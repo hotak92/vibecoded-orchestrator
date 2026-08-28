@@ -26,6 +26,8 @@ import {
   backgroundActivityLines,
   progressTotal,
   progressIcon,
+  updateAllModalDismissable,
+  type UpdateAllPhase,
 } from './update-all-progress';
 import { isErrorWarning } from '$lib/warning-severity';
 
@@ -501,5 +503,31 @@ describe('terminal-row sub-event: row untouched, background line updated', () =>
     // The FOOTER rule: the same event updates the background map and renders.
     const bg = applyBackgroundActivity(emptyBackgroundActivity(), 'p1', label);
     expect(backgroundActivityLines(bg, rows)).toEqual([`Alpha — ${label}`]);
+  });
+});
+
+// ─── v0.2.91 decision #26 — modal close-gating ───────────────────────────
+//
+// Both sides, because this is a gate on a dismissal:
+//   * BLOCKED while a destructive traversal is in flight;
+//   * ALLOWED in every terminal state — an undismissable modal is the dead
+//     end this wave removes, not one it adds.
+describe('updateAllModalDismissable', () => {
+  it('blocks dismissal only while the run is in flight', () => {
+    expect(updateAllModalDismissable('running')).toBe(false);
+  });
+
+  it('allows dismissal before the run starts and after it ends', () => {
+    // `done` carries BOTH the success report and the error report — the
+    // component sets phase='done' in its catch as well as its try — so this
+    // case is what keeps a failed run from stranding the user.
+    expect(updateAllModalDismissable('confirm')).toBe(true);
+    expect(updateAllModalDismissable('done')).toBe(true);
+  });
+
+  it('is exhaustive over the phase union (a new phase must be decided)', () => {
+    const phases: UpdateAllPhase[] = ['confirm', 'running', 'done'];
+    const blocked = phases.filter((p) => !updateAllModalDismissable(p));
+    expect(blocked).toEqual(['running']);
   });
 });

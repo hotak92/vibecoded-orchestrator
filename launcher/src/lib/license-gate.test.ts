@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   bannerCopy,
+  hasProTier,
   isLicenseActive,
   licenseStatus,
   moduleIsLicenseGated,
@@ -303,5 +304,46 @@ describe('bannerCopy', () => {
     expect(copy.title).toBe('');
     expect(copy.description).toBe('');
     expect(copy.actionLabel).toBe('');
+  });
+});
+
+// ─── P2-B4 (v0.2.91, decision #28): Pro-ROUTE deny predicate ──────────
+//
+// `hasProTier` drives BOTH the sidebar link gate and the two route deny
+// layouts (`routes/coordination/+layout.svelte`, `routes/hub/+layout.svelte`).
+// Pre-fix the predicate was inlined in `Sidebar.svelte` and the routes had
+// no gate at all; these tests pin the shared definition so a free-tier
+// user can never be handed the route chrome.
+describe('hasProTier (Pro-route deny predicate)', () => {
+  it('denies the free tier', () => {
+    expect(hasProTier('free')).toBe(false);
+  });
+
+  it('denies an unloaded license cache (null / undefined tier)', () => {
+    expect(hasProTier(null)).toBe(false);
+    expect(hasProTier(undefined)).toBe(false);
+  });
+
+  it('unlocks every tier at or above Pro', () => {
+    for (const tier of ['pro', 'mao', 'enterprise', 'admin']) {
+      expect(hasProTier(tier)).toBe(true);
+    }
+  });
+
+  it('denies an unknown tier slug (no silent escalation)', () => {
+    // Mirrors `vct_launcher_core::licensing::tier_rank`, which maps an
+    // unrecognised slug to rank 0.
+    expect(hasProTier('titanium')).toBe(false);
+    expect(hasProTier('')).toBe(false);
+  });
+
+  it('is case- and whitespace-insensitive on the slug', () => {
+    expect(hasProTier(' Pro ')).toBe(true);
+    expect(hasProTier('ADMIN')).toBe(true);
+  });
+
+  it('agrees with the license cache the sidebar reads', () => {
+    expect(hasProTier(mkCache({ orchestrator_tier: 'free' }).orchestrator_tier)).toBe(false);
+    expect(hasProTier(mkCache({ orchestrator_tier: 'pro' }).orchestrator_tier)).toBe(true);
   });
 });

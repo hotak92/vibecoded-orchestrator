@@ -330,3 +330,39 @@ export function backgroundActivityLines(
   }
   return lines;
 }
+
+// ─── v0.2.91 decision #26 — modal close-gating ───────────────────────────
+//
+// `update_all_projects` performs a real bundle install per project. Before
+// #26 the modal mounted `<DialogRoot bind:open>` with DialogRoot's defaults,
+// so Escape or a backdrop click closed it MID-RUN; reopening and re-clicking
+// then started a second concurrent run over the same folders, and the first
+// run's resolve later overwrote the live run's `report`/`phase`. (The backend
+// now refuses the second run outright — this half stops the user reaching
+// that refusal by accident, and keeps the modal's own header claim honest.)
+//
+// The gate is deliberately NARROW: only while a run is in flight. A modal
+// that cannot be dismissed in a TERMINAL state is the F-4-shaped dead end
+// this wave is removing everywhere else — the report, including a failure
+// report, must always be closable.
+//
+// Note DialogRoot's `onClose` is a NOTIFICATION, not a veto: gating it (the
+// EnrichmentProgressModal mistake) does not stop the dialog closing, it only
+// stops the parent hearing about it. `closeOnBackdrop` / `closeOnEscape` are
+// the actual gates — see `OnboardingWizard.svelte`'s mount for the reference
+// shape.
+
+/** The modal's three phases, as the component models them. */
+export type UpdateAllPhase = 'confirm' | 'running' | 'done';
+
+/**
+ * Whether the user may dismiss the modal in `phase`.
+ *
+ * `confirm` — yes, nothing has started. `running` — no, a destructive
+ * traversal is in flight. `done` — yes, and this is load-bearing: BOTH the
+ * success report and the error report land in `done`, so a gate that keyed
+ * on "did it succeed" would strand a user on a failure they cannot close.
+ */
+export function updateAllModalDismissable(phase: UpdateAllPhase): boolean {
+  return phase !== 'running';
+}

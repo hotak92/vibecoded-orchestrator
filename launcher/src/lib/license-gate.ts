@@ -75,6 +75,29 @@ export function isLicenseActive(cache: TierCacheView | null | undefined): boolea
 }
 
 /**
+ * Does this orchestrator tier unlock the Pro-gated ROUTES
+ * (`/coordination`, `/hub` — `Sidebar.svelte`'s `proOnly` set)?
+ *
+ * `pro`, `mao`, `enterprise` and `admin` all qualify; `free`, an unknown
+ * slug, and "no cache loaded yet" do not. The unknown-slug case matters:
+ * it mirrors `vct_launcher_core::licensing::tier_rank`, which maps an
+ * unrecognised tier to rank 0 so a supplied value can't silently
+ * escalate.
+ *
+ * v0.2.91 (P2-B4 / decision #28): extracted from the inline predicate in
+ * `Sidebar.svelte` so the sidebar's link gate and the two route deny
+ * layouts derive "has Pro" from ONE definition. This is a **UX-affordance
+ * predicate only** — the authority is the server-side
+ * `dashboard::require_tier` check every command on those routes now
+ * performs. Patching this function unlocks the deny screen and nothing
+ * behind it.
+ */
+export function hasProTier(tier: string | null | undefined): boolean {
+  const slug = (tier ?? 'free').toLowerCase().trim();
+  return slug === 'pro' || slug === 'mao' || slug === 'enterprise' || slug === 'admin';
+}
+
+/**
  * Does a module require an orchestrator-tier license?
  *
  * `license_required` is the canonical wire field from

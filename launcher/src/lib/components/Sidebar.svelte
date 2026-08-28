@@ -11,6 +11,7 @@
   import { page } from '$app/stores';
   import { selectedProject } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
+  import { hasProTier } from '$lib/license-gate';
   import { invoke, tauriAvailable } from '$lib/tauri';
 
   type NavItem = {
@@ -87,14 +88,20 @@
 
   /** True when the current orchestrator tier unlocks Pro-gated UI
    *  surfaces (Team section etc.). `pro`, `mao`, `enterprise`, and
-   *  `admin` all qualify; `free` does not. Server-side gates back
-   *  this client-side hint: a free user clicking a proOnly link gets
-   *  redirected to /store, and the underlying Tauri commands the
-   *  page would call also enforce tier. */
-  const hasPro = $derived.by(() => {
-    const tier = $license.cache?.orchestrator_tier ?? 'free';
-    return tier === 'pro' || tier === 'mao' || tier === 'enterprise' || tier === 'admin';
-  });
+   *  `admin` all qualify; `free` does not.
+   *
+   *  This flag gates the LINK only — a free user clicking a proOnly item
+   *  is sent to /store. Reaching the route another way (typed URL,
+   *  bookmark, back-button) lands on the route's own deny screen
+   *  (`routes/{coordination,hub}/+layout.svelte`), and every Tauri
+   *  command those pages invoke re-checks the tier server-side through
+   *  `dashboard::require_tier` (see `commands/coordination.rs` and
+   *  `commands/hub_proxy.rs`). v0.2.91 (P2-B4) built those two halves;
+   *  before that this comment described enforcement that did not exist.
+   *
+   *  The predicate itself lives in `$lib/license-gate` so the deny
+   *  layouts derive "has Pro" from the same definition. */
+  const hasPro = $derived(hasProTier($license.cache?.orchestrator_tier));
 
   const groups = $derived<NavGroup[]>([
     {

@@ -84,7 +84,7 @@ pub(crate) fn resolve_orchestrator_root(db: &Db) -> Option<PathBuf> {
     // Sticky cache — future calls take the cached path.
     let s = found.to_string_lossy().to_string();
     if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
-        eprintln!(
+        tracing::warn!(
             "[vct] resolve_orchestrator_root: failed to cache install_path: {}",
             e
         );
@@ -985,7 +985,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         // remote_check_ok/error so the frontend can honestly show
         // "couldn't check" and retry.
         if let Err(e) = crate::commands::self_update::ensure_upstream_remote(&p).await {
-            eprintln!(
+            tracing::warn!(
                 "[vct] check_for_updates: ensure_upstream_remote failed at {} ({}), skipping remote check",
                 p.display(),
                 e
@@ -1010,7 +1010,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
             // contention that even the retry couldn't clear. Don't hard-fail
             // the whole status check; surface it as an UNKNOWN remote state
             // (not a false "up to date"). The other signals still work.
-            eprintln!(
+            tracing::warn!(
                 "[vct] check_for_updates: git fetch failed at {} ({}), remote state unknown",
                 p.display(),
                 e
@@ -1047,7 +1047,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] check_for_updates: branch rev-parse spawn failed at {} ({}), assuming main",
                         p.display(),
                         e
@@ -1090,7 +1090,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                             remote_ahead = n > 0;
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] check_for_updates: rev-list count parse failed at {} (raw={:?}, {})",
                                 p.display(),
                                 raw,
@@ -1106,7 +1106,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                     let stderr = String::from_utf8_lossy(&revlist.stderr)
                         .trim()
                         .to_string();
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] check_for_updates: rev-list exited non-zero at {} ({})",
                         p.display(),
                         stderr
@@ -1119,7 +1119,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                     });
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] check_for_updates: rev-list spawn failed at {} ({})",
                         p.display(),
                         e
@@ -1471,7 +1471,7 @@ pub async fn get_known_install_path(db: State<'_, Db>) -> Result<Option<String>,
         // Sticky cache: future calls take the fast Strategy 1 path.
         // DB write failure here is non-fatal — log and proceed.
         if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] get_known_install_path: failed to cache install_path: {}",
                 e
             );
@@ -1616,7 +1616,7 @@ pub(crate) fn read_persisted_hardware_snapshot(db: &Db) -> Result<Option<Hardwar
     match serde_json::from_str::<HardwareSnapshot>(&raw) {
         Ok(snap) => Ok(Some(snap)),
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] hardware_snapshot row is unparseable; ignoring: {}",
                 e
             );
@@ -1722,21 +1722,21 @@ where
             // Probe failed. Try last-known snapshot.
             match read_persisted_hardware_snapshot(db) {
                 Ok(Some(snap)) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] install-time hw redetect failed ({}), falling back to last-known snapshot",
                         probe_err
                     );
                     Ok(snap)
                 }
                 Ok(None) => {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] install-time hw redetect failed ({}) and no last-known snapshot — propagating",
                         probe_err
                     );
                     Err(probe_err)
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] install-time hw redetect failed ({}) and last-known snapshot read failed ({}) — propagating probe error",
                         probe_err, e
                     );
@@ -1763,7 +1763,7 @@ pub(crate) async fn ensure_fresh_hardware_snapshot_for_install(
     match resolve_fresh_or_last_known_snapshot_with_probe(db, detect_system).await {
         Ok(snap) => Some(snap),
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] ensure_fresh_hardware_snapshot_for_install: no snapshot available ({}); install will fall back to GpuMode::Cpu",
                 e
             );
@@ -1779,7 +1779,7 @@ pub(crate) async fn ensure_fresh_hardware_snapshot_for_install(
 /// still hit the Preferences button.
 pub(crate) fn mark_hardware_redetect_pending_after_update(db: &Db) {
     if let Err(e) = db.app_state_set(APP_STATE_KEY_HARDWARE_REDETECT_PENDING, "1") {
-        eprintln!(
+        tracing::error!(
             "[vct] mark_hardware_redetect_pending_after_update: app_state write failed: {}",
             e
         );
@@ -1800,7 +1800,7 @@ pub(crate) fn is_hardware_redetect_pending(db: &Db) -> bool {
 /// guard at all call sites). Best-effort.
 pub(crate) fn clear_hardware_redetect_pending(db: &Db) {
     if let Err(e) = db.app_state_set(APP_STATE_KEY_HARDWARE_REDETECT_PENDING, "") {
-        eprintln!(
+        tracing::error!(
             "[vct] clear_hardware_redetect_pending: app_state write failed: {}",
             e
         );
@@ -1840,11 +1840,11 @@ pub fn consume_pending_hardware_redetect_if_set<R: tauri::Runtime>(
         match redetect_hardware_with_probe(db.inner(), detect_system).await {
             Ok(diff) => {
                 if diff.changed_fields.is_empty() {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] post-update hardware redetect: snapshot unchanged"
                     );
                 } else {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] post-update hardware redetect: {} field(s) changed: {:?}",
                         diff.changed_fields.len(),
                         diff.changed_fields
@@ -1852,7 +1852,7 @@ pub fn consume_pending_hardware_redetect_if_set<R: tauri::Runtime>(
                 }
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] post-update hardware redetect failed (non-fatal, last-known snapshot retained): {}",
                     e
                 );
@@ -2067,7 +2067,7 @@ pub async fn apply_hardware_reconfig(
         if let Err(e) =
             db.app_state_set(APP_STATE_KEY_HARDWARE_LAST_RECONFIGURED, &now)
         {
-            eprintln!("[vct] failed to persist hardware_last_reconfigured_at: {}", e);
+            tracing::error!("[vct] failed to persist hardware_last_reconfigured_at: {}", e);
         }
     }
 
@@ -2104,7 +2104,7 @@ pub fn seed_initial_hardware_snapshot_if_missing<R: tauri::Runtime>(
             Ok(Some(s)) if !s.is_empty() => return,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[vct] seed hw snapshot: app_state read failed: {}", e);
+                tracing::error!("[vct] seed hw snapshot: app_state read failed: {}", e);
                 return;
             }
         }
@@ -2115,7 +2115,7 @@ pub fn seed_initial_hardware_snapshot_if_missing<R: tauri::Runtime>(
         let system = match detect_system().await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[vct] seed hw snapshot: detect_system failed: {}", e);
+                tracing::error!("[vct] seed hw snapshot: detect_system failed: {}", e);
                 return;
             }
         };
@@ -2129,12 +2129,12 @@ pub fn seed_initial_hardware_snapshot_if_missing<R: tauri::Runtime>(
             Ok(Some(s)) if !s.is_empty() => return,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[vct] seed hw snapshot: app_state recheck failed: {}", e);
+                tracing::error!("[vct] seed hw snapshot: app_state recheck failed: {}", e);
                 return;
             }
         }
         if let Err(e) = write_persisted_hardware_snapshot(db.inner(), &snap) {
-            eprintln!("[vct] seed hw snapshot: persist failed: {}", e);
+            tracing::error!("[vct] seed hw snapshot: persist failed: {}", e);
         }
     });
 }
@@ -2795,7 +2795,7 @@ pub async fn install_orchestrator(
         db_ref,
     ) {
         Ok(report) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] install_orchestrator: registered {} of {} default MCP(s) to {}",
                 report.success_count(),
                 report.outcomes.len(),
@@ -2803,14 +2803,14 @@ pub async fn install_orchestrator(
             );
             for o in &report.outcomes {
                 if !o.ok {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] install_orchestrator: MCP `{}` failed: {}",
                         o.name,
                         o.error.as_deref().unwrap_or("unknown")
                     );
                 }
                 if !o.dropped_keys.is_empty() {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] install_orchestrator: dropped {} env key(s) from `{}` (allowlist/secret filter): {:?}",
                         o.dropped_keys.len(),
                         o.name,
@@ -2819,11 +2819,11 @@ pub async fn install_orchestrator(
                 }
             }
             for w in &report.db_warnings {
-                eprintln!("[vct] install_orchestrator: db warning: {}", w);
+                tracing::warn!("[vct] install_orchestrator: db warning: {}", w);
             }
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] install_orchestrator: MCP registration failed (soft-fail): {}. \
                  install.py's Python-side fallback will retry. Manually re-run \
                  `python install.py --update` or wire ~/.claude.json by hand if needed.",
@@ -2847,7 +2847,7 @@ pub async fn install_orchestrator(
     // Soft-fail: a DB hiccup must not block install completion.
     if let Some(db) = window.app_handle().try_state::<Db>() {
         if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &config.install_path) {
-            eprintln!("[vct] install_orchestrator: failed to persist install_path: {}", e);
+            tracing::error!("[vct] install_orchestrator: failed to persist install_path: {}", e);
         }
     }
 
@@ -3064,7 +3064,7 @@ async fn run_install_orchestrator_lightweight(
         db_ref,
     ) {
         Ok(report) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] lightweight: re-registered {} of {} default MCP(s) to {}",
                 report.success_count(),
                 report.outcomes.len(),
@@ -3072,7 +3072,7 @@ async fn run_install_orchestrator_lightweight(
             );
             for o in &report.outcomes {
                 if !o.ok {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] lightweight: MCP `{}` re-register failed: {}",
                         o.name,
                         o.error.as_deref().unwrap_or("unknown")
@@ -3081,7 +3081,7 @@ async fn run_install_orchestrator_lightweight(
             }
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] lightweight: MCP re-registration failed (soft-fail): {}. \
                  Manually re-run `python install.py --update` if MCP paths look stale.",
                 e
@@ -3097,7 +3097,7 @@ async fn run_install_orchestrator_lightweight(
     let install_path_str = install_path.to_string_lossy().to_string();
     if let Some(db) = window.app_handle().try_state::<Db>() {
         if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &install_path_str) {
-            eprintln!(
+            tracing::error!(
                 "[vct] run_install_orchestrator_lightweight: failed to persist install_path: {}",
                 e
             );
@@ -3162,7 +3162,7 @@ fn ensure_hub_stopped_for_update(install_path: &Path) -> Result<bool, String> {
     // strays). The count is informational.
     let swept = crate::commands::update_gate::pre_update_hub_kill_sweep();
     if swept > 0 {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: hub-sweep backstop terminated {} stray vct-hub process(es) the lockfile path did not cover",
             swept
         );
@@ -3178,7 +3178,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     let pid_raw = match std::fs::read_to_string(&pid_file) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: no {} — vct-hub is not running, skipping stop",
                 pid_file.display(),
             );
@@ -3201,7 +3201,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         Err(_) => {
             // Malformed lockfile — treat as "no hub running" and clean
             // up so install.py doesn't choke on it later.
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: {} contains malformed PID {:?}; removing stale lockfile",
                 pid_file.display(),
                 pid_raw.lines().next().unwrap_or("").trim(),
@@ -3215,7 +3215,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         // Stale lockfile from a previous hub crash. Clean it up so the
         // post-update `--start-if-not-running` path doesn't think a
         // hub is already running.
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: hub.pid claims pid {} but it's dead; removing stale lockfile",
             pid
         );
@@ -3223,7 +3223,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
-    eprintln!(
+    tracing::info!(
         "[vct] update_orchestrator: vct-hub running (pid {}); requesting graceful stop",
         pid
     );
@@ -3245,7 +3245,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         match cmd.status() {
             Ok(status) => {
                 if !status.success() {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] update_orchestrator: vct-hub --stop exited {:?}; will fall through to direct signal",
                         status.code()
                     );
@@ -3253,7 +3253,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
                 true
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] update_orchestrator: could not spawn vct-hub --stop ({}); falling through to direct signal",
                     e
                 );
@@ -3261,7 +3261,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             }
         }
     } else {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: vct-hub binary not found on disk; \
              skipping polite --stop and going straight to direct signal"
         );
@@ -3278,7 +3278,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             // graceful-shutdown path normally removes it; if it
             // didn't, do it now).
             let _ = std::fs::remove_file(&pid_file);
-            eprintln!(
+            tracing::info!(
                 "[vct] update_orchestrator: vct-hub pid {} stopped gracefully",
                 pid
             );
@@ -3291,7 +3291,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     // the kernel to kill the process. Refuse the update entirely if
     // even this fails — letting git pull continue with a live hub
     // would lock vct-hub.exe on Windows and corrupt the update.
-    eprintln!(
+    tracing::warn!(
         "[vct] update_orchestrator: vct-hub pid {} did not exit within 10s (polite_attempted={}); escalating to force-kill",
         pid, polite_attempted
     );
@@ -3360,7 +3360,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline2 {
         if !pid_is_alive(pid) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: vct-hub pid {} force-killed; cleared stale {}",
                 pid,
                 pid_file.display()
@@ -3430,7 +3430,7 @@ fn pre_pull_rename_vct_hub_binary(install_path: &Path) -> Option<PathBuf> {
 
     match std::fs::rename(&hub_canon, &backup_path) {
         Ok(()) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] update_orchestrator: pre-pull renamed vct-hub binary to {} (Windows). New binary will be written to {} by git pull.",
                 backup_path.display(),
                 hub_canon.display(),
@@ -3438,7 +3438,7 @@ fn pre_pull_rename_vct_hub_binary(install_path: &Path) -> Option<PathBuf> {
             Some(backup_path)
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: pre-pull rename of vct-hub FAILED ({}). git pull may fail with ERROR_SHARING_VIOLATION if the hub binary is still locked. Continuing — the user will see any git error.",
                 e,
             );
@@ -3565,14 +3565,14 @@ fn ensure_hub_started_after_update(
     ctx: HubRestartContext,
 ) -> Result<(), String> {
     let Some(hub_bin) = crate::hub_launcher::find_hub_binary() else {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: vct-hub binary not found on disk after install.py — \
              leaving hub stopped. Launcher restart will retry the discovery."
         );
         return Ok(());
     };
 
-    eprintln!(
+    tracing::info!(
         "[vct] update_orchestrator: starting vct-hub from {}",
         hub_bin.display()
     );
@@ -3590,7 +3590,7 @@ fn ensure_hub_started_after_update(
     match cmd.status() {
         Ok(status) if status.success() => {}
         Ok(status) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: vct-hub --start-if-not-running exited {:?}; \
                  launcher will retry on next startup",
                 status.code()
@@ -3598,7 +3598,7 @@ fn ensure_hub_started_after_update(
             return Ok(());
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: could not spawn vct-hub --start-if-not-running: {}; \
                  launcher will retry on next startup",
                 e
@@ -3623,7 +3623,7 @@ fn ensure_hub_started_after_update(
     // `false` unconditionally for `AbortRecovery`, so we always poll there.
     let root = vct_launcher_core::paths::vct_root_dir();
     if should_skip_redundant_health_poll(&root, ctx) {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: cutover sentinel absent (post-install) — install.py \
              already validated /health; skipping redundant 30 s poll"
         );
@@ -3632,7 +3632,7 @@ fn ensure_hub_started_after_update(
 
     match ctx {
         HubRestartContext::PostInstall => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: cutover sentinel still present at {} — \
                  install.py did not confirm /health; running full 30 s poll",
                 root.join(V0_2_21_CUTOVER_SENTINEL_NAME).display()
@@ -3643,7 +3643,7 @@ fn ensure_hub_started_after_update(
             Ok(())
         }
         HubRestartContext::AbortRecovery => {
-            eprintln!(
+            tracing::info!(
                 "[vct] abort_recovery: running vct-hub /health poll on a background thread \
                  (never consulting the cutover sentinel — install.py did not run on the abort \
                  path) so the conflict payload/modal is not delayed up to 30 s"
@@ -3667,7 +3667,7 @@ fn ensure_hub_started_after_update(
                     if poll_hub_health_for_30s(&root_owned) {
                         return; // hub came back healthy — nothing to report.
                     }
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] abort_recovery: vct-hub did NOT become healthy within 30 s after \
                          the update aborted; the hub is likely down. Restart the launcher or run \
                          `vct-hub --start-if-not-running`. Writing a durable deferral note."
@@ -3675,7 +3675,7 @@ fn ensure_hub_started_after_update(
                     emit_hub_restart_failed_after_abort_deferral(&install_owned);
                 })
             {
-                eprintln!(
+                tracing::warn!(
                     "[vct] abort_recovery: could not spawn the background hub health-poll thread \
                      ({}); skipping the async poll (best-effort — the abort itself completed).",
                     e
@@ -3708,7 +3708,7 @@ fn poll_hub_health_for_30s(root: &Path) -> bool {
                 .filter(|s| !s.is_empty());
             if let (Some(port), Some(token)) = (port, token) {
                 if probe_hub_health(port, &token) {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] update_orchestrator: vct-hub /health OK on 127.0.0.1:{}",
                         port
                     );
@@ -3719,7 +3719,7 @@ fn poll_hub_health_for_30s(root: &Path) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    eprintln!(
+    tracing::warn!(
         "[vct] update_orchestrator: vct-hub did not become healthy within 30 s; \
          launcher will start in hub-unavailable degraded mode. \
          User can retry via Stop menu → 'Start vct-hub'."
@@ -3780,7 +3780,7 @@ fn emit_hub_restart_failed_after_abort_deferral(install_path: &Path) {
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] hub_restart_failed_after_abort: deferral emit failed: {} — the hub-down state \
              may be missing from UPDATE_DEFERRED.md, but the hub is still down; restart the \
              launcher or run `vct-hub --start-if-not-running`",
@@ -4022,12 +4022,12 @@ impl<'a> WaitForBinaryRefresh<'a> {
                 // are valid exit states. AND the hub binary (when its
                 // sidecar exists) is at/above source too.
                 if iteration > 1 {
-                    eprintln!(
+                    tracing::info!(
                         "[v0.2.45 V45-B] binary refresh landed after {} poll(s): on-disk now v{} (source v{})",
                         iteration, on_disk_version, source_version,
                     );
                 } else if on_disk_version != source_version {
-                    eprintln!(
+                    tracing::warn!(
                         "[v0.2.48] on-disk binary v{} is ahead of source v{} — proceeding (newer binary is what the user wants to run)",
                         on_disk_version, source_version,
                     );
@@ -4060,7 +4060,7 @@ impl<'a> WaitForBinaryRefresh<'a> {
                     hub_displayed,
                 ));
             }
-            eprintln!(
+            tracing::warn!(
                 "[v0.2.45 V45-B] waiting for binary refresh: source=v{} on_disk=v{} (iteration {})",
                 source_version,
                 if on_disk_version.is_empty() {
@@ -4081,7 +4081,7 @@ impl<'a> WaitForBinaryRefresh<'a> {
                 if let Err(e) =
                     run_git_pull_ff_only(self.install_path, self.branch).await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "[v0.2.45 V45-B] git pull warning (will retry next iteration): {}",
                         e
                     );
@@ -4150,19 +4150,19 @@ impl<R: Runtime> DbUpdateClosedGuard<R> {
     fn new(app: AppHandle<R>) -> Self {
         if let Some(db) = app.try_state::<crate::db::Db>() {
             if let Err(e) = db.close_for_update() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] update_orchestrator: close_for_update failed ({}); \
                      proceeding (install.py may contend for the launcher.db lock)",
                     e
                 );
             } else {
-                eprintln!(
+                tracing::info!(
                     "[vct] update_orchestrator: launcher.db connection closed for the \
                      install.py window (writer lock released)"
                 );
             }
         } else {
-            eprintln!(
+            tracing::info!(
                 "[vct] update_orchestrator: no managed Db state — nothing to close"
             );
         }
@@ -4177,15 +4177,15 @@ impl<R: Runtime> DbUpdateClosedGuard<R> {
         }
         self.armed = false;
         let Some(db) = self.app.try_state::<crate::db::Db>() else {
-            eprintln!("[vct] update_orchestrator: no managed Db state to reopen");
+            tracing::info!("[vct] update_orchestrator: no managed Db state to reopen");
             return;
         };
         match db.reopen_after_update() {
             Ok(()) => {
-                eprintln!("[vct] update_orchestrator: launcher.db connection reopened");
+                tracing::info!("[vct] update_orchestrator: launcher.db connection reopened");
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[vct] update_orchestrator: FATAL — could not reopen launcher.db \
                      after update ({}); forcing restart so the launcher does not run \
                      on a dead in-memory DB",
@@ -4234,7 +4234,7 @@ pub async fn update_orchestrator<R: Runtime>(
     if update_requires_hard_cut(&install_path) {
         // Unreachable in v0.2.60 (floor=0.0.0). When v0.3.0 raises the floor,
         // replace this log with the routing to the hard-cut flow.
-        eprintln!(
+        tracing::info!(
             "[vct] update_orchestrator: installed version is below \
              min_upgradable_from — a guided hard-cut is required (v0.3.0 \
              activation; not wired in v0.2.60)"
@@ -4313,7 +4313,7 @@ pub async fn update_orchestrator<R: Runtime>(
     //      boot-time stale-cleanup is the second line of defense.
     let pre_sweep_count = crate::commands::update_gate::pre_update_mcp_kill_sweep();
     if pre_sweep_count > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] update_orchestrator: pre-sweep terminated {} MCP-shaped \
              process(es) before update",
             pre_sweep_count
@@ -4432,7 +4432,7 @@ pub async fn update_orchestrator<R: Runtime>(
     )
     .await
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: pre-merge fetch failed: {} — continuing",
             e
         );
@@ -4558,7 +4558,7 @@ pub async fn update_orchestrator<R: Runtime>(
         )
         .await;
     if f1_restored > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] update_orchestrator: F1 auto-restored {} byte-identical tracked file(s) \
              before divergence-plan resolution",
             f1_restored
@@ -4585,7 +4585,7 @@ pub async fn update_orchestrator<R: Runtime>(
         || !gen_reconcile.took_upstream.is_empty()
         || !gen_reconcile.restored_worktree.is_empty()
     {
-        eprintln!(
+        tracing::info!(
             "[vct] update_orchestrator: reconciled generated/release-controlled file(s) to \
              upstream — {} committed take-upstream, {} worktree-restored (reconcile_committed={})",
             gen_reconcile.took_upstream.len(),
@@ -4814,7 +4814,7 @@ pub async fn update_orchestrator<R: Runtime>(
         // modal; log and fall through to the normal path. The block is entered
         // ONLY when the index actually carries unmerged entries.
         if autostash_pop_failed && unmerged.is_empty() {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: autostash marker present but the index has \
                  NO unmerged entries — the pop left the tree clean; not emitting a \
                  (would-be-empty) conflict modal, continuing the update."
@@ -4836,7 +4836,7 @@ pub async fn update_orchestrator<R: Runtime>(
                 || pull_combined.contains("Successfully rebased");
             let pop_conflict_after_success = autostash_pop_failed && merge_succeeded;
 
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_orchestrator: pull exited 0 but the working tree has \
                  {} unmerged file(s){} — {}. Routing to the {} modal.",
                 unmerged.len(),
@@ -5135,7 +5135,7 @@ pub async fn update_orchestrator<R: Runtime>(
                 }
                 Ok(None) => break, // EOF
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] update_orchestrator: install.py stdout \
                          read error: {} (continuing; install.py still \
                          running)",
@@ -5720,7 +5720,7 @@ async fn handle_untracked_collisions_pre_pull(
     // leave the tree half-changed). Leave the whole set alone, write the
     // deferral, and surface the modal payload.
     if !collisions.divergent.is_empty() {
-        eprintln!(
+        tracing::info!(
             "[vct] {}: {} divergent untracked collision(s) with upstream-added \
              files — surfacing keep-mine/take-upstream choice (no auto-removal): {:?}",
             operation,
@@ -5742,7 +5742,7 @@ async fn handle_untracked_collisions_pre_pull(
     for path in &collisions.identical {
         let abs = install_path.join(path);
         match std::fs::remove_file(&abs) {
-            Ok(()) => eprintln!(
+            Ok(()) => tracing::info!(
                 "[vct] {}: auto-removed byte-identical untracked file {} \
                  (== incoming upstream blob) so the merge can take the tracked version",
                 operation, path,
@@ -5751,7 +5751,7 @@ async fn handle_untracked_collisions_pre_pull(
                 // Could not remove → do NOT proceed as if resolved; the pull
                 // would abort on it. Surface as a divergent-style modal so the
                 // user is never left with a silent half-state.
-                eprintln!(
+                tracing::warn!(
                     "[vct] {}: failed to auto-remove byte-identical untracked {}: {} \
                      — surfacing modal instead of proceeding",
                     operation, path, e,
@@ -5824,7 +5824,7 @@ fn write_untracked_collision_deferral(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] {}: could not emit untracked_collision_divergent deferral (non-fatal): {}",
             operation, e,
         );
@@ -5904,7 +5904,7 @@ fn write_autostash_pop_conflict_deferral(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_orchestrator: could not emit autostash_pop_conflict deferral \
              (non-fatal): {}",
             e,
@@ -5996,7 +5996,7 @@ async fn handle_untracked_overwrite_post_pull(
     for path in parsed {
         // Refuse traversal / absolute paths defensively even at classify time.
         if path.contains("..") || Path::new(&path).is_absolute() {
-            eprintln!(
+            tracing::warn!(
                 "[vct] {}: skipping suspicious collision path from stderr: {:?}",
                 operation, path
             );
@@ -6028,7 +6028,7 @@ async fn handle_untracked_overwrite_post_pull(
         }
     }
 
-    eprintln!(
+    tracing::warn!(
         "[vct] {}: untracked-overwrite abort parsed {} identical + {} divergent collision(s) \
          from stderr — surfacing resolvable modal (no auto-mutation here)",
         operation,
@@ -6121,7 +6121,7 @@ async fn run_pre_merge_user_editable(
             return Vec::new();
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pre_merge: compute_base_sha failed: {} — skipping pre-merge",
                 e
             );
@@ -6132,7 +6132,7 @@ async fn run_pre_merge_user_editable(
         Ok(Some(s)) => s,
         Ok(None) => return Vec::new(),
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pre_merge: compute_theirs_sha failed: {} — skipping pre-merge",
                 e
             );
@@ -6148,7 +6148,7 @@ async fn run_pre_merge_user_editable(
     let outcomes = match pre_merge_user_editable(install_path, &base, &theirs).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pre_merge: pre_merge_user_editable failed: {} — skipping pre-merge",
                 e
             );
@@ -6174,14 +6174,14 @@ async fn run_pre_merge_user_editable(
             match status {
                 Ok(s) if s.success() => merged_any = true,
                 Ok(s) => {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] pre_merge: git add failed for {} (exit {:?})",
                         outcome.path.display(),
                         s.code(),
                     );
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] pre_merge: git add spawn failed for {}: {}",
                         outcome.path.display(),
                         e,
@@ -6246,7 +6246,7 @@ async fn run_pre_merge_user_editable(
                 // clone in roughly the state it had before pre-merge,
                 // and the existing B4 modal will then surface the
                 // un-pre-merged conflict path.
-                eprintln!(
+                tracing::error!(
                     "[vct] pre_merge: git commit failed (exit {:?}): {} — attempting revert",
                     out.status.code(),
                     String::from_utf8_lossy(&out.stderr).trim(),
@@ -6269,7 +6269,7 @@ async fn run_pre_merge_user_editable(
                 }
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] pre_merge: git commit spawn failed: {} — falling through",
                     e,
                 );
@@ -6302,7 +6302,7 @@ fn maybe_emit_pre_merge_deferrals(
     if let Err(e) =
         emit_orchestrator_user_modified_deferrals(install_path, outcomes, pull_branch)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] pre_merge: deferral emission failed: {} — continuing (update succeeded)",
             e
         );
@@ -6378,7 +6378,7 @@ async fn finalize_update_and_restart<R: Runtime>(
         .run()
         .await
     {
-        eprintln!("[v0.2.45 V45-B] finalize_update_and_restart: {}", e);
+        tracing::error!("[v0.2.45 V45-B] finalize_update_and_restart: {}", e);
 
         // v0.2.55 (PRIMARY-BUG fix): WaitForBinaryRefresh timed out — the
         // on-disk dist binary never reached the exact `source_version`
@@ -6405,7 +6405,7 @@ async fn finalize_update_and_restart<R: Runtime>(
             !on_disk.is_empty() && version_is_outdated(running, &on_disk);
 
         if on_disk_beats_running {
-            eprintln!(
+            tracing::warn!(
                 "[v0.2.55] binary-refresh did not reach target, but on-disk dist \
                  binary v{} is NEWER than running v{} — restarting into it anyway \
                  (strictly better than staying on the old binary). A durable \
@@ -6435,7 +6435,7 @@ async fn finalize_update_and_restart<R: Runtime>(
             // diagnosable at session start instead of dying in a GUI
             // modal (the durable-logging gap: pre-v0.2.55 this surfaced
             // ONLY as a transient "click Update again" error string).
-            eprintln!(
+            tracing::error!(
                 "[v0.2.55] binary-refresh timed out and no newer dist binary is \
                  available (running v{}, on-disk v{}); writing durable deferral \
                  and aborting restart.",
@@ -6501,7 +6501,7 @@ async fn finalize_update_and_restart<R: Runtime>(
             .await;
 
     if handoff_result.handoff_active {
-        eprintln!(
+        tracing::info!(
             "[vct] finalize_update_and_restart: V52-AH handoff active (lock={:?}); \
              exiting current launcher — vct-updater.exe will perform the \
              swap + relaunch. Hub stays stopped so vct-hub.exe is swappable \
@@ -6517,7 +6517,7 @@ async fn finalize_update_and_restart<R: Runtime>(
     }
 
     if let Some(reason) = handoff_result.skip_reason.as_deref() {
-        eprintln!(
+        tracing::warn!(
             "[vct] finalize_update_and_restart: V52-AH handoff skipped (reason={}); \
              falling through to legacy restart_launcher",
             reason,
@@ -6532,7 +6532,7 @@ async fn finalize_update_and_restart<R: Runtime>(
     // completed on the finalize path, so the sentinel-skip heuristic applies.
     emit_progress(window, "update", "Starting vct-hub...", 97.0);
     if let Err(e) = ensure_hub_started_after_update(install_path, HubRestartContext::PostInstall) {
-        eprintln!(
+        tracing::warn!(
             "[vct] finalize_update_and_restart: ensure_hub_started_after_update \
              returned Err({}); continuing with launcher restart (hub will \
              retry on next boot)",
@@ -6547,7 +6547,7 @@ async fn finalize_update_and_restart<R: Runtime>(
         // VCT_AUTO_RESTART_LAUNCHER so the launcher_restart_required
         // deferral gets emitted as a fallback and the banner fires on
         // the next launcher start.
-        eprintln!(
+        tracing::warn!(
             "[vct] finalize_update_and_restart: auto-restart failed ({}); re-spawning \
              install.py to emit the launcher_restart_required deferral as a \
              fallback so the banner fires on next launcher start.",
@@ -6571,14 +6571,14 @@ async fn finalize_update_and_restart<R: Runtime>(
         }
         match fallback.output().await {
             Ok(out) if out.status.success() => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] finalize_update_and_restart: fallback install.py succeeded; \
                      launcher_restart_required deferral should now be present."
                 );
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
+                tracing::warn!(
                     "[vct] finalize_update_and_restart: fallback install.py exited \
                      non-zero ({:?}). stderr tail: {}",
                     out.status.code(),
@@ -6593,7 +6593,7 @@ async fn finalize_update_and_restart<R: Runtime>(
                 ));
             }
             Err(spawn_err) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] finalize_update_and_restart: could not spawn fallback \
                      install.py: {}. Surfacing the error to the GUI.",
                     spawn_err,
@@ -6661,7 +6661,7 @@ async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String>
             remote = crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         )),
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] assert_head_reached_upstream: behind-count failed ({e}) — proceeding \
                  (cannot confirm staleness; not blocking a healthy update on a git hiccup)."
             );
@@ -6905,7 +6905,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // lockfile so MCPs can respawn while the user resolves conflicts.
     let pre_sweep_count_merge = crate::commands::update_gate::pre_update_mcp_kill_sweep();
     if pre_sweep_count_merge > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] merge_orchestrator_with_upstream: pre-sweep terminated {} \
              MCP-shaped process(es) before merge",
             pre_sweep_count_merge
@@ -6954,7 +6954,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     )
     .await
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] merge_orchestrator_with_upstream: pre-merge fetch failed: {} — continuing",
             e
         );
@@ -7019,7 +7019,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
         || !gen_reconcile.took_upstream.is_empty()
         || !gen_reconcile.restored_worktree.is_empty()
     {
-        eprintln!(
+        tracing::info!(
             "[vct] merge_orchestrator_with_upstream: reconciled generated/release-controlled \
              file(s) to upstream — {} committed take-upstream, {} worktree-restored \
              (reconcile_committed={})",
@@ -7139,13 +7139,13 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
         // NO unmerged entries means the pop applied clean — do NOT emit an empty
         // "0 file(s)" conflict modal; fall through to the normal path.
         if autostash_pop_failed && unmerged.is_empty() {
-            eprintln!(
+            tracing::warn!(
                 "[vct] merge_orchestrator_with_upstream: autostash marker present but the \
                  index has NO unmerged entries — the pop left the tree clean; continuing."
             );
         }
         if !unmerged.is_empty() {
-            eprintln!(
+            tracing::warn!(
                 "[vct] merge_orchestrator_with_upstream: pull exited 0 but the working tree \
                  has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
                  conflict modal instead of proceeding on a broken tree.",
@@ -7253,7 +7253,7 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
     // Pre-v0.2.54 the rebase path had neither sweep nor gate.
     let pre_sweep_count_rebase = crate::commands::update_gate::pre_update_mcp_kill_sweep();
     if pre_sweep_count_rebase > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] rebase_orchestrator_onto_upstream: pre-sweep terminated {} \
              MCP-shaped process(es) before rebase",
             pre_sweep_count_rebase
@@ -7420,13 +7420,13 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
         // NO unmerged entries means the pop applied clean — do NOT emit an empty
         // "0 file(s)" conflict modal; fall through to the normal path.
         if autostash_pop_failed && unmerged.is_empty() {
-            eprintln!(
+            tracing::warn!(
                 "[vct] rebase_orchestrator_onto_upstream: autostash marker present but the \
                  index has NO unmerged entries — the pop left the tree clean; continuing."
             );
         }
         if !unmerged.is_empty() {
-            eprintln!(
+            tracing::info!(
                 "[vct] rebase_orchestrator_onto_upstream: rebase exited 0 but the working tree \
                  has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
                  conflict modal instead of proceeding on a broken tree.",
@@ -7631,7 +7631,7 @@ fn write_update_resume_sentinel(
     let json = match serde_json::to_string_pretty(&sentinel) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_resume_sentinel: serialize failed: {} — \
                  skipping sentinel write",
                 e
@@ -7641,7 +7641,7 @@ fn write_update_resume_sentinel(
     };
     let target = install_path.join(UPDATE_RESUME_SENTINEL_REL);
     let Some(parent) = target.parent() else {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_resume_sentinel: target has no parent: {} — \
              skipping",
             target.display()
@@ -7649,7 +7649,7 @@ fn write_update_resume_sentinel(
         return;
     };
     if let Err(e) = std::fs::create_dir_all(parent) {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_resume_sentinel: mkdir {} failed: {} — \
              skipping sentinel write",
             parent.display(),
@@ -7664,7 +7664,7 @@ fn write_update_resume_sentinel(
         std::process::id()
     ));
     if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
-        eprintln!(
+        tracing::error!(
             "[vct] update_resume_sentinel: write {} failed: {}",
             tmp.display(),
             e
@@ -7673,7 +7673,7 @@ fn write_update_resume_sentinel(
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, &target) {
-        eprintln!(
+        tracing::error!(
             "[vct] update_resume_sentinel: rename {} → {} failed: {}",
             tmp.display(),
             target.display(),
@@ -7693,7 +7693,7 @@ fn clear_update_resume_sentinel(install_path: &Path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[vct] update_resume_sentinel: clear {} failed: {}",
                 target.display(),
                 e
@@ -7737,7 +7737,7 @@ fn write_update_resume_deferral(
     let parent = match target.parent() {
         Some(p) => p,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] update_resume_deferral: target has no parent: {}",
                 target.display()
             );
@@ -7745,7 +7745,7 @@ fn write_update_resume_deferral(
         }
     };
     if let Err(e) = std::fs::create_dir_all(parent) {
-        eprintln!(
+        tracing::warn!(
             "[vct] update_resume_deferral: mkdir {} failed: {} — \
              skipping deferral write",
             parent.display(),
@@ -7842,7 +7842,7 @@ next successful install.py run, so the resolution is one command.\n\
         std::process::id()
     ));
     if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
-        eprintln!(
+        tracing::error!(
             "[vct] update_resume_deferral: write {} failed: {}",
             tmp.display(),
             e
@@ -7851,7 +7851,7 @@ next successful install.py run, so the resolution is one command.\n\
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, &target) {
-        eprintln!(
+        tracing::error!(
             "[vct] update_resume_deferral: rename {} → {} failed: {}",
             tmp.display(),
             target.display(),
@@ -7963,7 +7963,7 @@ fn clear_update_resume_deferral_if_solo(install_path: &Path) {
     if single_id && section_count == 1 {
         match std::fs::remove_file(&target) {
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[vct] update_resume_deferral: clear {} failed: {}",
                     target.display(),
                     e
@@ -7985,7 +7985,7 @@ fn clear_update_resume_deferral_if_solo(install_path: &Path) {
                 let json_sidecar = target.with_file_name("UPDATE_DEFERRED.json");
                 if json_sidecar.is_file() {
                     if let Err(e) = std::fs::remove_file(&json_sidecar) {
-                        eprintln!(
+                        tracing::error!(
                             "[vct] update_resume_deferral: clear JSON sidecar {} \
                              failed (entry may resurrect from JSON): {}",
                             json_sidecar.display(),
@@ -8394,7 +8394,7 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     // historically formed; protecting it is just as important.
     let pre_sweep_count_resume = crate::commands::update_gate::pre_update_mcp_kill_sweep();
     if pre_sweep_count_resume > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] resume_orchestrator_update: pre-sweep terminated {} \
              MCP-shaped process(es) before resume",
             pre_sweep_count_resume
@@ -8457,7 +8457,7 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     // returns Err. Surface the error to the eprintln stream for forensic
     // completeness; the GUI sees the Err via the Tauri return.
     if let Err(e) = &result {
-        eprintln!(
+        tracing::error!(
             "[vct] resume_orchestrator_update: post-pull tail failed \
              ({}); duration_ms={}",
             e,
@@ -9069,7 +9069,7 @@ pub async fn resolve_untracked_collision_and_retry<R: Runtime>(
     // abort again on the still-present refused file(s) via the same modal, so
     // the user gets another pass. Log it; proceed with the retry.
     if !refused.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[vct] resolve_untracked_collision_and_retry: {} file(s) refused (left in place); \
              retrying the update anyway — a still-colliding file re-surfaces the modal",
             refused.len(),
@@ -9086,7 +9086,7 @@ pub async fn resolve_untracked_collision_and_retry<R: Runtime>(
         &install_path,
         &["untracked_collision_divergent"],
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] resolve_untracked_collision_and_retry: could not settle \
              untracked_collision_divergent deferral (non-fatal): {}",
             e
@@ -9452,7 +9452,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
     // action is recoverable-by-forensics if it was ever wrong.
     let mut dropped_stash_sha: Option<String> = None;
     if checked_out.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[vct] resolve_autostash_pop_and_retry: no files were resolved this call \
              (target empty — pop already resolved out-of-band or stale payload); \
              SKIPPING git stash drop to avoid destroying an unrelated user stash."
@@ -9471,7 +9471,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
         );
         // Pure decision (unit-tested): resolved≥1 AND a stash entry present.
         if !should_drop_autostash(checked_out.len(), stash_present) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] resolve_autostash_pop_and_retry: resolved {} file(s) but the stash \
                  list is empty (autostash already dropped) — nothing to drop.",
                 checked_out.len()
@@ -9501,12 +9501,12 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
                 .await;
             match drop {
                 Ok(o) if o.status.success() => {}
-                Ok(o) => eprintln!(
+                Ok(o) => tracing::warn!(
                     "[vct] resolve_autostash_pop_and_retry: git stash drop non-zero ({}); \
                      continuing (the resolution is already staged)",
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
-                Err(e) => eprintln!(
+                Err(e) => tracing::warn!(
                     "[vct] resolve_autostash_pop_and_retry: git stash drop spawn failed ({}); \
                      continuing",
                     e
@@ -9539,7 +9539,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
         &install_path,
         &["autostash_pop_conflict"],
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] resolve_autostash_pop_and_retry: could not settle \
              autostash_pop_conflict deferral (non-fatal): {}",
             e
@@ -10398,7 +10398,7 @@ fn github_pat_from_legacy_file() -> Option<String> {
     ) {
         // Blob-shaped legacy file → refuse to propagate it. Metadata only:
         // reason slug + byte-length, NEVER the value.
-        eprintln!(
+        tracing::warn!(
             "[vct] github_pat legacy file at {} is not a well-formed single \
              secret (reason: {}, bytes: {}); skipping env-pair propagation. \
              Run `vct doctor` / `vct recover-blob` to inspect and split it.",
@@ -10467,14 +10467,14 @@ pub fn register_github_pat(
     match migrate_github_pat_installer_to_user_module_id(&db) {
         Ok(report) => {
             if !report.warnings.is_empty() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] github_pat module_id migration warnings: {:?}",
                     report.warnings
                 );
             }
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] github_pat module_id migration failed (will retry next call): {}",
                 e
             );
@@ -10489,14 +10489,14 @@ pub fn register_github_pat(
     match migrate_github_pat_file_to_keychain(&db) {
         Ok(report) => {
             if !report.warnings.is_empty() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] github_pat migration warnings: {:?}",
                     report.warnings
                 );
             }
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] github_pat migration failed (will retry next call): {}",
                 e
             );
@@ -10563,7 +10563,7 @@ pub fn register_github_pat(
             if let Err(e) = crate::commands::projects_v2::refresh_project_env_with_db(
                 &db, &row.id,
             ) {
-                eprintln!(
+                tracing::error!(
                     "[vct] register_github_pat: env-refresh for project {} failed: {}",
                     row.id, e
                 );
@@ -10582,7 +10582,7 @@ pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
         project_id: SENTINEL_SHARED,
     };
     if let Err(e) = secrets::delete(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY) {
-        eprintln!("[vct] clear_github_pat: keychain delete failed: {}", e);
+        tracing::error!("[vct] clear_github_pat: keychain delete failed: {}", e);
     }
     // Drop the active-flag row so a later `register_github_pat` starts
     // from a clean slate (default-active applies; `mark_secret_active`
@@ -10612,7 +10612,7 @@ pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
             if let Err(e) = crate::commands::projects_v2::refresh_project_env_with_db(
                 &db, &row.id,
             ) {
-                eprintln!(
+                tracing::error!(
                     "[vct] clear_github_pat: env-refresh for project {} failed: {}",
                     row.id, e
                 );
@@ -10626,8 +10626,21 @@ pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
 /// Bug 21: update an orchestrator at `path` by re-running the local-copy
 /// install. Skips the classify-target check (we know the path already
 /// has `.claude/`). Emits "install_progress" events.
+///
+/// v0.2.91 decision #26 — SINGLE-FLIGHT. The MenuBar's update-all loop guards
+/// this FRONTEND-side only (a disabled button), which does not survive a
+/// second window, a reopened surface, or any other caller; meanwhile the body
+/// below copies a whole orchestrator tree over `target`, so two concurrent
+/// runs interleave file writes into the same folder. The guard is keyed
+/// SEPARATELY from `update_all_projects` on purpose: that command reconciles
+/// registered PROJECT bundles, this one refreshes an orchestrator CLONE (see
+/// the boundary note in the VCO-clone gate below). Guarding one must never
+/// block the other, and the two must not be merged.
 #[command]
 pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), String> {
+    let _single_flight = crate::commands::single_flight::begin_or_refuse(
+        crate::commands::single_flight::OP_UPDATE_ORCHESTRATOR_AT,
+    )?;
     let target = PathBuf::from(&path);
     if !target.exists() {
         return Err(format!("update target {} does not exist", target.display()));
@@ -10662,7 +10675,7 @@ pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), 
     // binary path silently. Soft-fail: never block "Update complete".
     if let Ok(exe) = std::env::current_exe() {
         if let Err(e) = crate::commands::desktop_shortcut::refresh_desktop_shortcut(&target, &exe) {
-            eprintln!(
+            tracing::warn!(
                 "[update_orchestrator_at] desktop shortcut refresh failed (non-fatal): {}",
                 e
             );
@@ -10676,7 +10689,7 @@ pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), 
     if let Err(e) =
         crate::commands::manifest::refresh_install_manifest(&target, "orchestrator_update")
     {
-        eprintln!(
+        tracing::warn!(
             "[update_orchestrator_at] install-manifest refresh failed (non-fatal): {}",
             e
         );
@@ -10829,7 +10842,7 @@ pub async fn launch_installer_terminal(install_root: String) -> Result<(), Strin
             match cmd.spawn() {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] launch_installer_terminal: {} spawn failed: {e}; trying next",
                         emu
                     );

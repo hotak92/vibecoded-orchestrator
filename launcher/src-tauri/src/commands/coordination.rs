@@ -5,15 +5,38 @@
 //! optional Telegram bridge. Provides a test_connection command that
 //! probes Supabase directly from the launcher and a team_status proxy that
 //! reads the coordination tables for the live activity panel.
+//!
+//! ─── Tier gate (v0.2.91, P2-B4 / plan decision #28) ──────────────────
+//!
+//! `/coordination` is one of the two `proOnly` routes in
+//! `Sidebar.svelte`. Pre-v0.2.91 the ONLY thing that flag did was gate
+//! the sidebar *link*: a free-tier user reaching the route by typed URL,
+//! bookmark or back-button got the complete working feature, including
+//! `coordination_apply_schema`, whose own page copy warns it is
+//! "destructive if conflicting tables already exist with a different
+//! shape". EVERY command in this module now re-checks the cached
+//! orchestrator tier server-side through the shared
+//! `dashboard::require_tier` gate, so patching the client deny layout
+//! (`routes/coordination/+layout.svelte`) unlocks the placeholder text
+//! and nothing else.
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
+use crate::commands::dashboard::require_tier;
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
 use vct_launcher_core::process::CommandExt as _;
 
 const MODULE_ID: &str = "vct-coordination";
+
+/// Minimum orchestrator tier for this route's whole command surface.
+/// Mirrors `Sidebar.svelte`'s `proOnly` flag on `/coordination`; keep the
+/// two in step (`tests/test_v0291_pro_route_enforcement.py` pins it).
+const MIN_TIER: &str = "pro";
+
+/// Feature noun-phrase for the refusal copy (`tier_required_message`).
+const FEATURE: &str = "Team coordination";
 
 // ─── Config view + update ────────────────────────────────────────────────
 
@@ -36,6 +59,7 @@ pub async fn coordination_get_config(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<CoordinationConfig, String> {
+    require_tier(&db, MIN_TIER, FEATURE)?;
     let scope = SecretScope::PerProject { project_id: &project_id };
     let install_row = db.get_module_install(&project_id, MODULE_ID)?;
 
@@ -77,7 +101,7 @@ pub async fn coordination_get_config(
         match secrets::is_set_with_context(scope, MODULE_ID, key, bg) {
             Ok(present) => present,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct-coordination] keychain read for {key:?} unavailable \
                      ({e}); reporting not-set for this page load"
                 );
@@ -88,7 +112,7 @@ pub async fn coordination_get_config(
     let supabase_url = match secrets::get_with_context(scope, MODULE_ID, "SUPABASE_URL", bg) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct-coordination] keychain read for SUPABASE_URL unavailable \
                  ({e}); reporting unset for this page load"
             );
@@ -129,6 +153,7 @@ pub async fn coordination_set_config(
     update: CoordinationConfigUpdate,
     db: State<'_, Db>,
 ) -> Result<CoordinationConfig, String> {
+    require_tier(&db, MIN_TIER, FEATURE)?;
     let scope = SecretScope::PerProject { project_id: &project_id };
 
     if let Some(url) = update.supabase_url.as_deref() {
@@ -231,7 +256,9 @@ pub struct ConnectionTestResult {
 #[command]
 pub async fn coordination_test_connection(
     project_id: String,
+    db: State<'_, Db>,
 ) -> Result<ConnectionTestResult, String> {
+    require_tier(&db, MIN_TIER, FEATURE)?;
     let scope = SecretScope::PerProject { project_id: &project_id };
     let url = secrets::get(scope, MODULE_ID, "SUPABASE_URL")?
         .ok_or("SUPABASE_URL not set")?;
@@ -294,6 +321,10 @@ pub async fn coordination_apply_schema(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<(), String> {
+    // Tier gate FIRST — this is the destructive one (the page's own copy
+    // warns it can drop/reshape conflicting tables), so it must refuse
+    // before it reads a secret or spawns a process.
+    require_tier(&db, MIN_TIER, FEATURE)?;
     // Runs the coordination module's setup.py --non-interactive with the
     // project's Supabase env injected. The setup script itself knows how
     // to apply schema.sql / schema_v2.sql.
@@ -368,7 +399,11 @@ pub struct PresenceEntry {
 }
 
 #[command]
-pub async fn coordination_team_status(project_id: String) -> Result<TeamStatus, String> {
+pub async fn coordination_team_status(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<TeamStatus, String> {
+    require_tier(&db, MIN_TIER, FEATURE)?;
     let scope = SecretScope::PerProject { project_id: &project_id };
     let url = secrets::get(scope, MODULE_ID, "SUPABASE_URL")?.ok_or("SUPABASE_URL not set")?;
     let key = secrets::get(scope, MODULE_ID, "SUPABASE_KEY")?.ok_or("SUPABASE_KEY not set")?;
@@ -494,4 +529,50 @@ pub async fn coordination_team_status(project_id: String) -> Result<TeamStatus, 
         online_now,
         connection_ok,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P2-B4 (decision #28) — the server-side half. Every command in this
+    /// module opens with `require_tier(&db, MIN_TIER, FEATURE)`; this pins
+    /// the verdict that gate returns for each tier against the SAME
+    /// `tier_cache` row the commands read, so a free-tier caller reaching
+    /// the route by typed URL is refused before any secret read, HTTP
+    /// call, or `setup.py` spawn.
+    ///
+    /// The per-command call sites are pinned mechanically by
+    /// `tests/test_v0291_pro_route_enforcement.py` (a source ratchet — a
+    /// new `#[command]` added here without the gate fails it).
+    #[test]
+    fn free_tier_is_refused_and_licensed_tiers_are_unchanged() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        db.set_tier_cache("free", &serde_json::json!({}), None)
+            .expect("seed free tier");
+        let err = require_tier(&db, MIN_TIER, FEATURE)
+            .expect_err("free tier MUST NOT reach the coordination surface");
+        assert_eq!(
+            err, "Team coordination requires a Pro or higher tier license.",
+            "refusal copy must name the required tier, not a bare 'denied'"
+        );
+
+        for licensed in ["pro", "mao", "enterprise", "admin"] {
+            db.set_tier_cache(licensed, &serde_json::json!({}), None)
+                .expect("seed licensed tier");
+            assert!(
+                require_tier(&db, MIN_TIER, FEATURE).is_ok(),
+                "{licensed} tier must keep the coordination surface working"
+            );
+        }
+    }
+
+    /// The floor this module gates on must stay in step with
+    /// `Sidebar.svelte`'s `proOnly` flag — a silent bump to `mao` here
+    /// would lock out Pro users the sidebar still advertises the route to.
+    #[test]
+    fn min_tier_is_pro() {
+        assert_eq!(MIN_TIER, "pro");
+    }
 }

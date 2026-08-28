@@ -152,7 +152,7 @@ pub(crate) fn spawn_heartbeat_ticker(
             {
                 let db = app.state::<Db>();
                 if let Err(e) = touch(&db, &project_id) {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] warning: {} heartbeat tick failed for {}: {}",
                         label, project_id, e
                     );
@@ -192,11 +192,11 @@ fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
             let stale_secs = heartbeat_stale_secs();
             let db = app.state::<Db>();
             match db.mark_stale_running_kg_syncs_failed(stale_secs, KG_SYNC_STALE_ERROR, None) {
-                Ok(n) if n > 0 => eprintln!(
+                Ok(n) if n > 0 => tracing::error!(
                     "[vct] kg-sync heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
                     n, stale_secs
                 ),
-                Err(e) => eprintln!("[vct] warning: kg-sync heartbeat sweep failed: {}", e),
+                Err(e) => tracing::warn!("[vct] warning: kg-sync heartbeat sweep failed: {}", e),
                 _ => {}
             }
             match db.mark_stale_running_code_graph_builds_failed(
@@ -204,11 +204,11 @@ fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
                 CODE_GRAPH_STALE_ERROR,
                 None,
             ) {
-                Ok(n) if n > 0 => eprintln!(
+                Ok(n) if n > 0 => tracing::error!(
                     "[vct] code-graph heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
                     n, stale_secs
                 ),
-                Err(e) => eprintln!("[vct] warning: code-graph heartbeat sweep failed: {}", e),
+                Err(e) => tracing::warn!("[vct] warning: code-graph heartbeat sweep failed: {}", e),
                 _ => {}
             }
         }
@@ -224,9 +224,11 @@ fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
 /// project N's `sync_knowledge_graph.py --all` before starting N+1. With 8
 /// projects the detached subprocesses pile up (the field-reported "14"
 /// wrapper→python pairs), thrashing one Ollama instance and starving the
-/// machine. There was NO machine-wide KG-sync lock anywhere — `MigrateLockGuard`
-/// is keyed per-project_id (uncontended across distinct projects), and the
-/// stall watchdog bounds per-child silence, not cross-child concurrency.
+/// machine. There was NO machine-wide KG-sync lock anywhere — the migrate
+/// claim (`commands::single_flight`, keyed per-project_id since v0.2.91;
+/// `MigrateLockGuard` before that) is uncontended across distinct projects,
+/// and the stall watchdog bounds per-child silence, not cross-child
+/// concurrency.
 ///
 /// THE FIX: every `run_sync_task` must hold ONE of these permits across the
 /// ENTIRE subprocess lifetime (acquire → spawn → drain → exit). With a single
@@ -261,8 +263,8 @@ fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
 const KG_SYNC_MAX_CONCURRENT: usize = 1;
 
 /// The process-global semaphore. `LazyLock` mirrors the static-init style used
-/// elsewhere in the launcher (`MIGRATE_IN_FLIGHT`, `UNREGISTER_CANONICAL_ENV_KEYS`
-/// in `projects_v2.rs`).
+/// elsewhere in the launcher (`commands::single_flight::IN_FLIGHT`,
+/// `UNREGISTER_CANONICAL_ENV_KEYS` in `projects_v2.rs`).
 static KG_SYNC_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| {
         std::sync::Arc::new(tokio::sync::Semaphore::new(KG_SYNC_MAX_CONCURRENT))
@@ -455,7 +457,7 @@ pub fn resume_pending_syncs(
     ) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: kg-sync stale-running sweep failed: {}. \
                  Stale rows (if any) will appear as 'running' indefinitely; \
                  user can click Re-sync KG to recover.",
@@ -469,7 +471,7 @@ pub fn resume_pending_syncs(
     let pending_ids = match db.list_pending_kg_syncs() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: kg-sync pending-list lookup failed: {}. \
                  Queued syncs (if any) will not auto-resume this boot.",
                 e
@@ -489,14 +491,14 @@ pub fn resume_pending_syncs(
         let project = match db.get_project(pid) {
             Ok(Some(p)) => p,
             Ok(None) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: pending kg-sync references missing project {}; skipping",
                     pid
                 );
                 continue;
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: lookup for pending kg-sync {}: {}; skipping",
                     pid, e
                 );
@@ -839,7 +841,7 @@ fn resolve_stall_timeout() -> Option<std::time::Duration> {
         Some(v) => match v.trim().parse::<u64>() {
             Ok(n) => n,
             Err(_) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: KG_SYNC_STALL_TIMEOUT_SECS={:?} is not a non-negative \
                      integer; falling back to default {}s",
                     v, DEFAULT_STALL_TIMEOUT_SECS
@@ -1394,7 +1396,7 @@ fn upsert_quiet(
         error_message,
         log_tail,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: kg_syncs upsert failed for {}: {}",
             project_id, e
         );

@@ -33,6 +33,7 @@
     codeGraphSubLabel,
     progressTotal as computeProgressTotal,
     progressIcon,
+    updateAllModalDismissable,
   } from './update-all-progress';
   import { onDestroy } from 'svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
@@ -382,7 +383,21 @@
   }
 </script>
 
-<DialogRoot bind:open width="640px">
+<!-- v0.2.91 decision #26: close-gating. Escape / backdrop are blocked ONLY
+     while the run is in flight — the header's own claim ("can't interrupt
+     mid-list cleanly") was previously contradicted by DialogRoot's defaults,
+     and reopening mid-run was the ordinary way to start a second concurrent
+     run over the same project folders. Terminal states (`done`, whether the
+     run succeeded or errored) stay dismissable: an undismissable modal is
+     the dead end this cycle is removing, not adding. `onClose` is NOT a gate
+     (it is a notification) — see `updateAllModalDismissable`'s doc comment
+     and `OnboardingWizard.svelte:1107` for the reference shape. -->
+<DialogRoot
+  bind:open
+  width="640px"
+  closeOnBackdrop={updateAllModalDismissable(phase)}
+  closeOnEscape={updateAllModalDismissable(phase)}
+>
   {#snippet header()}
     <h3 class="ua-title">
       {#if phase === 'confirm'}Update all projects{/if}
@@ -570,8 +585,21 @@
   {#snippet footer()}
     {#if phase === 'confirm'}
       <button class="btn-ghost" onclick={close}>Cancel</button>
+      <!-- P2-I1 (v0.2.91 wave 5): this button calls `update_all_projects`
+           (projects_v2.rs) — the manifest-driven bundle reconcile that runs
+           for every REGISTERED project regardless of whether its folder is
+           an orchestrator clone. It is a DIFFERENT operation from
+           MenuBar's "Update N orchestrator clone(s)", which calls
+           `update_orchestrator_at` (a git-clone refresh gated to
+           clone-shaped folders only). The VCO-clone-gate comment inside
+           `installer.rs::update_orchestrator_at` names this boundary
+           explicitly (cited by symbol, not line: the v0.2.91 single-flight
+           guard moved it, and a line citation rots on every edit above it)
+           — do NOT merge these two code paths; "project
+           bundle(s)" below is deliberately worded to not collide with
+           MenuBar's label. -->
       <button class="btn-primary" onclick={runUpdateAll} disabled={projectCount === 0}>
-        Update {projectCount} project{projectCount === 1 ? '' : 's'}
+        Update {projectCount} project bundle{projectCount === 1 ? '' : 's'}
       </button>
     {:else if phase === 'running'}
       <button class="btn-ghost" disabled>Updating…</button>

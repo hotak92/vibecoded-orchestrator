@@ -131,11 +131,12 @@ pub trait TauriCommandInvoker: Send + Sync + 'static {
     fn invoke<'a>(&'a self, command: &'a str, args: Value) -> CommandFuture<'a>;
 }
 
-/// Explicit allowlist of legacy non-`module_*` Tauri commands that
-/// historically appeared in v0.2.20-v0.2.32 manifests' `action`
-/// fields as legacy `ActionRef::Legacy(string)` values. Adding a new
-/// entry here authorises a manifest's `tauri_command` step to invoke
-/// it via the v0.2.33 dispatcher.
+/// Explicit allowlist of legacy non-`module_*` Tauri commands a MANIFEST
+/// may name. Adding an entry authorises it on BOTH manifest-driven paths:
+/// a `tauri_command` step in a chained_action (v0.2.33 dispatcher) and a
+/// legacy `ActionRef::Legacy(string)` control action (v0.2.20-v0.2.32
+/// shape, dispatched from the renderer — see
+/// [`module_manifest_command_allowed`]).
 ///
 /// Inclusion criteria: the command must already be registered in
 /// `invoke_handler!` AND must accept JSON args structurally
@@ -145,40 +146,114 @@ pub trait TauriCommandInvoker: Send + Sync + 'static {
 /// whitelist is intentionally permissive for read-side commands and
 /// strict for writes.
 ///
-/// The orchestrator-core legacy commands (`redetect_orchestrator_root`,
-/// `validate_clone_manifest`, `kg_rebuild_current_project`, etc.) are
-/// SAFE to add but not currently invoked from any chained_action
-/// step — the orchestrator's vct-module.json uses them via the legacy
-/// `ActionRef::Legacy(string)` path which goes through frontend
-/// `invoke()`. They land here so future chained_action authors can
-/// reference them by name without each release re-grepping the source.
+/// v0.2.91 decision #24 — the RL block below was INVENTORIED FROM SOURCE,
+/// not guessed: `rl_settings.rs`'s module docstring names the RL manifest's
+/// `gui.config_tab` block as the caller of these commands, the vendored
+/// fixture `vct-launcher-core/tests/fixtures/manifests/vct-rl-reranker.v0.2.7.json`
+/// dispatches four of them as `on_change` / `options_source` strings, and
+/// `lib.rs` registers exactly these thirteen from that module. The paid
+/// manifest is not vendored in this repo, so the file that OWNS the
+/// commands is the inventory of record. Getters and `options_source`
+/// readers are included because those control kinds dispatch reads.
 pub(crate) const MANIFEST_DISPATCHABLE_COMMANDS: &[&str] = &[
-    // Orchestrator-core legacy commands (referenced from vct-module.json
-    // root manifest's gui.config_tab buttons — see the comment above
-    // on why these are pre-authorised).
+    // Orchestrator-core legacy commands. The root `vct-module.json`
+    // dispatches the first two from `gui.config_tab` buttons today; the
+    // other four are same-family orchestrator maintenance actions,
+    // pre-authorised so a future manifest author can reference them by
+    // name without re-grepping the source each release.
     "redetect_orchestrator_root",
     "validate_clone_manifest",
     "kg_rebuild_current_project",
     "kg_check_duplicates",
     "code_graph_reanalyze_current",
     "code_graph_prune_stale",
+    // vct-rl-reranker legacy commands (`commands/rl_settings.rs`). These
+    // read/aggregate launcher-DB state, which the declarative dispatcher
+    // cannot express (no `ActionDescriptor::Db` variant), so they stay
+    // legacy-routed by design — see that file's header. Every one is
+    // scoped to `module_settings` rows under module_id "vct-rl-reranker"
+    // (plus its `app_state` host-wide defaults) or to a read of the
+    // project list; none is destructive.
+    "set_rl_use_global",
+    "set_rl_online_training_disabled",
+    "set_rl_global_training_source_flag",
+    "get_rl_use_global",
+    "get_rl_online_training_disabled",
+    "get_rl_global_training_source_flag",
+    "list_rl_global_training_source_projects",
+    "set_dual_embedding_write_all_slots",
+    "get_dual_embedding_write_all_slots",
+    "set_dual_rl_log_enabled",
+    "get_dual_rl_log_enabled",
+    "set_dual_embedding_arctic_secondary",
+    "get_dual_embedding_arctic_secondary",
 ];
 
-/// Returns true when `name` is a whitelisted Tauri command the
-/// dispatcher will invoke when it appears as a `tauri_command` step
-/// in a manifest's chained_action. The policy:
+/// Returns true when `name` is a whitelisted Tauri command a manifest may
+/// name. The policy:
 ///   * Any name starting with `module_` is allowed (paid modules
 ///     register their commands under this prefix by convention).
 ///   * Any name in [`MANIFEST_DISPATCHABLE_COMMANDS`] is allowed.
 ///   * Everything else is rejected.
 ///
 /// Empty / whitespace-only names are rejected unconditionally.
+///
+/// This is the ONE home of the policy. Both manifest-driven dispatch paths
+/// consult it: the in-process `tauri_command` step (directly, in
+/// `execute_one_step`) and the renderer's legacy `ActionRef::Legacy(string)`
+/// path (over IPC, via [`module_manifest_command_allowed`]). There is no
+/// mirrored list in the frontend — a second copy of a security policy is a
+/// second copy that drifts.
 pub(crate) fn is_whitelisted_manifest_command(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return false;
     }
     trimmed.starts_with("module_") || MANIFEST_DISPATCHABLE_COMMANDS.contains(&trimmed)
+}
+
+/// v0.2.91 decision #24 — the allow-query the renderer's LEGACY dispatch
+/// path consults before forwarding a manifest-supplied command name.
+///
+/// ## The hole this closes
+///
+/// A manifest control's `action` / `on_change` / `options_source` may be a
+/// structured descriptor OR a bare command-name string
+/// (`ActionRef::Legacy`). The descriptor form has always been gated by
+/// [`is_whitelisted_manifest_command`]. The string form was not: the
+/// renderer passed the manifest's string straight to Tauri `invoke()`, so a
+/// malformed or hostile manifest naming `delete_project_v2` (or any of the
+/// ~378 registered commands) was dispatched with the caller's full
+/// privileges. Same untrusted input, same effect, one gate missing.
+///
+/// ## Why the check is a query rather than a rerouted dispatch
+///
+/// Rerouting the legacy path through the in-process dispatcher would need a
+/// hand-written `AppHandleCommandInvoker` branch for every command in the
+/// allowlist — the invoker's fallback arm explicitly tells callers to use
+/// the renderer path instead — so it would break every working first-party
+/// action to close the hole. A query keeps the policy in one place (here)
+/// and costs one local IPC round trip per legacy dispatch. The threat model
+/// is a hostile MANIFEST, not a hostile renderer: the renderer is our code,
+/// the manifest is third-party content.
+///
+/// FULL retirement of the legacy string form is manifest-breaking (it needs
+/// the paid modules to ship descriptor-only manifests in lockstep) and is
+/// recorded as designed security work for v0.2.92.
+///
+/// `Ok(())` = allowed. `Err(msg)` = refused, with the reason — the caller
+/// surfaces the message verbatim, so the frontend needs no policy knowledge.
+#[command]
+pub async fn module_manifest_command_allowed(command: String) -> Result<(), String> {
+    if is_whitelisted_manifest_command(&command) {
+        return Ok(());
+    }
+    Err(format!(
+        "module_dispatch: manifest-dispatched Tauri command '{}' is not whitelisted \
+         (allowed: any name starting with 'module_' OR one of {:?}). \
+         Reject prevents manifest-driven RCE.",
+        command, MANIFEST_DISPATCHABLE_COMMANDS,
+    ))
 }
 
 /// Production [`TauriCommandInvoker`] implementation. Holds the
@@ -1065,7 +1140,7 @@ async fn execute_chained_action(
                 // {step_idx + 1} formatting is one-based for user-
                 // facing error clarity (matches "step 2 failed" in
                 // toasts).
-                eprintln!(
+                tracing::error!(
                     "[module_dispatch] chained_action step {} of {} failed: {}",
                     step_idx + 1,
                     total_steps,
@@ -1376,7 +1451,7 @@ async fn run_poller(
                 Err(e) => {
                     // Transient read error — count toward the
                     // consecutive-failure budget but keep polling.
-                    eprintln!("[module_dispatch] poll body read error: {}", e);
+                    tracing::warn!("[module_dispatch] poll body read error: {}", e);
                     consecutive_failures += 1;
                     if consecutive_failures >= POLL_CONSECUTIVE_FAILURE_LIMIT {
                         sink.emit(
@@ -1403,7 +1478,7 @@ async fn run_poller(
                 // aborting on the first bad tick.
                 let status = r.status();
                 let body_text = r.text().await.unwrap_or_default();
-                eprintln!(
+                tracing::warn!(
                     "[module_dispatch] poll non-success status {} from {}: {}",
                     status, url, body_text,
                 );
@@ -1426,7 +1501,7 @@ async fn run_poller(
                 continue;
             }
             Err(e) => {
-                eprintln!("[module_dispatch] poll request error: {}", e);
+                tracing::warn!("[module_dispatch] poll request error: {}", e);
                 consecutive_failures += 1;
                 if consecutive_failures >= POLL_CONSECUTIVE_FAILURE_LIMIT {
                     sink.emit(
@@ -3124,6 +3199,100 @@ mod tests {
         // Edge: leading/trailing whitespace is trimmed — name still
         // resolves to a whitelisted form.
         assert!(is_whitelisted_manifest_command("  module_x  "));
+    }
+
+    // ─── v0.2.91 decision #24 — the legacy path's gate ───────────────
+    //
+    // Both sides, because this gate REFUSES things: the hostile name is
+    // rejected, AND every inventoried first-party action still dispatches.
+    // The leave-alone half matters more than usual here — the failure mode
+    // of an over-tight allowlist is a silently dead RL config tab.
+
+    /// The inventory, restated as a test so a future edit to
+    /// `MANIFEST_DISPATCHABLE_COMMANDS` that drops one of these fails here
+    /// instead of in a user's RL config tab. Sources: the root
+    /// `vct-module.json` (`redetect_orchestrator_root`,
+    /// `validate_clone_manifest`), the vendored RL v0.2.7 manifest fixture
+    /// (the four `set_rl_*` / `list_rl_*` names), and `rl_settings.rs`'s
+    /// own registration list (the remainder).
+    #[test]
+    fn every_inventoried_first_party_legacy_action_is_allowed() {
+        for name in [
+            // Orchestrator root manifest, dispatched TODAY.
+            "redetect_orchestrator_root",
+            "validate_clone_manifest",
+            // Orchestrator-core maintenance family.
+            "kg_rebuild_current_project",
+            "kg_check_duplicates",
+            "code_graph_reanalyze_current",
+            "code_graph_prune_stale",
+            // RL manifest fixture: on_change / options_source strings.
+            "set_rl_use_global",
+            "set_rl_online_training_disabled",
+            "set_rl_global_training_source_flag",
+            "list_rl_global_training_source_projects",
+            // rl_settings.rs's remaining registered surface.
+            "get_rl_use_global",
+            "get_rl_online_training_disabled",
+            "get_rl_global_training_source_flag",
+            "set_dual_embedding_write_all_slots",
+            "get_dual_embedding_write_all_slots",
+            "set_dual_rl_log_enabled",
+            "get_dual_rl_log_enabled",
+            "set_dual_embedding_arctic_secondary",
+            "get_dual_embedding_arctic_secondary",
+        ] {
+            assert!(
+                is_whitelisted_manifest_command(name),
+                "first-party legacy action '{name}' would stop dispatching",
+            );
+        }
+    }
+
+    /// The refusing half, at the command boundary the renderer actually
+    /// calls. `delete_project_v2` is the plan's named red-proof: it
+    /// dispatches today on the legacy path, and must not.
+    #[tokio::test]
+    async fn allow_query_refuses_destructive_and_unlisted_names() {
+        for name in [
+            "delete_project_v2",
+            "uninstall_module_v2",
+            "install_module_for_project",
+            "register_github_pat",
+            "",
+            "   ",
+        ] {
+            let r = module_manifest_command_allowed(name.to_string()).await;
+            assert!(
+                r.is_err(),
+                "allow-query must refuse '{name}' on the legacy path",
+            );
+            let msg = r.unwrap_err();
+            assert!(
+                msg.contains("not whitelisted"),
+                "refusal must say why; got: {msg}",
+            );
+        }
+    }
+
+    /// …and allows every inventoried name plus the `module_` family, over
+    /// the same boundary. A gate that refuses everything is not a gate.
+    #[tokio::test]
+    async fn allow_query_permits_inventoried_and_module_prefixed_names() {
+        for name in [
+            "redetect_orchestrator_root",
+            "set_rl_use_global",
+            "get_dual_rl_log_enabled",
+            "list_rl_global_training_source_projects",
+            "module_download_default_weights",
+        ] {
+            assert!(
+                module_manifest_command_allowed(name.to_string())
+                    .await
+                    .is_ok(),
+                "allow-query must permit '{name}'",
+            );
+        }
     }
 
     /// Happy path: a tauri_command step with a whitelisted name

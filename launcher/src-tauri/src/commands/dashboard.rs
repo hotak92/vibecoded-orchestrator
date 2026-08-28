@@ -78,7 +78,7 @@ async fn save_config(config: &OrchestratorConfig) -> Result<(), String> {
 /// (free/pro/mao/enterprise/admin). `feature` is a short noun phrase
 /// describing what's gated — capitalised at start (e.g. "Auto-updates",
 /// "RL-scored retrieval").
-fn tier_required_message(min_tier: &str, feature: &str) -> String {
+pub(crate) fn tier_required_message(min_tier: &str, feature: &str) -> String {
     let tier_label = match min_tier {
         "free" => "any",  // shouldn't happen, but defensive
         "pro" => "Pro",
@@ -141,10 +141,41 @@ fn feature_flags_for_tier(tier: &str) -> FeatureFlags {
 /// Fail-open-to-free: a DB read error yields `"free"` (same posture as
 /// `modules::is_module_licensed_v2`) — feature gating degrades to the
 /// free tier rather than erroring the whole dashboard.
-fn current_tier_slug(db: &Db) -> String {
+pub(crate) fn current_tier_slug(db: &Db) -> String {
     db.get_tier_cache()
         .map(|row| row.orchestrator_tier)
         .unwrap_or_else(|_| "free".to_string())
+}
+
+/// Refuse a command whose ENTIRE surface is tier-gated.
+///
+/// v0.2.91 (P2-B4 / plan decision #28). `update_orchestrator_setting`
+/// and `toggle_mcp_server` gate individual *arms* of a command whose
+/// other arms stay free; the Pro-only ROUTES (`/coordination`, `/hub`)
+/// need the whole command refused instead. Same three ingredients, one
+/// home: `current_tier_slug` (the canonical local tier state),
+/// `tier_rank` (the shared ladder — `admin` ≥ `enterprise` ≥ `mao` ≥
+/// `pro`), and `tier_required_message` (the tier-honest upsell copy).
+///
+/// Fail-closed by construction: `current_tier_slug` degrades a DB read
+/// error to `"free"` and `tier_rank` maps an unknown/attacker-supplied
+/// slug to rank 0, so both failure modes land on REFUSE.
+pub(crate) fn require_tier(db: &Db, min_tier: &str, feature: &str) -> Result<(), String> {
+    require_tier_for_slug(&current_tier_slug(db), min_tier, feature)
+}
+
+/// Testable core of `require_tier` — takes the resolved tier slug so
+/// unit tests don't need a managed `State<Db>` (same split as
+/// `update_orchestrator_setting_inner`).
+pub(crate) fn require_tier_for_slug(
+    tier: &str,
+    min_tier: &str,
+    feature: &str,
+) -> Result<(), String> {
+    if tier_rank(tier) >= tier_rank(min_tier) {
+        return Ok(());
+    }
+    Err(tier_required_message(min_tier, feature))
 }
 
 /// Get feature flags for the current cached license tier.
@@ -991,6 +1022,48 @@ mod tests {
         assert_eq!(current_tier_slug(&db), "pro");
         db.set_tier_cache("admin", &serde_json::json!({}), None).unwrap();
         assert_eq!(current_tier_slug(&db), "admin");
+    }
+
+    // ─── P2-B4 (v0.2.91, decision #28): whole-command tier gate ─────────
+
+    /// `require_tier_for_slug` is the shared refusal used by the Pro-only
+    /// ROUTE command surfaces (`commands::coordination`, the `/hub` half
+    /// of `commands::hub_proxy`). Free is refused; every tier at or above
+    /// the floor is unchanged; an unknown slug ranks 0 and is refused
+    /// (attacker-supplied tier values must not escalate).
+    #[test]
+    fn require_tier_for_slug_refuses_below_the_floor_only() {
+        let err = require_tier_for_slug("free", "pro", "Team coordination")
+            .expect_err("free tier MUST be refused a pro-gated surface");
+        assert_eq!(
+            err, "Team coordination requires a Pro or higher tier license.",
+            "the refusal must carry the tier-honest upsell copy"
+        );
+        for licensed in ["pro", "mao", "enterprise", "admin"] {
+            assert!(
+                require_tier_for_slug(licensed, "pro", "Team coordination").is_ok(),
+                "{licensed} must keep working unchanged"
+            );
+        }
+        assert!(
+            require_tier_for_slug("titanium", "pro", "Team coordination").is_err(),
+            "an unknown tier slug ranks 0 and must NOT unlock a pro gate"
+        );
+    }
+
+    /// The `State<Db>` form resolves the tier from `tier_cache`, and a
+    /// DB-less/erroring read degrades to "free" — i.e. fail-CLOSED for a
+    /// gate. Pins that the gate reads the same row the ActivationModal
+    /// and the module license gate read.
+    #[test]
+    fn require_tier_reads_the_tier_cache_row() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.set_tier_cache("free", &serde_json::json!({}), None).unwrap();
+        assert!(require_tier(&db, "pro", "Team coordination").is_err());
+        db.set_tier_cache("pro", &serde_json::json!({}), None).unwrap();
+        assert!(require_tier(&db, "pro", "Team coordination").is_ok());
+        db.set_tier_cache("admin", &serde_json::json!({}), None).unwrap();
+        assert!(require_tier(&db, "pro", "Team coordination").is_ok());
     }
 
     /// Forward-compat: unknown tier slugs flow through verbatim so a new

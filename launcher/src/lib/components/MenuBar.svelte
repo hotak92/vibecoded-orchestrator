@@ -176,12 +176,25 @@
             Settings
           </button>
           {#if updatableProjectIds.length > 0}
+            <!-- P2-I1 (v0.2.91 wave 5): this button calls `update_orchestrator_at`
+                 (installer.rs) — a git-clone refresh limited to projects whose
+                 folder IS an orchestrator source clone (validate_source_repo gate).
+                 It is a DIFFERENT operation from UpdateAllProjectsModal's
+                 `update_all_projects`, which reconciles the bundle files
+                 (hooks/scripts/agents/skills) of every REGISTERED project against
+                 the manifest, clone or not. The VCO-clone-gate comment inside
+                 `installer.rs::update_orchestrator_at` names this boundary
+                 explicitly (cited by symbol, not line — the v0.2.91
+                 single-flight guard moved it) — do NOT merge these two code
+                 paths; the
+                 label below exists so the two "update everything" affordances
+                 in the app aren't mistaken for the same action. -->
             <button class="user-menu-item user-menu-update" onclick={updateAllProjects} disabled={updatingAll}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
               </svg>
-              {updatingAll ? 'Updating…' : `Update ${updatableProjectIds.length} project${updatableProjectIds.length === 1 ? '' : 's'}`}
+              {updatingAll ? 'Updating…' : `Update ${updatableProjectIds.length} orchestrator clone${updatableProjectIds.length === 1 ? '' : 's'}`}
             </button>
           {/if}
           <button class="user-menu-item" onclick={() => { showUserMenu = false; ui.openActivation(); }}>

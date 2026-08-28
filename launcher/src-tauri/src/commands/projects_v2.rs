@@ -422,7 +422,7 @@ pub async fn create_project_v2(
             None,
             None,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: could not claim early project-setup row for {}: {}",
                 row.id, e
             );
@@ -461,7 +461,7 @@ pub async fn create_project_v2(
         // a warning toast so the user knows manual env setup is required.
         let msg = format!("env file write failed (apply_project_env_via_python): {}. \
                           Per-project KG routing will not work until this is resolved.", e);
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -487,13 +487,13 @@ pub async fn create_project_v2(
                  a reference file (manual setup may be required).",
                 e
             );
-            eprintln!("[vct] warning: {}", msg);
+            tracing::warn!("[vct] warning: {}", msg);
             warnings.push(msg);
         }
     } else if let Err(e) = ensure_project_env_template(folder, &env_settings) {
         let msg = format!("env template write failed (ensure_project_env_template): {}. \
                           The .env file may be missing managed keys.", e);
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -508,7 +508,7 @@ pub async fn create_project_v2(
         populate_project_state_from_filesystem(&row.id, &req.name, folder, &db);
     if !populate_report.warnings.is_empty() {
         for w in &populate_report.warnings {
-            eprintln!("[vct] populate warning ({}): {}", row.id, w);
+            tracing::warn!("[vct] populate warning ({}): {}", row.id, w);
         }
     }
 
@@ -551,7 +551,7 @@ pub async fn create_project_v2(
         let env_path = folder.join(".env");
         match b12_repair_stale_kg_collection(&env_path, &req.name) {
             Ok(B12Outcome::Repaired { canonical_kg }) => {
-                eprintln!(
+                tracing::info!(
                     "[vct] info: B12: rewrote stale KG_COLLECTION in {} → {}",
                     env_path.display(),
                     canonical_kg
@@ -574,7 +574,7 @@ pub async fn create_project_v2(
                     env_path.display(),
                     e
                 );
-                eprintln!("[vct] warning: B12: {}", msg);
+                tracing::warn!("[vct] warning: B12: {}", msg);
                 warnings.push(msg);
             }
         }
@@ -634,7 +634,7 @@ pub async fn create_project_v2(
             None,
             None,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: could not re-affirm project-setup row for {}: {}",
                 row.id, e
             );
@@ -888,7 +888,7 @@ pub(crate) async fn apply_post_bundle_steps(
         populate_project_state_from_filesystem(project_id, project_name, folder, db);
     if !populate_report_2.warnings.is_empty() {
         for w in &populate_report_2.warnings {
-            eprintln!("[vct] populate (post-bundle) warning ({}): {}", project_id, w);
+            tracing::warn!("[vct] populate (post-bundle) warning ({}): {}", project_id, w);
             warnings.push(format!("populate (post-bundle): {}", w));
         }
     }
@@ -910,7 +910,7 @@ pub(crate) async fn apply_post_bundle_steps(
         project_name,
         folder,
     ) {
-        eprintln!("[vct] {} ({})", w, project_id);
+        tracing::warn!("[vct] {} ({})", w, project_id);
         warnings.push(w);
     }
 
@@ -965,7 +965,7 @@ pub(crate) async fn apply_post_bundle_steps(
     // update must not overwrite a user opt-out. Verified via
     // `Db::set_project_module_enabled` (uses INSERT OR IGNORE pattern).
     if let Err(e) = db.set_project_module_enabled(project_id, "diagrams", true) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: could not seed project_modules('diagrams') for {}: {}",
             project_id, e,
         );
@@ -1019,7 +1019,7 @@ pub(crate) async fn apply_post_bundle_steps(
     // (decision logic lives in `update_should_skip_root_autobuild` below —
     // pure + unit-tested for both the act and the leave-alone cases.)
     if is_orchestrator_root_update {
-        eprintln!(
+        tracing::info!(
             "[vct] codegraph autobuild skipped for {} (orchestrator root — \
              install.py's revision-gated resync owns root analysis)",
             project_id
@@ -1052,7 +1052,7 @@ pub(crate) async fn apply_post_bundle_steps(
             None,
             None,
         ) {
-            eprintln!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
+            tracing::warn!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
         } else {
             codegraph::spawn_initial_build(
                 app.clone(),
@@ -1116,7 +1116,7 @@ pub(crate) async fn apply_post_bundle_steps(
     // regenerate-embeddings / migration flow, NOT by a bundle update, so a
     // content-change gate is correct and sufficient here.
     if !should_spawn_kg_sync_on_bundle(is_initial_create, kg_or_docs_content_changed) {
-        eprintln!(
+        tracing::info!(
             "[vct] kg-sync skipped for {} (bundle update touched no \
              knowledge/** or docs/** content; on-disk KG/docs unchanged \
              — nothing to re-embed)",
@@ -1133,7 +1133,7 @@ pub(crate) async fn apply_post_bundle_steps(
         None,
         None,
     ) {
-        eprintln!("[vct] warning: could not queue kg-sync for {}: {}", project_id, e);
+        tracing::warn!("[vct] warning: could not queue kg-sync for {}: {}", project_id, e);
     } else {
         kg_sync::spawn_initial_sync(
             app.clone(),
@@ -1183,7 +1183,7 @@ pub(crate) async fn apply_post_bundle_steps(
         None,
         None,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: could not queue kg-summary backfill for {}: {}",
             project_id, e,
         );
@@ -1406,7 +1406,7 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
             }
             if !out.status.success() {
                 // Non-zero exit but JSON parsed — already surfaced via errors[].
-                eprintln!("[vct] bootstrap-collections exit {} (errors surfaced via warnings)", out.status);
+                tracing::warn!("[vct] bootstrap-collections exit {} (errors surfaced via warnings)", out.status);
             }
         }
         Err(parse_err) => {
@@ -1784,7 +1784,7 @@ async fn run_install_bundle_core(
             }
 
             if !out.status.success() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] {} exit {} (errors surfaced via warnings)",
                     prefix, out.status
                 );
@@ -1916,57 +1916,22 @@ pub(crate) async fn run_install_bundle_update_with_root(
 ///
 /// Mirrors the per-key in-process lock pattern used by `diagram_watcher.rs`
 /// (`LazyLock<Mutex<HashMap<...>>>`).
-static MIGRATE_IN_FLIGHT: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
-/// Pure decision predicate for the migrate lock (unit-testable without the
-/// global): given whether the project_id is already in the in-flight set,
-/// return true iff a second wet apply must be REFUSED (soft-skip this cycle).
+/// Try to claim the per-project migrate lock. `None` on contention (the
+/// caller soft-skips this cycle); the returned guard releases on drop.
 ///
-/// Conservative: a poisoned mutex (`already_held == true` via the err-path
-/// caller) also refuses — never run a second wet apply when we can't prove the
-/// first finished.
-pub(crate) fn migrate_lock_should_refuse(already_held: bool) -> bool {
-    already_held
-}
-
-/// RAII guard for the per-project migrate lock. `acquire` returns `None` on
-/// contention (caller must soft-skip); the guard removes the project_id from
-/// the in-flight set on drop.
-struct MigrateLockGuard {
-    project_id: String,
-}
-
-impl MigrateLockGuard {
-    /// Try to acquire the lock for `project_id`. Returns `None` if a wet apply
-    /// is already in flight for this project (refuse-on-contention) OR if the
-    /// mutex is poisoned (conservative: do nothing rather than guess).
-    fn acquire(project_id: &str) -> Option<Self> {
-        let mut set = match MIGRATE_IN_FLIGHT.lock() {
-            Ok(s) => s,
-            // Poisoned mutex (a prior holder panicked): refuse, per
-            // `migrate_lock_should_refuse(true)`. Don't run a wet mutation
-            // against indeterminate state.
-            Err(_) => return None,
-        };
-        let already_held = set.contains(project_id);
-        if migrate_lock_should_refuse(already_held) {
-            return None;
-        }
-        set.insert(project_id.to_string());
-        Some(Self {
-            project_id: project_id.to_string(),
-        })
-    }
-}
-
-impl Drop for MigrateLockGuard {
-    fn drop(&mut self) {
-        if let Ok(mut set) = MIGRATE_IN_FLIGHT.lock() {
-            set.remove(&self.project_id);
-        }
-    }
+/// v0.2.91 (#26): the mechanism this used to own — a `LazyLock<Mutex<HashSet
+/// <String>>>` plus an RAII guard plus a refuse-on-contention predicate —
+/// moved VERBATIM in behaviour to `commands::single_flight`, which now serves
+/// this call site and the two update commands from one implementation rather
+/// than two copies of the same twenty lines. Semantics preserved exactly,
+/// including the conservative poisoned-mutex refusal; the key is namespaced
+/// so a project id cannot collide with an operation name.
+fn acquire_migrate_lock(
+    project_id: &str,
+) -> Option<crate::commands::single_flight::SingleFlightGuard> {
+    crate::commands::single_flight::try_begin(
+        crate::commands::single_flight::migrate_collections_key(project_id),
+    )
 }
 
 /// v0.2.70: pure predicate — does this dry-run plan describe an
@@ -2096,7 +2061,7 @@ fn spawn_root_identity_sweep(
     let orch_root = match find_local_repo_root() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: root identity sweep skipped for {} — \
                  orchestrator root not found: {}",
                 project_id, e
@@ -2107,7 +2072,7 @@ fn spawn_root_identity_sweep(
     let py_cmd: PathBuf = match resolve_python_for_vco_lib_local() {
         Some(p) => p,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: root identity sweep skipped for {} — \
                  no vco_lib-capable python resolved",
                 project_id
@@ -2149,7 +2114,7 @@ fn spawn_root_identity_sweep(
                 if let Some(line) =
                     stdout.lines().rev().find(|l| l.contains("IDENTITY_MIGRATION"))
                 {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] code-graph root identity sweep ({}): {}",
                         project_id,
                         line.trim()
@@ -2158,7 +2123,7 @@ fn spawn_root_identity_sweep(
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: root identity sweep for {} exited {}: {}",
                     project_id,
                     out.status.code().unwrap_or(-1),
@@ -2166,7 +2131,7 @@ fn spawn_root_identity_sweep(
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: root identity sweep for {} failed to spawn: {}",
                     project_id, e
                 );
@@ -2264,7 +2229,7 @@ pub(crate) async fn run_migrate_dry_run(
                 }
             }
             if !out.status.success() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] migrate-collections --dry-run exit {} (errors surfaced via warnings)",
                     out.status
                 );
@@ -2319,7 +2284,7 @@ pub(crate) async fn run_migrate_apply_additive(
     let mut warnings: Vec<String> = Vec::new();
 
     // DS-F2: refuse a second concurrent wet apply for this project.
-    let _guard = match MigrateLockGuard::acquire(project_id) {
+    let _guard = match acquire_migrate_lock(project_id) {
         Some(g) => g,
         None => {
             warnings.push(format!(
@@ -2406,7 +2371,7 @@ pub(crate) async fn run_migrate_apply_additive(
                 }
             }
             if !out.status.success() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] migrate-collections (wet additive apply) exit {} \
                      (errors surfaced via warnings)",
                     out.status
@@ -2832,7 +2797,7 @@ pub async fn update_project_v2(
              may be missing VCT_ORCHESTRATOR_ROOT until the next refresh.",
             e
         );
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -3116,12 +3081,24 @@ fn build_progress_finished(
 ///     `warnings[]` per-project. Don't trip stop_on_error.
 ///   * Empty project list → returns an empty report with all counts at 0.
 ///     Not an error; the GUI button just confirms "no projects to update".
+///
+/// v0.2.91 decision #26 — SINGLE-FLIGHT. Every iteration performs a real
+/// per-project bundle install, so two concurrent runs write the same project
+/// folders at the same time and the loser's stale resolve then overwrites the
+/// live run's state in the GUI. The modal was closable mid-run (DialogRoot's
+/// defaults), which made reopening it and re-clicking the ordinary way to get
+/// there. A second concurrent call is now REFUSED — not queued: queuing would
+/// just run the same destructive traversal a moment later. Sequential re-runs
+/// are unaffected (the guard releases on return, including on panic).
 #[command]
 pub async fn update_all_projects(
     opts: Option<UpdateAllOptions>,
     app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<UpdateAllReport, String> {
+    let _single_flight = crate::commands::single_flight::begin_or_refuse(
+        crate::commands::single_flight::OP_UPDATE_ALL_PROJECTS,
+    )?;
     let opts = opts.unwrap_or_default();
     let projects = db.list_projects()?;
 
@@ -3809,7 +3786,7 @@ pub fn write_project_env_files(
     let mut claude_settings: serde_json::Value = if claude_settings_path.exists() {
         match std::fs::read_to_string(&claude_settings_path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: {} is not valid JSON ({}); replacing with minimal env block",
                     claude_settings_path.display(),
                     e
@@ -3817,7 +3794,7 @@ pub fn write_project_env_files(
                 serde_json::json!({})
             }),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: could not read {} ({}); creating fresh",
                     claude_settings_path.display(),
                     e
@@ -4667,7 +4644,7 @@ pub async fn rename_project_v2(
              KG routing for the renamed project may be stale until manual repair.",
             e
         );
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
     // ensure_project_env_template is append-only, so the project-root `.env`
@@ -4705,7 +4682,7 @@ pub async fn rename_project_v2(
                  or manually edit the stale line to read KG_COLLECTION={}.",
                 row.folder_path, bound_kg, row.folder_path, bound_kg
             );
-            eprintln!("[vct] warning: {}", msg);
+            tracing::warn!("[vct] warning: {}", msg);
             warnings.push(msg);
         }
     }
@@ -4771,7 +4748,7 @@ pub async fn set_shared_kg_write_disabled(
              Toggle persisted to DB but env files may be stale.",
             e
         );
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -4853,7 +4830,7 @@ pub async fn set_shared_kg_read_disabled(
              Toggle persisted to DB but env files may be stale.",
             e
         );
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -4883,7 +4860,7 @@ pub async fn set_shared_kg_opt_out(
     opt_out: bool,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
-    eprintln!(
+    tracing::warn!(
         "[vct] DEPRECATED: Tauri command `set_shared_kg_opt_out` was called \
          (project_id={}, opt_out={}). The toggle now gates WRITES only — \
          reads of the shared KG are always on. Use \
@@ -4945,7 +4922,7 @@ pub fn refresh_project_env_with_db(
              Access-matrix env vars may be stale until next refresh.",
             e
         );
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -4987,7 +4964,7 @@ pub fn reproject_env_soft(db: &Db, project_id: &str) -> RefreshProjectEnvResult 
                  MCP-relevant env may be stale until the next refresh.",
                 project_id, e
             );
-            eprintln!("[vct] warning: {}", msg);
+            tracing::warn!("[vct] warning: {}", msg);
             RefreshProjectEnvResult {
                 kg_access_list: Vec::new(),
                 code_graph_access_list: Vec::new(),
@@ -12534,25 +12511,28 @@ export BY_HAND_KEY=\"user_typed\"
 
     /// DS-F2: the per-project migrate lock refuses a SECOND wet apply while
     /// one is already in flight (refuse-on-contention), and lets it through
-    /// again once released. Exercises the real `MigrateLockGuard` against the
-    /// global in-flight set, plus the pure decision predicate.
+    /// again once released.
+    ///
+    /// v0.2.91 (#26): the mechanism moved to `commands::single_flight` (one
+    /// implementation for this call site and the two update commands instead
+    /// of two copies). This test is unchanged in what it asserts — it drives
+    /// `acquire_migrate_lock`, the same function production calls, against
+    /// the same process-global set. The pure-predicate assertions went with
+    /// the predicate; contention is now proven by the claim itself, which is
+    /// the behaviour that was ever worth pinning.
     #[test]
     fn migrate_lock_acquire_then_refuse_on_contention() {
-        // Pure predicate: free → proceed; held → refuse.
-        assert!(!migrate_lock_should_refuse(false), "free lock must proceed");
-        assert!(migrate_lock_should_refuse(true), "held lock must refuse");
-
         // Use a unique project_id so this test doesn't collide with any
         // concurrently-running test that also touches the global set.
         let pid = format!("migrate-lock-test-{}", uuid::Uuid::new_v4().simple());
 
         // First acquire succeeds.
-        let g1 = MigrateLockGuard::acquire(&pid);
+        let g1 = acquire_migrate_lock(&pid);
         assert!(g1.is_some(), "first acquire must succeed");
 
         // Second acquire for the SAME project_id is refused (returns None),
         // and issues no subprocess (the caller soft-skips).
-        let g2 = MigrateLockGuard::acquire(&pid);
+        let g2 = acquire_migrate_lock(&pid);
         assert!(
             g2.is_none(),
             "second acquire for the same project must be refused (no concurrent wet apply)"
@@ -12560,7 +12540,7 @@ export BY_HAND_KEY=\"user_typed\"
 
         // A DIFFERENT project is unaffected by the contention on `pid`.
         let other = format!("migrate-lock-other-{}", uuid::Uuid::new_v4().simple());
-        let g_other = MigrateLockGuard::acquire(&other);
+        let g_other = acquire_migrate_lock(&other);
         assert!(
             g_other.is_some(),
             "a different project_id must acquire independently"
@@ -12569,7 +12549,7 @@ export BY_HAND_KEY=\"user_typed\"
 
         // Drop the first guard → the lock frees → re-acquire succeeds.
         drop(g1);
-        let g3 = MigrateLockGuard::acquire(&pid);
+        let g3 = acquire_migrate_lock(&pid);
         assert!(
             g3.is_some(),
             "re-acquire after release must succeed (guard frees the lock on drop)"
