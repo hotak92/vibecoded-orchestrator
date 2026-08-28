@@ -206,7 +206,7 @@ pub async fn create_local_project_repo(project_root: String) -> Result<(), Strin
     if let Err(e) = append_local_repo_gitignore_guard(root) {
         // Non-fatal: the repo exists; a missing ignore guard is a warning, not
         // a failure (the user can still add it). Log to stderr, don't fail.
-        eprintln!(
+        tracing::warn!(
             "[worktree_repo_mode] create_local_project_repo: gitignore guard append failed: {}",
             e
         );

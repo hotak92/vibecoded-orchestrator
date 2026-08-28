@@ -717,7 +717,7 @@ where
         match attempt_result {
             Ok(()) => {
                 if attempt > 0 {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] check_for_updates: git fetch succeeded after {} retries at {}",
                         attempt,
                         repo.display()
@@ -726,7 +726,7 @@ where
                 return Ok(());
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] check_for_updates: git fetch attempt {} failed at {}: {}",
                     attempt + 1,
                     repo.display(),
@@ -845,13 +845,13 @@ pub async fn check_for_launcher_update<R: Runtime>(
     // reports `stood_down` rather than a verdict it never established.
     let freshness = crate::services::binary_freshness::reconcile_dist_at_rest(&repo).await;
     if freshness.stood_down {
-        eprintln!(
+        tracing::info!(
             "[vct] check_for_launcher_update: binary freshness NOT probed this tick — an \
              update owns the tree (source SHAs say available={})",
             available,
         );
     } else if freshness.is_stale() {
-        eprintln!(
+        tracing::warn!(
             "[vct] check_for_launcher_update: source SHAs say available={} but the dist binary \
              is stale (staged={:?}, armed={})",
             available, freshness.staged, freshness.armed,
@@ -1040,7 +1040,7 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         )
         .await;
     if f1_restored > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] apply_launcher_update: F1 auto-restored {} byte-identical tracked file(s) \
              before divergence-plan resolution",
             f1_restored
@@ -1071,7 +1071,7 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         || !gen_reconcile.took_upstream.is_empty()
         || !gen_reconcile.restored_worktree.is_empty()
     {
-        eprintln!(
+        tracing::info!(
             "[vct] apply_launcher_update: reconciled generated/release-controlled file(s) to \
              upstream — {} committed take-upstream, {} worktree-restored (reconcile_committed={})",
             gen_reconcile.took_upstream.len(),
@@ -1327,7 +1327,7 @@ async fn finish_apply_after_pull<R: Runtime>(
         let running = std::env::current_exe().map_err(|e| e.to_string())?;
         match crate::services::binary_freshness::canonical_path_for_backup(&running) {
             Some(canonical) if canonical.is_file() => {
-                eprintln!(
+                tracing::info!(
                     "[apply_launcher_update] running from a pre-pull backup ({}); relaunching \
                      the canonical binary at {} instead",
                     running.display(),
@@ -1344,7 +1344,7 @@ async fn finish_apply_after_pull<R: Runtime>(
     // the install path here (self-update operates on the launcher's
     // enclosing checkout). Soft-fail: never block restart.
     if let Err(e) = crate::commands::desktop_shortcut::refresh_desktop_shortcut(repo, &exe) {
-        eprintln!(
+        tracing::warn!(
             "[apply_launcher_update] desktop shortcut refresh failed (non-fatal): {}",
             e
         );
@@ -1359,7 +1359,7 @@ async fn finish_apply_after_pull<R: Runtime>(
     // package.json, Cargo.toml, tauri.conf.json) are all on disk in the
     // new state. Soft-fail: never block restart.
     if let Err(e) = crate::commands::manifest::refresh_install_manifest(repo, "launcher_update") {
-        eprintln!(
+        tracing::warn!(
             "[apply_launcher_update] install-manifest refresh failed (non-fatal): {}",
             e
         );
@@ -1381,7 +1381,7 @@ async fn finish_apply_after_pull<R: Runtime>(
             db.inner(),
         );
     } else {
-        eprintln!(
+        tracing::warn!(
             "[apply_launcher_update] could not acquire Db State to mark hardware-redetect-pending; the next boot will skip the post-update redetect (Preferences button remains available)."
         );
     }
@@ -1391,7 +1391,7 @@ async fn finish_apply_after_pull<R: Runtime>(
     // OLD binary (the very file the updater is waiting to replace) and race it.
     // Exit and let the updater do its job.
     if handoff.handoff_active {
-        eprintln!(
+        tracing::info!(
             "[apply_launcher_update] stage1 handoff active (lock={:?}); exiting so vct-updater \
              can swap the locked binaries and relaunch",
             handoff.lock_path,

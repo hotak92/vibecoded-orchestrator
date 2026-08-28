@@ -630,7 +630,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
     let project = match db.get_project(project_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] re-render-claude-md: project {} not found; \
                  skipping background re-render",
                 project_id
@@ -638,7 +638,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
             return;
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] re-render-claude-md: db lookup for {} failed: {}; \
                  skipping background re-render",
                 project_id, e
@@ -649,7 +649,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
 
     let folder = PathBuf::from(&project.folder_path);
     if !folder.is_dir() {
-        eprintln!(
+        tracing::warn!(
             "[vct] re-render-claude-md: project folder {} does not exist; \
              skipping background re-render",
             folder.display()
@@ -660,7 +660,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
     let python = match resolve_project_python(&folder) {
         Some(p) => p,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] re-render-claude-md: no usable Python for project \
                  {} (folder={}); skipping background re-render",
                 project_id,
@@ -693,7 +693,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
 
     match spawn_result {
         Ok(child) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] re-render-claude-md: spawned pid={} for project {} ({})",
                 child.id(),
                 project_name,
@@ -701,7 +701,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
             );
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] re-render-claude-md: spawn failed for project {} ({}): {}",
                 project_name, project_id_str, e
             );
@@ -799,7 +799,7 @@ pub async fn is_project_module_active(
         // `projects_v2.rs:521`, so the row is missing rather than
         // user-disabled. Seed it default-active.
         if let Err(e) = db.set_project_module_enabled(&project_id, &module_name, true) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] is_project_module_active: backfill seed failed for \
                  ({}, {}): {} — returning true anyway; next call retries",
                 project_id, module_name, e

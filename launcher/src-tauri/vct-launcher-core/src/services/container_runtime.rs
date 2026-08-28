@@ -156,11 +156,10 @@ pub fn runtime_preference_from_env() -> Option<String> {
     if norm == "podman" || norm == "docker" {
         return Some(norm);
     }
-    eprintln!(
-        "[container_runtime] VCT_CONTAINER_RUNTIME={:?} unrecognized \
-         (expected 'podman' / 'docker' / 'auto'); falling through to \
-         auto-detect.",
-        raw
+    tracing::warn!(
+        value = ?raw,
+        "[container_runtime] VCT_CONTAINER_RUNTIME unrecognized (expected \
+         'podman' / 'docker' / 'auto'); falling through to auto-detect."
     );
     None
 }
@@ -293,7 +292,7 @@ pub async fn detect_container_runtime(
             || runtime_txt.as_deref() == Some(candidate.as_str());
         if runtime_binary_present(candidate).await {
             if was_pref {
-                eprintln!(
+                tracing::warn!(
                     "[container_runtime] preferred runtime '{}' (from {}) is \
                      installed but its daemon/machine isn't responding to \
                      `{} info`; trying the next candidate.",
@@ -979,15 +978,15 @@ pub fn is_runtime_pathological(
 
     // Indicator 1: command is a container runtime binary name.
     if matches!(cmd_trim, "podman" | "docker") {
-        eprintln!(
-            "[container_runtime] WARN: module {} declares runtime.command='{}' \
-             which is a container-runtime binary name. This is the pre-v0.2.49 \
-             Bug E manifest pattern. Dropping CMD override; using image ENTRYPOINT. \
-             Publisher should rebuild the image with runtime.command='' \
-             (and rely on the image's ENTRYPOINT) OR set command to the actual \
-             in-container binary (e.g. 'python', 'node').",
-            module_id.unwrap_or("<unknown>"),
-            cmd_trim,
+        tracing::warn!(
+            module = module_id.unwrap_or("<unknown>"),
+            command = cmd_trim,
+            "[container_runtime] module declares runtime.command as a \
+             container-runtime binary name. This is the pre-v0.2.49 Bug E \
+             manifest pattern. Dropping CMD override; using image ENTRYPOINT. \
+             Publisher should rebuild the image with runtime.command='' (and \
+             rely on the image's ENTRYPOINT) OR set command to the actual \
+             in-container binary (e.g. 'python', 'node')."
         );
         return true;
     }
@@ -999,12 +998,12 @@ pub fn is_runtime_pathological(
         // immediately under -d mode.
         let has_dash_c = args.iter().any(|a| a == "-c");
         if !has_dash_c {
-            eprintln!(
-                "[container_runtime] WARN: module {} declares runtime.command='{}' \
+            tracing::warn!(
+                module = module_id.unwrap_or("<unknown>"),
+                command = cmd_trim,
+                "[container_runtime] module declares a shell runtime.command \
                  without a '-c' arg. A detached shell with no command exits \
-                 immediately. Dropping CMD override; using image ENTRYPOINT.",
-                module_id.unwrap_or("<unknown>"),
-                cmd_trim,
+                 immediately. Dropping CMD override; using image ENTRYPOINT."
             );
             return true;
         }
@@ -1014,13 +1013,13 @@ pub fn is_runtime_pathological(
     // The launcher never substitutes {module_image} (it's a launcher-
     // side variable for the positional image arg, not a CMD-side one).
     if args.iter().any(|a| a.contains("{module_image}")) {
-        eprintln!(
-            "[container_runtime] WARN: module {} declares runtime.args containing \
+        tracing::warn!(
+            module = module_id.unwrap_or("<unknown>"),
+            "[container_runtime] module declares runtime.args containing an \
              unsubstituted '{{module_image}}' placeholder. This is the pre-v0.2.49 \
              Bug E pattern. Dropping CMD override; using image ENTRYPOINT. \
              Publisher should rebuild the image with the actual in-container CMD \
-             (or empty `command` to rely on the image's ENTRYPOINT).",
-            module_id.unwrap_or("<unknown>"),
+             (or empty `command` to rely on the image's ENTRYPOINT)."
         );
         return true;
     }
@@ -1041,10 +1040,11 @@ pub async fn ensure_volume_host_dirs_global(
         let host_resolved = resolve_value(&vol.host, ctx, &placeholders);
         let path = PathBuf::from(&host_resolved);
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
-            eprintln!(
-                "[container_runtime] global mkdir -p {} failed (will let podman surface the error): {}",
-                path.display(),
-                e
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "[container_runtime] global mkdir -p failed (will let the runtime \
+                 surface the error)"
             );
         }
     }
@@ -1285,20 +1285,21 @@ where
     {
         Ok(o) => o,
         Err(e) => {
-            eprintln!(
-                "[container_runtime] V52-D.2 reaper: spawn {} ps failed: {}",
-                runtime, e
+            tracing::warn!(
+                runtime,
+                error = %e,
+                "[container_runtime] V52-D.2 reaper: spawn `ps` failed"
             );
             return (0, 1);
         }
     };
 
     if !ps_output.status.success() {
-        eprintln!(
-            "[container_runtime] V52-D.2 reaper: {} ps exit {}, stderr={}",
+        tracing::warn!(
             runtime,
-            ps_output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&ps_output.stderr).chars().take(300).collect::<String>(),
+            exit_code = ps_output.status.code().unwrap_or(-1),
+            stderr = %String::from_utf8_lossy(&ps_output.stderr).chars().take(300).collect::<String>(),
+            "[container_runtime] V52-D.2 reaper: `ps` exited non-zero"
         );
         return (0, 1);
     }
@@ -1313,9 +1314,10 @@ where
     let snapshots = match parse_podman_ps_json(&stdout) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "[container_runtime] V52-D.2 reaper: parse {} ps json failed: {}",
-                runtime, e
+            tracing::warn!(
+                runtime,
+                error = %e,
+                "[container_runtime] V52-D.2 reaper: parse `ps` json failed"
             );
             return (0, 1);
         }
@@ -1333,25 +1335,28 @@ where
         match verdict {
             ReaperVerdict::Healthy => continue,
             ReaperVerdict::BrokenCmd => {
-                eprintln!(
-                    "[container_runtime] V52-D.2 reaper: reaping BrokenCmd container '{}' \
-                     (image='{}', cmd contains '{{module_image}}')",
-                    snap.name, snap.image,
+                tracing::info!(
+                    container = %snap.name,
+                    image = %snap.image,
+                    "[container_runtime] V52-D.2 reaper: reaping BrokenCmd container \
+                     (cmd contains '{{module_image}}')"
                 );
             }
             ReaperVerdict::Orphan => {
-                eprintln!(
-                    "[container_runtime] V52-D.2 reaper: reaping Orphan container '{}' \
-                     (image='{}', no DB row claims this name)",
-                    snap.name, snap.image,
+                tracing::info!(
+                    container = %snap.name,
+                    image = %snap.image,
+                    "[container_runtime] V52-D.2 reaper: reaping Orphan container \
+                     (no DB row claims this name)"
                 );
             }
             ReaperVerdict::StaleImage => {
                 let expected = expected_image_for(&snap.name).unwrap_or_default();
-                eprintln!(
-                    "[container_runtime] V52-D.2 reaper: reaping StaleImage container '{}' \
-                     (running='{}', expected='{}')",
-                    snap.name, snap.image, expected,
+                tracing::info!(
+                    container = %snap.name,
+                    running = %snap.image,
+                    expected = %expected,
+                    "[container_runtime] V52-D.2 reaper: reaping StaleImage container"
                 );
             }
         }
@@ -1369,28 +1374,31 @@ where
             }
             Ok(o) => {
                 errors += 1;
-                eprintln!(
-                    "[container_runtime] V52-D.2 reaper: {} rm -f {} exit {}, stderr={}",
+                tracing::warn!(
                     runtime,
-                    snap.name,
-                    o.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&o.stderr).chars().take(200).collect::<String>(),
+                    container = %snap.name,
+                    exit_code = o.status.code().unwrap_or(-1),
+                    stderr = %String::from_utf8_lossy(&o.stderr).chars().take(200).collect::<String>(),
+                    "[container_runtime] V52-D.2 reaper: `rm -f` exited non-zero"
                 );
             }
             Err(e) => {
                 errors += 1;
-                eprintln!(
-                    "[container_runtime] V52-D.2 reaper: spawn {} rm failed for {}: {}",
-                    runtime, snap.name, e
+                tracing::warn!(
+                    runtime,
+                    container = %snap.name,
+                    error = %e,
+                    "[container_runtime] V52-D.2 reaper: spawn `rm` failed"
                 );
             }
         }
     }
 
     if reaped > 0 || errors > 0 {
-        eprintln!(
-            "[container_runtime] V52-D.2 reaper: pass complete, reaped={} errors={}",
-            reaped, errors,
+        tracing::info!(
+            reaped,
+            errors,
+            "[container_runtime] V52-D.2 reaper: pass complete"
         );
     }
     (reaped, errors)
@@ -1587,10 +1595,11 @@ pub async fn ensure_volume_host_dirs(
         let host_resolved = resolve_value(&vol.host, ctx, &placeholders);
         let path = PathBuf::from(&host_resolved);
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
-            eprintln!(
-                "[container_runtime] mkdir -p {} failed (will let podman surface the error): {}",
-                path.display(),
-                e
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "[container_runtime] mkdir -p failed (will let the runtime surface \
+                 the error)"
             );
         }
     }
@@ -1705,11 +1714,11 @@ pub fn is_pull_token_placeholder(raw: &str) -> bool {
 /// returned as-is.
 pub fn resolve_pull_token_endpoint(raw: &str) -> &str {
     if raw.is_empty() || is_pull_token_placeholder(raw) {
-        eprintln!(
-            "[container_runtime] pull_token_endpoint is {:?}; \
-             substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. \
-             Fix the module manifest to remove this warning.",
-            raw
+        tracing::warn!(
+            value = ?raw,
+            "[container_runtime] pull_token_endpoint is unset or a placeholder; \
+             substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. Fix the \
+             module manifest to remove this warning."
         );
         RL_ARTIFACT_URL_DEFAULT_ENDPOINT
     } else {
@@ -1819,10 +1828,10 @@ pub async fn request_pull_token_http(
         .filter(|s| !s.is_empty())
     {
         Some(env_url) => {
-            eprintln!(
-                "[container_runtime] VCT_RL_PULL_TOKEN_ENDPOINT set; \
-                 using env override for pull-token endpoint: {}",
-                env_url
+            tracing::info!(
+                endpoint = %env_url,
+                "[container_runtime] VCT_RL_PULL_TOKEN_ENDPOINT set; using env \
+                 override for the pull-token endpoint"
             );
             endpoint_string = env_url;
             &endpoint_string
@@ -2184,10 +2193,10 @@ pub async fn pre_pull_with_auth_for_start(
         Err(e) => {
             // No token → anonymous pull. Will 401 on private images.
             // Same soft-fail discipline the launcher had pre-v0.2.49.
-            eprintln!(
-                "[container_runtime] pre-pull: pull-token gateway returned {}; \
-                 anonymous pull attempt (will 401 on private images).",
-                e
+            tracing::warn!(
+                error = %e,
+                "[container_runtime] pre-pull: pull-token gateway returned an \
+                 error; anonymous pull attempt (will 401 on private images)."
             );
             None
         }

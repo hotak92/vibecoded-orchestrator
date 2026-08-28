@@ -409,7 +409,7 @@ pub async fn link_global_into_project_mount(
         // as an orchestrator-managed file (replaceable) rather than a
         // user override. Without the marker, subsequent "Download default
         // weights" calls silently skip the slot.
-        eprintln!(
+        tracing::warn!(
             "[module_default_weights] symlink {} -> {} failed ({}); falling back to copy",
             target.display(),
             global_path.display(),
@@ -427,7 +427,7 @@ pub async fn link_global_into_project_mount(
         // copy will be treated as a user override on the NEXT call, which
         // is the pre-fix behaviour — not great but not worse than before).
         if let Err(marker_err) = tokio::fs::write(&marker, b"vct-managed").await {
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] warning: failed to write .vct-managed marker \
                  {} ({}); copy will be treated as user override on next update",
                 marker.display(),
@@ -1050,14 +1050,14 @@ pub async fn module_download_default_weights_inner(
     let project_slug = match db.get_project(&project_id) {
         Ok(Some(row)) => Some(row.slug),
         Ok(None) => {
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] project {} not found — skipping bind-mount link",
                 project_id
             );
             None
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] db.get_project({}) failed: {} — skipping bind-mount link",
                 project_id, e
             );
@@ -1074,7 +1074,7 @@ pub async fn module_download_default_weights_inner(
         )
         .await
         {
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] bind-mount link failed (non-fatal): {}",
                 e
             );
@@ -1092,7 +1092,7 @@ pub async fn module_download_default_weights_inner(
     )
     .await
     {
-        eprintln!(
+        tracing::warn!(
             "[module_default_weights] hub upsert failed (non-fatal): {}",
             e
         );
@@ -1412,7 +1412,7 @@ pub(crate) fn mark_weights_download_deferred(
         db.set_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY,
             &serde_json::Value::Bool(true))
     {
-        eprintln!(
+        tracing::warn!(
             "[module_default_weights] R5: failed to mark deferred flag \
              (best-effort, non-fatal): {}",
             set_err
@@ -1488,7 +1488,7 @@ pub async fn apply_default_weights_after_install(
             // Project vanished between install and post-install — unusual
             // but possible if the user uninstalled the project mid-flight.
             // Nothing to defer onto; just log + return.
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] R5 auto-trigger: project {} not found; \
                  skipping default-weights download",
                 project_id
@@ -1496,7 +1496,7 @@ pub async fn apply_default_weights_after_install(
             return Ok(());
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] R5 auto-trigger: get_project failed: {}; \
                  skipping default-weights download",
                 e
@@ -1523,7 +1523,7 @@ pub async fn apply_default_weights_after_install(
     // (bypassing this gate). On success that path calls
     // `clear_weights_download_deferred`, resetting the cooldown.
     if should_skip_r5_poll(db, project_id, module_id) {
-        eprintln!(
+        tracing::warn!(
             "[module_default_weights] R5 auto-trigger: skipping (deferred + \
              within 24-hour cooldown) for project {} module {}",
             project_id, module_id
@@ -1545,7 +1545,7 @@ pub async fn apply_default_weights_after_install(
 
     match result {
         Ok(downloaded) => {
-            eprintln!(
+            tracing::info!(
                 "[module_default_weights] R5 auto-trigger: downloaded {} ({}) \
                  for project {}",
                 downloaded.local_path, downloaded.version, project_id
@@ -1594,7 +1594,7 @@ pub async fn apply_default_weights_after_install(
             //   - "POST ...: connection timed out" (network blip).
             //   - "unsupported_embedding_source: ..." (v0.2.42 RT-3,
             //     structured error; includes list of alternatives).
-            eprintln!(
+            tracing::warn!(
                 "[module_default_weights] R5 auto-trigger soft-fail for \
                  project {} module {}: {}",
                 project_id, module_id, e

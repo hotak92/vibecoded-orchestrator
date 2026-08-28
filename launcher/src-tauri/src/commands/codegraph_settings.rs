@@ -113,7 +113,7 @@ pub async fn set_codegraph_floors(
             let refresh =
                 crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
             if !refresh.global_warnings.is_empty() || !refresh.failed.is_empty() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] set_codegraph_floors: env re-projection warnings: \
                      global={:?} failed={:?}",
                     refresh.global_warnings, refresh.failed
@@ -123,7 +123,7 @@ pub async fn set_codegraph_floors(
     )
     .await
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: set_codegraph_floors: {} (DB write already committed)",
             e
         );
@@ -206,7 +206,7 @@ pub async fn set_project_codegraph_index_dot_claude(
     if let Err(e) =
         crate::commands::projects_v2::refresh_project_env_with_db(&db, &project_id)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] set_project_codegraph_index_dot_claude: env re-projection \
              warning for {project_id}: {e}"
         );

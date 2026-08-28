@@ -116,14 +116,14 @@ pub async fn get_module_nav_items(
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[module_gui] skip {} (read error): {}", path.display(), e);
+                tracing::warn!("[module_gui] skip {} (read error): {}", path.display(), e);
                 continue;
             }
         };
         let manifest: ModuleManifest = match ModuleManifest::from_json(&raw) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[module_gui] skip {} (parse error): {}", path.display(), e);
+                tracing::warn!("[module_gui] skip {} (parse error): {}", path.display(), e);
                 continue;
             }
         };

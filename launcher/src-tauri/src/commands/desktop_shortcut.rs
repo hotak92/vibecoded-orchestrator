@@ -116,7 +116,7 @@ fn refresh_linux(install_path: &Path, launcher_binary: &Path) -> Result<(), Stri
     if desktop_dir.is_dir() {
         let dest = desktop_dir.join("vct-launcher.desktop");
         if let Err(e) = write_desktop_file(&dest, &body) {
-            eprintln!(
+            tracing::warn!(
                 "[desktop_shortcut] failed to write {}: {} (continuing)",
                 dest.display(),
                 e

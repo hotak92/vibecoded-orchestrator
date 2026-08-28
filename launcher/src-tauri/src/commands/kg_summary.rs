@@ -213,7 +213,7 @@ pub fn resume_pending_summaries(
     ) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: kg-summary stale-running sweep failed: {}. \
                  Stale rows (if any) will appear as 'running' indefinitely; \
                  user can click Re-build KG summaries to recover.",
@@ -227,7 +227,7 @@ pub fn resume_pending_summaries(
     let pending_ids = match db.list_pending_kg_summaries() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: kg-summary pending-list lookup failed: {}. \
                  Queued summary backfills (if any) will not auto-resume this boot.",
                 e
@@ -247,14 +247,14 @@ pub fn resume_pending_summaries(
         let project = match db.get_project(pid) {
             Ok(Some(p)) => p,
             Ok(None) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: pending kg-summary references missing project {}; skipping",
                     pid
                 );
                 continue;
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: lookup for pending kg-summary {}: {}; skipping",
                     pid, e
                 );
@@ -895,7 +895,7 @@ fn upsert_quiet(
         error_message,
         log_tail,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: kg_summaries upsert failed for {}: {}",
             project_id, e
         );

@@ -366,7 +366,8 @@ fn warn_legacy_global_env_once(project_id: &str) {
     if !seen.insert(project_id.to_string()) {
         return; // already warned for this project this process.
     }
-    eprintln!(
+    tracing::warn!(
+        project_id,
         "[vct-hub] DEPRECATION: the global hub.token was used to read \
          /projects/{}/env or /config, accepted ONLY because you set \
          VCT_HUB_LEGACY_GLOBAL_ENV=1 to re-open the compat window (the \
@@ -476,19 +477,21 @@ fn scoped_token_owns_url_project(
             Ok(Some(p)) => p.id,
             Ok(None) => return false, // unknown segment → keep the 403.
             Err(e) => {
-                eprintln!(
-                    "[vct-hub] auth: slug canonicalization lookup failed for {:?} ({}); \
-                     refusing (fail closed).",
-                    url_segment, e
+                tracing::error!(
+                    segment = ?url_segment,
+                    error = %e,
+                    "[vct-hub] auth: slug canonicalization lookup failed; \
+                     refusing (fail closed)."
                 );
                 return false;
             }
         },
         Err(e) => {
-            eprintln!(
-                "[vct-hub] auth: id canonicalization lookup failed for {:?} ({}); \
-                 refusing (fail closed).",
-                url_segment, e
+            tracing::error!(
+                segment = ?url_segment,
+                error = %e,
+                "[vct-hub] auth: id canonicalization lookup failed; \
+                 refusing (fail closed)."
             );
             return false;
         }
@@ -574,7 +577,7 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
     let state = match req.extensions().get::<AuthState>().cloned() {
         Some(s) => s,
         None => {
-            eprintln!("[vct-hub] auth middleware: AuthState extension missing");
+            tracing::error!("[vct-hub] auth middleware: AuthState extension missing");
             return (StatusCode::INTERNAL_SERVER_ERROR, "auth not configured").into_response();
         }
     };

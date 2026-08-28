@@ -339,7 +339,7 @@ pub async fn start_container_for_module_with_gpu_mode(
     // token resolves.
     if manifest.install.method == InstallMethod::ContainerPull {
         if let Err(e) = pre_pull_with_auth_for_start(manifest, &podman, &image).await {
-            eprintln!(
+            tracing::warn!(
                 "[module_service] pre-pull for start failed (continuing — cache may suffice): {}",
                 e
             );
@@ -637,13 +637,13 @@ fn ensure_hub_bind_widened_for_module(module_id: &str) {
 
     match widen_restart_action(env_value.as_deref(), hub_alive, recorded_bind.as_deref()) {
         WidenAction::LeaveAloneUserOptIn => {
-            eprintln!(
+            tracing::info!(
                 "[module_service] hub bind: VCT_HUB_BIND_ALL is set (user opt-in); \
                  leaving the user's env in charge of the widened bind."
             );
         }
         WidenAction::WarnUserForcedLoopback => {
-            eprintln!(
+            tracing::warn!(
                 "[module_service] WARNING: VCT_HUB_BIND_ALL={} forces the hub to \
                  loopback-only while hub-consuming module '{}' is installed — its \
                  container CANNOT reach the hub (host.containers.internal never \
@@ -661,7 +661,7 @@ fn ensure_hub_bind_widened_for_module(module_id: &str) {
         }
         WidenAction::AlreadyWidened => {}
         WidenAction::RestartHub => {
-            eprintln!(
+            tracing::warn!(
                 "[module_service] NOTICE: hub-consuming module '{}' needs the hub \
                  reachable from its container, but the running hub is bound to \
                  loopback (started before this module's install). Restarting the \
@@ -676,7 +676,7 @@ fn ensure_hub_bind_widened_for_module(module_id: &str) {
                 crate::hub_status::StopOutcome::Stopped
                 | crate::hub_status::StopOutcome::AlreadyStopped => {}
                 other => {
-                    eprintln!(
+                    tracing::warn!(
                         "[module_service] WARNING: could not stop the loopback-bound \
                          hub ({:?}); the module's container may not reach the hub \
                          until the hub is restarted (`vct-hub --stop` then \
@@ -827,7 +827,7 @@ pub async fn auto_migrate_per_project_to_global(
                 }
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[auto_migrate] list_module_installs_with_status({}) failed: {}",
                     status, e
                 );
@@ -856,7 +856,7 @@ pub async fn auto_migrate_per_project_to_global(
             Ok(Some(_)) => continue,
             Ok(None) => {} // proceed to migration
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[auto_migrate] get_global_module_install({}) failed: {}",
                     module_id, e
                 );
@@ -868,7 +868,7 @@ pub async fn auto_migrate_per_project_to_global(
         let per_project_rows = match db.list_per_project_installs_for_module(&module_id) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[auto_migrate] list_per_project_installs_for_module({}) failed: {}",
                     module_id, e
                 );
@@ -884,7 +884,7 @@ pub async fn auto_migrate_per_project_to_global(
             continue;
         }
 
-        eprintln!(
+        tracing::info!(
             "[auto_migrate] {} declares install.scope=global with {} per-project row(s); \
              migrating to single global row",
             module_id,
@@ -896,7 +896,7 @@ pub async fn auto_migrate_per_project_to_global(
             if let Some(container_name) = row.container_name.as_deref() {
                 if !container_name.is_empty() {
                     if let Err(e) = stop_container_for_project(container_name).await {
-                        eprintln!(
+                        tracing::error!(
                             "[auto_migrate] stop_container_for_project({}) failed: {}",
                             container_name, e
                         );
@@ -916,7 +916,7 @@ pub async fn auto_migrate_per_project_to_global(
         for row in &per_project_rows {
             if let Some(pid) = row.project_id.as_deref() {
                 if let Err(e) = db.delete_module_install(pid, &module_id) {
-                    eprintln!(
+                    tracing::error!(
                         "[auto_migrate] delete_module_install({}, {}) failed: {}",
                         pid, module_id, e
                     );
@@ -934,7 +934,7 @@ pub async fn auto_migrate_per_project_to_global(
         ) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[auto_migrate] insert_global_module_install({}) failed: {}",
                     module_id, e
                 );
@@ -964,13 +964,13 @@ pub async fn auto_migrate_per_project_to_global(
         {
             match start_global_container_after_install(&manifest, db).await {
                 Ok(name) => {
-                    eprintln!(
+                    tracing::info!(
                         "[auto_migrate] started global container {} for {}",
                         name, module_id
                     );
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[auto_migrate] start_global_container_after_install({}) failed: {}",
                         module_id, e
                     );
@@ -1061,7 +1061,7 @@ pub async fn reconcile_rl_port_to_bound(
     let container_name = match resolve_container_name(&name_template, &project.slug) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[module_service] port-reconcile: resolve_container_name({}/{}): {} — leaving alone",
                 project.id, module_id, e
             );
@@ -1098,7 +1098,7 @@ async fn reconcile_rl_port_with_bound(
         Err(e) => {
             // Introspection error → leave alone + log. NEVER treat an error as
             // "port gone" (option b conservative-on-doubt).
-            eprintln!(
+            tracing::error!(
                 "[module_service] port-reconcile: inspect {}/{} failed: {} — leaving alone",
                 project.id, module_id, e
             );
@@ -1125,13 +1125,13 @@ async fn reconcile_rl_port_with_bound(
             // env}; the per-project value flows through the hub-resolved
             // ProjectConfig channel instead).
             if let Err(e) = db.set_module_port(&project.id, module_id, bound) {
-                eprintln!(
+                tracing::warn!(
                     "[module_service] port-reconcile: set_module_port({}/{}, {}): {} — leaving alone",
                     project.id, module_id, bound, e
                 );
                 return PortReconcileOutcome::LeftAlone { reason: "db_write_failed" };
             }
-            eprintln!(
+            tracing::info!(
                 "[module_service] port-reconcile: {}/{} module_ports {:?} → {} (recorded live \
                  container bind; hub ProjectConfig now serves the correct RL port)",
                 project.id, module_id, row, bound
@@ -1857,7 +1857,7 @@ pub async fn apply_weights_update(
             let pid = project_id.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = run_finetune_then_rotate_async(pid, response, app).await {
-                    eprintln!("[module_service] background fine-tune failed: {}", e);
+                    tracing::error!("[module_service] background fine-tune failed: {}", e);
                 }
             });
             Ok(())
@@ -1901,7 +1901,7 @@ impl FinetuneSentinel {
         // container mid-job (the old behavior); the poller still treats the
         // resulting job-loss as failure, so we never report false success.
         if let Err(e) = std::fs::write(&path, b"1") {
-            eprintln!(
+            tracing::error!(
                 "[module_service] could not write finetune sentinel {:?}: {} \
                  (hub may recreate the container mid-job)",
                 path, e
@@ -2140,7 +2140,7 @@ async fn run_finetune_then_rotate_async(
                     }
                     Err(e) => {
                         consecutive_conn_errors += 1;
-                        eprintln!(
+                        tracing::error!(
                             "[module_service] finetune_status poll error ({}/{}): {}",
                             consecutive_conn_errors, MAX_CONSECUTIVE_CONN_ERRORS, e
                         );
@@ -2672,7 +2672,7 @@ where
     let claimed = match db.list_module_installs_with_containers() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_service] V52-D.2 reaper: list_module_installs_with_containers \
                  failed: {}",
                 e
@@ -2734,7 +2734,7 @@ where
     let runtime = match detect_container_runtime().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_service] V52-D.2 reaper: detect_container_runtime failed: {}",
                 e
             );
@@ -2752,7 +2752,7 @@ where
         )
         .await;
     if reaped > 0 || errors > 0 {
-        eprintln!(
+        tracing::info!(
             "[module_service] V52-D.2 reaper: pass complete, reaped={} errors={}",
             reaped, errors
         );
@@ -2776,7 +2776,7 @@ where
     let rows = match db.list_module_installs_needing_start() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_service] resume_containers_on_startup list failed: {}",
                 e
             );
@@ -2790,7 +2790,7 @@ where
         let manifest = match resolve_manifest(&module_id) {
             Some(m) => m,
             None => {
-                eprintln!(
+                tracing::warn!(
                     "[module_service] resume: manifest for {} not in catalog, skipping",
                     module_id
                 );
@@ -2858,7 +2858,7 @@ where
                 if let Err(e) =
                     start_global_container_for_module(&manifest, &module_id, db).await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "[module_service] resume: start_global_container_for_module({}): {}",
                         module_id, e
                     );
@@ -2872,14 +2872,14 @@ where
                 let project = match db.get_project(&project_id) {
                     Ok(Some(p)) => p,
                     Ok(None) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[module_service] resume: project {} not found, skipping",
                             project_id
                         );
                         continue;
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[module_service] resume: get_project({}): {}",
                             project_id, e
                         );
@@ -2892,7 +2892,7 @@ where
                         let rl_port = match ensure_project_rl_port(db, &project) {
                             Ok(p) => p,
                             Err(e) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "[module_service] resume: ensure_rl_port({}): {}",
                                     project_id, e
                                 );
@@ -2922,7 +2922,7 @@ where
                                 // is a forensic warning, not a start
                                 // failure (the container IS running).
                                 if resolved_name != prior_container_name {
-                                    eprintln!(
+                                    tracing::info!(
                                         "[module_service] resume: V52-D container_name drift \
                                          for {}/{}: DB='{}' → resolved='{}'; updating DB.",
                                         project_id, module_id,
@@ -2931,7 +2931,7 @@ where
                                     if let Err(e) = db.set_module_container_name(
                                         &project_id, &module_id, &resolved_name,
                                     ) {
-                                        eprintln!(
+                                        tracing::warn!(
                                             "[module_service] resume: V52-D \
                                              set_module_container_name({}, {}): {}",
                                             project_id, module_id, e
@@ -2947,7 +2947,7 @@ where
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "[module_service] resume: start_container_for_module({}, {}): {}",
                                     project_id, module_id, e
                                 );
@@ -2958,7 +2958,7 @@ where
                         if let Err(e) =
                             start_container_after_install(&manifest, &project, db).await
                         {
-                            eprintln!(
+                            tracing::warn!(
                                 "[module_service] resume: start_container_after_install({}, {}): {}",
                                 project_id, module_id, e
                             );
@@ -3024,7 +3024,7 @@ where
     let conn = match rusqlite::Connection::open(crate::db::db_path()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[module_service] daily poll: open DB: {}", e);
+            tracing::warn!("[module_service] daily poll: open DB: {}", e);
             return;
         }
     };
@@ -3033,7 +3033,7 @@ where
     let projects = match db.list_projects() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[module_service] daily poll: list_projects: {}", e);
+            tracing::warn!("[module_service] daily poll: list_projects: {}", e);
             return;
         }
     };
@@ -3086,7 +3086,7 @@ where
                 // No update — nothing to do.
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[module_service] daily poll: check_weights_update({}): {}",
                     project.id, e
                 );
@@ -3297,7 +3297,7 @@ pub async fn retry_failed_module_installs(
                 }
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[module_service] retry_failed_module_installs: \
                      list_module_installs_with_status({}) failed: {}",
                     status, e
@@ -3416,7 +3416,7 @@ pub async fn retry_failed_module_installs(
                 if let Err(e) =
                     db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "[module_service] retry self_heal: set_module_status({}, {}): {}",
                         project_id, module_id, e
                     );

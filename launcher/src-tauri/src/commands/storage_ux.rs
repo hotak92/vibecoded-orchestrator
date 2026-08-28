@@ -295,7 +295,7 @@ fn read_storage_config_from(path: &Path) -> (StorageConfig, bool) {
                 // delete the bad file; the user may want to recover it
                 // manually. The synthesized flag stays false so the FE
                 // doesn't pretend nothing is wrong.
-                eprintln!(
+                tracing::warn!(
                     "[storage_ux] warning: could not parse {} as TOML; using defaults",
                     path.display()
                 );
@@ -615,7 +615,7 @@ async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
     let runtime = match which_runtime() {
         Some(r) => r,
         None => {
-            eprintln!(
+            tracing::info!(
                 "[storage_ux] info: no podman/docker on PATH; returning empty legacy-volume list"
             );
             return Vec::new();
@@ -630,13 +630,13 @@ async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
     let out = match out {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[storage_ux] warning: `volume ls` failed: {e}");
+            tracing::warn!("[storage_ux] warning: `volume ls` failed: {e}");
             return Vec::new();
         }
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        eprintln!(
+        tracing::warn!(
             "[storage_ux] warning: `volume ls` exited non-zero: {}",
             stderr.trim()
         );
@@ -695,7 +695,7 @@ fn emit_deferral(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(&repo_root, &repo_root, &fields)
     {
-        eprintln!("[storage_ux] deferral emit failed ({}): {}", condition_id, e);
+        tracing::warn!("[storage_ux] deferral emit failed ({}): {}", condition_id, e);
     }
 }
 
@@ -895,7 +895,7 @@ pub fn set_storage_config_from_cli(
         // Deferral helper requires a Python interpreter on PATH — we
         // skip the emit when install.py drove this path (install.py
         // already records its own deferrals into the same file).
-        eprintln!(
+        tracing::warn!(
             "[storage_ux] override.yml at infrastructure/docker-compose.override.yml \
              carries user customizations; skipped overwrite. \
              Remove the file and re-run to accept launcher defaults."
@@ -908,7 +908,7 @@ pub fn set_storage_config_from_cli(
         // the user's choice is recorded; the next launcher start will
         // regenerate the override from it.
         if let Err(e) = write_compose_override(&body) {
-            eprintln!(
+            tracing::warn!(
                 "[storage_ux] note: storage.toml written but override.yml could not be \
                  generated: {}. Will regenerate on next launcher start.",
                 e

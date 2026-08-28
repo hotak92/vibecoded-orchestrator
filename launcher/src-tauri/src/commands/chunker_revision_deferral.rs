@@ -187,7 +187,7 @@ fn write_deferral_for_root_project(db: &Db, prev: &str, running: &str) -> usize 
             return 0;
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[chunker-deferral] SELECT orchestrator-root failed: {} — skipping",
                 e
             );
@@ -197,7 +197,7 @@ fn write_deferral_for_root_project(db: &Db, prev: &str, running: &str) -> usize 
 
     let folder = PathBuf::from(&folder_str);
     if !folder.is_dir() {
-        eprintln!(
+        tracing::warn!(
             "[chunker-deferral] orchestrator-root folder missing on disk: {} — skipping",
             folder_str
         );
@@ -207,7 +207,7 @@ fn write_deferral_for_root_project(db: &Db, prev: &str, running: &str) -> usize 
     match write_deferral_for_project(&folder, prev, running) {
         Ok(()) => 1,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[chunker-deferral] write failed for {}: {} — skipping",
                 folder_str, e
             );
@@ -240,7 +240,7 @@ pub fn write_chunker_deferral_if_crossing_boundary(
     let prev_vs_bump = match compare_versions(prev, CHUNKER_BUMP_VERSION) {
         Some(o) => o,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "[chunker-deferral] version parse failed: prev={}, running={} — skipping",
                 prev, running
             );
@@ -261,7 +261,7 @@ pub fn write_chunker_deferral_if_crossing_boundary(
     }
 
     let touched = write_deferral_for_root_project(db, prev, running);
-    eprintln!(
+    tracing::info!(
         "[chunker-deferral] upgrade crossed v0.2.46 boundary ({} → {}); \
          wrote re-sync notice to orchestrator-root project ({} written)",
         prev, running, touched
@@ -322,7 +322,7 @@ fn read_current_chunker_revision() -> Option<String> {
         .output()
         .ok()?;
     if !output.status.success() {
-        eprintln!(
+        tracing::warn!(
             "[chunker-revision] reader exited {} — skipping",
             output.status
         );
@@ -330,7 +330,7 @@ fn read_current_chunker_revision() -> Option<String> {
     }
     let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if rev.is_empty() {
-        eprintln!("[chunker-revision] reader returned empty string — skipping");
+        tracing::warn!("[chunker-revision] reader returned empty string — skipping");
         return None;
     }
     Some(rev)
@@ -352,7 +352,7 @@ fn write_revision_deferral_for_root_project(db: &Db, prev: &str, current: &str) 
         Ok(s) => s,
         Err(rusqlite::Error::QueryReturnedNoRows) => return 0,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[chunker-revision] SELECT orchestrator-root failed: {} — skipping",
                 e
             );
@@ -361,7 +361,7 @@ fn write_revision_deferral_for_root_project(db: &Db, prev: &str, current: &str) 
     };
     let folder = PathBuf::from(&folder_str);
     if !folder.is_dir() {
-        eprintln!(
+        tracing::warn!(
             "[chunker-revision] orchestrator-root folder missing on disk: {} — skipping",
             folder_str
         );
@@ -371,14 +371,14 @@ fn write_revision_deferral_for_root_project(db: &Db, prev: &str, current: &str) 
     let repo_root = match super::installer::find_local_repo_root() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[chunker-revision] cannot locate repo root: {} — skipping", e);
+            tracing::warn!("[chunker-revision] cannot locate repo root: {} — skipping", e);
             return 0;
         }
     };
     let py = match pick_python() {
         Some(p) => p,
         None => {
-            eprintln!("[chunker-revision] no python to emit deferral — skipping");
+            tracing::warn!("[chunker-revision] no python to emit deferral — skipping");
             return 0;
         }
     };
@@ -401,11 +401,11 @@ fn write_revision_deferral_for_root_project(db: &Db, prev: &str, current: &str) 
     match status {
         Ok(s) if s.success() => 1,
         Ok(s) => {
-            eprintln!("[chunker-revision] deferral python helper exited {}", s);
+            tracing::warn!("[chunker-revision] deferral python helper exited {}", s);
             0
         }
         Err(e) => {
-            eprintln!("[chunker-revision] deferral python helper spawn failed: {}", e);
+            tracing::warn!("[chunker-revision] deferral python helper spawn failed: {}", e);
             0
         }
     }
@@ -433,7 +433,7 @@ pub fn write_chunker_deferral_if_revision_changed(db: &Db) -> RevisionOutcome {
     let prior = match db.app_state_get(APP_STATE_KEY_CHUNKER_REVISION) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[chunker-revision] app_state_get failed: {} — skipping", e);
+            tracing::warn!("[chunker-revision] app_state_get failed: {} — skipping", e);
             return RevisionOutcome::Skipped;
         }
     };
@@ -443,7 +443,7 @@ pub fn write_chunker_deferral_if_revision_changed(db: &Db) -> RevisionOutcome {
             // already on disk were chunked under whatever revision shipped with
             // this build, so there's nothing older to re-chunk against.
             if let Err(e) = db.app_state_set(APP_STATE_KEY_CHUNKER_REVISION, &current) {
-                eprintln!("[chunker-revision] seed failed: {} — next boot retries", e);
+                tracing::warn!("[chunker-revision] seed failed: {} — next boot retries", e);
             }
             RevisionOutcome::FirstBoot
         }
@@ -455,12 +455,12 @@ pub fn write_chunker_deferral_if_revision_changed(db: &Db) -> RevisionOutcome {
             // every boot. Soft-fail: if this fails the deferral re-emits next
             // boot but DeferralReport dedups by condition_id (no duplicate).
             if let Err(e) = db.app_state_set(APP_STATE_KEY_CHUNKER_REVISION, &current) {
-                eprintln!(
+                tracing::warn!(
                     "[chunker-revision] marker advance failed: {} — deferral may re-emit (dedup'd)",
                     e
                 );
             }
-            eprintln!(
+            tracing::info!(
                 "[chunker-revision] revision changed {} → {}; wrote re-sync notice \
                  to orchestrator-root project ({} written)",
                 prev, current, touched

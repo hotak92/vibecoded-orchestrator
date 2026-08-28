@@ -426,7 +426,7 @@ async fn run_install_inner(
         ) {
             Ok(report) => {
                 if !report.ok() {
-                    eprintln!(
+                    tracing::error!(
                         "[installer_engine] run_install[{}]: module DB migration(s) failed at {}: {:?}",
                         module_id_for_log,
                         install_dir_for_log.display(),
@@ -443,7 +443,7 @@ async fn run_install_inner(
                         }),
                     );
                 } else if !report.applied.is_empty() {
-                    eprintln!(
+                    tracing::info!(
                         "[installer_engine] run_install[{}]: applied {} DB migration(s)",
                         module_id_for_log,
                         report.applied.len(),
@@ -455,7 +455,7 @@ async fn run_install_inner(
                 // Still soft-fail at the installer-engine level: the
                 // install row is `installed`, the migration is just
                 // pending. Surface via the same event.
-                eprintln!(
+                tracing::warn!(
                     "[installer_engine] run_install[{}]: apply_module_db_migrations errored: {}",
                     module_id_for_log, e
                 );
@@ -612,7 +612,7 @@ async fn container_pull(
         String,
     ) = match request_pull_token(container, l0_pull_token_endpoint).await {
         Ok(tok) => {
-            eprintln!(
+            tracing::info!(
                 "[installer_engine] container_pull[{}]: obtained pull token (expires_in={}s)",
                 module_id, tok.expires_in_s
             );
@@ -641,7 +641,7 @@ async fn container_pull(
                             // the right manifest. If the server already
                             // included a suffix, we trust it as-is.
                             let merged = merge_server_tag_with_client_variant(server_tag, tag);
-                            eprintln!(
+                            tracing::warn!(
                                 "[installer_engine] container_pull[{}]: tag mismatch (PATCH): \
                                  client resolved {:?}, server returned {:?}, \
                                  effective (with variant) {:?}. \
@@ -700,7 +700,7 @@ async fn container_pull(
             (Some(tok.pull_token), tok.username, None, resolved_tag)
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[installer_engine] container_pull[{}]: pull-token gateway returned: {}. \
                  Falling back to anonymous pull — will succeed only if the image is public.",
                 module_id, e
@@ -1231,7 +1231,7 @@ where
     match probe(image.to_string(), tag.to_string()).await {
         Ok(true) => Ok(tag.to_string()),
         Ok(false) => {
-            eprintln!(
+            tracing::warn!(
                 "[installer_engine] container_pull[{}]: variant {}:{} not found on registry; \
                  will try fallback if available",
                 module_id, image, tag
@@ -1239,7 +1239,7 @@ where
             match fallback_tag {
                 Some(fb) if fb != tag => match probe(image.to_string(), fb.to_string()).await {
                     Ok(true) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[installer_engine] container_pull[{}]: falling back to {}:{}",
                             module_id, image, fb
                         );
@@ -1271,7 +1271,7 @@ where
             // — the pull itself will surface a proper error if the tag
             // doesn't exist. False-negatives from a flaky probe MUST
             // NOT prevent valid installs.
-            eprintln!(
+            tracing::warn!(
                 "[installer_engine] container_pull[{}]: probe failed for {}:{}: {}. \
                  Falling through to blind pull (legacy behaviour).",
                 module_id, image, tag, probe_err
@@ -1510,7 +1510,7 @@ fn audit_pull_token_requested(
         "client_resolved_tag": client_resolved_tag,
     });
     if let Err(e) = db.audit("pull_token_requested", None, Some(module_id), &detail) {
-        eprintln!(
+        tracing::warn!(
             "[installer_engine] audit_pull_token_requested[{}]: write failed: {}",
             module_id, e
         );
@@ -1557,7 +1557,7 @@ fn audit_pull_token_resolved(
         "mismatch_class": class_str,
     });
     if let Err(e) = db.audit("pull_token_resolved", None, Some(module_id), &detail) {
-        eprintln!(
+        tracing::warn!(
             "[installer_engine] audit_pull_token_resolved[{}]: write failed: {}",
             module_id, e
         );
@@ -1579,7 +1579,7 @@ fn audit_pull_token_failed(
         "error_excerpt": excerpt,
     });
     if let Err(e) = db.audit("pull_token_failed", None, Some(module_id), &detail) {
-        eprintln!(
+        tracing::warn!(
             "[installer_engine] audit_pull_token_failed[{}]: write failed: {}",
             module_id, e
         );
@@ -2114,7 +2114,7 @@ async fn run_upgrade_inner(
             // post_install" sequence. The caller is responsible for any
             // additional DB cleanup; here we just bring the on-disk
             // artifact up to date.
-            eprintln!(
+            tracing::warn!(
                 "[installer_engine] run_upgrade[{}]: manifest declares no `upgrade` block; \
                  falling back to bare artifact re-fetch (no pre/post-upgrade hooks, no \
                  migration script). For load-bearing upgrades the module author should \
@@ -2252,7 +2252,7 @@ async fn run_upgrade_inner(
         ) {
             Ok(report) => {
                 if !report.ok() {
-                    eprintln!(
+                    tracing::error!(
                         "[installer_engine] run_upgrade[{}]: module DB migration(s) failed: {:?}",
                         module_id_for_log, report.errors,
                     );
@@ -2268,14 +2268,14 @@ async fn run_upgrade_inner(
                         }),
                     );
                 } else if !report.applied.is_empty() {
-                    eprintln!(
+                    tracing::info!(
                         "[installer_engine] run_upgrade[{}]: applied {} DB migration(s)",
                         module_id_for_log, report.applied.len(),
                     );
                 }
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[installer_engine] run_upgrade[{}]: apply_module_db_migrations errored: {}",
                     module_id_for_log, e
                 );

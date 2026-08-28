@@ -60,7 +60,7 @@ pub(crate) fn _migrate_shared_kg_setting(db: &Db, project_id: &str) -> Result<Op
             KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
         );
-        eprintln!(
+        tracing::info!(
             "[vct] migrated project setting `shared_kg_opt_out` → \
              `shared_kg_write_disabled` for project {}",
             project_id

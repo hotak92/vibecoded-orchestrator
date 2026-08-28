@@ -101,16 +101,16 @@ pub fn read_tuning_from(path: &Path) -> RetrievalTuning {
         return RetrievalTuning::default();
     };
     let Ok(parsed) = toml::from_str::<RetrievalTuning>(&raw) else {
-        eprintln!(
-            "[vct-hub retrieval_tuning] could not parse {} as TOML; using defaults",
-            path.display()
+        tracing::warn!(
+            path = %path.display(),
+            "[vct-hub retrieval_tuning] could not parse as TOML; using defaults"
         );
         return RetrievalTuning::default();
     };
     if !parsed.is_consistent() {
-        eprintln!(
-            "[vct-hub retrieval_tuning] {} failed invariant check; using defaults",
-            path.display()
+        tracing::warn!(
+            path = %path.display(),
+            "[vct-hub retrieval_tuning] failed invariant check; using defaults"
         );
         return RetrievalTuning::default();
     }

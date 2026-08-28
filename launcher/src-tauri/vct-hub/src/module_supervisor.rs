@@ -195,9 +195,9 @@ pub async fn start_container_for_module_with_gpu_mode(
             )
             .await
         {
-            eprintln!(
-                "[module_supervisor] pre-pull for start failed (continuing — cache may suffice): {}",
-                e
+            tracing::warn!(
+                error = %e,
+                "[module_supervisor] pre-pull for start failed (continuing — cache may suffice)"
             );
         }
     }
@@ -512,10 +512,9 @@ async fn reap_pathological_containers_for_resume(
     let claimed = match db.list_module_installs_with_containers() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "[module_supervisor] V52-D.2 reaper: list_module_installs_with_containers \
-                 failed: {}",
-                e
+            tracing::error!(
+                error = %e,
+                "[module_supervisor] V52-D.2 reaper: list_module_installs_with_containers failed"
             );
             return;
         }
@@ -556,9 +555,9 @@ async fn reap_pathological_containers_for_resume(
     let runtime = match detect_container_runtime().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
-                "[module_supervisor] V52-D.2 reaper: detect_container_runtime failed: {}",
-                e
+            tracing::warn!(
+                error = %e,
+                "[module_supervisor] V52-D.2 reaper: detect_container_runtime failed"
             );
             return;
         }
@@ -574,9 +573,10 @@ async fn reap_pathological_containers_for_resume(
         )
         .await;
     if reaped > 0 || errors > 0 {
-        eprintln!(
-            "[module_supervisor] V52-D.2 reaper: pass complete, reaped={} errors={}",
-            reaped, errors
+        tracing::info!(
+            reaped,
+            errors,
+            "[module_supervisor] V52-D.2 reaper: pass complete"
         );
     }
 }
@@ -594,9 +594,9 @@ pub async fn resume_containers_on_startup_with_starter(
     let rows = match db.list_module_installs_needing_start() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "[module_supervisor] resume_containers_on_startup list failed: {}",
-                e
+            tracing::error!(
+                error = %e,
+                "[module_supervisor] resume_containers_on_startup list failed"
             );
             return;
         }
@@ -609,9 +609,9 @@ pub async fn resume_containers_on_startup_with_starter(
             None => {
                 // Likely a module installed from a catalog that's no
                 // longer on disk. Skip silently-but-noisily.
-                eprintln!(
-                    "[module_supervisor] resume: manifest for {} not in catalog, skipping",
-                    module_id
+                tracing::warn!(
+                    module_id,
+                    "[module_supervisor] resume: manifest not in catalog, skipping"
                 );
                 continue;
             }
@@ -697,11 +697,11 @@ pub async fn resume_containers_on_startup_with_starter(
                 let sentinel =
                     vct_launcher_core::paths::finetune_sentinel_path(&module_id);
                 if running && sentinel.exists() {
-                    eprintln!(
-                        "[module_supervisor] resume: global {} has a fine-tune in \
+                    tracing::info!(
+                        module_id,
+                        "[module_supervisor] resume: global module has a fine-tune in \
                          flight (sentinel present) + container running; deferring \
-                         re-mint until the job finishes",
-                        module_id
+                         re-mint until the job finishes"
                     );
                     spawn_deferred_global_remint(manifest.clone(), module_id.clone());
                     continue;
@@ -710,9 +710,10 @@ pub async fn resume_containers_on_startup_with_starter(
                 if let Err(e) =
                     start_global_container_supervisor(&manifest, &module_id).await
                 {
-                    eprintln!(
-                        "[module_supervisor] resume: start_global_container_supervisor({}): {}",
-                        module_id, e
+                    tracing::error!(
+                        module_id,
+                        error = %e,
+                        "[module_supervisor] resume: start_global_container_supervisor failed"
                     );
                     let _ = db.set_global_module_last_error(&module_id, Some(&e));
                 } else {
@@ -737,16 +738,17 @@ pub async fn resume_containers_on_startup_with_starter(
                 let project = match db.get_project(&project_id) {
                     Ok(Some(p)) => p,
                     Ok(None) => {
-                        eprintln!(
-                            "[module_supervisor] resume: project {} not found, skipping",
-                            project_id
+                        tracing::warn!(
+                            project_id,
+                            "[module_supervisor] resume: project not found, skipping"
                         );
                         continue;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[module_supervisor] resume: get_project({}): {}",
-                            project_id, e
+                        tracing::error!(
+                            project_id,
+                            error = %e,
+                            "[module_supervisor] resume: get_project failed"
                         );
                         continue;
                     }
@@ -757,9 +759,10 @@ pub async fn resume_containers_on_startup_with_starter(
                         let rl_port = match ensure_project_rl_port(db, &project) {
                             Ok(p) => p,
                             Err(e) => {
-                                eprintln!(
-                                    "[module_supervisor] resume: ensure_rl_port({}): {}",
-                                    project_id, e
+                                tracing::error!(
+                                    project_id,
+                                    error = %e,
+                                    "[module_supervisor] resume: ensure_rl_port failed"
                                 );
                                 continue;
                             }
@@ -776,19 +779,23 @@ pub async fn resume_containers_on_startup_with_starter(
                                 // instead of triggering an endless
                                 // respawn loop.
                                 if resolved_name != prior_container_name {
-                                    eprintln!(
-                                        "[module_supervisor] resume: V52-D container_name drift \
-                                         for {}/{}: DB='{}' → resolved='{}'; updating DB.",
-                                        project_id, module_id,
-                                        prior_container_name, resolved_name,
+                                    tracing::warn!(
+                                        project_id,
+                                        module_id,
+                                        db_name = %prior_container_name,
+                                        resolved = %resolved_name,
+                                        "[module_supervisor] resume: V52-D container_name \
+                                         drift; updating DB."
                                     );
                                     if let Err(e) = db.set_module_container_name(
                                         &project_id, &module_id, &resolved_name,
                                     ) {
-                                        eprintln!(
+                                        tracing::error!(
+                                            project_id,
+                                            module_id,
+                                            error = %e,
                                             "[module_supervisor] resume: V52-D \
-                                             set_module_container_name({}, {}): {}",
-                                            project_id, module_id, e
+                                             set_module_container_name failed"
                                         );
                                     }
                                 }
@@ -799,9 +806,11 @@ pub async fn resume_containers_on_startup_with_starter(
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[module_supervisor] resume: start_container_for_module({}, {}): {}",
-                                    project_id, module_id, e
+                                tracing::error!(
+                                    project_id,
+                                    module_id,
+                                    error = %e,
+                                    "[module_supervisor] resume: start_container_for_module failed"
                                 );
                             }
                         }
@@ -810,9 +819,11 @@ pub async fn resume_containers_on_startup_with_starter(
                         if let Err(e) =
                             start_after_install(&manifest, &project, db).await
                         {
-                            eprintln!(
-                                "[module_supervisor] resume: start_container_after_install({}, {}): {}",
-                                project_id, module_id, e
+                            tracing::error!(
+                                project_id,
+                                module_id,
+                                error = %e,
+                                "[module_supervisor] resume: start_container_after_install failed"
                             );
                             let _ =
                                 db.set_module_last_error(&project_id, &module_id, Some(&e));
@@ -938,10 +949,10 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
         for poll in 0..MAX_POLLS {
             tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
             if !sentinel.exists() {
-                eprintln!(
-                    "[module_supervisor] deferred re-mint: fine-tune for {} \
-                     finished (sentinel cleared); performing re-mint",
-                    module_id
+                tracing::info!(
+                    module_id,
+                    "[module_supervisor] deferred re-mint: fine-tune finished \
+                     (sentinel cleared); performing re-mint"
                 );
                 break;
             }
@@ -949,13 +960,12 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
                 // Stuck sentinel — likely a crashed launcher that never
                 // cleaned up. Remove the stale file and re-mint anyway so we
                 // don't strand the container on a token this hub doesn't know.
-                eprintln!(
-                    "[module_supervisor] deferred re-mint: sentinel for {} still \
-                     present after {} polls (~{} min); treating as stale and \
-                     re-minting",
+                tracing::warn!(
                     module_id,
-                    MAX_POLLS,
-                    (MAX_POLLS as u64 * POLL_INTERVAL_SECS) / 60
+                    polls = MAX_POLLS,
+                    minutes = (MAX_POLLS as u64 * POLL_INTERVAL_SECS) / 60,
+                    "[module_supervisor] deferred re-mint: sentinel still present \
+                     after the poll budget; treating as stale and re-minting"
                 );
                 let _ = std::fs::remove_file(&sentinel);
             }
@@ -968,10 +978,11 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
         let db = match vct_launcher_core::db::Db::open() {
             Ok(db) => db,
             Err(e) => {
-                eprintln!(
-                    "[module_supervisor] deferred re-mint: Db::open() for {}: {} \
-                     (skipping re-mint; next hub boot is the backstop)",
-                    module_id, e
+                tracing::error!(
+                    module_id,
+                    error = %e,
+                    "[module_supervisor] deferred re-mint: Db::open() failed \
+                     (skipping re-mint; next hub boot is the backstop)"
                 );
                 return;
             }
@@ -990,24 +1001,25 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
                 // Read failure ⇒ unknown state. Don't risk resurrecting a
                 // user-stopped container on a guess; skip and let the next hub
                 // boot re-evaluate from a clean read.
-                eprintln!(
-                    "[module_supervisor] deferred re-mint: get_global_module_install({}): \
-                     {} (skipping re-mint; next hub boot is the backstop)",
-                    module_id, e
+                tracing::error!(
+                    module_id,
+                    error = %e,
+                    "[module_supervisor] deferred re-mint: get_global_module_install \
+                     failed (skipping re-mint; next hub boot is the backstop)"
                 );
                 return;
             }
         };
         if !should_deferred_remint(status.clone()) {
-            eprintln!(
-                "[module_supervisor] deferred re-mint: global {} is no longer \
-                 active (status {:?}); skipping re-mint so a user-stopped / \
-                 uninstalled container is not resurrected",
+            tracing::info!(
                 module_id,
-                status
+                status = status
                     .as_ref()
                     .map(|s| s.as_str())
-                    .unwrap_or("<row-missing>")
+                    .unwrap_or("<row-missing>"),
+                "[module_supervisor] deferred re-mint: global module is no longer \
+                 active; skipping re-mint so a user-stopped / uninstalled container \
+                 is not resurrected"
             );
             return;
         }
@@ -1017,10 +1029,11 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
                 let _ = db.set_global_module_container_name(&module_id, &name);
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
+                    module_id,
+                    error = %e,
                     "[module_supervisor] deferred re-mint: \
-                     start_global_container_supervisor({}): {}",
-                    module_id, e
+                     start_global_container_supervisor failed"
                 );
             }
         }
@@ -1080,9 +1093,10 @@ pub async fn start_global_container_supervisor(
             )
             .await
         {
-            eprintln!(
-                "[module_supervisor] global pre-pull for start failed (continuing — cache may suffice): {}",
-                e
+            tracing::warn!(
+                error = %e,
+                "[module_supervisor] global pre-pull for start failed (continuing — \
+                 cache may suffice)"
             );
         }
     }
@@ -1107,10 +1121,10 @@ pub async fn start_global_container_supervisor(
     if crate::module_identity::resolve_registered(module_id)
         && is_container_running(&container_name).await.unwrap_or(false)
     {
-        eprintln!(
-            "[module_supervisor] start_global_container_supervisor({}): already \
-             running + token registered (concurrent spawn won the race); no-op",
-            module_id
+        tracing::info!(
+            module_id,
+            "[module_supervisor] start_global_container_supervisor: already running \
+             + token registered (concurrent spawn won the race); no-op"
         );
         return Ok(container_name);
     }
@@ -1270,9 +1284,10 @@ pub async fn start_global_container_supervisor(
     // goes to /dev/null.
     match verify_container_hub_reachability(&podman, &container_name, hub_port).await {
         ReachabilityVerdict::Reached(note) => {
-            eprintln!(
-                "[module_supervisor] container→hub reachability for {}: {}",
-                container_name, note
+            tracing::info!(
+                container = %container_name,
+                note = %note,
+                "[module_supervisor] container→hub reachability"
             );
         }
         // v0.2.76 (A3): bind-state UNKNOWN (pre-v0.2.75 hub with no hub.bind
@@ -1282,15 +1297,17 @@ pub async fn start_global_container_supervisor(
         // hint tells the user what to do IF the module actually can't reach
         // the hub.
         ReachabilityVerdict::Unknown(note) => {
-            eprintln!(
-                "[module_supervisor] container→hub reachability for {}: {}",
-                container_name, note
+            tracing::info!(
+                container = %container_name,
+                note = %note,
+                "[module_supervisor] container→hub reachability (bind state unknown)"
             );
         }
         ReachabilityVerdict::Failed(reach_err) => {
-            eprintln!(
-                "[module_supervisor] ERROR: container→hub reachability FAILED for {}: {}",
-                container_name, reach_err
+            tracing::error!(
+                container = %container_name,
+                error = %reach_err,
+                "[module_supervisor] container→hub reachability FAILED"
             );
             if let Ok(db) = Db::open() {
                 let _ = db.audit(
@@ -1461,16 +1478,19 @@ async fn run_in_container_hub_probe(
         let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
-                eprintln!(
-                    "[module_supervisor] hub probe: could not exec {} in {}: {}",
-                    prog, container_name, e
+                tracing::debug!(
+                    prog,
+                    container = %container_name,
+                    error = %e,
+                    "[module_supervisor] hub probe: could not exec probe program"
                 );
                 continue;
             }
             Err(_) => {
-                eprintln!(
-                    "[module_supervisor] hub probe: exec {} in {} timed out",
-                    prog, container_name
+                tracing::debug!(
+                    prog,
+                    container = %container_name,
+                    "[module_supervisor] hub probe: exec timed out"
                 );
                 continue;
             }
@@ -2106,7 +2126,7 @@ mod tests {
     ///
     /// **Branch contract** (post-V52-D):
     ///   * On `start_container_for_module` Err: `last_error` is NOT
-    ///     written (eprintln!-only, unlike the NULL-container branch's
+    ///     written (diagnostic-log-only, unlike the NULL-container branch's
     ///     NEW-3.C surfacing).
     ///   * On `start_container_for_module` Ok: V52-D persists the
     ///     resolved container name back to DB IF it differs from the

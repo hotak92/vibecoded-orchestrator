@@ -1023,7 +1023,7 @@ mod cross_process_pace {
         if !WARNED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
             #[cfg(any(test, debug_assertions))]
             WARN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            eprintln!("[vct-secrets] WARN: {msg}");
+            tracing::warn!("[vct-secrets] {msg}");
         }
     }
 
@@ -1775,10 +1775,14 @@ fn background_lock_gate(ctx: CallContext) -> Option<KeychainError> {
         // line aids diagnosis without spamming production logs.
         Some(false) => None,
         None => {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[vct-secrets] debug: lock-state probe indeterminate; \
-                 proceeding with background keychain read"
+            // v0.2.91: was `#[cfg(debug_assertions)] eprintln!`. Now a
+            // DEBUG-level event, so the same diagnostic is reachable in a
+            // RELEASE build by setting VCO_LOG_LEVEL=debug — which is the
+            // build a user actually runs when they need it. Build-profile
+            // gating meant the line existed only where nobody was looking.
+            tracing::debug!(
+                "[vct-secrets] lock-state probe indeterminate; proceeding with \
+                 background keychain read"
             );
             None
         }

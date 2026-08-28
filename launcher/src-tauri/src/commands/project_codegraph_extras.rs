@@ -695,7 +695,7 @@ pub async fn sync_project_codegraph_extra_path(
         None,           // error_message: success path
         None,           // log_tail: not captured for the row-level UI
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: V52-Z code_graph_builds upsert failed for project {}: {}",
             project_id, e
         );
@@ -829,7 +829,7 @@ pub async fn reindex_project_codegraph_after_extras_change(
         None,
         None,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: V52-Z code_graph_builds upsert failed for project {}: {}",
             project_id, e
         );

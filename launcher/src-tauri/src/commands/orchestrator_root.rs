@@ -217,7 +217,7 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
 
     match insert_result {
         Ok(_) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] auto-registered orchestrator root: id={}, folder={}",
                 id, folder_path
             );
@@ -263,7 +263,7 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
             // upsert is a no-op, and if it crashed before reaching that
             // step we recover.
             if db.has_orchestrator_root_project().unwrap_or(false) {
-                eprintln!(
+                tracing::warn!(
                     "[vct] orchestrator_root row already exists (raced insert: {})",
                     e
                 );
@@ -318,7 +318,7 @@ fn ensure_orchestrator_root_state_populated(
 ) {
     let folder = std::path::Path::new(folder_path);
     if !folder.is_dir() {
-        eprintln!(
+        tracing::warn!(
             "[vct] WARN: orchestrator-root folder missing on disk: {} (skipping populate)",
             folder_path
         );
@@ -331,7 +331,7 @@ fn ensure_orchestrator_root_state_populated(
         + report.hooks_inserted
         + report.mcp_servers_inserted;
     if total > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] orchestrator-root populate: {} agents, {} skills, {} hooks, {} MCP servers",
             report.agents_inserted,
             report.skills_inserted,
@@ -340,7 +340,7 @@ fn ensure_orchestrator_root_state_populated(
         );
     }
     for w in &report.warnings {
-        eprintln!("[vct] orchestrator-root populate warning: {}", w);
+        tracing::warn!("[vct] orchestrator-root populate warning: {}", w);
     }
 }
 
@@ -410,7 +410,7 @@ fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
     let existing = match db.list_project_kg_bindings(root_id) {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] WARN: ensure_orchestrator_root_kg_binding read failed (non-fatal, skipping seed): {}",
                 e
             );
@@ -437,7 +437,7 @@ fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
         // operators can confirm the guard fired.
         if let Some(b) = primary {
             if b.collection_name != collection_name {
-                eprintln!(
+                tracing::warn!(
                     "[vct] orchestrator-root primary KG binding already set to '{}' (auto_seeded_by={:?}); skipping seed of '{}'",
                     b.collection_name,
                     b.config.get("auto_seeded_by").and_then(|v| v.as_str()),
@@ -463,7 +463,7 @@ fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
         &serde_json::json!({"auto_seeded_by": "ensure_orchestrator_root_kg_binding"}),
     ) {
         Ok(_) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] seeded orchestrator-root primary KG binding: {}",
                 collection_name
             );
@@ -472,7 +472,7 @@ fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
             // Don't propagate — the binding seed is a Priority-2
             // optimization; without it the shared KG resolution
             // falls back to LAST_RESORT_SHARED_KG_COLLECTION.
-            eprintln!(
+            tracing::warn!(
                 "[vct] WARN: ensure_orchestrator_root_kg_binding failed (non-fatal): {}",
                 e
             );

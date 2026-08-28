@@ -287,7 +287,7 @@ fn write_or_strip_deprecation_env(
     let mut root: serde_json::Value = if settings_path.exists() {
         match std::fs::read_to_string(&settings_path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: {} is not valid JSON ({}); replacing with minimal env block",
                     settings_path.display(),
                     e
@@ -295,7 +295,7 @@ fn write_or_strip_deprecation_env(
                 serde_json::json!({})
             }),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: could not read {} ({}); creating fresh",
                     settings_path.display(),
                     e
@@ -480,7 +480,7 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
     let conn = match rusqlite::Connection::open(crate::db::db_path()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[deprecation_poll] open DB: {}", e);
+            tracing::warn!("[deprecation_poll] open DB: {}", e);
             // Record error but don't update last_at (preserves "last success" semantics).
             if let Some(db) = app.try_state::<Db>() {
                 let _ = db.app_state_set(
@@ -497,7 +497,7 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
     let installs = match db.list_module_installs_needing_start() {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("[deprecation_poll] list installs: {}", e);
+            tracing::warn!("[deprecation_poll] list installs: {}", e);
             let _ = db.app_state_set(
                 APP_STATE_POLL_LAST_STATUS,
                 &format!("error:list_installs:{}", e),
@@ -518,7 +518,7 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
     let catalog = match crate::commands::module_catalog_client::fetch_module_catalog().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[deprecation_poll] L0 catalog fetch failed: {}", e);
+            tracing::error!("[deprecation_poll] L0 catalog fetch failed: {}", e);
             let _ = db.app_state_set(
                 APP_STATE_POLL_LAST_STATUS,
                 &format!("error:catalog_fetch:{}", e),
@@ -582,7 +582,7 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
                 module_id,
                 res.warnings.join("; ")
             );
-            eprintln!("[deprecation_poll] soft-fail: {}", msg);
+            tracing::warn!("[deprecation_poll] soft-fail: {}", msg);
             errors.push(msg);
         }
     }
@@ -597,7 +597,7 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
     let _ = db.app_state_set(APP_STATE_POLL_LAST_AT, &now);
     let _ = db.app_state_set(APP_STATE_POLL_LAST_STATUS, &status);
 
-    eprintln!(
+    tracing::info!(
         "[deprecation_poll] sweep done: {} installs checked, {} warnings, status={}",
         installs.len(),
         errors.len(),

@@ -698,19 +698,19 @@ pub(crate) async fn auto_restore_byte_identical_tracked_mods(
         match out {
             Ok(o) if o.status.success() => {
                 restored += 1;
-                eprintln!(
+                tracing::info!(
                     "[vct] auto_restore_byte_identical_tracked_mods: restored {} \
                      (working-tree content == incoming upstream blob)",
                     path
                 );
             }
-            Ok(o) => eprintln!(
+            Ok(o) => tracing::warn!(
                 "[vct] auto_restore_byte_identical_tracked_mods: git checkout -- {} \
                  failed ({}); leaving it in the risk set",
                 path,
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "[vct] auto_restore_byte_identical_tracked_mods: git checkout -- {} \
                  spawn failed ({}); leaving it in the risk set",
                 path, e
@@ -989,7 +989,7 @@ pub(crate) async fn pre_merge_user_editable(
         let ours = match std::fs::read(&absolute) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] pre_merge: skipping {} — read OURS failed: {}",
                     rel_path_str, e
                 );
@@ -1001,7 +1001,7 @@ pub(crate) async fn pre_merge_user_editable(
             Ok(Some(b)) => b,
             Ok(None) => Vec::new(),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] pre_merge: skipping {} — read BASE failed: {}",
                     rel_path_str, e
                 );
@@ -1013,7 +1013,7 @@ pub(crate) async fn pre_merge_user_editable(
             Ok(Some(b)) => b,
             Ok(None) => Vec::new(),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] pre_merge: skipping {} — read THEIRS failed: {}",
                     rel_path_str, e
                 );
@@ -1027,7 +1027,7 @@ pub(crate) async fn pre_merge_user_editable(
         // byte in any of the three sides signals binary. (Same
         // heuristic git itself uses for `core.binary` auto-detection.)
         if ours.contains(&0u8) || base.contains(&0u8) || theirs.contains(&0u8) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pre_merge: skipping {} — binary content detected; \
                  falling through to git pull's default handling",
                 rel_path_str
@@ -1051,7 +1051,7 @@ pub(crate) async fn pre_merge_user_editable(
                 // a temp sibling + rename. `git pull` will then see no
                 // diff at this path.
                 if let Err(e) = atomic_write(&absolute, &merged) {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] pre_merge: clean-merge write failed for {}: {} — skipping",
                         rel_path_str, e
                     );
@@ -1069,7 +1069,7 @@ pub(crate) async fn pre_merge_user_editable(
                 // Sidecar the upstream version, keep local in place.
                 let sidecar = sidecar_path_for(install_path, &rel_path, theirs_sha);
                 if let Err(e) = atomic_write(&sidecar, &theirs) {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] pre_merge: sidecar write failed for {} ({}): {} — skipping",
                         rel_path_str,
                         sidecar.display(),
@@ -1087,7 +1087,7 @@ pub(crate) async fn pre_merge_user_editable(
                 });
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] pre_merge: 3-way merge errored for {}: {} — skipping (git pull will handle)",
                     rel_path_str, e
                 );
@@ -1179,7 +1179,7 @@ pub(crate) fn emit_orchestrator_user_modified_deferrals(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] pre_merge: deferral emit failed: {} — deferral may be missing, continuing",
             e
         );
@@ -1720,7 +1720,7 @@ async fn pop_probe_file(
     let theirs = match read_blob_at_rev(install_path, merged_tree_oid, file).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: {} is deleted-by-merge (absent from merged tree) — \
                  modify/delete conflict → keeping FfOnly.",
                 file
@@ -1728,7 +1728,7 @@ async fn pop_probe_file(
             return PopProbe::Conflict;
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: read merged-tree blob for {} failed ({}) — \
                  conservative Conflict.",
                 file, e
@@ -1742,7 +1742,7 @@ async fn pop_probe_file(
     let base = match read_blob_at_rev(install_path, head, file).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: {} absent at HEAD but in the tracked-modified risk set \
                  (add-over-modified) — conflict → keeping FfOnly.",
                 file
@@ -1750,7 +1750,7 @@ async fn pop_probe_file(
             return PopProbe::Conflict;
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: read HEAD blob for {} failed ({}) — conservative Conflict.",
                 file, e
             );
@@ -1761,7 +1761,7 @@ async fn pop_probe_file(
     let ours = match tokio::fs::read(install_path.join(file)).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: read working-tree bytes for {} failed ({}) — \
                  conservative Conflict.",
                 file, e
@@ -1776,14 +1776,14 @@ async fn pop_probe_file(
     match do_3way_merge(&ours, &base, &theirs).await {
         Ok(ThreeWayResult::Clean(_)) => PopProbe::Clean,
         Ok(ThreeWayResult::Conflict) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: 3-way pop-probe CONFLICTS for {} → keeping FfOnly.",
                 file
             );
             PopProbe::Conflict
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] pop_probe_file: 3-way pop-probe errored for {} ({}) — conservative \
                  Conflict.",
                 file, e
@@ -2112,7 +2112,7 @@ pub(crate) async fn resolve_divergence_pull_plan(
                     match tracked_modified_overlapping_upstream(repo, base_sha, &theirs).await {
                         Ok(risk) => risk,
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] resolve_divergence_pull_plan: pop-conflict-risk check \
                                  failed ({}) — keeping --ff-only.",
                                 e
@@ -2137,7 +2137,7 @@ pub(crate) async fn resolve_divergence_pull_plan(
             let merged_tree_oid = match committed_divergence_merged_tree_oid(repo, &theirs).await {
                 Ok(oid) => oid,
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] resolve_divergence_pull_plan: merge-tree probe failed ({}) — \
                          keeping --ff-only; modal will surface on non-FF.",
                         e
@@ -2169,7 +2169,7 @@ pub(crate) async fn resolve_divergence_pull_plan(
                 // avoids the modal on the common clean case. Do NOT weaken that
                 // backstop.
                 if pop_probe_all_clean(repo, "HEAD", &merged_tree_oid, &pop_conflict_risk).await {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] resolve_divergence_pull_plan: {} tracked file(s) locally-modified \
                          AND upstream-changed, but the autostash POP pop-probes CLEAN for every \
                          one (dist binaries excluded) — routing through a real merge (no modal). \
@@ -2179,7 +2179,7 @@ pub(crate) async fn resolve_divergence_pull_plan(
                     );
                     PullPlan::RealMerge
                 } else {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] resolve_divergence_pull_plan: {} tracked file(s) locally-modified \
                          AND upstream-changed, and the autostash POP would CONFLICT for at least \
                          one — keeping --ff-only; modal surfaces if non-FF.",
@@ -2191,7 +2191,7 @@ pub(crate) async fn resolve_divergence_pull_plan(
                 // Tree carries no pop-conflict risk AND the merge is clean
                 // (merged_tree_oid is Some) — the common committed-KG-divergence
                 // case. Route through a real merge (no modal).
-                eprintln!(
+                tracing::info!(
                     "[vct] resolve_divergence_pull_plan: committed local divergence merges cleanly \
                      with upstream AND no pop-conflict risk — routing through a real merge \
                      (no modal)."
@@ -2203,7 +2203,7 @@ pub(crate) async fn resolve_divergence_pull_plan(
         // pull surface the real error.
         Ok(None) => PullPlan::FfOnly,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] resolve_divergence_pull_plan: could not resolve upstream tip for merge \
                  probe ({}) — keeping --ff-only.",
                 e
@@ -2317,7 +2317,7 @@ pub(crate) async fn classify_generated_divergence(
         // A malformed hand-curated pattern is a programming error; be
         // conservative and classify nothing rather than panic in the field.
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] classify_generated_divergence: globset build failed ({}) — \
                  classifying nothing (conservative).",
                 e
@@ -2419,13 +2419,13 @@ async fn revert_taken_checkouts_to_head(install_path: &Path, taken: &[String]) -
             .await;
         match status {
             Ok(s) if s.success() => reverted.push(path.clone()),
-            Ok(s) => eprintln!(
+            Ok(s) => tracing::warn!(
                 "[vct] revert_taken_checkouts_to_head: git checkout HEAD -- {} exited {:?} \
                  (best-effort revert; the failed commit recorded nothing)",
                 path,
                 s.code()
             ),
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "[vct] revert_taken_checkouts_to_head: git checkout HEAD -- {} spawn failed ({}) \
                  (best-effort revert)",
                 path, e
@@ -2463,7 +2463,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
         || install_path.join(".git").join("rebase-merge").exists()
         || install_path.join(".git").join("rebase-apply").exists()
     {
-        eprintln!(
+        tracing::error!(
             "[vct] resolve_generated_files_to_upstream: an in-progress merge/rebase is present \
              (.git/MERGE_HEAD or .git/rebase-*) — refusing to reconcile (the existing conflict/\
              resume flow must conclude it, not this reconcile). No-op."
@@ -2505,7 +2505,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
         let theirs_blob = read_blob_at_rev(install_path, &theirs, path).await.ok().flatten();
         if let (Some(h), Some(t)) = (&head_blob, &theirs_blob) {
             if h == t {
-                eprintln!(
+                tracing::warn!(
                     "[vct] resolve_generated_files_to_upstream: {} already byte-identical to \
                      upstream at HEAD — nothing to take (skipping, not audit-noise)",
                     path
@@ -2521,7 +2521,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
             .await;
         match out {
             Ok(o) if o.status.success() => {
-                eprintln!(
+                tracing::info!(
                     "[vct] resolve_generated_files_to_upstream: took upstream for {} \
                      (git checkout {} -- {})",
                     path,
@@ -2530,14 +2530,14 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                 );
                 committed_taken.push(path.clone());
             }
-            Ok(o) => eprintln!(
+            Ok(o) => tracing::warn!(
                 "[vct] resolve_generated_files_to_upstream: git checkout {} -- {} failed \
                  ({}); leaving it divergent (stays modal-forcing)",
                 theirs,
                 path,
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "[vct] resolve_generated_files_to_upstream: git checkout {} -- {} spawn \
                  failed ({}); leaving it divergent (stays modal-forcing)",
                 theirs, path, e
@@ -2608,13 +2608,13 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                     || combined.contains("no changes added to commit")
                     || combined.contains("nothing added to commit");
                 if nothing_to_commit {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] resolve_generated_files_to_upstream: reconcile commit was a no-op \
                          (nothing staged for the taken paths — already reconciled); reverting the \
                          checkouts to HEAD (expected, not an error)"
                     );
                 } else {
-                    eprintln!(
+                    tracing::error!(
                         "[vct] resolve_generated_files_to_upstream: reconcile commit failed \
                          (exit {:?}): {} — reverting the take-upstream checkouts to HEAD",
                         o.status.code(),
@@ -2629,7 +2629,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                 // reconcile_committed stays false; took_upstream stays empty.
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[vct] resolve_generated_files_to_upstream: reconcile commit spawn failed \
                      ({}) — reverting the take-upstream checkouts to HEAD",
                     e
@@ -2671,7 +2671,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
             Ok(bytes) => {
                 let sidecar = pre_reconcile_sidecar_path(install_path, path, &theirs);
                 if let Err(e) = atomic_write(&sidecar, &bytes) {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] resolve_generated_files_to_upstream: pre-restore sidecar write \
                          failed for {} ({}): {} — proceeding with the restore (best-effort)",
                         path,
@@ -2679,7 +2679,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                         e
                     );
                 } else {
-                    eprintln!(
+                    tracing::info!(
                         "[vct] resolve_generated_files_to_upstream: saved pre-restore content of \
                          {} to {} before dropping the local regeneration",
                         path,
@@ -2687,7 +2687,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                     );
                 }
             }
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "[vct] resolve_generated_files_to_upstream: could not read {} to sidecar before \
                  restore ({}) — proceeding (best-effort)",
                 path, e
@@ -2701,20 +2701,20 @@ pub(crate) async fn resolve_generated_files_to_upstream(
             .await;
         match out {
             Ok(o) if o.status.success() => {
-                eprintln!(
+                tracing::info!(
                     "[vct] resolve_generated_files_to_upstream: restored {} to HEAD \
                      (dropped local regeneration; the pull brings upstream's copy)",
                     path
                 );
                 restored.push(path.clone());
             }
-            Ok(o) => eprintln!(
+            Ok(o) => tracing::warn!(
                 "[vct] resolve_generated_files_to_upstream: git checkout HEAD -- {} failed \
                  ({}); leaving it in the risk set",
                 path,
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "[vct] resolve_generated_files_to_upstream: git checkout HEAD -- {} spawn \
                  failed ({}); leaving it in the risk set",
                 path, e
@@ -2768,7 +2768,7 @@ pub(crate) fn emit_generated_reconcile_deferrals(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] generated_files_reconciled: deferral emit failed: {} — deferral may be \
              missing, continuing",
             e
@@ -3025,7 +3025,7 @@ pub(crate) fn write_launcher_update_diverged_deferral(
     let parent = match target.parent() {
         Some(p) => p,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] launcher_update_diverged: target has no parent: {}",
                 target.display()
             );
@@ -3033,7 +3033,7 @@ pub(crate) fn write_launcher_update_diverged_deferral(
         }
     };
     if let Err(e) = std::fs::create_dir_all(parent) {
-        eprintln!(
+        tracing::warn!(
             "[vct] launcher_update_diverged: mkdir {} failed: {} — skipping",
             parent.display(),
             e
@@ -3251,7 +3251,7 @@ python install.py --update\n\
     // Atomic write: temp file in the same directory, then rename.
     let tmp = parent.join(format!("UPDATE_DEFERRED.md.tmp.{}", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
-        eprintln!(
+        tracing::error!(
             "[vct] launcher_update_diverged: write {} failed: {}",
             tmp.display(),
             e
@@ -3260,7 +3260,7 @@ python install.py --update\n\
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, &target) {
-        eprintln!(
+        tracing::error!(
             "[vct] launcher_update_diverged: rename {} → {} failed: {}",
             tmp.display(),
             target.display(),

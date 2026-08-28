@@ -153,7 +153,7 @@ impl PhaseReporter {
             None,
             None,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: project-setup phase update ({}) for {}: {}",
                 phase, self.project_id, e
             );
@@ -280,7 +280,7 @@ async fn run_setup_task(
             None,
             None,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: project-setup running transition for {}: {}",
                 project_id, e
             );
@@ -330,7 +330,7 @@ async fn run_setup_task(
             outcome.error.as_deref(),
             None,
         ) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: project-setup terminal write ({}) for {}: {}",
                 terminal_status, project_id, e
             );
@@ -431,7 +431,7 @@ pub fn resume_pending_setups(app: &AppHandle) -> (usize, usize) {
     ) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: project-setup stale-running sweep failed: {}. \
                  Stale rows (if any) will appear as 'running' indefinitely; \
                  the user can re-add or rebuild to recover.",
@@ -444,7 +444,7 @@ pub fn resume_pending_setups(app: &AppHandle) -> (usize, usize) {
     let pending_ids = match db.list_pending_project_setups() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: project-setup pending-list lookup failed: {}. \
                  Queued setups (if any) will not auto-resume this boot.",
                 e
@@ -458,14 +458,14 @@ pub fn resume_pending_setups(app: &AppHandle) -> (usize, usize) {
         let project = match db.get_project(pid) {
             Ok(Some(p)) => p,
             Ok(None) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: pending project-setup references missing project {}; skipping",
                     pid
                 );
                 continue;
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: lookup for pending project-setup {}: {}; skipping",
                     pid, e
                 );

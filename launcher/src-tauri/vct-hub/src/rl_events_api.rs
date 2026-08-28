@@ -181,7 +181,7 @@ async fn post_event(
     ) {
         Ok(id) => (StatusCode::OK, Json(PostEventResponse { ok: true, id })).into_response(),
         Err(e) => {
-            eprintln!("[vct-hub] post_rl_event insert failed: {}", e);
+            tracing::error!(error = %e, "[vct-hub] post_rl_event insert failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -271,7 +271,7 @@ async fn list_events(
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => {
-            eprintln!("[vct-hub] list_rl_events failed: {}", e);
+            tracing::error!(error = %e, "[vct-hub] list_rl_events failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -317,7 +317,7 @@ async fn count_events(
     ) {
         Ok(n) => (StatusCode::OK, Json(CountEventsResponse { count: n })).into_response(),
         Err(e) => {
-            eprintln!("[vct-hub] count_rl_events failed: {}", e);
+            tracing::error!(error = %e, "[vct-hub] count_rl_events failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -402,7 +402,7 @@ async fn prune_events(
         )
             .into_response(),
         Err(e) => {
-            eprintln!("[vct-hub] prune_rl_events failed: {}", e);
+            tracing::error!(error = %e, "[vct-hub] prune_rl_events failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

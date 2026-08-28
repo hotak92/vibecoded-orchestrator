@@ -203,11 +203,11 @@ pub fn mint_project_tokens(db: &Db) -> ProjectTokenRegistry {
     let projects = match db.list_projects() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
+                error = %e,
                 "[vct-hub] project_tokens: could not read projects for per-project \
-                 token minting ({}); resolvers fall back to the global hub.token \
-                 for every project this session.",
-                e
+                 token minting; resolvers fall back to the global hub.token for \
+                 every project this session."
             );
             return ProjectTokenRegistry::empty();
         }
@@ -222,22 +222,23 @@ pub fn mint_project_tokens(db: &Db) -> ProjectTokenRegistry {
         let token = match boot_token::generate_token() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "[vct-hub] project_tokens: CSPRNG failed for project {} ({}); \
-                     skipping its per-project token (global hub.token still works).",
-                    project.id, e
+                tracing::error!(
+                    project = %project.id,
+                    error = %e,
+                    "[vct-hub] project_tokens: CSPRNG failed; skipping its \
+                     per-project token (global hub.token still works)."
                 );
                 continue;
             }
         };
         let path = project_token_path(&project.id);
         if let Err(e) = boot_token::write_token_file(&path, &token) {
-            eprintln!(
-                "[vct-hub] project_tokens: could not write {} ({}); project {} \
-                 resolvers fall back to the global hub.token this session.",
-                path.display(),
-                e,
-                project.id
+            tracing::error!(
+                path = %path.display(),
+                project = %project.id,
+                error = %e,
+                "[vct-hub] project_tokens: could not write the token file; this \
+                 project's resolvers fall back to the global hub.token this session."
             );
             continue;
         }
@@ -299,19 +300,21 @@ pub fn lazy_mint_for_project(
             Ok(Some(p)) => p.id,
             Ok(None) => return None, // genuinely unknown → stay refused.
             Err(e) => {
-                eprintln!(
-                    "[vct-hub] project_tokens: lazy-mint slug lookup failed for {:?} ({}); \
-                     leaving the request refused.",
-                    url_segment, e
+                tracing::error!(
+                    segment = ?url_segment,
+                    error = %e,
+                    "[vct-hub] project_tokens: lazy-mint slug lookup failed; \
+                     leaving the request refused."
                 );
                 return None;
             }
         },
         Err(e) => {
-            eprintln!(
-                "[vct-hub] project_tokens: lazy-mint id lookup failed for {:?} ({}); \
-                 leaving the request refused.",
-                url_segment, e
+            tracing::error!(
+                segment = ?url_segment,
+                error = %e,
+                "[vct-hub] project_tokens: lazy-mint id lookup failed; \
+                 leaving the request refused."
             );
             return None;
         }
@@ -329,30 +332,31 @@ pub fn lazy_mint_for_project(
     let token = match boot_token::generate_token() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
-                "[vct-hub] project_tokens: lazy-mint CSPRNG failed for {} ({}); \
-                 leaving the request refused.",
-                canonical_id, e
+            tracing::error!(
+                project = %canonical_id,
+                error = %e,
+                "[vct-hub] project_tokens: lazy-mint CSPRNG failed; leaving the \
+                 request refused."
             );
             return None;
         }
     };
     let path = project_token_path(&canonical_id);
     if let Err(e) = boot_token::write_token_file(&path, &token) {
-        eprintln!(
-            "[vct-hub] project_tokens: lazy-mint could not write {} ({}); \
-             leaving the request refused.",
-            path.display(),
-            e
+        tracing::error!(
+            path = %path.display(),
+            error = %e,
+            "[vct-hub] project_tokens: lazy-mint could not write the token file; \
+             leaving the request refused."
         );
         return None;
     }
     registry.insert(canonical_id.clone(), token.clone());
-    eprintln!(
-        "[vct-hub] project_tokens: lazy-minted a per-project token for {} \
-         (added while the hub was running); its resolver will use the scoped \
-         token on the next request.",
-        canonical_id
+    tracing::info!(
+        project = %canonical_id,
+        "[vct-hub] project_tokens: lazy-minted a per-project token (project added \
+         while the hub was running); its resolver will use the scoped token on the \
+         next request."
     );
     Some((canonical_id, token))
 }
@@ -387,11 +391,11 @@ fn cleanup_stale_project_tokens(live_ids: &std::collections::HashSet<String>) {
         }
         let path = entry.path();
         if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!(
-                "[vct-hub] project_tokens: could not remove stale token file {} ({}); \
-                 harmless (its token is not in the live registry).",
-                path.display(),
-                e
+            tracing::debug!(
+                path = %path.display(),
+                error = %e,
+                "[vct-hub] project_tokens: could not remove stale token file; \
+                 harmless (its token is not in the live registry)."
             );
         }
     }

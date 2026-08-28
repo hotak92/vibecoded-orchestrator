@@ -272,7 +272,7 @@ pub async fn check_module_updates_available(
     let catalog = match cached_module_catalog(db.inner()).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[module_updates] check_module_updates_available({}) catalog fetch \
                  failed (soft-fail to empty list): {}",
                 project_id, e
@@ -422,7 +422,7 @@ pub fn spawn_module_update_check_loop<R: Runtime>(app: AppHandle<R>) {
             let conn = match rusqlite::Connection::open(crate::db::db_path()) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[module_updates] open DB: {} — retrying in 1h", e);
+                    tracing::warn!("[module_updates] open DB: {} — retrying in 1h", e);
                     tokio::time::sleep(WAKE_INTERVAL).await;
                     continue;
                 }
@@ -475,7 +475,7 @@ async fn run_poll_tick<R: Runtime>(app: &AppHandle<R>, tick_db: &Db) {
     let catalog = match cached_module_catalog(tick_db).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[module_updates] poll tick: catalog fetch failed: {}", e);
+            tracing::error!("[module_updates] poll tick: catalog fetch failed: {}", e);
             return;
         }
     };
@@ -484,7 +484,7 @@ async fn run_poll_tick<R: Runtime>(app: &AppHandle<R>, tick_db: &Db) {
     let projects = match tick_db.list_projects() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[module_updates] poll tick: list_projects failed: {}", e);
+            tracing::error!("[module_updates] poll tick: list_projects failed: {}", e);
             return;
         }
     };
@@ -494,7 +494,7 @@ async fn run_poll_tick<R: Runtime>(app: &AppHandle<R>, tick_db: &Db) {
         let installs = match tick_db.list_module_installs_for_project(&project.id) {
             Ok(rows) => rows,
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[module_updates] poll tick: list_module_installs_for_project({}) \
                      failed: {}",
                     project.id, e
@@ -512,7 +512,7 @@ async fn run_poll_tick<R: Runtime>(app: &AppHandle<R>, tick_db: &Db) {
             all_updates.extend(compute_updates_available(&rows, &catalog));
         }
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_updates] poll tick: list_global_module_installs failed: {}",
                 e
             );
@@ -581,7 +581,7 @@ fn write_partial_failure_deferral(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(&repo_root, &repo_root, &fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[module_updates] deferral emit failed (module_update_partial_failure {}): {}",
             module_id, e
         );

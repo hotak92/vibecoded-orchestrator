@@ -143,7 +143,7 @@ fn write_restart_marker(install_root: &Path) {
     }
     let stamp = chrono::Utc::now().to_rfc3339();
     if let Err(e) = std::fs::write(&marker, format!("restarted-at: {}\n", stamp)) {
-        eprintln!(
+        tracing::warn!(
             "[restart] could not write launcher-restart-marker at {}: {}",
             marker.display(),
             e,
@@ -272,7 +272,7 @@ pub async fn get_launcher_restart_status(
     // entry — false-keep is recoverable (button click), false-clear is
     // not.
     if restart_section.is_some() && restart_entry_is_stale(&target) {
-        eprintln!(
+        tracing::info!(
             "[restart] launcher_restart_required entry predates this \
              process (running binary is post-swap) — self-clearing",
         );
@@ -285,7 +285,7 @@ pub async fn get_launcher_restart_status(
                 // (the banner shows; the button path may still succeed)
                 // and drop the documented marker so install.py's
                 // `--apply-deferred` handler clears it on its side.
-                eprintln!(
+                tracing::warn!(
                     "[restart] self-clear failed (non-fatal): {} — \
                      writing launcher-restart-marker fallback",
                     e,
@@ -380,7 +380,7 @@ pub async fn restart_launcher<R: Runtime>(
     // the banner. Best-effort: failures here are logged but don't block
     // the restart.
     if let Err(e) = clear_restart_deferral(&install_root_path) {
-        eprintln!(
+        tracing::warn!(
             "[restart_launcher] failed to clear deferral (non-fatal): {}",
             e
         );
@@ -472,7 +472,7 @@ fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
         // Deleting it would cause the next launcher boot to lose the
         // stub entry and re-render the restart banner spuriously.
         if frontmatter_has_stub_flag(&updated) {
-            eprintln!(
+            tracing::warn!(
                 "[restart] UPDATE_DEFERRED.md at {} has stub:true — \
                  preserving file rather than unlinking (no real entries remain)",
                 target.display(),
@@ -505,7 +505,7 @@ fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
         let json_sidecar = target.with_file_name("UPDATE_DEFERRED.json");
         if json_sidecar.is_file() {
             if let Err(e) = std::fs::remove_file(&json_sidecar) {
-                eprintln!(
+                tracing::warn!(
                     "[restart] could not unlink JSON deferral sidecar at {} \
                      (banner may resurrect from JSON): {}",
                     json_sidecar.display(),

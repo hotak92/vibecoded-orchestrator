@@ -815,9 +815,10 @@ impl Db {
                         )
                     })?;
                 dropped += 1;
-                eprintln!(
-                    "[vct] reconcile-kg-access: dropped orphan project_id={} collection={}",
-                    project_id, collection_name
+                tracing::info!(
+                    project_id,
+                    collection = %collection_name,
+                    "[vct] reconcile-kg-access: dropped orphan row"
                 );
             }
         }
@@ -952,11 +953,12 @@ impl Db {
                 })?;
 
             if deleted > 0 || renamed > 0 {
-                eprintln!(
-                    "[vct] migrate-shared-kg: \
-                     legacy='{}' canonical='{}' \
-                     dedup_deleted={} renamed={}",
-                    legacy, canonical, deleted, renamed
+                tracing::info!(
+                    legacy = %legacy,
+                    canonical = %canonical,
+                    dedup_deleted = deleted,
+                    renamed,
+                    "[vct] migrate-shared-kg"
                 );
             }
 
@@ -1073,10 +1075,10 @@ impl Db {
                         )
                     })?;
                 if updated > 0 {
-                    eprintln!(
+                    tracing::info!(
+                        primary = %primary_name,
                         "[vct] sync-shared-to-primary: orchestrator-root shared row \
-                         rewritten to '{}' (matches primary)",
-                        primary_name
+                         rewritten to match primary"
                     );
                 }
                 Ok((updated, 0))
@@ -1103,10 +1105,10 @@ impl Db {
                         )
                     })?;
                 if inserted > 0 {
-                    eprintln!(
+                    tracing::info!(
+                        primary = %primary_name,
                         "[vct] sync-shared-to-primary: orchestrator-root shared row \
-                         created pointing at '{}' (matches primary)",
-                        primary_name
+                         created pointing at primary"
                     );
                 }
                 Ok((0, inserted))
@@ -1345,11 +1347,13 @@ impl Db {
                             row.collection_name, new_name, e
                         ));
                     }
-                    eprintln!(
-                        "[vct] adopt-populated: project_id={} role={} \
-                         {} → {} (rows={})",
-                        row.project_id, row.role,
-                        row.collection_name, new_name, count
+                    tracing::info!(
+                        project_id = %row.project_id,
+                        role = %row.role,
+                        from = %row.collection_name,
+                        to = %new_name,
+                        rows = count,
+                        "[vct] adopt-populated"
                     );
                     report.adopted += 1;
                 }
@@ -1365,12 +1369,12 @@ impl Db {
                         .iter()
                         .map(|(n, c)| format!("{} ({} rows)", n, c))
                         .collect();
-                    eprintln!(
-                        "[vct] adopt-populated DEFER: project_id={} role={} \
-                         advertised='{}' multiple populated candidates: [{}]",
-                        row.project_id, row.role,
-                        row.collection_name,
-                        alts.join(", ")
+                    tracing::warn!(
+                        project_id = %row.project_id,
+                        role = %row.role,
+                        advertised = %row.collection_name,
+                        candidates = %alts.join(", "),
+                        "[vct] adopt-populated DEFER: multiple populated candidates"
                     );
                     report.deferred += 1;
                 }
@@ -1437,10 +1441,13 @@ impl Db {
                 ) {
                     // Best-effort: log + continue. The boot reconcile
                     // catches the residue.
-                    eprintln!(
-                        "[vct] update_binding_for_adoption: kg_rename_access \
-                         project_id={} {} → {} warning (non-fatal): {}",
-                        project_id, old_collection, new_collection, e,
+                    tracing::warn!(
+                        project_id,
+                        from = %old_collection,
+                        to = %new_collection,
+                        error = %e,
+                        "[vct] update_binding_for_adoption: kg_rename_access failed \
+                         (non-fatal)"
                     );
                 }
             }

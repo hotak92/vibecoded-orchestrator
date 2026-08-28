@@ -51,11 +51,11 @@ pub fn start_if_not_running() -> LifecycleResult {
             // inode vs ours; elsewhere: recorded build fingerprint).
             let recorded = lockfile::read_identity();
             if lockfile::running_hub_is_stale(pid, recorded.as_deref()) {
-                eprintln!(
-                    "[vct-hub] running hub (pid {}, identity {}) is a stale or \
-                     foreign binary; stopping it so the current binary takes over",
+                tracing::warn!(
                     pid,
-                    recorded.as_deref().unwrap_or("unknown"),
+                    identity = recorded.as_deref().unwrap_or("unknown"),
+                    "[vct-hub] running hub is a stale or foreign binary; \
+                     stopping it so the current binary takes over"
                 );
                 // Reuse the graceful stop path (signals the pid in the
                 // lockfile, polls up to 10s, escalates, releases the
@@ -65,10 +65,10 @@ pub fn start_if_not_running() -> LifecycleResult {
                 match stop() {
                     LifecycleResult::Ok => {}
                     other => {
-                        eprintln!(
-                            "[vct-hub] could not stop the stale hub ({:?}); the \
-                             current binary may not take over until it exits",
-                            other
+                        tracing::error!(
+                            outcome = ?other,
+                            "[vct-hub] could not stop the stale hub; the current \
+                             binary may not take over until it exits"
                         );
                         // If the lockfile is still held by a live owner, do
                         // NOT spawn a duplicate — report no-op.
@@ -81,17 +81,14 @@ pub fn start_if_not_running() -> LifecycleResult {
                 }
                 // Stale hub gone (or lockfile freed) — fall through to spawn.
             } else {
-                eprintln!(
-                    "[vct-hub] already running (pid {}); current binary; nothing to do",
-                    pid
+                tracing::info!(
+                    pid,
+                    "[vct-hub] already running; current binary; nothing to do"
                 );
                 return LifecycleResult::Ok;
             }
         } else {
-            eprintln!(
-                "[vct-hub] stale lockfile (pid {} is dead); cleaning up",
-                pid
-            );
+            tracing::info!(pid, "[vct-hub] stale lockfile (owner is dead); cleaning up");
             let _ = lockfile::release();
         }
     }
@@ -153,10 +150,7 @@ pub fn start_if_not_running() -> LifecycleResult {
 
     match cmd.spawn() {
         Ok(child) => {
-            eprintln!(
-                "[vct-hub] spawned detached background hub (pid {})",
-                child.id()
-            );
+            tracing::info!(pid = child.id(), "[vct-hub] spawned detached background hub");
             LifecycleResult::Ok
         }
         Err(e) => LifecycleResult::Err(format!("failed to spawn vct-hub --foreground: {}", e)),
@@ -176,14 +170,14 @@ pub fn start_if_not_running() -> LifecycleResult {
 /// main task listens on SIGTERM/SIGINT (see `bin/main.rs`).
 pub fn stop() -> LifecycleResult {
     let Some(pid) = lockfile::read_pid() else {
-        eprintln!("[vct-hub] no lockfile; assuming hub is not running");
+        tracing::info!("[vct-hub] no lockfile; assuming hub is not running");
         return LifecycleResult::Ok;
     };
 
     if !pid_is_alive(pid) {
-        eprintln!(
-            "[vct-hub] lockfile present but owner pid {} is dead; cleaning up",
-            pid
+        tracing::info!(
+            pid,
+            "[vct-hub] lockfile present but owner is dead; cleaning up"
         );
         let _ = lockfile::release();
         return LifecycleResult::Ok;
@@ -239,7 +233,7 @@ pub fn stop() -> LifecycleResult {
             // The process is gone. The graceful-shutdown path SHOULD
             // have removed the lockfile; if it didn't, do it now.
             let _ = lockfile::release();
-            eprintln!("[vct-hub] stopped (pid {})", pid);
+            tracing::info!(pid, "[vct-hub] stopped");
             return LifecycleResult::Ok;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -257,18 +251,25 @@ pub fn stop() -> LifecycleResult {
 ///   running pid=<N>      → exit 0
 ///   not-running          → exit 1
 ///   stale pid=<N>        → exit 2
+///
+/// The three stdout lines are a MACHINE CONTRACT, not diagnostics: they
+/// are the command's answer. `docs/TROUBLESHOOTING.md` instructs users to
+/// act on the literal word `stale`, and the format is a documented CLI
+/// surface (`docs/CONFIGURATION.md`, `docs/GETTING_STARTED.md`). They
+/// stay bare `println!` so no log level, and no future log formatting,
+/// can alter or suppress them.
 pub fn status() -> LifecycleResult {
     match lockfile::read_pid() {
         Some(pid) if pid_is_alive(pid) => {
-            println!("running pid={}", pid);
+            println!("running pid={}", pid); // [vct-print-contract]
             LifecycleResult::Ok
         }
         Some(pid) => {
-            println!("stale pid={}", pid);
+            println!("stale pid={}", pid); // [vct-print-contract]
             LifecycleResult::OkExit(2)
         }
         None => {
-            println!("not-running");
+            println!("not-running"); // [vct-print-contract]
             LifecycleResult::OkExit(1)
         }
     }

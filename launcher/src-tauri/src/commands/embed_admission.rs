@@ -169,7 +169,7 @@ fn admission_semaphore(db: &Db) -> Arc<tokio::sync::Semaphore> {
     UPDATE_ALL_ADMISSION
         .get_or_init(|| {
             let cap = resolve_capacity(db);
-            eprintln!(
+            tracing::info!(
                 "[vct] update-all embed-admission gate: capacity {} \
                  (from app_state '{}', default {})",
                 cap,

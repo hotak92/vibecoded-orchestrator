@@ -59,7 +59,7 @@ pub(crate) fn copy_recursive_sync(src: &Path, dst: &Path) -> std::io::Result<()>
     if has_git_root(src) {
         copy_recursive_gitignore_aware(src, dst)
     } else {
-        eprintln!(
+        tracing::warn!(
             "[vct] copy_recursive_sync: source {} has no .git/ ancestor; \
              falling back to blind walker (gitignored files WILL be copied). \
              This is expected for non-checkout bundles and test fixtures.",
@@ -119,7 +119,7 @@ pub(crate) fn copy_recursive_gitignore_aware(src: &Path, dst: &Path) -> std::io:
                 // the whole copy. Mirror walkdir convention: log and
                 // continue. (Catches the rare case where a `.git/`
                 // sub-object is unreadable on shared developer boxes.)
-                eprintln!("[vct] walker error: {}", e);
+                tracing::warn!("[vct] walker error: {}", e);
                 continue;
             }
         };

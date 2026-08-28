@@ -90,6 +90,15 @@ pub mod rl_events;
 // Plan: .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.
 pub mod codegraph_extras;
 
+// v0.2.91 (decision #27): parked-entry store for hooks the launcher has
+// removed from a project's `.claude/settings.json`. Kept in its own module
+// rather than grown into `project_state` because it carries a DIFFERENT
+// contract: `project_state`'s hook accessors are the settings.json MIRROR,
+// while these are the restore-side store behind the real enforcement path
+// (`vco_lib.hooks_settings`). Tauri command surface in
+// `commands::project_hooks_settings` (launcher crate).
+pub mod project_hooks_settings;
+
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
     crate::paths::vct_root_dir().join("launcher.db")
@@ -229,7 +238,10 @@ impl Db {
         // Best-effort WAL flush + shrink so install.py sees a consistent
         // main DB and the -wal/-shm aren't left large/open.
         if let Err(e) = guard.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
-            eprintln!("[db] close_for_update: wal_checkpoint(TRUNCATE) best-effort failed: {}", e);
+            tracing::warn!(
+                error = %e,
+                "[db] close_for_update: wal_checkpoint(TRUNCATE) best-effort failed"
+            );
         }
         // Infallible move: swap the live conn out, stand-in in.
         let real = std::mem::replace(&mut *guard, standin);
@@ -239,10 +251,10 @@ impl Db {
         // on Windows) is released deterministically BEFORE we return — do
         // not rely on scope-end Drop timing.
         if let Err((conn, e)) = real.close() {
-            eprintln!(
-                "[db] close_for_update: Connection::close() returned err ({}); \
-                 dropping handle explicitly",
-                e
+            tracing::warn!(
+                error = %e,
+                "[db] close_for_update: Connection::close() returned an error; \
+                 dropping handle explicitly"
             );
             drop(conn);
         }

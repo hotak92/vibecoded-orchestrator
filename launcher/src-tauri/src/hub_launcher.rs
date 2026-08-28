@@ -48,7 +48,7 @@ pub fn find_hub_binary() -> Option<PathBuf> {
         if is_executable(&path) {
             return Some(path);
         }
-        eprintln!(
+        tracing::warn!(
             "[vct] VCT_HUB_BIN set to {} but not executable; falling through",
             p
         );
@@ -303,7 +303,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
     // disarmed (success tail) or on error paths where the gate is about
     // to be dropped, and they must succeed regardless.
     if crate::commands::update_gate::is_update_in_progress() {
-        eprintln!(
+        tracing::warn!(
             "[vct] ensure_hub_running: orchestrator update in progress \
              (.update-in-progress.json is fresh) — skipping hub respawn; \
              the post-update launcher boot will start the new hub."
@@ -312,7 +312,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
     }
 
     let Some(bin) = find_hub_binary() else {
-        eprintln!(
+        tracing::warn!(
             "[vct] vct-hub binary not found on this machine; \
              launcher will run in hub-unavailable degraded mode. \
              Set VCT_HUB_BIN or run install.py to deploy it."
@@ -345,7 +345,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
     if let crate::hub_status::HubStatus::Running { pid } = crate::hub_status::probe() {
         let running_exe = crate::commands::update_gate::process_exe_by_pid(pid);
         if running_hub_is_stale(pid, running_exe.as_deref(), &bin) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] vct-hub pid {} is running a stale or foreign binary ({}); \
                  stopping it so the install-folder copy {} can take over.",
                 pid,
@@ -364,7 +364,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
             match crate::hub_status::stop() {
                 crate::hub_status::StopOutcome::Stopped
                 | crate::hub_status::StopOutcome::AlreadyStopped => {}
-                other => eprintln!(
+                other => tracing::warn!(
                     "[vct] could not stop the stale hub ({:?}); the install-folder \
                      copy may not take over until the stale hub exits.",
                     other
@@ -373,7 +373,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
         }
     }
 
-    eprintln!("[vct] auto-starting vct-hub from {}", bin.display());
+    tracing::info!("[vct] auto-starting vct-hub from {}", bin.display());
 
     // Invoke synchronously so we know whether the spawn succeeded.
     // `--start-if-not-running` itself spawns a detached child and
@@ -405,7 +405,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
         Ok(status) if status.success() => SpawnOutcome::Started,
         Ok(status) => {
             let code = status.code().unwrap_or(-1);
-            eprintln!(
+            tracing::warn!(
                 "[vct] vct-hub --start-if-not-running exited {}; degraded mode",
                 code
             );
@@ -413,7 +413,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
         }
         Err(e) => {
             let msg = format!("{}", e);
-            eprintln!(
+            tracing::warn!(
                 "[vct] failed to spawn vct-hub from {}: {}; degraded mode",
                 bin.display(),
                 msg

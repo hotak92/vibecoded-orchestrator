@@ -63,6 +63,7 @@ except ImportError:  # pragma: no cover — script-mode invocation
 try:
     from vco_lib.bundled_versions import load_bundled_versions
     from vco_lib.diagram_paths import validate_scoped_path
+    from vco_lib.log_setup import configure_logging
     from vco_lib.npx_resolver import package_run_argv
 except ImportError:  # pragma: no cover — script-mode invocation
     _here = Path(__file__).resolve().parent.parent.parent
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover — script-mode invocation
         sys.path.insert(0, str(_here))
     from vco_lib.bundled_versions import load_bundled_versions
     from vco_lib.diagram_paths import validate_scoped_path
+    from vco_lib.log_setup import configure_logging
     from vco_lib.npx_resolver import package_run_argv
 
 
@@ -234,8 +236,7 @@ def _resolve_upstream_argv() -> list[str]:
 def main() -> None:
     """``python -m claude_mcp_servers.wrappers.mermaid_proxy`` entry."""
     # Log to stderr so we don't interfere with the stdout JSON-RPC channel.
-    logging.basicConfig(
-        level=logging.INFO,
+    configure_logging(
         format="[mermaid_proxy] %(levelname)s %(message)s",
         stream=sys.stderr,
     )

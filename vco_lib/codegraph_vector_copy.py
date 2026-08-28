@@ -63,6 +63,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 # MATCH the sibling call site in vco_lib/project_init.py.
 from vco_lib.weaviate_vectors import clean_named_vector
 
+# v0.2.91 (Decision #21): the CLI entry point below (--migrate-identity)
+# called `logging.basicConfig` directly with a hardcoded INFO level,
+# ignoring the global VCO_LOG_LEVEL pref. Route it through the ONE shared
+# helper instead.
+from vco_lib.log_setup import configure_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -1261,9 +1267,7 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     elif not (args.prefix and args.from_identity and args.to_identity):
         parser.error("--migrate-identity requires --prefix, --from and --to")
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
-    )
+    configure_logging(format="%(levelname)s %(name)s: %(message)s")
 
     client = _build_client(args.weaviate_url, args.grpc_port)
     if client is None:

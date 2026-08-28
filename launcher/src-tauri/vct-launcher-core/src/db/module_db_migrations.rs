@@ -255,9 +255,9 @@ pub fn apply_module_db_migrations(
             None => {
                 // Non-UTF8 filename — extremely rare on modern systems.
                 // Skip silently rather than failing the whole apply.
-                eprintln!(
-                    "[module_db_migrations] skipping non-UTF8 filename in {}",
-                    migrations_dir.display()
+                tracing::warn!(
+                    dir = %migrations_dir.display(),
+                    "[module_db_migrations] skipping non-UTF8 filename"
                 );
                 continue;
             }
@@ -381,11 +381,11 @@ pub fn apply_module_db_migrations(
 
         match exec_result {
             Ok(()) => {
-                eprintln!(
-                    "[module_db_migrations] applied {}::{} (sha={}..)",
+                tracing::info!(
                     module_id,
                     filename,
-                    &sha[..16.min(sha.len())],
+                    sha = &sha[..16.min(sha.len())],
+                    "[module_db_migrations] applied migration"
                 );
                 report.applied.push(filename);
             }

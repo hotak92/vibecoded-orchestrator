@@ -552,7 +552,7 @@ pub async fn services_start_all() -> Result<(), String> {
             match run_stack_wrapper("start").await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[lifecycle] launch-claude-mcp-stack start failed, \
                          falling back to direct compose: {}",
                         e
@@ -630,7 +630,7 @@ fn set_pause_markers_for_managed_services(pause: bool) {
             vct_launcher_core::services::watchdog_pause::remove_pause_marker(name)
         };
         if let Err(e) = res {
-            eprintln!(
+            tracing::warn!(
                 "[lifecycle] watchdog pause-marker {} for '{}' soft-failed: {}",
                 if pause { "create" } else { "remove" },
                 name,
@@ -655,7 +655,7 @@ fn set_pause_marker_for_service(name: &str, pause: bool) {
         vct_launcher_core::services::watchdog_pause::remove_pause_marker(name)
     };
     if let Err(e) = res {
-        eprintln!(
+        tracing::warn!(
             "[lifecycle] watchdog pause-marker {} for '{}' soft-failed: {}",
             if pause { "create" } else { "remove" },
             name,
@@ -682,7 +682,7 @@ pub async fn services_restart_all() -> Result<(), String> {
         match run_stack_wrapper("restart").await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[lifecycle] launch-claude-mcp-stack restart failed, \
                      falling back to direct compose: {}",
                     e
@@ -971,7 +971,7 @@ async fn resolve_pinned_or_pick(
                 // Soft-fail: log + still use the pick this round. We DON'T
                 // want a stat() failure on services.toml to block the
                 // user's button press.
-                eprintln!(
+                tracing::warn!(
                     "[services] persist_container_pick({}={}) soft-failed: {}",
                     service, pick, e
                 );
@@ -1341,7 +1341,7 @@ pub async fn auto_start_on_boot(app: AppHandle) {
             // container runtime detected. The runtime is only needed to
             // bring services UP from a stopped state.
             if services_already_running().await {
-                eprintln!(
+                tracing::info!(
                     "[lifecycle] runtime detection returned None but Weaviate \
                      is reachable — services already running, suppressing \
                      vct-no-container-runtime modal"

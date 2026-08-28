@@ -11,6 +11,15 @@
 //!
 //! Subcommand paths delegate to `vct_hub::lifecycle::*` and translate
 //! their `LifecycleResult` into a process exit code.
+//!
+//! ## Diagnostics (v0.2.91, #21)
+//!
+//! Every hub diagnostic goes through `tracing` at an honest level, gated
+//! by `VCO_LOG_LEVEL` > launcher.db `app_state['logging.level']` > INFO
+//! (resolved by `vct_launcher_core::logging`). The subscriber writes to
+//! stderr, which the detached daemon's callers redirect to a log file or
+//! to `/dev/null`; stdout is left clean because the lifecycle CLI parses
+//! it (`--status`, `--boot-status`).
 
 use std::process;
 
@@ -19,17 +28,39 @@ use vct_hub::cli::{self, Command};
 use vct_hub::lifecycle::{self, LifecycleResult};
 use vct_hub::lockfile;
 use vct_hub::server;
+use vct_launcher_core::logging;
 
 #[tokio::main]
 async fn main() {
+    // FIRST statement: install diagnostics before anything can want to
+    // emit one. `resolve_process_log_level` reads VCO_LOG_LEVEL and
+    // best-effort probes launcher.db for the stored preference — see
+    // below for why the hub can afford the DB read here and the launcher
+    // cannot.
+    //
+    // Every failure mode of that probe (no launcher.db yet, schema
+    // predating `app_state`, DB locked by a busy launcher) resolves to
+    // the default level rather than an error: logging setup must never be
+    // a reason the hub fails to start.
+    logging::init_tracing(logging::resolve_process_log_level());
+
     let cmd = cli::parse_env_args();
 
     match cmd {
         Command::Help => {
+            // [vct-print-contract] `--help` writes the usage text to
+            // stdout, verbatim and unprefixed. A CLI's help output is
+            // read by humans and redirected by scripts; routing it
+            // through the log subscriber would stamp every line with a
+            // timestamp and hide it whenever the level is raised.
             println!("{}", cli::usage());
             process::exit(0);
         }
         Command::Usage => {
+            // [vct-print-contract] Same text on the bad-invocation path,
+            // to stderr with EX_USAGE. Must appear whatever the log level
+            // says — it is the response to the command, not commentary
+            // about it.
             eprintln!("{}", cli::usage());
             process::exit(64); // EX_USAGE per BSD sysexits
         }
@@ -52,7 +83,16 @@ async fn run_foreground() {
         exit_with(err);
     }
 
-    eprintln!("[vct-hub] v0.2.21 starting (pid {})", std::process::id());
+    // v0.2.91: the version in this line used to be the hardcoded literal
+    // "v0.2.21" — the release it was written in — so every build since
+    // has announced the wrong version to the one log a support session
+    // reads first. Same source as /health now (`CARGO_PKG_VERSION`,
+    // inherited from the workspace).
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        "[vct-hub] starting"
+    );
 
     let bind_result = server::start_hub_server().await;
     let port = match bind_result {
@@ -66,16 +106,16 @@ async fn run_foreground() {
             // (e.g. after a stale-version takeover raced us);
             // unconditional removal would delete the winner's claim.
             let _ = lockfile::release_owned();
-            eprintln!("[vct-hub] failed to start server: {}", e);
+            tracing::error!(error = %e, "[vct-hub] failed to start server");
             process::exit(1);
         }
     };
-    eprintln!("[vct-hub] listening on http://127.0.0.1:{}", port);
+    tracing::info!(port, "[vct-hub] listening on http://127.0.0.1:{}", port);
 
     // Park until SIGTERM / SIGINT (Unix) or Ctrl-C (Windows).
     wait_for_shutdown_signal().await;
 
-    eprintln!("[vct-hub] shutting down");
+    tracing::info!("[vct-hub] shutting down");
     // v0.3.0 (WP-K): best-effort graceful close of the persistent keychain
     // Secret-Service connection (Linux). One clean client disconnect at a
     // controlled moment instead of an abrupt teardown mid-op — a mitigation of
@@ -88,7 +128,7 @@ async fn run_foreground() {
     // NEWER hub has since claimed (stale-version takeover while we were
     // being signalled).
     if let Err(e) = lockfile::release_owned() {
-        eprintln!("[vct-hub] warning: lockfile release failed: {}", e);
+        tracing::warn!(error = %e, "[vct-hub] lockfile release failed");
     }
     process::exit(0);
 }
@@ -100,7 +140,9 @@ fn exit_with(r: LifecycleResult) -> ! {
         LifecycleResult::Ok => process::exit(0),
         LifecycleResult::OkExit(code) => process::exit(code),
         LifecycleResult::Err(msg) => {
-            eprintln!("[vct-hub] {}", msg);
+            // ERROR, so it survives every level the preference can select
+            // (the resolver's floor is ERROR — no setting can hide this).
+            tracing::error!("[vct-hub] {}", msg);
             process::exit(1);
         }
     }
@@ -112,28 +154,28 @@ async fn wait_for_shutdown_signal() {
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[vct-hub] cannot install SIGTERM handler: {}", e);
+            tracing::error!(error = %e, "[vct-hub] cannot install SIGTERM handler");
             process::exit(1);
         }
     };
     let mut sigint = match signal(SignalKind::interrupt()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[vct-hub] cannot install SIGINT handler: {}", e);
+            tracing::error!(error = %e, "[vct-hub] cannot install SIGINT handler");
             process::exit(1);
         }
     };
     tokio::select! {
-        _ = sigterm.recv() => eprintln!("[vct-hub] SIGTERM received"),
-        _ = sigint.recv() => eprintln!("[vct-hub] SIGINT received"),
+        _ = sigterm.recv() => tracing::info!("[vct-hub] SIGTERM received"),
+        _ = sigint.recv() => tracing::info!("[vct-hub] SIGINT received"),
     }
 }
 
 #[cfg(windows)]
 async fn wait_for_shutdown_signal() {
     if let Err(e) = tokio::signal::ctrl_c().await {
-        eprintln!("[vct-hub] ctrl_c handler error: {}", e);
+        tracing::error!(error = %e, "[vct-hub] ctrl_c handler error");
         process::exit(1);
     }
-    eprintln!("[vct-hub] Ctrl-C received");
+    tracing::info!("[vct-hub] Ctrl-C received");
 }

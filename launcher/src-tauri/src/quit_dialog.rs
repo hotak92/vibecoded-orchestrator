@@ -169,7 +169,7 @@ fn resolve_pref(db: &Db, app_state_key: &str, legacy_key: Option<&str>, default:
         Ok(Some(v)) => return v,
         Ok(None) => {}
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] tray prefs: reading {} failed ({}) — using default {}",
                 app_state_key, e, default,
             );
@@ -181,7 +181,7 @@ fn resolve_pref(db: &Db, app_state_key: &str, legacy_key: Option<&str>, default:
         Some(k) => db
             .find_all_project_settings_bool("launcher", k)
             .unwrap_or_else(|e| {
-                eprintln!(
+                tracing::warn!(
                     "[vct] tray prefs: legacy lookup for {} failed ({}) — treating as absent",
                     k, e,
                 );
@@ -192,13 +192,13 @@ fn resolve_pref(db: &Db, app_state_key: &str, legacy_key: Option<&str>, default:
 
     let resolved = adopt_legacy_pref(&legacy_rows, default).unwrap_or(default);
     if let Err(e) = db.app_state_set_bool(app_state_key, resolved) {
-        eprintln!(
+        tracing::warn!(
             "[vct] tray prefs: could not persist re-homed {} ({}) — value still applies \
              this session",
             app_state_key, e,
         );
     } else if !legacy_rows.is_empty() {
-        eprintln!(
+        tracing::info!(
             "[vct] tray prefs: re-homed {} from {} per-project row(s) to app_state (= {})",
             app_state_key,
             legacy_rows.len(),
@@ -311,13 +311,13 @@ pub(crate) fn notify_hidden_to_tray_once<R: Runtime>(app: &AppHandle<R>) {
         Ok(Some(true)) => return,
         Ok(_) => {}
         Err(e) => {
-            eprintln!("[vct] tray notice: seen-flag read failed ({}) — skipping", e);
+            tracing::warn!("[vct] tray notice: seen-flag read failed ({}) — skipping", e);
             return;
         }
     }
     if let Err(e) = db.app_state_set_bool(APP_STATE_TRAY_NOTICE_SEEN, true) {
         // Write failed → we would nag on every hide. Prefer silence.
-        eprintln!(
+        tracing::warn!(
             "[vct] tray notice: could not persist seen-flag ({}) — not showing the notice",
             e,
         );
@@ -453,7 +453,7 @@ fn full_shutdown<R: Runtime>(app: AppHandle<R>) {
     force_quit();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = stop_services(&app).await {
-            eprintln!("[vct] stop_services failed during quit: {} (exiting anyway)", e);
+            tracing::warn!("[vct] stop_services failed during quit: {} (exiting anyway)", e);
         }
         app.exit(0);
     });

@@ -254,10 +254,10 @@ pub fn augment_path_for_graphical_launch() {
             std::env::set_var("PATH", &joined);
         }
         Err(e) => {
-            eprintln!(
-                "[vct] augment_path_for_graphical_launch: join_paths failed: {} — \
-                 PATH left unchanged",
-                e
+            tracing::warn!(
+                error = %e,
+                "[vct] augment_path_for_graphical_launch: join_paths failed — \
+                 PATH left unchanged"
             );
         }
     }
@@ -406,25 +406,25 @@ async fn version_probe(binary: &PathBuf) -> bool {
         // the launcher log to prove cause without strace. Elapsed-time
         // helps distinguish timeout-near-ceiling (raise the limit) from
         // genuine missing-binary (spawn error in <50ms).
-        eprintln!(
-            "[runtime] version_probe failed for {} after {}ms (ceiling {}s): {:?}",
-            binary.display(),
+        tracing::warn!(
+            binary = %binary.display(),
             elapsed_ms,
-            timeout_secs,
-            match &result {
+            ceiling_secs = timeout_secs,
+            cause = ?match &result {
                 Err(_) => "timeout".to_string(),
                 Ok(Err(e)) => format!("spawn error: {}", e),
                 Ok(Ok(out)) => format!("non-zero exit {:?}", out.status.code()),
-            }
+            },
+            "[runtime] version_probe failed"
         );
     } else {
         // Non-error path: log elapsed only when slow enough to be
         // interesting (>1s). Quiet on the happy path.
         if elapsed_ms > 1000 {
-            eprintln!(
-                "[runtime] version_probe ok for {} but slow: {}ms",
-                binary.display(),
-                elapsed_ms
+            tracing::info!(
+                binary = %binary.display(),
+                elapsed_ms,
+                "[runtime] version_probe ok but slow"
             );
         }
     }
@@ -501,42 +501,42 @@ async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> boo
     // says no runtime but I have it installed" reports. Slow-but-OK runs
     // (1.5-7s) are interesting precursors to future timeout regressions.
     if elapsed_ms > 1000 {
-        eprintln!(
-            "[runtime] daemon_usable_probe slow for {} {}: {}ms (ceiling {}s)",
-            runtime.display_name(),
-            binary.display(),
+        tracing::info!(
+            runtime = runtime.display_name(),
+            binary = %binary.display(),
             elapsed_ms,
-            timeout_secs
+            ceiling_secs = timeout_secs,
+            "[runtime] daemon_usable_probe slow"
         );
     }
     let output = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
-            eprintln!(
-                "[runtime] daemon_usable_probe spawn error for {} {}: {}",
-                runtime.display_name(),
-                binary.display(),
-                e
+            tracing::warn!(
+                runtime = runtime.display_name(),
+                binary = %binary.display(),
+                error = %e,
+                "[runtime] daemon_usable_probe spawn error"
             );
             return false;
         }
         Err(_) => {
-            eprintln!(
-                "[runtime] daemon_usable_probe timeout for {} {} (ceiling {}s)",
-                runtime.display_name(),
-                binary.display(),
-                timeout_secs
+            tracing::warn!(
+                runtime = runtime.display_name(),
+                binary = %binary.display(),
+                ceiling_secs = timeout_secs,
+                "[runtime] daemon_usable_probe timeout"
             );
             return false;
         }
     };
     if !output.status.success() {
-        eprintln!(
-            "[runtime] daemon_usable_probe: {} info exit {:?} — daemon likely \
-             unreachable (Docker: user not in `docker` group? Docker Desktop \
-             not started? Podman: rootless setup broken?)",
-            runtime.display_name(),
-            output.status.code()
+        tracing::warn!(
+            runtime = runtime.display_name(),
+            exit_code = ?output.status.code(),
+            "[runtime] daemon_usable_probe: `info` exited non-zero — daemon likely \
+             unreachable (Docker: user not in `docker` group? Docker Desktop not \
+             started? Podman: rootless setup broken?)"
         );
         return false;
     }
@@ -555,7 +555,7 @@ async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> boo
                     trimmed.starts_with("Server:") || trimmed.starts_with("Server Version:")
                 });
             if !has_server {
-                eprintln!(
+                tracing::warn!(
                     "[runtime] daemon_usable_probe: `docker info` succeeded but \
                      stdout has no `Server:` section — daemon not reachable \
                      (user not in docker group, or Docker Desktop not started)"
@@ -622,7 +622,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
         }
     }
 
-    eprintln!(
+    tracing::warn!(
         "[runtime] detect_compose_form: no compose support for {} (subcommand_status={:?}, \
          standalone_candidates={:?})",
         binary.display(),
@@ -722,11 +722,11 @@ async fn resolve_runtime() -> Option<RuntimeInfo> {
         Some("podman") => vec![ContainerRuntime::Podman],
         Some("docker") => vec![ContainerRuntime::Docker],
         Some(other) => {
-            eprintln!(
-                "[vct] runtime: VCT_CONTAINER_RUNTIME={:?} not recognized \
-                 (expected 'podman', 'docker', or 'auto'); falling back to \
-                 podman-then-docker auto-detection",
-                other
+            tracing::warn!(
+                value = ?other,
+                "[vct] runtime: VCT_CONTAINER_RUNTIME not recognized (expected \
+                 'podman', 'docker', or 'auto'); falling back to podman-then-docker \
+                 auto-detection"
             );
             vec![ContainerRuntime::Podman, ContainerRuntime::Docker]
         }

@@ -132,7 +132,7 @@ fn env_file_allowlist(db: &Db) -> Vec<PathBuf> {
             // panicking the SecretsPanel. `~/.vct-secrets/shared/` is
             // still enumerated by the caller, so most users keep an
             // import surface.
-            eprintln!(
+            tracing::warn!(
                 "env_file_allowlist: db.list_projects failed: {} \
                  (.env import surface degraded — keychain shared/ unaffected)",
                 e

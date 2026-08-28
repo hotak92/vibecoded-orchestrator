@@ -349,7 +349,7 @@ pub(crate) async fn dist_is_dirty(install_path: &Path) -> bool {
     {
         Ok(o) if o.status.success() => !o.stdout.is_empty(),
         Ok(o) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: git status for {} exited {:?}; treating dist as clean. \
                  stderr: {}",
                 rel,
@@ -359,7 +359,7 @@ pub(crate) async fn dist_is_dirty(install_path: &Path) -> bool {
             false
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: git status for {} could not spawn ({}); treating dist \
                  as clean",
                 rel, e,
@@ -415,7 +415,7 @@ pub(crate) fn pre_pull_rename_running_binary(install_path: &Path) -> Option<Path
 
     match std::fs::rename(&exe_canon, &backup_path) {
         Ok(()) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] binary_freshness: pre-pull renamed running launcher binary to {} \
                  (Windows). New binary will be written to {} by git pull.",
                 backup_path.display(),
@@ -424,7 +424,7 @@ pub(crate) fn pre_pull_rename_running_binary(install_path: &Path) -> Option<Path
             Some(backup_path)
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: pre-pull rename FAILED ({}). git pull will likely \
                  fail with ERROR_SHARING_VIOLATION or silently skip the binary. Continuing — \
                  the at-rest reconcile heals the skipped-binary case.",
@@ -481,7 +481,7 @@ pub(crate) fn revert_pre_pull_rename(backup_path: &Path) -> RevertOutcome {
     let state = compare_backup_to_canonical(backup_path, &canonical_path);
     match decide_revert(state) {
         RevertDecision::KeepCanonicalParkBackup => {
-            eprintln!(
+            tracing::info!(
                 "[vct] binary_freshness: NOT reverting pre-pull rename — {} holds bytes that \
                  differ from the backup {} (state={:?}). The pull landed a NEWER binary there; \
                  restoring the backup over it would freeze this install on the old binary \
@@ -495,7 +495,7 @@ pub(crate) fn revert_pre_pull_rename(backup_path: &Path) -> RevertOutcome {
         }
         RevertDecision::RestoreBackup => match std::fs::rename(backup_path, &canonical_path) {
             Ok(()) => {
-                eprintln!(
+                tracing::info!(
                     "[vct] binary_freshness: reverted pre-pull rename ({} → {})",
                     backup_path.display(),
                     canonical_path.display(),
@@ -503,7 +503,7 @@ pub(crate) fn revert_pre_pull_rename(backup_path: &Path) -> RevertOutcome {
                 RevertOutcome::Reverted
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: could not revert pre-pull rename ({} → {}): {}. \
                      The renamed file is left in place; the running launcher continues to work \
                      and the boot sweep collects the `.old-<pid>` sibling once this PID exits.",
@@ -589,7 +589,7 @@ pub(crate) async fn stage_dirty_binaries(
         {
             Ok(o) => o,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: git status failed for {}: {} (skipping; the \
                      handoff gracefully no-ops for this file)",
                     rel_path, e
@@ -614,7 +614,7 @@ pub(crate) async fn stage_dirty_binaries(
         {
             Ok(o) if o.status.success() => o,
             Ok(o) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: git show HEAD:{} exited non-zero ({:?}); skipping. \
                      stderr: {}",
                     rel_path,
@@ -624,7 +624,7 @@ pub(crate) async fn stage_dirty_binaries(
                 continue;
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: git show HEAD:{} spawn failed: {} (skipping)",
                     rel_path, e
                 );
@@ -636,7 +636,7 @@ pub(crate) async fn stage_dirty_binaries(
         // clone whose binaries were never checked out).
         if let Some(parent) = staged_abs.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: mkdir {} failed: {} (skipping {})",
                     parent.display(),
                     e,
@@ -651,7 +651,7 @@ pub(crate) async fn stage_dirty_binaries(
         // rename over a working binary.
         let tmp_path = staged_abs.with_extension("new.tmp");
         if let Err(e) = std::fs::write(&tmp_path, &show_out.stdout) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: write {} failed: {} (skipping)",
                 tmp_path.display(),
                 e,
@@ -659,7 +659,7 @@ pub(crate) async fn stage_dirty_binaries(
             continue;
         }
         if let Err(e) = std::fs::rename(&tmp_path, &staged_abs) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: rename {} → {} failed: {} (skipping)",
                 tmp_path.display(),
                 staged_abs.display(),
@@ -668,7 +668,7 @@ pub(crate) async fn stage_dirty_binaries(
             let _ = std::fs::remove_file(&tmp_path);
             continue;
         }
-        eprintln!(
+        tracing::info!(
             "[vct] binary_freshness: staged {} → {} ({} bytes)",
             rel_path,
             staged_abs.display(),
@@ -781,7 +781,7 @@ pub(crate) fn invalidate_stale_new_siblings(
         }
         match std::fs::remove_file(&staged) {
             Ok(()) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: dropped STALE staged binary {} — its canonical \
                      path {} already matches HEAD, so swapping the staged copy in would \
                      rename OLDER bytes over the current one (v0.2.91 MAJOR-2)",
@@ -790,7 +790,7 @@ pub(crate) fn invalidate_stale_new_siblings(
                 );
                 dropped.push(rel.clone());
             }
-            Err(e) => eprintln!(
+            Err(e) => tracing::warn!(
                 "[vct] binary_freshness: could not remove stale staged binary {}: {} \
                  (leaving it; the swap paths re-evaluate it next pass)",
                 staged.display(),
@@ -902,7 +902,7 @@ pub(crate) async fn stage_and_handoff_after_update(
     // gets a fresh `.new` written below.
     let dropped = invalidate_stale_new_siblings_for(install_path, &swap_candidate_rel_paths()).await;
     if !dropped.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[vct] binary_freshness: dropped {} stale staged binary/binaries before the \
              handoff: {:?}",
             dropped.len(),
@@ -912,7 +912,7 @@ pub(crate) async fn stage_and_handoff_after_update(
 
     let staged = stage_locked_binaries_for_handoff(install_path).await;
     if !staged.is_empty() {
-        eprintln!(
+        tracing::info!(
             "[vct] binary_freshness: staged {} binary/binaries for handoff: {:?}",
             staged.len(),
             staged,
@@ -926,7 +926,7 @@ pub(crate) async fn stage_and_handoff_after_update(
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: handoff returned error ({}); falling through to the \
                  caller's legacy restart path",
                 e,
@@ -1008,7 +1008,7 @@ impl ReconcileOutcome {
 /// rewriting the same dist files) or a second launcher process.
 pub(crate) fn update_owns_the_tree_at(gate_lock: &Path, handoff_lock: &Path) -> bool {
     if handoff_lock.exists() {
-        eprintln!(
+        tracing::info!(
             "[vct] binary_freshness: standing down — a stage1 update handoff lock is present \
              at {} (its swap list owns the dist binaries)",
             handoff_lock.display(),
@@ -1023,7 +1023,7 @@ pub(crate) fn update_owns_the_tree_at(gate_lock: &Path, handoff_lock: &Path) -> 
     }
     match crate::commands::update_gate::read_lockfile_at(gate_lock) {
         Some(p) if p.started_by_pid == std::process::id() => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binary_freshness: the in-progress update is OURS (pid {}) — reconciling \
                  anyway; this is the WI-2 'Already up to date still heals' path",
                 p.started_by_pid,
@@ -1089,7 +1089,7 @@ pub(crate) async fn reconcile_dist_at_rest_gated(
     update_owns_tree: bool,
 ) -> ReconcileOutcome {
     if update_owns_tree {
-        eprintln!(
+        tracing::info!(
             "[vct] binary_freshness: at-rest reconcile stands down for {} — an update owns the \
              tree (it drives its own staging + handoff)",
             install_path.display(),
@@ -1131,7 +1131,7 @@ pub(crate) async fn reconcile_dist_at_rest_gated(
         };
     }
 
-    eprintln!(
+    tracing::warn!(
         "[vct] binary_freshness: dist binaries are STALE at rest (running v{}, dist sidecar v{}, \
          dist dirty vs HEAD={}) — verdict {:?}",
         inputs.running_version,
@@ -1151,7 +1151,7 @@ pub(crate) async fn reconcile_dist_at_rest_gated(
         };
         (staged, armed)
     } else {
-        eprintln!(
+        tracing::info!(
             "[vct] binary_freshness: dist tree diverges from HEAD but the versions MATCH — \
              surfacing only. Nothing is staged and no swap is armed: an equal-version dirty \
              dist slot is what a local `cargo build` looks like, and overwriting it from HEAD \
@@ -1260,13 +1260,13 @@ fn clear_stale_condition_if_fresh_with<F>(
     match resolve(install_path, &[CID_BINARY_STALE]) {
         Ok(()) => {
             STALE_CONDITION_EMITTED.store(false, Ordering::SeqCst);
-            eprintln!(
+            tracing::info!(
                 "[vct] binary_freshness: the running binary matches the dist tree again — \
                  retired the {} record",
                 CID_BINARY_STALE,
             );
         }
-        Err(e) => eprintln!(
+        Err(e) => tracing::warn!(
             "[vct] binary_freshness: could not retire the {} record (non-fatal, the next \
              boot probes again): {}",
             CID_BINARY_STALE, e,
@@ -1356,12 +1356,12 @@ fn clear_handoff_skipped_if_delivered_with<F>(
         return;
     }
     match resolve(install_path, &[CID_HANDOFF_SKIPPED]) {
-        Ok(()) => eprintln!(
+        Ok(()) => tracing::info!(
             "[vct] binary_freshness: the dist tree matches HEAD and no staged `.new` sibling \
              remains — retired the {} record",
             CID_HANDOFF_SKIPPED,
         ),
-        Err(e) => eprintln!(
+        Err(e) => tracing::warn!(
             "[vct] binary_freshness: could not retire the {} record (non-fatal, the next \
              boot probes again): {}",
             CID_HANDOFF_SKIPPED, e,
@@ -1378,7 +1378,7 @@ fn clear_handoff_skipped_if_delivered_with<F>(
 pub(crate) fn arm_stage1_swap_on_exit(install_path: &Path) -> bool {
     let lock_path = vct_root_dir().join(crate::commands::update_handoff::UPDATE_LOCK_FILE);
     if lock_path.exists() {
-        eprintln!(
+        tracing::info!(
             "[vct] binary_freshness: NOT arming an at-rest swap — an update handoff lock \
              already exists at {} (a real update is finishing; its relaunch must win)",
             lock_path.display(),
@@ -1388,7 +1388,7 @@ pub(crate) fn arm_stage1_swap_on_exit(install_path: &Path) -> bool {
     match ARMED_SWAP_ROOT.lock() {
         Ok(mut slot) => {
             *slot = Some(install_path.to_path_buf());
-            eprintln!(
+            tracing::info!(
                 "[vct] binary_freshness: armed an at-rest binary swap for {} — it runs when YOU \
                  quit the launcher (no auto-restart, no auto-quit)",
                 install_path.display(),
@@ -1396,7 +1396,7 @@ pub(crate) fn arm_stage1_swap_on_exit(install_path: &Path) -> bool {
             true
         }
         Err(e) => {
-            eprintln!("[vct] binary_freshness: could not arm at-rest swap: {}", e);
+            tracing::warn!("[vct] binary_freshness: could not arm at-rest swap: {}", e);
             false
         }
     }
@@ -1440,7 +1440,7 @@ fn swap_on_exit_impl(install_root: &Path) {
     let dropped =
         invalidate_stale_new_siblings_for_blocking(install_root, &swap_candidate_rel_paths());
     if !dropped.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[vct] binary_freshness: armed swap dropped {} stale staged binary/binaries: {:?}",
             dropped.len(),
             dropped,
@@ -1454,7 +1454,7 @@ fn swap_on_exit_impl(install_root: &Path) {
     // arming time — re-checked here because the window between them is wide.
     let lock_path = vct_root_dir().join(UPDATE_LOCK_FILE);
     if lock_path.exists() {
-        eprintln!(
+        tracing::warn!(
             "[vct] binary_freshness: armed swap skipped — update handoff lock present at {}",
             lock_path.display(),
         );
@@ -1467,20 +1467,20 @@ fn swap_on_exit_impl(install_root: &Path) {
     // happens; the fresh binary is what their next manual launch executes
     // (standing no-auto-restart ruling).
     match prepare_update_handoff_impl(install_root, false) {
-        Ok(res) if res.handoff_active => eprintln!(
+        Ok(res) if res.handoff_active => tracing::info!(
             "[vct] binary_freshness: at-rest swap handed to vct-updater (no relaunch); lock={:?}",
             res.lock_path,
         ),
         Ok(res) => {
             // no_swaps_needed is the common, silent case (nothing staged).
             if res.skip_reason.as_deref() != Some("no_swaps_needed") {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binary_freshness: armed swap skipped — {}",
                     res.skip_reason.as_deref().unwrap_or("unknown reason"),
                 );
             }
         }
-        Err(e) => eprintln!("[vct] binary_freshness: armed swap could not run: {}", e),
+        Err(e) => tracing::warn!("[vct] binary_freshness: armed swap could not run: {}", e),
     }
 }
 
@@ -1511,7 +1511,7 @@ fn emit(install_path: &Path, fields: &crate::services::deferral::DeferralEntryFi
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(install_path, install_path, fields)
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] binary_freshness: deferral emit for {} failed (non-fatal): {}",
             fields.condition_id, e,
         );

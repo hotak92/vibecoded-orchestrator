@@ -70,7 +70,17 @@ dunce = "1"
 # doesn't rely on re-export through core's public API.
 directories = "6"
 
-# Logging (println for v0.2.21 minimal stub; structured logging is a v0.2.22 followup)
+# Logging. v0.2.91 (#21) retires the v0.2.21 "println minimal stub" note
+# that used to sit here: hub diagnostics now go through `tracing` macros
+# at honest levels. Only the macro crate is declared — the subscriber
+# lives in `vct_launcher_core::logging::init_tracing`, one home shared
+# with the launcher binary, so the two can never drift into different
+# formats or different level-resolution rules.
+#
+# Machine contracts (the `--status` / `--boot-status` stdout lines the
+# CLI and its callers parse) stay bare `println!`, annotated
+# `// [vct-print-contract]` and enforced by the no-bare-prints ratchet.
+tracing = "0.1"
 
 # Random for hub auth tokens (will reuse the same posture as the in-launcher hub)
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }

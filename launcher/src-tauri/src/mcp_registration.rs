@@ -707,7 +707,7 @@ pub fn register_default_orchestrator_mcps(
         // Surface any dropped keys as a soft warning so callers see them
         // in logs without parsing the structured report.
         if !outcome.dropped_keys.is_empty() {
-            eprintln!(
+            tracing::info!(
                 "[vct] register_default_orchestrator_mcps: dropped {} env key(s) \
                  from `{}` entry (allowlist/secret-shape filter): {:?}",
                 outcome.dropped_keys.len(),

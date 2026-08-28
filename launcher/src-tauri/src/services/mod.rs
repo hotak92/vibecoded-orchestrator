@@ -57,7 +57,7 @@ pub async fn stop_all<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
     if let Err(e) = crate::commands::lifecycle::services_stop_all().await {
         // Surface to stderr but DO NOT propagate — the user clicked
         // "Quit and stop services" and we must not block app.exit().
-        eprintln!("[vct] services::stop_all: best-effort stop failed: {}", e);
+        tracing::warn!("[vct] services::stop_all: best-effort stop failed: {}", e);
     }
     Ok(())
 }

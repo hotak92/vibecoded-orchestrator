@@ -582,7 +582,7 @@ pub async fn list_legacy_codegraph_collections(
         Err(e) => {
             // Weaviate unreachable → empty report, not an error. The
             // launcher's first-startup banner stays hidden in that case.
-            eprintln!("[vct] list_legacy_codegraph_collections: {}", e);
+            tracing::warn!("[vct] list_legacy_codegraph_collections: {}", e);
             return Ok(LegacyCodegraphReport {
                 collections: Vec::new(),
                 affected_projects: Vec::new(),
@@ -1370,7 +1370,7 @@ pub async fn get_code_graph_build_status_for_projects(
                 // Per-project soft-fail: log + surface as failed so
                 // the wizard shows the error to the user instead of
                 // hanging.
-                eprintln!(
+                tracing::warn!(
                     "[vct] get_code_graph_build_status_for_projects: \
                      db lookup failed for {}: {}",
                     pid, e
@@ -1506,19 +1506,19 @@ pub async fn list_orchestrator_kg_collections(
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[vct] list_orchestrator_kg_collections http client: {}", e);
+            tracing::warn!("[vct] list_orchestrator_kg_collections http client: {}", e);
             return Ok(Vec::new());
         }
     };
     let resp = match client.get(format!("{}/v1/schema", base)).send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[vct] list_orchestrator_kg_collections schema fetch: {}", e);
+            tracing::warn!("[vct] list_orchestrator_kg_collections schema fetch: {}", e);
             return Ok(Vec::new());
         }
     };
     if !resp.status().is_success() {
-        eprintln!(
+        tracing::info!(
             "[vct] list_orchestrator_kg_collections: schema HTTP {}",
             resp.status().as_u16()
         );
@@ -1527,7 +1527,7 @@ pub async fn list_orchestrator_kg_collections(
     let schema: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[vct] list_orchestrator_kg_collections parse: {}", e);
+            tracing::warn!("[vct] list_orchestrator_kg_collections parse: {}", e);
             return Ok(Vec::new());
         }
     };
@@ -1593,13 +1593,13 @@ pub fn set_shared_kg_collection_name_with_db(
     .ok();
     let report = crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
     for w in &report.global_warnings {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: shared-KG name override refresh-all: {}",
             w
         );
     }
     for (proj_name, err) in &report.failed {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: shared-KG name override env refresh failed \
              for {}: {}",
             proj_name, err

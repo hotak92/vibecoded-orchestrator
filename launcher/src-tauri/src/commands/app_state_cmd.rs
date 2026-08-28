@@ -62,7 +62,7 @@ fn maybe_reproject_after_app_state_write(
     }
     let report = crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
     for (name, err) in &report.failed {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: app_state_set({}) env re-projection failed for {}: {}",
             key, name, err
         );
@@ -86,7 +86,7 @@ async fn reproject_after_app_state_write_blocking(app: tauri::AppHandle, key: St
     )
     .await
     {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: app_state_set({}) env re-projection: {} \
              (DB write already committed)",
             key_for_log, e

@@ -273,7 +273,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
     let classes_lower = match fetch_schema_classes_lower(weaviate_url).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] binding-reconcile: schema probe failed ({}); skipping — \
                  probe failure is not evidence of absence, next boot retries",
                 e
@@ -286,7 +286,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
     let projects = match db.list_projects() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[vct] binding-reconcile: list_projects failed: {}", e);
+            tracing::warn!("[vct] binding-reconcile: list_projects failed: {}", e);
             return report;
         }
     };
@@ -300,7 +300,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
         let binding = match db.get_project_codegraph_binding(&project.id) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binding-reconcile: get binding for {}: {}",
                     project.id, e
                 );
@@ -355,7 +355,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                     b.enabled,
                     &b.config,
                 ) {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] binding-reconcile: restore {} → {} for {} failed: {}",
                         old_prefix, candidate, project.id, e
                     );
@@ -374,7 +374,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                     }),
                 )
                 .ok();
-                eprintln!(
+                tracing::info!(
                     "[vct] binding-reconcile: restored codegraph binding for {:?} \
                      ({} → {}, evidence: {})",
                     project.name,
@@ -412,7 +412,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                     if let Err(e) =
                         crate::services::deferral::emit_deferral_entry(root, folder, &fields)
                     {
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] binding-reconcile: repair deferral emit failed \
                              (non-fatal): {}",
                             e
@@ -426,7 +426,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                         folder,
                         &["codegraph_rename_split_pending"],
                     ) {
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] binding-reconcile: settling stale rename \
                              deferral failed (non-fatal): {}",
                             e
@@ -435,7 +435,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                 }
             }
             RepairDecision::Phantom => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] binding-reconcile: project {:?} has a phantom \
                      codegraph prefix {:?} and no evidence-backed restoration \
                      candidate; leaving it alone",
@@ -489,7 +489,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                     match crate::services::deferral::emit_deferral_entry(root, folder, &fields)
                     {
                         Ok(()) => report.phantom_deferrals += 1,
-                        Err(e) => eprintln!(
+                        Err(e) => tracing::warn!(
                             "[vct] binding-reconcile: phantom deferral emit failed \
                              (non-fatal): {}",
                             e
@@ -548,7 +548,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] binding-reconcile: kg_rename_access({} → {}) \
                              for {} failed: {}",
                             phantom_name, binding_backed, project.id, e
@@ -558,7 +558,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
             }
         }
         if !restored_here.is_empty() {
-            eprintln!(
+            tracing::info!(
                 "[vct] binding-reconcile: rewrote {} phantom kg_collection_access \
                  row(s) for {:?}: {:?}",
                 restored_here.len(),
@@ -588,7 +588,7 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                 if let Err(e) =
                     crate::services::deferral::emit_deferral_entry(root, folder, &fields)
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] binding-reconcile: access-repair deferral emit \
                          failed (non-fatal): {}",
                         e

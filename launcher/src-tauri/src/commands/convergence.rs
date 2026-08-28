@@ -488,7 +488,7 @@ pub(crate) fn converge_mcp_rows_for_project(
         Err(e) => {
             // Invariant 2 — a failed read is NOT "this project has no rows".
             // Seeding here would duplicate a live catalog.
-            eprintln!(
+            tracing::warn!(
                 "[vct] convergence: mcp rows unreadable for {:?} ({}); \
                  skipping — a failed read is not evidence of absence",
                 project_name, e
@@ -539,7 +539,7 @@ pub(crate) fn converge_mcp_rows_for_project(
                         .ok();
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] convergence: seed {}/{} failed: {}",
                             project_id, name, e
                         );
@@ -576,14 +576,14 @@ pub(crate) fn converge_mcp_rows_for_project(
                             }),
                         )
                         .ok();
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] convergence: retired MCP row {:?} for {:?} \
                              (left the default set in {})",
                             name, project_name, removed_in
                         );
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] convergence: retire {}/{} failed: {}",
                             project_id, name, e
                         );
@@ -627,7 +627,7 @@ pub(crate) fn converge_at_boot(db: &Db, repo_root: Option<&Path>) -> Convergence
                     Err(e) => {
                         // Invariant 2: a detector that could not read reports
                         // nothing. It does not report "no drift" either.
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] convergence: detector for tenant {} failed \
                              ({}); reporting nothing this pass",
                             tenant.id, e
@@ -687,7 +687,7 @@ pub(crate) fn converge_at_boot(db: &Db, repo_root: Option<&Path>) -> Convergence
             // Honest about the dropped channel rather than silent: a
             // standalone-binary install has no clone to write the ledger
             // into. The audit row above still carries every pending item.
-            eprintln!(
+            tracing::warn!(
                 "[vct] convergence: {} pending item(s) but no orchestrator clone \
                  was located, so no deferral was written (see the \
                  convergence_pass audit row)",
@@ -718,7 +718,7 @@ pub(crate) fn converge_project_after_bundle_update(
     let mut outcome = TenantOutcome::default();
     converge_mcp_rows_for_project(db, project_id, project_name, folder, &mut outcome);
     if outcome.seeded > 0 || outcome.retired > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] convergence (post-bundle, {}): seeded {} MCP row(s), retired {}",
             project_id, outcome.seeded, outcome.retired
         );
@@ -765,7 +765,7 @@ fn settle_deferral(root: &Path, report: &ConvergenceReport) {
             severity: "warning",
         };
         if let Err(e) = crate::services::deferral::emit_deferral_entry(root, root, &fields) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] convergence: pending-deferral emit failed (non-fatal): {}",
                 e
             );
@@ -782,7 +782,7 @@ fn settle_deferral(root: &Path, report: &ConvergenceReport) {
         root,
         &[CID_CONVERGENCE_PENDING],
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] convergence: settling stale convergence deferral failed \
              (non-fatal): {}",
             e

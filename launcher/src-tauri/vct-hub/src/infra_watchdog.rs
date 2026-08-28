@@ -718,10 +718,11 @@ async fn restart_service(
         match run_stack_wrapper(&wrapper, infra_dir).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
+                    service,
+                    error = %e,
                     "[vct-hub] infra watchdog: launch-claude-mcp-stack wrapper \
-                     failed while healing {} (falling back to direct compose): {}",
-                    service, e
+                     failed while healing (falling back to direct compose)"
                 );
                 // Fall through to direct compose.
             }
@@ -738,14 +739,14 @@ async fn restart_service(
 pub fn spawn_infra_watchdog(db: LauncherDbHandle) {
     let config = WatchdogConfig::from_env();
     if !config.enabled {
-        println!(
+        tracing::info!(
             "[vct-hub] infra watchdog DISABLED via {}=0; infra containers \
              will NOT be auto-restarted by the hub.",
             ENV_ENABLED
         );
         return;
     }
-    println!(
+    tracing::info!(
         "[vct-hub] infra watchdog enabled (interval {}s); supervising {}.",
         config.interval.as_secs(),
         CANONICAL_INFRA_SERVICES
@@ -774,10 +775,11 @@ pub fn watcher_enabled(db: &LauncherDbHandle) -> bool {
         Ok(None) => true,
         // Read error → fail-open (don't silently disable the safety net).
         Err(e) => {
-            eprintln!(
-                "[vct-hub] infra watchdog: could not read {} ({}); assuming \
-                 ENABLED (fail-open).",
-                APP_STATE_KEY_WATCHER_ENABLED, e
+            tracing::warn!(
+                error = %e,
+                "[vct-hub] infra watchdog: could not read {}; assuming ENABLED \
+                 (fail-open).",
+                APP_STATE_KEY_WATCHER_ENABLED
             );
             true
         }
@@ -838,7 +840,7 @@ async fn run_one_tick(
         None => {
             // No podman/docker reachable — nothing the watchdog can do.
             // Quiet (one line) so logs don't fill on a runtime-less host.
-            eprintln!(
+            tracing::debug!(
                 "[vct-hub] infra watchdog: no container runtime reachable this \
                  tick; will retry next interval."
             );
@@ -850,7 +852,7 @@ async fn run_one_tick(
     let infra_dir = match infrastructure_dir(db) {
         Some(d) => d,
         None => {
-            eprintln!(
+            tracing::debug!(
                 "[vct-hub] infra watchdog: cannot locate the orchestrator clone's \
                  infrastructure/docker-compose.yml (no orchestrator-root project \
                  row, or its folder is gone); skipping this tick."
@@ -938,17 +940,19 @@ async fn run_one_tick(
         }
 
         // Attempt the restart.
-        eprintln!(
-            "[vct-hub] infra watchdog: {} ({}) is DOWN and VCO-managed; \
-             attempting restart (consecutive failures so far: {}).",
-            service, container, backoff.consecutive_failures
+        tracing::warn!(
+            service,
+            container,
+            consecutive_failures = backoff.consecutive_failures,
+            "[vct-hub] infra watchdog: service is DOWN and VCO-managed; \
+             attempting restart."
         );
         match restart_service(&runtime, &infra_dir, service).await {
             Ok(()) => {
-                println!(
-                    "[vct-hub] infra watchdog: restart of {} ({}) issued \
-                     successfully.",
-                    service, container
+                tracing::info!(
+                    service,
+                    container,
+                    "[vct-hub] infra watchdog: restart issued successfully."
                 );
                 backoff.reset_on_success();
                 ticks_since_attempt.remove(service);
@@ -956,27 +960,25 @@ async fn run_one_tick(
             Err(e) => {
                 backoff.record_failure();
                 if backoff.is_given_up() {
-                    eprintln!(
-                        "[vct-hub] infra watchdog: GIVING UP on {} ({}) after {} \
-                         consecutive failed restarts. Last error: {}. The hub \
-                         will NOT retry until the service is seen running again \
-                         (start it manually, or `touch {}` to silence the \
-                         watchdog for it). ",
+                    tracing::error!(
                         service,
                         container,
-                        backoff.consecutive_failures,
-                        e,
-                        pause_marker_path(service).display(),
+                        consecutive_failures = backoff.consecutive_failures,
+                        error = %e,
+                        pause_marker = %pause_marker_path(service).display(),
+                        "[vct-hub] infra watchdog: GIVING UP after repeated failed \
+                         restarts. The hub will NOT retry until the service is seen \
+                         running again (start it manually, or `touch` the pause \
+                         marker to silence the watchdog for it)."
                     );
                 } else {
-                    eprintln!(
-                        "[vct-hub] infra watchdog: restart of {} ({}) failed \
-                         (attempt {} / {}): {}. Backing off.",
+                    tracing::warn!(
                         service,
                         container,
-                        backoff.consecutive_failures,
-                        MAX_CONSECUTIVE_FAILURES,
-                        e
+                        attempt = backoff.consecutive_failures,
+                        max_attempts = MAX_CONSECUTIVE_FAILURES,
+                        error = %e,
+                        "[vct-hub] infra watchdog: restart failed. Backing off."
                     );
                 }
                 // Reset the tick counter so the next attempt waits the

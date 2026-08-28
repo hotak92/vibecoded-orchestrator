@@ -304,7 +304,7 @@ fn write_license_cache_for_token_gateway_in(
     let path = match license_cache_path_in(home_override) {
         Some(p) => p,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "[licensing] cannot resolve ~/.vibecoded/license_cache.json \
                  (no UserDirs); token-gateway flow will fall back to anonymous pull"
             );
@@ -314,7 +314,7 @@ fn write_license_cache_for_token_gateway_in(
 
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
+            tracing::warn!(
                 "[licensing] failed to mkdir {}: {} \
                  — token-gateway flow will fall back to anonymous pull",
                 parent.display(),
@@ -340,7 +340,7 @@ fn write_license_cache_for_token_gateway_in(
     let body = match serde_json::to_string(&payload) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[licensing] serialize license cache: {} \
                  — token-gateway flow will fall back to anonymous pull",
                 e
@@ -350,7 +350,7 @@ fn write_license_cache_for_token_gateway_in(
     };
 
     if let Err(e) = std::fs::write(&path, body) {
-        eprintln!(
+        tracing::warn!(
             "[licensing] write {} failed: {} \
              — token-gateway flow will fall back to anonymous pull",
             path.display(),
@@ -362,7 +362,7 @@ fn write_license_cache_for_token_gateway_in(
     if let Err(e) = set_cache_file_mode_0600(&path) {
         // Non-fatal: the file is written; the mode-tightening just
         // failed. Log so the user can `chmod 600` manually if they care.
-        eprintln!(
+        tracing::warn!(
             "[licensing] chmod 0600 {} failed: {} \
              (cache written; token-gateway flow still functional)",
             path.display(),
@@ -390,7 +390,7 @@ fn remove_license_cache_for_token_gateway_in(home_override: Option<&std::path::P
         return;
     }
     if let Err(e) = std::fs::remove_file(&path) {
-        eprintln!(
+        tracing::warn!(
             "[licensing] remove {} failed: {} \
              (stale cache will be rejected by the gateway on next pull)",
             path.display(),
@@ -1266,7 +1266,7 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
     let existing = match db.list_license_keys() {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[licensing/backfill] list_license_keys failed: {} — skipping backfill",
                 e
             );
@@ -1285,7 +1285,7 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
     let raw = match std::fs::read_to_string(&legacy_file_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[licensing/backfill] could not read {}: {} — skipping backfill",
                 legacy_file_path.display(),
                 e
@@ -1306,7 +1306,7 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
         &canonical_username,
         &key,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[licensing/backfill] keychain write failed: {} — skipping row insert",
             e
         );
@@ -1316,7 +1316,7 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
     // Step 4: INSERT the license_keys row.
     let prefix = key_prefix_of(&key);
     if let Err(e) = db.upsert_license_key(ORCHESTRATOR_MODULE_ID, &prefix, &canonical_username) {
-        eprintln!(
+        tracing::warn!(
             "[licensing/backfill] upsert_license_key failed: {} — row NOT inserted",
             e
         );
@@ -1325,7 +1325,7 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
         return;
     }
 
-    eprintln!(
+    tracing::info!(
         "[licensing/backfill] v0.2.43: backfilled __orchestrator__ row from \
          {} (source=legacy_backfill_v0243, key_prefix={})",
         legacy_file_path.display(),
@@ -1334,7 +1334,7 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
 
     // Step 5: run the row migration (idempotent; picks up the row we just inserted).
     if let Err(e) = ensure_legacy_orchestrator_row_migrated(db) {
-        eprintln!(
+        tracing::warn!(
             "[licensing/backfill] ensure_legacy_orchestrator_row_migrated after backfill: {}",
             e
         );
@@ -1366,7 +1366,7 @@ pub async fn list_license_keys(db: State<'_, Db>) -> Result<Vec<LicenseKeySummar
     // Best-effort: if synthesis errors (transient keyring failure), we
     // still want to render whatever rows already exist. Log + continue.
     if let Err(e) = ensure_legacy_orchestrator_row_migrated(db_ref) {
-        eprintln!(
+        tracing::warn!(
             "[licensing] legacy orchestrator-row migration soft-failed: {} \
              — list_license_keys returning current rows only",
             e

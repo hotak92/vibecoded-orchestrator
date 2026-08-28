@@ -319,12 +319,13 @@ async fn migrate_secrets(
                     IMPORT_MODULE_ID,
                     &item.key,
                 ) {
-                    eprintln!(
-                        "[vct-hub secrets_api] mark_secret_active failed for \
-                         key {:?}: {} (keychain write succeeded but the entry \
-                         is un-served + un-listed until the active flag is \
-                         set; reporting as failed so the caller retries)",
-                        item.key, e,
+                    tracing::error!(
+                        key = ?item.key,
+                        error = %e,
+                        "[vct-hub secrets_api] mark_secret_active failed (keychain \
+                         write succeeded but the entry is un-served + un-listed \
+                         until the active flag is set; reporting as failed so the \
+                         caller retries)"
                     );
                     failed.push(MigrateFailure {
                         key: item.key,
@@ -358,13 +359,14 @@ async fn migrate_secrets(
                         "Migrated from .env (V47-C keychain migration)",
                         Some(true),
                     ) {
-                        eprintln!(
+                        tracing::error!(
+                            key = ?item.key,
+                            error = %e,
                             "[vct-hub secrets_api] set_project_secret_ref failed \
-                             for key {:?}: {} (keychain write + active-flag \
-                             succeeded but the per-project ref row did not land, \
-                             so the SecretsTab would not list it; reporting as \
-                             failed so the caller retries)",
-                            item.key, e,
+                             (keychain write + active-flag succeeded but the \
+                             per-project ref row did not land, so the SecretsTab \
+                             would not list it; reporting as failed so the caller \
+                             retries)"
                         );
                         failed.push(MigrateFailure {
                             key: item.key,

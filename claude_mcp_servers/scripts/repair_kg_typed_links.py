@@ -45,7 +45,14 @@ from typing import Any
 import requests
 import weaviate
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+# v0.2.91 (Decision #21): honors the global VCO_LOG_LEVEL pref via the
+# shared vco_lib helper instead of a hardcoded INFO level. Bare import —
+# vco_lib is a SHIPPED, editable-installed part of every healthy install,
+# so a failed import here already fails loudly (ImportError), matching the
+# "no silent-fallback on vco_lib imports" discipline used elsewhere.
+from vco_lib.log_setup import configure_logging
+
+configure_logging(format="%(levelname)s %(message)s")
 logger = logging.getLogger("repair_typed_links")
 
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")

@@ -245,8 +245,15 @@ try:
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".code_ranking")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging (v0.2.91 Decision #21: honors the global VCO_LOG_LEVEL
+# pref via the shared vco_lib helper instead of a hardcoded INFO level).
+# This runs before the file's later `_reraise_vco_lib_import` enrichment
+# wrapper is defined, so it uses a bare import — vco_lib is a SHIPPED,
+# editable-installed part of every healthy install (see the "vco_lib import
+# discipline" note further below), so a failed import here already fails
+# loudly (ImportError) with no fallback, matching that same discipline.
+from vco_lib.log_setup import configure_logging
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # PR-42 (v0.2.12): install a SIGHUP handler so the launcher (or the user

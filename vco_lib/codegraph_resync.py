@@ -149,6 +149,12 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
     path_reachable_on_disk,
 )
 
+# v0.2.91 (Decision #21): the CLI entry points below (--prune-ignored,
+# --run-resync, --backfill-metadata) each called `logging.basicConfig`
+# directly with a hardcoded INFO level, ignoring the global VCO_LOG_LEVEL
+# pref. Route them through the ONE shared helper instead.
+from vco_lib.log_setup import configure_logging  # noqa: E402 — grouped with the notes above
+
 # v0.2.82 (WP-2 task 3): the resync's "owed work" staleness + the convergence
 # report's embed-vs-stamp split delegate to the ONE pure guards module, so the
 # resync count can never drift from what the analyzer's re-walk actually does.
@@ -2977,7 +2983,7 @@ def _main(argv: Optional[list] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.prune_ignored:
-        logging.basicConfig(level=logging.INFO)
+        configure_logging()
         counts = prune_ignored_rows(
             args.project, index_dot_claude=args.index_dot_claude,
         )
@@ -2985,7 +2991,7 @@ def _main(argv: Optional[list] = None) -> int:
         logger.info("codegraph prune complete: %d row(s) deleted (%s)",
                     total, counts)
     elif args.run_resync:
-        logging.basicConfig(level=logging.INFO)
+        configure_logging()
         if not args.repo_root or not args.analyzer:
             print("[resync-driver] --run-resync needs --repo-root + --analyzer",
                   file=sys.stderr)
@@ -2998,7 +3004,7 @@ def _main(argv: Optional[list] = None) -> int:
             index_dot_claude=args.index_dot_claude,
         )
     elif args.backfill_metadata:
-        logging.basicConfig(level=logging.INFO)
+        configure_logging()
         counts = backfill_codegraph_metadata(args.project)
         # The reserved `_file_path_*` summary keys are totals, not per-collection
         # row counts — exclude them from the updated-rows sum.

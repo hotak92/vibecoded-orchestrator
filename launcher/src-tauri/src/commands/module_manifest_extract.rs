@@ -232,14 +232,14 @@ pub async fn extract_manifest_from_image(
         }
         ManifestSanitizerOutcome::Accepted(warnings) => {
             for w in &warnings {
-                eprintln!(
+                tracing::warn!(
                     "[module_manifest_extract] V52-D.3 sanitizer warning for {}: {}",
                     module_id, w
                 );
             }
         }
         ManifestSanitizerOutcome::Bypassed(reason) => {
-            eprintln!(
+            tracing::warn!(
                 "[module_manifest_extract] V52-D.3 sanitizer bypassed for {}: {} \
                  (Rust runtime sanitizer remains as second line of defense)",
                 module_id, reason

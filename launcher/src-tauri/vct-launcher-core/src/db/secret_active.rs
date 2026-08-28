@@ -581,10 +581,10 @@ pub fn is_secret_active_cross_launcher(
     let own_active = match own_db.is_secret_active(scope, project_id, module_id, key) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
+                error = %e,
                 "[secret_active] is_secret_active_cross_launcher: own-DB read \
-                 failed ({}); refusing to serve (error must not over-serve)",
-                e
+                 failed; refusing to serve (error must not over-serve)"
             );
             return false;
         }
@@ -757,11 +757,10 @@ pub fn is_secret_active_cross_launcher_for_requester(
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
+                error = %e,
                 "[secret_active] is_secret_active_cross_launcher_for_requester: \
-                 own-DB read failed ({}); refusing to serve (error must not \
-                 over-serve)",
-                e
+                 own-DB read failed; refusing to serve (error must not over-serve)"
             );
             return false;
         }
@@ -909,9 +908,12 @@ pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
                 Err(e) => {
                     // Never silently omit: a real keychain error marks the
                     // whole resolution degraded so the hub surfaces it.
-                    eprintln!(
-                        "[vct-secrets] WARN: keychain read failed for user secret \
-                         {key:?} ({scope_str}): {e} — resolution marked degraded"
+                    tracing::warn!(
+                        key = ?key,
+                        scope = %scope_str,
+                        error = %e,
+                        "[vct-secrets] keychain read failed for user secret — \
+                         resolution marked degraded"
                     );
                     *degraded = true;
                 }

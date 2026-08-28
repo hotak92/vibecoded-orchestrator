@@ -733,7 +733,7 @@ fn run_dismiss_cli(
 pub(crate) async fn run_boot_doctor_and_retries(root: PathBuf) {
     let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
     else {
-        eprintln!(
+        tracing::warn!(
             "[vct] boot doctor: no vco_lib-capable python resolved — skipping \
              (the on-demand `vco doctor` still works once a venv exists)"
         );
@@ -761,11 +761,11 @@ pub(crate) async fn run_boot_doctor_and_retries(root: PathBuf) {
             let problems = summarize_boot_findings(&out.stdout);
             match problems {
                 Some(0) => {}
-                Some(n) => eprintln!(
+                Some(n) => tracing::warn!(
                     "[vct] boot doctor: {n} problem(s) recorded in the deferral \
                      ledger — see the launcher's Updates page"
                 ),
-                None => eprintln!(
+                None => tracing::warn!(
                     "[vct] boot doctor: report unparseable (exit {}) — no findings \
                      applied",
                     out.status.code().unwrap_or(-1),
@@ -773,7 +773,7 @@ pub(crate) async fn run_boot_doctor_and_retries(root: PathBuf) {
             }
         }
         Err(e) => {
-            eprintln!("[vct] boot doctor: failed to spawn ({e}) — skipping");
+            tracing::warn!("[vct] boot doctor: failed to spawn ({e}) — skipping");
             return;
         }
     }
@@ -801,7 +801,7 @@ pub(crate) async fn run_boot_doctor_and_retries(root: PathBuf) {
             // Drop the handle without waiting — the child outlives this task.
             std::mem::drop(child);
         }
-        Err(e) => eprintln!(
+        Err(e) => tracing::warn!(
             "[vct] deferral retry: failed to spawn ({e}) — owed work stays owed \
              and the session-start hook retries it"
         ),

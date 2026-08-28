@@ -384,7 +384,7 @@ pub fn spawn<R: Runtime + 'static>(app: AppHandle<R>) {
     // downstream `reload_mcps_with` call will short-circuit because
     // `kill -HUP` is POSIX-only. No point burning a task on a no-op.
     if cfg!(windows) {
-        eprintln!(
+        tracing::warn!(
             "[settings_json_watcher] skipped on Windows (SIGHUP is POSIX-only); \
              use the manual 'Reload MCPs' button or restart your Claude Code session"
         );
@@ -393,7 +393,7 @@ pub fn spawn<R: Runtime + 'static>(app: AppHandle<R>) {
 
     tauri::async_runtime::spawn(async move {
         if let Err(e) = run_loop(app).await {
-            eprintln!("[settings_json_watcher] loop exited: {} (manual reload still available)", e);
+            tracing::warn!("[settings_json_watcher] loop exited: {} (manual reload still available)", e);
         }
     });
 }
@@ -419,7 +419,7 @@ async fn run_loop<R: Runtime + 'static>(app: AppHandle<R>) -> Result<(), String>
     // Initial project list sync. Failure here is non-fatal — we'll
     // retry on the next 30 s tick.
     if let Err(e) = sync_watches(&app, &mut watcher, &state).await {
-        eprintln!("[settings_json_watcher] initial sync failed: {} (will retry)", e);
+        tracing::warn!("[settings_json_watcher] initial sync failed: {} (will retry)", e);
     }
 
     // Bridge: a blocking-thread receiver that pumps events into a
@@ -468,7 +468,7 @@ async fn run_loop<R: Runtime + 'static>(app: AppHandle<R>) -> Result<(), String>
             _ = tokio::time::sleep(until_re_poll) => {
                 re_poll_deadline = Instant::now() + PROJECT_LIST_RE_POLL;
                 if let Err(e) = sync_watches(&app, &mut watcher, &state).await {
-                    eprintln!("[settings_json_watcher] re-sync failed: {} (will retry)", e);
+                    tracing::warn!("[settings_json_watcher] re-sync failed: {} (will retry)", e);
                 }
             }
         }
@@ -499,7 +499,7 @@ async fn sync_watches<R: Runtime + 'static>(
     // Add new.
     for dir in desired.difference(&watched) {
         if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-            eprintln!(
+            tracing::warn!(
                 "[settings_json_watcher] watch({}) failed: {} (skipping)",
                 dir.display(),
                 e
@@ -702,7 +702,7 @@ async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchSt
     };
 
     if !decision.reload {
-        eprintln!(
+        tracing::warn!(
             "[settings_json_watcher] skip auto-reload: MCP-relevant env unchanged for {:?} \
              (idempotent settings.json write(s) — no SIGHUP)",
             decision.skipped
@@ -732,7 +732,7 @@ async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchSt
     let report = tokio::task::spawn_blocking(maintenance::reload_mcps_via_shell_for_watcher)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("[settings_json_watcher] reload task join failed: {}", e);
+            tracing::warn!("[settings_json_watcher] reload task join failed: {}", e);
             maintenance::ReloadReport {
                 signaled_count: 0,
                 pids: Vec::new(),
@@ -742,13 +742,13 @@ async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchSt
         });
 
     if !report.errors.is_empty() {
-        eprintln!(
+        tracing::warn!(
             "[settings_json_watcher] reload completed with errors: {:?}",
             report.errors
         );
     }
     if report.signaled_count > 0 {
-        eprintln!(
+        tracing::info!(
             "[settings_json_watcher] auto-reload: signaled {} MCP process(es) [{:?}]",
             report.signaled_count, report.pids
         );

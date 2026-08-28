@@ -753,7 +753,7 @@ pub async fn rebuild_code_graph(
     // seeing it again even when fresh orphans appear. Soft-fail: a
     // hiccup writing to app_state must NOT block the rebuild.
     if let Err(e) = db.app_state_set_bool("legacy_codegraph_notice_dismissed", false) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: failed to reset legacy_codegraph_notice_dismissed \
              after rebuild_code_graph for {}: {}. Wizard re-detection on the \
              next launcher boot may be suppressed until the user clicks \
@@ -835,7 +835,7 @@ pub fn resume_pending_builds(
     ) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: code-graph stale-running sweep failed: {}. \
                  Stale rows (if any) will appear as 'running' indefinitely; \
                  user can click Re-build code graph to recover.",
@@ -847,7 +847,7 @@ pub fn resume_pending_builds(
     match db.sweep_dead_detached_code_graph_builds(crate::pid_is_alive) {
         Ok(failed) => {
             if !failed.is_empty() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] code-graph sweep: {} detached walk(s) died mid-run \
                      (project ids: {:?}); rows flipped to failed",
                     failed.len(),
@@ -857,7 +857,7 @@ pub fn resume_pending_builds(
             swept += failed.len();
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: dead-detached code-graph sweep failed: {}. \
                  Detached 'running' rows (if any) keep their pill until the \
                  next boot; user can click Re-build code graph to recover.",
@@ -873,7 +873,7 @@ pub fn resume_pending_builds(
     let pending_ids = match db.list_pending_code_graph_builds() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: code-graph pending-list lookup failed: {}. \
                  Queued builds (if any) will not auto-resume this boot.",
                 e
@@ -893,14 +893,14 @@ pub fn resume_pending_builds(
         let project = match db.get_project(pid) {
             Ok(Some(p)) => p,
             Ok(None) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: pending code-graph build references missing project {}; skipping",
                     pid
                 );
                 continue;
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: lookup for pending code-graph build {}: {}; skipping",
                     pid, e
                 );
@@ -936,7 +936,7 @@ pub fn resume_pending_builds(
             // launcher start. (Non-root boot-resume respawns run the normal
             // `spawn_initial_build` → `migrate_stale_identities_for_build`
             // sweep as part of their build; only the root skip is sweep-free.)
-            eprintln!(
+            tracing::warn!(
                 "[vct] code-graph boot-resume: skipping + clearing PENDING build \
                  for orchestrator-root project {} ({}). The root's code graph is \
                  rebuilt by the install.py resync (single-writer identity); \
@@ -956,7 +956,7 @@ pub fn resume_pending_builds(
                 Some("boot-resume skipped: orchestrator root is rebuilt by install.py resync"),
                 None,
             ) {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: could not clear root PENDING code-graph build for {}: {}. \
                      It may re-appear as pending on the next boot (harmless — it will be \
                      skipped again).",
@@ -1237,7 +1237,7 @@ async fn run_build_task(
         if action == EmbeddingChangeAction::ForceRecreate {
             let prev_cfg = stored_configured_profile.as_deref().unwrap_or("?");
             let want = configured.as_deref().unwrap_or("?");
-            eprintln!(
+            tracing::info!(
                 "[vct] code-graph: configured embedding profile changed for '{}' \
                  (was {} → now {}) — full re-embed (one-time migration) via --force-recreate",
                 canonical_identity, prev_cfg, want
@@ -1307,7 +1307,7 @@ async fn run_build_task(
             &db, &project_id,
         )
         .unwrap_or_else(|e| {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: resolve_codegraph_index_dot_claude for {}: {} \
                  — defaulting to exclude .claude",
                 project_id, e
@@ -1644,7 +1644,7 @@ async fn run_build_task(
                          vector space.",
                         canonical_identity, stored, prov.model, prov.dim
                     );
-                    eprintln!("[vct] code-graph: {}", warning);
+                    tracing::warn!("[vct] code-graph: {}", warning);
                     // Surface verbatim to the GUI via app_state (D1: detection
                     // only — no automatic destructive action on tier drift).
                     let _ = db.app_state_set(
@@ -1724,7 +1724,7 @@ fn upsert_quiet(
         error_message,
         log_tail,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: code_graph_builds upsert failed for {}: {}",
             project_id, e
         );
@@ -2052,7 +2052,7 @@ pub(crate) fn resolve_codegraph_identity(db: &Db, project_id: &str, display_name
     let (identity, source) =
         pick_codegraph_identity(binding.as_ref().map(|b| b.collection_prefix.as_str()), display_name);
     if source == IdentitySource::RawNameFallback {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: code-graph identity for project {} could not be \
              derived from a binding prefix or a sanitizable display name \
              ('{}'); falling back to the raw display name. Rows may not match \
@@ -2562,7 +2562,7 @@ async fn migrate_stale_identities_for_build(
                         "identity migration (sweep) → '{}': moved={} deduped={} left={} failures={}",
                         canonical_identity, s.moved, s.deduped, s.left, s.failures,
                     );
-                    eprintln!("[vct] code-graph {}", detail);
+                    tracing::info!("[vct] code-graph {}", detail);
                     emit_build(
                         app,
                         project_id,
@@ -2573,7 +2573,7 @@ async fn migrate_stale_identities_for_build(
                     );
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] warning: code-graph identity sweep → '{}' failed: {} \
                          — proceeding with the build under the canonical identity \
                          (old-identity rows, if any, will be pruned when their files \
@@ -2587,7 +2587,7 @@ async fn migrate_stale_identities_for_build(
             // No stale-identity rows — nothing to migrate.
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: code-graph identity sweep probe for '{}' \
                  failed: {} — proceeding with the build under the canonical identity.",
                 canonical_identity, e
@@ -2608,7 +2608,7 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
     let mut cmd = match configure_vco_lib_command(db, "vco_lib.codegraph_resync") {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: metadata backfill for '{}' skipped — {}. \
                  is_test/doc flags will be topped up on the next backfill run.",
                 canonical_identity, e
@@ -2625,7 +2625,7 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: metadata backfill for '{}' exited {}: {}",
                     canonical_identity,
                     out.status.code().unwrap_or(-1),
@@ -2633,7 +2633,7 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[vct] warning: metadata backfill for '{}' failed to spawn: {}",
                     canonical_identity, e
                 );
@@ -2710,7 +2710,7 @@ fn persist_codegraph_provenance(
         enabled,
         &config,
     ) {
-        eprintln!(
+        tracing::warn!(
             "[vct] warning: could not persist code-graph provenance for {}: {}",
             project_id, e
         );
@@ -2771,7 +2771,7 @@ pub(crate) fn resolve_bundled_script(
         if !wrapper_requires_resilience_marker(bin) || analyzer_wrapper_is_resilient(&p1) {
             return Some(p1);
         }
-        eprintln!(
+        tracing::warn!(
             "[codegraph] WARN: project-local wrapper {} is stale \
              (pre-RT-4: no resilient interpreter-discovery marker) — falling \
              back to the orchestrator copy. A single-file bundle refresh will \
@@ -2930,7 +2930,7 @@ fn emit_stale_wrapper_deferral(
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(&repo_root, project_folder, &fields)
     {
-        eprintln!("[codegraph] stale-wrapper deferral emit failed: {}", e);
+        tracing::warn!("[codegraph] stale-wrapper deferral emit failed: {}", e);
     }
 }
 

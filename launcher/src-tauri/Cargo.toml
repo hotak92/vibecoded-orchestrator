@@ -51,6 +51,15 @@ vct-launcher-core = { path = "vct-launcher-core" }
 # different — TBD. For now the launcher tests will fail to compile
 # until resolved.
 
+# v0.2.91 (user decision #21): leveled diagnostics. Only the `tracing`
+# FACADE is a launcher dependency — the subscriber (tracing-subscriber)
+# is declared once, on vct-launcher-core, which owns `logging::init_tracing`
+# for both this binary and vct-hub. Two independent subscriber setups
+# would be a duplicate-logic violation and a race for the global
+# subscriber slot. Already resolved at 0.1.44 in the workspace lockfile
+# via tauri, so this adds no new tree.
+tracing = "0.1"
+
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

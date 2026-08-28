@@ -124,6 +124,27 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 # so this is a first-class edge on an already-vendored crate, not a new tree.
 flate2 = "1"
 
+# v0.2.91 (#21): leveled diagnostics. `tracing` supplies the macros used
+# across this crate; `tracing-subscriber` backs the ONE subscriber
+# installer (`logging::init_tracing`) that both binaries call, so the
+# launcher and the hub cannot drift into two different logging setups.
+#
+# `tracing` 0.1.44 is already resolved in the workspace lockfile
+# (transitively via Tauri), so it is a first-class edge on an
+# already-vendored crate, not a new tree.
+#
+# `tracing-subscriber` is declared with default-features OFF and only
+# `fmt` + `std`: no `ansi` (hub stderr is routinely redirected to a log
+# file, where escape sequences are noise) and no `env-filter` (that pulls
+# the regex-automata/matchers tree to reimplement a four-value choice the
+# `logging` module already parses in ten lines). `fmt` brings `registry`,
+# which is what the reloadable level filter needs.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "std",
+] }
+
 # Bug 31: libc statvfs for free-space probe (Unix only)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

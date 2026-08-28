@@ -855,12 +855,11 @@ impl<'de> Deserialize<'de> for ConfigControl {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                eprintln!(
-                    "[manifest] forward-compat: control kind '{}' not recognised by \
-                     this launcher version — rendering as Unsupported placeholder. \
-                     Original error: {}",
-                    if kind_string.is_empty() { "<missing>" } else { kind_string.as_str() },
-                    err,
+                tracing::warn!(
+                    kind = if kind_string.is_empty() { "<missing>" } else { kind_string.as_str() },
+                    error = %err,
+                    "[manifest] forward-compat: control kind not recognised by this \
+                     launcher version — rendering as Unsupported placeholder."
                 );
                 Ok(ConfigControl::Unsupported { kind_string, raw: value })
             }

@@ -213,7 +213,7 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
     let launcher_db = match req.extensions().get::<LauncherDbHandle>().cloned() {
         Some(h) => h,
         None => {
-            eprintln!("[module_db_api] LauncherDbHandle missing from request extensions");
+            tracing::error!("[module_db_api] LauncherDbHandle missing from request extensions");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "no_db_state", "launcher db handle missing");
         }
     };
@@ -317,7 +317,7 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
             }
         }
         Err(e) => {
-            eprintln!("[module_db_api] token lookup error: {}", e);
+            tracing::error!(error = %e, "[module_db_api] token lookup error");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "token lookup failed");
         }
     };

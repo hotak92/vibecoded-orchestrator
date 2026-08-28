@@ -88,7 +88,7 @@ use crate::http_error::error_response;
 /// can include path prefixes, schema hints, or sqlite filenames that we
 /// don't want to leak across the localhost boundary even on 127.0.0.1.
 fn db_error_response(context: &str, raw: String) -> axum::response::Response {
-    eprintln!("[vct-hub] {} failed: {}", context, raw);
+    tracing::error!(context, error = %raw, "[vct-hub] request failed");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
@@ -719,10 +719,11 @@ async fn project_env(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!(
-                        "[vct-hub] WARN: keychain read failed for module secret \
-                         {:?} (project {}): {} — env marked degraded",
-                        s.key, project.id, e
+                    tracing::warn!(
+                        key = ?s.key,
+                        project = %project.id,
+                        error = %e,
+                        "[vct-hub] keychain read failed for module secret — env marked degraded"
                     );
                     mark_keychain_degraded(&mut keychain_degraded);
                 }
@@ -791,10 +792,11 @@ async fn project_env(
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!(
-                            "[vct-hub] WARN: keychain read failed for bundled secret \
-                             {:?} (project {}): {} — env marked degraded",
-                            bs.key, project.id, e
+                        tracing::warn!(
+                            key = ?bs.key,
+                            project = %project.id,
+                            error = %e,
+                            "[vct-hub] keychain read failed for bundled secret — env marked degraded"
                         );
                         mark_keychain_degraded(&mut keychain_degraded);
                     }
@@ -835,10 +837,11 @@ async fn project_env(
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            eprintln!(
-                                "[vct-hub] WARN: keychain read failed for legacy \
-                                 github_pat slot (project {}): {} — env marked degraded",
-                                project.id, e
+                            tracing::warn!(
+                                project = %project.id,
+                                error = %e,
+                                "[vct-hub] keychain read failed for legacy github_pat \
+                                 slot — env marked degraded"
                             );
                             mark_keychain_degraded(&mut keychain_degraded);
                         }
@@ -948,10 +951,12 @@ async fn project_env(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!(
-                        "[vct-hub] WARN: keychain read failed for granted secret \
-                         {:?} (owner {}, grantee {}): {} — env marked degraded",
-                        g.key, g.owner_project_id, project.id, e
+                    tracing::warn!(
+                        key = ?g.key,
+                        owner = %g.owner_project_id,
+                        grantee = %project.id,
+                        error = %e,
+                        "[vct-hub] keychain read failed for granted secret — env marked degraded"
                     );
                     mark_keychain_degraded(&mut keychain_degraded);
                 }

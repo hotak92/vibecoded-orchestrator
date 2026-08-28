@@ -24,6 +24,16 @@
 //! becomes a one-line PR diff failure instead of a customer-facing
 //! incident.
 //!
+//! ## Print policy
+//!
+//! EVERY `println!` / `eprintln!` in this file is CLI OUTPUT, not a
+//! diagnostic, and is annotated `// [vct-print-contract]` for the
+//! no-bare-prints ratchet. This binary is a standalone CI tool whose
+//! stdout/stderr report (`[OK]` / `[FAIL]` / `[error]` / `[deprecation]`
+//! lines) IS its result; it installs no `tracing` subscriber and must
+//! not, since a log level could then suppress the very findings the PR
+//! gate exists to surface.
+//!
 //! Usage:
 //!   validate-manifest path/to/vct-module.json [more.json ...]
 //!   (glob expansion is the shell's job, not the bin's.)
@@ -45,6 +55,7 @@ use std::process::ExitCode;
 use vct_launcher_core::manifest::{ModuleManifest, WarningSeverity};
 
 fn print_usage() {
+    // [vct-print-contract] CLI output, not diagnostics.
     eprintln!(
         "usage: validate-manifest [--allow-empty] <manifest.json> [...]\n\
          \n\
@@ -79,6 +90,7 @@ fn main() -> ExitCode {
 
     if paths.is_empty() {
         if allow_empty {
+            // [vct-print-contract] CLI output, not diagnostics.
             println!("[skip] no manifest paths provided (--allow-empty)");
             return ExitCode::SUCCESS;
         }
@@ -104,26 +116,32 @@ fn main() -> ExitCode {
                             WarningSeverity::Error       => "[error]",
                             WarningSeverity::Deprecation => "[deprecation]",
                         };
+                        // [vct-print-contract] CLI output, not diagnostics.
                         println!("{} {}: {}: {}", prefix, path.display(), w.field, w.message);
                     }
+                    // [vct-print-contract] CLI output, not diagnostics.
                     eprintln!("[FAIL] {}: manifest contract validation failed", path.display());
                     errors += 1;
                 } else {
                     // No errors. Print any deprecation warnings, then OK.
                     for w in &warnings {
+                        // [vct-print-contract] CLI output, not diagnostics.
                         println!("[deprecation] {}: {}: {}", path.display(), w.field, w.message);
                     }
+                    // [vct-print-contract] CLI output, not diagnostics.
                     println!("[OK]   {}", path.display());
                     ok += 1;
                 }
             }
             Err(msg) => {
+                // [vct-print-contract] CLI output, not diagnostics.
                 eprintln!("[FAIL] {}: {}", path.display(), msg);
                 errors += 1;
             }
         }
     }
 
+    // [vct-print-contract] CLI output, not diagnostics.
     println!(
         "\nvalidate-manifest: {} ok, {} failed (of {} total)",
         ok,
@@ -134,6 +152,7 @@ fn main() -> ExitCode {
         // Hint at the most common cause so the PR author isn't left
         // wondering. The serde error chain usually points at the
         // offending field directly.
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!(
             "\nHint: if a paid module shipped a NEW control kind / step kind that\n\
              this launcher version doesn't know about, the launcher itself needs\n\

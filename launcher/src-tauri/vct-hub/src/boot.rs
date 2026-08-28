@@ -123,14 +123,15 @@ impl From<std::io::Error> for BootError {
 pub fn run_register_boot() -> LifecycleResult {
     match register() {
         Ok(path) => {
-            eprintln!(
-                "[vct-hub] boot autostart: registered ({})",
-                path.display()
-            );
+            tracing::info!(unit = %path.display(), "[vct-hub] boot autostart: registered");
             LifecycleResult::Ok
         }
         Err(e) => {
-            eprintln!("[vct-hub] boot autostart: ERROR {}: {}", error_kind(&e), e);
+            tracing::error!(
+                kind = error_kind(&e),
+                error = %e,
+                "[vct-hub] boot autostart: register failed"
+            );
             LifecycleResult::Err(format!("register-boot failed: {}", e))
         }
     }
@@ -140,11 +141,15 @@ pub fn run_register_boot() -> LifecycleResult {
 pub fn run_unregister_boot() -> LifecycleResult {
     match unregister() {
         Ok(()) => {
-            eprintln!("[vct-hub] boot autostart: unregistered");
+            tracing::info!("[vct-hub] boot autostart: unregistered");
             LifecycleResult::Ok
         }
         Err(e) => {
-            eprintln!("[vct-hub] boot autostart: ERROR {}: {}", error_kind(&e), e);
+            tracing::error!(
+                kind = error_kind(&e),
+                error = %e,
+                "[vct-hub] boot autostart: unregister failed"
+            );
             LifecycleResult::Err(format!("unregister-boot failed: {}", e))
         }
     }
@@ -152,22 +157,27 @@ pub fn run_unregister_boot() -> LifecycleResult {
 
 /// `vct-hub --boot-status` entry point. Exit codes per the v0.2.21
 /// design: 0 enabled, 1 disabled, 2 not-installed, 3 inspection error.
+///
+/// The four stdout words are a MACHINE CONTRACT — the command's answer,
+/// paired with the exit code the launcher's `hub_status::boot_status`
+/// reads, and documented as a CLI surface in `docs/GETTING_STARTED.md`.
+/// Bare `println!` so no log level can suppress or reformat them.
 pub fn run_boot_status() -> LifecycleResult {
     match status() {
         Ok(BootStatus::Enabled) => {
-            println!("enabled");
+            println!("enabled"); // [vct-print-contract]
             LifecycleResult::OkExit(0)
         }
         Ok(BootStatus::Disabled) => {
-            println!("disabled");
+            println!("disabled"); // [vct-print-contract]
             LifecycleResult::OkExit(1)
         }
         Ok(BootStatus::NotInstalled) => {
-            println!("not-installed");
+            println!("not-installed"); // [vct-print-contract]
             LifecycleResult::OkExit(2)
         }
         Err(e) => {
-            println!("error: {}", e);
+            println!("error: {}", e); // [vct-print-contract]
             // Inspection error is distinct from "disabled" — exit 3 lets
             // the launcher render an "OS not supported / cannot inspect"
             // state rather than misreading as plain disabled.
@@ -300,11 +310,11 @@ fn atomic_write(path: &Path, body: &[u8]) -> std::io::Result<()> {
 fn warn_if_non_default_state_dir() {
     if let Ok(custom) = std::env::var("VCT_STATE_DIR") {
         if !custom.is_empty() {
-            eprintln!(
-                "[vct-hub] boot autostart: WARNING — VCT_STATE_DIR={} is non-default. \
-                 The boot unit will use this state dir on subsequent logins, \
-                 which may not be what you want for dev installs.",
-                custom
+            tracing::warn!(
+                state_dir = %custom,
+                "[vct-hub] boot autostart: VCT_STATE_DIR is non-default. The boot \
+                 unit will use this state dir on subsequent logins, which may not \
+                 be what you want for dev installs."
             );
         }
     }
@@ -675,13 +685,13 @@ mod macos {
             .output();
         let signed = matches!(&out, Ok(o) if o.status.success());
         if !signed {
-            eprintln!(
-                "[vct-hub] boot autostart: WARNING — binary at {} appears unsigned. \
-                 macOS Gatekeeper may prevent launchd from executing it, leaving the \
-                 LaunchAgent in a restart loop. For dev builds, run \
+            tracing::warn!(
+                binary = %bin.display(),
+                "[vct-hub] boot autostart: binary appears unsigned. macOS Gatekeeper \
+                 may prevent launchd from executing it, leaving the LaunchAgent in a \
+                 restart loop. For dev builds, run \
                  `xattr -d com.apple.quarantine <bin>` or sign locally. \
-                 See v0.2.21.1 codesigning followup.",
-                bin.display()
+                 See v0.2.21.1 codesigning followup."
             );
         }
     }

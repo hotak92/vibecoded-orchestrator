@@ -46,7 +46,17 @@ import requests
 import weaviate
 from weaviate.classes.config import Configure, Property
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# v0.2.91 (Decision #21): honors the global VCO_LOG_LEVEL pref via the
+# shared vco_lib helper instead of a hardcoded INFO level. Bare import —
+# vco_lib is a SHIPPED, editable-installed part of every healthy install,
+# so a failed import here already fails loudly (ImportError). NOTE: this is
+# deliberately NOT wrapped in the graceful try/except the
+# vco_lib.embedding_service import below uses — that fallback is a
+# pre-existing (pre-v0.2.91) accommodation specific to this script's
+# half-installed-venv case, not something to extend to a brand-new import.
+from vco_lib.log_setup import configure_logging
+
+configure_logging(format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migrate_embeddings")
 
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")

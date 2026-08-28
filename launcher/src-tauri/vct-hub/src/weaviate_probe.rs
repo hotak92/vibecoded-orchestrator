@@ -68,9 +68,9 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
     let projects = match db.list_projects() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "[vct-hub] weaviate_probe: list_projects failed: {}; skipping class check",
-                e
+            tracing::error!(
+                error = %e,
+                "[vct-hub] weaviate_probe: list_projects failed; skipping class check"
             );
             return None;
         }
@@ -138,7 +138,7 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
         .build()
         .ok();
     let Some(client) = client else {
-        eprintln!("[vct-hub] weaviate_probe: failed to build reqwest::Client; skipping");
+        tracing::error!("[vct-hub] weaviate_probe: failed to build reqwest::Client; skipping");
         return None;
     };
 
@@ -191,30 +191,34 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
     // 4. Write sidecar JSONL — one line per probe round so consumers
     // can read the LATEST line for fresh state.
     if let Err(e) = append_summary_sidecar(&summary) {
-        eprintln!(
-            "[vct-hub] weaviate_probe: sidecar write failed (non-fatal): {}",
-            e
+        tracing::warn!(
+            error = %e,
+            "[vct-hub] weaviate_probe: sidecar write failed (non-fatal)"
         );
     }
 
-    // 5. Log to stderr.
+    // 5. Report the round. Missing classes are a WARN (the install is
+    // usable but retrieval against those classes will not work); an
+    // all-present round is routine INFO. The sidecar written above is the
+    // durable record either way — it is not level-gated.
     if missing_count > 0 {
-        eprintln!(
-            "[vct-hub] weaviate_probe: {} of {} expected Weaviate classes are MISSING. \
+        tracing::warn!(
+            missing = missing_count,
+            probed = summary.probed_count,
+            "[vct-hub] weaviate_probe: expected Weaviate classes are MISSING. \
              Run `python -m vco_lib.weaviate_schema bootstrap-collections` (or click \
-             'Update Bundle' in the launcher GUI) to create them.",
-            missing_count, summary.probed_count
+             'Update Bundle' in the launcher GUI) to create them."
         );
     } else if summary.probed_count > 0 {
-        eprintln!(
-            "[vct-hub] weaviate_probe: all {} expected classes present",
-            summary.probed_count
+        tracing::info!(
+            probed = summary.probed_count,
+            "[vct-hub] weaviate_probe: all expected classes present"
         );
     }
     if probe_error_count > 0 {
-        eprintln!(
-            "[vct-hub] weaviate_probe: {} probe(s) errored (weaviate unreachable?); see sidecar",
-            probe_error_count
+        tracing::warn!(
+            errored = probe_error_count,
+            "[vct-hub] weaviate_probe: probe(s) errored (weaviate unreachable?); see sidecar"
         );
     }
 

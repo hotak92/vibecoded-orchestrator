@@ -132,7 +132,7 @@ struct ServiceWatchState {
 pub fn spawn<R: Runtime + 'static>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = run_loop(app).await {
-            eprintln!("[services_watcher] loop exited: {}", e);
+            tracing::warn!("[services_watcher] loop exited: {}", e);
         }
     });
 }
@@ -161,7 +161,7 @@ async fn run_loop<R: Runtime + 'static>(app: AppHandle<R>) -> Result<(), String>
         let snapshot = match lifecycle::services_status().await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[services_watcher] status probe failed: {} (continuing)", e);
+                tracing::warn!("[services_watcher] status probe failed: {} (continuing)", e);
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }

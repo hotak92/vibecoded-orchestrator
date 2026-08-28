@@ -292,11 +292,11 @@ async fn spawn_server(
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("[diagrams-local-server] axum::serve exited: {}", e);
+            tracing::error!("[diagrams-local-server] axum::serve exited: {}", e);
         }
     });
 
-    eprintln!(
+    tracing::info!(
         "[diagrams-local-server] listening on http://127.0.0.1:{} (vendor_root={})",
         port,
         final_state.vendor_root.display(),

@@ -26,6 +26,20 @@
 //!     `mcp_registration.target_projects`) render as a permissive `{}`
 //!     (any JSON value) — the launcher accepts and forwards opaquely.
 //!
+//! ## Print policy
+//!
+//! EVERY `println!` / `eprintln!` in this file is CLI OUTPUT, not a
+//! diagnostic, and is annotated `// [vct-print-contract]` for the
+//! no-bare-prints ratchet. This binary is a standalone CI tool: its
+//! stdout IS the schema (`export-schema > file`), and its stderr IS its
+//! report. It installs no `tracing` subscriber and must not — routing a
+//! tool's own output through a level-gated logger would let a log level
+//! silently empty the file CI diffs against.
+//!
+//! The annotations are per-line rather than a blanket file exemption so
+//! that a genuine diagnostic added here later still has to be justified
+//! one line at a time.
+//!
 //! Usage:
 //!   export-schema                  → stdout (used by CI for `> file && diff`)
 //!   export-schema --out <path>     → write to <path> directly (atomic-rename)
@@ -40,6 +54,7 @@ use schemars::schema_for;
 use vct_launcher_core::manifest::ModuleManifest;
 
 fn print_usage() {
+    // [vct-print-contract] CLI output, not diagnostics.
     eprintln!(
         "usage: export-schema [--out <path> | --check <path>]\n\
          \n\
@@ -71,6 +86,7 @@ fn main() -> ExitCode {
             }
             "--out" => {
                 let Some(p) = args.get(i + 1) else {
+                    // [vct-print-contract] CLI output, not diagnostics.
                     eprintln!("--out requires a path");
                     return ExitCode::from(2);
                 };
@@ -79,6 +95,7 @@ fn main() -> ExitCode {
             }
             "--check" => {
                 let Some(p) = args.get(i + 1) else {
+                    // [vct-print-contract] CLI output, not diagnostics.
                     eprintln!("--check requires a path");
                     return ExitCode::from(2);
                 };
@@ -86,6 +103,7 @@ fn main() -> ExitCode {
                 i += 2;
             }
             other => {
+                // [vct-print-contract] CLI output, not diagnostics.
                 eprintln!("unknown flag: {}", other);
                 print_usage();
                 return ExitCode::from(2);
@@ -94,6 +112,7 @@ fn main() -> ExitCode {
     }
 
     if out.is_some() && check.is_some() {
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!("--out and --check are mutually exclusive");
         return ExitCode::from(2);
     }
@@ -105,6 +124,7 @@ fn main() -> ExitCode {
         return write_atomically(&path, &schema_json);
     }
     // Default: stdout.
+    // [vct-print-contract] CLI output, not diagnostics.
     println!("{}", schema_json);
     ExitCode::SUCCESS
 }
@@ -121,6 +141,7 @@ fn run_check(committed_path: &PathBuf, generated: &str) -> ExitCode {
     let on_disk = match std::fs::read_to_string(committed_path) {
         Ok(s) => s,
         Err(e) => {
+            // [vct-print-contract] CLI output, not diagnostics.
             eprintln!(
                 "[FAIL] cannot read committed schema at {}: {}\n\
                  Run: cargo run -p vct-launcher-core --bin export-schema --out {}",
@@ -132,9 +153,11 @@ fn run_check(committed_path: &PathBuf, generated: &str) -> ExitCode {
         }
     };
     if on_disk == generated {
+        // [vct-print-contract] CLI output, not diagnostics.
         println!("[OK] {} matches the live schema", committed_path.display());
         ExitCode::SUCCESS
     } else {
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!(
             "[FAIL] {} is out of sync with the live schema.\n\
              Run: cargo run -p vct-launcher-core --bin export-schema --out {}\n\
@@ -145,6 +168,7 @@ fn run_check(committed_path: &PathBuf, generated: &str) -> ExitCode {
         // Print a unified-ish diff hint so CI logs surface the drift.
         let on_disk_lines: Vec<&str> = on_disk.lines().collect();
         let gen_lines: Vec<&str> = generated.lines().collect();
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!(
             "(committed: {} lines, generated: {} lines)",
             on_disk_lines.len(),
@@ -157,6 +181,7 @@ fn run_check(committed_path: &PathBuf, generated: &str) -> ExitCode {
 fn write_atomically(path: &PathBuf, contents: &str) -> ExitCode {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     if let Err(e) = std::fs::create_dir_all(parent) {
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!("[FAIL] cannot create parent dir {}: {}", parent.display(), e);
         return ExitCode::FAILURE;
     }
@@ -167,10 +192,12 @@ fn write_atomically(path: &PathBuf, contents: &str) -> ExitCode {
             .unwrap_or_else(|| "schema".to_string())
     ));
     if let Err(e) = std::fs::write(&tmp, contents) {
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!("[FAIL] cannot write tempfile {}: {}", tmp.display(), e);
         return ExitCode::FAILURE;
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
+        // [vct-print-contract] CLI output, not diagnostics.
         eprintln!(
             "[FAIL] cannot atomic-rename {} → {}: {}",
             tmp.display(),
@@ -181,6 +208,7 @@ fn write_atomically(path: &PathBuf, contents: &str) -> ExitCode {
         let _ = std::fs::remove_file(&tmp);
         return ExitCode::FAILURE;
     }
+    // [vct-print-contract] CLI output, not diagnostics.
     println!("wrote {}", path.display());
     ExitCode::SUCCESS
 }

@@ -58,9 +58,9 @@ pub async fn start_hub_server() -> Result<u16, String> {
             weaviate_probe::spawn_startup_probe(probe_db, &local_config);
         }
         Err(e) => {
-            eprintln!(
-                "[vct-hub] weaviate_probe: cannot open launcher.db for class check ({}); skipping",
-                e
+            tracing::warn!(
+                error = %e,
+                "[vct-hub] weaviate_probe: cannot open launcher.db for class check; skipping"
             );
         }
     }
@@ -268,7 +268,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("[vct-hub] Server error: {}", e);
+            tracing::error!(error = %e, "[vct-hub] server error");
         }
     });
 
@@ -333,9 +333,17 @@ pub async fn start_hub_server() -> Result<u16, String> {
     } else {
         "all interfaces (VCT_HUB_BIND_ALL opt-in or hub-consuming module installed)"
     };
-    println!(
-        "[vct-hub] API server running on http://127.0.0.1:{} (bound {}: {})",
-        actual_port, bind_ip, bind_note
+    // v0.2.91: this was the hub's ONE diagnostic on stdout — the stream
+    // the lifecycle CLI's machine contract owns (`--status`,
+    // `--boot-status`). Nothing ever parsed it, so moving it to the
+    // diagnostics channel with the rest costs nothing and stops a daemon
+    // log line from interleaving into a parsed stream.
+    tracing::info!(
+        port = actual_port,
+        bind = %bind_ip,
+        exposure = bind_note,
+        "[vct-hub] API server running on http://127.0.0.1:{}",
+        actual_port
     );
     Ok(actual_port)
 }
@@ -476,12 +484,12 @@ fn resolve_hub_bind_ip(db: &vct_launcher_core::db::Db) -> std::net::Ipv4Addr {
     let modules_present = match db.has_global_module_install() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "[vct-hub] WARNING: could not read module installs for the bind \
-                 decision ({}); keeping the conservative loopback bind. If a \
+            tracing::warn!(
+                error = %e,
+                "[vct-hub] could not read module installs for the bind \
+                 decision; keeping the conservative loopback bind. If a \
                  hub-consuming module's container cannot reach the hub, restart \
-                 the hub once launcher.db is readable.",
-                e
+                 the hub once launcher.db is readable."
             );
             false
         }
@@ -489,7 +497,7 @@ fn resolve_hub_bind_ip(db: &vct_launcher_core::db::Db) -> std::net::Ipv4Addr {
     let (ip, reason) = decide_hub_bind_ip(env_value.as_deref(), modules_present);
     match reason {
         BindReason::ModuleWiden => {
-            eprintln!(
+            tracing::info!(
                 "[vct-hub] NOTICE: binding 0.0.0.0 (all interfaces) because a \
                  hub-consuming module is installed — its container reaches the \
                  hub via host.containers.internal, which loopback cannot serve \
@@ -503,8 +511,8 @@ fn resolve_hub_bind_ip(db: &vct_launcher_core::db::Db) -> std::net::Ipv4Addr {
             );
         }
         BindReason::UserEnvOptOut if modules_present => {
-            eprintln!(
-                "[vct-hub] WARNING: VCT_HUB_BIND_ALL={} forces a loopback-only \
+            tracing::warn!(
+                "[vct-hub] VCT_HUB_BIND_ALL={} forces a loopback-only \
                  bind while a hub-consuming module is installed — its container \
                  CANNOT reach the hub (host.containers.internal never resolves \
                  to the host's 127.0.0.1). Unset VCT_HUB_BIND_ALL (or set it to \

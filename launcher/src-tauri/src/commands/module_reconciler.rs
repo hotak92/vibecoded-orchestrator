@@ -149,7 +149,7 @@ fn reconcile_installed_modules_inner(
     let installs = match db.list_module_installs_with_status("installed") {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("[reconciler] failed to list installed module rows: {}", e);
+            tracing::error!("[reconciler] failed to list installed module rows: {}", e);
             return report;
         }
     };
@@ -175,7 +175,7 @@ fn reconcile_installed_modules_inner(
                     .map(last_error_indicates_pull_failure)
                     .unwrap_or(false)
             {
-                eprintln!(
+                tracing::warn!(
                     "[reconciler] V0243-12: {} ({}): container_pull, \
                      container_name=NULL, last_error indicates pull failure \
                      ({:?}); marking status=broken",
@@ -188,7 +188,7 @@ fn reconcile_installed_modules_inner(
                         report.broken.push(row.module_id.clone());
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::error!(
                             "[reconciler] failed to mark {} broken (pull-fail): {}",
                             row.module_id, e
                         );
@@ -201,7 +201,7 @@ fn reconcile_installed_modules_inner(
             continue;
         }
 
-        eprintln!(
+        tracing::warn!(
             "[reconciler] {} ({}@{}): on-disk manifest missing at {}; marking status=broken",
             row.module_id,
             row.project_id.as_deref().unwrap_or("<global>"),
@@ -217,7 +217,7 @@ fn reconcile_installed_modules_inner(
                 // and will surface the same problem on next boot —
                 // user sees a misleading-but-stable state instead of
                 // a launcher that won't boot.
-                eprintln!(
+                tracing::error!(
                     "[reconciler] failed to mark {} broken: {}",
                     row.module_id, e
                 );
@@ -234,7 +234,7 @@ fn reconcile_installed_modules_inner(
         || report.healthy > 0
         || !report.healed_installing.is_empty()
     {
-        eprintln!(
+        tracing::info!(
             "[reconciler] swept {} installed module row(s): {} healthy, {} broken; \
              {} wedged-installing row(s) auto-healed to error",
             report.healthy as usize + report.broken.len(),
@@ -287,7 +287,7 @@ fn heal_wedged_installing_rows(db: &Db, report: &mut ReconcileReport) {
     let rows = match db.list_module_installs_with_status("installing") {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[reconciler] failed to list wedged 'installing' rows: {}",
                 e
             );
@@ -296,7 +296,7 @@ fn heal_wedged_installing_rows(db: &Db, report: &mut ReconcileReport) {
     };
 
     for row in rows {
-        eprintln!(
+        tracing::warn!(
             "[reconciler] {} ({}@{}): wedged at status='installing' at boot \
              (no install in progress across a restart) — healing to status=error",
             row.module_id,
@@ -312,7 +312,7 @@ fn heal_wedged_installing_rows(db: &Db, report: &mut ReconcileReport) {
             Err(e) => {
                 // Per-row soft-fail: the row stays 'installing' and is
                 // re-attempted on the next boot. Never block startup.
-                eprintln!(
+                tracing::error!(
                     "[reconciler] failed to heal wedged 'installing' row {}: {}",
                     row.module_id, e
                 );

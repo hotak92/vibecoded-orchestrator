@@ -1372,7 +1372,7 @@ pub(crate) fn resolve_manifest_for_install(
                 _ => false, // any parse failure → on-disk wins (safety net)
             };
             if l0_is_newer {
-                eprintln!(
+                tracing::info!(
                     "[v0.2.45 V45-C] L0 catalog has newer version for {}: \
                      on_disk={} l0={} — synthesizing from L0 \
                      (preserving on-disk install.scope={})",
@@ -1489,7 +1489,7 @@ fn apply_authoritative_scope(
     if manifest.install.scope == authoritative {
         return;
     }
-    eprintln!(
+    tracing::info!(
         "[scope-backstop] {}: resolved manifest scope={} overridden by \
          authoritative on-disk extracted-manifest scope={} \
          (scope is a module identity property, not per-version)",
@@ -1672,7 +1672,7 @@ pub async fn install_module_for_project(
                         "existing_install_id": prior.id,
                     }),
                 )?;
-                eprintln!(
+                tracing::info!(
                     "[modules] install_module_for_project[{}]: an install is already \
                      in flight — returning the in-flight row instead of spawning a \
                      second pull.",
@@ -1785,14 +1785,14 @@ pub async fn install_module_for_project(
                 {
                     Ok(Some(refresh_report)) => {
                         for (name, err) in &refresh_report.failed {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] warning: post-seed env re-projection failed for {}: {}",
                                 name, err
                             );
                         }
                     }
                     Ok(None) => {} // 0 rows inserted → no refresh ran
-                    Err(e) => eprintln!("[vct] warning: {}", e),
+                    Err(e) => tracing::warn!("[vct] warning: {}", e),
                 }
             }
         }
@@ -1881,7 +1881,7 @@ pub async fn install_module_for_project(
                     return Err(format!("Install rejected for module {}: {}", module_id, msg));
                 }
                 for w in warnings.iter().filter(|w| w.severity == WarningSeverity::Deprecation) {
-                    eprintln!(
+                    tracing::warn!(
                         "[install] manifest deprecation for {}: {}: {}",
                         module_id, w.field, w.message
                     );
@@ -1959,7 +1959,7 @@ pub async fn install_module_for_project(
                     if !allowlist.is_empty() {
                         match db.list_mcp_tool_defaults(&mcp_reg.mcp_name) {
                             Ok(defaults) if !defaults.is_empty() => {
-                                eprintln!(
+                                tracing::info!(
                                     "[v0.2.43/V0243-17] {} (mcp={}): tool_allowlist \
                                      declares {} tool(s); {} row(s) confirmed in \
                                      module_mcp_tool_defaults",
@@ -1974,7 +1974,7 @@ pub async fn install_module_for_project(
                                 // soft-failed. Audit the anomaly for later forensics;
                                 // do NOT fail the install (rows can be reconciled on
                                 // next update / restart).
-                                eprintln!(
+                                tracing::warn!(
                                     "[v0.2.43/V0243-17] WARN: {} (mcp={}): tool_allowlist \
                                      has {} tool(s) but module_mcp_tool_defaults has 0 rows \
                                      — reconcile_module_tool_allowlist may have soft-failed. \
@@ -1994,7 +1994,7 @@ pub async fn install_module_for_project(
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
+                                tracing::error!(
                                     "[v0.2.43/V0243-17] {} (mcp={}): list_mcp_tool_defaults \
                                      query failed: {}",
                                     module_id, mcp_reg.mcp_name, e,
@@ -2125,7 +2125,7 @@ pub async fn install_module_for_project(
                                 // misleading "download pending" hint for a
                                 // user who chose the free tier.
                                 if !is_module_licensed(&manifest_clone, db_ref) {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "[module_default_weights] R5 auto-trigger: \
                                          skipping (license revoked between install-gate \
                                          and spawn) for module {} project {}",
@@ -2148,7 +2148,7 @@ pub async fn install_module_for_project(
                         (Some(name), None)
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::error!(
                             "[module_service] start_container_after_install failed (install row stays installed): {}",
                             e
                         );
@@ -2444,7 +2444,7 @@ pub async fn update_module_for_project(
                     if !allowlist.is_empty() {
                         match db.list_mcp_tool_defaults(&mcp_reg.mcp_name) {
                             Ok(defaults) if !defaults.is_empty() => {
-                                eprintln!(
+                                tracing::info!(
                                     "[v0.2.43/V0243-17] update: {} (mcp={}): {} row(s) in \
                                      module_mcp_tool_defaults (expected >= 1 for {} tool(s))",
                                     module_id, mcp_reg.mcp_name,
@@ -2452,7 +2452,7 @@ pub async fn update_module_for_project(
                                 );
                             }
                             Ok(_) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "[v0.2.43/V0243-17] WARN: update: {} (mcp={}): \
                                      tool_allowlist non-empty but 0 rows in \
                                      module_mcp_tool_defaults after reconcile",
@@ -2470,7 +2470,7 @@ pub async fn update_module_for_project(
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
+                                tracing::error!(
                                     "[v0.2.43/V0243-17] update: {} (mcp={}): \
                                      list_mcp_tool_defaults failed: {}",
                                     module_id, mcp_reg.mcp_name, e,
@@ -2596,7 +2596,7 @@ pub async fn uninstall_module_v2(
     let manifest_opt = match install_path_manifest_lookup(&db, &module_id) {
         Ok((m, _)) => Some(m),
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[uninstall] manifest for {} not in catalog ({}); falling back to legacy \
                  hardcoded behaviour (remove install_dir, no MCP deregister, no secret wipe). \
                  If the module declares preserve_paths or registers an MCP, manual cleanup \
@@ -2623,7 +2623,7 @@ pub async fn uninstall_module_v2(
             )
             .await
             {
-                eprintln!(
+                tracing::error!(
                     "[uninstall] stop_container_for_project({}) failed: {}",
                     container_name, e
                 );
@@ -2647,16 +2647,16 @@ pub async fn uninstall_module_v2(
         .await;
 
         if let Err(e) = tokio::fs::remove_dir_all(&install_path).await {
-            eprintln!("[uninstall] remove_dir_all {}: {}", install_path.display(), e);
+            tracing::warn!("[uninstall] remove_dir_all {}: {}", install_path.display(), e);
         }
 
         if !preserved.is_empty() {
             if let Err(e) = restore_preserved_paths(&install_path, preserved).await {
-                eprintln!("[uninstall] restore_preserved_paths failed: {}", e);
+                tracing::error!("[uninstall] restore_preserved_paths failed: {}", e);
             }
         }
     } else if !uninstall_block.remove_install_dir {
-        eprintln!(
+        tracing::info!(
             "[uninstall] manifest.uninstall.remove_install_dir=false; leaving {} on disk.",
             install_path.display(),
         );
@@ -2676,7 +2676,7 @@ pub async fn uninstall_module_v2(
                 if let Err(e) =
                     crate::mcp_registration::deregister_mcp(&target, &mcp.mcp_name)
                 {
-                    eprintln!(
+                    tracing::error!(
                         "[uninstall] deregister_mcp({}) failed: {}",
                         mcp.mcp_name, e
                     );
@@ -2695,7 +2695,7 @@ pub async fn uninstall_module_v2(
                     _ => SecretScope::PerProject { project_id: &project_id },
                 };
                 if let Err(e) = secrets::delete(scope, &module_id, &decl.key) {
-                    eprintln!(
+                    tracing::error!(
                         "[uninstall] secrets::delete({}/{}) failed: {}",
                         module_id, decl.key, e
                     );
@@ -2722,7 +2722,7 @@ pub async fn uninstall_module_v2(
     // project, not the module, and may apply again if the module is
     // reinstalled.
     if let Err(e) = db.clear_mcp_tool_defaults_for_module(&module_id) {
-        eprintln!(
+        tracing::error!(
             "[uninstall] clear_mcp_tool_defaults_for_module({}) failed: {}",
             module_id, e
         );
@@ -2771,7 +2771,7 @@ async fn uninstall_global_module(
     let manifest_opt = match install_path_manifest_lookup(db, &module_id) {
         Ok((m, _)) => Some(m),
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[uninstall] manifest for {} not in catalog ({}); falling back to legacy \
                  hardcoded behaviour (remove install_dir, no MCP deregister, no secret wipe).",
                 module_id, e,
@@ -2794,7 +2794,7 @@ async fn uninstall_global_module(
             )
             .await
             {
-                eprintln!(
+                tracing::error!(
                     "[uninstall] global stop_container_for_project({}) failed: {}",
                     container_name, e
                 );
@@ -2809,7 +2809,7 @@ async fn uninstall_global_module(
         let preserved =
             stash_preserve_paths(&install_path, &uninstall_block.preserve_paths, &ctx).await;
         if let Err(e) = tokio::fs::remove_dir_all(&install_path).await {
-            eprintln!(
+            tracing::warn!(
                 "[uninstall] global remove_dir_all {}: {}",
                 install_path.display(),
                 e
@@ -2817,14 +2817,14 @@ async fn uninstall_global_module(
         }
         if !preserved.is_empty() {
             if let Err(e) = restore_preserved_paths(&install_path, preserved).await {
-                eprintln!(
+                tracing::error!(
                     "[uninstall] global restore_preserved_paths failed: {}",
                     e
                 );
             }
         }
     } else if !uninstall_block.remove_install_dir {
-        eprintln!(
+        tracing::info!(
             "[uninstall] manifest.uninstall.remove_install_dir=false; leaving {} on disk.",
             install_path.display(),
         );
@@ -2841,7 +2841,7 @@ async fn uninstall_global_module(
                 if let Err(e) =
                     crate::mcp_registration::deregister_mcp(&target, &mcp.mcp_name)
                 {
-                    eprintln!(
+                    tracing::error!(
                         "[uninstall] global deregister_mcp({}) failed: {}",
                         mcp.mcp_name, e
                     );
@@ -2861,7 +2861,7 @@ async fn uninstall_global_module(
                     if let Err(e) =
                         secrets::delete(SecretScope::Global, &module_id, &decl.key)
                     {
-                        eprintln!(
+                        tracing::error!(
                             "[uninstall] global secrets::delete({}/{}) failed: {}",
                             module_id, decl.key, e
                         );
@@ -2890,7 +2890,7 @@ async fn uninstall_global_module(
     // posture change is visible.
     match db.has_global_module_install() {
         Ok(false) => {
-            eprintln!(
+            tracing::info!(
                 "[uninstall] '{}' was the last hub-consuming (global) module — the \
                  hub's bind narrows back to loopback-only (127.0.0.1) on its next \
                  start. Restart it now if you want the narrowed bind immediately: \
@@ -2903,7 +2903,7 @@ async fn uninstall_global_module(
             // bind stays (leave-alone).
         }
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[uninstall] could not check remaining global installs ({}); \
                  hub bind state unchanged (it re-derives at next hub start).",
                 e
@@ -2920,7 +2920,7 @@ async fn uninstall_global_module(
     // `module_settings(project_id, module_id, 'enabled_for_project')`
     // for every project — but that's Stream B's surface.
     if let Err(e) = db.clear_mcp_tool_defaults_for_module(&module_id) {
-        eprintln!(
+        tracing::error!(
             "[uninstall] global clear_mcp_tool_defaults_for_module({}) failed: {}",
             module_id, e
         );
@@ -2992,7 +2992,7 @@ fn reconcile_module_tool_allowlist(
         .collect();
     match db.reconcile_mcp_tool_defaults(&mcp.mcp_name, module_id, &entries, now_ms) {
         Ok(n) => {
-            eprintln!(
+            tracing::info!(
                 "[v0.2.34] reconciled {} MCP tool default(s) for {} (mcp={})",
                 n, module_id, mcp.mcp_name
             );
@@ -3000,7 +3000,7 @@ fn reconcile_module_tool_allowlist(
         Err(e) => {
             // Don't return the error — the install / update succeeded;
             // the defaults can be reconciled again next time.
-            eprintln!(
+            tracing::error!(
                 "[v0.2.34] reconcile_mcp_tool_defaults({}, {}) failed: {} \
                  (install/update continues; hub will fall back to hardcoded \
                   defaults until next reconcile)",
@@ -3029,7 +3029,7 @@ async fn stash_preserve_paths(
         chrono::Utc::now().timestamp_millis(),
     ));
     if let Err(e) = tokio::fs::create_dir_all(&stash_dir).await {
-        eprintln!(
+        tracing::error!(
             "[uninstall] create stash dir {} failed: {}; preserve_paths disabled this run.",
             stash_dir.display(),
             e,
@@ -3057,7 +3057,7 @@ async fn stash_preserve_paths(
         };
         let dst = stash_dir.join(&basename);
         if let Err(e) = tokio::fs::rename(&src, &dst).await {
-            eprintln!(
+            tracing::error!(
                 "[uninstall] stash preserve_path {} -> {} failed: {}",
                 src.display(),
                 dst.display(),
@@ -3101,7 +3101,7 @@ async fn restore_preserved_paths(
             }
         }
         if let Err(e) = tokio::fs::rename(&stashed_at, &target).await {
-            eprintln!(
+            tracing::error!(
                 "[uninstall] restore preserve_path {} -> {} failed: {}",
                 stashed_at.display(),
                 target.display(),

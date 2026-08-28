@@ -182,7 +182,7 @@ fn read_tuning_from(path: &Path) -> RetrievalTuning {
                 if parsed.validate().is_ok() {
                     parsed
                 } else {
-                    eprintln!(
+                    tracing::warn!(
                         "[retrieval_tuning] {} parsed but failed validation; using defaults",
                         path.display()
                     );
@@ -190,7 +190,7 @@ fn read_tuning_from(path: &Path) -> RetrievalTuning {
                 }
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[retrieval_tuning] could not parse {} as TOML ({}); using defaults",
                     path.display(),
                     e

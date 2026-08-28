@@ -121,7 +121,7 @@ pub fn probe_and_apply_workaround_if_needed() -> ProbeOutcome {
     // recompiling. If the probe ever causes a regression in some
     // distro/driver combo we haven't tested, the user can disable it.
     if std::env::var_os("VCT_WEBKIT_PREFLIGHT_OFF").is_some() {
-        eprintln!("[webkit-preflight] disabled via VCT_WEBKIT_PREFLIGHT_OFF — skipping probe");
+        tracing::warn!("[webkit-preflight] disabled via VCT_WEBKIT_PREFLIGHT_OFF — skipping probe");
         return ProbeOutcome::DisabledByEnv;
     }
 
@@ -129,7 +129,7 @@ pub fn probe_and_apply_workaround_if_needed() -> ProbeOutcome {
     // themselves (e.g. via .desktop file) we don't touch it. This also
     // makes the probe idempotent — re-running it is a no-op.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some() {
-        eprintln!(
+        tracing::warn!(
             "[webkit-preflight] WEBKIT_DISABLE_DMABUF_RENDERER already set — skipping probe"
         );
         return ProbeOutcome::UserOverrideRespected;
@@ -143,18 +143,18 @@ pub fn probe_and_apply_workaround_if_needed() -> ProbeOutcome {
 
     match result {
         Ok(()) => {
-            eprintln!("[webkit-preflight] EGL probe passed — WebKit will use GPU/DMABUF path");
+            tracing::info!("[webkit-preflight] EGL probe passed — WebKit will use GPU/DMABUF path");
             ProbeOutcome::EglHealthy
         }
         Err(ProbeError::LibrariesMissing(which)) => {
-            eprintln!(
+            tracing::warn!(
                 "[webkit-preflight] {} not found — leaving WebKit env untouched",
                 which
             );
             ProbeOutcome::LibrariesMissing
         }
         Err(ProbeError::EglInitFailed(detail)) => {
-            eprintln!(
+            tracing::warn!(
                 "[webkit-preflight] EGL probe failed ({}); setting \
                  WEBKIT_DISABLE_DMABUF_RENDERER=1 to keep WebKit from \
                  aborting. The GPU path will return automatically once \
@@ -175,7 +175,7 @@ pub fn probe_and_apply_workaround_if_needed() -> ProbeOutcome {
             // var is read only by NVIDIA's userspace).
             if is_wayland_session() {
                 std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
-                eprintln!(
+                tracing::info!(
                     "[webkit-preflight] also set __NV_DISABLE_EXPLICIT_SYNC=1 (Wayland session)"
                 );
             }
@@ -303,7 +303,7 @@ unsafe fn probe_one_render_node(
         // this node too.
         let errno = *libc::__errno_location();
         if errno == libc::EACCES {
-            eprintln!(
+            tracing::warn!(
                 "[webkit-preflight] {} not openable (EACCES) — skipping; \
                  user may not be in the 'render' group",
                 path_str

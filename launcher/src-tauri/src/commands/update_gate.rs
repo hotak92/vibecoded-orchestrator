@@ -202,7 +202,7 @@ pub fn delete_lockfile_at(path: &Path) -> bool {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[update_gate] failed to remove {}: {}",
                 path.display(),
                 e
@@ -263,7 +263,7 @@ pub fn skip_if_update_in_progress(task_name: &str) -> bool {
 /// mutate the process-wide `VCT_STATE_DIR`).
 pub fn skip_if_update_in_progress_at(task_name: &str, path: &Path) -> bool {
     if is_update_in_progress_at(path) {
-        eprintln!(
+        tracing::warn!(
             "[update_gate] {}: orchestrator update in progress — skipping this tick \
              (avoids contending with install.py for the launcher.db writer lock)",
             task_name
@@ -285,7 +285,7 @@ pub fn cleanup_if_stale_at(path: &Path) -> bool {
         None => true, // malformed deadline = stale
     };
     if stale {
-        eprintln!(
+        tracing::warn!(
             "[update_gate] removing stale lockfile (deadline={})",
             data.expected_completion_by
         );
@@ -337,7 +337,7 @@ impl UpdateInProgressGuard {
             return;
         }
         if let Err(e) = write_lockfile_at(&self.path, phase, DEFAULT_UPDATE_DURATION_MIN) {
-            eprintln!("[update_gate] advance_phase({:?}) failed: {}", phase, e);
+            tracing::warn!("[update_gate] advance_phase({:?}) failed: {}", phase, e);
         }
     }
 
@@ -422,7 +422,7 @@ fn pre_update_mcp_kill_sweep_posix() -> usize {
         if !mcp_pattern_match(&cmdline) {
             continue;
         }
-        eprintln!(
+        tracing::info!(
             "[update_gate] kill-sweep: terminating PID {} (cmd: {})",
             pid.as_u32(),
             cmdline.chars().take(120).collect::<String>()
@@ -455,7 +455,7 @@ fn pre_update_mcp_kill_sweep_windows() -> usize {
         if !mcp_pattern_match(&cmdline) {
             continue;
         }
-        eprintln!(
+        tracing::info!(
             "[update_gate] kill-sweep: terminating PID {} (cmd: {})",
             pid.as_u32(),
             cmdline.chars().take(120).collect::<String>()
@@ -662,7 +662,7 @@ pub fn steady_state_orphaned_mcp_reap() -> usize {
             continue;
         }
 
-        eprintln!(
+        tracing::warn!(
             "[update_gate] steady-state reap: terminating ORPHANED MCP PID {} \
              (parent {:?} dead, age {}s, cmd: {})",
             pid.as_u32(),
@@ -759,7 +759,7 @@ pub fn pre_update_hub_kill_sweep() -> usize {
             .map(|s| s.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!(
+        tracing::info!(
             "[update_gate] hub-sweep: terminating stray vct-hub PID {} (exe: {}, cmd: {})",
             pid.as_u32(),
             exe_basename,

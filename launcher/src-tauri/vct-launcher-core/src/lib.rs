@@ -30,6 +30,14 @@ pub mod deferral_registry;
 // machine_id_hash as the install path. See knowledge/concepts/
 // supervisor-image-resolution-variant-gap-2026-06-04.md.
 pub mod licensing;
+// v0.2.91 (#21): diagnostic log-level resolution + the ONE tracing
+// subscriber installer. Lives here rather than in either binary because
+// BOTH `vct-launcher` and `vct-hub` need the same precedence rule
+// (VCO_LOG_LEVEL > app_state `logging.level` > INFO) and the same
+// stderr/compact subscriber. Two copies would drift, and the level a
+// user picks in Preferences would then mean different things in the two
+// processes.
+pub mod logging;
 pub mod manifest;
 // v0.2.83 WP-B4: cross-language MCP scan/registration rule table loader.
 // Promoted into the core crate (like `bundled_versions`) so BOTH the

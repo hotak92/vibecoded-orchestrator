@@ -326,7 +326,7 @@ pub async fn cached_module_catalog(db: &Db) -> Result<L0CatalogResponse, String>
             // Best-effort cache write; do NOT fail the whole op if the cache
             // write fails (we already have the data).
             if let Err(e) = write_cache(db, &envelope) {
-                eprintln!("[module-catalog] cache write failed: {}", e);
+                tracing::error!("[module-catalog] cache write failed: {}", e);
             }
             Ok(envelope)
         }
@@ -335,7 +335,7 @@ pub async fn cached_module_catalog(db: &Db) -> Result<L0CatalogResponse, String>
             // it is better than returning Err — the user sees the catalog with
             // a stale-marker badge rather than an empty list + scary banner.
             if let Some(stale) = read_cache_raw(db) {
-                eprintln!(
+                tracing::warn!(
                     "[module-catalog] fetch failed ({}); falling back to stale cache",
                     fetch_err
                 );
@@ -357,7 +357,7 @@ pub async fn refresh_module_catalog(
         // Surface to the renderer so the UI can decide whether to retry;
         // we don't fail the whole call because the data IS valid, the DB
         // write is the only loss.
-        eprintln!("[module-catalog] refresh cache write failed: {}", e);
+        tracing::error!("[module-catalog] refresh cache write failed: {}", e);
     }
     Ok(envelope)
 }
@@ -404,7 +404,7 @@ pub(crate) fn parse_response_text(text: &str) -> Result<L0CatalogResponse, Strin
         // fields it does recognise (serde drops unknown fields silently with
         // our current struct layout), and the renderer-side L9 banner (Agent
         // E's scope) shows the user that an update is recommended.
-        eprintln!(
+        tracing::warn!(
             "[module-catalog] schema_version mismatch: server={}, launcher knows={}. \
              Rendering best-effort; consider updating the launcher.",
             envelope.schema_version, CURRENT_SCHEMA_VERSION
@@ -440,7 +440,7 @@ where
         match attempt_fn().await {
             AttemptOutcome::Ok(envelope) => {
                 if attempt > 0 {
-                    eprintln!(
+                    tracing::info!(
                         "[module-catalog] fetch succeeded after {} retries",
                         attempt
                     );
@@ -448,7 +448,7 @@ where
                 return Ok(envelope);
             }
             AttemptOutcome::Transient(e) => {
-                eprintln!(
+                tracing::warn!(
                     "[module-catalog] attempt {} failed (transient): {}",
                     attempt + 1,
                     if e.is_empty() { "(no detail)" } else { &e }
@@ -461,7 +461,7 @@ where
                 // Parse errors are NOT retryable. Return immediately so the
                 // caller (cache layer) does NOT overwrite cache with a bad
                 // value.
-                eprintln!("[module-catalog] permanent failure: {}", e);
+                tracing::error!("[module-catalog] permanent failure: {}", e);
                 return Err(e);
             }
         }
@@ -596,7 +596,7 @@ fn bust_cache_if_version_changed_inner(db: &Db, running_version: &str) -> Versio
     let prior = match db.app_state_get(APP_STATE_KEY_LAUNCHER_VERSION) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module-catalog] version-change check: app_state_get failed: {}",
                 e
             );
@@ -609,7 +609,7 @@ fn bust_cache_if_version_changed_inner(db: &Db, running_version: &str) -> Versio
             // here is non-fatal — next boot just goes through the same
             // FirstBoot branch.
             if let Err(e) = db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, running_version) {
-                eprintln!(
+                tracing::error!(
                     "[module-catalog] version-change seed failed: {}",
                     e
                 );
@@ -624,7 +624,7 @@ fn bust_cache_if_version_changed_inner(db: &Db, running_version: &str) -> Versio
             let rows_deleted = match db.app_state_delete_like(APP_STATE_CACHE_LIKE) {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!(
+                    tracing::error!(
                         "[module-catalog] version-change cache wipe failed ({} → {}): {}",
                         prev, running_version, e
                     );
@@ -632,13 +632,13 @@ fn bust_cache_if_version_changed_inner(db: &Db, running_version: &str) -> Versio
                 }
             };
             if let Err(e) = db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, running_version) {
-                eprintln!(
+                tracing::error!(
                     "[module-catalog] version-change marker update failed: {}",
                     e
                 );
             }
             if rows_deleted > 0 {
-                eprintln!(
+                tracing::info!(
                     "[module-catalog] launcher version changed {} → {}; \
                      wiped {} stale cache row(s)",
                     prev, running_version, rows_deleted

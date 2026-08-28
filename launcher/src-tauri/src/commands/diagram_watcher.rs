@@ -187,7 +187,7 @@ pub async fn subscribe_to_diagram_changes<R: Runtime>(
     // can't run (read-only volume, permission denied) the watcher
     // setup will fail loudly below.
     if let Err(e) = std::fs::create_dir_all(&diagrams_root) {
-        eprintln!(
+        tracing::warn!(
             "[diagram_watcher] could not create {} for watch: {} — \
              polling fallback will be used",
             diagrams_root.display(),
@@ -207,7 +207,7 @@ pub async fn subscribe_to_diagram_changes<R: Runtime>(
     }) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[diagram_watcher] notify::recommended_watcher failed for {}: {} — \
                  polling fallback will be used",
                 project_id, e
@@ -217,7 +217,7 @@ pub async fn subscribe_to_diagram_changes<R: Runtime>(
     };
 
     if let Err(e) = watcher.watch(&diagrams_root, RecursiveMode::Recursive) {
-        eprintln!(
+        tracing::warn!(
             "[diagram_watcher] watch({}) failed: {} — polling fallback will be used",
             diagrams_root.display(),
             e
@@ -308,7 +308,7 @@ fn spawn_debounce_task<R: Runtime + 'static>(app: AppHandle<R>) {
                     kind: slot.kind.as_str(),
                 };
                 if let Err(e) = app.emit("diagram-changed", &payload) {
-                    eprintln!("[diagram_watcher] emit failed: {}", e);
+                    tracing::warn!("[diagram_watcher] emit failed: {}", e);
                 }
             }
         }

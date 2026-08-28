@@ -167,7 +167,7 @@ fn refresh_env_after_user_secret_change(
         if let Err(e) =
             crate::commands::projects_v2::refresh_project_env_with_db(db, project_id)
         {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: env-file refresh after {} on {}/{} failed: {}. \
                  The keychain change has committed; env surfaces may be stale \
                  until the next refresh.",
@@ -183,7 +183,7 @@ fn refresh_env_after_user_secret_change(
     let projects = match db.list_projects() {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: env-file fan-out after {} on shared/global {} failed \
                  to list registered projects: {}. The keychain change has committed; \
                  env surfaces will pick it up on the next per-project refresh.",
@@ -196,7 +196,7 @@ fn refresh_env_after_user_secret_change(
         if let Err(e) =
             crate::commands::projects_v2::refresh_project_env_with_db(db, &row.id)
         {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: env-file refresh after {} on shared/global {}/{} \
                  for project {} failed: {}. Other registered projects continue \
                  to refresh; this one will be stale until next refresh.",
@@ -2727,7 +2727,7 @@ pub async fn set_shared_secrets_read_disabled(
              persisted to DB but env files may be stale until the next refresh.",
             e
         );
-        eprintln!("[vct] warning: {}", msg);
+        tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
 
@@ -2749,7 +2749,7 @@ pub async fn set_shared_secrets_read_disabled(
                     marker.display(),
                     e
                 );
-                eprintln!("[vct] warning: {}", msg);
+                tracing::warn!("[vct] warning: {}", msg);
                 warnings.push(msg);
             }
         } else if marker.exists() {
@@ -2761,7 +2761,7 @@ pub async fn set_shared_secrets_read_disabled(
                     marker.display(),
                     e
                 );
-                eprintln!("[vct] warning: {}", msg);
+                tracing::warn!("[vct] warning: {}", msg);
                 warnings.push(msg);
             }
         }

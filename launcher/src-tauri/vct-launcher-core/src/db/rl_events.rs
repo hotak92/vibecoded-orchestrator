@@ -836,9 +836,9 @@ impl Db {
             let ids = match archive_row_ids(&pending) {
                 Ok(ids) => ids,
                 Err(e) => {
-                    eprintln!(
-                        "[vct] rl archive: leaving unreadable pending sidecar in \
-                         place — {e}"
+                    tracing::warn!(
+                        error = %e,
+                        "[vct] rl archive: leaving unreadable pending sidecar in place"
                     );
                     continue;
                 }
@@ -863,11 +863,11 @@ impl Db {
                 if let Ok(dir_handle) = std::fs::File::open(archive_dir) {
                     let _ = dir_handle.sync_all();
                 }
-                eprintln!(
-                    "[vct] rl archive: promoted stale sidecar {} — {} row(s) \
-                     recovered (their DELETE had committed before the crash)",
-                    final_path.display(),
-                    ids.len(),
+                tracing::info!(
+                    sidecar = %final_path.display(),
+                    rows = ids.len(),
+                    "[vct] rl archive: promoted stale sidecar; rows recovered \
+                     (their DELETE had committed before the crash)"
                 );
             } else if present == ids.len() {
                 std::fs::remove_file(&pending).map_err(|e| {
@@ -962,7 +962,7 @@ impl Db {
             Ok(Some(_)) => return, // already ran on this DB
             Ok(None) => {}
             Err(e) => {
-                eprintln!("[launcher-db] quarantine backfill guard read failed: {}", e);
+                tracing::warn!(error = %e, "[launcher-db] quarantine backfill guard read failed");
                 return; // no positive confirmation → do nothing (conservative)
             }
         }
@@ -970,18 +970,21 @@ impl Db {
         match self.backfill_quarantine_out_of_range(now_ms) {
             Ok(marked) => {
                 if marked > 0 {
-                    eprintln!(
-                        "[launcher-db] RL-14 quarantine backfill: marked {} \
-                         historical out-of-range rl_events row(s)",
-                        marked
+                    tracing::info!(
+                        marked,
+                        "[launcher-db] RL-14 quarantine backfill: marked historical \
+                         out-of-range rl_events row(s)"
                     );
                 }
                 if let Err(e) = self.app_state_set(QUARANTINE_BACKFILL_STATE_KEY, "done") {
-                    eprintln!("[launcher-db] quarantine backfill guard write failed: {}", e);
+                    tracing::warn!(error = %e, "[launcher-db] quarantine backfill guard write failed");
                 }
             }
             Err(e) => {
-                eprintln!("[launcher-db] RL-14 quarantine backfill failed (will retry next open): {}", e);
+                tracing::warn!(
+                    error = %e,
+                    "[launcher-db] RL-14 quarantine backfill failed (will retry next open)"
+                );
             }
         }
     }

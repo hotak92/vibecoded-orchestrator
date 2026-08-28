@@ -137,10 +137,10 @@ pub fn restrict_file_to_owner_windows(path: &Path) {
             _ => {
                 // No stable identity to grant to — leave the default ACL
                 // in place rather than guess. Soft-fail.
-                eprintln!(
+                tracing::warn!(
+                    path = %path.display(),
                     "[boot_token] restrict_file_to_owner_windows: USERNAME unset; \
-                     leaving default ACL on {}",
-                    path.display()
+                     leaving default ACL"
                 );
                 return;
             }
@@ -172,19 +172,19 @@ pub fn restrict_file_to_owner_windows(path: &Path) {
                 // Non-zero exit: keep the file, log the code. Do NOT log
                 // stderr verbatim to avoid surfacing the path/user in a
                 // way that could aid enumeration; the exit code is enough.
-                eprintln!(
-                    "[boot_token] restrict_file_to_owner_windows: icacls exited {} \
-                     for {} (default ACL retained; write is intact)",
-                    o.status.code().unwrap_or(-1),
-                    path.display()
+                tracing::warn!(
+                    exit_code = o.status.code().unwrap_or(-1),
+                    path = %path.display(),
+                    "[boot_token] restrict_file_to_owner_windows: icacls exited \
+                     non-zero (default ACL retained; write is intact)"
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
                     "[boot_token] restrict_file_to_owner_windows: icacls spawn failed \
-                     ({}) for {} (default ACL retained; write is intact)",
-                    e,
-                    path.display()
+                     (default ACL retained; write is intact)"
                 );
             }
         }

@@ -265,12 +265,12 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                             );
                         }
                         crate::hub_status::StopOutcome::BinaryNotFound => {
-                            eprintln!(
+                            tracing::error!(
                                 "[vct] tray: cannot stop hub — vct-hub binary not found"
                             );
                         }
                         crate::hub_status::StopOutcome::Failed(msg) => {
-                            eprintln!("[vct] tray: hub stop failed: {}", msg);
+                            tracing::error!("[vct] tray: hub stop failed: {}", msg);
                         }
                     }
                 });

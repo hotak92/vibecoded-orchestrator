@@ -128,10 +128,10 @@ impl LocalConfig {
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[vct-config] WARN: failed to parse {} ({}); using compiled defaults",
-                            p.display(),
-                            e
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "[vct-config] failed to parse config file; using compiled defaults"
                         );
                     }
                 },
@@ -139,10 +139,10 @@ impl LocalConfig {
                     // Common case (user never created the file). No log.
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[vct-config] WARN: failed to read {} ({}); using compiled defaults",
-                        p.display(),
-                        e
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %e,
+                        "[vct-config] failed to read config file; using compiled defaults"
                     );
                 }
             }
@@ -172,9 +172,9 @@ impl LocalConfig {
                 format!("{}={}", field, src)
             })
             .collect();
-        eprintln!(
-            "[vct-config] loaded local config (provenance: {})",
-            pretty.join(", ")
+        tracing::info!(
+            provenance = %pretty.join(", "),
+            "[vct-config] loaded local config"
         );
 
         cfg

@@ -102,7 +102,7 @@ where
     let rows = match db.list_project_folder_paths() {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[folder-probe] failed to list project folder paths: {} \
                  (boot probe skipped this cycle)",
                 e
@@ -128,14 +128,14 @@ where
             (false, true) => {
                 // Folder disappeared between boots. Flip the flag.
                 if let Err(e) = db.set_project_folder_missing_flag(&id, true) {
-                    eprintln!(
+                    tracing::warn!(
                         "[folder-probe] failed to mark project {} as folder-missing: {}",
                         id, e
                     );
                     report.update_errors.push(id.clone());
                     continue;
                 }
-                eprintln!(
+                tracing::warn!(
                     "[folder-probe] project {}: folder is missing at {} (flagged)",
                     id, folder_path
                 );
@@ -144,14 +144,14 @@ where
             (true, false) => {
                 // Folder reappeared between boots — clear the flag.
                 if let Err(e) = db.set_project_folder_missing_flag(&id, false) {
-                    eprintln!(
+                    tracing::warn!(
                         "[folder-probe] failed to clear project {}'s folder-missing flag: {}",
                         id, e
                     );
                     report.update_errors.push(id.clone());
                     continue;
                 }
-                eprintln!(
+                tracing::info!(
                     "[folder-probe] project {}: folder restored at {} (cleared)",
                     id, folder_path
                 );

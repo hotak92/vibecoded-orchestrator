@@ -498,7 +498,7 @@ pub async fn recheck_openai_validity<R: Runtime>(
     {
         Ok(Ok(())) => {}
         Ok(Err(e)) | Err(e) => {
-            eprintln!("[openai] recheck recovery transition warning: {}", e);
+            tracing::warn!("[openai] recheck recovery transition warning: {}", e);
         }
     }
 
@@ -571,7 +571,7 @@ pub fn clear_openai_api_key(db: State<'_, Db>) -> Result<(), String> {
     // `clear_github_pat`'s soft-fail philosophy: the user clicked Clear,
     // they expect a clean slate even if the keychain row was already gone.
     if let Err(e) = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY) {
-        eprintln!("[openai] clear_openai_api_key: keychain delete failed: {}", e);
+        tracing::warn!("[openai] clear_openai_api_key: keychain delete failed: {}", e);
     }
     // Drop the active-flag row so a future register starts clean.
     let _ = db.forget_secret_active_state(
