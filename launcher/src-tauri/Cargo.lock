@@ -5438,7 +5438,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vct-launcher-core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5472,7 +5472,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 
@@ -5517,7 +5517,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vct-launcher-core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5529,7 +5529,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

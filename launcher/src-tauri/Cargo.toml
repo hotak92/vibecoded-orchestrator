@@ -253,7 +253,7 @@ libloading = "0.8"
 # references `winreg::` after the port — verified by grep over
 # `launcher/src-tauri/src/` and `launcher/src-tauri/vct-hub/src/`.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # Release-profile privacy + size hardening (PR-4, 2026-05-06).
 #
