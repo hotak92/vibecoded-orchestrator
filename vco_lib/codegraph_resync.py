@@ -2116,10 +2116,12 @@ def _record_unconverged_deferral(
 # `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
 # Locked by tests/test_stale_env_token_parity_v0291.py.
 #
-# NO LATCH here (deliberate, verified): `_register_spawn_with_hub` has a
-# single call site and fires ONCE per resync spawn inside a short-lived
-# install process — unlike the MCP surfaces, there is no second call to
-# protect from re-presenting the dead pin.
+# NO LATCH here (deliberate, verified): the shared wire helper
+# `_hub_post_codegraph_build` has exactly two one-shot callers, each in its
+# own short-lived process — `_register_spawn_with_hub` fires ONCE per resync
+# spawn (install process) and `_report_terminal_to_hub` fires ONCE per walk
+# completion (detached driver process) — unlike the MCP surfaces, there is
+# no long-lived process that would re-present the dead pin.
 
 #: The ONE definitive line. Byte-identical to every mirror.
 STALE_ENV_TOKEN_MESSAGE = (
@@ -2150,21 +2152,117 @@ def _stale_env_token_fallback(root: Path) -> Optional[str]:
     return disk_tok
 
 
+def _hub_post_codegraph_build(project_name: str, payload: dict,
+                              path_suffix: str = ""):
+    """The ONE wire helper for BOTH halves of the R-4 detached-walk build
+    contract — registration (``_register_spawn_with_hub``) and terminal
+    report (``_report_terminal_to_hub``). Registration and completion are
+    one contract (see the KG rule "pid-liveness tracking needs a terminal
+    report"): both halves resolve port/token/URL HERE so they can never
+    drift apart.
+
+    Wire contract (Rust half: ``modules_api.rs``):
+
+        POST http://127.0.0.1:<port>/api/v1/projects/<project>/codegraph-builds
+             — registration (``path_suffix=""``,
+               ``register_codegraph_build``)
+        POST .../projects/<project>/codegraph-builds/terminal
+             — terminal report (``path_suffix="/terminal"``,
+               ``report_codegraph_build_terminal``)
+
+    The terminal report is a SUBPATH, not a status on the registration
+    route (M4, v0.2.91): a pre-#31 hub ignores unknown body fields, so a
+    terminal payload on the base route would have EXECUTED as a
+    registration there — able to clobber a superseding walk's fresh running
+    row with the dead reporter's pid. On the subpath an old hub simply
+    404s, which lands in the callers' soft-skip: the exact pre-fix degrade
+    (row untouched).
+
+    Raises on ANY failure (hub down, 404 on older hubs, token missing/
+    refused) — the two public wrappers own the soft-fail posture and log
+    at debug. Returns the HTTP response object on success.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from vco_lib.paths import vct_root_dir
+
+    root = vct_root_dir()
+    port_raw = os.environ.get("VCT_HUB_PORT") or ""
+    if not port_raw:
+        try:
+            port_raw = (root / "hub.port").read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001
+            port_raw = ""
+    port = int(port_raw) if port_raw else 7700
+    token = os.environ.get("VCT_HUB_TOKEN") or ""
+    if not token:
+        token = (root / "hub.token").read_text(encoding="utf-8").strip()
+    body = _json.dumps(payload).encode("utf-8")
+    url = (
+        f"http://127.0.0.1:{port}/api/v1/projects/"
+        f"{urllib.parse.quote(project_name, safe='')}/codegraph-builds"
+        f"{path_suffix}"
+    )
+
+    def _post(bearer: str):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {bearer}",
+                "Content-Type": "application/json",
+            },
+        )
+        return urllib.request.urlopen(req, timeout=3.0)
+
+    try:
+        return _post(token)
+    except urllib.error.HTTPError as http_exc:
+        # v0.2.91 (WP-D item 4) — STALE-ENV FALLBACK. `$VCT_HUB_TOKEN`
+        # wins above and the hub rotates `hub.token` on every start,
+        # so an install run launched from a pre-update shell presented
+        # a dead credential: the build row never registered, and the
+        # GUI showed no running walk. On a PROVABLE refusal (401/403)
+        # with a provably-stale pin, retry ONCE with the on-disk
+        # token. NO latch here — each caller runs once per spawn/walk
+        # in its own short-lived process.
+        # MUST MATCH the SSOT
+        # `vco_lib/project_config.py::_stale_env_token_fallback`.
+        # A failed retry re-raises the ORIGINAL error into the callers'
+        # soft no-op debug line — this wire is observability, never a
+        # gate on the spawn or the walk.
+        if http_exc.code not in (401, 403):
+            raise
+        fallback = _stale_env_token_fallback(root)
+        if fallback is None:
+            raise
+        try:
+            resp = _post(fallback)
+        except Exception:
+            raise http_exc from None
+        logger.warning("%s", STALE_ENV_TOKEN_MESSAGE)
+        return resp
+
+
 def _register_spawn_with_hub(
     project_name: str, pid: int, repo_root: "Path | str | None" = None
 ) -> None:
-    """R-4 (Python half): best-effort registration of the detached resync
-    driver in the launcher's ``code_graph_builds`` tracker via vct-hub, so
-    the GUI top progress shows the walk and the boot orphan-sweep can
-    death-detect it (pid-aliveness).
+    """R-4 (Python half, registration): best-effort registration of the
+    detached resync driver in the launcher's ``code_graph_builds`` tracker
+    via vct-hub, so the GUI top progress shows the walk and the boot
+    orphan-sweep can death-detect it (pid-aliveness).
 
-    Wire contract (Rust half ships together under R-4 —
-    ``modules_api.rs::register_codegraph_build``):
-
-        POST http://127.0.0.1:<port>/api/v1/projects/<project>/codegraph-builds
-        Authorization: Bearer <vct_root_dir>/hub.token
-        {"status": "running", "pid": <pid>, "source": "install_resync",
-         "repo_root": "<abs repo root>"}
+    Body: ``{"status": "running", "pid": <pid>, "source": "install_resync",
+    "repo_root": "<abs repo root>"}`` — see ``_hub_post_codegraph_build``
+    for the shared wire contract. The COMPLETION half of this contract is
+    ``_report_terminal_to_hub`` (v0.2.91 #31): without it, every successful
+    walk was later mislabeled "failed" by the pid-aliveness reconciler,
+    because a success-exit and a mid-run death are indistinguishable from
+    pid-gone alone.
 
     ``repo_root`` is the PRIMARY resolver on the hub side: ``project_name`` is
     the codegraph project name (Weaviate class prefix), which is neither the
@@ -2178,24 +2276,6 @@ def _register_spawn_with_hub(
     spawn.
     """
     try:
-        import json as _json
-        import urllib.error
-        import urllib.parse
-        import urllib.request
-
-        from vco_lib.paths import vct_root_dir
-
-        root = vct_root_dir()
-        port_raw = os.environ.get("VCT_HUB_PORT") or ""
-        if not port_raw:
-            try:
-                port_raw = (root / "hub.port").read_text(encoding="utf-8").strip()
-            except Exception:  # noqa: BLE001
-                port_raw = ""
-        port = int(port_raw) if port_raw else 7700
-        token = os.environ.get("VCT_HUB_TOKEN") or ""
-        if not token:
-            token = (root / "hub.token").read_text(encoding="utf-8").strip()
         # repo_root is the PRIMARY resolver on the hub side: project_name here
         # is the codegraph project name (Weaviate class prefix), which is
         # neither the launcher project id nor its slug — the hub can't resolve
@@ -2204,56 +2284,195 @@ def _register_spawn_with_hub(
         _payload = {"status": "running", "pid": int(pid), "source": "install_resync"}
         if repo_root:
             _payload["repo_root"] = str(repo_root)
-        body = _json.dumps(_payload).encode("utf-8")
-        url = (
-            f"http://127.0.0.1:{port}/api/v1/projects/"
-            f"{urllib.parse.quote(project_name, safe='')}/codegraph-builds"
-        )
-
-        def _post(bearer: str):
-            req = urllib.request.Request(
-                url,
-                data=body,
-                method="POST",
-                headers={
-                    "Authorization": f"Bearer {bearer}",
-                    "Content-Type": "application/json",
-                },
-            )
-            return urllib.request.urlopen(req, timeout=3.0)
-
-        try:
-            resp = _post(token)
-        except urllib.error.HTTPError as http_exc:
-            # v0.2.91 (WP-D item 4) — STALE-ENV FALLBACK. `$VCT_HUB_TOKEN`
-            # wins above and the hub rotates `hub.token` on every start,
-            # so an install run launched from a pre-update shell presented
-            # a dead credential: the build row never registered, and the
-            # GUI showed no running walk. On a PROVABLE refusal (401/403)
-            # with a provably-stale pin, retry ONCE with the on-disk
-            # token. NO latch here — unlike the MCP surfaces this helper
-            # runs once per spawn in a short-lived install process.
-            # MUST MATCH the SSOT
-            # `vco_lib/project_config.py::_stale_env_token_fallback`.
-            # A failed retry re-raises the ORIGINAL error into the same
-            # soft no-op debug line below — registration is observability,
-            # never a gate on the spawn.
-            if http_exc.code not in (401, 403):
-                raise
-            fallback = _stale_env_token_fallback(root)
-            if fallback is None:
-                raise
-            try:
-                resp = _post(fallback)
-            except Exception:
-                raise http_exc from None
-            logger.warning("%s", STALE_ENV_TOKEN_MESSAGE)
+        resp = _hub_post_codegraph_build(project_name, _payload)
         logger.info(
             "codegraph resync: registered spawn with hub (HTTP %s)",
             getattr(resp, "status", "?"),
         )
     except Exception as exc:  # noqa: BLE001 — observability, never a gate
         logger.debug("codegraph resync: hub registration skipped: %s", exc)
+
+
+# ─── Terminal report (v0.2.91 #31 — the completion half of R-4) ─────────
+#
+# Field failure 2026-08-28: a hub-registered walk SUCCEEDED (analyzer exit 0,
+# 0 insert errors), the driver exited, and ~24 min later the launcher's
+# pid-aliveness reconciler classified the dead pid as "the walk died before
+# completing" — a false failure on a healthy code graph, with files_analyzed=0
+# and log_tail NULL as the fingerprint. Rule (KG: pid-liveness-tracking-needs-
+# a-terminal-report-2026-08-28): never ship the register half without the
+# terminal half. The driver now posts success/partial/failed + stats through
+# the SAME wire it registered on; the reconciler keeps firing, but only for
+# rows with no terminal status — which is now genuinely "died or lost".
+
+#: Byte cap for the log tail carried on the terminal report. Mirrors the
+#: launcher DB layer's LOG_TAIL_MAX_BYTES (db/log_tail.rs) — the hub caps
+#: again defensively on write.
+_TERMINAL_LOG_TAIL_MAX_BYTES = 4096
+
+#: Scan window over the END of the shared resync log for the analyzer's
+#: machine-readable summary lines ("Files analyzed:", "PRUNE_FAILURES=",
+#: "CODEGRAPH_PROVENANCE") — all printed at the end of a walk.
+_TERMINAL_LOG_SCAN_MAX_BYTES = 256 * 1024
+
+#: Byte cap for the error message carried on the terminal report.
+_TERMINAL_ERROR_MAX_CHARS = 512
+
+
+def _terminal_status_for(rc: int, prune_failures: "int | None") -> str:
+    """Terminal build status for the detached walk's analyzer outcome.
+
+    PARITY with the launcher-spawned reader (``commands/codegraph.rs``:
+    non-zero exit → ``failed``; exit 0 with ``PRUNE_FAILURES=N``, N>0 →
+    ``partial`` via ``success_or_partial_status``; otherwise ``success``).
+    Deliberately keyed on the ANALYZER outcome, not the driver's post-walk
+    convergence probe — convergence is the resync LEDGER's domain
+    (``codegraph_embed_resync_pending``), while the build row mirrors what
+    the launcher-spawned path would have recorded for the same run.
+    """
+    if rc != 0:
+        return "failed"
+    if (prune_failures or 0) > 0:
+        return "partial"
+    return "success"
+
+
+def _parse_analyzer_stats(text: str) -> dict:
+    """Parse the analyzer's machine-readable summary lines out of a resync
+    log window. Returns ``{"files_analyzed": int|None, "prune_failures":
+    int|None, "analyzed_commit": str|None}`` — ``None`` = line absent or
+    unparseable (absent stats are honest; never fabricated).
+
+    Python twin of the launcher's stdout readers — must match the emit
+    sites AND the Rust parsers:
+      * ``templates/scripts/analyze_code_graph.py`` — "Files analyzed: N"
+        and ``PRUNE_FAILURES=N`` (strict ``^PRUNE_FAILURES=\\d+$`` shape);
+      * ``vco_lib/codegraph_guards.py::provenance_line`` —
+        ``CODEGRAPH_PROVENANCE ... analyzed_commit=<sha|none>``;
+      * ``launcher/src-tauri/src/commands/codegraph.rs`` —
+        ``parse_files_analyzed`` / ``parse_prune_failures`` /
+        ``parse_codegraph_provenance``.
+    Last occurrence wins for every key (the freshest line is authoritative
+    — matches the Rust provenance parser's bottom-up scan; the summary
+    lines appear once per run in practice).
+    """
+    stats: dict = {
+        "files_analyzed": None,
+        "prune_failures": None,
+        "analyzed_commit": None,
+    }
+    for line in text.splitlines():
+        trimmed = line.strip()
+        idx = trimmed.find("Files analyzed:")
+        if idx != -1:
+            tokens = trimmed[idx + len("Files analyzed:"):].split()
+            if tokens:
+                try:
+                    stats["files_analyzed"] = int(tokens[0])
+                except ValueError:
+                    pass
+            continue
+        if trimmed.startswith("PRUNE_FAILURES="):
+            digits = trimmed[len("PRUNE_FAILURES="):]
+            if digits.isdigit():
+                stats["prune_failures"] = int(digits)
+            continue
+        if trimmed.startswith("CODEGRAPH_PROVENANCE "):
+            for tok in trimmed.split()[1:]:
+                if tok.startswith("analyzed_commit="):
+                    commit = tok[len("analyzed_commit="):]
+                    stats["analyzed_commit"] = None if commit == "none" else commit
+    return stats
+
+
+def _collect_terminal_stats(
+    log_path: "Path | str | None",
+) -> "tuple[dict, Optional[str]]":
+    """Read the tail window of the shared per-spawn resync log and extract
+    (stats dict, bounded log tail). The analyzer inherited the driver's
+    stdout fd (the log file) and has EXITED by the time this runs, so its
+    end-of-walk summary lines are flushed and on disk. Soft-fail: any read
+    problem (no path passed — e.g. the spawn degraded to DEVNULL — missing
+    file, decode issue) → (all-None stats, no tail); the terminal report
+    still goes out with the status alone.
+    """
+    empty = {"files_analyzed": None, "prune_failures": None, "analyzed_commit": None}
+    if not log_path:
+        return empty, None
+    try:
+        path = Path(log_path)
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - _TERMINAL_LOG_SCAN_MAX_BYTES))
+            window = fh.read().decode("utf-8", errors="replace")
+        tail = (
+            window.encode("utf-8")[-_TERMINAL_LOG_TAIL_MAX_BYTES:]
+            .decode("utf-8", errors="replace")
+        )
+        return _parse_analyzer_stats(window), tail
+    except Exception as exc:  # noqa: BLE001 — stats are best-effort
+        logger.debug("codegraph resync: terminal log-stat read skipped: %s", exc)
+        return empty, None
+
+
+def _report_terminal_to_hub(
+    project_name: str,
+    status: str,
+    *,
+    repo_root: "Path | str | None" = None,
+    files_analyzed: "int | None" = None,
+    duration_ms: "int | None" = None,
+    error_message: "str | None" = None,
+    log_tail: "str | None" = None,
+    analyzed_commit: "str | None" = None,
+) -> None:
+    """R-4 (Python half, TERMINAL report — v0.2.91 #31): post the walk's
+    outcome through the same wire the spawn registered on, so the
+    ``code_graph_builds`` row finalizes instead of being false-failed by the
+    pid-aliveness reconciler after the driver exits.
+
+    Posts to the ``/terminal`` SUBPATH of the registration route (M4 — see
+    ``_hub_post_codegraph_build``: on a pre-#31 hub the subpath 404s into
+    this function's soft-skip, the exact pre-fix degrade; the base route
+    would instead have executed the report as a registration there). Body
+    extends the registration payload: ``{"status": "success"|"partial"|
+    "failed", "pid": <driver pid>, "source": "install_resync", "repo_root":
+    ..., "files_analyzed": N?, "duration_ms": M?, "error_message": ...?,
+    "log_tail": ...?, "analyzed_commit": ...?}``. ``pid`` is this driver
+    process (== the pid the spawn registered, os.getpid()); the hub finalizes
+    ONLY a still-``running`` row carrying this exact pid, so a superseding
+    walk's fresh registration is never clobbered by a stale report.
+
+    Same soft-fail posture as registration: hub down / endpoint absent /
+    token missing → debug log, never a gate on the driver's exit.
+    """
+    try:
+        payload: dict = {
+            "status": status,
+            "pid": os.getpid(),
+            "source": "install_resync",
+        }
+        if repo_root:
+            payload["repo_root"] = str(repo_root)
+        if files_analyzed is not None:
+            payload["files_analyzed"] = int(files_analyzed)
+        if duration_ms is not None:
+            payload["duration_ms"] = int(duration_ms)
+        if error_message:
+            payload["error_message"] = str(error_message)[:_TERMINAL_ERROR_MAX_CHARS]
+        if log_tail:
+            payload["log_tail"] = log_tail
+        if analyzed_commit:
+            payload["analyzed_commit"] = analyzed_commit
+        resp = _hub_post_codegraph_build(project_name, payload,
+                                         path_suffix="/terminal")
+        logger.info(
+            "codegraph resync: reported terminal '%s' to hub (HTTP %s)",
+            status,
+            getattr(resp, "status", "?"),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never a gate
+        logger.debug("codegraph resync: hub terminal report skipped: %s", exc)
 
 
 def run_resync_and_verify(
@@ -2263,6 +2482,7 @@ def run_resync_and_verify(
     *,
     prune_stale: bool = False,
     index_dot_claude: bool = True,
+    log_path: "Path | str | None" = None,
 ) -> int:
     """R-7 driver — runs INSIDE the detached child spawned by
     :func:`spawn_background_resync`.
@@ -2270,8 +2490,14 @@ def run_resync_and_verify(
     1. Runs the analyzer as a blocking subprocess (NO timeout — project
        rule; the analyzer self-guards per embed request). ``--prune-stale``
        is forwarded only when the spawn confirmed it safe (no extra paths).
-    2. Re-probes the stale-row counts post-walk.
-    3. Positive zero → resolves any persisted resync ledger entry.
+    2. Posts the TERMINAL build status to the hub (v0.2.91 #31 — the
+       completion half of the R-4 spawn registration; without it the
+       pid-aliveness reconciler false-failed every successful walk).
+       ``log_path`` (the spawn's shared per-run log, forwarded via
+       ``--log-path``) is where the analyzer's end-of-walk summary lines
+       are read back for the report's stats; ``None`` → status-only report.
+    3. Re-probes the stale-row counts post-walk.
+    4. Positive zero → resolves any persisted resync ledger entry.
        Stale rows remain / probe unavailable → records the ONE-TIME
        unconverged deferral (soft-fail WITH a signal — the RT-5 walk died
        with none).
@@ -2317,11 +2543,48 @@ def run_resync_and_verify(
     if prune_stale:
         argv.append("--prune-stale")
     print(f"[resync-driver] running: {' '.join(argv)}", flush=True)
+    analyzer_started = time.monotonic()
+    start_error: Optional[str] = None
     try:
         rc = subprocess.run(argv, cwd=str(repo_root)).returncode  # noqa: S603
     except Exception as exc:  # noqa: BLE001
         print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)
+        start_error = f"could not start the analyzer: {exc}"
         rc = -1
+    analyzer_duration_ms = int((time.monotonic() - analyzer_started) * 1000)
+
+    # v0.2.91 (#31): TERMINAL report — the completion half of the R-4 spawn
+    # registration. The analyzer's completion is known exactly here (rc is
+    # final; its end-of-walk summary lines are flushed to the shared log), so
+    # this is where the build row finalizes. Placed BEFORE the post-walk
+    # probes: the probes serve the resync LEDGER (convergence), not the build
+    # row, and must never delay or gate the terminal status. Soft-fail
+    # throughout — the reporter never changes the driver's exit.
+    try:
+        stats, log_tail = _collect_terminal_stats(log_path)
+        terminal_status = _terminal_status_for(rc, stats.get("prune_failures"))
+        error_message = start_error
+        if error_message is None and terminal_status == "failed":
+            error_message = (
+                f"analyzer exited {rc}; see the resync log for details"
+            )
+        _report_terminal_to_hub(
+            project_name,
+            terminal_status,
+            repo_root=repo_root,
+            # Mirror the launcher-spawned reader: a FAILED run's count is 0
+            # (nothing trustworthy was inserted); success/partial carry the
+            # parsed count, or omit it when the line wasn't found.
+            files_analyzed=(
+                0 if terminal_status == "failed" else stats.get("files_analyzed")
+            ),
+            duration_ms=analyzer_duration_ms,
+            error_message=error_message,
+            log_tail=log_tail,
+            analyzed_commit=stats.get("analyzed_commit"),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never a gate
+        logger.debug("codegraph resync: terminal report raised: %s", exc)
 
     try:
         counts = count_stale_rows(
@@ -2767,6 +3030,14 @@ def spawn_background_resync(
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
 
+    # v0.2.91 (#31): tell the driver WHERE its own stdout lands so it can read
+    # the analyzer's end-of-walk summary lines back out of the shared log for
+    # the terminal report (fd introspection is not portable; the path is).
+    # Only when a real log file was opened — a DEVNULL degrade has no stats
+    # source and the driver then posts a status-only terminal report.
+    if log_handle is not None and log_path is not None:
+        argv += ["--log-path", str(log_path)]
+
     # F9: spawn the ignore-set prune as a SECOND detached child (this module
     # run as a script — see the __main__ handler). Background, soft-fail:
     # a prune spawn failure never blocks the resync itself. Rows it deletes
@@ -2980,6 +3251,10 @@ def _main(argv: Optional[list] = None) -> int:
     parser.add_argument("--prune-stale", action="store_true",
                         help="forward --prune-stale to the analyzer "
                              "(--run-resync; spawn passes it only when safe)")
+    parser.add_argument("--log-path",
+                        help="the spawn's shared per-run log file "
+                             "(--run-resync; stats source for the #31 "
+                             "terminal report)")
     args = parser.parse_args(argv)
 
     if args.prune_ignored:
@@ -3002,6 +3277,7 @@ def _main(argv: Optional[list] = None) -> int:
             Path(args.analyzer),
             prune_stale=args.prune_stale,
             index_dot_claude=args.index_dot_claude,
+            log_path=Path(args.log_path) if args.log_path else None,
         )
     elif args.backfill_metadata:
         configure_logging()

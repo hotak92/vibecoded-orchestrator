@@ -65,6 +65,10 @@ pub fn router() -> Router<LauncherDbHandle> {
             "/projects/{project_id}/codegraph-builds",
             post(register_codegraph_build),
         )
+        .route(
+            "/projects/{project_id}/codegraph-builds/terminal",
+            post(report_codegraph_build_terminal),
+        )
         .route("/projects/by-slug/{slug}", get(get_project_by_slug_route))
         .route("/projects/by-path", get(get_project_by_path_route))
 }
@@ -325,7 +329,9 @@ async fn get_project_by_slug_route(
 struct RegisterCodegraphBuildReq {
     /// OS pid of the DETACHED analyzer driver (must be > 0). This is the
     /// wrapper/driver pid (`codegraph_resync.py --run-resync`), NOT the
-    /// analyzer child — the driver is what outlives the launcher.
+    /// analyzer child — the driver is what outlives the launcher. On a
+    /// terminal report it is the row-match guard: only a still-`running`
+    /// row carrying exactly this pid finalizes.
     pid: u32,
     /// Free-text origin marker (e.g. "install_resync"). Advisory only.
     #[serde(default)]
@@ -339,34 +345,54 @@ struct RegisterCodegraphBuildReq {
     /// callers that legitimately pass one. (Pre-gate correctness audit C-3.)
     #[serde(default)]
     repo_root: Option<String>,
+    /// v0.2.91 (#31): route-scoped status. On the REGISTRATION route only
+    /// `"running"` (or absent — pre-#31 drivers keep working) is accepted;
+    /// terminal statuses there are REJECTED (M4 — see the handler doc). On
+    /// the `/terminal` subroute the field is REQUIRED and must be one of
+    /// `"success"` / `"partial"` / `"failed"`.
+    #[serde(default)]
+    status: Option<String>,
+    // ── Terminal-report stats (ignored on registration) ──
+    /// Parsed "Files analyzed: N" count; absent = unknown → stored as 0
+    /// (same fallback as the launcher-spawned stdout reader).
+    #[serde(default)]
+    files_analyzed: Option<u32>,
+    /// Analyzer wall time measured by the driver; absent → the DB layer
+    /// falls back to `now - started_at`.
+    #[serde(default)]
+    duration_ms: Option<i64>,
+    /// Failure summary for `status = "failed"` (e.g. the analyzer exit code).
+    #[serde(default)]
+    error_message: Option<String>,
+    /// Bounded tail of the shared resync log (the DB layer caps at 4 KiB).
+    #[serde(default)]
+    log_tail: Option<String>,
+    /// Detected languages, when the reporter has them cheaply. The Python
+    /// driver currently omits this (no cheap source — the launcher derives
+    /// it from its own pre-build walk); accepted for forward-compat.
+    #[serde(default)]
+    languages: Option<Vec<String>>,
+    /// `analyzed_commit=<sha>` from the analyzer's CODEGRAPH_PROVENANCE
+    /// line; stamps `project_codegraph_bindings.last_analyzed_commit` on a
+    /// successful finalize. Absent = unknown → the stored commit is kept.
+    #[serde(default)]
+    analyzed_commit: Option<String>,
 }
 
-/// POST /projects/{id-or-slug-or-codegraph-name}/codegraph-builds — R-4 (v0.2.73).
-///
-/// Registers a DETACHED analyzer walk (install.py's background resync via
-/// `vco_lib/codegraph_resync.py`) as the project's `code_graph_builds` row
-/// (status='running' + pid) so the GUI progress system shows it and the
-/// launcher's boot sweep can death-detect it (RT-1/RT-5). Single-writer
-/// rule: the row is system-observed state written via the hub — the Python
-/// spawner never opens launcher.db directly. Soft on the caller side: a
-/// 404 / hub-down is a no-op for the spawner (best-effort visibility).
-async fn register_codegraph_build(
-    State(h): State<LauncherDbHandle>,
-    Path(project_id): Path<String>,
-    Json(req): Json<RegisterCodegraphBuildReq>,
-) -> impl IntoResponse {
-    let _ = &req.source; // advisory only; not persisted
-    if req.pid == 0 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_pid",
-            "pid must be a positive OS process id".to_string(),
-        );
-    }
-    // PRIMARY: resolve by repo_root path (the unambiguous identifier the
-    // Python spawner actually has — see repo_root doc above). Canonical match
-    // mirrors get_project_by_path_route.
-    if let Some(raw) = req.repo_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+/// Shared project resolution for BOTH codegraph-builds routes. PRIMARY:
+/// resolve by `repo_root` path (the unambiguous identifier the Python
+/// spawner actually has — see the `repo_root` field doc). Canonical match
+/// mirrors `get_project_by_path_route`. FALLBACK: id-or-slug from the path
+/// segment, same order as the config resolver. Shared by registration and
+/// terminal report so the terminal report can never resolve to a different
+/// project than its own registration did. `Err` = the ready-to-return
+/// error response (404 / 500 envelope).
+fn resolve_codegraph_build_project(
+    h: &LauncherDbHandle,
+    path_segment: &str,
+    repo_root: Option<&str>,
+) -> Result<(String, &'static str), axum::response::Response> {
+    if let Some(raw) = repo_root.map(str::trim).filter(|s| !s.is_empty()) {
         if let Ok(projects) = h.0.list_projects() {
             let canonical_query = std::fs::canonicalize(raw)
                 .ok()
@@ -383,43 +409,218 @@ async fn register_codegraph_build(
                 false
             });
             if let Some(p) = matched {
-                return match h.0.register_running_code_graph_build(&p.id, req.pid) {
-                    Ok(()) => Json(serde_json::json!({
-                        "registered": true, "project_id": p.id, "pid": req.pid,
-                        "status": "running", "resolved_by": "path",
-                    }))
-                    .into_response(),
-                    Err(e) => db_error_response("register codegraph build", e),
-                };
+                return Ok((p.id, "path"));
             }
         }
     }
-    // FALLBACK: id-or-slug resolution, same order as the config resolver.
-    let row = match h.0.get_project(&project_id) {
-        Ok(Some(r)) => r,
-        Ok(None) => match h.0.get_project_by_slug(&project_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    "project_not_found",
-                    format!("project {} not found", project_id),
-                )
-            }
-            Err(e) => return db_error_response("register codegraph build (slug lookup)", e),
+    match h.0.get_project(path_segment) {
+        Ok(Some(r)) => Ok((r.id, "id")),
+        Ok(None) => match h.0.get_project_by_slug(path_segment) {
+            Ok(Some(r)) => Ok((r.id, "slug")),
+            Ok(None) => Err(error_response(
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+                format!("project {} not found", path_segment),
+            )),
+            Err(e) => Err(db_error_response("resolve codegraph build (slug lookup)", e)),
         },
-        Err(e) => return db_error_response("register codegraph build (id lookup)", e),
-    };
-    match h.0.register_running_code_graph_build(&row.id, req.pid) {
-        Ok(()) => Json(serde_json::json!({
-            "registered": true,
-            "project_id": row.id,
-            "pid": req.pid,
-            "status": "running",
-        }))
-        .into_response(),
+        Err(e) => Err(db_error_response("resolve codegraph build (id lookup)", e)),
+    }
+}
+
+/// POST /projects/{id-or-slug-or-codegraph-name}/codegraph-builds — R-4
+/// (v0.2.73): the REGISTRATION half of the detached-walk build contract.
+///
+/// Registers a DETACHED analyzer walk (install.py's background resync via
+/// `vco_lib/codegraph_resync.py`) as the project's `code_graph_builds` row
+/// (status='running' + pid) so the GUI progress system shows it and the
+/// launcher's boot sweep can death-detect it (RT-1/RT-5).
+///
+/// The COMPLETION half lives on the `/terminal` SUBROUTE
+/// (`report_codegraph_build_terminal`) — registration and completion are
+/// one contract (KG: pid-liveness-tracking-needs-a-terminal-report-
+/// 2026-08-28), but they are separate ROUTES on purpose (M4, v0.2.91):
+/// a pre-#31 hub ignores unknown body fields via serde, so a terminal
+/// report posted to THIS route on an old hub would have executed as a
+/// registration — overwriting a superseding walk's fresh running row with
+/// the dead reporter's pid and false-failing it. On the subpath an old hub
+/// simply 404s and the driver's soft-skip degrades to the exact pre-fix
+/// behavior (row untouched). For the same reason this route REJECTS
+/// terminal statuses (400 naming the subpath) rather than silently
+/// ignoring them — a mis-routed terminal report must never mutate a row.
+///
+/// Single-writer rule: the row is system-observed state written via the hub
+/// — the Python spawner never opens launcher.db directly. Soft on the caller
+/// side: a 404 / hub-down is a no-op for the spawner (best-effort
+/// visibility).
+async fn register_codegraph_build(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(req): Json<RegisterCodegraphBuildReq>,
+) -> impl IntoResponse {
+    use vct_launcher_core::db::code_graph_builds::status as build_status;
+
+    let _ = &req.source; // advisory only; not persisted
+    if req.pid == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_pid",
+            "pid must be a positive OS process id".to_string(),
+        );
+    }
+    // M4: this route accepts ONLY "running" (or absent — pre-#31 drivers).
+    // Terminal (and garbage) statuses are rejected BEFORE any resolution so
+    // a mis-routed report can never mutate a row here.
+    let status = req.status.as_deref().unwrap_or(build_status::RUNNING);
+    if status != build_status::RUNNING {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_status",
+            format!(
+                "this route only registers walks (status \"running\"); \
+                 terminal statuses go to POST .../codegraph-builds/terminal, \
+                 got {:?}",
+                status
+            ),
+        );
+    }
+
+    let (resolved_id, resolved_by) =
+        match resolve_codegraph_build_project(&h, &project_id, req.repo_root.as_deref()) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+    match h.0.register_running_code_graph_build(&resolved_id, req.pid) {
+        Ok(()) => {
+            let mut body = serde_json::json!({
+                "registered": true,
+                "project_id": resolved_id,
+                "pid": req.pid,
+                "status": "running",
+            });
+            if resolved_by == "path" {
+                body["resolved_by"] = serde_json::json!("path");
+            }
+            Json(body).into_response()
+        }
         Err(e) => db_error_response("register codegraph build", e),
     }
+}
+
+/// POST /projects/{id-or-slug-or-codegraph-name}/codegraph-builds/terminal
+/// — v0.2.91 (#31): the TERMINAL half of the detached-walk build contract.
+///
+/// Finalizes the walk's `code_graph_builds` row with its outcome + stats,
+/// and on success/partial advances the project's codegraph binding
+/// (`last_analyzed_commit` / `last_analyzed_at`) the way the
+/// launcher-spawned build path does. Without this half, every successful
+/// walk was later false-failed by the pid-aliveness reconciler (field
+/// failure 2026-08-28). A report whose pid no longer matches the running
+/// row is a no-op (`finalized: false`) — a superseding walk's registration
+/// wins.
+///
+/// Why a SUBROUTE and not a status on the registration route (M4): an old
+/// hub has no `/terminal` route and 404s — the driver's soft-skip then
+/// gives the exact pre-#31 degrade (row untouched, reconciler behavior
+/// unchanged). Folding the terminal status into the registration route's
+/// body would instead make an old hub EXECUTE the report as a registration
+/// (serde ignores unknown fields), clobbering a superseding walk's row.
+async fn report_codegraph_build_terminal(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(req): Json<RegisterCodegraphBuildReq>,
+) -> impl IntoResponse {
+    use vct_launcher_core::db::code_graph_builds::status as build_status;
+
+    let _ = &req.source; // advisory only; not persisted
+    if req.pid == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_pid",
+            "pid must be a positive OS process id".to_string(),
+        );
+    }
+    // The terminal route REQUIRES an explicit terminal status — "running"
+    // (or absence) here is a caller bug, not a registration.
+    let status = match req.status.as_deref() {
+        Some(s @ (build_status::SUCCESS | build_status::PARTIAL | build_status::FAILED)) => s,
+        other => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_status",
+                format!(
+                    "terminal status must be \"success\"/\"partial\"/\"failed\" \
+                     (registrations go to POST .../codegraph-builds), got {:?}",
+                    other.unwrap_or("<absent>")
+                ),
+            )
+        }
+    };
+
+    let (resolved_id, resolved_by) =
+        match resolve_codegraph_build_project(&h, &project_id, req.repo_root.as_deref()) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+    let finalized = match h.0.finalize_detached_code_graph_build(
+        &resolved_id,
+        req.pid,
+        status,
+        req.files_analyzed.unwrap_or(0),
+        req.duration_ms,
+        req.languages.as_deref(),
+        req.error_message.as_deref(),
+        req.log_tail.as_deref(),
+    ) {
+        Ok(done) => done,
+        Err(e) => return db_error_response("finalize codegraph build", e),
+    };
+    if !finalized {
+        tracing::warn!(
+            "[vct-hub] codegraph terminal report for project {} (pid {}) matched \
+             no running row — superseded by a newer walk, already terminal, or \
+             never registered; leaving the row alone",
+            resolved_id, req.pid
+        );
+    }
+    // Mirror the launcher-spawned path's post-build binding stamp (its
+    // `persist_codegraph_provenance` advances last_analyzed_commit/-at after
+    // a build whose inserts succeeded — SUCCESS or PARTIAL). Routed through
+    // the shared `Db::advance_codegraph_binding_analyzed` (see its doc for
+    // why model/dim/config stay untouched hub-side). Soft-fail: a binding
+    // hiccup never fails the terminal report — the build row is already
+    // finalized.
+    if finalized && matches!(status, build_status::SUCCESS | build_status::PARTIAL) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match h.0.advance_codegraph_binding_analyzed(
+            &resolved_id,
+            req.analyzed_commit.as_deref(),
+            now_ms,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                "[vct-hub] no codegraph binding to stamp for project {} \
+                 (seeding is the launcher/build path's job)",
+                resolved_id
+            ),
+            Err(e) => tracing::warn!(
+                "[vct-hub] warning: could not stamp codegraph binding for {}: {}",
+                resolved_id, e
+            ),
+        }
+    }
+    let mut body = serde_json::json!({
+        "finalized": finalized,
+        "project_id": resolved_id,
+        "pid": req.pid,
+        "status": status,
+    });
+    if resolved_by == "path" {
+        body["resolved_by"] = serde_json::json!("path");
+    }
+    Json(body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2442,5 +2643,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), 404);
+    }
+
+    // ─── v0.2.91 (#31): terminal report on the same route ───────────────
+
+    /// ACT: the terminal success report finalizes the registered row with
+    /// its stats AND stamps the codegraph binding's analyzed commit/time —
+    /// the two facts the live field failure showed stuck at
+    /// running-then-false-failed and NULL respectively.
+    #[tokio::test]
+    async fn terminal_report_finalizes_row_and_stamps_binding() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-t1", "Terminal One", "/tmp/proj-t1");
+        h.0.set_project_codegraph_binding(
+            "proj-t1",
+            "TerminalOne",
+            Some("CodeSage-Large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        let client = reqwest::Client::new();
+
+        // Register (spawn half), then report terminal (driver half) — the
+        // same wire contract, extended payload.
+        let reg = client
+            .post(format!("{}/projects/TerminalOneCodegraph/codegraph-builds", base))
+            .json(&serde_json::json!({
+                "status": "running", "pid": 3924749,
+                "source": "install_resync", "repo_root": "/tmp/proj-t1",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reg.status(), 200);
+
+        let resp = client
+            .post(format!(
+                "{}/projects/TerminalOneCodegraph/codegraph-builds/terminal",
+                base
+            ))
+            .json(&serde_json::json!({
+                "status": "success", "pid": 3924749,
+                "source": "install_resync", "repo_root": "/tmp/proj-t1",
+                "files_analyzed": 1784, "duration_ms": 180000,
+                "log_tail": "converged: 0 stale rows (analyzer exit 0)",
+                "analyzed_commit": "abc123def",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.get("finalized").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(body.get("resolved_by").and_then(|v| v.as_str()), Some("path"));
+
+        let row = h.0.get_code_graph_build("proj-t1").unwrap().unwrap();
+        assert_eq!(row.status, "success");
+        assert_eq!(row.files_analyzed, 1784);
+        assert_eq!(row.duration_ms, Some(180_000));
+        assert!(row.finished_at.is_some());
+        assert!(row.log_tail.as_deref().unwrap().contains("converged"));
+
+        let binding = h.0.get_project_codegraph_binding("proj-t1").unwrap().unwrap();
+        assert_eq!(
+            binding.last_analyzed_commit.as_deref(),
+            Some("abc123def"),
+            "success finalize must stamp the binding like the launcher path"
+        );
+        assert!(binding.last_analyzed_at.is_some());
+        // The stored space stays launcher-owned.
+        assert_eq!(binding.embedding_model.as_deref(), Some("CodeSage-Large-v2"));
+        assert_eq!(binding.embedding_dim, Some(2048));
+    }
+
+    /// A failed terminal report finalizes the row but does NOT stamp the
+    /// binding (nothing trustworthy was analyzed).
+    #[tokio::test]
+    async fn terminal_failed_report_skips_binding_stamp() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-t2", "Terminal Two", "/tmp/proj-t2");
+        h.0.set_project_codegraph_binding(
+            "proj-t2", "TerminalTwo", None, None, None, None, true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        h.0.register_running_code_graph_build("proj-t2", 555).unwrap();
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{}/projects/proj-t2/codegraph-builds/terminal", base))
+            .json(&serde_json::json!({
+                "status": "failed", "pid": 555,
+                "error_message": "analyzer exited 4; see the resync log for details",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.get("finalized").and_then(|v| v.as_bool()), Some(true));
+
+        let row = h.0.get_code_graph_build("proj-t2").unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert!(row.error_message.as_deref().unwrap().contains("exited 4"));
+        let binding = h.0.get_project_codegraph_binding("proj-t2").unwrap().unwrap();
+        assert_eq!(
+            binding.last_analyzed_at, None,
+            "failed walks must not advance the binding stamp"
+        );
+    }
+
+    /// LEAVE-ALONE legs: an unknown/non-terminal status on the terminal
+    /// route is a 400; a terminal report with no matching running row
+    /// (never registered / pid superseded) is a 200 `finalized: false`
+    /// no-op that touches nothing — the pid-aliveness reconciler stays the
+    /// authority for genuinely-dead walks.
+    #[tokio::test]
+    async fn terminal_report_rejects_bad_status_and_noops_without_match() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-t3", "Terminal Three", "/tmp/proj-t3");
+        let client = reqwest::Client::new();
+
+        for bad_status in ["skipped", "running", "borked"] {
+            let bad = client
+                .post(format!("{}/projects/proj-t3/codegraph-builds/terminal", base))
+                .json(&serde_json::json!({"status": bad_status, "pid": 7}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad.status(), 400, "non-terminal status {:?} rejected", bad_status);
+        }
+        // Absent status on the terminal route is a caller bug, not a default.
+        let absent = client
+            .post(format!("{}/projects/proj-t3/codegraph-builds/terminal", base))
+            .json(&serde_json::json!({"pid": 7}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(absent.status(), 400, "terminal route requires an explicit status");
+
+        // Never registered → no row to finalize; leave-alone.
+        let resp = client
+            .post(format!("{}/projects/proj-t3/codegraph-builds/terminal", base))
+            .json(&serde_json::json!({"status": "success", "pid": 7, "files_analyzed": 3}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.get("finalized").and_then(|v| v.as_bool()), Some(false));
+        assert!(h.0.get_code_graph_build("proj-t3").unwrap().is_none());
+
+        // Superseded pid: a newer walk re-registered; the stale report noops.
+        h.0.register_running_code_graph_build("proj-t3", 9001).unwrap();
+        let stale = client
+            .post(format!("{}/projects/proj-t3/codegraph-builds/terminal", base))
+            .json(&serde_json::json!({"status": "success", "pid": 7}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), 200);
+        let body: serde_json::Value = stale.json().await.unwrap();
+        assert_eq!(body.get("finalized").and_then(|v| v.as_bool()), Some(false));
+        let row = h.0.get_code_graph_build("proj-t3").unwrap().unwrap();
+        assert_eq!(row.status, "running", "the fresh registration survives");
+        assert_eq!(row.pid, Some(9001));
+    }
+
+    /// M4: the REGISTRATION route refuses terminal statuses — a terminal
+    /// report mis-routed there (or replayed against it) must never execute
+    /// as a registration and clobber a superseding walk's fresh running
+    /// row with the dead reporter's pid. 400 + row byte-untouched.
+    #[tokio::test]
+    async fn registration_route_rejects_terminal_status_and_touches_nothing() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-t4", "Terminal Four", "/tmp/proj-t4");
+        // Walk B's fresh registration — the row M4's hazard would clobber.
+        h.0.register_running_code_graph_build("proj-t4", 9002).unwrap();
+        let client = reqwest::Client::new();
+
+        for terminal in ["success", "partial", "failed"] {
+            let resp = client
+                .post(format!("{}/projects/proj-t4/codegraph-builds", base))
+                .json(&serde_json::json!({
+                    "status": terminal, "pid": 1234,
+                    "source": "install_resync", "repo_root": "/tmp/proj-t4",
+                    "files_analyzed": 9,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                400,
+                "registration route must reject terminal status {:?}",
+                terminal
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+                Some("invalid_status")
+            );
+        }
+        let row = h.0.get_code_graph_build("proj-t4").unwrap().unwrap();
+        assert_eq!(row.status, "running", "walk B's row survives untouched");
+        assert_eq!(row.pid, Some(9002), "walk B's pid never overwritten");
+        assert_eq!(row.files_analyzed, 0);
     }
 }

@@ -217,6 +217,87 @@ impl Db {
         Ok(())
     }
 
+    /// Finalize a DETACHED analyzer walk's build row (v0.2.91 #31 — the
+    /// TERMINAL half of the R-4 registration contract). Called by the hub's
+    /// codegraph-build endpoint when the resync driver posts its outcome.
+    /// Without this, every SUCCESSFUL hub-registered walk was later
+    /// mislabeled "failed" by the pid-aliveness reconciler — a success-exit
+    /// and a mid-run death are indistinguishable from pid-gone alone (KG:
+    /// pid-liveness-tracking-needs-a-terminal-report-2026-08-28).
+    ///
+    /// Guarded UPDATE, not an upsert: it touches ONLY a row that is still
+    /// `running` AND carries EXACTLY this pid — so a stale report from a
+    /// superseded walk can never clobber a newer registration (fresh pid),
+    /// a launcher-owned build (pid NULL), or an already-terminal row.
+    /// Returns `Ok(true)` when the row finalized, `Ok(false)` for the
+    /// leave-alone no-match case.
+    ///
+    /// Row semantics on finalize: `finished_at = now`; `duration_ms` =
+    /// caller-provided analyzer wall time, falling back to `now -
+    /// started_at`; `pid` is KEPT (it documents the terminal row's detached
+    /// provenance — every liveness consumer, sweep and heartbeat alike,
+    /// gates on `status = 'running'`, so a pid on a terminal row is inert);
+    /// `heartbeat_at` untouched (always NULL for detached rows — see the
+    /// field doc). `status` must be one of the terminal trio
+    /// success/partial/failed (same vocabulary as the launcher-spawned
+    /// writer; `skipped` is a launcher-side decision, never a wire status).
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_detached_code_graph_build(
+        &self,
+        project_id: &str,
+        pid: u32,
+        status: &str,
+        files_analyzed: u32,
+        duration_ms: Option<i64>,
+        languages: Option<&[String]>,
+        error_message: Option<&str>,
+        log_tail: Option<&str>,
+    ) -> Result<bool, String> {
+        if !matches!(
+            status,
+            status::SUCCESS | status::PARTIAL | status::FAILED
+        ) {
+            return Err(format!(
+                "invalid terminal code-graph build status: {}",
+                status
+            ));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let langs_json: Option<String> = languages.map(|l| {
+            serde_json::to_string(l).unwrap_or_else(|_| "[]".to_string())
+        });
+        let log_tail_capped: Option<String> = log_tail.map(cap_log_tail);
+        let guard = self.lock();
+        let affected = guard
+            .execute(
+                "UPDATE code_graph_builds
+                    SET status         = ?1,
+                        finished_at    = ?2,
+                        duration_ms    = COALESCE(?3, CASE
+                            WHEN started_at IS NOT NULL THEN ?2 - started_at
+                            ELSE NULL
+                        END),
+                        files_analyzed = ?4,
+                        languages      = ?5,
+                        error_message  = ?6,
+                        log_tail       = ?7
+                  WHERE project_id = ?8 AND status = 'running' AND pid = ?9",
+                params![
+                    status,
+                    now_ms,
+                    duration_ms,
+                    files_analyzed,
+                    langs_json,
+                    error_message,
+                    log_tail_capped,
+                    project_id,
+                    pid as i64,
+                ],
+            )
+            .map_err(|e| format!("finalize detached code_graph_build: {}", e))?;
+        Ok(affected > 0)
+    }
+
     pub fn get_code_graph_build(
         &self,
         project_id: &str,
@@ -382,8 +463,17 @@ impl Db {
     }
 
     /// R-4 (v0.2.73): reconcile DETACHED 'running' rows (pid IS NOT NULL)
-    /// against actual process liveness. For each such row, `is_pid_alive`
-    /// decides:
+    /// against actual process liveness.
+    ///
+    /// v0.2.91 (#31): a healthy walk now finalizes its own row through
+    /// `finalize_detached_code_graph_build` BEFORE the driver exits, so a
+    /// row this sweep still sees as 'running' with a dead pid genuinely
+    /// "died or lost" — the flip below is no longer ambiguous about
+    /// success-exits (which used to be false-failed for lack of a terminal
+    /// report). The sweep itself is unchanged on purpose: it remains the
+    /// authority for TRUE deaths (pid gone AND no terminal status).
+    ///
+    /// For each such row, `is_pid_alive` decides:
     ///   * alive → leave alone (the detached walk is still working; it
     ///     survives launcher restarts by design).
     ///   * positively dead → flip to 'failed' with a message naming the
@@ -868,6 +958,201 @@ mod tests {
         assert_eq!(
             ghost.status, "running",
             "pid-NULL rows are the ghost sweep's job, not the detached sweep's"
+        );
+    }
+
+    // ─── v0.2.91 (#31): terminal report for detached walks ──────────────
+
+    /// ACT: a successful terminal report finalizes the registered running
+    /// row — status/stat fields land, finished_at stamps, the caller's
+    /// analyzer wall time wins over the started_at fallback, and the pid
+    /// is KEPT (terminal-row provenance; liveness consumers are
+    /// status-gated).
+    #[test]
+    fn finalize_detached_finalizes_matching_running_row() {
+        let (db, pid_str) = fresh_db_with_project();
+        db.register_running_code_graph_build(&pid_str, 3924749).unwrap();
+
+        let langs = vec!["py".to_string()];
+        let done = db
+            .finalize_detached_code_graph_build(
+                &pid_str,
+                3924749,
+                status::SUCCESS,
+                1784,
+                Some(180_000),
+                Some(&langs),
+                None,
+                Some("converged: 0 stale rows (analyzer exit 0)"),
+            )
+            .unwrap();
+        assert!(done, "matching running row must finalize");
+
+        let row = db.get_code_graph_build(&pid_str).unwrap().unwrap();
+        assert_eq!(row.status, "success");
+        assert_eq!(row.files_analyzed, 1784);
+        assert_eq!(row.duration_ms, Some(180_000), "caller duration wins");
+        assert!(row.finished_at.is_some());
+        assert_eq!(row.languages.as_deref().unwrap(), ["py"]);
+        assert_eq!(row.error_message, None);
+        assert!(row.log_tail.as_deref().unwrap().contains("converged"));
+        assert_eq!(
+            row.pid,
+            Some(3924749),
+            "pid kept on the terminal row (detached provenance)"
+        );
+    }
+
+    /// ACT: the failed terminal report carries the error + zero count.
+    /// Missing caller duration falls back to now - started_at.
+    #[test]
+    fn finalize_detached_failed_records_error_and_duration_fallback() {
+        let (db, pid_str) = fresh_db_with_project();
+        db.register_running_code_graph_build(&pid_str, 77).unwrap();
+
+        let done = db
+            .finalize_detached_code_graph_build(
+                &pid_str,
+                77,
+                status::FAILED,
+                0,
+                None,
+                None,
+                Some("analyzer exited 4; see the resync log for details"),
+                None,
+            )
+            .unwrap();
+        assert!(done);
+        let row = db.get_code_graph_build(&pid_str).unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.files_analyzed, 0);
+        assert!(
+            row.error_message.as_deref().unwrap_or("").contains("exited 4")
+        );
+        assert!(
+            row.duration_ms.is_some(),
+            "duration falls back to now - started_at"
+        );
+    }
+
+    /// LEAVE-ALONE: a report whose pid does not match the registered row
+    /// (a superseding walk re-registered), or that targets a launcher-owned
+    /// (pid-NULL) running row, or an already-terminal row, is a no-op.
+    #[test]
+    fn finalize_detached_leaves_mismatched_and_terminal_rows_alone() {
+        let (db, pid_str) = fresh_db_with_project();
+
+        // Superseded: registered pid differs from the reporting pid.
+        db.register_running_code_graph_build(&pid_str, 2222).unwrap();
+        let done = db
+            .finalize_detached_code_graph_build(
+                &pid_str, 1111, status::SUCCESS, 5, None, None, None, None,
+            )
+            .unwrap();
+        assert!(!done, "stale walk's report must not clobber the fresh registration");
+        let row = db.get_code_graph_build(&pid_str).unwrap().unwrap();
+        assert_eq!(row.status, "running");
+        assert_eq!(row.pid, Some(2222));
+
+        // Launcher-owned running row (pid NULL): not the wire's to finalize.
+        db.upsert_code_graph_build(
+            &pid_str, status::RUNNING, Some(1), None, None, 0, None, false, None, None,
+        )
+        .unwrap();
+        let done = db
+            .finalize_detached_code_graph_build(
+                &pid_str, 1111, status::SUCCESS, 5, None, None, None, None,
+            )
+            .unwrap();
+        assert!(!done, "pid-NULL launcher builds are not finalized via the wire");
+        assert_eq!(
+            db.get_code_graph_build(&pid_str).unwrap().unwrap().status,
+            "running"
+        );
+
+        // Already terminal: a duplicate report is a no-op.
+        db.register_running_code_graph_build(&pid_str, 9).unwrap();
+        assert!(db
+            .finalize_detached_code_graph_build(
+                &pid_str, 9, status::SUCCESS, 5, None, None, None, None,
+            )
+            .unwrap());
+        let done = db
+            .finalize_detached_code_graph_build(
+                &pid_str, 9, status::FAILED, 0, None, None, Some("late"), None,
+            )
+            .unwrap();
+        assert!(!done, "terminal rows never re-finalize");
+        assert_eq!(
+            db.get_code_graph_build(&pid_str).unwrap().unwrap().status,
+            "success"
+        );
+    }
+
+    /// Vocabulary: only the terminal trio is accepted on the wire writer.
+    #[test]
+    fn finalize_detached_rejects_non_terminal_status() {
+        let (db, pid_str) = fresh_db_with_project();
+        db.register_running_code_graph_build(&pid_str, 5).unwrap();
+        for bad in ["running", "pending", "skipped", "borked"] {
+            let err = db
+                .finalize_detached_code_graph_build(
+                    &pid_str, 5, bad, 0, None, None, None, None,
+                )
+                .expect_err("must reject");
+            assert!(err.contains(bad), "error names the status: {}", err);
+        }
+    }
+
+    /// The #31 asymmetry, both legs: a finalized (success) row survives the
+    /// dead-pid sweep untouched (act — the false-failure class is closed),
+    /// while a row with NO terminal report and a dead pid still classifies
+    /// failed (leave-alone — the reconciler stays authoritative for true
+    /// deaths).
+    #[test]
+    fn sweep_after_terminal_report_keeps_success_and_still_fails_true_deaths() {
+        let (db, _ids) = fresh_db_with_mixed_build_states();
+        let mk = |db: &Db, label: &str, pid: u32| -> String {
+            let id = uuid::Uuid::new_v4().to_string();
+            let slug = db.generate_unique_slug(label).unwrap();
+            db.insert_project(
+                &id,
+                label,
+                &fixture_path(&format!("cgbuild-{}", label)),
+                ProjectHost::Base,
+                &slug,
+            )
+            .unwrap();
+            db.register_running_code_graph_build(&id, pid).unwrap();
+            id
+        };
+        let reported = mk(&db, "detached-reported", 4001);
+        let silent_death = mk(&db, "detached-silent-death", 4002);
+
+        // The healthy walk reports before its driver exits...
+        assert!(db
+            .finalize_detached_code_graph_build(
+                &reported, 4001, status::SUCCESS, 1784, Some(1), None, None, None,
+            )
+            .unwrap());
+
+        // ...then BOTH pids are dead by the time the sweep runs.
+        let failed = db
+            .sweep_dead_detached_code_graph_builds(|_| false)
+            .unwrap();
+        assert_eq!(
+            failed,
+            vec![silent_death.clone()],
+            "only the unreported death flips"
+        );
+        assert_eq!(
+            db.get_code_graph_build(&reported).unwrap().unwrap().status,
+            "success",
+            "a terminal-reported walk must never be false-failed by the sweep"
+        );
+        assert_eq!(
+            db.get_code_graph_build(&silent_death).unwrap().unwrap().status,
+            "failed"
         );
     }
 

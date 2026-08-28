@@ -1409,6 +1409,50 @@ impl Db {
             .map_err(|e| format!("get_project_codegraph_binding: {}", e))
     }
 
+    /// v0.2.91 (#31): advance ONLY `last_analyzed_commit` /
+    /// `last_analyzed_at` on an EXISTING codegraph binding — the terminal
+    /// report of a hub-registered detached walk (install.py's resync) lands
+    /// here, mirroring what the launcher-spawned build path stamps through
+    /// `persist_codegraph_provenance` → `set_project_codegraph_binding`.
+    /// Living in this allowlisted writer file keeps the single-writer
+    /// contract (see `db/bindings_writer.rs` header) intact: the hub calls
+    /// THIS method rather than copying the launcher's stamping logic.
+    ///
+    /// Deliberately narrower than the launcher path:
+    ///   * `embedding_model` / `embedding_dim` / `config_json` are NEVER
+    ///     touched — the drift classifier that decides whether a live tier
+    ///     may overwrite the stored space is launcher-side machinery
+    ///     (`classify_embedding_change` + app_state), and the detached
+    ///     resync re-embeds into the binding's EXISTING space by
+    ///     construction, so commit/timestamp are the only facts it can
+    ///     honestly advance.
+    ///   * UPDATE-only, never an upsert: hub-side we don't know the
+    ///     canonical `collection_prefix`, and seeding a binding is the
+    ///     launcher/build path's job. No binding → `Ok(false)` leave-alone.
+    ///   * `analyzed_commit = None` (non-git tree / provenance line absent)
+    ///     PRESERVES the stored commit rather than clearing it — the walk
+    ///     genuinely ran (timestamp advances), but "commit unknown" is not
+    ///     evidence the old commit stamp is wrong.
+    pub fn advance_codegraph_binding_analyzed(
+        &self,
+        project_id: &str,
+        analyzed_commit: Option<&str>,
+        analyzed_at: i64,
+    ) -> Result<bool, String> {
+        let guard = self.lock();
+        let affected = guard
+            .execute(
+                "UPDATE project_codegraph_bindings
+                    SET last_analyzed_commit = COALESCE(?2, last_analyzed_commit),
+                        last_analyzed_at = ?3,
+                        updated_at = ?3
+                  WHERE project_id = ?1",
+                params![project_id, analyzed_commit, analyzed_at],
+            )
+            .map_err(|e| format!("advance_codegraph_binding_analyzed: {}", e))?;
+        Ok(affected > 0)
+    }
+
     pub fn delete_project_codegraph_binding(&self, project_id: &str) -> Result<(), String> {
         let guard = self.lock();
         guard
@@ -2775,6 +2819,84 @@ mod tests {
             .unwrap();
         let perms = db.list_project_permissions("p1").unwrap();
         assert_eq!(perms.len(), 3);
+    }
+
+    // ───── v0.2.91 (#31): detached-walk binding stamp ─────
+
+    /// ACT: the terminal-report stamp advances commit + timestamp while
+    /// PRESERVING model/dim/prefix/enabled/config — the launcher-side
+    /// drift machinery owns those.
+    #[test]
+    fn advance_codegraph_binding_stamps_commit_and_time_preserving_space() {
+        let db = make_db();
+        seed_project(&db, "p1", "One");
+        db.set_project_codegraph_binding(
+            "p1",
+            "ProjectOne",
+            Some("CodeSage-Large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &serde_json::json!({"configured_profile": "codesage"}),
+        )
+        .unwrap();
+
+        let stamped = db
+            .advance_codegraph_binding_analyzed("p1", Some("abc123"), 1_800_000_000_000)
+            .unwrap();
+        assert!(stamped);
+
+        let b = db.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(b.last_analyzed_commit.as_deref(), Some("abc123"));
+        assert_eq!(b.last_analyzed_at, Some(1_800_000_000_000));
+        assert_eq!(b.updated_at, 1_800_000_000_000);
+        // The stored space + config anchor are untouched.
+        assert_eq!(b.collection_prefix, "ProjectOne");
+        assert_eq!(b.embedding_model.as_deref(), Some("CodeSage-Large-v2"));
+        assert_eq!(b.embedding_dim, Some(2048));
+        assert!(b.enabled);
+        assert_eq!(
+            b.config.get("configured_profile").and_then(|v| v.as_str()),
+            Some("codesage")
+        );
+    }
+
+    /// Commit-unknown (non-git tree / provenance absent) PRESERVES the
+    /// stored commit while the timestamp still advances.
+    #[test]
+    fn advance_codegraph_binding_none_commit_preserves_stored_commit() {
+        let db = make_db();
+        seed_project(&db, "p1", "One");
+        db.set_project_codegraph_binding(
+            "p1", "ProjectOne", None, None, Some("oldsha"), Some(1), true,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        assert!(db
+            .advance_codegraph_binding_analyzed("p1", None, 2_000)
+            .unwrap());
+        let b = db.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(
+            b.last_analyzed_commit.as_deref(),
+            Some("oldsha"),
+            "unknown commit must not clear the stored stamp"
+        );
+        assert_eq!(b.last_analyzed_at, Some(2_000));
+    }
+
+    /// LEAVE-ALONE: no binding row → Ok(false), and no row is created
+    /// (seeding a binding is the launcher/build path's job — hub-side the
+    /// canonical prefix is unknown).
+    #[test]
+    fn advance_codegraph_binding_without_binding_is_a_no_op() {
+        let db = make_db();
+        seed_project(&db, "p1", "One");
+        assert!(!db
+            .advance_codegraph_binding_analyzed("p1", Some("sha"), 5)
+            .unwrap());
+        assert!(db.get_project_codegraph_binding("p1").unwrap().is_none());
     }
 }
 
