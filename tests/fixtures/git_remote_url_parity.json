@@ -1,0 +1,31 @@
+{
+  "_comment": "Cross-language parity fixture for git remote URL SHAPE validation (v0.2.91 #30, M5). Consumed by BOTH launcher/src/lib/components/subagent-git-repo-logic.test.ts (isValidGitRemoteUrl — the UI mirror driving the Connect button) AND the Rust unit test url_validation_parity_table in launcher/src-tauri/src/commands/worktree_repo_mode.rs (is_valid_git_remote_url — the authoritative backend gate). Rows are [url, valid] tuples. Edit HERE only; both suites iterate this table and assert cases.length == case_count (silent-truncation guard) — bump case_count in the same edit that adds/removes rows. Leading-dash rows (M8) pin the argument-injection guard: a '-...' candidate would reach git as an OPTION, so both validators must reject it before any git process runs.",
+  "_format_version": 1,
+  "case_count": 24,
+  "cases": [
+    ["https://github.com/example/example-repo.git", true],
+    ["http://host.example/repo", true],
+    ["ssh://git@host.example/org/repo.git", true],
+    ["git://host.example/repo.git", true],
+    ["https://host.example:8443/org/repo", true],
+    ["git@github.com:example/example-repo.git", true],
+    ["user@host.example:path/with:colon", true],
+    ["", false],
+    ["   ", false],
+    ["not a url", false],
+    ["/plain/local/path", false],
+    ["C:\\local\\path", false],
+    ["file:///tmp/repo", false],
+    ["ftp://host.example/repo", false],
+    ["https://", false],
+    ["https://host.example", false],
+    ["https://host.example/", false],
+    ["git@host.example", false],
+    ["git@host.example:", false],
+    ["@host.example:path", false],
+    ["git@:path", false],
+    ["git@host.example: path", false],
+    ["-t@host.example:path", false],
+    ["--mirror=fetch@host.example:path", false]
+  ]
+}

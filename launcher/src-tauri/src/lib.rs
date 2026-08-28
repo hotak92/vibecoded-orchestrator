@@ -2759,6 +2759,14 @@ pub fn run() {
             commands::worktree_repo_mode::get_worktree_repo_mode,
             commands::worktree_repo_mode::detect_project_git_repo,
             commands::worktree_repo_mode::create_local_project_repo,
+            // v0.2.91 (#30): the modal's "Connect an existing repo" arm —
+            // remote-URL attach (init+remote+fetch only, never merged over),
+            // local-folder attach (record-only), nested-repo candidates,
+            // and the "scaffold-only folder" copy probe.
+            commands::worktree_repo_mode::attach_existing_repo_remote,
+            commands::worktree_repo_mode::attach_existing_repo_local,
+            commands::worktree_repo_mode::list_nested_repo_candidates,
+            commands::worktree_repo_mode::detect_scaffold_only_root,
             // v0.2.26 (2026-05-22): generic declarative HTTP-action
             // dispatcher. Single Tauri command that executes any
             // `ActionDescriptor::Http` descriptor declared in a

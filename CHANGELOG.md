@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **New Project modal polish** (not a bug fix): the path field's
+  auto-derive-from-name behavior is now stated in the form hint ("follows
+  the name above until you edit or browse it"), and the name/path logic is
+  extracted to pure functions with tests pinning the long-standing guard
+  that a browsed folder survives later name edits.
 - **The launcher's X / Cmd+W button now reduces to the tray instead of
   prompting** (user-visible behavior change). The `tray_close_to_tray`
   preference had shipped with default `true` and a Preferences label saying
@@ -84,6 +89,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **"Connect an existing repo" in the subagent-git modal.** When a project
+  root has no git repository, the worktree-isolation prompt now offers a
+  fourth choice alongside local-init / no-repo: connect the repo the code
+  already lives in — by remote URL, by browsing to a local folder, or by
+  picking a detected nested repo. The remote arm runs `git init` +
+  `git remote add` + `git fetch` ONLY — it never checks out or merges over
+  existing files (a sentinel-file test pins that byte-exactly), and a fetch
+  failure keeps the recorded remote with an honest retry hint rather than
+  deleting a `.git` the user now owns. The local arm records where the repo
+  lives (the modal and toast say plainly that recording a path does not by
+  itself make worktree isolation work at the root). A freshly-scaffolded
+  empty project folder is detected and named as such in the modal copy, so
+  "this folder was created empty" is stated rather than implied. URL
+  validation is enforced identically in the UI and the backend via one
+  shared 24-case parity fixture both test suites read, including rejection
+  of option-shaped strings (leading `-`) before any git process spawns.
+- **KG node-type and folder vocabulary is now open** (types + folders both).
+  `knowledge/VOCABULARY.md` class declarations — the existing
+  ``#### **`co:X`** (alias: `x`)`` headings, optionally with a
+  ``- **Folder**: `name` `` line — now extend the valid node-type set and the
+  trusted `knowledge/` subfolder set everywhere: the kg-sync validator warns
+  only for genuinely undeclared types (and tells you how to declare one),
+  and the MCP's path normalization trusts declared custom folders. One SSOT
+  parser (`vco_lib/kg_vocabulary.py`, fence-aware so prose or fenced
+  examples can never smuggle in a type) feeds both consumers, mtime-keyed so
+  a declaration added mid-session takes effect on the very next write with
+  no restart. Built-in types keep their canonical folders — a declaration
+  cannot re-route them, so existing project layouts never silently migrate.
+  VOCABULARY.md documents the extension pattern with a prefer-existing-types
+  rule and a soft 256-category capacity note for RL-module users.
 - **`vco doctor`** — one probe engine at three invocation points: the end of
   every install/update, launcher boot (a cheap subset: no subprocess, no
   network), and on demand (`vco doctor` / `python -m vco_lib.doctor`, with
@@ -287,6 +322,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Successful background code-graph walks were reported as "build failed".**
+  The detached resync driver registered itself in the launcher's build
+  tracker (`running` + pid) but never reported completion, so after it
+  exited the pid-aliveness sweep could not tell "finished and exited" from
+  "died mid-walk" and marked every such success as a failure — a red
+  "Code graph: build failed" badge over a perfectly healthy graph. The
+  driver now posts a terminal report (success/partial/failed + stats + log
+  tail) to a dedicated `…/codegraph-builds/terminal` endpoint when the
+  analyzer finishes, the build row is finalized under a guard that can
+  never clobber a fresher walk's registration, and successful walks also
+  stamp the binding's last-analyzed commit the way launcher-spawned builds
+  do. An older hub simply 404s the new endpoint and the driver soft-skips —
+  exactly the pre-fix behavior, never worse. True mid-walk deaths still
+  classify as failures.
+- **`knowledge/` paths with custom subfolders were mangled on write.** The
+  MCP's path auto-correction did not recognize undeclared subfolders and
+  re-prefixed the whole path (`knowledge/thoughts/foo.md` became
+  `knowledge/concepts/knowledge/thoughts/foo.md`). A path already rooted
+  under `knowledge/` is now never re-prefixed: declared subfolders are
+  trusted, undeclared ones re-route the basename into the node type's
+  canonical folder with a message pointing at the declaration syntax.
+- **Two `Optional[bool]` renderings in the deferral-retry trail** used
+  two-key dict lookups that a strict type check rejects; both now use total
+  three-state mappings (behavior unchanged).
+- **`nanoid` override bumped 3.3.11 → 3.3.18** (CVE-2026-67213,
+  CVE-2026-67214; the 5.x copy was never in the vulnerable ranges).
 - **Deferral entries cleared mid-run were written straight back.** A ledger
   entry the A-2 seed copied into the run report at the start of an update, and
   that a LATER step of the same update legitimately cleared from disk (the

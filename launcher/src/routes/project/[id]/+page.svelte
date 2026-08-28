@@ -132,9 +132,11 @@
    *   1. If the root is INSIDE a repo (self or parent) → isolation already
    *      works. Auto-record `use_existing` (idempotent) and never prompt.
    *   2. If the root is NOT inside a repo AND no choice is recorded yet →
-   *      surface the modal so the user picks create-local / opt-out.
+   *      surface the modal so the user picks create-local / connect-existing
+   *      (v0.2.91 #30) / opt-out.
    *   3. If a choice is already recorded (`local_init` / `no_repo` /
-   *      `use_existing`) → respect it, never re-prompt.
+   *      `use_existing` / `use_existing_at` / `use_existing_remote`) →
+   *      respect it, never re-prompt.
    * Entirely best-effort: any probe failure leaves the modal closed (never
    * blocks the page).
    */
@@ -168,12 +170,15 @@
     }
   }
 
-  function onSubagentGitChoose(_mode: 'use_existing' | 'local_init' | 'no_repo') {
-    // The modal already persisted the choice + ran the git-init side effect
-    // (for local_init). Nothing more to do here — close is handled by the
-    // modal's bindable `open`. The `no_repo` choice has no filesystem side
-    // effect; it's honoured at runtime by the SubagentStart/Stop hooks that
-    // warn/flag on a shared-tree spawn.
+  function onSubagentGitChoose(
+    _mode: 'use_existing' | 'local_init' | 'no_repo' | 'use_existing_at' | 'use_existing_remote',
+  ) {
+    // The modal already persisted the choice + ran the side effect
+    // (git-init for local_init; init+remote+fetch for use_existing_remote;
+    // record-only for use_existing_at — v0.2.91 #30). Nothing more to do
+    // here — close is handled by the modal's bindable `open`. The `no_repo`
+    // choice has no filesystem side effect; it's honoured at runtime by the
+    // SubagentStart/Stop hooks that warn/flag on a shared-tree spawn.
     showSubagentGitModal = false;
   }
   function onSubagentGitDismiss() {

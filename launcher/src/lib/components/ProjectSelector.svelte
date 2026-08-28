@@ -23,6 +23,19 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import AdoptProjectModal from '$lib/components/AdoptProjectModal.svelte';
+  // v0.2.91 (#32): Name↔Path coupling extracted to pure, unit-tested
+  // logic (project-selector-path-logic.test.ts). The browse handler's
+  // `pathTouched = true` guard was ALREADY present at base (#32's "browse
+  // loses the path" field diagnosis was retracted — the clobber could not
+  // occur); this change is hardening + UX copy, not a bugfix: it PINS the
+  // guard with tests and adds the auto-derive hint by the path field.
+  // Every path-field transition routes through these functions.
+  import {
+    autoDerivedPath,
+    deriveAutoPath,
+    onBrowsePicked,
+    seedPathTouched,
+  } from '$lib/components/project-selector-path-logic';
 
   // v0.2.46 V47-G-final: third-party detection signals returned by the
   // detect_third_party_project_signals Tauri command. Mirrors the Rust
@@ -127,16 +140,6 @@
   let suggestedRoot = $state('~/code');
   const inTauri = isTauriRuntime();
 
-  /** kebab-case slug for the folder name, fallback 'my-project'. */
-  function slugify(s: string): string {
-    return s
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 64);
-  }
-
   /**
    * Bug-3 v0.2.4 (2026-05-12): single-string assembly of the pre-existing
    * leftovers summary. The previous markup used a chain of `{#if}` blocks
@@ -169,21 +172,23 @@
   async function openCreate() {
     showCreate = true;
     open = false;
-    pathTouched = createPath !== '' && createPath !== undefined;
+    pathTouched = seedPathTouched(createPath);
     // Resolve ~/code once per modal open. Browser mode keeps the literal
     // tilde so the user sees a recognizable shape.
     const suggested = await suggestProjectFolder();
     suggestedRoot = suggested || '~/code';
     if (!pathTouched) {
-      createPath = `${suggestedRoot}/${slugify(createName) || 'my-project'}`;
+      createPath = deriveAutoPath(suggestedRoot, createName);
     }
   }
 
-  // Reactively keep the path in sync with the name until the user edits it.
+  // Reactively keep the path in sync with the name until the user edits
+  // (or browses — #32) it. `autoDerivedPath` returns null for the
+  // leave-alone cases; all four inputs are read inside the call, so the
+  // effect tracks them as before.
   $effect(() => {
-    if (!showCreate || pathTouched) return;
-    const root = suggestedRoot || '~/code';
-    createPath = `${root}/${slugify(createName) || 'my-project'}`;
+    const derived = autoDerivedPath(showCreate, pathTouched, suggestedRoot, createName);
+    if (derived !== null) createPath = derived;
   });
 
   function onPathInput() {
@@ -286,9 +291,13 @@
       defaultPath: createPath || undefined,
       title: 'Select project folder',
     });
+    // #32 guard (present at base, pinned by tests): a successful pick
+    // marks the path TOUCHED so the reactive Name→Path sync above can
+    // never overwrite the browsed folder.
+    const next = onBrowsePicked({ path: createPath, touched: pathTouched }, picked);
+    createPath = next.path;
+    pathTouched = next.touched;
     if (picked) {
-      createPath = picked;
-      pathTouched = true;
       scheduleInspect();
     }
   }
@@ -728,6 +737,7 @@
           </div>
           <p class="form-hint">
             Absolute path. The folder will be created if it doesn't exist yet.
+            {#if !pathTouched} Follows the name above until you edit or browse it.{/if}
             {#if !inTauri} (Browse requires the desktop app — type the path manually here.){/if}
           </p>
         </div>
