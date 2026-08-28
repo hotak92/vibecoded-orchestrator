@@ -115,7 +115,7 @@ base64 = "0.22"
 # Version 0.8 is the family already transitively in the lockfile (via
 # Tauri / its deps), so adding it as a direct dep is zero net build
 # size — just promotes the resolved version to a first-class edge.
-schemars = { version = "0.8", features = ["preserve_order"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
 
 # R1 (v0.2.91): gzip for the rl_events retention ARCHIVE sidecar. The 90-day
 # prune is archive-then-delete — victim rows are written to a compressed,
