@@ -49,7 +49,7 @@
     "devalue": ">=5.8.1",
     "lodash-es": "^4.18.1",
     "dompurify": ">=3.4.11",
-    "nanoid@3": "3.3.11",
+    "nanoid@3": "3.3.18",
     "@excalidraw/mermaid-to-excalidraw": {
       "nanoid": ">=5.0.9"
     }

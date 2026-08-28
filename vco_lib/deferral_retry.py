@@ -794,7 +794,7 @@ def _dispatch_locked(
         backend = probed[handler.backend]
         trail(
             f"{cid}: {handler.backend} backend gate → "
-            + {True: "reachable", False: "provably down"}.get(backend, "unknown")
+            + {True: "reachable", False: "provably down", None: "unknown"}[backend]
         )
         if backend is not True:
             results.append(
@@ -817,7 +817,8 @@ def _dispatch_locked(
                 + {
                     True: "the child's own clear removed the condition",
                     False: "the condition is STILL in the ledger",
-                }.get(cleared, "the ledger could not be re-read")
+                    None: "the ledger could not be re-read",
+                }[cleared]
             )
             if cleared is not True:
                 result = RetryResult(

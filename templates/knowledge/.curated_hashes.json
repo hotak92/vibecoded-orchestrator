@@ -5,6 +5,7 @@
    "f580a3bb83abd7b49c17ed0fc2a5f15afa9e7e5e4e4361c92785e12b6791af5b"
   ],
   "VOCABULARY.md": [
+   "a5fc4fa826a3fbb01fcc76740b0fa2e77d32f95c2154bc61443e7c42a4640994",
    "a9430fb1079711914696de5f7c3ccb4fb698c9b0e15fa1c7e742f0258daa3956",
    "b0b0e7888c79f57858f036ec548fb4f60c3d1b8240c437bb1ddbd5ae4453f54f"
   ],
@@ -515,6 +516,6 @@
    "f677af0f4e90801d9a080061d0abd443a6391316950bfa057e13466f11bf2b08"
   ]
  },
- "generated_at": "2026-07-30T11:57:05Z",
+ "generated_at": "2026-08-28T15:11:02Z",
  "schema_version": 1
 }

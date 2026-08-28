@@ -226,7 +226,7 @@ pub mod telemetry_cmd;
 // processes spawn in a respawn loop, requiring manual taskkill.
 pub mod update_gate;
 pub mod volumes;
-// v0.2.71 Track T-WT: GUI-only per-project worktree-repo mode (tri-state)
+// v0.2.71 Track T-WT (modes extended v0.2.91): GUI-only per-project worktree-repo mode
 // backing the subagent-git modal. NOT hub-resolved (config_api.rs untouched);
 // the harness spawn pathway VCO would need to consume it cannot be
 // intercepted. The generate_handler! entries for set_/get_worktree_repo_mode

@@ -168,7 +168,9 @@ CODEGRAPH_ACCESS_VOCABULARY_VERSION = 1
 KG_COLLECTION_ACCESS_VOCABULARY_VERSION = 1
 
 #: ``code_graph_builds.status`` controlled vocabulary.
-#: v1 set: ``'pending'`` | ``'running'`` | ``'success'`` | ``'failed'``.
+#: Current set: ``'pending'`` | ``'running'`` | ``'success'`` | ``'partial'``
+#: | ``'failed'`` | ``'skipped'`` (``partial`` since mig 038; ``skipped``
+#: since origin — the pre-v0.2.91 comment under-listed the real set).
 CODE_GRAPH_BUILDS_STATUS_VOCABULARY_VERSION = 1
 
 #: Project bootstrap version — represents "this project was bootstrapped
