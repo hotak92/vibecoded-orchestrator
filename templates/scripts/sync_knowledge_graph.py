@@ -950,6 +950,98 @@ def parse_frontmatter(content: str) -> Tuple[Optional[Dict], str]:
         return None, content
 
 
+# Node types shipped with every project. The vocabulary is deliberately OPEN:
+# a project extends it by declaring additional classes in its
+# knowledge/VOCABULARY.md ontology (`#### **`co:X`** (alias: `x`)` headings —
+# see that file's "Declaring your own node types" section), which
+# _load_vocabulary_node_types() picks up alongside these built-ins.
+# Validation must not hardcode a closed set; note the RL reranker's
+# type-embedding capacity lives in the private RL module (the SSOT parser
+# records a soft warning past 256 types — verify against your module).
+#
+# SSOT: vco_lib/kg_vocabulary.py (task #33, v0.2.91). This literal MUST MATCH
+# vco_lib.kg_vocabulary.BUILTIN_NODE_TYPES (parity pinned by
+# tests/test_v0291_kg_vocabulary_consumers.py) — kept inline only for the
+# version-skew fallback below.
+_BUILTIN_NODE_TYPES = frozenset(
+    {"project", "concept", "tool", "research", "model", "hardware", "pattern", "insight", "guide"}
+)
+_VOCABULARY_TYPES_CACHE: Optional[frozenset] = None
+_VOCAB_IMPORT_WARNED = False
+
+# Fallback parser — MUST MATCH vco_lib/kg_vocabulary.py's type extraction
+# (_CLASS_HEADING_RE / _FENCE_RE semantics; same parity test as above).
+# Heading-anchored + fence-aware so prose or documentation examples that
+# merely DESCRIBE a declaration (e.g. "(alias: `x`)" in a fenced code block)
+# can never declare a type — a naive `alias:` scan fails toward green.
+_VOCAB_CLASS_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s+\*\*`co:[A-Za-z0-9_-]+`\*\*\s*"
+    r"\(alias:\s*`([A-Za-z0-9_-]+)`\)\s*$"
+)
+_VOCAB_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+
+
+def _parse_vocabulary_types_fallback(text: str) -> set:
+    """Aliases declared by REAL class-heading lines (fenced blocks inert)."""
+    aliases: set = set()
+    fence_delim = None
+    for line in text.splitlines():
+        fence_m = _VOCAB_FENCE_RE.match(line)
+        if fence_m:
+            delim = fence_m.group(1)
+            if fence_delim is None:
+                fence_delim = delim
+            elif delim == fence_delim:
+                fence_delim = None
+            continue
+        if fence_delim is not None:
+            continue
+        m = _VOCAB_CLASS_HEADING_RE.match(line)
+        if m:
+            aliases.add(m.group(1).lower())
+    return aliases
+
+
+def _load_vocabulary_node_types() -> frozenset:
+    """Valid node types = built-ins ∪ aliases declared in the project's
+    knowledge/VOCABULARY.md. Missing/unreadable ontology → built-ins only.
+
+    A-leg (one home): delegates to the SSOT ``vco_lib.kg_vocabulary``.
+    vco_lib is already a hard dependency of this script (see the
+    ``embedding_service`` import at module top), so the ImportError branch
+    only fires on VERSION SKEW — a project whose bundled script is newer
+    than the orchestrator clone's vco_lib (predating ``kg_vocabulary``).
+    Per-node validation must not crash kg-sync for that, so we warn once
+    and fall back to the inline parser above (parity-locked to the SSOT).
+    """
+    global _VOCABULARY_TYPES_CACHE, _VOCAB_IMPORT_WARNED
+    if _VOCABULARY_TYPES_CACHE is not None:
+        return _VOCABULARY_TYPES_CACHE
+    try:
+        from vco_lib.kg_vocabulary import load_vocabulary
+        types = frozenset(load_vocabulary(PROJECT_ROOT).node_types)
+    except ImportError as exc:
+        if not _VOCAB_IMPORT_WARNED:
+            _VOCAB_IMPORT_WARNED = True
+            print(
+                f"⚠️  vco_lib.kg_vocabulary unavailable ({exc}) — validating "
+                f"node types with the built-in fallback parser. Run "
+                f"`python install.py --update` from the orchestrator root "
+                f"to refresh vco_lib.",
+                file=sys.stderr,
+            )
+        merged = set(_BUILTIN_NODE_TYPES)
+        try:
+            text = (PROJECT_ROOT / "knowledge" / "VOCABULARY.md").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            pass  # missing/unreadable/mis-encoded ontology → built-ins only
+        else:
+            merged |= _parse_vocabulary_types_fallback(text)
+        types = frozenset(merged)
+    _VOCABULARY_TYPES_CACHE = types
+    return _VOCABULARY_TYPES_CACHE
+
+
 def validate_node_against_vocabulary(node_data: Dict, file_path: Path) -> List[str]:
     """
     Validate node against vocabulary and tag hierarchy rules.
@@ -963,11 +1055,14 @@ def validate_node_against_vocabulary(node_data: Dict, file_path: Path) -> List[s
     """
     warnings = []
 
-    # 1. Type validation
-    valid_types = {"project", "concept", "tool", "research", "model", "hardware", "pattern", "insight", "guide"}
+    # 1. Type validation (open vocabulary: built-ins + VOCABULARY.md aliases)
+    valid_types = _load_vocabulary_node_types()
     node_type = node_data.get("node_type", "")
     if node_type not in valid_types:
-        warnings.append(f"Invalid node type '{node_type}' (valid: {', '.join(sorted(valid_types))})")
+        warnings.append(
+            f"Node type '{node_type}' not declared (known: {', '.join(sorted(valid_types))}). "
+            f"Declare custom types in knowledge/VOCABULARY.md as a class heading with (alias: `{node_type}`)"
+        )
 
     # 2. Tag validation
     tags = node_data.get("tags", [])

@@ -97,6 +97,46 @@ rdfs:Resource
     └── co:Pattern
 ```
 
+### Declaring your own node types
+
+The node-type vocabulary is **open**: the orchestrator's validators and
+path normalization read this file, so adding a class section here extends
+the accepted `type:` values for this project.
+
+**Prefer an existing type.** Reuse a built-in (or an already-declared
+custom type) whenever a suitable one exists — `concept` and `insight`
+cover most knowledge. Add a new type only when it is genuinely necessary
+for retrieval or organization.
+
+To declare one, add a class section following the exact heading shape the
+built-ins above use — a heading with the bold `co:` name and an
+`(alias: `…`)` — plus an optional **Folder** bullet:
+
+```markdown
+#### **`co:Thought`** (alias: `thought`)
+- **Definition**: A fleeting idea captured before it is lost
+- **Folder**: `thoughts`
+- **Properties**: title, context, next_step
+```
+
+Rules the tooling applies:
+
+- **Only real heading lines count.** Mentions of `alias:` in prose,
+  tables, or fenced code blocks (like the example above) declare nothing.
+- The **alias** (lowercased) becomes the `type:` value nodes may use.
+- The optional `- **Folder**: `name`` bullet gives the type a dedicated
+  `knowledge/<name>/` subfolder: nodes of that type are auto-filed there,
+  and paths under that subfolder are trusted by path normalization. The
+  value must be a single path segment (letters, digits, `_`, `-`).
+- **Without a Folder line** a custom type files under `knowledge/concepts/`
+  — the same default the built-in `pattern` / `insight` / `guide` types use.
+- A declaration cannot re-route a **built-in** type to a different folder;
+  built-in routing always wins.
+- **Capacity note**: keep the total type set modest. Past 256 types the
+  parser emits a soft warning — the RL reranker's type-embedding registry
+  is sized in the RL module itself, so verify against your module's
+  capacity before relying on RL reranking across that many categories.
+
 ---
 
 ## Properties (Typed Relationships)

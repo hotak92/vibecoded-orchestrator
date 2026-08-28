@@ -3120,12 +3120,22 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # so parent.parent.parent = <project>/
 _SERVER_INFERRED_BASE: Path = Path(__file__).resolve().parent.parent.parent
 
-# Valid subfolders inside knowledge/ — used for path auto-correction.
+# BUILT-IN subfolders inside knowledge/ — the base of an OPEN set used for
+# path auto-correction. The set is extendable per-project: a class section in
+# knowledge/VOCABULARY.md may declare a `- **Folder**: `name`` bullet, and
+# `_normalize_kg_file_path` trusts declared folders like built-in ones (SSOT:
+# vco_lib/kg_vocabulary.py, resolved via `_kg_vocabulary()` below).
+# MUST MATCH vco_lib/kg_vocabulary.py::BUILTIN_KNOWLEDGE_SUBFOLDERS — kept as
+# a literal (not an import) so a stale-copy vco_lib can never fail MCP startup;
+# parity pinned by tests/test_v0291_kg_vocabulary_consumers.py.
 _KNOWLEDGE_SUBFOLDERS: frozenset[str] = frozenset({
     "concepts", "coordination", "hardware", "insights", "models", "notes",
     "patterns", "projects", "research", "techniques", "tools", "training", "user",
 })
-# Canonical node_type → knowledge subfolder mapping.
+# BUILT-IN node_type → knowledge subfolder mapping (open the same way: custom
+# types declared in VOCABULARY.md may carry their own Folder route).
+# MUST MATCH vco_lib/kg_vocabulary.py::BUILTIN_NODE_TYPE_TO_FOLDER (same
+# parity test as above).
 _NODE_TYPE_TO_FOLDER: dict[str, str] = {
     "project":       "projects",
     "concept":       "concepts",
@@ -3136,20 +3146,81 @@ _NODE_TYPE_TO_FOLDER: dict[str, str] = {
     "coordination":  "coordination",
 }
 
+_kg_vocab_import_warned = False
+
+
+def _kg_vocabulary():
+    """Resolve the project's OPEN KG vocabulary (task #33, v0.2.91) — lazy.
+
+    Delegates to ``vco_lib.kg_vocabulary.load_vocabulary`` (cached there,
+    keyed by path + file mtime_ns — so a mid-session edit to VOCABULARY.md
+    is picked up on the next call without an MCP restart) against the SAME
+    project root relative .md writes resolve to: KG_BASE_DIR →
+    CLAUDE_PROJECT_DIR chain → the server-inferred base.
+
+    Imported LAZILY with a warn-once fallback to the built-in literals above
+    (the ``_active_chunk_model_id`` R2-9 stale-copy precedent): a mid-update
+    install whose stale site-packages vco_lib predates ``kg_vocabulary``
+    must still START, and the fallback is behaviourally IDENTICAL for every
+    project without custom VOCABULARY.md declarations. Never fails MCP
+    startup — this is a new-member degrade, not import-time breakage
+    masking (contrast the loud-fail imports at module top).
+    """
+    global _kg_vocab_import_warned
+    try:
+        from vco_lib.kg_vocabulary import load_vocabulary
+    except ImportError as exc:
+        if not _kg_vocab_import_warned:
+            _kg_vocab_import_warned = True
+            logger.warning(
+                "weaviate-kg: vco_lib.kg_vocabulary unavailable (%s) — using "
+                "built-in node-type/folder vocabulary only (custom "
+                "VOCABULARY.md declarations ignored). Run `python install.py "
+                "--update` to refresh vco_lib.",
+                exc,
+            )
+        return None
+    base = Path(KG_BASE_DIR) if KG_BASE_DIR else (
+        _resolve_project_root_for_deferral() or _SERVER_INFERRED_BASE
+    )
+    return load_vocabulary(base)
+
 
 def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple[str, list[str]]:
     """Auto-correct file_path so it always lands inside knowledge/.
 
     Returns (corrected_path, list_of_adjustments_made).
     Absolute paths are returned unchanged — they are assumed intentional.
+
+    The trusted-subfolder set and the node_type → folder routing are OPEN:
+    built-ins ∪ the project's knowledge/VOCABULARY.md declarations (SSOT
+    vco_lib/kg_vocabulary.py). A path already rooted under ``knowledge/``
+    is NEVER re-prefixed with another ``knowledge/…`` segment (pre-v0.2.91
+    mangling bug: ``knowledge/thoughts/foo.md`` with an undeclared
+    ``thoughts`` became ``knowledge/concepts/knowledge/thoughts/foo.md``) —
+    an UNDECLARED subfolder under knowledge/ instead re-routes the BASENAME
+    into the canonical folder for *node_type*, matching what a bare
+    filename gets.
     """
+    vocab = _kg_vocabulary()
+    if vocab is not None:
+        subfolders = vocab.knowledge_subfolders
+        folder_for = vocab.folder_for
+    else:
+        # Stale-copy fallback: built-ins-only SETS (custom VOCABULARY.md
+        # declarations ignored) — but the REWRITTEN normalization flow below
+        # still applies, including the no-double-prefix rule for undeclared
+        # knowledge/-rooted paths. Deliberately NOT the pre-#33 mangling.
+        subfolders = _KNOWLEDGE_SUBFOLDERS
+        folder_for = lambda nt: _NODE_TYPE_TO_FOLDER.get(nt, "concepts")  # noqa: E731
+
     adjustments: list[str] = []
     fp = (file_path or "").strip()
 
     # Empty path → derive from title and node_type
     if not fp:
         slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-        folder = _NODE_TYPE_TO_FOLDER.get(node_type, "concepts")
+        folder = folder_for(node_type)
         fp = f"knowledge/{folder}/{slug}.md"
         adjustments.append(f"derived from title+node_type → {fp}")
         return fp, adjustments
@@ -3165,18 +3236,33 @@ def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple
 
     parts = Path(fp).parts  # e.g. ("knowledge", "concepts", "foo.md")
 
-    # Already rooted under knowledge/ with a known subfolder → trust it
-    if parts[0] == "knowledge" and len(parts) >= 2 and parts[1] in _KNOWLEDGE_SUBFOLDERS:
+    if parts[0] == "knowledge":
+        # Rooted under knowledge/ with a declared (built-in or VOCABULARY.md)
+        # subfolder → trust it
+        if len(parts) >= 2 and parts[1] in subfolders:
+            return fp, adjustments
+        # Rooted under knowledge/ but the subfolder is UNDECLARED (or the
+        # file sits directly at knowledge/<name>.md). Never prepend another
+        # knowledge/… prefix — re-route the basename into the canonical
+        # folder for node_type instead.
+        folder = folder_for(node_type)
+        fp = f"knowledge/{folder}/{parts[-1]}"
+        adjustments.append(
+            f"re-routed undeclared knowledge/ path into 'knowledge/{folder}/' "
+            f"(subfolder not declared in VOCABULARY.md; declare it with a "
+            f"`- **Folder**: `…`` line to make it trusted)"
+        )
         return fp, adjustments
 
-    # Starts directly with a known knowledge subfolder (missing "knowledge/" prefix)
-    if parts[0] in _KNOWLEDGE_SUBFOLDERS:
+    # Starts directly with a declared knowledge subfolder (missing
+    # "knowledge/" prefix)
+    if parts[0] in subfolders:
         fp = f"knowledge/{fp}"
         adjustments.append("prepended 'knowledge/' prefix")
         return fp, adjustments
 
     # Bare filename or unrecognised path → prepend knowledge/<node_type_folder>/
-    folder = _NODE_TYPE_TO_FOLDER.get(node_type, "concepts")
+    folder = folder_for(node_type)
     fp = f"knowledge/{folder}/{fp}"
     adjustments.append(f"prepended 'knowledge/{folder}/' from node_type={node_type!r}")
     return fp, adjustments
@@ -5272,7 +5358,9 @@ async def hybrid_search(
     Args:
         query: Natural language query describing what you want to find
         limit: Max results to return (default: 5)
-        node_type: Filter by type (project, concept, tool, model, hardware, research)
+        node_type: Filter by type (built-ins: project, concept, tool, model,
+            hardware, research, pattern, insight, guide — the set is OPEN:
+            projects may declare additional types in knowledge/VOCABULARY.md)
         tags: Filter by tags (e.g., ["AI", "python"])
         days: If set, only return nodes updated in the last N days
         include_stale: Default False excludes nodes whose valid_until date has
@@ -5976,7 +6064,11 @@ async def store_knowledge_node(
     Args:
         title: Node title (unique per file)
         content: Full markdown content
-        node_type: Type (project, concept, tool, model, hardware, research)
+        node_type: Type (built-ins: project, concept, tool, model, hardware,
+                   research, pattern, insight, guide — the set is OPEN: declare
+                   additional types in knowledge/VOCABULARY.md as a class
+                   heading with an alias, optionally with a `- **Folder**:`
+                   line to give the type its own knowledge/ subfolder)
         tags: Tags without # (e.g., ["AI", "VRAM"])
         links: Typed WikiLinks in "relationshipType::Target" format
         file_path: Relative path from KG_BASE_DIR (e.g., "knowledge/concepts/VRAM_Management.md")
