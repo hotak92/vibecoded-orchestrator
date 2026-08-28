@@ -114,7 +114,7 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    color: #00bfa6;
+    color: var(--color-teal);
     text-decoration: underline;
     text-underline-offset: 2px;
     font-size: 13px;
@@ -122,7 +122,7 @@
     border-radius: 3px;
   }
   .link:hover {
-    color: #1ad3ba;
+    color: var(--color-teal-hover);
   }
   .link:focus-visible {
     outline: 2px solid rgba(0, 191, 166, 0.55);

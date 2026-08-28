@@ -6,15 +6,15 @@
   // v0.2.43 (contributor branch feat/launcher-logo-circular-white):
   // version string moved to the right-sidebar brand footer
   // (RightSidebar.svelte `.rs-brand-footer`) so the statusbar
-  // is no longer a duplicate display surface. StatusBar now
-  // shows only realtime telemetry (connected state + app count).
+  // is no longer a duplicate display surface.
+  // v0.2.91 (P2-B1): the "Connected" dot was never wired to any
+  // real connectivity signal (no Weaviate/Ollama/hub check backed
+  // it) and always rendered, even when those services were down.
+  // Removed rather than wired to an unverified claim — StatusBar
+  // now shows only the bound app-count.
 </script>
 
 <footer class="status-bar">
-  <div class="status-left">
-    <div class="status-dot"></div>
-    <span>Connected</span>
-  </div>
   <div class="status-right">
     <span>{appCount} app{appCount !== 1 ? 's' : ''} activated</span>
   </div>
@@ -32,20 +32,6 @@
     flex-shrink: 0;
     font-size: 11px;
     color: var(--color-muted);
-  }
-
-  .status-left {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .status-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--color-teal);
-    box-shadow: 0 0 8px rgba(0, 191, 166, 0.6);
   }
 
   .status-right {

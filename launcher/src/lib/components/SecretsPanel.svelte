@@ -347,12 +347,19 @@
       // discard our results so we don't overwrite the newer project's grants.
       if (mySeq !== grantsLoadSeq) return;
       grants = loaded;
-      // Fetch the paused state for each issued grant so Pause/Resume renders
-      // correctly on load. R2-16: run the N probes in PARALLEL (Promise.all)
-      // instead of an await-in-loop — N sequential round-trips added avoidable
-      // latency on projects with many grants.
+      // Fetch the paused state for each issued AND received grant so
+      // Pause/Resume (issued side) and the paused badge (received side,
+      // P2-M3) both render correctly on load. The pause row is keyed by
+      // (owner, key, requester) regardless of which side of the grant is
+      // asking, so the same probe call works for both directions — only
+      // `projectId` (owner) vs `requesterProjectId` (grantee) needs to be
+      // read from the right field, which is already `owner_project_id` /
+      // `grantee_project_id` on every SecretGrant row. R2-16: run the N
+      // probes in PARALLEL (Promise.all) instead of an await-in-loop — N
+      // sequential round-trips added avoidable latency on projects with
+      // many grants.
       const pausedPairs = await Promise.all(
-        loaded.issued.map(async (g) => {
+        [...loaded.issued, ...loaded.received].map(async (g) => {
           try {
             const p = await isSecretPausedForRequester({
               projectId: g.owner_project_id,
@@ -843,11 +850,15 @@
           <p class="grants-hint grants-received-hint">Granted to this project:</p>
           <div class="grants-list">
             {#each grants.received as g (`${g.key}::${g.owner_project_id}`)}
-              <div class="grant-row grant-row-received">
+              {@const paused = grantPaused[grantPauseKey(g.key, g.grantee_project_id)] === true}
+              <div class="grant-row grant-row-received" class:grant-row-paused={paused}>
                 <div class="grant-info">
                   <span class="grant-grantee">{projectLabel(g.owner_project_id)}</span>
                   <span class="grant-arrow">→</span>
                   <span class="grant-key mono">{g.key}</span>
+                  {#if paused}
+                    <span class="grant-paused-badge" title="The owner paused this grant — reads will fail with key_not_active until they resume it">paused</span>
+                  {/if}
                   {#if g.note}
                     <span class="grant-note">{g.note}</span>
                   {/if}
@@ -927,6 +938,14 @@
           Use <strong>Unset</strong> instead if you just want to clear the current value
           (the entry stays visible so you can re-set it).
         </p>
+        {#if sState.error}
+          <!-- P2-M4: a failed Remove used to only reach the panel-level
+               .msg-error banner, which renders BEHIND this overlay
+               (z-index: 1000) — the user saw nothing happen and had to
+               Cancel to discover why. Render it inside the card instead
+               so it's visible while the modal stays open for a retry. -->
+          <p class="confirm-error">{sState.error}</p>
+        {/if}
         <div class="confirm-actions">
           <button
             class="btn-3d btn-3d-ghost btn-3d-sm"
@@ -1505,6 +1524,16 @@
 
   .confirm-hint strong {
     color: var(--color-teal);
+  }
+
+  .confirm-error {
+    font-size: 12px;
+    color: var(--color-pink);
+    background: rgba(255, 79, 160, 0.1);
+    border: 1px solid rgba(255, 79, 160, 0.25);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 14px;
   }
 
   .confirm-actions {

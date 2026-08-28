@@ -121,7 +121,7 @@
   .gfp-chip.active {
     background: rgba(0,191,166,0.25);
     border-color: rgba(0,191,166,0.6);
-    color: #0fc;
+    color: var(--color-teal);
   }
   .gfp input[type="range"] { width: 100%; }
   .gfp-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }

@@ -10,13 +10,21 @@
   //   3. Toast on success/error.
   //
   // The JSON wire type is `number` — we persist the parsed float, NOT
-  // the raw string from the input. NaN values are coerced to the default
-  // (or 0 if no default) before persistence.
+  // the raw string from the input.
+  //
+  // v0.2.91 (P2-M6): unparseable input is REJECTED, not coerced. It used
+  // to fall back to the control's declared default and run through the
+  // same persist-and-toast path as a legitimate empty-field clear, so the
+  // user was told "Saved <label>" while a value they never typed was
+  // written. The decision now lives in `./numberInputCommit` so the
+  // clear-vs-garbage branch is unit-testable; an empty field still means
+  // "restore the default".
 
   import { onMount } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import { dispatchAction } from '$lib/module-dispatch';
   import { toast } from '$lib/stores/toast';
+  import { decideNumberCommit } from './numberInputCommit';
   import type { NumberInputControl } from '$lib/types/manifest';
 
   let {
@@ -75,39 +83,34 @@
     }
   });
 
-  function clamp(n: number): number {
-    let result = n;
-    if (control.min !== null && control.min !== undefined && result < control.min) {
-      result = control.min;
-    }
-    if (control.max !== null && control.max !== undefined && result > control.max) {
-      result = control.max;
-    }
-    return result;
-  }
-
-  function parseValue(): number | null {
-    if (rawValue === '' || rawValue === '-' || rawValue === '.') return null;
-    const n = Number(rawValue);
-    if (!Number.isFinite(n)) return null;
-    return clamp(n);
-  }
-
-  async function commit() {
+  /**
+   * Commit on blur / Enter.
+   *
+   * `badInput` comes from the native input's ValidityState: a
+   * `<input type="number">` reports unparseable text ("abc") as an EMPTY
+   * value with that flag set, so without it garbage is indistinguishable
+   * from a deliberate clear — which is exactly how the silent
+   * default-substitution went unnoticed.
+   */
+  async function commit(badInput = false) {
     if (isDisabled) return;
-    const parsed = parseValue();
-    if (parsed === null) {
-      // Empty / partial input — fall back to default (or 0).
-      const fallback = control.default ?? 0;
-      rawValue = String(fallback);
-      await commitValue(fallback);
+    const decision = decideNumberCommit(rawValue, control, badInput);
+    if (decision.action === 'reject') {
+      // Inline error, no persist, and no "Saved" toast. The user's text
+      // stays in the field so they can correct it.
+      error = decision.message;
       return;
     }
-    // Reflect the clamped value back into the input.
-    if (String(parsed) !== rawValue) {
-      rawValue = String(parsed);
+    error = '';
+    // Reflect the clamped / defaulted value back into the input.
+    if (decision.display !== rawValue) {
+      rawValue = decision.display;
     }
-    await commitValue(parsed);
+    await commitValue(decision.value);
+  }
+
+  function onBlur(e: FocusEvent & { currentTarget: HTMLInputElement }) {
+    void commit(e.currentTarget.validity?.badInput ?? false);
   }
 
   async function commitValue(n: number) {
@@ -135,8 +138,9 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
-      void commit();
-      (e.target as HTMLInputElement).blur();
+      const input = e.target as HTMLInputElement;
+      void commit(input.validity?.badInput ?? false);
+      input.blur();
     }
   }
 
@@ -162,7 +166,7 @@
       max={control.max ?? undefined}
       step={control.step ?? undefined}
       disabled={isDisabled}
-      onblur={commit}
+      onblur={onBlur}
       onkeydown={onKeydown}
       aria-invalid={error !== ''}
       aria-describedby={error ? `${inputId}-err` : undefined}

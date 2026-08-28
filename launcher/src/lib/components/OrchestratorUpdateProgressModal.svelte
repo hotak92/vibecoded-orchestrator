@@ -66,7 +66,7 @@
   // bleed up here.
 
   import { orchestrator } from '$lib/stores/orchestrator';
-  import { updater } from '$lib/stores/updater';
+  import { updater, titleForUpdateKind } from '$lib/stores/updater';
   import { ui } from '$lib/stores/ui';
 
   const COMPLETED_HOLD_MS = 1800;
@@ -156,14 +156,17 @@
   // `upd.kind` while the popover was open — UpdateBadge resets it when
   // the user dismisses, but during an active update it remains the
   // value the user clicked on.
-  const title = $derived.by(() => {
-    switch (upd.kind) {
-      case 'binary_stale':  return 'Restarting launcher';
-      case 'install_stale': return 'Installing update';
-      case 'remote_ahead':  return 'Updating orchestrator';
-      default:              return 'Updating orchestrator';
-    }
-  });
+  //
+  // P2-M7 (v0.2.91 wave 5): titling is delegated to the shared
+  // `titleForUpdateKind` in `stores/updater.ts` instead of a local
+  // switch — this file's previous switch had no `merge_resolved_incomplete`
+  // arm and silently fell through to "Updating orchestrator", mistitling
+  // the resume-after-hand-resolved-conflict path. `resume_operation`
+  // comes from the same `updateStatus` UpdateBadge reads for its
+  // identical Finish/Continue distinction.
+  const title = $derived(
+    titleForUpdateKind(upd.kind, orchState.updateStatus?.resume_operation)
+  );
 
   // Stage + message come straight from the install_progress events. We
   // surface both so power users see the short tag ("update", "install",

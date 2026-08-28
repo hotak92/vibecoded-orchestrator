@@ -278,7 +278,7 @@
     cursor: not-allowed;
   }
   button.primary {
-    background: var(--accent, #3b82f6);
-    border-color: var(--accent, #3b82f6);
+    background: var(--color-teal);
+    border-color: var(--color-teal);
   }
 </style>

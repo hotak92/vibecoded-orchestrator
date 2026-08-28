@@ -220,6 +220,51 @@ function pickKind(status: {
 }
 
 /**
+ * P2-M7 (v0.2.91 wave 5): whether a `merge_resolved_incomplete` resume is
+ * the autostash-pop story — the merge itself SUCCEEDED and only restoring
+ * the user's uncommitted local changes (`git --autostash` pop) conflicted —
+ * versus a plain halted-at-a-real-conflict resume that was resolved
+ * outside the launcher. These are different states with different
+ * remediation (see `UPDATE_DEFERRED.md`'s per-file steps for the former).
+ *
+ * SSOT for that branch: `UpdateBadge.svelte`'s popover copy ("Finish
+ * Update" vs "Continue Update") and `titleForUpdateKind` below (used by
+ * `OrchestratorUpdateProgressModal`'s overlay title) both call this
+ * instead of each re-deriving `resumeOperation === 'autostash-pop'`
+ * independently.
+ */
+export function isAutostashPopResume(resumeOperation?: string | null): boolean {
+  return resumeOperation === 'autostash-pop';
+}
+
+/**
+ * P2-M7: in-progress overlay title for `OrchestratorUpdateProgressModal`,
+ * per update kind. Extracted here (rather than left as a second inline
+ * switch in the modal) because `updater.ts` already owns `UpdateKind` and
+ * its priority ordering, and because the modal's previous copy of this
+ * switch had no `merge_resolved_incomplete` arm at all — it silently fell
+ * through to the generic "Updating orchestrator", mistitling the one
+ * resume path the project's CLAUDE.md says must be surfaced prominently.
+ *
+ * `resumeOperation` only matters for `merge_resolved_incomplete`; every
+ * other kind ignores it.
+ */
+export function titleForUpdateKind(kind: UpdateKind, resumeOperation?: string | null): string {
+  switch (kind) {
+    case 'merge_resolved_incomplete':
+      return isAutostashPopResume(resumeOperation) ? 'Finishing update' : 'Resuming update';
+    case 'binary_stale':
+      return 'Restarting launcher';
+    case 'install_stale':
+      return 'Installing update';
+    case 'remote_ahead':
+      return 'Updating orchestrator';
+    default:
+      return 'Updating orchestrator';
+  }
+}
+
+/**
  * v0.2.23 (B4 / D19): try to parse a Tauri error as a non-FF divergence
  * payload from `update_orchestrator`. Returns null on any other shape.
  */

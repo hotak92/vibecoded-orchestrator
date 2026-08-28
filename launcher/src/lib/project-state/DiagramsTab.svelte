@@ -789,10 +789,18 @@
 
   $effect(() => {
     // Re-load everything when the project itself changes (nav between
-    // projects without remount).
-    if (projectId && moduleActive) {
-      void load();
-    }
+    // projects without remount). P2-M5: re-check the module-enabled gate
+    // first — only onMount called loadModuleState() before, so
+    // `moduleActive` stayed the PREVIOUS project's value across a switch,
+    // which could both hide an enabled project's real diagrams and show
+    // a disabled project's enabled UI.
+    if (!projectId) return;
+    void (async () => {
+      await loadModuleState();
+      if (moduleActive) {
+        void load();
+      }
+    })();
   });
 
   onDestroy(() => {

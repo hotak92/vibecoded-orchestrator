@@ -125,6 +125,7 @@
         </label>
         <label><span>Model</span><input bind:value={newModel} placeholder="optional" /></label>
       </div>
+      <p class="ps-hint">This creates a database row only — no <code>.claude/skills/{'{name}'}/</code> directory is written. The skill won't run until that directory exists (create it yourself, or run Re-scan after adding one).</p>
       <button class="ps-btn-primary" onclick={register}>Register</button>
     </div>
   {/if}
@@ -154,7 +155,7 @@
             <td>
               <input type="checkbox" checked={s.enabled}
                 onchange={(e) => toggle(s.skill_name, (e.target as HTMLInputElement).checked)}
-                title="Toggles registry only — .md file untouched" />
+                title="Renames the skill's directory between skills/ and skills.disabled/ (git-visible if tracked)" />
             </td>
             <td><button class="ps-btn-link" onclick={() => unregister(s.skill_name)}>Unregister</button></td>
           </tr>
@@ -180,13 +181,15 @@
   .ps-empty-state .ps-empty { padding: 0 0 8px; }
   .ps-empty-hint { color: #aaa; font-size: 12px; padding: 0 0 16px; max-width: 480px; margin: 0 auto; }
   .ps-empty-hint code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; }
+  .ps-hint { font-size: 11px; color: #888; margin: 6px 0 0; }
+  .ps-hint code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; }
   .ps-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .ps-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .ps-table th { text-align: left; padding: 6px 8px; color: #888; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .ps-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }
   .ps-table code { font-family: ui-monospace, monospace; font-size: 11px; }
   .ps-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: #ccc; }
-  .ps-tag-bundled { background: rgba(0,191,166,0.15); color: #0fc; }
+  .ps-tag-bundled { background: rgba(0,191,166,0.15); color: var(--color-teal); }
   .ps-tag-user { background: rgba(123,95,255,0.15); color: #c4b3ff; }
   .ps-tag-paid-module { background: rgba(255,200,70,0.15); color: #fc6; }
   .ps-tag-project { background: rgba(58,163,255,0.15); color: #6cf; }

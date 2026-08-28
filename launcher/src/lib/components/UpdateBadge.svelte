@@ -21,7 +21,7 @@
 
   import { onMount } from 'svelte';
   import { orchestrator } from '$lib/stores/orchestrator';
-  import { updater } from '$lib/stores/updater';
+  import { updater, isAutostashPopResume } from '$lib/stores/updater';
   import { ui } from '$lib/stores/ui';
   import OrchestratorUpdateDivergenceModal from './OrchestratorUpdateDivergenceModal.svelte';
   import OrchestratorUntrackedCollisionModal from './OrchestratorUntrackedCollisionModal.svelte';
@@ -57,7 +57,11 @@
         // misdescribe the state, and point at the deferral's per-file steps
         // (the resume marker-scan's generic `commit --amend` remediation is
         // wrong for a stash-pop conflict).
-        if (op === 'autostash-pop') {
+        // P2-M7: the branch itself now lives in `isAutostashPopResume`
+        // (stores/updater.ts) so this popover's copy and
+        // `OrchestratorUpdateProgressModal`'s overlay title decide it the
+        // same way instead of each carrying an independent check.
+        if (isAutostashPopResume(op)) {
           return {
             title: 'Finish Update',
             desc:

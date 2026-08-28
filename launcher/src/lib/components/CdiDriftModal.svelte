@@ -115,7 +115,7 @@
   }
 
   button.primary {
-    background: var(--accent-color, #4a9eff);
+    background: var(--color-teal);
     color: white;
     border: none;
     padding: 0.5rem 1.25rem;

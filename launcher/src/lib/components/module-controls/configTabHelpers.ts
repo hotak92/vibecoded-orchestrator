@@ -364,3 +364,61 @@ export function configTabHasDefaultWeightsButton(
     ),
   );
 }
+
+// ─── v0.2.91 (P2-B8): `{{control:<id>}}` sibling snapshot ──────────────
+
+/**
+ * Build the `id → value` map the renderer hands to `module_dispatch`'s
+ * `{{control:<id>}}` resolver.
+ *
+ * Two classes of control are excluded, for different reasons:
+ *
+ *   * **Stateless** (`button`, `info`, `info_dynamic`, `link`, and the
+ *     forward-compat `Unsupported` fallback) — they carry no value at all.
+ *
+ *   * **Self-persisting** (`text_input`, `number_input`, `date_picker`,
+ *     `file_picker`) — they own their value in local component state and
+ *     write it straight to `module_settings`, never reporting it back to
+ *     the tab. `values` is loaded on mount and never refreshed, so a
+ *     snapshot entry for one of these ships the MOUNT-TIME value: a user
+ *     who edited the RL retrain date and clicked retrain in the same
+ *     session silently sent the pre-edit date.
+ *
+ *     Omitting them is not a gap. `module_dispatch.rs:768-778` checks the
+ *     snapshot per key and falls back to `db.get_setting(...)`, which is
+ *     fresh because each of those controls awaits its own persist before
+ *     dispatching. The stale entry was overriding a correct source.
+ *
+ * Conflict policy (unchanged): if two sections define the same control
+ * id, the later section wins.
+ *
+ * @param ckey Composite-key builder — the renderer keys `values` by
+ *   `<section_idx>:<control_id>`, while the dispatcher wants plain ids.
+ */
+export function snapshotSiblingValues(
+  sections: ConfigSection[],
+  values: Record<string, unknown>,
+  ckey: (sectionIdx: number, controlId: string) => string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (let i = 0; i < sections.length; i++) {
+    for (const control of sections[i].controls) {
+      if (
+        control.kind === 'button' ||
+        control.kind === 'info' ||
+        control.kind === 'info_dynamic' ||
+        control.kind === 'link' ||
+        control.kind === 'Unsupported' ||
+        control.kind === 'text_input' ||
+        control.kind === 'number_input' ||
+        control.kind === 'date_picker' ||
+        control.kind === 'file_picker'
+      ) {
+        continue;
+      }
+      const v = values[ckey(i, control.id)];
+      if (v !== undefined) out[control.id] = v;
+    }
+  }
+  return out;
+}

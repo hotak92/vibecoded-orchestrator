@@ -50,7 +50,7 @@
     flex-wrap: wrap;
   }
   .np-text strong {
-    color: var(--color-teal, #0fc);
+    color: var(--color-teal);
     font-weight: 700;
   }
   .np-btn {
@@ -59,7 +59,7 @@
     background: rgba(0, 191, 166, 0.18);
     border: 1px solid rgba(0, 191, 166, 0.5);
     border-radius: 8px;
-    color: var(--color-teal, #0fc);
+    color: var(--color-teal);
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;

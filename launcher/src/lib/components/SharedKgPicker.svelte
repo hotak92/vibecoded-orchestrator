@@ -176,7 +176,7 @@
     word-break: break-all;
   }
   .skp-name.is-current {
-    color: #0fc;
+    color: var(--color-teal);
     border: 1px dashed rgba(0,191,166,0.4);
     padding: 1px 6px;
     border-radius: 3px;
@@ -197,7 +197,7 @@
   .skp-pick-btn {
     background: rgba(0,191,166,0.15);
     border: 1px solid rgba(0,191,166,0.35);
-    color: #0fc;
+    color: var(--color-teal);
     padding: 4px 10px;
     border-radius: 4px;
     cursor: pointer;

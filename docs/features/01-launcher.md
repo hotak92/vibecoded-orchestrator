@@ -746,7 +746,14 @@ Wrap any jargon in `<Term key="...">` to get a hover tooltip with a short ELI5 d
 `/project/[id]` shows a tabbed view of the active project's Claude Code configuration, backed by the `project_*` tables from migration 002.
 
 ### Agents / Skills / Hooks / Permissions Tabs
-`AgentsTab.svelte`, `SkillsTab.svelte`, `HooksTab.svelte`, `PermissionsTab.svelte` — each shows the respective project configuration with enable/disable toggles. Hooks tab includes event, matcher, command, and enabled state.
+`AgentsTab.svelte`, `SkillsTab.svelte`, `HooksTab.svelte`, `PermissionsTab.svelte` — each shows the respective project configuration with enable/disable toggles.
+
+Every toggle edits what the harness actually reads, never just a DB row:
+
+- **Agents / skills** — the `.md` file (or the whole skill directory) is moved between `.claude/agents/` and `.claude/agents.disabled/`, the globs Claude Code discovers them by (the v0.2.53 FS-disable contract).
+- **Hooks** — the entry is added to or removed from `.claude/settings.json`'s `hooks` block, the file Claude Code's hook engine reads, through the single writer `python -m vco_lib.hooks_settings` (v0.2.91, decision #27). A disabled hook's entry is parked in `project_hooks.disabled_entry_json` so re-enabling restores it byte-for-byte; unregistering never deletes the hook script file. Before v0.2.91 these controls wrote only `project_hooks` rows, which nothing reads — the toggle was inert.
+
+The Hooks tab shows event, matcher, command, timeout, source, and a three-way state: **Running** (declared in `settings.json`), **Disabled** (removed by VCO, entry parked, restorable), **Not in settings.json** (a stale mirror row — it does not run and there is nothing to restore). When `settings.json` is missing or unparseable the tab refuses to edit it, says so, and disables its controls rather than showing DB rows as if they were the truth.
 
 ### KG / Code Graph Tab
 `KgCodegraphTab.svelte` shows KG collection binding and code graph binding, including last-analyzed commit SHA and timestamp.
@@ -760,7 +767,8 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 #### Listing commands (read-only)
 - `list_project_agents(project_id)` — all agents registered for a project with `enabled` flag.
 - `list_project_skills(project_id)` — all skills registered for a project.
-- `list_project_hooks(project_id)` — all hooks (event, matcher, command, enabled).
+- `list_project_hooks(project_id)` — the hooks the launcher has MIRRORED (event, matcher, command, `enabled`). Not the truth about what runs; the Hooks tab uses `list_project_hooks_effective` instead.
+- `list_project_hooks_effective(project_id)` (`commands/project_hooks_settings.rs`) — reads `.claude/settings.json` and joins the mirror rows only for metadata. Returns each hook's state (`active` / `disabled` / `orphan`), the settings.json path, and an honest `settings_readable` + `error_code` when the file cannot be parsed.
 - `list_project_permissions(project_id)` — entries from `permissions.allow` / `permissions.ask` / `permissions.deny`.
 - `list_project_secret_refs(project_id)` — secret references with `is_set` presence flag.
 - `get_project_state_snapshot(project_id)` — single-call full snapshot of all six tables for the dashboard initial load.
@@ -768,7 +776,7 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 #### Agent / skill / hook mutations
 - `register_project_agent(project_id, name, source)` / `set_project_agent_enabled(agent_id, enabled)` / `unregister_project_agent(agent_id)`.
 - `register_project_skill(project_id, name, source)` / `set_project_skill_enabled(skill_id, enabled)` / `unregister_project_skill(skill_id)`.
-- `register_project_hook(project_id, event, matcher, command)` / `set_project_hook_enabled(hook_id, enabled)` / `unregister_project_hook(hook_id)`.
+- `register_project_hook(project_id, req)` / `set_project_hook_enabled(project_id, event, matcher, command, enabled)` / `unregister_project_hook(project_id, event, matcher, command)` — these live in `commands/project_hooks_settings.rs` (not `project_state_cmd.rs`) and edit `.claude/settings.json`. Identity is the natural key `(event, matcher, command)`, not a row id, because a hook can exist in `settings.json` with no mirror row at all. `register` optionally seeds the hook script when the command points at one that does not exist (never overwriting an existing file, the `create_starter_diagram_file` rule).
 
 #### Permissions / secrets / bindings
 - `add_project_permission(project_id, kind, pattern)` / `delete_project_permission(perm_id)`.

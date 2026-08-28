@@ -285,10 +285,16 @@ mirrored in the launcher DB. To change those, edit the `.md` directly.
 
 #### Gotchas
 
-- The toggle is **advisory** unless something downstream of the
-  launcher reads the `project_agents.enabled` column. As of v1.0 the
-  Claude Code harness itself does not read this DB; it loads `.md`
-  files directly. Treat `enabled` as a launcher-internal preference.
+- **The toggle moves a file on disk.** The harness does not read this
+  DB — it globs `.claude/agents/*.md` — so disabling an agent MOVES
+  its `.md` to `.claude/agents.disabled/<name>.md`, and enabling moves
+  it back (the v0.2.53 FS-disable contract,
+  `project_state_cmd::apply_fs_disable_agent`). Nothing is deleted,
+  but your working tree changes, so expect the move in `git status`.
+  The `project_agents.enabled` column just records which side the
+  file is on. If the file is already present in BOTH locations the
+  toggle refuses rather than clobbering one — clean up the duplicate
+  by hand first.
 - Two agent files with the same `name:` in frontmatter collide on the
   `(project_id, agent_name)` unique key — the second insert upserts
   over the first.
@@ -337,7 +343,7 @@ want user-scope skills in this view, register them manually with
 | `skill_name` | From `name:` in `SKILL.md` frontmatter, or directory name as fallback. |
 | `source` | Same vocabulary as agents: `bundled` / `user` / `paid-module` / `project`. |
 | `model` | Frontmatter `model:`. Display-only (harness reads it from the file). |
-| `enabled` | User-owned toggle. Same caveat as agents: advisory unless downstream consumers read it. |
+| `enabled` | User-owned toggle. Same mechanism as agents, on whole directories: disabling MOVES `.claude/skills/<name>/` to `.claude/skills.disabled/<name>/` (`apply_fs_disable_skill`), which is what actually hides it from the harness. Nothing is deleted; the move shows in `git status`. |
 | `file_path` | Absolute path to `SKILL.md`. |
 | `config.description` | From frontmatter `description:`. |
 
@@ -364,12 +370,36 @@ want user-scope skills in this view, register them manually with
 
 #### What this tab is for
 
-Mirrors `<project>/.claude/settings.json`'s `hooks` block as
-queryable rows, with a per-row `enabled` toggle. Hooks are lifecycle
-callbacks the harness runs on events (file edits, session start,
-compaction, etc.) and are the **only** mechanism for *automated*
-harness behavior — memory and instructions cannot fulfill "each time
-X" requirements.
+Reads `<project>/.claude/settings.json`'s `hooks` block — the file the
+harness actually reads — and lets you enable, disable, register and
+unregister hooks by editing it. Hooks are lifecycle callbacks the
+harness runs on events (file edits, session start, compaction, etc.)
+and are the **only** mechanism for *automated* harness behavior —
+memory and instructions cannot fulfill "each time X" requirements.
+
+> **Changed in v0.2.91 (decision #27).** Before this release the tab's
+> controls wrote only `project_hooks` rows, which nothing reads: a
+> hook you unchecked kept firing, and one you registered never fired.
+> All four controls now edit `settings.json` through a single writer
+> (`python -m vco_lib.hooks_settings`), and the rows you see are read
+> back out of that file rather than out of the DB.
+
+**`settings.json` is usually tracked by git**, so enabling, disabling
+or registering a hook here will show up in your next `git diff`. The
+tab says so above the table.
+
+#### The three states
+
+| State | Meaning |
+|---|---|
+| **Running** | Declared in `settings.json`. The harness runs it on every matching event. |
+| **Disabled** | VCO removed its entry from `settings.json` and parked the exact entry in `project_hooks.disabled_entry_json`. It does not run; re-enabling restores it byte-for-byte, including its `timeout` / `background` keys and its position in the group. |
+| **Not in settings.json** | The launcher has a mirror row but the file does not declare the hook — someone removed it outside the launcher. It does not run, and there is nothing parked to restore, so the toggle is disabled. **Clear record** drops the stale row. |
+
+If `settings.json` is missing or unparseable, the tab refuses to edit
+it, shows why, and disables its controls. It never falls back to
+showing DB rows as though they described what runs — that fallback is
+exactly the bug above.
 
 #### How rows get there
 
@@ -382,9 +412,14 @@ X" requirements.
 - The `timeout` field in `settings.json` is in **seconds**; the DB
   column `timeout_ms` is in **milliseconds** — populate multiplies
   by 1000.
-- Manual: the **+ Register** button calls `register_project_hook`.
-  It does **not** edit `settings.json` — the row exists in the DB
-  only unless something else writes it back.
+- Manual: the **+ Register** button calls `register_project_hook`,
+  which **adds the entry to `settings.json`** (joining an existing
+  group with the same matcher rather than creating a parallel one)
+  and then mirrors it into the DB. Tick "Create the hook script if it
+  doesn't exist yet" and it also seeds a runnable starter script at
+  the path your command invokes — bash or PowerShell chosen by the
+  `.sh` / `.ps1` suffix. It never overwrites a file that already
+  exists.
 - A missing `settings.json` is fine (no warning). A malformed one
   emits a warning to the populate report and skips hook population
   (KG/codegraph bindings still write).
@@ -413,14 +448,15 @@ row.
 
 | Column | Meaning |
 |---|---|
-| `id` | Auto-increment primary key (hooks have no natural unique name). |
+| `id` | Auto-increment primary key of the mirror row, when there is one. It is **not** the identity the launcher acts on — a hook can live in `settings.json` with no mirror row at all, so every mutation is keyed by `(event, matcher, command)`, which is also `project_hooks`' UNIQUE constraint. |
 | `event` | Event name. The launcher's "common events" dropdown lists: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `StopFailure`, `PreCompact`, `PostCompact`, `TeammateIdle`, `TaskCompleted`. The harness supports more (see CLAUDE.md hook table); the dropdown is convenience-only — any string is accepted. |
 | `matcher` | Tool-name pattern. Empty = match all. Examples: `Edit(*.py)`, `Edit(knowledge/**/*.md)`, `Edit(*)\|Write(*)`, `*`. Matcher syntax is harness-defined. |
 | `command` | Shell command run on the event. The harness invokes `bash -c <command>` with env scrubbed for secrets. |
 | `source` | `bundled` / `user` / `paid-module` / `project`. Auto-populated rows are `project`. |
-| `timeout_ms` | Per-hook timeout in milliseconds. `null` = harness default. |
-| `enabled` | Advisory toggle. **Critical caveat: turning a row off here does NOT remove the hook from `settings.json`.** The harness reads `settings.json`, not this table. To actually disable a hook, edit `settings.json`. |
-| `config` (JSON) | The full hook entry from `settings.json` — preserves `type`, `background`, and any other keys for the GUI to render. |
+| `timeout_ms` | Per-hook timeout, stored in milliseconds and shown in seconds (the unit `settings.json` uses). `null` = harness default. |
+| `enabled` (DB column) | The launcher's mirror flag. It has never gated anything on its own — the harness reads `settings.json`, not this table. The tab's checkbox no longer writes this column directly; it drives the settings.json edit, which keeps the column in sync as a convenience for the hub's read routes. |
+| `disabled_entry_json` (DB column, v0.2.91) | The parked entry for a hook VCO removed from `settings.json`: the inner hook item verbatim, its matcher, its position, and the group's other keys when the whole group was emptied. `NULL` = nothing parked. This is what makes re-enable exact. |
+| `config` (JSON) | The full hook entry as `populate_hooks` last saw it in `settings.json` — preserves `type`, `background`, and any other keys for the GUI to render. |
 
 #### Blocking behavior
 
@@ -647,13 +683,21 @@ tabs are user preferences, not facts to be silently overwritten.
    creation. To surface a new agent: either re-onboard the project,
    ask the user to re-scan, or call `register_project_agent` via
    the Tauri command if you're inside the launcher process.
-3. **Editing `.claude/settings.json`'s `hooks` block does not update
-   the Hooks tab** — same reason. Re-populate is required.
-4. **Do not assume `enabled = false` blocks the harness.** The
-   Claude Code harness reads `.md` files and `settings.json`
-   directly. The launcher's `enabled` toggle is currently advisory.
-   To truly disable an agent or hook, edit/remove the underlying
-   file or `settings.json` entry.
+3. **Editing `.claude/settings.json`'s `hooks` block by hand IS
+   picked up by the Hooks tab** (since v0.2.91 it reads that file on
+   every load), but the `project_hooks` mirror still only refreshes
+   on populate / Re-scan. A hand-added hook shows up immediately with
+   `source: project` and no bundle attribution; a hand-*removed* one
+   shows as **Not in settings.json** until the stale row is cleared.
+4. **Do not assume the `project_hooks.enabled` COLUMN blocks the
+   harness.** It never has — the harness reads `.md` files and
+   `settings.json` directly. To disable a hook programmatically, use
+   `commands::project_hooks_settings::disable_hook` (or the GUI
+   toggle), which removes the entry from `settings.json` and parks
+   it; writing `enabled = 0` through `Db::set_project_hook_enabled`
+   changes nothing the harness can see. For agents and skills, the
+   equivalent real mechanism is the FS-disable move performed by
+   `set_project_agent_enabled` / `set_project_skill_enabled`.
 5. **Re-running populate preserves user toggles** but **overwrites**
    `model`, `file_path`, `description`, `source`, and the `config`
    blob from frontmatter. Do not store user preferences in any of

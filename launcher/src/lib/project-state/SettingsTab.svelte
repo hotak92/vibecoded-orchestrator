@@ -377,8 +377,15 @@
     <section class="ps-section">
       <h2>Project env vars (notes only)</h2>
       <p class="ps-hint">
-        Values are stored in <code>~/.vct-secrets/</code> or the OS keychain — not here. This list is a
-        reminder of what your agents expect. Use the Secrets panel to set actual values.
+        <!-- v0.2.91 F-1: `envEntries` is component-local state with no
+             backend — `load()` never fetches it and no command persists it,
+             so the rows a user adds vanish on the next tab switch. The
+             heading's "(notes only)" disclaims the VALUES being stored; it
+             does not tell the reader the NOTES are not stored either. Say so
+             until there is a single-project env API to save them to. -->
+        <strong>Not saved</strong> — this list is scratch space and resets when you
+        leave the tab. Values are stored in <code>~/.vct-secrets/</code> or the OS
+        keychain, never here; use the Secrets panel to set actual values.
       </p>
       <table class="ps-table">
         <thead><tr><th>KEY</th><th>Notes / placeholder</th><th></th></tr></thead>

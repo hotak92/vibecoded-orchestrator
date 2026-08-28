@@ -25,10 +25,35 @@
   //     unblocks the install; the other two routes abort the install
   //     attempt.
   //   - Backdrop click / Escape are treated as Cancel (same dismissal
-  //     semantics).
+  //     semantics) — EXCEPT while the modal is busy, see below.
+  //
+  // v0.2.91 (P2-B7):
+  //
+  //   Cancel now genuinely cancels. The "Detect again" success path
+  //   pauses ~350 ms on "Detected <runtime> — proceeding…" before it
+  //   closes and calls `onProceed()`; during that pause the modal used
+  //   to stay fully interactive (`redetecting` goes false in
+  //   `detectAgain`'s `finally`, which runs BEFORE the timer), so a
+  //   Cancel click — or Escape, or a backdrop click — ran `onCancel()`
+  //   and then the pending timer ran `onProceed()` anyway. Both fired,
+  //   and the install the user had just cancelled went ahead.
+  //
+  //   The pause is now owned by `$lib/components/install-preflight-gate`:
+  //   `cancel()` clears the pending timer, and `preflightBusy()` (which
+  //   spans the pause, unlike `redetecting`) gates BOTH the footer and
+  //   `DialogRoot`'s dismissal props. Once a proceed is committed the
+  //   modal is inert until it fires — there is no window in which a
+  //   dismissal and a proceed can both win.
 
+  import { onDestroy } from 'svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import { invoke } from '$lib/tauri';
+  import {
+    cancelProceed,
+    newProceedGate,
+    preflightBusy,
+    scheduleProceed,
+  } from '$lib/components/install-preflight-gate';
 
   interface RuntimeAvailability {
     available: boolean;
@@ -50,6 +75,11 @@
   } = $props();
 
   let redetecting = $state(false);
+  // v0.2.91 (P2-B7): the deferred-proceed gate. `proceeding` spans the
+  // cosmetic pause that `redetecting` does not, and holds the timer
+  // handle so `cancel()` can clear it.
+  let gate = $state(newProceedGate());
+  const busy = $derived(preflightBusy(gate, redetecting));
   // Local copy of the availability so the "Detect again" button can
   // refresh it without forcing the parent to re-render. Initialised from
   // the prop on open.
@@ -103,12 +133,14 @@
         // Resolved — close the modal and let the install proceed.
         lastRedetectMessage = `Detected ${fresh.detected ?? 'runtime'} — proceeding…`;
         // Tiny pause so the user sees the success message before the
-        // modal disappears. Cosmetic only; the proceed handler is what
-        // actually unblocks the install path.
-        setTimeout(() => {
+        // modal disappears. The pause is cosmetic; the timer it schedules
+        // is NOT — it carries the proceed that unblocks the install. From
+        // here the modal is `busy` (every dismissal route is inert) until
+        // the timer fires or `cancel()` clears it.
+        scheduleProceed(gate, () => {
           open = false;
           onProceed();
-        }, 350);
+        });
       } else {
         lastRedetectMessage =
           'Still no container runtime detected. After installing Podman, return here and click "Detect again".';
@@ -121,9 +153,20 @@
   }
 
   function cancel() {
+    // Defence in depth: `busy` already makes every dismissal route inert
+    // while a proceed is pending, so this should find nothing to clear.
+    // It stays because "cancel means cancel" must not depend on the
+    // disabled-attribute half staying correct.
+    cancelProceed(gate);
     open = false;
     onCancel();
   }
+
+  // A modal that no longer exists must not start an install. The parent
+  // keeps this component mounted for the page's lifetime, so this only
+  // fires on navigation away — but a pending proceed surviving that would
+  // be the same defect wearing a different hat.
+  onDestroy(() => cancelProceed(gate));
 </script>
 
 {#if open}
@@ -131,9 +174,15 @@
        so screen readers announce "No container runtime detected" when
        the dialog opens. The native <dialog> + showModal() handles focus
        trap and Escape; the labelledby fills WCAG 2.4.6 (accessible name). -->
+  <!-- v0.2.91 (P2-B7): `onClose` is a NOTIFICATION, not a gate — only
+       these two props stop the native <dialog> closing. While a proceed
+       is committed (or a detection is in flight) both are false, so
+       Escape and backdrop can't race the pending proceed. -->
   <DialogRoot
     bind:open
     onClose={cancel}
+    closeOnBackdrop={!busy}
+    closeOnEscape={!busy}
     width="600px"
     ariaLabelledBy="install-preflight-runtime-title"
   >
@@ -177,7 +226,7 @@
           type="button"
           class="secondary"
           onclick={cancel}
-          disabled={redetecting}
+          disabled={busy}
         >
           Cancel
         </button>
@@ -185,7 +234,7 @@
           type="button"
           class="secondary"
           onclick={detectAgain}
-          disabled={redetecting}
+          disabled={busy}
         >
           {redetecting ? 'Detecting…' : 'Detect again'}
         </button>
@@ -193,7 +242,7 @@
           type="button"
           class="primary"
           onclick={openInstallPage}
-          disabled={redetecting || !installUrl}
+          disabled={busy || !installUrl}
           aria-describedby="install-podman-external-hint"
         >
           Install Podman

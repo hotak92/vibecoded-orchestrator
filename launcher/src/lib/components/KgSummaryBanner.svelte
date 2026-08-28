@@ -245,7 +245,7 @@
             {retrying ? 'Retrying…' : 'Retry'}
           </button>
         {/if}
-        {#if view.status === 'success'}
+        {#if view.status === 'success' || view.status === 'skipped'}
           <button
             type="button"
             class="bg-btn-x"

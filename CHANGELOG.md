@@ -250,8 +250,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shipped lie; this is what stops the next one being added.
 - The Python sdist now ships `vco_lib/**/*.toml`. Three import-time data
   tables were absent from it (the wheel was unaffected).
+- **A `logging.level` preference (`error` / `warn` / `info` / `debug`) now
+  controls the verbosity of VCO's own diagnostic logging, launcher and Python
+  side.** vct-hub projects the choice into `VCO_LOG_LEVEL`. It is emitted only
+  into `.claude/env`, in the defaulted form
+  `export VCO_LOG_LEVEL="${VCO_LOG_LEVEL:-<stored>}"`, deliberately never into
+  `.claude/settings.json`'s `env` map — that map structurally overwrites
+  inherited environment for MCP subprocesses, which would let the preference
+  clobber an operator's own shell export instead of losing to it. The launcher,
+  `vct-launcher-core` and `vct-hub` crates gain a `tracing` dependency and move
+  their diagnostic `print!`/`println!` call sites onto it, gated by the same
+  env var. On the Python side, `vco_lib/log_setup.py` is the one place that
+  parses `VCO_LOG_LEVEL` and wraps `logging.basicConfig`; nine Python entry
+  points across `vco_lib/` and `claude_mcp_servers/` that each previously
+  hardcoded `logging.basicConfig(level=logging.INFO)` now call it instead, and
+  a source-scan test asserts none remain outside that one module. The
+  preference's own hint names its own gap: MCP servers are not covered by it —
+  they follow their own environment, or the default.
+- **Dual-embedding writes, RL-log collection, and the Arctic secondary-model
+  slot each gained a host-wide default tier**, sitting between a project's
+  explicit choice and the hardcoded `false` floor. Each of the three flags
+  resolves independently through explicit project row > host-wide default >
+  `false`, then one cross-tier clamp applies: the RL-log flag can only be
+  forced DOWN by the dual-write flag's resolved value, never up — a project
+  inheriting a host-wide dual-write default keeps inheriting it rather than
+  being pinned to an explicit row, and turning dual-write off writes an
+  explicit `log = false` row only when the log was actually resolving to on.
+  `DualWriteFlagsPanel` is one component mounted twice: `scope="project"` on
+  each project's Settings tab (unchanged) and the new `scope="global"` mount
+  on Preferences for the host-wide defaults. A project's control gained a
+  genuine third "inherit" position that clears its per-project row rather than
+  only ever writing `true`/`false`. The cascade is parity-tested against a
+  shared truth table shared by the Rust resolver and its Python mirror, and
+  reads no `module_installs`/module-enabled flag — RL-log collection stays
+  independent of whether the RL Reranker module itself is enabled.
 
 ### Fixed
+
+- **The launcher's Hooks tab did nothing at all.** Its Enabled checkbox,
+  Delete button and "+ Register" form wrote rows into the launcher database
+  — a table nothing reads. Claude Code's hook engine reads
+  `<project>/.claude/settings.json` directly, so a hook you unchecked kept
+  firing on every matching event, a hook you deleted kept firing, and a hook
+  you registered never fired. Agents and skills had received the enforcing
+  file-move contract in v0.2.53; hooks never got an equivalent. All four
+  controls now edit the `hooks` block of `settings.json` itself:
+  - **Disable** surgically removes just that hook's entry — sibling hooks in
+    the same group, and every other key in the file (`env`, `permissions`,
+    anything you added), are untouched, and key order is preserved.
+  - **Enable** restores the removed entry byte-for-byte, including its
+    `timeout` / `background` keys and its position in the group. The exact
+    entry is parked in the database while it is off, so the restore is a
+    replay rather than a reconstruction.
+  - **Register** adds the entry (joining an existing group with the same
+    matcher rather than creating a parallel one) and can seed a runnable
+    starter hook script — bash or PowerShell, chosen by the command's `.sh` /
+    `.ps1` suffix — when the file it points at does not exist yet. It never
+    overwrites a file that does.
+  - **Unregister** removes the entry and **never deletes the hook script
+    file**; the confirmation says so.
+
+  The tab now renders what `settings.json` actually declares, with three
+  honest states — *Running*, *Disabled* (parked, restorable) and *Not in
+  settings.json* (a stale record that does not run and cannot be restored) —
+  instead of one checkbox that meant none of them. An unparseable or missing
+  `settings.json` is an explicit refusal with the reason shown and the
+  controls switched off, never a silent fall back to database rows. All edits
+  go through one writer (`python -m vco_lib.hooks_settings`, which reuses the
+  same shape knowledge the installer's settings.json merge already owns),
+  are validated before and after, are written atomically, and refuse to write
+  through a symlinked `settings.json` or `.claude/`. Since `settings.json` is
+  usually tracked by git, the tab says up front that these toggles will show
+  up in your next diff.
+
+  The same writer now also backs the hub's `PATCH /cli/hooks/{hook_id}/enabled`
+  route and the `vco-cli` `hooks enable`/`hooks disable` subcommands, which
+  previously flipped a DB-only mirror flag with no effect on
+  `settings.json` — the same class of bug the tab itself shipped with. Both
+  CLI subcommands' `--project` flag is now **required** rather than optional:
+  toggling a hook edits that project's `.claude/settings.json`, so the hub
+  must be told which project's file to change.
 
 - **A failed Windows binary swap could leave an install frozen on an old
   launcher indefinitely.** The source updated, the running `.exe` stayed old
@@ -378,6 +456,157 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`bash scripts/test-keychain-safe.sh`, never a bare `cargo test
   --workspace`) and the `PYTHONPATH` shadow trap that makes a stale
   `site-packages` copy of `vco_lib` silently shadow the checkout.
+- **The per-project "Enabled" checkbox on a global-scope module tile
+  (currently only the RL Reranker) was a silent no-op.** It wrote
+  `module_installs.enabled`, a row the RL rerank gate
+  (`ProjectConfig.rl_reranker_enabled_for_project`, resolved through
+  `module_effective_enabled`) never reads — unchecking it produced a success
+  toast and a flipped checkbox while reranking kept following the host-wide
+  default. The tile now keys on the catalog's `kind` (a host-wide-install
+  signal) so a global-scope module with no per-project install row renders
+  the real per-project override control instead of the inert legacy checkbox.
+  The host-wide panel's own one-way door is closed too: `globalEnabled` had a
+  real, persistent `null` ("no override set") state that became unreachable
+  after the first click, because the setter only ever wrote `true`/`false`
+  and the one method that deleted the row was neither exposed as a command
+  nor scoped to a single module. A new `module_clear_global_enabled` command
+  and a third "Use system default" button restore it. Because reranking has
+  no trained model yet, every surface that renders the RL Reranker's switch
+  (the module tile, the global panel, and the status panel) now also states
+  plainly that "On" does not mean results are being reranked today — a
+  dormancy notice to be deleted the moment a trained model ships.
+- **A manifest-supplied module action could invoke any registered Tauri
+  command from the renderer, with no server-side check that the manifest
+  was allowed to name it.** Every renderer path that dispatches a
+  manifest-supplied action string — the shared `dispatchAction`,
+  `ModuleConfigTab`'s local copy (used by `on_change`, button actions, and
+  `options_source` loads), and each chained `tauri_command` step — now
+  consults `module_manifest_command_allowed` before invoking, and fails
+  closed if the query itself fails. Verified against the parsed manifests:
+  the root manifest's 2 dispatched actions and the vendored RL manifest's 4
+  legacy actions plus 1 `module_*` action are all allowed;
+  `delete_project_v2` is refused end to end, with the renderer never issuing
+  the invoke in the first place.
+- **"Update all projects" could be started a second time while the first run
+  was still in progress.** The modal had no close-gating override, so
+  reopening it after a backdrop or Escape dismissal and clicking again began
+  a second pass over the same projects, whose eventual result would race the
+  first run's `report`/`phase` state. `update_all_projects` (manifest-driven
+  bundle reconcile over registered projects) and `update_orchestrator_at`
+  (orchestrator-clone git refresh — a deliberately separate operation, not
+  merged into the other) each gain a single-flight guard, and the modal now
+  gates dismissal on the run being in progress. The two "Update N project(s)"
+  buttons (MenuBar and the modal) now carry distinct labels instead of
+  reading as the same action offered twice.
+- **The `/coordination` and `/hub` routes enforced no tier gate at all**,
+  despite a `Sidebar.svelte` comment claiming the underlying Tauri commands
+  "also enforce tier." All 9 gated commands (5 in `commands/coordination.rs`,
+  including the destructive `coordination_apply_schema`, and 4 in
+  `commands/hub_proxy.rs`) now call the shared tier gate as their first
+  statement — before any secret is read or process spawned, in
+  `coordination_apply_schema`'s case — so a DB error or an unknown tier slug
+  refuses rather than admits. Both routes now render a client-side deny
+  layout for a free-tier user reaching them by typed URL, bookmark, or back
+  button. The Preferences boot-autostart pair hosted in the same
+  `hub_proxy.rs` module stays deliberately ungated: gating it would strand a
+  free user's ability to manage the hub service they run themselves.
+- **The code-graph scrubber that strips comments and strings before
+  extracting a function's body could truncate the body at a `#`, `//`, or
+  `--` marker that was actually inside a string, or apply one language's
+  comment marker to another language's source.** `for (int i = n; i > 0;
+  --i) {`, `if (u == "http://x") { … }`, and `log("#tag"); if (c) {` each lost
+  a real `{`/`}` from the brace counter, producing a short, truncated
+  `function_body` and degraded embeddings for every non-Python extractor
+  (Python builds bodies from its own AST and never reaches this scrubber).
+  The scrubber is now one left-to-right pass per language — comment/string
+  markers loaded from a per-language table and threaded through every
+  extractor call site as `language=` — tracking whether it is currently
+  inside a string or a comment so neither construct can spuriously open
+  inside the other, plus cross-line state for constructs that genuinely span
+  lines (block comments, raw/template/verbatim strings, Lua long brackets). A
+  single-line string left open at end-of-line still resets at the newline, so
+  a lexer mistake is bounded to the line that caused it.
+- **A batch of smaller GUI correctness and copy fixes**:
+  - The launcher's status bar no longer renders a permanent, unconditional
+    "Connected" dot and label backed by no signal; it renders only the
+    already-bound app count.
+  - Switching from Sign Up back to Sign In no longer leaves the login button
+    permanently disabled by a stale `confirmEmail` flag that `switchMode()`
+    never cleared.
+  - The install-preflight runtime modal's Cancel button now actually cancels:
+    the pending auto-proceed timer is cleared (not merely its callback
+    skipped), closing the ~350 ms window where a user could click Cancel and
+    still have the install proceed afterward.
+  - The enrichment progress modal now allows dismissal mid-run — matching
+    what its own Cancel-button tooltip already promised — and always notifies
+    its parent, instead of silently becoming impossible to reopen; dismissing
+    mid-run now toasts the re-entry path (re-run Save from the dropdown to
+    resume where it left off).
+  - Editing a date, text, number, or file-picker module control and
+    immediately triggering a chained action that reads it back no longer
+    sends the pre-edit value: all four control kinds join the existing
+    "already fresh, do not read the stale snapshot" skip list.
+  - The Module Config tab now reloads a project's control values on a global
+    project switch instead of continuing to show the previously selected
+    project's values.
+  - The Diagrams tab's project-switch handler now also reloads the
+    module-enabled gate, not just the diagram list — it could previously keep
+    showing the enabled-project UI for a project where the module is
+    disabled, or hide an enabled project's diagrams behind the prior
+    project's gate.
+  - Agents/Skills tab copy no longer claims a toggle "never touches the
+    filesystem" when disabling one renames the underlying file (visibly, in
+    a tracked directory); registering an agent or skill with no backing file
+    now warns instead of leaving a checkbox that can never run.
+  - A grantee can now see when a secret grant made to them has been paused,
+    matching the status already shown to the grant's owner.
+  - A failed secret removal keeps its confirmation modal open so the error
+    renders where it is visible, instead of behind the modal that already
+    closed.
+  - Non-numeric input to a module's number control is now rejected with an
+    inline error instead of being silently replaced by the control's default
+    and confirmed with a "Saved" toast.
+  - The resume/"Finish Update" path — reached after a hand-resolved merge
+    conflict — is now titled for what it is instead of falling through to
+    the generic "Updating orchestrator" title; both the update badge and the
+    progress modal now derive their title from one shared function.
+  - The Store no longer advertises invented semver version numbers (`2.1.0`,
+    `1.4.0`, and four others) for six placeholder apps that are also marked
+    "Coming soon" with no checkout URL.
+  - A skipped KG-summary run can now be dismissed, matching its two sibling
+    banners.
+  - The date-picker module control gained the inline error paragraph its
+    three sibling controls already had.
+  - Off-brand colour literals — nine `#0fc` sites standing in for
+    `--color-teal`, several stray `#00bfa6`/`#1ad3ba` literals, and a stray
+    `rgb(120,220,160)` — were replaced with the real design tokens; the
+    Updates page's two most consequential buttons moved off an invented blue
+    onto `--color-teal`; the launcher-restart banner's near-miss red
+    (`rgba(255, 79, 80, …)`, a one-digit typo of the brand pink `rgba(255,
+    79, 160, …)`) is now the real brand pink at all three sites it appeared.
+  - Four more primary buttons — in the retrieval-tuning panel, the external
+    services dialog, the CDI drift modal, and the storage preferences page —
+    rendered in three different off-brand blues through a `--accent`/
+    `--accent-color` indirection that resolves to nothing in `app.css`; all
+    four now render `--color-teal`.
+  - The Secrets-import panel's error and success colours resolved through
+    another pair of undefined tokens (`--danger`, `--success`) to a hardcoded
+    dark red and dark green found nowhere else in the palette; both now use
+    real brand tokens (`--color-pink` for errors, `--color-teal` for
+    success).
+  - The dual-write panel's "Both default OFF" copy — stale since a third
+    checkbox shipped in v0.2.88 without updating the sentence — now says
+    "All three." Its log-toggle was also unclickable in exactly the state its
+    own tooltip promises an auto-enable cascade for; the toggle now honors
+    that cascade instead of blocking it.
+  - "Code-graph collections" and "Code Graph Embeddings" — two headings 249
+    lines apart in the same Preferences page — now agree on "Code Graph."
+  - The "Project env vars" table on a project's Settings tab now states up
+    front that it is scratch space that resets on tab switch, since nothing
+    ever persisted the rows it let you add.
+  - The host-wide module panel no longer claims a per-project override
+    control exists on "each project's Modules panel" for modules where no
+    such control was wired.
 
 ## [0.2.90] - 2026-07-31
 

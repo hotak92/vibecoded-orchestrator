@@ -151,8 +151,9 @@
         <label><span>Source module</span><input bind:value={newSourceModule} placeholder="optional" /></label>
         <label><span>Model</span><input bind:value={newModel} placeholder="claude/sonnet" /></label>
       </div>
+      <p class="ps-hint">This creates a database row only — no <code>.claude/agents/{'{name}'}.md</code> file is written. The agent won't run until that file exists (create it yourself, or run Re-scan after adding one).</p>
       <button class="ps-btn-primary" onclick={register}>Register</button>
-      <p class="ps-hint">Toggling agent enabled flag NEVER touches the user filesystem; only the DB registry row.</p>
+      <p class="ps-hint">Toggling enabled renames the agent's <code>.md</code> file between <code>.claude/agents/</code> and <code>.claude/agents.disabled/</code> — if the folder is tracked by git, this shows up as a working-tree change.</p>
     </div>
   {/if}
 
@@ -179,7 +180,7 @@
             <td><span class="ps-tag ps-tag-{a.source}">{a.source}</span></td>
             <td>{a.model ?? '—'}</td>
             <td>
-              <label class="ps-tooltip" title="Toggles registry only — .md file untouched">
+              <label class="ps-tooltip" title="Renames the .md file between agents/ and agents.disabled/ (git-visible if tracked)">
                 <input
                   type="checkbox"
                   checked={a.enabled}
@@ -220,7 +221,7 @@
     font-size: 10px; padding: 1px 6px; border-radius: 8px;
     background: rgba(255,255,255,0.08); color: #ccc;
   }
-  .ps-tag-bundled { background: rgba(0,191,166,0.15); color: #0fc; }
+  .ps-tag-bundled { background: rgba(0,191,166,0.15); color: var(--color-teal); }
   .ps-tag-user { background: rgba(123,95,255,0.15); color: #c4b3ff; }
   .ps-tag-paid-module { background: rgba(255,200,70,0.15); color: #fc6; }
   .ps-tag-project { background: rgba(58,163,255,0.15); color: #6cf; }
@@ -235,4 +236,5 @@
   .ps-btn-link:hover { text-decoration: underline; }
   .ps-tooltip { cursor: help; }
   .ps-hint { font-size: 11px; color: #888; margin: 6px 0 0; }
+  .ps-hint code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; }
 </style>

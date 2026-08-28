@@ -41,11 +41,40 @@
   //     onClose={() => (showModal = false)}
   //   />
   //   The modal kicks off the enrichment loop automatically on mount;
-  //   onClose fires after the user dismisses any final-state UI.
+  //   onClose fires on EVERY dismissal — Close button, Escape, backdrop.
+  //
+  // ─── Dismissal contract (v0.2.91, P2-B6) ───────────────────────────
+  //
+  // `DialogRoot.onClose` is a NOTIFICATION, not a gate: only
+  // `closeOnBackdrop` / `closeOnEscape` stop the native <dialog> from
+  // closing (DialogRoot.svelte:148-159 — neither consults `onClose`).
+  // This modal used to pass `onClose={allDone ? onClose : undefined}`,
+  // which prevented nothing and merely stopped the PARENT being told:
+  // Escape or backdrop mid-run closed the dialog while
+  // `KgCodegraphTab`'s `enrichmentTarget` stayed non-null, so the
+  // component sat mounted with a literal `open={true}` that nothing
+  // could ever re-trigger. The dialog could not be shown again, and the
+  // file makes no toast calls, so the run went silent for good.
+  //
+  // Direction taken: ALLOW early dismissal and always report it. That
+  // is what the disabled Cancel button's own tooltip already promises
+  // ("close this modal and re-run from the dropdown to continue from
+  // where it left off"), what the sibling this was forked from does
+  // (`CodeGraphReanalysisModal.svelte:154` passes `onClose`
+  // unconditionally), and it is safe: enrichment is idempotent and
+  // server-side, so dismissing loses no work. Dismissing mid-run toasts
+  // the re-entry path so the user is never left without a way back —
+  // re-running Save from the dropdown resumes where it left off.
+  //
+  // The alternative — blocking dismissal with
+  // `closeOnBackdrop={allDone} closeOnEscape={allDone}` — was rejected:
+  // it contradicts the tooltip and traps the user in a modal for a
+  // multi-collection sweep with no cancel.
 
   import { onDestroy, onMount, untrack } from 'svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import { invoke, listen } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
   import type {
     EnrichmentReport,
     EnrichmentProgress,
@@ -292,9 +321,41 @@
   const hasPerClassErrors = $derived(
     rows.some((r) => r.status === 'error'),
   );
+
+  /**
+   * Single dismissal handler for every route (Close button, Escape,
+   * backdrop) — v0.2.91 (P2-B6).
+   *
+   * Always calls the parent's `onClose` so `enrichmentTarget` is nulled
+   * and the modal can be mounted again. When the run is still going, it
+   * also says so: the enrichment continues server-side and re-running
+   * Save resumes it, which is exactly what the disabled Cancel button's
+   * tooltip promises. Without this the run went silent — the modal makes
+   * no other toast calls.
+   */
+  function handleClose() {
+    if (!allDone) {
+      toast.info(
+        'Enrichment continues in the background. Re-run Save from the ' +
+          'dropdown to watch it — it resumes where it left off.',
+      );
+    }
+    onClose();
+  }
 </script>
 
-<DialogRoot open={true} width="640px" onClose={allDone ? onClose : undefined}>
+<!-- v0.2.91 (P2-B6): `onClose` unconditional. Dismissal stays allowed
+     (both props keep DialogRoot's permissive defaults — stated
+     explicitly so the next editor doesn't read the absence as an
+     oversight); `handleClose` makes sure the parent always hears about
+     it and the user always learns the run continued. -->
+<DialogRoot
+  open={true}
+  width="640px"
+  closeOnBackdrop={true}
+  closeOnEscape={true}
+  onClose={handleClose}
+>
   {#snippet header()}
     <div class="epm-header">
       {#if phase === 'error'}
@@ -444,7 +505,7 @@
           Cancel (idempotent)
         </button>
       {:else}
-        <button class="epm-btn epm-btn-primary" onclick={onClose}>
+        <button class="epm-btn epm-btn-primary" onclick={handleClose}>
           Close
         </button>
       {/if}

@@ -41,7 +41,7 @@
   }
 
   .crumb a {
-    color: var(--accent, #2563eb);
+    color: var(--color-teal);
     text-decoration: none;
   }
 

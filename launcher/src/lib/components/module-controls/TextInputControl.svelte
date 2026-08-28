@@ -261,7 +261,7 @@
     border-radius: 6px;
     border: 1px solid rgba(0, 191, 166, 0.40);
     background: rgba(0, 191, 166, 0.18);
-    color: #00bfa6;
+    color: var(--color-teal);
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;

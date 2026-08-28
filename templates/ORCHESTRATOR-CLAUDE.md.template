@@ -74,7 +74,10 @@ These rules apply to YOU (Claude) working inside any project that has VCO instal
 
 1. **Don't auto-destroy user data.** Weaviate collections, KG embeddings, code-graph embeddings, the launcher SQLite DB, and `.claude/state/` content represent hours of work and on-disk vectors that are expensive to regenerate. If your task seems to require dropping a collection, deleting `.claude/state/`, or wiping the launcher DB — STOP and ask the user explicitly. The orchestrator's own update flow uses a deferral pattern (`UPDATE_DEFERRED.md`) precisely so destructive operations are never auto-applied; follow the same discipline in any new code.
 
-2. **Don't delete `.claude/{agents,skills,hooks}/*.md` to "uninstall" them.** Those are bundled by the orchestrator and `install-bundle --update` will re-add them. Instead, disable via the launcher GUI (per-project Agents/Skills/Hooks tabs → toggle off) or via the `set_project_{agent,skill,hook}_enabled` Tauri commands. Disabled rows survive bundle updates.
+2. **Don't delete bundled agents, skills, or hooks to "uninstall" them.** They are shipped by the orchestrator and `install-bundle --update` will re-add them. Disable them from the launcher GUI instead (per-project Agents / Skills / Hooks tabs → toggle off). Each tab's toggle edits the thing the harness actually reads, so know what it touches:
+   - **Agents / Skills** — the file is MOVED between `.claude/agents/` and `.claude/agents.disabled/` (skills: the whole `.claude/skills/<name>/` directory). Claude Code discovers them by globbing those paths, so the move is the mechanism; nothing is deleted.
+   - **Hooks** — the hook's entry is REMOVED from `.claude/settings.json` (the file Claude Code's hook engine reads) and parked in the launcher DB, so re-enabling restores it exactly. The hook SCRIPT file is never deleted.
+   All three touch your working tree and `.claude/settings.json` is usually VCS-tracked, so expect these toggles to show up in `git status`.
 
 3. **Don't bypass hooks or MCPs without telling the user.** If a hook fails or an MCP times out, surface the issue and let the user decide. Don't silently `export VCT_DISABLE_HOOKS=1` or strip a misbehaving server from `~/.claude.json` — those defaults were chosen for a reason, and silent overrides leak into other sessions.
 

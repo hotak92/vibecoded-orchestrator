@@ -499,9 +499,9 @@
   }
 
   .rt-btn-primary {
-    background: var(--accent, #3b82f6);
+    background: var(--color-teal);
     color: #fff;
-    border-color: var(--accent, #3b82f6);
+    border-color: var(--color-teal);
   }
 
   .rt-btn-primary:hover:not(:disabled) {

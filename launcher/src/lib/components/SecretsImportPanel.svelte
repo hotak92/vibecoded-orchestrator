@@ -146,7 +146,12 @@
   .key { font-weight: 600; margin: 0 0.5rem; }
   .source { color: var(--muted, #888); font-size: 0.85em; }
   .badge { background: var(--accent-soft, #eef); padding: 0.1rem 0.4rem; border-radius: 0.2rem; font-size: 0.8em; margin-left: 0.5rem; }
-  .error { color: var(--danger, #c00); }
-  .results li.ok { color: var(--success, #060); }
-  .results li.err { color: var(--danger, #c00); }
+  /* v0.2.91 F-15: `--danger` and `--success` are defined NOWHERE in
+     app.css, so these always painted their inline fallbacks — #c00 dark red
+     and #060 dark green, hues that appear in no other surface of a
+     navy/teal/purple/pink product. Repointed at the real tokens
+     (launcher/src/app.css `@theme`). */
+  .error { color: var(--color-pink); }
+  .results li.ok { color: var(--color-teal); }
+  .results li.err { color: var(--color-pink); }
 </style>

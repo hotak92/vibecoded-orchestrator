@@ -620,8 +620,13 @@
   .upd-btn { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); color: inherit; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
   .upd-btn:hover:not(:disabled) { background: rgba(255,255,255,0.1); }
   .upd-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .upd-btn-primary { background: rgba(80, 140, 240, 0.2); border-color: rgba(80, 140, 240, 0.5); }
-  .upd-btn-primary:hover:not(:disabled) { background: rgba(80, 140, 240, 0.3); }
+  /* P2-I9 (v0.2.91 wave 5): was an invented rgba(80,140,240,*) blue — this
+     button is the CTA for "Update now" / the confirm modal's "Continue" /
+     the destructive git-resync modal's "Resync now", the two most
+     consequential actions on this page, in a product whose palette has
+     no blue at all. Brand teal. */
+  .upd-btn-primary { background: rgba(var(--color-teal-rgb), 0.2); border-color: var(--color-teal); }
+  .upd-btn-primary:hover:not(:disabled) { background: rgba(var(--color-teal-rgb), 0.3); }
 
   .upd-hint { font-size: 11px; color: #888; margin: 0 0 8px; line-height: 1.5; }
   .upd-paths { list-style: none; padding: 0; margin: 0; font-size: 11px; }

@@ -28,7 +28,7 @@
   // selected we render a placeholder and disable controls (the
   // dedicated rl_settings Tauri commands all reject empty project_id).
 
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import { projects, selectedProject } from '$lib/stores/projects';
   import {
@@ -38,6 +38,9 @@
     type ConfigTab,
     type SelectOption,
   } from '$lib/types/manifest';
+  // v0.2.91 decision #24: the backend allow-query for manifest-supplied
+  // legacy command names. ONE home for the policy (Rust); this file asks.
+  import { assertLegacyActionAllowed } from '$lib/module-dispatch';
   // v0.2.32 L6: filter logic extracted for testability — the Svelte
   // component is now declarative-only and the predicate is a pure
   // function over (options, filter, runtime values).
@@ -51,6 +54,7 @@
     buttonHiddenByWeightsProbe,
     configTabHasDefaultWeightsButton,
     sectionUsesProjectId,
+    snapshotSiblingValues,
     substituteEmbeddingSourceInAction,
   } from '$lib/components/module-controls/configTabHelpers';
   // v0.2.32 L4 + L5 (2026-05-24): info_dynamic + date_picker.
@@ -354,24 +358,7 @@
       await ensureEmbeddingSourceCached(projectId);
     }
 
-    // v0.2.75 RL-11: probe the default-weights bucket ONLY when this tab
-    // actually carries a gated button (unrelated module tabs never pay
-    // the edge round-trip). Failure → false: hidden is the conservative
-    // render for a button whose click would fail identically.
-    if (tauriAvailable() && configTabHasDefaultWeightsButton(configTab.sections)) {
-      try {
-        weightsBucketAvailable = await invoke<boolean>(
-          'module_default_weights_available',
-          {
-            moduleId,
-            embeddingSource: embeddingSourceByProjectId[projectId] ?? 'qwen3',
-          },
-        );
-      } catch (e) {
-        console.warn('[ModuleConfigTab] default-weights bucket probe failed:', e);
-        weightsBucketAvailable = false;
-      }
-    }
+    await probeDefaultWeightsBucket(projectId);
 
     if (!tauriAvailable()) return;
 
@@ -383,11 +370,52 @@
       }
     }
 
-    // v0.2.32 L6: collect every `filter.equals_runtime` identifier
-    // referenced by a multi_select, then resolve them in parallel via
-    // `module_get_runtime_value`. The resolved strings live in
-    // `runtimeValues` so the filter-application code below can read
-    // synchronously at render time.
+    await resolveRuntimeValues(projectId);
+  });
+
+  /**
+   * v0.2.75 RL-11: probe the default-weights bucket ONLY when this tab
+   * actually carries a gated button (unrelated module tabs never pay the
+   * edge round-trip). Failure → false: hidden is the conservative render
+   * for a button whose click would fail identically.
+   *
+   * v0.2.91 (P2-B9): extracted from `onMount` because the verdict is
+   * per-(module, embedding-source) and the embedding source is a
+   * property of the PROJECT — a global project switch has to re-probe,
+   * not keep the previous project's answer.
+   */
+  async function probeDefaultWeightsBucket(pid: string) {
+    if (!tauriAvailable()) return;
+    if (!configTabHasDefaultWeightsButton(configTab.sections)) return;
+    try {
+      weightsBucketAvailable = await invoke<boolean>(
+        'module_default_weights_available',
+        {
+          moduleId,
+          embeddingSource: embeddingSourceByProjectId[pid] ?? 'qwen3',
+        },
+      );
+    } catch (e) {
+      console.warn('[ModuleConfigTab] default-weights bucket probe failed:', e);
+      weightsBucketAvailable = false;
+    }
+  }
+
+  /**
+   * v0.2.32 L6: collect every `filter.equals_runtime` identifier
+   * referenced by a multi_select, then resolve them in parallel via
+   * `module_get_runtime_value`. The resolved strings live in
+   * `runtimeValues` so the filter-application code can read synchronously
+   * at render time.
+   *
+   * Errors fall back to empty string ⇒ the filter treats the option as
+   * non-matching (per the L6 "fail-open" choice in `filterOptions`).
+   *
+   * v0.2.91 (P2-B9): extracted from `onMount` — every lookup is
+   * project-scoped, so a global project switch must re-resolve them.
+   */
+  async function resolveRuntimeValues(pid: string) {
+    if (!tauriAvailable()) return;
     const runtimeKeysToResolve = new Set<string>();
     for (let i = 0; i < configTab.sections.length; i++) {
       for (const control of configTab.sections[i].controls) {
@@ -397,17 +425,13 @@
         }
       }
     }
-
-    // Resolve runtime values in parallel. Each lookup is independent
-    // (different identifier ⇒ different backing source) so we don't
-    // serialise. Errors fall back to empty string ⇒ filter treats
-    // the option as non-matching (per the L6 "fail-open" choice in
-    // `filterOptions` below).
+    // Each lookup is independent (different identifier ⇒ different
+    // backing source) so we don't serialise.
     await Promise.all(
       Array.from(runtimeKeysToResolve).map(async (key) => {
         try {
           const v = await invoke<string>('module_get_runtime_value', {
-            projectId,
+            projectId: pid,
             key,
           });
           runtimeValues[key] = v ?? '';
@@ -420,7 +444,78 @@
         }
       }),
     );
+  }
+
+  // ─── v0.2.91 (P2-B9): reload on a GLOBAL project switch ───────────────
+  //
+  // `projectId` is reactive ($selectedProject), but every load path was
+  // mount-only (`onMount`) or section-picker-only
+  // (`onSectionProjectChange`) — this file contained no `$effect` at all.
+  // Switching the active project with the tab open left every section
+  // showing the PREVIOUS project's persisted values, across all control
+  // kinds, with no visible cue. A project switch is a store update rather
+  // than navigation, so neither the route nor a `{#key}` remounts us.
+  //
+  // Mirrors `onSectionProjectChange`'s invalidate-then-reload shape,
+  // applied to the sections that FOLLOW the global project. Sections with
+  // a section-local pick are an explicit override and are left alone.
+  //
+  // Storm control: the effect tracks `projectId` and nothing else — the
+  // whole body runs inside `untrack`, so mutating `values` /
+  // `optionsByControl` / `runtimeValues` (all `$state`) does not re-enter
+  // it. `lastLoadedProjectId` makes it a no-op on the first run
+  // (`onMount` owns the initial load) and on any re-run with an unchanged
+  // id.
+  let lastLoadedProjectId: string | null = null;
+
+  $effect(() => {
+    const pid = projectId;
+    untrack(() => {
+      if (lastLoadedProjectId === null) {
+        lastLoadedProjectId = pid;
+        return;
+      }
+      if (pid === lastLoadedProjectId) return;
+      lastLoadedProjectId = pid;
+      void reloadForGlobalProject(pid);
+    });
   });
+
+  async function reloadForGlobalProject(pid: string) {
+    if (!tauriAvailable()) return;
+
+    // Drop stale per-control state for every section that follows the
+    // global project, so the next render either shows the new project's
+    // persisted value or falls back to the control's declared default.
+    for (let i = 0; i < configTab.sections.length; i++) {
+      // `!== undefined`, not truthiness: `effectiveProjectId` reads the
+      // pick with `??`, so an explicit "none" pick ('') is still an
+      // override and must survive the global switch.
+      if (pickedProjectIdBySection[i] !== undefined) continue;
+      for (const control of configTab.sections[i].controls) {
+        if (control.kind === 'Unsupported') continue;
+        const k = ckey(i, control.id);
+        delete values[k];
+        delete optionsByControl[k];
+        delete errors[k];
+      }
+    }
+
+    if (!pid) return;
+
+    await ensureEmbeddingSourceCached(pid);
+    await probeDefaultWeightsBucket(pid);
+    for (let i = 0; i < configTab.sections.length; i++) {
+      // `!== undefined`, not truthiness: `effectiveProjectId` reads the
+      // pick with `??`, so an explicit "none" pick ('') is still an
+      // override and must survive the global switch.
+      if (pickedProjectIdBySection[i] !== undefined) continue;
+      if (sectionHasEffectiveProject(i)) {
+        await loadSectionState(i);
+      }
+    }
+    await resolveRuntimeValues(pid);
+  }
 
   // v0.2.32 L6: the inline `filterOptions` previously lived here. It
   // has been extracted to `$lib/components/module-controls/multiSelectFilter`
@@ -554,28 +649,20 @@
    * Conflict policy: if two sections define a control with the same
    * id, the later section wins. This matches how `dispatchAction`'s
    * `extraArgs` already handles sibling references in the legacy path.
+   *
+   * v0.2.91 (P2-B8): the body moved to
+   * `configTabHelpers.snapshotSiblingValues` (pure ⇒ unit-testable), and
+   * the four SELF-PERSISTING kinds — `text_input`, `number_input`,
+   * `date_picker`, `file_picker` — are now excluded. They write straight
+   * to `module_settings` and never report back to this tab, so a
+   * snapshot entry shipped the MOUNT-TIME value (a user who edited the
+   * RL retrain date and clicked retrain in the same session silently
+   * sent the pre-edit date). The dispatcher's per-key `db.get_setting`
+   * fallback already serves those ids, and it is fresh. See the helper's
+   * doc comment for the full rationale.
    */
   function siblingValuesSnapshot(): Record<string, unknown> {
-    const out: Record<string, unknown> = {};
-    for (let i = 0; i < configTab.sections.length; i++) {
-      for (const control of configTab.sections[i].controls) {
-        // Stateless kinds contribute no sibling value.
-        if (
-          control.kind === 'button' ||
-          control.kind === 'info' ||
-          control.kind === 'info_dynamic' ||
-          control.kind === 'link' ||
-          // v0.2.33 (Agent D): forward-compat fallback has no value
-          // shape the renderer can reason about.
-          control.kind === 'Unsupported'
-        ) {
-          continue;
-        }
-        const v = values[ckey(i, control.id)];
-        if (v !== undefined) out[control.id] = v;
-      }
-    }
-    return out;
+    return snapshotSiblingValues(configTab.sections, values, ckey);
   }
 
   async function dispatchAction<T = unknown>(
@@ -617,6 +704,12 @@
     // Legacy string actions: forward the embedding-source as an extra
     // arg. Commands that don't read it are unaffected (Tauri ignores
     // unknown args); commands that DO read it get the resolved value.
+    //
+    // v0.2.91 decision #24: `action` is a manifest-supplied command NAME.
+    // Gate it against the backend allowlist (the SAME one the declarative
+    // path enforces in-process) before invoking. Throws on refusal; the
+    // callers' existing catch renders it as the control's inline error.
+    await assertLegacyActionAllowed(action);
     return invoke<T>(action, {
       moduleId,
       projectId: effectivePid,
@@ -1490,7 +1583,7 @@
   }
   .action-button.variant-primary {
     background: rgba(0, 191, 166, 0.18);
-    color: #00bfa6;
+    color: var(--color-teal);
     border-color: rgba(0, 191, 166, 0.40);
   }
   .action-button.variant-primary:hover:not(:disabled) {

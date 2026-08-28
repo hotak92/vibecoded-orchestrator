@@ -39,6 +39,7 @@
   function switchMode() {
     mode = mode === 'login' ? 'register' : 'login';
     error = null;
+    confirmEmail = false;
   }
 </script>
 

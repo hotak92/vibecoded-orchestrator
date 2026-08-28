@@ -54,12 +54,12 @@
     { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '', checkoutUrl: '' },
     { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '', checkoutUrl: '' },
     { id: 'mao', name: 'Multi-Agent Orchestrator (MAO)', desc: 'Coming soon — 10 specialist agents + Maestro coordinator + Planner pipeline + Tauri UI on top of Standard.', color: 'pink', icon: 'M', version: 'preview', checkoutUrl: '' },
-    { id: 'ecosystem-app-1', name: 'Ecosystem App 1', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'E', version: '2.1.0', checkoutUrl: '' },
-    { id: 'ecosystem-app-2', name: 'Ecosystem App 2', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'E', version: '1.4.0', checkoutUrl: '' },
-    { id: 'convertifacile', name: 'ConvertiFacile', desc: 'Universal file conversion — documents, images, audio', color: 'pink', icon: 'C', version: '1.0.0', checkoutUrl: '' },
-    { id: 'dataweave', name: 'DataWeave', desc: 'Visual data pipeline builder for ETL workflows', color: 'teal', icon: 'D', version: '0.9.0', checkoutUrl: '' },
-    { id: 'formcraft', name: 'FormCraft', desc: 'Drag & drop form builder with smart validations', color: 'purple', icon: 'F', version: '1.2.0', checkoutUrl: '' },
-    { id: 'pixelsnap', name: 'PixelSnap', desc: 'Screenshot tool with annotations and quick sharing', color: 'pink', icon: 'P', version: '1.1.0', checkoutUrl: '' },
+    { id: 'ecosystem-app-1', name: 'Ecosystem App 1', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'E', version: '', checkoutUrl: '' },
+    { id: 'ecosystem-app-2', name: 'Ecosystem App 2', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'E', version: '', checkoutUrl: '' },
+    { id: 'convertifacile', name: 'ConvertiFacile', desc: 'Universal file conversion — documents, images, audio', color: 'pink', icon: 'C', version: '', checkoutUrl: '' },
+    { id: 'dataweave', name: 'DataWeave', desc: 'Visual data pipeline builder for ETL workflows', color: 'teal', icon: 'D', version: '', checkoutUrl: '' },
+    { id: 'formcraft', name: 'FormCraft', desc: 'Drag & drop form builder with smart validations', color: 'purple', icon: 'F', version: '', checkoutUrl: '' },
+    { id: 'pixelsnap', name: 'PixelSnap', desc: 'Screenshot tool with annotations and quick sharing', color: 'pink', icon: 'P', version: '', checkoutUrl: '' },
   ];
 
   // Apps that are not yet purchasable. "Get" / "Activate" buttons are

@@ -682,7 +682,7 @@
     gap: 8px;
     background: rgba(13, 23, 53, 0.97);
     border: 1px solid rgba(0, 191, 166, 0.45);
-    color: #0fc;
+    color: var(--color-teal);
     padding: 6px 12px;
     border-radius: 14px;
     font-size: 12px;

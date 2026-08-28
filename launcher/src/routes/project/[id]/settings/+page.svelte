@@ -65,7 +65,7 @@
 <Toast />
 
 <style>
-  .ps-page { min-height: 100vh; background: var(--color-bg, #0e0e16); color: var(--color-light, #e8e8ee); }
+  .ps-page { min-height: 100vh; background: var(--color-bg, #0e0e16); color: var(--color-text, #e8e8ee); }
   .ps-header { display: flex; align-items: center; gap: 12px; padding: 10px 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
   .ps-header h1 { font-size: 16px; margin: 0; }
   .ps-back { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }

@@ -15,9 +15,17 @@
   //   3. "Clear" button writes `null` (RL's `/global/retrain` reads
   //      this as "no earliest_date filter" = all history).
   //
-  // The persisted value is also visible to sibling controls via
-  // `siblingValuesSnapshot()` in ModuleConfigTab, so a chained_action
-  // body can reference it as `{{control:<this_id>}}`.
+  // Sibling visibility (corrected v0.2.91, P2-B8): a chained_action body
+  // CAN reference this control as `{{control:<this_id>}}`, but it does
+  // NOT resolve through `siblingValuesSnapshot()` in ModuleConfigTab —
+  // this control never reports its new value back to the tab, so that
+  // map holds whatever was persisted when the tab mounted. It resolves
+  // through the dispatcher's per-key DB fallback
+  // (`module_dispatch.rs:768-778` → `db.get_setting`), which is fresh
+  // because step 2 above awaits the persist before dispatching. The
+  // four self-persisting kinds are therefore excluded from the snapshot
+  // on purpose; putting this one back in re-introduces the stale-date
+  // bug the retrain action shipped with.
 
   import { onMount } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
@@ -43,6 +51,7 @@
   let value = $state<string>('');
   let busy = $state(false);
   let loading = $state(true);
+  let error = $state<string>('');
 
   const isDisabled = $derived(disabled || busy || loading || projectId === '');
 
@@ -128,6 +137,7 @@
   async function onChange(newValue: string) {
     if (isDisabled) return;
     busy = true;
+    error = '';
     value = newValue;
     try {
       // Persist the new value. Empty string maps to JSON `null` so
@@ -147,7 +157,13 @@
         await dispatchAction({ moduleId, projectId }, control.on_change, persistValue);
       }
     } catch (err) {
+      // P2-I5: DatePickerControl was the only module control that
+      // surfaced a persist failure via toast only — FilePickerControl,
+      // NumberInputControl and TextInputControl all also render an
+      // inline error paragraph so the failure stays visible after the
+      // toast fades.
       const msg = err instanceof Error ? err.message : String(err);
+      error = msg;
       toast.error(`${control.label}: ${msg}`);
     } finally {
       busy = false;
@@ -180,6 +196,8 @@
       max={control.max ?? undefined}
       disabled={isDisabled}
       onchange={(e) => onChange((e.target as HTMLInputElement).value)}
+      aria-invalid={error !== ''}
+      aria-describedby={error ? `${inputId}-err` : undefined}
     />
     <button
       type="button"
@@ -194,6 +212,9 @@
   </div>
   {#if loading}
     <p class="loading-msg" aria-live="polite">Loading…</p>
+  {/if}
+  {#if error}
+    <p id="{inputId}-err" class="error-message" aria-live="polite">{error}</p>
   {/if}
 </div>
 
@@ -282,6 +303,12 @@
   .loading-msg {
     margin: 0;
     color: var(--color-muted);
+    font-size: 12px;
+  }
+
+  .error-message {
+    margin: 0;
+    color: #e74c3c;
     font-size: 12px;
   }
 </style>

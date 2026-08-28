@@ -443,11 +443,11 @@
   .status-success {
     background: rgba(70, 200, 120, 0.08);
     border-bottom-color: rgba(70, 200, 120, 0.30);
-    color: rgb(120, 220, 160);
+    color: var(--color-teal);
   }
   .status-success .bg-glyph {
     background: rgba(70, 200, 120, 0.18);
-    color: rgb(120, 220, 160);
+    color: var(--color-teal);
   }
   /* Partial (v0.2.73 C-11): inserts succeeded, stale prune incomplete.
      Amber warning tint — distinct from the pink `failed` (a hard error)

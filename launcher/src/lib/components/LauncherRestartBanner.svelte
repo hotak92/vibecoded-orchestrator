@@ -395,12 +395,12 @@
   }
 
   .lrb-locked {
-    background: rgba(255, 79, 80, 0.10);
-    border-bottom-color: rgba(255, 79, 80, 0.40);
+    background: rgba(255, 79, 160, 0.10);
+    border-bottom-color: rgba(255, 79, 160, 0.40);
     color: rgb(255, 150, 150);
   }
   .lrb-locked .lrb-glyph {
-    background: rgba(255, 79, 80, 0.22);
+    background: rgba(255, 79, 160, 0.22);
     color: rgb(255, 160, 160);
   }
 </style>
