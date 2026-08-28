@@ -73,6 +73,20 @@ from vco_lib import weaviate_helpers as _wh
 # silently inline-degrade. MUST MATCH the sibling call site in
 # vco_lib/codegraph_vector_copy.py.
 from vco_lib.weaviate_vectors import clean_named_vector
+# v0.2.91 (decision #27): the invoked-script anchor-walk behind
+# ``_vco_hook_script_identity`` lives in ``vco_lib.hooks_settings`` — the
+# launcher's settings.json hook editor needs the identical "which token is the
+# script actually being RUN" logic to find the script a newly-registered hook
+# command points at (starter-file seeding). Two copies of a walk this subtle
+# would drift, and the conservative guard in ``_merge_hooks_for_bundle`` (never
+# rewrite a user's OWN hook) depends on it being exactly right. LOUD-FAIL
+# import, same rule as the sibling above.
+from vco_lib.hooks_settings import (
+    CMD_SEPARATOR_TOKENS as _HOOK_CMD_SEPARATOR_TOKENS,
+    INTERPRETER_TOKENS as _HOOK_INTERPRETER_TOKENS,
+    SCRIPT_FLAG_TOKENS as _HOOK_SCRIPT_FLAG_TOKENS,
+    invoked_script_tokens as _invoked_script_tokens,
+)
 
 # Default Weaviate port. Canonical value lives in
 # ``vco_lib.weaviate_helpers`` (v0.2.77 Part 7a convergence); re-exported
@@ -12471,19 +12485,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     return result
 
 
-# Interpreter tokens after which a `.claude/hooks/<name>` token is the
-# INVOKED script (bash/sh/PowerShell, .exe variants). Used by
-# `_vco_hook_script_identity` to anchor on the invoked-script POSITION.
-_HOOK_INTERPRETER_TOKENS = frozenset({
-    "bash", "sh", "dash", "zsh",
-    "pwsh", "pwsh.exe", "powershell", "powershell.exe",
-})
-# PowerShell flags whose VALUE (next token) is the script to run.
-_HOOK_SCRIPT_FLAG_TOKENS = frozenset({"-file", "-command"})
-# Shell control operators that reset "command start" so the token after them
-# can begin a fresh invocation (e.g. the `||` in the VCO disable-guard prefix
-# `[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/x.sh`).
-_HOOK_CMD_SEPARATOR_TOKENS = frozenset({"||", "&&", ";", "|", "&"})
+# The interpreter / script-flag / separator token sets that anchor the
+# invoked-script walk now live in `vco_lib.hooks_settings` (imported at module
+# top as `_HOOK_INTERPRETER_TOKENS` / `_HOOK_SCRIPT_FLAG_TOKENS` /
+# `_HOOK_CMD_SEPARATOR_TOKENS`), shared with the launcher's settings.json hook
+# editor. Only the VCO-hook PATH pattern below is specific to this module.
 
 # A bare `.claude/hooks/<name>.{sh,ps1}` token (with optional `${VAR}/` /
 # `%VAR%/` / path prefix ahead of `.claude/`, no embedded whitespace), with the
@@ -12518,56 +12524,17 @@ def _vco_hook_script_identity(command: str) -> Optional[str]:
     PowerShell `-File`/`-Command` flag. Tokens appearing later as arguments or
     after a pipe (without one of those anchors) are NOT invocations.
     """
-    if not command or not isinstance(command, str):
-        return None
-    # Normalize path separators (bash eats `\`; PowerShell accepts both) so a
-    # stale backslash command and the forward-slash form collapse to the same
-    # identity. Strip quotes so quoted path tokens still split cleanly.
-    norm = command.replace("\\", "/").replace('"', " ").replace("'", " ")
-    tokens = norm.split()
-    if not tokens:
-        return None
-
-    # Walk tokens tracking whether the CURRENT position is a command-start
-    # (eligible to be the invoked script): true at index 0, after a shell
-    # control operator, after an interpreter token, or after a -File/-Command
-    # flag. A `.claude/hooks/<name>` token is the invoked script ONLY at such a
-    # position. Anywhere else (a later argument / pipe operand) → not an
-    # invocation; keep scanning but never resolve identity for it.
-    at_command_start = True
-    expect_script_value = False  # set after a -File/-Command flag
-    for tok in tokens:
-        low = tok.lower()
-        if expect_script_value:
-            # This token is the explicit script value of -File/-Command.
-            m = _HOOK_TOKEN_RE.match(tok)
-            if m:
-                return m.group(1)
-            expect_script_value = False
-            at_command_start = False
-            continue
-        if at_command_start:
-            m = _HOOK_TOKEN_RE.match(tok)
-            if m:
-                return m.group(1)
-            if low in _HOOK_INTERPRETER_TOKENS:
-                # Next token is the script the interpreter runs.
-                at_command_start = True
-                continue
-            # A real executable / token at command-start that isn't an
-            # interpreter (e.g. `cat`, `my-wrapper.sh`) — subsequent tokens are
-            # its arguments, not invocations.
-            at_command_start = False
-            continue
-        # Not at command start: handle separators + script flags.
-        if low in _HOOK_CMD_SEPARATOR_TOKENS:
-            at_command_start = True
-            continue
-        if low in _HOOK_SCRIPT_FLAG_TOKENS:
-            expect_script_value = True
-            continue
-        # Plain argument — ignore (this is where the BLOCKER false-positive
-        # was: a hook path here is an arg, not an invocation).
+    # The anchor-walk itself (which token is the script actually being RUN,
+    # normalized across `\`/`/`, quoting and var-expansion) lives in
+    # `vco_lib.hooks_settings.invoked_script_tokens` — see the import note
+    # above. Identity = the FIRST invocation-anchored token that is a
+    # `.claude/hooks/<name>.{sh,ps1}` path; a command whose only such path sits
+    # at an ARGUMENT position yields no anchored match and returns None, which
+    # is the conservative "this is the user's own hook, never touch it" answer.
+    for tok in _invoked_script_tokens(command):
+        m = _HOOK_TOKEN_RE.match(tok)
+        if m:
+            return m.group(1)
     return None
 
 

@@ -158,6 +158,15 @@ pub async fn list_project_skills(
     db.list_project_skills(&project_id)
 }
 
+/// The hooks the launcher has MIRRORED for this project.
+///
+/// **Not the truth about what runs.** Claude Code reads
+/// `<project>/.claude/settings.json`; this table is populated from that file
+/// at scan time and can be stale the moment the file is edited by anything
+/// else. Rendering enable/disable state from these rows is exactly the
+/// v0.2.91 P2-B2 placebo. Use
+/// `commands::project_hooks_settings::list_project_hooks_effective`, which
+/// reads settings.json and joins these rows only for metadata.
 #[command]
 pub async fn list_project_hooks(
     project_id: String,
@@ -477,54 +486,26 @@ pub async fn unregister_project_skill(
     db.unregister_project_skill(&project_id, &skill_name)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RegisterHookReq {
-    pub event: String,
-    #[serde(default)]
-    pub matcher: String,
-    pub command: String,
-    #[serde(default = "default_source")]
-    pub source: String,
-    pub source_module: Option<String>,
-    pub timeout_ms: Option<i64>,
-    #[serde(default)]
-    pub config: JsonValue,
-}
-fn default_source() -> String {
-    "project".to_string()
-}
-
-#[command]
-pub async fn register_project_hook(
-    project_id: String,
-    req: RegisterHookReq,
-    db: State<'_, Db>,
-) -> Result<ProjectHook, String> {
-    db.register_project_hook(
-        &project_id,
-        &req.event,
-        &req.matcher,
-        &req.command,
-        &req.source,
-        req.source_module.as_deref(),
-        req.timeout_ms,
-        &req.config,
-    )
-}
-
-#[command]
-pub async fn set_project_hook_enabled(
-    hook_id: i64,
-    enabled: bool,
-    db: State<'_, Db>,
-) -> Result<(), String> {
-    db.set_project_hook_enabled(hook_id, enabled)
-}
-
-#[command]
-pub async fn unregister_project_hook(hook_id: i64, db: State<'_, Db>) -> Result<(), String> {
-    db.unregister_project_hook(hook_id)
-}
+// ─── Hooks: enforcement lives elsewhere (v0.2.91, decision #27) ─────────
+//
+// `register_project_hook` / `set_project_hook_enabled` /
+// `unregister_project_hook` USED to live here as a pure INSERT / UPDATE /
+// DELETE against `project_hooks` — a table nothing reads. Claude Code's hook
+// engine reads `<project>/.claude/settings.json` directly, so all three were
+// inert: unchecking a hook did not stop it firing, registering one did not
+// make it fire (review v0291-wave5-phase2-ux-completeness, P2-B2). Agents and
+// skills got the v0.2.53 FS-disable enforcement contract
+// (`apply_fs_disable_agent` / `apply_fs_disable_skill` above); hooks never did.
+//
+// They now live in `commands::project_hooks_settings`, which edits the
+// settings.json hooks block through the single writer
+// `python -m vco_lib.hooks_settings` and uses this table only as a mirror plus
+// the parked-entry store. They are NOT re-exported here: a hook mutation that
+// touches only the DB is the bug, and there should be no local symbol offering
+// one.
+//
+// `list_project_hooks` below stays — it is a legitimate read of what the
+// launcher has MIRRORED — but see its doc comment before rendering from it.
 
 #[derive(Debug, Deserialize)]
 pub struct AddPermissionReq {
@@ -848,7 +829,7 @@ pub async fn set_project_kg_binding(
             .as_deref()
             .unwrap_or("http://localhost:8081");
         if let Err(e) = ensure_kg_collection(weaviate_url, &collection_for_ensure).await {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: ensure_kg_collection({}) on {}: {}",
                 collection_for_ensure, weaviate_url, e
             );
@@ -902,13 +883,13 @@ pub fn reproject_after_kg_binding_change(
         let report =
             crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
         for w in &report.global_warnings {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: orchestrator-root KG rebind refresh-all: {}",
                 w
             );
         }
         for (name, err) in &report.failed {
-            eprintln!(
+            tracing::warn!(
                 "[vct] warning: orchestrator-root KG rebind env refresh \
                  failed for {}: {}",
                 name, err

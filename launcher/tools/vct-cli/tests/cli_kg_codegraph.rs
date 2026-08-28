@@ -88,6 +88,54 @@ fn codegraph_search_rejects_unknown_subcommand() {
     assert!(err.contains("error") || err.contains("Unknown") || err.contains("unrecognized"));
 }
 
+// ─── hooks enable/disable — `--project` is REQUIRED (v0.2.91 wave 5) ────
+//
+// Pre-fix `--project` was `Option<String>` and silently unused when
+// omitted — the hub route toggled a DB mirror flag that nothing
+// downstream read, so "which project" never mattered. Real enforcement
+// edits the owning project's `.claude/settings.json`, so the hub cannot
+// act without knowing the project; clap now refuses locally (never even
+// reaches the network) rather than the hub having to refuse it remotely.
+// Same shape as `kg_search_requires_project_flag` above.
+
+#[test]
+fn hooks_enable_requires_project_flag() {
+    let (_out, err, code) = run_vco(&["hooks", "enable", "5"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("--project") || err.contains("project"),
+        "stderr should mention missing --project flag, got: {}",
+        err
+    );
+}
+
+#[test]
+fn hooks_disable_requires_project_flag() {
+    let (_out, err, code) = run_vco(&["hooks", "disable", "5"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("--project") || err.contains("project"),
+        "stderr should mention missing --project flag, got: {}",
+        err
+    );
+}
+
+#[test]
+fn hooks_enable_help_advertises_required_project_flag() {
+    let (out, _err, code) = run_vco(&["hooks", "enable", "--help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("--project"), "help missing --project\n{}", out);
+    assert!(out.contains("REQUIRED"), "help should say REQUIRED, not leave it implicit\n{}", out);
+}
+
+#[test]
+fn hooks_disable_help_advertises_required_project_flag() {
+    let (out, _err, code) = run_vco(&["hooks", "disable", "--help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("--project"), "help missing --project\n{}", out);
+    assert!(out.contains("REQUIRED"), "help should say REQUIRED, not leave it implicit\n{}", out);
+}
+
 // ─── End-to-end: CLI → stub hub ──────────────────────────────────────────
 //
 // We can't stand up the full Tauri launcher in a test, but we can

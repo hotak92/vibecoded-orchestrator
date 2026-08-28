@@ -724,6 +724,23 @@ impl Db {
             .map_err(|e| format!("collect: {}", e))
     }
 
+    /// Flip the MIRROR flag on a hook row.
+    ///
+    /// **This does not enable or disable anything.** Claude Code's hook engine
+    /// reads `<project>/.claude/settings.json`; a hook whose row says
+    /// `enabled = 0` keeps firing on every matching event. Until v0.2.91 this
+    /// call *was* the launcher's "disable" button, which is why that button
+    /// was a placebo (review v0291-wave5-phase2-ux-completeness, P2-B2).
+    ///
+    /// Real enforcement lives in
+    /// `commands::project_hooks_settings::{disable_hook, enable_hook}`, which
+    /// edit the settings.json hooks block through
+    /// `python -m vco_lib.hooks_settings` and park the removed entry via
+    /// `db::project_hooks_settings`. Those paths keep this flag in sync as a
+    /// convenience for existing readers (the hub's `/project-state` and CLI
+    /// routes) — they do not depend on it.
+    ///
+    /// New callers wanting to turn a hook off want `disable_hook`, not this.
     pub fn set_project_hook_enabled(&self, hook_id: i64, enabled: bool) -> Result<(), String> {
         let guard = self.lock();
         let n = guard
@@ -1218,10 +1235,12 @@ impl Db {
         if let Some(prev) = &old_primary {
             if prev != collection_name {
                 if let Err(e) = self.kg_rename_access(project_id, prev, collection_name) {
-                    eprintln!(
-                        "[vct] warning: set_project_kg_binding_with_root_sync: \
-                         kg_rename_access(primary, {} → {}): {}",
-                        prev, collection_name, e
+                    tracing::warn!(
+                        from = %prev,
+                        to = %collection_name,
+                        error = %e,
+                        "[vct] set_project_kg_binding_with_root_sync: \
+                         kg_rename_access(primary) failed"
                     );
                 }
             }
@@ -1232,10 +1251,12 @@ impl Db {
                     if let Err(e) =
                         self.kg_rename_access(project_id, prev_shared, collection_name)
                     {
-                        eprintln!(
-                            "[vct] warning: set_project_kg_binding_with_root_sync: \
-                             kg_rename_access(shared mirror, {} → {}): {}",
-                            prev_shared, collection_name, e
+                        tracing::warn!(
+                            from = %prev_shared,
+                            to = %collection_name,
+                            error = %e,
+                            "[vct] set_project_kg_binding_with_root_sync: \
+                             kg_rename_access(shared mirror) failed"
                         );
                     }
                 }
@@ -1575,12 +1596,12 @@ impl Db {
             // exist, the file was probably moved out-of-band and the
             // DB is just catching up; treat as a no-op move and flip
             // the flag. Either way: don't fail the toggle.
-            eprintln!(
-                "[fs-disable] WARN: {} '{}' file missing at expected source {} (dst_exists={}); flipping DB flag only",
-                kind_label,
+            tracing::warn!(
+                kind = kind_label,
                 name,
-                src.display(),
-                dst_exists
+                source = %src.display(),
+                dst_exists,
+                "[fs-disable] file missing at expected source; flipping DB flag only"
             );
             let n = self.write_enabled_flag(project_id, name, enabled, kind)?;
             if n == 0 {
@@ -1643,16 +1664,15 @@ impl Db {
                         // Both writes failed. Log loudly per the design
                         // spec ("disk full" scenario) so the user can
                         // recover manually.
-                        eprintln!(
-                            "[fs-disable] FATAL: {} '{}' is now INCONSISTENT. \
-                             DB still says enabled={} but file is at {}. \
-                             DB error: {}; rollback error: {}",
-                            kind_label,
+                        tracing::error!(
+                            kind = kind_label,
                             name,
-                            !enabled,
-                            dst.display(),
-                            db_err,
-                            re
+                            db_says_enabled = !enabled,
+                            file_at = %dst.display(),
+                            db_error = %db_err,
+                            rollback_error = %re,
+                            "[fs-disable] FATAL: entry is now INCONSISTENT between \
+                             the DB flag and the file location"
                         );
                         Err(format!(
                             "{} '{}' INCONSISTENT STATE: file moved to {} but \
@@ -1762,22 +1782,24 @@ impl Db {
                 }
                 (false, false) => {
                     report.stale_rows += 1;
-                    eprintln!(
-                        "[fs-disable migrate] WARN: {} '{}' row says enabled=0 but file is missing at both {} and {}",
-                        kind_label_short(kind),
+                    tracing::warn!(
+                        kind = kind_label_short(kind),
                         name,
-                        enabled_path.display(),
-                        disabled_path.display()
+                        enabled_path = %enabled_path.display(),
+                        disabled_path = %disabled_path.display(),
+                        "[fs-disable migrate] row says enabled=0 but the file is \
+                         missing at both locations"
                     );
                 }
                 (true, true) => {
                     report.both_locations += 1;
-                    eprintln!(
-                        "[fs-disable migrate] WARN: {} '{}' exists at BOTH {} and {}. Leaving as-is. Manual cleanup needed.",
-                        kind_label_short(kind),
+                    tracing::warn!(
+                        kind = kind_label_short(kind),
                         name,
-                        enabled_path.display(),
-                        disabled_path.display()
+                        enabled_path = %enabled_path.display(),
+                        disabled_path = %disabled_path.display(),
+                        "[fs-disable migrate] entry exists at BOTH locations. \
+                         Leaving as-is. Manual cleanup needed."
                     );
                 }
             }

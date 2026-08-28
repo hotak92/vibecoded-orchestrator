@@ -160,17 +160,27 @@ enum LicenseCmd {
 enum HooksCmd {
     /// List hooks for a project (id or slug).
     List { project: String },
-    /// Enable a hook by numeric id.
+    /// Enable a hook by numeric id — restores its `.claude/settings.json`
+    /// entry (v0.2.91 wave 5: a real edit via the hub's hook-enforcement
+    /// bridge, not a DB-only mirror flag).
     Enable {
         hook_id: i64,
+        /// Owning project (id or slug), REQUIRED: toggling a hook edits
+        /// that project's .claude/settings.json, so the hub must know
+        /// which project's file to change.
         #[arg(long)]
-        project: Option<String>,
+        project: String,
     },
-    /// Disable a hook by numeric id.
+    /// Disable a hook by numeric id — removes its `.claude/settings.json`
+    /// entry (v0.2.91 wave 5: a real edit via the hub's hook-enforcement
+    /// bridge, not a DB-only mirror flag).
     Disable {
         hook_id: i64,
+        /// Owning project (id or slug), REQUIRED: toggling a hook edits
+        /// that project's .claude/settings.json, so the hub must know
+        /// which project's file to change.
         #[arg(long)]
-        project: Option<String>,
+        project: String,
     },
 }
 

@@ -195,6 +195,13 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 42 = migration 042_project_hooks_disabled_entry.sql (v0.2.91, decision #27
+#: — nullable project_hooks.disabled_entry_json). The Hooks tab was a full
+#: placebo (its rows were read by nothing while Claude Code reads
+#: .claude/settings.json directly); disable/enable now edit that file through
+#: `python -m vco_lib.hooks_settings`, so a disabled hook's removed entry is
+#: PARKED in this column to make re-enable exact. Bumped ATOMICALLY with mig
+#: 042's Rust registration.
 #: 41 = migration 041_job_heartbeats.sql (BUG 2, v0.2.89 — nullable
 #: heartbeat_at liveness columns on kg_syncs + code_graph_builds so a task
 #: death with the launcher still up is detected by the 5-min sweeper /
@@ -218,7 +225,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 41
+LAUNCHER_DB_TABLE_SET_VERSION = 42
 
 
 # ===========================================================================

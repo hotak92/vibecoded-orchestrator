@@ -1,0 +1,46 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+-- Copyright (c) 2026 VibeCoded Tools
+-- Migration 042 (v0.2.91, decision #27): park a disabled hook's settings.json
+-- entry so re-enabling can restore it exactly.
+--
+-- WHY: until v0.2.91 the launcher's Hooks tab was a full placebo. Its
+-- register/toggle/delete wrote `project_hooks` rows, and NOTHING read them —
+-- Claude Code's hook engine reads `<project>/.claude/settings.json` directly,
+-- so unchecking a hook did not stop it firing and registering one did not make
+-- it fire (review v0291-wave5-phase2-ux-completeness, P2-B2). Enforcement is
+-- now an actual edit to that file, performed by the single writer
+-- `python -m vco_lib.hooks_settings`.
+--
+-- Disabling therefore REMOVES the hook's entry from settings.json. To make
+-- that reversible the removed entry has to live somewhere, and this column is
+-- that somewhere:
+--
+--   * disabled_entry_json TEXT NULL — the parked entry (schema 1: event,
+--     matcher, group/hook indices, the inner hook item verbatim, and the
+--     group's other keys when the whole group had to go). NULL = the hook is
+--     not parked, which is the overwhelmingly common case.
+--
+-- Note on the roles of the two "off" signals, which are NOT redundant:
+--   * `enabled = 0` alone (the pre-v0.2.91 state) means only "the launcher's
+--     mirror says off" — an advisory flag with no enforcement behind it.
+--   * `disabled_entry_json IS NOT NULL` means "VCO removed this entry from
+--     settings.json and holds it for restore". That is the enforcing state,
+--     and it is the one the Hooks tab renders as unchecked. The truth about
+--     what RUNS always comes from settings.json itself; this table stays a
+--     mirror plus the parked-entry store.
+--
+-- A column, not a new table: the parked entry is 1:1 with the hook row it
+-- belongs to and dies with it via the existing ON DELETE CASCADE. No index —
+-- project_hooks holds tens of rows per project and every read is already a
+-- full per-project scan (`idx_project_hooks_pid`); a partial index here would
+-- cost more to maintain than it saves.
+--
+-- Not touched by `register_project_hook`'s populate-time UPSERT (which only
+-- overwrites source / source_module / timeout_ms / config_json / updated_at),
+-- so a "Re-scan from disk" cannot lose a parked entry.
+--
+-- Plain additive ALTER TABLE — idempotent via the runner's version check, not
+-- self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 41->42 atomically
+-- with this migration (B-2 discipline).
+
+ALTER TABLE project_hooks ADD COLUMN disabled_entry_json TEXT;

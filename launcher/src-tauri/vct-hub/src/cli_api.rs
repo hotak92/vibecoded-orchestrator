@@ -21,7 +21,12 @@
 //!   POST   /cli/license/deactivate    — clear local license state
 //!   POST   /cli/license/refresh       — force tier re-validation
 //!   GET    /cli/hooks/{project_id}    — list hooks for a project
-//!   PATCH  /cli/hooks/{hook_id}       — toggle/edit a hook (project_id in body)
+//!   PATCH  /cli/hooks/{hook_id}       — toggle a hook's enforcement (project_id
+//!                                       REQUIRED in body — v0.2.91 wave 5: this
+//!                                       edits the project's .claude/settings.json
+//!                                       through vco_lib.hooks_settings, so the
+//!                                       owning project must be known; see
+//!                                       `crate::hooks_enforcement`)
 //!   GET    /cli/telemetry             — telemetry status
 //!   POST   /cli/telemetry/consent     — set consent on/off
 //!   GET    /cli/kg/collections        — auto-detected orchestrator KG collections
@@ -168,9 +173,11 @@ async fn create_project(
     // the project create — matching the existing post-insert audit which
     // is also fire-and-forget.
     if let Err(e) = h.0.populate_kg_collection_access_for_project(&row.id, &row.name) {
-        eprintln!(
-            "[vct-hub] warning: populate_kg_collection_access_for_project({}, {}): {}",
-            row.id, row.name, e
+        tracing::warn!(
+            project = %row.id,
+            name = %row.name,
+            error = %e,
+            "[vct-hub] populate_kg_collection_access_for_project failed"
         );
     }
     let _ = h.0.audit(
@@ -226,7 +233,7 @@ async fn rename_project(
         // logged (no GUI/CLI surface here for them — the boot
         // reconcile is the backup).
         for warn in h.0.propagate_kg_access_on_rename(&project.id, &old_name, &req.new_name) {
-            eprintln!("[vct-hub] rename access propagation warning: {}", warn);
+            tracing::warn!(warning = %warn, "[vct-hub] rename access propagation warning");
         }
         let _ = h.0.audit(
             "project_rename",
@@ -397,22 +404,66 @@ struct HookEnabledReq {
     enabled: bool,
 }
 
+/// Toggle a hook's enforcement from the `vco hooks enable/disable` CLI
+/// (v0.2.91 wave 5 residual close).
+///
+/// Pre-fix this called `Db::set_project_hook_enabled(hook_id, enabled)` — a
+/// bare mirror-table `UPDATE` that nothing downstream reads, so `vco hooks
+/// disable <id>` silently did not stop the hook firing. Real enforcement
+/// (`hooks_enforcement::enforce_hook_toggle`) edits the owning project's
+/// `.claude/settings.json`, which means the owning project must be known:
+/// `project_id` in the body — optional pre-fix because it was only used for
+/// the audit log — is now REQUIRED and refused with a clear 400 when
+/// absent, rather than silently no-opping. Accepts id OR slug, same as
+/// every other `/cli/*` project-scoped route (`resolve_project` is
+/// synchronous and this handler needs to `.await` the enforcement call, so
+/// the id-or-slug resolution is inlined rather than routed through it).
 async fn set_hook_enabled(
     State(h): State<LauncherDbHandle>,
     Path(hook_id): Path<i64>,
     Json(req): Json<HookEnabledReq>,
 ) -> impl IntoResponse {
-    match h.0.set_project_hook_enabled(hook_id, req.enabled) {
+    let id_or_slug = match req.project_id.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return crate::http_error::error_response(
+                StatusCode::BAD_REQUEST,
+                "project_id_required",
+                "toggling a hook edits .claude/settings.json, which needs the owning \
+                 project. Pass `--project <id-or-slug>` (`vco hooks list <project>` to \
+                 find it).",
+            );
+        }
+    };
+    let project = match h
+        .0
+        .get_project(id_or_slug)
+        .ok()
+        .flatten()
+        .or_else(|| h.0.get_project_by_slug(id_or_slug).ok().flatten())
+    {
+        Some(p) => p,
+        None => {
+            return crate::http_error::error_response(
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+                format!("project not found: {}", id_or_slug),
+            );
+        }
+    };
+    match crate::hooks_enforcement::enforce_hook_toggle(&h.0, &project.id, hook_id, req.enabled)
+        .await
+    {
         Ok(()) => {
             let _ = h.0.audit(
                 "hook_set_enabled",
-                req.project_id.as_deref(),
+                Some(project.id.as_str()),
                 None,
                 &serde_json::json!({ "hook_id": hook_id, "enabled": req.enabled, "via": "cli" }),
             );
             Json(serde_json::json!({ "ok": true })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2723,5 +2774,168 @@ mod hub_access_matrix_wiring_tests {
             "expected 'project not found' error, got: {:?}",
             body
         );
+    }
+
+    // ─── PATCH /cli/hooks/{hook_id}/enabled — real enforcement ──────────
+    //
+    // v0.2.91 wave 5 residual close. This is the route the shipped
+    // `vco hooks enable/disable <id> --project <p>` CLI hits
+    // (`launcher/tools/vct-cli/src/main.rs::hooks`). Pre-fix it called
+    // `Db::set_project_hook_enabled(hook_id, enabled)` — a bare mirror
+    // `UPDATE` — so `vco hooks disable <id>` silently did not stop the
+    // hook firing. These tests exercise the real HTTP surface.
+
+    const CLI_HOOK_SETTINGS_JSON: &str = r#"{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cost-tracker.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+    /// Create a project via the real `POST /cli/projects` route (rooted at
+    /// a tempdir with `.claude/settings.json` on disk) and mirror the one
+    /// hook it declares, returning `(tempdir, project_id, hook_id)`.
+    async fn seed_cli_project_with_real_hook(
+        base: &str,
+        client: &reqwest::Client,
+        handle: &LauncherDbHandle,
+        name: &str,
+    ) -> (tempfile::TempDir, String, i64) {
+        let td = tempfile::TempDir::new().unwrap();
+        let claude = td.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), CLI_HOOK_SETTINGS_JSON).unwrap();
+
+        let resp = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": name,
+                "folder_path": td.path().to_string_lossy(),
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "project create failed: {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        let row = handle
+            .0
+            .register_project_hook(
+                &pid,
+                "Stop",
+                "",
+                "bash .claude/hooks/cost-tracker.sh",
+                "project",
+                None,
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        (td, pid, row.id)
+    }
+
+    #[tokio::test]
+    async fn cli_hooks_disable_edits_settings_json_on_disk() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+        let (td, pid, hook_id) =
+            seed_cli_project_with_real_hook(&base, &client, &handle, "CliHookDisable").await;
+        let settings_path = td.path().join(".claude").join("settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+
+        let resp = client
+            .patch(format!("{}/cli/hooks/{}/enabled", base, hook_id))
+            .json(&serde_json::json!({ "project_id": pid, "enabled": false }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "body: {:?}", resp.text().await);
+
+        let after = std::fs::read_to_string(&settings_path).unwrap();
+        assert_ne!(after, before, "the CLI's disable must edit settings.json, not just the DB");
+        assert!(!after.contains("cost-tracker.sh"), "entry must be gone: {}", after);
+    }
+
+    #[tokio::test]
+    async fn cli_hooks_disable_accepts_a_project_slug_not_only_the_id() {
+        // `vco hooks disable <id> --project <slug>` is the documented
+        // shape (`HooksCmd::List` already accepts "id or slug"; the
+        // enforcement path must match, not silently require the UUID).
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+        let (td, pid, hook_id) =
+            seed_cli_project_with_real_hook(&base, &client, &handle, "CliHookSlug").await;
+        let slug = handle.0.get_project(&pid).unwrap().unwrap().slug;
+        let settings_path = td.path().join(".claude").join("settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+
+        let resp = client
+            .patch(format!("{}/cli/hooks/{}/enabled", base, hook_id))
+            .json(&serde_json::json!({ "project_id": slug, "enabled": false }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "body: {:?}", resp.text().await);
+        assert_ne!(std::fs::read_to_string(&settings_path).unwrap(), before);
+    }
+
+    /// The refusal this route MUST make: no `project_id` in the body means
+    /// the hub cannot resolve which project's `settings.json` to edit.
+    /// Pre-fix `project_id` was optional (only used for the audit log), so
+    /// omitting it silently toggled the DB mirror and touched no file —
+    /// exactly the placebo this lane closes. Now it must be a clean 400,
+    /// never a silent no-op success.
+    #[tokio::test]
+    async fn cli_hooks_enable_without_project_id_is_refused_not_silent() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+        let (td, _pid, hook_id) =
+            seed_cli_project_with_real_hook(&base, &client, &handle, "CliHookNoProject").await;
+        let settings_path = td.path().join(".claude").join("settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+
+        let resp = client
+            .patch(format!("{}/cli/hooks/{}/enabled", base, hook_id))
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body["error"]["code"], "project_id_required", "body: {}", body);
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).unwrap(),
+            before,
+            "a refused toggle must not edit settings.json"
+        );
+    }
+
+    /// Leave-alone: a sibling `/cli/*` route this change did not touch
+    /// keeps working — guards against the hooks handler edit having
+    /// collaterally broken the shared router wiring.
+    #[tokio::test]
+    async fn cli_hooks_list_route_is_unaffected_by_the_enforcement_change() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+        let (_td, pid, _hook_id) =
+            seed_cli_project_with_real_hook(&base, &client, &handle, "CliHookListUnaffected")
+                .await;
+
+        let resp = client.get(format!("{}/cli/hooks/{}", base, pid)).send().await.expect("send");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body["count"], 1, "body: {}", body);
     }
 }

@@ -299,14 +299,23 @@ struct PatchHookBody {
     enabled: Option<bool>,
 }
 
+/// Toggle a hook's enforcement (v0.2.91 wave 5 residual close): drives the
+/// real `vco_lib.hooks_settings` writer through
+/// `hooks_enforcement::enforce_hook_toggle` — an actual edit to
+/// `<project>/.claude/settings.json`, not the pre-fix `Db::
+/// set_project_hook_enabled` mirror-only `UPDATE` that nothing downstream
+/// read. See `crate::hooks_enforcement` for why the hub carries its own
+/// (documented) caller of that writer rather than reusing the launcher's.
 async fn patch_hook(
     State(h): State<LauncherDbHandle>,
-    Path((_project_id, hook_id)): Path<(String, i64)>,
+    Path((project_id, hook_id)): Path<(String, i64)>,
     Json(body): Json<PatchHookBody>,
 ) -> impl IntoResponse {
     if let Some(en) = body.enabled {
-        if let Err(e) = h.0.set_project_hook_enabled(hook_id, en) {
-            return err400(e);
+        if let Err(e) =
+            crate::hooks_enforcement::enforce_hook_toggle(&h.0, &project_id, hook_id, en).await
+        {
+            return e.into_response();
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -959,5 +968,185 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let refs = h.0.list_project_secret_refs("ps-proj-2").unwrap();
         assert!(!refs[0].is_set, "explicit is_set=false must still clear");
+    }
+
+    // ─── PATCH /projects/{id}/hooks/{hook_id} — real enforcement ────────
+    //
+    // v0.2.91 wave 5 residual close. Pre-fix this route called
+    // `Db::set_project_hook_enabled(hook_id, enabled)` — a bare mirror
+    // `UPDATE` — so the HTTP round trip below would return 204 while
+    // `.claude/settings.json` never changed. These tests exercise the
+    // actual HTTP surface (not `hooks_enforcement::enforce_hook_toggle`
+    // directly, which the sibling `hooks_enforcement` test module already
+    // covers) — the thing that would have caught the placebo is a real
+    // request against the mounted router.
+
+    // Canonical `json.dumps(..., indent=2)` shape (what `write_settings`
+    // always emits) — NOT arbitrary formatting. `disable` reformats the
+    // file to this shape on its own, so a byte-for-byte round-trip
+    // assertion after disable+enable only holds when the fixture starts
+    // already in canonical form (same reason `hooks_enforcement.rs`'s
+    // `SETTINGS_JSON` fixture is indented this way).
+    const HOOK_SETTINGS_JSON: &str = r#"{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/cost-tracker.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+    /// Seed a project rooted at a REAL tempdir with a `.claude/settings.json`
+    /// on disk plus the matching `project_hooks` mirror row, and return the
+    /// hook's numeric id — the shape `patch_hook` needs end to end (a real
+    /// file to edit, a real row to resolve `hook_id` from).
+    fn seed_project_with_real_hook(db: &Db, project_id: &str) -> (tempfile::TempDir, i64) {
+        let td = tempfile::TempDir::new().unwrap();
+        let claude = td.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), HOOK_SETTINGS_JSON).unwrap();
+        seed_project(db, project_id, project_id, &td.path().to_string_lossy());
+        let row = db
+            .register_project_hook(
+                project_id,
+                "Stop",
+                "",
+                "bash .claude/hooks/cost-tracker.sh",
+                "project",
+                None,
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        (td, row.id)
+    }
+
+    #[tokio::test]
+    async fn patch_hook_disable_edits_settings_json_on_disk() {
+        let (base, h) = spawn_project_state_hub().await;
+        let (td, hook_id) = seed_project_with_real_hook(&h.0, "hook-http-1");
+        let settings_path = td.path().join(".claude").join("settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+
+        let resp = reqwest::Client::new()
+            .patch(format!("{}/projects/hook-http-1/hooks/{}", base, hook_id))
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 204, "body: {:?}", resp.text().await);
+
+        let after = std::fs::read_to_string(&settings_path).unwrap();
+        assert_ne!(
+            after, before,
+            "the HTTP round trip must edit settings.json — this is the fix, not just \
+             a 204 status"
+        );
+        assert!(
+            !after.contains("cost-tracker.sh"),
+            "the disabled hook's entry must be gone from the file: {}",
+            after
+        );
+        assert!(
+            h.0.get_parked_project_hook_entry("hook-http-1", "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+                .unwrap()
+                .is_some(),
+            "the removed entry must be parked for an exact re-enable"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_hook_enable_after_disable_round_trips_via_http() {
+        let (base, h) = spawn_project_state_hub().await;
+        let (td, hook_id) = seed_project_with_real_hook(&h.0, "hook-http-2");
+        let settings_path = td.path().join(".claude").join("settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .patch(format!("{}/projects/hook-http-2/hooks/{}", base, hook_id))
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 204);
+
+        let resp = client
+            .patch(format!("{}/projects/hook-http-2/hooks/{}", base, hook_id))
+            .json(&serde_json::json!({ "enabled": true }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 204, "body: {:?}", resp.text().await);
+
+        let after = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(after, before, "re-enable via HTTP restores the exact original bytes");
+    }
+
+    /// Leave-alone: an unknown `hook_id` for a real project must 404 with a
+    /// structured body, and must not touch that project's settings.json.
+    #[tokio::test]
+    async fn patch_hook_unknown_hook_id_404s_and_writes_nothing() {
+        let (base, h) = spawn_project_state_hub().await;
+        let (td, _hook_id) = seed_project_with_real_hook(&h.0, "hook-http-3");
+        let settings_path = td.path().join(".claude").join("settings.json");
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+
+        let resp = reqwest::Client::new()
+            .patch(format!("{}/projects/hook-http-3/hooks/{}", base, 999_999_i64))
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body["error"]["code"], "hook_not_found", "body: {}", body);
+        assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), before);
+    }
+
+    /// Leave-alone: a sibling route this change did not touch
+    /// (agent enable/disable — a DIFFERENT, already-real FS-move
+    /// enforcement mechanism, see `Db::set_project_agent_enabled`) keeps
+    /// working exactly as before. Guards against the router wiring change
+    /// for hooks having collaterally broken an unrelated route.
+    #[tokio::test]
+    async fn patch_agent_route_is_unaffected_by_the_hooks_enforcement_change() {
+        let (base, h) = spawn_project_state_hub().await;
+        let td = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(td.path().join(".claude").join("agents")).unwrap();
+        let agent_path = td.path().join(".claude").join("agents").join("demo.md");
+        std::fs::write(&agent_path, "# demo agent\n").unwrap();
+        seed_project(&h.0, "hook-http-4", "hook-http-4", &td.path().to_string_lossy());
+        h.0.register_project_agent(
+            "hook-http-4",
+            "demo",
+            "project",
+            None,
+            None,
+            Some(&agent_path.to_string_lossy()),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let resp = reqwest::Client::new()
+            .patch(format!("{}/projects/hook-http-4/agents/demo", base))
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 204, "body: {:?}", resp.text().await);
+        assert!(
+            !agent_path.exists(),
+            "agent disable still moves the file (unrelated, pre-existing mechanism)"
+        );
+        assert!(td.path().join(".claude").join("agents.disabled").join("demo.md").exists());
     }
 }

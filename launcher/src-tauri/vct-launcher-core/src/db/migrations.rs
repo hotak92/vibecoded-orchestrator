@@ -223,6 +223,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "heartbeat_at liveness columns on kg_syncs + code_graph_builds (BUG 2, v0.2.89 — field-reported kg_sync rows stuck RUNNING ~70 h). Terminal-state writes happen only in-task and the only reconciliation was the boot-time orphan sweep, so any task death with the launcher still up (tokio panic/abort, admission-queue park, launcher killed without restart) left RUNNING forever. The running task now stamps heartbeat_at every 60 s (a task-liveness marker, NOT a per-item deadline — the stall watchdog already bounds subprocess silence); staleness = status='running' AND COALESCE(heartbeat_at, started_at, 0) older than the stale window (started_at fallback covers pre-migration legacy rows). Consumers: Db::touch_*_heartbeat tickers, Db::mark_stale_running_*_failed (5-min sweeper spawned from resume_pending_syncs + read-time guards in both status commands). One migration for both columns because the tables are deliberate twins reconciled in the same sweep pass. Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 40->41 atomically with this migration (B-2).",
         sql: include_str!("migrations/041_job_heartbeats.sql"),
     },
+    Migration {
+        version: 42,
+        description: "project_hooks.disabled_entry_json (v0.2.91, decision #27 — the Hooks tab stops being a placebo). Until now register/toggle/delete on the Hooks tab wrote project_hooks rows that NOTHING read: Claude Code's hook engine reads <project>/.claude/settings.json directly, so unchecking a hook never stopped it firing and registering one never made it fire (review v0291-wave5-phase2-ux-completeness P2-B2; apply_fs_disable_hook never existed while its agent/skill siblings did). Enforcement is now a real edit to that file through the single writer `python -m vco_lib.hooks_settings`, which means DISABLING removes the entry — so the removed entry needs a home to make re-enable exact. This nullable TEXT column is that home: the parked entry (schema 1 — event, matcher, group/hook indices, the inner hook item verbatim, plus the group's other keys when the whole group was emptied). NULL = not parked (the common case); NOT NULL = VCO holds this entry out of settings.json and can restore it. `enabled = 0` alone remains the legacy advisory mirror flag; the parked column is the enforcing signal, and the truth about what RUNS is always settings.json itself. A column rather than a table: 1:1 with its hook row, dies with it via the existing ON DELETE CASCADE. No index — tens of rows per project and every read is already a per-project scan. Untouched by populate's UPSERT (which overwrites only source/source_module/timeout_ms/config_json/updated_at), so Re-scan from disk cannot lose a parked entry. Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 41->42 atomically with this migration (B-2).",
+        sql: include_str!("migrations/042_project_hooks_disabled_entry.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -353,7 +358,11 @@ fn apply_one(conn: &Connection, m: &Migration) -> Result<(), String> {
 }
 
 fn tracing_apply(m: &Migration) {
-    eprintln!("[launcher-db] applying migration {}: {}", m.version, m.description);
+    tracing::info!(
+        version = m.version,
+        description = m.description,
+        "[launcher-db] applying migration"
+    );
 }
 
 #[cfg(test)]
