@@ -133,7 +133,7 @@ gethostname = "1"
 hex = "0.4"
 
 # Bug 31: launcher.toml config (volume location, etc.)
-toml = "0.9"
+toml = "1.1"
 
 # H5 (2026-05-08): cryptographically random hub auth tokens.
 # We generate a fresh 32-byte token on every hub startup and persist it
