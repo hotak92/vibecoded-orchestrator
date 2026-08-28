@@ -203,7 +203,10 @@ def parse_vocabulary_text(text: str) -> KgVocabulary:
 
         class_m = _CLASS_HEADING_RE.match(line)
         if class_m:
-            current_alias = class_m.group("alias").lower()
+            # The alias group is non-optional in _CLASS_HEADING_RE, so a match
+            # always carries it — str() is a type-level fact for pyright (which
+            # models Match.group as possibly-None), not a runtime guard.
+            current_alias = str(class_m.group("alias")).lower()
             types.add(current_alias)
             continue
         if _ANY_HEADING_RE.match(line):
@@ -213,7 +216,8 @@ def parse_vocabulary_text(text: str) -> KgVocabulary:
         if current_alias is not None:
             folder_m = _FOLDER_LINE_RE.match(line)
             if folder_m:
-                folder = folder_m.group("folder")
+                # Same type-level fact as the alias group above.
+                folder = str(folder_m.group("folder"))
                 subfolders.add(folder)
                 if current_alias in BUILTIN_NODE_TYPE_TO_FOLDER:
                     builtin_folder = BUILTIN_NODE_TYPE_TO_FOLDER[current_alias]
