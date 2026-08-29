@@ -118,16 +118,27 @@ anything.
    `infrastructure/`, `knowledge/` — existing destination files are never
    overwritten.
 3. **Rewrite path-bearing values** in the destination: `KG_BASE_DIR` in
-   `.claude/settings.json` and `.claude/env` (grep the old path afterwards —
-   zero hits required).
+   `.claude/settings.json` and `.claude/env`, AND the deferral ledger's
+   apply commands (`.claude/context/UPDATE_DEFERRED.md` + `.json` embed
+   absolute paths — a stale `source <old>/.claude/env` would poison a
+   session). Grep the old path across the whole destination afterwards —
+   zero hits required.
 4. **Git hygiene** (if the destination is a repo): add the bundle paths to
    `.git/info/exclude` (LOCAL-only, never the tracked `.gitignore`) so
    VCO-managed files can't reach a commit by accident; deliberately
    un-exclude anything you want tracked.
 5. **Flip the DB row with the launcher CLOSED** (single-writer): back up
    `launcher.db`, then `UPDATE projects SET folder_path='<new>' WHERE
-   id='<project-id>'`, then check every other table's path-like columns for
-   the old path (expect none), then `PRAGMA wal_checkpoint(TRUNCATE)`.
+   id='<project-id>'`, then sweep EVERY table's path-like columns for the
+   old path and CLASSIFY each hit: operational columns (rows future code
+   acts on — e.g. agent/skill `file_path`) get rewritten; historical
+   columns (`log_tail`, telemetry payloads) were TRUE at event time —
+   leave them untouched, never falsify history. `PRAGMA
+   wal_checkpoint(TRUNCATE)` when done. Note: harness per-path state
+   (`~/.claude.json` project entry, `~/.claude/projects/<path-slug>/`
+   auto-memory + transcripts) does NOT follow a move — COPY (never move)
+   the auto-memory directory to the new path's slug if the old path hosted
+   sessions.
 6. **Re-point the toolchain**: relaunch the launcher; verify the hub resolves
    the new path (`/api/v1/projects/by-path`); sweep path-like DB columns
    beyond `projects.folder_path` too (`project_agents.file_path` and
