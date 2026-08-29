@@ -100,6 +100,42 @@ python -m vco_lib.project_init install-bundle \
 
 Add `--force` to accept the shipped versions for files you've intentionally modified. Files preserved by VCO are tracked in `.claude/.vco-manifest.json` under `preserved_files`.
 
+## Moving this project to a different folder (manual protocol)
+
+The launcher GUI does not yet offer "change project path". Until it does, a
+move is a MANUAL protocol — follow it exactly; improvised moves lose KG
+routing or leak VCO files into commits. Project identity (id, Weaviate
+collections, secrets scoping) is keyed by the launcher DB row, NOT the path —
+so a correct move changes only path-bearing state and never re-embeds
+anything.
+
+1. **Inventory first**: list what exists in BOTH the old and new folder.
+   Files present on both sides with DIFFERENT content are conflicts — never
+   auto-overwrite either side; merge deliberately (a project's live
+   `.claude/CONTEXT_STATE.md` always beats a template seed).
+2. **Copy additively** (`rsync -a --ignore-existing`): `.claude/`, root
+   `CLAUDE.md`, `MEMORY.md`, `.env.vco.reference`, `.vscode/`,
+   `infrastructure/`, `knowledge/` — existing destination files are never
+   overwritten.
+3. **Rewrite path-bearing values** in the destination: `KG_BASE_DIR` in
+   `.claude/settings.json` and `.claude/env` (grep the old path afterwards —
+   zero hits required).
+4. **Git hygiene** (if the destination is a repo): add the bundle paths to
+   `.git/info/exclude` (LOCAL-only, never the tracked `.gitignore`) so
+   VCO-managed files can't reach a commit by accident; deliberately
+   un-exclude anything you want tracked.
+5. **Flip the DB row with the launcher CLOSED** (single-writer): back up
+   `launcher.db`, then `UPDATE projects SET folder_path='<new>' WHERE
+   id='<project-id>'`, then check every other table's path-like columns for
+   the old path (expect none), then `PRAGMA wal_checkpoint(TRUNCATE)`.
+6. **Re-point the toolchain**: relaunch the launcher; verify the hub resolves
+   the new path (`/api/v1/projects/by-path`); run `kg-sync --all` from the
+   new root (content-identical nodes keep their embeddings; only file_path
+   metadata refreshes); re-run the code-graph analyzer on the new root when
+   convenient.
+7. **Never delete the old folder automatically** — leave it until a human
+   confirms nothing was missed.
+
 ---
 
 _(Add project-specific sections below: build commands, deployment notes, conventions, anything else a fresh Claude session needs.)_
