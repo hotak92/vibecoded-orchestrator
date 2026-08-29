@@ -129,9 +129,17 @@ anything.
    id='<project-id>'`, then check every other table's path-like columns for
    the old path (expect none), then `PRAGMA wal_checkpoint(TRUNCATE)`.
 6. **Re-point the toolchain**: relaunch the launcher; verify the hub resolves
-   the new path (`/api/v1/projects/by-path`); run `kg-sync --all` from the
-   new root (content-identical nodes keep their embeddings; only file_path
-   metadata refreshes); re-run the code-graph analyzer on the new root when
+   the new path (`/api/v1/projects/by-path`); sweep path-like DB columns
+   beyond `projects.folder_path` too (`project_agents.file_path` and
+   `project_skills.file_path` carry absolute paths — rewrite them in the
+   same launcher-closed window). Then run kg-sync from the new root WITH
+   THE PROJECT'S OWN ENV and the VCO venv — a bare `kg-sync --all` can
+   resolve the project's own `.venv` (no weaviate) or inherit another
+   session's KG env:
+   `cd <new-root> && set -a && source .claude/env && set +a && \
+    <vco-venv>/bin/python .claude/scripts/sync_knowledge_graph.py --all`
+   (content-identical nodes keep their embeddings; only file_path metadata
+   refreshes). Re-run the code-graph analyzer on the new root when
    convenient.
 7. **Never delete the old folder automatically** — leave it until a human
    confirms nothing was missed.
