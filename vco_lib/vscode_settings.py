@@ -1646,7 +1646,11 @@ def set_mode_remote_control(path: Path, *, stash: Optional[Path] = None) -> dict
             merged_login = login_removed
             prior_doc, _prior_err = _read_stash(stash)
             prior_path = prior_doc.get("settings_path") if prior_doc else None
-            if isinstance(prior_path, str) and _same_file(Path(prior_path), path):
+            if (
+                prior_doc is not None
+                and isinstance(prior_path, str)
+                and _same_file(Path(prior_path), path)
+            ):
                 prior_values = prior_doc.get("values")
                 if isinstance(prior_values, dict):
                     merged_values = {**prior_values, **stashed_values}
