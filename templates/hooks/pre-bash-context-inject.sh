@@ -54,6 +54,14 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
+# WP-E (v0.2.92): also extract transcript_path + prompt_id in the SAME parse
+# (avoids a second stdin read/JSON decode). transcript_path is a PATH only —
+# it is threaded to the producer's --transcript flag below and the file's
+# CONTENTS are read in-process by the shared vco_lib/transcript_context.py
+# reader there, never in this shell (R31 privacy discipline: thinking/output
+# text must never reach argv, `ps`, or a hook log). prompt_id scopes the
+# query-cache key (query-cache.sh) so two turns issuing the same short
+# trigger don't collide on one cache entry when their enriched text differs.
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
@@ -61,14 +69,20 @@ try:
     print(d.get('tool_name', ''))
     print(d.get('session_id', ''))
     print(json.dumps(d.get('tool_input', {})))
+    print(d.get('transcript_path', ''))
+    print(d.get('prompt_id', ''))
 except Exception:
     print('')
     print('')
     print('{}')
-" 2>/dev/null || printf '\n\n{}\n')
+    print('')
+    print('')
+" 2>/dev/null || printf '\n\n{}\n\n\n')
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 TOOL_ARGS=$(printf '%s' "$_PARSED" | sed -n '3p')
+TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '4p')
+PROMPT_ID=$(printf '%s' "$_PARSED" | sed -n '5p')
 
 # Only fire for Bash tool
 if [[ "$TOOL_NAME" != "Bash" ]]; then
@@ -127,7 +141,7 @@ if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMA
     if [ -n "$_CG_SYM" ]; then
     # v0.2.72 P2: the extracted symbol doubles as the --anchor (5th arg) so the
     # CLI's shared pipeline biases the rerank toward code call-linked to it.
-    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" "$_CG_SYM" 2>/dev/null || true)"
+    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" "$_CG_SYM" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
     if [ -n "$_CG_RAW" ]; then
         _CGB_INJECT=""
         _CGB_READS=""
@@ -292,10 +306,15 @@ if [ -n "$VENV" ] && [ -f "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search
     # re-paying the ~1.3 s round-trip. Falls back to the direct call when the
     # cache helper is absent (partial install).
     if command -v vco_kg_search_cached >/dev/null 2>&1; then
-        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 > "$KG_TMP" 2>/dev/null ) &
+        # WP-E (v0.2.92): prompt_id scopes the cache key; transcript_path
+        # threads to the producer's --transcript flag (path only — see the
+        # parse block above for the privacy rationale).
+        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
         KG_PID=$!
     else
-        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
+        _FALLBACK_ARGS=("$QUERY" --limit 1 --hook-format)
+        [ -n "$TRANSCRIPT_PATH" ] && _FALLBACK_ARGS+=(--transcript "$TRANSCRIPT_PATH")
+        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "${_FALLBACK_ARGS[@]}" 2>/dev/null \
             | head -40 > "$KG_TMP") &
         KG_PID=$!
     fi

@@ -42,6 +42,7 @@ sys.path.insert(0, str(MCP_DIR))
 
 # pylint: disable=wrong-import-position
 from _lib.sighup_handler import register_sighup_exit_handler  # noqa: E402
+from tests.common.child_env import child_env  # noqa: E402
 
 
 _IS_WINDOWS = platform.system().lower().startswith("win")
@@ -114,6 +115,7 @@ class SighupTriggersCleanExitTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=child_env(),
         )
         try:
             # Wait for the handler to be installed before sending the

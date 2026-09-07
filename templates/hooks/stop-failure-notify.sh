@@ -32,10 +32,20 @@ if [ -n "${PY:-}" ]; then
     SESSION_ID=$(echo "$PAYLOAD" | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id','')[:8])" 2>/dev/null || echo "")
 fi
 
-# Log the failure
-LOG_DIR="$HOME/.claude/metrics"
-mkdir -p "$LOG_DIR"
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"session_id\":\"$SESSION_ID\",\"error_type\":\"$ERROR_TYPE\",\"error_message\":\"$ERROR_MSG\"}" >> "$LOG_DIR/failures.jsonl"
+# Log the failure. v0.2.92 W7: the metrics home moved out of ~/.claude;
+# `_lib/metrics-dir.sh` is the ONE shell-side resolver (sibling:
+# `_lib/metrics-dir.ps1`). A missing helper skips the log line rather than
+# guessing a path — the urgent notification below still fires, which is the
+# part the user actually depends on.
+_SF_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/metrics-dir.sh"
+if [ -f "$_SF_LIB" ]; then
+    # shellcheck source=_lib/metrics-dir.sh disable=SC1091
+    . "$_SF_LIB"
+    LOG_DIR="$(vco_metrics_dir 2>/dev/null || printf '')"
+    if [ -n "$LOG_DIR" ]; then
+        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"session_id\":\"$SESSION_ID\",\"error_type\":\"$ERROR_TYPE\",\"error_message\":\"$ERROR_MSG\"}" >> "$LOG_DIR/failures.jsonl"
+    fi
+fi
 
 # Cross-platform urgent desktop notification (Linux/macOS/Windows). See audit F2.
 if [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then

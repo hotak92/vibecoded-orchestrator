@@ -36,6 +36,8 @@ try {
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+# The ONE guarded detached-spawn home (Start-VcoDetachedProcess).
+. (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
 $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 
 $Drain = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_drain_citations.py"
@@ -60,12 +62,13 @@ $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.log"
 try { New-Item -ItemType Directory -Force -Path (Split-Path $DrainLog) -ErrorAction SilentlyContinue | Out-Null } catch { }
 try {
     $env:CLAUDE_PROJECT_DIR = $ProjectRoot
-    Start-Process -FilePath $VenvPy `
+    # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1): an
+    # unguarded `-WindowStyle Hidden` is REJECTED on non-Windows PowerShell
+    # editions and takes the whole detached drain with it.
+    Start-VcoDetachedProcess -FilePath $VenvPy `
         -ArgumentList @($Drain, "--session-id", $SessionId, "--transcript-path", $TranscriptPath) `
-        -WindowStyle Hidden `
         -RedirectStandardOutput $DrainLog `
-        -RedirectStandardError "$DrainLog.err" `
-        -ErrorAction SilentlyContinue | Out-Null
+        -RedirectStandardError "$DrainLog.err"
 } catch { }
 
 exit 0

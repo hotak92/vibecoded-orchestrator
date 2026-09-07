@@ -12,10 +12,16 @@
     // rationale comment. Do NOT re-add `|| true` in ci.yml and do NOT
     // grow the exclude list without logging the error count + a
     // CHANGELOG backlog entry, as done for the two exclusions below.
+    // v0.2.92: `claude_mcp_servers/model_router` joins the gate. It is new
+    // this cycle and it typechecks 0/0 today, so it lands with no cleanup
+    // debt — which is the ONLY moment adding a surface is free. A package
+    // that ships without being in `include` is a package whose first type
+    // error arrives in the field.
     "include": [
         "vco_lib",
         "claude_mcp_servers/weaviate_mcp",
-        "claude_mcp_servers/search_mcp"
+        "claude_mcp_servers/search_mcp",
+        "claude_mcp_servers/model_router"
     ],
     "exclude": [
         "**/.venv",
@@ -32,5 +38,11 @@
         // so it needs no exclude entry. Add it to `include` once the
         // v0.2.55 backlog clears it.
     ],
-    "pythonVersion": "3.12"
+    "pythonVersion": "3.12",
+    // v0.2.92: unused-import ratchet ON. The 21-violation backlog this
+    // surfaced was cleared (11 dead imports deleted; 10 deliberate
+    // re-exports / importability probes kept with per-line
+    // `# pyright: ignore[reportUnusedImport]` + reason). Any new unused
+    // import now fails the gate.
+    "reportUnusedImport": "error"
 }

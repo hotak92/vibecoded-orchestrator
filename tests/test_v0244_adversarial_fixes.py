@@ -13,6 +13,41 @@ Covers:
 import sys
 from pathlib import Path
 
+import pytest
+
+from tests.common.launcher_db_fixture import make_launcher_db
+
+
+# ─── file-local state pin (v0.2.92) ─────────────────────────────────────────
+#
+# Four tests below drive the real ``install._seed_weaviate_shared_kg_only``
+# with ``_is_orchestrator_root_install`` faked True. When they were written
+# (v0.2.44) they stubbed every write path that existed:
+# ``_write_app_state_key`` and ``_rebind_orchestrator_root_to_canonical``.
+# v0.2.76's R8 shim then added a THIRD one under them —
+# ``_converge_orchestrator_root_kg_pointer`` (install.py:15208) — which
+# resolves ``~/.vct/launcher.db`` and UPSERTs
+# ``app_state.orchestrator_root_kg_collection``. Nobody re-audited the stubs,
+# so from 2026-08-28 every local ``pytest tests/`` rewrote the maintainer's
+# live pointer to this file's last fixture literal (``'NewKG'``).
+#
+# So this pin deliberately does NOT stub the new writer BY NAME — that is the
+# move that expired last time. It redirects the PATH RESOLUTION those writers
+# share, which a future fourth write path inherits for free. ``VCT_STATE_DIR``
+# steers ``vco_lib.paths.vct_root_dir`` (hence ``_discover_app_state_db_path``);
+# ``VCT_LAUNCHER_DB_PATH`` outranks it, so both are pinned.
+#
+# ``tests/conftest.py`` (W-STATE) now does this for the whole suite. This
+# file-local copy is intentional redundancy: these four tests are the ones with
+# a PROVEN blast radius on live user state, and they must stay safe even if
+# this file is ever run with a different conftest or added to the opt-in list.
+@pytest.fixture(autouse=True)
+def _pin_launcher_state_to_tmp(tmp_path_factory, monkeypatch):
+    state_dir = tmp_path_factory.mktemp("v0244-vct-state")
+    monkeypatch.setenv("VCT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(state_dir / "launcher.db"))
+    yield
+
 
 def test_path_resolves_on_disk_handles_nul_byte():
     """Fix 1: a NUL byte in file_path must not crash strategy 1."""
@@ -268,31 +303,19 @@ def test_g2_dual_clone_warning_fires(monkeypatch, tmp_path, capsys):
     current) tuple indicating the mismatch.
     """
     import sys
-    import sqlite3
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
 
-    # Build a fixture launcher.db
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY, name TEXT, folder_path TEXT,
-            host TEXT, created_at INT, updated_at INT, slug TEXT, rl_port INT
-        )
-        """
-    )
+    # Build a fixture launcher.db on the REAL schema.
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    conn.execute(
-        "INSERT INTO projects VALUES ('test-pid', 'TestProj', ?, "
-        "'orchestrator_root', 0, 0, 'test', NULL)",
-        (str(elsewhere),),  # registered points elsewhere
-    )
-    conn.commit()
-    conn.close()
+    db_path = make_launcher_db(tmp_path / "launcher.db", projects=[{
+        "project_id": "test-pid", "name": "TestProj",
+        "folder_path": str(elsewhere),  # registered points elsewhere
+        "host": "orchestrator_root", "slug": "test",
+        "created_at": 0, "updated_at": 0,
+    }])
     monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db_path))
 
     # PROJECT_ROOT is tmp_path itself, not tmp_path/elsewhere
@@ -316,28 +339,16 @@ def test_g2_no_warning_when_paths_match(monkeypatch, tmp_path):
     returns None (no warning).
     """
     import sys
-    import sqlite3
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
 
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY, name TEXT, folder_path TEXT,
-            host TEXT, created_at INT, updated_at INT, slug TEXT, rl_port INT
-        )
-        """
-    )
-    conn.execute(
-        "INSERT INTO projects VALUES ('test-pid', 'TestProj', ?, "
-        "'orchestrator_root', 0, 0, 'test', NULL)",
-        (str(tmp_path),),  # matches PROJECT_ROOT
-    )
-    conn.commit()
-    conn.close()
+    db_path = make_launcher_db(tmp_path / "launcher.db", projects=[{
+        "project_id": "test-pid", "name": "TestProj",
+        "folder_path": str(tmp_path),  # matches PROJECT_ROOT
+        "host": "orchestrator_root", "slug": "test",
+        "created_at": 0, "updated_at": 0,
+    }])
     monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db_path))
     monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
 
@@ -688,26 +699,15 @@ def test_i2_check_dual_clone_skips_foreign_uid(monkeypatch, tmp_path):
         return  # POSIX-specific assertion
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
-    import os as _os
-    import sqlite3 as _sqlite3
 
-    # Build a minimal launcher.db that would otherwise trigger the
-    # dual-clone branch (orchestrator_root row pointing at a foreign
-    # folder).
-    db = tmp_path / "launcher.db"
-    conn = _sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, "
-        "folder_path TEXT, host TEXT, created_at INTEGER, "
-        "updated_at INTEGER, slug TEXT, rl_port INTEGER)"
-    )
-    conn.execute(
-        "INSERT INTO projects VALUES "
-        "('test-pid', 'p', ?, 'orchestrator_root', 0, 0, 't', NULL)",
-        (str(tmp_path / "elsewhere"),),
-    )
-    conn.commit()
-    conn.close()
+    # Build a launcher.db that would otherwise trigger the dual-clone
+    # branch (orchestrator_root row pointing at a foreign folder).
+    db = make_launcher_db(tmp_path / "launcher.db", projects=[{
+        "project_id": "test-pid", "name": "p",
+        "folder_path": str(tmp_path / "elsewhere"),
+        "host": "orchestrator_root", "slug": "t",
+        "created_at": 0, "updated_at": 0,
+    }])
 
     # Make _discover_db_path() + get_orchestrator_root_project_id() return
     # our test fixtures.
@@ -751,23 +751,16 @@ def test_i2_check_dual_clone_proceeds_with_own_uid(monkeypatch, tmp_path):
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
-    import sqlite3 as _sqlite3
 
-    db = tmp_path / "launcher.db"
-    conn = _sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, "
-        "folder_path TEXT, host TEXT, created_at INTEGER, "
-        "updated_at INTEGER, slug TEXT, rl_port INTEGER)"
-    )
     foreign_folder = str(tmp_path / "elsewhere")
-    conn.execute(
-        "INSERT INTO projects VALUES "
-        "('test-pid', 'p', ?, 'orchestrator_root', 0, 0, 't', NULL)",
-        (foreign_folder,),
-    )
-    conn.commit()
-    conn.close()
+    # Written in-process, so the file's st_uid IS our uid — which is the
+    # precondition this test needs (see the "Don't mock stat" note below).
+    db = make_launcher_db(tmp_path / "launcher.db", projects=[{
+        "project_id": "test-pid", "name": "p",
+        "folder_path": foreign_folder,
+        "host": "orchestrator_root", "slug": "t",
+        "created_at": 0, "updated_at": 0,
+    }])
 
     from vco_lib import launcher_db_reader as _ldb
     monkeypatch.setattr(

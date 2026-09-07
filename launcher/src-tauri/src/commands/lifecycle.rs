@@ -775,7 +775,7 @@ async fn route_service_action(
                 other => other,
             };
             let mut args: Vec<&str> = if verb == "up" {
-                vec!["up", "-d", name]
+                compose_single_service_up_args(name)
             } else {
                 vec![verb, name]
             };
@@ -790,6 +790,32 @@ async fn route_service_action(
             // claude_mcp_servers stack).
             control_adopted_container(info, name, effective, action).await
         }
+    }
+}
+
+/// `compose up` args for ONE named service.
+///
+/// v0.2.92 BLOCKER-1: `code_embed` is the ONLY compose service BUILT from the
+/// checkout (`infrastructure/docker-compose.yml::code_embed.build`), and
+/// `up -d` builds an image only when it is MISSING — so a source fix (this
+/// release's over-window REFUSAL, in place of a silent HTTP-200 truncation)
+/// can be live in git and absent from the running service through every
+/// update. Measured before the fix: image built 2026-05-16, container
+/// `--force-recreate`d 2026-07-12, service still truncating.
+///
+/// This leg targets ONE named service, so `--build` is scoped and cheap — a
+/// cache hit when the source is unchanged. It is deliberately NOT added to
+/// `services_start_all`'s whole-stack `up -d`, where it would rebuild a 6 GB
+/// CUDA image on every "Start services" click; staleness on that path stays
+/// OBSERVABLE instead, through `/health.source_sha` (`vco doctor` and the
+/// session-start hook).
+///
+/// Pure, so the flag is unit-testable without a runtime, a daemon, or compose.
+fn compose_single_service_up_args(name: &str) -> Vec<&str> {
+    if name == "code_embed" {
+        vec!["up", "-d", "--build", name]
+    } else {
+        vec!["up", "-d", name]
     }
 }
 
@@ -1491,6 +1517,30 @@ mod services_lifecycle_tests {
     use super::*;
 
     #[test]
+    fn code_embed_single_service_up_rebuilds_the_image() {
+        // The image is BUILT from the checkout; `up -d` alone would start the
+        // container from whatever image already exists, however old.
+        assert_eq!(
+            compose_single_service_up_args("code_embed"),
+            vec!["up", "-d", "--build", "code_embed"]
+        );
+    }
+
+    #[test]
+    fn pulled_services_are_not_rebuilt() {
+        // weaviate/ollama pull pinned upstream images — there is nothing to
+        // build, and `--build` on them would be noise at best.
+        assert_eq!(
+            compose_single_service_up_args("weaviate"),
+            vec!["up", "-d", "weaviate"]
+        );
+        assert_eq!(
+            compose_single_service_up_args("ollama"),
+            vec!["up", "-d", "ollama"]
+        );
+    }
+
+    #[test]
     fn validate_service_name_accepts_canonical() {
         assert!(validate_service_name("weaviate").is_ok());
         assert!(validate_service_name("ollama").is_ok());
@@ -1790,26 +1840,14 @@ mod services_lifecycle_tests {
 
     /// RAII helper: redirect `vct_root_dir()` (and therefore both
     /// services.toml AND the watchdog-paused marker dir) at a temp dir for
-    /// the duration of a test via `VCT_STATE_DIR`. Restores on drop.
-    struct TempStateRoot {
-        _dir: tempfile::TempDir,
-        prev: Option<std::ffi::OsString>,
-    }
-    impl TempStateRoot {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let prev = std::env::var_os("VCT_STATE_DIR");
-            std::env::set_var("VCT_STATE_DIR", dir.path());
-            TempStateRoot { _dir: dir, prev }
-        }
-    }
-    impl Drop for TempStateRoot {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-                None => std::env::remove_var("VCT_STATE_DIR"),
-            }
-        }
+    /// the duration of a test.
+    ///
+    /// v0.2.92: the local `TempStateRoot` struct is gone. It restored by
+    /// UNSETTING when there was no prior value, and took no workspace lock.
+    use vct_launcher_core::test_env::{state_dir_guard, StateDirGuard};
+
+    fn temp_state_root() -> StateDirGuard {
+        state_dir_guard()
     }
 
     /// The PRODUCER drops a marker for a VCO-managed (`Unresolved`) service
@@ -1819,7 +1857,7 @@ mod services_lifecycle_tests {
     #[test]
     #[serial_test::serial]
     fn pause_marker_produced_for_unresolved_service_and_cleared_on_start() {
-        let _root = TempStateRoot::new();
+        let _root = temp_state_root();
         // No adoption entry → Unresolved (the VCO-managed default).
         assert!(
             !vct_launcher_core::services::watchdog_pause::is_service_paused("weaviate"),
@@ -1845,7 +1883,7 @@ mod services_lifecycle_tests {
     #[test]
     #[serial_test::serial]
     fn pause_marker_not_produced_for_externally_managed_service() {
-        let _root = TempStateRoot::new();
+        let _root = temp_state_root();
         // Mark ollama as Adopt.
         let mut state = adoption::read();
         state.upsert(ServiceAdoption {
@@ -1870,7 +1908,7 @@ mod services_lifecycle_tests {
     #[test]
     #[serial_test::serial]
     fn pause_markers_all_managed_round_trip() {
-        let _root = TempStateRoot::new();
+        let _root = temp_state_root();
         // All three default to Unresolved (no services.toml).
         set_pause_markers_for_managed_services(true);
         for svc in ["weaviate", "ollama", "code_embed"] {

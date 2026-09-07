@@ -923,39 +923,14 @@ pub fn set_storage_config_from_cli(
 mod cli_helper_tests {
     use super::*;
 
-    // v0.2.15 (0.2): the helper uses the PROCESS-GLOBAL env var
-    // VCT_STATE_DIR to redirect writes. Cargo runs each test in its
-    // own thread within the SAME process, so concurrent calls would
-    // stomp on each other's env var even with per-thread tempdirs.
-    // A process-wide Mutex serialises test entry — the test bodies
-    // themselves still run quickly so this doesn't slow the suite
-    // meaningfully. The Uuid-based tempdir name is kept for defence
-    // in depth + clearer test-debug paths in panic messages (each
-    // run prints a distinct path).
-    use std::sync::Mutex;
-    static STATE_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_state_dir<F: FnOnce(&Path)>(f: F) {
-        // Take the lock for the WHOLE function so no other test can
-        // observe the env var mid-setup or mid-teardown. Poisoning is
-        // benign here (another test panicked while holding the lock):
-        // tear down the env regardless and continue.
-        let _guard = STATE_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "vct-pr28-{}",
-            uuid::Uuid::new_v4(),
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var("VCT_STATE_DIR").ok();
-        std::env::set_var("VCT_STATE_DIR", &dir);
-        f(&dir);
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // v0.2.15 (0.2): these tests redirect writes through the PROCESS-GLOBAL
+    // `VCT_STATE_DIR`. v0.2.92: the file-local `STATE_DIR_LOCK` + hand-rolled
+    // helper are replaced by the workspace ones. Two things improve: the mutex now
+    // excludes env-mutating tests in EVERY file rather than only this one, and
+    // the scratch dir is a `tempfile::TempDir` (removed by RAII) instead of a
+    // hand-made `$TMPDIR/vct-pr28-<uuid>` that leaked whenever a body panicked
+    // before the trailing `remove_dir_all`.
+    use vct_launcher_core::test_env::with_state_dir;
 
     #[test]
     fn cli_helper_deferred_is_noop() {
@@ -1857,17 +1832,13 @@ mod tests {
         Fut: std::future::Future<Output = T>,
     {
         let _g = RESOLVER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("VCT_STATE_DIR").ok();
-        match val {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
-        let out = f().await;
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
-        out
+        // The set/restore pair is the shared `env_guard`, which restores on
+        // drop (so an `.await` that panics can no longer leave the var
+        // pointing at this test's value). `RESOLVER_ENV_LOCK` is still taken
+        // FIRST here and nowhere in this file is it taken the other way
+        // round, so the two locks have a consistent order.
+        let _env = vct_launcher_core::test_env::env_guard(&[("VCT_STATE_DIR", val)]);
+        f().await
     }
 
     #[tokio::test]

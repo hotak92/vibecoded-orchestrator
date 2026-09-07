@@ -16,7 +16,14 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# v0.2.92 (WP-19). MUST MATCH the `serde_json` entry in
+# `launcher/src-tauri/Cargo.toml` [workspace.dependencies]. This crate is a
+# SEPARATE workspace (its own Cargo.lock), so it cannot inherit and a
+# feature added there does not reach here. `preserve_order` keeps `vco`'s
+# `--json` output in the order the hub sent it instead of alphabetising it.
+# Lockstep is pinned by
+# `launcher/src-tauri/tests/serde_json_preserve_order.rs`.
+serde_json = { version = "1", features = ["preserve_order"] }
 directories = "5"
 anyhow = "1"
 

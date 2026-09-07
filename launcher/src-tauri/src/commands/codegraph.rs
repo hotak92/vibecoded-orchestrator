@@ -2768,18 +2768,26 @@ pub(crate) fn resolve_bundled_script(
         // the marker before trusting the project-local copy. Wrappers that
         // never carried the marker (e.g. kg-duplicates) skip the check —
         // marker-checking them would flag every healthy copy as stale.
+        //
+        // v0.2.92: WHICH wrappers those are is no longer a hand-written list
+        // (it named 2 stems and a field project carried 5 stale wrappers).
+        // The SHIPPED template decides — see `wrapper_requires_resilience_marker`.
         if !wrapper_requires_resilience_marker(bin) || analyzer_wrapper_is_resilient(&p1) {
             return Some(p1);
         }
+        let fallback = resolve_orchestrator_script(bin);
         tracing::warn!(
             "[codegraph] WARN: project-local wrapper {} is stale \
-             (pre-RT-4: no resilient interpreter-discovery marker) — falling \
-             back to the orchestrator copy. A single-file bundle refresh will \
-             heal it.",
-            p1.display()
+             (pre-RT-4: no resilient interpreter-discovery marker); \
+             orchestrator fallback: {}",
+            p1.display(),
+            fallback
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "NONE — this operation will fail".to_string())
         );
-        emit_stale_wrapper_deferral(project_folder, bin, &p1);
-        // fall through to the orchestrator candidates below
+        emit_stale_wrapper_deferral(project_folder, bin, &p1, fallback.as_deref());
+        return fallback;
     }
 
     resolve_orchestrator_script(bin)
@@ -2801,7 +2809,12 @@ pub(crate) fn resolve_orchestrator_script(bin: &str) -> Option<std::path::PathBu
     // 3. Sibling-of-exe convention
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            for hop in [".", "..", "../.."].iter() {
+            // ONE home for the hop list: `vct_launcher_core::paths`. The two
+            // ladders (there and here) had drifted into byte-identical copies
+            // of the same three hops, and BOTH were one hop short of the
+            // shipped `launcher/dist/<target>/` layout — so fixing one would
+            // have left the other silently broken.
+            for hop in vct_launcher_core::paths::ORCHESTRATOR_HOP_SUFFIXES.iter() {
                 let p3 = parent.join(hop).join(".claude").join("scripts").join(bin);
                 if p3.is_file() {
                     return Some(p3);
@@ -2823,14 +2836,74 @@ pub(crate) fn resolve_orchestrator_script(bin: &str) -> Option<std::path::PathBu
     None
 }
 
-/// Which bundled wrappers ship the resilient (`$VCT_INSTALL_ROOT`) ladder and
-/// therefore SHOULD be stale-checked. `code-graph-analyze[.ps1]` (RT-4) and
-/// `kg-sync[.ps1]` (v0.2.37 backport) do. `kg-duplicates` is a simple
-/// project-local-only wrapper with no ladder and no `.ps1` sibling — marker-
-/// checking it would false-positive every healthy copy, so it is excluded.
+/// The string a healthy (RT-4+) wrapper must still contain.
+///
+/// MUST MATCH `vco_lib/wrapper_health.py::RESILIENT_WRAPPER_MARKER` — the
+/// Python side answers the same question at bundle-install time. The literal
+/// is pinned by `tests/test_v0292_wrapper_health.py::MarkerParityTests`.
+pub(crate) const RESILIENT_WRAPPER_MARKER: &str = "VCT_INSTALL_ROOT";
+
+/// Does `<bin>` ship the resilient (`$VCT_INSTALL_ROOT`) ladder, and therefore
+/// need its project-local copy stale-checked?
+///
+/// v0.2.92 — DERIVED, not hand-listed. This used to be
+/// `matches!(stem, "code-graph-analyze" | "kg-sync")`, and the Python probe
+/// carried a parallel 4-entry tuple. A field project (2026-09-05) held FIVE
+/// pre-VCO wrappers — `kg-sync`, `kg-search`, `kg-info`, `code-graph-query`,
+/// `code-graph-analyze` — all pointing at another checkout's venv and another
+/// project's `KG_COLLECTION` default; exactly one of them was noticed.
+///
+/// The enumeration now reads the SHIPPED TEMPLATE: `<repo>/templates/scripts/<bin>`
+/// is the same file `vco_lib.wrapper_health` reads, so both sides cover the
+/// identical set and a wrapper added in a future release is covered the day it
+/// ships. It also DERIVES the exclusions the old list spelled out by hand —
+/// `kg-duplicates` and `generate-kg-summary.py` carry no marker in their
+/// shipped form, so they are still never marker-checked.
+///
+/// Conservative when the shipped template cannot be read (no repo root,
+/// missing file): returns `false` ⇒ the project-local copy is trusted. An
+/// undecidable case must not condemn a healthy file.
 fn wrapper_requires_resilience_marker(bin: &str) -> bool {
-    let stem = bin.strip_suffix(".ps1").unwrap_or(bin);
-    matches!(stem, "code-graph-analyze" | "kg-sync")
+    let Ok(repo_root) = crate::commands::installer::find_local_repo_root() else {
+        return false;
+    };
+    let shipped = repo_root.join("templates").join("scripts").join(bin);
+    match std::fs::read_to_string(&shipped) {
+        Ok(contents) => contents.contains(RESILIENT_WRAPPER_MARKER),
+        Err(_) => false,
+    }
+}
+
+/// Every project-local wrapper under `<project>/.claude/scripts` that is
+/// marker-bearing upstream but stale on disk. Used by the deferral emitter so
+/// the entry names ALL of them, not just whichever one happened to be resolved
+/// first (the deferral writer dedups by `condition_id`, so the old per-`bin`
+/// emit named exactly one wrapper however many were broken).
+fn stale_project_wrappers(project_folder: &std::path::Path) -> Vec<String> {
+    let Ok(repo_root) = crate::commands::installer::find_local_repo_root() else {
+        return Vec::new();
+    };
+    let shipped_dir = repo_root.join("templates").join("scripts");
+    let scripts_dir = project_folder.join(".claude").join("scripts");
+    let Ok(entries) = std::fs::read_dir(&shipped_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            std::fs::read_to_string(e.path())
+                .map(|c| c.contains(RESILIENT_WRAPPER_MARKER))
+                .unwrap_or(false)
+        })
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| {
+            let installed = scripts_dir.join(name);
+            installed.is_file() && !analyzer_wrapper_is_resilient(&installed)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Health-check a project-local `code-graph-analyze` / `.ps1` wrapper: does
@@ -2850,9 +2923,59 @@ fn wrapper_requires_resilience_marker(bin: &str) -> bool {
 /// candidate is healthy by definition of the ladder.
 fn analyzer_wrapper_is_resilient(path: &std::path::Path) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(contents) => contents.contains("VCT_INSTALL_ROOT"),
+        Ok(contents) => contents.contains(RESILIENT_WRAPPER_MARKER),
         Err(_) => false,
     }
+}
+
+/// The `Detected:` prose for `stale_codegraph_wrapper_pending`. Pure, so the
+/// honesty of the claim can be tested without spawning the emitter.
+///
+/// v0.2.92: this text used to assert "The launcher is currently falling back
+/// to the healthy orchestrator copy, so builds still work" — unconditionally,
+/// with no reference to whether a fallback had in fact resolved. On the
+/// 2026-09-05 field report it had NOT: the code-graph build died with "script
+/// not found", and the KG sync never consulted this guard at all, ran the
+/// stale wrapper, and failed 329/329. A mechanism must not be credited by a
+/// sentence; report what actually resolved.
+fn stale_wrapper_detected_text(
+    all_stale: &[String],
+    stale_wrapper: &std::path::Path,
+    fallback: Option<&std::path::Path>,
+) -> String {
+    let stale_list = all_stale
+        .iter()
+        .map(|n| format!("\n  - .claude/scripts/{}", n))
+        .collect::<String>();
+    let consequence = match fallback {
+        Some(p) => format!(
+            "For THIS operation the launcher fell back to the orchestrator \
+             copy at {} — but that fallback is per-call and is not guaranteed \
+             to resolve (it depends on $VCT_LAUNCHER_SCRIPTS_DIR / the \
+             launcher binary's location / $PATH).",
+            p.display()
+        ),
+        None => "NO orchestrator fallback resolved for this wrapper \
+             ($VCT_LAUNCHER_SCRIPTS_DIR unset, no sibling-of-exe copy, not on \
+             $PATH), so the operation that needed it FAILED with \
+             \"script not found\". This is not cosmetic."
+            .to_string(),
+    };
+    format!(
+        "One or more project-local VCO wrappers under .claude/scripts are \
+         pre-RT-4 (2026-02-era) or pre-VCO copies: they lack the resilient \
+         $VCT_INSTALL_ROOT interpreter-discovery ladder that the shipped \
+         version carries, so they hard-code a venv path from another checkout \
+         (exit 127 / ModuleNotFoundError) and the pre-VCO generation also \
+         defaults KG_COLLECTION to a FOREIGN collection name — running one \
+         can write another project's knowledge graph.\n\
+         Stale wrapper(s) detected:{}\n\
+         (resolution that tripped this: {})\n\
+         {}",
+        stale_list,
+        stale_wrapper.display(),
+        consequence
+    )
 }
 
 /// Best-effort: append a per-project `stale_codegraph_wrapper_pending`
@@ -2872,21 +2995,28 @@ fn emit_stale_wrapper_deferral(
     project_folder: &std::path::Path,
     bin: &str,
     stale_wrapper: &std::path::Path,
+    fallback: Option<&std::path::Path>,
 ) {
     let repo_root = match crate::commands::installer::find_local_repo_root() {
         Ok(r) => r,
         Err(_) => return,
     };
 
-    let detected = format!(
-        "The project-local code-graph analyzer wrapper at {} is a pre-RT-4 \
-         (2026-02-era) copy: it lacks the resilient $VCT_INSTALL_ROOT \
-         interpreter-discovery ladder, so it can hard-code a stale venv path \
-         and fail (exit 127 / ModuleNotFoundError). The launcher is currently \
-         falling back to the healthy orchestrator copy, so builds still work; \
-         refresh this one file to restore project-local resolution.",
-        stale_wrapper.display()
-    );
+    // v0.2.92: name EVERY stale wrapper, not just the one being resolved.
+    // The deferral writer dedups by `condition_id`, so the previous per-`bin`
+    // emit produced a single entry naming a single file — a field project with
+    // five stale wrappers got one of them mentioned and the other four went
+    // unreported.
+    let mut all_stale = stale_project_wrappers(project_folder);
+    let this_one = stale_wrapper
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| bin.to_string());
+    if !all_stale.iter().any(|n| *n == this_one) {
+        all_stale.push(this_one);
+        all_stale.sort();
+    }
+    let detected = stale_wrapper_detected_text(&all_stale, stale_wrapper, fallback);
     // POSIX single-quote the folder for the emitted shell command (paths may
     // contain spaces; embedded single quotes use the standard '\'' escape).
     let folder_sh = format!("'{}'", project_folder.display().to_string().replace('\'', r"'\''"));
@@ -2895,18 +3025,30 @@ fn emit_stale_wrapper_deferral(
     // invented flag would be argparse-rejected (the C-10 lesson). Give TWO
     // valid remediations: a targeted one-file copy from the bundle template,
     // or the full manifest-driven refresh (--force overwrites the stale copy).
+    let copy_lines = all_stale
+        .iter()
+        .map(|n| {
+            format!(
+                "cp {root}/templates/scripts/{name} {folder}/.claude/scripts/{name}\n",
+                root = repo_root.display(),
+                name = n,
+                folder = folder_sh
+            )
+        })
+        .collect::<String>();
     let command_to_apply = format!(
-        "# Option A — refresh JUST the stale wrapper by copying the bundle \
-         template (replace <orchestrator-root> with your install root):\n\
-         cp <orchestrator-root>/templates/scripts/{bin} \
-         {folder}/.claude/scripts/{bin}\n\
+        "# Option A — refresh JUST the stale wrapper(s) by copying the bundle \
+         template(s) from this install's orchestrator root:\n\
+         {copy_lines}\
          \n\
-         # Option B — full manifest-driven bundle refresh (--force also \
-         overwrites ANY other user-modified bundle files, so review the \
-         resulting UPDATE_DEFERRED summary):\n\
-         python -m vco_lib.project_init install-bundle --update --force \
+         # Option B — full manifest-driven bundle refresh. Since v0.2.92 a \
+         plain --update already ADOPTS a wrapper that is provably a stale \
+         shipped artifact (your bytes are backed up under \
+         .claude/backups/bundle-adoptions/<ts>/ first), so --force is only \
+         needed for files VCO could NOT prove were stale:\n\
+         python -m vco_lib.project_init install-bundle --update \
          --folder {folder}",
-        bin = bin,
+        copy_lines = copy_lines,
         folder = folder_sh
     );
 
@@ -2916,16 +3058,21 @@ fn emit_stale_wrapper_deferral(
     // while importing `vco_lib` from the orchestrator clone
     // (`sys_path_root = repo_root`). Best-effort — a failure must not break
     // the analyzer fallback that already succeeded.
-    let why_deferred = "Overwriting a user-touched wrapper without consent \
-        could clobber local edits; the orchestrator copy is used meanwhile so \
-        nothing is broken. Refresh the one file when convenient.";
+    let why_deferred = "Overwriting a wrapper without consent could clobber \
+        local edits, so VCO does not do it from the launcher's resolution \
+        path. This is NOT cosmetic: until the wrapper is refreshed, any \
+        operation that resolves it may fail outright, or write into another \
+        project's collection. Run one of the commands below.";
     let fields = crate::services::deferral::DeferralEntryFields {
         condition_id: "stale_codegraph_wrapper_pending",
-        title: "Stale project-local code-graph analyzer wrapper",
+        title: "Stale project-local VCO script wrapper(s)",
         detected: &detected,
         why_deferred,
         command_to_apply: &command_to_apply,
-        severity: "info",
+        // v0.2.92: was "info", which read as cosmetic next to a registry
+        // class of `action_required`. A wrapper in this state can fail a
+        // build outright or write a FOREIGN collection — that is a warning.
+        severity: "warning",
     };
     if let Err(e) =
         crate::services::deferral::emit_deferral_entry(&repo_root, project_folder, &fields)
@@ -3167,6 +3314,131 @@ mod build_tests {
         let resolved = resolve_analyzer_script(&d).expect("must resolve");
         assert_eq!(resolved, p);
         fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.2.92: the marker-bearing set is DERIVED from `templates/scripts/`,
+    /// not hand-listed. The old `matches!(stem, "code-graph-analyze" |
+    /// "kg-sync")` covered 2 of the shipped wrappers; a field project
+    /// (2026-09-05) carried FIVE stale ones and exactly one was noticed.
+    ///
+    /// Asserted against the REAL shipped templates so a wrapper that gains or
+    /// loses the ladder changes this test's inputs automatically.
+    ///
+    /// Mutation check: restore the hardcoded `matches!` and the `kg-search` /
+    /// `code-graph-query` / `kg-info` assertions fail.
+    /// v0.2.92 (defect 4 of the 2026-09-05 field report): the deferral's
+    /// prose must not credit a fallback that did not resolve.
+    ///
+    /// Mutation check: restore the old unconditional sentence ("The launcher
+    /// is currently falling back to the healthy orchestrator copy, so builds
+    /// still work") and the no-fallback assertions fail.
+    #[test]
+    fn detected_text_reports_the_fallback_that_actually_resolved() {
+        let stale = std::path::Path::new("/p/.claude/scripts/kg-sync");
+        let names = vec!["code-graph-analyze".to_string(), "kg-sync".to_string()];
+
+        // No fallback resolved — the field case. The text must say so.
+        let none = stale_wrapper_detected_text(&names, stale, None);
+        assert!(
+            none.contains("NO orchestrator fallback resolved"),
+            "must state that nothing resolved; got:\n{none}"
+        );
+        assert!(
+            !none.contains("builds still work"),
+            "must not credit a fallback that did not fire; got:\n{none}"
+        );
+
+        // A fallback DID resolve — name it, and still do not promise it always
+        // will (it is per-call and env-dependent).
+        let some = stale_wrapper_detected_text(
+            &names,
+            stale,
+            Some(std::path::Path::new("/orch/.claude/scripts/kg-sync")),
+        );
+        assert!(some.contains("/orch/.claude/scripts/kg-sync"));
+        assert!(!some.contains("builds still work"));
+        assert!(some.contains("not guaranteed"));
+
+        // Both forms enumerate EVERY stale wrapper, not just the resolved one.
+        for text in [&none, &some] {
+            assert!(text.contains(".claude/scripts/kg-sync"));
+            assert!(
+                text.contains(".claude/scripts/code-graph-analyze"),
+                "every stale wrapper must be named; got:\n{text}"
+            );
+        }
+        // And the cross-project consequence is stated, not implied.
+        assert!(none.contains("FOREIGN collection"));
+    }
+
+    #[test]
+    fn wrapper_marker_requirement_is_derived_from_the_shipped_templates() {
+        let repo_root = crate::commands::installer::find_local_repo_root()
+            .expect("cargo test runs inside the checkout, so the root must resolve");
+        let shipped = repo_root.join("templates").join("scripts");
+        assert!(
+            shipped.join("kg-search").is_file(),
+            "fixture precondition: templates/scripts/kg-search must ship"
+        );
+
+        // Marker-bearing upstream — NONE of these were in the old hardcoded
+        // 2-stem list, and all three were among the field project's stale set.
+        for bin in ["kg-search", "kg-info", "code-graph-query"] {
+            assert!(
+                wrapper_requires_resilience_marker(bin),
+                "{bin} ships the $VCT_INSTALL_ROOT ladder, so its project-local \
+                 copy must be marker-checked"
+            );
+        }
+        // Still covered (regression guard for the two the old list named).
+        assert!(wrapper_requires_resilience_marker("code-graph-analyze"));
+        assert!(wrapper_requires_resilience_marker("kg-sync"));
+
+        // NOT marker-bearing upstream — the exclusions the old list spelled
+        // out by hand are now derived. Marker-checking these would flag every
+        // healthy copy as stale.
+        assert!(!wrapper_requires_resilience_marker("kg-duplicates"));
+        assert!(!wrapper_requires_resilience_marker("generate-kg-summary.py"));
+        // A file VCO does not ship at all is never condemned.
+        assert!(!wrapper_requires_resilience_marker("not-a-vco-script"));
+    }
+
+    /// The deferral names EVERY stale wrapper, not just the resolved one.
+    /// The deferral writer dedups by `condition_id`, so a per-`bin` emit
+    /// produced one entry naming one file however many were broken.
+    #[test]
+    fn stale_project_wrappers_lists_every_broken_copy() {
+        let proj = tmpdir("stale-many");
+        let scripts = proj.join(".claude").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        // Three stale (pre-VCO shape: another checkout's venv, foreign
+        // collection default), one healthy, one VCO does not ship.
+        for bin in ["kg-sync", "kg-search", "code-graph-query"] {
+            fs::write(
+                scripts.join(bin),
+                b"#!/bin/bash\nsource /other/checkout/.venv/bin/activate\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            scripts.join("kg-info"),
+            b"#!/bin/bash\n: \"${VCT_INSTALL_ROOT:-}\"\n",
+        )
+        .unwrap();
+        fs::write(scripts.join("my-own-tool"), b"#!/bin/bash\necho hi\n").unwrap();
+
+        let found = stale_project_wrappers(&proj);
+        assert_eq!(
+            found,
+            vec![
+                "code-graph-query".to_string(),
+                "kg-search".to_string(),
+                "kg-sync".to_string()
+            ],
+            "every stale marker-bearing wrapper must be listed; healthy and \
+             non-shipped files must not be"
+        );
+        fs::remove_dir_all(&proj).ok();
     }
 
     #[test]

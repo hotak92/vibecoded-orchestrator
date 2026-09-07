@@ -12,7 +12,7 @@
 // event; intermediate progress is not surfaced today (see install.rs).
 // We model install as a single async call with start/end states.
 
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import { invoke, listen, tauriAvailable } from '$lib/tauri';
 import { toast } from '$lib/stores/toast';
 import type {
@@ -95,6 +95,39 @@ interface ModulesState {
   /** v0.2.33: dev-affordance hint (review §10.c). */
   devAffordanceHint: DevAffordanceHint | null;
   installed: ModuleInstallRow[]; // for currently-selected project
+  /**
+   * v0.2.92: which project's rows `installed` currently reflects, or
+   * `null` if no successful `loadInstalled()` has landed yet. This is
+   * the tri-state signal callers need to tell "this project genuinely
+   * has no install row for module X" (installedProjectId === the
+   * selected project's id, and `installed` doesn't contain X) apart from
+   * "we don't know yet" (installedProjectId is null, or belongs to a
+   * DIFFERENT project because a switch raced ahead of the fetch, or the
+   * project's own load errored — see `installedLoadError`). Only ever
+   * set on a SUCCESSFUL `loadInstalled` resolve; a failed load leaves it
+   * unchanged (stale data for a stale project must not be read as valid
+   * for a different one — see `installedLoadError`).
+   *
+   * CLAUDE.md "Conservative defaults on best-effort paths": when a
+   * caller can't positively confirm this project's install-row
+   * precondition, it must treat the state as unknown, not guess `false`.
+   * Comparing against this field (rather than trusting `installed` /
+   * `installedIds` blindly) is how callers keep that guarantee — see
+   * `resolveProjectScopedAction` in `module-status-display.ts`.
+   */
+  installedProjectId: string | null;
+  /** v0.2.92: true while a `loadInstalled()` call is in flight. */
+  installedLoading: boolean;
+  /**
+   * v0.2.92: the error from the most recent `loadInstalled()` call, or
+   * `null` if the last attempt (for whichever project it targeted)
+   * succeeded. Cleared at the START of every new attempt so a stale
+   * failure doesn't linger after a later call succeeds. Lets callers
+   * distinguish "still loading" (installedLoading=true) from "load
+   * failed" (installedLoading=false, installedLoadError set) instead of
+   * both looking like an indefinite unresolved spinner.
+   */
+  installedLoadError: string | null;
   installingId: string | null;
   /** v0.2.67: per-module live install progress keyed by module_id. */
   installProgress: Record<string, ModuleInstallProgress>;
@@ -103,17 +136,27 @@ interface ModulesState {
 }
 
 function createModulesStore() {
-  const { subscribe, update } = writable<ModulesState>({
+  // v0.2.92: keep a reference to the raw writable (not just its
+  // destructured `subscribe`/`update`) so `loadInstalledSpeculative`
+  // below can `get()` the freshly-committed state right after an
+  // `update()` call resolves, without relying on `this` (consumers may
+  // destructure the returned store API, which drops `this` binding —
+  // same hazard `loadCatalogImpl` was already extracted to avoid).
+  const store = writable<ModulesState>({
     catalog: [],
     l0Status: null,
     parseErrors: [],
     devAffordanceHint: null,
     installed: [],
+    installedProjectId: null,
+    installedLoading: false,
+    installedLoadError: null,
     installingId: null,
     installProgress: {},
     loading: false,
     error: null,
   });
+  const { subscribe, update } = store;
 
   // Wire the install-complete event once.
   if (tauriAvailable()) {
@@ -173,6 +216,48 @@ function createModulesStore() {
         ...s,
         loading: false,
         error: e instanceof Error ? e.message : String(e),
+      }));
+    }
+  }
+
+  // v0.2.92: extracted as a closure (same rationale as `loadCatalogImpl`
+  // above) so `loadInstalledSpeculative` can call it directly without
+  // going through `this`.
+  async function loadInstalledImpl(projectId: string): Promise<void> {
+    if (!tauriAvailable()) return;
+    // Mark in-flight + clear any stale error from a PRIOR attempt up
+    // front. `installedProjectId` is deliberately left untouched here —
+    // it must keep pointing at whatever project's rows are still
+    // validly loaded until THIS call actually succeeds, so a caller
+    // checking "installedProjectId === this project" during the
+    // in-flight window correctly reads "unknown" rather than
+    // momentarily seeing a cleared/ambiguous value.
+    update((s) => ({ ...s, installedLoading: true, installedLoadError: null }));
+    try {
+      const installed = await invoke<ModuleInstallRow[]>('list_installed_modules', {
+        projectId,
+      });
+      update((s) => ({
+        ...s,
+        installed,
+        installedProjectId: projectId,
+        installedLoading: false,
+        installedLoadError: null,
+      }));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      // On failure, `installedProjectId` is intentionally NOT updated —
+      // it must not claim `projectId`'s rows are known-valid when the
+      // fetch for `projectId` just failed. Any stale rows already in
+      // `installed` (from a previously-loaded project) stay put too;
+      // callers gate on `installedProjectId` matching the CURRENT
+      // project, not on `installed` alone, so this staleness is inert
+      // for them.
+      update((s) => ({
+        ...s,
+        installedLoading: false,
+        installedLoadError: message,
+        error: message,
       }));
     }
   }
@@ -242,18 +327,33 @@ function createModulesStore() {
       }
     },
 
-    async loadInstalled(projectId: string): Promise<void> {
-      if (!tauriAvailable()) return;
-      try {
-        const installed = await invoke<ModuleInstallRow[]>('list_installed_modules', {
-          projectId,
+    loadInstalled: loadInstalledImpl,
+
+    /**
+     * v0.2.92: convenience for SPECULATIVE per-project loads — mount /
+     * project-switch reactive effects that aren't part of an explicit
+     * user action already narrating its own success/failure (unlike
+     * e.g. the install/update button handlers, which reload `installed`
+     * as part of a flow that already shows its own toast via
+     * `detectModuleErrorAfterAction`). Awaits `loadInstalledImpl` and,
+     * if it left an error on the store, surfaces ONE toast keyed per
+     * project so repeated speculative reloads for the same project
+     * collapse rather than stacking — this is what makes a failed load
+     * visibly distinct from "still loading" (CLAUDE.md "Conservative
+     * defaults on best-effort paths": the caller must not treat a
+     * failed/unknown precondition as silently resolved).
+     *
+     * Call sites that already narrate their own outcome should keep
+     * calling `loadInstalled` directly — routing them through here
+     * would show the user two toasts for one failure.
+     */
+    async loadInstalledSpeculative(projectId: string): Promise<void> {
+      await loadInstalledImpl(projectId);
+      const err = get(store).installedLoadError;
+      if (err) {
+        toast.error(`Couldn't check this project's install status: ${err}`, {
+          key: `modules:installed-load:${projectId}`,
         });
-        update((s) => ({ ...s, installed }));
-      } catch (e) {
-        update((s) => ({
-          ...s,
-          error: e instanceof Error ? e.message : String(e),
-        }));
       }
     },
 

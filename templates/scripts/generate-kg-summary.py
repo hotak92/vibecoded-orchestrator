@@ -39,6 +39,17 @@ For single-chunk nodes: generates description + summary only.
 v0.2.73 M2: the 4-tier backend ladder was EXTRACTED verbatim into the sibling
 module ``summary_backends.py`` (one home — the code-summary generator is the
 second caller). This script is now a thin caller; behaviour is unchanged.
+
+v0.2.92 WP-Q: two behaviours arrive from that shared module.
+  * A tier that stops serving (usage limit, auth, sustained capacity) is
+    DEMOTED and the next tier answers, instead of every remaining node
+    spawning another doomed `claude -p`. The latch is cross-process
+    because this script runs ONCE PER NODE.
+  * A model NON-ANSWER ("Ready. What do you need summarized?", a refusal,
+    an empty reply) is never written to the sidecar, and an EXISTING entry
+    holding one is regenerated even though its content hash still matches
+    — a row that never held a valid summary is not "satisfied" by it. The
+    hash gate itself is unchanged and still skips healthy unchanged nodes.
 """
 
 import argparse
@@ -84,6 +95,10 @@ _read_app_state_value = _sb._read_app_state_value
 openai_consent_granted = _sb.openai_consent_granted
 _openai_model = _sb._openai_model
 call_openai = _sb.call_openai
+# v0.2.92 WP-Q additions — same "keep every name reachable" contract.
+is_non_answer = _sb.is_non_answer
+BackendUnavailable = _sb.BackendUnavailable
+NonAnswerResponse = _sb.NonAnswerResponse
 
 # SAME dict object as the shared module's cache (main() reads
 # _BACKEND_CACHE["choice"] for the sidecar entry's `backend` field).
@@ -248,7 +263,18 @@ Content:
     return call_llm(prompt)
 
 
-def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
+def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int, str]]:
+    """Fetch this node's stored chunks, sorted by chunk_num.
+
+    W7 (v0.2.92 wiring audit): filtered by title AND ``file_path``. A title
+    is not a node identity — measured live, two titles per collection map to
+    two different file_paths each — and a title-only filter silently blended
+    BOTH nodes' chunks into one node's ``chunk_summaries`` sidecar, which is
+    what the retrieval chunk-map header renders. ``file_path`` is the same
+    relative path this script keys the sidecar by, so the two agree by
+    construction. An empty ``file_path`` degrades to the pre-fix title-only
+    filter (no worse than before).
+    """
     try:
         # ORCHESTRATOR_ROOT honors VCT_ORCHESTRATOR_ROOT (PR-2 portability)
         # so per-project installs find claude_mcp_servers/ in the orchestrator
@@ -277,10 +303,12 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
         weaviate_grpc = int(os.getenv("GRPC_PORT", "50052"))
         client = weaviate.connect_to_local(host=weaviate_host, port=weaviate_port, grpc_port=weaviate_grpc)
         coll = client.collections.get(kg_collection)
-        resp = coll.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title),
-            limit=20,
-        )
+        chunk_filter = Filter.by_property("title").equal(title)
+        if file_path:
+            chunk_filter = chunk_filter & Filter.by_property("file_path").equal(
+                file_path
+            )
+        resp = coll.query.fetch_objects(filters=chunk_filter, limit=20)
         chunks = []
         for obj in resp.objects:
             cn = obj.properties.get("chunk_num", 1) or 1
@@ -292,6 +320,40 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
     except Exception as e:
         print(f"  Warning: couldn't fetch chunks from Weaviate: {e}", file=sys.stderr)
         return []
+
+
+def stored_entry_is_usable(entry: dict) -> bool:
+    """True when a cached sidecar entry actually holds summaries.
+
+    v0.2.92 WP-Q: the content-hash gate is correct and stays (it is why an
+    unchanged node costs 0 s instead of ~34 s). What it must NOT do is
+    treat a row as satisfied by a value that was never a summary — a field
+    scan found 43% of one project's entries holding a model non-answer,
+    frozen forever because the source file's hash had not changed. Adding
+    the validity precondition means those rows heal on the next ordinary
+    run, with no user action and no guessing which ones are bad.
+
+    Both `description` and `summary` are required here (unlike the code
+    sidecar, where an empty `summary` is legitimate for a trivial body).
+    """
+    if not isinstance(entry, dict):
+        return False
+    if _sb.is_non_answer(entry.get("description")):
+        return False
+    if _sb.is_non_answer(entry.get("summary")):
+        return False
+    # Chunk summaries are optional ENRICHMENT: a stored one that is a
+    # non-answer invalidates the entry, but a MISSING one does not. Absent
+    # is not poisoned, and treating it as poisoned would re-run the two
+    # whole-node calls on every sync for any node whose chunk fetch keeps
+    # failing (Weaviate down, chunk row absent) — churn in exchange for a
+    # retrieval-tier nicety. The whole-node description + summary, which
+    # are the load-bearing fields, are still validated above.
+    chunk_summaries = entry.get("chunk_summaries")
+    if isinstance(chunk_summaries, dict) and chunk_summaries:
+        if any(_sb.is_non_answer(v) for v in chunk_summaries.values()):
+            return False
+    return True
 
 
 def main():
@@ -334,20 +396,37 @@ def main():
     formats = load_formats()
     existing = formats.get(rel_path, {})
     if not args.force and existing.get("content_hash") == c_hash:
-        print(f"  {title}: unchanged (hash match), skipping")
-        sys.exit(0)
+        if stored_entry_is_usable(existing):
+            print(f"  {title}: unchanged (hash match), skipping")
+            sys.exit(0)
+        # Wording deliberately avoids the phrase the launcher and
+        # tests/test_v0270_shipped_kg_summaries.py match on ("hash match"):
+        # this is the REGENERATE path, and a reader (or a grep) must not
+        # mistake it for the skip path.
+        log(f"  {title}: cached entry holds a non-answer, not a summary — "
+            f"regenerating it now")
 
     if select_backend() == "skip":
         sys.exit(0)
 
     log(f"  Generating summaries for: {title}")
 
-    description = generate_description(title, body)
-    summary = generate_summary(title, body)
+    try:
+        description = generate_description(title, body)
+        summary = generate_summary(title, body)
+    except _sb.NonAnswerResponse as exc:
+        # Writing this would poison the sidecar and the hash gate would
+        # then freeze it. Fail loudly instead: the launcher records the
+        # node as failed and the user can see why.
+        log(f"  {title}: {exc}")
+        sys.exit(1)
+    except RuntimeError as exc:
+        log(f"  {title}: summary generation failed — {exc}")
+        sys.exit(1)
     print(f"  Description: {description[:80]}...")
     print(f"  Summary: {summary[:80]}...")
 
-    entry = {
+    entry: dict = {          # mixed value types (str + int + dict)
         "title": title,
         "description": description,
         "summary": summary,
@@ -356,17 +435,26 @@ def main():
         "backend": _BACKEND_CACHE.get("choice", "?"),
     }
 
-    chunks = get_chunks_from_weaviate(title)
+    chunks = get_chunks_from_weaviate(title, rel_path)
     total_chunks = len(chunks) if chunks else 1
 
     if total_chunks > 1:
         print(f"  Multi-chunk node ({total_chunks} chunks), generating per-chunk summaries...")
         chunk_summaries = {}
         for cn, chunk_content in chunks:
-            cs = generate_chunk_summary(title, cn, total_chunks, chunk_content)
+            try:
+                cs = generate_chunk_summary(title, cn, total_chunks, chunk_content)
+            except RuntimeError as exc:
+                # Includes NonAnswerResponse. Omitting the chunk keeps the
+                # (valid) whole-node description + summary; caching a
+                # non-answer here would make the entry unusable AND
+                # hash-frozen. The omission is regenerated next run.
+                log(f"    Chunk {cn}: not stored — {exc}")
+                continue
             chunk_summaries[str(cn)] = cs
             print(f"    Chunk {cn}: {cs[:60]}...")
-        entry["chunk_summaries"] = chunk_summaries
+        if chunk_summaries:
+            entry["chunk_summaries"] = chunk_summaries
         entry["total_chunks"] = total_chunks
 
     formats[rel_path] = entry

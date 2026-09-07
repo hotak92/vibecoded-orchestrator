@@ -25,7 +25,7 @@ from __future__ import annotations
 
 # ---------------------------------------------------------------------------
 # Phase 0.B Part 2 (2026-05-25): the legacy `install-bundle --update`
-# backfill helpers (`_backfill_kg_collection_env_in_project`,
+# backfill helpers (removed v0.2.92 — superseded by the config-projection single writer) (`_backfill_kg_collection_env_in_project`,
 # `_backfill_code_graph_project_env_in_project`,
 # `_backfill_code_graph_project_env`) have been migrated to delegate to
 # `vco_lib.config_projection.apply_project_env` — the single legal
@@ -106,7 +106,6 @@ if _sys.platform == "win32":
 
 import argparse
 import datetime
-import html as _html
 import json
 import os
 import platform
@@ -147,7 +146,11 @@ from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
 from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
+from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
+from vco_lib import paths as _paths  # noqa: E402
+from vco_lib import boot_service as _boot_service  # noqa: E402
+from vco_lib import containers as _containers  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -355,10 +358,10 @@ DEFAULT_CODE_EMBED_PORT = 11440
 
 # Embedding model configurations.
 #
-# Per-model token/chunking limits live in
+# Per-model token/chunking limits live in exactly ONE place:
 #   claude_mcp_servers/weaviate_mcp/chunking.py:MODEL_TOKEN_LIMITS
-# and code-side in
-#   claude_mcp_servers/weaviate_mcp/code_truncation.py:CODE_MODEL_TOKEN_LIMITS
+# (v0.2.92 folded the code-side CODE_MODEL_TOKEN_LIMITS copy into it; that
+#  copy had drifted to a 4x-too-large jina budget before it was deleted.)
 # That is the single source of truth — do not re-declare chunk sizes here.
 # Each profile keeps its own static `embedding_models` — these are the
 # Ollama-served embedding models that MUST be pulled regardless of
@@ -1127,36 +1130,36 @@ def _bootstrap_launcher_dist_subdir() -> Optional[str]:
     return None
 
 
-def _bootstrap_resolve_vco_version(root: Path) -> tuple[str, Optional[str]]:
-    """Return (vco_version, short_sha).
+def _run_metrics_migration_hook() -> None:
+    """v0.2.92 WP-D (register item 20, WP-8 recipe R1): the every-run legacy
+    metrics-archive migration (was SessionStart-hook-only, so the history
+    copy ran late for frequent updaters). Soft-fail; COPY-never-MOVE.
+    """
+    try:
+        from vco_lib.metrics_migration import ensure_metrics_migrated
 
-    Reads VERSION file when present; falls back to git short-sha resolution.
+        result = ensure_metrics_migrated()
+        if result.status == "failed":
+            _log_install_event("metrics_migration", "warn", f"metrics migration failed: {'; '.join(result.errors)}")
+    except Exception as exc:  # noqa: BLE001 — best-effort by design
+        _log_install_event("metrics_migration", "warn", f"metrics migration could not run: {exc}")
+
+
+def _bootstrap_resolve_vco_version(root: Path) -> tuple[str, Optional[str]]:
+    """Return (vco_version, short_sha) — the version SSOT, bootstrap-shaped.
+
+    v0.2.92 WP-D: delegates to :func:`vco_lib.vco_version.resolve` (the ONE
+    resolver: pyproject semver + git commit; the former VERSION-file chain
+    never resolved to a version on clone installs — R28 recipe 3).
     Soft-fails to ('unknown', None).
     """
-    version_file = root / "VERSION"
-    vco_version = "unknown"
-    if version_file.is_file():
-        try:
-            vco_version = version_file.read_text(
-                encoding="utf-8", errors="replace"
-            ).strip() or "unknown"
-            if vco_version != "unknown" and not vco_version.startswith("v"):
-                vco_version = "v" + vco_version
-        except OSError:
-            pass
-    short_sha: Optional[str] = None
-    git_dir = root / ".git"
-    if git_dir.exists():
-        try:
-            r = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                short_sha = (r.stdout or "").strip() or None
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            short_sha = None
-    return (vco_version, short_sha)
+    try:
+        from vco_lib import vco_version as _vv
+
+        resolved = _vv.resolve(root)
+        return (resolved.semver or "unknown", resolved.commit)
+    except Exception:  # noqa: BLE001 — bootstrap must never raise here
+        return ("unknown", None)
 
 
 def _bootstrap_resolve_paths(root: Path) -> dict:
@@ -1291,20 +1294,16 @@ def _bootstrap_package_manager_advice(
                 "file", "libappindicator-gtk3-devel", "librsvg2-devel",
             ]
 
-    # SELinux Z-flag — Fedora-family + Enforcing
+    # SELinux Z-flag — Fedora-family + Enforcing. v0.2.92 (§3.5): the
+    # probe itself is `vco_lib.containers.selinux_enforcing` (was a second
+    # inline `getenforce` beside `_detect_selinux_enforcing`); the distro
+    # gate stays here because it is a bootstrap-envelope decision.
     selinux_z = False
     if (
         canonical_os == "linux" and distro
         and (distro.get("id") or "").lower() in ("fedora", "rhel", "centos", "rocky", "almalinux")
     ):
-        try:
-            r = subprocess.run(
-                ["getenforce"], capture_output=True, text=True,
-                timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
-            )
-            selinux_z = (r.stdout or "").strip().lower() == "enforcing"
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            selinux_z = False
+        selinux_z = _containers.selinux_enforcing()
 
     # NVIDIA container toolkit install hint (L-P0-7)
     nvidia_toolkit: Optional[str] = None
@@ -3967,6 +3966,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
                               deferral_report=_lightweight_deferral)
+    _rerender_model_gateway_boot_service(args)
     # NB (v0.3.0 L-3): the stale-unit reconcile is deliberately NOT called on
     # the lightweight path. The launcher's lightweight argv is
     # `install.py --quiet --lightweight [...]` with NO `--update`
@@ -5937,10 +5937,10 @@ def main() -> int:
                 f"{'y' if _seeded == 1 else 'ies'} from disk (A-2 seed)",
             )
     except Exception as exc:  # noqa: BLE001 — seeding is best-effort
-        _log_install_event(
-            "deferral_report", "warn",
-            f"A-2 disk seed failed: {exc}",
-        )
+        _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
+
+    # v0.2.92 WP-D (register item 20): metrics migration on every run (helper above).
+    _run_metrics_migration_hook()
 
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
@@ -6968,6 +6968,7 @@ def main() -> int:
     # final write happens at line ~2181 below).
     _materialize_boot_service(PROJECT_ROOT, sysinfo, args,
                               deferral_report=_deferral_report)
+    _rerender_model_gateway_boot_service(args)
     _reconcile_stale_units_step(PROJECT_ROOT, args, _deferral_report)
 
     # v0.2.37 (2026-05-27): seed the launcher's install_path resolver
@@ -8908,79 +8909,44 @@ def _runtime_preference_from_env() -> Optional[str]:
     """Return the user's explicit `VCT_CONTAINER_RUNTIME` preference, or
     None if unset / set to "auto".
 
-    Canonical contract (v0.2.14, consolidated across install.py,
-    launcher Rust, hooks, and the boot wrapper): values are
-    case-insensitive, trimmed, and "auto" is treated as "no preference".
-    Unknown values log to stderr and are ignored (fall through to
-    auto-detect).
-
-    Callers should check this BEFORE running auto-detection so the
-    user's choice wins over PATH order. Audit Bug #3 (cross-OS audit,
-    2026-05-17).
+    v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.
+    runtime_preference_from_env` — the ONE parser, shared with the hooks'
+    CLI and pinned against the Rust mirror. Unknown values warn on stderr
+    and fall through to auto-detect (Audit Bug #3, 2026-05-17).
     """
-    raw = os.environ.get("VCT_CONTAINER_RUNTIME", "").strip().lower()
-    if not raw or raw == "auto":
-        return None
-    if raw in ("podman", "docker"):
-        return raw
-    print(
-        f"  VCT_CONTAINER_RUNTIME={raw!r} unrecognized (expected "
-        "'podman' / 'docker' / 'auto'); falling through to auto-detect.",
-        file=sys.stderr,
-    )
-    return None
+    return _containers.runtime_preference_from_env()
 
 
 def _detect_container_runtime() -> str:
     """Detect Docker or Podman. Prefer Podman everywhere — no commercial
     license required, increasingly native on macOS/Windows.
 
-    Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var as the
-    user's explicit preference (v0.2.14 Bug #3 fix). If set to a
-    recognized value, returns that runtime IF it's reachable; else
-    falls through to auto-detect (we don't want a misconfigured env
-    var to silently leave the user with no runtime — auto-detect
-    finds whatever IS working).
+    v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.resolve` with
+    the historical install.py probe depth — `<runtime> version` only (the
+    daemon round-trip is `_container_runtime_reachable`, compose is
+    `_get_compose_command`; both are separate steps with their own
+    messages). Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto`.
 
     Returns:
-      - "podman" or "docker" if a runtime is present AND its daemon
-        responds to `version`/`info` (i.e. it can actually run containers).
-      - "" if neither runtime is on PATH OR the daemon isn't responding.
-        Caller distinguishes the two cases via `_detect_installed_runtime()`.
+      - "podman" or "docker" if a runtime is present AND `version` exits 0.
+      - "" otherwise (not on PATH, refused, or the probe could not run).
+        Caller distinguishes the cases via `_detect_installed_runtime()`.
     """
-    pref = _runtime_preference_from_env()
-    if pref is not None:
-        # User explicitly chose. Try ONLY that one; if it works, honor.
-        # If not, fall through to auto-detect (lenient: don't strand the
-        # user on a misconfigured env var). Stderr explains the fallthrough.
-        if shutil.which(pref):
-            try:
-                result = subprocess.run(
-                    [pref, "version"], capture_output=True, text=True, timeout=15,
-                )
-                if result.returncode == 0:
-                    return pref
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-        print(
-            f"  VCT_CONTAINER_RUNTIME={pref!r} not reachable; falling "
-            "through to auto-detect.",
-            file=sys.stderr,
+    res = _containers.resolve(probe_daemon=False, probe_compose=False)
+    if res.requested and not res.runtime:
+        # Ruling (v0.2.92 BLOCKER-4, overturning merge-lane ASK #1): a pinned
+        # runtime that is unusable is REFUSED, not swapped for the other one.
+        # podman and docker have per-runtime named volumes, so "rescuing" the
+        # user by driving the other runtime stands the stack up on an EMPTY
+        # data plane. The resolver already emitted the actionable hint on
+        # stderr; the install log gets the structured record too.
+        _log_install_event(
+            "runtime", "warn", res.reason,
+            data={"requested": res.requested,
+                  "requested_installed": res.requested_installed,
+                  "alternative_usable": res.alternative_usable},
         )
-
-    candidates = ["podman", "docker"]
-
-    for cmd in candidates:
-        if shutil.which(cmd):
-            try:
-                result = subprocess.run(
-                    [cmd, "version"], capture_output=True, text=True, timeout=15,
-                )
-                if result.returncode == 0:
-                    return cmd
-            except (subprocess.TimeoutExpired, OSError):
-                continue
-    return ""
+    return res.runtime or ""
 
 
 def _container_runtime_reachable(container_cmd: str) -> bool:
@@ -8988,29 +8954,13 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
 
     Used by `_start_services()` before compose-up to surface a
     cross-platform actionable hint when the runtime is installed but
-    not running. Without this, compose-up takes 10-30s to fail with
-    a cryptic stderr ("Cannot connect to the Docker daemon" or
-    "Cannot connect to Podman socket"), which we then have to parse.
-
-    Returns False if the runtime isn't on PATH OR `<runtime> info`
-    fails. Returns True if the daemon/socket is responsive.
-
-    Why `info` (not `version`): `version` only checks the client
-    binary; `info` round-trips to the daemon/socket and exercises the
-    same code path that compose-up needs. Catches stopped Docker
-    Desktop on macOS, stopped podman.socket on Linux rootless,
-    unstarted podman machine on Windows.
+    not running. v0.2.92 (§3.5): thin call into
+    :func:`vco_lib.containers.daemon_responsive` (`<runtime> info`, which
+    round-trips to the daemon / socket / machine — the same code path
+    compose-up needs). A probe that could not run counts as "not
+    reachable" here, because the caller's next step would fail the same way.
     """
-    if not container_cmd or not shutil.which(container_cmd):
-        return False
-    try:
-        result = subprocess.run(
-            [container_cmd, "info"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+    return _containers.daemon_responsive(container_cmd) is True
 
 
 def _podman_machine_auto_init_and_start() -> tuple[bool, str]:
@@ -9339,25 +9289,13 @@ def _detect_installed_runtime() -> str:
     """Lightweight presence check — returns the FIRST container-runtime
     binary on PATH regardless of whether its daemon is running.
 
-    Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var (v0.2.14
-    Bug #3 fix). If the explicit preference is installed (even if the
-    daemon isn't responsive), it wins over the auto-detect order.
-
-    Use case: `_detect_container_runtime()` returned "" (no working
-    runtime) but we want to give a better message than "install Podman/
-    Docker" if one IS installed, just stopped. On Windows specifically,
-    Docker Desktop ships `docker.exe` on PATH but `docker version` fails
-    until the user opens Docker Desktop from the Start Menu.
-
+    v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.
+    installed_runtime`. Honors `VCT_CONTAINER_RUNTIME` (an installed
+    preference wins even when its daemon is down). Use case: give "Docker
+    is installed but not running" instead of "install Docker".
     Returns "" when neither binary is on PATH.
     """
-    pref = _runtime_preference_from_env()
-    if pref is not None and shutil.which(pref):
-        return pref
-    for cmd in ("podman", "docker"):
-        if shutil.which(cmd):
-            return cmd
-    return ""
+    return _containers.installed_runtime()
 
 
 def _nvidia_container_toolkit_install_hint() -> str:
@@ -9553,51 +9491,17 @@ def _ensure_nvidia_cdi_spec_for_podman() -> None:
 def _detect_selinux_enforcing() -> bool:
     """Return True iff SELinux is currently in `Enforcing` mode.
 
-    Detection chain (priority order):
-      1. `getenforce` returns "Enforcing" — canonical signal on Fedora /
-         RHEL / CentOS Stream / Rocky / Alma. Trusted when present.
-      2. `/sys/fs/selinux/enforce` reads "1" — fallback for minimal
-         containers / chrooted environments where `getenforce` may not
-         be on PATH.
-      3. Any failure (binary missing, sysfs unreadable, file is "0",
-         non-Linux OS) → False (assume non-SELinux distro: Ubuntu, Arch,
-         openSUSE without enforcement, etc.).
-
-    The semantics are intentionally conservative: a False return is
-    treated by callers as "no SELinux label fix needed". Only return
-    True when we are certain SELinux is enforcing AND will reject bare
-    bind mounts inside Podman/Docker.
-
-    No subprocess on non-Linux. Best-effort soft-fail throughout.
+    v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.
+    selinux_enforcing` (getenforce → sysfs → False). install.py used to
+    carry this body AND a second inline `getenforce` in the bootstrap
+    probe; both now go through the one home. The sysfs path is built here
+    so the test double on ``install.Path`` still steers the fallback.
     """
-    if platform.system() != "Linux":
-        return False
-
-    # Step 1: getenforce (the canonical signal on Fedora/RHEL family).
-    getenforce = shutil.which("getenforce")
-    if getenforce:
-        try:
-            result = subprocess.run(
-                [getenforce], capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                # `getenforce` prints exactly one of: Enforcing, Permissive,
-                # Disabled. Case sensitive on stock RHEL.
-                return result.stdout.strip().lower() == "enforcing"
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            pass  # Fall through to sysfs probe.
-
-    # Step 2: sysfs fallback for minimal containers without selinux-utils.
-    # /sys/fs/selinux/enforce is "1" when enforcing, "0" when permissive,
-    # absent entirely when SELinux is not compiled into the kernel.
     try:
-        enforce_path = Path("/sys/fs/selinux/enforce")
-        if enforce_path.is_file():
-            return enforce_path.read_text(encoding="utf-8").strip() == "1"
-    except (OSError, UnicodeDecodeError):
-        pass
-
-    return False
+        sysfs = Path("/sys/fs/selinux/enforce")
+    except OSError:  # soft-fail contract: any unexpected error → False
+        return False
+    return _containers.selinux_enforcing(sysfs=sysfs)
 
 
 def _print_selinux_bind_mount_hint() -> None:
@@ -11858,6 +11762,13 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     print("OK")
     _log_install_event("4/10", "ok", "vco CLI editable install completed")
 
+    # v0.2.92: prove the editable install TOOK (a later pip step used to
+    # replace it with a frozen copy) and repair it when it did not.
+    _install_companions.repair_and_report_vco_lib(
+        PROJECT_ROOT, venv_python, printer=print,
+        log_event=lambda st, msg, data: _log_install_event("4/10", st, msg, data=data),
+    )
+
     # A1 (v0.2.38): pip-install weaviate_mcp as an editable package so all
     # consumer scripts can `from weaviate_mcp.chunking import Chunker` (etc.)
     # without sys.path hacks.  Runs AFTER the root `pip install -e .` so the
@@ -13204,6 +13115,43 @@ def _start_services(
         if sysinfo.has_gpu and not detected["code_embed_url"]:
             services_to_start.append("code_embed")
 
+    # ── v0.2.92 BLOCKER-1: rebuild the code_embed IMAGE when it is not
+    # provably built from this checkout ─────────────────────────────────────
+    # The decision (ownership gate, evidence probe, what to print) lives in
+    # vco_lib.code_embed_image — one home shared with `vco doctor`, the
+    # registry's clear probe and the session-start hooks, so no two surfaces
+    # can disagree about what "the running service is current" means.
+    build_services: list[str] = []
+    #: services added to ``services_to_recreate`` because their IMAGE is
+    #: stale, not because their compose CONFIG changed. Tracked separately so
+    #: the summary line does not report a rebuild as "config changed".
+    recreate_for_rebuild: list[str] = []
+    from vco_lib import code_embed_image as _cei
+    _rebuild = _cei.plan_rebuild(
+        decisions=decisions,
+        has_gpu=sysinfo.has_gpu,
+        force_separate=force_separate,
+        install_root=PROJECT_ROOT,
+        url=detected.get("code_embed_url"),
+        services_to_start=services_to_start,
+        services_to_recreate=services_to_recreate,
+        adopt_action=ACTION_ADOPT,
+        managed_probe=PROBE_VCT_MANAGED,
+    )
+    for _line in _rebuild.lines:
+        print(_line)
+    if _rebuild.build:
+        build_services.append(_cei.COMPOSE_SERVICE)
+        recreate_for_rebuild.extend(_rebuild.recreate)
+        services_to_recreate.extend(_rebuild.recreate)
+        _log_install_event(
+            "5/10", "rebuild",
+            "code_embed image not provably current → --build",
+            data={"verdict": _rebuild.verdict,
+                  "expected_sha": _rebuild.expected_sha,
+                  "served_sha": _rebuild.served_sha},
+        )
+
     # All required services already up AND none needs a config-recreate —
     # nothing to do. (v0.2.61: a vct-managed adopt with a changed compose
     # config lands in services_to_recreate, so we must NOT early-return when
@@ -13422,6 +13370,11 @@ def _start_services(
                 print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
+    # v0.2.92 BLOCKER-1: `--build` when (and only when) the code_embed image
+    # is not provably built from this checkout — see the escalation above.
+    # Placed before the service names so it applies to the named set.
+    if build_services:
+        cmd.append("--build")
     # v0.2.61 (FINDING-1 fix): when a vct-managed service we OWN was adopted
     # but its compose config changed (e.g. the Weaviate write-amp env tuning),
     # it lands in services_to_recreate and we add `--force-recreate` + name the
@@ -13440,10 +13393,17 @@ def _start_services(
     if services_to_recreate:
         cmd.append("--force-recreate")
         cmd.extend(explicit_services)
-        print(
-            f"  Recreating (config changed): {', '.join(services_to_recreate)}"
-            + (f"; starting: {', '.join(services_to_start)}" if services_to_start else "")
-        )
+        config_changed = [
+            s for s in services_to_recreate if s not in recreate_for_rebuild
+        ]
+        parts = []
+        if config_changed:
+            parts.append(f"config changed: {', '.join(config_changed)}")
+        if recreate_for_rebuild:
+            parts.append(f"image rebuilt: {', '.join(recreate_for_rebuild)}")
+        if services_to_start:
+            parts.append(f"starting: {', '.join(services_to_start)}")
+        print("  Recreating (" + "; ".join(parts) + ")")
     elif services_to_start:
         # When subset detection said only some services are missing, pass them
         # explicitly so compose doesn't try to recreate already-running ones.
@@ -13481,6 +13441,36 @@ def _start_services(
             data={"runtime": sysinfo.container_cmd, "timeout_sec": docker_timeout},
         )
         sys.exit(1)
+    # v0.2.92 BLOCKER-1: `--build` is the NEW flag on this path. Not every
+    # compose implementation in the field accepts it on `up` (older
+    # podman-compose builds), and an install that used to succeed must not
+    # start failing because of a freshness optimisation. Retry ONCE without
+    # it: the stack comes up as before, and the image's staleness stays
+    # OBSERVABLE — `/health` still reports no matching source_sha, so `vco
+    # doctor` re-detects it in this same run and defers
+    # `code_embed_image_stale` with the explicit compose command. Degrading
+    # loudly beats both failing the install and pretending it rebuilt.
+    if result.returncode != 0 and "--build" in cmd:
+        print("  compose up --build failed — retrying without --build ...")
+        retry_cmd = [c for c in cmd if c != "--build"]
+        try:
+            result = subprocess.run(
+                retry_cmd, capture_output=True, text=True, cwd=str(infra_dir),
+                timeout=docker_timeout, env=compose_env,
+            )
+        except subprocess.TimeoutExpired:
+            result = subprocess.CompletedProcess(
+                retry_cmd, 1, "",
+                "compose up (retry without --build) timed out",
+            )
+        if result.returncode == 0:
+            for _line in _cei.build_rejected_lines(" ".join(compose_cmd), infra_dir):
+                print(_line)
+            _log_install_event(
+                "5/10", "warning",
+                "compose rejected --build; code_embed image NOT rebuilt",
+                data={"runtime": sysinfo.container_cmd},
+            )
     if result.returncode != 0:
         print("  FAIL")
         for line in (result.stderr or "").strip().splitlines()[-10:]:
@@ -13519,38 +13509,21 @@ def _start_services(
 
 
 def _get_compose_command(container_cmd: str) -> list[str]:
-    """Return the compose command as a list of args."""
-    if container_cmd == "podman":
-        # Prefer standalone podman-compose if present
-        if shutil.which("podman-compose"):
-            return ["podman-compose"]
-        # Try `podman compose` plugin
-        try:
-            result = subprocess.run(
-                ["podman", "compose", "version"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                return ["podman", "compose"]
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-        # Last-resort fallback (user will see error if neither works)
-        return ["podman", "compose"]
+    """Return the compose command as a list of args.
 
-    # Docker: try v2 plugin first, then standalone
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return ["docker", "compose"]
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    if shutil.which("docker-compose"):
-        return ["docker-compose"]
-    return ["docker", "compose"]
+    v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.
+    compose_command`, which holds the ONE preference order — the
+    launcher's: `<runtime> compose` (subcommand) first, then the standalone
+    `<runtime>-compose` (PATH or ~/.local/bin). Pre-merge this function
+    preferred standalone `podman-compose` while `ensure-containers.sh`
+    and the launcher preferred the subcommand — the split-brain R13 closes.
+    Last-resort fallback is unchanged: `[<runtime>, "compose"]`, so the
+    user sees compose's own error rather than "no runtime".
+    """
+    found = _containers.compose_command(container_cmd)
+    if found is not None:
+        return found[0]
+    return [container_cmd, "compose"]
 
 
 def _wait_for_ollama() -> None:
@@ -16838,7 +16811,9 @@ from vco_lib.kg_binding_heal import (  # noqa: E402
     _prefix_adopt_kg_bindings_pass,
     _rebind_collection_names_to_on_disk_casing,
     converge_root_pointer_write_side as _converge_root_pointer_write_side_impl,
+    emit_ambiguous_evidence_entry as _emit_ambiguous_evidence_entry,
     pointer_drift_needs_rw as _pointer_drift_needs_rw,
+    resolve_evidence_heal_plan as _resolve_evidence_heal_plan,
     self_heal_kg_bindings as _self_heal_kg_bindings_impl,
 )
 
@@ -17341,6 +17316,23 @@ def _self_heal_kg_bindings_on_update(
         )
         needs_rebind = True
 
+    # D18 (v0.2.92): the evidence-backed primary repoint. Invisible to all
+    # three RO legs above — its binding's class EXISTS, so nothing there
+    # fires. Read-only, self-short-circuiting, `None` when unlookable.
+    _evidence_plan = _resolve_evidence_heal_plan(
+        db_path=db_path, weaviate_url=weaviate_url,
+        existing_classes=existing_classes, log_event=_log_install_event,
+    )
+    # The ambiguity ASK, raised BEFORE the `needs_rebind` gate: an ambiguous
+    # project owes no write, so the RW pass is never entered for it and an emit
+    # sited there would be inert (why, in full: the emitter's docstring). The
+    # entry text lives in the owner module, beside the decision it reports.
+    _emit_ambiguous_evidence_entry(
+        deferral_report, plan=_evidence_plan, deferral_entry_cls=DeferralEntry,
+    )
+    if _evidence_plan is not None and _evidence_plan.has_work:
+        needs_rebind = True
+
     if not needs_rebind:
         # Common case: launcher.db is consistent with on-disk Weaviate
         # casing → no rebind needed → no writer-lock acquisition → no
@@ -17378,6 +17370,7 @@ def _self_heal_kg_bindings_on_update(
         connect_rw=_connect_launcher_db_with_retry,
         deferral_entry_cls=DeferralEntry,
         run_adoption_uplifts=_run_adoption_uplifts,
+        evidence_plan=_evidence_plan,
     )
 
 # ---------------------------------------------------------------------------
@@ -18190,9 +18183,13 @@ def _persist_runtime_txt(container_runtime: str | None) -> None:
 
 # Stable filename / label for the boot service across OSes. Reverse-DNS
 # form on macOS (required by launchd), bare filename on Linux + Windows.
-_BOOT_SERVICE_UNIT_NAME = "claude-mcp-containers.service"
-_BOOT_SERVICE_PLIST_LABEL = "com.vibecodedtools.claude-mcp-containers"
-_BOOT_SERVICE_TASK_NAME = "ClaudeMcpContainers"
+# v0.2.92 (WP-10): the values live in `vco_lib.boot_service`, the one home
+# that both REGISTERS and UNREGISTERS them; these names stay as aliases so
+# install.py's other references (the repair helper, the uninstall plan) and
+# the tests that read them keep resolving.
+_BOOT_SERVICE_UNIT_NAME = _boot_service.CONTAINER_STACK_UNIT_NAME
+_BOOT_SERVICE_PLIST_LABEL = _boot_service.CONTAINER_STACK_PLIST_LABEL
+_BOOT_SERVICE_TASK_NAME = _boot_service.CONTAINER_STACK_TASK_NAME
 
 
 def _resolve_compose_working_dir(
@@ -18300,381 +18297,126 @@ def _probe_compose_working_dir_via_ps(container_cmd: str) -> Optional[str]:
 def _read_template(template_relpath: str) -> Optional[str]:
     """Read a template file relative to PROJECT_ROOT. Returns None if
     the file isn't present (e.g. minimal install without the templates/
-    tree shipped). Caller logs + skips."""
-    path = PROJECT_ROOT / template_relpath
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
+    tree shipped). Caller logs + skips.
 
-
-def _render_template(template_text: str, substitutions: dict) -> str:
-    """Naive `{{KEY}}` substitution. We deliberately don't pull in
-    jinja2 / string.Template here — the substitution set is closed and
-    we want install.py to stay stdlib-only for the early steps."""
-    rendered = template_text
-    for key, value in substitutions.items():
-        rendered = rendered.replace("{{" + key + "}}", str(value))
-    return rendered
-
-
-def _backup_and_write_idempotent(
-    target: Path,
-    rendered: str,
-) -> tuple[bool, Optional[Path]]:
-    """Write `rendered` to `target` ONLY if content differs from what's
-    on disk. Backs up the prior file to `<target>.bak-<ISO8601>` before
-    overwriting. Returns (changed, backup_path_or_None).
-
-    Idempotent: re-running install/update with unchanged template +
-    substitutions is a no-op (zero writes, zero backups).
+    v0.2.92: body is ``vco_lib.boot_service.read_template``. The NAME stays
+    — ``tests/test_scheduled_task_xml_escape.py`` monkeypatches it to feed
+    a fixture template, and PROJECT_ROOT is read here (at call time) so a
+    test that redirects the install root is honoured.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_file():
-        try:
-            existing = target.read_text(encoding="utf-8")
-        except OSError:
-            existing = None
-        if existing == rendered:
-            return False, None
-        # Content differs — back up the prior version.
-        stamp = _utc_iso_now().replace(":", "").replace("-", "")
-        backup = target.with_name(target.name + f".bak-{stamp}")
-        try:
-            backup.write_text(existing or "", encoding="utf-8")
-        except OSError:
-            backup = None
-    else:
-        backup = None
-    target.write_text(rendered, encoding="utf-8")
-    return True, backup
+    return _boot_service.read_template(PROJECT_ROOT, template_relpath)
+
+
+def _boot_service_event(
+    phase: str, detail: str, data: dict | None = None,
+) -> None:
+    """Bridge ``vco_lib.boot_service``'s event sink onto install.jsonl."""
+    _log_install_event("boot-service", phase, detail, data=data)
 
 
 def _user_home_for_install() -> Path:
-    """Return the user home directory for boot-service / config writes.
+    """User home for boot-service / config writes, honouring
+    ``VCT_USER_HOME_OVERRIDE`` (pytest redirects systemd-unit / launchd-plist /
+    log writes into a ``tmp_path`` fake home through it).
 
-    Honors ``VCT_USER_HOME_OVERRIDE`` env var when set (used by pytest
-    fixtures to redirect systemd-unit / launchd-plist / log writes into
-    a ``tmp_path``-based fake home). Falls back to ``Path.home()``.
+    Why the indirection exists (Bug X, 2026-05-16): the boot-service
+    materializer and ``_repair_systemd_unit_working_dir`` called ``Path.home()``
+    directly, so a test monkeypatching the renderer to raise still reached the
+    repair step first and corrupted the REAL
+    ``~/.config/systemd/user/claude-mcp-containers.service``. One helper means
+    one env-var monkeypatch sandboxes the whole surface — on every OS, since
+    the systemd/launchd/Task-Scheduler writers append their own subpaths.
 
-    Why this exists (Bug X, 2026-05-16): the boot-service materializer
-    + ``_repair_systemd_unit_working_dir`` historically called
-    ``Path.home()`` directly. Tests that monkeypatched
-    ``install._materialize_boot_service_linux`` to raise (verifying the
-    dispatcher's soft-fail) still hit the repair step BEFORE the
-    patched renderer, and the repair step's ``Path.home()`` returned
-    the real user home — corrupting ``~/.config/systemd/user/claude-mcp-containers.service``
-    on every test run with the pytest ``tmp_path``. This single helper
-    consolidates the lookup so a single env-var monkeypatch sandboxes
-    the entire surface.
-
-    Cross-OS: returns a real or fake home on Linux/macOS/Windows
-    identically; the systemd/launchd/Task Scheduler writers that consume
-    it append their OS-specific subpaths (``.config/systemd/user``,
-    ``Library/LaunchAgents``, etc.).
+    v0.2.92: the body is now ``vco_lib.paths.user_home()``, which became the
+    one home for the override when other callers needed it; two copies of an
+    env-var lookup is the drift the modularity rule forbids. The NAME stays —
+    its call sites and monkeypatch contract pin it.
     """
-    override = os.environ.get("VCT_USER_HOME_OVERRIDE", "").strip()
-    if override:
-        return Path(override)
-    return Path.home()
+    return _paths.user_home()
+
+
+def _rerender_model_gateway_boot_service(args: argparse.Namespace) -> None:
+    """Refresh an EXISTING model-gateway boot registration on ``--update``.
+
+    Creates nothing: the gateway's autostart is opt-in (a login-time daemon
+    holding an OAuth passthrough is the user's decision, not an installer's),
+    so this only re-resolves the absolute paths baked into a unit the user
+    already asked for. Without it, a clone that moved leaves that unit
+    pointing at an ``ExecStart`` which no longer exists and the gateway
+    silently stops coming up at login — the same failure the container
+    stack's ``_repair_systemd_unit_working_dir`` exists to prevent.
+
+    Soft-fail: never blocks an install, on any OS.
+    """
+    if not getattr(args, "update", False):
+        return
+    try:
+        _boot_service.rerender_if_registered(
+            _boot_service.model_gateway_spec(os_key=platform.system()),
+            templates_root=PROJECT_ROOT,
+            on_event=_boot_service_event,
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail catch-all
+        _log_install_event(
+            "boot-service", "warn",
+            f"model-gateway boot re-render raised: {exc.__class__.__name__}: {exc}",
+        )
 
 
 def _materialize_boot_service_linux(
     install_path: Path,
     working_dir: Path,
 ) -> None:
-    """Linux: render the systemd user unit and enable it via
-    `systemctl --user enable` + `loginctl enable-linger`."""
-    template = _read_template("templates/systemd/claude-mcp-containers.service.template")
-    if template is None:
-        _log_install_event(
-            "boot-service", "skip",
-            "templates/systemd/claude-mcp-containers.service.template missing",
-        )
-        return
+    """Linux: render the systemd user unit and enable it.
 
-    unit_dir = _user_home_for_install() / ".config" / "systemd" / "user"
-    unit_path = unit_dir / _BOOT_SERVICE_UNIT_NAME
-    wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
-    log_dir = _user_home_for_install() / ".local" / "state" / "vct"
-    log_file = log_dir / "claude-mcp-containers.log"
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-    rendered = _render_template(template, {
-        "INSTALLED_AT_PATH": str(unit_path),
-        "WORKING_DIR": str(working_dir),
-        "WRAPPER_SCRIPT": str(wrapper),
-        "LOG_FILE": str(log_file),
-    })
-    try:
-        changed, backup = _backup_and_write_idempotent(unit_path, rendered)
-    except OSError as exc:
-        _log_install_event(
-            "boot-service", "warn",
-            f"could not write systemd unit: {exc}",
-        )
-        return
-
-    _log_install_event(
-        "boot-service", "ok" if changed else "skip",
-        ("systemd unit written" if changed else "systemd unit unchanged"),
-        data={"unit_path": str(unit_path),
-              "backup": str(backup) if backup else None},
+    v0.2.92 (WP-10): a thin call into ``vco_lib.boot_service``, which is the
+    ONE home for boot-service registration (it also holds the unregister half
+    the uninstaller uses, and the gateway's registration). The name and its
+    two-keyword signature stay because the dispatcher below resolves it as a
+    module global and two test files monkeypatch it there.
+    """
+    _boot_service.register_linux(
+        _boot_service.container_stack_spec(
+            install_path, working_dir, os_key="Linux",
+        ),
+        _read_template("templates/systemd/claude-mcp-containers.service.template"),
+        on_event=_boot_service_event,
+        home=_user_home_for_install(),
     )
-
-    # daemon-reload + enable. Soft-fail if systemctl absent (containers,
-    # WSL minimal, etc.).
-    systemctl = shutil.which("systemctl")
-    if not systemctl:
-        _log_install_event(
-            "boot-service", "skip",
-            "systemctl not on PATH — skipping daemon-reload / enable",
-        )
-        return
-    for cmd in (
-        [systemctl, "--user", "daemon-reload"],
-        [systemctl, "--user", "enable", _BOOT_SERVICE_UNIT_NAME],
-    ):
-        try:
-            subprocess.run(cmd, check=False, capture_output=True, timeout=15)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            _log_install_event(
-                "boot-service", "warn",
-                f"systemctl invocation failed: {' '.join(cmd)} → {exc}",
-            )
-
-    # loginctl enable-linger — needed so the user-scoped unit fires at
-    # boot without an active login session. Check existing state first
-    # (idempotent — no-op if already lingering).
-    loginctl = shutil.which("loginctl")
-    if not loginctl:
-        _log_install_event(
-            "boot-service", "skip",
-            "loginctl not on PATH — user-unit will only fire at login",
-        )
-        return
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
-    if not user:
-        return
-    try:
-        probe = subprocess.run(
-            [loginctl, "show-user", user, "--property=Linger"],
-            check=False, capture_output=True, text=True, timeout=5,
-        )
-        already_lingering = "Linger=yes" in probe.stdout
-    except (OSError, subprocess.TimeoutExpired):
-        already_lingering = False
-    if not already_lingering:
-        try:
-            subprocess.run(
-                [loginctl, "enable-linger", user],
-                check=False, capture_output=True, timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            _log_install_event(
-                "boot-service", "warn",
-                f"loginctl enable-linger failed: {exc}",
-            )
 
 
 def _materialize_boot_service_macos(
     install_path: Path,
     working_dir: Path,
 ) -> None:
-    """macOS: render the LaunchAgent plist and bootstrap it via
-    `launchctl bootstrap` (modern) or `launchctl load -w` (legacy)."""
-    template = _read_template(
-        "templates/launchd/com.vibecodedtools.claude-mcp-containers.plist.template"
+    """macOS: render the LaunchAgent plist and bootstrap it. Thin call into
+    ``vco_lib.boot_service`` (see :func:`_materialize_boot_service_linux`)."""
+    _boot_service.register_macos(
+        _boot_service.container_stack_spec(
+            install_path, working_dir, os_key="Darwin",
+        ),
+        _read_template(
+            "templates/launchd/com.vibecodedtools.claude-mcp-containers.plist.template"
+        ),
+        on_event=_boot_service_event,
+        home=_user_home_for_install(),
     )
-    if template is None:
-        _log_install_event(
-            "boot-service", "skip",
-            "launchd template missing",
-        )
-        return
-
-    plist_dir = _user_home_for_install() / "Library" / "LaunchAgents"
-    plist_path = plist_dir / f"{_BOOT_SERVICE_PLIST_LABEL}.plist"
-    wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
-    log_dir = _user_home_for_install() / "Library" / "Logs"
-    log_file = log_dir / "claude-mcp-containers.log"
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-    rendered = _render_template(template, {
-        "INSTALLED_AT_PATH": str(plist_path),
-        "LABEL": _BOOT_SERVICE_PLIST_LABEL,
-        "WORKING_DIR": str(working_dir),
-        "WRAPPER_SCRIPT": str(wrapper),
-        "LOG_FILE": str(log_file),
-    })
-    try:
-        changed, backup = _backup_and_write_idempotent(plist_path, rendered)
-    except OSError as exc:
-        _log_install_event(
-            "boot-service", "warn",
-            f"could not write launchd plist: {exc}",
-        )
-        return
-
-    _log_install_event(
-        "boot-service", "ok" if changed else "skip",
-        ("launchd plist written" if changed else "launchd plist unchanged"),
-        data={"plist_path": str(plist_path),
-              "backup": str(backup) if backup else None},
-    )
-
-    launchctl = shutil.which("launchctl")
-    if not launchctl:
-        _log_install_event(
-            "boot-service", "skip",
-            "launchctl not on PATH — skipping load",
-        )
-        return
-
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    # Modern syntax (macOS 10.10+): `launchctl bootstrap gui/<uid> <plist>`.
-    # Idempotent: if the agent is already bootstrapped, this returns non-zero
-    # with "Bootstrap failed: 17: File exists" — we tolerate that.
-    bootstrap_rc = -1
-    try:
-        proc = subprocess.run(
-            [launchctl, "bootstrap", f"gui/{uid}", str(plist_path)],
-            check=False, capture_output=True, text=True, timeout=10,
-        )
-        bootstrap_rc = proc.returncode
-    except (OSError, subprocess.TimeoutExpired):
-        bootstrap_rc = -1
-    if bootstrap_rc != 0:
-        # Fall back to legacy `launchctl load -w <plist>`. -w persists the
-        # enable across reboots. Same idempotency tolerance.
-        try:
-            subprocess.run(
-                [launchctl, "load", "-w", str(plist_path)],
-                check=False, capture_output=True, timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            _log_install_event(
-                "boot-service", "warn",
-                f"launchctl load fallback failed: {exc}",
-            )
 
 
 def _materialize_boot_service_windows(
     install_path: Path,
     working_dir: Path,
 ) -> None:
-    """Windows: render the Task Scheduler XML and import it via
-    `schtasks /Create /XML <file> /F` (per-user logon trigger, no
-    admin scope)."""
-    template = _read_template(
-        "templates/windows/claude-mcp-containers.task.xml.template"
+    """Windows: render the Task Scheduler XML and import it via ``schtasks``.
+    Thin call into ``vco_lib.boot_service`` (see
+    :func:`_materialize_boot_service_linux`)."""
+    _boot_service.register_windows(
+        _boot_service.container_stack_spec(
+            install_path, working_dir, os_key="Windows",
+        ),
+        _read_template("templates/windows/claude-mcp-containers.task.xml.template"),
+        on_event=_boot_service_event,
     )
-    if template is None:
-        _log_install_event(
-            "boot-service", "skip",
-            "Windows Task Scheduler XML template missing",
-        )
-        return
-
-    # We materialize the task XML at <install>/state/installed_boot_task.xml
-    # so idempotency-check on re-runs is a simple file-compare. Also
-    # serves as an audit artefact (operator can inspect what got
-    # registered).
-    state_dir = install_path / "state"
-    task_xml_path = state_dir / "installed_boot_task.xml"
-    # v0.2.14 Bug #2: prefer the PowerShell sibling on Windows. It uses
-    # powershell.exe (always present on Win10+) so the Scheduled Task no
-    # longer requires Git Bash / WSL bash on PATH. Fall back to the .sh
-    # wrapper only when the .ps1 isn't shipped (older orchestrator
-    # snapshot, custom install). The Task XML template's <Arguments>
-    # block invokes powershell.exe -File <WRAPPER_SCRIPT> when the
-    # template is at v0.2.14+; if a user has an older template still
-    # invoking bash, they'd point WRAPPER_SCRIPT at the .sh — but
-    # the manifest-driven update flow propagates both together so this
-    # mismatch should not occur in practice.
-    wrapper_ps1 = install_path / "scripts" / "launch-claude-mcp-stack.ps1"
-    wrapper_sh = install_path / "scripts" / "launch-claude-mcp-stack.sh"
-    if wrapper_ps1.exists():
-        wrapper = wrapper_ps1
-    else:
-        wrapper = wrapper_sh
-    # Forward-slash form avoids XML quoting issues. PowerShell accepts
-    # both forward and backslash path separators uniformly.
-    wrapper_forward = str(wrapper).replace("\\", "/")
-    working_dir_forward = str(working_dir).replace("\\", "/")
-    # W-P1-5 (v0.2.53 Track H): XML-escape USERDOMAIN + USERNAME before
-    # substituting into the Task Scheduler XML template. Pre-fix code
-    # pasted raw env values into <UserId>DOMAIN\user</UserId>; if
-    # USERDOMAIN contains characters XML 1.0 forbids — `&`, `<`, `>`
-    # (rare but possible in WORKGROUP names containing `&`, e.g.
-    # "ACME&CO") — the resulting XML is malformed and `schtasks
-    # /Create /XML` exits non-zero. `html.escape(..., quote=False)`
-    # converts only the three XML-special chars (we don't need to
-    # escape `"` or `'` because USER_ID is substituted into element
-    # content, not attribute values). USERDOMAIN + USERNAME are read
-    # AS-IS from the env BEFORE escaping — see test_scheduled_task_xml_escape.
-    raw_domain = os.environ.get("USERDOMAIN", "")
-    raw_username = os.environ.get("USERNAME", "")
-    domain = _html.escape(raw_domain, quote=False)
-    username = _html.escape(raw_username, quote=False)
-    user_id = (
-        domain
-        + ("\\" if raw_domain else "")
-        + username
-    ).strip("\\")
-    if not user_id:
-        # Fallback: POSIX-style USER env (CI / WSL) → also XML-escape.
-        user_id = _html.escape(
-            os.environ.get("USER", "user"), quote=False,
-        )
-
-    rendered = _render_template(template, {
-        "LABEL": _BOOT_SERVICE_TASK_NAME,
-        "WORKING_DIR": working_dir_forward,
-        "WRAPPER_SCRIPT": wrapper_forward,
-        "CREATED_AT": _utc_iso_now(),
-        "USER_ID": user_id,
-    })
-    try:
-        changed, backup = _backup_and_write_idempotent(task_xml_path, rendered)
-    except OSError as exc:
-        _log_install_event(
-            "boot-service", "warn",
-            f"could not write Task Scheduler XML: {exc}",
-        )
-        return
-
-    _log_install_event(
-        "boot-service", "ok" if changed else "skip",
-        ("Task XML written" if changed else "Task XML unchanged"),
-        data={"task_xml_path": str(task_xml_path),
-              "backup": str(backup) if backup else None},
-    )
-
-    schtasks = shutil.which("schtasks")
-    if not schtasks:
-        _log_install_event(
-            "boot-service", "skip",
-            "schtasks not on PATH — Task Scheduler import skipped",
-        )
-        return
-    try:
-        subprocess.run(
-            [schtasks, "/Create", "/TN", _BOOT_SERVICE_TASK_NAME,
-             "/XML", str(task_xml_path), "/F"],
-            check=False, capture_output=True, timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        _log_install_event(
-            "boot-service", "warn",
-            f"schtasks /Create failed: {exc}",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -18958,22 +18700,13 @@ from vco_lib.install_mcp import (  # noqa: E402
 
 
 def _resolve_venv_python_for_install(install_root: Path) -> Optional[Path]:
-    """Locate the Python interpreter inside the install's venv.
+    """Locate the interpreter inside the install's venv; None when absent.
 
-    Tries the canonical modern layout `<root>/.venv` first, then the legacy
-    `<root>/claude_mcp_servers/.venv`. Returns None if neither exists; the
-    caller treats that as a soft-fail and proceeds to the Python fallback.
-    """
-    sub = "Scripts" if platform.system().lower().startswith("win") else "bin"
-    py_name = "python.exe" if platform.system().lower().startswith("win") else "python"
-    candidates = [
-        install_root / ".venv" / sub / py_name,
-        install_root / "claude_mcp_servers" / ".venv" / sub / py_name,
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+    v0.2.92: body moved to
+    ``vco_lib.install_companions.resolve_install_venv_python`` (the doctor needs
+    the same answer; vco_lib must not import install.py). The name is pinned by
+    its tests + two call sites, so it stays here and delegates — no mirror."""
+    return _install_companions.resolve_install_venv_python(install_root)
 
 
 def _launcher_binary_relative_path() -> tuple[str, str]:
@@ -22501,9 +22234,13 @@ def _materialize_boot_service(
     "matched", except it didn't — the only thing that matched was the
     stale-but-consistent state).
     """
-    # Honor the `_BOOT_SERVICE_DISABLE` env var for CI / minimal installs
-    # that don't want a system service materialized.
-    if os.environ.get("VCT_DISABLE_BOOT_SERVICE", "").strip() == "1":
+    # Honor the `VCT_DISABLE_BOOT_SERVICE` env var for CI / minimal installs
+    # that don't want a system service materialized. ONE reader
+    # (`vco_lib.boot_service.boot_registration_disabled`) so the flag gates
+    # the model gateway's registration too — a kill-switch that stopped only
+    # one of VCO's two boot services would be a flag nothing honours for the
+    # other.
+    if _boot_service.boot_registration_disabled():
         _log_install_event(
             "boot-service", "skip",
             "VCT_DISABLE_BOOT_SERVICE=1 — skipping",
@@ -23684,15 +23421,16 @@ def _check_claude_cli() -> None:
 #   - We never shell out to `bash -c` — pure Python subprocess + npm
 #     directly. Avoids the bash-3.2 macOS issue + the missing-bash
 #     Windows-native issue.
-#   - Audit log path uses `Path.home()` (cross-OS user home) and the
-#     same `~/.claude/metrics/` convention as `costs.jsonl`,
-#     `failures.jsonl`, `kg_update_tokens.jsonl`.
+#   - Audit log path uses `vco_lib.paths.claude_metrics_dir()` (v0.2.92:
+#     was an inline `Path.home()`, which resolved the REAL ~/.claude at
+#     import time and ignored $VCT_CLAUDE_DIR) — same `~/.claude/metrics/`
+#     convention as `costs.jsonl`, `failures.jsonl`, `kg_update_tokens.jsonl`.
 
 _NPM_PATH: str | None = shutil.which("npm")  # cached at import time
 
 # Audit log location — sibling of cost-tracker / stop-failure outputs.
 _BUNDLED_VERSIONS_AUDIT_LOG: Path = (
-    Path.home() / ".claude" / "metrics" / "bundled_versions.jsonl"
+    _paths.claude_metrics_dir() / "bundled_versions.jsonl"
 )
 
 
@@ -23946,14 +23684,15 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
     The skip/argv DECISION lives in
     ``vco_lib.install_companions.codegraph_ts_install_plan`` (pure + tested);
     this shim owns only the subprocess run + logging glue (opt out with
-    ``VCT_SKIP_CODEGRAPH_TS=1``; pip target ``<root>[codegraph-ts]`` so
-    pyproject's pins are the single source of truth).
+    ``VCT_SKIP_CODEGRAPH_TS=1``; pip target ``-e <root>[codegraph-ts]``, whose
+    ``-e`` is LOAD-BEARING — without it pip replaces step 4's editable install
+    with a frozen copy of vco_lib; see that docstring for the v0.2.92 evidence).
     """
     from vco_lib.install_companions import (
         CODEGRAPH_TS_SKIP_ENV,
         codegraph_ts_install_plan,
     )
-    _log_install_event("codegraph-ts", "start", "pip install .[codegraph-ts]")
+    _log_install_event("codegraph-ts", "start", "pip install -e .[codegraph-ts]")
     should, skip_reason, pip_target = codegraph_ts_install_plan(
         pyproject_exists=(PROJECT_ROOT / "pyproject.toml").exists(),
         skip_env=(os.environ.get("VCT_SKIP_CODEGRAPH_TS") == "1"),
@@ -23980,8 +23719,8 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
             fail_message="  WARN: codegraph-ts extra install exited non-zero.",
             user_hint_lines=[
                 "Cross-language code-graph call edges stay Python-only until "
-                "this succeeds. Retry: pip install '.[codegraph-ts]' (orch "
-                "venv). Skip permanently with VCT_SKIP_CODEGRAPH_TS=1.",
+                "this succeeds. Retry: pip install -e '.[codegraph-ts]' (orch "
+                "venv; -e required). Skip with VCT_SKIP_CODEGRAPH_TS=1.",
             ],
         )
         if result.returncode == 0:
@@ -23990,7 +23729,7 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"  WARN: codegraph-ts extra install failed: {e}")
         _log_install_event("codegraph-ts", "warn",
-                           f"pip install .[codegraph-ts] failed: {e}")
+                           f"pip install -e .[codegraph-ts] failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -24120,6 +23859,29 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
 # Uninstall
 # ---------------------------------------------------------------------------
 
+def _gateway_boot_artefact(os_name: str) -> str:
+    """Name the model-gateway autostart artefact for the uninstall plan.
+
+    The plan is read before anything is removed, so it names the exact
+    per-OS artefact rather than a generic phrase — a `--dry-run` a user can
+    audit. Registration is opt-in, so on most machines this names something
+    that was never created; the removal below is idempotent and says so.
+    """
+    if os_name == "Linux":
+        return (
+            f"systemd user unit ~/.config/systemd/user/"
+            f"{_boot_service.MODEL_GATEWAY_UNIT_NAME}"
+        )
+    if os_name == "Darwin":
+        return (
+            f"LaunchAgent ~/Library/LaunchAgents/"
+            f"{_boot_service.MODEL_GATEWAY_PLIST_LABEL}.plist"
+        )
+    if os_name == "Windows":
+        return f"Scheduled Task {_boot_service.MODEL_GATEWAY_TASK_NAME}"
+    return f"(no model-gateway boot service on {os_name})"
+
+
 def _run_uninstall(args: argparse.Namespace) -> int:
     """Uninstall the orchestrator.
 
@@ -24171,12 +23933,29 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     print("This uninstaller will:")
     print()
 
-    container_runtime = shutil.which("podman") or shutil.which("docker")
+    # v0.2.92 (MAJOR-3): route through the ONE resolver. This used to be a
+    # FOURTH copy of runtime + compose detection — `shutil.which("podman") or
+    # shutil.which("docker")` plus a hardcoded `<runtime> compose down` — which
+    # (a) ignored VCT_CONTAINER_RUNTIME, so a user who pinned docker had their
+    # podman stack targeted and their docker stack left running, with the
+    # printed volume commands naming the wrong runtime (a printed command is
+    # shipped code), and (b) assumed the `compose` subcommand exists, so on a
+    # standalone `podman-compose` host step 1 failed and did nothing.
+    _rt = _containers.resolve()
+    compose_argv = _rt.compose
+    # Name for the PRINTED commands: the resolved runtime, or — when nothing
+    # resolved (daemon down, refused pin) — whatever is installed, so the
+    # manual cleanup block below still names something real.
+    container_runtime = _rt.runtime or _rt.installed
     compose_dir = PROJECT_ROOT / "infrastructure"
-    will_stop_containers = container_runtime is not None and compose_dir.exists()
+    will_stop_containers = compose_argv is not None and compose_dir.exists()
     if will_stop_containers:
-        print(f"  [1] Stop containers via `{container_runtime} compose down`")
+        print(f"  [1] Stop containers via `{' '.join(compose_argv)} down`")
         print(f"      (preserves volumes — separate step below)")
+    elif compose_dir.exists():
+        # Never silent: pre-v0.2.92 an unusable/absent runtime made step 1 a
+        # no-op with no line in the plan at all.
+        print(f"  [1] [skip] Containers not stopped — {_rt.reason}")
 
     if not args.keep_data:
         print(f"  [2] Remove container volumes (Weaviate KG data + Ollama models + code embeddings)")
@@ -24215,6 +23994,23 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         boot_artefact = f"(no boot service on {os_name})"
     print(f"  [5] Remove boot autostart: {boot_artefact}")
     print(f"      + `vct-hub --unregister-boot` (no-op if never enabled)")
+    print(f"      + model gateway autostart: {_gateway_boot_artefact(os_name)}")
+
+    # v0.2.92 (WP-10): the model gateway's runtime state. Until now this
+    # uninstaller removed exactly one file under the state root
+    # (launcher.db) and nothing else, so a gateway that had ever run left
+    # its token, pid, port, log and exported context table behind. Named
+    # files only — `~/.vct/` also holds hub.token, hub.port, services.toml
+    # and the launcher DB the user may want to keep, so the DIRECTORY is
+    # never removed and never walked.
+    gateway_state = _boot_service.gateway_state_paths()
+    gateway_present = [p for p in gateway_state if p.exists()]
+    if gateway_present:
+        print(f"  [5b] Remove model-gateway state files under {_paths.vct_root_dir()}:")
+        for path in gateway_present:
+            print(f"       - {path.name if path.parent == _paths.vct_root_dir() else path}")
+    else:
+        print(f"  [5b] [skip] No model-gateway state files under {_paths.vct_root_dir()}")
 
     if args.remove_projects:
         print(f"  [6] Remove .claude/ folders in registered projects (--remove-projects)")
@@ -24240,14 +24036,14 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         if _confirm("Stop containers (compose down)?"):
             try:
                 result = subprocess.run(
-                    [container_runtime, "compose", "down"],
+                    [*compose_argv, "down"],
                     cwd=str(compose_dir),
                     capture_output=True,
                     text=True,
                     timeout=120,
                 )
                 if result.returncode == 0:
-                    audit.append(f"stopped containers via {container_runtime} compose down")
+                    audit.append(f"stopped containers via {' '.join(compose_argv)} down")
                 else:
                     audit.append(f"WARN: compose down exited {result.returncode}: {result.stderr.strip()[:200]}")
             except (subprocess.TimeoutExpired, OSError) as e:
@@ -24275,11 +24071,15 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             # printed help. Users run them manually if they want full cleanup.
             volflag = "--volume" + "s"  # = "--volumes"
             removeop = "vol" + "ume rm"  # = "volume rm"
-            downop = "compose down " + volflag
+            downop = "down " + volflag
+            # The compose DRIVER comes from the resolver, so a standalone
+            # `podman-compose` host is told `podman-compose down --volumes`
+            # rather than a `podman compose ...` it cannot run.
+            compose_str = " ".join(compose_argv) if compose_argv else f"{container_runtime} compose"
             print()
             print("  To remove orchestrator container volumes manually, run:")
             print(f"    cd {compose_dir}")
-            print(f"    {container_runtime} {downop}")
+            print(f"    {compose_str} {downop}")
             print(f"  (alternatively, list and remove individually:)")
             print(f"    {container_runtime} volume ls -q | grep -E 'weaviate|ollama|code_embed|codesage'")
             print(f"    {container_runtime} {removeop} <NAME>     # one at a time")
@@ -24328,23 +24128,38 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     # the systemd unit / LaunchAgent / Scheduled Task lives in the USER's
     # home or the OS task store and points INTO the clone — so after clone
     # deletion every boot retried `scripts/launch-claude-mcp-stack.*` from a
-    # deleted path forever. Removal logic lives in
-    # `vco_lib/boot_service_cleanup.py` (shared, unit-tested, soft-fail).
+    # deleted path forever. Removal logic lives in `vco_lib/boot_service.py`
+    # (the ONE home for register + unregister + status; shared, unit-tested,
+    # soft-fail). v0.2.92 duplication-merge: the former
+    # `vco_lib/boot_service_cleanup.py` forwarding shim is deleted.
     if _confirm(f"Remove boot autostart entries ({boot_artefact} + vct-hub)?"):
-        from vco_lib.boot_service_cleanup import (
-            unregister_container_boot_service,
-            unregister_hub_boot_service,
-        )
-        audit.extend(unregister_container_boot_service(
-            unit_name=_BOOT_SERVICE_UNIT_NAME,
-            plist_label=_BOOT_SERVICE_PLIST_LABEL,
-            task_name=_BOOT_SERVICE_TASK_NAME,
+        audit.extend(_boot_service.unregister(
+            _boot_service.container_stack_unregister_spec(),
         ))
         # Resolve the bundled vct-hub binary (Tier 1 only — never download
         # or rebuild during an uninstall); fall back to PATH inside the
         # helper.
         hub_bin = _try_bundled_vct_hub_binary(PROJECT_ROOT)
-        audit.extend(unregister_hub_boot_service(hub_bin))
+        audit.extend(_boot_service.unregister_hub_boot_service(hub_bin))
+        # v0.2.92 (WP-10): the model gateway's own autostart, through the
+        # SAME module that registered it. Idempotent — a machine that never
+        # opted in says so and removes nothing.
+        audit.extend(_boot_service.unregister(
+            _boot_service.model_gateway_spec(os_key=platform.system()),
+        ))
+
+    # Step 5b: model-gateway runtime state (v0.2.92 WP-10).
+    #
+    # `~/.vct/` was never scrubbed by this uninstaller — only launcher.db
+    # was removed — so the gateway's token, pid, port, log and exported
+    # chat-model context table survived an uninstall and confused the next
+    # install (a stale pid file makes a fresh gateway refuse to start).
+    # Named files only; the state root itself belongs to other components
+    # and to the user.
+    if gateway_present and _confirm(
+        f"Remove model-gateway state files under {_paths.vct_root_dir()}?"
+    ):
+        audit.extend(_boot_service.remove_gateway_state())
 
     # Step 6: per-project .claude/ folders (opt-in).
     if args.remove_projects:

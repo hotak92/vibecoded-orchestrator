@@ -28,11 +28,13 @@ already-audited machinery:
     from ``knowledge/**`` / ``docs/**``. NO new drop path.
 
   * **codegraph** (`codegraph_collection`) → re-run the project's
-    ``.claude/scripts/code-graph-analyze . --force-recreate`` which drops +
-    rebuilds the 5 ``<prefix>_Code*`` classes from the source walk. NO new
-    drop path. (v0.2.75: docs previously said ``--force``, a flag the
-    analyzer's argparse rejects — the RUNNER below always used the real
-    ``--force-recreate``.)
+    ``.claude/scripts/code-graph-analyze . --from-resolver --force-recreate``
+    which drops + rebuilds the 5 ``<prefix>_Code*`` classes from the source
+    walk. NO new drop path. (v0.2.75: docs previously said ``--force``, a flag
+    the analyzer's argparse rejects — the RUNNER below always used the real
+    ``--force-recreate``. v0.2.92 BLOCKER-2 added ``--from-resolver`` so the
+    family that gets DROPPED is the project's bound one, not one derived from
+    the folder basename.)
 
 After a successful regenerate, the artifact is re-registered at canonical via
 ``vco_lib.artifact_version_registry.register_artifact_version`` (preceded by an
@@ -58,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
+from . import remedy_shell
 from . import artifact_version_registry as avr
 from . import schema_versions as sv
 
@@ -165,7 +168,8 @@ def regenerate_derived_collection(
         --force-rebuild --project-folder <folder>`` (drop+recreate+re-sync from
         ``knowledge/**`` / ``docs/**``).
       * ``codegraph_collection`` → ``.claude/scripts/code-graph-analyze .
-        --force-recreate`` (drop+rebuild the 5 Code* classes from the walk).
+        --from-resolver --force-recreate`` (drop+rebuild the 5 Code* classes
+        from the walk, against the project's BOUND prefix).
 
     On success, re-registers the artifact at canonical (idempotent
     unregister→register). On a GUARD refusal, NOTHING is dropped and the result
@@ -463,12 +467,22 @@ def _regenerate_codegraph(
     classes with the canonical schema. The 5 ``<prefix>_Code*`` classes share
     one recorded version so a single re-analyze re-derives all of them.
 
-    NOTE (C2): analyze_code_graph.py defines ``--force-recreate``
-    (analyze_code_graph.py:6832, plain ``parse_args`` with no
-    ``allow_abbrev=False``). We pass it VERBATIM — NOT the ``--force``
-    abbreviation, which works today only via argparse prefix-matching and would
-    become ambiguous (argparse exit 2 → silent drop-stops-working) the moment
-    any other ``--force*`` flag is added.
+    NOTE (C2): analyze_code_graph.py defines ``--force-recreate``. We pass it
+    VERBATIM — NOT the ``--force`` abbreviation, which worked only via argparse
+    prefix-matching (the parser is ``allow_abbrev=False`` since v0.2.75 and now
+    rejects it outright).
+
+    ``--from-resolver`` (v0.2.92, BLOCKER-2): ``--force-recreate`` DROPS the
+    five ``<prefix>_Code*`` classes, and the prefix comes from the analyzer's
+    resolution ladder whose last rung is the folder BASENAME. This function is
+    invoked with ``env=os.environ`` from a CLI that need not carry
+    ``CODE_GRAPH_PROJECT``, so without an identity flag a regenerate of a
+    moved/renamed project rebuilt the wrong family — and on a basename
+    collision would have dropped another project's. ``--from-resolver`` is the
+    same flag the per-edit hooks and the launcher use;
+    ``vco_lib.codegraph_drop_guard`` (inside ``create_collections``) is the
+    run-time backstop when the hub is unreachable and the resolver itself falls
+    back. A refusal exits 5 with nothing deleted, surfaced as ``res.error``.
     """
     is_win = sys.platform.startswith("win")
     script = (
@@ -485,10 +499,10 @@ def _regenerate_codegraph(
     if is_win:
         cmd = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-File", str(script), ".", "--force-recreate",
+            "-File", str(script), ".", "--from-resolver", "--force-recreate",
         ]
     else:
-        cmd = ["bash", str(script), ".", "--force-recreate"]
+        cmd = ["bash", str(script), ".", "--from-resolver", "--force-recreate"]
     proc = run(
         cmd,
         cwd=str(folder),
@@ -537,14 +551,34 @@ def _reingest_remediation_command(
     artifact_type: str, folder: Path, artifact_name: str
 ) -> str:
     """The exact command that completes the unfinished re-ingest for a
-    dropped-but-empty collection (the C1 deferral's ``command_to_apply``)."""
+    dropped-but-empty collection (the C1 deferral's ``command_to_apply``).
+
+    v0.2.92 (R42 sweep): rendered for the LOCAL shell. This used to be
+    ``cd '<folder>' && .claude/scripts/<wrapper>`` — POSIX in three ways at
+    once. Windows PowerShell 5.1 rejects ``&&``; cmd.exe keeps the single
+    quotes and so ``cd`` lands nowhere; and the wrapper a Windows install
+    actually ships is the ``.ps1`` sibling, which is not directly executable.
+    A dropped-but-not-re-ingested collection is EMPTY until this command
+    runs, so on Windows the data stayed missing and the printed fix could not
+    be pasted. The wrapper is now named absolutely, which also removes the
+    unstated "you must be in the project directory" precondition the ``cd``
+    encoded.
+    """
     if artifact_type == "codegraph_collection":
-        return (
-            f"cd {str(folder)!r} && "
-            ".claude/scripts/code-graph-analyze . --force-recreate"
+        # v0.2.92 (BLOCKER-2): --from-resolver, for the same reason
+        # `_regenerate_codegraph` passes it. This string is pasted into a
+        # plain terminal, where `.claude/env` has NOT been sourced, so the
+        # analyzer's last resolution rung — the folder BASENAME — is exactly
+        # the one a pasted remedy lands on.
+        return remedy_shell.script_invocation(
+            folder, ".claude/scripts/code-graph-analyze",
+            remedy_shell.quote(str(folder)), "--from-resolver",
+            "--force-recreate",
         )
     # KG / Development / Diagrams (and the shared KG) re-ingest via kg-sync.
-    return f"cd {str(folder)!r} && .claude/scripts/kg-sync --all"
+    return remedy_shell.script_invocation(
+        folder, ".claude/scripts/kg-sync", "--all",
+    )
 
 
 def build_reingest_incomplete_entry(res: RegenerateResult, folder: Path):
@@ -595,7 +629,7 @@ def build_reingest_incomplete_entry(res: RegenerateResult, folder: Path):
             f"{remediation}\n"
             "# Then dismiss:\n"
             "python -m vco_lib.project_init dismiss-deferral "
-            f"--folder {str(folder)!r} "
+            f"--folder {remedy_shell.quote(folder)} "
             f"--condition-id schema_reingest_incomplete_{slug}"
         ),
         kg_node_refs=[],

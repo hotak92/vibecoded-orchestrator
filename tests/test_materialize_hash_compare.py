@@ -29,6 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from tests._v0284_bundle_fixtures import make_fake_orchestrator  # noqa: E402
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import self_install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
@@ -241,7 +242,7 @@ class ForceFlagRegisteredTest(unittest.TestCase):
     def test_force_flag_in_argparse(self):
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "install.py"), "--help"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=child_env(),
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("--force-materialize-claude-dir", result.stdout,

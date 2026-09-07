@@ -82,49 +82,44 @@ mkdir -p "$(dirname "$ALERT_LOG")"
 [[ -z "$EDITED_FILE" ]] && exit 0
 [[ ! -f "$EDITED_FILE" ]] && exit 0
 
-# Collect any matching credential patterns
+# Collect any matching credential patterns.
+#
+# PATTERN SOURCE (changed - read this before adding a regex): the shapes are
+# NOT defined here. They come from the credential-shape vocabulary SSOT
+# vco_lib/credential_shapes.py via _lib/credshapes.sh, `content_scan` context -
+# the SAME vocabulary _lib/credscan.sh consumes, so this PostToolUse scanner
+# and the SubagentStop reconciler can no longer disagree about which vendors
+# they can see. They previously did: this file had the GitHub fine-grained PAT
+# and unquoted-dotenv shapes while credscan.sh did not, and BOTH carried an
+# "Anthropic/OpenAI API key" label over a pattern that matched neither modern
+# OpenAI project keys (sk-proj-/sk-svcacct-/sk-admin-) nor OpenRouter
+# (sk-or-v1-). Add shapes to the SSOT, never here.
 ALERTS=()
 
-check_pattern() {
-    local label="$1"; shift
-    if grep -qE "$*" "$EDITED_FILE" 2>/dev/null; then
-        ALERTS+=("$label")
-    fi
-}
-
-check_pattern "Anthropic/OpenAI API key"  'sk-(ant-api03|[a-zA-Z0-9]{30,})-[a-zA-Z0-9]'
-check_pattern "AWS access key"            'AKIA[A-Z0-9]{16}'
-check_pattern "GitHub token"             'gh[pousr]_[a-zA-Z0-9]{36}'
-# D-13 (v0.2.75): GitHub fine-grained PAT (github_pat_ + 22 alnum + _ +
-# 59 alnum). The gh[pousr]_ shape above NEVER matches these — yet
-# github_pat_* is exactly the shape VCO's own secrets flow provisions,
-# so the scanner that exists to catch a leaked token stayed blind to the
-# most likely one. MUST MATCH the canonical anchor in
-# scripts/check-no-secrets.sh (TOKEN_SHAPES, the
-# `github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}` entry) — one pattern home,
-# never a fourth fork. The exact-format shape (not the looser
-# github_pat_[A-Za-z0-9_]{60,}) is deliberate: the loose form
-# false-positives on Rust release-binary rodata identifier soup; here it
-# also keeps us from matching identifiers like `get_github_pat_preview`.
-check_pattern "GitHub fine-grained PAT"  'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}'
 # v0.2.82: PEM detection requires a PLAUSIBLE key body, not just the BEGIN
 # marker. Pattern-definition/test files legitimately contain the marker as a
 # literal (vct-launcher-core/src/secrets.rs ships a 13-char stub PEM as the
 # write-guard's leave-alone fixture) and were re-alerting on EVERY edit.
 # BODY FLOOR = 120 base64 chars. An RSA key body is >=1600 chars, but a real
-# EC SEC1 P-256 key body is only ~164 chars — the earlier >=256 floor SILENTLY
+# EC SEC1 P-256 key body is only ~164 chars - the earlier >=256 floor SILENTLY
 # MISSED every EC key (the smallest real leak we must still catch). 120 stays
 # comfortably above the 13-char secrets.rs stub while catching P-256 EC keys.
-# MUST MATCH the .ps1 sibling's $b64.Length floor. Needs a multi-line window
-# that grep -E can't express, hence $PY.
+# MUST MATCH the .ps1 sibling's $b64.Length floor.
+#
+# This BODY FLOOR is CONTROL FLOW over a multi-line window, not vocabulary:
+# grep -E cannot express it, so it stays language-local here while the marker
+# regex itself comes from the shared vocabulary (shape id `pem_private_key`).
+# Same split as the env-key-needle SSOT, where the segment-split predicate also
+# stays language-local.
 check_pem_key() {
-    if "$PY" - "$EDITED_FILE" <<'PYEOF' 2>/dev/null
+    if "$PY" - "$EDITED_FILE" "$1" <<'PYEOF' 2>/dev/null
 import re, sys
 try:
     text = open(sys.argv[1], encoding="utf-8", errors="ignore").read()
 except Exception:
     sys.exit(1)
-for m in re.finditer(r"BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY", text):
+marker = sys.argv[2] if len(sys.argv) > 2 else "BEGIN [A-Z0-9 ]*PRIVATE KEY"
+for m in re.finditer(marker, text):
     window = text[m.end():m.end() + 8192]
     end = window.find("-----END")
     body = window if end < 0 else window[:end]
@@ -133,29 +128,36 @@ for m in re.finditer(r"BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY", text):
 sys.exit(1)  # marker(s) without a plausible body -> stub/pattern, no alert
 PYEOF
     then
-        ALERTS+=("PEM private key")
+        return 0
     fi
+    return 1
 }
-check_pem_key
-check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["'"'"'][a-zA-Z0-9+/=_\-]{32,}'
-# D-13 (v0.2.75): unquoted-assignment variant of the generic-secret
-# pattern. The quoted form above requires an opening quote after the
-# `=`, so a `.env`-style bare `API_KEY=abc123...` (no quotes — the common
-# dotenv shape) escaped it. Anchor on a value that starts with a
-# non-quote, non-space char and runs >=32 chars of secret-alphabet so a
-# short `API_KEY=on` config line doesn't trip.
-check_pattern "Generic secret (unquoted)" '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*[a-zA-Z0-9+/=_\-]{32,}'
-# Smoke-test marker — used by hook tests to verify the scanner +
-# alert-routing flow without leaving real-looking credentials in
-# example fixtures. Tests use the literal string
-# VCT_HOOK_LEAK_PROBE_a3f7c2 — VCT-prefixed so it's recognizable as
-# ours, _PROBE suffix to signal testing intent, plus a 6-char random
-# hex tail to make the token unique enough that it cannot
-# accidentally appear in CHANGELOG prose or external docs.
-# Previously this was LEAK_TEST_KEY; renamed 2026-05-18 because the
-# bare-word pattern matched a legitimate CHANGELOG release-note
-# entry describing the smoke-test infrastructure itself.
-check_pattern "Hook leak-test marker"    'VCT_HOOK_LEAK_PROBE_a3f7c2'
+
+# shellcheck source=_lib/credshapes.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/credshapes.sh" ] && . "$SCRIPT_DIR/_lib/credshapes.sh"
+if ! command -v credshapes_for_context >/dev/null 2>&1 \
+   || ! credshapes_for_context content_scan \
+   || [ "${#CREDSHAPES_PATTERNS[@]}" -eq 0 ]; then
+    # A MISSING vocabulary must not look like a clean file. Downstream treats an
+    # empty ALERTS array as "nothing found", so degrading silently here would
+    # turn a broken install into a permanent all-clear. Raise it as a real
+    # alert so it travels the same notification + JSONL path as any finding.
+    ALERTS+=("credential scanner UNAVAILABLE (_lib/credshapes.sh missing)")
+else
+    for _PTS_SHAPE_I in "${!CREDSHAPES_PATTERNS[@]}"; do
+        # Key on the STABLE SSOT shape id, not the display label - a label is
+        # presentation and may be reworded without warning.
+        if [ "${CREDSHAPES_IDS[$_PTS_SHAPE_I]}" = "pem_private_key" ]; then
+            if check_pem_key "${CREDSHAPES_PATTERNS[$_PTS_SHAPE_I]}"; then
+                ALERTS+=("${CREDSHAPES_LABELS[$_PTS_SHAPE_I]}")
+            fi
+            continue
+        fi
+        if grep -qE -- "${CREDSHAPES_PATTERNS[$_PTS_SHAPE_I]}" "$EDITED_FILE" 2>/dev/null; then
+            ALERTS+=("${CREDSHAPES_LABELS[$_PTS_SHAPE_I]}")
+        fi
+    done
+fi
 
 if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"

@@ -15,8 +15,16 @@ Behaviour:
   **warn-only** (annotation, exit 0). Once any .ps1 lands on base in that
   root, the rule turns blocking for it.
 - Modification parity is always blocking.
-- Files under ``_lib/`` or ``lib/`` subdirectories of any scan root are
-  excluded (those are sourced helpers, not hooks).
+- Existence parity covers ``_lib/`` (v0.2.92 delivery audit m2: the
+  sourced helpers ship per-OS like everything else — ``_lib/credshapes``,
+  ``_lib/metrics-dir`` — so a missing sibling there is the same defect).
+  The one declared exception is ``PS1_ONLY_LIB`` below. ``lib/``
+  directories stay excluded.
+- Modification parity still excludes ``_lib/`` and ``lib/`` (helpers are
+  sourced by their siblings, not registered as hooks) but DOES pair
+  extension-less bash wrappers with their ``.ps1`` (``kg-sync`` /
+  ``kg-sync.ps1``): pre-v0.2.92 the suffix filter made those invisible,
+  so the two flavours could drift silently.
 
 v0.2.54 Track E (Theme 6): the parity gate now covers
 ``templates/scripts/`` in addition to ``templates/hooks/``. Pre-Track-E
@@ -59,7 +67,23 @@ from pathlib import Path
 SCAN_ROOTS = ("templates/hooks", "templates/scripts", ".claude/hooks")
 # Legacy alias kept for any out-of-tree consumers that imported HOOKS_DIRS.
 HOOKS_DIRS = SCAN_ROOTS
+# Modification parity skips these subdirs (sourced helpers, not hooks).
 EXCLUDED_SUBDIRS = ("_lib", "lib")
+# Existence parity only skips these (v0.2.92 delivery audit m2: `_lib`
+# helpers ship per-OS and need siblings like every other shipped file).
+EXISTENCE_EXCLUDED_SUBDIRS = ("lib",)
+# `.ps1`-only `_lib` helpers with no POSIX counterpart BY DESIGN — a
+# Windows mechanism with nothing to mirror. Mirrors PS1_ONLY_LIB in
+# tests/test_v0292_sibling_parity_blind_spots.py: a name here must exist
+# in BOTH places or the two gates disagree about what is allowed.
+PS1_ONLY_LIB = frozenset({
+    "resolve-powershell.ps1",
+    # v0.2.92 BLOCKER-1: splits a compose command string into head + args.
+    # POSIX has nothing to mirror — `$COMPOSE_CMD up -d` word-splits correctly
+    # for both `podman-compose` and `podman compose`, while PowerShell needs an
+    # explicit splat whose naive form mis-handles the one-token shape.
+    "compose-invocation.ps1",
+})
 MAGIC_COMMENT_PREFIX = "# OS-EXEMPT-PARITY:"
 MAGIC_COMMENT_LINE_LIMIT = 5
 
@@ -119,8 +143,13 @@ def find_scan_roots(repo_root: Path) -> list[Path]:
 
 
 def is_excluded(rel_path: Path) -> bool:
-    """True if rel_path lies under an excluded subdir of the hooks root."""
+    """True if rel_path lies under a modification-parity-excluded subdir."""
     return any(part in EXCLUDED_SUBDIRS for part in rel_path.parts)
+
+
+def is_existence_excluded(rel_path: Path) -> bool:
+    """True if rel_path lies under an existence-parity-excluded subdir."""
+    return any(part in EXISTENCE_EXCLUDED_SUBDIRS for part in rel_path.parts)
 
 
 def has_magic_comment(file_path: Path) -> bool:
@@ -151,17 +180,32 @@ def has_magic_comment(file_path: Path) -> bool:
 
 
 def list_hook_files(hooks_dir: Path, suffix: str) -> list[Path]:
-    """Return absolute paths of hook files with the given suffix, excluding
-    files under _lib/ or lib/."""
+    """Return absolute paths of hook files with the given suffix.
+
+    Existence-grade exclusion applies (``lib/`` only — ``_lib/`` helpers
+    are shipped per-OS and must have siblings like every other file).
+    """
     out = []
     for p in hooks_dir.rglob(f"*{suffix}"):
         if not p.is_file():
             continue
         rel = p.relative_to(hooks_dir)
-        if is_excluded(rel):
+        if is_existence_excluded(rel):
             continue
         out.append(p)
     return out
+
+
+def _starts_with_bash_shebang(path: Path) -> bool:
+    """True iff `path`'s first line is a `#!/…bash` shebang. The shebang
+    check ensures we don't accept a random unrelated file (e.g. a JSON
+    config sharing the stem) as a bash wrapper."""
+    try:
+        with path.open("rb") as f:
+            first_line = f.readline(256).decode("utf-8", errors="replace").rstrip()
+    except OSError:
+        return False
+    return first_line.startswith("#!") and "bash" in first_line
 
 
 def _has_extensionless_bash_sibling(ps1_path: Path) -> bool:
@@ -172,23 +216,11 @@ def _has_extensionless_bash_sibling(ps1_path: Path) -> bool:
     ship as `name` (extensionless bash wrapper, e.g. `kg-sync`) + `name.ps1`.
     Both are valid parity shapes; this function lets the gate recognize the
     latter without flagging it as a missing-.sh-sibling violation.
-
-    The check is: does a file at the same stem WITHOUT any suffix exist AND
-    start with a `#!/bin/bash` or `#!/usr/bin/env bash` shebang? The
-    shebang check ensures we don't accept a random unrelated file as a
-    bash sibling (e.g. a JSON config that happens to share the stem).
     """
     if ps1_path.suffix != ".ps1":
         return False
     bare = ps1_path.with_suffix("")
-    if not bare.is_file():
-        return False
-    try:
-        with bare.open("rb") as f:
-            first_line = f.readline(256).decode("utf-8", errors="replace").rstrip()
-    except OSError:
-        return False
-    return first_line.startswith("#!") and "bash" in first_line
+    return bare.is_file() and _starts_with_bash_shebang(bare)
 
 
 def base_has_ps1(repo_root: Path, hooks_dir_rel: str, base_ref: str) -> bool:
@@ -205,7 +237,7 @@ def base_has_ps1(repo_root: Path, hooks_dir_rel: str, base_ref: str) -> bool:
         if not line.endswith(".ps1"):
             continue
         rel = Path(line).relative_to(hooks_dir_rel)
-        if is_excluded(rel):
+        if is_existence_excluded(rel):
             continue
         return True
     return False
@@ -302,6 +334,11 @@ def _check_one_root(
         # contract.
         if _has_extensionless_bash_sibling(ps1):
             continue
+        # v0.2.92 delivery audit m2: `_lib` is now IN existence parity, so
+        # the one ps1-only helper needs a declared exception. A name in
+        # PS1_ONLY_LIB must also be in the ratchet test's PS1_ONLY_LIB.
+        if ps1.parent.name == "_lib" and ps1.name in PS1_ONLY_LIB:
+            continue
         if has_magic_comment(ps1):
             continue
         rel = ps1.relative_to(repo_root).as_posix()
@@ -322,14 +359,22 @@ def _check_one_root(
         ):
             continue
         p = Path(changed_path)
-        if p.suffix not in (".sh", ".ps1"):
+        if p.suffix == ".sh":
+            sibling = p.with_suffix(".ps1").as_posix()
+        elif p.suffix == ".ps1":
+            sibling = p.with_suffix(".sh").as_posix()
+        elif _starts_with_bash_shebang(repo_root / changed_path):
+            # v0.2.92 delivery audit m2: an extension-less bash wrapper
+            # (e.g. `kg-sync`) pairs with `<name>.ps1` exactly like a
+            # `.sh` file does. Pre-fix, the suffix filter made modifying
+            # one flavour without the other invisible to this gate.
+            sibling = (p.parent / (p.name + ".ps1")).as_posix()
+        else:
             continue
         rel_to_root = Path(changed_path).relative_to(scan_root_rel)
         if is_excluded(rel_to_root):
             continue
 
-        sibling_suffix = ".ps1" if p.suffix == ".sh" else ".sh"
-        sibling = p.with_suffix(sibling_suffix).as_posix()
         sibling_path_abs = repo_root / sibling
         source_path_abs = repo_root / changed_path
         if source_path_abs.exists() and has_magic_comment(source_path_abs):

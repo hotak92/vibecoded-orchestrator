@@ -142,6 +142,12 @@ _rule(
 #   * echo/printf of a `$SECRET`-shaped variable expansion
 # Both land in _CREDENTIAL_ACCESS_RULES below so the block message
 # appends the vct-secrets remediation signpost.
+# v0.2.92 (WP-20/N7): `echo_secret_var` is one of the two rules the
+# local-service-token allow-shape can relax — but only when EVERY expansion of
+# that variable is a loopback auth header, and an `echo`/`printf` site is never
+# one, so in practice an echo of a token-file variable still blocks. See
+# `_local_service_token_vars`. `printenv_secret` is NEVER relaxed (it keys on a
+# read VERB, not on an expansion).
 _rule(
     "printenv_secret",
     r"\b(printenv|env)\s+\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
@@ -164,6 +170,12 @@ _rule(
 # `'…'` literal is stripped first and never matches. Only SECRET-SHAPED names
 # (KEY/TOKEN/SECRET/PASS/CRED) fire, so a non-secret `$T` (hub-token file) in an
 # auth header to localhost stays allowed — see the benign planner-shape fixtures.
+# v0.2.92 (WP-20/N7): this rule and `echo_secret_var` are the ONLY two the
+# local-service-token allow-shape can relax, and only for a variable assigned
+# from a token file whose EVERY expansion is a loopback `Authorization:` /
+# `x-api-key:` header — see `_local_service_token_vars`. A secret-shaped `$TOKEN`
+# read from anywhere else, echoed, put in a request body, sent to a non-loopback
+# host, or exposed by `curl -v` still fires here exactly as before.
 _rule(
     "secret_var_expansion",
     r"\$\{?\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
@@ -299,6 +311,20 @@ _ENV_READ_RULES: frozenset[str] = frozenset({
     "env_exfil_multihop",
     "env_grep_secrets",
     "printenv_secret",
+    "echo_secret_var",
+    "secret_var_expansion",
+})
+
+# v0.2.92 (WP-20 / N7): the ONLY two rules a local-service-token exemption can
+# ever relax. Both key on a `$VAR`/`${VAR}` EXPANSION of a secret-shaped name,
+# which is exactly what a loopback auth header contains and nothing else here
+# is. Every other rule — `printenv_secret` (a read VERB, no expansion),
+# `env_grep_secrets`, the three `env_exfil_*`, `read_env_files`,
+# `read_proc_environ`, `read_ssh_keys`, `read_bash_history`, and the whole
+# non-credential rule set — is untouched by the exemption, by construction:
+# the exemption is applied by masking specific variable NAMES on a surface only
+# these two rules read. Adding a rule here widens the scanner; do not.
+_LOCAL_TOKEN_EXEMPT_RULES: frozenset[str] = frozenset({
     "echo_secret_var",
     "secret_var_expansion",
 })
@@ -785,6 +811,237 @@ def _python_env_secret_hit(python_payloads: list[str]) -> bool:
     return any(_PYTHON_ENV_SECRET.search(p) for p in python_payloads)
 
 
+# ─── v0.2.92 (WP-20 / N7): the local-service-token allow-shape ───────────────
+#
+# Reading a localhost-only service token out of an owner-only file and putting
+# it in an auth header addressed to 127.0.0.1 is a legitimate, routine
+# operation (`vct-hub`'s own `hub.token`, the model gateway's
+# `~/.config/<svc>/token`). Before this, `secret_var_expansion` blocked it and
+# the block was worked around by doing the read inside Python instead — a
+# worked-around rule is a rule that has stopped protecting anything.
+#
+# **This is an allow-SHAPE, not a loosening**, and the distinction is the whole
+# point. Three conditions must ALL hold, within one command string:
+#
+#   1. the variable is assigned from `$(cat <path>)` / `` `cat <path>` `` where
+#      `<path>` is a recognisable LOCAL-SERVICE token file (`~/.vct/*token*`,
+#      `~/.config/<svc>/token`, plus the `$HOME` spellings) — not any file that
+#      happens to hold a credential;
+#   2. EVERY expansion of that variable anywhere in the command sits in an
+#      `Authorization:` / `x-api-key:` header value; and
+#   3. every such site is a `curl`/`wget`/`http(ie)` invocation whose ONLY URLs
+#      are loopback (`127.0.0.1`, `localhost`, `[::1]`), with no userinfo in the
+#      URL and no response-tracing flag (`-v`, `--trace…`) that would print the
+#      header back out.
+#
+# "EVERY expansion" is what keeps it a shape: one `echo "$TOKEN"`, one
+# `curl -d "$TOKEN"`, one remote host, one `-v`, and the exemption does not
+# apply AT ALL — the command blocks exactly as it did before. There is no
+# per-site exemption, deliberately: a per-site one would allow the header AND
+# let the same command echo the value on the next line.
+#
+# Nothing here touches the filesystem. The scanner stays a pure function of the
+# string, so the tests stay hermetic and a path that does not exist is judged
+# the same as one that does.
+
+#: Token-file paths recognised as a LOCAL-SERVICE token. Anchored at both ends
+#: against a single substitution body, so `~/.aws/credentials`,
+#: `~/.ssh/id_rsa`, `/etc/shadow` and `~/.config/gh/hosts.yml` are all outside
+#: it and keep the block. `~/.vct/` covers `hub.token`, `hub.token.<project_id>`
+#: and `diagrams.token`; `~/.config/<svc>/token` covers the gateway shape.
+_LOCAL_SERVICE_TOKEN_PATH = re.compile(
+    r"^(?:~|\$HOME|\$\{HOME\})/"
+    r"(?:"
+    r"\.vct/[\w.\-]*token[\w.\-]*"
+    r"|\.config/[\w.\-]+/token"
+    r")$"
+)
+
+#: `NAME=$(cat <path>)` / `NAME=`cat <path>`` — optionally `export`-ed, and
+#: tolerant of the space the double-quote neutralizer leaves behind when the
+#: source was written `NAME="$(cat …)"`.
+_TOKEN_FILE_ASSIGN = re.compile(
+    r"(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_]\w*)=\s*"
+    r"(?:\$\(\s*cat\s+(?P<sub>[^)]+?)\s*\)|`\s*cat\s+(?P<bt>[^`]+?)\s*`)"
+)
+
+#: Any absolute URL in a command segment. The host token keeps its port so the
+#: loopback test can strip it deliberately rather than matching a prefix.
+_ABSOLUTE_URL = re.compile(r"https?://([^\s'\"|;&)]+)", re.IGNORECASE)
+
+#: curl/wget flags that ECHO the request headers back to stderr/stdout. With one
+#: of these the token stops being confined to the request and lands in whatever
+#: captures the output — the leak the rule exists to prevent, arriving by
+#: another door. Refusing the exemption here is a NARROWING.
+_HEADER_ECHOING_FLAGS = re.compile(
+    r"(?:^|\s)(?:-[A-Za-z]*v[A-Za-z]*|--verbose|--trace(?:-ascii|-time)?|--libcurl)(?:\s|$)"
+)
+
+#: Segment separators — including the NEWLINE. This runs on the surfaces
+#: BEFORE ``check_command`` collapses them to one line for the flat regex rules:
+#: that collapse erases the statement boundary in a multi-line command, which
+#: would fuse an assignment line and its `curl` line into one segment and lose
+#: the shape. The flat rules do not care (they scan for patterns, not
+#: statements); this does.
+_SEGMENT_SPLIT = re.compile(r"\|\||&&|[;|&\n]")
+
+#: A shell LINE CONTINUATION (`\` at end of line) — not a statement separator.
+#: Folded to a space before segmenting, otherwise a `curl` invocation written
+#: across several lines (the normal way anyone writes one with three headers)
+#: would be chopped into segments, none of which starts with `curl`.
+_LINE_CONTINUATION = re.compile(r"\\[ \t]*\r?\n")
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+_HTTP_CLIENTS = frozenset({"curl", "wget", "http", "https"})
+
+
+def _var_expansion_re(name: str) -> "re.Pattern[str]":
+    """Match `$NAME` / `${NAME}` for exactly ``name``.
+
+    ``\\b`` after the bare form is load-bearing: without it a one-letter name
+    like ``T`` (the workaround spelling that provoked this work) would match the
+    ``$T`` prefix of an unrelated ``$TOKEN`` and exempt a variable nobody
+    checked.
+    """
+    return re.compile(r"\$(?:\{" + re.escape(name) + r"\}|" + re.escape(name) + r"\b)")
+
+
+def _auth_header_site_re(name: str) -> "re.Pattern[str]":
+    """Match an `Authorization:`/`x-api-key:` header value that IS ``$name``.
+
+    An optional scheme word (`Bearer` / `Basic` / `Token`) may sit between the
+    colon and the expansion; nothing else may. The header name itself survives
+    on the SKELETON surface (double-quoted literal text is kept there), which is
+    why the site test runs on the skeleton and not on the env-read surface —
+    the latter strips the literal ``Authorization:`` and would leave a bare
+    ``$TOKEN`` indistinguishable from any other use.
+    """
+    return re.compile(
+        r"(?:Authorization|x-api-key)\s*:\s*(?:Bearer|Basic|Token)?\s*"
+        r"\$(?:\{" + re.escape(name) + r"\}|" + re.escape(name) + r"\b)",
+        re.IGNORECASE,
+    )
+
+
+def _is_loopback_url(url_tail: str) -> bool:
+    """True when the host of ``scheme://<url_tail>`` is a loopback literal.
+
+    Rejects userinfo (`user:pass@127.0.0.1` — a credential inside the URL, and
+    also a way to make a remote host LOOK loopback to a naive suffix match).
+    """
+    if "@" in url_tail.split("/", 1)[0]:
+        return False
+    host = url_tail.split("/", 1)[0]
+    if host.startswith("["):
+        closing = host.find("]")
+        if closing == -1:
+            return False
+        host = host[: closing + 1]
+    else:
+        host = host.split(":", 1)[0]
+    return host.lower() in _LOOPBACK_HOSTS
+
+
+def _segment_is_loopback_http_call(segment: str) -> bool:
+    """True when ``segment`` is an HTTP client call addressing ONLY loopback."""
+    words = segment.split()
+    # Skip leading `VAR=value` assignments — `FOO=1 curl …` is still a curl call.
+    idx = 0
+    while idx < len(words) and re.fullmatch(r"[A-Za-z_]\w*=\S*", words[idx]):
+        idx += 1
+    if idx >= len(words):
+        return False
+    binary = words[idx].rsplit("/", 1)[-1].lower()
+    if binary not in _HTTP_CLIENTS:
+        return False
+    if _HEADER_ECHOING_FLAGS.search(segment):
+        return False
+    urls = _ABSOLUTE_URL.findall(segment)
+    if not urls:
+        # No absolute URL at all (bare `curl 127.0.0.1:8787`, or a URL built
+        # from a variable). Cannot PROVE the destination is loopback, so do not
+        # claim it is.
+        return False
+    return all(_is_loopback_url(u) for u in urls)
+
+
+def _local_service_token_vars(skeleton: str, env_surface: str) -> "frozenset[str]":
+    """Variable names that satisfy the whole local-service-token allow-shape.
+
+    Both arguments are the surfaces BEFORE ``check_command`` whitespace-collapses
+    them, so statement-separating NEWLINES are still present; each segment is
+    normalised individually below.
+
+    Two surfaces, each for the half it can answer:
+
+    * ``env_surface`` finds the ASSIGNMENT. It has all inert literal text
+      stripped, so a quoted MENTION of the shape — a commit message reading
+      ``-m "TOKEN=$(cat ~/.vct/hub.token)"``, a heredoc documenting it — cannot
+      register a candidate. Only an assignment the shell would really perform
+      survives there. (The real forms all do: ``TOKEN=`` is unquoted text even
+      when the substitution is written ``TOKEN="$(cat …)"``, and command
+      substitutions are kept on that surface because they execute.)
+    * ``skeleton`` judges the USES. The literal ``Authorization:`` and the URL
+      live in a double-quoted argument, which only the skeleton keeps; on the
+      env-read surface they are gone and every use would look identical.
+
+    Returns the names whose EVERY expansion sits in a loopback auth header — an
+    empty set (the overwhelmingly common case) means nothing is exempted and the
+    scan is bit-for-bit what it was before this shape existed.
+    """
+    env_joined = _LINE_CONTINUATION.sub(" ", env_surface)
+    skeleton_joined = _LINE_CONTINUATION.sub(" ", skeleton)
+
+    candidates: set[str] = set()
+    for match in _TOKEN_FILE_ASSIGN.finditer(env_joined):
+        path = match.group("sub") or match.group("bt") or ""
+        if _LOCAL_SERVICE_TOKEN_PATH.match(path.strip()):
+            candidates.add(match.group(1))
+    if not candidates:
+        return frozenset()
+
+    segments = [
+        " ".join(part.split()) for part in _SEGMENT_SPLIT.split(skeleton_joined)
+    ]
+    exempt: set[str] = set()
+    for name in candidates:
+        expansion = _var_expansion_re(name)
+        site = _auth_header_site_re(name)
+        uses = 0
+        ok = True
+        for segment in segments:
+            spans = [m.span() for m in expansion.finditer(segment)]
+            if not spans:
+                continue
+            uses += len(spans)
+            site_spans = [m.span() for m in site.finditer(segment)]
+            in_header = all(
+                any(s <= start and end <= e for s, e in site_spans)
+                for start, end in spans
+            )
+            if not (in_header and _segment_is_loopback_http_call(segment)):
+                ok = False
+                break
+        if ok and uses:
+            exempt.add(name)
+    return frozenset(exempt)
+
+
+def _mask_vars(surface: str, names: "frozenset[str]") -> str:
+    """Blank the expansions of ``names`` on ``surface``.
+
+    Replacement is a space, not a placeholder word, so no rule can key on the
+    mask itself. Only the named variables are masked — any OTHER secret-shaped
+    expansion in the same command still fires normally, which is what keeps
+    this an exemption for ONE reviewed variable rather than for the command.
+    """
+    masked = surface
+    for name in names:
+        masked = _var_expansion_re(name).sub(" ", masked)
+    return masked
+
+
 def check_command(cmd: str, _depth: int = 0) -> tuple[bool, str]:
     """Check a command string for security violations.
 
@@ -798,11 +1055,30 @@ def check_command(cmd: str, _depth: int = 0) -> tuple[bool, str]:
     # runs on the skeleton (heredoc bodies + single-quoted contents stripped,
     # double-quoted literals kept). Falling back to the raw command would
     # re-open the FP class, so both surfaces are always used.
-    skeleton = " ".join(_neutralize(cmd, env_read=False).split())
-    env_surface = " ".join(_neutralize(cmd, env_read=True).split())
+    skeleton_lines = _neutralize(cmd, env_read=False)
+    env_surface_lines = _neutralize(cmd, env_read=True)
+    skeleton = " ".join(skeleton_lines.split())
+    env_surface = " ".join(env_surface_lines.split())
+
+    # v0.2.92 (WP-20 / N7): a THIRD surface, used by exactly two rules. It is
+    # the env-read surface with the expansions of local-service-token variables
+    # blanked — and it is identical to `env_surface` unless the full allow-shape
+    # holds (assignment from a token file AND every expansion in a loopback auth
+    # header AND no header-echoing flag). See `_local_service_token_vars`.
+    # It gets the PRE-COLLAPSE surfaces because it reasons about statements, and
+    # the collapse above erases the newline that separates them.
+    exempt_vars = _local_service_token_vars(skeleton_lines, env_surface_lines)
+    env_surface_local_token = (
+        _mask_vars(env_surface, exempt_vars) if exempt_vars else env_surface
+    )
 
     for name, pattern, explanation in _RULES:
-        surface = env_surface if name in _ENV_READ_RULES else skeleton
+        if name in _LOCAL_TOKEN_EXEMPT_RULES:
+            surface = env_surface_local_token
+        elif name in _ENV_READ_RULES:
+            surface = env_surface
+        else:
+            surface = skeleton
         if pattern.search(surface):
             reason = f"[{name}] {explanation}"
             if name in _CREDENTIAL_ACCESS_RULES:

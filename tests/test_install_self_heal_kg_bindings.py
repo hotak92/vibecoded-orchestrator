@@ -26,10 +26,11 @@ Test coverage:
 The tests stub out Weaviate via a small in-process HTTP server
 (``http.server.BaseHTTPRequestHandler``) so the helper's
 ``urllib.request.urlopen`` call lands in the test's fixture instead of
-hitting a real Weaviate. The launcher.db is built via ``sqlite3``
-directly because the launcher's own migrations live in Rust and aren't
-callable from Python tests — we hand-roll just enough schema for the
-helper to see.
+hitting a real Weaviate. The launcher.db is built by APPLYING the shipped
+migration SQL (``tests.common.launcher_db_fixture``), so its schema is the
+launcher's schema by construction. This module used to hand-roll "just
+enough schema for the helper to see" — four partial CREATE TABLEs that
+could not fail when the real table grew a NOT NULL column or a CHECK.
 """
 
 from __future__ import annotations
@@ -50,6 +51,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    connect,
+    create_empty_launcher_db,
+    set_app_state,
+)
 import install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
@@ -109,51 +115,52 @@ def _start_stub_weaviate(classes: list[str]) -> tuple[http.server.HTTPServer, in
 # ─── launcher.db helpers ──────────────────────────────────────────────────
 
 
-_PROJECT_KG_BINDINGS_DDL = """
-CREATE TABLE project_kg_bindings (
-    project_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    collection_name TEXT NOT NULL,
-    embedding_model TEXT,
-    embedding_dim INTEGER,
-    kg_dir_path TEXT,
-    weaviate_url TEXT,
-    config_json TEXT,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (project_id, role)
+_INSERT_BINDING_SQL = (
+    "INSERT INTO project_kg_bindings "
+    "(project_id, role, collection_name, embedding_model, "
+    "embedding_dim, kg_dir_path, weaviate_url, config_json, "
+    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)"
 )
-"""
+
+
+def _create_wal_launcher_db(db_path: Path):
+    """A REAL-schema launcher.db (shipped migrations) in WAL mode.
+
+    v0.2.49 Bug N: ``journal_mode = WAL`` mirrors the launcher's production
+    config (`launcher/src-tauri/vct-launcher-core/src/db.rs::init_pragmas`).
+    In WAL mode, RO connections do NOT block on writer transactions — the
+    load-bearing property the RO-first detection path in
+    `_self_heal_kg_bindings_on_update` depends on. Without WAL the default
+    rollback-journal mode makes RO connections block just like RW ones,
+    rendering the Bug N regression test indistinguishable from the pre-fix
+    path. The pragma is applied here (not in a migration) because the real
+    runtime applies it the same way — at connection setup, not in schema.
+    """
+    db_path = create_empty_launcher_db(db_path)
+    conn = connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
 
 
 def _build_launcher_db(db_path: Path, rows: list[tuple[str, str, str]]) -> None:
-    """Create launcher.db with a project_kg_bindings table seeded with rows.
+    """Create launcher.db with project_kg_bindings seeded with rows.
 
-    Each row is ``(project_id, role, collection_name)``. Other columns
-    get sane defaults (None / '{}' / current millis).
-
-    v0.2.49 Bug N: also sets ``journal_mode = WAL`` to mirror the
-    launcher's production config (`launcher/src-tauri/vct-launcher-core/
-    src/db.rs::init_pragmas`). In WAL mode, RO connections do NOT block
-    on writer transactions — which is the load-bearing property the
-    RO-first detection path in `_self_heal_kg_bindings_on_update`
-    depends on. Without WAL, the default rollback-journal mode causes
-    RO connections to block on writer transactions just like RW ones,
-    making the Bug N regression test indistinguishable from the
-    pre-fix path.
+    Each row is ``(project_id, role, collection_name)``; ``role`` must satisfy
+    the real table's CHECK (``primary`` | ``shared`` | ``archive``). Other
+    columns get sane defaults (None / '{}' / current millis).
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    _create_wal_launcher_db(db_path)
+    conn = connect(db_path)
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(_PROJECT_KG_BINDINGS_DDL)
         now = int(time.time() * 1000)
         for project_id, role, collection_name in rows:
             conn.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name, embedding_model, "
-                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?)",
-                (project_id, role, collection_name, now),
+                _INSERT_BINDING_SQL,
+                (project_id, role, collection_name, "{}", now),
             )
         conn.commit()
     finally:
@@ -162,7 +169,7 @@ def _build_launcher_db(db_path: Path, rows: list[tuple[str, str, str]]) -> None:
 
 def _read_bindings(db_path: Path) -> list[tuple[str, str, str]]:
     """Read ``(project_id, role, collection_name)`` triples from launcher.db."""
-    conn = sqlite3.connect(str(db_path))
+    conn = connect(db_path)
     try:
         cur = conn.execute(
             "SELECT project_id, role, collection_name FROM project_kg_bindings "
@@ -302,6 +309,19 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
             self._db_path,
             rows=[("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
         )
+        # ...AND a CONVERGED shared-KG pointer pair, which is the other half
+        # of "nothing to heal". Migration 037 seeds
+        # `orchestrator_root_kg_collection`, so on the real schema a DB whose
+        # `last_installed_shared_kg_collection` is unset reads as pointer
+        # DRIFT (`pointer_drift_needs_rw` → True) and legitimately owes the RW
+        # pass. The pre-migration fixture had an EMPTY app_state, which made
+        # "no work owed" true by omission rather than by state. Stating the
+        # converged pair restores the intended premise — the helper's own
+        # docstring calls it "a default install has them equal → no RW open".
+        set_app_state(
+            self._db_path, "last_installed_shared_kg_collection",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+        )
         self._server, self._port = _start_stub_weaviate(
             classes=["VibeCodedOrchestrator_KnowledgeGraph"]
         )
@@ -330,11 +350,21 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
             install._self_heal_kg_bindings_on_update(report)
 
-        # Post-Bug-N contract: exactly one RO open, ZERO RW opens.
+        # Post-Bug-N contract: RO-only detection, ZERO RW opens.
+        #
+        # TWO read-only opens, both lock-free by construction (`mode=ro` +
+        # WAL): the Bug-N detection probe, and the v0.2.92 D18 evidence-heal
+        # PRECONDITION (`kg_binding_heal.resolve_evidence_heal_plan` — "does
+        # any *_KnowledgeGraph class exist that no binding row names?"). Here
+        # the answer is no, so the precondition short-circuits BEFORE the
+        # expensive evidence scan: a healthy machine pays one extra RO open
+        # and no Weaviate traffic. The invariant that matters is the RW count
+        # below — an RW open is what blocks on the hub's writer lock.
         self.assertEqual(
             len(ro_calls),
-            1,
-            f"Bug N: helper should open RO connection ONCE for detection. "
+            2,
+            f"Bug N: helper should open RO connections for detection ONLY "
+            f"(1 Bug-N probe + 1 D18 precondition). "
             f"Got {len(ro_calls)} RO calls: {ro_calls}",
         )
         self.assertEqual(
@@ -356,10 +386,18 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         proceeds to open RW + apply them. Inverse pin: the RO-first
         optimization must not break the rebind-needed path.
         """
-        # Pre-seed: lowercase-c binding that needs a rebind.
+        # Pre-seed: lowercase-c binding that needs a rebind...
         _build_launcher_db(
             self._db_path,
             rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        # ...and a CONVERGED pointer pair, so the case-rebind is the ONLY
+        # reason the RW pass opens. Without this the migration-seeded
+        # `orchestrator_root_kg_collection` would also read as pointer drift
+        # and the RW open could no longer be attributed to the rebind.
+        set_app_state(
+            self._db_path, "last_installed_shared_kg_collection",
+            "VibeCodedOrchestrator_KnowledgeGraph",
         )
         self._server, self._port = _start_stub_weaviate(
             classes=["VibeCodedOrchestrator_KnowledgeGraph"]
@@ -386,10 +424,26 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
             install._self_heal_kg_bindings_on_update(report)
 
-        # RO opened for detection, RW opened to apply.
+        # RO opened for detection, RW opened to apply. FOUR RO opens, all
+        # lock-free: the Bug-N probe, the D18 evidence-heal precondition,
+        # and — because the precondition does NOT clear here — the two the
+        # evidence scan itself makes (identity snapshot + shared-pointer
+        # exemption).
+        #
+        # It does not clear on purpose. The binding names
+        # `Vibecoded…` (lowercase c) while Weaviate holds `VibeCoded…`, so
+        # by EXACT membership the live class is named by no binding row and
+        # the precondition must let the scan run. Exact is the only safe
+        # comparison: `unbound_evidence` is computed with exact membership,
+        # so a case-insensitive precondition could skip a genuine unbound
+        # ghost whose name differs only in case from a bound one. Nothing is
+        # written twice — pass 1 rebinds this row first, and the D18 pass
+        # then re-reads it under the same cursor, sees a name that is no
+        # longer the one the scan measured, and refuses.
         self.assertEqual(
-            len(ro_calls), 1,
-            f"expected 1 RO probe, got {len(ro_calls)} calls: {ro_calls}",
+            len(ro_calls), 4,
+            f"expected 4 RO probes (Bug-N detection + D18 precondition + "
+            f"2 evidence-scan reads), got {len(ro_calls)} calls: {ro_calls}",
         )
         self.assertEqual(
             len(rw_calls), 1,
@@ -552,22 +606,16 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         """
         # Seed with a config_json carrying a prior sentinel.
         db_path = self._db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path))
+        _create_wal_launcher_db(db_path)
+        conn = connect(db_path)
         try:
-            conn.execute(_PROJECT_KG_BINDINGS_DDL)
-            now = int(time.time() * 1000)
             conn.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name, embedding_model, "
-                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-                "updated_at) VALUES "
-                "(?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+                _INSERT_BINDING_SQL,
                 (
                     "p1", "shared",
                     "VibecodedOrchestrator_KnowledgeGraph",  # lowercase c
                     json.dumps({"manual_override": "v0.2.28-recovery"}),
-                    now,
+                    int(time.time() * 1000),
                 ),
             )
             conn.commit()
@@ -583,7 +631,7 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         install._self_heal_kg_bindings_on_update(report)
 
         # Pass-1 rebound the row.
-        conn = sqlite3.connect(str(db_path))
+        conn = connect(db_path)
         try:
             cur = conn.execute(
                 "SELECT collection_name, config_json "
@@ -640,45 +688,30 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         self.assertNotIn("multi_candidate_prefix_adopt", ids)
 
 
-# v0.2.49 access-matrix Step A.5: schema mirrors migration 029.
-# created_at / updated_at INTEGER NOT NULL DEFAULT 0 (legacy rows
-# backfill to 0; v0.2.49+ INSERTs bind both).
-_KG_COLLECTION_ACCESS_DDL = """
-CREATE TABLE kg_collection_access (
-    project_id      TEXT NOT NULL,
-    collection_name TEXT NOT NULL,
-    access_level    TEXT NOT NULL,
-    created_at      INTEGER NOT NULL DEFAULT 0,
-    updated_at      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (project_id, collection_name)
-)
-"""
-
-
 def _build_launcher_db_with_access(
     db_path: Path,
     binding_rows: list[tuple[str, str, str]],
     access_rows: list[tuple[str, str, str]],
 ) -> None:
     """Create launcher.db with both project_kg_bindings AND
-    kg_collection_access tables seeded.
+    kg_collection_access seeded.
 
     binding_rows: [(project_id, role, collection_name)]
     access_rows:  [(project_id, collection_name, access_level)]
+
+    v0.2.49 access-matrix Step A.5: ``kg_collection_access.created_at`` /
+    ``updated_at`` are ``INTEGER NOT NULL DEFAULT 0`` in migration 029 —
+    legacy rows backfill to 0, v0.2.49+ INSERTs bind both. Rows seeded here
+    omit them, so they land on that legacy 0/0 default deliberately.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    _create_wal_launcher_db(db_path)
+    conn = connect(db_path)
     try:
-        conn.execute(_PROJECT_KG_BINDINGS_DDL)
-        conn.execute(_KG_COLLECTION_ACCESS_DDL)
         now = int(time.time() * 1000)
         for project_id, role, collection_name in binding_rows:
             conn.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name, embedding_model, "
-                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?)",
-                (project_id, role, collection_name, now),
+                _INSERT_BINDING_SQL,
+                (project_id, role, collection_name, "{}", now),
             )
         for project_id, collection_name, access_level in access_rows:
             conn.execute(
@@ -694,7 +727,7 @@ def _build_launcher_db_with_access(
 
 def _read_access(db_path: Path) -> list[tuple[str, str, str]]:
     """Read (project_id, collection_name, access_level) triples."""
-    conn = sqlite3.connect(str(db_path))
+    conn = connect(db_path)
     try:
         cur = conn.execute(
             "SELECT project_id, collection_name, access_level "
@@ -711,7 +744,7 @@ def _read_access_with_audit(
     """v0.2.49 access-matrix Step A.5: read full row including audit
     columns. Used by tests that pin the seed-path invariant
     (`created_at == updated_at` on first INSERT)."""
-    conn = sqlite3.connect(str(db_path))
+    conn = connect(db_path)
     try:
         cur = conn.execute(
             "SELECT project_id, collection_name, access_level, "
@@ -1008,11 +1041,20 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
     def test_access_matrix_absent_table_does_not_block_binding_heal(self):
         """Older launcher.db schemas may not have `kg_collection_access`.
         The binding heal should still complete normally."""
-        # Build launcher.db with bindings ONLY (no access table).
+        # Build launcher.db with bindings ONLY, then DROP the access table:
+        # the ABSENCE is the thing under test, so it is now created
+        # explicitly rather than being a side effect of a partial fixture.
+        # Every other table keeps its real shape.
         _build_launcher_db(
             self._db_path,
             rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
         )
+        conn = connect(self._db_path)
+        try:
+            conn.execute("DROP TABLE kg_collection_access")
+            conn.commit()
+        finally:
+            conn.close()
         self._server, self._port = _start_stub_weaviate(
             classes=["VibeCodedOrchestrator_KnowledgeGraph"]
         )
@@ -1241,19 +1283,6 @@ class RebindCollectionNamesHelperTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
-_APP_STATE_DDL = """
-CREATE TABLE app_state (
-    key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER
-)
-"""
-
-_PROJECTS_DDL = """
-CREATE TABLE projects (
-    id TEXT PRIMARY KEY, name TEXT, host TEXT
-)
-"""
-
-
 def _build_launcher_db_full(
     db_path: Path,
     *,
@@ -1266,25 +1295,20 @@ def _build_launcher_db_full(
     columns) + projects + app_state — enough for the end-to-end pass-5 sweep.
 
     access_rows: [(project_id, collection_name, access_level, created_at, updated_at)]
-    projects:    [(id, name, host)]
+    projects:    [(id, name, host)] — ``host`` must satisfy the real CHECK
+                 (``base`` | ``mao`` | ``orchestrator_root``). ``folder_path``
+                 and ``slug`` are UNIQUE in the real table, so both are
+                 derived per id; the sweep under test reads neither.
     app_state:   [(key, value)]
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    _create_wal_launcher_db(db_path)
+    conn = connect(db_path)
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(_PROJECT_KG_BINDINGS_DDL)
-        conn.execute(_KG_COLLECTION_ACCESS_DDL)
-        conn.execute(_PROJECTS_DDL)
-        conn.execute(_APP_STATE_DDL)
         now = int(time.time() * 1000)
         for project_id, role, collection_name in binding_rows:
             conn.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name, embedding_model, "
-                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?)",
-                (project_id, role, collection_name, now),
+                _INSERT_BINDING_SQL,
+                (project_id, role, collection_name, "{}", now),
             )
         for project_id, collection_name, access_level, created_at, updated_at in access_rows:
             conn.execute(
@@ -1295,12 +1319,21 @@ def _build_launcher_db_full(
             )
         for pid, name, host in projects:
             conn.execute(
-                "INSERT INTO projects (id, name, host) VALUES (?, ?, ?)",
-                (pid, name, host),
+                "INSERT INTO projects (id, name, folder_path, host, slug, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (pid, name, f"/vct-self-heal-fixture/{pid}", host, pid,
+                 now, now),
             )
         for key, value in app_state:
+            # UPSERT, not INSERT: migration 037 SEEDS
+            # `orchestrator_root_kg_collection` with the default
+            # `VibeCodedOrchestrator_KnowledgeGraph`, so a plain INSERT of
+            # that key raises UNIQUE. Production's app_state writer is an
+            # upsert for exactly this reason; the fixture matches it.
             conn.execute(
-                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
+                "INSERT INTO app_state (key, value, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+                "value = excluded.value, updated_at = excluded.updated_at",
                 (key, value, now),
             )
         conn.commit()
@@ -1387,3 +1420,165 @@ class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _read_state(db_path: Path, key: str) -> str:
+    """One app_state value (``''`` when absent)."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = ?", (key,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return (row[0] or "") if row else ""
+
+
+class SelfHealIdentityPickRemedyEndToEndTests(unittest.TestCase):
+    """v0.2.92 — the drift deferral's PRINTED REMEDY, exercised end to end
+    through the production entry point.
+
+    ``shared_kg_pointer_drift_unresolved`` tells the user to pick the
+    canonical shared collection in the launcher's Identity tab and re-run
+    ``python install.py --update``. That command writes ONE app_state key
+    (``shared_kg.collection_name``) and nothing else — a THIRD key, neither
+    of the two the drift probe compares. Until v0.2.92 nothing in the
+    convergence path read it, so the remedy could be followed to the letter
+    and the entry would stand.
+
+    The unit-level coverage of the picker leg lives in
+    ``tests/test_kg_pointer_drift_heal_r8.py``; it calls
+    ``heal_shared_kg_pointer_drift`` DIRECTLY, which cannot see whether the
+    production entry point still reaches that function — or whether its own
+    RO gate still opens the read-write pass for this shape. This class runs
+    the whole remedy through ``install._self_heal_kg_bindings_on_update``:
+
+      1. drifted DB, no pick        -> the entry fires,
+      2. the user picks (one key)   -> re-run: entry GONE, three keys/rows
+                                       converged onto the pick,
+      3. re-run again               -> nothing left to do, still silent.
+
+    The drift shape is one triple agreement can never resolve (a nonempty
+    ``role='shared'`` binding set with no single ``last``-matching
+    consensus), so the pick is the ONLY thing that can clear it: if the
+    picker leg is removed, or pass 5 is dropped from
+    ``self_heal_kg_bindings``, or the RO gate stops opening the RW pass for
+    a ptr/last divergence, step 2 re-emits and this test goes red.
+    """
+
+    def setUp(self):
+        self._tmp = (
+            Path(__file__).resolve().parent
+            / f"_tmp_self_heal_pick_{os.getpid()}_{id(self)}"
+        )
+        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._tmp / "launcher.db"
+        self._env_patch = mock.patch.dict(
+            os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
+        )
+        self._env_patch.start()
+        self._server = None
+        self._port = None
+
+    def tearDown(self):
+        self._env_patch.stop()
+        if self._server is not None:
+            self._server.shutdown()
+            self._server = None
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
+            os.environ.pop(k, None)
+
+    def test_identity_pick_then_update_clears_the_drift_entry(self):
+        DEAD = "VibeCodedOrchestrator_KnowledgeGraph"  # ptr (machine default)
+        OLD = "OldCanonical_KnowledgeGraph"            # last (live, stale)
+        OTHER = "OtherProject_KnowledgeGraph"          # breaks the consensus
+        NEW = "AcmeCorp_KnowledgeGraph"                # the Identity-tab pick
+        ts = 1000
+        _build_launcher_db_full(
+            self._db_path,
+            binding_rows=[
+                ("root", "shared", OLD),
+                ("p1", "shared", OTHER),
+            ],
+            access_rows=[
+                # seed-authored row at the dead pointer name
+                ("root", DEAD, "read", ts, ts),
+            ],
+            projects=[
+                ("root", "VibeCoded Orchestrator", "orchestrator_root"),
+                ("p1", "Acme", "base"),
+            ],
+            app_state=[
+                ("orchestrator_root_kg_collection", DEAD),
+                ("last_installed_shared_kg_collection", OLD),
+            ],
+        )
+        # Every bound name is LIVE, so no case-rebind and no prefix adoption
+        # is owed: the pointer drift is the ONLY reason the RW pass opens.
+        self._server, self._port = _start_stub_weaviate(
+            classes=[DEAD, OLD, OTHER, NEW]
+        )
+        os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{self._port}"
+
+        # 1. Drifted, no pick recorded → the deferral fires.
+        report1 = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report1)
+        self.assertIn(
+            "shared_kg_pointer_drift_unresolved",
+            [e.condition_id for e in report1.entries],
+            "a divergence with no consensus and no pick must defer",
+        )
+        self.assertEqual(
+            _read_state(self._db_path, "orchestrator_root_kg_collection"), DEAD,
+            "the deferring run must touch nothing",
+        )
+
+        # 2. The user follows the printed remedy. The launcher's
+        #    `set_shared_kg_collection_name` writes ONE app_state key.
+        set_app_state(self._db_path, "shared_kg.collection_name", NEW)
+
+        #    Re-run `python install.py --update`.
+        report2 = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report2)
+
+        self.assertNotIn(
+            "shared_kg_pointer_drift_unresolved",
+            [e.condition_id for e in report2.entries],
+            "following the printed remedy must CLEAR the entry, not re-emit "
+            "it — the whole point of the v0.2.92 picker leg",
+        )
+        self.assertEqual(
+            _read_state(self._db_path, "orchestrator_root_kg_collection"), NEW
+        )
+        self.assertEqual(
+            _read_state(self._db_path, "last_installed_shared_kg_collection"),
+            NEW,
+            "without the seed-snapshot write the next run reads divergent "
+            "again and the entry comes back",
+        )
+        self.assertIn(
+            ("root", "shared", NEW), _read_bindings(self._db_path),
+            "the root's shared binding must follow the pick, or the next "
+            "install run re-derives `last` from the stale row",
+        )
+        root_access = {
+            (c, lvl) for (pid, c, lvl) in _read_access(self._db_path)
+            if pid == "root"
+        }
+        self.assertIn(
+            (NEW, "read"), root_access,
+            "the seed-authored access row at the dead pointer follows too",
+        )
+
+        # 3. Converged: a third run is silent and changes nothing.
+        report3 = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report3)
+        self.assertNotIn(
+            "shared_kg_pointer_drift_unresolved",
+            [e.condition_id for e in report3.entries],
+        )
+        self.assertEqual(
+            _read_state(self._db_path, "orchestrator_root_kg_collection"), NEW
+        )

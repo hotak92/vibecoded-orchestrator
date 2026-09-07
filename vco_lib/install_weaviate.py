@@ -967,7 +967,11 @@ MCP_JSON_STALE_ENV_KEYS = ("WEAVIATE_URL", "KG_COLLECTION", "SHARED_KG_COLLECTIO
 # a truthy value ("1"/"true"/"yes"/"on"), the quarantine helper is a total
 # no-op — for users who DELIBERATELY keep a divergent `.mcp.json` weaviate-kg
 # env (e.g. pointing one project at a different Weaviate on purpose).
-# Documented in docs/post-install/UPDATE-RECOVERY.md and in the deferral text.
+# Documented in docs/TROUBLESHOOTING.md (the `stale_mcp_json_shadow_quarantined`
+# paragraph) and in the deferral text. Corrected v0.2.92: this line used to
+# cite docs/post-install/UPDATE-RECOVERY.md, which contains no quarantine
+# content at all — a pointer to documentation that was never written reads
+# exactly like documentation that exists.
 MCP_JSON_QUARANTINE_SKIP_ENV = "VCO_SKIP_MCP_JSON_QUARANTINE"
 
 # v0.2.89 review NIT-3: quarantine backups land under `.claude/context/`

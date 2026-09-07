@@ -64,6 +64,38 @@ class TestDetectionAndCounts:
 
 
 # ----------------------------------------------------------------------
+# model_max_tokens — v0.2.92 (WP-E): public alias for _model_max_tokens,
+# added so other modules (search_knowledge.py, query_code_graph.py) can
+# resolve the query-budget SSOT without reaching into a private attribute.
+# ----------------------------------------------------------------------
+
+
+class TestModelMaxTokensPublicWrapper:
+    def test_public_wrapper_matches_private_impl(self) -> None:
+        # Same result for a real, registered model — not a re-implementation.
+        assert qc.model_max_tokens("qwen3-embedding:0.6b") == qc._model_max_tokens(
+            "qwen3-embedding:0.6b"
+        )
+        assert qc.model_max_tokens("codesage/codesage-large-v2") == qc._model_max_tokens(
+            "codesage/codesage-large-v2"
+        )
+
+    def test_public_wrapper_delegates_not_duplicates(self, monkeypatch) -> None:
+        # Monkeypatching the PRIVATE name changes the PUBLIC wrapper's
+        # result — proves delegation, not two independent implementations
+        # that could silently drift apart.
+        monkeypatch.setattr(qc, "_model_max_tokens", lambda m: 999)
+        assert qc.model_max_tokens("anything") == 999
+
+    def test_public_wrapper_returns_none_for_unresolvable_lookup(self, monkeypatch) -> None:
+        monkeypatch.setattr(qc, "_model_max_tokens", lambda m: None)
+        assert qc.model_max_tokens("unknown-model") is None
+
+    def test_public_wrapper_exported_in___all__(self) -> None:
+        assert "model_max_tokens" in qc.__all__
+
+
+# ----------------------------------------------------------------------
 # chunk_query — uses the shared Chunker; degrades to whole-query on failure.
 # ----------------------------------------------------------------------
 

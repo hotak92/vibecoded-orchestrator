@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from tests.common.pre_edit_hook_sandbox import (  # noqa: E402
     build_sandbox,
     install_dual_driver,
@@ -125,7 +126,7 @@ def _run_driver(tmp_path: Path, extra_args: list, *, cg_script: Path | None = No
         capture_output=True,
         text=True,
         timeout=60,
-        env=env,
+        env=child_env(env),
     )
     return proc, kg_sink, cg_sink
 
@@ -276,7 +277,7 @@ def test_dual_driver_legs_run_concurrently(tmp_path: Path):
             sys.executable, str(driver_copy), "--query", "q",
             "--kg-limit", "1", "--cg-limit", "2", "--cg-script", str(slow_cg),
         ],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=child_env(),
     )
     elapsed = time.monotonic() - t0
     assert proc.returncode == 0, proc.stderr
@@ -516,6 +517,7 @@ def _recorder(payload: dict, inject: Path, reads: Path) -> None:
         text=True,
         timeout=30,
         check=True,
+        env=child_env(),
     )
 
 

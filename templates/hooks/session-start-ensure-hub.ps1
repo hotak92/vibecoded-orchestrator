@@ -7,24 +7,28 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # SessionStart hook: ensure vct-hub is running (Step 9, v0.2.21).
 # PowerShell port of session-start-ensure-hub.sh — same semantics.
 #
-# Idempotent: invokes `vct-hub --start-if-not-running` (Step 5's CLI),
-# which returns 0 whether the hub started fresh OR was already running.
+# Idempotent: `python -m vco_lib.hub_ensure ensure` leaves a live hub alone
+# and otherwise invokes `vct-hub --start-if-not-running` (Step 5's CLI).
 # Soft-fail throughout — never blocks Claude Code startup. Worst case:
 # a single stderr line + exit 0.
 #
-# Binary-discovery order (v0.2.63: install-folder copy preferred over PATH —
-# must match the launcher's hub_launcher::find_hub_binary):
+# v0.2.92 (ruling R20): binary discovery and the spawn are NO LONGER mirrored
+# here. They live in `vco_lib/hub_ensure.py`, the ONE home shared with the
+# .sh sibling and the Rust launcher (`hub_launcher.rs`). The discovery chain
+# it implements is unchanged:
 #   1. $env:VCT_HUB_BIN    — explicit override (dev builds, custom installs)
 #   2. <repo_root>\launcher\dist\<arch>\vct-hub(.exe)  (INSTALL-FOLDER copy)
 #      then <repo_root>\launcher\dist\vct-hub(.exe)    (arch-less fallback)
 #   3. PATH                — first vct-hub.exe / vct-hub on PATH
 #   4. $HOME\.vct\bin\vct-hub.exe (or .\vct-hub on non-Windows PowerShell)
-# If none match: emit one stderr line, exit 0.
+# If none match the module exits 3 with a named reason; this hook turns that
+# into one stderr line + exit 0.
 #
 # Env overrides:
 #   $env:VCT_HUB_BIN       — explicit binary path (highest precedence).
 #   $env:VCT_DISABLE_HOOKS — set to non-empty to bypass entirely.
-#   $env:VCO_HOOK_DEBUG=1  — verbose stderr (which path won, exit code).
+#   $env:VCO_HOOK_DEBUG=1  — verbose stderr, and run the spawn in the
+#                            foreground (`--wait`) so its exit code is known.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
@@ -46,10 +50,13 @@ function Write-Debug-Line {
 # mid-update would re-lock vct-hub.exe between the stop and the swap. MCP
 # servers already honour this gate (exit 75); the hook does too.
 #
-# Staleness without a JSON parse: the launcher rewrites the lockfile on
-# every phase advance and the expected update duration is 15 minutes, so
-# "modified within the last 15 minutes" is a faithful proxy for the
-# in-JSON `expected_completion_by` deadline.
+# The gate stays HERE, not in `vco_lib.hub_ensure`: the two callers answer it
+# differently on purpose. The launcher parses the in-JSON deadline
+# (`commands::update_gate::is_update_in_progress`); this hook has no JSON
+# deadline parse, so it uses the mtime proxy below. The launcher rewrites the
+# lockfile on every phase advance and the expected update duration is 15
+# minutes, so "modified within the last 15 minutes" is a faithful proxy for
+# the in-JSON `expected_completion_by` deadline.
 # ---------------------------------------------------------------------------
 $vctRoot = if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR } else {
     $p = [System.Environment]::GetFolderPath('UserProfile')
@@ -71,123 +78,68 @@ if (Test-Path -LiteralPath $updateGateFile) {
 }
 
 # ---------------------------------------------------------------------------
-# Get-ArchDirName :: name matching launcher\dist\<arch>\.
-# Best-effort; empty string if not derivable.
+# Hub discovery + "start if not running": ONE home -- `python -m vco_lib.hub_ensure`
+# (v0.2.92, ruling R20). This hook, its .sh sibling and `hub_launcher.rs` each
+# used to carry their own copy of the four-step chain; the copies had already
+# drifted on arch-slot naming. Class A of the A>B>C rule: one Python
+# implementation, called via a ~50 ms subprocess on this session-start path.
+#
+# Loud-fail: if the resolver cannot run at all (no interpreter, broken
+# install), say so on stderr and skip -- never fall back to an inline copy.
 # ---------------------------------------------------------------------------
-function Get-ArchDirName {
-    $arch = ""
+$LibDir = Join-Path $PSScriptRoot "_lib"
+$FindPy = Join-Path $LibDir "find-python.ps1"
+if (Test-Path $FindPy) { . $FindPy }
+$RunPy = $PY
+$VenvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+if (Test-Path $VenvLib) {
+    . $VenvLib
     try {
-        $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower()
+        $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+        if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) { $RunPy = $VcoVenvPython }
     } catch { }
-    if ($IsWindows -or ($PSVersionTable.PSEdition -eq "Desktop")) {
-        return "windows-$arch"
-    } elseif ($IsMacOS) {
-        return "macos-$arch"
-    } elseif ($IsLinux) {
-        return "linux-$arch"
-    }
-    return ""
 }
-
-# ---------------------------------------------------------------------------
-# Get-HubExeNames :: list of candidate filenames to probe at each location.
-# Windows tries .exe first; POSIX-style PowerShell tries the bare binary.
-# ---------------------------------------------------------------------------
-function Get-HubExeNames {
-    if ($IsWindows -or ($PSVersionTable.PSEdition -eq "Desktop")) {
-        return @("vct-hub.exe", "vct-hub")
-    }
-    return @("vct-hub", "vct-hub.exe")
-}
-
-# ---------------------------------------------------------------------------
-# Find-HubBinary :: returns the first existing+executable candidate, or $null.
-# ---------------------------------------------------------------------------
-function Find-HubBinary {
-    # 1. Explicit override.
-    if ($env:VCT_HUB_BIN) {
-        if (Test-Path -LiteralPath $env:VCT_HUB_BIN) {
-            Write-Debug-Line "found via VCT_HUB_BIN: $($env:VCT_HUB_BIN)"
-            return $env:VCT_HUB_BIN
-        }
-        Write-Debug-Line "VCT_HUB_BIN set but not found: $($env:VCT_HUB_BIN) -- falling through"
-    }
-
-    # 2. INSTALL-FOLDER copy (v0.2.63): the repo's own dist hub, arch-qualified
-    #    subdir then arch-less fallback. PREFERRED over PATH/.vct\bin so a stale
-    #    vct-hub on PATH never wins over the copy install.py deployed for THIS
-    #    project. Must match the launcher's find_hub_binary order (hub_launcher.rs).
-    $arch = Get-ArchDirName
-    if ($arch) {
-        foreach ($name in Get-HubExeNames) {
-            $candidate = Join-Path $RepoRoot "launcher\dist\$arch\$name"
-            if (Test-Path -LiteralPath $candidate) {
-                Write-Debug-Line "found at in-tree arch dist: $candidate"
-                return $candidate
-            }
-        }
-    }
-    foreach ($name in Get-HubExeNames) {
-        $candidate = Join-Path $RepoRoot "launcher\dist\$name"
-        if (Test-Path -LiteralPath $candidate) {
-            Write-Debug-Line "found at in-tree flat dist: $candidate"
-            return $candidate
-        }
-    }
-
-    # 3. PATH.
-    foreach ($name in Get-HubExeNames) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) {
-            Write-Debug-Line "found on PATH: $($cmd.Source)"
-            return $cmd.Source
-        }
-    }
-
-    # 4. Known user-install location.
-    $userHome = [System.Environment]::GetFolderPath('UserProfile')
-    if (-not $userHome -and $env:HOME) { $userHome = $env:HOME }
-    if ($userHome) {
-        foreach ($name in Get-HubExeNames) {
-            $candidate = Join-Path $userHome ".vct\bin\$name"
-            if (Test-Path -LiteralPath $candidate) {
-                Write-Debug-Line "found at user install: $candidate"
-                return $candidate
-            }
-        }
-    }
-
-    return $null
-}
-
-$HubBin = Find-HubBinary
-
-if (-not $HubBin) {
-    [Console]::Error.WriteLine("[vct] vct-hub not found on PATH; skipping auto-start (set VCT_HUB_BIN to override)")
+if (-not $RunPy) {
+    # v0.2.92 MAJOR-6: stdout, not stderr (see the .sh sibling).
+    Write-Output "session-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); skipping"
     exit 0
 }
 
-# Idempotent invocation. `--start-if-not-running` exits 0 whether the hub
-# started fresh, was already running, or could not start (in which case
-# the hub writes its own diagnostic to stderr).
-#
-# We deliberately spawn detached so that a slow first-time start cannot
-# block the SessionStart hook bus past its 10s budget. The hub itself
-# short-circuits when already running, so the cost of the spawn is bounded.
+# The .ps1 side uses --json + ConvertFrom-Json (the .sh side evals --shell),
+# matching the established ensure-containers pair.
+$HubArgs = @("-m", "vco_lib.hub_ensure", "ensure", "--json", "--repo-root", $RepoRoot)
+if ($env:VCO_HOOK_DEBUG -eq "1") {
+    # Foreground so the hub's own exit code is observable while debugging.
+    $HubArgs += "--wait"
+}
+$HubRes = $null
+$HubRc = $null
 try {
-    if ($env:VCO_HOOK_DEBUG -eq "1") {
-        & $HubBin --start-if-not-running
-        Write-Debug-Line "vct-hub --start-if-not-running exit=$LASTEXITCODE"
-    } else {
-        # Spawn detached so a cold-start hub probe cannot block the hook bus.
-        # WindowStyle Hidden + no -Wait: returns immediately, stdout/stderr
-        # default to the parent stream which Claude Code drops past the
-        # 10s hook timeout. The hub writes its own log file regardless.
-        Start-Process -FilePath $HubBin -ArgumentList "--start-if-not-running" `
-            -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+    # v0.2.92 MAJOR-6: `2>$null` threw the reason away, so a crash on Windows
+    # printed only "rc=N" with no cause. Capture it and report the tail.
+    $HubErr = [System.IO.Path]::GetTempFileName()
+    $HubJson = & $RunPy @HubArgs 2>$HubErr
+    $HubRc = $LASTEXITCODE
+    if ($HubRc -in 0, 3, 4) { $HubRes = ($HubJson | Out-String) | ConvertFrom-Json }
+} catch { $HubRes = $null }
+if (-not $HubRes) {
+    $HubWhy = ""
+    if (Test-Path $HubErr) {
+        $HubWhy = ((Get-Content $HubErr -Tail 3 -ErrorAction SilentlyContinue) -join " ").Trim()
+        Remove-Item $HubErr -Force -ErrorAction SilentlyContinue
     }
-} catch {
-    Write-Debug-Line "spawn failed: $($_.Exception.Message)"
+    Write-Output "session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$HubRc): $HubWhy; skipping"
+    exit 0
 }
 
+# Soft-fail contract: the module exits 3 (no binary) / 4 (spawn failed) LOUDLY
+# with a named reason; the hook reports it once and still exits 0, because a
+# SessionStart hook must never block Claude Code from starting.
+if ($HubRc -ne 0) {
+    Write-Output "[vct] $($HubRes.reason)"
+    exit 0
+}
+
+$HubWhat = if ($HubRes.binary) { $HubRes.binary } else { "pid $($HubRes.pid)" }
+Write-Debug-Line "vct-hub $($HubRes.state): $HubWhat"
 exit 0

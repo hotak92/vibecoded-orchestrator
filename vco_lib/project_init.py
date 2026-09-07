@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
 """Project init helpers — single source of truth for sanitization, schema,
 and collection-name derivation across Python and Rust.
 
@@ -47,14 +49,12 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional, cast
 
 # NEW-8 / B3 (v0.2.53) — symlink-blocking defense used by
 # ``_write_file_atomic``. Mirrors install.py's V47-B contract for the
@@ -66,6 +66,13 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 # in-function local imports of `to_posix_rel` elsewhere in this file are left as
 # they are — pre-existing, and harmless (same object).
 from vco_lib.paths import to_posix_rel
+from vco_lib import codegraph_orphan_snapshot as _cos
+from vco_lib import codegraph_prefix_record as _cpr
+# v0.2.92 W3 (§3 item 11): `.git/info/exclude` computation + append moved to
+# their own module when the project-move engine became a third caller.
+from vco_lib import git_exclude as _git_exclude
+from vco_lib import shipped_artifact as _shipped
+from vco_lib import bundle_skip_deferral as _bsd
 from vco_lib import weaviate_helpers as _wh
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
@@ -82,9 +89,11 @@ from vco_lib.weaviate_vectors import clean_named_vector
 # rewrite a user's OWN hook) depends on it being exactly right. LOUD-FAIL
 # import, same rule as the sibling above.
 from vco_lib.hooks_settings import (
-    CMD_SEPARATOR_TOKENS as _HOOK_CMD_SEPARATOR_TOKENS,
-    INTERPRETER_TOKENS as _HOOK_INTERPRETER_TOKENS,
-    SCRIPT_FLAG_TOKENS as _HOOK_SCRIPT_FLAG_TOKENS,
+    # The three *_TOKENS aliases below are re-exports: tests read them via
+    # module attribute and assert identity with hooks_settings' originals.
+    CMD_SEPARATOR_TOKENS as _HOOK_CMD_SEPARATOR_TOKENS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
+    INTERPRETER_TOKENS as _HOOK_INTERPRETER_TOKENS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
+    SCRIPT_FLAG_TOKENS as _HOOK_SCRIPT_FLAG_TOKENS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
     invoked_script_tokens as _invoked_script_tokens,
 )
 
@@ -143,7 +152,7 @@ def _scoped_environ(*keys: str):
 # tests/test_vco_lib_project_init.py asserts the two are the SAME object);
 # ``_FALLBACK_PREFIX`` is used by an install-flow call site in this module.
 from vco_lib.codegraph_naming import (  # noqa: E402,F401  (re-exports)
-    _SAFE_CLASS_RE,
+    _SAFE_CLASS_RE,  # pyright: ignore[reportUnusedImport] — re-export (install.py + identity test)
     FALLBACK_PREFIX as _FALLBACK_PREFIX,
 )
 
@@ -265,7 +274,7 @@ def _dev_diagrams_from_primary(primary: str, basename_fallback: str) -> tuple[st
     This is the SAME rule config_projection's ``_derive_dev_diagrams_from_kg``
     realizes (D1). It is retained here for the two remaining project_init
     call-sites that resolve a primary from an ON-DISK settings.json env pin (the
-    D3 resolver's settings-fallback tier + ``_backfill_kg_collection_env_in_project``),
+    D3 resolver's settings-fallback tier + the former backfill (removed v0.2.92 — superseded by the config-projection single writer)),
     which the config_projection seam — a launcher.db resolver — does not cover.
     The launcher.db binding resolution itself now routes through the seam (see
     :func:`_resolve_bundle_collection_names_binding_first`), so this helper is no
@@ -1140,16 +1149,35 @@ def _fetch_schema(name: str, weaviate_url: Optional[str] = None) -> Optional[dic
 
 def _list_classes(weaviate_url: Optional[str] = None) -> list[str]:
     """Return all class names currently defined on the server (for orphan
-    detection). Returns [] on transport failure."""
+    detection).
+
+    Raises:
+        vco_lib.weaviate_helpers.ProbeUnavailable: the live schema could NOT be
+            read (transport failure, non-200, unparsable body, no ``classes``
+            array). A genuinely empty server still returns ``[]``.
+
+    v0.2.92 W18 — this used to ``return []`` on transport failure, so "Weaviate
+    is down" and "Weaviate holds no classes" arrived at every caller as the same
+    value. One caller consumed that value as an EXCLUSION set
+    (:func:`_detect_orphan_code_collections`), where an empty set excludes
+    nothing: a transient outage therefore WIDENED a destructive recommendation
+    the user pastes. The three call sites now each decide what "could not read
+    the schema" means for their own decision; none of them may read it as
+    "nothing is live".
+
+    The body is :func:`vco_lib.weaviate_helpers.probe_class_listing` — the ONE
+    home for this question. The ``list[str]`` signature is kept deliberately:
+    eleven existing test patches replace this function with a plain list, and
+    the tri-state belongs at the DECISION, not at every mock.
+
+    ``request=_http_request`` is passed explicitly so the module-local
+    ``mock.patch.object(project_init, "_http_request", ...)`` seam that the
+    existing HTTP-level tests use keeps working.
+    """
     base = (weaviate_url or _weaviate_url_default()).rstrip("/")
-    try:
-        status, body = _http_request("GET", f"{base}/v1/schema")
-        if status != 200:
-            return []
-        payload = json.loads(body.decode("utf-8"))
-        return [c.get("class", "") for c in payload.get("classes", []) if c.get("class")]
-    except Exception:
-        return []
+    return _wh.probe_class_listing(
+        base, timeout=10.0, request=_http_request,
+    ).require()
 
 
 def _expected_props_for(name: str, target_def_fn: Callable[[str], dict]) -> list[dict]:
@@ -2085,6 +2113,20 @@ def migrate_collections(
                     ),
                 })
             # "none" (staging vanished mid-sweep) → nothing to report.
+    except _wh.ProbeUnavailable as e:
+        # v0.2.92 W18 — CALL SITE 1 of 3 for `_list_classes`. The live schema
+        # could not be READ, so this sweep has no evidence at all: it can
+        # neither surface an orphan nor prove one is redundant. It therefore
+        # does NOTHING — which is what the old `[]` return produced too, but
+        # silently and while calling it a clean bill of health. The behaviour is
+        # unchanged and fail-CLOSED (the SAFE-DROP branch below needs a live
+        # class list to reach); only the log now names the real cause instead of
+        # implying the server was empty.
+        _log("7b.recover", "warn",
+             f"A-10 unmatched-orphan-staging sweep SKIPPED — could not read "
+             f"the live schema: {e}. Nothing surfaced and nothing dropped; "
+             f"re-run once Weaviate is reachable.",
+             data={"error": str(e), "branch": "schema_unreadable_skip"})
     except Exception as e:
         # Soft-fail: the extra sweep must never break migrate-collections.
         _log("7b.recover", "warn",
@@ -3172,7 +3214,14 @@ def _write_bootstrap_deferral(
 # Manifest schema (`<folder>/.claude/.vco-manifest.json`):
 #   {
 #     "schema_version": 2,
-#     "vco_version": "<orchestrator HEAD or release tag>",
+#     "vco_version": "<release semver, e.g. 0.2.92 (pyproject [project]
+#                      version via vco_lib.vco_version; 'unknown' when the
+#                      running semver could not be determined). Pre-v0.2.92
+#                      manifests hold a git short SHA HERE — read them with
+#                      vco_lib.vco_version.recorded_manifest_version, which
+#                      returns (version=None, commit=<sha>) for that shape>",
+#     "vco_commit": "<git short SHA of the orchestrator at install time,
+#                      or null on a non-git (tarball) install>",
 #     "installed_at": "ISO-8601",
 #     "files": {
 #       "<rel-path-from-folder>": {
@@ -3479,17 +3528,28 @@ def _settings_template_path(orchestrator_root: Path) -> Path:
     return orchestrator_root / "templates" / name
 
 
+# v0.2.92: `_prune_now_empty_parents` moved to `vco_lib.fs_prune`. This module
+# is ratchet-capped and must SHRINK, not grow; the empty-dir rule is also
+# needed by `knowledge_residue`, so it has one home now. Imported lazily at the
+# call site (this module's import graph is already heavy).
+
+
 def _file_sha256(path: Path) -> str:
-    """SHA256 hex digest of a file's bytes. Returns empty string if the
-    file is missing."""
-    import hashlib
+    """SHA256 of a file, or "" when it is missing.
+
+    Delegates to ``vco_lib.hashing.sha256_file`` — this was a duplicate of it
+    (v0.2.92). The "" is the only real difference and stays LOCAL: callers here
+    read it as "no installed copy to compare", while the shared helper keeps
+    raising for everyone else.
+    """
+    from vco_lib.hashing import sha256_file
+
     if not path.exists() or not path.is_file():
         return ""
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    try:
+        return sha256_file(path)
+    except OSError:
+        return ""
 
 
 def _bytes_sha256(data: bytes) -> str:
@@ -3529,45 +3589,34 @@ def _read_manifest(folder: Path) -> dict:
 
 
 def _write_manifest_atomic(folder: Path, manifest: dict) -> None:
-    """Atomic-write the manifest via tempfile + os.replace. Same pattern as
-    `deferral_report.write`."""
+    """Atomic-write the manifest through the ONE home,
+    :func:`vco_lib.atomic.atomic_write_text` (v0.2.92 duplication-merge —
+    was an inline tempfile + ``os.replace`` copy)."""
+    from vco_lib.atomic import atomic_write_text
+
     target = folder / _MANIFEST_REL
-    target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(target.parent), suffix=".tmp", prefix=".vco-manifest-",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp_path, str(target))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(target, payload)
 
 
-def _resolve_vco_version(orchestrator_root: Path) -> str:
-    """Best-effort orchestrator version string for the manifest. Uses
-    `git rev-parse --short HEAD` when available, falls back to "unknown".
-    Never raises.
+def _running_vco_version_pair(orchestrator_root: Path) -> tuple[str, Optional[str]]:
+    """``(semver_or_unknown, commit)`` for the RUNNING orchestrator.
+
+    v0.2.92 WP-D: thin call into the ONE version resolver
+    (:func:`vco_lib.vco_version.resolve` — pyproject semver + git commit).
+    Replaces the local ``_resolve_vco_version`` (git short SHA or
+    "unknown"), whose output could never parse as semver and therefore
+    silently disarmed every version-boundary gate that consumed the
+    manifest (WP-A map, row 2). The two halves stay separate fields so no
+    consumer can substitute one for the other. Never raises.
     """
-    import subprocess as _sp
     try:
-        res = _sp.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(orchestrator_root),
-            capture_output=True, text=True, timeout=5,
-        )
-        if res.returncode == 0:
-            sha = res.stdout.strip()
-            if sha:
-                return sha
-    except Exception:
-        pass
-    return "unknown"
+        from vco_lib import vco_version as _vv
+
+        resolved = _vv.resolve(orchestrator_root)
+        return (resolved.semver or "unknown", resolved.commit)
+    except Exception:  # noqa: BLE001 — a version string must never break an install
+        return ("unknown", None)
 
 
 @dataclass
@@ -3666,6 +3715,7 @@ def _enumerate_bundle_files(
     # was missing the extension-less detect-workflow-needs /
     # generate-workflow wrappers, so project bundles silently skipped them).
     from vco_lib.bundle_globs import script_patterns as _script_patterns
+    from vco_lib.rewire import has_rewire_region, rewire_transform
     scripts_src = templates / "scripts"
     if scripts_src.exists():
         seen: set[str] = set()
@@ -3674,11 +3724,31 @@ def _enumerate_bundle_files(
                 if script_file.is_dir() or script_file.name in seen:
                     continue
                 seen.add(script_file.name)
+                # v0.2.92 WP-16 (R4/R21): a script carrying a `VCO-REWIRE`
+                # region gets the install-time rewriter as its transform, so
+                # the installed copy KNOWS its orchestrator root instead of
+                # depending on `$VCT_ORCHESTRATOR_ROOT` being in the
+                # environment. Detected by CONTENT — a hand-kept filename list
+                # is precisely the drift the sentinels exist to avoid.
+                # A read failure here must not silently ship an UNBAKED script
+                # while the run reports success, so it is not swallowed: the
+                # op is enumerated with the transform, and the transform's own
+                # read in `_file_action` raises into the loop's per-op
+                # `except`, which records a real error.
+                try:
+                    _needs_rewire = has_rewire_region(script_file.read_bytes())
+                except OSError:
+                    _needs_rewire = True
                 ops.append(_BundleFileOp(
                     dest_rel=str(Path(".claude") / "scripts" / script_file.name),
                     source_abs=script_file,
                     source_rel=str(script_file.relative_to(orchestrator_root)),
-                    transform=None,
+                    transform=(
+                        rewire_transform(
+                            orchestrator_root, filename=script_file.name,
+                        )
+                        if _needs_rewire else None
+                    ),
                     always_overwrite=False,
                 ))
 
@@ -3740,12 +3810,19 @@ def _enumerate_bundle_files(
     # Infrastructure compose files. Copy all docker-* / podman-* yml at
     # the top level of `infrastructure/`. The hook `ensure-containers.sh`
     # picks the right overlay at runtime; we just need the files present.
+    # v0.2.92 delivery audit m7: `*override*` files are EXCLUDED — the
+    # launcher writes `docker-compose.override.yml` into the clone as a
+    # machine-local volume-location config (gitignored, "per-machine"),
+    # and replicating it into every project tree would copy this
+    # machine's paths into other projects' installs.
     infra_src = orchestrator_root / "infrastructure"
     if infra_src.exists():
         for compose_file in sorted(infra_src.iterdir()):
             if not compose_file.is_file():
                 continue
             n = compose_file.name
+            if "override" in n:
+                continue
             if not (
                 (n.startswith("docker-compose") or n.startswith("podman-compose"))
                 and (n.endswith(".yml") or n.endswith(".yaml"))
@@ -4078,6 +4155,16 @@ def _stale_orchestrator_root_heal_match(
     `<old_root>/claude_mcp_servers/...` and round-tripping with that
     `old_root` reproduces the file byte-for-byte. False on Windows
     paths (case-insensitive FS makes the round-trip unreliable).
+
+    SCOPE (v0.2.92 WP-16, stated so the next reader does not over-trust it):
+    the `/claude_mcp_servers/` anchor means this helper heals AGENT/SKILL
+    bodies, which name that path in prose. It does NOT generally fire for the
+    `VCO-REWIRE`-marked scripts, whose baked value is a bare root with no such
+    suffix — and they do not need it, because the manifest records their
+    POST-transform hash so a moved clone is already an `installed_hash ==
+    prior_hash` `overwrite`. The subs map below is kept EQUAL to
+    `vco_lib.rewire.rewire_subs` (pinned by a test) so that when the anchor
+    does happen to be present, the two round-trips cannot disagree.
     """
     try:
         installed = target_path.read_bytes()
@@ -4228,88 +4315,6 @@ def _bundle_op_kind(dest_rel: str) -> Optional[str]:
     return None
 
 
-def _installed_matches_template_history(
-    template_source: Path,
-    installed_hash: str,
-    orchestrator_root: Path,
-    *,
-    max_commits: int = 50,
-) -> bool:
-    """v0.2.31 heal: did this file's installed sha match ANY historical
-    version of the template under `templates/`? If yes, the file was
-    shipped by VCO at some point — the user hasn't edited it, it's just
-    stale. Safe to overwrite.
-
-    Bounded git-log walk on the template path. Looks at `git log -p`
-    for the path, hashes each historical blob's content, and compares.
-
-    Returns False (= preserve as user-modified) on any error path:
-      - orchestrator_root isn't a git repo (tarball install)
-      - git isn't on PATH
-      - template path not under orchestrator_root
-      - git log returns no history (new file not yet committed)
-
-    `max_commits` caps the walk depth (~6 months at typical release
-    cadence for this repo). Adjust upward if false-preserves happen.
-
-    Note: this helper covers the `_file_action` "no prior_hash in
-    manifest but file exists on disk" case introduced by adding new
-    files to the bundle without retro-actively updating manifests on
-    existing installs. The discipline for genuinely user-modified
-    files (= file content never matched any shipped version) is
-    unchanged — those still take the preserve path.
-    """
-    import subprocess as _sp
-
-    if not orchestrator_root.is_dir():
-        return False
-    git_dir = orchestrator_root / ".git"
-    if not git_dir.exists():
-        # Tarball install or non-git source tree. Can't walk history.
-        return False
-    try:
-        rel = template_source.resolve().relative_to(orchestrator_root.resolve())
-    except (OSError, RuntimeError, ValueError):
-        return False
-    rel_str = str(rel).replace("\\", "/")
-    # `git log --format=%H` over the path → list of commits touching it.
-    # We then `git show <sha>:<path>` for each and sha-256 the bytes.
-    try:
-        result = _sp.run(
-            [
-                "git", "-C", str(orchestrator_root),
-                "log", f"-{max_commits}", "--pretty=format:%H", "--", rel_str,
-            ],
-            capture_output=True, text=True, timeout=5.0,
-        )
-    except (FileNotFoundError, _sp.SubprocessError):
-        return False
-    if result.returncode != 0:
-        return False
-    commits = [c.strip() for c in result.stdout.splitlines() if c.strip()]
-    if not commits:
-        # File never had a commit touching it under this path. Could be
-        # legitimately new (uncommitted) or moved/renamed; fall through
-        # to default-preserve.
-        return False
-    for sha in commits:
-        try:
-            blob = _sp.run(
-                [
-                    "git", "-C", str(orchestrator_root),
-                    "show", f"{sha}:{rel_str}",
-                ],
-                capture_output=True, timeout=2.0,
-            )
-        except (FileNotFoundError, _sp.SubprocessError):
-            continue
-        if blob.returncode != 0:
-            continue
-        if _bytes_sha256(blob.stdout) == installed_hash:
-            return True
-    return False
-
-
 def _file_action(
     op: _BundleFileOp,
     target_path: Path,
@@ -4352,11 +4357,25 @@ def _file_action(
                           copying so the user's disable choice survives
                           bundle updates.
 
-    PR-2 heal (2026-05-06): if `orchestrator_root` is supplied and the
-    file was produced via `_apply_subs` (transform present), an installed
-    file that round-trips to the source bytes under a DIFFERENT (stale)
-    orchestrator root is treated as overwritable — the user moved the
-    clone, didn't edit the file. See `_stale_orchestrator_root_heal_match`.
+    PR-2 heal (2026-05-06): if `orchestrator_root` is supplied and the op has
+    a placeholder-substituting transform, an installed file that round-trips
+    to the source bytes under a DIFFERENT (stale) orchestrator root is treated
+    as overwritable — the user moved the clone, didn't edit the file. See
+    `_stale_orchestrator_root_heal_match`.
+
+    v0.2.92 WP-16 correction: that sentence used to say "produced via
+    `_apply_subs`", and `_apply_subs` was the only transform in the engine.
+    It no longer is — `vco_lib.rewire.rewire_transform` is the second family
+    (the ten `VCO-REWIRE`-marked scripts). The heal is CORRECT for both where
+    it can fire, because rewire's vocabulary is deliberately the same four
+    placeholders the heal round-trips (`vco_lib/rewire.py::rewire_subs`) and
+    its escaping is the identity on the only roots the heal accepts (POSIX
+    absolute, no backslash or quote). It rarely fires for a rewired script
+    because the heal's anchor is a literal `<old_root>/claude_mcp_servers/`
+    path in the file, which a baked-root line is not — and it does not need
+    to: the manifest records the POST-transform hash, so a moved clone leaves
+    `installed_hash == prior_hash` and classifies `overwrite` before the heal
+    is ever consulted.
     """
     # Compute the source bytes (after transform if any). We always need
     # the bytes to compute hashes; reading is cheap relative to the rest.
@@ -4408,7 +4427,25 @@ def _file_action(
 
     if not update_mode:
         # First-install semantics: never touch existing files (preserves
-        # any user customizations on pre-existing folders).
+        # any user customizations on pre-existing folders) — EXCEPT when the
+        # pre-existing file is PROVABLY a stale VCO-shaped artifact rather
+        # than user work.
+        #
+        # v0.2.92 field bug: this branch used to be unconditional, so a
+        # project added with safe add whose `.claude/scripts/` held pre-VCO
+        # wrappers kept every one of them and reported the fact as an
+        # `informational_record`. Its KG build then failed 329/329 against
+        # another project's venv. The repo already HAS the right outcome for
+        # a stale shipped codefile — the v0.2.84 D7/R2 `adopt` action, which
+        # backs the current bytes up before writing the shipped ones ("we
+        # don't expect users to edit any VCO CODEFILE"). That rule was only
+        # ever reachable in update mode; first install never met it. Here it
+        # is, narrowed to the provable cases (see the predicate) so a
+        # genuinely bespoke hook is still preserved untouched.
+        if not _is_knowledge_dest(op.dest_rel) and _shipped.stale_shipped_artifact_reason(
+            op, target_path, source_bytes, installed_hash, orchestrator_root
+        ):
+            return ("adopt", source_bytes)
         return ("skip-existing", source_bytes)
 
     # Update mode: consult the manifest. If installed_hash matches what
@@ -4419,11 +4456,13 @@ def _file_action(
     if prior_hash and installed_hash == prior_hash:
         return ("overwrite", source_bytes)
 
-    # PR-2 heal: stale-orchestrator-root scenario. Only kick in when the
-    # file is `_apply_subs`-transformed AND we have a current
-    # orchestrator_root to compare against. Doesn't fire for
-    # non-substituted files (hooks, scripts, compose) because their
-    # transform is None.
+    # PR-2 heal: stale-orchestrator-root scenario. Only kicks in for an op
+    # that HAS a placeholder-substituting transform and when we have a current
+    # orchestrator_root to compare against. Byte-copy ops (hooks, compose,
+    # `.vscode/tasks.json`, knowledge nodes) carry `transform=None` and skip
+    # it. v0.2.92: the ten `VCO-REWIRE`-marked scripts now have a transform
+    # too — see the note in this function's docstring for why the heal stays
+    # correct for them and why they do not depend on it.
     if (
         op.transform is not None
         and orchestrator_root is not None
@@ -4456,7 +4495,7 @@ def _file_action(
     if (
         not prior_hash
         and orchestrator_root is not None
-        and _installed_matches_template_history(
+        and _shipped.installed_matches_template_history(
             op.source_abs, installed_hash, orchestrator_root
         )
     ):
@@ -4512,96 +4551,58 @@ def _file_action(
 
 
 def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> Optional[Path]:
-    """Atomic file write: temp file in same dir + os.replace. Optionally
-    sets a unix mode bit (0o755 for shell scripts to preserve executable).
+    """Per-project bundle file write: atomic, symlink-safe, optional mode.
 
-    NEW-8 / B3 (v0.2.53) — symlink-blocking defense ported from the
-    orchestrator-self V47-B handling. When ``target`` itself is a
-    symlink, or its parent (or any ancestor up to a sensible bound) is
-    a symlink, we REFUSE to write through it. The orchestrator-self
-    path handles this via ``is_symlink_blocking`` + ``compute_vco_new_path``
-    (install.py:1286); per-project ``_write_file_atomic`` previously
-    just did tempfile + os.replace, which on POSIX would replace the
-    symlink TARGET (silent destruction of unrelated content).
+    v0.2.92 (duplication-merge, PLAN-EXTENSION §3.13): a THIN WRAPPER over
+    :func:`vco_lib.atomic.atomic_write_bytes` with ``symlink_safe=True`` —
+    the ~100-line sibling implementation this function used to be (tempfile
+    + ``os.replace`` + its own copy of the NEW-8 ancestor walk) is gone; the
+    walk lives once in ``vco_lib.atomic._symlink_safe_redirect_target``,
+    shared with :func:`vco_lib.atomic.atomic_copy_file`. What stays here is
+    the CALLER-SPECIFIC part: the stderr redirect notice the install log
+    captures, and the return contract ``install_project_bundle`` folds into
+    its ``symlink_preserved_under_install_path`` deferral. The name and
+    signature are unchanged because four test files import it by name.
 
-    Behaviour
-      * If the target itself is a symlink, redirect the write to the
-        `.vco-new` sibling and emit a stderr warning so the run logs
-        the redirect. The caller's expected file is gone — the new
-        sibling is the new VCO-shipped content for the user to merge
-        manually. Mirrors V47-B's contract.
-      * If a parent directory is a symlink (e.g. user symlinked
-        ``<project>/.claude`` to a shared location), same treatment:
-        redirect to ``<canonical parent>.vco-new/<rest of path>``.
-      * In both redirect cases we surface the redirect via stderr so
-        the install log captures it, AND return the redirect target so
-        the caller can surface a structured deferral (v0.2.70: Bug B —
-        ``install_project_bundle`` accumulates these and emits ONE
-        consolidated ``symlink_preserved_under_install_path`` deferral).
+    ``fsync=False`` on purpose: this writer runs hundreds of times per
+    bundle install and has never fsync'd; the merge preserved that rather
+    than silently changing install latency (the shared home defaults to
+    fsync=True for the small config/state files its other callers write).
+
+    ``mode`` is supplied by the CALLER, not chosen here. The two shipped
+    callers (``install_project_bundle``'s adopt branch and its
+    create/overwrite branch) pass **0o700** — owner-only rwx — for ``*.sh`` and
+    for everything under ``.claude/scripts/`` (many shims are extension-less:
+    ``kg-search``, ``code-graph-query``, ``cost-summary``). It is 0o700 rather
+    than 0o755 because CodeQL's ``py/overly-permissive-file`` flags both 0o755
+    (world) and 0o750 (group), and the project folder belongs to one user.
+    This docstring said 0o755 until v0.2.92; the code has shipped 0o700 since
+    the CodeQL fix, so any test or reviewer that trusted the docstring was
+    reading a promise no code backed.
+
+    NEW-8 / B3 (v0.2.53) — symlink-blocking defense. When ``target`` itself
+    is a symlink, or its parent (or any ancestor) is a symlink, we REFUSE to
+    write through it and redirect to the ``.vco-new`` sibling at the level
+    the symlink lives (``.claude`` symlinked + ``.claude/agents/x`` →
+    ``.claude.vco-new/agents/x``). The redirect is surfaced via stderr so
+    the install log captures it, AND returned so the caller can surface a
+    structured deferral (v0.2.70 Bug B).
 
     Returns
       ``None`` on a normal (non-redirected) write. The ``redirect_target``
-      ``Path`` when the write was redirected to a ``.vco-new`` sibling due
-      to a symlink-blocking detection. Callers that need to surface this
-      to users (``install_project_bundle`` and its settings-merge helper)
-      capture it; callers that don't need deferral wiring ignore the
-      return value (it's discarded as an expression statement).
+      ``Path`` when the write was redirected to a ``.vco-new`` sibling.
 
     Reference:
     ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
     §6.7 / B3.
     """
-    # NEW-8 (v0.2.53) — symlink-blocking detection.
-    #
-    # Two cases to guard:
-    #   1. `target` itself is a symlink (file/dir).
-    #   2. An ancestor of `target` is a symlink — we'd silently write
-    #      through it into the symlink's destination.
-    # Both are redirected to the `.vco-new` sibling pattern.
-    #
-    # We bound the ancestor walk at the first "real" directory so we
-    # don't spend time on absurd hierarchies; in practice the walk is
-    # at most ~6 levels (project root → .claude → agents → ...).
-    redirect_target: Optional[Path] = None
-    if is_symlink_blocking(target):
-        # Direct hit: target itself is a symlink.
-        redirect_target = compute_vco_new_path(target)
-    else:
-        # Walk ancestors looking for a symlinked directory. We start
-        # from target.parent (since target itself isn't a symlink) and
-        # walk up. We stop walking once we leave target's chain of
-        # ancestors that exist on disk.
-        ancestor = target.parent
-        seen: set[str] = set()
-        while True:
-            ancestor_str = str(ancestor)
-            if ancestor_str in seen:
-                break
-            seen.add(ancestor_str)
-            if is_symlink_blocking(ancestor):
-                # Redirect the write to a `.vco-new` sibling of the
-                # symlinked ancestor, replicating the rest of the path
-                # inside the new directory. E.g.
-                # target = .claude/agents/coder.md, ancestor = .claude
-                # → redirect to `.claude.vco-new/agents/coder.md`.
-                vco_new_anc = compute_vco_new_path(ancestor)
-                # The path tail BELOW the symlinked ancestor.
-                try:
-                    rel = target.relative_to(ancestor)
-                except ValueError:
-                    # Defensive: if relative_to fails (shouldn't with
-                    # the ancestor walk), fall back to using target's
-                    # filename only.
-                    rel = Path(target.name)
-                redirect_target = vco_new_anc / rel
-                break
-            # Continue up. Stop at root or when parent doesn't change
-            # (path normalisation root case).
-            parent = ancestor.parent
-            if parent == ancestor:
-                break
-            ancestor = parent
+    from vco_lib.atomic import atomic_write_bytes
 
+    # chmod is a documented no-op on Windows inside the shared writer; a
+    # chmod OSError never fails the write.
+    redirect_target = atomic_write_bytes(
+        target, data, fsync=False, mode=mode, symlink_safe=True,
+    )
     if redirect_target is not None:
         sys.stderr.write(
             f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
@@ -4610,34 +4611,6 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
             f"the symlink and its destination are untouched. Merge manually "
             f"when ready.\n"
         )
-        target = redirect_target
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(target.parent),
-        suffix=".tmp",
-        prefix=f".{target.name}.",
-    )
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp_path, str(target))
-        if mode is not None:
-            try:
-                os.chmod(str(target), mode)
-            except OSError:
-                # chmod is a no-op on Windows; don't fail.
-                pass
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-    # v0.2.70 (Bug B): surface the redirect to the caller so it can emit a
-    # structured `symlink_preserved_under_install_path` deferral. None on a
-    # normal write.
     return redirect_target
 
 
@@ -4764,15 +4737,15 @@ def _emit_user_modified_deferral(
         for p in modified_files
     )
     claude_merge_hint = (
-        f"# RECOMMENDED for CLAUDE.md / CLAUDE.local.md (the common case):\n"
-        f"# open this folder in Claude Code and ask:\n"
-        f"#   \"Merge the orchestrator's shipped CLAUDE.md against my local\n"
-        f"#    one. Preserve project-specific Dev Constraints / KG conventions\n"
-        f"#    but adopt new orchestrator-shipped guidance. Show me the diff\n"
-        f"#    before writing.\"\n"
-        f"# Claude reads $VCT_ORCHESTRATOR_ROOT/CLAUDE.md and your local one,\n"
-        f"# proposes a 3-way merge, and writes the result with your approval.\n"
-        f"#\n"
+        "# RECOMMENDED for CLAUDE.md / CLAUDE.local.md (the common case):\n"
+        "# open this folder in Claude Code and ask:\n"
+        "#   \"Merge the orchestrator's shipped CLAUDE.md against my local\n"
+        "#    one. Preserve project-specific Dev Constraints / KG conventions\n"
+        "#    but adopt new orchestrator-shipped guidance. Show me the diff\n"
+        "#    before writing.\"\n"
+        "# Claude reads $VCT_ORCHESTRATOR_ROOT/CLAUDE.md and your local one,\n"
+        "# proposes a 3-way merge, and writes the result with your approval.\n"
+        "#\n"
         if has_claude_md else ""
     )
     cmd = (
@@ -4780,7 +4753,7 @@ def _emit_user_modified_deferral(
         f"# Inspect the differences (per file, if you prefer the manual path):\n"
         f"#   diff -u <orchestrator>/<source-rel> {folder}/<dest-rel>\n"
         f"# Run from a shell where `.claude/env` has been sourced (or\n"
-        f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/VCO_dev). Then either\n"
+        f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/vibecoded-orchestrator). Then either\n"
         f"# accept shipped versions (forces overwrite — destroys local edits):\n"
         f"python -m vco_lib.project_init install-bundle "
         f"--folder {str(folder)!r} --orchestrator-root "
@@ -4907,70 +4880,6 @@ def _emit_orphan_preserved_deferral(
             "may have customized these for project-specific use. Use the "
             "options below to either keep them indefinitely or remove "
             "them manually."
-        ),
-        command_to_apply=cmd,
-        severity="info",
-        kg_node_refs=[],
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
-
-
-def _emit_skipped_existing_deferral(
-    folder: Path, skipped_files: list[str], orchestrator_root: Path,
-) -> None:
-    """Emit `bundle_skipped_existing_files`: one deferral entry per project
-    listing pre-existing files that the first-install path SKIPPED because
-    their content differs from the orchestrator's shipped version.
-
-    Why: a Claude Code session opening this folder needs to know the bundle
-    install was incomplete — the user may have a stale custom hook that
-    will silently miss new orchestrator-side improvements until they
-    explicitly run `--update --force`.
-
-    Severity is `info` (not `warning`) — the project is functional, just
-    not 100% in lockstep with the orchestrator's defaults.
-
-    Per-project grouping (single entry, file list inside): one entry per
-    file would be noisy and harder to action. The single entry's command
-    fixes ALL of them in one go.
-    """
-    if not skipped_files:
-        return
-    from vco_lib.deferral_report import DeferralEntry
-    from vco_lib import deferral_emit as _de
-
-    files_md = _format_file_list_md(sorted(skipped_files))
-    # Item 4 (Gap 7, 2026-05-13): emit $VCT_ORCHESTRATOR_ROOT (set by
-    # `.claude/env`) instead of a baked literal path so the command is
-    # portable across machines / orchestrator clone relocations.
-    cmd = (
-        f"# Run from a shell where `.claude/env` has been sourced, or\n"
-        f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/VCO_dev. Then accept\n"
-        f"# the orchestrator's shipped versions for ALL skipped files:\n"
-        f"python -m vco_lib.project_init install-bundle "
-        f"--folder {str(folder)!r} --orchestrator-root "
-        f"\"$VCT_ORCHESTRATOR_ROOT\" --update --force --json"
-    )
-    entry = DeferralEntry(
-        condition_id="bundle_skipped_existing_files",
-        title="Pre-existing files preserved during first-install",
-        detected=(
-            f"During the first-install of this project's bundle, "
-            f"{len(skipped_files)} file(s) under `.claude/` and "
-            f"`infrastructure/` already existed AND differed from the "
-            f"orchestrator's shipped versions. They were preserved to "
-            f"avoid overwriting user customizations:\n"
-            f"{files_md}"
-        ),
-        why_deferred=(
-            "These files already existed when the bundle was first "
-            "installed and differ from the orchestrator's shipped "
-            "versions. We preserved them to avoid overwriting user "
-            "customizations. If you intended to use the orchestrator's "
-            "defaults, run "
-            "`python -m vco_lib.project_init install-bundle --folder "
-            "<path> --update --force` to overwrite."
         ),
         command_to_apply=cmd,
         severity="info",
@@ -5280,8 +5189,16 @@ def render_conditional_blocks(
 # render invisibly in markdown viewers.
 # ---------------------------------------------------------------------------
 
-MANAGED_REGION_OPEN = "<!-- >>>VCO_MANAGED>>> -->"
-MANAGED_REGION_CLOSE = "<!-- <<<VCO_MANAGED<<< -->"
+# v0.2.92 WP-15: the marker literals moved to `vco_lib.deferral_report`, which
+# already owned the deferral-reminder pair and is now the ONE home for the
+# VCO-owned Markdown-region vocabulary (the divergence check needs all three
+# families — reminder / AUTO / managed — in a single place to strip them).
+# Re-exported here under the historical names so every existing importer of
+# `project_init.MANAGED_REGION_OPEN` is unaffected.
+from vco_lib.deferral_report import (  # noqa: E402
+    MANAGED_REGION_CLOSE,
+    MANAGED_REGION_OPEN,
+)
 
 
 def merge_managed_region(
@@ -5479,18 +5396,16 @@ def resolve_active_modules(
     return active
 
 
-def _normalise_for_diff(text: str) -> list[str]:
-    """Normalise a file for the "meaningfully differs" check.
-
-    Strips trailing whitespace per line and trims trailing blank lines
-    so a one-line whitespace change doesn't flag the file for review.
-    Anything beyond whitespace + EOL normalisation counts as a real diff.
-    """
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    # Trim trailing all-empty lines.
-    while lines and lines[-1] == "":
-        lines.pop()
-    return lines
+# v0.2.92 WP-15: the "meaningfully differs" rule moved to
+# `vco_lib.template_divergence` (ONE home, with its own tests). Thin aliases
+# under the historical names so existing importers are unaffected.
+from vco_lib.template_divergence import (  # noqa: E402
+    meaningfully_differs as _meaningfully_differs,
+    # Re-exported under its historical name for callers that import it from
+    # here; `meaningfully_differs` is what this module itself now uses.
+    normalise_for_diff as _normalise_for_diff,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (test reads it via module attr)
+    remove_stale_root_claude_md_sidecar as _remove_stale_root_sidecar,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -5499,7 +5414,21 @@ def _normalise_for_diff(text: str) -> list[str]:
 #
 # `template_review_pending` re-fires on EVERY bundle update for any project
 # whose CLAUDE.md / CONTEXT_STATE.md / MEMORY.md meaningfully differ from the
-# shipping reference — which is essentially every established project, forever.
+# shipping reference.
+#
+# v0.2.92 WP-15 CORRECTION: this comment used to end that sentence with
+# "— which is essentially every established project, forever", and that was
+# TRUE, but not for the reason implied. Three of the differences being counted
+# were VCO's OWN injected content: the deferral-reminder block (so any project
+# carrying any ledger entry at all diverged), the `>>>VCO_MANAGED>>>` marker
+# lines VCO wraps around the render at create time while writing the reference
+# sidecar UNwrapped (so a pristine VCO-created project diverged on its second
+# bundle run), and — on an orchestrator root — a comparison against the wrong
+# document entirely. `strip_vco_owned_regions` + the root exclusion in
+# `_install_project_level_templates` removed the CAUSE. What remains below
+# handles the legitimate residue: a project whose files genuinely diverge
+# because the USER edited them, which is exactly what the nudge is for.
+#
 # Most users dismiss it every time. B-F7 gives the dismissal a MEMORY: at
 # dismissal time we snapshot the sha256 of each reference sidecar
 # (`.claude/context/templates/<NAME>.reference.md`) into the manifest under
@@ -5711,8 +5640,28 @@ def _install_project_level_templates(
 
     templates_dir = orchestrator_root / "templates"
     subs = _project_template_subs(orchestrator_root, folder, project_name)
+    # Reuses the EXISTING root-identity home (`_canonical_path_eq`, symlink-
+    # and case-safe) rather than adding a second `folder == orchestrator_root`
+    # comparison — §9.3 sweep 7 wants exactly one such idiom in this module.
+    is_root_target = _is_root_bundle_target(orchestrator_root, folder)
 
     for template_name, live_rel, ref_rel in _PROJECT_LEVEL_TEMPLATES:
+        # v0.2.92 WP-15 half 2 — ROOT EXCLUSION. On the orchestrator root,
+        # `CLAUDE.md` is rendered by install.py from
+        # `templates/ORCHESTRATOR-CLAUDE.md.template` (an 889-line document
+        # with its own AUTO-region owner). This loop walks the PROJECT
+        # template, so comparing them compared two DIFFERENT DOCUMENTS and
+        # every orchestrator root was reported diverged by construction —
+        # forever, with no user action able to clear it. Skip the entry
+        # entirely (a skip, not a fork: the other two entries still run,
+        # because `.claude/CONTEXT_STATE.md` and `MEMORY.md` ARE the
+        # project-shaped files on the root and their reference IS this
+        # template's render). The stale sidecar is removed below.
+        if is_root_target and live_rel == Path("CLAUDE.md"):
+            if not dry_run:
+                _remove_stale_root_sidecar(folder, ref_rel, log=_log_auto)
+            continue
+
         src = templates_dir / template_name
         if not src.exists():
             # Templates not shipped on this orchestrator clone — skip
@@ -5798,7 +5747,10 @@ def _install_project_level_templates(
             # problem than a template diff.
             continue
         reference_text = substituted.decode("utf-8", errors="replace")
-        if _normalise_for_diff(existing_text) != _normalise_for_diff(reference_text):
+        # v0.2.92 WP-15 half 1 — COMPARE LIKE AGAINST LIKE. The rule (strip
+        # VCO's OWN injected regions from BOTH sides, THEN normalise
+        # whitespace) lives in `vco_lib.template_divergence`.
+        if _meaningfully_differs(existing_text, reference_text):
             out["diverged"].append(str(live_rel))
 
     return out
@@ -5982,128 +5934,13 @@ def _run_rl_client_setup(folder: Path) -> dict:
     }
 
 
-def _emit_migrate_required_deferral(
-    folder: Path,
-    *,
-    project_name: str,
-    weaviate_url: str,
-    plan_entries: list[dict],
-) -> None:
-    """Emit `schema_migration_required`: a Weaviate dry-run plan revealed
-    one or more collections need a LOSSY `rebuild` (drop + re-embed via
-    Ollama) to reach the target schema. `rebuild` regenerates vectors
-    rather than preserving them, so we DO NOT auto-apply it — we surface a
-    deferral entry that names each collection + its required action and tells
-    the user the explicit command to consent.
-
-    v0.2.70: additive `copy` migrations are LOSSLESS (staging double-copy
-    that round-trips every UUID + named vector + property byte-for-byte; copy
-    never re-embeds and never drops the live collection) and are AUTO-APPLIED
-    without a deferral. The caller (`_cmd_migrate_collections` gate) filters
-    the plan to `action == "rebuild"` before calling this emitter, so it is
-    only ever invoked with lossy rebuild entries.
-
-    Args:
-        folder: target user-project folder.
-        project_name: raw project name (the user-facing label).
-        weaviate_url: the URL the dry-run probed (echoed in the command_to_apply).
-        plan_entries: list of `{"collection", "action"}` dicts where action is
-            `rebuild` (legacy single-vector or unhandled escape). The gate
-            filters out additive `copy` before this call.
-
-    Severity is `warning`: the project is functional with the existing schema
-    (read paths still work), but new schema features (e.g. `index_null_state`)
-    are missing until the user explicitly consents to migrate.
-    """
-    if not plan_entries:
-        return
-    from vco_lib.deferral_report import DeferralEntry
-    from vco_lib import deferral_emit as _de
-
-    # Render the per-collection action plan as a bullet list. Sorted for
-    # determinism so deferral .md doesn't churn between runs that produce
-    # the same plan in different order.
-    detected_lines = []
-    for entry in sorted(plan_entries, key=lambda e: (e.get("collection") or "", e.get("action") or "")):
-        coll = entry.get("collection") or "?"
-        # v0.2.70: the gate (`_cmd_migrate_collections`) filters the plan to
-        # `action == "rebuild"` before calling this emitter, so every entry
-        # here is a lossy rebuild (legacy single-vector or unhandled escape).
-        # Additive `copy` is auto-applied, never deferred.
-        detected_lines.append(
-            f"  - `{coll}` → **rebuild** (drop + re-embed; legacy single-vector format)"
-        )
-
-    # Build the suggested command. `vco_lib` lives in the ORCHESTRATOR
-    # clone's venv (NOT this project's venv) — running `python -m
-    # vco_lib.project_init ...` from the project directory fails with
-    # ModuleNotFoundError. The command below uses an explicit
-    # `cd $VCT_ORCHESTRATOR_ROOT && .venv/bin/python -m ...` invocation
-    # so the user (or an LLM agent reading this) doesn't have to figure
-    # out the venv plumbing. `--name '<project>'` scopes the migration
-    # to THIS project's collections regardless of where the orchestrator
-    # clone lives. (v0.2.18 doc fix 2026-05-19: prior wording assumed
-    # the user knew to run from VCT_ORCHESTRATOR_ROOT.)
-    #
-    # v0.2.54 Track D (P0-2): both commands now pass `--project-folder`
-    # so the CLI's post-rebuild re-ingest step can locate the project's
-    # `.claude/scripts/sync_knowledge_graph.py` and restore the dropped
-    # data immediately. Pre-fix the command promised "falls back to
-    # drop+re-embed" while the CLI path never re-embedded — the user's
-    # collection stayed empty until the next full install.py run.
-    #
-    # v0.2.70: this emitter only fires for lossy `rebuild` now (additive
-    # `copy` is auto-applied), so the command always documents the
-    # drop + recreate + re-ingest path. The smart `migrate-collections`
-    # call preserves vectors via copy where possible and only rebuilds the
-    # legacy collections; `--force-rebuild` is the all-collections escape.
-    folder_arg = f"--project-folder {str(folder)!r} "
-    cmd = (
-        f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
-        f"# NOT in this project's venv). The --name flag scopes the work to\n"
-        f"# THIS project's collections. Preserves vectors via copy where possible;\n"
-        f"# for legacy single-vector collections it drops, recreates with the\n"
-        f"# target schema, and re-ingests from knowledge/ + docs/ (requires the\n"
-        f"# embedding backend to be healthy; ~3-5 min).\n"
-        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-        f"{folder_arg}--json\n"
-        f"# OR force the destructive drop+recreate+re-ingest for ALL collections\n"
-        f"# (slower; same embedding-backend requirement):\n"
-        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-        f"{folder_arg}--force-rebuild --json"
-    )
-
-    entry = DeferralEntry(
-        condition_id="schema_migration_required",
-        title="Schema migration required",
-        detected=(
-            f"A pre-update dry-run of `migrate-collections` against "
-            f"`{weaviate_url}` reported one or more per-project Weaviate "
-            f"collections need a data-rebuilding migration (drop + re-embed) "
-            f"to reach the current target schema:\n"
-            + "\n".join(detected_lines)
-        ),
-        # must match projects_v2.rs run_migrate_dry_run warning (cross-language
-        # mirror — see launcher/src-tauri/src/commands/projects_v2.rs). Keep the
-        # framing semantically identical: rebuild re-embeds (vectors regenerated,
-        # not preserved) so it is consent-gated; additive copy is lossless and
-        # auto-applied without a deferral.
-        why_deferred=(
-            "Schema drift detected. `rebuild` re-embeds every object via Ollama "
-            "(vectors are regenerated, not preserved), so it is deferred for "
-            "explicit consent. Additive `copy` migrations preserve all data "
-            "(UUIDs + named vectors + properties round-trip byte-for-byte) and "
-            "are auto-applied without a deferral. The bundle install (hooks, "
-            "agents, scripts) still proceeds and is unaffected."
-        ),
-        command_to_apply=cmd,
-        severity="warning",
-        kg_node_refs=[],
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
+# `_emit_migrate_required_deferral` lives in `vco_lib.migrate_deferral`
+# (v0.2.92): ~120 lines of self-contained remedy-string building, lifted out of
+# this ratchet-capped file. Re-exported so `project_init._emit_...` keeps
+# resolving for its existing callers and tests.
+from vco_lib.migrate_deferral import (  # noqa: E402,F401
+    _emit_migrate_required_deferral,
+)
 
 
 def _cleanup_legacy_bash_env_in_project(
@@ -6502,6 +6339,9 @@ def _emit_bash_env_cleanup_deferral(
         )
         cmd = (
             f"# Fix permissions and re-run the bundle update:\n"
+            f"#   POSIX:   chmod u+w <path>\n"
+            f"#   Windows: attrib -R <path>   (cmd.exe)  |  "
+            f"Set-ItemProperty <path> IsReadOnly $false   (PowerShell)\n"
             f"chmod u+w {folder}/{settings_rel}\n"
             f"python -m vco_lib.project_init install-bundle "
             f"--folder {str(folder)!r} --update --json"
@@ -6564,26 +6404,46 @@ _CHUNKER_BUMP_VERSION = "0.2.46"
 def _parse_semver(version: str) -> "tuple[int, int, int] | None":
     """Parse "X.Y.Z" into (major, minor, patch). None on malformed input.
 
-    Doesn't pull in `packaging` — orchestrator version strings are always
-    plain semver without pre-release tags.
+    v0.2.92: delegates to
+    :func:`vco_lib.codegraph_extractor_generation.parse_semver` — ONE parser
+    for both boundary questions this file asks (chunker preset, extractor
+    generation). The name is kept because existing call sites + tests import
+    it. Loud-fail on the import is deliberate: vco_lib is part of every healthy
+    install, and a silent inline-copy degrade would re-create the very
+    duplication this delegation removes.
     """
-    parts = version.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        return (int(parts[0]), int(parts[1]), int(parts[2]))
-    except ValueError:
-        return None
+    from vco_lib.codegraph_extractor_generation import parse_semver
+
+    return parse_semver(version)
 
 
 def _crosses_chunker_boundary(prev_version: str, running_version: str) -> bool:
-    """True iff this upgrade crosses the v0.2.46 chunker-preset boundary."""
-    prev = _parse_semver(prev_version)
-    running = _parse_semver(running_version)
-    bump = _parse_semver(_CHUNKER_BUMP_VERSION)
-    if prev is None or running is None or bump is None:
-        return False
-    return prev < bump <= running
+    """True iff this upgrade crosses the v0.2.46 chunker-preset boundary.
+
+    v0.2.92: the ``prev < bump <= running`` rule itself lives in
+    :func:`vco_lib.codegraph_extractor_generation.crosses_version_boundary`,
+    which the extractor-generation detector also uses. This function is now
+    just the chunker boundary's binding of that shared rule, so the two
+    "was this built by an older version of us" questions cannot drift apart.
+
+    **SUPERSEDED in v0.2.92 (WP-D) — no longer called by the bundle flow.**
+    As wired from v0.2.47 to v0.2.91 this gate compared the manifest's
+    ``vco_version`` (a git short SHA on every clone install, never semver)
+    against the semver constant ``_CHUNKER_BUMP_VERSION``, so it was
+    structurally inert: it has never fired for a real user, no matter how
+    they updated. The live replacement is :func:`vco_lib.chunker_revision.gate` —
+    state-keyed on the ``_CHUNKER_REVISION`` sentinel (R26/R27), firing on
+    all four install/update surfaces. This function survives only because
+    ``tests/test_v0247_chunker_deferral_python.py`` pins its boundary
+    arithmetic as the shared-rule binding; deleting it (and
+    ``_emit_chunker_resync_deferral`` below, which shares the supersession)
+    is pending the user's R28 removal ruling (wave-3 ASK batch).
+    """
+    from vco_lib.codegraph_extractor_generation import crosses_version_boundary
+
+    return crosses_version_boundary(
+        prev_version, running_version, _CHUNKER_BUMP_VERSION,
+    )
 
 
 def _emit_chunker_resync_deferral(
@@ -6593,6 +6453,15 @@ def _emit_chunker_resync_deferral(
 ) -> None:
     """Emit `chunker_preset_overhaul_pending`: KG + codegraph need re-syncing
     after an upgrade across the v0.2.46 chunker-preset boundary.
+
+    **SUPERSEDED in v0.2.92 (WP-D) — no longer called by the bundle flow.**
+    The live emitter is :func:`_emit_chunker_revision_resync_deferral`
+    (same condition_id, same commands, keyed on the state-keyed
+    ``_CHUNKER_REVISION`` sentinel instead of a semver boundary this
+    emitter's inputs could never satisfy — see
+    :func:`_crosses_chunker_boundary`'s supersession note). Retained for
+    the same reason + the argparse-sweep test that drives it; removal
+    pending the user's R28 ruling (wave-3 ASK batch).
 
     Post-v0.2.46 the chunker uses MUCH larger chunks for qwen3-embedding
     (target_tokens 9500 vs. legacy 1000) and a five-tier preset routing
@@ -6608,6 +6477,7 @@ def _emit_chunker_resync_deferral(
     relevant top-k results. The user can defer the re-sync indefinitely.
     """
     from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import chunker_revision as _chunker_revision
     from vco_lib import deferral_emit as _de
 
     detected = (
@@ -6628,17 +6498,10 @@ def _emit_chunker_resync_deferral(
     # could never run as written. `--force-recreate` is the real drop+rebuild
     # flag, which is exactly the "re-chunk everything" this deferral wants.
     # Guarded by tests/test_deferral_command_argparse_sweep.py.
-    cmd = (
-        "# Re-chunk this project's KG under the new presets:\n"
-        f"cd {folder}\n"
-        ".claude/scripts/kg-sync --all\n"
-        "\n"
-        "# Re-chunk this project's code graph under the new presets\n"
-        "# (drop + rebuild the 5 Code* classes so every entity re-embeds):\n"
-        ".claude/scripts/code-graph-analyze . --force-recreate\n"
-        "\n"
+    cmd = _chunker_revision.resync_commands(
+        folder,
         "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
-        "# Consider running them when you're not actively coding."
+        "# Consider running them when you're not actively coding.",
     )
 
     entry = DeferralEntry(
@@ -6664,6 +6527,223 @@ def _emit_chunker_resync_deferral(
     _de.emit(folder, entry)
 
 
+# ---------------------------------------------------------------------------
+# v0.2.92: extractor-generation re-index trigger (per-project bundle update)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_codegraph_project_name(folder: Path) -> str:
+    """The name whose Weaviate code-graph classes belong to ``folder``.
+
+    Only from a source that KNOWS, in the order the analyzer itself is invoked
+    with:
+
+    1. ``CODE_GRAPH_PROJECT`` — the explicit code-graph binding, read from the
+       ONE canonical env surface (``.claude/settings.json`` ``env``) via
+       ``knowledge_residue``; no second env parser.
+    2. ``PROJECT_NAME`` — the project's display identity, same surface.
+    3. the identity SSOT, :mod:`vco_lib.project_identity`:
+
+       * folder IS a registered ``launcher.db`` project → that project's name.
+         AUTHORITATIVE, and it is what a moved or renamed folder needs: the
+         registered name is the one whose rows exist.
+       * the DB is readable and the folder is NOT registered → the folder
+         basename, which is not a guess here but the analyzer's OWN
+         ``--project`` default, and therefore the convention the standalone
+         (never-added-to-the-launcher) project's rows were written under...
+         **unless some OTHER registered project already answers to that
+         name**, in which case return "" — that collision (``~/a/myapp``
+         registered, ``~/b/myapp`` not) is the concrete route by which this
+         function would have re-indexed one project's source into another
+         project's rows.
+       * there is NO ``launcher.db`` on this machine at all → the basename.
+         A machine with no launcher has no registry for the folder to be
+         absent FROM, so nothing is being guessed at and no other project's
+         rows can exist to collide with. This is the free-tier / CLI-only
+         install, and it must keep working.
+       * a ``launcher.db`` EXISTS but could not be read → "".
+         ``resolve_identity``'s own contract: when nothing can be POSITIVELY
+         read, the caller "MUST NOT fall back to a basename-derived identity
+         — that fallback is the whole bug this module exists to kill". An
+         unreadable registry cannot tell the standalone case from the
+         registered-elsewhere case, so there the basename IS a guess.
+         (``resolve_snapshot`` reports both as ``resolvable=False``; the
+         file's existence is what separates "there is no registry" from
+         "the registry would not answer", and only the second must refuse.)
+
+    Empty string when none of those answer, and the caller then does nothing:
+    never guess a project name and act on another project's rows.
+
+    v0.2.92 R2 — this used to end in an UNCONDITIONAL basename fallback,
+    including when the DB was unreadable, which contradicted the promise in
+    the line above. The consequence here is milder than the blockers
+    ``project_identity`` was created for (this feeds a NON-destructive
+    background re-walk, so a wrong name pollutes rather than destroys) but the
+    resolution rule must not differ per blast radius — a second rule is how
+    the first one erodes.
+
+    Not resolving is cheap: the caller logs, does NOT stamp the generation,
+    and the next bundle update re-triggers. Every launcher-managed project
+    answers at tier 1 (``config_projection`` pins ``CODE_GRAPH_PROJECT`` into
+    ``.claude/settings.json`` ``env``) or tier 3-registered.
+    """
+    try:
+        from vco_lib import knowledge_residue as _kres
+
+        env = _kres.project_settings_env(Path(folder)) or {}
+    except Exception:  # noqa: BLE001 — unreadable env surface ⇒ try the DB
+        env = {}
+    for key in ("CODE_GRAPH_PROJECT", "PROJECT_NAME"):
+        val = env.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    try:
+        from vco_lib import project_identity as _pid
+
+        basename = Path(folder).name.strip()
+        snapshot = _pid.resolve_snapshot()
+        if not snapshot.resolvable:
+            # Separate "there is no registry" from "the registry would not
+            # answer" — resolve_snapshot reports both as unresolvable. Reuses
+            # the ONE discovery home (VCT_LAUNCHER_DB_PATH env → the standard
+            # path) rather than re-implementing the lookup order here.
+            from vco_lib.launcher_db_reader import _discover_db_path
+
+            return basename if _discover_db_path() is None else ""
+        registered = snapshot.identity_for_folder(Path(folder))
+        if registered is not None:
+            return (registered.name or "").strip()
+        if not basename:
+            return ""
+        # Unregistered folder: the basename is the analyzer's own --project
+        # default, EXCEPT when another registered project already answers to
+        # it — that is the collision (~/a/myapp registered, ~/b/myapp not)
+        # that would re-index this source into that project's rows. Matched
+        # on the identity module's own normalisation, so case and separator
+        # variants collide too.
+        taken = {
+            _pid.normalise_for_match(p.name or "")
+            for p in snapshot.projects
+            if (p.name or "").strip()
+        }
+        if _pid.normalise_for_match(basename) in taken:
+            return ""
+        return basename
+    except Exception:  # noqa: BLE001 — could not look is never a verdict
+        return ""
+
+
+def _trigger_extractor_generation_reindex(
+    folder: Path,
+    *,
+    prev_version: str,
+    running_version: str,
+    is_root_target: bool,
+    result: dict,
+    log: Callable[..., None],
+) -> None:
+    """Decide + (when owed) launch the extractor-generation re-index.
+
+    Thin shim: every decision lives in
+    :mod:`vco_lib.codegraph_extractor_generation` (per the modularity rule —
+    ``project_init`` is a mega-file and this is not where new logic goes).
+    This function only resolves the two inputs that are project_init's to know
+    (the code-graph project name and whether ``.claude/`` is first-party
+    source) and folds the outcome into the install envelope.
+
+    NEVER raises; NEVER blocks. Outcomes:
+      * ``launched``  → a detached background walk is running; one warning-free
+        log line + an informational entry in ``result["warnings"]`` so the
+        launcher toast tells the user something is happening in the background
+        (unbounded silent work is exactly what the project rules forbid).
+      * ``stamped``   → nothing owed AND we could prove it; recorded so future
+        updates stop asking.
+      * ``deferred``  → the code-embed service is down; the helper handed back a
+        DeferralEntry which is emitted through the ONE locked emitter so the
+        user gets a resume command in UPDATE_DEFERRED.md.
+      * ``skipped`` / ``failed`` → logged; the project stays owed and the next
+        update re-triggers (no stamp is written).
+    """
+    from vco_lib import codegraph_extractor_generation as _ceg
+
+    project_name = _resolve_codegraph_project_name(folder)
+    if not project_name:
+        log("4.bundle.extractor_reindex", "warn",
+            "extractor-generation re-index skipped: no code-graph project name")
+        return
+
+    outcome = _ceg.ensure_extractor_generation(
+        Path(folder),
+        prev_version=prev_version,
+        running_version=running_version,
+        project_name=project_name,
+        # The orchestrator clone indexes its own `.claude/` as first-party
+        # source; every user project excludes it (generated tooling). Same
+        # tri-state the analyzer resolves — passed explicitly so the spawn's
+        # probes classify `.claude/**` rows the same way the walk will.
+        index_dot_claude=bool(is_root_target),
+    )
+
+    phase = {
+        "launched": "ok", "stamped": "ok", "skipped": "ok",
+        "deferred": "warn", "failed": "warn",
+    }.get(outcome.status, "warn")
+    log("4.bundle.extractor_reindex", phase, outcome.message,
+        data={"status": outcome.status, "reason": outcome.reason,
+              "generation": outcome.generation, "pid": outcome.pid,
+              "project": project_name})
+
+    if outcome.status == "launched":
+        result.setdefault("extractor_reindex", {})
+        result["extractor_reindex"] = {
+            "status": outcome.status, "reason": outcome.reason,
+            "generation": outcome.generation, "pid": outcome.pid,
+        }
+        result["warnings"].append(
+            f"code-graph re-index started in the background for "
+            f"{project_name} (v0.2.92 added Python API extraction and fixed C# "
+            f"route attribution; unchanged entities are NOT re-embedded). "
+            f"Progress: <vct_root>/logs/resync-*.log"
+        )
+    elif outcome.status == "deferred" and outcome.deferral is not None:
+        try:
+            from vco_lib import deferral_emit as _de
+            from vco_lib.deferral_report import DeferralEntry as _DeferralEntry
+
+            # `codegraph_extractor_generation.ReindexResult.deferral` is
+            # declared `object` so that module keeps no import edge to
+            # `deferral_report`; the value it carries when `status ==
+            # "deferred"` is always a real `DeferralEntry` (see that module's
+            # own field comment and `_retarget_deferral`). The annotation is
+            # the only thing wider than reality, hence the cast — same
+            # convention as `codegraph_ref_dedup._http_request`. NOT an
+            # `isinstance` narrowing: the emit path here is duck-typed by
+            # contract and `tests/test_v0292_reindex_trigger.py` drives it with
+            # a sentinel to prove the wiring forwards whatever it is given.
+            # (Pre-existing `reportArgumentType`; fixed in v0.2.92 W18 because
+            # this file is exclusively held this wave and pyright is a gate.)
+            _de.emit(Path(folder), cast("_DeferralEntry", outcome.deferral))
+        except Exception as e:  # noqa: BLE001 — a deferral write never blocks
+            log("4.bundle.extractor_reindex", "warn",
+                f"extractor-reindex deferral write failed: {e}")
+        result["warnings"].append(
+            f"code-graph re-index deferred for {project_name}: "
+            f"{outcome.message} — see UPDATE_DEFERRED.md"
+        )
+    elif outcome.status == "failed":
+        result["warnings"].append(
+            f"code-graph re-index could not start for {project_name}: "
+            f"{outcome.message}"
+        )
+    else:
+        result.setdefault("extractor_reindex", {})
+        result["extractor_reindex"] = {
+            "status": outcome.status, "reason": outcome.reason,
+            "generation": outcome.generation,
+        }
+
+
 def current_chunker_revision() -> str:
     """Return the live ``_CHUNKER_REVISION`` sentinel from chunking.py.
 
@@ -6672,6 +6752,10 @@ def current_chunker_revision() -> str:
     The sentinel is bumped whenever MODEL_TOKEN_LIMITS / CHUNKING_PRESETS change
     chunk boundaries; a mismatch against the launcher's last-seen value is what
     triggers the re-sync deferral (R2-4).
+
+    v0.2.92 WP-D: the per-project state-keyed gate that CONSUMES this
+    sentinel lives in :mod:`vco_lib.chunker_revision` (extracted per the
+    project_init ratchet) and is invoked from ``install_project_bundle``.
     """
     # Import lazily: chunking.py lives under claude_mcp_servers/, not on the
     # vco_lib import path by default. Resolve the repo root from this file.
@@ -6706,40 +6790,39 @@ def _emit_chunker_revision_resync_deferral(
     dedup to a single deferral entry and self-resolve identically.
     """
     from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import chunker_revision as _chunker_revision
     from vco_lib import deferral_emit as _de
 
     detected = (
         f"The KG chunker revision changed from `{prev_revision}` to "
         f"`{cur_revision}` (see `_CHUNKER_REVISION` in "
-        f"`claude_mcp_servers/weaviate_mcp/chunking.py`). The chunk boundaries "
-        f"this revision produces differ from the rows already in this project's "
+        f"`claude_mcp_servers/weaviate_mcp/chunking.py`). For entries whose "
+        f"content now plans differently under the new revision (for this "
+        f"transition: content above the new 8 192-unit qwen3 chunk budget), "
+        f"the boundaries differ from the rows already in this project's "
         f"KG + code graph — search recall degrades on long answers because "
         f"relevant content lives in a chunk the new preset would fold "
         f"differently. Re-sync to re-chunk under the current revision."
     )
-    cmd = (
-        "# Re-chunk this project's KG under the new revision:\n"
-        f"cd {folder}\n"
-        ".claude/scripts/kg-sync --all\n"
-        "\n"
-        "# Re-chunk this project's code graph under the new revision\n"
-        "# (drop + rebuild the 5 Code* classes so every entity re-embeds):\n"
-        ".claude/scripts/code-graph-analyze . --force-recreate\n"
-        "\n"
-        "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
-        "# Consider running them when you're not actively coding."
+    cmd = _chunker_revision.resync_commands(
+        folder,
+        "# The kg-sync half re-chunks only entries whose stored chunk plan\n"
+        "# differs from the current revision (everything else is hash-\n"
+        "# skipped); the code-graph half re-embeds every entity. Both run\n"
+        "# embed I/O through Ollama — consider a quiet moment.",
     )
     entry = DeferralEntry(
         condition_id="chunker_preset_overhaul_pending",
         title="KG + codegraph re-sync recommended (chunker revision changed)",
         detected=detected,
         why_deferred=(
-            "Auto-rechunking every KG row and code-graph entity at update "
-            "time would block boot for minutes and consume significant Ollama "
-            "GPU time. We defer the decision so the user can pick a quiet "
-            "moment. Searches WORK in the meantime — they just return less "
-            "relevant top-k results. Once you run the re-sync commands below, "
-            "this deferral self-resolves on the next bundle update."
+            "Auto-rechunking at update time (every code-graph entity, plus "
+            "the KG entries whose boundaries changed) would run significant "
+            "embed I/O on the user's backends at a moment they did not pick. "
+            "We defer the decision so the user can choose a quiet moment. "
+            "Searches WORK in the meantime — they just return less relevant "
+            "top-k results. Once you run the re-sync commands below, this "
+            "deferral self-resolves on the next bundle update."
         ),
         command_to_apply=cmd,
         severity="info",
@@ -7270,6 +7353,15 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
 # KG-family suffixes considered for legacy detection.
 _KG_SUFFIXES = ("_KnowledgeGraph", "_Development")
 
+# v0.2.92 W8 — GUARD-side KG family: a superset of the DETECTION set above.
+# Detection deliberately scans only the two suffixes it knows how to migrate
+# (re-embed from `knowledge/**/*.md`), but the drop GUARD must recognise every
+# class a project actually reads, `_Diagrams` included, before clearing any of
+# them for deletion. Keep in sync with
+# ``vco_lib.project_identity._KG_FAMILY_SUFFIXES`` (the resolver-side list that
+# builds the keep-tokens this guard tests against).
+_KG_FAMILY_SUFFIXES_ALL = _KG_SUFFIXES + ("_Diagrams",)
+
 # Code-graph entity suffixes — regenerable from source.
 _CODEGRAPH_SUFFIXES = (
     "_CodeFunction",
@@ -7446,9 +7538,131 @@ def _live_kg_collection_binding() -> Optional[str]:
     return val.strip() or None
 
 
+#: The `.claude/settings.json` ``env`` keys that NAME a Weaviate collection (or
+#: a code-graph class prefix) this project READS. CLAUDE.md calls this env block
+#: "the canonical channel that propagates to MCP subprocesses on every Claude
+#: Code surface" — so whatever these say, the MCP is querying it right now.
+_SELF_COLLECTION_ENV_KEYS: tuple[str, ...] = (
+    "KG_COLLECTION",
+    "SHARED_KG_COLLECTION",
+    "DEVELOPMENT_COLLECTION",
+    "DIAGRAMS_COLLECTION",
+    "CODE_GRAPH_PROJECT",
+)
+
+
+def _self_veto_tokens(
+    project_name: str,
+    project_folder: Optional[Path],
+    *,
+    identity: Optional[Any] = None,
+) -> set[str]:
+    """Normalised tokens naming the collections THIS project reads — from
+    EVERY source, unioned.
+
+    v0.2.92 F-2. Detection and both run-time drop guards consulted only
+    ``launcher.db``. The project's own ``.claude/settings.json`` ``env`` block
+    was never read, even though it is the channel the MCP actually resolves
+    from, and settings↔DB divergence is field-proven (a project registered
+    through the hub's ``POST /api/v1/cli/projects`` gets a ``projects`` row with
+    NO ``project_kg_bindings`` rows, so the DB's idea of its primary is an
+    invented name-derivation while the settings pin names the real, populated
+    class). In that shape the real live collection is in NO keep-set, and if
+    ``_is_similar_prefix`` matches it, detection emits a drop and the DB-only
+    run-time guard allows it.
+
+    The rule this implements: **a candidate matching the project's own live
+    binding from EITHER source — launcher.db or its own settings — is never
+    legacy.** UNION, never replace. Both sources can be individually wrong or
+    stale; the union fails safe in the direction that matters, because
+    over-protecting leaves a dead class lying around while under-protecting
+    deletes live data.
+
+    Sources unioned here:
+
+    1. ``_resolve_bundle_collection_names_binding_first`` — the EXISTING
+       binding-first resolver (launcher.db tier 1 → on-disk ``KG_COLLECTION``
+       pin tier 2 → name derivation tier 3). Contributes the winning primary
+       PLUS its derived ``_Development`` / ``_Diagrams`` siblings, which is what
+       protected a live 8-object ``*_Development`` class in the field.
+    2. The raw ``.claude/settings.json`` ``env`` values in
+       :data:`_SELF_COLLECTION_ENV_KEYS`, read through the existing
+       ``knowledge_residue.project_settings_env`` SSOT. Needed because (1)
+       returns the DB answer when the folder IS registered, so a settings value
+       that DISAGREES with the DB is invisible to it — and that disagreement is
+       precisely the dangerous shape.
+    3. ``_live_kg_collection_binding()`` — the process env ``KG_COLLECTION``.
+       This restores a protection HEAD had and W8 regressed: with an identity
+       present, ``_detect_legacy_kg_collections`` took ``live_binding`` from the
+       identity and stopped consulting the env at all, trading one protection
+       for another instead of keeping both.
+    4. ``identity.keep_tokens()`` when an identity is supplied — belt and
+       braces, and the only source for an unregistered project.
+
+    Each value contributes TWO tokens: its normalised full name and its
+    normalised family PREFIX (``Foo_KnowledgeGraph`` → ``fooknowledgegraph`` +
+    ``foo``), the same two-halves rule
+    :meth:`~vco_lib.project_identity.IdentitySnapshot.kg_keep_tokens` uses — the
+    prefix half is what covers derived siblings that have no binding row and no
+    env key of their own. A bare prefix (``CODE_GRAPH_PROJECT``) contributes
+    itself.
+
+    Never raises: any unreachable source contributes nothing.
+    """
+    from vco_lib.project_identity import _strip_family_suffix
+
+    values: list[str] = []
+
+    def _add(v: object) -> None:
+        if isinstance(v, str) and v.strip():
+            values.append(v.strip())
+
+    # (1) the existing binding-first resolver.
+    if project_folder is not None:
+        try:
+            names = _resolve_bundle_collection_names_binding_first(
+                project_name or Path(project_folder).name, Path(project_folder),
+            )
+            for key in ("kg_collection", "development_collection",
+                        "diagrams_collection"):
+                _add(names.get(key))
+        except Exception:  # noqa: BLE001 — a veto source may never break detection
+            pass
+
+        # (2) the raw on-disk env pins (visible even when tier 1 won above).
+        try:
+            from vco_lib.knowledge_residue import project_settings_env
+            env = project_settings_env(Path(project_folder))
+            for key in _SELF_COLLECTION_ENV_KEYS:
+                _add(env.get(key))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # (3) the process env KG_COLLECTION (HEAD's protection, restored by union).
+    try:
+        _add(_live_kg_collection_binding())
+    except Exception:  # noqa: BLE001
+        pass
+
+    tokens: set[str] = set()
+    for val in values:
+        tokens.add(_normalise_prefix_for_match(val))
+        tokens.add(_normalise_prefix_for_match(_strip_family_suffix(val)))
+
+    # (4) the resolved identity's own collections.
+    if identity is not None:
+        try:
+            tokens |= identity.keep_tokens()
+        except Exception:  # noqa: BLE001
+            pass
+
+    tokens.discard("")
+    return tokens
+
+
 def _kg_binding_keep_set_normalised() -> tuple[set[str], bool]:
-    """Return ``(normalised_kg_class_names, resolvable)`` — EVERY project's live
-    KG collection binding (all roles), normalised for case-insensitive match.
+    """Return ``(normalised_keep_tokens, resolvable)`` — EVERY project's live
+    KG-family data, normalised for case-insensitive match.
 
     SEV-2 #2 (v0.2.73): the legacy-KG drop detector must NEVER emit a drop
     command against ANOTHER active project's KG class. BUG-1 only protected the
@@ -7458,19 +7672,55 @@ def _kg_binding_keep_set_normalised() -> tuple[set[str], bool]:
     command re-embeds from THIS project's ``.md`` (never the other project's),
     so running it drops the other project's populated KG unrecoverably.
 
+    v0.2.92 W8 — WIDENED to cover every BOUND ROLE, not just the rows stored in
+    ``project_kg_bindings``. That table holds NO row for ``*_Development`` /
+    ``*_Diagrams``: the launcher DERIVES those by suffix-swapping the primary
+    (hub Decision C, v0.2.46), so a keep-set built from binding rows alone could
+    never contain them — which is exactly how a live 8-object ``*_Development``
+    class that a project actively reads via ``DEVELOPMENT_COLLECTION`` became a
+    proposed drop target in the field. The set now comes from
+    :func:`vco_lib.project_identity.IdentitySnapshot.kg_keep_tokens`, which
+    enumerates the derived siblings AND carries each class's normalised PREFIX
+    alongside its normalised full name (see that method for why both halves are
+    kept). Callers match with ``norm(class) in tokens or norm(prefix) in tokens``.
+
     This mirrors ``_codegraph_keep_set_normalised``: the launcher.db binding
     table is the ground truth. ``resolvable`` is False only when launcher.db is
     unreachable — callers MUST refuse to emit any drop command in that case
     (conservative data-safety), never treat an empty set as "nothing is live".
     """
     try:
-        from vco_lib.launcher_db_reader import kg_binding_keep_set
-        names, resolvable = kg_binding_keep_set()
+        from vco_lib.project_identity import resolve_snapshot
+        snap = resolve_snapshot()
     except Exception:
         return (set(), False)
-    normed = {_normalise_prefix_for_match(n) for n in names if n}
-    normed.discard("")
-    return (normed, resolvable)
+    if not snap.resolvable:
+        return (set(), False)
+    return (snap.kg_keep_tokens(), True)
+
+
+def _keep_token_hit(
+    class_name: str, class_prefix: str, keep_tokens: Optional[set[str]],
+) -> bool:
+    """True when ``class_name`` (or its ``class_prefix``) is live per keep-set.
+
+    ONE membership rule shared by the KG family (whose keep-set carries both
+    full names and prefixes) and the code-graph family (whose keep-set carries
+    prefixes only) — a bare prefix never collides with a normalised full class
+    name, so the same two-part test is correct for both.
+
+    ``keep_tokens=None`` (keep-set not applicable / unresolvable) → False; the
+    caller's own conservative gate decides what that means.
+    """
+    if not keep_tokens:
+        return False
+    if class_name:
+        if _normalise_prefix_for_match(class_name) in keep_tokens:
+            return True
+    if class_prefix:
+        if _normalise_prefix_for_match(class_prefix) in keep_tokens:
+            return True
+    return False
 
 
 def _detect_legacy_collections_with_suffixes(
@@ -7481,14 +7731,34 @@ def _detect_legacy_collections_with_suffixes(
     live_binding: Optional[str] = None,
     cross_project_keep_set: Optional[set[str]] = None,
     cross_project_keep_resolvable: Optional[bool] = None,
+    canonical_prefix_override: Optional[str] = None,
+    self_veto_tokens: Optional[set[str]] = None,
 ) -> list[dict]:
     """Shared core for legacy KG + legacy code-graph detection.
 
     Args:
-        project_name: raw project name as registered with the launcher.
+        project_name: the project's AUTHORITATIVE registered name (launcher.db
+            ``projects.name``), NOT the folder basename. v0.2.92 W8: callers
+            resolve it through ``vco_lib.project_identity``; passing a basename
+            for a registered project whose folder was renamed/moved is what made
+            this detector emit drop commands against the project's own live
+            collections.
         weaviate_url: Weaviate REST endpoint.
         suffixes: tuple of class-name suffixes to inspect (KG family or
             code-graph family).
+        canonical_prefix_override: the AUTHORITATIVE class prefix for this
+            family, when the caller can resolve one that beats the name
+            sanitizer. Two reasons it exists (v0.2.92 W8):
+              * KG — a bound primary (``project_kg_bindings``) may use a casing
+                / stem the name sanitizer does not reproduce (``VibeCoded
+                Orchestrator`` → binding ``VCODev_KnowledgeGraph``). The binding
+                is what the project READS, so it is the canonical.
+              * code-graph — the code family uses the underscore-PRESERVING
+                ``canonical_class_prefix`` rule, NOT the underscore-DROPPING
+                ``sanitize_for_weaviate_class`` this function defaults to. Left
+                unset, ``ACME_widget`` yielded canonical ``ACMEWidget`` for
+                classes that actually live under ``ACME_widget``.
+            ``None`` → the historical ``sanitize_for_weaviate_class`` derivation.
         live_binding: the project's LIVE knowledge-graph collection (the
             class it actually reads — env ``KG_COLLECTION`` / hub-resolved).
             When provided, it is the AUTHORITATIVE canonical: a candidate
@@ -7509,13 +7779,16 @@ def _detect_legacy_collections_with_suffixes(
                                            # case-REBIND, never copy+drop.
         }
 
-        cross_project_keep_set: SEV-2 #2 (KG family only). The normalised set
-            of EVERY project's live KG collection binding (all roles), from
-            launcher.db. A candidate whose full class name (normalised) is in
-            this set is ANOTHER project's live KG — NEVER a drop target, even
-            when ``_is_similar_prefix`` matches this project's prefix. Code-graph
-            callers pass None (their exclusion is prefix-based via the code
-            keep-set, applied elsewhere).
+        cross_project_keep_set: SEV-2 #2. The normalised keep-token set of EVERY
+            project's live data for this family, from launcher.db. A candidate
+            whose full class name OR whose class prefix (both normalised) is in
+            this set is a project's live data — NEVER a drop target, even when
+            ``_is_similar_prefix`` matches this project's prefix. v0.2.92 W8:
+            the code-graph caller now passes its keep-set here too (previously
+            it passed None, so a project's own live ``<prefix>_Code*`` classes
+            were emitted as drop candidates whenever the canonical prefix was
+            mis-derived), and the KG set carries the derived ``_Development`` /
+            ``_Diagrams`` siblings that ``project_kg_bindings`` never stores.
         cross_project_keep_resolvable: pairs with ``cross_project_keep_set``.
             When False (launcher.db unreachable), the keep-set is NOT applied to
             detection (historic substring/Levenshtein behavior is retained), and
@@ -7524,6 +7797,15 @@ def _detect_legacy_collections_with_suffixes(
             refuses any drop when the keep-set can't be confirmed. So detection
             never depends on ambient launcher.db state, yet an unverifiable
             candidate can never be dropped.
+        self_veto_tokens: v0.2.92 F-2. Normalised tokens naming the collections
+            THIS project reads, unioned from launcher.db AND from its own
+            ``.claude/settings.json`` ``env`` block (see
+            :func:`_self_veto_tokens`). Applied UNCONDITIONALLY — unlike
+            ``cross_project_keep_set`` it is NOT gated on
+            ``cross_project_keep_resolvable``, because it is a SELF veto whose
+            settings-file half stays readable when launcher.db is not, and a
+            project's own live collection is never a legacy candidate whatever
+            the DB can or cannot say.
 
     Returns [] in any of these conditions (treated as "nothing to migrate"):
       - Weaviate unreachable.
@@ -7533,10 +7815,16 @@ def _detect_legacy_collections_with_suffixes(
         suggest migrating someone else's data).
       - The only matching class IS the canonical name (fresh-install path),
         matched CASE-INSENSITIVELY (BUG-1) or equal to the live binding.
-      - (KG family) the candidate class is ANY project's live KG binding
-        (SEV-2 #2 cross-project exclusion).
+      - the candidate class (or its prefix) is ANY project's live bound data
+        for this family (SEV-2 #2 cross-project exclusion, widened in W8).
+      - the candidate class (or its prefix) is in ``self_veto_tokens`` — THIS
+        project's own live data per launcher.db OR per its settings.json
+        (v0.2.92 F-2).
     """
-    canonical_prefix = sanitize_for_weaviate_class(project_name)
+    canonical_prefix = (
+        (canonical_prefix_override or "").strip()
+        or sanitize_for_weaviate_class(project_name)
+    )
     if not canonical_prefix:
         return []
     # BUG-1: the live KG binding (env KG_COLLECTION) is the authoritative
@@ -7568,7 +7856,20 @@ def _detect_legacy_collections_with_suffixes(
     if canonical_prefix == _FALLBACK_PREFIX and project_name.strip().lower() != _FALLBACK_PREFIX:
         return []
 
-    # Schema fetch — soft-fail to empty list if Weaviate is unreachable.
+    # Schema fetch — soft-fail to an empty candidate list when the live schema
+    # cannot be READ. Deliberately NOT routed through
+    # ``weaviate_helpers.probe_class_listing`` (v0.2.92 W18 considered it): this
+    # is not the "which classes exist?" question. Each candidate's
+    # ``embedding_dim`` comes from its own ``vectorConfig``, so the FULL schema
+    # objects are needed, and the listing helper returns names only — going
+    # through it would mean one extra ``GET /v1/schema/<class>`` per candidate.
+    #
+    # The ``[]`` arms below are safe HERE and were audited as such: the class
+    # list is an INCLUSION source (no classes read ⇒ no candidates ⇒ no deferral
+    # ⇒ no drop command), the opposite of ``_detect_orphan_code_collections``,
+    # where the same value was an EXCLUSION set and an outage WIDENED a
+    # destructive recommendation. Same silent-zero shape, opposite consequence —
+    # which is why the fix went to the one that failed OPEN.
     base = (weaviate_url or _weaviate_url_default()).rstrip("/")
     try:
         status, body = _http_request("GET", f"{base}/v1/schema", timeout=10.0)
@@ -7618,17 +7919,36 @@ def _detect_legacy_collections_with_suffixes(
         if live_binding_lc is not None and class_name_lc == live_binding_lc:
             continue
 
-        # SEV-2 #2: cross-project KG-binding exclusion. A candidate whose FULL
-        # class name (normalised) is ANY project's live KG binding is that
-        # project's active data — NEVER a drop target. Mirrors the code-graph
-        # binding-exclusion (`_detect_orphan_code_collections`). This closes the
-        # substring false-match hole: `Foobar_KnowledgeGraph` (a different
-        # project's live 2590-node class) would otherwise be emitted for project
-        # `Foo` because "foo" is a substring of "foobar".
-        if cross_keep is not None:
-            norm_class = _normalise_prefix_for_match(class_name)
-            if norm_class and norm_class in cross_keep:
-                continue
+        # v0.2.92 F-2: SELF veto. A candidate that is this project's own live
+        # collection per launcher.db OR per its own `.claude/settings.json`
+        # `env` block is never legacy. Checked UNCONDITIONALLY (the settings
+        # half does not depend on launcher.db being readable) and BEFORE the
+        # similarity heuristic, so a settings↔DB divergence — the field-proven
+        # shape, and the hub-registered-but-never-bundled shape where the DB
+        # holds no binding row at all — can never reach an emitted drop.
+        if self_veto_tokens and _keep_token_hit(
+            class_name, cand_prefix, self_veto_tokens,
+        ):
+            continue
+
+        # SEV-2 #2: cross-project binding exclusion. A candidate whose FULL
+        # class name OR whose class PREFIX (normalised) belongs to ANY project's
+        # live bound data is that project's active data — NEVER a drop target.
+        # Mirrors the code-graph binding-exclusion
+        # (`_detect_orphan_code_collections`). This closes the substring
+        # false-match hole: `Foobar_KnowledgeGraph` (a different project's live
+        # 2590-node class) would otherwise be emitted for project `Foo` because
+        # "foo" is a substring of "foobar".
+        #
+        # v0.2.92 W8 — the PREFIX half is what protects a family member the
+        # binding table does not enumerate: `<X>_Development` / `<X>_Diagrams`
+        # are derived from `<X>_KnowledgeGraph` by suffix-swap and have no row
+        # of their own, so full-name matching alone left a live `_Development`
+        # class (read via DEVELOPMENT_COLLECTION) exposed to a drop command.
+        if cross_keep is not None and _keep_token_hit(
+            class_name, cand_prefix, cross_keep,
+        ):
+            continue
 
         # Conservative prefix-similarity check.  Without this we'd
         # mistakenly suggest migrating Quux_KnowledgeGraph just because
@@ -7669,6 +7989,8 @@ def _detect_legacy_kg_collections(
     weaviate_url: str,
     *,
     live_binding: Optional[str] = None,
+    identity: Optional[Any] = None,
+    project_folder: Optional[Path] = None,
 ) -> list[dict]:
     """Detect KG-family classes (KnowledgeGraph + Development) that look
     like THIS project's data under a different prefix.
@@ -7679,22 +8001,60 @@ def _detect_legacy_kg_collections(
     binding (`_live_kg_collection_binding()`) — the AUTHORITATIVE canonical
     that must never be proposed as a drop target (BUG-1). Tests inject it
     explicitly; the install caller relies on the env default.
+
+    `identity` (v0.2.92 W8) is the project's resolved
+    :class:`vco_lib.project_identity.ProjectIdentity`. When supplied, its BOUND
+    primary supplies both the live binding (beating the env, which the install
+    subprocess usually does not carry) and the canonical class prefix — so the
+    detector reasons about the collections the project actually reads instead
+    of about a name-sanitizer guess.
+
+    `project_folder` (v0.2.92 F-2) lets the detector ALSO read the project's own
+    ``.claude/settings.json`` ``env`` pins. Passing it is what closes the
+    settings↔DB divergence hole; leaving it None keeps the launcher.db-only
+    behaviour.
     """
+    canonical_prefix_override: Optional[str] = None
+    if identity is not None:
+        if live_binding is None:
+            live_binding = (getattr(identity, "kg_primary", None) or "").strip() or None
+        try:
+            canonical_prefix_override = identity.kg_canonical_prefix() or None
+        except Exception:  # noqa: BLE001 — never break detection on identity shape
+            canonical_prefix_override = None
     if live_binding is None:
         live_binding = _live_kg_collection_binding()
-    # SEV-2 #2: resolve the cross-project KG-binding keep-set so a DIFFERENT
-    # active project's live KG class can never be emitted as a drop target.
+    # SEV-2 #2: resolve the cross-project KG keep-set so a DIFFERENT active
+    # project's live KG-family class can never be emitted as a drop target.
     cross_keep, cross_resolvable = _kg_binding_keep_set_normalised()
+    if identity is not None and cross_resolvable:
+        # Belt-and-braces: an identity resolved by the caller (possibly the
+        # unregistered last-resort form, which has no launcher.db row) still
+        # protects its OWN collections.
+        try:
+            cross_keep = set(cross_keep) | identity.keep_tokens()
+        except Exception:  # noqa: BLE001
+            pass
+    # F-2: UNION the self veto (settings.json env + the process-env
+    # KG_COLLECTION HEAD used to consult) — never a replacement for the
+    # identity-derived `live_binding` above.
+    self_veto = _self_veto_tokens(project_name, project_folder, identity=identity)
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _KG_SUFFIXES,
         live_binding=live_binding,
         cross_project_keep_set=cross_keep,
         cross_project_keep_resolvable=cross_resolvable,
+        canonical_prefix_override=canonical_prefix_override,
+        self_veto_tokens=self_veto,
     )
 
 
 def _detect_legacy_codegraph_collections(
-    project_name: str, weaviate_url: str,
+    project_name: str,
+    weaviate_url: str,
+    *,
+    identity: Optional[Any] = None,
+    project_folder: Optional[Path] = None,
 ) -> list[dict]:
     """Detect code-graph-family classes (CodeFunction / CodeModule /
     CodeClass / CodeAPI / CodeInteraction) that look like THIS project's
@@ -7702,13 +8062,48 @@ def _detect_legacy_codegraph_collections(
 
     Code-graph data is regenerable from source — the deferral entry
     suggests `code-graph-analyze` re-run rather than copy-with-vectors.
+
+    v0.2.92 W8 — two data-safety corrections:
+
+      * the canonical prefix now uses the code family's own
+        underscore-PRESERVING rule (:func:`derive_project_code_prefix`, or the
+        BOUND ``project_codegraph_bindings.collection_prefix`` when
+        ``identity`` supplies one), not the KG sanitizer. The two diverge on
+        every underscored/hyphenated name, so the KG rule declared a project's
+        own live classes "non-canonical".
+      * the cross-project code keep-set is now APPLIED (it previously wasn't
+        passed at all), so no project's live ``<prefix>_Code*`` class can be
+        proposed for drop. "Regenerable" is not a licence to drop a live bound
+        collection — regenerating 1692 objects costs a full analyzer run, and
+        the drop is irreversible if the source tree is not present.
     """
+    code_prefix: Optional[str] = None
+    if identity is not None:
+        code_prefix = (getattr(identity, "codegraph_prefix", None) or "").strip() or None
+    if not code_prefix:
+        code_prefix = derive_project_code_prefix(project_name) or None
+    keep, resolvable = _codegraph_keep_set_normalised()
+    if identity is not None and resolvable:
+        try:
+            keep = set(keep) | identity.keep_tokens()
+        except Exception:  # noqa: BLE001
+            pass
+    # F-2: the settings-pinned `CODE_GRAPH_PROJECT` is the prefix the analyzer /
+    # MCP env-fallback actually target; a candidate under it is this project's
+    # own live code graph however launcher.db reads.
+    self_veto = _self_veto_tokens(project_name, project_folder, identity=identity)
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _CODEGRAPH_SUFFIXES,
+        cross_project_keep_set=keep,
+        cross_project_keep_resolvable=resolvable,
+        canonical_prefix_override=code_prefix,
+        self_veto_tokens=self_veto,
     )
 
 
-def _legacy_kg_drop_revalidated(class_name: str) -> bool:
+def _legacy_kg_drop_revalidated(
+    class_name: str, project_folder: Optional[str] = None,
+) -> bool:
     """RUN-TIME re-validation guard for a consented legacy-KG drop (SEV-2 #2).
 
     Returns True ONLY when ``class_name`` (normalised) is confirmed to be NOT a
@@ -7719,18 +8114,112 @@ def _legacy_kg_drop_revalidated(class_name: str) -> bool:
     never trusting the detect-time snapshot.
 
     Conservative: returns False (refuse the drop) when the keep-set is
-    UNRESOLVABLE (launcher.db down) — we never drop a populated collection we
-    cannot positively confirm is dead. This function is embedded verbatim into
-    the emitted deferral command so the guard runs on the user's machine at
-    execution time.
+    UNRESOLVABLE — launcher.db absent, unopenable, OR unreadable (v0.2.92 F-1
+    made "the binding query failed" stop masquerading as "the table is empty",
+    which had this guard ALLOWING drops on a corrupt / foreign-schema DB). We
+    never drop a populated collection we cannot positively confirm is dead.
+
+    ``project_folder`` (v0.2.92 F-2) additionally re-checks the project's OWN
+    ``.claude/settings.json`` ``env`` pins, so a live collection that the
+    settings name and launcher.db does not still refuses. The emitted deferral
+    command interpolates it.
+
+    This function is embedded verbatim into the emitted deferral command so the
+    guard runs on the user's machine at execution time.
     """
+    # F-2 self veto FIRST: it is readable even when launcher.db is not, and it
+    # can only ever REFUSE — never widen the blast radius.
+    if project_folder:
+        try:
+            veto = _self_veto_tokens("", Path(project_folder))
+            decomp_self = _strip_known_suffix(class_name, _KG_FAMILY_SUFFIXES_ALL)
+            if _keep_token_hit(
+                class_name, decomp_self[0] if decomp_self else "", veto,
+            ):
+                return False
+        except Exception:  # noqa: BLE001 — a veto source may never grant a drop
+            return False
     keep_set, resolvable = _kg_binding_keep_set_normalised()
     if not resolvable:
         return False
     norm = _normalise_prefix_for_match(class_name)
     if not norm:
         return False
-    return norm not in keep_set
+    # v0.2.92 W8: match the class name AND its family prefix — `<X>_Development`
+    # / `<X>_Diagrams` have no binding row of their own, so a name-only test
+    # cleared them for deletion while the project was actively reading them.
+    decomp = _strip_known_suffix(class_name, _KG_FAMILY_SUFFIXES_ALL)
+    prefix = decomp[0] if decomp else ""
+    return not _keep_token_hit(class_name, prefix, keep_set)
+
+
+def _legacy_codegraph_drop_revalidated(
+    class_name: str, project_folder: Optional[str] = None,
+) -> bool:
+    """RUN-TIME re-validation guard for a consented legacy CODE-GRAPH drop.
+
+    The code-graph sibling of :func:`_legacy_kg_drop_revalidated` (v0.2.92 W8).
+    Until W8 the emitted code-graph cleanup command was a bare
+    ``_delete_class(...)`` with NO guard at all, on the reasoning that
+    code-graph data is regenerable. That reasoning does not hold for a LIVE
+    BOUND collection: regeneration requires a full analyzer run over a source
+    tree that may not be present, the drop is irreversible, and — as the field
+    incident showed — the class proposed for deletion can be the project's own
+    1692-object live code graph when the canonical prefix was mis-derived.
+
+    Returns True ONLY when ``class_name``'s prefix is confirmed NOT to be a
+    bound code-graph prefix of ANY project AND the keep-set is resolvable.
+    Conservative: returns False (refuse) when launcher.db cannot be opened OR
+    read (v0.2.92 F-1) — we never drop a collection we cannot positively confirm
+    is dead. Embedded verbatim into the emitted deferral command so the guard
+    runs on the user's machine at execution time, against the CURRENT bindings
+    (a project may have been re-added between detect-time and run-time).
+
+    ``project_folder`` (v0.2.92 F-2) additionally re-checks the project's own
+    ``.claude/settings.json`` ``CODE_GRAPH_PROJECT`` pin — the prefix the
+    analyzer and the MCP's env fallback actually target.
+    """
+    decomp = _strip_known_suffix(class_name, _CODEGRAPH_SUFFIXES)
+    if decomp is None:
+        # Not a code-graph class name at all — refuse rather than guess.
+        return False
+    prefix, _sfx = decomp
+    # F-2 self veto FIRST (readable without launcher.db; can only refuse).
+    if project_folder:
+        try:
+            if _keep_token_hit(
+                class_name, prefix, _self_veto_tokens("", Path(project_folder)),
+            ):
+                return False
+        except Exception:  # noqa: BLE001 — a veto source may never grant a drop
+            return False
+    keep_set, resolvable = _codegraph_keep_set_normalised()
+    if not resolvable:
+        return False
+    if not _normalise_prefix_for_match(prefix):
+        return False
+    return not _keep_token_hit(class_name, prefix, keep_set)
+
+
+def _embeddable_project_folder(project_folder: Optional[Path]) -> str:
+    """The folder as a string SAFE to interpolate into a ``python -c "…"`` line.
+
+    The emitted drop commands live inside a shell DOUBLE-quoted ``python -c``
+    payload whose Python string literals are SINGLE-quoted. A path containing
+    either quote character would break one of those two layers and hand the
+    user a command that does not run (or, worse, runs differently than it
+    reads). Such a path yields ``""`` instead, which the guard reads as "no
+    folder" and falls back to its launcher.db-only check — a degradation in the
+    conservative direction (the guard only ever gets LESS permissive from the
+    settings veto, so losing it cannot authorise a drop that would otherwise be
+    refused).
+    """
+    if project_folder is None:
+        return ""
+    raw = str(project_folder)
+    if '"' in raw or "'" in raw:
+        return ""
+    return raw
 
 
 def _format_legacy_kg_detected(candidates: list[dict]) -> str:
@@ -7748,7 +8237,41 @@ def _format_legacy_kg_detected(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _format_case_rebind_instruction(old: str, new: str) -> list[str]:
+def _bootstrap_collections_cmd(
+    project_name: str, project_folder: Optional[Path] = None,
+) -> str:
+    """Render a runnable ``bootstrap-collections`` invocation.
+
+    v0.2.92 W8 — ``--name`` takes a raw PROJECT NAME, which
+    ``bootstrap_collections`` sanitizes into ``<sanitized>_KnowledgeGraph`` /
+    ``_Development``. The legacy-KG remediation used to interpolate the
+    candidate's CANONICAL CLASS NAME there, which double-derived:
+    ``--name 'ACMEWidget_KnowledgeGraph'`` creates
+    ``ACMEWidgetKnowledgeGraph_KnowledgeGraph``, a garbage class, while the
+    collection the user was told to prepare is never touched — so the following
+    ``kg-sync --all`` re-embeds into nothing and the subsequent drop of the
+    legacy class loses the data for real.
+
+    ``--project-folder`` is included when known so bootstrap resolves the
+    project's BOUND primary (binding-first, via
+    ``_resolve_bundle_collection_names_binding_first``) rather than
+    name-deriving, and so any Weaviate-down deferral lands in the right project.
+    """
+    cmd = (
+        "python -m vco_lib.project_init bootstrap-collections "
+        f"--name {project_name!r}"
+    )
+    if project_folder is not None:
+        cmd += f" --project-folder {str(project_folder)!r}"
+    return cmd
+
+
+def _format_case_rebind_instruction(
+    old: str,
+    new: str,
+    project_name: str,
+    project_folder: Optional[Path] = None,
+) -> list[str]:
     """Render a NON-destructive case-rebind instruction for a legacy
     candidate that differs from the canonical ONLY by case (BUG-1).
 
@@ -7768,8 +8291,7 @@ def _format_case_rebind_instruction(old: str, new: str) -> list[str]:
         "# destroy the populated collection). Re-run bootstrap-collections;",
         "# its case-conflict recovery rebinds the launcher to the actual-",
         "# cased class:",
-        "python -m vco_lib.project_init bootstrap-collections "
-        f"--name {new!r}",
+        _bootstrap_collections_cmd(project_name, project_folder),
         "# Verify the project now reads the populated class:",
         "#   .claude/scripts/kg-search list",
         "",
@@ -7780,6 +8302,8 @@ def _format_legacy_kg_command(
     project_name: str,
     weaviate_url: str,
     candidates: list[dict],
+    *,
+    project_folder: Optional[Path] = None,
 ) -> str:
     """Render the suggested migration commands for the KG deferral.
 
@@ -7819,7 +8343,8 @@ def _format_legacy_kg_command(
         # future detector regression that mis-flags `case_only` still cannot
         # produce a destructive command.
         if old.lower() == new.lower():
-            lines.extend(_format_case_rebind_instruction(old, new))
+            lines.extend(_format_case_rebind_instruction(
+                old, new, project_name, project_folder))
             continue
 
         # GENUINE legacy (different prefix): re-embed from source .md
@@ -7829,25 +8354,28 @@ def _format_legacy_kg_command(
         cnt = c.get("object_count", "?")
         lines.append(f"# {old} → {new}  ({cnt} objects) — re-embed from source .md")
         lines.append("# 1. Ensure the canonical exists with the current named-vector schema:")
-        lines.append(
-            "python -m vco_lib.project_init bootstrap-collections "
-            f"--name {new!r}"
-        )
+        lines.append(_bootstrap_collections_cmd(project_name, project_folder))
         lines.append("# 2. Re-embed the canonical from the on-disk knowledge/**/*.md (source of truth):")
         lines.append(".claude/scripts/kg-sync --all")
         lines.append("# 3. Drop the legacy class (vectors were the wrong shape/model; .md already re-embedded).")
         lines.append("#    RUN-TIME re-validation (SEV-2 #2): the guard refuses the drop if this")
         lines.append("#    class is a LIVE KG binding of ANY project (re-checked NOW, not at detect")
-        lines.append("#    time), or if launcher.db can't be read (conservative — never drop a")
-        lines.append("#    populated collection we can't confirm is dead):")
+        lines.append("#    time), if this project's own .claude/settings.json env pins it, or if")
+        lines.append("#    launcher.db can't be read (conservative — never drop a populated")
+        lines.append("#    collection we can't confirm is dead):")
+        # v0.2.92 F-2: the folder is interpolated so the RUN-TIME guard also
+        # re-reads this project's own `.claude/settings.json` env pins, not
+        # just launcher.db. `''` (no folder known) keeps the DB-only behaviour.
+        _pf = _embeddable_project_folder(project_folder)
         lines.append(
             "python -c \"from vco_lib.project_init import _delete_class, "
             "_legacy_kg_drop_revalidated; "
-            f"n={old!r}; "
+            f"n={old!r}; f={_pf!r}; "
             f"(_delete_class(n, weaviate_url={weaviate_url!r}) "
-            "or print('dropped ' + n)) if _legacy_kg_drop_revalidated(n) "
-            "else print('REFUSED (live KG binding of a project, or launcher.db "
-            "unreadable): ' + n)\""
+            "or print('dropped ' + n)) if _legacy_kg_drop_revalidated(n, f) "
+            "else print('REFUSED (live KG binding of a project, or a "
+            "settings.json pin of this project, or launcher.db unreadable): ' "
+            "+ n)\""
         )
         lines.append("")
     lines.append(
@@ -7866,15 +8394,35 @@ def _format_legacy_codegraph_command(
     project_name: str,
     weaviate_url: str,
     candidates: list[dict],
+    *,
+    project_folder: Optional[Path] = None,
 ) -> str:
     """Render the suggested cleanup commands for the code-graph deferral.
 
     Code-graph data is regenerable from source — the safe path is
     drop legacy + re-run `code-graph-analyze` against the project root.
+
+    v0.2.92 W8 — DROP-GUARD PARITY with the KG sibling. Every emitted drop now
+    embeds :func:`_legacy_codegraph_drop_revalidated`, which re-checks the
+    CURRENT ``project_codegraph_bindings`` at the moment the user runs the
+    command and REFUSES when the class belongs to a live binding (or when
+    launcher.db can't be read). The previous bare ``_delete_class(...)`` was
+    the one destructive command in this family with no run-time re-validation
+    at all, and the field incident it enabled deleted nothing less than the
+    project's own live code graph.
+
+    ``project_name`` MUST be the AUTHORITATIVE registered name: the re-analyze
+    command below writes to ``canonical_class_prefix(project_name)``, so a
+    folder-basename guess rebuilds the graph under a prefix the binding does
+    not point at — a silently useless rebuild on top of a destructive drop.
     """
     lines = [
         "# Code-graph collections are REGENERATED from source — drop the",
         "# legacy classes and re-run code-graph-analyze on the project.",
+        "# Each drop RE-VALIDATES at run time (v0.2.92): it refuses when the",
+        "# class is a LIVE code-graph binding of ANY project (re-checked NOW,",
+        "# not at detect time), when this project's own .claude/settings.json",
+        "# CODE_GRAPH_PROJECT pins its prefix, or when launcher.db can't be read.",
         "",
     ]
     for c in candidates:
@@ -7882,10 +8430,17 @@ def _format_legacy_codegraph_command(
         lines.append(
             f"# Drop {old}  ({c.get('object_count', '?')} objects)"
         )
+        _pf = _embeddable_project_folder(project_folder)
         lines.append(
-            "python -c \"from vco_lib.project_init import _delete_class; "
-            f"_delete_class({old!r}, weaviate_url={weaviate_url!r}); "
-            f"print('dropped {old}')\""
+            "python -c \"from vco_lib.project_init import _delete_class, "
+            "_legacy_codegraph_drop_revalidated; "
+            f"n={old!r}; f={_pf!r}; "
+            f"(_delete_class(n, weaviate_url={weaviate_url!r}) "
+            "or print('dropped ' + n)) if "
+            "_legacy_codegraph_drop_revalidated(n, f) "
+            "else print('REFUSED (live code-graph binding of a project, or a "
+            "settings.json pin of this project, or launcher.db unreadable): ' "
+            "+ n)\""
         )
         lines.append("")
     lines.append(
@@ -7919,7 +8474,8 @@ def _emit_legacy_kg_deferral(
     from vco_lib import deferral_emit as _de
 
     detected_lines = _format_legacy_kg_detected(candidates)
-    cmd = _format_legacy_kg_command(project_name, weaviate_url, candidates)
+    cmd = _format_legacy_kg_command(
+        project_name, weaviate_url, candidates, project_folder=folder)
 
     detected = (
         f"During the per-project install, Weaviate at `{weaviate_url}` was "
@@ -8061,7 +8617,8 @@ def _emit_legacy_codegraph_deferral(
     from vco_lib import deferral_emit as _de
 
     detected_lines = _format_legacy_kg_detected(candidates)  # same renderer
-    cmd = _format_legacy_codegraph_command(project_name, weaviate_url, candidates)
+    cmd = _format_legacy_codegraph_command(
+        project_name, weaviate_url, candidates, project_folder=folder)
 
     detected = (
         f"During the per-project install, Weaviate at `{weaviate_url}` was "
@@ -8125,8 +8682,15 @@ def _normalise_prefix_for_match(s: str) -> str:
     lowercase. Must match the Rust rule so the Python orphan-detector and the
     Rust wizard agree on which prefixes are "the same". "VibeCoded_Orchestrator",
     "vibecodedorchestrator", "VibeCoded Orchestrator" all normalise equal.
+
+    v0.2.92 W8: the RULE now lives in ``vco_lib.project_identity`` (the Python
+    sibling of the Rust ``project_identity.rs``) so the identity resolver and
+    this module share ONE implementation; this stays as the historical import
+    path every existing caller/test uses. Behaviour is unchanged — it still
+    normalises the WHOLE string and does NOT reduce a class name to its prefix.
     """
-    return "".join(c.lower() for c in (s or "") if c.isascii() and c.isalnum())
+    from vco_lib.project_identity import normalise_for_match
+    return normalise_for_match(s)
 
 
 def _codegraph_keep_set_normalised() -> tuple[set[str], bool]:
@@ -8211,23 +8775,53 @@ def _detect_orphan_code_collections(
                               "object_count"}],
           "ondisk_orphans": [{"dir", "size_bytes"}],
           "keep_resolvable": bool,
+          "live_schema_resolvable": bool,
           "total_reclaim_bytes": int,
         }
 
-    HARD GUARD: when the keep-set is UNRESOLVABLE (launcher.db down), returns
-    EMPTY orphan lists — we never flag anything we can't positively attribute.
+    TWO HARD GUARDS, both returning EMPTY orphan lists — we never flag anything
+    we cannot positively attribute:
+
+    * ``keep_resolvable is False`` — launcher.db could not be read, so the
+      binding keep-set is unknown.
+    * ``live_schema_resolvable is False`` (v0.2.92 W18) — the LIVE SCHEMA could
+      not be read, so the live-class evidence is unknown.
+
+    The second guard is a data-safety FIX, not a symmetry nicety. The live class
+    list is used as an EXCLUSION set twice in branch (b): a dir matching a live
+    class is skipped, and a dir whose prefix has ANY live class is skipped. An
+    EMPTY exclusion set excludes NOTHING, so returning ``[]`` for "Weaviate is
+    down" made ``ondisk_orphans`` **WIDER**, not narrower — and the emitted
+    command is a filesystem-level ``rm`` the user pastes.
+    ``cross_project_keep_resolvable`` did not cover it: the keep-set comes from
+    launcher.db, so Weaviate-down + launcher.db-up sailed straight through, and
+    the detect-time snapshot then persisted the empty set as proof that
+    "nothing was live", which the reclaim's own re-check accepted. The safety
+    net removed itself.
 
     Injection points (``keep_set``, ``schema_fetcher``, ``ondisk_lister``)
-    exist for unit tests; production callers pass none.
+    exist for unit tests; production callers pass none. A ``schema_fetcher``
+    that RAISES is treated exactly like an unreadable live schema.
     """
     result: dict = {
         "live_orphans": [],
         "ondisk_orphans": [],
         "keep_resolvable": True,
+        # v0.2.92 W18 — TRI-STATE, like everything else that reports a probe in
+        # this module: True = the live schema was READ, False = the read was
+        # ATTEMPTED and failed, None = it was never attempted because an earlier
+        # guard (an unresolvable keep-set) already returned. Consumers that ACT
+        # on this detection must refuse on anything that is not True; the
+        # emitter refuses on an explicit False and is unreachable for None,
+        # because both guards return empty orphan lists.
+        "live_schema_resolvable": True,
+        "live_schema_unresolvable_reason": "",
         "total_reclaim_bytes": 0,
         # SEV-3 #1: detect-time snapshot of normalised prefixes that have ANY
-        # live code class (populated below while Weaviate is UP). Empty when
-        # Weaviate is unreachable at detect time.
+        # live code class (populated below while Weaviate is UP). Empty ONLY
+        # when the schema was READ and genuinely holds no code class — an
+        # unreadable schema now returns before this is populated, so the
+        # snapshot can no longer be persisted as a false "nothing was live".
         "live_prefixes_normalised": [],
     }
 
@@ -8240,13 +8834,29 @@ def _detect_orphan_code_collections(
 
     # DATA-SAFETY: cannot confirm the keep-set → flag NOTHING.
     if not keep_resolvable:
+        # The schema is never even ASKED for on this path, so claiming it was
+        # readable would be as untrue as claiming it was not. `None` = "not
+        # attempted", the third state of the same tri-state the rest of this
+        # module uses (`probe_classes_exist` already returns True/False/None).
+        result["live_schema_resolvable"] = None
         return result
 
     # ── (a) live-schema orphans ─────────────────────────────────────────
-    if schema_fetcher is not None:
-        live_classes = list(schema_fetcher())
-    else:
-        live_classes = _list_classes(weaviate_url)
+    # v0.2.92 W18 — CALL SITE 2 of 3 for `_list_classes`, and the one the
+    # tri-state exists for. "Could not read the schema" is treated EXACTLY like
+    # `keep_resolvable is False`: flag nothing, emit nothing, persist no
+    # snapshot. See the two-hard-guards paragraph in the docstring.
+    try:
+        if schema_fetcher is not None:
+            live_classes = list(schema_fetcher())
+        else:
+            live_classes = _list_classes(weaviate_url)
+    except Exception as _exc:  # noqa: BLE001 — could not check ≠ nothing live
+        result["live_schema_resolvable"] = False
+        result["live_schema_unresolvable_reason"] = (
+            getattr(_exc, "reason", "") or f"{type(_exc).__name__}: {_exc}"
+        )
+        return result
     live_class_set_lc = {c.lower() for c in live_classes}
 
     # SEV-3 #1: capture the DETECT-TIME live-prefix snapshot while Weaviate is
@@ -8326,6 +8936,16 @@ def _detect_orphan_code_collections(
             # it. This is the detect-time-snapshot guard against reclaiming an
             # active project's segment dir when its binding row is momentarily
             # absent (Weaviate is DOWN at reclaim, so this is the only chance).
+            #
+            # v0.2.92 W18 — this comment used to describe a guard that FAILED
+            # OPEN. `live_prefixes_normalised` is an EXCLUSION set, and it was
+            # built from a class list that returned `[]` on transport failure,
+            # so precisely when Weaviate was unreachable the set was empty, this
+            # skip never fired, and the "only chance" was spent excluding
+            # nothing. The function now returns before reaching here unless the
+            # schema was READ, so the set is only ever empty because the server
+            # genuinely holds no code class. A safety comment describing a guard
+            # that fails open is part of the defect, not documentation of it.
             if _pfx_norm and _pfx_norm in live_prefixes_normalised:
                 continue
             result["ondisk_orphans"].append({
@@ -8340,162 +8960,27 @@ def _detect_orphan_code_collections(
     return result
 
 
-def _format_orphan_code_command(
-    weaviate_url: str,
-    live_orphans: list[dict],
-    ondisk_orphans: list[dict],
-    volume_dir: Optional[str],
-    project_folder: Optional[str] = None,
-) -> str:
-    """Render the two CONSENTED, RE-VALIDATING cleanup commands for the
-    orphan-code deferral. Never renders a drop that isn't re-validated at run
-    time against the live binding table + live schema.
-    """
-    lines = [
-        "# ORPHAN CODE-COLLECTION CLEANUP — CONSENTED, re-validated at run time.",
-        "# Both commands re-probe the LIVE launcher.db bindings + live Weaviate",
-        "# schema BEFORE any drop (re-probe-before-acting) — a case-only variant",
-        "# of a live binding is NEVER dropped. Nothing here auto-runs.",
-        "",
-    ]
-    if live_orphans:
-        lines.append("# (a) LIVE-schema orphan classes (no current binding):")
-        for o in live_orphans:
-            cnt = o.get("object_count")
-            cnt_txt = f"{cnt} objects" if isinstance(cnt, int) else "count unknown"
-            lines.append(f"#     - {o['class_name']}  ({cnt_txt})")
-        lines.append(
-            "python -m vco_lib.project_init drop-orphan-code-collections "
-            f"--weaviate-url {weaviate_url!r} --confirm"
-        )
-        lines.append("")
-    if ondisk_orphans:
-        lines.append(
-            "# (b) ON-DISK stranded segment dirs (class ALREADY gone from the"
-        )
-        lines.append(
-            "#     live schema — Weaviate's schema DELETE cannot reclaim these)."
-        )
-        lines.append(
-            "#     FILESYSTEM-LEVEL reclaim. INVARIANT: Weaviate MUST be STOPPED"
-        )
-        lines.append(
-            "#     first — deleting a segment dir under a RUNNING Weaviate can"
-        )
-        lines.append(
-            "#     CORRUPT the volume (Weaviate holds the dir in its shard map)."
-        )
-        lines.append(
-            "#     The command REFUSES to run while Weaviate answers /v1/meta;"
-        )
-        lines.append(
-            "#     stop the weaviate container (launcher Services tab, or"
-        )
-        lines.append(
-            "#     `podman stop weaviate_claude` / `docker compose stop weaviate`),"
-        )
-        lines.append(
-            "#     run it, then restart Weaviate. GUARD (with Weaviate DOWN it"
-        )
-        lines.append(
-            "#     CANNOT re-fetch the schema): it removes ONLY dirs whose"
-        )
-        lines.append(
-            "#     normalised prefix is (a) NOT a live launcher.db code-graph"
-        )
-        lines.append(
-            "#     binding AND (b) NOT in the DETECT-TIME live-prefix snapshot"
-        )
-        lines.append(
-            "#     (captured while Weaviate was UP). It REFUSES everything when"
-        )
-        lines.append(
-            "#     the keep-set is unresolvable OR the snapshot is missing."
-        )
-        for o in ondisk_orphans:
-            mb = o["size_bytes"] / (1024 * 1024)
-            lines.append(f"#     - {o['dir']}  ({mb:.1f} MB)")
-        vd = volume_dir or "<weaviate-volume-dir>"
-        recl = (
-            "python -m vco_lib.project_init reclaim-stranded-code-segments "
-            f"--volume-dir {vd!r} --weaviate-url {weaviate_url!r} "
-            "--confirm --i-understand-filesystem-level"
-        )
-        # SEV-3 #1: pass the project folder so the reclaim can locate the
-        # detect-time live-prefix snapshot in `.claude/state/`.
-        if project_folder:
-            recl += f" --project-folder {str(project_folder)!r}"
-        lines.append(recl)
-        lines.append("")
-    return "\n".join(lines)
+# v0.2.92 W18: the two CONSENTED cleanup commands this deferral prints are pure
+# text derived from the detection, so they live next to the snapshot they
+# reference (`codegraph_orphan_snapshot`) and are unit-testable without a
+# deferral sink. A printed command is shipped code and gets the same review as
+# code that executes; giving it its own home is part of that.
+_format_orphan_code_command = _cos.render_cleanup_command
 
 
-# SEV-3 #1: detect-time live-prefix snapshot state file. The fs-level reclaim
-# runs with Weaviate DOWN and cannot re-fetch the schema, so the DETECT step
-# (Weaviate UP) persists which normalised prefixes had ANY live code class. The
-# reclaim reads this and REFUSES to rm a dir whose prefix was live at detect
-# time (the "active code-graph but momentarily-absent binding row" degenerate).
-_ORPHAN_LIVE_PREFIX_SNAPSHOT_FILENAME = "codegraph-orphan-live-prefixes.json"
-_ORPHAN_LIVE_PREFIX_SNAPSHOT_SCHEMA = "vco.codegraph_orphan_live_prefixes.v1"
+# v0.2.92 W18: the detect-time live-prefix snapshot — the handshake between the
+# detector (Weaviate UP) and the fs-level reclaim (Weaviate DOWN by
+# construction) — now lives in `vco_lib.codegraph_orphan_snapshot`, together
+# with the tri-state read that neutralises a snapshot written during an outage
+# by a pre-v0.2.92 run. Thin aliases keep the historical names their callers and
+# tests use.
+_ORPHAN_LIVE_PREFIX_SNAPSHOT_FILENAME = _cos.SNAPSHOT_FILENAME
+_ORPHAN_LIVE_PREFIX_SNAPSHOT_SCHEMA = _cos.SNAPSHOT_SCHEMA
+_WHAT_ORPHAN_SNAPSHOT = _cos.WHAT_SNAPSHOT
 
-
-def _orphan_live_prefix_snapshot_path(folder: Path) -> Path:
-    """Path of the detect-time live-prefix snapshot state file."""
-    return (
-        Path(folder) / ".claude" / "state"
-        / _ORPHAN_LIVE_PREFIX_SNAPSHOT_FILENAME
-    )
-
-
-def _write_orphan_live_prefix_snapshot(
-    folder: Path, live_prefixes_normalised: list[str],
-) -> bool:
-    """Persist the detect-time normalised live-prefix set. Best-effort:
-    returns False on I/O failure rather than raising."""
-    p = _orphan_live_prefix_snapshot_path(folder)
-    payload = {
-        "schema": _ORPHAN_LIVE_PREFIX_SNAPSHOT_SCHEMA,
-        "live_prefixes_normalised": sorted(
-            {s for s in (live_prefixes_normalised or []) if s}
-        ),
-        "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        from vco_lib.atomic import atomic_write_text
-        atomic_write_text(p, json.dumps(payload, indent=2) + "\n")
-        return True
-    except Exception:
-        try:
-            p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            return True
-        except Exception:
-            return False
-
-
-def _read_orphan_live_prefix_snapshot(
-    folder: Path,
-) -> tuple[set[str], bool]:
-    """Read the detect-time live-prefix snapshot.
-
-    Returns ``(normalised_prefixes, present)``. ``present`` is False when the
-    file is missing/malformed — the reclaim treats a MISSING snapshot as
-    "cannot confirm which prefixes were live → refuse the fs reclaim entirely"
-    (conservative data-safety; the file is written whenever a deferral is
-    emitted, so its absence at reclaim time is an anomaly worth refusing on)."""
-    p = _orphan_live_prefix_snapshot_path(folder)
-    try:
-        raw = p.read_text(encoding="utf-8")
-    except Exception:
-        return (set(), False)
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return (set(), False)
-    vals = data.get("live_prefixes_normalised")
-    if not isinstance(vals, list):
-        return (set(), False)
-    return ({str(v) for v in vals if isinstance(v, str) and v}, True)
+_orphan_live_prefix_snapshot_path = _cos.snapshot_path
+_write_orphan_live_prefix_snapshot = _cos.write_snapshot
+_read_orphan_live_prefix_snapshot = _cos.read_snapshot
 
 
 def _emit_orphan_code_collections_deferral(
@@ -8510,7 +8995,21 @@ def _emit_orphan_code_collections_deferral(
     SEV-3 #1: also persists the detect-time live-prefix snapshot (Weaviate is UP
     here) into `.claude/state/` so the later fs-level reclaim (Weaviate DOWN) can
     refuse any dir whose prefix was live at detect time.
+
+    v0.2.92 W18: REFUSES outright when the detection says the live schema was
+    unreadable — no entry, and specifically NO SNAPSHOT. Writing a snapshot from
+    an unreadable schema is what let the reclaim's own re-check pass on an empty
+    "nothing was live" set. The detector already returns empty lists in that
+    state, so this is defence in depth; the test seam is what makes it worth
+    having.
     """
+    # The check is `is False` on purpose: only a PRODUCER that positively
+    # reported "I could not read the schema" refuses the emit. A dict without
+    # the key is a legacy/hand-built detection, not a claim about the schema —
+    # and `tests/test_v0292_wp4_orphan_fail_open.py` pins that the real detector
+    # always sets the key, so the missing-key path is never a production shape.
+    if detection.get("live_schema_resolvable") is False:
+        return False
     live_orphans = detection.get("live_orphans", []) or []
     ondisk_orphans = detection.get("ondisk_orphans", []) or []
     if not live_orphans and not ondisk_orphans:
@@ -8565,11 +9064,16 @@ def _emit_orphan_code_collections_deferral(
             "data (CLAUDE.md rule 1) — the user runs the guarded commands "
             "explicitly. The DROP command (a) re-probes the live binding table "
             "+ live schema before any drop, so a case-only variant of a live "
-            "binding is never dropped. The fs-level RECLAIM runs with Weaviate "
-            "down and CANNOT re-fetch the schema, so it instead guards against "
-            "BOTH the live binding keep-set AND the detect-time live-prefix "
-            "snapshot (captured while Weaviate was up), and refuses everything "
-            "when either is unavailable."
+            "binding is never dropped, and it REFUSES (exit 2) rather than "
+            "reporting zero orphans when either probe cannot run. The fs-level "
+            "RECLAIM runs with Weaviate down and CANNOT re-fetch the schema, "
+            "so it instead guards against BOTH the live binding keep-set AND "
+            "the detect-time live-prefix snapshot (captured while Weaviate was "
+            "up), and removes nothing when the keep-set is unresolvable or the "
+            "snapshot is missing, malformed, or written by a pre-v0.2.92 run "
+            "that could not prove it had read the live schema. This entry "
+            "itself is only ever written from a detection whose live-schema "
+            "read SUCCEEDED."
         ),
         command_to_apply=cmd,
         severity="warning",
@@ -8592,6 +9096,17 @@ def _revalidated_orphan_live_classes(weaviate_url: str) -> list[str]:
     consented drop command re-derives the orphan set from the CURRENT launcher
     bindings + CURRENT live schema, never the stale snapshot. Returns [] when
     the keep-set is unresolvable (refuse to drop anything).
+
+    Raises:
+        vco_lib.weaviate_helpers.ProbeUnavailable: the live schema could not be
+            read. v0.2.92 W18 — CALL SITE 3 of 3. This used to return ``[]``,
+            which the caller printed as *"no orphans to drop after run-time
+            re-validation … or all reclaimed already"*: a "the work is done"
+            message for a run that verified nothing. The drop was already
+            fail-CLOSED (an empty list drops nothing), so this changes no
+            deletion — it changes an answer that was WRONG into a refusal that
+            says why. :func:`_cmd_drop_orphan_code_collections` converts it to
+            exit 2.
     """
     keep_set, resolvable = _codegraph_keep_set_normalised()
     if not resolvable:
@@ -8626,57 +9141,22 @@ def _revalidated_orphan_live_classes(weaviate_url: str) -> list[str]:
 # `codegraph_prefix_drift_detected` deferral (consent — never auto-migrate).
 # ═══════════════════════════════════════════════════════════════════════════
 
-_CODEGRAPH_PREFIX_GEN_FILENAME = "codegraph-prefix-generation.json"
-_CODEGRAPH_PREFIX_GEN_SCHEMA = "vco.codegraph_prefix_generation.v1"
+# v0.2.92 W18: the record's FORMAT, reads, write and staleness decision now
+# live in `vco_lib.codegraph_prefix_record` (project_init is >16k lines;
+# CLAUDE.md forbids growing it further, and the record is a self-contained
+# concern). The names below are thin aliases kept because every existing caller
+# and four test modules reach for them here. `project_init` keeps only the I/O
+# at the edges: the Weaviate probe that supplies the evidence and the deferral
+# emission that consumes the decision.
+_CODEGRAPH_PREFIX_GEN_FILENAME = _cpr.RECORD_FILENAME
+_CODEGRAPH_PREFIX_GEN_SCHEMA = _cpr.RECORD_SCHEMA
+_PREFIX_SOURCE_BINDING = _cpr.SOURCE_BINDING
+_PREFIX_SOURCE_DERIVED = _cpr.SOURCE_DERIVED
 
-
-def _codegraph_prefix_gen_path(folder: Path) -> Path:
-    """Return the per-project code-prefix generation state file path
-    (`<folder>/.claude/state/codegraph-prefix-generation.json`)."""
-    return Path(folder) / ".claude" / "state" / _CODEGRAPH_PREFIX_GEN_FILENAME
-
-
-def _read_codegraph_prefix_generation(folder: Path) -> Optional[str]:
-    """Read the recorded last-seen code-graph prefix for this project, or None.
-
-    Soft-fail: returns None on any error (missing file / malformed JSON).
-    """
-    p = _codegraph_prefix_gen_path(folder)
-    try:
-        raw = p.read_text(encoding="utf-8")
-    except Exception:
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return None
-    val = data.get("collection_prefix")
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    return None
-
-
-def _write_codegraph_prefix_generation(folder: Path, prefix: str) -> bool:
-    """Atomic-write the last-seen code-graph prefix generation. Best-effort:
-    returns False on any I/O failure rather than raising (recording is an aid,
-    not a hard requirement)."""
-    p = _codegraph_prefix_gen_path(folder)
-    payload = {
-        "schema": _CODEGRAPH_PREFIX_GEN_SCHEMA,
-        "collection_prefix": prefix,
-        "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        from vco_lib.atomic import atomic_write_text
-        atomic_write_text(p, json.dumps(payload, indent=2) + "\n")
-        return True
-    except Exception:
-        try:
-            p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            return True
-        except Exception:
-            return False
+_codegraph_prefix_gen_path = _cpr.record_path
+_read_codegraph_prefix_generation = _cpr.read_prefix
+_read_codegraph_prefix_generation_source = _cpr.read_source
+_write_codegraph_prefix_generation = _cpr.write
 
 
 def detect_codegraph_prefix_drift(
@@ -8685,32 +9165,99 @@ def detect_codegraph_prefix_drift(
     *,
     emit_deferral: bool = True,
     weaviate_url: Optional[str] = None,
+    code_prefix: Optional[str] = None,
+    live_class_probe: Optional[Callable[..., dict]] = None,
 ) -> Optional[dict]:
     """Detect a code-graph prefix-generation drift for a project (FIX-C-RECUR).
 
-    Compares the CURRENT canonical code prefix (from the sanitizer) against the
-    last-seen generation recorded in `.claude/state/`. On a DIFFERENCE:
+    Compares the CURRENT canonical code prefix against the last-seen generation
+    recorded in `.claude/state/`. On a DIFFERENCE:
       * emit a `codegraph_prefix_drift_detected` deferral (consent — names the
         old + new prefix + the consented migrate/cleanup command),
       * DO NOT auto-migrate.
     On NO change (or first-ever run): record the current prefix silently and
     return None.
 
+    Args:
+        code_prefix: the AUTHORITATIVE prefix — the project's bound
+            ``project_codegraph_bindings.collection_prefix`` (v0.2.92 W8).
+            ``None`` falls back to ``derive_project_code_prefix(project_name)``,
+            which is correct ONLY when ``project_name`` is itself authoritative.
+            The install caller now always passes the binding, because the guard
+            previously recorded a prefix sanitized from the FOLDER BASENAME:
+            for a project whose folder does not match its registered name that
+            record described a collection set that never existed, so the drift
+            condition fired off a false premise AND the state file itself became
+            inconsistent with the live binding.
+
+            v0.2.92 F-3 tightened what may be passed here: ONLY a prefix backed
+            by a real ``project_codegraph_bindings`` row. The identity resolver
+            fills ``codegraph_prefix`` with a name sanitization for a
+            registered-but-unanalyzed project AND for the basename identity it
+            returns when the folder match fails (stale ``projects.folder_path``
+            after an out-of-protocol move; a case-insensitive filesystem). Those
+            reached this function indistinguishable from a real binding, so the
+            record was overwritten with a WRONG value stamped ``"binding"`` and
+            a FALSE drift deferral was emitted — the original poisoning, now
+            wearing an authoritative label. Use
+            ``ProjectIdentity.authoritative_codegraph_prefix()``.
+
+    Derived-cannot-outrank rule (v0.2.92 F-3): when ``code_prefix`` is absent
+    (so ``current`` is a derivation) and the RECORDED value's provenance is
+    ``"binding"`` or UNKNOWN (a pre-v0.2.92 record), a disagreement is NOT
+    reported and the record is NOT rewritten — we have no authoritative answer,
+    so we write none. Two DERIVED generations disagreeing is still reported:
+    that is a genuine sanitizer-generation change on an unregistered project,
+    which is what this guard is for.
+
+    Poisoned-record correction (W8): when the RECORDED prefix is provably the
+    folder-basename derivation and the authoritative prefix differs, the record
+    is a leftover of that bug, not evidence of a sanitizer-generation change —
+    it is silently re-derived to the authoritative value (with an
+    auto-resolution row for the audit trail) instead of raising a false drift.
+    Any genuinely orphaned old-generation classes remain covered by the
+    legacy-code-graph detector, which scans the live schema rather than trusting
+    this file.
+
+    Live-class evidence gate (v0.2.92 W18): when ``weaviate_url`` names a
+    server, the two prefixes are additionally checked AGAINST IT before any
+    claim is made — three of five measured live records named a prefix matching
+    ZERO live classes, so the string compare alone was reporting "drift" for
+    records that never described a real collection set.
+
+    ======================  ===========================================
+    live-class evidence     what happens
+    ======================  ===========================================
+    recorded has classes    drift reported; the reclaim command names them
+    recorded has none, and  record silently re-derived to the binding,
+    an AUTHORITATIVE         auto-resolution row written, NO deferral
+    current has classes
+    recorded has none,      drift reported WITHOUT claiming anything is
+    nothing to correct to    orphaned and WITHOUT a reclaim command
+    could not check         historic behaviour, and the entry says the
+    (or no URL given)        live schema was NOT consulted
+    ======================  ===========================================
+
+    ``live_class_probe`` is the test seam for that probe (same shape as
+    :func:`probe_classes_exist`); production leaves it ``None``.
+
     Returns a dict ``{"old_prefix", "new_prefix"}`` when drift was detected,
     else None. Best-effort throughout (never raises into the caller).
     """
+    authoritative = bool((code_prefix or "").strip())
     try:
-        current = derive_project_code_prefix(project_name)
+        current = (code_prefix or "").strip() or derive_project_code_prefix(project_name)
     except Exception:
         return None
     if not current:
         return None
+    source = _PREFIX_SOURCE_BINDING if authoritative else _PREFIX_SOURCE_DERIVED
 
     recorded = _read_codegraph_prefix_generation(folder)
 
     if recorded is None:
         # First-ever observation — record the baseline, no drift.
-        _write_codegraph_prefix_generation(folder, current)
+        _write_codegraph_prefix_generation(folder, current, source=source)
         return None
 
     if _normalise_prefix_for_match(recorded) == _normalise_prefix_for_match(current):
@@ -8718,23 +9265,138 @@ def detect_codegraph_prefix_drift(
         # normalised compare — the collections are the SAME logical set).
         # Refresh the exact-cased record and return.
         if recorded != current:
-            _write_codegraph_prefix_generation(folder, current)
+            _write_codegraph_prefix_generation(folder, current, source=source)
         return None
 
-    # DRIFT: the sanitizer produced a genuinely different prefix generation.
+    # ── v0.2.92 F-3: a DERIVED prefix may not overwrite, nor contradict, a
+    # record it cannot outrank. ────────────────────────────────────────────
+    # We are here with `recorded != current`. When `current` is only a
+    # name/basename derivation, the disagreement has two possible causes and we
+    # cannot tell them apart:
+    #   (a) a genuine sanitizer-generation change — the case this guard exists
+    #       for; or
+    #   (b) OUR value is the wrong one, because the project IS registered but
+    #       the folder match failed (stale `projects.folder_path` after an
+    #       out-of-protocol move — the very event class that opened this
+    #       incident — or a case-insensitive filesystem), so `resolve_identity`
+    #       handed back the basename identity.
+    # In (b) the recorded value is the GOOD one and emitting drift + rewriting
+    # the record reproduces the original poisoning, now with an authoritative
+    # label on it. So: when the RECORD claims (or may have) binding provenance
+    # and we hold only a derivation, do nothing at all — no deferral, no write.
+    # Two derived generations disagreeing IS reportable (that is (a) with both
+    # sides comparable), which keeps the guard alive for genuinely unregistered
+    # standalone projects.
+    if not authoritative:
+        recorded_source = _read_codegraph_prefix_generation_source(folder)
+        if recorded_source != _PREFIX_SOURCE_DERIVED:
+            # "binding" (outranks us) or None (pre-v0.2.92 record, provenance
+            # unknown — the population that carries the field poisoning).
+            _log_auto(
+                f"codegraph prefix-generation: recorded {recorded!r} "
+                f"(source={recorded_source or 'unknown'}) is not outranked by "
+                f"the DERIVED {current!r} — leaving the record untouched and "
+                f"reporting no drift (v0.2.92 F-3)"
+            )
+            return None
+
+    # W8 poisoned-record correction — only ever taken when we hold an
+    # AUTHORITATIVE prefix to correct TO.
+    if authoritative and _recorded_prefix_is_basename_poison(folder, recorded):
+        _write_codegraph_prefix_generation(folder, current, source=source)
+        try:
+            from vco_lib import deferral_emit as _de
+            _de.record_auto_resolution(
+                folder,
+                "codegraph_prefix_drift_detected",
+                "corrected_basename_derived_prefix_record",
+                f"recorded code-graph prefix {recorded!r} was derived from the "
+                f"folder basename, not from this project's binding; re-derived "
+                f"to the authoritative {current!r} instead of reporting a "
+                f"false prefix drift",
+                log=_log_auto,
+            )
+        except Exception:  # noqa: BLE001 — observability, never a gate
+            pass
+        return None
+
+    # ── v0.2.92 W18: LIVE-CLASS EVIDENCE GATE ─────────────────────────────
+    # Everything above compares two STRINGS. Measured across five live installs,
+    # THREE state files named a prefix matching ZERO live Weaviate classes — a
+    # record that never addressed a real collection set. Comparing it as though
+    # it were a generation produced a deferral asserting the old classes "are
+    # now ORPHANED" and printing a reclaim command for collections that do not
+    # exist. So before claiming drift, ask the server.
+    #
+    # The probe runs ONLY when the caller NAMED a server (`weaviate_url`). No
+    # URL, no evidence, no new branch — which keeps every existing direct caller
+    # (and its tests) on the historic path and keeps this function hermetic by
+    # default instead of reaching for an ambient localhost.
+    evidence = _cpr.EVIDENCE_REPORT_UNVERIFIED
+    if weaviate_url:
+        try:
+            recorded_live = probe_prefix_has_live_code_classes(
+                recorded, weaviate_url, probe=live_class_probe,
+            )
+            current_live = probe_prefix_has_live_code_classes(
+                current, weaviate_url, probe=live_class_probe,
+            )
+            evidence = _cpr.classify_generation_evidence(
+                recorded_live=recorded_live,
+                current_live=current_live,
+                current_is_authoritative=authoritative,
+            )
+        except Exception:  # noqa: BLE001 — evidence is an aid, never a gate
+            evidence = _cpr.EVIDENCE_REPORT_UNVERIFIED
+
+    if evidence == _cpr.EVIDENCE_HEAL_TO_CURRENT:
+        # The recorded prefix addresses NOTHING on this server and the
+        # AUTHORITATIVE one addresses live classes: the record was wrong, not
+        # stale. Correct it silently — same disposition as the W8 poisoned-
+        # record branch above, which this generalises to records whose wrongness
+        # did not come from the folder basename (one of the three measured
+        # cases was a KG-rule/code-rule divergence in the writer instead).
+        _write_codegraph_prefix_generation(folder, current, source=source)
+        try:
+            from vco_lib import deferral_emit as _de
+            _de.record_auto_resolution(
+                folder,
+                "codegraph_prefix_drift_detected",
+                "corrected_prefix_record_naming_no_live_class",
+                f"recorded code-graph prefix {recorded!r} matches ZERO live "
+                f"classes at {weaviate_url}, while the bound {current!r} "
+                f"matches at least one; re-derived the record to the binding "
+                f"instead of reporting a prefix drift with nothing to reclaim",
+                log=_log_auto,
+            )
+        except Exception:  # noqa: BLE001 — observability, never a gate
+            pass
+        return None
+
+    # DRIFT: a genuinely different prefix generation.
     drift = {"old_prefix": recorded, "new_prefix": current}
     if emit_deferral:
         try:
             _emit_codegraph_prefix_drift_deferral(
                 folder, project_name, recorded, current,
                 weaviate_url=weaviate_url,
+                old_classes_live=(
+                    True if evidence == _cpr.EVIDENCE_REPORT_OLD_CLASSES_LIVE
+                    else False if evidence == _cpr.EVIDENCE_REPORT_OLD_CLASSES_ABSENT
+                    else None
+                ),
             )
         except Exception:
             pass
     # Record the NEW generation so the deferral fires ONCE per drift, not every
     # run (the user consents + migrates; the next run sees no further drift).
-    _write_codegraph_prefix_generation(folder, current)
+    _write_codegraph_prefix_generation(folder, current, source=source)
     return drift
+
+
+# v0.2.92 W18: moved to `vco_lib.codegraph_prefix_record` with the rest of the
+# record's logic; alias kept under the historical name.
+_recorded_prefix_is_basename_poison = _cpr.recorded_is_basename_derivation
 
 
 def _emit_codegraph_prefix_drift_deferral(
@@ -8744,31 +9406,30 @@ def _emit_codegraph_prefix_drift_deferral(
     new_prefix: str,
     *,
     weaviate_url: Optional[str] = None,
+    old_classes_live: Optional[bool] = None,
 ) -> None:
-    """Emit `codegraph_prefix_drift_detected` (consent — never auto-migrate)."""
+    """Emit `codegraph_prefix_drift_detected` (consent — never auto-migrate).
+
+    ``old_classes_live`` is the TRI-STATE live-schema evidence about the OLD
+    prefix (v0.2.92 W18): ``True`` = its classes exist, ``False`` = the schema
+    was read and they do not, ``None`` = not checked / could not check. It
+    decides what this entry is allowed to CLAIM. Only ``True`` may say the old
+    classes are orphaned and print the reclaim command — a printed command is
+    shipped code, and a reclaim aimed at a collection set that does not exist
+    is the false-premise shape this cycle exists to remove.
+    """
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import deferral_emit as _de
 
     wv = weaviate_url or _weaviate_url_default()
-    old_classes = ", ".join(f"{old_prefix}{s}" for s in _CODEGRAPH_SUFFIXES)
-    detected = (
-        f"The code-graph collection prefix for project {project_name!r} "
-        f"changed from {old_prefix!r} to {new_prefix!r} (a sanitizer-"
-        f"generation change). The previous generation's code classes "
-        f"({old_classes}) are now ORPHANED — the analyzer writes only to the "
-        f"NEW prefix, so the old set accumulates dead on-disk segments unless "
-        f"migrated or dropped."
-    )
-    cmd = (
-        "# The old code-graph classes are orphaned by the prefix change.\n"
-        "# Reclaim them (CONSENTED) — the detector re-validates against the\n"
-        "# live binding table before any drop:\n"
-        "python -m vco_lib.project_init detect-orphan-code-collections "
-        f"--weaviate-url {wv!r} --project-folder {str(folder)!r}\n"
-        "# then run the drop command it prints in "
-        "`orphan_code_collections_detected`.\n"
-        "# The new-prefix code graph is (re)built by re-running the analyzer:\n"
-        f".claude/scripts/code-graph-analyze . --project {project_name!r}"
+    # The three TEXT variants are a pure function of the evidence, so they live
+    # next to the record they describe (`codegraph_prefix_record`) and are unit-
+    # tested there without a deferral sink. `_CODEGRAPH_SUFFIXES` is passed in
+    # rather than re-listed: this module owns that SSOT.
+    detected, cmd = _cpr.render_drift_entry_text(
+        folder, project_name, old_prefix, new_prefix,
+        weaviate_url=wv, code_suffixes=_CODEGRAPH_SUFFIXES,
+        old_classes_live=old_classes_live,
     )
     entry = DeferralEntry(
         condition_id="codegraph_prefix_drift_detected",
@@ -8800,73 +9461,26 @@ def _emit_codegraph_prefix_drift_deferral(
 # stays single-owned by Python (the launcher never hand-parses it).
 # ---------------------------------------------------------------------------
 
-# Suffix appended to a live file path to form its safe-add reference sidecar
-# (e.g. `.env` -> `.env.vco.reference`). The Rust launcher uses the same string
-# when it writes the `.env` reference; kept here so the git-exclude pattern
-# below matches it too.
-_SAFE_ADD_SIDECAR_SUFFIX = ".vco.reference"
-
-# v0.2.63 (C1 fix — "check if files are VCO's or user's"): the safe-add
-# `.git/info/exclude` entries are computed PER-ADD from the files VCO actually
-# created (`_safe_add_exclude_entries`), NOT a blanket dir-glob. A blanket
-# `/.vscode/` or `/infrastructure/` or `/knowledge/` would silently hide a
-# user's OWN same-named dir (those names are common in existing projects —
-# safe-add's whole purpose). So we exclude only VCO-created paths.
+# v0.2.92 W3 (§3 item 11): the `.git/info/exclude` machinery moved to
+# `vco_lib/git_exclude.py` when `vco_lib/project_move.py` became a third
+# caller. The names below are thin re-exports so the two call sites in this
+# module (and the direct unit tests in tests/test_safe_add_bundle.py) keep
+# working against ONE implementation.
 #
-# Top-level entries that are UNAMBIGUOUSLY VCO's (a user can't own them) →
-# collapse to a single dir/file glob instead of listing every created file
-# under them. Everything else is excluded as its SPECIFIC created path.
-_SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL = {
-    ".claude": "/.claude/",
-    ".vco-manifest.json": "/.vco-manifest.json",
-}
+# `_write_file_atomic` is threaded in explicitly rather than letting the
+# shared helper pick its own writer: this module's writer REFUSES to write
+# through a symlinked target or parent (v0.2.53 NEW-8/B3), and an extraction
+# that silently dropped that defense would be a security regression disguised
+# as a refactor.
+_SAFE_ADD_SIDECAR_SUFFIX = _git_exclude.SAFE_ADD_SIDECAR_SUFFIX
+_SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL = _git_exclude.VCO_EXCLUSIVE_TOPLEVEL
 
 
 def _safe_add_exclude_entries(result: dict, folder: Path) -> list:
     """Compute the `.git/info/exclude` entries for ONLY the paths VCO actually
-    created in THIS add — collision-safe (never a blanket dir-glob that could
-    hide a user's own `.vscode/` / `infrastructure/` / `knowledge/` files).
-
-    VCO-exclusive top-level namespaces (`.claude/`, `.vco-manifest.json`)
-    collapse to one glob; every other VCO-created path is excluded SPECIFICALLY
-    (e.g. `/infrastructure/docker-compose.yml`, not `/infrastructure/`). Plus the
-    Rust-written `.env.vco.reference` sidecar (not in the Python create list).
+    created in THIS add. See :func:`vco_lib.git_exclude.safe_add_exclude_entries`.
     """
-    actions = result.get("actions", {}) or {}
-    created: list = []
-    for key in ("create", "overwrite", "always-overwrite"):
-        created.extend(actions.get(key, []) or [])
-
-    entries: list = []
-    seen = set()
-
-    def _add(entry: str) -> None:
-        if entry and entry not in seen:
-            seen.add(entry)
-            entries.append(entry)
-
-    for rel in created:
-        rel = str(rel).replace("\\", "/").lstrip("/")
-        if not rel:
-            continue
-        top = rel.split("/", 1)[0]
-        glob = _SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL.get(top)
-        if glob is not None:
-            _add(glob)
-        else:
-            # A specific VCO-created path (a root file like CLAUDE.md, or a file
-            # inside a possibly-user-owned dir like .vscode/ or infrastructure/).
-            # Anchored so it matches ONLY this exact path the user did not author.
-            _add("/" + rel)
-
-    # The manifest is VCO's even if `actions` didn't enumerate it.
-    if result.get("manifest_written"):
-        _add("/.vco-manifest.json")
-    # The Rust launcher wrote the `.env` reference sidecar before this step.
-    sidecar = ".env" + _SAFE_ADD_SIDECAR_SUFFIX
-    if (folder / sidecar).exists():
-        _add("/" + sidecar)
-    return entries
+    return _git_exclude.safe_add_exclude_entries(result, folder)
 
 
 def _append_git_info_exclude(
@@ -8874,79 +9488,15 @@ def _append_git_info_exclude(
 ) -> dict:
     """Idempotently append ``paths`` to ``<folder>/.git/info/exclude``.
 
-    `.git/info/exclude` is the LOCAL-only ignore file: it is never committed
-    (unlike the tracked `.gitignore`), so adding VCO-created paths there keeps
-    them out of the user's commits without modifying any tracked file.
-
-    Soft-fail + idempotent:
-      - No `.git` directory (not a git repo, or a bare/worktree layout where
-        `.git` is a file) -> action="not_a_git_repo", no-op.
-      - Entry already present (exact-line match) -> not re-added.
-      - Write failure -> action="write_failed:<ErrorClass>", no raise.
-
-    Returns ``{"action": str, "added": [str, ...], "path": str}``. Actions:
-      - "appended"        — one or more new lines written.
-      - "noop"            — every path already present.
-      - "not_a_git_repo"  — no `.git` directory.
-      - "write_failed:*"  — append raised OSError.
-
-    v0.2.63 (safe-add): keeps VCO files out of the user's Bitbucket/Git repo.
+    See :func:`vco_lib.git_exclude.append_git_info_exclude`. The local
+    ``_write_file_atomic`` (symlink-refusing) is injected as the writer so
+    behaviour is unchanged from the pre-extraction implementation.
     """
-    git_dir = folder / ".git"
-    result: dict = {"action": "not_a_git_repo", "added": [], "path": ""}
-    # Only the standard (non-bare, non-submodule-file) layout is handled. When
-    # `.git` is a file (worktree/submodule pointer) we conservatively skip —
-    # resolving the real gitdir is out of scope and the user can exclude
-    # manually.
-    if not git_dir.is_dir():
-        return result
-
-    info_dir = git_dir / "info"
-    exclude_path = info_dir / "exclude"
-    result["path"] = str(exclude_path)
-
-    try:
-        existing = (
-            exclude_path.read_text(encoding="utf-8")
-            if exclude_path.exists()
-            else ""
-        )
-    except OSError as e:
-        result["action"] = f"write_failed:{type(e).__name__}"
-        return result
-
-    # Exact-line membership check (strip trailing whitespace per line).
-    present = {line.strip() for line in existing.splitlines()}
-    to_add = [p for p in paths if p not in present]
-    if not to_add:
-        result["action"] = "noop"
-        return result
-
-    block_lines = [
-        "",
-        "# VCO safe-add (v0.2.63): keep orchestrator-created files out of "
-        "your commits.",
-        "# This is .git/info/exclude (LOCAL-only) — not the tracked "
-        ".gitignore.",
-    ]
-    block_lines.extend(to_add)
-    block = "\n".join(block_lines) + "\n"
-
-    # Ensure we don't glue onto a non-newline-terminated last line.
-    prefix = existing
-    if prefix and not prefix.endswith("\n"):
-        prefix += "\n"
-
-    try:
-        info_dir.mkdir(parents=True, exist_ok=True)
-        _write_file_atomic(exclude_path, (prefix + block).encode("utf-8"))
-    except OSError as e:
-        result["action"] = f"write_failed:{type(e).__name__}"
-        return result
-
-    result["action"] = "appended"
-    result["added"] = to_add
-    return result
+    return _git_exclude.append_git_info_exclude(
+        folder,
+        paths,
+        write_bytes=lambda path, data: _write_file_atomic(path, data),
+    )
 
 
 def _emit_safe_add_skipped_env_merge_deferral(
@@ -9299,6 +9849,7 @@ def install_project_bundle(
     log_event: Optional[Callable[..., None]] = None,
     safe_add: bool = False,
     skip_kinds: frozenset[str] = frozenset(),
+    _classification_only: bool = False,
 ) -> dict:
     """Install (or update) the per-project Claude bundle in `folder`.
 
@@ -9341,6 +9892,15 @@ def install_project_bundle(
             (empty frozenset) is byte-identical to the historical behaviour. Used
             by install.py's WP-1 delegated call to map the legacy
             ``--skip-materialize-claude-dir`` flag (→ skip hooks/scripts/settings).
+        _classification_only: v0.2.92 WP-D INTERNAL seam — set by the
+            bundle-staleness census and the post-install self-check, which
+            re-run the engine in dry-run purely to CLASSIFY files. Skips the
+            knowledge-residue / foreign-row step (a detect-only Weaviate
+            round trip that belongs to a real install's report, not to a
+            classification re-entry — and re-entering it would double-count
+            the wiring in every caller that observes one install). No effect
+            unless combined with ``dry_run=True``; never set it from user
+            surfaces.
 
     Returns a JSON-serialisable dict:
       {
@@ -9395,6 +9955,12 @@ def install_project_bundle(
     skip_kinds = frozenset(skip_kinds) & BUNDLE_SKIP_KINDS
 
     folder = Path(folder).resolve()
+    # Captured BEFORE this run writes anything: a project that already has a
+    # bundle manifest was installed by an EARLIER orchestrator, so its KG was
+    # built under an earlier chunker revision. `update_mode` alone cannot say
+    # this — a brand-new project can be created by an update run — which is
+    # exactly the distinction the chunker gate needs (round-3 BLOCKER-A).
+    _had_prior_install = (folder / _MANIFEST_REL).exists()
     if not folder.exists() or not folder.is_dir():
         # v0.2.85 D2: action-key set derived from the ONE schema tuple
         # (BUNDLE_ACTION_KEYS) — no drifting literal. This is the early-return
@@ -9431,6 +9997,9 @@ def install_project_bundle(
     # `_enumerate_bundle_files` → `_enumerate_knowledge_ops`) and the
     # knowledge-retirement branch in the orphan loop below.
     is_root_target = _is_root_bundle_target(orchestrator_root, folder)
+    # v0.2.92 WP-D: ONE version resolution feeds both envelope fields (and,
+    # below, the manifest payload) — a single git spawn + pyproject read.
+    _run_semver, _run_commit = _running_vco_version_pair(orchestrator_root)
 
     result: dict = {
         "folder": str(folder),
@@ -9454,7 +10023,10 @@ def install_project_bundle(
         "actions": {k: [] for k in BUNDLE_ACTION_KEYS},
         "settings_action": "",
         "manifest_written": False,
-        "vco_version": _resolve_vco_version(orchestrator_root),
+        # v0.2.92 WP-D: version SSOT — semver (pyproject) + commit (git),
+        # two fields, two meanings. Pre-v0.2.92 this held a git SHA.
+        "vco_version": _run_semver,
+        "vco_commit": _run_commit,
         "warnings": [],
         "errors": [],
     }
@@ -9840,11 +10412,11 @@ def install_project_bundle(
     orphan_retired: list[str] = []  # v0.2.83 B-F5: kept-on-disk, manifest-retired
     knowledge_retired: list[str] = []
     prior_files: dict = manifest.get("files", {}) or {}
-    new_files_keys = set(new_files.keys())
-    # Compute orphans BEFORE we also include user-modified preserves —
-    # the preserved files write their prior entry into new_files (line
-    # ~4456), so subtracting new_files_keys from prior_files gives the
-    # paths the new run truly did NOT see.
+    # Orphans are prior_files MINUS what THIS run ENUMERATED AS OPS — never
+    # minus `new_files`: user-modified preserves write their PRIOR manifest
+    # entry back into `new_files`, so that subtraction would hide a genuinely
+    # retired path the moment it was also preserved. (v0.2.92: this comment
+    # described a `new_files_keys` set that was built and never read.)
     seen_in_ops = {op.dest_rel for op in ops}
     for prior_rel, prior_entry in prior_files.items():
         if prior_rel in seen_in_ops:
@@ -9913,6 +10485,12 @@ def install_project_bundle(
                 try:
                     target_path.unlink()
                     orphan_deleted.append(prior_rel)
+                    # v0.2.92 delivery audit m1: an upstream-deleted skill
+                    # must not linger as an empty directory. Best-effort;
+                    # never removes user content (rmdir = empty-only).
+                    from vco_lib.fs_prune import prune_now_empty_parents
+
+                    prune_now_empty_parents(folder, target_path.parent)
                 except OSError as e:
                     _log("4.bundle.orphan", "warn",
                          f"could not delete orphan {prior_rel}: {e}",
@@ -9982,7 +10560,12 @@ def install_project_bundle(
     # rows-before-file ordering) live in `vco_lib.knowledge_residue`;
     # foreign-row guards (shared-identity skip, absolute/`..` defense) in
     # `vco_lib.collection_repair`.
-    if not is_root_target:
+    #
+    # v0.2.92 WP-D: `_classification_only` re-entries (census / self-check
+    # dry-runs) skip this step — the residue report belongs to a real
+    # install, and re-running it would double-invoke the wiring (and probe
+    # Weaviate from a path that must stay filesystem-only).
+    if not is_root_target and not _classification_only:
         try:
             from vco_lib import collection_repair as _crep
             from vco_lib import knowledge_residue as _kres
@@ -10317,10 +10900,16 @@ def install_project_bundle(
     # Project name derived from folder basename — kept simple per
     # coord ("no fancy templating engine"). Callers that want a
     # different display name can edit CLAUDE.md after install.
-    # Assigned OUTSIDE the try: the legacy-KG / legacy-codegraph
-    # detection further down also reads it, and a templates-install
-    # failure swallowed by the except below must not leave it unbound
-    # (NameError in the failure path).
+    # Assigned OUTSIDE the try: a templates-install failure swallowed by the
+    # except below must not leave it unbound (NameError in the failure path).
+    #
+    # SCOPE (v0.2.92 W8): this basename derivation is now a TEMPLATE-TEXT
+    # concern ONLY. The collection detectors below no longer read it — they use
+    # `authoritative_identity`, resolved from launcher.db. Do not re-point them
+    # at this variable: for any registered project whose folder basename differs
+    # from its `projects.name`, the basename resolves to a DIFFERENT collection
+    # family than the one the project reads, and the detectors emit migrate/DROP
+    # commands against the project's own live data.
     derived_project_name = folder.name or "Project"
     try:
         templates_result = _install_project_level_templates(
@@ -10376,7 +10965,15 @@ def install_project_bundle(
         try:
             manifest_payload = {
                 "schema_version": _MANIFEST_SCHEMA_VERSION,
+                # v0.2.92 WP-D: `vco_version` is the SEMVER (pyproject
+                # [project] version) and `vco_commit` the short SHA —
+                # two fields, two meanings. Legacy manifests carry only
+                # `vco_version` holding a SHA; readers route through
+                # `vco_lib.vco_version.recorded_manifest_version`, which
+                # maps that shape to (version=None, commit=<sha>) so a
+                # SHA can never be compared as a version again.
                 "vco_version": result["vco_version"],
+                "vco_commit": result.get("vco_commit"),
                 "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "files": dict(sorted(new_files.items())),
                 # Schema v2 (2026-05-13): foundation for audit/diff tooling
@@ -10413,30 +11010,78 @@ def install_project_bundle(
                  data={"error": err})
             result["errors"].append({"path": str(_MANIFEST_REL), "error": err})
 
-    # v0.2.47 RL-7.5 chunker-preset deferral (per-project flow).
-    # When the prior `.vco-manifest.json` recorded a vco_version strictly
-    # less than v0.2.46 AND the current orchestrator is >= v0.2.46, append
-    # a `chunker_preset_overhaul_pending` deferral entry. Per-project flow
-    # is independent of the launcher-driven flow (which writes the same
-    # deferral to the orchestrator-root project only — see
-    # `launcher/src-tauri/src/commands/chunker_revision_deferral.rs`).
-    # Soft-fail: a write error logs but doesn't abort the install.
+    # v0.2.92 WP-D — chunker-resync detection, STATE-KEYED (R26).
+    #
+    # This block SUPERSEDES the v0.2.47 semver-boundary gate that used to
+    # live here (`_crosses_chunker_boundary` on the manifest's
+    # `vco_version`). That gate was structurally inert on every git-clone
+    # install — the manifest recorded a git short SHA, the comparator
+    # expected semver, and `crosses_version_boundary` returns False on
+    # unparseable input — so it never fired for any real user, no matter
+    # how they updated (WP-A skip-safety map, row 2; R28 outcome:
+    # SUPERSEDED by this state-keyed check, which is the same mechanism
+    # the launcher's root-only R2-4 flow always used, now wired into the
+    # ONE engine so all four surfaces — root install/update, project
+    # install/update — get it). Compare the project's stored last-seen
+    # `_CHUNKER_REVISION` sentinel against the live one; emit the SAME
+    # condition_id (`chunker_preset_overhaul_pending`) so ledger
+    # lifecycles and remediation commands are unchanged.
+    # Soft-fail: a gate error logs but doesn't abort the install.
     if not dry_run:
-        prev_version = (manifest or {}).get("vco_version") or ""
-        running_version = result.get("vco_version") or ""
-        if prev_version and running_version and _crosses_chunker_boundary(
-            prev_version, running_version,
-        ):
-            try:
-                _emit_chunker_resync_deferral(folder, prev_version, running_version)
-            except Exception as e:
-                err = f"{type(e).__name__}: {e}"
-                _log("4.bundle.deferral", "error",
-                     f"chunker-resync deferral write failed: {err}",
-                     data={"error": err})
-                result["warnings"].append(
-                    f"chunker-resync deferral write failed: {err}"
-                )
+        from vco_lib import chunker_revision as _chunker_revision
+
+        gate_outcome = _chunker_revision.gate(
+            folder, log=_log, had_prior_install=_had_prior_install
+        )
+        if gate_outcome.startswith("error:"):
+            result["warnings"].append(
+                f"chunker-revision gate failed: {gate_outcome}"
+            )
+        elif gate_outcome == "resync-emitted":
+            result["warnings"].append(
+                "KG + codegraph re-sync recommended (chunker revision "
+                "changed) — see UPDATE_DEFERRED.md "
+                "(chunker_preset_overhaul_pending)"
+            )
+
+    # v0.2.92 — EXTRACTOR-GENERATION re-index (auto-triggered on update).
+    #
+    # v0.2.92 fixed two code-graph EXTRACTORS (Python emitted no CodeAPI at
+    # all; C# mis-bound route attributes). Both change what is extracted from
+    # source that itself did not change — and the analyzer's per-FILE gate
+    # (`_get_existing_module`) short-circuits an unchanged file on EVERY walk,
+    # incremental AND full. So without this trigger an existing user updates,
+    # gets the fixed code, and keeps a broken graph with nothing to tell them:
+    # measured, a full re-analyze restores ZERO of the missing rows.
+    #
+    # This is the per-project seam because it is the ONE path the launcher runs
+    # for every project AND (since v0.2.85) for the orchestrator root.
+    # install.py's own `_trigger_codegraph_embed_resync` covers PROJECT_ROOT
+    # only, and gates on the embed-revision owed-probe, which is structurally
+    # blind to this axis (every row IS at the current revision after an
+    # extractor-only fix).
+    #
+    # Soft-fail + background: the helper never raises and never blocks — it
+    # spawns a detached, resumable walk with no global timeout, and degrades to
+    # a deferral entry when the code-embed service is down.
+    if not dry_run:
+        try:
+            _trigger_extractor_generation_reindex(
+                folder,
+                prev_version=(manifest or {}).get("vco_version") or "",
+                running_version=result.get("vco_version") or "",
+                is_root_target=is_root_target,
+                result=result,
+                log=_log,
+            )
+        except Exception as e:  # noqa: BLE001 — never abort an install
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.extractor_reindex", "warn",
+                 f"extractor-generation re-index raised: {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"extractor-generation re-index skipped: {err}"
+            )
 
     # Per-project deferral entries — single entry per case, listing all
     # affected files. Two distinct cases are tracked:
@@ -10545,11 +11190,32 @@ def install_project_bundle(
             notice_paths = _format_file_list_md(
                 sorted(rel for rel, _ in adopted_paths)
             )
+            # v0.2.92: on FIRST install, `adopt` is reachable only via
+            # `shipped_artifact.stale_shipped_artifact_reason` — i.e. every
+            # path listed here
+            # was provably a stale VCO-shaped artifact (an older shipped
+            # version, or a copy missing the `$VCT_INSTALL_ROOT` ladder its
+            # shipped template carries), not user work. Say so, because a
+            # user watching a brand-new project get files rewritten deserves
+            # the reason and not just the list.
+            why = (
+                "  These were pre-existing files at VCO-shipped destinations "
+                "that are provably STALE VCO ARTIFACTS — either an older "
+                "version VCO itself shipped, or a pre-RT-4/pre-VCO copy "
+                "missing the $VCT_INSTALL_ROOT interpreter-discovery ladder "
+                "(such a copy cannot reach this install's venv, and the "
+                "pre-VCO generation defaults KG_COLLECTION to a FOREIGN "
+                "collection). Files that are genuinely yours were left "
+                "untouched.\n"
+                if not update_mode
+                else ""
+            )
             print(
                 "\n[vct] NOTICE — shipped-file adoption (v0.2.84):\n"
                 f"  {len(adopted_paths)} bundle file(s) at VCO-shipped "
                 "destinations diverged from the shipped version and were "
                 "ADOPTED (refreshed to the current shipped bytes).\n"
+                f"{why}"
                 "  Your previous bytes were backed up (kept forever; prune "
                 f"when you no longer need them) under:\n    {adopt_backup_dir_rel}\n"
                 f"{notice_paths}\n",
@@ -10578,7 +11244,7 @@ def install_project_bundle(
 
         if skipped_existing_paths:
             try:
-                _emit_skipped_existing_deferral(
+                _bsd.emit_skipped_existing_deferral(
                     folder, skipped_existing_paths, orchestrator_root,
                 )
             except Exception as e:
@@ -10635,15 +11301,85 @@ def install_project_bundle(
         weaviate_url = os.environ.get(
             "WEAVIATE_URL", _weaviate_url_default(),
         )
+        # v0.2.92 W8 — ONE identity resolution for all three collection
+        # consumers below (legacy-KG, legacy-code-graph, prefix-drift guard).
+        #
+        # `authoritative_identity is None` means launcher.db could not be READ
+        # at all. In that state we cannot tell a project's own live collections
+        # from a stranger's, so every consumer below is SKIPPED: nothing is
+        # detected, no deferral is written, no state file is stamped. We
+        # deliberately do NOT fall back to a folder-basename identity — that
+        # fallback is what produced migrate/DROP commands aimed at a project's
+        # own 1692-object code graph and its live `*_Development` class.
+        # (A readable DB with no row for this folder is a DIFFERENT state: that
+        # yields a `registered=False` last-resort identity and detection
+        # proceeds, which is the standalone-CLI case PR-10B was written for.)
+        authoritative_identity = None
+        try:
+            from vco_lib.project_identity import resolve_identity as _resolve_identity
+            authoritative_identity, _identity_snapshot = _resolve_identity(
+                folder, fallback_name=project_name,
+            )
+        except Exception as e:  # noqa: BLE001 — resolver soft-fails by contract
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.identity", "error",
+                 f"project-identity resolution failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"project-identity resolution failed: {err}")
+
+        identity_resolvable = authoritative_identity is not None
+        # Envelope surface (machine contract read by the Rust caller):
+        #   None                     → launcher.db unreadable, detectors skipped
+        #   {"registered": False}    → readable DB, folder not registered
+        #   {"registered": True, …}  → the resolved bindings
+        # The unregistered form carries NO folder-derived value on purpose:
+        # ``tests/test_v0285_bundle_seams.py::PinS2DefaultByteParityTests`` pins
+        # two DIFFERENT temp folders to byte-identical envelopes, and a
+        # basename-derived name/prefix would make that pin fail for a reason
+        # that has nothing to do with what it guards. The full detail is always
+        # in the `4.bundle.identity` forensic log event.
+        if authoritative_identity is None:
+            authoritative_name = derived_project_name
+            result["authoritative_identity"] = None
+            _log("4.bundle.identity", "ok",
+                 "launcher.db unreadable — skipping legacy-collection detection "
+                 "and the code-prefix drift guard (cannot confirm which "
+                 "collections are live; never guess from the folder basename)",
+                 data={"skipped": True})
+        else:
+            authoritative_name = authoritative_identity.name
+            identity_data = {
+                "name": authoritative_identity.name,
+                "registered": authoritative_identity.registered,
+                "kg_primary": authoritative_identity.kg_primary,
+                "development": authoritative_identity.development,
+                "diagrams": authoritative_identity.diagrams,
+                "codegraph_prefix": authoritative_identity.codegraph_prefix,
+            }
+            result["authoritative_identity"] = (
+                {"registered": True, **identity_data}
+                if authoritative_identity.registered else {"registered": False}
+            )
+            _log("4.bundle.identity", "ok",
+                 f"authoritative identity: name={authoritative_identity.name!r} "
+                 f"registered={authoritative_identity.registered}",
+                 data=identity_data)
+
         legacy_kg_candidates: list[dict] = []
         legacy_codegraph_candidates: list[dict] = []
         try:
-            legacy_kg_candidates = _detect_legacy_kg_collections(
-                derived_project_name, weaviate_url,
-            )
+            if identity_resolvable:
+                legacy_kg_candidates = _detect_legacy_kg_collections(
+                    authoritative_name, weaviate_url,
+                    identity=authoritative_identity,
+                    # F-2: also veto against this project's OWN settings.json
+                    # env pins, not just what launcher.db knows.
+                    project_folder=folder,
+                )
             _log("4.bundle.legacy-kg", "ok",
                  f"legacy KG candidates: {len(legacy_kg_candidates)}",
                  data={"count": len(legacy_kg_candidates),
+                       "skipped": not identity_resolvable,
                        "candidates": [c["class_name"] for c in legacy_kg_candidates]})
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -10653,12 +11389,16 @@ def install_project_bundle(
             result["warnings"].append(f"legacy-KG detection failed: {err}")
 
         try:
-            legacy_codegraph_candidates = _detect_legacy_codegraph_collections(
-                derived_project_name, weaviate_url,
-            )
+            if identity_resolvable:
+                legacy_codegraph_candidates = _detect_legacy_codegraph_collections(
+                    authoritative_name, weaviate_url,
+                    identity=authoritative_identity,
+                    project_folder=folder,
+                )
             _log("4.bundle.legacy-codegraph", "ok",
                  f"legacy code-graph candidates: {len(legacy_codegraph_candidates)}",
                  data={"count": len(legacy_codegraph_candidates),
+                       "skipped": not identity_resolvable,
                        "candidates": [c["class_name"] for c in legacy_codegraph_candidates]})
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -10671,7 +11411,7 @@ def install_project_bundle(
             try:
                 _emit_legacy_kg_deferral(
                     folder,
-                    project_name=derived_project_name,
+                    project_name=authoritative_name,
                     weaviate_url=weaviate_url,
                     candidates=legacy_kg_candidates,
                 )
@@ -10720,7 +11460,7 @@ def install_project_bundle(
             try:
                 _emit_legacy_codegraph_deferral(
                     folder,
-                    project_name=derived_project_name,
+                    project_name=authoritative_name,
                     weaviate_url=weaviate_url,
                     candidates=legacy_codegraph_remaining,
                 )
@@ -10738,6 +11478,25 @@ def install_project_bundle(
         # v0.2.83 B-F6: report the NON-dropped remainder (what actually deferred).
         result["legacy_codegraph_candidates"] = legacy_codegraph_remaining
 
+        # v0.2.92 F-12(b): FAIL LOUDLY on a configured-but-nonexistent
+        # collection. Until now nothing on the install side probed the names in
+        # `.claude/settings.json` — a `SHARED_KG_COLLECTION` naming a class that
+        # does not exist degraded in total silence (empty search results, no
+        # error from any component, field-observed for three days). The probe is
+        # TRI-STATE: Weaviate unreachable yields "unknown", never "absent".
+        try:
+            collections_check = verify_configured_collections_exist(
+                folder, weaviate_url, log_event=log_event,
+            )
+            result["configured_collections"] = collections_check
+            for _msg in collections_check.get("warnings", []):
+                result["warnings"].append(_msg)
+        except Exception as e:  # noqa: BLE001 — a probe never blocks an install
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.configured-collections", "error",
+                 f"configured-collection probe failed: {err}",
+                 data={"error": err})
+
         # v0.2.73 FIX-C-RECUR wiring (F1): run the code-graph prefix-drift
         # forward-guard ONCE per bundle install/update, right beside the legacy
         # code-graph detection it complements. `detect_codegraph_prefix_drift`
@@ -10748,15 +11507,44 @@ def install_project_bundle(
         # drift), and emits `codegraph_prefix_drift_detected` (consent — never
         # auto-migrate) when the current prefix differs from the recorded
         # generation. Soft-fail (best-effort — never blocks the bundle install).
+        #
+        # v0.2.92 W8: fed from the SAME authoritative identity as the two
+        # detectors above. It used to sanitize the folder basename, so the state
+        # file recorded a prefix generation the project never had — the guard
+        # then compared two wrong values and the file itself contradicted the
+        # live binding. When the identity is unresolvable we stamp NOTHING (a
+        # guessed baseline is worse than no baseline).
         try:
-            drift = detect_codegraph_prefix_drift(
-                folder, derived_project_name,
-                emit_deferral=True, weaviate_url=weaviate_url,
-            )
+            drift = None
+            if authoritative_identity is not None:
+                # v0.2.92 F-3: pass the prefix ONLY when a real
+                # `project_codegraph_bindings` row backs it. `codegraph_prefix`
+                # is populated for registered-but-unanalyzed projects (and for
+                # the basename identity produced when the folder match fails)
+                # from a NAME SANITIZER — passing that made the drift guard
+                # stamp a guess into the generation record labelled
+                # `source="binding"`/authoritative, and emit a false drift
+                # deferral against the good recorded value. `None` here keeps
+                # the historic DERIVED posture, which the guard now refuses to
+                # let overwrite a record it cannot outrank.
+                drift = detect_codegraph_prefix_drift(
+                    folder, authoritative_name,
+                    emit_deferral=True, weaviate_url=weaviate_url,
+                    code_prefix=(
+                        authoritative_identity.authoritative_codegraph_prefix()
+                        if hasattr(
+                            authoritative_identity,
+                            "authoritative_codegraph_prefix",
+                        )
+                        else authoritative_identity.codegraph_prefix
+                    ),
+                )
             result["codegraph_prefix_drift"] = drift
             _log("4.bundle.codegraph-prefix-drift", "ok",
-                 ("drift detected" if drift else "no drift (baseline recorded)"),
-                 data={"drift": drift})
+                 ("skipped (identity unresolvable)" if not identity_resolvable
+                  else "drift detected" if drift
+                  else "no drift (baseline recorded)"),
+                 data={"drift": drift, "skipped": not identity_resolvable})
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.codegraph-prefix-drift", "error",
@@ -10995,56 +11783,45 @@ def install_project_bundle(
                 f"stale .mcp.json shadow check failed: {err}"
             )
 
+    # v0.2.92 WP-D (R27 surfaces b): post-install SELF-CHECK + census flip,
+    # one thin call — the body (manifest-semver re-read, second dry-run
+    # with nothing left to change, census-state flip + root-ledger refresh)
+    # lives in vco_lib.bundle_staleness. Soft-fail; warns, never blocks.
+    if not dry_run:
+        from vco_lib import bundle_staleness as _bs
+
+        result["warnings"].extend(_bs.post_install_hook(
+            folder,
+            orchestrator_root,
+            update_mode=bool(update_mode),
+            manifest_written=bool(result.get("manifest_written")),
+            skip_kinds=skip_kinds,
+            log=_log,
+        ))
+
     return result
 
 
-# Wrappers that ship the resilient `$VCT_INSTALL_ROOT` interpreter-discovery
-# ladder and therefore SHOULD be stale-checked. MUST match the Rust
-# `wrapper_requires_resilience_marker` set (code-graph-analyze, kg-sync +
-# `.ps1` siblings). `kg-duplicates` has no ladder and is excluded there too.
-_RESILIENT_WRAPPER_BASENAMES: tuple[str, ...] = (
-    "code-graph-analyze",
-    "code-graph-analyze.ps1",
-    "kg-sync",
-    "kg-sync.ps1",
-)
-
-# The marker string that MUST appear in a healthy (RT-4+) wrapper. Mirrors the
-# Rust `analyzer_wrapper_is_resilient` marker. We detect a string the templates
-# already ship rather than adding a fresh sentinel, so the check stays true no
-# matter how the templates are re-worded, as long as they honour the ladder.
-_RESILIENT_WRAPPER_MARKER = "VCT_INSTALL_ROOT"
-
-
 def _codegraph_wrapper_still_stale(folder: Path) -> bool:
-    """v0.2.77 L4-1 probe: does the project STILL carry a stale codegraph
-    analyzer / kg-sync wrapper (exists but lacks the resilient
-    ``$VCT_INSTALL_ROOT`` ladder)?
+    """v0.2.77 L4-1 probe: does the project STILL carry a stale wrapper
+    (exists under ``.claude/scripts`` but lacks the resilient
+    ``$VCT_INSTALL_ROOT`` ladder its shipped template carries)?
 
-    Mirrors the Rust ``analyzer_wrapper_is_resilient`` health-check so the
-    ``stale_codegraph_wrapper_pending`` deferral (emitted Rust-side when the
-    launcher falls back to the orchestrator copy) self-clears once the user
-    refreshes the wrapper (Option A ``cp`` / Option B ``--force``).
+    Backs the ``stale_codegraph_wrapper_pending`` self-clear: once the user
+    refreshes the wrapper (or a bundle install adopts it) the next bundle
+    update sees a healthy copy and clears the entry.
 
-    Returns ``True`` if ANY resilient-ladder wrapper under
-    ``.claude/scripts`` exists AND does not contain the marker (conservative:
-    an unreadable file is treated as stale — same as the Rust default). Returns
-    ``False`` when no such wrapper is stale (nothing left to defer).
+    v0.2.92: the hand-written 4-entry basename tuple this used to walk is
+    gone. :func:`vco_lib.wrapper_health.stale_project_wrappers` DERIVES the
+    set from ``templates/scripts`` — every shipped file whose own bytes carry
+    the marker — so the probe covers ``kg-search`` / ``kg-info`` /
+    ``code-graph-query`` / ``kg-migrate`` / ``kg-dedup`` (all of which ship
+    the ladder and none of which the old tuple named) and picks up any future
+    wrapper the day it ships. Conservative on read errors: unreadable ⇒ stale.
     """
-    scripts_dir = folder / ".claude" / "scripts"
-    for basename in _RESILIENT_WRAPPER_BASENAMES:
-        wrapper = scripts_dir / basename
-        if not wrapper.is_file():
-            continue
-        try:
-            contents = wrapper.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            # Unreadable → conservatively treat as stale (still-applicable),
-            # mirroring the Rust conservative default.
-            return True
-        if _RESILIENT_WRAPPER_MARKER not in contents:
-            return True
-    return False
+    from vco_lib import wrapper_health as _wh
+
+    return bool(_wh.stale_project_wrappers(folder))
 
 
 def _probe_deferrals(folder: Path, report) -> "tuple[list[str], dict, bool]":
@@ -11490,6 +12267,247 @@ def _apply_canonical_env_via_config_projection(
     return result
 
 
+def _resolve_shared_kg_name(folder: Optional[Path] = None) -> str:
+    """Resolve THIS machine's shared-KG class name (v0.2.92 F-12).
+
+    ``_SHARED_KG_NAME`` (``VibeCodedOrchestrator_KnowledgeGraph``) is VCO's
+    LAST-RESORT default, not a description of the install. On an
+    adopt-and-route install the orchestrator root's own collection serves both
+    roles, so the generic literal names a class that does not exist — a state
+    field-observed on a live machine, where one project's shared-KG searches
+    returned nothing for three days and no component reported an error. Any
+    writer that hardcodes the literal manufactures that state.
+
+    Resolution order (first non-empty wins), all soft-fail:
+
+    1. This project's own ``shared`` KG binding in launcher.db.
+    2. The project's existing on-disk ``SHARED_KG_COLLECTION`` pin — a value
+       already in ``.claude/settings.json`` is a user/launcher decision, and an
+       explicit empty string is the documented "cross-project fan-out
+       intentionally disabled" choice, honoured verbatim.
+    3. The ORCHESTRATOR-ROOT project's ``shared`` binding, then its ``primary``
+       — on an adopt-and-route install the root's primary IS the machine's
+       canonical shared collection.
+    4. ``_SHARED_KG_NAME`` — unchanged behaviour when nothing resolves (a
+       genuinely launcher-less standalone install, where this name is also what
+       bootstrap will create).
+
+    Never raises.
+    """
+    # v0.2.92 size-gate extraction: the reader moved to
+    # ``vco_lib.kg_binding_read``. Imported here
+    # — lazily, but OUTSIDE the swallow-all try below so a broken install
+    # surfaces loudly instead of silently skipping tier 1.
+    from vco_lib.kg_binding_read import _read_kg_binding_override
+
+    # 1. this project's own shared binding.
+    if folder is not None:
+        try:
+            override = _read_kg_binding_override(Path(folder))
+            val = (override.get("shared_kg_collection") or "").strip()
+            if val:
+                return val
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2. an existing on-disk pin (including the explicit-disable "").
+        try:
+            from vco_lib.knowledge_residue import project_settings_env
+            existing = project_settings_env(Path(folder)).get(
+                "SHARED_KG_COLLECTION"
+            )
+            if isinstance(existing, str):
+                return existing.strip()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 3. the orchestrator root's shared, then primary, binding.
+    try:
+        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
+        root_primary, root_shared = get_orchestrator_root_bindings()
+        for cand in (root_shared, root_primary):
+            if isinstance(cand, str) and cand.strip():
+                return cand.strip()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 4. last resort.
+    return _SHARED_KG_NAME
+
+
+def probe_classes_exist(
+    class_names: Iterable[str],
+    weaviate_url: Optional[str] = None,
+    *,
+    timeout: float = 8.0,
+) -> dict:
+    """Probe Weaviate for each class name. TRI-STATE, never binary.
+
+    Returns ``{class_name: True | False | None}`` where ``None`` means **the
+    probe could not run** (Weaviate unreachable, non-200, unparseable schema) —
+    NOT "absent". Reporting "absent" for "could not check" is the same
+    conflation :func:`vco_lib.project_identity.resolve_snapshot` was fixed for
+    in F-1, and it would turn every offline install into a false alarm.
+
+    Matching is CASE-INSENSITIVE: Weaviate class names are case-sensitive, but
+    every VCO adoption path treats a case-variant as the same logical class
+    (BUG-1), so a lowercase-c ``Vibecoded…`` on disk satisfies a capital-C
+    configured name.
+
+    Empty / whitespace names are skipped entirely — an empty
+    ``SHARED_KG_COLLECTION`` is the documented "fan-out disabled" choice, not a
+    missing collection.
+
+    ONE ``GET /v1/schema`` call regardless of how many names are probed.
+
+    v0.2.92 W18: the schema read itself is
+    :func:`vco_lib.weaviate_helpers.probe_class_listing` — this function owns
+    only the per-name MEMBERSHIP decision, not a fourth copy of the fetch. The
+    tri-state is unchanged (``unknown`` listing → every name ``None``); an
+    ``absent`` listing (schema read, zero classes) is a real answer and yields
+    ``False`` for every name, as before.
+    """
+    wanted = [n.strip() for n in class_names if isinstance(n, str) and n.strip()]
+    if not wanted:
+        return {}
+    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
+    listing = _wh.probe_class_listing(
+        base, timeout=timeout, request=_http_request,
+    )
+    if listing.is_unknown():  # could not check ≠ absent
+        return {n: None for n in wanted}
+    live = {c.lower() for c in listing.require()}
+    return {n: (n.lower() in live) for n in wanted}
+
+
+def probe_prefix_has_live_code_classes(
+    prefix: str,
+    weaviate_url: Optional[str] = None,
+    *,
+    probe: Optional[Callable[..., dict]] = None,
+) -> Optional[bool]:
+    """TRI-STATE: does ``prefix`` address ANY live code-graph class?
+
+    ``True`` (at least one of the five ``<prefix>_Code*`` classes exists) /
+    ``False`` (the schema was READ and none of them exists) / ``None`` (could
+    not check — the schema was unreadable, or ``prefix`` is empty).
+
+    v0.2.92 W18. This is the EVIDENCE a decision about a stale
+    prefix-generation record needs: "the prefix in the state file addresses
+    nothing on this server" is a fact that separates a record which was simply
+    WRONG from a genuine sanitizer-generation change. Adding it here, next to
+    :func:`probe_classes_exist`, keeps the schema read in one place.
+
+    ``vco_lib.codegraph_extractor_generation.code_graph_exists`` performs the
+    same True/False/None reduction over the same probe after deriving a prefix
+    from a project NAME; its tail should delegate here (a three-line change in
+    a module this lane does not own — reported, not made).
+
+    ``probe`` is the injection seam for tests; production leaves it ``None``.
+    """
+    pfx = (prefix or "").strip()
+    if not pfx:
+        return None
+    names = [f"{pfx}{sfx}" for sfx in _CODEGRAPH_SUFFIXES]
+    _probe = probe or probe_classes_exist
+    try:
+        results = _probe(names, weaviate_url)
+    except Exception:  # noqa: BLE001 — could not check ≠ absent
+        return None
+    states = [results.get(n) for n in names]
+    if any(s is True for s in states):
+        return True
+    if all(s is False for s in states):
+        return False
+    return None
+
+
+def verify_configured_collections_exist(
+    folder: Path,
+    weaviate_url: Optional[str] = None,
+    *,
+    log_event: Optional[Callable] = None,
+) -> dict:
+    """FAIL LOUDLY when a collection this project is CONFIGURED to read is
+    absent from Weaviate (v0.2.92 F-12(b)).
+
+    Nothing on the install side probed configured collection names: the identity
+    snapshot, the detectors and the env writers all trusted them. A
+    configured-but-nonexistent ``SHARED_KG_COLLECTION`` therefore degraded in
+    total silence — searches returned an empty result set and no component said
+    a word. A warning that reaches the user beats a silent empty result.
+
+    Probes the ``.claude/settings.json`` ``env`` values for ``KG_COLLECTION``,
+    ``SHARED_KG_COLLECTION`` and ``DEVELOPMENT_COLLECTION``.
+
+    Returns ``{"probed": bool, "present": [...], "absent": [...],
+    "unknown": [...], "warnings": [...]}``. ``probed`` is False (and every name
+    lands in ``unknown``) when Weaviate could not be reached — the caller must
+    NOT report those as absent. Never raises.
+    """
+    out: dict = {
+        "probed": False, "present": [], "absent": [], "unknown": [],
+        "warnings": [],
+    }
+    try:
+        from vco_lib.knowledge_residue import project_settings_env
+        env = project_settings_env(Path(folder))
+    except Exception:  # noqa: BLE001
+        return out
+
+    configured: list[tuple[str, str]] = []
+    for key in ("KG_COLLECTION", "SHARED_KG_COLLECTION", "DEVELOPMENT_COLLECTION"):
+        val = env.get(key)
+        # An explicit empty SHARED_KG_COLLECTION is "fan-out intentionally
+        # disabled" — a choice, not a missing collection.
+        if isinstance(val, str) and val.strip():
+            configured.append((key, val.strip()))
+    if not configured:
+        return out
+
+    url = (weaviate_url or (env.get("WEAVIATE_URL") or "").strip()
+           or _weaviate_url_default())
+    # `bootstrap-collections --name` is REQUIRED by the parser; PROJECT_NAME is
+    # the same raw display name the env writers put in this block.
+    proj_name = (env.get("PROJECT_NAME") or "").strip() or Path(folder).name
+    results = probe_classes_exist([v for _k, v in configured], url)
+    out["probed"] = any(v is not None for v in results.values())
+    for key, name in configured:
+        state = results.get(name)
+        if state is True:
+            out["present"].append(name)
+        elif state is False:
+            out["absent"].append(name)
+            msg = (
+                f"configured collection {name!r} ({key} in "
+                f".claude/settings.json) does NOT exist in Weaviate at {url} — "
+                f"every query routed through it returns nothing, silently. "
+                f"Re-run `{_bootstrap_collections_cmd(proj_name, Path(folder))}` "
+                f"to create it, or correct the {key} value to the class you "
+                f"meant."
+            )
+            out["warnings"].append(msg)
+        else:
+            # None → COULD NOT CHECK. Not absent (F-1's lesson, restated).
+            out["unknown"].append(name)
+
+    if log_event is not None:
+        try:
+            log_event(
+                "4.bundle.configured-collections",
+                "warn" if out["absent"] else "ok",
+                (f"{len(out['absent'])} configured collection(s) absent from "
+                 f"Weaviate" if out["absent"]
+                 else "configured collections verified"
+                 if out["probed"] else
+                 "configured-collection probe skipped (Weaviate unreachable)"),
+                data={k: out[k] for k in ("probed", "present", "absent", "unknown")},
+            )
+        except Exception:  # noqa: BLE001 — observability is never a gate
+            pass
+    return out
+
+
 def _apply_standalone_env(
     folder: Path,
     orchestrator_root: Optional[Path],
@@ -11573,7 +12591,16 @@ def _apply_standalone_env(
     kg_collection = f"{sanitized}_KnowledgeGraph"
     dev_collection = f"{sanitized}_Development"
     diagrams_collection = f"{sanitized}_Diagrams"
-    shared_kg = "VibeCodedOrchestrator_KnowledgeGraph"
+    # v0.2.92 F-12(a): resolve the shared-KG name instead of hardcoding the
+    # generic literal. The literal is VCO's LAST-RESORT default, not a fact
+    # about this machine — and on an adopt-and-route install (where the
+    # orchestrator root's own collection serves both roles) it names a class
+    # that does not exist. Writing it here was a copy-through: the env-ensure
+    # reconcile only fills ABSENT keys, and corrects a present-but-different
+    # value ONLY when the binding carries a `manual_override` sentinel, so a
+    # scaffold-authored generic default SURVIVES adoption and the project's
+    # shared-KG searches silently return nothing forever.
+    shared_kg = _resolve_shared_kg_name(folder)
 
     env: dict[str, str] = {
         "PROJECT_NAME": raw_name,
@@ -11713,7 +12740,7 @@ def _backfill_code_graph_project_env_in_project(
         return sanitize_for_weaviate_class(folder.name or "")
 
     # v0.2.31: same manual_override-correction pattern the KG-side
-    # backfill (`_backfill_kg_collection_env_in_project`) uses since
+    # the former backfill (removed v0.2.92 — superseded by the config-projection single writer) used since
     # v0.2.30. When launcher.db's `project_codegraph_bindings.config_json`
     # carries a `manual_override` sentinel, treat the DB row's
     # `collection_prefix` as the source of truth and correct
@@ -11826,7 +12853,6 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
         {"collection_prefix": str | None, "has_manual_override": bool}
     """
     import json as _json
-    import os as _os
     import sqlite3 as _sqlite3
 
     out: dict = {"collection_prefix": None, "has_manual_override": False}
@@ -11891,401 +12917,6 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
             pass
 
     return out
-
-
-def _read_kg_binding_override(folder: Path) -> dict:
-    """v0.2.30: same launcher.db read as `_read_kg_collection_from_launcher_db`,
-    but ALSO returns whether each binding carries a `manual_override`
-    sentinel in its `config_json`. The caller uses this to decide
-    whether an existing-but-stale settings.json env value should be
-    corrected (manual_override = yes → correct) or preserved
-    (manual_override = no → leave alone, the user might have edited
-    settings.json directly).
-
-    Returns a dict with keys:
-        primary_kg_collection: str | None
-        primary_has_manual_override: bool
-        shared_kg_collection: str | None
-        shared_has_manual_override: bool
-
-    Soft-fails to an empty/defaults dict on any error path. Path
-    resolution + Windows-aware comparison match
-    `_read_kg_collection_from_launcher_db`.
-    """
-    import json as _json
-    import os as _os
-    import sqlite3 as _sqlite3
-
-    out: dict = {
-        "primary_kg_collection": None,
-        "primary_has_manual_override": False,
-        "shared_kg_collection": None,
-        "shared_has_manual_override": False,
-    }
-
-    # Path resolution delegated to `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
-    from vco_lib.paths import launcher_db_path
-    db_path = launcher_db_path()
-
-    if not db_path.is_file():
-        return out
-
-    try:
-        folder_canonical = folder.resolve()
-    except (OSError, RuntimeError):
-        return out
-
-    try:
-        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-    except _sqlite3.Error:
-        return out
-
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
-        except _sqlite3.Error:
-            return out
-        project_id = None
-        for row_id, row_folder in rows:
-            if _canonical_path_eq(row_folder or "", folder_canonical):
-                project_id = row_id
-                break
-        if project_id is None:
-            return out
-        try:
-            cur.execute(
-                "SELECT role, collection_name, config_json FROM project_kg_bindings "
-                "WHERE project_id = ?",
-                (project_id,),
-            )
-            for role, name, config_json in cur.fetchall():
-                if not name:
-                    continue
-                try:
-                    cfg = _json.loads(config_json or "{}")
-                except (_json.JSONDecodeError, TypeError):
-                    cfg = {}
-                has_override = bool(
-                    cfg.get("manual_override")
-                ) if isinstance(cfg, dict) else False
-                if role == "primary":
-                    out["primary_kg_collection"] = name
-                    out["primary_has_manual_override"] = has_override
-                elif role == "shared":
-                    out["shared_kg_collection"] = name
-                    out["shared_has_manual_override"] = has_override
-        except _sqlite3.Error:
-            return out
-    finally:
-        try:
-            conn.close()
-        except _sqlite3.Error:
-            pass
-
-    return out
-
-
-def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
-    """Look up `(primary_kg_collection, shared_kg_collection)` for the
-    project at `folder` by reading the launcher.db `project_kg_bindings`
-    table directly. Returns an empty dict on any soft-fail path (DB not
-    found, project not registered, query error) — caller falls through
-    to the derivation chain in `_backfill_kg_collection_env_in_project`.
-
-    The shared-binding `role='shared'` collection name is returned as
-    `shared_kg_collection`; the `role='primary'` collection name as
-    `primary_kg_collection`. Either may be absent if only one role has
-    been seeded.
-
-    Path resolution rules: matches `_discover_app_state_db_path` in
-    install.py — `$VCT_STATE_DIR/launcher.db` if set, else
-    `~/.vct/launcher.db`. Cross-OS via `Path.home()`.
-
-    The folder match uses absolute-path equality after `resolve()` on
-    both sides, with a Windows-aware compare (case-insensitive on
-    Windows, case-sensitive elsewhere) to handle launcher.db rows
-    written from a different drive-letter casing on the same OS.
-    """
-    import os as _os
-    import sqlite3 as _sqlite3
-
-    out: dict = {}
-
-    # DB path resolution — delegated to `vco_lib.paths.launcher_db_path`
-    # (v0.2.40 F5). The canonical resolver also honours `$VCT_STATE_DIR`
-    # so multi-launcher dev setups continue to work, and mirrors
-    # install.py._discover_app_state_db_path.
-    from vco_lib.paths import launcher_db_path
-    db_path = launcher_db_path()
-
-    if not db_path.is_file():
-        return out
-
-    try:
-        folder_canonical = folder.resolve()
-    except (OSError, RuntimeError):
-        return out
-
-    try:
-        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-    except _sqlite3.Error:
-        return out
-
-    try:
-        cur = conn.cursor()
-        # Find the project row that matches our folder.
-        try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
-        except _sqlite3.Error:
-            return out
-        project_id = None
-        for row_id, row_folder in rows:
-            if _canonical_path_eq(row_folder or "", folder_canonical):
-                project_id = row_id
-                break
-        if project_id is None:
-            return out
-        try:
-            cur.execute(
-                "SELECT role, collection_name FROM project_kg_bindings "
-                "WHERE project_id = ?",
-                (project_id,),
-            )
-            for role, name in cur.fetchall():
-                if not name:
-                    continue
-                if role == "primary":
-                    out["primary_kg_collection"] = name
-                elif role == "shared":
-                    out["shared_kg_collection"] = name
-        except _sqlite3.Error:
-            return out
-    finally:
-        try:
-            conn.close()
-        except _sqlite3.Error:
-            pass
-
-    return out
-
-
-def _backfill_kg_collection_env_in_project(
-    folder: Path,
-    project_name: Optional[str] = None,
-) -> dict:
-    """Idempotent: add `KG_COLLECTION` / `SHARED_KG_COLLECTION` /
-    `DEVELOPMENT_COLLECTION` to a per-project `.claude/settings.json::env`
-    block when missing. Source of truth = launcher.db's
-    `project_kg_bindings` table. Fall-back derivation when DB is
-    unavailable.
-
-    Discipline (matching `_backfill_code_graph_project_env_in_project`):
-      - Missing settings file → `action="missing"`, no-op.
-      - File unparseable JSON → `action="unparseable"`, no-op.
-      - Missing `env` block → create it with all 3 keys (when
-        derivable).
-      - All 3 keys present → `action="noop"`. User-set values are
-        preserved verbatim — this function only ADDS, never overwrites.
-      - One or two keys missing → fill the missing ones
-        (`action="backfilled"`).
-
-    Resolution chain (used only for keys that are missing):
-      1. launcher.db `project_kg_bindings` (primary + shared roles).
-         Read-only; soft-fails to step 2 on any DB error / not-registered.
-      2. Existing `env.KG_COLLECTION` minus `_KnowledgeGraph` (derive
-         development_collection by suffix swap to `_Development`).
-      3. Explicit `project_name` argument or existing `env.PROJECT_NAME`.
-      4. `folder.name` sanitized via `sanitize_for_weaviate_class`.
-
-    `SHARED_KG_COLLECTION` semantic: writing an empty string is
-    legitimate (it means "don't fan-out to shared KG"). We treat a
-    `role='shared'` binding with a non-empty collection_name as a
-    write-target, and write `""` when the DB has no shared binding.
-    This matches the v0.2.21 launcher behavior where the shared role
-    is optional.
-
-    Args:
-        folder: target user-project folder.
-        project_name: optional explicit project name override for
-            derivation chain step 3.
-
-    Returns:
-        Same shape as `_backfill_code_graph_project_env_in_project`:
-        `{"action": str, "added_keys": [str, ...], "path": str,
-          "resolved_values": {key: value, ...}}`.
-    """
-    settings_file = folder / ".claude" / "settings.json"
-    result: dict = {
-        "action": "missing",
-        "added_keys": [],
-        "path": str(settings_file),
-        "resolved_values": {},
-    }
-
-    if not settings_file.exists():
-        return result
-
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        result["action"] = "unparseable"
-        return result
-
-    if not isinstance(data, dict):
-        result["action"] = "unparseable"
-        return result
-
-    env = data.get("env")
-    if not isinstance(env, dict):
-        env = {}
-        data["env"] = env
-        env_was_missing = True
-    else:
-        env_was_missing = False
-
-    # Cache DB lookup — we may read it twice during derivation.
-    _db_cache: dict = {}
-    _db_loaded = False
-
-    def _from_db() -> dict:
-        nonlocal _db_loaded
-        if not _db_loaded:
-            _db_cache.update(_read_kg_collection_from_launcher_db(folder))
-            _db_loaded = True
-        return _db_cache
-
-    def _derive_basename() -> str:
-        if project_name:
-            return sanitize_for_weaviate_class(str(project_name))
-        kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
-        if isinstance(kg, str) and kg.endswith("_KnowledgeGraph"):
-            return kg[: -len("_KnowledgeGraph")]
-        existing_pn = env.get("PROJECT_NAME") if isinstance(env, dict) else None
-        if isinstance(existing_pn, str) and existing_pn:
-            return sanitize_for_weaviate_class(existing_pn)
-        return sanitize_for_weaviate_class(folder.name or "")
-
-    added: list[str] = []
-    resolved: dict = {}
-
-    # v0.2.30 fix: launcher.db's `project_kg_bindings` row is the
-    # canonical source of truth for KG_COLLECTION. When the user (or a
-    # prior migration) put a `manual_override` sentinel in the binding's
-    # config_json, that's a signal that the launcher's auto-seed default
-    # was overridden deliberately. In that case, ALSO correct an
-    # existing-but-stale env value — not just add missing keys. Without
-    # this, `install.py --update` can leave `env.KG_COLLECTION` pinned
-    # to the orchestrator-root default literal even when launcher.db
-    # says "the user picked something else", causing silent KG-search
-    # misroute. The Rust seed-guard already preserves the binding on
-    # boot; this completes the loop on the Python install side.
-    _db_override = _read_kg_binding_override(folder)
-
-    # KG_COLLECTION (primary) — fill if missing OR correct if launcher.db
-    # has a manual_override that differs.
-    db_primary = _db_override.get("primary_kg_collection")
-    has_manual_override_primary = _db_override.get("primary_has_manual_override", False)
-    if "KG_COLLECTION" not in env:
-        if db_primary:
-            env["KG_COLLECTION"] = db_primary
-        else:
-            db = _from_db()
-            if "primary_kg_collection" in db:
-                env["KG_COLLECTION"] = db["primary_kg_collection"]
-            else:
-                env["KG_COLLECTION"] = f"{_derive_basename()}_KnowledgeGraph"
-        added.append("KG_COLLECTION")
-        resolved["KG_COLLECTION"] = env["KG_COLLECTION"]
-    elif has_manual_override_primary and db_primary and env["KG_COLLECTION"] != db_primary:
-        # Correct an existing wrong value: launcher.db has an explicit
-        # manual_override, settings.json env disagrees. Trust the DB.
-        env["KG_COLLECTION"] = db_primary
-        added.append("KG_COLLECTION (corrected)")
-        resolved["KG_COLLECTION"] = db_primary
-
-    # SHARED_KG_COLLECTION — empty-string is a legitimate user choice.
-    # Only add when the key is absent, not when it's "" (empty means
-    # "intentionally disabled cross-project fan-out"). Same
-    # manual-override correction logic as primary.
-    db_shared = _db_override.get("shared_kg_collection")
-    has_manual_override_shared = _db_override.get("shared_has_manual_override", False)
-    if "SHARED_KG_COLLECTION" not in env:
-        if db_shared:
-            env["SHARED_KG_COLLECTION"] = db_shared
-        else:
-            db = _from_db()
-            if "shared_kg_collection" in db:
-                env["SHARED_KG_COLLECTION"] = db["shared_kg_collection"]
-            else:
-                # No shared binding seeded — leave the cross-project gate
-                # closed by default. The user can flip it via the launcher's
-                # Identity tab → Manage shared KG collection.
-                env["SHARED_KG_COLLECTION"] = ""
-        added.append("SHARED_KG_COLLECTION")
-        resolved["SHARED_KG_COLLECTION"] = env["SHARED_KG_COLLECTION"]
-    elif (
-        has_manual_override_shared
-        and db_shared
-        and env["SHARED_KG_COLLECTION"] != db_shared
-        and env["SHARED_KG_COLLECTION"] != ""  # respect user's explicit-disable
-    ):
-        env["SHARED_KG_COLLECTION"] = db_shared
-        added.append("SHARED_KG_COLLECTION (corrected)")
-        resolved["SHARED_KG_COLLECTION"] = db_shared
-
-    # DEVELOPMENT_COLLECTION — derived by suffix swap from the primary.
-    # v0.2.84 PLAN-v0284 D3/D1: route BOTH the suffix-swap and the name-derived
-    # fallback through the ONE-rule helper `_dev_diagrams_from_primary` so the
-    # dev-name derivation has a single home (== config_projection's future
-    # one-rule realization + the hub's Decision C). Same resolved value as
-    # before for both the binding-first primary and the name-derived last
-    # resort — just no longer an inline duplicate of the rule.
-    if "DEVELOPMENT_COLLECTION" not in env:
-        primary = env.get("KG_COLLECTION", "")
-        primary = primary if isinstance(primary, str) else ""
-        dev_name, _diagrams = _dev_diagrams_from_primary(
-            primary, _derive_basename(),
-        )
-        env["DEVELOPMENT_COLLECTION"] = dev_name
-        added.append("DEVELOPMENT_COLLECTION")
-        resolved["DEVELOPMENT_COLLECTION"] = dev_name
-    elif (
-        has_manual_override_primary
-        and db_primary
-        and env.get("KG_COLLECTION") == db_primary
-    ):
-        # KG_COLLECTION just got corrected from override; recompute the
-        # paired DEVELOPMENT_COLLECTION via suffix swap if it doesn't
-        # match the new primary's basename.
-        expected_dev = (
-            db_primary[: -len("_KnowledgeGraph")] + "_Development"
-            if db_primary.endswith("_KnowledgeGraph")
-            else None
-        )
-        if expected_dev and env.get("DEVELOPMENT_COLLECTION") != expected_dev:
-            env["DEVELOPMENT_COLLECTION"] = expected_dev
-            added.append("DEVELOPMENT_COLLECTION (corrected)")
-            resolved["DEVELOPMENT_COLLECTION"] = expected_dev
-
-    if not added and not env_was_missing:
-        result["action"] = "noop"
-        return result
-
-    try:
-        payload = json.dumps(data, indent=2) + "\n"
-        _write_file_atomic(settings_file, payload.encode("utf-8"))
-    except OSError as e:
-        result["action"] = f"write_failed:{type(e).__name__}"
-        return result
-
-    result["action"] = "backfilled"
-    result["added_keys"] = added
-    result["resolved_values"] = resolved
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -13351,6 +13982,10 @@ def _cmd_detect_orphan_code_collections(args: argparse.Namespace) -> int:
         "live_orphans": detection["live_orphans"],
         "ondisk_orphans": detection["ondisk_orphans"],
         "keep_resolvable": detection["keep_resolvable"],
+        # v0.2.92 W18: the second precondition, reported alongside the first so
+        # a caller (human or script) can tell "nothing is orphaned" from
+        # "nothing could be checked".
+        "live_schema_resolvable": detection.get("live_schema_resolvable", True),
         "total_reclaim_bytes": detection["total_reclaim_bytes"],
         "deferral_emitted": emitted,
     }
@@ -13361,6 +13996,15 @@ def _cmd_detect_orphan_code_collections(args: argparse.Namespace) -> int:
             print(
                 "keep-set UNRESOLVABLE (launcher.db unreachable) — flagged "
                 "NOTHING (conservative).",
+                file=sys.stderr,
+            )
+        if detection.get("live_schema_resolvable") is False:
+            print(
+                "live schema UNREADABLE "
+                f"({detection.get('live_schema_unresolvable_reason') or 'Weaviate unreachable'}) "
+                "— flagged NOTHING and wrote no detect-time snapshot "
+                "(conservative). This is NOT a clean bill of health; re-run "
+                "once Weaviate is reachable.",
                 file=sys.stderr,
             )
         for o in detection["live_orphans"]:
@@ -13379,7 +14023,8 @@ def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
     CURRENT launcher bindings + CURRENT live schema at RUN TIME (re-probe-
     before-acting) — never trusts a stale detect-time snapshot, and never drops
     a class whose prefix (case-insensitively) matches a live binding. Requires
-    --confirm. Exit 0 on clean drop; 1 on any drop error; 2 without --confirm.
+    --confirm. Exit 0 on clean drop; 1 on any drop error; 2 when it REFUSES
+    (no --confirm, or a precondition it could not verify).
     """
     if not getattr(args, "confirm", False):
         print(
@@ -13389,10 +14034,34 @@ def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
         )
         return 2
     weaviate_url = args.weaviate_url or _weaviate_url_default()
+    # v0.2.92 W18: the launcher.db keep-set is checked HERE, up front, so an
+    # unreadable DB is a visible REFUSAL rather than an empty drop list that
+    # printed "…or all reclaimed already". Both preconditions of this
+    # destructive command now fail loudly and distinguishably.
+    _keep_set, _keep_resolvable = _codegraph_keep_set_normalised()
+    if not _keep_resolvable:
+        print(
+            "refusing: could not read the launcher.db code-graph binding "
+            "keep-set, so NO class can be proven to be an orphan. Nothing was "
+            "dropped. Start the launcher (or fix VCT_LAUNCHER_DB_PATH) and "
+            "re-run.",
+            file=sys.stderr,
+        )
+        return 2
     # RUN-TIME re-validation: re-derive the orphan set from the CURRENT
-    # bindings + CURRENT live schema. If the keep-set is unresolvable, this
-    # returns [] and we drop nothing.
-    to_drop = _revalidated_orphan_live_classes(weaviate_url)
+    # bindings + CURRENT live schema.
+    try:
+        to_drop = _revalidated_orphan_live_classes(weaviate_url)
+    except _wh.ProbeUnavailable as exc:
+        # "0 orphans, done" would be the wrong answer to "I could not check".
+        print(
+            f"refusing: could not read the live Weaviate schema at "
+            f"{weaviate_url} ({exc.reason or exc}), so no class can be "
+            f"re-validated as an orphan. Nothing was dropped. Start Weaviate "
+            f"and re-run.",
+            file=sys.stderr,
+        )
+        return 2
     result: dict = {"dropped": [], "errors": [], "revalidated_count": len(to_drop)}
     for cls in to_drop:
         try:
@@ -13406,8 +14075,11 @@ def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
         for n in result["dropped"]:
             print(f"dropped orphan: {n}")
         if not to_drop:
-            print("no orphans to drop after run-time re-validation "
-                  "(keep-set unresolvable, or all reclaimed already).")
+            # v0.2.92 W18: both "could not check" cases now REFUSE above with
+            # exit 2, so reaching here means the check RAN and found nothing.
+            print("no orphan classes to drop: the live schema and the "
+                  "launcher.db keep-set were both read, and every live code "
+                  "class belongs to a current binding.")
         for err in result["errors"]:
             print(f"  ERROR {err['collection']}: {err['error']}")
     return 1 if result["errors"] else 0
@@ -13432,10 +14104,15 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
       (b) absent from the DETECT-TIME live-prefix snapshot (captured while
           Weaviate was UP and persisted into `.claude/state/` by the detector).
     It REFUSES to remove ANYTHING when the keep-set is unresolvable (launcher.db
-    down) OR when the detect-time snapshot is missing (``--project-folder``
-    omitted, or the snapshot file absent) — because without the snapshot it
-    cannot rule out the "active code-graph, momentarily-absent binding row"
-    degenerate. Conservative by construction: never rm a dir it cannot prove is
+    down) OR when the detect-time snapshot is not TRUSTWORTHY — because without
+    it the command cannot rule out the "active code-graph, momentarily-absent
+    binding row" degenerate. A snapshot is untrustworthy when
+    ``--project-folder`` was omitted, when the file is absent or malformed, and
+    (v0.2.92 W18) when it lacks the ``live_schema_resolvable`` marker: a
+    pre-v0.2.92 detect run performed during a Weaviate outage wrote an EMPTY
+    prefix list that this command then read as "nothing was live". Replacing
+    such a file needs one read-only `detect-orphan-code-collections` run with
+    Weaviate up. Conservative by construction: never rm a dir it cannot prove is
     dead.
     Exit 0 on clean reclaim; 1 on error; 2 on missing flags / Weaviate-up.
     """
@@ -13485,11 +14162,15 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
 
     project_folder = getattr(args, "project_folder", None)
     if project_folder:
-        live_snapshot, snapshot_present = _read_orphan_live_prefix_snapshot(
-            Path(project_folder),
-        )
+        snapshot = _read_orphan_live_prefix_snapshot(Path(project_folder))
     else:
-        live_snapshot, snapshot_present = (set(), False)
+        snapshot = _wh.ProbeResult.unknown(
+            "--project-folder was not passed, so there is no detect-time "
+            "snapshot to read",
+            what=_WHAT_ORPHAN_SNAPSHOT,
+        )
+    snapshot_present = snapshot.is_known()
+    live_snapshot: set[str] = set() if snapshot.is_unknown() else snapshot.require()
 
     result: dict = {
         "removed": [],
@@ -13498,16 +14179,21 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
         "snapshot_present": snapshot_present,
     }
 
-    # SEV-3 #1: without the detect-time snapshot we cannot verify a prefix was
-    # dead at detect time → refuse everything (conservative).
-    if not snapshot_present:
+    # SEV-3 #1 / v0.2.92 W18: without a snapshot we can TRUST we cannot verify a
+    # prefix was dead at detect time → refuse everything (conservative). An
+    # unmarked pre-v0.2.92 snapshot counts as "cannot trust": it may have been
+    # captured during a Weaviate outage, in which case its emptiness is not
+    # evidence of anything.
+    if snapshot.is_unknown():
+        result["snapshot_unresolvable_reason"] = snapshot.reason
         if getattr(args, "json", False):
             print(json.dumps(result))
         else:
             print(
-                "detect-time live-prefix snapshot MISSING (pass --project-folder "
-                "pointing at the project whose deferral emitted this command) — "
-                "removed NOTHING (conservative).",
+                f"detect-time live-prefix snapshot UNUSABLE: {snapshot.reason}. "
+                f"Removed NOTHING (conservative). Re-run "
+                f"`python -m vco_lib.project_init detect-orphan-code-collections "
+                f"--project-folder <project>` with Weaviate UP, then retry.",
                 file=sys.stderr,
             )
         return 0
@@ -13570,7 +14256,8 @@ def _bundle_update_pointer_heal() -> None:
     lock. Never raises — a bundle update must always exit on its own result.
     """
     import sqlite3
-    import urllib.request
+    # `urllib.request` is already imported unconditionally at module scope
+    # (line 53); a second function-local import shadowed it for no reason.
 
     try:
         from vco_lib.kg_binding_heal import heal_shared_kg_pointer_drift

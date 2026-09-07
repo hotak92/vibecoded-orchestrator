@@ -17,6 +17,12 @@
   import { listen, invoke, safeInvoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { KgSyncStatus, KgSyncView } from '$lib/types/launcher';
+  import {
+    kgSyncBannerRunningLabel,
+    kgSyncBannerSuccessLabel,
+    kgSyncDoneCount,
+    kgSyncTotalCount,
+  } from './kg-sync-banner-logic';
 
   interface Props {
     projectId: string;
@@ -86,9 +92,11 @@
             kg_total: 0,
             kg_succeeded: 0,
             kg_failed: 0,
+            kg_skipped: 0,
             docs_total: 0,
             docs_succeeded: 0,
             docs_failed: 0,
+            docs_skipped: 0,
             error_message: null,
             log_tail: null,
             current_phase: null,
@@ -97,9 +105,11 @@
           kg_total: e.payload.kg_total ?? view?.kg_total ?? 0,
           kg_succeeded: e.payload.kg_succeeded ?? view?.kg_succeeded ?? 0,
           kg_failed: e.payload.kg_failed ?? view?.kg_failed ?? 0,
+          kg_skipped: e.payload.kg_skipped ?? view?.kg_skipped ?? 0,
           docs_total: e.payload.docs_total ?? view?.docs_total ?? 0,
           docs_succeeded: e.payload.docs_succeeded ?? view?.docs_succeeded ?? 0,
           docs_failed: e.payload.docs_failed ?? view?.docs_failed ?? 0,
+          docs_skipped: e.payload.docs_skipped ?? view?.docs_skipped ?? 0,
           current_phase: e.payload.current_phase,
           error_message: e.payload.error_message ?? view?.error_message ?? null,
         };
@@ -134,8 +144,11 @@
   }
 
   function progressCounter(v: KgSyncView): string {
-    const done = v.kg_succeeded + v.docs_succeeded;
-    const total = v.kg_total + v.docs_total;
+    // v0.2.92 WP-B1: a file that was intentionally skipped (archived /
+    // embed-skip / excluded) is fully ACCOUNTED FOR — count it in `done`
+    // so the bar completes honestly instead of stalling at total - skips.
+    const done = kgSyncDoneCount(v);
+    const total = kgSyncTotalCount(v);
     if (total === 0) return '';
     return `${done} / ${total}`;
   }
@@ -144,23 +157,13 @@
     switch (v.status) {
       case 'pending':
         return 'KG sync: queued';
-      case 'running': {
-        const counter = progressCounter(v);
-        if (v.current_phase === 'scan') return 'KG sync: scanning knowledge/ and docs/…';
-        // v0.2.71 Piece 5a: waiting on the process-global single-flight lane
-        // (another project's KG sync is running first; queued syncs WAIT).
-        if (v.current_phase === 'queued') return 'KG sync: waiting for the embed lane…';
-        if (counter) {
-          if (v.current_phase === 'docs') return `KG sync: embedding docs (${counter})`;
-          return `KG sync: embedding (${counter})`;
-        }
-        return 'KG sync: embedding…';
-      }
-      case 'success': {
-        const total = v.kg_total + v.docs_total;
-        if (total === 0) return 'KG sync: complete';
-        return `KG sync: indexed ${total} node${total === 1 ? '' : 's'}`;
-      }
+      case 'running':
+        // v0.2.92 WP-B1: the running-label decision (incl. the new
+        // 'finalize' stage and the neutral unknown-phase fallback) lives
+        // in kg-sync-banner-logic.ts — unit-tested there.
+        return kgSyncBannerRunningLabel(progressCounter(v), v.current_phase);
+      case 'success':
+        return kgSyncBannerSuccessLabel(v);
       case 'failed':
         return 'KG sync: failed';
       case 'skipped':

@@ -102,10 +102,22 @@ def _real_provenance_line(repo_path: Path) -> str:
     change in the producer breaks this fixture instead of the parser
     silently (M6). Only the producer's git probe is stubbed (deterministic
     sha without needing a real git repo); the patch is scoped to this call
-    so it can never clobber a test's own ``subprocess.run`` stub."""
+    so it can never clobber a test's own stub.
+
+    v0.2.92 (WP-G): ``provenance_line`` no longer runs ``subprocess.run``
+    itself — it delegates to :func:`vco_lib.git_meta.git_head_sha`, which
+    short-circuits to ``None`` when ``repo_path`` has no ``.git`` directory
+    (true for every ``tmp_path`` fixture here) *before* it would ever reach
+    a subprocess call. Stubbing ``codegraph_guards.subprocess.run`` therefore
+    silently stopped being exercised — the sha resolution never got that far,
+    and this helper would have started returning ``analyzed_commit=none``
+    instead of the fixture sha, not raising. Patch the producer's actual git
+    seam (``codegraph_guards.git_meta.git_head_sha``) directly instead, which
+    keeps the same "deterministic sha, no real git repo needed" contract the
+    docstring above promises."""
     with mock.patch.object(
-        codegraph_guards.subprocess, "run",
-        return_value=types.SimpleNamespace(returncode=0, stdout=f"{_FIXTURE_SHA}\n"),
+        codegraph_guards.git_meta, "git_head_sha",
+        return_value=_FIXTURE_SHA,
     ):
         return codegraph_guards.provenance_line(
             "codesage-large-v2", 2048, 7, repo_path
@@ -463,8 +475,14 @@ def test_provenance_producer_shape_matches_parser():
 
     # Round-trip: git probe fails → producer emits analyzed_commit=none →
     # parser maps it to None (commit honestly unknown).
+    # v0.2.92 (WP-G): the producer's git probe is now git_meta.git_head_sha,
+    # which reaches subprocess.run inside vco_lib.git_meta (Path(".") has a
+    # real .git dir here, so head_state() does not short-circuit before the
+    # call) — patch it there so the "git could not run" arm is genuinely
+    # exercised instead of raising AttributeError on a symbol that no longer
+    # lives on codegraph_guards.
     with mock.patch.object(
-        codegraph_guards.subprocess, "run",
+        codegraph_guards.git_meta.subprocess, "run",
         side_effect=OSError("git absent"),
     ):
         none_line = codegraph_guards.provenance_line("m", 1024, 7, Path("."))
@@ -521,8 +539,9 @@ def test_main_forwards_log_path_to_the_driver(monkeypatch, tmp_path):
     seen: dict = {}
 
     def _fake_run(project, repo_root, analyzer, *, prune_stale=False,
-                  index_dot_claude=True, log_path=None):
-        seen.update(project=project, log_path=log_path)
+                  force_rewalk=False, index_dot_claude=True, log_path=None):
+        seen.update(project=project, log_path=log_path,
+                    force_rewalk=force_rewalk)
         return 0
 
     monkeypatch.setattr(cr, "run_resync_and_verify", _fake_run)
@@ -534,6 +553,10 @@ def test_main_forwards_log_path_to_the_driver(monkeypatch, tmp_path):
     ])
     assert rc == 0
     assert seen["project"] == "P"
+    # v0.2.92: the driver forwards the analyzer's force-rewalk decision as
+    # EXPLICIT ARGV (it used to ride ambient env). Default must stay False —
+    # an ordinary resync must never bypass the analyzer's per-file skip gate.
+    assert seen["force_rewalk"] is False
     assert seen["log_path"] == tmp_path / "l.log"
 
 
@@ -543,7 +566,7 @@ def test_main_log_path_is_optional(monkeypatch, tmp_path):
     seen: dict = {}
 
     def _fake_run(project, repo_root, analyzer, *, prune_stale=False,
-                  index_dot_claude=True, log_path=None):
+                  force_rewalk=False, index_dot_claude=True, log_path=None):
         seen["log_path"] = log_path
         return 0
 

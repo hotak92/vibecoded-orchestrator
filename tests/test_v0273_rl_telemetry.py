@@ -357,7 +357,7 @@ def _transcript(tmp_path, query, answer_text):
         },
     ]
     p = tmp_path / "transcript.jsonl"
-    p.write_text("\n".join(json.dumps(l) for l in lines))
+    p.write_text("\n".join(json.dumps(entry) for entry in lines))
     return str(p)
 
 

@@ -1,0 +1,568 @@
+{
+  "_comment": [
+    "v0.2.92 PLAN-EXTENSION §3.5 / R13 — ONE fixture for the container-runtime + compose decision,",
+    "read by tests/test_container_runtime_ssot.py (Python: vco_lib.containers.resolve) AND by",
+    "launcher/src-tauri/vct-launcher-core/src/services/runtime.rs tests (Rust: candidate_order + select_runtime).",
+    "Each scenario describes a host: `env` (VCT_CONTAINER_RUNTIME), `on_path` (binaries shutil.which finds),",
+    "`version_ok` / `daemon_ok` (which `<rt> version` / `<rt> info` exit 0; a runtime listed in `probe_unknown`",
+    "times out instead), `compose_subcommand_ok` (`<rt> compose version` exits 0), `standalone_on_path`.",
+    "`expect` is the Python tri-state result. `expect_rust` is what the launcher decides for the same host:",
+    "null = no runtime (Rust never returns a runtime without compose — its caller has nothing to drive).",
+    "RULED (v0.2.92 BLOCKER-4, overturning the earlier merge-lane ASK #1 ruling): VCT_CONTAINER_RUNTIME is a PIN.",
+    "With it set to an UNUSABLE runtime BOTH surfaces refuse — Python returns `absent` carrying `requested`,",
+    "`requested_installed` and `alternative_usable` plus an actionable reason; Rust returns no runtime (expect_rust = null).",
+    "The fall-through the ASK #1 ruling kept (loudly) was a DATA-PLANE FORK: podman and docker have per-runtime named",
+    "volumes (infrastructure/docker-compose.yml), so `docker compose up -d` for a podman user brings up an EMPTY Weaviate",
+    "on :8081 that every downstream heal reads as their KG. `expect.substituted` is therefore false on EVERY row, and the",
+    "resolver still COMPUTES it (`pref is not None and candidate != pref`) so reintroducing a fall-through fails here.",
+    "v0.2.92 delivery-audit M1 added the THIRD leg: `expect_module_plane` is what",
+    "launcher/.../services/container_runtime.rs (module containers: install, pull,",
+    "start, supervise) decides for the same host via runtime_candidate_order +",
+    "decide_module_runtime. It differs from `expect_rust` where compose is the",
+    "question (module containers need no compose: `usable_runtime_but_no_compose_anywhere`",
+    "is ok=podman here and null there) and it is the only surface that reads",
+    "`runtime_txt` (install.py's recorded runtime — a pin channel that exists only",
+    "on the module plane; see the runtime_txt_* scenarios). The module plane is",
+    "two-state over its Err: a probe that times out collapses into the same refusal",
+    "arm as a dead daemon (`probe_timeout_is_unknown_not_absent` stays unknown ONLY",
+    "on the Python side)."
+  ],
+  "scenarios": [
+    {
+      "name": "nothing_installed",
+      "env": null,
+      "on_path": [],
+      "version_ok": [],
+      "daemon_ok": [],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": null,
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "no_responsive": true
+      }
+    },
+    {
+      "name": "podman_only_subcommand_compose",
+      "env": null,
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "podman_only_standalone_compose",
+      "env": null,
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [],
+      "standalone_on_path": [
+        "podman-compose"
+      ],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "standalone",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "standalone"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "both_compose_forms_prefer_subcommand",
+      "env": null,
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [
+        "podman-compose"
+      ],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "both_runtimes_podman_first",
+      "env": null,
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "env_docker_wins_over_podman",
+      "env": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "docker",
+        "requested": "docker",
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "docker"
+      }
+    },
+    {
+      "name": "env_auto_is_no_preference",
+      "env": "auto",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "env_unrecognised_falls_back_to_auto",
+      "env": "bogus",
+      "on_path": [
+        "docker"
+      ],
+      "version_ok": [
+        "docker"
+      ],
+      "daemon_ok": [
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "docker",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "docker"
+      }
+    },
+    {
+      "name": "podman_daemon_down_docker_usable",
+      "env": null,
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "docker"
+      }
+    },
+    {
+      "name": "podman_without_compose_docker_with_compose_wins",
+      "env": null,
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "usable_runtime_but_no_compose_anywhere",
+      "env": null,
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": null,
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "installed_but_daemon_down_is_absent_with_hint",
+      "env": null,
+      "on_path": [
+        "docker"
+      ],
+      "version_ok": [
+        "docker"
+      ],
+      "daemon_ok": [],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "docker",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "no_responsive": true
+      }
+    },
+    {
+      "name": "probe_timeout_is_unknown_not_absent",
+      "env": null,
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [],
+      "daemon_ok": [],
+      "probe_unknown": [
+        "podman"
+      ],
+      "compose_subcommand_ok": [],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "unknown",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "no_responsive": true
+      }
+    },
+    {
+      "_why": "The reboot case: podman pinned, podman installed but its machine/socket is down, Docker Desktop running. Pre-BLOCKER-4 this resolved DOCKER and ran `docker compose up -d` against docker's OWN empty volumes. Now both surfaces refuse and the hint names docker as the repin target.",
+      "name": "env_pref_unusable_is_refused_not_substituted",
+      "env": "podman",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "docker"
+      ],
+      "daemon_ok": [
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "podman",
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "podman",
+          "via": "VCT_CONTAINER_RUNTIME",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_pin_usable_resolves_it_on_the_module_plane",
+      "_why": "install.py recorded podman in state/install/runtime.txt at install time; the module plane pins on that record (the module's named volumes live under the recorded runtime). The env-var-free surfaces (Python resolve + runtime.rs) never read the file, so they auto-detect — a deliberate, documented asymmetry: the pin channel that exists only on the module plane pins only there.",
+      "env": null,
+      "runtime_txt": "podman",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_pin_unusable_is_refused_not_substituted",
+      "_why": "Delivery-audit v0.2.92 M1, the runtime.txt arm: install recorded podman, the podman machine is stopped after a reboot, Docker Desktop is running, no env var set. Pre-M1 the module plane fell through to docker and pulled/started the module image against docker's EMPTY copy of every named volume; the supervisor's next pass re-selected podman. The refusal names the file the pin came from and the env override that supersedes it. The env-free surfaces auto-detect docker for the INFRA stack (no pin exists for them) — recorded here so the asymmetry is a ruled fact, not an accident.",
+      "env": null,
+      "runtime_txt": "podman",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": null,
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "podman",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    }
+  ]
+}

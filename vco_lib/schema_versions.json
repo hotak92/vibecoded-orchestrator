@@ -1,5 +1,5 @@
 {
-  "_comment": "Generated from vco_lib/schema_versions.py \u2014 DO NOT edit by hand. Regenerate via scripts/regen_schema_versions_json.py whenever the Python module changes. Parity asserted by tests/test_schema_versions_parity.py.",
+  "_comment": "Generated from vco_lib/schema_versions.py \u2014 DO NOT edit by hand. Regenerate via scripts/regen_schema_versions_json.py whenever the Python module changes. Parity asserted by tests/test_v52_ag_schema_versions.py (Python) and launcher/src-tauri/tests/schema_versions_rust_parity.rs (Rust, include_str! at compile time).",
   "canonical_versions": {
     "bundle_materialization": 2,
     "code_formats": 1,
@@ -12,7 +12,7 @@
     "kg_collection_access_vocabulary": 1,
     "kg_node_formats": 1,
     "kg_node_frontmatter": 1,
-    "launcher_db_table_set": 42,
+    "launcher_db_table_set": 44,
     "module_installs_shape": 1,
     "module_settings_shape": 1,
     "project_bootstrap_version": 1,

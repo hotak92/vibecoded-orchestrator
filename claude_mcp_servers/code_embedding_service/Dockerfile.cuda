@@ -30,6 +30,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# v0.2.92 BLOCKER-1: `image_source.py` holds the ONE definition of "which
+# files this image is built from" and is hashed BY the service itself for
+# /health.source_sha. Keep this COPY set in step with
+# image_source.IMAGE_SOURCE_FILES (a test pins the pair).
+COPY image_source.py .
 COPY server.py .
 
 # Redirect ALL HuggingFace state (model weights + modules cache) to mounted volume.

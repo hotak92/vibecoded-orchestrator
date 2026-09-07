@@ -51,6 +51,13 @@ pub(crate) struct BindingReconcileReport {
     /// `kg_collection_access` rows rewritten back from v0.2.49 phantom
     /// names to their binding-backed siblings.
     pub access_rows_restored: usize,
+    /// v0.2.92 W12 — `role='shared'` KG binding rows repointed off a class
+    /// that does not exist, by
+    /// [`shared_kg_binding::repair_shared_kg_bindings`]. A different table and
+    /// a different defect from `bindings_repaired` (which is CODE-GRAPH
+    /// bindings), sharing this sweep only because both need the SAME
+    /// `/v1/schema` snapshot.
+    pub shared_bindings_repaired: usize,
 }
 
 /// The repair decision for one project's code-graph binding. Pure output of
@@ -294,6 +301,60 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
     // sys_path_root for the Python deferral bridge; deferrals are skipped
     // (soft-fail) when the orchestrator clone can't be located.
     let repo_root = crate::commands::installer::find_local_repo_root().ok();
+
+    // ── v0.2.92 W12: `role='shared'` KG binding repair ───────────────────
+    //
+    // A DIFFERENT defect from this module's own (a last-resort CONSTANT
+    // persisted as a binding row on a re-pointed install, rather than a
+    // half-completed rename), but the same evidence discipline and — the
+    // reason it lives here — the same input: ONE `/v1/schema` snapshot.
+    // Calling it from this sweep costs zero extra probes; giving it its own
+    // boot task would double the boot-time Weaviate traffic to answer the
+    // same question twice.
+    //
+    // Placed BEFORE the per-project loop deliberately. The two sweeps are
+    // independent (this one reads/writes `project_kg_bindings` rows with
+    // `role='shared'`; the loop below touches `project_codegraph_bindings`
+    // and `kg_collection_access`, and never the shared role), so ordering
+    // cannot change either outcome — but a fixed order keeps the boot log
+    // and any ledger records deterministic across runs.
+    //
+    // `Some(&classes_lower)`: reaching this line already PROVES the probe
+    // succeeded — the `Err` arm above returned. The `Option` is the callee's
+    // own contract, exercised directly in its unit tests.
+    //
+    // Scope precondition (checked, currently inert): this snapshot comes from
+    // ONE machine-global Weaviate URL, while `project_kg_bindings` carries a
+    // per-row `weaviate_url` column. That column is only ever PRESERVED
+    // (`project_identity` carries it forward on a rewrite) — no resolver reads
+    // it: the hub serves `LocalConfig::load().weaviate_url` and
+    // `project_env_settings::populate` builds `http://localhost:{port}`. So
+    // every retrieval client sees the same instance this snapshot describes,
+    // and "absent here" means "absent for that client". If a per-project
+    // Weaviate URL ever becomes a real resolver leg, this sweep (and the
+    // code-graph one below, which has the same exposure) must fetch per URL
+    // instead — otherwise a project on another instance would look phantom.
+    let shared = crate::commands::project_state_populate::shared_kg_binding
+        ::repair_shared_kg_bindings(db, Some(&classes_lower), repo_root.as_deref());
+    report.shared_bindings_repaired = shared.repaired;
+    if shared.repaired > 0
+        || shared.skipped_manual_override > 0
+        || shared.phantom_without_evidence > 0
+    {
+        tracing::info!(
+            "[vct] shared-kg-repair (boot): inspected {}, repaired {}, \
+             ledger records {}, left alone: {} manual-override / {} \
+             phantom-without-evidence",
+            shared.inspected,
+            // The REPORT field, not the local — this is the value a caller
+            // sees, so reading it here keeps the log honest if the two ever
+            // drift apart.
+            report.shared_bindings_repaired,
+            shared.deferrals_emitted,
+            shared.skipped_manual_override,
+            shared.phantom_without_evidence,
+        );
+    }
 
     for project in &projects {
         // ── CG binding repair ────────────────────────────────────────────
@@ -922,6 +983,208 @@ mod tests {
         assert_eq!(after.last_analyzed_at, Some(1_700_000_000));
         assert!(after.enabled);
         assert_eq!(after.config, serde_json::json!({"k": "v"}));
+    }
+
+    // ── v0.2.92 W12: the `role='shared'` KG repair, through THIS entry ──
+    //
+    // The gate chain itself is unit-tested in
+    // `project_state_populate::shared_kg_binding`. What these three prove is
+    // the thing those tests cannot: that the sweep is actually REACHED from
+    // the boot entry point, with the boot snapshot, and that the boot path
+    // honours the two promises the repair makes.
+
+    /// Seed the machine that produced the outage: an orchestrator-root whose
+    /// real KG is `VCODev_KnowledgeGraph`, and one project whose `role='shared'`
+    /// row still names the bundled constant (a class that does not exist).
+    fn seed_poisoned_shared_binding(
+        db: &Db,
+        project_folder: &std::path::Path,
+        shared_config: serde_json::Value,
+    ) -> String {
+        db.insert_project(
+            "w12-root",
+            "VibeCoded Orchestrator",
+            &project_folder.join("_root").to_string_lossy(),
+            ProjectHost::OrchestratorRoot,
+            "orchestrator-root",
+        )
+        .unwrap();
+        crate::db::bindings_writer::write_kg_binding(
+            db,
+            "w12-root",
+            "primary",
+            "VCODev_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let pid = "w12-victim".to_string();
+        db.insert_project(
+            &pid,
+            "Transcrypt",
+            &project_folder.to_string_lossy(),
+            ProjectHost::Base,
+            "transcrypt",
+        )
+        .unwrap();
+        crate::db::bindings_writer::write_kg_binding(
+            db,
+            &pid,
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &shared_config,
+        )
+        .unwrap();
+        pid
+    }
+
+    fn shared_name(db: &Db, pid: &str) -> Option<String> {
+        db.list_project_kg_bindings(pid)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.role == "shared")
+            .map(|b| b.collection_name)
+    }
+
+    fn deferred_md(folder: &std::path::Path) -> String {
+        std::fs::read_to_string(
+            folder.join(".claude").join("context").join("UPDATE_DEFERRED.md"),
+        )
+        .unwrap_or_default()
+    }
+
+    /// ACT (end-to-end): the shared-KG repair RUNS at boot off the same schema
+    /// snapshot the code-graph sweep fetched — no second probe, no separate
+    /// task. Without the wiring this is the test that goes red: the repair
+    /// function existed and was fully tested for six hours while never
+    /// executing once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reconcile_repairs_the_shared_kg_binding() {
+        let db = Db::open_in_memory().unwrap();
+        let td = tempfile::TempDir::new().unwrap();
+        let pid = seed_poisoned_shared_binding(&db, td.path(), serde_json::Value::Null);
+
+        // The live schema: the real shared KG exists, the bundled-constant
+        // class does not.
+        let (url, _server) = spawn_fake_weaviate_schema(vec![
+            "VCODev_KnowledgeGraph".to_string(),
+            "Transcrypt_KnowledgeGraph".to_string(),
+        ]);
+        let report = reconcile_half_renamed_bindings_at_boot(&db, &url).await;
+
+        assert!(!report.probe_failed);
+        assert_eq!(
+            report.shared_bindings_repaired, 1,
+            "the boot sweep must RUN the shared-KG repair, not just own a field"
+        );
+        assert_eq!(
+            shared_name(&db, &pid).as_deref(),
+            Some("VCODev_KnowledgeGraph"),
+        );
+
+        // The ledger record (W12 Task 4). The emit shells out to
+        // `vco_lib.deferral_emit`, so it needs BOTH a locatable orchestrator
+        // clone and a resolvable interpreter. Key the assertion on those
+        // PRECONDITIONS rather than on the outcome — an outcome-keyed branch
+        // would pass vacuously on the day the emit silently stops working,
+        // which is the failure mode this whole cycle is about.
+        let md = deferred_md(td.path());
+        let can_emit = crate::commands::installer::find_local_repo_root().is_ok()
+            && vct_launcher_core::python_resolve::resolve_python_for_vco_lib().is_some();
+        if can_emit {
+            assert!(
+                md.contains("shared_kg_binding_repaired"),
+                "clone root + interpreter both resolve, so the repair record \
+                 must have landed in the project's ledger. Got: {:?}",
+                md
+            );
+            assert!(
+                md.contains("Shared-KG binding repointed off a class that does not exist"),
+                "ledger entry present but not the W12 record: {}",
+                md
+            );
+            assert!(
+                md.contains("VibeCodedOrchestrator_KnowledgeGraph")
+                    && md.contains("VCODev_KnowledgeGraph"),
+                "the record must name BOTH the phantom it replaced and the \
+                 class it adopted, or a human cannot retrace it: {}",
+                md
+            );
+        } else {
+            assert!(
+                md.contains("shared_kg_binding_repaired") == false,
+                "no emit was possible, so nothing may claim one happened: {}",
+                md
+            );
+        }
+    }
+
+    /// LEAVE-ALONE, through the boot path: a row carrying a deliberate human
+    /// correction is never rewritten. This is the promise made to the affected
+    /// user in writing, so it is pinned at the entry point a real boot uses —
+    /// not only at the pure decision function.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reconcile_never_touches_a_manual_override_shared_row() {
+        let db = Db::open_in_memory().unwrap();
+        let td = tempfile::TempDir::new().unwrap();
+        let pid = seed_poisoned_shared_binding(
+            &db,
+            td.path(),
+            serde_json::json!({"manual_override": "transcrypt-2026-09-01-phantom-shared-kg"}),
+        );
+
+        // Full repair evidence is on offer — and must still be declined.
+        let (url, _server) = spawn_fake_weaviate_schema(vec![
+            "VCODev_KnowledgeGraph".to_string(),
+            "Transcrypt_KnowledgeGraph".to_string(),
+        ]);
+        let report = reconcile_half_renamed_bindings_at_boot(&db, &url).await;
+
+        assert_eq!(report.shared_bindings_repaired, 0);
+        assert_eq!(
+            shared_name(&db, &pid).as_deref(),
+            Some("VibeCodedOrchestrator_KnowledgeGraph"),
+            "a manual_override row is not ours to overwrite"
+        );
+        assert!(
+            !deferred_md(td.path()).contains("shared_kg_binding_repaired"),
+            "a skipped row must not produce a repair record"
+        );
+    }
+
+    /// LEAVE-ALONE (the §5.4 leg, shared-KG axis): Weaviate unreachable → the
+    /// early return means the shared sweep is never even called, so a
+    /// phantom-looking shared row survives untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reconcile_does_not_touch_shared_bindings_when_probe_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let td = tempfile::TempDir::new().unwrap();
+        let pid = seed_poisoned_shared_binding(&db, td.path(), serde_json::Value::Null);
+
+        // Definitely-closed port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let report =
+            reconcile_half_renamed_bindings_at_boot(&db, &format!("http://{}", addr)).await;
+
+        assert!(report.probe_failed);
+        assert_eq!(report.shared_bindings_repaired, 0);
+        assert_eq!(
+            shared_name(&db, &pid).as_deref(),
+            Some("VibeCodedOrchestrator_KnowledgeGraph"),
+            "probe failure is not evidence of absence"
+        );
+        assert!(!deferred_md(td.path()).contains("shared_kg_binding_repaired"));
     }
 
     /// LEAVE-ALONE (the load-bearing §5.4 leg): Weaviate unreachable →

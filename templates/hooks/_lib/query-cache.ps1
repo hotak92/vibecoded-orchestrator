@@ -108,19 +108,37 @@ function Set-VcoQueryCache {
     } catch { }
 }
 
-# Invoke-VcoKgSearchCached <VenvPy> <RlScript> <Query> <Limit> -- run the
-# RL-aware KG search through the shared TTL cache; return the raw "KG:"-prefixed
-# block(s), served from cache on a repeat query. MUST MATCH query-cache.sh
-# vco_kg_search_cached (same "kg" surface + key order). Best-effort.
+# Invoke-VcoKgSearchCached <VenvPy> <RlScript> <Query> <Limit> [PromptId] [TranscriptPath]
+# -- run the RL-aware KG search through the shared TTL cache; return the raw
+# "KG:"-prefixed block(s), served from cache on a repeat query. MUST MATCH
+# query-cache.sh vco_kg_search_cached (same "kg" surface + key order).
+# Best-effort.
+#
+# WP-E (v0.2.92): PromptId/TranscriptPath are OPTIONAL, default "" (an
+# omitting caller reproduces pre-WP-E behaviour byte-for-byte). PromptId
+# joins the cache key ONLY -- see query-cache.sh's vco_kg_search_cached
+# docstring for why (the query text on this boundary is always the raw,
+# unenriched trigger; enrichment happens inside rl_kg_search.py from
+# --transcript, so two turns issuing the same short trigger must not
+# collide on one cache key). That separation holds only while a PromptId is
+# actually delivered: with an EMPTY PromptId every turn contributes the same
+# key component, all turns collapse onto ONE key, and a cross-turn re-ask of
+# the identical trigger is a HIT replaying a different enrichment window's
+# result for up to the TTL (900 s). See query-cache.sh's KNOWN DEGRADATION
+# note -- same behaviour, same out-of-scope call, stated in both siblings so
+# neither reads as an unconditional guarantee.
+# TranscriptPath is a PATH, never text -- passed
+# through as --transcript <path> so enrichment composition happens in the
+# process that embeds it.
 function Invoke-VcoKgSearchCached {
-    param([string]$VenvPy, [string]$RlScript, [string]$Query, [int]$Limit = 1)
+    param([string]$VenvPy, [string]$RlScript, [string]$Query, [int]$Limit = 1, [string]$PromptId = "", [string]$TranscriptPath = "")
     if (-not $Query) { return "" }
     if (-not $VenvPy -or -not (Test-Path -LiteralPath $VenvPy)) { return "" }
     if (-not (Test-Path -LiteralPath $RlScript)) { return "" }
 
     $key = ""
     if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
-        $key = Get-VcoQueryCacheKey "kg" $Query "$Limit"
+        $key = Get-VcoQueryCacheKey "kg" $Query "$Limit" $PromptId
     }
     if ($key -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
         $qc = Get-VcoQueryCache $key
@@ -129,7 +147,11 @@ function Invoke-VcoKgSearchCached {
 
     $out = ""
     try {
-        $out = (& $VenvPy $RlScript $Query --limit $Limit --hook-format 2>$null | Select-Object -First 40) -join "`n"
+        if ($TranscriptPath) {
+            $out = (& $VenvPy $RlScript $Query --limit $Limit --hook-format --transcript $TranscriptPath 2>$null | Select-Object -First 40) -join "`n"
+        } else {
+            $out = (& $VenvPy $RlScript $Query --limit $Limit --hook-format 2>$null | Select-Object -First 40) -join "`n"
+        }
     } catch { $out = "" }
     if ($null -eq $out) { $out = "" }
     if ($key -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
@@ -171,7 +193,9 @@ function Invoke-VcoDualSearchCached {
         [string]$CgProjectArg = "",
         [int]$CgLimit = 2,
         [string]$CgExcludeFile = "",
-        [string]$CgAnchor = ""
+        [string]$CgAnchor = "",
+        [string]$PromptId = "",
+        [string]$TranscriptPath = ""
     )
     $fallback = @{ Ok = $false; Kg = ""; Cg = "" }
     if (-not $Query) { return @{ Ok = $true; Kg = ""; Cg = "" } }
@@ -179,10 +203,14 @@ function Invoke-VcoDualSearchCached {
     if (-not $VenvPy -or -not (Test-Path -LiteralPath $VenvPy)) { return $fallback }
 
     # 1. Per-leg cache probe (identical keys to the single-leg wrappers).
+    # PromptId joins BOTH keys (WP-E, v0.2.92) -- same rationale as
+    # Invoke-VcoKgSearchCached: the query text here is always the raw
+    # trigger, never the enriched text, so two different turns issuing the
+    # same short trigger must not collide on one cache entry.
     $kgKey = ""; $cgKey = ""
     if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
-        if ($WantKg) { $kgKey = Get-VcoQueryCacheKey "kg" $Query "$KgLimit" }
-        if ($WantCg) { $cgKey = Get-VcoQueryCacheKey "cg" $Query $CgProjectArg "$CgLimit" $CgExcludeFile $CgAnchor }
+        if ($WantKg) { $kgKey = Get-VcoQueryCacheKey "kg" $Query "$KgLimit" $PromptId }
+        if ($WantCg) { $cgKey = Get-VcoQueryCacheKey "cg" $Query $CgProjectArg "$CgLimit" $CgExcludeFile $CgAnchor $PromptId }
     }
     $kgOut = ""; $cgOut = ""
     $needKg = $WantKg; $needCg = $WantCg
@@ -231,6 +259,10 @@ function Invoke-VcoDualSearchCached {
         if ($CgExcludeFile) { $cliArgs += @("--cg-exclude-file", $CgExcludeFile) }
         if ($CgAnchor) { $cliArgs += @("--cg-anchor", $CgAnchor) }
     }
+    # WP-E (v0.2.92): one --transcript flag threads to BOTH legs inside
+    # hook_dual_search.py. Omitted entirely when empty so a caller without a
+    # TranscriptPath reproduces today's argv exactly.
+    if ($TranscriptPath) { $cliArgs += @("--transcript", $TranscriptPath) }
 
     $lines = @()
     try {

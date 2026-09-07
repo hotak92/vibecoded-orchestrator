@@ -119,6 +119,17 @@ Two caveats:
 
 ### `<vct_root>/update.log` (updater forensic trail)
 
+> **This file only exists after a binary-swap handoff has run.** It is written
+> by `vct-updater`, which the launcher spawns ONLY when there is a staged
+> `<target>.new` binary to swap in. So on an install where no update ever
+> completed — including one that has been silently failing to detect updates —
+> `update.log` is **legitimately absent**, and its absence is not a symptom of
+> broken diagnostics. It is also overwritten on every handoff, so it describes
+> the LAST swap and no earlier one.
+>
+> The diagnostics that exist on **every** install, updated or not, are listed
+> under "Always-present diagnostics" below. Reach for those first.
+
 - Plain text, overwritten each handoff. Lines to look for:
   - `swap OK: <path>` / `swap FAILED <path>: MoveFileExW failed: GetLastError=32`
     (32 = ERROR_SHARING_VIOLATION → something still held the binary;
@@ -201,6 +212,61 @@ Two caveats:
 | Launcher restarts into the OLD version repeatedly | dist binary still stale (lock) on Windows; on Intel Macs pre-v0.2.54, the arm64-hardcoded dist path | update to ≥v0.2.54; Windows: quit fully, let vct-updater swap |
 | **Update says "Already up to date", source IS current, but the launcher version never changes** | **stale dist binary (frozen exe) — see the stale-exe recipe below** | **v0.2.91+ heals it at boot/update-check; on older builds use the manual recipe** |
 | Hub still on old version after update | pre-v0.2.54 hub-restart-before-staging ordering | `vct-hub --stop` then relaunch the launcher |
+| **Preferences → Launcher updates has said "Up to date" for weeks, `Branch: HEAD`, `Commits behind: 0`, `Running:` and `Latest source release:` show the SAME version** | **detached HEAD on a build before v0.2.92 — the check was structurally blind, see below** | **update once by hand (below), then use the GUI's Reattach button** |
+
+---
+
+## Detached HEAD (and the pre-v0.2.92 blindness it caused)
+
+**How to recognise it**: `git -C <install> branch --show-current` prints
+nothing, or `git -C <install> rev-parse --abbrev-ref HEAD` prints the literal
+word `HEAD`. You get here by running `git checkout v0.2.NN`, `git checkout
+<sha>`, or any tool that leaves HEAD pointing at a commit rather than a branch.
+
+**What it does NOT break**: `git pull --ff-only <remote> main` fast-forwards a
+detached HEAD perfectly well, and so does "Update orchestrator" in the
+launcher. Older versions of this document and of the launcher's own error text
+blamed detached HEAD for pull failures; that attribution was wrong and has been
+removed.
+
+**What it DID break, before v0.2.92**: the launcher's *self-update check*
+(Preferences → Launcher updates) asked git for the current branch, got the
+literal string `HEAD` back, and then compared against a ref
+(`vco_upstream/HEAD`) that does not exist in a VCO clone. git returned an
+error; the code turned that error into the number `0`; and `0 commits behind`
+rendered as **"✓ Up to date"**. At the same time the "Latest source release"
+line asked `git describe` — *the closest tag reachable from HEAD* — so an
+install detached on its own release tag was told the newest release was the one
+it was already on. Every number on the page was internally consistent and all
+of them were answers to the wrong question. The check never recovered on its
+own.
+
+**On v0.2.92+** the branch is normalised through one shared resolver, a failed
+probe renders as **"⚠ Couldn't check for updates"** instead of a green tick,
+the release tag comes from the remote, and the page offers a one-click
+**Reattach** button.
+
+**If you are on an older build, the fix cannot reach you through that page** —
+the binary that would tell you about it is the binary you are not getting. Two
+routes:
+
+1. **Preferred (GUI):** the *orchestrator* update badge in the launcher's
+   MenuBar is a different check and was **never** blind to detached HEAD. If it
+   is lit, click **Update orchestrator**; that pulls the source, runs
+   `install.py --update`, and deploys the new launcher binary. Quit the
+   launcher fully (tray → Quit) and relaunch. The Reattach button then appears.
+2. **Terminal (one-time):** from the install root —
+   ```bash
+   git -C <install> status              # confirm the tree is clean
+   git -C <install> fetch vco_upstream
+   git -C <install> checkout main       # reattach
+   python install.py --update
+   ```
+   Do **not** run `checkout main` while you have local commits on the detached
+   HEAD: they would become unreferenced. `git -C <install> branch my-work` first
+   if `git -C <install> merge-base --is-ancestor HEAD vco_upstream/main` exits
+   non-zero. (The GUI button applies exactly these two guards for you and
+   refuses, with the reason, rather than proceeding.)
 
 ---
 
@@ -228,12 +294,34 @@ nothing (that shape is indistinguishable from a local `cargo build`, and your
 build is yours). It never restarts or quits itself, and it stands down entirely
 while an update is running.
 
+### Always-present diagnostics
+
+These exist regardless of whether an update ever completed. Copy whichever are
+present before changing anything:
+
+| File | Written by | Present when |
+|---|---|---|
+| `<vct_root>/logs/launcher.<date>.log` | the launcher itself | **always**, from the first launch on v0.2.92+ — created eagerly at startup with a banner line. Newest 14 daily files are kept; older ones are deleted. |
+| `<vct_root>/logs/hub.<date>.log` | `vct-hub` | whenever the hub has run (v0.2.92+) |
+| `<install>/state/logs/install.jsonl` | `install.py` | after any `install.py` run |
+| `<install>/.claude/context/UPDATE_DEFERRED.md` | the launcher + `install.py` | whenever something was deferred |
+| `<vct_root>/update.log` | `vct-updater` | **only after a binary-swap handoff** — see the note above |
+| `<vct_root>/launcher-update-state.json` | the launcher's update check | after the first check |
+
+The launcher logs were added in v0.2.92. Before that the launcher wrote its
+diagnostics to **stderr only** — and on Windows a release build has no console
+and no stderr, so every "couldn't check for updates" warning it emitted went
+nowhere. If you are on an older build, `update.log` and `install.jsonl` are all
+there is, and neither records launcher-side update *checks*.
+
 **Manual recipe** (any version; needs no working launcher):
 
 ```bash
-# 0. FIRST, copy these aside — they say what actually failed:
-#    ~/.vct/update.log         (%USERPROFILE%\.vct\update.log on Windows)
+# 0. FIRST, copy aside whatever of these EXISTS (see the table above — several
+#    are legitimately absent on an install that never completed an update):
+#    ~/.vct/logs/launcher.*.log   (v0.2.92+; %USERPROFILE%\.vct\... on Windows)
 #    <install>/state/logs/install.jsonl
+#    ~/.vct/update.log            (ONLY after a binary swap ever ran)
 
 # 1. Fully quit the launcher (tray -> Quit), then stop the hub.
 vct-hub --stop

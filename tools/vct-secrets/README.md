@@ -113,10 +113,23 @@ git clone https://github.com/hotak92/vibecoded-orchestrator
 cd vibecoded-orchestrator
 mkdir -p ~/.vct-secrets/{shared,projects}
 chmod 700 ~/.vct-secrets
-cp tools/vct-secrets/vct                 ~/.vct-secrets/vct
-cp tools/vct-secrets/git-credential-vct  ~/.vct-secrets/git-credential-vct
-chmod 755 ~/.vct-secrets/vct ~/.vct-secrets/git-credential-vct
-export PATH="$HOME/.vct-secrets:$PATH"   # add to your shell rc
+# SYMLINK the CLI from the checkout — do NOT copy it.
+mkdir -p ~/.local/bin
+ln -sfn "$PWD/tools/vct-secrets/vct" ~/.local/bin/vct
+export PATH="$HOME/.local/bin:$PATH"     # add to your shell rc
+```
+
+> **Why a symlink and not `cp`.** Earlier revisions of this file told you to copy
+> `vct` into `~/.vct-secrets/`. Do not. That directory holds your secret material
+> and `install.py` is forbidden from ever writing to it — so a copy placed there
+> can **never be refreshed by an update** and silently rots. A copy also breaks
+> outright against current code: `vct` now sources `tools/vct-secrets/lib/`, which
+> a two-file copy does not bring along. A symlink resolves to the checkout, so it
+> is current by construction and picks up every fix on your next `git pull`.
+>
+> If you already have a copy at `~/.vct-secrets/vct`, `vct doctor` will detect it,
+> name the guards it is missing, and print the command to replace it. It will not
+> overwrite anything by itself.
 ```
 
 To use the git credential helper for HTTPS pushes (also manual):

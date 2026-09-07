@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Windows Task Scheduler XML for the VCO model gateway
+  (`vct-model-gateway`). Registered per-user against a logon trigger, no
+  admin elevation.
+
+  DEFAULT OFF. This task exists only because the user asked for it, via the
+  `register-boot` flag of `vct-model-gateway` or the launcher's gateway
+  toggle. The gateway proxies under the user's Claude login and any
+  configured vendor subscription, so making it a logon-time daemon widens
+  the machine's security surface — the user's decision, not the
+  installer's. `install.py` run with the `update` flag re-renders an
+  EXISTING task; it never creates a first one.
+
+  (Long flags are named without their leading double hyphen throughout this
+  comment: XML 1.0 forbids the two-hyphen sequence inside a comment, and the
+  container-stack template carries the same note for the same reason.)
+
+  Written by vco_lib/boot_service.py and imported with
+  `schtasks /Create /TN <name> /XML <file> /F`. The `/F` is what makes
+  re-registration idempotent.
+
+  NO GIT BASH / WSL DEPENDENCY. The container-stack task learned this the
+  hard way in v0.2.14 (Bug #2): a task that invoked `bash` failed silently
+  at every logon on a machine without Git Bash on PATH. This task invokes
+  cmd.exe — always present — and cmd.exe invokes the gateway entry point
+  directly. There is no PowerShell wrapper in between because the gateway
+  needs no runtime detection: `boot_service.resolve_gateway_exec()` already
+  decided, at registration time, between the `vct-model-gateway` console
+  script and `<python> -m model_router`, and baked the answer in below.
+
+  Template substitutions:
+    {{LABEL}}           — task name (no path separators)
+    {{EXEC_COMMAND}}    — the gateway executable, forward-slash form
+    {{EXEC_ARGUMENTS}}  — its arguments (may be empty for the console
+                          script; `-m model_router` for the fallback), with
+                          the `serve` verb already appended
+    {{WORKING_DIR}}     — directory the task runs in
+    {{STATE_DIR}}       — VCT state root pinned at registration time
+    {{BOOT_LOG_FILE}}   — file cmd.exe appends the process's own output to.
+                          Deliberately NOT the daemon's own log file: the
+                          daemon logs to stderr as well as to that file, so
+                          redirecting into the same path would write every
+                          record twice.
+    {{CREATED_AT}}      — ISO8601 timestamp at registration time
+    {{USER_ID}}         — Windows user id (DOMAIN\user) for the logon
+                          trigger context
+
+  Every substituted value is XML-escaped once, centrally, by
+  `boot_service.register_windows` — an install path containing `&` used to
+  produce XML that `schtasks /Create /XML` rejects outright.
+
+  Env propagation: Task Scheduler XML has no env declarations, so the same
+  shape the container-stack task uses applies here —
+  `cmd.exe /c "set VAR=value&& <command> <args> >> <log> 2>&1"`. `set` is
+  per-process (it does not leak into the user's interactive environment)
+  and the `&&` chain makes the child inherit it. `&amp;&amp;` and `&gt;`
+  are the XML escapes for `&&` and `>`.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>{{CREATED_AT}}</Date>
+    <Author>{{USER_ID}}</Author>
+    <Description>VCT model gateway — local Anthropic-shaped model picker serving your Claude login and configured vendor namespaces. Starts at user logon.</Description>
+    <URI>\{{LABEL}}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{{USER_ID}}</UserId>
+      <!-- Give the session (and the hub, which the gateway prefers to
+           resolve vendor keys through) a moment to come up first. The
+           gateway starts fine without the hub — key resolution is lazy and
+           retried — so this is politeness, not a dependency. -->
+      <Delay>PT10S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{{USER_ID}}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <!-- PT0S = no time limit. A daemon that Task Scheduler killed after
+         three days would look like an intermittent gateway outage. -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>5</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "set VCT_STATE_DIR={{STATE_DIR}}&amp;&amp; &quot;{{EXEC_COMMAND}}&quot; {{EXEC_ARGUMENTS}} &gt;&gt; &quot;{{BOOT_LOG_FILE}}&quot; 2&gt;&amp;1"</Arguments>
+      <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

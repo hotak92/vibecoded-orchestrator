@@ -78,7 +78,13 @@ del "$env:USERPROFILE\.vct\update.result.json"
 python install.py --update
 ```
 
-Before deleting anything, copy `%USERPROFILE%\.vct\update.log` and `<install>\state\logs\install.jsonl` aside — they say which swap failed and why.
+Before deleting anything, copy these aside:
+
+- `%USERPROFILE%\.vct\logs\launcher.*.log` — the launcher's own diagnostics (v0.2.92+). **Always present**; this is the one to send.
+- `<install>\state\logs\install.jsonl` — every `install.py` run.
+- `%USERPROFILE%\.vct\update.log` — **only if it exists.** It is written by `vct-updater` during a binary-swap handoff, so an install where no update ever completed legitimately has none. Its absence means "no swap has run here", not "your diagnostics are broken".
+
+On builds before v0.2.92 there is no launcher log at all: the launcher wrote to stderr, and a release Windows build has neither a console nor a stderr sink, so its warnings went nowhere. On those builds `install.jsonl` is the only always-present record, and it does not cover launcher-side update *checks*.
 
 ### Windows: MCP fork-bomb during update (V52-AI — FIXED in v0.2.52)
 
@@ -649,6 +655,48 @@ Since v0.2.18 (`refactor(EmbeddingService) + OpenAI integration`, see `CHANGELOG
 
 The free Ollama path (`qwen3-embedding:0.6b`) is unaffected; switch back in the Embeddings panel if you want to disable the OpenAI route entirely.
 
+## Code-embedding service runs an image older than its source (`code_embed_image_stale`)
+
+`code_embed` is the only VCO service that ships as a container image **built
+from the orchestrator checkout** rather than pulled from a registry. Both
+`docker compose up` and `podman-compose up` build an image only when it is
+**missing** — a changed build context is not a rebuild trigger, and
+`--force-recreate` replaces the *container* from the *same* image. So before
+v0.2.92 a source fix could stay live in git and absent from the running
+service through every update. Measured on a maintainer machine: image built
+2026-05-16, container force-recreated 2026-07-12, service still answering
+over-window input with a silently truncated leading window at HTTP 200.
+
+**How to check.** The service publishes the digest of the source files it is
+actually running:
+
+```bash
+curl -s http://localhost:11440/health | python -m json.tool   # look for source_sha
+python -m vco_lib.code_embed_image --json                      # compare with the checkout
+```
+
+Exit code: `0` current, `1` stale, `2` unknown (service down, or this tree has
+no service source — normal for a per-project install). A `/health` with **no**
+`source_sha` field at all is a pre-v0.2.92 image.
+
+**How to fix.** `python install.py --update` from the orchestrator root now
+adds `--build` to its compose invocation whenever the image is not provably
+current, and names `code_embed` so the rebuilt image reaches the running
+container. If your compose is too old to accept `--build` on `up` (the
+installer says so and falls back), rebuild explicitly:
+
+```bash
+cd <orchestrator-root>/infrastructure
+docker compose --profile gpu up -d --build --force-recreate code_embed
+```
+
+**Order matters.** Refresh the image **before** re-running any code-graph
+re-sync. Rebuilding the graph first re-walks every entity through the old,
+truncating service and then reports success — you would have to do it twice.
+
+CPU-tier installs are unaffected: they route code embeddings through Ollama
+and do not run this container at all.
+
 ## Shared KG looks empty after upgrading from <v0.2.12
 
 The bundled shared collection is named `VibeCodedOrchestrator_KnowledgeGraph`; some older installs have data under the previous name `VibeCodedTools_KnowledgeGraph`. Fresh installs land on the current name; an older install with data under the previous name will find `hybrid_search` querying the current (empty) one.
@@ -660,6 +708,37 @@ Two paths:
 
 See `docs/CONFIGURATION.md` → "Shared KG collection" for the full migration matrix.
 
+## A stale KG binding is healed, asked about, or diagnosed — never guessed
+
+On every install/update, the evidence heal (`kg_binding_heal`) re-points a
+primary KG binding at the Weaviate class that demonstrably holds the
+project's data — the doctor's file-backed ownership verdict, never a
+name-derived guess. It never moves or deletes Weaviate data; a repoint is
+recorded as an informational `kg_binding_evidence_repointed` ledger entry.
+Three outcomes, by design:
+
+1. **Healed** — exactly one class holds the data, or one class's evidence is
+   decisive (its matched-path count exceeds the runner-up's by more than 2x
+   AND by more than 10 paths; a sample window that cannot tell two classes
+   apart reads as a tie, not a verdict).
+2. **Asked** — a near-tie raises `kg_binding_ambiguous_evidence` (an
+   action-required ledger entry listing every candidate with its counts and
+   how far short of the margin the leader fell). Pick the class in the
+   launcher's project KG tab — saving a DIFFERENT collection records your
+   pick (`config_json` `manual_override`) and the next update drops the
+   entry — or use the printed SQL stanza (no launcher needed).
+3. **Diagnosed only** — below the doctor's evidence bar (fewer than 2 of the
+   first 100 sampled `file_path`s under the project folder, or under 80%
+   ownership): `vco doctor`'s `kg_binding_evidence_mismatch` names it; repair
+   by picking the right class in the launcher.
+
+Never healed, on purpose: a row carrying `manual_override` (a human's
+deliberate pick is never overwritten by automation), a target class already
+named by another binding row, and any run where Weaviate or `launcher.db`
+could not be read — probe failure is not evidence. To merge leftover objects
+into the class you kept: `python -m vco_lib.project_init migrate-collections
+--help`.
+
 ## Update Bundle deferrals: `UPDATE_DEFERRED.md`
 
 When you click "Update bundle" in the per-project Settings page (or run `python -m vco_lib.project_init install-bundle --update`), the orchestrator writes `<project>/.claude/context/UPDATE_DEFERRED.md` whenever an update step needs explicit user consent before continuing. The launcher toast surfaces the count ("5 files updated, 2 deferrals"); the file lists each deferral entry with the exact command to clear it.
@@ -668,7 +747,9 @@ The two deferral types you'll encounter most often:
 
 **`bundle_user_modified_preserved`** — Update Bundle detected that one of your project files differs from the orchestrator's prior-shipped hash recorded in `.claude/.vco-manifest.json`. The orchestrator interpreted this as "user edits present" and preserved your version on disk rather than overwriting. Each preserved file appears in the deferral with the explicit force command (typically `python -m vco_lib.project_init install-bundle --update --force --file <path>`) that accepts the orchestrator's default for that file. Inspect your edits first; run the force command only if you want to discard them.
 
-**`schema_migration_required`** — Update Bundle detected drift between the Weaviate target schema and the schema currently on disk for one of your project's collections. Because schema migration is destructive (it can re-embed or recreate collection objects), the bundle path never auto-applies it. The deferral entry shows the explicit consent command: `cd "$VCT_ORCHESTRATOR_ROOT" && .venv/bin/python -m vco_lib.project_init migrate-collections --name '<project>'` (the v0.2.19 fix made this work correctly from project venvs — previously it produced `ModuleNotFoundError`). Run it once you have a Weaviate backup or are comfortable with the migration's destructive scope.
+**`schema_migration_required`** — Update Bundle detected drift between the Weaviate target schema and the schema currently on disk for one of your project's collections. Because schema migration is destructive (it can re-embed or recreate collection objects), the bundle path never auto-applies it. The deferral entry shows the explicit consent command: `cd "$VCT_ORCHESTRATOR_ROOT" && .venv/bin/python -m vco_lib.project_init migrate-collections --name '<project>'` (the v0.2.19 fix made this work correctly from project venvs — previously it produced `ModuleNotFoundError`). Run it once you have a Weaviate backup or are comfortable with the migration's destructive scope. Two env knobs tune that run: `VCT_CODEGRAPH_INDEX_TYPE=hfresh` opts the project's five code-graph collections into the vector-preserving index-type migration (default `hnsw` keeps them out of the plan; the CLI `--index-type` flag takes precedence when given), and `VCT_EDGE_TIMEOUT_SECS` (default `3600`; `0` disables the cap) bounds each migration edge subprocess — raise it on I/O-degraded machines rather than letting a long purge be killed mid-run.
+
+**`stale_mcp_json_shadow_quarantined`** — an orphan `<project>/.mcp.json` weaviate-kg block whose env disagrees with the migrated `.claude/settings.json` was moved aside to `.claude/context/.mcp.json.bak-<date>` so it can no longer shadow the real config. If the divergence is deliberate — you point this project's weaviate-kg at a different Weaviate on purpose — set `VCO_SKIP_MCP_JSON_QUARANTINE=1` (truthy: `1`/`true`/`yes`/`on`) in the project env and the quarantine step becomes a no-op. Restoring a backup byte-identically is also detected and left alone (reported as `stale_mcp_json_restore_detected` instead of re-quarantining).
 
 The file lives at `<project>/.claude/context/UPDATE_DEFERRED.md` and is regenerated on each Update Bundle / `install.py --update` run.
 
@@ -808,6 +889,55 @@ fell back to cosine). It reads the same state the pipeline writes, so a healthy
 report means the loop is wired end-to-end; a fallback-heavy report points at the
 reranker container or the license gate. Free-tier installs (no RL license) will
 see the gate reported closed — that is expected, retrieval uses plain cosine.
+
+## Remote Control: "Remote Control initialization failed" in a panel pointed at the gateway
+
+**Symptom**: in the VS Code Claude Code panel, `/remote-control` (or the
+mobile-app flow) fails with "Remote Control initialization failed" —
+including when the session's selected model is a Claude model routed
+through the gateway.
+
+**Root cause — the gate is the ENDPOINT, not the auth.** Claude Code
+enables Remote Control only in sessions talking directly to
+`api.anthropic.com`. Pointing the panel at the VCO model gateway sets
+`ANTHROPIC_BASE_URL` to the gateway, so Remote Control is refused there —
+*even when you are signed in with claude.ai* (OAuth does not bypass the
+endpoint gate; verified against Claude Code 2.1.258; the gate shipped in
+v2.1.196). A second, independent gate also applies: API keys,
+`claude setup-token`, and `CLAUDE_CODE_OAUTH_TOKEN` all fail with "Remote
+Control requires a full-scope login token".
+
+What does NOT work:
+
+- **Any gateway or panel configuration.** The session must reach
+  `api.anthropic.com` directly; no proxy setting changes that.
+- **A per-workspace `.vscode/settings.json` override** to give one
+  workspace a native panel: `claudeCode.environmentVariables` has VS Code
+  setting scope `machine`, so the key cannot be set per workspace.
+- **Downgrading Claude Code below v2.1.196** to re-enable Remote Control
+  through a custom `ANTHROPIC_BASE_URL` — do not do this: auto-update
+  reverts the downgrade and a month of fixes goes with it.
+
+What DOES work — the supported coexistence pattern: Remote Control
+sessions and gateway sessions are independent processes and run alongside
+each other on one machine. Keep the panel on the gateway, and start a
+**native-auth Remote Control server** in the background:
+
+```bash
+bash .claude/scripts/rc-native.sh start        # POSIX (Linux/macOS)
+powershell -NoProfile -ExecutionPolicy Bypass -File .claude/scripts/rc-native.ps1 start   # Windows (5.1)
+```
+
+The server is detached (survives the terminal closing; not a boot service —
+it does not survive a reboot, just start it again), prints the
+`https://claude.ai/code?environment=...` join URL, and answers sessions
+opened from the Claude mobile app or claude.ai/code on the Anthropic
+subscription. It requires a full-scope claude.ai login, and the working
+directory must be trusted by the CLI — if `start` reports "Workspace not
+trusted", run `claude` in that directory once (interactively) and accept
+the trust dialog; VS Code panel usage does not record CLI trust. The
+`rc-native` skill (`.claude/skills/rc-native/`) automates the start/status/
+stop/logs lifecycle.
 
 ## When asking for help
 

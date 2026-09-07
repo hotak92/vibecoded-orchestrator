@@ -25,7 +25,22 @@ Environment variables:
                           gpu backend only — the ollama backend holds no in-process weights.
   OLLAMA_URL              Ollama API URL (default: http://localhost:11435)
   CODE_EMBED_INSTRUCTION  Query instruction prefix (default: "" — CodeSage needs none)
-  CODE_EMBED_MAX_SEQ_LEN  Max sequence length (default: model default)
+  CODE_EMBED_MAX_SEQ_LEN  Sets the served max_seq_length window (default: the
+                          model snapshot's sentence_bert_config.json — 1024
+                          for codesage-large-v2, NOT the 2048 in config.json).
+                          An input whose token count exceeds the window is
+                          REFUSED with HTTP 400 ("input length exceeds the
+                          context length"), never silently truncated (W1).
+                          If you change it, change the SSOT too:
+                          MODEL_TOKEN_LIMITS in weaviate_mcp/chunking.py is
+                          where every chunk/entity budget is derived from —
+                          this env only moves the SERVING window. Leaving the
+                          two out of step is the exact drift W1 was (budgets
+                          sized for one window, model serving another); it no
+                          longer loses text silently — the refusal + the
+                          caller's shrink make it loud — but a budget above
+                          the served window costs an extra round trip per
+                          over-window entity and a truncated leading window.
   CODE_EMBED_TRUST_REMOTE "true" | "false" (default: "true")
 
 Usage:
@@ -37,29 +52,120 @@ Usage:
 
 API:
   POST /embed  {"texts": [...], "is_query": false}  → {"embeddings": [[...], ...], "dim": N}
-  GET  /health  → {"status": "ok", "backend": "...", "model": "...", "dim": N}
+  GET  /health  → {"status": "ok", "backend": "...", "model": "...", "dim": N,
+                   "source_sha": "<sha256 of the source files in this image>"}
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 logger = logging.getLogger("code_embedding_service")
-# v0.2.91 (Decision #21): honors the global VCO_LOG_LEVEL pref via the
-# shared vco_lib helper instead of a hardcoded INFO level. Bare import —
-# vco_lib is a SHIPPED, editable-installed part of every healthy install,
-# so a failed import here already fails loudly (ImportError), matching the
-# "no silent-fallback on vco_lib imports" discipline used elsewhere.
-from vco_lib.log_setup import configure_logging
-configure_logging(format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+_LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+
+
+def _configure_logging_for_environment() -> bool:
+    """Configure logging; return True when ``vco_lib`` was available.
+
+    v0.2.91 (Decision #21) routed this through ``vco_lib.log_setup`` so the
+    global ``VCO_LOG_LEVEL`` pref is honoured, as a BARE import under the
+    "no silent-fallback on vco_lib imports" discipline.
+
+    v0.2.92: that discipline's premise — *vco_lib is part of every healthy
+    install* — is FALSE for this one file.  ``server.py`` runs in two
+    environments, and only one of them is a VCO install:
+
+    * the **host process** (``python -m claude_mcp_servers.code_embedding_service.server``)
+      — a VCO install; ``vco_lib`` is there and a failure to import it IS a
+      broken install;
+    * the **container image**, whose Dockerfiles COPY exactly
+      ``requirements.txt`` + ``image_source.py`` + ``server.py`` into a
+      ``pytorch`` base and install nothing else.  ``vco_lib`` is absent BY
+      DESIGN and cannot be added: the compose build context is this service
+      directory, so a ``COPY`` cannot reach the repo root.
+
+    A bare import therefore made the shipped image unstartable —
+    ``ModuleNotFoundError: No module named 'vco_lib'`` at import time, before
+    uvicorn binds, under ``restart: unless-stopped`` (i.e. a crash loop).
+    Nobody saw it because nothing ever rebuilt the image; the two defects hid
+    each other. Verified by running the then-current source inside the
+    then-current image.
+
+    So: fall back, but ANNOUNCE.  This is not the masking the rule forbids —
+    the fallback names the environment on the container's own log, and it is
+    scoped to ``ImportError`` of that one module.  Anything else propagates.
+    """
+    try:
+        from vco_lib.log_setup import configure_logging
+    except ImportError:
+        logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+        logger.warning(
+            "vco_lib is not importable — running as the minimal containerized "
+            "service image, where it is absent by design. Logging falls back to "
+            "INFO and the global VCO_LOG_LEVEL preference is NOT honoured. If "
+            "you are seeing this from a host process rather than a container, "
+            "your VCO install is broken: re-run `python install.py --update`."
+        )
+        return False
+    configure_logging(format=_LOG_FORMAT)
+    return True
+
+
+#: True when ``vco_lib`` resolved (host process); False in the minimal image.
+#: Reported on ``/health`` so the answer to "which environment is serving me?"
+#: is readable rather than inferred — a HOST process with this False is a
+#: broken install, while a container with it False is the normal shape.
+VCO_LIB_AVAILABLE = _configure_logging_for_environment()
+
+
+def _load_image_source_sha():
+    """Digest of the source files THIS process is running, or ``None``.
+
+    Loaded by path (not by import name) so it works identically as
+    ``/app/server.py`` in the image — where ``claude_mcp_servers`` is not a
+    package and the repo root is not on ``sys.path`` — and as a package
+    module in the checkout.  The rule itself lives once, in
+    ``image_source.py``, which is COPYed into the image alongside this file;
+    see that module for why a mirror was not acceptable.
+
+    ``None`` (rendered as JSON ``null`` on ``/health``) means "could not
+    compute", which is NOT the same as the field being ABSENT: absent means a
+    pre-v0.2.92 image that predates the field entirely.  Callers treat both
+    as *not provably current*, and only the digest matching the checkout as
+    *current*.
+    """
+    here = Path(__file__).resolve().parent
+    module_path = here / "image_source.py"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_vco_code_embed_image_source", module_path
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.source_sha(here)
+    except Exception:  # noqa: BLE001 — a self-description must never crash the service
+        logger.warning("could not compute the image source digest from %s", module_path)
+        return None
+
+
+#: The digest of the files this process is running (see ``/health``).
+#: Computed ONCE at import: it describes the code that is loaded, so
+#: re-reading the files later could only report something this process is
+#: not running.
+SOURCE_SHA = _load_image_source_sha()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -157,10 +263,16 @@ def _load_gpu_model():
         "device": device,
         "model_kwargs": {"torch_dtype": torch_dtype},
     }
-    if MAX_SEQ_LEN:
-        kwargs["model_kwargs"]["max_seq_length"] = int(MAX_SEQ_LEN)
-
+    # W11 (2026-09-05, verified against sentence-transformers 5.5.0's
+    # signature): CODE_EMBED_MAX_SEQ_LEN used to be plumbed into
+    # ``model_kwargs``, which SentenceTransformer forwards to
+    # ``AutoModel.from_pretrained`` — the TRANSFORMER's kwargs. The window
+    # that governs truncation is the ``max_seq_length`` ATTRIBUTE (not an
+    # init parameter at all), so the documented knob could not change it.
+    # Set the attribute directly after load instead.
     _st_model = SentenceTransformer(MODEL_NAME, **kwargs)
+    if MAX_SEQ_LEN:
+        _st_model.max_seq_length = int(MAX_SEQ_LEN)
     dim = _st_model.get_sentence_embedding_dimension()
     global _st_model_dim
     _st_model_dim = dim  # cache for /health so idle-unload survives liveness probes
@@ -168,8 +280,54 @@ def _load_gpu_model():
     return _st_model
 
 
+def _gpu_token_count(model, text: str) -> int:
+    """Tokenise ``text`` with the model's own tokenizer, UNTRUNCATED.
+
+    ``model.encode`` truncates silently at ``max_seq_length`` (HTTP 200, no
+    marker), so the honest window check must count on the raw tokenizer.
+    """
+    ids = model.tokenizer(text, add_special_tokens=True)["input_ids"]
+    return len(ids)
+
+
+def _refuse_over_window(model, texts: list[str], is_query: bool) -> None:
+    """W1 (wiring audit, 2026-09-05): REFUSE over-window input instead of
+    letting sentence-transformers truncate it silently.
+
+    ``model.encode`` accepts any length and drops everything past
+    ``max_seq_length`` with a 200 — the GPU code tier's default path fed it
+    entities budgeted for the 2 048 architectural cap while the snapshot
+    serves 1 024 (``sentence_bert_config.json``), so roughly half of every
+    maximal entity never influenced its vector, untagged. This mirrors what
+    ``truncate: false`` gives on the Ollama side: a hard refusal the caller
+    can catch.
+
+    The message deliberately carries the phrase ``input length exceeds the
+    context length`` — the SAME shape ``_is_context_overflow_error``
+    (``vco_lib.embedding_service``) recognises on Ollama refusals, matched
+    through the ``CodeEmbed /embed returned HTTP 400: ...`` wrapper the
+    CodeEmbedAdapter raises. One home, one behaviour: do not invent a
+    second phrasing, and do not widen the detector to match a new one.
+    """
+    window = int(model.max_seq_length)
+    for i, text in enumerate(texts):
+        if is_query and INSTRUCTION:
+            text = INSTRUCTION + text
+        n = _gpu_token_count(model, text)
+        if n > window:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"input length exceeds the context length: text at index "
+                    f"{i} is {n} tokens, window is {window} "
+                    f"(model {MODEL_NAME}, sentence_bert max_seq_length)"
+                ),
+            )
+
+
 def _embed_gpu(texts: list[str], is_query: bool = False) -> list[list[float]]:
     model = _load_gpu_model()
+    _refuse_over_window(model, texts, is_query)
     prompt = INSTRUCTION if is_query and INSTRUCTION else None
     embeddings = model.encode(
         texts,
@@ -196,9 +354,20 @@ def _embed_ollama(texts: list[str], is_query: bool = False) -> list[list[float]]
     for text in texts:
         if is_query and INSTRUCTION:
             text = INSTRUCTION + text
+        # v0.2.92 R40: num_ctx was UNSET, so this leg inherited Ollama's 2048
+        # default regardless of the model's real window. Resolved from the one
+        # home (chunking.MODEL_TOKEN_LIMITS) so the window we REQUEST and the
+        # chunk sizes we PRODUCE cannot drift apart — when they do, Ollama
+        # truncates the tail and still answers 200.
+        from vco_lib.embedding_providers.ollama import _num_ctx_for_model
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={"model": MODEL_NAME, "prompt": text},
+            json={
+                "model": MODEL_NAME,
+                "prompt": text,
+                "options": {"num_ctx": _num_ctx_for_model(MODEL_NAME)},
+                "truncate": False,  # v0.2.92: refuse, never silently drop the tail
+            },
             timeout=30,
         )
         if resp.status_code != 200:
@@ -556,6 +725,16 @@ async def health():
             # v0.2.79 §C: idle-unload observability.
             "model_loaded": model_loaded,
             "idle_unload_secs": IDLE_UNLOAD_SECS,
+            # v0.2.92 BLOCKER-1: image-vs-source staleness, made CHECKABLE.
+            # This service ships as an image BUILT from the checkout, and
+            # `compose up` builds only when the image is MISSING — so a
+            # source fix can be live in git and absent from every running
+            # install. `vco_lib.code_embed_image` compares this digest with
+            # the checkout's; `vco doctor` reports the mismatch; install.py
+            # passes `--build` when it is not provably current. A field that
+            # is ABSENT (not null) identifies a pre-v0.2.92 image.
+            "source_sha": SOURCE_SHA,
+            "vco_lib_available": VCO_LIB_AVAILABLE,
         }
     except Exception as e:
         # Log the full error internally; return only a generic message in the
@@ -616,22 +795,39 @@ if __name__ == "__main__":
     # ensure-containers hook from spawning a GPU model load mid-update,
     # which would race the launcher's binary refresh.
     #
-    # `_lib.update_gate` is SHIPPED; import_lib_member LOUD-FAILS if it's
-    # missing. The pre-fix silent `exit_if_update_in_progress = None` stub
-    # disabled the mid-update GPU-load guard on the exact broken-install
-    # path most likely to be mid-update. When this service runs as a bare
-    # script (container / ensure-containers hook) sys.path[0] is the
-    # server's own dir, so the parent (claude_mcp_servers/) must be
-    # inserted for `_lib` to resolve.
+    # `_lib.update_gate` is SHIPPED on the HOST; import_lib_member LOUD-FAILS
+    # if it is present-but-broken. The pre-fix silent
+    # `exit_if_update_in_progress = None` stub disabled the mid-update
+    # GPU-load guard on the exact broken-install path most likely to be
+    # mid-update. When this service runs as a bare script (host process /
+    # ensure-containers hook) sys.path[0] is the server's own dir, so the
+    # parent (claude_mcp_servers/) must be inserted for `_lib` to resolve.
     from pathlib import Path as _Path
     _mcp_root = str(_Path(__file__).resolve().parent.parent)
     if _mcp_root not in sys.path:
         sys.path.insert(0, _mcp_root)
-    from _lib.bootstrap import import_lib_member
-    exit_if_update_in_progress = import_lib_member(
-        "update_gate", "exit_if_update_in_progress"
-    )
-    exit_if_update_in_progress("code-embedding service")
+    #
+    # v0.2.92: `_lib` lives in `claude_mcp_servers/`, which the Dockerfiles do
+    # NOT copy — so in the container this import raised ModuleNotFoundError
+    # and the image could not start at all. The gate reads a HOST marker file
+    # the container cannot see, so it could never have fired there; on the
+    # host-process path `_lib` resolves and the gate runs unchanged. Announce
+    # the skip rather than failing (same reasoning as
+    # `_configure_logging_for_environment`).
+    try:
+        from _lib.bootstrap import import_lib_member
+    except ImportError:
+        logger.warning(
+            "claude_mcp_servers/_lib is not importable — running as the "
+            "minimal containerized service image. The mid-update start gate "
+            "is skipped; it reads a host marker file this container cannot "
+            "see in any case."
+        )
+    else:
+        exit_if_update_in_progress = import_lib_member(
+            "update_gate", "exit_if_update_in_progress"
+        )
+        exit_if_update_in_progress("code-embedding service")
 
     # Detect import path: standalone (container) vs package (python -m ...)
     try:

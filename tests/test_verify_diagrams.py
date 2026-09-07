@@ -11,9 +11,10 @@ Mirrors the style of ``test_verify_pins.py`` /
   doesn't depend on a live launcher DB.
 * Uses ``tmp_path`` for on-disk fixtures (.claude folder layouts,
   CLAUDE.md, hook scripts).
-* The launcher DB is materialised in-memory or as a tmp SQLite file
-  with just enough schema to exercise the verifier (projects +
-  _schema_migrations + project_modules + the diagrams-related tables).
+* The launcher DB is materialised as a tmp SQLite file carrying the REAL
+  launcher schema (``tests.common.launcher_db_fixture`` applies the shipped
+  migrations), then seeded with the rows the verifier reads (projects +
+  project_modules).
 
 The Weaviate-class check is tested via heavy mocking (no live
 Weaviate); the hub-allowlist check is tested via stubbing the
@@ -25,7 +26,6 @@ import argparse
 import json
 import sqlite3
 import sys
-import time
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +35,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    add_project,
+    create_empty_launcher_db,
+    insert_rows,
+)
 from vco_lib.cli import verify_diagrams as vd  # noqa: E402
 
 
@@ -44,92 +49,30 @@ from vco_lib.cli import verify_diagrams as vd  # noqa: E402
 
 
 def _seed_launcher_db(db_path: Path) -> None:
-    """Create a launcher DB matching the schema this verifier reads.
+    """Create a launcher DB with the REAL schema and the verifier's rows.
 
-    Includes:
-      * _schema_migrations (max version 22)
-      * projects table with one row
-      * Every table from migration 022
+    The schema comes from the shipped migrations (all 44 of them), so every
+    table ``verify_diagrams.DIAGRAMS_TABLES`` looks for — ``project_diagrams``,
+    ``diagram_snapshots``, ``diagram_access``, ``project_mcp_tool_grants``,
+    ``project_modules``, ``diagram_index_retry`` — exists in its real shape.
+    The pre-merge version hand-rolled all six, and three of them had columns
+    the launcher never wrote (``diagram_snapshots.project_diagram_id``,
+    ``diagram_access.owner_project_id`` / ``.permission``).
+
+    Seeded rows: one project (``p-1``) and its
+    ``project_modules('diagrams', enabled=1)`` row.
     """
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE _schema_migrations (
-            version INTEGER PRIMARY KEY,
-            description TEXT NOT NULL,
-            applied_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT NOT NULL UNIQUE
-        );
-
-        CREATE TABLE project_diagrams (
-            id INTEGER PRIMARY KEY,
-            project_id TEXT NOT NULL
-        );
-
-        CREATE TABLE diagram_snapshots (
-            id INTEGER PRIMARY KEY,
-            project_diagram_id INTEGER NOT NULL
-        );
-
-        CREATE TABLE diagram_access (
-            id INTEGER PRIMARY KEY,
-            owner_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            permission TEXT NOT NULL
-        );
-
-        CREATE TABLE project_mcp_tool_grants (
-            project_id TEXT NOT NULL,
-            mcp_name TEXT NOT NULL,
-            tool_name TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (project_id, mcp_name, tool_name)
-        );
-
-        CREATE TABLE project_modules (
-            project_id TEXT NOT NULL,
-            module_name TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            registered_at INTEGER NOT NULL,
-            PRIMARY KEY (project_id, module_name)
-        );
-
-        CREATE TABLE diagram_index_retry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            error TEXT,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at INTEGER NOT NULL,
-            last_error_at INTEGER
-        );
-        """
+    create_empty_launcher_db(db_path)
+    add_project(
+        db_path,
+        project_id="p-1",
+        name="demo",
+        folder_path="/tmp/does-not-matter",
+        slug="demo",
     )
-    now = int(time.time())
-    cur.execute(
-        "INSERT INTO _schema_migrations (version, description, applied_at) "
-        "VALUES (?, ?, ?)",
-        (22, "diagrams", now),
-    )
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?,?,?,?)",
-        ("p-1", "demo", "/tmp/does-not-matter", "demo"),
-    )
-    cur.execute(
-        "INSERT INTO project_modules "
-        "(project_id, module_name, enabled, registered_at) "
-        "VALUES (?, ?, ?, ?)",
-        ("p-1", "diagrams", 1, now),
-    )
-    conn.commit()
-    conn.close()
+    insert_rows(db_path, "project_modules", [{
+        "project_id": "p-1", "module_name": "diagrams", "enabled": 1,
+    }])
 
 
 @pytest.fixture
@@ -353,8 +296,15 @@ def test_migration_022_applied(launcher_db):
 
 
 def test_migration_022_too_old(launcher_db):
+    # DELIBERATE migration-level simulation: the DB carries the real
+    # schema, so `_schema_migrations` holds every shipped version (max
+    # is far above 22). Deleting everything from 22 up reproduces a
+    # launcher.db that stopped BELOW migration 022 — the state
+    # `_check_migration_022` reports as `max(...)=<n> < 22`. (The
+    # pre-merge fixture seeded version 22 alone, so deleting that one row
+    # was enough; it is not, against the real migration set.)
     conn = sqlite3.connect(str(launcher_db))
-    conn.execute("DELETE FROM _schema_migrations WHERE version=22")
+    conn.execute("DELETE FROM _schema_migrations WHERE version >= 22")
     conn.commit()
     conn.close()
     result = vd._check_migration_022()

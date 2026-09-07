@@ -105,7 +105,13 @@ class TestEmitChunkerResyncDeferral:
             # tests/test_deferral_command_argparse_sweep.py.
             assert "kg-sync --all" in content
             assert "kg-sync --all --force" not in content
-            assert "code-graph-analyze . --force-recreate" in content
+            # v0.2.92 (BLOCKER-2): the analyzer half carries --from-resolver
+            # and takes the folder as its positional repo_path (absolute
+            # wrapper path, no `cd`). Without an identity flag the analyzer's
+            # last resolution rung is the folder BASENAME, and
+            # --force-recreate DROPS the five <basename>_Code* classes.
+            assert "--from-resolver --force-recreate" in content
+            assert "code-graph-analyze . --force-recreate" not in content
 
     def test_severity_is_info(self) -> None:
         with tempfile.TemporaryDirectory() as td:

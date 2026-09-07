@@ -378,3 +378,10 @@ supabase/.temp/
 .claude/context/UPDATE_DEFERRED.md
 .claude/context/SELF-HANDOFF-*.md
 .wt/
+
+# Per-test temp roots. The owning test DOES clean up in tearDown
+# (test_orchestrator_root_kg_collection_persist.py), so these only
+# survive a KILLED run — which happened repeatedly this cycle when
+# agents were terminated mid-suite by upstream rate limits. Ignored so
+# a crashed run cannot leave a launcher.db that `git add -A` commits.
+tests/_tmp_orchroot_*/

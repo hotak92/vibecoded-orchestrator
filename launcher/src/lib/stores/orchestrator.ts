@@ -83,24 +83,67 @@ export interface UpdateStatus {
   installed_version: string;
   running_version: string;
   on_disk_binary_version: string;
-  /** v0.2.83 (WP-A2 / D2): honest remote-check health. Mirror of the two
-   *  fields WP-A1 added to Rust `installer::UpdateStatus`.
+  /** v0.2.92 (WP-13): what the remote-currency probe actually established.
+   *  Mirror of Rust `vct_launcher_core::check_state::CheckState`.
    *
-   *  `remote_check_ok === false` means the `git fetch` / `rev-list` probe
-   *  could NOT determine whether the remote is ahead — the signal is
-   *  UNKNOWN, NOT "up to date". `remote_check_error` carries a concise
-   *  stage-label / last-stderr-line for the popover copy. On success (or in
-   *  the non-git / not-applicable case) Rust returns `remote_check_ok=true`
-   *  with `remote_check_error=null`.
+   *  Replaces the v0.2.83 `remote_check_ok: boolean` + `remote_check_error`
+   *  pair. Two changes matter:
    *
-   *  Both are OPTIONAL for back-compat: a launcher running against a
-   *  pre-v0.2.83 Rust binary returns neither field. Readers MUST treat a
-   *  MISSING `remote_check_ok` as `true` (healthy) — an absent field is the
-   *  old "no health surface" world, where the check either worked or
-   *  soft-failed to `remote_ahead=false`; scheduling a retry there would be
-   *  a pointless storm. Only an explicit `=== false` is a failed check. */
-  remote_check_ok?: boolean;
-  remote_check_error?: string | null;
+   *  1. **`not_applicable` is now sayable.** A non-git install has no remote
+   *     and never will; the bool pair had to report that as `ok: true`, and
+   *     this file's readers then rendered it green — "checked, fine" for a
+   *     check that never ran.
+   *  2. **There is no missing-field case to guess at.** The pair was
+   *     OPTIONAL, and readers here treated ABSENT as healthy. That was a
+   *     defensible compat choice at the time and it is now removed: the Rust
+   *     enum always serialises its `state` tag, the GUI and the binary ship
+   *     together, and "the field is missing so assume everything is fine" is
+   *     the exact instinct this whole work package exists to delete. */
+  remote_check: CheckState;
+  /** v0.2.92 (WP-13): `true` when the install's clone has a detached HEAD.
+   *  Rendered explicitly rather than shown as `Branch: main`, which is what
+   *  the normalisation used to leave behind. */
+  head_detached?: boolean;
+}
+
+/** What a probe actually established. Mirror of Rust
+ *  `vct_launcher_core::check_state::CheckState` (internally tagged on
+ *  `state`).
+ *
+ *  Three states because two are not enough — see `check_state.rs` for the
+ *  full rationale. In short: a check that cannot distinguish "I could not
+ *  determine this" from "this is fine" is not a check, and "there is nothing
+ *  here to check" is a third, different truth. */
+export type CheckState =
+  | { state: 'ok' }
+  | { state: 'not_applicable' }
+  | { state: 'unknown'; error: string };
+
+/** How a surface should render a {@link CheckState}. One helper so the badge,
+ *  the Updates page and the tray copy cannot drift into three different
+ *  interpretations of the same three states — which is the file-level version
+ *  of the mistake that produced the incident (two SUBSYSTEMS interpreting one
+ *  git question differently). */
+export type CheckRendering = 'ok' | 'not_applicable' | 'unknown';
+
+/** Narrow a {@link CheckState} to its rendering. A missing or malformed value
+ *  is `'unknown'`, NEVER `'ok'`: an absent field means we did not hear an
+ *  answer, and the only safe reading of silence is that we do not know. */
+export function renderCheck(state: CheckState | null | undefined): CheckRendering {
+  if (!state || typeof state !== 'object') return 'unknown';
+  if (state.state === 'ok') return 'ok';
+  if (state.state === 'not_applicable') return 'not_applicable';
+  return 'unknown';
+}
+
+/** The reason a check could not complete, or `null` when it did (or did not
+ *  apply). Surfaces show this verbatim — it is git's own message, which is
+ *  more useful to a user pasting it into an issue than any paraphrase. */
+export function checkError(state: CheckState | null | undefined): string | null {
+  if (state && typeof state === 'object' && state.state === 'unknown') {
+    return state.error || null;
+  }
+  return null;
 }
 
 type OrchestratorStatus = 'unknown' | 'not_installed' | 'installed' | 'installing' | 'updating' | 'error';
@@ -123,8 +166,8 @@ interface OrchestratorState {
    *                amber "couldn't check" badge must NOT render (no startup
    *                flash);
    *    - `true`  — the last COMPLETED check ended with `updateStatus === null`
-   *                (command soft-failed) OR `remote_check_ok === false` (probe
-   *                couldn't determine remote state);
+   *                (command soft-failed) OR `remote_check.state === 'unknown'`
+   *                (the probe couldn't determine remote state);
    *    - `false` — the last completed check succeeded (or there was no remote
    *                to check, e.g. not_installed).
    *  `updater.ts::doSync` derives its `remoteCheckFailed` from THIS, so the
@@ -140,9 +183,9 @@ interface OrchestratorState {
 // Remote-check retry scheduling (v0.2.83, WP-A2 / D3)
 // ---------------------------------------------------------------------------
 //
-// When a `checkStatus()` lands `remote_check_ok === false`, the remote signal
-// is UNKNOWN — not "up to date". Rather than wait up to an hour for the next
-// poll (A-RC2), the store schedules a short burst of retries.
+// When a `checkStatus()` lands `remote_check.state === 'unknown'`, the remote
+// signal is UNKNOWN — not "up to date". Rather than wait up to an hour for the
+// next poll (A-RC2), the store schedules a short burst of retries.
 //
 // Policy (D3):
 //   - delays 30s → 90s → 300s, capped at 3 retries per failure episode;
@@ -150,9 +193,13 @@ interface OrchestratorState {
 //     timer is armed is a no-op (no stacking); a manual check cancels +
 //     replaces the pending timer;
 //   - an episode RESETS (retry counter → 0, pending timer cleared) the moment
-//     a check lands `remote_check_ok !== false` (ok, or MISSING = older Rust
-//     back-compat = treated as ok). Only an explicit `=== false` keeps the
-//     episode alive.
+//     a check lands anything other than `unknown` — `ok` (it worked) or
+//     `not_applicable` (there is nothing here to check, so retrying is
+//     pointless). Only `unknown` keeps the episode alive.
+//     v0.2.92 (WP-13): the old "MISSING field ⇒ treated as ok" branch is
+//     gone. An absent value now reads as `unknown` via `renderCheck` — the
+//     Rust enum always emits its tag, so absence means we heard no answer,
+//     and inferring health from silence is the defect this release closes.
 //
 // The timer lives at module scope (not in the store value) so it survives
 // store subscription churn and so `cancelScheduledRetry()` — exported for
@@ -294,14 +341,23 @@ function createOrchestratorStore() {
                 || !!updateStatus.merge_resolved_incomplete)
             : false;
 
-          // v0.2.83 (WP-A2 / D3 + N-4): remote-check retry episode management.
-          // Treat a MISSING remote_check_ok as healthy (older Rust
-          // back-compat) — only an EXPLICIT `=== false` is a failed check.
-          // A null updateStatus (the command itself soft-failed to null via
-          // safeInvoke) is ALSO a failed check: we couldn't determine remote
-          // state, so retry rather than pretend "up to date".
+          // v0.2.83 (WP-A2 / D3 + N-4) → v0.2.92 (WP-13): remote-check retry
+          // episode management, now driven by the tri-state.
+          //
+          // `unknown` is a failed check and retries. `not_applicable` is NOT
+          // a failure — there is no remote here, so retrying would be a
+          // pointless storm — and it is NOT a success either; it just does
+          // not schedule anything. A null updateStatus (the command itself
+          // soft-failed via safeInvoke) is a failed check for the same reason
+          // an `unknown` is: we could not determine remote state, so we
+          // retry rather than pretend "up to date".
+          //
+          // The v0.2.83 "MISSING field ⇒ healthy" branch is GONE. The field
+          // is now always present (the Rust enum serialises its tag), the GUI
+          // ships in the same binary as the Rust, and an absent value means
+          // "no answer heard" — which reads as `unknown` via `renderCheck`.
           const remoteCheckFailed =
-            updateStatus === null || updateStatus.remote_check_ok === false;
+            updateStatus === null || renderCheck(updateStatus.remote_check) === 'unknown';
 
           update((s) => ({
             ...s,

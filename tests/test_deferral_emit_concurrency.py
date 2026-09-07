@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 # Each worker emits this many DISTINCT entries; two workers ⇒ 2N total.
@@ -122,6 +123,7 @@ class ConcurrentWriterSerializationPin(unittest.TestCase):
                 args + [str(self.folder), prefix, str(_N)] + extra,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=child_env(),
             )
 
         # Launch both at once so their read-modify-write cycles overlap.

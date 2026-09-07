@@ -287,32 +287,13 @@ pub async fn retrieval_tuning_reset() -> Result<RetrievalTuning, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use tempfile::TempDir;
-
-    // VCT_STATE_DIR is process-wide; serialise tests that mutate the
-    // global cwd/env so parallel runs don't observe each other.
-    // Mirrors the pattern in vct-launcher-core/src/paths.rs::tests.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    /// Run `f` with VCT_STATE_DIR pointing at a fresh tempdir; restore
-    /// the previous env var on exit.
-    fn with_state_dir<F: FnOnce(&Path)>(f: F) {
-        let _g = SERIALIZE.lock().unwrap();
-        let prev = std::env::var_os("VCT_STATE_DIR");
-        let tmp = TempDir::new().expect("tempdir");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            f(tmp.path());
-        }));
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
-    }
+    // v0.2.92: this module used to carry its own `SERIALIZE` mutex and its
+    // own `with_state_dir` — a near-copy of the workspace helper that
+    // serialised only WITHIN this file, so a concurrently-running test in
+    // another file could still observe (and clobber) the redirect. Both are
+    // now the shared ones from `vct_launcher_core::test_env`, whose
+    // `GLOBAL_ENV_MUTEX` spans the whole workspace.
+    use vct_launcher_core::test_env::{state_dir_guard, with_state_dir};
 
     #[test]
     fn defaults_match_calibrated_constants() {
@@ -444,26 +425,15 @@ kg_tier_full = 0.75
     async fn cmd_get_returns_defaults_on_empty() {
         // Each test gets its own tempdir via VCT_STATE_DIR so concurrent
         // tests don't observe each other's file.
-        let _g = SERIALIZE.lock().unwrap();
-        let prev = std::env::var_os("VCT_STATE_DIR");
-        let tmp = TempDir::new().expect("tempdir");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         let got = retrieval_tuning_get().await.unwrap();
         assert_eq!(got, RetrievalTuning::default());
-
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     #[tokio::test]
     async fn cmd_set_persists() {
-        let _g = SERIALIZE.lock().unwrap();
-        let prev = std::env::var_os("VCT_STATE_DIR");
-        let tmp = TempDir::new().expect("tempdir");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         let mut t = RetrievalTuning::default();
         t.code_graph_score_floor = 0.42;
@@ -471,19 +441,11 @@ kg_tier_full = 0.75
 
         let read_back = retrieval_tuning_get().await.unwrap();
         assert_eq!(read_back, t);
-
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     #[tokio::test]
     async fn cmd_set_rejects_invalid_ordering() {
-        let _g = SERIALIZE.lock().unwrap();
-        let prev = std::env::var_os("VCT_STATE_DIR");
-        let tmp = TempDir::new().expect("tempdir");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
 
         let mut t = RetrievalTuning::default();
         t.kg_tier_min = 0.90;  // > kg_tier_single_chunk (0.55) → invalid
@@ -499,19 +461,11 @@ kg_tier_full = 0.75
             !path.exists(),
             "rejected set must not write the tuning file"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     #[tokio::test]
     async fn cmd_reset_writes_defaults() {
-        let _g = SERIALIZE.lock().unwrap();
-        let prev = std::env::var_os("VCT_STATE_DIR");
-        let tmp = TempDir::new().expect("tempdir");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         // First set a non-default value...
         let mut t = RetrievalTuning::default();
@@ -524,10 +478,5 @@ kg_tier_full = 0.75
 
         let read_back = retrieval_tuning_get().await.unwrap();
         assert_eq!(read_back, RetrievalTuning::default());
-
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 }

@@ -17,20 +17,18 @@ itself — those live in tests for server.py / the bash hook).
 
 from __future__ import annotations
 
-import os
-import sqlite3
 from pathlib import Path
 
 import pytest
 
+from tests.common.launcher_db_fixture import make_launcher_db
 from vco_lib.config_projection import (
     project_env_from_db,
     list_canonical_keys,
 )
 
 
-# ─── Helpers (copied from tests/test_config_projection.py to keep this
-#    module self-contained — same schema, same column subset) ────────────
+# ─── Helper — one project row on the REAL launcher.db schema ────────────
 
 
 def _make_launcher_db(
@@ -41,66 +39,25 @@ def _make_launcher_db(
     project_folder: str,
     project_slug: str = "proj",
 ) -> None:
-    """Minimal launcher.db fixture for the SB1 seed test.
+    """One-project launcher.db on the REAL (migration-applied) schema.
 
-    Schema mirrors ``vct-launcher-core/src/db/migrations/`` (just the
-    columns ``project_env_from_db`` reads). Single project; no KG
-    bindings / access rows needed because we only assert
-    ``VCT_PROJECT_ID`` is present in the resulting canonical env.
+    The old inline DDL declared six tables by hand with a guessed column
+    subset — ``projects`` without ``host`` / ``created_at`` / ``updated_at``,
+    ``module_settings`` with a NOT NULL ``project_id`` that migration 034
+    made nullable. ``project_env_from_db`` reads every one of those tables,
+    so the guess was the thing under test as much as the code was. No KG
+    bindings / access rows are seeded: these tests only assert
+    ``VCT_PROJECT_ID`` reaches the canonical env.
     """
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT NOT NULL
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            embedding_model TEXT,
-            PRIMARY KEY (project_id, role)
-        );
-        CREATE TABLE kg_collection_access (
-            project_id TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            PRIMARY KEY (project_id, collection_name)
-        );
-        CREATE TABLE codegraph_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE diagram_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE module_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT NOT NULL,
-            module_id TEXT NOT NULL,
-            setting_key TEXT NOT NULL,
-            setting_value TEXT NOT NULL,
-            UNIQUE(project_id, module_id, setting_key)
-        );
-        """
+    make_launcher_db(
+        db_path,
+        projects=[{
+            "project_id": project_id,
+            "name": project_name,
+            "folder_path": project_folder,
+            "slug": project_slug,
+        }],
     )
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-        (project_id, project_name, project_folder, project_slug),
-    )
-    conn.commit()
-    conn.close()
 
 
 # ─── SB1 contract: VCT_PROJECT_ID lands in the canonical env ────────────

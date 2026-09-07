@@ -36,7 +36,7 @@ Nodes exceeding ~2500 tokens are automatically split into chunks by `Chunker` (`
 <details>
 <summary>Details</summary>
 
-The working limit is 2500 tokens (`MAX_EMBEDDING_TOKENS = 2500` in `sync_knowledge_graph.py`), conservative relative to the model's 8k spec. `TokenCounter` uses `langchain_ollama.ChatOllama` for accurate counting, falling back to character approximation. Chunks are stored as separate Weaviate objects; `search_knowledge.py` deduplicates them by `source_id` on retrieval.
+The chunk plan — the single-vs-multi gate AND the boundaries — is ONE shared computation, `weaviate_mcp/kg_chunk_plan.py::plan_node_chunks` (v0.2.92 W8), called by `sync_knowledge_graph.py`, the MCP `store_knowledge_node` write, the `--rechunk` plan comparison and the shipped-sidecar generator. The threshold is the ACTIVE model's own preset max (8 192 counter-units for qwen3), not a hardcoded constant; `kg_chunk_plan.LEGACY_FALLBACK_MAX_TOKENS = 2500` is the fallback when no model id resolves. `TokenCounter` counts in ONE deterministic conservative unit — `len(text) // CHARS_PER_TOKEN_TEXT`, no chat-model tokenizer (D16, v0.2.92); chunk budgets derive from the embedding model's own `num_ctx` window (see `MODEL_TOKEN_LIMITS` in `chunking.py`). Chunks are stored as separate Weaviate objects; `search_knowledge.py` deduplicates them by `source_id` on retrieval.
 
 </details>
 
@@ -182,7 +182,7 @@ Backend for code graph queries. Subcommands: `search "<concept>"`, `similar "<fu
 Two embedding stacks: text (KG, docs) and code (code-graph entities). Each has a primary, a legacy fallback for older installs that haven't re-indexed, and an optional OpenAI path. Switching between primary and legacy is a one-env-var change (`ACTIVE_EMBEDDING`) — no re-indexing required as long as both named vectors are populated.
 
 ### Primary text embedding: `qwen3-embedding:0.6b` via Ollama
-1024-dimensional vectors stored under named vector `qwen3_embed`. Default for all KG and development collection searches. Model served by Ollama at `http://localhost:11435` (`OLLAMA_URL`). `num_ctx=8192` required (set by the MCP server at embedding time).
+1024-dimensional vectors stored under named vector `qwen3_embed`. Default for all KG and development collection searches. Model served by Ollama at `http://localhost:11435` (`OLLAMA_URL`). `num_ctx` is set explicitly at embedding time, resolved per model (10 240 here) from the chunk-sizing table; unset means Ollama's small default and silent truncation.
 
 ### Legacy text embedding: `snowflake-arctic-embed2` (preserved)
 1024-dimensional vectors under named vector `ollama_embed`. Kept populated for backward compatibility; allows switching `ACTIVE_EMBEDDING` back to `"ollama"` without re-indexing.
@@ -203,10 +203,10 @@ Controls which named vector is used for search queries. KG values: `"qwen3"` (de
 When `true` (default for fresh installs), objects are stored with all named vectors populated simultaneously. Existing collections need migration before enabling.
 
 ### Smart code truncation (`code_truncation.py`)
-Truncates code before embedding using priority order: (1) signature always included, (2) docstring/leading comment always included, (3) method/field names for classes, (4) body truncated at statement boundaries. Model-aware token budgets: CodeSage = 2048 tokens (~7168 chars), jina-v2 = 8192 tokens (~28672 chars).
+Truncates code before embedding using priority order: (1) signature always included, (2) docstring/leading comment always included, (3) method/field names for classes, (4) body truncated at statement boundaries. Model-aware token budgets, derived from the ONE SSOT (`chunking.MODEL_TOKEN_LIMITS`): CodeSage-Large-v2 = 1024 tokens (~3584 chars) — the window `sentence_bert_config.json` actually SERVES, not the 2048 `max_position_embeddings` architectural cap (v0.2.92 wiring-audit W1); jina-v2-base-code = 2048 tokens (~7168 chars). A budgeted entity that still overflows is REFUSED by the backend (HTTP 400 / `truncate: false`) and the caller shrinks and tags it — never a silent tail loss.
 
 ### Text chunking (`chunking.py`)
-`Chunker` and `TokenCounter` classes. Accurate token counting via `langchain_ollama.ChatOllama`; character approximation fallback. Produces `Chunk` / `DocumentChunk` dataclasses with `chunk_number`, `total_chunks`, `token_count`, `source_id`, `metadata`. Chunk target size: 800–2000 tokens.
+`Chunker` and `TokenCounter` classes. ONE deterministic conservative counting unit (`len(text) // CHARS_PER_TOKEN_TEXT` — no chat-model tokenizer, D16 v0.2.92); chunk budgets clamp the tier preset to the embedding model's own `num_ctx` window (`MODEL_TOKEN_LIMITS`), unknown models under-fill to the small tier. Produces `Chunk` / `DocumentChunk` dataclasses with `chunk_number`, `total_chunks`, `token_count`, `source_id`, `metadata`. Chunk target size: 800–2000 tokens.
 
 ---
 
@@ -216,7 +216,7 @@ Truncates code before embedding using priority order: (1) signature always inclu
 Core sync backend: parses YAML frontmatter, extracts WikiLinks (typed and untyped), generates embeddings, upserts to Weaviate. Handles schema migration (adds `typed_links` property if missing on existing collections).
 
 ### `maintain_knowledge_graph.py`
-Integrity checks: orphaned nodes, broken WikiLinks, nodes missing required frontmatter fields.
+Integrity checks: orphaned nodes, broken WikiLinks, nodes missing required frontmatter fields. `--fix` / `--rebuild` are REFUSED when the resolved collection is the SHARED KG (nodes other projects contributed look like orphans from any single project root and would be deleted); `--check` stays available. Override — accepting that loss — with `VCO_MAINTAIN_SHARED_KG_CONSENT=1`.
 
 ### `add_temporal_metadata.py`
 Backfills `valid_from` / `created` / `updated` fields in YAML frontmatter from `git log` history. Falls back to filesystem timestamps for files not in git.
@@ -276,7 +276,7 @@ Each line is in **hub-row shape**: field-for-field the `RlEventOut` the hub's `G
 When set, all path resolution (node writes, `kg-sync`, hook auto-sync) uses this as the project root. Enables using the same MCP server config across multiple projects — the KG collection in Weaviate is still distinguished by `KG_COLLECTION`.
 
 ### `query_logger.py`
-Optional query usage logger imported by `search_knowledge.py` and `sync_knowledge_graph.py`. Logs tool invocations to JSONL. Silently skipped if import fails.
+Optional query usage logger imported by `search_knowledge.py` and `sync_knowledge_graph.py`. Logs tool invocations to JSONL. Silently skipped if import fails. Files land under `<VCT_STATE_DIR or ~/.vct>/logs/weaviate_mcp/`; set `VCT_QUERY_LOG_DIR` to relocate them (primarily a test / diagnostic override).
 
 ### Schema-Creation Gotchas (Weaviate ≤ 1.30)
 

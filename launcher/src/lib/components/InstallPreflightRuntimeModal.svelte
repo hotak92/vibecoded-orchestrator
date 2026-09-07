@@ -60,6 +60,15 @@
     detected: string | null;
     platform: string; // 'linux' | 'macos' | 'windows' | 'unknown'
     install_url: string | null;
+    // v0.2.92 BLOCKER-4. `VCT_CONTAINER_RUNTIME` is a PIN: a pinned runtime
+    // that is unusable is refused, never swapped for the other one (they keep
+    // separate named volumes, so the swap stood up an empty stack). These
+    // carry that case so this modal stops telling a user to install a runtime
+    // they already have.
+    pinned?: string | null;
+    pinned_unusable?: boolean;
+    pinned_installed?: boolean;
+    alternative_usable?: string | null;
   }
 
   let {
@@ -105,7 +114,17 @@
     return 'your system';
   })());
 
-  const installUrl = $derived(current?.install_url ?? availability?.install_url ?? null);
+  const runtimeInfo = $derived(current ?? availability ?? null);
+  const pinnedUnusable = $derived(runtimeInfo?.pinned_unusable === true);
+  const pinnedName = $derived(runtimeInfo?.pinned ?? null);
+  const altUsable = $derived(runtimeInfo?.alternative_usable ?? null);
+  // A pinned runtime that IS installed needs starting, not installing. Offering
+  // an install link there is the "could not distinguish" defect in the UI.
+  const installUrl = $derived(
+    pinnedUnusable && runtimeInfo?.pinned_installed === true
+      ? null
+      : (current?.install_url ?? availability?.install_url ?? null),
+  );
 
   async function openInstallPage() {
     // Always-true guard: the install_url comes from the Rust side which
@@ -187,13 +206,36 @@
     ariaLabelledBy="install-preflight-runtime-title"
   >
     {#snippet header()}
-      <h2 id="install-preflight-runtime-title">No container runtime detected</h2>
+      <h2 id="install-preflight-runtime-title">
+        {pinnedUnusable
+          ? `${pinnedName ?? 'The pinned runtime'} is pinned but not usable`
+          : 'No container runtime detected'}
+      </h2>
     {/snippet}
     {#snippet body()}
-      <p class="lead">
-        VCO needs <strong>Podman</strong> or <strong>Docker</strong> to install this module.
-        Neither is currently available on your PATH ({platformLabel}).
-      </p>
+      {#if pinnedUnusable}
+        <p class="lead">
+          <code>VCT_CONTAINER_RUNTIME</code> pins VCO to
+          <strong>{pinnedName}</strong>, which is not usable right now
+          ({platformLabel}).
+          {#if altUsable}
+            <strong>{altUsable}</strong> is usable — but VCO will not drive it
+            for you: the two runtimes keep <em>separate</em> named volumes, so
+            starting the stack on {altUsable} would bring up an empty Weaviate
+            rather than your knowledge graph.
+          {/if}
+        </p>
+        <p class="hint">
+          Start {pinnedName}, or unset <code>VCT_CONTAINER_RUNTIME</code>{altUsable
+            ? ` / set it to ${altUsable}`
+            : ''}.
+        </p>
+      {:else}
+        <p class="lead">
+          VCO needs <strong>Podman</strong> or <strong>Docker</strong> to install this module.
+          Neither is currently available on your PATH ({platformLabel}).
+        </p>
+      {/if}
 
       <p class="hint">
         Podman is the recommended runtime — it's daemonless, rootless by default, and

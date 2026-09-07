@@ -163,13 +163,31 @@ def find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
     return positions
 
 
-def token_estimate(text: str) -> int:
-    """Char→token estimate (1 token ≈ 4 chars). Cheap, dependency-free.
+def _chars_per_token_text() -> int:
+    """The chars-per-token ratio, read from its ONE home (register #50).
 
-    The MCP path prefers the real ``TokenCounter`` when available; this is the
-    portable fallback the drain uses without importing the chunker.
+    Imported lazily, at the use site, so this module's own import stays as
+    pure as its docstring claims — the same shape
+    ``vco_lib.embedding_service._chars_per_token_text`` and
+    ``vco_lib.query_enrichment._approx_chars_per_token`` already use for this
+    exact constant. No local fallback literal: a second copy is the thing
+    being removed, and every context that can import ``answer_window`` can
+    import its sibling ``weaviate_mcp.chunking`` (the drain reaches both
+    through ``claude_mcp_servers``).
     """
-    return len(text) // 4
+    from claude_mcp_servers.weaviate_mcp.chunking import CHARS_PER_TOKEN_TEXT
+    return CHARS_PER_TOKEN_TEXT
+
+
+def token_estimate(text: str) -> int:
+    """Char→token estimate. Cheap: arithmetic, no tokenizer, no Ollama call.
+
+    Same unit as the chunker's ``TokenCounter`` (D16, v0.2.92: both are
+    ``len(text) // CHARS_PER_TOKEN_TEXT``), so a drain-side estimate and an
+    index-side count are always on the same scale. The RATIO comes from
+    ``chunking``, which is a plain module-constant read.
+    """
+    return len(text) // _chars_per_token_text()
 
 
 def extract_answer_window(
@@ -202,7 +220,7 @@ def extract_answer_window(
     """
     parts: list[str] = []
     total_chars = 0
-    threshold_chars = threshold_tokens * 4
+    threshold_chars = threshold_tokens * _chars_per_token_text()
     for msg_idx in range(start_msg_idx, len(messages)):
         msg = messages[msg_idx]
         if msg.get("type", "") != "assistant":

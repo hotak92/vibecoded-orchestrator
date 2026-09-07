@@ -43,9 +43,21 @@ from vco_lib.deferral_report import DeferralReport  # type: ignore  # noqa: E402
 
 @pytest.fixture
 def fake_home(tmp_path: Path, monkeypatch) -> Path:
-    """Redirect Path.home() to a tmp dir for the duration of the test."""
+    """Redirect the user home to a tmp dir for the duration of the test.
+
+    BOTH levers, because the code under test uses the higher-precedence one:
+    ``install._user_home_for_install()`` checks ``$VCT_USER_HOME_OVERRIDE``
+    BEFORE ``Path.home()``, and v0.2.92's W-CLAUDE guard pins that env var
+    suite-wide (so the whole suite stops writing the developer's real
+    ``~/.config/systemd/user/`` and ``~/.claude.json``). A fixture that patched
+    only the ``Path.home`` symbol was therefore silently outranked — the exact
+    per-symbol-bet failure this repo keeps re-learning. Setting the env var is
+    what actually steers the resolver; the ``Path.home`` patch stays for any
+    consumer that bypasses the helper.
+    """
     fake = tmp_path / "home"
     fake.mkdir()
+    monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(fake))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake))
     return fake
 

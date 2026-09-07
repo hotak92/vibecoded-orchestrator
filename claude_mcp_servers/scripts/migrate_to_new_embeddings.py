@@ -99,6 +99,28 @@ NEW_KG_VECTOR = "qwen3_embed"
 NEW_CODE_VECTOR = "codesage_embed"
 
 
+def _fallback_num_ctx(model: str) -> int:
+    """``num_ctx`` for the legacy inline-Ollama legs (v0.2.92 R40, m-R5-4).
+
+    Routed through the ONE resolver
+    (``vco_lib.embedding_providers.ollama._num_ctx_for_model`` — the same
+    SSOT the canonical adapter uses, which reads
+    ``chunking.MODEL_TOKEN_LIMITS``) instead of a hardcoded 8192. This
+    script re-embeds a whole corpus when the user switches models, so a
+    hard 8192 on a model whose window is larger (qwen3: 10 240) silently
+    truncated tails on every chunk between 8 192 and 10 240 tokens.
+
+    Soft-fail: when ``vco_lib`` isn't importable at all (the half-install
+    case that also sets ``HAS_EMBEDDING_SERVICE = False``), fall back to
+    the pre-v0.2.47 conservative 8192 rather than refusing to run.
+    """
+    try:
+        from vco_lib.embedding_providers.ollama import _num_ctx_for_model
+        return int(_num_ctx_for_model(model))
+    except Exception:
+        return 8_192
+
+
 def _active_kg_slot() -> str:
     """Return the slot name to migrate KG collections TO.
 
@@ -192,13 +214,18 @@ def get_text_embedding(text: str) -> list[float] | None:
         except Exception as e:
             logger.warning("EmbeddingService text embed failed (%s); falling back to inline Ollama", e)
     # Legacy fallback: direct Ollama call.
+    fallback_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
             json={
-                "model": os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
+                "model": fallback_model,
                 "prompt": text,
-                "options": {"num_ctx": 8192},
+                "options": {"num_ctx": _fallback_num_ctx(fallback_model)},
+                # v0.2.92 R40: never let Ollama truncate silently — an
+                # explicit 400 the caller logs beats a 200 that dropped
+                # the tail (matches the canonical adapter).
+                "truncate": False,
             },
             timeout=60,
         )
@@ -533,7 +560,12 @@ def main():
         try:
             resp = requests.post(
                 f"{OLLAMA_URL}/api/embeddings",
-                json={"model": embedding_model_for_probe, "prompt": "test", "options": {"num_ctx": 8192}},
+                json={
+                    "model": embedding_model_for_probe,
+                    "prompt": "test",
+                    "options": {"num_ctx": _fallback_num_ctx(embedding_model_for_probe)},
+                    "truncate": False,  # v0.2.92 R40 — see get_text_embedding
+                },
                 timeout=10,
             )
             assert resp.status_code == 200, f"Ollama embedding failed: {resp.status_code}"

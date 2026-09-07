@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyPlaceholder, keyHint } from '$lib/secret-presence-copy';
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { invoke, safeInvoke, isTauriRuntime } from '$lib/tauri';
@@ -140,8 +141,8 @@
           </label>
           <label><span>Supabase service key</span>
             <input type="password" bind:value={supabaseKey}
-              placeholder={config?.supabase_key_set ? '•••••• (already set)' : 'paste service key'} />
-            <small>{config?.supabase_key_set ? 'Stored in keychain. Leave blank to keep.' : 'Required.'}</small>
+              placeholder={keyPlaceholder(config?.supabase_key_presence, 'paste service key')} />
+            <small>{keyHint(config?.supabase_key_presence, 'Required.')}</small>
           </label>
         </div>
       </section>
@@ -163,7 +164,7 @@
         <div class="co-form-grid">
           <label><span>Bot token</span>
             <input type="password" bind:value={telegramToken}
-              placeholder={config?.telegram_bot_token_set ? '•••••• (already set)' : 'optional'} />
+              placeholder={keyPlaceholder(config?.telegram_bot_token_presence, 'optional')} />
           </label>
           <label><span>Group chat ID</span>
             <input bind:value={telegramGroup} placeholder="-100…" />

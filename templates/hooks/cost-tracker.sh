@@ -2,7 +2,7 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
-# cost-tracker.sh — Stop hook: append token/cost data to ~/.claude/metrics/costs.jsonl
+# cost-tracker.sh — Stop hook: append token/cost data to <metrics dir>/costs.jsonl
 # Reads Claude's stdin JSON payload (stop event) and logs cost data.
 # Fires on every Stop event (end of each Claude response).
 #
@@ -18,13 +18,14 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Output format (costs.jsonl):
 #   {"timestamp":"ISO","session_id":"...","model":"...","input_tokens":N,"output_tokens":N,"cache_read_tokens":N,"auth_mode":"api|subscription","cost_usd":N|null}
 #
-# Portability note (audit F19, 2026-04-30): the metrics directory is
-# resolved Python-side via `pathlib.Path.home()` below, which works on
-# every OS regardless of $HOME / %USERPROFILE%. The `~/.claude/...` path
-# in the comment above is bash-shorthand and is also expanded correctly
-# by every shell that can execute this hook (bash on Linux/macOS, Git
-# Bash on Windows). cmd.exe / PowerShell don't expand tildes — but they
-# also can't run a `.sh` hook in the first place; that's audit F1.
+# Portability note (audit F19, 2026-04-30 · reworked v0.2.92 W7): the metrics
+# directory is resolved by `_lib/metrics-dir.sh` — the ONE shell-side home for
+# that decision, mirrored by `_lib/metrics-dir.ps1` and pinned to
+# `vco_lib/paths.py` by a parity test. It honours $VCT_STATE_DIR and falls back
+# to $HOME/%USERPROFILE%, so it works on every OS. The resolved path is passed
+# INTO the Python below rather than recomputed there: a second resolution in
+# the heredoc would be a third copy of the rule, and the pre-v0.2.92 hooks had
+# already drifted on the home-directory question alone.
 
 set -euo pipefail
 
@@ -35,10 +36,20 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0  # No Python — silent no-op
 
+# Metrics home (v0.2.92 W7 — no longer under ~/.claude). Missing helper =>
+# silent no-op, the same discipline as the missing-Python case above: a
+# partial install must not make the hook guess a path.
+_CT_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/metrics-dir.sh"
+[ -f "$_CT_LIB" ] || exit 0
+# shellcheck source=_lib/metrics-dir.sh disable=SC1091
+. "$_CT_LIB"
+COSTS_DIR="$(vco_metrics_dir 2>/dev/null || printf '')"
+[ -n "$COSTS_DIR" ] || exit 0
+
 PAYLOAD=$(cat)
 
 # Extract fields using python (resolved portably above)
-"$PY" - <<'PYEOF' "$PAYLOAD"
+COSTS_DIR="$COSTS_DIR" "$PY" - <<'PYEOF' "$PAYLOAD"
 import sys, json, os, pathlib
 from datetime import datetime, timezone
 
@@ -105,10 +116,15 @@ record = {
     "cost_usd": cost_usd,
 }
 
-metrics_dir = pathlib.Path.home() / ".claude" / "metrics"
+# Resolved by _lib/metrics-dir.sh and handed in via the environment — the ONE
+# home for the decision. No inline reconstruction here.
+metrics_dir = pathlib.Path(os.environ["COSTS_DIR"])
 metrics_dir.mkdir(parents=True, exist_ok=True)
 costs_file = metrics_dir / "costs.jsonl"
 
-with open(costs_file, "a") as f:
+# encoding pinned (v0.2.92 W7): the .ps1 sibling always wrote utf-8 while this
+# side used the platform default, so a non-UTF-8 model name would have produced
+# two different byte streams for the same record on Git Bash / Windows.
+with open(costs_file, "a", encoding="utf-8") as f:
     f.write(json.dumps(record) + "\n")
 PYEOF

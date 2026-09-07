@@ -196,7 +196,7 @@ except ImportError:
 
 from mcp.server.fastmcp import FastMCP
 import weaviate
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import Filter, MetadataQuery, QueryReference
 import aiohttp
 
 # FN-5a (v0.2.81): the six REQUIRED shipped-submodule relative imports below
@@ -457,6 +457,146 @@ _resolved_project_config = None  # cached resolve() result (or None if unreachab
 _MODULE_LOAD_WORKSPACE: str = os.environ.get("CLAUDE_PROJECT_DIR", "")
 
 
+# ─── v0.2.92: WHOSE project is this module resolving for? ───────────────
+#
+# This module has two consumers with very different amounts of context:
+#
+#   1. The MCP SERVER process. Claude Code spawns it with
+#      ``CLAUDE_PROJECT_DIR`` pointing at the workspace, so "which project"
+#      is answered authoritatively by the harness.
+#   2. A LIBRARY IMPORT from a project CLI. ``templates/scripts/
+#      search_knowledge.py`` imports the tier helpers from here; a plain
+#      shell has no ``CLAUDE_PROJECT_DIR`` at all.
+#
+# Pre-v0.2.92 case 2 fell back to ``Path(__file__).parent.parent.parent`` —
+# the ORCHESTRATOR's install root — and then resolved the ORCHESTRATOR's
+# config from the hub, labelled it ``src=hub``, and let it OUTRANK the
+# project's own correct ``KG_COLLECTION`` env var. A user running
+# ``kg-search`` inside their project saw the orchestrator's collections
+# announced as if the hub had endorsed them for their project. The
+# collection constants (`KG_COLLECTION`, `SHARED_KG_COLLECTION`,
+# `CODE_GRAPH_PROJECT`, the access lists) were all silently orchestrator-
+# scoped for every library consumer — a landmine for any future CLI that
+# reads them.
+#
+# The fix is structural, not documentary: name the CONTEXT the resolution
+# is keyed on, and let a merely-GUESSED context lose to an explicit env
+# var. There is no longer any code path that answers "the orchestrator"
+# to a question about "here" while claiming authority for the answer.
+_CTX_WORKSPACE = "workspace"  # CLAUDE_PROJECT_DIR — the harness told us
+_CTX_CWD = "cwd"              # a bundled project found by walking up from CWD
+_CTX_MODULE = "module"        # last resort: where server.py happens to live
+
+#: The orchestrator install root (this module's own ``parent.parent.parent``).
+#: Only ever used as the ``_CTX_MODULE`` guess.
+_MODULE_OWN_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _looks_like_vco_project(path: Path) -> bool:
+    """True when ``path`` carries the marker files a bundled VCO project has.
+
+    ``.claude/settings.json`` is the canonical per-project env channel (the
+    file Claude Code itself reads); ``.claude/env`` is its shell sibling.
+    Both are written unconditionally by ``install-bundle`` — including under
+    safe-add — so either one present means "this directory is a VCO project".
+    Pure filesystem check: no hub call, no import, cheap enough to run on
+    every ancestor.
+    """
+    claude = path / ".claude"
+    try:
+        return (claude / "settings.json").is_file() or (claude / "env").is_file()
+    except OSError:
+        return False
+
+
+def _resolution_context() -> "tuple[Path, str]":
+    """Return ``(project_root, context_kind)`` for hub resolution.
+
+    Priority:
+      1. ``CLAUDE_PROJECT_DIR`` when it names an existing directory —
+         authoritative, the harness told us which workspace we serve.
+      2. The nearest ancestor of the CWD that looks like a bundled VCO
+         project — authoritative enough: the caller is standing in it.
+         This is the case a project CLI hits (no ``CLAUDE_PROJECT_DIR``).
+      3. ``_MODULE_OWN_ROOT`` — a GUESS. Correct only when the process
+         happens to be about the orchestrator itself.
+
+    NOT cached: ``CLAUDE_PROJECT_DIR`` is patched between calls by the
+    NEW-6 regression tests, and the cost is a handful of ``is_file()``
+    stats. The expensive part (the hub round-trip) is memoised by
+    :func:`_try_resolve_project_config`.
+    """
+    workspace = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if workspace:
+        try:
+            candidate = Path(workspace)
+            if candidate.is_dir():
+                return candidate.resolve(), _CTX_WORKSPACE
+        except OSError:
+            pass
+    try:
+        here = Path.cwd().resolve()
+    except OSError:
+        here = None
+    if here is not None:
+        for ancestor in (here, *here.parents):
+            if _looks_like_vco_project(ancestor):
+                return ancestor, _CTX_CWD
+    return _MODULE_OWN_ROOT, _CTX_MODULE
+
+
+def _hub_context_is_authoritative() -> bool:
+    """True when the hub was asked about a project we actually identified.
+
+    False for :data:`_CTX_MODULE` — there the "project" is just wherever
+    ``server.py`` was installed, so anything the hub says about it is an
+    answer to a question nobody asked.
+    """
+    return _resolution_context()[1] != _CTX_MODULE
+
+
+def _env_speaks(env_name: str, empty_means_unset: bool = False) -> bool:
+    """True when ``env_name`` carries an explicit value for this process."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return False
+    if empty_means_unset and not raw.strip():
+        return False
+    return True
+
+
+def _hub_value_wins(*env_names: str, empty_means_unset: bool = False) -> bool:
+    """Should a hub-resolved value take precedence over env here?
+
+    THE one home for the precedence rule (v0.2.92). Hub-first stays the
+    rule whenever we know which project we are. When the context is only a
+    guess, an explicit env var — written into the project's own
+    ``.claude/settings.json`` by the launcher — wins, because it describes
+    the caller's project while the hub answer describes the orchestrator's.
+    The hub answer is still used when env is silent: a guess beats a
+    bundled default.
+    """
+    if _hub_context_is_authoritative():
+        return True
+    return not any(
+        _env_speaks(name, empty_means_unset=empty_means_unset) for name in env_names
+    )
+
+
+#: ``(env_name, hub_value, env_value)`` triples recorded at module load when
+#: the hub and an env var disagree. Surfaced once by
+#: :func:`_log_collection_resolution` — a silent override of a correct env
+#: var is exactly how the v0.2.92 report's issue 2 stayed invisible.
+_HUB_ENV_CONFLICTS: "list[tuple[str, str, str]]" = []
+
+
+def _note_hub_env_conflict(env_name: str, hub_value: str, env_value: str) -> None:
+    """Record a hub-vs-env disagreement for the startup log."""
+    entry = (env_name, hub_value, env_value)
+    if entry not in _HUB_ENV_CONFLICTS:
+        _HUB_ENV_CONFLICTS.append(entry)
+
+
 def _try_resolve_project_config():
     """Best-effort: resolve the project config via vct-hub once.
 
@@ -490,11 +630,12 @@ def _try_resolve_project_config():
         # whichever workspace server.py physically lives in (the global
         # ~/.claude.json registration's path), causing telemetry mislabeling
         # and wrong KG collection routing for any non-default project.
-        _workspace = os.environ.get('CLAUDE_PROJECT_DIR', '')
-        if _workspace and Path(_workspace).is_dir():
-            _project_root = Path(_workspace).resolve()
-        else:
-            _project_root = Path(__file__).resolve().parent.parent.parent
+        #
+        # v0.2.92: the ladder (and, crucially, WHETHER the answer counts as
+        # authoritative) now lives in `_resolution_context()`. A library
+        # import from a project CLI lands on the CWD's project instead of
+        # silently resolving the orchestrator's config.
+        _project_root, _ = _resolution_context()
         _resolved_project_config = _resolve_project_config(_project_root)
         return _resolved_project_config
     except Exception:
@@ -504,16 +645,30 @@ def _try_resolve_project_config():
         return None
 
 
-def _config_field(
+def _config_field_with_source(
     field_name: str,
     env_name: str,
     default: str,
     empty_means_unset: bool = False,
-) -> str:
-    """Resolve a single config field via the hub; fall back to env.
+    hub_empty_is_meaningful: bool = False,
+) -> "tuple[str, str]":
+    """Resolve one config field and say WHERE the value came from.
 
-    Used at module load to populate the KG_COLLECTION etc. constants.
-    Cheap on the cached path — _try_resolve_project_config() memoises.
+    THE one home for the hub/env/default precedence AND for the source
+    label that the startup log + error messages quote. Pre-v0.2.92 the
+    value and its label were computed by two separate functions
+    (``_config_field`` / ``_resolve_source_for``) that re-derived the same
+    decision from different inputs — so the label could disagree with the
+    value it described. It did: a library import got the orchestrator's
+    collection names stamped ``src=hub``.
+
+    Returns ``(value, source)`` where source is one of:
+      ``"hub"``                      hub-resolved, context identified
+      ``"hub(unverified-context)"``  hub-resolved from the module-path
+                                     GUESS, used only because env is silent
+      ``"env"``                      taken from ``env_name``
+      ``"default"``                  bundled fallback
+      ``"default(empty-env-coerced)"`` env was blank and coerced
 
     Args:
         field_name: Attribute name on the ProjectConfig dataclass.
@@ -525,6 +680,9 @@ def _config_field(
             env value is returned literally — used for keys where empty
             carries semantic meaning (e.g. DEVELOPMENT_COLLECTION's empty
             default disables docs-fanout in hybrid_search).
+        hub_empty_is_meaningful: When True, an empty hub value is a real
+            answer ("this project is explicitly unbound") rather than "no
+            hub value" — the SHARED_KG_COLLECTION semantic.
 
     v0.2.27: ``empty_means_unset=True`` added for KG_COLLECTION-shape
     fields where an empty literal would propagate to Weaviate queries
@@ -533,17 +691,57 @@ def _config_field(
     Linux per PR-27) wrote ``KG_COLLECTION=""`` and the MCP picked it up.
     """
     cfg = _try_resolve_project_config()
+    hub_value = ""
+    hub_answered = False
     if cfg is not None:
         try:
-            value = getattr(cfg, field_name, "")
-            if value:
-                return str(value)
+            raw_hub = getattr(cfg, field_name, "")
+            hub_value = str(raw_hub) if raw_hub else ""
+            hub_answered = bool(hub_value) or hub_empty_is_meaningful
         except Exception:
-            pass
-    raw = os.getenv(env_name, default)
-    if empty_means_unset and isinstance(raw, str) and not raw.strip():
-        return default
-    return raw
+            hub_value, hub_answered = "", False
+
+    env_raw = os.environ.get(env_name)
+    env_coerced = False
+    if (
+        empty_means_unset
+        and isinstance(env_raw, str)
+        and not env_raw.strip()
+    ):
+        env_raw = None
+        env_coerced = True
+
+    # Surface a disagreement rather than silently preferring one side.
+    if hub_answered and env_raw is not None and env_raw != hub_value:
+        _note_hub_env_conflict(env_name, hub_value, env_raw)
+
+    if hub_answered and _hub_value_wins(
+        env_name, empty_means_unset=empty_means_unset
+    ):
+        # The label carries the context, not just the origin: a hub answer
+        # keyed on the module-path GUESS is a different claim from one keyed
+        # on a project the harness (or the CWD) identified, and conflating
+        # them is what let `src=hub` read as an endorsement it was not.
+        return hub_value, (
+            "hub" if _hub_context_is_authoritative() else "hub(unverified-context)"
+        )
+    if env_raw is not None:
+        return env_raw, "env"
+    if env_coerced:
+        return default, "default(empty-env-coerced)"
+    return default, "default"
+
+
+def _config_field(
+    field_name: str,
+    env_name: str,
+    default: str,
+    empty_means_unset: bool = False,
+) -> str:
+    """Value-only wrapper over :func:`_config_field_with_source`."""
+    return _config_field_with_source(
+        field_name, env_name, default, empty_means_unset=empty_means_unset
+    )[0]
 
 
 # Default truncation limit in Claude Code is ~25K chars.
@@ -2312,17 +2510,55 @@ def _code_chunk_summaries_header(
     return _render_chunk_map(chunk_summaries, shown_chunk_nums)
 
 
-def _fetch_node_chunks(coll, title: str, hit_chunk: int, total: int, max_chunks: int):
+def _node_chunk_key(result: dict) -> "tuple[str, str, object]":
+    """The identity of ONE chunk row for result de-duplication.
+
+    W7 (v0.2.92 wiring audit): keyed on ``file_path`` FIRST — a title is not
+    a node identity (measured live: 2 titles per collection map to two
+    file_paths each), so a ``(title, chunk_number)`` key silently DROPS the
+    colliding node's chunk at the same chunk_number, whichever arrived
+    second. ``title`` is kept in the tuple so a row with no stored
+    ``file_path`` (legacy; none measured live) still de-duplicates exactly
+    as it did before.
+    """
+    return (
+        result.get("file_path", "") or "",
+        result.get("title", "") or "",
+        result.get("chunk_number"),
+    )
+
+
+def _fetch_node_chunks(
+    coll, title: str, hit_chunk: int, total: int, max_chunks: int,
+    file_path: str = "",
+):
     """Fetch up to ``max_chunks`` content chunks centred on ``hit_chunk``.
 
     Returns a list of (chunk_num, content) tuples sorted by chunk_num. Empty list
     on failure (collection unavailable, no chunks, etc.).
 
-    Mirrors the inline ``_fetch_chunks`` previously embedded in rl_kg_search.py.
+    W7 (v0.2.92 wiring audit): the filter keys on ``title AND file_path`` —
+    title ALONE is NOT a node identity (measured live: 2 colliding titles in
+    each of VCODev_KnowledgeGraph / VCODev_Development, each mapping to two
+    file_paths), and a title-only fetch interleaved two nodes' chunks in the
+    ``three_chunks`` / ``full`` window. ``file_path`` is the canonical node
+    key everywhere else in the write path (kg-sync scopes deletes, the
+    embed-skip, and the plan comparison by it) and measured 100% populated
+    on real rows (764/764 KG, 338/338 Development). HONEST DEGRADATION: a
+    result with NO file_path falls back to the title-only filter — the
+    pre-fix behaviour, no worse — and any sibling chunks the tighter filter
+    cannot see simply shrink the window, which the caller reports as a
+    PARTIAL view (no ``coverage: complete`` hint) rather than silently
+    mis-assembling another node's chunks into this one.
     """
     try:
+        chunk_filter = Filter.by_property("title").equal(title)
+        if file_path:
+            chunk_filter = chunk_filter & Filter.by_property("file_path").equal(
+                file_path
+            )
         objs = coll.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title),
+            filters=chunk_filter,
             limit=(total or max_chunks) + 1,
         )
         chunk_list: list[tuple[int, str]] = []
@@ -2417,7 +2653,13 @@ def _format_result_by_tier(
 
     # single_chunk / three_chunks / full — multi-chunk assembly when possible
     window = _TIER_CHUNK_WINDOW.get(tier, 1)
-    chunks = _fetch_node_chunks(coll, title, hit_chunk, total_chunks, window) if coll is not None else []
+    chunks = (
+        _fetch_node_chunks(
+            coll, title, hit_chunk, total_chunks, window, file_path=fp
+        )
+        if coll is not None
+        else []
+    )
     if chunks and total_chunks and total_chunks > 1:
         shown_nums = [cn for cn, _ in chunks]
         # Whole-node summary header when partial view (all-tiers below 'full' for multi-chunk).
@@ -2443,7 +2685,14 @@ def _format_result_by_tier(
         # returned chunks already cover the ENTIRE node, so it doesn't waste a
         # Read on the source file. Only emitted when coverage is 100% — when
         # is_partial, the absence of the hint signals "more exists on disk".
-        if not is_partial:
+        #
+        # W7 (v0.2.92 wiring audit): ALSO requires the node key. Without a
+        # `file_path` the assembler falls back to the title-only filter, which
+        # under a duplicate title can return the right COUNT of the wrong rows
+        # — "complete" would then vouch for a window that silently mixes two
+        # nodes. Such a result degrades to an UNCLAIMED (partial) view, which
+        # is the honest answer and tells the caller to Read the file.
+        if not is_partial and fp:
             base["coverage"] = "complete"
             base["retrieval_hint"] = (
                 "Full node provided (all chunks). No further Read of the source "
@@ -2472,8 +2721,9 @@ def _format_result_by_tier(
     base["content"] = content
     # Coverage hint (2026-06-15): a single-chunk node (total_chunks <= 1) is
     # returned in its entirety here — this is the common `full`-tier case for
-    # the many KG nodes that embed as one chunk (large-context embedders like
-    # qwen3 fit ~13.5k tokens / ~50KB per chunk). Tell the caller so it doesn't
+    # the many KG nodes that embed as one chunk (chunks are capped by the
+    # R39 policy ceiling at 8 192 tokens / ~32KB, well inside large-context
+    # embedders like qwen3's 10 240 num_ctx). Tell the caller so it doesn't
     # redundantly Read the source file. For a MULTI-chunk node that reached this
     # fallback because chunk-fetch FAILED, coverage is NOT complete (content is
     # the single matched chunk's snippet) → no hint, so the caller knows to Read.
@@ -2496,7 +2746,7 @@ def _format_result_by_tier(
 # collection name would propagate to Weaviate queries and cause
 # schema-fail with a confusing error message — see the "every configured
 # collection schema-failed" bug from 2026-05-22.
-KG_COLLECTION = _config_field(
+KG_COLLECTION, _KG_COLLECTION_SOURCE = _config_field_with_source(
     "kg_collection",
     "KG_COLLECTION",
     "ClaudeKnowledgeGraph",
@@ -2526,12 +2776,18 @@ _SHARED_KG_DEFAULT = "VibeCodedOrchestrator_KnowledgeGraph"
 # asymmetric-access design (module docstring) says a project that's
 # been explicitly unbound stays unbound. The default only applies on
 # env-fallback (hub unreachable), matching pre-v0.2.21 behaviour.
-_cfg_for_shared_kg = _try_resolve_project_config()
-if _cfg_for_shared_kg is not None:
-    _SHARED_KG_RAW = _cfg_for_shared_kg.shared_kg_collection
-else:
-    _SHARED_KG_RAW = os.getenv("SHARED_KG_COLLECTION", _SHARED_KG_DEFAULT)
-SHARED_KG_COLLECTION = _SHARED_KG_RAW
+#
+# v0.2.92: routed through the shared resolver so the "explicit empty = this
+# project is unbound" semantic (``hub_empty_is_meaningful``) and the
+# authoritative-context gate live in ONE place. The gate matters most here:
+# under a merely-guessed context, an "unbound" answer about the ORCHESTRATOR
+# would have blanked the calling project's shared KG.
+SHARED_KG_COLLECTION, _SHARED_KG_COLLECTION_SOURCE = _config_field_with_source(
+    "shared_kg_collection",
+    "SHARED_KG_COLLECTION",
+    _SHARED_KG_DEFAULT,
+    hub_empty_is_meaningful=True,
+)
 
 # Per-project WRITE gate. When true, store_knowledge_node refuses writes
 # whose resolved target is SHARED_KG_COLLECTION (scope='shared' or explicit
@@ -2616,7 +2872,7 @@ SHARED_KG_READ_DISABLED = _resolve_shared_kg_read_disabled()
 # uses KG_COLLECTION only — docs have no WikiLinks so graph traversal can't
 # find useful neighbors there.
 # v0.2.21 Step 18: resolved via vct-hub (with env-fallback to "").
-DEVELOPMENT_COLLECTION = _config_field(
+DEVELOPMENT_COLLECTION, _DEVELOPMENT_COLLECTION_SOURCE = _config_field_with_source(
     "development_collection", "DEVELOPMENT_COLLECTION", ""
 )
 
@@ -2659,63 +2915,62 @@ DIAGRAMS_COLLECTION = _config_field(
 # ``VCODev_KnowledgeGraph``. Without source tracking, the user couldn't
 # tell that the VS Code surface wasn't propagating to MCP subprocesses
 # on Linux (a known limitation since PR-27 v0.2.12).
-def _resolve_source_for(field_name: str, env_name: str, resolved: str, default: str) -> str:
-    """Determine where the resolved value came from.
+# v0.2.92: the per-key source is now produced BY the resolver
+# (:func:`_config_field_with_source`) at the moment the value is chosen, so a
+# label can no longer describe a decision different from the one that was
+# actually made. ``_resolve_source_for`` — which re-derived the label from
+# scratch and could (and did) disagree with the value — is gone.
+def _resolution_context_note() -> str:
+    """Render the project root the collections were resolved FOR.
 
-    Returns one of: "hub" | "env" | "default" | "default(empty-env-coerced)".
-    Pure function; called once per config field at module load.
+    The v0.2.92 report's issue 2 was a reader who could not tell WHOSE
+    project the log line described. Naming the root + how it was chosen
+    makes that unambiguous in both the MCP-server and library-import cases.
     """
-    cfg = _try_resolve_project_config()
-    if cfg is not None:
-        try:
-            hub_value = getattr(cfg, field_name, "")
-            if hub_value and str(hub_value) == resolved:
-                return "hub"
-        except Exception:
-            pass
-    raw_env = os.environ.get(env_name)
-    if raw_env is None:
-        return "default"
-    if raw_env.strip() == "" and resolved == default:
-        # Empty-string env coerced to default by empty_means_unset semantic.
-        return "default(empty-env-coerced)"
-    if raw_env == resolved:
-        return "env"
-    # Fall-through: hub returned a different value than env, or empty env
-    # was honoured literally (SHARED_KG_COLLECTION semantic).
-    return "env" if raw_env == resolved else "default"
+    root, kind = _resolution_context()
+    return f"project-root={str(root)!r} via={kind}"
 
-
-_KG_COLLECTION_SOURCE = _resolve_source_for(
-    "kg_collection", "KG_COLLECTION", KG_COLLECTION, "ClaudeKnowledgeGraph"
-)
-_SHARED_KG_COLLECTION_SOURCE = _resolve_source_for(
-    "shared_kg_collection",
-    "SHARED_KG_COLLECTION",
-    SHARED_KG_COLLECTION,
-    _SHARED_KG_DEFAULT,
-)
-_DEVELOPMENT_COLLECTION_SOURCE = _resolve_source_for(
-    "development_collection", "DEVELOPMENT_COLLECTION", DEVELOPMENT_COLLECTION, ""
-)
 
 # Loud startup log so users debugging "wrong collection name" can grep
 # logs for "weaviate-kg: resolved" and see exactly which name + source.
-# Logged at INFO (the MCP's default level) — not WARNING, because the
-# common case is correctly-resolved values; warnings would be noise.
-# Only escalate to WARNING when we're falling back to the bundled
-# defaults (signals likely env-propagation problem).
+# Logged at INFO in the MCP SERVER process (the documented diagnostic —
+# CLAUDE.md tells users to read this line) and at DEBUG when this module is
+# merely IMPORTED as a library by a project CLI: there it is not a startup
+# line at all, it describes constants the surrounding program may never read,
+# and asserting it at INFO is what let a user read it as "my CLI is searching
+# the orchestrator's KG". Only escalate to WARNING when we're falling back to
+# the bundled defaults (signals likely env-propagation problem) or when the
+# hub and an explicit env var disagree.
+_RUNNING_AS_MCP_SERVER = __name__ == "__main__"
+
+
 def _log_collection_resolution() -> None:
     """One-shot startup log of the resolved collection names + sources."""
-    logger.info(
-        "weaviate-kg: resolved collections (kg=%r src=%s, shared=%r src=%s, dev=%r src=%s)",
+    logger.log(
+        logging.INFO if _RUNNING_AS_MCP_SERVER else logging.DEBUG,
+        "weaviate-kg: resolved collections (kg=%r src=%s, shared=%r src=%s, "
+        "dev=%r src=%s) [%s]",
         KG_COLLECTION,
         _KG_COLLECTION_SOURCE,
         SHARED_KG_COLLECTION,
         _SHARED_KG_COLLECTION_SOURCE,
         DEVELOPMENT_COLLECTION,
         _DEVELOPMENT_COLLECTION_SOURCE,
+        _resolution_context_note(),
     )
+    for env_name, hub_value, env_value in _HUB_ENV_CONFLICTS:
+        logger.warning(
+            "weaviate-kg: %s disagreement — hub says %r, %s says %r; using %r "
+            "(%s). If the env value is the correct one, the launcher's "
+            "per-project binding is stale: fix it in the Identity tab rather "
+            "than editing env, or the two surfaces keep diverging.",
+            env_name,
+            hub_value,
+            env_name,
+            env_value,
+            hub_value if _hub_context_is_authoritative() else env_value,
+            _resolution_context_note(),
+        )
     fallback_keys = []
     if _KG_COLLECTION_SOURCE in ("default", "default(empty-env-coerced)"):
         fallback_keys.append(
@@ -2876,8 +3131,12 @@ def _kg_peer_collections() -> list[str]:
     sanitize-then-suffix logic for the legacy CSV format.
     """
     # Hub-first path: kg_access_list is canonical class names.
+    # v0.2.92: only when the hub was asked about a project we identified —
+    # under the module-path guess an explicit VCT_KG_ACCESS_LIST (written into
+    # the caller's own .claude/settings.json) describes the caller's peers,
+    # while the hub answer describes the orchestrator's.
     _cfg_for_peers = _try_resolve_project_config()
-    if _cfg_for_peers is not None:
+    if _cfg_for_peers is not None and _hub_value_wins("VCT_KG_ACCESS_LIST"):
         out: list[str] = []
         seen: set[str] = set()
         for coll in _cfg_for_peers.kg_access_list:
@@ -2944,8 +3203,9 @@ def _diagrams_peer_collections() -> list[str]:
     """
     # Hub-first path: if the hub exposes ``diagrams_access_list``, use
     # it. Falls back to env CSV otherwise.
+    # v0.2.92: same authoritative-context gate as the KG peer list above.
     _cfg = _try_resolve_project_config()
-    if _cfg is not None:
+    if _cfg is not None and _hub_value_wins("VCT_DIAGRAMS_ACCESS_LIST"):
         try:
             hub_list = list(getattr(_cfg, "diagrams_access_list", []) or [])
         except Exception:
@@ -3281,8 +3541,19 @@ def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple
 #
 # Fall-through honours the historical env precedence CODE_GRAPH_PROJECT
 # > PROJECT_NAME (for environments without a hub-resolvable config).
+#
+# v0.2.92: gated on an identified project context, like the collection
+# constants above. This is the highest-consequence one — a library import
+# that silently adopted the ORCHESTRATOR's code-graph prefix would query
+# `<Orchestrator>_Code*` while claiming to be the caller's project.
 _cfg_for_cgp = _try_resolve_project_config()
-if _cfg_for_cgp is not None and _cfg_for_cgp.code_graph_collection_prefix:
+if (
+    _cfg_for_cgp is not None
+    and _cfg_for_cgp.code_graph_collection_prefix
+    and _hub_value_wins(
+        "CODE_GRAPH_PROJECT", "PROJECT_NAME", empty_means_unset=True
+    )
+):
     CODE_GRAPH_PROJECT = _cfg_for_cgp.code_graph_collection_prefix
 else:
     CODE_GRAPH_PROJECT = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME", "")
@@ -3376,11 +3647,13 @@ def _code_collection(base: str) -> str:
     return base
 
 
-# Maximum approximate token count for a single Weaviate insert.
-# qwen3-embedding supports 32k tokens but we keep a conservative 2000-token limit
-# for chunk granularity (legacy snowflake-arctic-embed2 limit; also good for retrieval).
-# 2000 tokens ≈ 8 000 chars (1 token ≈ 4 chars).
-_MAX_SINGLE_CHUNK_TOKENS = 2000
+# NOTE (W8, v0.2.92 wiring audit): the hardcoded 2 000-token single-chunk gate
+# `_MAX_SINGLE_CHUNK_TOKENS` ("legacy snowflake-arctic-embed2 limit") that used
+# to live here is DELETED, not merely unused: it diverged from kg-sync's
+# ACTIVE-model preset gate (8 192 for qwen3), so the two writers produced
+# different chunk plans for the same node. The store path plans through
+# `kg_chunk_plan.plan_node_chunks` (threshold = the active model's preset max),
+# whose no-model fallback is `kg_chunk_plan.LEGACY_FALLBACK_MAX_TOKENS`.
 
 
 class WeaviateUnreachable(Exception):
@@ -3402,10 +3675,15 @@ class WeaviateSchemaError(Exception):
     the MCP picks up a freshly-migrated schema on the next call (PR-41,
     Issue A from mcp-instability-vs-public-repo-2026-05-16.md).
 
-    The user_msg hints at the relevant migration script:
-    scripts/migrate-development-temporal-props.{sh,ps1} for property
-    issues, scripts/migrate-shared-kg-schema.{sh,ps1} for class/index
-    issues.
+    The user_msg hints at the relevant migration script — but since v0.2.92
+    only when the diagnosis has been VERIFIED against the live schema of the
+    collection that actually failed, and never by naming a different
+    collection. See _build_schema_error_hint for the data-safety contract:
+    scripts/migrate-development-temporal-props.{sh,ps1} (additive) is offered
+    for property issues on the collections it actually walks, and
+    scripts/migrate-shared-kg-schema.{sh,ps1} (which DELETEs the shared KG)
+    only when the failing collection IS the configured shared KG and its
+    missing null index has been confirmed by probe.
     """
     def __init__(self, msg: str, user_msg: str = ""):
         super().__init__(msg)
@@ -3686,33 +3964,226 @@ _CONNECTION_ERROR_PATTERNS = (
 )
 
 
+# ─── Failing-collection identification (v0.2.92) ─────────────────────────────
+# Weaviate error strings name the collection at fault, but in three different
+# shapes and — for GRPC search errors — as the LOWERCASED INDEX name rather
+# than the schema class name ("at index vibecodedorchestrator_codemodule" for
+# class VibeCodedOrchestrator_CodeModule). Everything downstream that probes
+# or NAMES a collection in a remediation must go through these two functions,
+# because guessing the wrong collection is exactly how the pre-v0.2.92 hint
+# came to recommend dropping an unrelated 738-node shared KG.
+_FAILING_COLLECTION_PATTERNS = (
+    r"\bat index ([A-Za-z0-9_]+)",
+    r"could not find class ['\"]?([A-Za-z0-9_]+)",
+    r"class not found[:\s]+['\"]?([A-Za-z0-9_]+)",
+    r"\bin class ['\"]?([A-Za-z0-9_]+)",
+    r"\bclass ['\"]([A-Za-z0-9_]+)['\"]",
+)
+
+
+def _extract_failing_collection(exc_msg: str) -> Optional[str]:
+    """The collection/index token named in a Weaviate error, or None.
+
+    Best-effort and pure: returns the token exactly as the message spelled it
+    (possibly a lowercased index name). None when the message names nothing —
+    callers MUST treat None as "unknown", never as "probably the shared KG".
+    """
+    if not exc_msg:
+        return None
+    for pattern in _FAILING_COLLECTION_PATTERNS:
+        match = re.search(pattern, exc_msg, re.IGNORECASE)
+        if match:
+            token = match.group(1).strip()
+            if token:
+                return token
+    return None
+
+
+def _resolve_schema_class_name(token: str) -> Optional[str]:
+    """Map a collection token to its EXACT schema class name, or None.
+
+    GRPC errors carry the lowercased index name, and Weaviate only
+    capitalises the first character of a class, so
+    ``collections.get("vibecodedorchestrator_codemodule")`` 404s. Resolution
+    is a case-insensitive match against the live schema listing. Returns None
+    on any failure (Weaviate down, token unknown) — never guesses.
+    """
+    if not token:
+        return None
+    try:
+        client = get_weaviate_client()
+        names = list(client.collections.list_all(simple=True).keys())
+    except Exception as exc:  # noqa: BLE001 — probe is best-effort by contract
+        logger.debug("schema-hint: could not list collections (%s)", exc)
+        return None
+    lowered = token.lower()
+    for name in names:
+        if name.lower() == lowered:
+            return name
+    return None
+
+
+def _probe_index_null_state(class_name: str) -> Optional[bool]:
+    """Live ``invertedIndexConfig.indexNullState`` for ``class_name``.
+
+    True (present) / False (genuinely absent) / None (could not determine).
+    The None case is load-bearing: callers must fall back to a NON-destructive
+    hint rather than assume the defect, per the "conservative defaults on
+    best-effort paths" rule — an operation that cannot positively confirm its
+    precondition does nothing rather than guess.
+    """
+    if not class_name:
+        return None
+    try:
+        client = get_weaviate_client()
+        config = client.collections.get(class_name).config.get()
+        state = getattr(
+            getattr(config, "inverted_index_config", None), "index_null_state", None
+        )
+    except Exception as exc:  # noqa: BLE001 — probe is best-effort by contract
+        logger.debug("schema-hint: indexNullState probe failed for %s (%s)", class_name, exc)
+        return None
+    if state is None:
+        return None
+    return bool(state)
+
+
+# Suffixes of the collections scripts/migrate-development-temporal-props.sh
+# actually walks (it selects on this alternation). A `no such prop` failure on
+# any other class is NOT something that script can fix, so it must not be
+# recommended there.
+_TEMPORAL_PROPS_SUFFIXES = ("_KnowledgeGraph", "_Development", "_Diagrams")
+
+
 def _build_schema_error_hint(exc: Exception, lower_msg: str) -> str:
     """Build a user-friendly hint for schema errors pointing at the right
-    migration script (PR-41 Issue F)."""
+    migration script (PR-41 Issue F).
+
+    v0.2.92 data-safety contract — every branch obeys all three:
+
+    * **Verify the premise at emit time.** A hint that asserts a schema defect
+      PROBES the live schema of the collection that actually failed. The
+      pre-v0.2.92 `indexNullState` branch asserted the defect from a substring
+      match alone and fired on a purely client-side query-construction bug
+      (`Filter.by_property` against a cross-reference property), whose GRPC
+      message merely contains the words "nested query".
+    * **Never name a collection other than the one at fault.** The old branch
+      redirected from a per-project `*_CodeModule` failure to
+      `scripts/migrate-shared-kg-schema.sh`, which DELETEs
+      `$SHARED_KG_COLLECTION` — a different, populated, unrelated collection.
+      Pasting it destroyed data and did not fix the bug.
+    * **Fail safe when the premise cannot be confirmed.** No client, no
+      network, unparseable message → describe what failed and what to check.
+      Never emit a destructive command on an unverified diagnosis.
+    """
+    raw_msg = str(exc)
+    # Pure, offline: the token exactly as the message spelled it. Only the
+    # indexNullState branch needs the token RESOLVED to a schema class (it has
+    # to probe that class), so resolution — the only step that touches the
+    # network — is deferred into that branch. Keeps every other hint, and the
+    # unit tests that exercise them, fully offline.
+    token = _extract_failing_collection(raw_msg)
+    named = token
+
     if "no such prop" in lower_msg or "no such property" in lower_msg:
+        where = f" on '{named}'" if named else ""
+        base = f"Schema error: {exc}. A required property is missing{where}."
+        # The temporal-props migration is additive (non-destructive) but only
+        # walks the three suffixes below — recommending it for a *_Code* class
+        # would be a wrong-target instruction that silently does nothing.
+        if named and not named.lower().endswith(
+            tuple(s.lower() for s in _TEMPORAL_PROPS_SUFFIXES)
+        ):
+            return (
+                f"{base} '{named}' is not a *_KnowledgeGraph / *_Development / "
+                f"*_Diagrams collection, so scripts/migrate-development-"
+                f"temporal-props.sh does NOT cover it. Inspect the live schema "
+                f"first: curl -s {WEAVIATE_URL}/v1/schema/{named}"
+            )
         return (
-            f"Schema error: {exc}. The collection is missing a required "
-            f"property. Run scripts/migrate-development-temporal-props.sh "
-            f"to add temporal properties (created/updated/valid_from/"
-            f"valid_until) to existing *_Development collections."
+            f"{base} Run scripts/migrate-development-temporal-props.sh to add "
+            f"temporal properties (created/updated/valid_from/valid_until) to "
+            f"existing *_KnowledgeGraph / *_Development / *_Diagrams "
+            f"collections. That migration is additive — it adds properties and "
+            f"deletes nothing."
         )
+
     if "build inverted filter" in lower_msg or "nested query" in lower_msg:
+        # The ONLY branch that probes. Resolve the token to its exact schema
+        # class first (GRPC errors name the lowercased INDEX, and weaviate
+        # only capitalises the first character, so an unresolved token 404s).
+        # A token we cannot resolve leaves state None → the fail-safe hint.
+        class_name = _resolve_schema_class_name(token) if token else None
+        state = _probe_index_null_state(class_name) if class_name else None
+        named = class_name or token
+
+        if state is True:
+            # Premise refuted. This is the common case for the code-graph
+            # query bugs and must NOT carry a migration command.
+            return (
+                f"Query error: {exc}. Probed '{class_name}': "
+                f"invertedIndexConfig.indexNullState is already True, so this "
+                f"is NOT the known missing-null-index condition and NO "
+                f"migration is needed. A 'nested query ... value type' message "
+                f"with the null index present means the FILTER was built with "
+                f"the wrong value type for the property — most often filtering "
+                f"a cross-reference property with "
+                f"Filter.by_property(...).contains_any([...]) instead of "
+                f"Filter.by_ref(<link>).by_property(<prop>). Check the "
+                f"property's dataType: curl -s {WEAVIATE_URL}/v1/schema/"
+                f"{class_name}"
+            )
+
+        if state is False:
+            # Premise CONFIRMED for this specific collection. Only now may a
+            # recreate be discussed, and only for the collection at fault.
+            if class_name == SHARED_KG_COLLECTION and SHARED_KG_COLLECTION:
+                return (
+                    f"Schema error: {exc}. Probed '{class_name}': "
+                    f"invertedIndexConfig.indexNullState is absent, and this IS "
+                    f"the configured shared KG. Weaviate <=1.30 cannot add the "
+                    f"null index retroactively. "
+                    f"scripts/migrate-shared-kg-schema.sh targets exactly this "
+                    f"collection; it DROPS and recreates it, re-syncing content "
+                    f"from knowledge/**/*.md. Confirm every node has a backing "
+                    f".md file before running it — anything stored only in "
+                    f"Weaviate is lost."
+                )
+            return (
+                f"Schema error: {exc}. Probed '{class_name}': "
+                f"invertedIndexConfig.indexNullState is absent. Weaviate <=1.30 "
+                f"cannot add it retroactively, so fixing it requires recreating "
+                f"'{class_name}' — which DESTROYS that collection's contents. "
+                f"No command is offered here: confirm a repopulation path for "
+                f"'{class_name}' first (code-graph classes are rebuilt by "
+                f".claude/scripts/code-graph-analyze; KG classes by "
+                f".claude/scripts/kg-sync --all). Only '{class_name}' is "
+                f"affected — do not migrate any other collection."
+            )
+
+        # state is None → could not confirm. Diagnose, never destroy.
+        where = f" for '{named}'" if named else ""
         return (
-            f"Schema error: {exc}. The collection lacks "
-            f"invertedIndexConfig.indexNullState=True. Weaviate <=1.30 "
-            f"cannot retroactively add this; run "
-            f"scripts/migrate-shared-kg-schema.sh to drop + recreate the "
-            f"shared KG with the correct schema (content is re-synced "
-            f"from knowledge/**/*.md)."
+            f"Query error: {exc}. Could not verify the schema{where}, so no "
+            f"migration is being recommended: this message shape has two very "
+            f"different causes — a missing "
+            f"invertedIndexConfig.indexNullState, OR a filter built with the "
+            f"wrong value type for the property (e.g. Filter.by_property on a "
+            f"cross-reference property, which needs Filter.by_ref). Check "
+            f"which it is before changing anything: curl -s {WEAVIATE_URL}"
+            f"/v1/schema/{named or '<collection>'}"
         )
+
     # "could not find class" / "class not found"
+    which = f" ('{named}')" if named else ""
     return (
-        f"Schema error: {exc}. The expected class is not in the Weaviate "
-        f"schema. If you just ran a migration, the MCP's client cache "
+        f"Schema error: {exc}. The expected class{which} is not in the "
+        f"Weaviate schema. If you just ran a migration, the MCP's client cache "
         f"will be reset on retry. If the class was never created, run "
         f"install.py --update to recreate it, OR use the launcher GUI's "
         f"Identity tab 'Manage shared KG collection' picker to designate "
-        f"an existing orchestrator-shaped class as canonical."
+        f"an existing orchestrator-shaped class as canonical. Both are "
+        f"additive — neither deletes an existing collection."
     )
 
 
@@ -3900,6 +4371,7 @@ _EMBED_SERVICE_RETRY_WINDOW = 10.0  # don't re-probe failed construction more th
 try:
     from .embeddings import (  # noqa: E402 — after bootstrap, re-export post config
         _get_embedding_service,
+        _active_text_slot_name,
         get_ollama_embedding,
         get_legacy_text_embedding,
         get_openai_embedding,
@@ -3920,6 +4392,29 @@ try:
     )
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".embeddings")
+
+
+# W3 + W8 (v0.2.92 wiring audit): the KG write path derives its truncation
+# properties and its chunk PLAN from the two shared homes, never inline:
+#   * ``vco_lib.kg_truncation_tags.truncation_tag_properties`` — ONE stamper
+#     for the ``truncated_slots`` / ``secondary_truncated_slots`` properties
+#     (every writer uses it; the constants live in that module and are
+#     re-exported via ``rl_enrichment`` above).
+#   * ``.kg_chunk_plan.plan_node_chunks`` — ONE chunk-plan computation shared
+#     with kg-sync (threshold from the ACTIVE model preset, deterministic
+#     TokenCounter gate, RAW stored content), so an MCP-written row and a
+#     kg-sync-written row for the same node carry the identical plan.
+try:
+    from vco_lib.kg_truncation_tags import (  # noqa: E402
+        truncation_tag_properties as _truncation_tag_properties,
+    )
+except ImportError as _exc:
+    _reraise_vco_lib_import(_exc, "kg_truncation_tags.truncation_tag_properties")
+
+try:
+    from . import kg_chunk_plan as _kg_chunk_plan  # noqa: E402
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".kg_chunk_plan")
 
 
 def serialize_datetime(value):
@@ -4070,14 +4565,23 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
 
 
 def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
-                           collection_name: str) -> list[dict]:
+                           collection_name: str,
+                           file_path: str = "") -> list[dict]:
     """
     Fetch the chunk immediately before (hit_num-1) and after (hit_num+1) for
     the same source node identified by *title*.
 
-    Prefers property-based filter (source_id + chunk_number) for efficiency.
-    Falls back to title filter + content-prefix parsing for backward
-    compatibility with objects that lack explicit chunk properties.
+    W7 (v0.2.92 wiring audit): keyed on ``file_path AND chunk_num`` — the
+    canonical per-node key — instead of ``source_node_id == title``. The old
+    filter only ever matched MCP-written rows (whose source_node_id WAS the
+    title) and, under duplicate titles (measured: 2 live collisions per
+    collection), matched BOTH nodes' chunks at the same chunk_num and picked
+    an arbitrary one via ``limit=1``. The file_path key matches every
+    writer's rows (kg-sync always wrote a per-write uuid4 source_node_id, so
+    the old Strategy 1 returned nothing for them).
+
+    Falls back to the title filter + content-prefix parsing for objects that
+    lack a file_path (legacy rows; none measured live).
 
     Returns formatted result dicts with distance=None (exact neighbour fetch).
     """
@@ -4092,19 +4596,20 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
     neighbours = []
 
     # Strategy 1: Property-based filter (fast, exact) for new-format objects
-    try:
-        for target_num in target_nums:
-            prop_filter = (
-                Filter.by_property("source_node_id").equal(title)
-                & Filter.by_property("chunk_num").equal(target_num)
-            )
-            result = coll.query.fetch_objects(filters=prop_filter, limit=1)
-            for obj in result.objects:
-                neighbours.append(_format_obj(obj, collection_name, distance=None))
-    except Exception:
-        # source_node_id / chunk_num properties may not exist on this collection;
-        # fall through to content-prefix fallback below.
-        pass
+    if file_path:
+        try:
+            for target_num in target_nums:
+                prop_filter = (
+                    Filter.by_property("file_path").equal(file_path)
+                    & Filter.by_property("chunk_num").equal(target_num)
+                )
+                result = coll.query.fetch_objects(filters=prop_filter, limit=1)
+                for obj in result.objects:
+                    neighbours.append(_format_obj(obj, collection_name, distance=None))
+        except Exception:
+            # file_path / chunk_num properties may not exist on this collection;
+            # fall through to content-prefix fallback below.
+            pass
 
     # If property-based fetch found all targets, return early
     found_nums = {nb.get("chunk_number") for nb in neighbours}
@@ -4132,7 +4637,9 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
 def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str) -> list[dict]:
     """
     For each chunked result in *results*, fetch adjacent chunks (N-1, N+1)
-    and merge them into the list with deduplication by (title, chunk_number).
+    and merge them into the list, de-duplicated by the per-NODE chunk
+    identity ``_node_chunk_key`` (file_path + title + chunk_number — W7:
+    a title alone is not a node identity).
 
     KG-2 (v0.2.73): neighbours are only RENDERED at the `three_chunks` and
     `full` tiers — the `summary` / `single_chunk` tiers show just the matched
@@ -4153,11 +4660,11 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
     Returns:
         Combined list: original results + neighbour chunks, deduplicated.
     """
-    seen: set[tuple[str, int | None]] = set()
+    seen: set = set()
     combined: list[dict] = []
 
     for r in results:
-        key = (r.get("title", ""), r.get("chunk_number"))
+        key = _node_chunk_key(r)
         if key not in seen:
             seen.add(key)
             combined.append(r)
@@ -4193,10 +4700,11 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
             # Will render at summary/single_chunk → neighbours discarded; skip.
             continue
         neighbours = _fetch_adjacent_chunks(
-            coll, r["title"], cn, tc, collection_name
+            coll, r["title"], cn, tc, collection_name,
+            file_path=r.get("file_path") or "",
         )
         for nb in neighbours:
-            nb_key = (nb.get("title", ""), nb.get("chunk_number"))
+            nb_key = _node_chunk_key(nb)
             if nb_key not in seen:
                 seen.add(nb_key)
                 combined.append(nb)
@@ -4241,6 +4749,8 @@ _RL_ENRICHMENT_EXPORTS = (
     "_reset_rl_telemetry_writers", "_rl_pack_linked_embs_for_node",
     "_rl_regenerate_node_vector", "_rl_refetch_node_vector",
     "_rl_find_representative_obj", "_rl_attach_other_slot_for_node",
+    "_rl_attach_active_truncation_for_node", "_stored_slot_truncation_state",
+    "TRUNCATED_SLOTS_PROP", "SECONDARY_TRUNCATED_SLOTS_PROP",
     "_rl_enrich_nodes_with_linked_embs", "_resolve_dual_rl_log_enabled",
     "_resolve_dual_rl_log_inputs", "_slot_short_source", "_rl_cache_and_rerank",
     # X-4 (v0.2.75): enrichment fan-out gate (TTL-cached skip predicate).
@@ -4310,11 +4820,13 @@ async def search_single_collection(collection_name: str, query: str, limit: int,
 
         # Primary hits
         results: list[dict] = []
-        seen: set[tuple[str, int | None]] = set()   # (title, chunk_number) dedup
+        # W7: per-NODE chunk identity (see `_node_chunk_key`) — a
+        # (title, chunk_number) key drops a colliding node's whole result.
+        seen: set = set()
 
         for obj in response.objects:
             formatted = _format_obj(obj, collection_name, obj.metadata.distance)
-            key = (formatted["title"], formatted["chunk_number"])
+            key = _node_chunk_key(formatted)
             if key not in seen:
                 seen.add(key)
                 results.append(formatted)
@@ -4326,11 +4838,12 @@ async def search_single_collection(collection_name: str, query: str, limit: int,
                 neighbours = _fetch_adjacent_chunks(
                     coll, r["title"], r["chunk_number"], r["total_chunks"],
                     collection_name,
+                    file_path=r.get("file_path") or "",
                 )
                 neighbour_candidates.extend(neighbours)
 
         for nb in neighbour_candidates:
-            key = (nb["title"], nb["chunk_number"])
+            key = _node_chunk_key(nb)
             if key not in seen:
                 seen.add(key)
                 results.append(nb)
@@ -6412,31 +6925,100 @@ async def store_knowledge_node(
         }
 
         # --- Chunk large content so every portion gets an accurate embedding ---
-        # Small nodes (≤ _MAX_SINGLE_CHUNK_TOKENS ≈ 8 000 chars / 2000 tokens) are
-        # stored as a single Weaviate object — identical to the previous behaviour.
-        # Large nodes are split by Chunker; each chunk becomes its own object,
-        # sharing the same title/tags/links/file_path metadata but carrying only
-        # its slice of content.  The content field is prefixed with an ordering
-        # header ("[chunk N/total]\n\n") so all chunks can be reassembled in order
-        # without requiring schema changes in Weaviate.
+        # W8 (v0.2.92 wiring audit): the plan comes from the ONE shared
+        # computation (``kg_chunk_plan.plan_node_chunks``) that kg-sync also
+        # uses — the single-vs-multi gate is the ACTIVE model's preset max
+        # (NOT the old hardcoded ``_MAX_SINGLE_CHUNK_TOKENS = 2000`` "legacy
+        # arctic limit", which made a 2 001–8 192-token qwen3 node chunk here
+        # but stay whole under kg-sync), measured with the chunker's
+        # deterministic ``TokenCounter`` (not the Ollama tokenizer, whose unit
+        # drifts from the budget's). Stored content is RAW chunk text — the
+        # ``[chunk N/total]`` ordering prefix is GONE (readers prefer the
+        # ``chunk_num`` / ``total_chunks`` properties every writer stores and
+        # only fall back to parsing a prefix on legacy rows that carry one),
+        # ``source_node_id`` is a per-write uuid (like kg-sync — it was
+        # ``title``, which collides under W7's duplicate titles), and a
+        # ``content_hash`` is stamped so the next kg-sync can skip/compare.
+        # ``tests/test_wiring_w8_shared_chunk_plan.py`` pins the parity.
         # -----------------------------------------------------------------------
-        token_count = await count_tokens_async(content)
+        _write_source_node_id = str(uuid.uuid4())
+        _plan = _kg_chunk_plan.plan_node_chunks(
+            content,
+            _active_chunk_model_id(),
+            source_id=_write_source_node_id,
+        )
+        # Storage-layer content signature — the SAME function kg-sync keys its
+        # embed-skip on (vco_lib home, parity-locked with the script's copy).
+        from vco_lib.knowledge_residue import (
+            content_signature_excluding_updated as _content_sig,
+        )
+        _content_hash = _content_sig(content)
 
-        if token_count <= _MAX_SINGLE_CHUNK_TOKENS:
+        async def _legacy_vector_and_record(text: str):
+            """The DUAL-OFF flat-vector embed — ONE home for BOTH branches.
+
+            Returns ``(vector, active_slot, record)``. W3: pre-fix the
+            single-chunk legacy leg had been given the tagged capture while
+            the MULTI-chunk legacy leg still embedded through the bare
+            ``get_embedding`` and stamped nothing — one writer, two
+            behaviours. Both now call this.
+
+            The tagged capture runs on this path too: with the default
+            write-all-slots toggle OFF the fan-out IS exactly the ACTIVE
+            embed ``get_embedding`` would have taken, so the stored vector is
+            unchanged and only the record is gained. The record is narrowed
+            to the ACTIVE slot — the only vector this branch stores, so a
+            secondary the fan-out happened to embed must not appear in it —
+            and is ``None`` when the untagged ``get_embedding`` fallback
+            supplied the vector, because nothing measured THAT embed: the row
+            then carries no property and resolves UNKNOWN, never an
+            unprovable empty record.
+            """
+            _vectors, _truncated_all = await _get_all_kg_embeddings_tagged(text)
+            _slot = _active_text_slot_name()
+            _vector = _vectors.get(_slot) if _vectors else None
+            if _vector is None:
+                return (await get_embedding(text)), _slot, None
+            return (
+                _vector, _slot,
+                [s for s in _truncated_all if s == _slot],
+            )
+
+        if _plan.is_single:
             # Single-object insert — store explicit chunk properties for consistency
             properties["chunk_num"] = 1
             properties["total_chunks"] = 1
-            properties["source_node_id"] = title
+            properties["source_node_id"] = _write_source_node_id
+            properties["content_hash"] = _content_hash
             if EMBEDDING_SOURCE == "weaviate":
                 collection.data.insert(properties=properties)
             elif DUAL_EMBEDDING_ENABLED:
-                vectors = await _get_all_kg_embeddings(content)
+                # W3: the SINGLE-chunk branch persists the truncation record
+                # too — through the SAME atomic capture
+                # (``_get_all_kg_embeddings_tagged``) and the SAME shared
+                # stamper (``truncation_tag_properties``) the multi-chunk
+                # branch uses. Pre-fix this branch used the untagged gather,
+                # so every MCP-written single-chunk row (the overwhelming
+                # majority) resolved UNKNOWN for every slot.
+                vectors, truncated_all = await _get_all_kg_embeddings_tagged(content)
+                properties.update(
+                    _truncation_tag_properties(
+                        truncated_all, _active_text_slot_name(),
+                        measured_slots=vectors or (),
+                    )
+                )
                 collection.data.insert(
                     properties=properties,
                     vector=vectors if vectors else None,
                 )
             else:
-                vector = await get_embedding(content)
+                # Legacy flat-vector path — see `_legacy_vector_and_record`.
+                vector, _slot, _record = await _legacy_vector_and_record(content)
+                properties.update(
+                    _truncation_tag_properties(
+                        _record, _slot, measured_slots=(_slot,),
+                    )
+                )
                 collection.data.insert(properties=properties, vector=vector)
             chunk_count = 1
         else:
@@ -6456,7 +7038,8 @@ async def store_knowledge_node(
             # budget here, and the SECONDARY slots absorb the degradation instead:
             # embedding_service.embed_text_all_configured embeds each secondary
             # from a BOUNDED, EXPLICITLY-TAGGED sub-window when the chunk exceeds
-            # that secondary's num_ctx (svc.last_secondary_truncated records which),
+            # that secondary's num_ctx (the per-call record svc captures — see
+            # ``embed_text_all_configured_tagged`` — records which),
             # rather than clamping the active chunk or letting Ollama/OpenAI
             # silently truncate. The active model is resolved via the R2-3
             # resolver so the openai-active case (empty EMBEDDING_MODEL +
@@ -6464,44 +7047,70 @@ async def store_knowledge_node(
             # read; single-write installs are byte-UNCHANGED (the resolver returns
             # EMBEDDING_MODEL when set). Lazy resolver (loud-fallback to
             # EMBEDDING_MODEL on a stale-copy install — never fails startup).
-            _active_chunk_model = _active_chunk_model_id()
-            chunker = Chunker.for_model(_active_chunk_model)
-            raw_chunks = chunker.chunk_text(content, source_id=title)
-            chunk_count = len(raw_chunks)
+            raw_chunks = _plan.chunks
+            chunk_count = _plan.total
             prepared_inserts: list[tuple[dict, "list | dict | None"]] = []
             for chunk in raw_chunks:
-                # Prefix stored content with ordering header (no schema changes needed)
-                chunk_stored = (
-                    f"[chunk {chunk.chunk_number + 1}/{chunk.total_chunks}]\n\n"
-                    f"{chunk.content}"
-                )
                 chunk_props = dict(properties)
-                chunk_props["content"] = chunk_stored
+                # W8: RAW chunk content — no "[chunk N/total]" prefix (kg-sync's
+                # stored shape; the chunk_num/total_chunks properties carry the
+                # ordering, and `_stored_plan_matches_current` compares raw).
+                chunk_props["content"] = chunk.content
                 # Explicit chunk properties for efficient retrieval
                 chunk_props["chunk_num"] = chunk.chunk_number + 1   # 1-indexed
                 chunk_props["total_chunks"] = chunk.total_chunks
-                chunk_props["source_node_id"] = title
+                chunk_props["source_node_id"] = _write_source_node_id
+                chunk_props["content_hash"] = _content_hash
                 if EMBEDDING_SOURCE == "weaviate":
                     prepared_inserts.append((chunk_props, None))
                 elif DUAL_EMBEDDING_ENABLED:
-                    # R3-2: capture which SECONDARY slots were embedded from a
-                    # bounded sub-window for THIS chunk (chunk exceeded that
-                    # model's num_ctx) and PERSIST it as a chunk property so the
-                    # stored secondary (e.g. arctic) vectors can be partitioned
-                    # truncated-vs-full from stored data alone. The active slot is
-                    # never truncated (full-fidelity), so an empty list means every
-                    # stored vector for this chunk is faithful. The tag is captured
-                    # atomically with the vectors (no cross-task race).
-                    vectors, truncated_slots = await _get_all_kg_embeddings_tagged(
+                    # R3-2 + v0.2.92 (m-R6-1): capture the per-call truncation
+                    # record ATOMICALLY with the vectors (``embed_text_all_
+                    # configured_tagged`` — the COMPLETE record, the ACTIVE slot
+                    # included) and persist it as TWO chunk properties derived
+                    # from that ONE capture by the SHARED stamper
+                    # (``truncation_tag_properties`` — W3 routed every writer
+                    # through it so the derivation cannot drift):
+                    #   * ``truncated_slots`` — the complete record verbatim.
+                    #     Its PRESENCE is the era marker: rows that carry it can
+                    #     answer "was slot S a leading window?" for EVERY slot;
+                    #     rows that predate it resolve UNKNOWN for the active
+                    #     slot (rl_enrichment._stored_slot_truncation_state).
+                    #   * ``secondary_truncated_slots`` — the SECONDARY-only
+                    #     view (the active slot dropped), byte-identical to what
+                    #     R3-2 wrote, so pre-v0.2.92 readers and the dual-log
+                    #     other-slot leg keep seeing the same property they
+                    #     always did. An empty list means every stored SECONDARY
+                    #     vector for this chunk is faithful.
+                    # The active-slot name for the view comes from the
+                    # session-cached service (warm here: the capture above just
+                    # ran through it; a cold cache means the inline fallback ran,
+                    # whose record is empty, so the exclusion is a no-op).
+                    vectors, truncated_all = await _get_all_kg_embeddings_tagged(
                         chunk.content
                     )
-                    chunk_props["secondary_truncated_slots"] = truncated_slots
+                    chunk_props.update(
+                        _truncation_tag_properties(
+                            truncated_all, _active_text_slot_name(),
+                            measured_slots=vectors or (),
+                        )
+                    )
                     prepared_inserts.append(
                         (chunk_props, vectors if vectors else None)
                     )
                 else:
-                    # Embed the raw chunk text (without header) for clean vectors
-                    vector = await get_embedding(chunk.content)
+                    # Legacy flat-vector path — the SAME one-home helper the
+                    # single-chunk branch uses. W3: this leg embedded through
+                    # the bare ``get_embedding`` and stamped NOTHING, which
+                    # made it the last untagged store leg in the MCP.
+                    vector, _slot, _record = await _legacy_vector_and_record(
+                        chunk.content
+                    )
+                    chunk_props.update(
+                        _truncation_tag_properties(
+                            _record, _slot, measured_slots=(_slot,),
+                        )
+                    )
                     prepared_inserts.append((chunk_props, vector))
             for chunk_props, chunk_vec in prepared_inserts:
                 if EMBEDDING_SOURCE == "weaviate":
@@ -7431,6 +8040,67 @@ def _dedup_objects_by_full_name(objects: list) -> list:
     return [_pick_canonical_chunk(groups[k]) for k in order]
 
 
+# ─── Cross-reference read path (v0.2.92) ─────────────────────────────────────
+# `query_code_structure`'s `dependencies` and `extends` branches are the only
+# two places the MCP resolves a Weaviate CROSS-REFERENCE. Both were broken in
+# the same three ways, so both now go through the helpers below rather than
+# open-coding the sequence twice (one concern, one home — and since v0.2.92 the
+# READ side is shared with the CLI and the analyzer via
+# `vco_lib.codegraph_references`, see the import a few lines down):
+#
+#   1. `return_references=["imports"]` passed a list[str]. The weaviate v4
+#      client validates the argument type and rejects it outright with
+#      "Argument 'return_references' must be one of: [_QueryReference], but
+#      got <class 'str'>" — so BOTH query types failed 100% of the time,
+#      independent of the data. `_code_return_references` builds the
+#      `QueryReference(link_on=...)` the client actually requires.
+#   2. `obj.references` is None when a fetch resolves no links, so
+#      `obj.references.get(...)` raised AttributeError. (The CLI sibling
+#      `templates/scripts/query_code_graph.py` already guarded this in
+#      v0.2.70 C1c; the MCP never did.)
+#   3. `obj.references[name]` is a `_CrossReference`, NOT a list — it is not
+#      iterable, so the `for x in refs.get(name, [])` loops would have raised
+#      TypeError even after (1) was fixed. The resolved targets live on
+#      `.objects`.
+#
+# The build side deliberately uses the SAME upstream primitive as
+# `vco_lib/codegraph_vector_copy.py::_query_references_for`
+# (`weaviate.classes.query.QueryReference`) rather than importing that
+# function: it is keyed by BASE COLLECTION and returns every reference the
+# base declares, while these call sites want ONE named link resolved into
+# target OBJECTS (not uuids). Same primitive, different question — see the
+# module docstring note in codegraph_vector_copy for the uuid-side contract.
+
+
+def _code_return_references(link_on: str) -> list:
+    """Build the `return_references` argument that resolves ONE named link.
+
+    weaviate v4 requires `_QueryReference` instances here; a bare property
+    name (str) is rejected by client-side validation before any network call.
+    """
+    return [QueryReference(link_on=link_on)]
+
+
+# One home (CLAUDE.md § "search before you add, extract before you duplicate"):
+# the read-side normalisation and the duplicate-beacon collapse now live in
+# `vco_lib/codegraph_references.py`. The CLI sibling
+# `templates/scripts/query_code_graph.py` carried the SAME `_CrossReference`
+# defect on its own `dependencies`/`extends` branches, and the analyzer's WRITE
+# pass (`create_cross_references`) needs the same read to add only edges that
+# are not already stored — three consumers, so the logic is extracted rather
+# than copied a third time. The aliases keep the names this module and
+# tests/test_v0292_mcp_query_structure.py already use.
+#
+# vco_lib is a HARD dependency of this module (see `from vco_lib.log_setup
+# import configure_logging` in the import block at the top): a failing import
+# means a BROKEN install and must surface loudly, never degrade to an inline
+# copy.
+from vco_lib.codegraph_references import (  # noqa: E402 — kept beside its explainer
+    dedup_ref_targets as _dedup_ref_targets,
+    read_cross_reference as _read_cross_reference,
+)
+
+
 # M-2 / CG-2 (v0.2.73): query types whose relationships are populated only
 # by language-specific analyzer passes. Calls/paths come from the call-graph
 # extraction (now cross-language via tree-sitter — Part 5); type_users comes
@@ -7630,10 +8300,13 @@ def query_code_structure(
             coll = client.collections.get(_proj_coll("CodeModule"))
 
             if query_type == "dependencies":
+                # OUTBOUND: resolve the module's own `imports` cross-reference
+                # to the modules IT imports. See _code_return_references /
+                # _read_cross_reference for the three-part v0.2.92 fix.
                 response = coll.query.fetch_objects(
                     filters=with_project(Filter.by_property("path").equal(target)),
                     limit=1,
-                    return_references=["imports"]
+                    return_references=_code_return_references("imports"),
                 )
 
                 if not response.objects:
@@ -7643,18 +8316,38 @@ def query_code_structure(
                         + _code_structure_not_found_hint(query_type, target, effective_project),
                     }, indent=2)
 
-                imports = response.objects[0].references.get("imports", [])
+                imports = _dedup_ref_targets(
+                    _read_cross_reference(response.objects[0], "imports"), ("path",)
+                )
                 results = [{"path": imp.properties.get("path"), "file_path": imp.properties.get("path", "")} for imp in imports]
 
             else:  # imports
+                # INBOUND (the reverse of `dependencies`): modules whose
+                # `imports` cross-reference POINTS AT `target`.
+                #
+                # v0.2.92: this filtered with
+                # `Filter.by_property("imports").contains_any([target])`, but
+                # `imports` is a ReferenceProperty, not TEXT_ARRAY (see
+                # analyze_code_graph.py's CodeModule schema). Weaviate reads a
+                # filter path that names a reference property as a reference
+                # COUNT filter, so it demanded ints and rejected the paths with
+                # "nested query: nested clause at pos 0: value type should be
+                # []int but is []string" — every reverse-imports query failed.
+                # `Filter.by_ref` walks the link and filters the TARGET's
+                # `path`, which is the question actually being asked. The
+                # project filter still applies to the OUTER (importing) module.
+                #
                 # v0.2.46 V46-D: emit truncation signal so the LLM
                 # consumer knows when the list is capped at IMPORTS_LIMIT.
                 IMPORTS_LIMIT = 20
                 response = coll.query.fetch_objects(
-                    filters=with_project(Filter.by_property("imports").contains_any([target])),
-                    limit=IMPORTS_LIMIT
+                    filters=with_project(
+                        Filter.by_ref("imports").by_property("path").equal(target)
+                    ),
+                    limit=IMPORTS_LIMIT,
                 )
-                results = [{"path": obj.properties.get("path"), "file_path": obj.properties.get("path", "")} for obj in response.objects]
+                importers = _dedup_ref_targets(response.objects, ("path",))
+                results = [{"path": obj.properties.get("path"), "file_path": obj.properties.get("path", "")} for obj in importers]
                 _truncation_meta = {
                     "truncated": len(response.objects) >= IMPORTS_LIMIT,
                     "limit": IMPORTS_LIMIT,
@@ -7687,14 +8380,16 @@ def query_code_structure(
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("full_name").equal(target)),
                 limit=8,
-                return_references=["extends"]
+                return_references=_code_return_references("extends"),
             )
 
             canonical = _pick_canonical_chunk(response.objects)
             if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
-            extends = canonical.references.get("extends", [])
+            extends = _dedup_ref_targets(
+                _read_cross_reference(canonical, "extends"), ("full_name", "name")
+            )
             results = [{
                 "name": base.properties.get("name"),
                 "full_name": base.properties.get("full_name"),

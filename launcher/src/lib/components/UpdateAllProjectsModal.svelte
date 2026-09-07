@@ -410,9 +410,10 @@
     {#if phase === 'confirm'}
       <p class="ua-desc">
         Re-runs the bundle install (hooks, scripts, agents, skills, infrastructure
-        templates) on every registered project. User-modified files are preserved;
-        only orchestrator-shipped files that match the prior installed hash are
-        overwritten.
+        templates) on every registered project. Your <code>knowledge/</code> notes are
+        never overwritten. Other files you have edited are backed up to
+        <code>.claude/backups/bundle-adoptions/&lt;timestamp&gt;/</code> and replaced with
+        the shipped version, so your edit stays recoverable but is not what runs.
       </p>
       <p class="ua-count">
         <strong>{projectCount}</strong>

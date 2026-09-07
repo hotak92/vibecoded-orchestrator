@@ -3,10 +3,14 @@
 """Lua extractor for the code-graph analyzer (P2f stage 2, v0.2.76).
 
 Moved VERBATIM from ``templates/scripts/analyze_code_graph.py``:
-``CodeGraphAnalyzer._analyze_lua_file`` — only body edits are the mechanical ``self.`` -> ``ctx.`` rename
-(``ctx`` IS the analyzer instance) and the analyzer-resident embedding
-seams reached via ``ctx.``. Behavior is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+``CodeGraphAnalyzer._analyze_lua_file`` — the move itself was verbatim apart from
+the mechanical ``self.`` -> ``ctx.`` rename (``ctx`` IS the analyzer
+instance) and the analyzer-resident embedding seams reached via ``ctx.``.
+Behaviour has since been CORRECTED here (v0.2.92 and WP-5b — see the notes
+below), so it is no longer byte-identical to the analyzer's original;
+``tests/test_codegraph_golden.py`` pins what it does TODAY, and the
+corpus README explains why a snapshot is evidence of behaviour rather
+than of correctness.
 """
 from __future__ import annotations
 
@@ -25,8 +29,8 @@ from vco_lib.codegraph_entities import (
     ModuleDescriptor,
 )
 from vco_lib.codegraph_lang._shared import (
-    _extract_balanced_block,
     _extract_external_calls,
+    extract_end_keyword_block,
     run_pure_extractor,
 )
 
@@ -37,7 +41,8 @@ def extract_lua_file(
     """Pure producer: parse a Lua file, RETURN a :class:`FileExtraction`."""
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('--')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('--')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
@@ -141,7 +146,13 @@ def extract_lua_file(
             continue
 
         start_line = content[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="lua")  # V52-O.11.E (was: start_line + 40)
+        # v0.2.92 WP-5b: the `end`-keyword scanner. This call used to be
+        # `_extract_balanced_block(language="lua")`, which counts `{`/`}` — a
+        # `function … end` body has no brace at all, so the scan found no
+        # opener and took the runaway branch. Measured on the golden corpus:
+        # `vector.lua`'s `clamp` (a 10-line function closing on line 38) was
+        # stored ending at 39, the last line of the file.
+        end_line = extract_end_keyword_block(source_lines, start_line, language="lua")
         body = '\n'.join(source_lines[start_line - 1:end_line])
 
         func_full_name = f"{file_path.stem}.{func_name}"

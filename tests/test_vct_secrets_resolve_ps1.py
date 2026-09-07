@@ -407,3 +407,105 @@ def test_live_no_on_disk_token_keeps_the_401_path(tmp_path, secrets_dir):
     assert cp.returncode == 1, f"stderr={cp.stderr}"
     assert bearers == [_STALE_ENV_TOKEN], bearers
     assert _DEFINITIVE_LINE not in cp.stderr
+
+
+# ─── v0.3.0: the `.no-shared-fallback` per-project opt-out ──────────────
+#
+# PS1 sibling of the same block in ``tests/test_agent_secrets.py`` and
+# ``tests/test_vct_secrets_resolve.sh``. R42: parity by WRITING the
+# PowerShell behaviour, never by narrowing the other two to what .ps1
+# happened to do.
+#
+# `docs/VCT_SECRETS_PRIMITIVE.md` §"Design choices" promises a project can
+# opt out of the SHARED file-store tier with
+# `projects/<NAME>/.no-shared-fallback`; the launcher's "Disable shared
+# secrets for this project" toggle WRITES it. Until v0.3.0 no resolver READ
+# it, so the toggle gated tier 1 while tier 2 kept serving the values the
+# user opted out of.
+#
+# Driven through the resolver's own CLI entry point, so removing the call
+# to `Test-SharedFallbackDisabled` inside `Get-FileStoreValue` reddens these.
+
+_MARKER = ".no-shared-fallback"
+
+
+@pytest.fixture()
+def optout_store(tmp_path: Path) -> Path:
+    """`shared/` holds a key no project has its own copy of.
+
+    Resolution reaching it is therefore unambiguous evidence the shared
+    leg ran.
+    """
+    root = tmp_path / "optout-store"
+    (root / "shared").mkdir(parents=True)
+    (root / "projects" / "optdemo").mkdir(parents=True)
+    (root / "projects" / "optother").mkdir(parents=True)
+    (root / "shared" / "OPTOUT_KEY").write_text("shared-only-value", encoding="utf-8")
+    (root / "projects" / "optdemo" / "OWN_KEY").write_text(
+        "own-value", encoding="utf-8"
+    )
+    return root
+
+
+def _opt_out(store: Path, name: str) -> None:
+    (store / "projects" / name).mkdir(parents=True, exist_ok=True)
+    (store / "projects" / name / _MARKER).write_text("", encoding="utf-8")
+
+
+def test_ps1_no_marker_shared_still_resolves(tmp_path, optout_store):
+    """LEAVE-ALONE half — without the marker nothing changes."""
+    cp = _run_resolver(tmp_path, "optdemo", "OPTOUT_KEY", optout_store)
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-only-value"
+
+
+def test_ps1_marker_blocks_the_shared_tier(tmp_path, optout_store):
+    """ACT half — with the marker the shared copy must NOT resolve."""
+    _opt_out(optout_store, "optdemo")
+    cp = _run_resolver(tmp_path, "optdemo", "OPTOUT_KEY", optout_store)
+    assert cp.returncode != 0, cp.stdout
+    assert cp.stdout == ""
+
+
+def test_ps1_marker_leaves_the_projects_own_keys_alone(tmp_path, optout_store):
+    _opt_out(optout_store, "optdemo")
+    cp = _run_resolver(tmp_path, "optdemo", "OWN_KEY", optout_store)
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "own-value"
+
+
+def test_ps1_marker_is_scoped_to_the_project_that_placed_it(tmp_path, optout_store):
+    _opt_out(optout_store, "optdemo")
+    cp = _run_resolver(tmp_path, "optother", "OPTOUT_KEY", optout_store)
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-only-value"
+
+
+def test_ps1_shared_pseudo_name_never_opts_itself_out(tmp_path, optout_store):
+    """A stray `projects/shared/` orphan must not kill every shared read."""
+    _opt_out(optout_store, "shared")
+    cp = _run_resolver(tmp_path, "shared", "OPTOUT_KEY", optout_store)
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-only-value"
+
+
+def test_ps1_optout_refusal_never_prints_the_value(tmp_path, optout_store):
+    _opt_out(optout_store, "optdemo")
+    cp = _run_resolver(tmp_path, "optdemo", "OPTOUT_KEY", optout_store)
+    assert "shared-only-value" not in (cp.stdout + cp.stderr)
+
+
+def test_ps1_pseudo_name_exclusion_is_case_sensitive(tmp_path, optout_store):
+    """A project literally NAMED "Shared" is a real project, not the scope.
+
+    PowerShell's `-eq` is case-insensitive on strings, so the obvious
+    spelling of the pseudo-name carve-out would swallow "Shared" here while
+    the bash and Python siblings (case-sensitive) gated it — the opt-out
+    would be silently inert on Windows for that one project. Pinned in all
+    three suites so the divergence cannot come back through any of them.
+    """
+    (optout_store / "projects" / "Shared").mkdir(parents=True, exist_ok=True)
+    _opt_out(optout_store, "Shared")
+    cp = _run_resolver(tmp_path, "Shared", "OPTOUT_KEY", optout_store)
+    assert cp.returncode != 0, cp.stdout
+    assert cp.stdout == ""

@@ -57,7 +57,9 @@
   // The real drop-and-recreate command (analyzer's `--force-recreate` flag).
   // Displayed by the modal for the user to run manually — never auto-executed.
   // Validated by tests/test_deferral_command_argparse_sweep.py (svelte + ts scan).
-  let dropCommand = $derived(buildDropRecreateCommand(projectName));
+  // v0.2.92 (BLOCKER-2): identity via --from-resolver, NOT the display name —
+  // see codegraph-build-banner-logic.ts.
+  let dropCommand = buildDropRecreateCommand();
   let now = $state(Date.now());
   // Tick the clock once per second only while we're in a terminal state
   // that needs auto-hide. Cheaper than a constant 1Hz timer.

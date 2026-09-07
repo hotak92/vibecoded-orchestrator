@@ -493,22 +493,14 @@ fn which_python() -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
+    use vct_launcher_core::test_env::state_dir_guard;
 
-    // Serialise tests that mutate process-wide env (PATH, VCT_STATE_DIR,
-    // FAKE_PODMAN_*). Parallel `cargo test` would otherwise observe
-    // each other's settings.
-    //
-    // Acquire via `serialize_lock()` which strips poison so a panic in
-    // one test doesn't cascade into PoisonError in every other test of
-    // the suite. Each individual test's assertion failures still
-    // surface — we just don't conflate a previous test's panic with
-    // *this* test's behaviour.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn serialize_lock() -> std::sync::MutexGuard<'static, ()> {
-        SERIALIZE.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
+    // v0.2.92: the file-local `SERIALIZE` mutex is GONE. Every test
+    // that took it also redirects `VCT_STATE_DIR`, and
+    // `state_dir_guard()` holds the workspace-wide
+    // `GLOBAL_ENV_MUTEX` for the whole body — which additionally
+    // excludes env-mutating tests in OTHER files, something a
+    // file-local mutex could never do.
 
     /// Build a minimal, valid v0.2.33-shape manifest JSON for module id
     /// `id`. Used as the "good" extracted body in happy-path tests.
@@ -671,10 +663,8 @@ esac
 
     #[tokio::test]
     async fn extract_manifest_happy_path() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -700,16 +690,13 @@ esac
             .join("vct-module.json");
         assert_eq!(out.on_disk_path, expected);
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_image_missing_file() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -733,16 +720,13 @@ esac
             err
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_invalid_json() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -764,16 +748,13 @@ esac
             err
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_id_mismatch() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -795,16 +776,13 @@ esac
             err
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_atomic_bak_rollback_on_rename_failure() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -864,16 +842,13 @@ esac
             ".bak must hold the pre-rename manifest body"
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_cleans_up_tmp_dir_on_success() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -900,16 +875,13 @@ esac
             tmp_dir.display()
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_cleans_up_container_on_drop() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -950,16 +922,13 @@ esac
             log
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_create_failure_surfaces_stderr() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -983,7 +952,6 @@ esac
             err
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
         reset_fake_env();
     }
 
@@ -1003,9 +971,8 @@ esac
     /// reachable and the test runs; otherwise we skip cleanly.
     #[tokio::test]
     async fn v0252_d3_extract_rejects_bug_e_manifest() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = state_dir_guard();
 
         // Self-gate: can we reach the sanitizer? Probe by running
         // the CLI against a known-bad manifest in the tempdir.
@@ -1042,7 +1009,6 @@ esac
             return;
         }
 
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -1121,7 +1087,6 @@ esac
             );
         }
 
-        std::env::remove_var("VCT_STATE_DIR");
         std::env::remove_var("PYTHONPATH");
         reset_fake_env();
     }
@@ -1132,10 +1097,8 @@ esac
     /// through the pipeline.
     #[tokio::test]
     async fn v0252_d3_extract_bypass_env_skips_sanitizer() {
-        let _g = serialize_lock();
         reset_fake_env();
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
         let bin = install_fake_podman(tmp.path());
         let _p = push_path(&bin);
 
@@ -1157,7 +1120,6 @@ esac
         .expect("bypass + good manifest must succeed");
         assert_eq!(out.parsed.id, "vct-test-mod");
 
-        std::env::remove_var("VCT_STATE_DIR");
         std::env::remove_var("VCT_MANIFEST_SANITIZER_BYPASS");
         reset_fake_env();
     }

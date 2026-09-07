@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 from vco_lib.project_init import (  # noqa: E402
     MANAGED_REGION_OPEN,
@@ -51,7 +52,7 @@ def _run_cli(args: list[str], *, env_extra: dict | None = None) -> subprocess.Co
         [sys.executable, "-m", "vco_lib.project_init", *args],
         capture_output=True,
         text=True,
-        env=env,
+        env=child_env(env),
         cwd=str(REPO_ROOT),
     )
 

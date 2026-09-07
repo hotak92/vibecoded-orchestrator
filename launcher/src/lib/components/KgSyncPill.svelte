@@ -16,6 +16,11 @@
   import { onDestroy, onMount } from 'svelte';
   import { listen, safeInvoke } from '$lib/tauri';
   import type { KgSyncStatus, KgSyncView } from '$lib/types/launcher';
+  import {
+    kgSyncDoneCount,
+    kgSyncPhaseKind,
+    kgSyncTotalCount,
+  } from './kg-sync-banner-logic';
 
   interface Props {
     projectId: string;
@@ -60,9 +65,11 @@
           kg_total: e.payload.kg_total ?? view?.kg_total ?? 0,
           kg_succeeded: e.payload.kg_succeeded ?? view?.kg_succeeded ?? 0,
           kg_failed: e.payload.kg_failed ?? view?.kg_failed ?? 0,
+          kg_skipped: e.payload.kg_skipped ?? view?.kg_skipped ?? 0,
           docs_total: e.payload.docs_total ?? view?.docs_total ?? 0,
           docs_succeeded: e.payload.docs_succeeded ?? view?.docs_succeeded ?? 0,
           docs_failed: e.payload.docs_failed ?? view?.docs_failed ?? 0,
+          docs_skipped: e.payload.docs_skipped ?? view?.docs_skipped ?? 0,
           current_phase: e.payload.current_phase,
           error_message: e.payload.error_message ?? view?.error_message ?? null,
         };
@@ -92,19 +99,29 @@
   }
 
   function statusLabel(v: KgSyncView): string {
-    const done = v.kg_succeeded + v.docs_succeeded;
-    const total = v.kg_total + v.docs_total;
+    const done = kgSyncDoneCount(v);
+    const total = kgSyncTotalCount(v);
     switch (v.status) {
       case 'pending': return 'KG queued';
-      case 'running':
-        if (v.current_phase === 'scan') return 'KG scanning…';
+      case 'running': {
+        const kind = kgSyncPhaseKind(v.current_phase);
+        if (kind === 'scan') return 'KG scanning…';
         // v0.2.71 Piece 5a: waiting on the global single-flight embed lane.
-        if (v.current_phase === 'queued') return 'KG waiting…';
+        if (kind === 'queued') return 'KG waiting…';
+        // v0.2.92 WP-B1: the script's post-summary `.node_formats.json`
+        // regen can run up to 600 s after the final counts — show it as
+        // its own stage instead of a stalled-looking "17/17".
+        if (kind === 'finalize') return 'KG finalizing…';
         if (total > 0) return `KG ${done}/${total}`;
         return 'KG embedding…';
-      case 'success':
+      }
+      case 'success': {
         if (total === 0) return 'KG synced';
-        return `KG ${total} node${total === 1 ? '' : 's'}`;
+        // v0.2.92 WP-B1 / D12: count files actually indexed, not the
+        // discovered total (intentionally-skipped nodes are not indexed).
+        const indexed = v.kg_succeeded + v.docs_succeeded;
+        return `KG ${indexed} node${indexed === 1 ? '' : 's'}`;
+      }
       case 'failed': return 'KG sync failed';
       case 'skipped': return 'KG no content';
     }

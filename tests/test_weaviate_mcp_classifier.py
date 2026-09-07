@@ -30,12 +30,23 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import claude_mcp_servers.weaviate_mcp.server as srv  # noqa: E402
+
+# v0.2.92 hint-safety fakes live with the primary suite for that fix (repo
+# convention: see tests/test_install_bundle.py's _make_fake_orchestrator,
+# cross-imported by four other test modules).
+from tests.test_v0292_mcp_query_structure import (  # noqa: E402
+    DESTRUCTIVE_MARKERS,
+    FAKE_SCHEMA_CLASSES,
+    _FakeSchemaClient,
+    _nested_query_error,
+)
 
 _classify = srv._classify_weaviate_failure
 WeaviateUnreachable = srv.WeaviateUnreachable
@@ -120,7 +131,15 @@ class SchemaErrorTests(unittest.TestCase):
         self.assertIn("migrate-development-temporal-props.sh", result.user_msg)
 
     def test_nested_query_index_null_state(self):
-        """Issue D symptom: collection lacks indexNullState=True."""
+        """Issue D symptom: collection lacks indexNullState=True.
+
+        CLASSIFICATION only. Until v0.2.92 this test also asserted that the
+        hint recommended ``migrate-shared-kg-schema.sh``; that assertion
+        pinned a data-loss bug and was moved (not deleted) into
+        :class:`IndexNullStateHintSafetyTests` below, which pins the
+        verified-premise contract that replaced it. Do not restore the old
+        assertion here — see that class's docstring for why.
+        """
         result = _classify(
             Exception(
                 "build inverted filter allow list: fetch doc ids for "
@@ -128,21 +147,14 @@ class SchemaErrorTests(unittest.TestCase):
             )
         )
         self.assertIsInstance(result, WeaviateSchemaError)
-        self.assertIn(
-            "migrate-shared-kg-schema.sh",
-            result.user_msg,
-            f"hint missing shared-kg migration script: {result.user_msg}",
-        )
 
     def test_build_inverted_filter_alone(self):
         result = _classify(Exception("build inverted filter allow list: failed"))
         self.assertIsInstance(result, WeaviateSchemaError)
-        self.assertIn("migrate-shared-kg-schema.sh", result.user_msg)
 
     def test_nested_query_alone(self):
         result = _classify(Exception("nested query error during is_null filter"))
         self.assertIsInstance(result, WeaviateSchemaError)
-        self.assertIn("migrate-shared-kg-schema.sh", result.user_msg)
 
     def test_schema_error_takes_precedence_over_query_error_class(self):
         """A WeaviateQueryError whose message looks like schema must be
@@ -301,6 +313,148 @@ class HintBuildersTests(unittest.TestCase):
         self.assertFalse(data["success"])
         self.assertEqual(data["error_class"], "WeaviateAuthError")
         self.assertEqual(data["hint"], "check key")
+
+
+class IndexNullStateHintSafetyTests(unittest.TestCase):
+    """v0.2.92 — the indexNullState hint must VERIFY before it recommends.
+
+    WHY THE OLD ASSERTIONS ARE GONE. Until v0.2.92 three tests in
+    :class:`SchemaErrorTests` asserted that ANY message containing "nested
+    query" or "build inverted filter" produced a hint recommending
+    ``scripts/migrate-shared-kg-schema.sh``. That script ``DELETE``s
+    ``$SHARED_KG_COLLECTION``. The hint fired on a substring match alone, so
+    a purely client-side query-construction bug in ``query_code_structure``
+    — filtering the ``imports`` CROSS-REFERENCE on a per-project
+    ``*_CodeModule`` with ``Filter.by_property(...).contains_any([...])``,
+    whose GRPC rejection happens to contain the words "nested query" — told
+    the user to drop an unrelated, populated shared KG (738 nodes on the
+    machine where this was found). The premise was false too: every
+    collection involved had ``indexNullState=true``.
+
+    Those tests therefore PINNED a data-loss instruction. They are replaced,
+    not deleted: the assertions below pin the guarantee that replaced them,
+    so the fix stays testable and a regression is loud.
+
+    The contract, in three parts:
+      1. VERIFY the premise at emit time — probe the live schema of the
+         collection that actually failed before asserting it is defective.
+      2. NEVER name a collection other than the one at fault, and never
+         redirect from a code-graph class to the shared KG.
+      3. FAIL SAFE — when the premise cannot be confirmed (no client, no
+         parseable collection name), describe what to check and emit NOTHING
+         destructive.
+    """
+
+    # Messages that name NO collection — the shapes the pre-v0.2.92 tests used.
+    UNIDENTIFIABLE = (
+        "build inverted filter allow list: fetch doc ids for prop/value "
+        "pair: nested query: schema not configured",
+        "build inverted filter allow list: failed",
+        "nested query error during is_null filter",
+    )
+
+    def _hint_for(self, message, *, classes=None, shared="Fake_SharedKnowledgeGraph"):
+        client = _FakeSchemaClient(classes or FAKE_SCHEMA_CLASSES)
+        with mock.patch.object(srv, "get_weaviate_client", return_value=client), \
+             mock.patch.object(srv, "SHARED_KG_COLLECTION", shared):
+            result = _classify(Exception(message))
+        self.assertIsInstance(result, WeaviateSchemaError)
+        return result.user_msg
+
+    def _assert_nothing_destructive(self, hint):
+        for marker in DESTRUCTIVE_MARKERS:
+            self.assertNotIn(
+                marker, hint,
+                f"hint offered the destructive '{marker}' — {hint}",
+            )
+
+    # ---- FAIL SAFE: premise cannot be confirmed ----------------------
+
+    def test_unidentifiable_collection_emits_nothing_destructive(self):
+        for message in self.UNIDENTIFIABLE:
+            with self.subTest(message=message):
+                hint = self._hint_for(message)
+                self._assert_nothing_destructive(hint)
+                self.assertIn("Could not verify", hint)
+
+    def test_unidentifiable_collection_never_touches_weaviate(self):
+        """Hermeticity: a message naming no collection must not attempt a
+        connection — otherwise every CI run without Weaviate pays a connect
+        timeout inside a unit test."""
+        for message in self.UNIDENTIFIABLE:
+            with self.subTest(message=message):
+                with mock.patch.object(srv, "get_weaviate_client") as get_client:
+                    _classify(Exception(message))
+                get_client.assert_not_called()
+
+    def test_probe_failure_emits_nothing_destructive(self):
+        client = _FakeSchemaClient(FAKE_SCHEMA_CLASSES, get_raises=True)
+        with mock.patch.object(srv, "get_weaviate_client", return_value=client):
+            result = _classify(Exception(_nested_query_error("fakeproject_codeclass")))
+        self._assert_nothing_destructive(result.user_msg)
+        self.assertIn("Could not verify", result.user_msg)
+
+    # ---- VERIFY: premise refuted by the probe ------------------------
+
+    def test_present_index_null_state_emits_nothing_destructive(self):
+        hint = self._hint_for(_nested_query_error("fakeproject_codemodule"))
+        self._assert_nothing_destructive(hint)
+        self.assertIn("already True", hint)
+        self.assertIn("FakeProject_CodeModule", hint)
+
+    def test_code_graph_failure_never_points_at_the_shared_kg(self):
+        """The v0.2.92 BLOCKER, pinned at the classifier boundary."""
+        hint = self._hint_for(_nested_query_error("fakeproject_codemodule"))
+        self.assertNotIn("Fake_SharedKnowledgeGraph", hint)
+        self.assertNotIn("migrate-shared-kg-schema", hint)
+
+    # ---- ACT: premise CONFIRMED by the probe -------------------------
+
+    def test_confirmed_absent_on_the_shared_kg_does_offer_the_migration(self):
+        """The leave-alone cases above are only meaningful if the act case
+        still fires: when the failing collection IS the configured shared KG
+        and the probe confirms its null index is gone, the migration script
+        is exactly right and must still be offered."""
+        classes = dict(FAKE_SCHEMA_CLASSES, Fake_SharedKnowledgeGraph=False)
+        hint = self._hint_for(
+            _nested_query_error("fake_sharedknowledgegraph"), classes=classes
+        )
+        self.assertIn("migrate-shared-kg-schema.sh", hint)
+        self.assertIn("Fake_SharedKnowledgeGraph", hint)
+        self.assertIn("is absent", hint)
+
+    def test_confirmed_absent_elsewhere_offers_no_paste_ready_drop(self):
+        hint = self._hint_for(_nested_query_error("fakeproject_codeclass"))
+        self.assertIn("FakeProject_CodeClass", hint)
+        self.assertIn("is absent", hint)
+        self._assert_nothing_destructive(hint)
+        self.assertIn("do not migrate any other collection", hint)
+
+    # ---- NEVER misdirect --------------------------------------------
+
+    def test_no_hint_names_a_collection_other_than_the_failing_one(self):
+        cases = (
+            ("fakeproject_codemodule", "FakeProject_CodeModule", None),
+            ("fakeproject_codeclass", "FakeProject_CodeClass", None),
+            (
+                "fake_sharedknowledgegraph",
+                "Fake_SharedKnowledgeGraph",
+                dict(FAKE_SCHEMA_CLASSES, Fake_SharedKnowledgeGraph=False),
+            ),
+        )
+        for index_name, failing, classes in cases:
+            with self.subTest(failing=failing):
+                schema = classes or FAKE_SCHEMA_CLASSES
+                hint = self._hint_for(
+                    _nested_query_error(index_name), classes=schema
+                )
+                for other in schema:
+                    if other == failing:
+                        continue
+                    self.assertNotIn(
+                        other, hint,
+                        f"hint for {failing} named unrelated collection {other}",
+                    )
 
 
 if __name__ == "__main__":

@@ -404,7 +404,18 @@ def test_c1_build_reingest_incomplete_entry():
     )
     cg_entry = sregen.build_reingest_incomplete_entry(cg, folder)
     assert cg_entry is not None
-    assert "code-graph-analyze . --force-recreate" in cg_entry.command_to_apply
+    # v0.2.92 (R42 sweep): the analyzer is still invoked with
+    # `--force-recreate`, but the repo argument is now the ABSOLUTE project
+    # folder rather than `.`. The literal this replaces was
+    # `cd '<folder>' && .claude/scripts/code-graph-analyze . --force-recreate`,
+    # whose `&&` PowerShell 5.1 rejects and whose single quotes cmd.exe keeps —
+    # so on Windows the collection stayed EMPTY behind an un-pasteable fix.
+    # Dropping the `cd` also removes the unstated "run this from the project
+    # directory" precondition that made `.` correct in the first place.
+    assert "code-graph-analyze" in cg_entry.command_to_apply
+    assert "--force-recreate" in cg_entry.command_to_apply
+    assert str(folder) in cg_entry.command_to_apply
+    assert " && " not in cg_entry.command_to_apply
 
     # A clean (ok) result → no entry (defensive).
     ok = sregen.RegenerateResult(

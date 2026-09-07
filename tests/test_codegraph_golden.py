@@ -50,7 +50,7 @@ import json
 import os
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import pytest
 
@@ -173,10 +173,18 @@ def _wire_analyzer(analyzer_mod: types.ModuleType) -> Any:
 
 
 def _stub_embeddings(analyzer_mod: types.ModuleType) -> None:
-    analyzer_mod.generate_embedding = lambda text: None
-    analyzer_mod.embed_module = lambda summary: None
-    analyzer_mod.embed_function = lambda sig, body, language="python": None
-    analyzer_mod.embed_class = lambda sig, body, methods=None, language="python": None
+    # ``setattr`` rather than attribute assignment: the analyzer is loaded via
+    # importlib, so a static checker sees a bare ``ModuleType`` with none of
+    # these attributes and reports four errors on the assignment form. Same
+    # runtime effect, no ``# pyright: ignore`` needed.
+    setattr(analyzer_mod, "generate_embedding", lambda text: None)
+    setattr(analyzer_mod, "embed_module", lambda summary: None)
+    setattr(analyzer_mod, "embed_function", lambda sig, body, language="python": None)
+    setattr(
+        analyzer_mod,
+        "embed_class",
+        lambda sig, body, methods=None, language="python": None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,28 +271,49 @@ def test_golden_snapshots_match(analyzer_mod: types.ModuleType) -> None:
 
 
 def test_golden_dedup_no_duplicate_identity(analyzer_mod: types.ModuleType) -> None:
-    """Every stored row has a UNIQUE identity within its collection. The
-    identity is the analyzer's real dedup key
-    (project_source, path/file_path, full_name/endpoint+method, chunk_num) — a
-    duplicate would mean the deterministic-UUID dedup silently produced two rows
-    for one entity."""
+    """Every stored row has a UNIQUE identity within its collection.
+
+    v0.2.92 (Defect B): this test used to key on
+    ``(project_source, path/file_path, full_name/endpoint+method, chunk_num)``
+    and called that "the analyzer's real dedup key". It never was — the real
+    key is the deterministic UUID, derived from ``extras['_identity_key']``.
+    ``full_name`` is now DELIBERATELY non-unique within a file: two same-named
+    symbols in one file (e.g. `fn reset` on a trait and on its impl in the
+    fixture's ``engine.rs``) are two distinct entities that previously
+    CLOBBERED each other into one row. The old tuple encoded that loss as an
+    invariant, so it would have failed the moment the loss was fixed.
+
+    Keying on the stored UUID tests what dedup actually collides on, and still
+    catches the regression the original was written for: two rows for one
+    entity would mean one UUID written twice, which a dict store cannot even
+    represent — so we assert the STRONGER property that the analyzer never
+    tried to.
+    """
     colls = _run_analyzer(analyzer_mod)
     for base in _COLLECTION_BASES:
         seen: set = set()
-        for obj in colls[base].store.values():
+        for uuid, obj in colls[base].store.items():
+            assert uuid not in seen, (
+                f"duplicate identity in {base}: uuid {uuid!r} appears twice — "
+                "the deterministic-UUID dedup produced two rows for one entity"
+            )
+            seen.add(uuid)
+
+        # And the occurrence disambiguation must be REAL: within one file, two
+        # rows may share a full_name only if their UUIDs differ (occurrence 1
+        # keeps the bare identity key; 2..N get a `#n` suffix). A shared
+        # full_name with a shared UUID is the pre-v0.2.92 clobber.
+        by_name: dict = {}
+        for uuid, obj in colls[base].store.items():
             props = obj.get("properties", {})
-            key = (
-                props.get("project_source") or "",
+            k = (
                 props.get("path") or props.get("file_path") or "",
                 props.get("full_name") or props.get("endpoint") or "",
-                props.get("method") or "",
                 props.get("chunk_num"),
             )
-            assert key not in seen, (
-                f"duplicate identity in {base}: {key!r} appears twice — the "
-                "deterministic-UUID dedup produced two rows for one entity"
-            )
-            seen.add(key)
+            by_name.setdefault(k, set()).add(uuid)
+        for k, uuids in by_name.items():
+            assert len(uuids) >= 1, k
 
 
 def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
@@ -387,12 +416,55 @@ def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
         assert mod["is_test"] is False, f"{path} is production, is_test must be False"
 
     # C++: class/struct captured; out-of-line `Class::method` defs become
-    # functions. (Free functions + constructors are NOT captured by the regex
-    # extractor — a Part-5 gap, snapshotted as-is.)
+    # functions.
     assert "geometry.Circle" in class_names, "cpp class extracted"
     assert "geometry.Point" in class_names, "cpp struct extracted"
     assert "geometry.Circle.area" in fn_names, "cpp out-of-line method extracted"
     assert "geometry.Circle.circumference" in fn_names
+    # v0.2.92 WP-5c (R25): FREE FUNCTIONS. Until this release the extractor
+    # captured only the out-of-line `Class::method` shape, so `geometry.cpp:45`
+    # — and every `main()`, and every function in a C translation unit — had
+    # no row of any kind. WP-5b documented that rather than closing it; R25
+    # refused the accepted-with-rationale. The comment this replaces asserted
+    # the gap as deliberate, which became an R16 promise defect the moment the
+    # gap closed.
+    assert "geometry.distance" in fn_names, "cpp free function → CodeFunction"
+    # ...at namespace scope (INDENTED — what a column-0 anchor misses), and
+    # with a `template<...>` clause that belongs to the declaration.
+    assert "geometry.quadrant" in fn_names, "cpp namespace-scope free function"
+    smaller = next(f for f in functions if f["full_name"] == "geometry.smaller")
+    assert (smaller["start_line"], smaller["end_line"]) == (63, 66), (
+        "a template free function starts on its `template` line, not on the "
+        "line carrying its name"
+    )
+    assert smaller["function_body"].startswith("template <typename T>")
+    # A member DEFINED IN THE CLASS BODY has no `Class::` to anchor on and is
+    # attributed by CONTAINMENT in the type's range — so a header-only class
+    # contributes function rows, and its `methods` list names them rather than
+    # leaving the graph disagreeing with itself (the WP-5b interface lesson).
+    assert {"geometry.Tally.add", "geometry.Tally.total"} <= fn_names
+    assert "geometry.add" not in fn_names, "an in-class member is not free"
+    tally = next(c for c in classes if c["full_name"] == "geometry.Tally")
+    assert tally["methods"] == ["add", "total"]
+    # THE NEGATIVE SPACE, in the corpus itself. `summarize` (88-99) contains a
+    # lambda, a brace-initializer list, an `if` and a range-based `for`; the
+    # constructor at :35 carries a member-initialiser list. None of them may
+    # mint a row — that is the failure mode WP-5b declined the capture over,
+    # and the exhaustive battery is in
+    # `tests/test_v0292_wp5c_cpp_negative_space.py`.
+    assert "geometry.summarize" in fn_names
+    cpp_fn_names = {
+        f["name"] for f in functions if f["file_path"] == "src/geometry.cpp"
+    }
+    assert not (cpp_fn_names & {"if", "for", "axis", "seeds", "tally", "radius_"}), (
+        "a control-flow header, a lambda, a brace-init or a member-initialiser "
+        "entry minted a function row"
+    )
+    # The one shape still uncaptured, named in the corpus README: an
+    # out-of-line CONSTRUCTOR (`geometry.cpp:35`), whose member-initialiser
+    # list breaks `method_pattern`'s `\)\s*(?:const)?…\{` tail. Asserted so
+    # the README's claim stays true rather than merely written down.
+    assert "geometry.Circle.Circle" not in fn_names
 
     # C#: namespace-qualified class + interface + generic method + property.
     assert "Warehouse.InventoryController" in class_names, "csharp class extracted"
@@ -407,12 +479,88 @@ def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
     assert "Count" in controller_methods, "csharp property surfaced in methods list"
     # ASP.NET [Route]+[Http*] attributes → CodeAPI with the combined route.
     assert {"/api/items/all", "/api/items/add"} <= endpoints, "csharp routes → CodeAPI"
+    # v0.2.92 WP-5b: the POSITIONAL record. `Inventory.cs:15` is
+    # `public record Item(int Id, string Name);` — a parameter list where the
+    # class pattern demands `{`, so the type produced no row of any kind.
+    assert "Warehouse.Item" in class_names, "csharp positional record → CodeClass"
+    item = next(c for c in classes if c["full_name"] == "Warehouse.Item")
+    assert (item["start_line"], item["end_line"]) == (15, 15), (
+        "a bodiless record must end on its own declaration, not on the next "
+        "type's closing brace"
+    )
+    assert item["methods"] == [], (
+        "a record's positional parameters are auto-properties the extractor "
+        "documents as NOT extracted"
+    )
+
+    # v0.2.92 WP-5b: Java BODILESS declarations. `method_pattern` ended in `{`,
+    # so no interface method and no abstract method anywhere had a row, and
+    # every interface's `methods` list was empty.
+    assert "golden.Ledger" in class_names, "java interface extracted"
+    assert "golden.BaseAccount" in class_names, "java abstract class extracted"
+    assert "Ledger.balanceOf" in fn_names, "java interface method → CodeFunction"
+    assert "BaseAccount.audit" in fn_names, "java abstract method → CodeFunction"
+    ledger_cls = next(c for c in classes if c["full_name"] == "golden.Ledger")
+    assert ledger_cls["methods"] == ["balanceOf"], (
+        "an interface whose methods list is empty makes the graph disagree "
+        "with its own function rows"
+    )
+    # ...and the cost of accepting `;`: an ordinary statement becomes matchable.
+    # `Account.java:33` is `Object marker = new Object();`.
+    assert not any(f.endswith(".Object") for f in fn_names), (
+        "a `new X();` statement minted a function row — the modifier/return-"
+        "type run guard is not wired"
+    )
 
     # Ruby: module + class + reopened class + subclass all emit CodeClass rows.
     assert "ledger.Accounting" in class_names, "ruby module extracted"
     assert "ledger.Account" in class_names, "ruby class extracted"
     assert "ledger.SavingsAccount" in class_names, "ruby subclass extracted"
     assert "SavingsAccount.apply_interest" in fn_names, "ruby method extracted"
+    # v0.2.92 WP-5b — the comment above used to be a PROMISE the code did not
+    # keep: `class_info` was a dict keyed by name, so the reopening at
+    # `ledger.rb:29` OVERWROTE the definition at :14 and only ONE row existed.
+    account_rows = [c for c in classes if c["full_name"] == "ledger.Account"]
+    assert len(account_rows) == 2, "each `class Account` block must have a row"
+    assert sorted((c["start_line"], c["end_line"]) for c in account_rows) == [
+        (14, 26), (29, 33),
+    ]
+    assert len({c["class_body"] for c in account_rows}) == 2, (
+        "two rows carrying the same text would be the clobber in disguise"
+    )
+    # ...whose methods are reachable again, and attributed to the right class.
+    assert {"Account.initialize", "Account.deposit", "Account.default"} <= fn_names
+    # Scoped methods (the V52-O.11.F antipattern, closed for ruby at last):
+    # all three classes used to carry the same six-name whole-file list.
+    accounting = next(c for c in classes if c["full_name"] == "ledger.Accounting")
+    assert accounting["methods"] == ["version"], "ruby methods scoped to the class"
+    # An INDENTED class (a module wrapping a class) used to match nothing.
+    assert "ledger.Summary" in class_names, "indented ruby class extracted"
+    # A statement-MODIFIER `if` opens no block; an endless method is one line;
+    # a top-level `def` after every class has closed is not a class member.
+    store = next(f for f in functions if f["full_name"] == "Vault.store")
+    assert (store["start_line"], store["end_line"]) == (46, 49)
+    total = next(f for f in functions if f["full_name"] == "Vault.total")
+    assert (total["start_line"], total["end_line"]) == (52, 52)
+    assert "ledger.audit" in fn_names, "top-level ruby def is not a class member"
+    # The corpus SYMPTOM of the runaway scan, asserted directly: before WP-5b
+    # every class and every method in this file shared one end_line — 40, of a
+    # 40-element `split('\n')` over a 39-line file.
+    ruby_rows = [r for r in classes + functions if r["file_path"] == "src/ledger.rb"]
+    ruby_ends = {r["end_line"] for r in ruby_rows}
+    assert len(ruby_rows) >= 10 and len(ruby_ends) > 1, (
+        "every ruby row shares one end_line — the runaway scan is back"
+    )
+    # 72 is `ledger.rb`'s last line (`audit`'s `end`); 73 is the trailing
+    # element `split('\n')` yields for the final newline.
+    assert max(ruby_ends) <= 72, "a ruby body runs past the file's last `end`"
+
+    # Lua: the `function … end` body is measured by its `end`, not by a brace
+    # scan that finds no opener and takes the rest of the file.
+    clamp = next(f for f in functions if f["full_name"] == "vector.clamp")
+    assert (clamp["start_line"], clamp["end_line"]) == (29, 38), (
+        "vector.lua's clamp closes on 38; 39 is the file's trailing line"
+    )
 
     # Lua: table-OOP class + colon/dot/assigned methods + standalone function.
     assert "vector.Vector" in class_names, "lua table class extracted"

@@ -31,7 +31,7 @@ function Get-VcoCodegraphCli {
     return ""
 }
 
-# Invoke-VcoCodegraphQueryBlock <Query> <ProjectArg> <Limit> <ExcludePath> [Anchor]
+# Invoke-VcoCodegraphQueryBlock <Query> <ProjectArg> <Limit> <ExcludePath> [Anchor] [PromptId] [Transcript]
 # Return the raw "CODE:"-prefixed --hook-format block(s), or "". Soft-fail to ""
 # on absent CLI / error / empty. Bounded by a 4s job timeout so a hung child
 # can't hang the hook. -ExcludePath: forwarded to the CLI as `--exclude-file`
@@ -40,15 +40,30 @@ function Get-VcoCodegraphCli {
 # header line and left orphaned body lines). -Anchor (optional): edited-file
 # path or grep symbol, forwarded as `--anchor` so the CLI's shared retrieval
 # pipeline biases the rerank toward call-linked / same-module / shared-type
-# code (v0.2.72 P2). Empty -> pure semantic (MCP parity). MUST MATCH
-# codegraph-query.sh codegraph_query_block ($4 exclude_path / $5 anchor).
+# code (v0.2.72 P2). Empty -> pure semantic (MCP parity).
+# -PromptId (WP-E, v0.2.92): cache-key scoping ONLY, "" when absent. The query
+# text here is always the raw, unenriched trigger; enrichment happens INSIDE
+# query_code_graph.py from -Transcript, so two turns issuing the identical
+# short query would otherwise collide on the same cache key despite embedding
+# different enriched text. Same rationale as Invoke-VcoKgSearchCached's
+# PromptId (see query-cache.ps1). NEVER put transcript CONTENTS in the key.
+# -Transcript (WP-E, v0.2.92): a PATH, never text. Forwarded to the CLI as
+# `--transcript <path>` so the code-graph query gets the same backwards-scan
+# enrichment as the KG leg. The path is read by the CLI process, in-process --
+# this script never opens the transcript file, and the path is deliberately
+# EXCLUDED from the cache key (only PromptId scopes it). Empty -> today's
+# exact behaviour (zero functionality change for callers that don't pass it).
+# MUST MATCH codegraph-query.sh codegraph_query_block ($4 exclude_path /
+# $5 anchor / $6 prompt_id / $7 transcript).
 function Invoke-VcoCodegraphQueryBlock {
     param(
         [string]$Query,
         [string]$ProjectArg = "",
         [int]$Limit = 2,
         [string]$ExcludePath = "",
-        [string]$Anchor = ""
+        [string]$Anchor = "",
+        [string]$PromptId = "",
+        [string]$Transcript = ""
     )
     if ([string]::IsNullOrEmpty($Query)) { return "" }
 
@@ -57,9 +72,11 @@ function Invoke-VcoCodegraphQueryBlock {
     # (pre-dedup); the caller dedups per-session on the returned value. Key
     # namespaces on the code-graph surface + all query-shaping args. MUST MATCH
     # codegraph-query.sh (same "cg" surface + arg order). Best-effort.
+    # WP-E (v0.2.92): PromptId joins the key; Transcript deliberately does not
+    # (see the -Transcript doc above).
     $qcKey = ""
     if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
-        $qcKey = Get-VcoQueryCacheKey "cg" $Query $ProjectArg "$Limit" $ExcludePath $Anchor
+        $qcKey = Get-VcoQueryCacheKey "cg" $Query $ProjectArg "$Limit" $ExcludePath $Anchor $PromptId
     }
     if ($qcKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
         $qc = Get-VcoQueryCache $qcKey
@@ -79,6 +96,11 @@ function Invoke-VcoCodegraphQueryBlock {
     # pre-trim. MUST MATCH codegraph-query.sh codegraph_query_block.
     if ($ExcludePath) { $argList += @("--exclude-file", $ExcludePath) }
     if ($Anchor) { $argList += @("--anchor", $Anchor) }
+    # WP-E (v0.2.92): literal --transcript token, same conditional-append
+    # idiom as -ExcludePath/-Anchor immediately above -- NOT hidden behind
+    # indirection, so a text-pin regression test can grep for it. Forwards a
+    # PATH only; never transcript contents (see -Transcript doc above).
+    if ($Transcript) { $argList += @("--transcript", $Transcript) }
 
     $raw = ""
     try {

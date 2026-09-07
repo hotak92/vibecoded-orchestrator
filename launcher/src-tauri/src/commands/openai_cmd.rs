@@ -1390,23 +1390,34 @@ mod tests {
 
     // ─── has/get_preview/clear: Preferences row helpers (Commit 7) ─────
     //
-    // These tests exercise the actual keychain so they're gated on the
-    // process-wide `keychain_serialize_lock` (same convention used by
-    // installer.rs PAT tests). The lock guarantees no other test module
-    // is racing for the same `shared.user/openai_api_key` keychain slot.
+    // v0.2.92 (WP-G, register item 30): these tests used to exercise the
+    // REAL OS keychain (gated by the process-wide `keychain_serialize_lock`
+    // plus a `keyring_available()` real-keychain probe-and-skip). That
+    // still flaked under lock contention/timing even on hosts where the
+    // probe itself succeeded — the probe only proves the keychain was
+    // reachable at THAT instant, not that it stays reachable for the
+    // duration of the test body a moment later (D-Bus/Secret-Service is
+    // its own out-of-process daemon subject to independent load).
     //
-    // CI environments without an OS keychain (headless Linux without a
-    // configured Secret Service) skip via the `keyring_available()`
-    // probe so we don't get flaky failures on `secrets::set`.
-
-    fn keyring_available() -> bool {
-        // v0.2.76 (A4): delegate to the ONE shared probe. It runs the canary
-        // through the bounded-timeout worker, so a wedged Secret Service
-        // returns false instead of hanging this test forever (the old raw
-        // `Entry::new(..).set_password("canary")` had no timeout — the exact
-        // 13-min hang this cycle fixed).
-        secrets::keyring_probe_available()
-    }
+    // Fixed for real, not by `#[ignore]`: route through the same
+    // thread-local mock keychain seam (`secrets::for_tests::MockGuard`)
+    // already used by `licensing.rs` and `project_env_settings.rs` to
+    // un-ignore their own flaky keychain tests (v0.2.42 W5 precedent,
+    // see `licensing.rs`'s comment above `ensure_legacy_orchestrator_row_migrated`
+    // tests). `secrets::set`/`get`/`delete` short-circuit to the mock
+    // store BEFORE any real `Entry` construction whenever
+    // `for_tests::mock_is_active()` is true (see `secrets.rs`), so these
+    // tests now touch zero real OS keychain state and cannot flake on
+    // keychain reachability, locking, or timing. The `keyring_available()`
+    // real-keychain probe is gone from this block entirely — it is not
+    // just unneeded once the mock is active, it was the actual real-keychain
+    // touch-point being removed here.
+    //
+    // `keychain_serialize_lock` is kept: `for_tests::enable_mock`/
+    // `disable_mock` mutate PROCESS-WIDE thread-local state (see
+    // `secrets.rs::for_tests`), so concurrent test threads racing to
+    // enable/disable the mock must still be serialized the same way the
+    // real-keychain tests were.
 
     fn make_db_for_tests() -> Db {
         // Same as make_db() above; pulled out so the keychain-gated
@@ -1417,10 +1428,7 @@ mod tests {
     #[test]
     fn has_openai_api_key_false_when_absent() {
         let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no usable keychain on this host");
-            return;
-        }
+        let _mock = secrets::for_tests::MockGuard::new();
         // Ensure no residual entry from a prior aborted test.
         let scope = SecretScope::Shared {
             project_id: SENTINEL_SHARED,
@@ -1433,10 +1441,7 @@ mod tests {
     #[test]
     fn has_openai_api_key_true_when_present() {
         let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no usable keychain on this host");
-            return;
-        }
+        let _mock = secrets::for_tests::MockGuard::new();
         let scope = SecretScope::Shared {
             project_id: SENTINEL_SHARED,
         };
@@ -1450,10 +1455,7 @@ mod tests {
     #[test]
     fn get_openai_api_key_preview_returns_masked_value() {
         let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no usable keychain on this host");
-            return;
-        }
+        let _mock = secrets::for_tests::MockGuard::new();
         let scope = SecretScope::Shared {
             project_id: SENTINEL_SHARED,
         };
@@ -1480,10 +1482,7 @@ mod tests {
     #[test]
     fn get_openai_api_key_preview_returns_none_when_absent() {
         let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no usable keychain on this host");
-            return;
-        }
+        let _mock = secrets::for_tests::MockGuard::new();
         let scope = SecretScope::Shared {
             project_id: SENTINEL_SHARED,
         };
@@ -1497,10 +1496,7 @@ mod tests {
     #[test]
     fn clear_openai_api_key_removes_keychain_and_state() {
         let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no usable keychain on this host");
-            return;
-        }
+        let _mock = secrets::for_tests::MockGuard::new();
         let scope = SecretScope::Shared {
             project_id: SENTINEL_SHARED,
         };
@@ -1553,10 +1549,7 @@ mod tests {
     #[test]
     fn clear_openai_api_key_is_idempotent_on_missing_entry() {
         let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no usable keychain on this host");
-            return;
-        }
+        let _mock = secrets::for_tests::MockGuard::new();
         let scope = SecretScope::Shared {
             project_id: SENTINEL_SHARED,
         };

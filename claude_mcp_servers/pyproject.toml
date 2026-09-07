@@ -1,12 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# pyproject.toml — packaging for the `weaviate_mcp` sub-package.
+# pyproject.toml — packaging for the sub-packages under `claude_mcp_servers/`
+# that must be importable from an ARBITRARY working directory after install:
+# `weaviate_mcp` and `model_router`.
 #
-# After `pip install -e claude_mcp_servers/` (which install.py runs
-# automatically after the root requirements.txt install), all consumer
-# scripts can `from weaviate_mcp.chunking import Chunker` or
-# `from weaviate_mcp.server import hybrid_search` without sys.path hacks.
+# After `pip install -e claude_mcp_servers/` (which install.py runs at step
+# 4/10, after the root requirements.txt install), all consumer scripts can
+# `from weaviate_mcp.chunking import Chunker` or `from model_router.server
+# import create_app` without sys.path hacks, and the `vct-model-gateway`
+# console script resolves on PATH.
+#
+# `claude_mcp_servers/` itself has NO `__init__.py` and is not a package, so
+# `python -m claude_mcp_servers.<anything>` only resolves from the repository
+# root (via PEP 420 implicit namespace packages). The console script and the
+# top-level module names below are what make the gateway runnable from a
+# service unit, whose working directory is not the checkout.
+#
+# NOT packaged here, deliberately: `search_mcp`, `rl_client`, `_lib`,
+# `wrappers`, `code_embedding_service`. Every one of them is reached by an
+# explicit `sys.path` insert in the script that launches it (the MCP servers
+# are spawned by absolute path, not as installed modules), so they are already
+# delivered by the clone. Installing them as TOP-LEVEL modules would put a
+# name as generic as `_lib` into site-packages and create the "non-editable
+# copy shadows the checkout" failure mode this project has already been bitten
+# by. A test that derives this list from "directories containing __init__.py"
+# would therefore be wrong; the criterion is "must import from an arbitrary
+# cwd", and these two are the ones that must.
 #
 # install.py handles the invocation; users don't run this directly.
 
@@ -15,15 +35,20 @@ requires = ["hatchling >= 1.18"]
 build-backend = "hatchling.build"
 
 [project]
+# The distribution NAME stays `weaviate-mcp` even though it now ships two
+# packages: renaming it would leave every existing install carrying an
+# orphaned `weaviate_mcp-*.dist-info` alongside the new one, with two editable
+# finders pointing at the same source tree. The name is an upgrade contract,
+# not a description.
 name = "weaviate-mcp"
-version = "0.2.38"
-description = "Weaviate MCP server for the VibeCoded Orchestrator — semantic KG + code-graph search"
+version = "0.2.92"
+description = "VibeCoded Orchestrator MCP servers — Weaviate KG/code-graph search and the local model gateway"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
 authors = [
     { name = "Martino Cesaratto", email = "martino.cesaratto@gmail.com" },
 ]
-keywords = ["mcp", "weaviate", "knowledge-graph", "claude-code", "orchestrator"]
+keywords = ["mcp", "weaviate", "knowledge-graph", "claude-code", "orchestrator", "gateway"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -37,6 +62,12 @@ classifiers = [
 # Versions are kept in sync with the root file; install.py installs the root
 # requirements.txt first, then `pip install -e .` here (no re-download
 # since the packages are already present in the venv).
+#
+# `model_router` adds no dependency: it needs `aiohttp` (already declared for
+# the MCP servers) and `vco_lib` (installed from the ROOT distribution before
+# this one — deliberately not declared here, because declaring the root
+# distribution as a dependency of one of its own sub-distributions would make
+# pip resolve the repository as a package of itself).
 dependencies = [
     "mcp>=1.27.0",
     "weaviate-client>=4.21.0",
@@ -46,5 +77,12 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.scripts]
+# The gateway daemon's entry point. Mirrors the root distribution's
+# `vco = vco_lib.cli.__main__:main`; hatchling emits a `.exe` shim on Windows,
+# which is what makes a Scheduled Task able to launch it without naming a
+# Python interpreter path.
+vct-model-gateway = "model_router.__main__:main"
+
 [tool.hatch.build.targets.wheel]
-packages = ["weaviate_mcp"]
+packages = ["weaviate_mcp", "model_router"]

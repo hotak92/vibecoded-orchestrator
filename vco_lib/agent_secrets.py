@@ -166,19 +166,62 @@ def _detect_file_project_name(project: Optional[str]) -> Optional[str]:
     return None
 
 
+#: Per-project opt-out marker for the tier-2 SHARED fallback. A project
+#: that holds ``projects/<NAME>/.no-shared-fallback`` resolves ONLY its own
+#: ``projects/<NAME>/<key>`` files from the file store — ``shared/<key>`` is
+#: not consulted for it.
+#:
+#: This filename is MIRRORED, byte-for-byte, in three sibling resolvers that
+#: cannot call into Python on this path:
+#:   * ``templates/scripts/vct_secrets_resolve.sh``  (VCT_NO_SHARED_FALLBACK_MARKER)
+#:   * ``templates/scripts/vct_secrets_resolve.ps1`` ($VctNoSharedFallbackMarker)
+#:   * ``tools/vct-secrets/vct``                     (VCT_NO_SHARED_FALLBACK_MARKER)
+#: and it is WRITTEN by the launcher's shared-secrets toggle in
+#: ``launcher/src-tauri/src/commands/secrets_cmd.rs``. The four spellings are
+#: locked together by ``tests/test_no_shared_fallback_marker_parity.py``; the
+#: BEHAVIOUR of each resolver is pinned by its own suite. Change one, change
+#: all five.
+NO_SHARED_FALLBACK_MARKER = ".no-shared-fallback"
+
+
+def _shared_fallback_disabled(root: Path, name: Optional[str]) -> bool:
+    """Whether ``name`` has opted out of the tier-2 shared fallback.
+
+    False whenever no project name applies: the marker is per-project, and
+    a caller with no project identity has nothing to opt out of. Also False
+    for the ``shared`` pseudo-name — opting the shared scope out of itself
+    is meaningless, and treating it otherwise would let a stray
+    ``projects/shared/`` orphan silently disable every shared read.
+
+    Must match ``vct_secrets_resolve.sh::shared_fallback_disabled``,
+    ``vct_secrets_resolve.ps1::Test-SharedFallbackDisabled`` and
+    ``vct::shared_fallback_disabled``.
+    """
+    if not name or name == "shared":
+        return False
+    return (root / "projects" / name / NO_SHARED_FALLBACK_MARKER).exists()
+
+
 def _file_store_get(key: str, project: Optional[str]) -> Optional[str]:
     """Resolve ``key`` from the file store; None when absent.
 
     Order: ``projects/<NAME>/<key>`` (when a project name applies) →
     ``shared/<key>``. Strips ONE trailing newline, matching
     ``vct exec`` semantics.
+
+    The ``shared/`` leg is SKIPPED when the resolved project holds the
+    ``.no-shared-fallback`` marker (see :data:`NO_SHARED_FALLBACK_MARKER`).
+    This is the tier-2 half of the launcher's per-project
+    "Disable shared secrets" gate: without it the toggle silenced tier 1
+    while tier 2 kept serving the very values the user opted out of.
     """
     root = _secrets_root()
     candidates: list[Path] = []
     name = _detect_file_project_name(project)
     if name:
         candidates.append(root / "projects" / name / key)
-    candidates.append(root / "shared" / key)
+    if not _shared_fallback_disabled(root, name):
+        candidates.append(root / "shared" / key)
     for path in candidates:
         if path.is_file():
             try:
@@ -491,7 +534,7 @@ def get(
             f"file store: {_secrets_root()}; tier 3 project .env: "
             f"{_tier3_desc}; tiers 2+3 "
             f"checked={allow_file_fallback}). Fix: launcher SecretsPanel, "
-            f"`vct set --project shared --key {key}`, or add the key to "
+            f"`vct set --shared --key {key}`, or add the key to "
             f"the project's .env"
         ) from hub_error
     raise hub_error

@@ -29,7 +29,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -39,46 +38,37 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import install  # noqa: E402
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    create_empty_launcher_db,
+    set_app_state,
+)
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 
 # ─── launcher.db helpers ──────────────────────────────────────────────────
 
 
-_APP_STATE_DDL = """
-CREATE TABLE app_state (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  INTEGER NOT NULL
-)
-"""
-
-
 def _build_launcher_db_with_app_state(
     db_path: Path,
     seed_root_collection: str | None,
 ) -> None:
-    """Create launcher.db with the app_state table; optionally seed the
-    orchestrator_root_kg_collection row with `seed_root_collection`.
+    """Create launcher.db (REAL schema — `app_state` comes from migration
+    008) and optionally seed the orchestrator_root_kg_collection row with
+    `seed_root_collection`.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    create_empty_launcher_db(db_path)
     conn = sqlite3.connect(str(db_path))
     try:
+        # WAL is what the launcher runs in; the locked-DB test below
+        # depends on the reader/writer semantics of this mode.
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(_APP_STATE_DDL)
-        if seed_root_collection is not None:
-            conn.execute(
-                "INSERT INTO app_state (key, value, updated_at) "
-                "VALUES (?, ?, ?)",
-                (
-                    "orchestrator_root_kg_collection",
-                    seed_root_collection,
-                    int(time.time() * 1000),
-                ),
-            )
-        conn.commit()
     finally:
         conn.close()
+    if seed_root_collection is not None:
+        set_app_state(
+            db_path, "orchestrator_root_kg_collection", seed_root_collection,
+        )
 
 
 def _read_root_collection(db_path: Path) -> str | None:
@@ -171,13 +161,15 @@ class OrchestratorRootCollectionPersistTests(unittest.TestCase):
     def test_override_with_missing_app_state_table_skips_cleanly(self):
         """Pre-migration-008 launcher.db has no app_state table. Helper
         must NOT crash + leave a deferral entry."""
-        # Build launcher.db with NO app_state table.
+        # DELIBERATE degraded shape: a launcher.db predating migration
+        # 008 has no `app_state`. Build the real schema, then drop that
+        # one table so the helper meets exactly the missing-table case
+        # (the real migration set always creates it).
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        create_empty_launcher_db(self._db_path)
         conn = sqlite3.connect(str(self._db_path))
         try:
-            conn.execute(
-                "CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY)"
-            )
+            conn.execute("DROP TABLE app_state")
             conn.commit()
         finally:
             conn.close()
@@ -227,10 +219,24 @@ class OrchestratorRootCollectionPersistTests(unittest.TestCase):
         migration hasn't been applied for this column). Helper INSERTs
         the override value."""
         # Build app_state with NO orchestrator_root_kg_collection row.
+        # Migration 008 SEEDS that row with the default, so reproducing
+        # "row absent" means deleting it — under the pre-merge hand-rolled
+        # app_state the table simply started empty, which is a state the
+        # real migration set never produces.
         _build_launcher_db_with_app_state(
             self._db_path,
             seed_root_collection=None,
         )
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            conn.execute(
+                "DELETE FROM app_state "
+                "WHERE key = 'orchestrator_root_kg_collection'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(_read_root_collection(self._db_path))
         os.environ["VCT_ORCHESTRATOR_ROOT_KG_COLLECTION"] = "AcmeCorp_KG"
         report = DeferralReport()
         install._persist_orchestrator_root_kg_collection(report)

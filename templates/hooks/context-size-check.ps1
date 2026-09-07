@@ -58,7 +58,7 @@ $Label has exceeded the recommended size. This can cause:
 - Reduced session efficiency
 
 Recommended Action:
-   Spawn doc-maintainer agent to refresh $Label:
+   Spawn doc-maintainer agent to refresh ${Label}:
 
    "Please spawn the doc-maintainer agent to refresh $Label"
 

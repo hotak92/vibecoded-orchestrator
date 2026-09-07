@@ -41,7 +41,6 @@ import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -207,17 +206,26 @@ def _git_is_usable(install_root: Path) -> bool:
     hiccup), but read as "clean" by a CLEAR probe that would then wrongly
     resolve. This precondition separates the two readings without duplicating
     the porcelain parsing.
+
+    v0.2.92: delegates to :func:`vco_lib.git_meta.head_state` rather than
+    running its own ``git rev-parse``. That module had shipped since v0.2.53
+    with a docstring promising these call sites would migrate onto it and ZERO
+    production consumers to show for it (R16 category 1); this is one of them,
+    wired per R24.
+
+    **The tri-state is merged here deliberately, and that is not the collapse
+    the release is about.** ``head_state`` distinguishes NOT_APPLICABLE (no
+    ``.git``, or a repo with no commits) from UNKNOWN (git absent, timed out) —
+    but this precondition's single caller, :func:`_dist_dirty`, maps BOTH to
+    ``None`` ("cannot conclude anything about dirtiness"), because neither one
+    is evidence that the dist dir is clean. Merging with a stated reason is
+    fine; merging because the type could not express the difference is the
+    defect. If a future caller needs the difference, call ``head_state``
+    directly — it is one line away and it still has it.
     """
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=str(install_root),
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0
+    from vco_lib.git_meta import head_state
+
+    return head_state(install_root).is_usable
 
 
 def _dist_dirty(install_root: Path, dist_rel_dir: str) -> Optional[bool]:
@@ -532,12 +540,106 @@ def pid_is_alive(pid: int) -> bool:
         return True  # uncertain → conservative
 
 
+def kg_binding_evidence_still_mismatched(ctx: ProbeContext) -> Optional[bool]:
+    """``kg_binding_evidence_mismatch`` — is a project's data still outside its binding?
+
+    A thin wrapper over the SAME scan the doctor's ``kg_binding_evidence``
+    probe emits from (:func:`vco_lib.kg_binding_doctor.scan_kg_binding_evidence`).
+    One home for the rule — a separate re-implementation here could clear an
+    entry the doctor would immediately re-emit (or keep one it would not).
+
+    Returns:
+        True  — at least one registered project's data still demonstrably
+                lives in a class its primary binding does not name.
+        False — the scan ran and every binding matches where its data lives:
+                the user repaired it from the Identity tab (or the ghost's
+                data moved on), and this entry describes a state that is over.
+        None  — the scan could not LOOK (launcher.db unreadable, Weaviate
+                unreachable). Positive evidence only, as everywhere else in
+                this module: an unlookable state never reads as repaired.
+    """
+    from vco_lib.kg_binding_doctor import scan_kg_binding_evidence
+
+    try:
+        scan = scan_kg_binding_evidence()
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+    if scan is None:
+        return None
+    return bool(scan.mismatches)
+
+
+def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``kg_unclaimed_populated_classes`` — is unclaimed data still unclaimed?
+
+    A thin wrapper over the SAME scan the doctor's ``kg_binding_evidence``
+    probe emits from (:func:`vco_lib.kg_binding_doctor.scan_kg_binding_evidence`)
+    — one home for the rule, exactly like its sibling
+    ``kg_binding_evidence_still_mismatched``. "Unclaimed" there means a
+    populated ``*_KnowledgeGraph`` class no binding row names and no
+    registered project's folder anchors (the removed-project leftover).
+
+    Returns:
+        True  — at least one populated class is still unclaimed.
+        False — the scan ran and every populated class is accounted for:
+                the user re-added the project, re-bound the class from the
+                Identity tab, or the class was emptied outside VCO. The
+                entry described a state that is over.
+        None  — the scan could not LOOK (launcher.db unreadable, Weaviate
+                unreachable). An unlookable state never reads as resolved.
+    """
+    from vco_lib.kg_binding_doctor import scan_kg_binding_evidence
+
+    try:
+        scan = scan_kg_binding_evidence()
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+    if scan is None:
+        return None
+    return bool(scan.unclaimed)
+
+
 #: name → probe. Referenced from the registry as ``probe:py:<name>``.
+def code_embed_image_still_stale(ctx: ProbeContext) -> Optional[bool]:
+    """``code_embed_image_stale`` — is the running service still on old source?
+
+    A thin wrapper over :func:`vco_lib.code_embed_image.image_state`, which is
+    the SAME reading the doctor's ``code_embed_image`` probe emits from and the
+    same reading that decides whether the compose invocation gets
+    ``--build``. One home for the rule: a
+    separate re-implementation here could clear an entry the doctor would
+    immediately re-emit.
+
+    Returns:
+        True  — the service still reports a digest that is not this checkout's
+                (or reports none at all, which identifies a pre-v0.2.92 image).
+        False — the digests match: the image has been rebuilt and the entry
+                describes a condition that is over.
+        None  — could not look (service down, no service source in this tree,
+                the service could not hash itself). Positive evidence only:
+                a silent service is never read as "fixed".
+    """
+    from vco_lib import code_embed_image
+
+    try:
+        state = code_embed_image.image_state(ctx.folder)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if state.verdict == code_embed_image.STALE:
+        return True
+    if state.verdict == code_embed_image.CURRENT:
+        return False
+    return None
+
+
 PROBES: dict[str, ProbeFn] = {
     "orchestrator_sidecars_still_present": orchestrator_sidecars_still_present,
     "launcher_dist_still_dirty": launcher_dist_still_dirty,
     "launcher_binary_stale_still_applies": launcher_binary_stale_still_applies,
     "disk_space_still_low": disk_space_still_low,
+    "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
+    "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
+    "code_embed_image_still_stale": code_embed_image_still_stale,
 }
 
 
@@ -610,6 +712,16 @@ def clear_mechanism_sentence(condition_id: str) -> str:
     removes it by itself". Rendering them identically (which the ledger did
     until this fix) is what let ~21 permanently-manual rows look exactly like
     rows VCO was about to clear.
+
+    **This function answers a REGISTRY question and nothing else**, so its
+    ``paired-resolution`` arm says what the registry declares — "auto, the
+    emitting component clears it" — which is the mechanism, not a prediction
+    that it will happen soon. Whether VCO has ACTUALLY been able to retry is a
+    different question, answered from the attempt trail by
+    :func:`retry_history_note` and appended by :func:`probe_status_sentence`,
+    the leg that reaches the ledger and the GUI. Do not fold the trail read in
+    here: this is called for conditions with no dispatcher handler at all, and
+    it must stay usable without a folder.
     """
     try:
         from vco_lib.deferral_registry import condition
@@ -652,28 +764,106 @@ def clear_mechanism_sentence(condition_id: str) -> str:
     )
 
 
+def retry_history_note(folder: Optional[Path], condition_id: str) -> str:
+    """The retry-history correction for ``condition_id`` in ``folder``, or ``""``.
+
+    v0.2.92, register item 26. :func:`clear_mechanism_sentence` renders the
+    ``paired-resolution`` family as *"auto — the component that emitted this
+    entry clears it when its owed work completes"*, which every surface shows
+    the user as **"VCO retries this itself"**. That is true only while the
+    backend the retry needs eventually comes back. A user whose code-embed
+    service has been down since the entry appeared was reading a promise being
+    kept in form and not in substance, with nothing on any surface saying so.
+
+    :func:`vco_lib.deferral_retry.retry_disposition_note` is the reader that
+    knows better — it counts the durable ``BLOCKED`` trail rows and the
+    attempt cap. It was built for exactly this and left unwired, because the
+    dispatcher that owns it correctly refused to write into an entry owned by
+    another component (``codegraph_resync`` re-emits its condition every
+    deferred run, last-write-wins, so a disposition written from the
+    dispatcher would revert in silence). ``probe_status`` is this module's
+    field to annotate, so the correction belongs here — this is the leg that
+    reaches **the ledger**: ``deferral_report`` renders it as
+    ``**Probe status**:`` in ``.claude/context/UPDATE_DEFERRED.md`` and carries
+    it in the JSON sidecar, which is what a session-start read (and any agent
+    following CLAUDE.md's ledger protocol) actually sees.
+
+    **Not the launcher GUI, yet** — verified, not assumed:
+    ``launcher/src/lib/deferral-ledger.ts:239`` switches on ``disposition``
+    alone and hardcodes *"VCO retries this itself when the thing it needs comes
+    back up."*; nothing in ``launcher/src`` reads ``probe_status``. That is
+    register item 27 and it belongs to the launcher lane. Saying "and the GUI"
+    here would be a fresh R16 promise in the act of fixing one.
+
+    Gated on ``handler_name_for``: a condition with no dispatcher handler was
+    never promised a retry, so quoting retry history at it would be a second
+    kind of wrong sentence.
+
+    Args:
+        folder: Project folder whose attempt trail is read. ``None`` (the
+            default when a caller has no folder) yields ``""`` — an empty note
+            is a real answer here, not a failure.
+        condition_id: The condition to summarise.
+
+    Returns:
+        The note, or ``""`` when there is nothing more accurate to say than
+        the generic disposition. Never raises: a retry module that cannot be
+        imported or a trail that cannot be read degrades to ``""``.
+    """
+    if folder is None:
+        return ""
+    try:
+        from vco_lib.deferral_retry import handler_name_for, retry_disposition_note
+
+        if handler_name_for(condition_id) is None:
+            return ""
+        return retry_disposition_note(Path(folder), condition_id) or ""
+    except Exception:  # noqa: BLE001 — an annotation must never break a pass
+        return ""
+
+
 def probe_status_sentence(
-    condition_id: str, probe_name: Optional[str], verdict: Optional[bool]
+    condition_id: str,
+    probe_name: Optional[str],
+    verdict: Optional[bool],
+    folder: Optional[Path] = None,
 ) -> Optional[str]:
     """The ``DeferralEntry.probe_status`` text for one probed entry.
 
     ``None`` only for the resolved case (``verdict is False``), where the entry
     is about to be removed and a status would never be read.
+
+    ``folder`` is optional and defaults to ``None`` so the pre-v0.2.92
+    three-argument call shape keeps working; supply it (as
+    :func:`probe_report` does) to get the retry-history correction appended —
+    see :func:`retry_history_note`. Without it the sentence is the same
+    generic one as before, which is honest but less specific: the note can
+    only be earned by reading a trail, and a caller that gave us no folder has
+    no trail to read.
+
+    The note is appended to whichever base sentence applies, not only to the
+    ``clear_mechanism_sentence`` arm. A cid with a wired handler whose retries
+    have been blocked for three passes is equally mis-described by "still
+    applies — the condition still holds", which invites the reader to wait for
+    a retry that is not happening.
     """
     if verdict is False:
         return None
     if probe_name is None:
-        return clear_mechanism_sentence(condition_id)
-    if verdict is True:
-        return (
+        base = clear_mechanism_sentence(condition_id)
+    elif verdict is True:
+        base = (
             f"still applies — clear probe `{probe_name}` re-checked this on the "
             "last update and the condition still holds."
         )
-    return (
-        f"undetermined — clear probe `{probe_name}` could not decide on the "
-        "last update, so the entry was KEPT. It is re-probed on every update "
-        "and clears as soon as the probe can confirm the condition is over."
-    )
+    else:
+        base = (
+            f"undetermined — clear probe `{probe_name}` could not decide on the "
+            "last update, so the entry was KEPT. It is re-probed on every update "
+            "and clears as soon as the probe can confirm the condition is over."
+        )
+    note = retry_history_note(folder, condition_id)
+    return f"{base} {note}" if note else base
 
 
 @dataclass
@@ -751,7 +941,7 @@ def probe_report(
             out.verdicts[cid] = verdict
             if verdict is False:
                 out.resolvable.append(cid)
-        status = probe_status_sentence(cid, name, verdict)
+        status = probe_status_sentence(cid, name, verdict, folder=Path(folder))
         out.statuses[cid] = status
         try:
             if getattr(entry, "probe_status", None) != status:
@@ -1021,6 +1211,7 @@ __all__ = [
     "record_probe_resolution",
     "registry_probe_name",
     "resolvable_condition_ids",
+    "retry_history_note",
     "run_probe",
     "upstream_sidecar_paths",
 ]

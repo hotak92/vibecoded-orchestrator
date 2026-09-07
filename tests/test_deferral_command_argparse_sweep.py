@@ -19,11 +19,16 @@ minting a bogus flag, so this sweep validates the whole family:
      ``vco_lib.project_init._build_arg_parser``, …) — the actual argparse
      contract, never a hand-maintained flag list.
    * Rust-side emitted strings are SOURCE-PARSED: line-based scan of
-     ``launcher/src-tauri/src/**/*.rs`` (documented pattern: skip ``//``
-     comment lines; stop at the ``#[cfg(test)]`` / ``mod tests`` marker so
-     negative test assertions like ``!content.contains("… --force")`` don't
-     trip the sweep; ``format!`` placeholders are irrelevant because only
-     ``--flag`` tokens are validated).
+     ``launcher/src-tauri/src/**/*.rs`` (v0.2.92 WP-G: comments — line,
+     trailing, and nested block — are stripped via
+     ``tests.common.rust_source.strip_rust_comments``; string-literal
+     content is preserved since that is where the emitted commands live.
+     Lines inside a ``#[cfg(test)]``-gated item are excluded per-item via
+     ``cfg_test_line_numbers`` so negative test assertions like
+     ``!content.contains("… --force")`` don't trip the sweep, WITHOUT
+     blinding production code declared after the first test module;
+     ``format!`` placeholders are irrelevant because only ``--flag``
+     tokens are validated).
    * CLIs without a registered parser (git, podman, arbitrary shell) are out
      of scope — the sweep validates VCO's own CLIs only.
 
@@ -61,6 +66,11 @@ _KG_SYNC_PATH = _REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 _INSTALL_PY_PATH = _REPO_ROOT / "install.py"
 
 sys.path.insert(0, str(_REPO_ROOT))
+
+from tests.common.rust_source import (  # noqa: E402
+    cfg_test_line_numbers,
+    strip_rust_comments,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +184,6 @@ _SCAN_EXCLUDE_PARTS = {
 }
 
 _FLAG_RE = re.compile(r"--[A-Za-z0-9][A-Za-z0-9-]*")
-_RUST_TEST_MARKER = re.compile(r"^\s*(#\[cfg\(test\)\]|mod tests\b)")
 
 
 def _iter_scan_files():
@@ -216,24 +225,33 @@ def _scan_lines(path: Path, kind: str):
     """Yield (lineno, line) for scannable lines of one source file.
 
     Python: skip ``#`` comment lines (commands live in string literals).
-    Rust: skip ``//`` comment lines AND everything from the first
-    ``#[cfg(test)]`` / ``mod tests`` marker on — the test module is the
-    tail-of-file convention in this codebase, and its negative assertions
-    intentionally name bogus flags.
+    Rust (v0.2.92 WP-G register-34): route through
+    ``tests.common.rust_source.strip_rust_comments`` — a full lexer-aware
+    comment strip (line ``//``, trailing ``//``, and nested ``/* */``, all
+    of which the old ``line.lstrip().startswith("//")`` check missed) that
+    PRESERVES string-literal content, since the emitted CLI commands this
+    sweep hunts for live inside string literals. `#[cfg(test)]`-gated lines
+    are excluded per-ITEM via ``cfg_test_line_numbers`` rather than by
+    stopping at the first marker and blinding the rest of the file — the
+    old "tail-of-file convention" stop-scan was the same bug class
+    documented as the v0.2.90 lesson in ``rust_source.py``'s own docstring:
+    production code declared AFTER a test module was never scanned.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return
+    if kind == "rs":
+        test_lines = cfg_test_line_numbers(text)
+        for lineno, line in enumerate(strip_rust_comments(text), start=1):
+            if lineno in test_lines:
+                continue  # adversarial fixture, not a real emission site
+            yield lineno, line
+        return
     for lineno, line in enumerate(text.splitlines(), start=1):
         stripped = line.lstrip()
         if kind == "py" and stripped.startswith("#"):
             continue
-        if kind == "rs":
-            if _RUST_TEST_MARKER.match(line):
-                return  # test module reached — stop scanning this file
-            if stripped.startswith("//"):
-                continue
         if kind == "svelte":
             # Svelte commands live in string / template literals; skip comment
             # lines in both the <script> (`//`) and markup (`<!-- … -->`)
@@ -245,6 +263,84 @@ def _scan_lines(path: Path, kind: str):
             ):
                 continue
         yield lineno, line
+
+
+def test_rust_scan_strips_comments_but_not_strings_and_does_not_blind_the_tail(
+    tmp_path,
+) -> None:
+    """Red-proof for the v0.2.92 WP-G register-34 fix to the Rust branch of
+    ``_scan_lines``.
+
+    Three shapes the OLD implementation got wrong, all in one fixture (each
+    verified separately below against an emulation of the old logic, to
+    confirm the fixture actually exercises the old bug and isn't merely
+    coincidentally green):
+
+    1. A TRAILING ``//`` comment on a code line — the old check
+       (``line.lstrip().startswith("//")``) only recognized a comment that
+       starts the line, so ``fn f() {  // code-graph-analyze . --trailing``
+       leaked the comment's bogus flag straight through. Must NOT be yielded.
+    2. A string literal that legitimately EMITS a CLI command — must still
+       be yielded verbatim, flag intact (the reason ``strip_rust_comments``
+       and not ``scrub_rust_lines`` was used — stripping strings would have
+       destroyed the very text this sweep exists to validate).
+    3. Production code declared AFTER a ``#[cfg(test)]`` module — must still
+       be scanned (the tail-of-file blinding bug: the OLD code ``return``-ed
+       at the first marker and silently skipped everything after it).
+    """
+    src = (
+        "fn emit() -> String {  // e.g. code-graph-analyze . --trailing-bogus\n"
+        '    format!("code-graph-analyze . --project {}", name)\n'
+        "}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn old_bad_shape_is_rejected() {\n"
+        '        assert!(!cmd.contains("code-graph-analyze . --force"));\n'
+        "    }\n"
+        "}\n"
+        "\n"
+        "fn emit_after_tests() -> String {\n"
+        '    format!("code-graph-analyze . --also-bogus {}", name)\n'
+        "}\n"
+    )
+    rs_file = tmp_path / "emitter.rs"
+    rs_file.write_text(src, encoding="utf-8")
+
+    hits = list(_scan_lines(rs_file, "rs"))
+    joined = "\n".join(line for _, line in hits)
+
+    # (1) the trailing comment's bogus flag must not survive as a scan hit.
+    assert "--trailing-bogus" not in joined, hits
+    # (2) the real emission (inside a string literal) must survive intact.
+    assert any("--project" in line for _, line in hits), hits
+    # (3) production code AFTER the cfg(test) module must still be scanned —
+    # this is the line the old tail-blinding bug silently dropped.
+    assert any("--also-bogus" in line for _, line in hits), hits
+    # The adversarial fixture INSIDE #[cfg(test)] must be excluded.
+    assert "--force" not in joined, hits
+
+    # --- pre-fix emulation: prove the fixture actually exercises both bugs ---
+    _old_marker = re.compile(r"^\s*(#\[cfg\(test\)\]|mod tests\b)")
+
+    def _old_scan_lines_rs(text: str):
+        for old_lineno, old_line in enumerate(text.splitlines(), start=1):
+            if _old_marker.match(old_line):
+                return  # tail-of-file blinding bug
+            if old_line.lstrip().startswith("//"):
+                continue
+            yield old_lineno, old_line
+
+    old_joined = "\n".join(line for _, line in _old_scan_lines_rs(src))
+    assert "--trailing-bogus" in old_joined, (
+        "fixture no longer exercises the trailing-comment leak — "
+        "strengthen it, don't let this assertion silently stop proving red"
+    )
+    assert "--also-bogus" not in old_joined, (
+        "fixture no longer exercises the tail-of-file blinding bug — "
+        "strengthen it, don't let this assertion silently stop proving red"
+    )
 
 
 def test_every_emitted_cli_flag_exists_on_the_real_parser(cli_registry):

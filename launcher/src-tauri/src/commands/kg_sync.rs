@@ -40,10 +40,17 @@
 //! propagated to the create_project_v2 caller — the user has already
 //! gotten their `ProjectView` back by the time this runs.
 //!
-//! Idempotency: `sync_knowledge_graph.py` derives Weaviate UUIDs from the
-//! node title; re-running on an already-synced project is a content-hash
-//! upsert at the Weaviate layer, not a duplicate insert. Safe to invoke
-//! repeatedly via `retry_kg_sync`.
+//! Idempotency (v0.2.92 WP-B1, corrected): `sync_knowledge_graph.py`
+//! does NOT derive Weaviate UUIDs from anything — inserts use
+//! Weaviate-assigned UUIDs, and re-runs stay duplicate-free only because
+//! each write first DELETES the existing rows matching the node's
+//! `file_path` (delete-by-file_path + insert, not an upsert). That
+//! delete is exact-match on the stored `file_path` string, so it is
+//! idempotent only under ONE canonical spelling — which is why the
+//! script (v0.2.92) now stores POSIX `file_path` everywhere and matches
+//! both spellings at delete, mirroring the MCP's C-7 fix. Safe to
+//! invoke repeatedly via `retry_kg_sync`; a content-hash embed-skip
+//! fast path avoids the re-embed entirely when nothing changed.
 
 use serde::Serialize;
 use tauri::{command, AppHandle, Emitter, Manager, State};
@@ -303,14 +310,21 @@ pub struct KgSyncView {
     pub kg_total: u32,
     pub kg_succeeded: u32,
     pub kg_failed: u32,
+    /// Intentional non-synces (archived / frontmarker / excluded /
+    /// embed-skipped nodes) — v0.2.92 WP-B1 / D12. LIVE-EVENT ONLY: the
+    /// `kg_syncs` row has no such column (no schema change), so stored
+    /// rows report 0; the number remains visible in the script's stdout
+    /// (`📊 KG: S succeeded, F failed, K skipped`) captured in `log_tail`.
+    pub kg_skipped: u32,
     pub docs_total: u32,
     pub docs_succeeded: u32,
     pub docs_failed: u32,
+    pub docs_skipped: u32,
     pub error_message: Option<String>,
     pub log_tail: Option<String>,
     /// Live phase indicator. Only populated on `running` events emitted
-    /// during the sync (e.g. "scan", "knowledge", "docs"). Always None
-    /// for stored rows fetched via `get_kg_sync_status`.
+    /// during the sync (e.g. "scan", "knowledge", "docs", "finalize").
+    /// Always None for stored rows fetched via `get_kg_sync_status`.
     pub current_phase: Option<String>,
 }
 
@@ -325,9 +339,12 @@ impl KgSyncView {
             kg_total: row.kg_total,
             kg_succeeded: row.kg_succeeded,
             kg_failed: row.kg_failed,
+            // No DB column for skips (live-event only — see field doc).
+            kg_skipped: 0,
             docs_total: row.docs_total,
             docs_succeeded: row.docs_succeeded,
             docs_failed: row.docs_failed,
+            docs_skipped: 0,
             error_message: row.error_message,
             log_tail: row.log_tail,
             current_phase: None,
@@ -781,9 +798,14 @@ struct ProgressCounts {
     kg_total: u32,
     kg_succeeded: u32,
     kg_failed: u32,
+    /// Live-only skip count (v0.2.92 WP-B1) — never persisted to the row;
+    /// forwarded to `KgSyncView` so the GUI can complete its progress
+    /// counter honestly (succeeded + skipped == processed).
+    kg_skipped: u32,
     docs_total: u32,
     docs_succeeded: u32,
     docs_failed: u32,
+    docs_skipped: u32,
 }
 
 impl ProgressCounts {
@@ -792,9 +814,11 @@ impl ProgressCounts {
             kg_total: 0,
             kg_succeeded: 0,
             kg_failed: 0,
+            kg_skipped: 0,
             docs_total: 0,
             docs_succeeded: 0,
             docs_failed: 0,
+            docs_skipped: 0,
         }
     }
 }
@@ -1173,13 +1197,25 @@ async fn run_subprocess(
                     docs_seen = docs_seen.saturating_add(1);
                     counts.docs_succeeded = docs_seen; // optimistic; reconciled by summary
                     current_phase = "docs";
-                } else if let Some((s, f)) = parse_summary_line(&line, "📊 KG:") {
+                } else if is_finalize_line(&line) {
+                    // v0.2.92 WP-B1: the script prints this stage marker
+                    // right before its post-summary `.node_formats.json`
+                    // regen (up to 600 s, synchronous). Map it to a distinct
+                    // phase so the GUI shows "finalizing summaries…" with
+                    // the bar complete but the status honestly `running` —
+                    // instead of a stalled-looking "embedding (N/N)" on a
+                    // live process (field report: kg_syncs row appeared
+                    // "running after python was done").
+                    current_phase = "finalize";
+                } else if let Some((s, f, k)) = parse_summary_line(&line, "📊 KG:") {
                     counts.kg_succeeded = s;
                     counts.kg_failed = f;
+                    counts.kg_skipped = k;
                     kg_summary_seen = true;
-                } else if let Some((s, f)) = parse_summary_line(&line, "📊 Docs:") {
+                } else if let Some((s, f, k)) = parse_summary_line(&line, "📊 Docs:") {
                     counts.docs_succeeded = s;
                     counts.docs_failed = f;
+                    counts.docs_skipped = k;
                     docs_summary_seen = true;
                 }
 
@@ -1354,10 +1390,14 @@ fn reconcile_optimistic_counts_on_crash(
     if !kg_summary_seen {
         counts.kg_succeeded = 0;
         counts.kg_failed = counts.kg_total;
+        // Skips are only ever set FROM a summary line (never optimistic),
+        // so an unseen summary means zero trustworthy skips too.
+        counts.kg_skipped = 0;
     }
     if !docs_summary_seen {
         counts.docs_succeeded = 0;
         counts.docs_failed = counts.docs_total;
+        counts.docs_skipped = 0;
     }
 }
 
@@ -1450,9 +1490,11 @@ fn emit_sync(
         kg_total: counts.kg_total,
         kg_succeeded: counts.kg_succeeded,
         kg_failed: counts.kg_failed,
+        kg_skipped: counts.kg_skipped,
         docs_total: counts.docs_total,
         docs_succeeded: counts.docs_succeeded,
         docs_failed: counts.docs_failed,
+        docs_skipped: counts.docs_skipped,
         error_message: error.map(|s| s.to_string()),
         log_tail: None,
         current_phase: current_phase.map(|s| s.to_string()),
@@ -1539,7 +1581,20 @@ pub(crate) fn resolve_kg_sync_script(
     } else {
         "kg-sync"
     };
-    vct_launcher_core::paths::resolve_installed_script(project_folder, bin)
+    // v0.2.92 (field bug 2026-09-05): this used to call the RAW ladder
+    // `vct_launcher_core::paths::resolve_installed_script`, which trusts a
+    // project-local copy on MERE EXISTENCE. The stale-wrapper health guard
+    // lived only in `codegraph::resolve_bundled_script`, so the KG sync — the
+    // one path that WRITES a collection — was the single wrapper spawn site
+    // with no guard at all. A project added with safe add kept its pre-VCO
+    // `kg-sync`, the launcher ran it, and the initial sync failed 329/329
+    // with `ModuleNotFoundError: No module named 'weaviate'` after the
+    // wrapper sourced another checkout's venv. Worse than failing: that
+    // generation of wrapper defaults `KG_COLLECTION` to a FOREIGN collection
+    // name, so a run from a shell without the env set writes someone else's
+    // knowledge graph. Route through the guarded resolver — same ladder,
+    // plus the marker check and the deferral emit.
+    crate::commands::codegraph::resolve_bundled_script(project_folder, bin)
 }
 
 // v0.2.89 BUG 1: `invocation_for` (the powershell-vs-direct spawn shape)
@@ -1596,16 +1651,43 @@ fn parse_found_header(line: &str) -> Option<FoundHeader> {
 ///     "📊 Docs: 12 succeeded, 0 failed"
 /// emitted by `sync_knowledge_graph.py::main`. `prefix` is the lookup
 /// fragment ("📊 KG:" or "📊 Docs:"); we also tolerate the prefix without
-/// emoji for robustness. Returns (succeeded, failed) when the line
-/// matches, None otherwise.
-fn parse_summary_line(line: &str, prefix: &str) -> Option<(u32, u32)> {
+/// emoji for robustness. Returns (succeeded, failed, skipped) when the
+/// line matches, None otherwise.
+///
+/// v0.2.92 WP-B1: the script's summary now APPENDS ", K skipped"
+/// (archived / frontmarker / excluded / embed-skipped nodes are no longer
+/// counted as succeeded). BOTH shapes must parse: a stale project bundle
+/// runs the OLD script under the NEW launcher, and the new script may run
+/// under an old launcher transiently. `skipped` is 0 when the fragment is
+/// absent (legacy shape), and any trailing text after the numbers (e.g.
+/// the " (N → shared)" routing note) remains ignored.
+// CONTRACT: tests/fixtures/kg_sync_stdout_contract.json pins these literals.
+// The prefixes and field markers below are EMITTED by
+// templates/scripts/sync_knowledge_graph.py and PARSED here. Both sides were
+// previously tested against independently hard-coded literals, so they could
+// drift apart with both suites green (v0.2.92 m5).
+fn parse_summary_line(line: &str, prefix: &str) -> Option<(u32, u32, u32)> {
     let trimmed = line.trim();
     if !trimmed.starts_with(prefix) && !trimmed.contains(prefix.trim_start_matches("📊 ")) {
         return None;
     }
     let succeeded = extract_number_before(trimmed, "succeeded")?;
     let failed = extract_number_before(trimmed, "failed")?;
-    Some((succeeded, failed))
+    // Optional third count — ", K skipped" (v0.2.92). Absent on the legacy
+    // two-count shape; anything trailing that isn't "<int> skipped" → 0.
+    let skipped = extract_number_before(trimmed, "skipped").unwrap_or(0);
+    Some((succeeded, failed, skipped))
+}
+
+/// v0.2.92 WP-B1: true for the script's post-summary stage marker
+/// `📝 Refreshing .node_formats.json summaries …`, printed (flushed)
+/// immediately before the `.node_formats.json` regen — a synchronous
+/// step that can run up to 600 s AFTER the final counts. MUST stay in
+/// sync with `_regen_node_formats_after_full_sync` in
+/// templates/scripts/sync_knowledge_graph.py (the prefix match is
+/// deliberately on the stable leading fragment, not the trailing "…").
+fn is_finalize_line(line: &str) -> bool {
+    line.trim_start().starts_with("📝 Refreshing .node_formats.json summaries")
 }
 
 /// Parse the integer that immediately precedes `marker` in `s`. Tolerant
@@ -1732,17 +1814,70 @@ mod tests {
         // Note the variable whitespace after the colon — the script's
         // emit uses tab-like alignment; we tolerate both.
         let line = "📊 KG:   48 succeeded, 2 failed";
-        let (s, f) = parse_summary_line(line, "📊 KG:").expect("must parse");
+        let (s, f, k) = parse_summary_line(line, "📊 KG:").expect("must parse");
         assert_eq!(s, 48);
         assert_eq!(f, 2);
+        assert_eq!(k, 0, "legacy two-count shape → skipped defaults to 0");
     }
 
     #[test]
     fn parse_summary_docs_line() {
         let line = "📊 Docs: 12 succeeded, 0 failed";
-        let (s, f) = parse_summary_line(line, "📊 Docs:").expect("must parse");
+        let (s, f, k) = parse_summary_line(line, "📊 Docs:").expect("must parse");
         assert_eq!(s, 12);
         assert_eq!(f, 0);
+        assert_eq!(k, 0);
+    }
+
+    // ─── v0.2.92 WP-B1: the ", K skipped" summary shape ───────────────
+
+    #[test]
+    fn parse_summary_kg_line_with_skipped() {
+        let line = "📊 KG:   113 succeeded, 0 failed, 4 skipped";
+        let (s, f, k) = parse_summary_line(line, "📊 KG:").expect("must parse");
+        assert_eq!(s, 113);
+        assert_eq!(f, 0);
+        assert_eq!(k, 4);
+    }
+
+    #[test]
+    fn parse_summary_skipped_shape_with_shared_note_suffix() {
+        // The script appends the shared-routing note AFTER the counts in
+        // both shapes; trailing text must stay ignored.
+        let line = "📊 KG:   40 succeeded, 1 failed, 2 skipped (7 → shared)";
+        let (s, f, k) = parse_summary_line(line, "📊 KG:").expect("must parse");
+        assert_eq!((s, f, k), (40, 1, 2));
+    }
+
+    #[test]
+    fn parse_summary_legacy_shape_with_shared_note_suffix() {
+        let line = "📊 Docs: 9 succeeded, 0 failed (2 → shared)";
+        let (s, f, k) = parse_summary_line(line, "📊 Docs:").expect("must parse");
+        assert_eq!((s, f, k), (9, 0, 0));
+    }
+
+    #[test]
+    fn parse_summary_zero_skipped_fragment() {
+        let line = "📊 KG:   5 succeeded, 0 failed, 0 skipped";
+        let (s, f, k) = parse_summary_line(line, "📊 KG:").expect("must parse");
+        assert_eq!((s, f, k), (5, 0, 0));
+    }
+
+    #[test]
+    fn finalize_line_is_recognized_and_is_not_a_summary() {
+        // v0.2.92 WP-B1: the stage marker the script prints immediately
+        // before its (up to 600 s) post-summary regen — mapped to the
+        // "finalize" phase by run_subprocess's dispatch.
+        let line = "📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...";
+        assert!(is_finalize_line(line));
+        // Leading whitespace tolerated (the script never indents it today,
+        // but tolerance is free and the prefix match must not be exact-full-line).
+        assert!(is_finalize_line("   📝 Refreshing .node_formats.json summaries"));
+        // Not the marker / not a summary line:
+        assert!(!is_finalize_line("🔄 Syncing node: Foo"));
+        assert!(!is_finalize_line("📊 KG:   5 succeeded, 0 failed, 0 skipped"));
+        assert!(!is_finalize_line("   (node-format refresh timed out; summaries left as-is — non-fatal)"));
+        assert!(parse_summary_line(line, "📊 KG:").is_none());
     }
 
     #[test]
@@ -1773,14 +1908,12 @@ mod tests {
     // v0.2.89 BUG 1: `invocation_for_picks_powershell_on_windows` moved to
     // `commands::script_invocation::tests` alongside the function.
 
-    #[test]
-    fn resolve_kg_sync_finds_project_local_copy() {
-        let d = tmpdir("resolve");
+    fn write_kg_sync_wrapper(d: &std::path::Path, body: &[u8]) -> std::path::PathBuf {
         let scripts = d.join(".claude").join("scripts");
         fs::create_dir_all(&scripts).unwrap();
         let bin = if cfg!(windows) { "kg-sync.ps1" } else { "kg-sync" };
         let p = scripts.join(bin);
-        fs::write(&p, b"#!/usr/bin/env bash\necho ok\n").unwrap();
+        fs::write(&p, body).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1788,8 +1921,77 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&p, perms).unwrap();
         }
+        p
+    }
+
+    #[test]
+    fn resolve_kg_sync_finds_project_local_copy() {
+        let d = tmpdir("resolve");
+        // v0.2.92: the wrapper must carry the resilient-ladder marker to be
+        // trusted — `resolve_kg_sync_script` now goes through the SAME guarded
+        // resolver as the code-graph analyzer. A body without the marker is
+        // covered by `resolve_kg_sync_rejects_stale_project_local_copy` below.
+        let p = write_kg_sync_wrapper(
+            &d,
+            b"#!/usr/bin/env bash\n: \"${VCT_INSTALL_ROOT:-}\"\necho ok\n",
+        );
         let resolved = resolve_kg_sync_script(&d).expect("must resolve");
         assert_eq!(resolved, p);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// RED-PROOF for the v0.2.92 field bug (2026-09-05): a project-local
+    /// `kg-sync` that lacks the `$VCT_INSTALL_ROOT` ladder — the shape a
+    /// pre-VCO project carries, pointing at ANOTHER checkout's venv and
+    /// defaulting `KG_COLLECTION` to a FOREIGN collection — must NOT be
+    /// returned. Before the fix `resolve_kg_sync_script` called the RAW
+    /// ladder, which trusted it on mere existence: the initial sync ran it
+    /// and failed 329/329 with `ModuleNotFoundError: No module named
+    /// 'weaviate'`.
+    ///
+    /// Mutation check: point `resolve_kg_sync_script` back at
+    /// `vct_launcher_core::paths::resolve_installed_script` and this test
+    /// fails (it resolves to the stale path).
+    #[test]
+    fn resolve_kg_sync_rejects_stale_project_local_copy() {
+        let d = tmpdir("resolve-stale");
+        let stale = write_kg_sync_wrapper(
+            &d,
+            b"#!/bin/bash\nsource /some/other/checkout/.venv/bin/activate\n              export KG_COLLECTION=\"${KG_COLLECTION:-ClaudeKnowledgeGraph}\"\n",
+        );
+
+        // NO env mutation here (v0.2.92 flake fix). This test used to clear
+        // `VCT_LAUNCHER_SCRIPTS_DIR` + `PATH` process-globally on the theory
+        // that the fallback tiers had to be silenced. They do not: the
+        // assertion is "the STALE path is not what came back", and a buggy
+        // resolver returns the stale project-local copy from TIER 1 — before
+        // either env-driven tier is ever consulted. So the clearing bought
+        // nothing and cost correctness under `--test-threads>1`: `PATH` and
+        // `VCT_LAUNCHER_SCRIPTS_DIR` are process-global, this site took no
+        // part in `vct_launcher_core::test_env::GLOBAL_ENV_MUTEX`, and its
+        // save/restore pair could interleave with any other env-mutating test
+        // in the binary (`hub_launcher::find_hub_binary_*` reads `PATH`).
+        // The fix is the strong one: remove the shared state, don't serialize
+        // it. This test is now env-independent by construction.
+        let resolved = resolve_kg_sync_script(&d);
+
+        assert_ne!(
+            resolved.as_deref(),
+            Some(stale.as_path()),
+            "a stale (pre-ladder) project-local kg-sync must never be spawned — \
+             it reaches another checkout's venv and another project's collection"
+        );
+        // Stronger than `!= stale`: NOTHING inside the project folder may be
+        // returned once the local copy is condemned — only the orchestrator
+        // fallback (outside `d`) or None is acceptable.
+        if let Some(r) = resolved.as_deref() {
+            assert!(
+                !r.starts_with(&d),
+                "condemned project-local wrapper dir must not supply the \
+                 fallback either; got {}",
+                r.display()
+            );
+        }
         fs::remove_dir_all(&d).ok();
     }
 
@@ -1805,13 +2007,16 @@ mod tests {
             kg_total: 58,
             kg_succeeded: 17,
             kg_failed: 0,
+            kg_skipped: 3,
             docs_total: 0,
             docs_succeeded: 0,
             docs_failed: 0,
+            docs_skipped: 0,
         };
         reconcile_optimistic_counts_on_crash(&mut counts, false, false);
         assert_eq!(counts.kg_succeeded, 0);
         assert_eq!(counts.kg_failed, 58);
+        assert_eq!(counts.kg_skipped, 0, "unseen summary → no trustworthy skips");
         assert_eq!(counts.docs_succeeded, 0);
         assert_eq!(counts.docs_failed, 0);
     }
@@ -1824,9 +2029,11 @@ mod tests {
             kg_total: 58,
             kg_succeeded: 56,
             kg_failed: 2,
+            kg_skipped: 0,
             docs_total: 12,
             docs_succeeded: 7,
             docs_failed: 0,
+            docs_skipped: 0,
         };
         reconcile_optimistic_counts_on_crash(&mut counts, true, false);
         assert_eq!(counts.kg_succeeded, 56, "KG summary seen, keep");
@@ -1841,15 +2048,19 @@ mod tests {
             kg_total: 58,
             kg_succeeded: 56,
             kg_failed: 2,
+            kg_skipped: 4,
             docs_total: 12,
             docs_succeeded: 11,
             docs_failed: 1,
+            docs_skipped: 2,
         };
         reconcile_optimistic_counts_on_crash(&mut counts, true, true);
         assert_eq!(counts.kg_succeeded, 56);
         assert_eq!(counts.kg_failed, 2);
+        assert_eq!(counts.kg_skipped, 4, "both summaries seen, skips kept");
         assert_eq!(counts.docs_succeeded, 11);
         assert_eq!(counts.docs_failed, 1);
+        assert_eq!(counts.docs_skipped, 2);
     }
 
     #[test]
@@ -1860,9 +2071,11 @@ mod tests {
             kg_total: 58,
             kg_succeeded: 17,
             kg_failed: 0,
+            kg_skipped: 0,
             docs_total: 0,
             docs_succeeded: 0,
             docs_failed: 0,
+            docs_skipped: 0,
         };
         reconcile_optimistic_counts_on_crash(&mut counts, false, false);
         assert_eq!(counts.kg_failed, 58);

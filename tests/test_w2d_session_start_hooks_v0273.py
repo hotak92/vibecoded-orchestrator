@@ -45,6 +45,9 @@ def _run(script: Path, *, env_extra=None, stdin="", project_dir=None, cwd=None):
         env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     if env_extra:
         env.update(env_extra)
+    # §3.16: deliberately unpinned — the minimal env (and the -S wrapper venv
+    # below) exist to make vco_lib UNIMPORTABLE; a repo-root PYTHONPATH would
+    # undo exactly the condition under test.
     return subprocess.run(
         ["bash", str(script)],
         env=env,

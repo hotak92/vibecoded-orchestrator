@@ -710,7 +710,8 @@ async fn container_pull(
         }
     };
 
-    // ─── Step 2: pick container runtime (podman preferred, docker fallback) ─
+    // ─── Step 2: pick container runtime (pin honoured or refused, never
+    // substituted — v0.2.92 delivery-audit M1; see container_runtime.rs) ──
     let runtime = detect_container_runtime().await?;
 
     // ─── Step 3 (v0.2.46 V46-E C2): build a per-pull --authfile rather
@@ -1326,7 +1327,11 @@ pub(crate) fn build_per_pull_authfile(
 /// first wins, so `-cuda` is checked before any hypothetical `-cu`
 /// (none exists today; defensive in case a future module ships one).
 ///
-/// TODO(v0.2.47): drive this list from the L0 catalog's
+/// LIMITATION (was `TODO(v0.2.47)` — de-labelled v0.2.92): the version
+/// label promised a release that shipped 45+ releases ago, which is the
+/// deferral shape this repo's release rule forbids. The limitation is
+/// real and is stated plainly instead of carrying a broken promise:
+/// this list could be driven from the L0 catalog's
 /// `compatibility.variants` field rather than hardcoding. Catalog-driven
 /// resolution lets new module publishers ship custom variants (e.g.
 /// `-tensorrt`, `-trt-llm`) without a launcher rebuild. For v0.2.46 the
@@ -4022,7 +4027,10 @@ mod tests {
     /// pipes; the async runtime sizes vary) — but a Windows-portable
     /// driver requires either a small Rust helper binary or PowerShell,
     /// and the spec authorises deferring that to v0.2.38.
-    // TODO(v0.2.38): add a Windows-portable regression driver.
+    // LIMITATION (was `TODO(v0.2.38)` — de-labelled v0.2.92): no
+    // Windows-portable regression driver exists for this path. Stated as
+    // a standing limitation rather than a version-labelled promise that
+    // has been outstanding for 45+ releases.
     #[cfg(unix)]
     #[test]
     fn stdio_null_avoids_pipe_buffer_deadlock_on_high_volume_stderr() {

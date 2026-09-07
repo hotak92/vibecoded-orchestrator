@@ -1,6 +1,23 @@
 #!/bin/bash
 # Wrapper script for sync_knowledge_graph.py with automatic venv activation.
 #
+# EXIT CODES (the ladder this wrapper shares with the script it runs;
+# the script's own half is printed by `sync_knowledge_graph.py::_print_usage`):
+#
+#   0  clean run
+#   1  the sync RAN and some nodes/docs failed
+#   2  usage error, or a refused/wrong project root
+#   3  the sync DID NOT RUN: no Python environment with VCO's KG
+#      dependencies (wrapper-only; sync_knowledge_graph.py never emits it)
+#
+# v0.2.92: 3 is new. The venv refusal below used to return 1, which is the
+# code the script uses for "I ran and some nodes failed" — so a caller
+# could not tell "did not run" from "ran, partially failed", and the
+# launcher's kg_sync.rs would report a partial sync where none happened.
+# A check that cannot distinguish "could not determine" from a real
+# result is not a check. PARITY: kg-sync.ps1 documents and returns the
+# same ladder.
+#
 # v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
 # from `code-graph-analyze`. Pre-v0.2.37 this wrapper only probed
 # `$PROJECT_ROOT/.venv` + `$PROJECT_ROOT/claude_mcp_servers/.venv`, both
@@ -47,21 +64,76 @@ venv_has_kg_deps() {
     "$py" -c "import weaviate, weaviate_mcp" 2>/dev/null
 }
 
-# Probe candidate venvs. Launcher-provided $VCT_INSTALL_ROOT canonical
-# install-root takes precedence; script-relative paths are fallbacks for
-# direct CLI use inside the orchestrator clone.
-CANDIDATES=(
-    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
-    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
-    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
-    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
+# v0.2.92 (W3 §4bis): read `VCT_ORCHESTRATOR_ROOT` out of the project's own
+# `.claude/env`. This is the DURABLE tier — the one that works in a plain
+# terminal, in CI, and from any cron: it needs no env inheritance at all,
+# because the value is file-backed and written by the canonical env
+# projection on every install and update.
+#
+# It exists because the field failure had no env at all: a user project with
+# its own dep-less `.venv`, run from a shell with no `VCT_INSTALL_ROOT`, fell
+# through every candidate to a bare `python3` and crashed inside the sync
+# script with `ModuleNotFoundError`. An env-only ladder cannot help there.
+orchestrator_root_from_project_env() {
+    local env_file="$SCRIPT_DIR/../env"
+    [ -r "$env_file" ] || return 1
+    # First assignment wins, `export ` prefix tolerated, one quote pair
+    # stripped — the same line rule `vco_lib/envfile.py::parse_env_lines`
+    # applies, so the file has one meaning on both sides.
+    local line
+    line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?VCT_ORCHESTRATOR_ROOT=' \
+            "$env_file" 2>/dev/null)" || return 1
+    [ -n "$line" ] || return 1
+    line="${line#*=}"
+    line="${line%\"}"; line="${line#\"}"
+    line="${line%\'}"; line="${line#\'}"
+    [ -n "$line" ] || return 1
+    printf '%s' "$line"
+}
+
+# Is $1 a real VCO orchestrator clone (not the user's project that merely
+# happens to own a `.venv`)? Same discriminator as
+# `templates/hooks/_lib/resolve-vco-venv.sh::_is_vco_orchestrator_clone` and
+# as `install.py::validate_source_repo`. Without it, `$SCRIPT_DIR/../../.venv`
+# IS the user's project venv whenever this wrapper is bundled into a project.
+is_vco_orchestrator_clone() {
+    [ -d "$1" ] || return 1
+    [ -f "$1/install.py" ] || return 1
+    [ -f "$1/first-install.sh" ] || return 1
+    return 0
+}
+
+# Probe candidate venvs, canonical first. $VCT_VENV is the explicit override,
+# then the launcher-provided install root, then the file-backed orchestrator
+# root, then clone-relative paths — the last of which are GATED so a user
+# project's venv can never be selected.
+PROJECT_ENV_ROOT="$(orchestrator_root_from_project_env || true)"
+CLONE_ROOT="$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || true)"
+
+CANDIDATES=()
+[ -n "${VCT_VENV:-}" ] && CANDIDATES+=("$VCT_VENV")
+# The `${VCT_INSTALL_ROOT:-}` form is kept verbatim (rather than the bare
+# `$VCT_INSTALL_ROOT` the guard above already makes safe) because the Gap-6b
+# canonical-first ordering gate pins this exact literal across all five
+# wrappers — one shape for five files beats five shapes and a broken gate.
+[ -n "${VCT_INSTALL_ROOT:-}" ] && CANDIDATES+=(
+    "${VCT_INSTALL_ROOT:-}/.venv"
+    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"
 )
+[ -n "$PROJECT_ENV_ROOT" ] && CANDIDATES+=(
+    "$PROJECT_ENV_ROOT/.venv"
+    "$PROJECT_ENV_ROOT/claude_mcp_servers/.venv"
+)
+if [ -n "$CLONE_ROOT" ] && is_vco_orchestrator_clone "$CLONE_ROOT"; then
+    CANDIDATES+=(
+        "$CLONE_ROOT/.venv"
+        "$CLONE_ROOT/claude_mcp_servers/.venv"
+    )
+fi
 
 VENV_PATH=""
 for c in "${CANDIDATES[@]}"; do
     [ -z "$c" ] && continue
-    [ "$c" = "/.venv" ] && continue                    # empty VCT_INSTALL_ROOT → skip
-    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
     if venv_has_kg_deps "$c"; then
         VENV_PATH="$c"
         break
@@ -74,22 +146,64 @@ done
 # a `bin/activate` script. Direct invocation works on every OS, and
 # exporting VIRTUAL_ENV keeps any spawned subprocesses informed that a
 # venv is active (some libraries probe $VIRTUAL_ENV directly).
+VENV_PYTHON=""
 if [ -n "$VENV_PATH" ]; then
     export VIRTUAL_ENV="$VENV_PATH"
-    if [ -x "$VENV_PATH/bin/python" ]; then
-        VENV_PYTHON="$VENV_PATH/bin/python"
-    elif [ -x "$VENV_PATH/Scripts/python.exe" ]; then
-        VENV_PYTHON="$VENV_PATH/Scripts/python.exe"
-    elif [ -x "$VENV_PATH/bin/python3" ]; then
-        VENV_PYTHON="$VENV_PATH/bin/python3"
-    elif [ -x "$VENV_PATH/Scripts/python3.exe" ]; then
-        VENV_PYTHON="$VENV_PATH/Scripts/python3.exe"
-    else
-        echo "kg-sync: WARNING: VENV_PATH=$VENV_PATH has no python binary at conventional paths" >&2
-        VENV_PYTHON="python3"
-    fi
-else
-    VENV_PYTHON="python3"
+    for p in \
+        "$VENV_PATH/bin/python" \
+        "$VENV_PATH/Scripts/python.exe" \
+        "$VENV_PATH/bin/python3" \
+        "$VENV_PATH/Scripts/python3.exe"; do
+        if [ -x "$p" ]; then VENV_PYTHON="$p"; break; fi
+    done
+fi
+
+# v0.2.92 (W3 §4bis): NO BARE `python3` FALLBACK.
+#
+# Until now, a failed probe silently set VENV_PYTHON="python3" and ran the
+# sync anyway. Whatever `python3` happened to be first on PATH then crashed
+# inside sync_knowledge_graph.py with `ModuleNotFoundError: weaviate` — an
+# error that names the wrong problem, from a script the user did not run,
+# after the wrapper had already decided everything was fine.
+#
+# The hooks' shared resolver (`templates/hooks/_lib/resolve-vco-venv.sh`) has
+# had the honest posture for several releases: name every candidate, name the
+# remedy, exit non-zero. This wrapper drifted from it. A shipped component
+# does not get a silent fallback (standing rule).
+#
+# PARITY: this refusal must match kg-sync.ps1's (same tiers, same message
+# shape, same exit code).
+#
+# EXIT 3, NOT 1: 1 is already spoken for by sync_knowledge_graph.py, which
+# returns it when the sync RAN and some nodes failed. Reusing it here made
+# "I never started" indistinguishable from "I finished with failures" —
+# the two demand opposite responses (fix your install vs. look at the
+# named failures). 3 is the next free rung above the script's 0/1/2.
+if [ -z "$VENV_PYTHON" ]; then
+    {
+        echo "kg-sync: ERROR - no Python environment with VCO's KG dependencies."
+        echo "kg-sync: A candidate qualifies only when BOTH 'weaviate' and"
+        echo "kg-sync: 'weaviate_mcp' import from it. Probed, in order:"
+        if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+            echo "kg-sync:   (none - no VCT_VENV, no VCT_INSTALL_ROOT, no"
+            echo "kg-sync:    VCT_ORCHESTRATOR_ROOT in $SCRIPT_DIR/../env, and"
+            echo "kg-sync:    $CLONE_ROOT is not a VCO orchestrator clone)"
+        else
+            for c in "${CANDIDATES[@]}"; do echo "kg-sync:   - $c"; done
+        fi
+        echo "kg-sync: Fix by any ONE of:"
+        echo "kg-sync:   * run this from a launcher-managed session (it exports"
+        echo "kg-sync:     VCT_INSTALL_ROOT);"
+        echo "kg-sync:   * export VCT_VENV=/path/to/orchestrator/.venv;"
+        echo "kg-sync:   * export VCT_INSTALL_ROOT=/path/to/orchestrator;"
+        echo "kg-sync:   * re-run the orchestrator install so this project's"
+        echo "kg-sync:     .claude/env carries VCT_ORCHESTRATOR_ROOT."
+        echo "kg-sync: Refusing to run with an unqualified interpreter - doing so"
+        echo "kg-sync: fails later with a misleading ModuleNotFoundError."
+        echo "kg-sync: (exit 3 = did not run; 1 would mean the sync ran and"
+        echo "kg-sync:  some nodes failed)"
+    } >&2
+    exit 3
 fi
 
 # v0.2.89 BUG 3 (plan §1.3 B): pin the target project root via the NEW

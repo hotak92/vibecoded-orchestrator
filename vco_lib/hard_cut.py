@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
+from vco_lib import remedy_shell
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -278,10 +280,19 @@ def hard_cut(
     res.steps.append("git bundle verified")
 
     # ---- Step 2: write the hard_cut_performed deferral ------------------
-    restore_cmd = (
-        f"git -C {clone_root} fetch {bundle_path} "
-        f"'refs/*:refs/heads/restored-pre-hardcut/*' && "
-        f"git -C {clone_root} reset --hard restored-pre-hardcut/main"
+    # v0.2.92 (R42 sweep): rendered for the LOCAL shell. This used to be one
+    # `a && b` line with a single-quoted refspec — two POSIX-isms in the one
+    # command that undoes a hard cut. Windows PowerShell 5.1 rejects `&&`
+    # outright, and cmd.exe hands git the quotes as part of the refspec, so
+    # the restore path was un-pasteable on Windows: the OS is irrelevant to
+    # whether a hard cut happened, so half the population could not use it.
+    # Two lines, shell-appropriate quoting; see `vco_lib.remedy_shell`.
+    restore_cmd = remedy_shell.steps(
+        f"git -C {remedy_shell.quote(clone_root)} fetch "
+        f"{remedy_shell.quote(bundle_path)} "
+        f"{remedy_shell.quote('refs/*:refs/heads/restored-pre-hardcut/*')}",
+        f"git -C {remedy_shell.quote(clone_root)} reset --hard "
+        "restored-pre-hardcut/main",
     )
     try:
         res.deferral_written = bool(

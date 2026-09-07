@@ -37,10 +37,14 @@ Python owns the class name — so it gets the same source-scan treatment.
 from __future__ import annotations
 
 import re
+import sys
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 LEDGER_RS = (
     REPO_ROOT
     / "launcher"
@@ -51,9 +55,23 @@ LEDGER_RS = (
 )
 LEDGER_TS = REPO_ROOT / "launcher" / "src" / "lib" / "deferral-ledger.ts"
 
+from tests.common.rust_source import strip_rust_comments  # noqa: E402
+
 
 def _rust_source() -> str:
-    return LEDGER_RS.read_text(encoding="utf-8")
+    """The ledger module as CODE: comments stripped, string literals kept.
+
+    Every pin in this file reads either a code construct (const decl,
+    ``matches!`` arm, ``out.inconclusive = out.inconclusive``) or a string
+    literal (status vocabulary, path segments) — both survive
+    ``strip_rust_comments`` byte-for-byte. What must NOT satisfy a pin is
+    PROSE: a commented-out const would hand ``_const_u`` a stale value, and
+    a doc-comment mentioning ``UPDATE_DEFERRED.md`` would trip the
+    reader-never-parses-the-markdown scan, which exists to catch a code
+    path. String-literal mentions of the .md still trip it — the deliberate
+    asymmetry of the shared stripper (see ``tests/common/rust_source.py``).
+    """
+    return "\n".join(strip_rust_comments(LEDGER_RS.read_text(encoding="utf-8")))
 
 
 def _ts_declaration(name: str, source: str) -> str:

@@ -68,59 +68,63 @@ if (-not (Test-Path $AlertDir)) {
 
 if (-not $EditedFile -or -not (Test-Path -LiteralPath $EditedFile -PathType Leaf)) { exit 0 }
 
-# Credential patterns mirrored from post-tool-security.sh.
+# PATTERN SOURCE (changed - read this before adding a regex): the shapes are
+# NOT defined here, and this is no longer a hand-kept mirror of
+# post-tool-security.sh. Both read the SAME vocabulary from _lib/credshapes.ps1
+# ('content_scan' context), whose SSOT is vco_lib/credential_shapes.py. The old
+# hand-lockstep arrangement is what let the copies drift until they disagreed
+# about which vendors they could see - and until the "Anthropic/OpenAI API key"
+# label sat over a pattern matching neither modern OpenAI project keys
+# (sk-proj-/sk-svcacct-/sk-admin-) nor OpenRouter (sk-or-v1-). Add shapes to
+# the SSOT, never here.
+#
 # `Hook leak-test marker` (VCT_HOOK_LEAK_PROBE_a3f7c2) is a smoke-test
-# marker — keeps fixture credentials non-real-looking; users seeing
-# this alert know it's a test, not a real leak. Previously the marker
-# was the bare word LEAK_TEST_KEY; renamed 2026-05-18 because the
-# common-English-looking token tripped on a legitimate CHANGELOG
-# release-note entry. The new sentinel ends in a 6-char random hex
-# (a3f7c2) so it cannot accidentally appear in docs or prose.
-# D-13 (v0.2.75): the "GitHub fine-grained PAT" and "Generic secret
-# (unquoted)" rows MUST MATCH post-tool-security.sh's check_pattern list
-# (which in turn anchors the github_pat_ shape on
-# scripts/check-no-secrets.sh's TOKEN_SHAPES). See the .sh sibling's
-# comments for the rationale (gh[pousr]_ never matches github_pat_*; the
-# quoted generic pattern skips .env-style bare assignments).
-$patterns = @(
-    @{ Label = "Anthropic/OpenAI API key"; Re = 'sk-(ant-api03|[a-zA-Z0-9]{30,})-[a-zA-Z0-9]' },
-    @{ Label = "AWS access key";          Re = 'AKIA[A-Z0-9]{16}' },
-    @{ Label = "GitHub token";            Re = 'gh[pousr]_[a-zA-Z0-9]{36}' },
-    @{ Label = "GitHub fine-grained PAT"; Re = 'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}' },
-    # "PEM private key" is NOT in this table — v0.2.82 moved it to a
-    # dedicated plausible-body check below (MUST MATCH the .sh sibling's
-    # check_pem_key): the bare BEGIN-marker regex re-alerted on every edit
-    # of files that carry the marker as a literal (pattern tables, the
-    # secrets.rs write-guard stub fixture).
-    @{ Label = "Generic secret";          Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["''][a-zA-Z0-9+/=_\-]{32,}' },
-    @{ Label = "Generic secret (unquoted)"; Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*[a-zA-Z0-9+/=_\-]{32,}' },
-    @{ Label = "Hook leak-test marker";   Re = 'VCT_HOOK_LEAK_PROBE_a3f7c2' }
-)
+# marker - keeps fixture credentials non-real-looking; users seeing this alert
+# know it's a test, not a real leak. It ends in a 6-char random hex so it
+# cannot accidentally appear in docs or prose.
+$CredShapesLib = Join-Path $LibDir "credshapes.ps1"
+if (Test-Path -LiteralPath $CredShapesLib -PathType Leaf) { . $CredShapesLib }
 
 $content = $null
 try { $content = Get-Content -LiteralPath $EditedFile -Raw -ErrorAction Stop } catch { exit 0 }
 
 $alerts = @()
-foreach ($p in $patterns) {
-    if ($content -match $p.Re) { $alerts += $p.Label }
-}
 
-# v0.2.82: PEM detection requires a PLAUSIBLE key body (>=120 base64 chars
-# after the BEGIN marker, before -----END). An RSA key body is >=1600 chars,
-# but a real EC SEC1 P-256 key body is only ~164 chars — the earlier >=256
-# floor SILENTLY MISSED every EC key. 120 stays above the 13-char secrets.rs
-# write-guard stub while catching P-256 EC keys. MUST MATCH the .sh sibling's
-# check_pem_key body floor.
-$pemMatches = [regex]::Matches($content, 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY')
-foreach ($pm in $pemMatches) {
-    $start = $pm.Index + $pm.Length
-    $len = [Math]::Min(8192, $content.Length - $start)
-    if ($len -le 0) { continue }
-    $window = $content.Substring($start, $len)
-    $endIdx = $window.IndexOf('-----END')
-    $body = if ($endIdx -ge 0) { $window.Substring(0, $endIdx) } else { $window }
-    $b64 = ($body -replace '[^A-Za-z0-9+/=]', '')
-    if ($b64.Length -ge 120) { $alerts += "PEM private key"; break }
+if (-not (Get-Command Get-CredShapes -ErrorAction SilentlyContinue)) {
+    # A MISSING vocabulary must not look like a clean file: downstream reads an
+    # empty $alerts as "nothing found", so a silent degrade would turn a broken
+    # install into a permanent all-clear. Raise it as a real alert instead.
+    $alerts += "credential scanner UNAVAILABLE (_lib/credshapes.ps1 missing)"
+} else {
+    foreach ($shape in (Get-CredShapes -Context 'content_scan')) {
+        # Key on the STABLE SSOT shape id, not the display label.
+        if ($shape.Id -eq 'pem_private_key') {
+            # v0.2.82: PEM detection requires a PLAUSIBLE key body (>=120 base64
+            # chars after the BEGIN marker, before -----END). An RSA key body is
+            # >=1600 chars, but a real EC SEC1 P-256 body is only ~164 - the
+            # earlier >=256 floor SILENTLY MISSED every EC key. 120 stays above
+            # the 13-char secrets.rs write-guard stub while catching P-256 EC
+            # keys. MUST MATCH the .sh sibling's check_pem_key body floor.
+            #
+            # The body floor is CONTROL FLOW over a multi-line window, not
+            # vocabulary - a single regex cannot express it - so it stays
+            # language-local here while the marker itself comes from the shared
+            # vocabulary.
+            $pemMatches = [regex]::Matches($content, $shape.Re)
+            foreach ($pm in $pemMatches) {
+                $pemStart = $pm.Index + $pm.Length
+                $len = [Math]::Min(8192, $content.Length - $pemStart)
+                if ($len -le 0) { continue }
+                $window = $content.Substring($pemStart, $len)
+                $endIdx = $window.IndexOf('-----END')
+                $body = if ($endIdx -ge 0) { $window.Substring(0, $endIdx) } else { $window }
+                $b64 = ($body -replace '[^A-Za-z0-9+/=]', '')
+                if ($b64.Length -ge 120) { $alerts += $shape.Label; break }
+            }
+            continue
+        }
+        if ($content -match $shape.Re) { $alerts += $shape.Label }
+    }
 }
 
 if ($alerts.Count -gt 0) {

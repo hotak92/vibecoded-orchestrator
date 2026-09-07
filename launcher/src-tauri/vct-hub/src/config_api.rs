@@ -87,7 +87,15 @@ use super::retrieval_tuning_io::{read_tuning, RetrievalTuning};
 // further customised still resolves to a working Ollama / gRPC
 // endpoint pair. Env-var overrides (set by the launcher when it
 // boots a non-default stack) win over the defaults.
-const DEFAULT_OLLAMA_URL: &str = "http://localhost:11435";
+// v0.2.92 (§3.12): the port literal lives ONCE in vct-launcher-core
+// (`services::container_runtime::DEFAULT_OLLAMA_PORT`); this is the URL
+// form of that constant, not a second declaration of the port.
+fn default_ollama_url() -> String {
+    format!(
+        "http://localhost:{}",
+        vct_launcher_core::services::container_runtime::DEFAULT_OLLAMA_PORT
+    )
+}
 const DEFAULT_GRPC_PORT: u16 = 50052;
 
 // ─── Resolver protocol version (v0.2.22 Item #2) ─────────────────
@@ -463,11 +471,15 @@ struct ProjectConfigResponse {
     /// per-request schema snapshot (the SAME cached probe the casing
     /// rebinds above use — zero extra roundtrips) POSITIVELY shows that a
     /// served collection name does not exist on Weaviate: `kg_collection`,
-    /// `development_collection`, and (when a codegraph binding row exists)
-    /// `<code_graph_collection_prefix>_CodeModule`. The shared-KG name is
-    /// deliberately NOT checked — it may legitimately not exist pre-first-
-    /// seed on a fresh install, and the hub's startup probe sidecar already
-    /// records it.
+    /// `development_collection`, `shared_kg_collection` (v0.2.92 W12), and
+    /// (when a codegraph binding row exists)
+    /// `<code_graph_collection_prefix>_CodeModule`.
+    ///
+    /// v0.2.92 W12 — the shared-KG leg was MISSING in v0.2.89, which is why
+    /// a project bound to an absent shared class degraded silently: the
+    /// fan-out matched nothing and every component still reported success.
+    /// See `probe_collections` for why the "fresh install" exemption that
+    /// justified the omission did not hold.
     ///
     /// NEVER populated on probe failure: `weaviate_schema_probe::class_exists`
     /// returns `None` when the snapshot came from a failed `/v1/schema`
@@ -486,6 +498,28 @@ struct ProjectConfigResponse {
     /// advisory field no bundled client fetches by key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// v0.2.92 W12 — per-leg probe OUTCOME for all four served collection
+    /// names, `warnings`' missing counterpart.
+    ///
+    /// `warnings` can only report bad news. With Weaviate down it is empty —
+    /// byte-identical to a fully-healthy install — so a client could not tell
+    /// "all four classes exist" from "I could not check any of them", and the
+    /// honest `None`-never-warns rule (probe failure ≠ absence) is exactly
+    /// what produced that ambiguity. This field carries the four states
+    /// uniformly: `present` | `absent` | `unchecked` | `not_configured`.
+    ///
+    /// Relationship to `warnings`, guaranteed by construction (both are built
+    /// in ONE pass in `probe_collections`): a leg warns if and only if its
+    /// state is `absent`. So `warnings` stays the human-readable channel with
+    /// remediation hints, and this is the machine-readable one.
+    ///
+    /// ALWAYS serialized — deliberately no `skip_serializing_if`. A field that
+    /// vanishes when everything is fine would reintroduce the ambiguity it
+    /// exists to remove. Additive: the Python resolver picks known keys, the
+    /// bash/ps1 resolvers extract one field at a time, and no launcher
+    /// frontend code reads `/config` at all — an unknown extra field is inert
+    /// for every bundled consumer, so `schema_version` stays 1.
+    probe_state: CollectionProbeState,
     /// v0.2.31 — absolute path to Claude Code's per-workspace session-
     /// transcript directory (``~/.claude/projects/<slug>/``). The
     /// launcher computes this once from ``projects.folder_path`` using
@@ -900,19 +934,39 @@ async fn project_config(
     // discipline as `hub_global_active_embedding` above — the hub crate
     // deliberately doesn't depend on the launcher binary crate that owns
     // the named constant).
+    //
+    // v0.2.92 W12 — third leg added: the orchestrator-root project's PRIMARY
+    // KG binding. Rationale, and why its absence was a bug of the same family
+    // as the phantom row it accompanies:
+    //   * The Python resolver's chain ends at
+    //     `_resolve_shared_kg_default_from_launcher_db` (the orchestrator-root
+    //     primary binding), so a project with NO `role='shared'` row resolved
+    //     CORRECTLY there and to the empty string here — the two surfaces
+    //     disagreed, which is the R1 resolver-drift class.
+    //   * Rowless projects are not hypothetical: `POST /api/v1/cli/projects`
+    //     registers a project without writing ANY binding row, and (v0.2.92
+    //     W12 Fix 1) `populate_kg_bindings` now deliberately writes NO shared
+    //     row when the name cannot be resolved, because a guessed row would
+    //     outrank the read-time resolver permanently.
+    //   * An empty `shared_kg_collection` is itself a silent degrade: the
+    //     fan-out simply has no collection to read. Resolving the real name
+    //     here keeps the answer honest, and when the leg cannot resolve
+    //     either, the field stays empty (never a guessed constant).
     let shared_kg_collection_raw = h
         .0
         .app_state_get("shared_kg.collection_name")
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
+        .or_else(|| {
             kg_bindings
                 .iter()
                 .find(|b| b.role == "shared")
                 .map(|b| b.collection_name.clone())
-                .unwrap_or_default()
-        });
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| resolve_shared_kg_from_orchestrator_root(&h.0))
+        .unwrap_or_default();
     // v0.2.46 Decision C — `development_collection` derives from the
     // primary KG collection via suffix-swap `_KnowledgeGraph` →
     // `_Development`, NOT from a `role='archive'` binding row.
@@ -1080,14 +1134,19 @@ async fn project_config(
             }
         });
 
-    // v0.2.89 (BUG 4 §5.4) — phantom-name validation. The casing-rebind
-    // calls above populated the per-URL schema snapshot, so `class_exists`
-    // answers from cache (zero extra roundtrips). Assembly is a pure helper
-    // (`phantom_warnings`) so the probe-failure / binding-gate legs are
-    // unit-testable without a live Weaviate.
-    let warnings = phantom_warnings(
+    // v0.2.89 (BUG 4 §5.4) + v0.2.92 W12 — phantom-name validation AND the
+    // per-leg probe state. The casing-rebind calls above populated the per-URL
+    // schema snapshot, so `class_exists` answers from cache (zero extra
+    // roundtrips). Assembly is a pure helper (`probe_collections`) so the
+    // probe-failure / binding-gate legs are unit-testable without a live
+    // Weaviate, and both outputs come from ONE pass so they cannot disagree.
+    let ConfigProbeReport {
+        warnings,
+        state: probe_state,
+    } = probe_collections(
         &kg_collection,
         &development_collection,
+        &shared_kg_collection,
         cg_binding
             .as_ref()
             .map(|_| code_graph_collection_prefix.as_str()),
@@ -1152,7 +1211,7 @@ async fn project_config(
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var("OLLAMA_URL").ok().filter(|v| !v.is_empty()))
-        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+        .unwrap_or_else(default_ollama_url);
     let grpc_port = std::env::var("VCT_GRPC_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1253,6 +1312,7 @@ async fn project_config(
         rl_global_training_source_flag,
         rl_reranker_enabled_for_project,
         warnings,
+        probe_state,
         claude_session_dir,
         retrieval_tuning,
         code_graph_extra_paths,
@@ -1314,8 +1374,102 @@ fn single_field_response(
     }
 }
 
-/// v0.2.89 (BUG 4 §5.4) — pure assembly of the `/config` phantom-name
-/// warnings.
+/// The probe outcome for ONE served collection name.
+///
+/// v0.2.92 W12 (Task 2). Before this existed the `/config` payload could only
+/// say "here is a phantom" — never "I checked and it is fine" versus "I could
+/// not check". Those two rendered IDENTICALLY (an absent `warnings` field), so
+/// a client talking to a hub whose Weaviate was down saw a payload
+/// indistinguishable from a fully-healthy install. That is the same
+/// silent-degradation class as the missing shared-KG warning leg this cycle
+/// fixed; a warning-only channel can report bad news but cannot report the
+/// ABSENCE of news.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeState {
+    /// Probe succeeded and the class exists.
+    Present,
+    /// Probe succeeded and the class does NOT exist — the phantom case, and
+    /// the ONLY state that produces a warning.
+    Absent,
+    /// No usable answer: the `/v1/schema` snapshot failed, or the per-URL
+    /// cache is cold/expired. NEVER reported as absent — probe failure is not
+    /// evidence of absence (the §5.4 negative-cache lesson).
+    Unchecked,
+    /// Nothing is configured for this field, so there is no class to check.
+    /// For the three collection legs that means an empty served name; for the
+    /// code-graph leg it means NO `project_codegraph_bindings` row (the served
+    /// prefix is then a name-derived fallback whose classes are absent BY
+    /// DESIGN, which is why v0.2.89 exempted it from warnings and why it must
+    /// not be reported as `absent` here either).
+    NotConfigured,
+}
+
+impl ProbeState {
+    /// The wire value. Stable strings — the bash/PowerShell/Python resolver
+    /// clients compare them literally.
+    fn as_str(self) -> &'static str {
+        match self {
+            ProbeState::Present => "present",
+            ProbeState::Absent => "absent",
+            ProbeState::Unchecked => "unchecked",
+            ProbeState::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// Per-leg probe outcome for every collection name `/config` serves.
+///
+/// Additive and ALWAYS present (no `skip_serializing_if`): a field that
+/// disappears when everything is fine would reintroduce the exact ambiguity it
+/// exists to remove. Pre-v0.2.92 clients ignore unknown top-level fields (the
+/// Python resolver picks known keys; the bash/ps1 resolvers extract one field
+/// at a time), so adding it is wire-compatible and `schema_version` stays 1.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct CollectionProbeState {
+    kg_collection: &'static str,
+    development_collection: &'static str,
+    shared_kg_collection: &'static str,
+    /// The state of `<code_graph_collection_prefix>_CodeModule` — the same
+    /// derived class the warning leg checks, not the prefix itself.
+    code_graph_collection_prefix: &'static str,
+}
+
+/// Both `/config` probe outputs, assembled in ONE pass.
+struct ConfigProbeReport {
+    warnings: Vec<String>,
+    state: CollectionProbeState,
+}
+
+/// Classify one served name against the schema probe.
+///
+/// `class` is `None`/empty for "not configured". `exists` is the injected
+/// probe: `Some(true)`/`Some(false)` only after a SUCCESSFUL snapshot, `None`
+/// for "could not check".
+///
+/// The empty-name check lives here rather than relying on the injected probe:
+/// `class_exists` does answer `None` for `""`, but a helper whose honesty
+/// depends on its caller's implementation detail is one refactor away from
+/// reporting `unchecked` for a field that is simply unset.
+fn classify_probe(class: Option<&str>, exists: &impl Fn(&str) -> Option<bool>) -> ProbeState {
+    let Some(class) = class.filter(|c| !c.is_empty()) else {
+        return ProbeState::NotConfigured;
+    };
+    match exists(class) {
+        Some(true) => ProbeState::Present,
+        Some(false) => ProbeState::Absent,
+        None => ProbeState::Unchecked,
+    }
+}
+
+/// v0.2.89 (BUG 4 §5.4) + v0.2.92 W12 — pure assembly of the `/config`
+/// phantom-name warnings AND the per-leg probe state.
+///
+/// Both outputs come from ONE classification pass so they cannot disagree: a
+/// warning is emitted if and only if that leg classified as
+/// [`ProbeState::Absent`]. Previously the "should this warn?" decision was
+/// spelled out inline per leg; deriving it from the state makes
+/// `warnings ⊆ absent legs` structural rather than a coincidence two editors
+/// have to maintain.
 ///
 /// * `cg_prefix` is `Some(prefix)` ONLY when a `project_codegraph_bindings`
 ///   row exists. A never-analyzed project's name-derived FALLBACK prefix has
@@ -1324,47 +1478,120 @@ fn single_field_response(
 ///   classes is a genuine phantom (the field half-rename class).
 /// * `exists` is the probe answer per class name. `Some(false)` (probe
 ///   succeeded AND class absent) is the ONLY warning trigger; `None` (probe
-///   failed / cache cold) never warns — probe failure ≠ absence.
-/// * The shared-KG name is intentionally NOT checked: it may legitimately
-///   not exist pre-first-seed on a fresh install, and the hub's startup
-///   probe sidecar already records it.
-fn phantom_warnings(
+///   failed / cache cold) never warns — probe failure ≠ absence. That
+///   distinction is the whole point of the mechanism: "I could not check"
+///   rendered as "it is not there" would turn every Weaviate restart into a
+///   fleet of false phantom reports.
+/// * `shared_kg_collection` is checked since v0.2.92 (W12). v0.2.89 exempted
+///   it on the reasoning that it "may legitimately not exist pre-first-seed
+///   on a fresh install" — but `kg_collection` sits in exactly the same
+///   pre-first-seed window and warns anyway, so the exemption was
+///   inconsistent, and it is what kept a `role='shared'` binding row naming
+///   an ABSENT class silent while every component reported success (the
+///   re-pointed-install phantom: the row was seeded from the last-resort
+///   const while the machine's real shared KG lived under another name).
+///   An EMPTY name is not a phantom — nothing is configured, so there is no
+///   class to be absent — and every leg skips empty names outright.
+fn probe_collections(
     kg_collection: &str,
     development_collection: &str,
+    shared_kg_collection: &str,
     cg_prefix: Option<&str>,
     exists: impl Fn(&str) -> Option<bool>,
-) -> Vec<String> {
+) -> ConfigProbeReport {
     let mut warnings = Vec::new();
-    let mut warn_if_phantom = |field: &str, class: &str, hint: &str| {
-        if exists(class) == Some(false) {
-            warnings.push(format!(
-                "{} {:?} does not exist on Weaviate (phantom name). {}",
-                field, class, hint
-            ));
-        }
-    };
-    warn_if_phantom(
-        "kg_collection",
-        kg_collection,
-        "Reads/writes will target a missing class until a kg-sync creates \
-         it, or fix the KG binding in the launcher's Identity tab.",
-    );
-    warn_if_phantom(
-        "development_collection",
-        development_collection,
-        "docs/ syncs will target a missing class until a sync creates it.",
-    );
-    if let Some(prefix) = cg_prefix {
-        warn_if_phantom(
+
+    // The code-graph leg probes a DERIVED class name, so its owned String has
+    // to outlive the classification call.
+    let cg_class = cg_prefix
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{}_CodeModule", p));
+
+    let legs: [(&str, Option<&str>, &str); 4] = [
+        (
+            "kg_collection",
+            Some(kg_collection),
+            "Reads/writes will target a missing class until a kg-sync creates \
+             it, or fix the KG binding in the launcher's Identity tab.",
+        ),
+        (
+            "development_collection",
+            Some(development_collection),
+            "docs/ syncs will target a missing class until a sync creates it.",
+        ),
+        (
+            "shared_kg_collection",
+            Some(shared_kg_collection),
+            "The cross-project shared-KG fan-out (hybrid_search / \
+             semantic_graph_search) will match NOTHING against this name and \
+             still report success. Point the shared binding at the real class \
+             (launcher Identity tab, 'Manage shared KG collection'), or create \
+             the class with a kg-sync seed.",
+        ),
+        (
             "code_graph_collection_prefix",
-            &format!("{}_CodeModule", prefix),
+            cg_class.as_deref(),
             "Code-graph reads will return nothing (e.g. a pre-v0.2.89 rename \
              moved the binding off the populated classes). The launcher's \
              boot repair may restore it; otherwise rebuild the code graph or \
              fix the prefix in the Identity tab.",
-        );
+        ),
+    ];
+
+    let mut states = [ProbeState::NotConfigured; 4];
+    for (i, (field, class, hint)) in legs.iter().enumerate() {
+        let state = classify_probe(*class, &exists);
+        states[i] = state;
+        if state == ProbeState::Absent {
+            warnings.push(format!(
+                "{} {:?} does not exist on Weaviate (phantom name). {}",
+                field,
+                class.unwrap_or_default(),
+                hint
+            ));
+        }
     }
-    warnings
+
+    ConfigProbeReport {
+        warnings,
+        state: CollectionProbeState {
+            kg_collection: states[0].as_str(),
+            development_collection: states[1].as_str(),
+            shared_kg_collection: states[2].as_str(),
+            code_graph_collection_prefix: states[3].as_str(),
+        },
+    }
+}
+
+/// v0.2.92 W12 — last DB-backed leg of the shared-KG chain: the
+/// orchestrator-root project's PRIMARY KG binding, which is the source of
+/// truth for the shared-KG name on every machine that has run the launcher
+/// once (`ensure_orchestrator_root_kg_binding` seeds it at boot).
+///
+/// MUST MATCH the other two implementations of this leg:
+///   * `launcher/src-tauri/src/commands/project_env_settings.rs`
+///     (`resolve_shared_kg_from_orchestrator_root`, Priority 2)
+///   * `vco_lib/config_projection.py`
+///     (`_resolve_shared_kg_default_from_launcher_db`)
+/// The slug is a string literal here for the same reason
+/// `hub_global_active_embedding` inlines its app_state key: the hub crate
+/// deliberately does not depend on the launcher binary crate that owns the
+/// named constant.
+///
+/// Deliberately does NOT fall back to the bundled last-resort constant. A
+/// constant is a READ-TIME fallback owned by the clients that have one; the
+/// hub answering with a guessed class name is what promotes a guess to
+/// authority (see the W12 header in
+/// `commands/project_state_populate/shared_kg_binding.rs`). `None` here
+/// leaves the field empty, which is an honest "not configured".
+fn resolve_shared_kg_from_orchestrator_root(db: &vct_launcher_core::db::Db) -> Option<String> {
+    let root = db.get_project_by_slug("orchestrator-root").ok().flatten()?;
+    db.list_project_kg_bindings(&root.id)
+        .ok()?
+        .into_iter()
+        .find(|b| b.role == "primary")
+        .map(|b| b.collection_name)
+        .filter(|s| !s.is_empty())
 }
 
 /// JOIN over `codegraph_access` (grantee filter) + `projects`
@@ -1478,8 +1705,14 @@ fn list_diagram_grantor_names_for_grantee(
 ///   ``"123abc"``         → ``"vct"``        (leading digit invalid → fallback)
 ///   ``"!!!"``            → ``"vct"``        (all-symbol → empty → fallback)
 ///
-/// **Cross-language parity** is verified by
-/// ``launcher/src-tauri/tests/diagrams_class_name_parity.rs`` (Rust)
+/// **Cross-language parity** is verified by the
+/// ``diagrams_class_name_parity_with_python_fixture`` test below (in this
+/// same file's ``#[cfg(test)] mod tests`` — NOT a separate
+/// ``launcher/src-tauri/tests/*.rs`` integration-test file; that path was
+/// named here as a plan but never created, and one was never needed:
+/// ``sanitize_diagrams_class_prefix`` is a private helper with exactly one
+/// internal call site (see above), so an in-module `#[test]` reaches it
+/// without requiring `pub` visibility an external `tests/` file would need)
 /// and ``tests/test_diagrams_class_name_parity.py`` (Python), both
 /// consuming the shared JSON fixture at
 /// ``tests/fixtures/diagrams_class_name_parity.json``.
@@ -1609,6 +1842,27 @@ mod tests {
     use axum::Router;
     use std::sync::Arc;
     use vct_launcher_core::db::Db;
+
+    /// Adapter keeping the v0.2.89 warning-matrix assertions verbatim after
+    /// W12 folded warnings + probe state into one pass. It CALLS the real
+    /// `probe_collections` — it is not a second implementation, so those tests
+    /// still pin production behaviour rather than a test-only copy of it.
+    fn phantom_warnings(
+        kg_collection: &str,
+        development_collection: &str,
+        shared_kg_collection: &str,
+        cg_prefix: Option<&str>,
+        exists: impl Fn(&str) -> Option<bool>,
+    ) -> Vec<String> {
+        probe_collections(
+            kg_collection,
+            development_collection,
+            shared_kg_collection,
+            cg_prefix,
+            exists,
+        )
+        .warnings
+    }
 
     /// Seed a minimal project row. Mirrors the helper in
     /// modules_api.rs::tests so the test fixtures stay symmetric
@@ -2392,14 +2646,11 @@ mod tests {
         // is absent, the resolver returns the calibrated defaults from
         // knowledge/concepts/score-driven-retrieval-tiers.md.
         //
-        // VCT_STATE_DIR is process-wide; the parent test harness in
-        // vct-launcher-core::paths::tests already serialises mutation,
-        // but here we set it to a fresh tempdir (with no .toml in it)
-        // BEFORE spawning the hub so the global resolver path lands
-        // in a guaranteed-empty directory.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev_state = std::env::var_os("VCT_STATE_DIR");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        // VCT_STATE_DIR is process-wide. `state_dir_guard()` takes the
+        // workspace-wide GLOBAL_ENV_MUTEX, points the var at a fresh
+        // (guaranteed-empty) tempdir BEFORE the hub is spawned, and
+        // restores the PRIOR value when the guard drops.
+        let _tmp = vct_launcher_core::test_env::state_dir_guard();
 
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-tuning-default", "myproject");
@@ -2435,11 +2686,6 @@ mod tests {
         assert!(
             (rt.get("kg_tier_full").and_then(|v| v.as_f64()).unwrap() - 0.75).abs() < 1e-9
         );
-
-        match prev_state {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     #[tokio::test]
@@ -2447,9 +2693,7 @@ mod tests {
         // v0.2.22 Item #13. When <vct_root_dir>/retrieval-tuning.toml
         // exists with valid values, the resolver returns those values
         // verbatim (no defaulting / no clamping).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev_state = std::env::var_os("VCT_STATE_DIR");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = vct_launcher_core::test_env::state_dir_guard();
         std::fs::write(
             tmp.path().join("retrieval-tuning.toml"),
             "\
@@ -2487,11 +2731,6 @@ kg_tier_full = 0.8
         assert!(
             (rt.get("kg_tier_full").and_then(|v| v.as_f64()).unwrap() - 0.8).abs() < 1e-9
         );
-
-        match prev_state {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     #[tokio::test]
@@ -2499,9 +2738,7 @@ kg_tier_full = 0.8
         // Single-field filter on the new nested object must return the
         // whole RetrievalTuning struct (the resolver's ?key= filter
         // operates on top-level fields and returns nested objects as-is).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev_state = std::env::var_os("VCT_STATE_DIR");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = vct_launcher_core::test_env::state_dir_guard();
 
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-key-tuning", "myproject");
@@ -2520,11 +2757,6 @@ kg_tier_full = 0.8
         assert!(
             (nested.get("kg_tier_min").and_then(|v| v.as_f64()).unwrap() - 0.42).abs() < 1e-9
         );
-
-        match prev_state {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     #[tokio::test]
@@ -2747,8 +2979,8 @@ kg_tier_full = 0.8
         // Replaces the pre-cr-b2 underscore-replace algorithm that
         // diverged from the indexer's writer-side naming for any
         // non-alphanumeric input. Cross-language parity for the wider
-        // input set is pinned by `diagrams_class_name_parity.rs`
-        // (integration test) against the shared JSON fixture.
+        // input set is pinned by `diagrams_class_name_parity_with_python_fixture`
+        // (below, in this same `mod tests`) against the shared JSON fixture.
 
         // All-alphanumeric inputs (round-trip unchanged — these passed
         // pre-cr-b2 too, but are pinned here as smoke).
@@ -3004,6 +3236,269 @@ kg_tier_full = 0.8
     /// hub ignored the override entirely, so a SharedKgPicker pick made
     /// the hub disagree with the Rust `populate()` (which honored it) and
     /// with the Python projection (fixed in the same change).
+    // ── v0.2.92 W12 Task 2: `probe_state` — "I could not check" ─────────
+    //
+    // `warnings` can only say "this is broken". The four tests below pin the
+    // distinction it could NOT express: healthy vs unverifiable.
+
+    /// THE decisive assertion. Same four configured names, two probe
+    /// outcomes: everything present, and nothing checkable. Both produce ZERO
+    /// warnings — that is correct and unavoidable (probe failure must never be
+    /// reported as absence) and is exactly why a client needed a second
+    /// channel. `probe_state` must make the two payloads differ.
+    #[test]
+    fn probe_state_distinguishes_healthy_from_unverifiable() {
+        let all_present = probe_collections(
+            "P_KnowledgeGraph",
+            "P_Development",
+            "Shared_KnowledgeGraph",
+            Some("P"),
+            |_| Some(true),
+        );
+        let cannot_check = probe_collections(
+            "P_KnowledgeGraph",
+            "P_Development",
+            "Shared_KnowledgeGraph",
+            Some("P"),
+            |_| None,
+        );
+
+        assert!(all_present.warnings.is_empty());
+        assert!(
+            cannot_check.warnings.is_empty(),
+            "probe failure must never warn — probe failure is not evidence of \
+             absence"
+        );
+        assert_ne!(
+            all_present.state, cannot_check.state,
+            "with warnings identical (both empty), probe_state is the ONLY \
+             thing that can tell a client 'all four exist' from 'I could not \
+             check any of them'. If these ever compare equal the silent \
+             degradation is back."
+        );
+        assert_eq!(all_present.state.kg_collection, "present");
+        assert_eq!(all_present.state.development_collection, "present");
+        assert_eq!(all_present.state.shared_kg_collection, "present");
+        assert_eq!(all_present.state.code_graph_collection_prefix, "present");
+        assert_eq!(cannot_check.state.kg_collection, "unchecked");
+        assert_eq!(cannot_check.state.development_collection, "unchecked");
+        assert_eq!(cannot_check.state.shared_kg_collection, "unchecked");
+        assert_eq!(cannot_check.state.code_graph_collection_prefix, "unchecked");
+    }
+
+    /// A leg with nothing configured is `not_configured`, never `absent` —
+    /// there is no class to be missing. Includes the code-graph leg's own
+    /// version of "unconfigured": NO binding row, where the served prefix is a
+    /// name-derived fallback whose classes are absent by design.
+    #[test]
+    fn probe_state_marks_unconfigured_legs() {
+        // A probe that would answer "absent" for anything it is asked about —
+        // so a leg reported `not_configured` PROVES it was never asked.
+        let r = probe_collections("", "", "", None, |_| Some(false));
+        assert_eq!(r.state.kg_collection, "not_configured");
+        assert_eq!(r.state.development_collection, "not_configured");
+        assert_eq!(r.state.shared_kg_collection, "not_configured");
+        assert_eq!(
+            r.state.code_graph_collection_prefix, "not_configured",
+            "no codegraph BINDING row → the served prefix is a fallback; \
+             reporting it absent would fire for every fresh project"
+        );
+        assert!(
+            r.warnings.is_empty(),
+            "an unconfigured field is not a phantom: {:?}",
+            r.warnings
+        );
+    }
+
+    /// `warnings` and `probe_state` are built in ONE pass, so the invariant
+    /// "a leg warns IFF its state is absent" is structural. Pin it, because a
+    /// future editor adding a leg to one output and not the other is exactly
+    /// how the shared-KG leg went missing for a release in the first place.
+    #[test]
+    fn probe_state_absent_is_exactly_the_warning_set() {
+        // Only the shared KG is missing — the re-pointed-install phantom.
+        let r = probe_collections(
+            "P_KnowledgeGraph",
+            "P_Development",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            Some("P"),
+            |c| Some(c != "VibeCodedOrchestrator_KnowledgeGraph"),
+        );
+        assert_eq!(r.state.shared_kg_collection, "absent");
+        assert_eq!(r.state.kg_collection, "present");
+        assert_eq!(r.state.development_collection, "present");
+        assert_eq!(r.state.code_graph_collection_prefix, "present");
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].starts_with("shared_kg_collection "));
+
+        // And the inverse direction: every absent leg produces a warning.
+        let all_gone = probe_collections(
+            "P_KnowledgeGraph",
+            "P_Development",
+            "Shared_KnowledgeGraph",
+            Some("P"),
+            |_| Some(false),
+        );
+        assert_eq!(all_gone.warnings.len(), 4, "{:?}", all_gone.warnings);
+        for state in [
+            all_gone.state.kg_collection,
+            all_gone.state.development_collection,
+            all_gone.state.shared_kg_collection,
+            all_gone.state.code_graph_collection_prefix,
+        ] {
+            assert_eq!(state, "absent");
+        }
+    }
+
+    /// Wire-level: the field is ALWAYS serialized (unlike `warnings`, which is
+    /// skipped when empty) and is fetchable via `?key=`. A field that vanished
+    /// on a healthy install would reintroduce the ambiguity it exists to
+    /// remove.
+    #[tokio::test]
+    async fn config_response_always_carries_probe_state() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-probe", "probeproj");
+
+        let body: serde_json::Value =
+            reqwest::get(format!("{}/projects/p-probe/config", base))
+                .await
+                .expect("hub reachable")
+                .json()
+                .await
+                .expect("json body");
+
+        let st = body
+            .get("probe_state")
+            .and_then(|v| v.as_object())
+            .expect("probe_state present on every successful resolve");
+        for leg in [
+            "kg_collection",
+            "development_collection",
+            "shared_kg_collection",
+            "code_graph_collection_prefix",
+        ] {
+            let v = st.get(leg).and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                ["present", "absent", "unchecked", "not_configured"].contains(&v),
+                "probe_state.{} carried an unknown value {:?}",
+                leg,
+                v
+            );
+        }
+        // Deliberately NO assertion on WHICH state each leg carries. This
+        // test hub talks to whatever `WEAVIATE_URL` resolves to, so the
+        // outcome depends on the developer's machine — pinning "unchecked"
+        // here passed on a laptop with Weaviate down and failed the moment it
+        // was up, which is precisely the de-hermeticised gate this repo has
+        // been bitten by. The OUTCOMES are pinned hermetically against the
+        // pure `probe_collections` above; what only an end-to-end resolve can
+        // prove is that the field is wired into the payload at all.
+        //
+        // The one outcome assertion that IS hermetic is a RELATIONSHIP: any
+        // leg that warned must read `absent`, whatever the machine's Weaviate
+        // happens to be doing.
+        for w in body
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
+            let text = w.as_str().unwrap_or("");
+            let leg = text.split_whitespace().next().unwrap_or("");
+            assert_eq!(
+                st.get(leg).and_then(|v| v.as_str()),
+                Some("absent"),
+                "warning {:?} names leg {:?}, whose probe_state must be \
+                 'absent' — the two outputs come from one pass and may never \
+                 disagree",
+                text,
+                leg
+            );
+        }
+
+        // `?key=probe_state` returns the nested object.
+        let single: serde_json::Value =
+            reqwest::get(format!("{}/projects/p-probe/config?key=probe_state", base))
+                .await
+                .expect("hub reachable")
+                .json()
+                .await
+                .expect("json body");
+        assert!(single.get("probe_state").is_some(), "{:?}", single);
+    }
+
+    /// v0.2.92 W12 Task 3 — CROSS-CRATE parity for the shared-KG resolver.
+    ///
+    /// The launcher's two copies were collapsed into one
+    /// (`project_state_populate::shared_kg_binding::resolve_shared_kg_collection`).
+    /// This crate cannot call it: `vct-hub` depends on `vct-launcher-core`
+    /// only, never on the launcher binary crate — a real boundary, not
+    /// laziness. So the third implementation stays, pinned BEHAVIOURALLY: the
+    /// truth table below is asserted verbatim on both sides, against the same
+    /// `vct_launcher_core::db::Db`. Its twin is
+    /// `shared_kg_binding::tests::shared_resolution_truth_table`. Change one,
+    /// the other goes red.
+    #[test]
+    fn shared_resolution_truth_table_matches_launcher() {
+        // Row 1: nothing recorded → None (never a guessed constant; the hub
+        // serves "" and the phantom leg treats that as not_configured).
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(resolve_shared_kg_from_orchestrator_root(&db), None);
+
+        // Row 2: an orchestrator-root row with NO primary binding → still None.
+        seed_project(
+            &db,
+            "root-id",
+            "VibeCoded Orchestrator",
+            "/tmp/vct-parity-root",
+            "orchestrator-root",
+        );
+        assert_eq!(resolve_shared_kg_from_orchestrator_root(&db), None);
+
+        // Row 3: the orchestrator-root PRIMARY binding is the answer.
+        db.set_project_kg_binding(
+            "root-id",
+            "primary",
+            "VCODev_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_shared_kg_from_orchestrator_root(&db).as_deref(),
+            Some("VCODev_KnowledgeGraph"),
+        );
+
+        // Row 4: an EMPTY collection_name is not an answer. Written through
+        // raw SQL because the row writer will not produce one — the filter is
+        // a guard against a hand-edited DB, and a guard nobody tests is a
+        // guard that gets "simplified" away.
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "UPDATE project_kg_bindings SET collection_name = '' \
+                     WHERE project_id = 'root-id' AND role = 'primary'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(resolve_shared_kg_from_orchestrator_root(&db), None);
+
+        // NOTE the asymmetry with the launcher twin: this leg-2 helper does
+        // NOT read `app_state[shared_kg.collection_name]` (leg 1) — the hub
+        // applies that override at its own call site, before falling through
+        // here, while the launcher's SSOT bundles both legs. The two agree on
+        // everything leg 2 owns, which is what this table covers; leg 1's
+        // priority is pinned separately on each side
+        // (`config_shared_kg_honors_app_state_override` here,
+        // `resolution_prefers_app_state_override_then_orchestrator_root`
+        // there).
+    }
+
     #[tokio::test]
     async fn config_shared_kg_honors_app_state_override() {
         let (base, h) = spawn_config_api_hub().await;
@@ -4193,38 +4688,243 @@ kg_tier_full = 0.8
     /// when a binding row exists (`cg_prefix = Some(..)`).
     #[test]
     fn phantom_warnings_matrix() {
-        // ACT: probe succeeded, every class absent → all three legs warn.
-        let w = phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", Some("Pfx"), |_| {
-            Some(false)
-        });
-        assert_eq!(w.len(), 3, "all three phantom legs must warn: {:?}", w);
+        // ACT: probe succeeded, every class absent → all four legs warn
+        // (v0.2.92 W12 added the shared-KG leg to the pre-existing three).
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            Some("Pfx"),
+            |_| Some(false),
+        );
+        assert_eq!(w.len(), 4, "all four phantom legs must warn: {:?}", w);
         assert!(w[0].contains("Kg_KnowledgeGraph"));
         assert!(w[1].contains("Kg_Development"));
-        assert!(w[2].contains("Pfx_CodeModule"));
+        assert!(w[2].contains("Shared_KnowledgeGraph"));
+        assert!(w[3].contains("Pfx_CodeModule"));
 
         // LEAVE-ALONE: classes exist → silent.
-        let w = phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", Some("Pfx"), |_| {
-            Some(true)
-        });
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            Some("Pfx"),
+            |_| Some(true),
+        );
         assert!(w.is_empty(), "existing classes must not warn: {:?}", w);
 
         // LEAVE-ALONE (the load-bearing leg): probe failed → NEVER warn.
         // Pre-v0.2.89 the negative-cache made "Weaviate down" look identical
         // to "class absent"; the `None` contract is what fixes that.
-        let w =
-            phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", Some("Pfx"), |_| None);
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            Some("Pfx"),
+            |_| None,
+        );
         assert!(w.is_empty(), "probe failure must never warn: {:?}", w);
 
         // LEAVE-ALONE: no codegraph binding row → the CodeModule leg is
         // skipped even when the class is absent (fresh never-analyzed
         // projects are not phantoms).
-        let w = phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", None, |class| {
-            // KG + dev exist; everything else absent.
-            Some(class == "Kg_KnowledgeGraph" || class == "Kg_Development")
-        });
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            None,
+            |class| {
+                // KG + dev + shared exist; everything else absent.
+                Some(
+                    class == "Kg_KnowledgeGraph"
+                        || class == "Kg_Development"
+                        || class == "Shared_KnowledgeGraph",
+                )
+            },
+        );
         assert!(
             w.is_empty(),
             "no binding row ⇒ no codegraph phantom warning: {:?}",
+            w
+        );
+    }
+
+    /// v0.2.92 W12 — a project with NO `role='shared'` binding row resolves
+    /// the shared-KG name from the orchestrator-root project's PRIMARY
+    /// binding instead of serving an empty string.
+    ///
+    /// Rowless projects are the normal outcome of two shipped paths: the hub
+    /// registration route writes no binding rows at all, and the launcher's
+    /// populate now deliberately writes no shared row when it cannot resolve
+    /// the name (rather than persisting a guess). Before this leg the hub
+    /// answered "" for both while the Python resolver answered correctly.
+    #[tokio::test]
+    async fn config_shared_kg_resolves_from_orchestrator_root_when_no_row() {
+        let (base, h) = spawn_config_api_hub().await;
+
+        // The orchestrator-root project + its primary binding: the machine's
+        // source of truth for the shared-KG name.
+        seed_project(
+            &h.0,
+            "p-root",
+            "VibeCoded Orchestrator",
+            "/tmp/test-config-project-p-root",
+            "orchestrator-root",
+        );
+        h.0.set_project_kg_binding(
+            "p-root",
+            "primary",
+            "RootOwned_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        // A project with a primary binding but NO shared row.
+        let id = "p-no-shared-row";
+        seed_project(
+            &h.0,
+            id,
+            "No Shared Row",
+            "/tmp/test-config-project-p-no-shared-row",
+            "no-shared-row",
+        );
+        h.0.set_project_kg_binding(
+            id,
+            "primary",
+            "NoSharedRow_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some("RootOwned_KnowledgeGraph"),
+            "a missing shared row must resolve from the orchestrator-root \
+             primary binding, not degrade to an empty name; body={}",
+            body
+        );
+    }
+
+    /// LEAVE-ALONE half of the leg above: with no orchestrator-root project
+    /// registered there is nothing to resolve, and the hub must answer with
+    /// an honest empty name rather than the bundled last-resort constant.
+    /// Serving a constant here is precisely how a guess becomes authority.
+    #[tokio::test]
+    async fn config_shared_kg_stays_empty_when_nothing_resolves() {
+        let (base, h) = spawn_config_api_hub().await;
+        let id = "p-unresolvable-shared";
+        seed_project(
+            &h.0,
+            id,
+            "Unresolvable Shared",
+            "/tmp/test-config-project-p-unresolvable-shared",
+            "unresolvable-shared",
+        );
+        h.0.set_project_kg_binding(
+            id,
+            "primary",
+            "UnresolvableShared_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some(""),
+            "no override, no row, no orchestrator-root ⇒ empty (never a \
+             guessed constant); body={}",
+            body
+        );
+    }
+
+    /// v0.2.92 W12 (Fix 2) — the shared-KG leg, decision by decision.
+    ///
+    /// The three cases are the whole contract: a configured-and-present
+    /// class is silent, a configured-and-ABSENT class fails loudly, and a
+    /// class the probe could not check is NEVER reported as absent.
+    #[test]
+    fn phantom_warnings_shared_kg_leg() {
+        // ACT: shared class positively ABSENT (everything else present) →
+        // exactly one warning, naming the shared field and the class.
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            Some("Pfx"),
+            |class| Some(class != "Shared_KnowledgeGraph"),
+        );
+        assert_eq!(w.len(), 1, "only the shared leg may warn here: {:?}", w);
+        assert!(w[0].contains("shared_kg_collection"), "{}", w[0]);
+        assert!(w[0].contains("Shared_KnowledgeGraph"), "{}", w[0]);
+
+        // LEAVE-ALONE: shared class present → silent.
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            Some("Pfx"),
+            |_| Some(true),
+        );
+        assert!(w.is_empty(), "present shared class must not warn: {:?}", w);
+
+        // LEAVE-ALONE (load-bearing): the probe could not answer for the
+        // shared class. "Could not determine" must NOT be rendered as
+        // "absent" — otherwise a Weaviate restart invents phantoms.
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "Shared_KnowledgeGraph",
+            Some("Pfx"),
+            |class| {
+                if class == "Shared_KnowledgeGraph" {
+                    None // probe failed / cache cold for this class
+                } else {
+                    Some(true)
+                }
+            },
+        );
+        assert!(
+            !w.iter().any(|s| s.contains("Shared_KnowledgeGraph")),
+            "an unanswerable probe must never claim the class is absent: {:?}",
+            w
+        );
+        assert!(w.is_empty(), "no other leg may warn either: {:?}", w);
+
+        // LEAVE-ALONE: nothing configured (empty name) is not a phantom.
+        // `class_exists` answers None for "", which is what keeps it silent;
+        // pin the end-to-end behaviour rather than that internal detail.
+        let w = phantom_warnings(
+            "Kg_KnowledgeGraph",
+            "Kg_Development",
+            "",
+            Some("Pfx"),
+            |class| Some(!class.is_empty()),
+        );
+        assert!(
+            !w.iter().any(|s| s.contains("shared_kg_collection")),
+            "an unconfigured (empty) shared name must not warn: {:?}",
             w
         );
     }
@@ -4279,6 +4979,20 @@ kg_tier_full = 0.8
             &empty_json_obj(),
         )
         .unwrap();
+        // v0.2.92 W12 — a shared binding row naming a class the fake schema
+        // does not serve. This is the three-day-outage shape: the row exists,
+        // every resolver honours it, and nothing on the machine has the class.
+        h.0.set_project_kg_binding(
+            phantom_id,
+            "shared",
+            "PhantomShared_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
         h.0.set_project_codegraph_binding(
             phantom_id,
             "HouseOfFlirt",
@@ -4309,10 +5023,22 @@ kg_tier_full = 0.8
         assert!(joined.contains("Phantom_KnowledgeGraph"), "{}", joined);
         assert!(joined.contains("Phantom_Development"), "{}", joined);
         assert!(joined.contains("HouseOfFlirt_CodeModule"), "{}", joined);
+        // v0.2.92 W12 — the leg that was missing. Without it this exact
+        // response shipped with no mention of the dead shared pointer.
+        assert!(
+            joined.contains("PhantomShared_KnowledgeGraph"),
+            "an absent shared-KG class must be reported: {}",
+            joined
+        );
         // Served VALUES are unchanged — degrade-with-warning, never mutate.
         assert_eq!(
             body.get("kg_collection").and_then(|v| v.as_str()),
             Some("Phantom_KnowledgeGraph")
+        );
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some("PhantomShared_KnowledgeGraph"),
+            "warning about the shared name must not change it"
         );
 
         // Leg 2: healthy binding → every class exists → field ABSENT
@@ -4323,6 +5049,19 @@ kg_tier_full = 0.8
         h.0.set_project_kg_binding(
             healthy_id,
             "primary",
+            "Existing_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+        // A shared row that DOES name a live class must stay silent — the
+        // leave-alone half of the shared leg, end to end.
+        h.0.set_project_kg_binding(
+            healthy_id,
+            "shared",
             "Existing_KnowledgeGraph",
             Some("qwen3-embedding:0.6b"),
             Some(1024),

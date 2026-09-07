@@ -4,6 +4,13 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { projects as projectsStore } from '$lib/stores/projects';
+  import { secrets as secretsStore } from '$lib/stores/secrets';
+  import {
+    badgeForRef,
+    entryOf,
+    BADGE_LABEL,
+    BADGE_TITLE,
+  } from './secret-ref-status';
   import type { ProjectSecretRef } from '$lib/types/project-state';
 
   let { projectId }: { projectId: string } = $props();
@@ -36,12 +43,45 @@
   };
   let lastMigration = $state<MigrationResult | null>(null);
 
+  // ─── "Set?" column: a LIVE two-store probe, not a stored column ───────
+  //
+  // `ProjectSecretRef.is_set` is a snapshot the WRITER left behind — the
+  // hub's .env migration passes `Some(true)` at registration time
+  // (`vct-hub/src/secrets_api.rs`) and nothing ever revises it. Rendering
+  // it meant the column said "set" for a key the user had since deleted,
+  // and "missing" for one that resolves fine from the tier-2 file store.
+  //
+  // The derivation lives in `./secret-ref-status` because this repo's
+  // vitest runs headless with no svelte component runner, so logic inside
+  // a `.svelte` file cannot be tested. See that module's header for the
+  // full rationale and the invariants it must not fork.
+
+  /** Probe both stores for each listed ref via the shared `secrets` store
+   * (one `get_secret_status_v2` round-trip per key — the same command the
+   * sibling SecretsPanel uses, so the two surfaces cannot disagree). */
+  async function refreshStatuses(list: ProjectSecretRef[]) {
+    // Declare whose view this is BEFORE probing. A `keychain-shared` ref is
+    // owned by the `_user_shared_` sentinel, which names no reader, so
+    // without this the probe answers about the all-readers `*` row: neither
+    // this project's pause of a shared key nor its "Disable shared secrets"
+    // checkbox below could reach the column beside it.
+    secretsStore.setRequesterProject(projectId);
+    for (const r of list) {
+      const e = entryOf(r, projectId);
+      secretsStore.register(e);
+      await secretsStore.refresh(e);
+    }
+  }
+
   async function load() {
     loading = true;
     try {
       refs = await invoke<ProjectSecretRef[]>('list_project_secret_refs', { projectId });
       // Load the GAP-2 toggle state alongside the refs.
       sharedSecretsReadDisabled = await projectsStore.getSharedSecretsReadDisabled(projectId);
+      // Probe both stores per ref so the "Set?" column reports what is
+      // actually there rather than what the writer once recorded.
+      await refreshStatuses(refs);
     } catch (e) { toast.error(e); }
     finally { loading = false; }
   }
@@ -54,6 +94,14 @@
     sharedSecretsReadDisabled = next;
     try {
       sharedSecretsReadDisabled = await projectsStore.setSharedSecretsReadDisabled(projectId, next);
+      // This toggle is not cosmetic for the column beside it: the backend
+      // writes/removes `~/.vct-secrets/projects/<NAME>/.no-shared-fallback`,
+      // and that marker is exactly what decides whether a key satisfied
+      // only by `~/.vct-secrets/shared/` still resolves here. Without this
+      // re-probe every such row keeps its pre-toggle badge until the tab is
+      // reloaded — the user turns the gate on and is still told the shared
+      // value serves them (or off, and is still told it does not).
+      await refreshStatuses(refs);
     } catch (e) {
       sharedSecretsReadDisabled = !next;
       toast.error(e);
@@ -191,10 +239,17 @@
       <span>Disable shared secrets for this project</span>
     </label>
     <p class="ps-hint">
-      When on, this project does NOT resolve user-shared secrets (the
-      "Shared (this user)" bucket). Per-project and infrastructure secrets
-      (e.g. <code>github_pat</code>) are unaffected. Mirrors the shared-KG
-      read gate on the Identity tab.
+      When on, this project does NOT resolve shared secrets. The two stores
+      are gated with deliberately different reach, because only one of them
+      can tell the buckets apart: the <strong>keychain</strong> drops the
+      "Shared (this user)" bucket only — per-project and module-declared
+      secrets are untouched; the <strong>file store</strong>
+      (<code>~/.vct-secrets/</code>) skips its whole <code>shared/</code>
+      directory for this project, <code>github_pat</code> included, since
+      it is one flat namespace with no such distinction.
+      <code>git push</code> is unaffected either way
+      (<code>git-credential-vct</code> reads the file directly). Mirrors
+      the shared-KG read gate on the Identity tab.
     </p>
   </div>
 
@@ -209,6 +264,7 @@
       </thead>
       <tbody>
         {#each refs as r (r.secret_key)}
+          {@const badge = badgeForRef(r, projectId, $secretsStore.entries)}
           <tr>
             <td><code>{r.secret_key}</code></td>
             <td>
@@ -218,11 +274,10 @@
             </td>
             <td>{(r.required_for ?? []).join(', ') || '—'}</td>
             <td>
-              {#if r.is_set}
-                <span class="ps-status ps-status-set">set</span>
-              {:else}
-                <span class="ps-status ps-status-unset">missing</span>
-              {/if}
+              <span
+                class="ps-status ps-status-{badge}"
+                title={BADGE_TITLE[badge]}
+              >{BADGE_LABEL[badge]}</span>
             </td>
             <td>
               <button class="ps-btn-link-pos" onclick={() => deepLinkSet(r.secret_key)}>Set value</button>
@@ -248,9 +303,30 @@
   .ps-table code { font-family: ui-monospace, monospace; font-size: 11px; }
   .ps-table small { display: block; color: #666; font-size: 10px; }
   .ps-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(123,95,255,0.15); color: #c4b3ff; }
-  .ps-status { font-size: 10px; padding: 1px 6px; border-radius: 8px; }
+  .ps-status { font-size: 10px; padding: 1px 6px; border-radius: 8px; cursor: help; }
   .ps-status-set { background: rgba(0,191,166,0.2); color: #0fc; }
-  .ps-status-unset { background: rgba(255,99,99,0.15); color: #f99; }
+  /* Resolves, just not from the keychain — teal like `set`, because the
+     user's question is "will my tools find it?" and the answer is yes. */
+  .ps-status-file-store { background: rgba(0,191,166,0.14); color: #7fe6d8; }
+  /* The shared fall-through leg. Same teal family as the file-store badge
+     (both mean "this resolves"), one step dimmer so the two are
+     distinguishable at a glance — the difference matters: deleting a
+     SHARED copy breaks other projects too. */
+  .ps-status-shared-file-store { background: rgba(0,191,166,0.10); color: #6fd3c6; }
+  /* Paused: present in the keychain but withheld by the active flag. */
+  .ps-status-unset { background: rgba(255,196,99,0.15); color: #fc9; }
+  /* "We could not look" gets its own neutral treatment — never the red
+     that means "absent", which would invite a needless re-entry. */
+  .ps-status-unknown { background: rgba(255,255,255,0.08); color: #aaa; }
+  /* The shared tier is switched off for this project. Neutral, never the
+     red of "absent": the value is there and the checkbox above restores
+     it — nothing is missing and nothing needs re-entering. */
+  .ps-status-shared-opted-out { background: rgba(255,255,255,0.05); color: #9aa; border: 1px solid rgba(255,255,255,0.18); }
+  /* The ref names a file / env var neither store covers, and no copy was
+     found in the stores we DID check. Neutral for the same reason: this
+     is "not measured", not "not there". */
+  .ps-status-declared-elsewhere { background: rgba(255,255,255,0.05); color: #9aa; border: 1px dashed rgba(255,255,255,0.28); }
+  .ps-status-not-set { background: rgba(255,99,99,0.15); color: #f99; }
   .ps-btn-primary { background: rgb(0,191,166); border: none; color: #000; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600; }
   .ps-btn-secondary { background: rgba(123,95,255,0.18); border: 1px solid rgba(123,95,255,0.4); color: #c4b3ff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500; margin-right: 6px; }
   .ps-btn-secondary:hover:not(:disabled) { background: rgba(123,95,255,0.28); }

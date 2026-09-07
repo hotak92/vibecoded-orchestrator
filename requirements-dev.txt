@@ -12,3 +12,15 @@ playwright>=1.61.0
 
 # Type checking
 pyright>=1.1.409
+
+# Packaging-delivery proof (MIT / Apache 2.0)
+# `tests/test_model_router_packaging.py` BUILDS the real wheel from
+# `claude_mcp_servers/pyproject.toml` and INSTALLS it into a throwaway venv —
+# the only evidence that `model_router` reaches a third-party machine. Without
+# `build` on the runner both heavy classes SkipTest and CI reported "7 skipped",
+# i.e. the acceptance criterion had no test behind it (v0.2.92 MAJOR-11).
+# `hatchling` is the declared build backend of that pyproject; having it present
+# lets the test pass `--no-isolation`, which keeps the wheel build hermetic
+# (no PyPI fetch of the backend mid-test) as the module docstring promises.
+build>=1.2.2
+hatchling>=1.18

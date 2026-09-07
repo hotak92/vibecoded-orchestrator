@@ -35,6 +35,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "check-dist-freshness.py"
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "build-bundled-launcher.sh"
@@ -120,6 +122,7 @@ def _run_gate(repo: Path, *extra: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=60,
+        env=child_env(),
     )
 
 

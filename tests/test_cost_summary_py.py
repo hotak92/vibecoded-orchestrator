@@ -14,6 +14,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "templates" / "scripts" / "cost-summary.py"
 
@@ -29,7 +31,7 @@ def _write_costs(tmp_path: Path, records: list[dict]) -> Path:
 def _run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env=child_env(),
     )
 
 

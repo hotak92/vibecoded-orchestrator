@@ -335,11 +335,45 @@ pub async fn kg_check_duplicates(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Find the JSON document — the script may have prefixed lines from
-    // the venv-activation shim, so we scan for the first '{'.
+    // ─── Why this parse is TOLERANT while its siblings are STRICT ───────
+    //
+    // This scan-to-the-first-'{' is a COMPATIBILITY SHIM for already-installed
+    // projects, and it is the only stdout-JSON parse in the launcher that
+    // keeps one. It is documented here with evidence because the reason it
+    // used to give ("the script may have prefixed lines from the venv-
+    // activation shim") was never true and had never been tested.
+    //
+    // Measured 2026-09-05 against a live 763-node collection: the polluter is
+    // the shipped script ITSELF. `detect_duplicates.py::find_duplicates` ran
+    // BEFORE the `--json` branch and printed its banner, node count, per-10
+    // progress lines and its error branch to STDOUT, so every `--json` run
+    // emitted ~5 prose lines in front of the payload. The venv `activate` it
+    // sources prints nothing; the shim was a guess.
+    //
+    // That emitter is FIXED in `templates/scripts/detect_duplicates.py`
+    // (v0.2.92): those lines now go through `_progress`, which switches to
+    // stderr as soon as `--json` is parsed. Verified after the fix — stdout is
+    // exactly `{"threshold": …}` and strict-parses.
+    //
+    // The shim stays anyway because `build_script_command` resolves the
+    // PROJECT-LOCAL `.claude/scripts/kg-duplicates`, which invokes the
+    // PROJECT-LOCAL `detect_duplicates.py`. Every project installed before
+    // v0.2.92 still carries the polluting copy until it bundle-updates, and
+    // turning this strict today would break the duplicates modal for all of
+    // them. Once the minimum supported bundle carries the fix, delete the
+    // scan and parse `&stdout` whole, like `bundle_staleness::census_from_stdout`
+    // and the three `projects_v2` migrate-schema sites already do.
+    //
+    // Known residual risk of the shim, recorded rather than hidden: the old
+    // script's error branch prints `str(exc)` to this stream, so an exception
+    // whose text contains a '{' would make the scan slice into the ERROR TEXT.
+    // The diagnostics below therefore name the FIRST stdout line, which is
+    // what identifies the emitter, instead of only the sliced document.
     let json_start = stdout.find('{').ok_or_else(|| {
         format!(
-            "kg-duplicates --json produced no JSON document. stdout tail: {}",
+            "kg-duplicates --json produced no JSON document; first stdout \
+             line was `{}`. stdout tail: {}",
+            crate::commands::subprocess_contract::stdout_parse_diagnostic(&stdout),
             tail_1kb(&stdout)
         )
     })?;
@@ -353,8 +387,10 @@ pub async fn kg_check_duplicates(
     }
     let payload: Payload = serde_json::from_str(json_doc).map_err(|e| {
         format!(
-            "parse kg-duplicates JSON: {} (doc head: {})",
+            "parse kg-duplicates JSON: {} — first stdout line was `{}` \
+             (doc head: {})",
             e,
+            crate::commands::subprocess_contract::stdout_parse_diagnostic(&stdout),
             &json_doc.chars().take(200).collect::<String>()
         )
     })?;

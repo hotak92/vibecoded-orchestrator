@@ -101,7 +101,7 @@ class BundleAdoptionActTests(unittest.TestCase):
         self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
         # JSONL notice present.
         jsonl = self.proj / ".claude" / "logs" / "auto-resolutions.jsonl"
-        rows = [json.loads(l) for l in jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
+        rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
         self.assertTrue(any(r["action"] == "adopted_shipped_file" for r in rows))
 
     # ---- FAIL-WITHOUT-FIX PIN: manifest-LESS stale shipped file ----
@@ -157,7 +157,7 @@ class BundleAdoptionActTests(unittest.TestCase):
         self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
         # JSONL notice line present, naming the file + backup.
         jsonl = self.proj / ".claude" / "logs" / "auto-resolutions.jsonl"
-        rows = [json.loads(l) for l in jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
+        rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
         self.assertTrue(
             any(r["action"] == "adopted_shipped_file" and f"foo.{self.ext}" in r["detail"]
                 for r in rows),

@@ -314,6 +314,116 @@ export function moduleActionForKind(
 }
 
 /**
+ * v0.2.92: project-scoped override for a module card/rail's action.
+ * Shared by the Home Library grid (`routes/+page.svelte`) and the
+ * right-rail "Quick Actions" panel (`RightSidebar.svelte`) — both render
+ * an action button straight off the catalog `kind` and both hit the same
+ * bug, so the fix lives here once rather than being duplicated per surface.
+ *
+ * Why this exists (field report, 2026-08-31): the catalog `kind` that
+ * drives `moduleActionForKind` is computed by `lookup_install_state`
+ * (Rust, commands/modules.rs) by walking `module_installs` across ALL
+ * projects on the host, not just the currently selected one — it answers
+ * "is this module installed somewhere", which is the right question for
+ * the catalog's own badge. But `update_module_for_project` (the Tauri
+ * command the 'Update' button calls) requires a row that matches the
+ * SELECTED project's id exactly (`get_module_install(project_id,
+ * module_id)` — strict per-project lookup, no global-scope fallback).
+ * So a project that has never installed the module gets `kind:
+ * 'update_available'` (because some OTHER project has an older version
+ * installed) and a live "Update" button that always fails with:
+ * "module <id> not installed for project <uuid>; use
+ * install_module_for_project instead".
+ *
+ * Fix: cross-check against `hasInstallRowForProject` — whether
+ * `$modules.installed` (sourced from `list_installed_modules(project_id)`,
+ * the exact same per-project query the backend consults for `update`)
+ * already has a row for this module. When the catalog says "update" but
+ * this project has NO row, the one Tauri command guaranteed to succeed
+ * from this state is `install_module_for_project` (UPSERT-safe — it
+ * creates a fresh row for this project regardless of any other project's
+ * install state), so we offer "Install" instead and flag the mismatch via
+ * `kindOverride` so the caller's own badge/label vocabulary (Home says
+ * "Available", the right-rail Status row says "Not installed" — see
+ * `RightSidebar.svelte`'s `statusLabel`) renders the honest string instead
+ * of "Update available" next to an Install button.
+ *
+ * `kindOverride` deliberately carries the neutral catalog-kind value
+ * ('available'), not literal display text — each surface already owns its
+ * own kind → text mapping (`badgeFor` in +page.svelte, `statusLabel` in
+ * RightSidebar.svelte) and should keep using it for every kind, this one
+ * included, rather than this helper duplicating either surface's copy.
+ *
+ * The 'broken' / 'error' kinds are NOT touched here: their action
+ * (`install_module_for_project`, labelled Reinstall / Retry install) is
+ * already UPSERT-safe and does not require a pre-existing per-project
+ * row, so it always succeeds regardless of which project's row produced
+ * that kind.
+ *
+ * v0.2.92 follow-up (coordinator review, same date): `hasInstallRowForProject`
+ * is TRI-STATE — `boolean | null`, not `boolean`. `null` means "we don't
+ * know yet" (the store hasn't finished loading THIS project's install
+ * rows, or the load failed — see `installedProjectId` /
+ * `installedLoadError` in `stores/modules.ts`). The original boolean
+ * signature conflated that with `false` ("loaded, and genuinely no row"),
+ * which meant a module that IS installed for this project could
+ * momentarily render "Available" + an Install button purely because the
+ * fetch hadn't resolved yet — CLAUDE.md's "Conservative defaults on
+ * best-effort paths" rule ("when an operation can't positively confirm
+ * its precondition, do nothing rather than guess") is exactly the rule
+ * that boolean shape violated. On `null` we do NOT override the kind and
+ * do NOT guess an action — we return the catalog's own (un-overridden)
+ * action with `pending: true`, so the caller renders the SAME
+ * Update/Retry/Reinstall button it always would, just disabled until the
+ * per-project state resolves, rather than silently guessing either
+ * "Install" or "Update".
+ */
+export interface ProjectScopedActionState {
+  /** Neutral catalog-kind override for badge/label rendering, or `null`
+   *  to keep whatever kind the caller already has. The only value ever
+   *  returned today is `'available'` (see docstring above). */
+  kindOverride: 'available' | null;
+  /** Action button to render (label + store method), or `null` for none. */
+  action: ModuleCatalogAction | null;
+  /**
+   * v0.2.92: true when `hasInstallRowForProject` was `null` (unknown) AND
+   * the catalog kind is one this helper would otherwise override
+   * (`update_available`) — i.e. `action` is the catalog's un-overridden
+   * value and the caller should render it DISABLED (with a "checking…"
+   * affordance) rather than clickable, because we cannot yet tell
+   * whether Update or Install is the correct operation. Always `false`
+   * when `action` is null, and always `false` for kinds this helper
+   * doesn't gate on per-project state (broken/error/etc. — their action
+   * is UPSERT-safe regardless of what we know).
+   */
+  pending: boolean;
+}
+
+export function resolveProjectScopedAction(
+  kind: string | null | undefined,
+  hasInstallRowForProject: boolean | null,
+): ProjectScopedActionState {
+  const baseAction = moduleActionForKind(kind);
+  if (kind === 'update_available') {
+    if (hasInstallRowForProject === null) {
+      // Unknown — leave the catalog kind alone and return the
+      // UN-overridden action, but flag it `pending` so the caller
+      // disables it instead of guessing which of Update/Install is
+      // correct (see docstring above).
+      return { kindOverride: null, action: baseAction, pending: true };
+    }
+    if (hasInstallRowForProject === false) {
+      return {
+        kindOverride: 'available',
+        action: { label: 'Install', method: 'install' },
+        pending: false,
+      };
+    }
+  }
+  return { kindOverride: null, action: baseAction, pending: false };
+}
+
+/**
  * Detect whether a just-attempted install/update actually failed.
  *
  * Why this exists (2026-06-06, found via live test): the backend

@@ -72,6 +72,8 @@ def _run(root: Path, prompt: str, agent_id: str) -> subprocess.CompletedProcess:
     env["CLAUDE_PROJECT_DIR"] = str(root)
     env["VCT_INSTALL_ROOT"] = str(root)
     env.pop("VCT_DISABLE_HOOKS", None)
+    # §3.16: deliberately unpinned — the hook must resolve the sandbox's FAKE
+    # .venv itself, and its child runs the test's own stub producer, not repo code.
     return subprocess.run(
         ["bash", str(HOOK)],
         input=json.dumps(payload),

@@ -42,9 +42,15 @@ use tauri::{AppHandle, Runtime};
 
 /// Stop all VCT services (Weaviate, Ollama, etc.) — best-effort.
 ///
-/// TODO: wire — the doc says this is for "Quit and stop services"
-/// confirmation but no such dialog exists yet. When a quit-confirmation
-/// is added, it should call this before `app.exit(0)`. Failures are
+/// SUPERSEDED (corrected v0.2.92): the claim that "no such dialog exists
+/// yet" was FALSE — `quit_dialog.rs::stop_services` exists and is the live
+/// implementation on the quit path. This function is a second copy of that
+/// concern, not an unwired feature waiting for a caller.
+///
+/// It is left in place rather than deleted because removing shipped surface
+/// needs the user's explicit approval. Consolidating the two onto one home
+/// (this repo's "one concern, one home" rule) is a real change to the quit
+/// path and is recorded for the user as a decision, not taken silently. Failures are
 /// logged to stderr and the function returns `Ok(())` regardless: the
 /// user explicitly asked to quit and a flaky container runtime must not
 /// strand them in a half-quit state.

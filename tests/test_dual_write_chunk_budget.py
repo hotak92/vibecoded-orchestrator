@@ -27,7 +27,9 @@ Tests:
   4. ``configured_text_models`` reflects the write-all-slots + arctic-secondary env
      decision (the WRITE fan-out set — not the active chunk budget).
   5. The chunker-revision sentinel advanced to v0.2.88 (active boundaries changed
-     for the dual-write installs that ran v0.2.87 → its own documented contract).
+     for the dual-write installs that ran v0.2.87 → its own documented contract),
+     and again to v0.2.92 (D16/R29: tiers clamp to the embedding model's own
+     window — see TestChunkerRevisionBumped).
 The tagged-degradation path itself (bounded sub-window + last_secondary_truncated)
 is red-proofed in tests/test_embedding_service.py.
 """
@@ -41,12 +43,14 @@ import uuid as _uuid
 from pathlib import Path
 
 from claude_mcp_servers.weaviate_mcp.chunking import (
+    CHUNK_TOKEN_POLICY_CEILING,
     CHUNKING_PRESETS,
     MODEL_TOKEN_LIMITS,
     Chunker,
     TokenCounter,
     chunking_preset_for_model,
     chunking_preset_for_models,
+    _BUDGET_SAFETY_MARGIN_RATIO,
     _CHUNKER_REVISION,
 )
 
@@ -76,12 +80,16 @@ class TestMinAcrossSlots:
         assert chunking_preset_for_models([_QWEN]) == \
             chunking_preset_for_model(_QWEN)
 
-    def test_empty_list_falls_back_to_large_context(self) -> None:
-        assert chunking_preset_for_models([]) == CHUNKING_PRESETS["large_context"]
+    def test_empty_list_under_fills_to_small_context(self) -> None:
+        # D16 (v0.2.92, R29): no model info means no window is KNOWN — under-fill
+        # to the tightest general tier (same shape as query_enrichment's
+        # _resolve_budget unknown branch) instead of guessing large-context.
+        assert chunking_preset_for_models([]) == CHUNKING_PRESETS["small_context"]
 
     def test_unknown_model_never_widens_budget(self) -> None:
-        # arctic (4 096) + an unknown model (defaulted to 8 192) still resolves to
-        # arctic's tighter medium tier.
+        # arctic (4 096) + an unknown model: D16 made unknown contribute NOTHING
+        # to the min (it used to be defaulted to 8 192), so the pair still
+        # resolves to arctic's tighter medium tier.
         assert chunking_preset_for_models([_ARCTIC, "totally-unknown-model:9b"]) == \
             CHUNKING_PRESETS["medium_context"]
 
@@ -112,9 +120,17 @@ class TestActiveSlotFidelityInvariant:
         # qwen3-active install that is qwen3's XLARGE tier — NOT arctic's medium
         # tier (which min-across-slots would give). This is the invariant the
         # store_knowledge_node write path now honours (Chunker.for_model(active)).
+        # D16 + R39 (v0.2.92): "unclamped" here means not clamped to the
+        # SECONDARY's window — the tier is still bounded by
+        # min(CHUNK_TOKEN_POLICY_CEILING 8 192, the ACTIVE model's OWN window
+        # budget int(10 240 * 0.9) = 9 216); the R39 policy binds for qwen3.
         active_chunker = Chunker.for_model(_QWEN)
+        capacity = int(MODEL_TOKEN_LIMITS[_QWEN] * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
+        budget = min(capacity, CHUNK_TOKEN_POLICY_CEILING)
         assert (active_chunker.min_tokens, active_chunker.max_tokens,
-                active_chunker.target_tokens) == CHUNKING_PRESETS["xlarge_context"]
+                active_chunker.target_tokens) == (4_600, 8_192, 8_192) == (
+            min(4_600, budget), min(13_500, budget), min(9_500, budget)
+        )
         # And it must NOT be arctic's medium tier (the pre-rework min-clamp value).
         assert (active_chunker.min_tokens, active_chunker.max_tokens,
                 active_chunker.target_tokens) != CHUNKING_PRESETS["medium_context"]
@@ -234,9 +250,12 @@ class TestConfiguredTextModels:
         # The min-across-slots UTILITY (retained, NOT the active write budget)
         # answers "smallest window that fits all slots" = arctic's medium tier.
         assert chunking_preset_for_models(models) == CHUNKING_PRESETS["medium_context"]
-        # The ACTIVE-slot chunk budget, by contrast, is qwen3's own xlarge tier
-        # (unclamped) — proving the write path does NOT use the min for the active.
-        assert chunking_preset_for_model(_QWEN) == CHUNKING_PRESETS["xlarge_context"]
+        # The ACTIVE-slot chunk budget, by contrast, is qwen3's own tier —
+        # not the min-across-slots medium. (D16 + R39, v0.2.92: "own tier"
+        # now means the xlarge SHAPE clamped to min(policy 8 192, qwen3's
+        # own 10 240-ctx budget 9 216) = 8 192; "unclamped by the SECONDARY"
+        # is the invariant this file guards.)
+        assert chunking_preset_for_model(_QWEN) == (4_600, 8_192, 8_192)
         assert chunking_preset_for_model(_QWEN) != chunking_preset_for_models(models)
 
     def test_embedding_model_env_override_sizes_active_slot(self, monkeypatch) -> None:
@@ -290,17 +309,28 @@ class TestConfiguredTextModels:
 
 class TestChunkerRevisionBumped:
     def test_revision_reflects_dual_budget_change(self) -> None:
-        # The sentinel's own contract: bump when boundaries change for anyone. The
-        # WP-O rework (v0.2.88) reverts the v0.2.87 min-across-slots clamp back to
-        # active-model sizing — active boundaries change for the dual-write installs
-        # that ran v0.2.87, so the revision advanced. (Single-model installs were
-        # byte-unchanged by both v0.2.87 and this rework.)
+        # The sentinel's own contract: bump when boundaries change for anyone.
+        # v0.2.88 (WP-O) reverted the v0.2.87 min-across-slots clamp back to
+        # active-model sizing. v0.2.92 (D16/R29) clamped every tier to the
+        # embedding model's OWN window — qwen3-active installs re-chunk content
+        # in the 9 216..13 500-unit range (smaller chunks, more of them), so
+        # the revision advanced again. Tiers that already fit are byte-unchanged.
         assert _CHUNKER_REVISION != "v0.2.47.5"
         assert _CHUNKER_REVISION != "v0.2.87", (
             "v0.2.87's min-clamp was reverted by WP-O; the revision must advance so "
             "dual-write installs re-sync back to active-model boundaries"
         )
-        assert _CHUNKER_REVISION == "v0.2.88"
+        assert _CHUNKER_REVISION != "v0.2.88", (
+            "v0.2.88's unbounded xlarge max (13 500 > qwen3's 10 240 num_ctx) "
+            "silently truncated max-packed chunks at embed time; the revision "
+            "must advance so installs re-sync to window-clamped boundaries"
+        )
+        assert _CHUNKER_REVISION != "v0.2.92", (
+            "v0.2.92's CodeSage entry still budgeted the 2 048 architectural "
+            "cap while the service serves 1 024 (W1) — the revision must "
+            "advance so codesage installs re-sync to window-true boundaries"
+        )
+        assert _CHUNKER_REVISION == "v0.2.92.1"
 
 
 # ===========================================================================
@@ -463,6 +493,16 @@ def _patch_server_for_write(monkeypatch, tmp_path, coll: _FakeCollection):
         return TokenCounter.count_tokens(content)
 
     monkeypatch.setattr(srv, "count_tokens_async", _count_tokens)
+
+    async def _tagged(_text):
+        # W3: the non-dual multi-chunk branch consults the tagged gather for
+        # the truncation record; the VECTOR stays on the patched
+        # ``get_embedding`` below (returning no slots forces that fallback),
+        # keeping this test hermetic — no real EmbeddingService/inline
+        # gather, no Ollama dependency.
+        return {}, []
+
+    monkeypatch.setattr(srv, "_get_all_kg_embeddings_tagged", _tagged)
 
     async def _embed(_text):
         return [0.1] * 8

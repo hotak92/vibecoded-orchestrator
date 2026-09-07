@@ -38,6 +38,24 @@ from typing import Dict, List, Set, Tuple
 import re
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
+# v0.2.92 (R4/R21) — INSTALL-TIME BAKED ROOT. `vco_lib/rewire.py` substitutes
+# the placeholder below when this file is installed into a project, so the
+# installed script can reach its orchestrator clone with NOTHING in the
+# environment. In the clone the placeholder stays literal,
+# `Path("{{ORCHESTRATOR_ROOT}}")/"vco_lib"` is not a directory, and this block
+# is inert — the validation IS the placeholder guard.
+# It is used ONLY when NEITHER env pin ($VCT_ORCHESTRATOR_ROOT,
+# $VCT_INSTALL_ROOT) names a real orchestrator root — a VALID pin always
+# wins, a provably stale one is healed — and the ladder in
+# `_resolve_mcp_servers_dir` below is unchanged.
+_VCO_BAKED_ORCHESTRATOR_ROOT = "{{ORCHESTRATOR_ROOT}}"
+_vco_env_pins = [os.environ.get(_k, "").strip()
+                 for _k in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT")]
+if (Path(_VCO_BAKED_ORCHESTRATOR_ROOT) / "vco_lib").is_dir() and not any(
+    _p and (Path(_p) / "vco_lib").is_dir() for _p in _vco_env_pins
+):
+    os.environ["VCT_ORCHESTRATOR_ROOT"] = _VCO_BAKED_ORCHESTRATOR_ROOT
+
 # Add paths.
 #
 # PR-2 portability (2026-05-06): claude_mcp_servers/ only lives in the
@@ -594,11 +612,11 @@ def main():
             # consistency check itself) — but --fix and --rebuild WILL
             # need to embed via sync_node, so they have to abort.
             print(f"❌ No embedding backend reachable: {e}", file=sys.stderr)
-            print(
-                "   See .claude/context/EMBEDDING_FAILURES.md + "
-                "~/.claude/metrics/embedding_failures.jsonl",
-                file=sys.stderr,
-            )
+            # The path is RESOLVED (v0.2.92): the literal that used to be here
+            # named ~/.claude/metrics, which W7 turned into a read-only archive.
+            from vco_lib.embedding_fidelity import failures_jsonl_display_path
+            print("   See .claude/context/EMBEDDING_FAILURES.md + "
+                  + failures_jsonl_display_path(), file=sys.stderr)
             sys.exit(1)
 
         # Initialize Weaviate client + bind to the embedding service

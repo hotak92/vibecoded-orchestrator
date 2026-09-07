@@ -56,7 +56,14 @@ def gen(monkeypatch, tmp_path):
     # recorded so tests can count/inspect them.
     calls: list[str] = []
     monkeypatch.setattr(mod, "select_backend", lambda: "cli")
-    monkeypatch.setattr(mod, "call_llm", lambda p: (calls.append(p), f"S{len(calls)}")[1])
+    # v0.2.92 WP-Q: the stub must return a REALISTIC summary. A 2-character
+    # placeholder is now (correctly) classified as a model non-answer, which
+    # would make every fixture entry look poisoned and regenerate forever.
+    monkeypatch.setattr(
+        mod, "call_llm",
+        lambda p: (calls.append(p),
+                   f"Summary {len(calls)}: resolves the value and returns it.")[1],
+    )
     mod._sb._BACKEND_CACHE["choice"] = "cli"
     mod._test_calls = calls
     return mod
@@ -152,9 +159,23 @@ def test_hash_drift_regenerates(gen, monkeypatch, tmp_path):
 
 
 def test_needs_generation_no_row_hash_never_churns(gen):
-    # Pre-v0.2.61 rows without content_hash: existing entry is kept as-is.
-    assert gen.needs_generation({"content_hash": "old"}, "", force=False) is False
+    # Pre-v0.2.61 rows without content_hash: a HEALTHY existing entry is kept
+    # as-is (staleness is undetectable without a hash, so never churn).
+    healthy = {"content_hash": "old",
+               "one_liner": "Resolves the collection prefix for a project.",
+               "summary": "Delegates to the endorsed sanitizer; None when unresolvable."}
+    assert gen.needs_generation(healthy, "", force=False) is False
     assert gen.needs_generation(None, "", force=False) is True
+
+
+def test_needs_generation_regenerates_a_poisoned_hashless_entry(gen):
+    """v0.2.92 WP-Q — "never churn without a hash" is about UNDETECTABLE
+    staleness. A stored non-answer is detectable without any hash, and it is
+    exactly the already-damaged row the hash gate would otherwise freeze."""
+    poisoned = {"content_hash": "old",
+                "one_liner": "Ready. What do you need summarized?",
+                "summary": ""}
+    assert gen.needs_generation(poisoned, "", force=False) is True
 
 
 # ─────────────────────────── cap + resume ────────────────────────────────────

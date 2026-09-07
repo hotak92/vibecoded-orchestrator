@@ -12,6 +12,11 @@ mod commands;
 mod hub_launcher;
 mod hub_status;
 mod installer_engine;
+// Shared read-modify-write primitives for USER-OWNED JSON files (advisory
+// lock + atomic rename + pre-write backup). Extracted from
+// `mcp_registration` when `commands::artifact_tool` became the second
+// call-site; both now go through one implementation.
+mod json_file;
 mod project_backfill;
 mod mcp_registration;
 mod quit_dialog;
@@ -82,6 +87,10 @@ pub use vct_launcher_core::paths;
 pub use vct_launcher_core::project_naming;
 pub use vct_launcher_core::registry;
 pub use vct_launcher_core::secrets;
+// v0.3.0: tier-2 file-store location/presence probes (see the module
+// header in vct-launcher-core). Re-exported so command modules reach the
+// ONE implementation instead of re-deriving `~/.vct-secrets` locally.
+pub use vct_launcher_core::secrets_file_store;
 pub use vct_launcher_core::state;
 pub use vct_launcher_core::types;
 
@@ -650,6 +659,23 @@ pub fn run() {
         tracing::warn!("[vct] warning: ensure_orchestrator_root failed: {}", e);
     }
 
+    // v0.2.92 WP-11: seed the chat-model context table from the ONE shipped
+    // seed file when it is empty, then export it to
+    // `<vct_root>/model-gateway/chat_model_context.json`.
+    //
+    // The export runs on EVERY boot, not only on the seeding boot: the model
+    // gateway reads that file (never launcher.db, never the hub — it must
+    // keep working when neither is running), so a table that only reached
+    // the file on the boot that created it would be a preference the daemon
+    // never sees. Seeding itself is once-per-table: the seeder gates on
+    // emptiness, so a row the user deleted is not silently reinstated.
+    //
+    // Runs here, beside the other DB-dependent startup steps, rather than in
+    // `setup()` — the handle is already in scope and the work is a ~3 KB file
+    // read plus tens of rows. Soft-fail end to end: every failure path inside
+    // logs a line the user can act on and none of them can block boot.
+    commands::chat_model_context::seed_and_export_on_boot(&db_handle);
+
     // v0.2.21 Step 19: launcher-startup project-row backfill. Sweep
     // every registered project and ensure the v0.2.21 resolver
     // endpoint's expected binding rows + module_settings exist.
@@ -728,6 +754,13 @@ pub fn run() {
         // out of sync with the launcher DB. See
         // commands::project_codegraph_extras::ExtrasLockRegistry.
         .manage(commands::project_codegraph_extras::ExtrasLockRegistry::default())
+        // v0.2.92 WP-12 — handles for model gateways THIS launcher started.
+        // Empty after a restart on purpose: `model_gateway_stop` will only
+        // signal a process whose identity it can prove, and a pid read back
+        // out of a file is not proof (a crashed daemon leaves the file, and
+        // the OS reuses pids). The GUI reports `supervised: false` and says
+        // how to stop it instead.
+        .manage(commands::model_gateway::GatewaySupervisor::default())
         .setup(|app| {
             // v0.2.54 Track D (Theme 5): pin the process boot instant.
             // `get_launcher_restart_status` compares UPDATE_DEFERRED.md's
@@ -2490,6 +2523,12 @@ pub fn run() {
             // toggle.
             quit_dialog::get_tray_window_prefs,
             quit_dialog::set_tray_window_pref,
+            // Machine-global Artifact-tool switch. Deliberately NOT an
+            // app_state key: the consumer is Claude Code itself, reading
+            // `~/.claude/settings.json`, so that file is the source of truth
+            // and the getter re-reads it rather than reporting a launcher row.
+            commands::artifact_tool::get_artifact_tool_state,
+            commands::artifact_tool::set_artifact_tool_enabled,
             // Container-services lifecycle (Podman/Docker compose).
             // App-launch suite (launch_app/kill_app/get_app_status/etc.) was
             // archived 2026-04-28: zero FE consumers (Svelte) and zero Hub
@@ -2552,6 +2591,7 @@ pub fn run() {
             commands::embedding_slot_counts::project_embedding_slot_counts,
             commands::projects_v2::perform_hard_cut,
             commands::projects_v2::rename_project_v2,
+            commands::projects_v2::rename_collections_v2,
             commands::projects_v2::set_shared_kg_write_disabled,
             commands::projects_v2::get_shared_kg_write_disabled_cmd,
             // v0.2.46 Decision B — symmetric READ gate. Mirrors
@@ -2572,6 +2612,16 @@ pub fn run() {
             // resolver's newly-warm DB cache propagates everywhere.
             commands::projects_v2::refresh_all_projects_env,
             commands::projects_v2::switch_project_host_v2,
+            // v0.2.92 WP-17 (W3) — change a registered project's folder.
+            // `preview_` is read-only and MUST be called first: the modal
+            // shows the conflict list before the user confirms, because the
+            // one thing a move cannot do is ask afterwards.
+            commands::projects_v2::preview_project_path_change,
+            commands::projects_v2::change_project_path_v2,
+            // Live (running/flipped) moves for the interrupted-move banner.
+            // `running` = interrupted before the flip, project untouched;
+            // `flipped` = moved, reconciliation owed. Two different sentences.
+            commands::projects_v2::list_live_project_moves_v2,
             commands::projects_v2::delete_project_v2,
             commands::projects_v2::launch_project_in_editor,
             // v0.2.49 Phase 6 S-4 — read-only accessor for the boot
@@ -2693,6 +2743,7 @@ pub fn run() {
             // Stream 2 follow-up (v0.2.20, 2026-05-19): orchestrator-core
             // config-tab actions. Backs the controls declared in the
             // repo-root `vct-module.json::gui.config_tab` block.
+            commands::bundle_staleness::bundle_staleness_census,
             commands::orchestrator_core::kg_rebuild_current_project,
             commands::orchestrator_core::kg_check_duplicates,
             commands::orchestrator_core::code_graph_reanalyze_current,
@@ -2826,6 +2877,31 @@ pub fn run() {
             commands::project_hooks_settings::register_project_hook,
             commands::project_hooks_settings::set_project_hook_enabled,
             commands::project_hooks_settings::unregister_project_hook,
+            // v0.2.92 WP-11 — the version-keyed chat-model context table
+            // (migration 043). Every mutation re-exports
+            // `<vct_root>/model-gateway/chat_model_context.json` and returns
+            // the export outcome with its own result, so an edit that did
+            // not reach the model gateway is visible in the pane instead of
+            // only in a log line.
+            commands::chat_model_context::chat_model_context_list,
+            commands::chat_model_context::chat_model_context_status,
+            commands::chat_model_context::chat_model_context_upsert,
+            commands::chat_model_context::chat_model_context_delete,
+            commands::chat_model_context::chat_model_context_reseed,
+            commands::chat_model_context::chat_model_context_export,
+            // v0.2.92 WP-12 — the model gateway's GUI surface. `..._status`
+            // is polled by the Services page; the two `vscode_*` actions
+            // shell to `python -m vco_lib.vscode_settings` rather than
+            // editing the user's settings.json from Rust.
+            commands::model_gateway::model_gateway_status,
+            commands::model_gateway::model_gateway_start,
+            commands::model_gateway::model_gateway_stop,
+            commands::model_gateway::model_gateway_set_boot,
+            commands::model_gateway::model_gateway_check,
+            commands::model_gateway::model_gateway_vscode_targets,
+            commands::model_gateway::model_gateway_vscode_inspect,
+            commands::model_gateway::model_gateway_point_panel,
+            commands::model_gateway::model_gateway_reset_native,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.
@@ -3343,6 +3419,14 @@ pub fn run() {
             commands::self_update::check_for_launcher_update,
             commands::self_update::apply_launcher_update,
             commands::self_update::force_resync_launcher,
+            // v0.2.92 WP-13: the ONLY path-less `git checkout <branch>` in
+            // the launcher. Before it existed there was no in-GUI way out of
+            // a detached HEAD at all — every other checkout in this codebase
+            // is path-scoped and cannot move HEAD — so a GUI-first user in
+            // that state had to reach for a terminal. Three guards
+            // (detached / clean tree / commit is an upstream ancestor); see
+            // the command's doc comment.
+            commands::self_update::reattach_orchestrator_branch,
             commands::self_update::get_user_owned_paths,
             commands::self_update::get_cached_update_status,
             commands::self_update::set_auto_check_enabled,
@@ -3951,25 +4035,17 @@ mod install_path_seed_tests {
 #[cfg(test)]
 mod orphan_reaper_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // VCT_STATE_DIR is process-wide; serialise tests that mutate it so
-    // parallel runs don't observe each other. Mirrors the pattern used
-    // by paths.rs's own tests + module_manifest_extract.rs.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn serialize_lock() -> std::sync::MutexGuard<'static, ()> {
-        SERIALIZE.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
+    // v0.2.92: the file-local SERIALIZE mutex is gone — both of its
+    // users redirect `VCT_STATE_DIR`, and `state_dir_guard()` holds the
+    // workspace-wide `GLOBAL_ENV_MUTEX` for the whole test body.
+    use vct_launcher_core::test_env::state_dir_guard;
 
     /// A lockfile whose holder PID is dead must be removed so the next
     /// install.py --update isn't blocked for 15s by a phantom holder.
     #[test]
     fn reap_stale_install_py_lock_removes_dead_pid_lockfile() {
-        let _g = serialize_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let prior = std::env::var("VCT_STATE_DIR").ok();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
 
         // Sentinel: a PID that's guaranteed not allocated. Using
         // `i32::MAX as u32` matches the pid_is_alive() defense-in-
@@ -3989,11 +4065,6 @@ mod orphan_reaper_tests {
             "dead-PID lockfile must be removed; still at {}",
             lock_path.display()
         );
-
-        match prior {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     /// A lockfile whose holder PID is alive must be preserved. This is
@@ -4003,10 +4074,7 @@ mod orphan_reaper_tests {
     /// serialise the launcher's own install attempts behind it.
     #[test]
     fn reap_stale_install_py_lock_leaves_live_pid_lockfile_alone() {
-        let _g = serialize_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let prior = std::env::var("VCT_STATE_DIR").ok();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
 
         // Use OUR pid as the "live holder" — pid_is_alive(self) is
         // unconditionally true on every supported OS (see
@@ -4031,11 +4099,6 @@ mod orphan_reaper_tests {
             "lockfile body must be untouched; got {:?}",
             after
         );
-
-        match prior {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 }
 

@@ -15,6 +15,19 @@
 //!   POST   /cli/projects              — create a project
 //!   PATCH  /cli/projects/{id|slug}    — rename a project
 //!   DELETE /cli/projects/{id|slug}    — delete a project
+//!   POST   /cli/projects/{id|slug}/move — project-move state machine
+//!                                       (action=begin|commit|finish|abort;
+//!                                       v0.2.92 WP-17 — `commit` is ONE
+//!                                       transaction: flip folder_path,
+//!                                       re-point the dependent path columns,
+//!                                       queue the code-graph rebuild)
+//!   GET    /cli/projects/moves        — live (running/flipped) moves
+//!   POST   /cli/projects/{id|slug}/rename-collections
+//!                                     — v0.2.92 WP-18: ONE transaction that
+//!                                       flips name + slug + the KG binding
+//!                                       rows + the code-graph prefix. Called
+//!                                       only AFTER the collections have been
+//!                                       copied and verified.
 //!   GET    /cli/audit                 — list audit events (filters via query)
 //!   GET    /cli/license               — current tier / license info
 //!   POST   /cli/license/activate      — activate a license key
@@ -53,6 +66,22 @@ pub fn router() -> Router<LauncherDbHandle> {
         // Projects
         .route("/cli/projects", post(create_project))
         .route("/cli/projects/{id_or_slug}", patch(rename_project).delete(delete_project))
+        // v0.2.92 WP-17: the project-move state machine (begin/commit/finish/
+        // abort). ONE route rather than four because the four are phases of
+        // one operation and must never be reachable out of order — the state
+        // machine in `project_moves` enforces the order, and a single
+        // endpoint keeps that enforcement in one place.
+        .route("/cli/projects/{id_or_slug}/move", post(project_move))
+        .route("/cli/projects/moves", get(list_project_moves))
+        // v0.2.92 WP-18: the collection-rename FLIP. ONE call, not a state
+        // machine, because the rename's claim and its resumable phases live
+        // in the project folder's sentinel — the only thing the database has
+        // to do is the all-or-nothing flip, and giving it four actions would
+        // imply a durability it does not own.
+        .route(
+            "/cli/projects/{id_or_slug}/rename-collections",
+            post(rename_collections),
+        )
         // Audit
         .route("/cli/audit", get(list_audit))
         // License
@@ -269,6 +298,168 @@ async fn delete_project(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         }
     })
+}
+
+// ─── Project move (v0.2.92 WP-17 / W3) ──────────────────────────────────
+
+/// One request against the move state machine.
+///
+/// FOUR actions rather than one "do the move" call, because the move's safety
+/// property IS the ordering and the ordering has to be observable from
+/// outside:
+///
+///   begin   — claim single-flight BEFORE the CLI copies anything, so a
+///             concurrent GUI move cannot start behind its back.
+///   commit  — ONE transaction: flip `folder_path`, re-point the dependent
+///             path columns, queue the code-graph rebuild. All or nothing.
+///   finish  — the CLI's post-commit reconciliation ran. Only after this is
+///             the move `completed`; a crash before it leaves `flipped`,
+///             which is what makes the owed work visible at next boot.
+///   abort   — release a claim that never flipped. Refused for a flipped
+///             move: the project HAS moved, and recording that as "failed"
+///             would tell the next reader the opposite of what happened.
+///
+/// The launcher's `change_project_path_v2` drives the same four steps against
+/// its own `Db` handle. Two surfaces, one order, one core implementation.
+#[derive(Deserialize)]
+struct MoveReq {
+    action: String,
+    move_id: String,
+    #[serde(default)]
+    new_path: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// How long a `running` claim may sit with no progress before a new move may
+/// retire it. Deliberately generous: the pre-commit phases copy a project's
+/// user material and run a full bundle install, which on a cold machine is
+/// minutes. Retiring a LIVE move's claim would let a second move copy into a
+/// second destination and race the first to the flip.
+const MOVE_STALE_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
+
+async fn project_move(
+    State(h): State<LauncherDbHandle>,
+    Path(id_or_slug): Path<String>,
+    Json(req): Json<MoveReq>,
+) -> axum::response::Response {
+    resolve_project(&h, &id_or_slug, |project| {
+        if req.move_id.trim().is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "move_id is required" })),
+            )
+                .into_response();
+        }
+        match req.action.as_str() {
+            "begin" => {
+                if req.new_path.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "new_path is required for action=begin"
+                        })),
+                    )
+                        .into_response();
+                }
+                // The destination must exist as a directory before a claim is
+                // taken. Creating it here would repeat the create-flow defect
+                // that materialised an empty scaffold from a typo'd path and
+                // started this whole work package.
+                if !std::path::Path::new(&req.new_path).is_dir() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "refused": "dst_parent_missing",
+                            "error": format!(
+                                "new_path must be an existing directory: {}",
+                                req.new_path
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+                match h.0.begin_project_move(
+                    &req.move_id,
+                    &project.id,
+                    &req.new_path,
+                    MOVE_STALE_AFTER_MS,
+                ) {
+                    Ok(row) => Json(serde_json::json!({
+                        "move_id": row.id,
+                        "project_id": row.project_id,
+                        "src": row.src,
+                        "dst": row.dst,
+                        "status": row.status,
+                    }))
+                    .into_response(),
+                    Err(e) => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "refused": "move_in_flight", "error": e
+                        })),
+                    )
+                        .into_response(),
+                }
+            }
+            "commit" => match h.0.commit_project_move(&req.move_id, &project.id) {
+                Ok(report) => Json(serde_json::json!({
+                    "move_id": req.move_id,
+                    "status": "flipped",
+                    "agents_repointed": report.agents_repointed,
+                    "skills_repointed": report.skills_repointed,
+                    "codegraph_enqueued": report.codegraph_enqueued,
+                    "reconcile_warnings": report.reconcile_warnings,
+                }))
+                .into_response(),
+                Err(e) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "refused": "commit_failed", "error": e })),
+                )
+                    .into_response(),
+            },
+            "finish" => match h.0.finish_project_move(&req.move_id) {
+                Ok(()) => Json(serde_json::json!({
+                    "move_id": req.move_id, "status": "completed"
+                }))
+                .into_response(),
+                Err(e) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "refused": "finish_failed", "error": e })),
+                )
+                    .into_response(),
+            },
+            "abort" => match h.0.fail_project_move(&req.move_id, &req.reason) {
+                Ok(()) => Json(serde_json::json!({
+                    "move_id": req.move_id, "status": "failed"
+                }))
+                .into_response(),
+                Err(e) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "refused": "abort_failed", "error": e })),
+                )
+                    .into_response(),
+            },
+            other => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "unknown action '{}' (expected begin|commit|finish|abort)",
+                        other
+                    )
+                })),
+            )
+                .into_response(),
+        }
+    })
+}
+
+/// Live (`running` / `flipped`) moves, for the boot sweep and the GUI banner.
+async fn list_project_moves(State(h): State<LauncherDbHandle>) -> impl IntoResponse {
+    match h.0.list_live_project_moves() {
+        Ok(rows) => Json(serde_json::json!({ "moves": rows })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 // ─── Audit ──────────────────────────────────────────────────────────────
@@ -2938,4 +3129,110 @@ mod hub_access_matrix_wiring_tests {
         let body: serde_json::Value = resp.json().await.expect("json");
         assert_eq!(body["count"], 1, "body: {}", body);
     }
+}
+
+// ─── Collection rename (v0.2.92 WP-18 / W14) ────────────────────────────
+
+/// The FLIP request. One shot, not a state machine.
+///
+/// The rename's single-flight claim and its resumable phases live in the
+/// project folder's sentinel (`vco_lib.collection_rename`), because a rename
+/// is gated on state that IS in the folder — which destination classes VCO
+/// created, the fact that makes a resume safe rather than a collision. What
+/// the database must provide is the all-or-nothing flip, and modelling that
+/// as four actions would imply a durability it does not own.
+///
+/// `expected_current_name` is a compare-and-swap guard, not decoration: the
+/// caller derived `new_kg_bindings` / `new_codegraph_prefix` from a project
+/// row it read before copying gigabytes. If the name changed underneath, the
+/// derived family describes a different project and the flip must refuse.
+#[derive(Deserialize)]
+struct RenameCollectionsReq {
+    new_name: String,
+    #[serde(default)]
+    expected_current_name: Option<String>,
+    /// `[{"role": "primary", "collection": "New_KnowledgeGraph"}]`
+    #[serde(default)]
+    kg_bindings: Vec<KgBindingFlip>,
+    #[serde(default)]
+    codegraph_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KgBindingFlip {
+    role: String,
+    collection: String,
+}
+
+async fn rename_collections(
+    State(h): State<LauncherDbHandle>,
+    Path(id_or_slug): Path<String>,
+    Json(req): Json<RenameCollectionsReq>,
+) -> axum::response::Response {
+    resolve_project(&h, &id_or_slug, |project| {
+        let new_name = req.new_name.trim().to_string();
+        if new_name.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "refused": "degenerate_name",
+                    "error": "new_name is required"
+                })),
+            )
+                .into_response();
+        }
+        // Same refusal as the Tauri rename surface: the orchestrator-root
+        // slug is canonical and several auto-heal paths match on it.
+        if project.host == ProjectHost::OrchestratorRoot {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "refused": "orchestrator_root",
+                    "error": "the orchestrator-root project's slug is \
+                              canonical; renaming its collection family would \
+                              silently disable the KG auto-heal paths that \
+                              match on it"
+                })),
+            )
+                .into_response();
+        }
+        let new_slug = match h.0.generate_unique_slug(&new_name) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+        let expected = req
+            .expected_current_name
+            .clone()
+            .unwrap_or_else(|| project.name.clone());
+        let bindings: Vec<(String, String)> = req
+            .kg_bindings
+            .iter()
+            .map(|b| (b.role.clone(), b.collection.clone()))
+            .collect();
+
+        match vct_launcher_core::db::bindings_writer::commit_collection_rename(
+            &h.0,
+            &project.id,
+            &expected,
+            &new_name,
+            &new_slug,
+            &bindings,
+            req.codegraph_prefix.as_deref(),
+        ) {
+            Ok(report) => Json(serde_json::json!({
+                "ok": true,
+                "project_id": report.project_id,
+                "new_name": report.new_name,
+                "new_slug": report.new_slug,
+                "kg_bindings_flipped": report.kg_bindings_flipped,
+                "codegraph_flipped": report.codegraph_flipped,
+            }))
+            .into_response(),
+            Err(e) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "refused": "flip_failed", "error": e })),
+            )
+                .into_response(),
+        }
+    })
 }

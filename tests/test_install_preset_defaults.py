@@ -23,14 +23,12 @@ Covers:
       - emits `preset_defaults` events to install.jsonl with the right
         phase (`ok` | `skip` | `warn`)
 
-The tests use `sqlite3` directly + `tempfile.TemporaryDirectory` rather
-than `:memory:` so the path-discovery + on-disk-existence checks are
-exercised realistically.
+The tests write a real on-disk launcher.db (never `:memory:`) so the
+path-discovery + on-disk-existence checks are exercised realistically.
 """
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -40,6 +38,12 @@ from unittest import mock
 # install.py lives at the repo root; tests/ is a sibling. Mirror the
 # pattern in test_install_choices_replay.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    connect,
+    create_corrupt_launcher_db,
+    create_empty_launcher_db,
+    set_app_state,
+)
 import install  # type: ignore  # noqa: E402
 
 
@@ -47,37 +51,26 @@ import install  # type: ignore  # noqa: E402
 # Helpers
 # ---------------------------------------------------------------------------
 
-_APP_STATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS app_state (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  INTEGER NOT NULL
-);
-"""
-
 
 def _create_db_with_app_state(db_path: Path) -> None:
-    """Create launcher.db with the v0.2.18 app_state schema applied.
-    Mirrors what the launcher's `migrations::apply` would have done on
-    first boot."""
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_APP_STATE_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
+    """Create launcher.db by applying the SHIPPED migrations — the same
+    thing the launcher's `migrations::apply` does on first boot, rather
+    than a hand-written one-table approximation of it."""
+    create_empty_launcher_db(db_path)
 
 
 def _create_db_without_app_state(db_path: Path) -> None:
-    """Create launcher.db with a different schema but NO app_state
-    table — exercises the soft-fail path for `no such table` errors."""
-    conn = sqlite3.connect(str(db_path))
+    """A launcher.db that is real in every way EXCEPT that `app_state` is
+    gone — exercises the soft-fail path for `no such table` errors.
+
+    Built by applying the real migrations and then DROPping the one table,
+    so every OTHER table still has its true shape: the degraded state is
+    deliberate and narrow, not a side effect of a partial hand-rolled
+    schema."""
+    create_empty_launcher_db(db_path)
+    conn = connect(db_path)
     try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS dummy (
-                id INTEGER PRIMARY KEY
-            );
-        """)
+        conn.execute("DROP TABLE app_state")
         conn.commit()
     finally:
         conn.close()
@@ -85,7 +78,7 @@ def _create_db_without_app_state(db_path: Path) -> None:
 
 def _read_app_state(db_path: Path) -> dict[str, str]:
     """Return the current app_state contents as a {key: value} dict."""
-    conn = sqlite3.connect(str(db_path))
+    conn = connect(db_path)
     try:
         cur = conn.cursor()
         cur.execute("SELECT key, value FROM app_state")
@@ -347,21 +340,12 @@ class WritePresetDefaultsTests(unittest.TestCase):
         with _LogFixture() as log_fix, _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
             # Pre-populate with user's manual choices.
-            conn = sqlite3.connect(str(db_fix.db_path))
-            try:
-                conn.execute(
-                    "INSERT INTO app_state (key, value, updated_at) "
-                    "VALUES (?, ?, ?)",
-                    ("default_text_embedding", "user-picked-text-model", 1),
-                )
-                conn.execute(
-                    "INSERT INTO app_state (key, value, updated_at) "
-                    "VALUES (?, ?, ?)",
-                    ("default_code_embedding", "user-picked-code-model", 1),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            set_app_state(
+                db_fix.db_path, "default_text_embedding", "user-picked-text-model",
+            )
+            set_app_state(
+                db_fix.db_path, "default_code_embedding", "user-picked-code-model",
+            )
 
             install._write_preset_defaults_to_app_state(
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
@@ -413,16 +397,7 @@ class WritePresetDefaultsTests(unittest.TestCase):
         # the text row AND populate the missing code row.
         with _LogFixture() as log_fix, _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
-            conn = sqlite3.connect(str(db_fix.db_path))
-            try:
-                conn.execute(
-                    "INSERT INTO app_state (key, value, updated_at) "
-                    "VALUES (?, ?, ?)",
-                    ("default_text_embedding", "user-text-model", 1),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            set_app_state(db_fix.db_path, "default_text_embedding", "user-text-model")
 
             install._write_preset_defaults_to_app_state(
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
@@ -451,8 +426,8 @@ class WritePresetDefaultsTests(unittest.TestCase):
         # but proves the defense-in-depth path. Then point the helper
         # at a path that exists but isn't a sqlite DB at all.
         with _LogFixture() as log_fix, _DbFixture() as db_fix:
-            # Write garbage bytes to launcher.db.
-            db_fix.db_path.write_bytes(b"not a sqlite file" * 100)
+            # Write garbage bytes to launcher.db (not a SQLite file at all).
+            create_corrupt_launcher_db(db_fix.db_path)
             # Must not raise.
             install._write_preset_defaults_to_app_state(
                 {"active_embedding": "gpu",

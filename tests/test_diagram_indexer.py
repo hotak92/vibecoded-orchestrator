@@ -18,7 +18,6 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
@@ -26,13 +25,11 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.common.launcher_db_fixture import make_launcher_db
 from vco_lib.diagram_indexer import (
     DiagramRow,
-    ExcalidrawMetadata,
-    MermaidMetadata,
     _MERMAID_KINDS,
     _validate_scoped_path,
-    _upsert_row,
     humanize_filename,
     index_diagram,
     index_diagram_async,
@@ -308,54 +305,34 @@ class TestScopedPathValidator:
 
 
 # ---------------------------------------------------------------------------
-# DB schema fixture (mirrors Phase 1.1's project_diagrams table)
+# DB fixture — the REAL launcher schema (migrations applied)
 # ---------------------------------------------------------------------------
-
-
-_PROJECT_DIAGRAMS_SCHEMA = """
-CREATE TABLE projects (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE project_diagrams (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id TEXT NOT NULL,
-    diagram_name TEXT NOT NULL,
-    diagram_type TEXT NOT NULL CHECK(diagram_type IN ('mermaid','excalidraw')),
-    file_path TEXT NOT NULL,
-    category_path TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    inferred_title TEXT,
-    diagram_kind TEXT,
-    content_text TEXT,
-    node_count INTEGER,
-    edge_count INTEGER,
-    chat_id TEXT,
-    linked_session_summary TEXT,
-    config_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(project_id, diagram_name)
-);
-"""
 
 
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
-    """Create a fresh SQLite DB with the project_diagrams schema."""
-    p = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(p))
-    try:
-        conn.executescript(_PROJECT_DIAGRAMS_SCHEMA)
-        conn.execute(
-            "INSERT INTO projects (id, name) VALUES (?, ?)",
-            ("proj-test-uuid", "TestProject"),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return p
+    """A fresh launcher.db carrying the real schema, one project seeded.
+
+    ``project_diagrams`` / ``diagram_snapshots`` / ``diagram_index_retry``
+    all come from the shipped migration 022, so this fixture cannot drift
+    from the table the launcher actually writes.
+    """
+    return make_launcher_db(
+        tmp_path,
+        projects=[
+            {"project_id": "proj-test-uuid", "name": "TestProject",
+             "folder_path": tmp_path / "test-project"},
+            # `project_diagrams.project_id` REFERENCES projects(id) in the
+            # real schema (migration 022) and the indexer turns foreign keys
+            # ON, so the async-wrapper tests' "proj-async-uuid" must be a
+            # REGISTERED project. The hand-rolled fixture had no FK, which let
+            # those tests index against an id no launcher could ever produce;
+            # the property they pin (the diagrams_collection kwarg reaches
+            # _weaviate_upsert) is unchanged by registering it legally.
+            {"project_id": "proj-async-uuid", "name": "AsyncProject",
+             "folder_path": tmp_path / "async-project"},
+        ],
+    )
 
 
 @pytest.fixture
@@ -649,8 +626,14 @@ class TestRetryTableEnqueue:
         f = cat / "fail.mmd"
         f.write_text("flowchart TD\n  A --> B")
 
-        # Confirm retry table doesn't exist yet.
+        # DELIBERATE degraded shape: migration 022 ships
+        # `diagram_index_retry`, so the real schema already has it. This
+        # test pins the indexer's own CREATE TABLE IF NOT EXISTS path —
+        # the case of a launcher.db predating 022 (or a standalone DB the
+        # indexer manages itself) — so we drop the table to reproduce it.
         conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE IF EXISTS diagram_index_retry")
+        conn.commit()
         existing = conn.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='diagram_index_retry'"
@@ -876,32 +859,27 @@ class TestSidecarDict:
 # snapshot_diagram_file + `snapshot create` CLI subcommand (A6 wire-up)
 # ---------------------------------------------------------------------------
 #
-# The DB schema fixture above (`_PROJECT_DIAGRAMS_SCHEMA`) doesn't include
-# diagram_snapshots — we extend it locally here so the snapshot tests
-# don't depend on migration 022 being applied. Mirrors the
-# launcher-core SQL in `launcher/src-tauri/vct-launcher-core/src/db/
-# migrations/022_diagrams.sql` byte-for-byte.
-
-_SNAPSHOTS_SCHEMA = """
-CREATE TABLE diagram_snapshots (
-    id              INTEGER PRIMARY KEY,
-    diagram_id      INTEGER NOT NULL,
-    content_hash    TEXT NOT NULL,
-    content         BLOB NOT NULL,
-    created_at      INTEGER NOT NULL,
-    trigger         TEXT NOT NULL,
-    label           TEXT,
-    UNIQUE(diagram_id, content_hash)
-);
-"""
+# `diagram_snapshots` ships in migration 022, which the `db_path` fixture
+# applies, so these tests no longer carry a local copy of that CREATE TABLE
+# (the copy claimed to mirror 022 "byte-for-byte" — a claim nothing checked).
 
 
 def _add_snapshots_table(db_path: Path) -> None:
-    """Apply the diagram_snapshots schema fragment to an existing DB."""
+    """Assert the real schema gave us `diagram_snapshots`.
+
+    Kept as a call-site marker for the snapshot tests: it used to apply a
+    hand-rolled copy of the migration-022 fragment; now it verifies the
+    migration-supplied table is there, so a future migration that drops or
+    renames it fails these tests loudly instead of silently re-creating it.
+    """
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.executescript(_SNAPSHOTS_SCHEMA)
-        conn.commit()
+        assert conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='diagram_snapshots'"
+        ).fetchone() is not None, (
+            "diagram_snapshots missing — migration 022 did not apply"
+        )
     finally:
         conn.close()
 

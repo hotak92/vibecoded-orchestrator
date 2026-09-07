@@ -2,6 +2,22 @@
 # Usage: .\kg-sync.ps1 FILE
 #        .\kg-sync.ps1 --all
 #
+# EXIT CODES (the ladder this wrapper shares with the script it runs;
+# the script's own half is printed by `sync_knowledge_graph.py::_print_usage`):
+#
+#   0  clean run
+#   1  the sync RAN and some nodes/docs failed
+#   2  usage error, or a refused/wrong project root
+#   3  the sync DID NOT RUN: no Python environment with VCO's KG
+#      dependencies (wrapper-only; sync_knowledge_graph.py never emits it)
+#
+# v0.2.92: 3 is new. The venv refusal below used to return 1, which is the
+# code the script uses for "I ran and some nodes failed" — so a caller
+# could not tell "did not run" from "ran, partially failed". A check that
+# cannot distinguish "could not determine" from a real result is not a
+# check. PARITY: the bash sibling `kg-sync` documents and returns the
+# same ladder.
+#
 # v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
 # from the bash sibling. Pre-v0.2.37 this script only probed
 # `$ProjectRoot\.venv` + `$ProjectRoot\claude_mcp_servers\.venv`, both
@@ -36,13 +52,79 @@ function Test-VenvHasKgDeps {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Candidate venv python locations, canonical-first.
-$Candidates = @(
-    $(if ($env:VCT_INSTALL_ROOT) { Join-Path $env:VCT_INSTALL_ROOT ".venv\Scripts\python.exe" }),
-    $(if ($env:VCT_INSTALL_ROOT) { Join-Path $env:VCT_INSTALL_ROOT "claude_mcp_servers\.venv\Scripts\python.exe" }),
-    (Join-Path $ProjectRoot ".venv\Scripts\python.exe"),
-    (Join-Path $ProjectRoot "claude_mcp_servers\.venv\Scripts\python.exe")
-)
+# v0.2.92 (W3 §4bis): read `VCT_ORCHESTRATOR_ROOT` out of the project's own
+# `.claude\env`. This is the DURABLE tier — the one that works in a plain
+# terminal, in CI, and from any scheduled task: it needs no env inheritance at
+# all, because the value is file-backed and written by the canonical env
+# projection on every install and update.
+# PARITY: this block must match the bash sibling `kg-sync` (same tiers, same
+# order, same refusal).
+function Get-OrchestratorRootFromProjectEnv {
+    $envFile = Join-Path $ScriptDir "..\env"
+    if (-not (Test-Path $envFile)) { return $null }
+    # First assignment wins, `export ` prefix tolerated, one quote pair
+    # stripped — the same line rule `vco_lib/envfile.py::parse_env_lines`
+    # applies, so the file has one meaning on every surface that reads it.
+    foreach ($line in (Get-Content -LiteralPath $envFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*(export\s+)?VCT_ORCHESTRATOR_ROOT\s*=\s*(.*)$') {
+            $val = $Matches[2].Trim()
+            if ($val.Length -ge 2 -and (
+                    ($val.StartsWith('"') -and $val.EndsWith('"')) -or
+                    ($val.StartsWith("'") -and $val.EndsWith("'")))) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+            if ($val) { return $val }
+            return $null
+        }
+    }
+    return $null
+}
+
+# Is this a real VCO orchestrator clone (not the user's project that merely
+# happens to own a `.venv`)? Same discriminator as
+# `templates/hooks/_lib/resolve-vco-venv.ps1` and `install.py::validate_source_repo`.
+# Without it, `$ProjectRoot\.venv` IS the user's project venv whenever this
+# wrapper is bundled into a project.
+function Test-VcoOrchestratorClone {
+    param([string]$Candidate)
+    if (-not $Candidate) { return $false }
+    if (-not (Test-Path $Candidate)) { return $false }
+    if (-not (Test-Path (Join-Path $Candidate "install.py"))) { return $false }
+    if (-not (Test-Path (Join-Path $Candidate "first-install.sh"))) { return $false }
+    return $true
+}
+
+function Get-VenvPythonCandidates {
+    param([string]$Root)
+    return @(
+        (Join-Path $Root ".venv\Scripts\python.exe"),
+        (Join-Path $Root ".venv\bin\python"),
+        (Join-Path $Root "claude_mcp_servers\.venv\Scripts\python.exe"),
+        (Join-Path $Root "claude_mcp_servers\.venv\bin\python")
+    )
+}
+
+# Candidate venv python locations, canonical-first: explicit override, then
+# the launcher-provided install root, then the file-backed orchestrator root,
+# then clone-relative paths — the last GATED so a user project's venv can
+# never be selected.
+$ProjectEnvRoot = Get-OrchestratorRootFromProjectEnv
+$Candidates = @()
+if ($env:VCT_VENV) {
+    $Candidates += @(
+        (Join-Path $env:VCT_VENV "Scripts\python.exe"),
+        (Join-Path $env:VCT_VENV "bin\python")
+    )
+}
+if ($env:VCT_INSTALL_ROOT) {
+    $Candidates += Get-VenvPythonCandidates $env:VCT_INSTALL_ROOT
+}
+if ($ProjectEnvRoot) {
+    $Candidates += Get-VenvPythonCandidates $ProjectEnvRoot
+}
+if (Test-VcoOrchestratorClone $ProjectRoot) {
+    $Candidates += Get-VenvPythonCandidates $ProjectRoot
+}
 
 $VenvPython = $null
 foreach ($cand in $Candidates) {
@@ -52,13 +134,43 @@ foreach ($cand in $Candidates) {
     }
 }
 
+# v0.2.92 (W3 §4bis): NO BARE `python` FALLBACK, and the refusal names every
+# candidate plus the remedy. A shipped component does not get a silent
+# fallback (standing rule); the bash sibling refuses identically.
+#
+# EXIT 3, NOT 1: 1 is already spoken for by sync_knowledge_graph.py, which
+# returns it when the sync RAN and some nodes failed. Reusing it here made
+# "I never started" indistinguishable from "I finished with failures" —
+# the two demand opposite responses (fix your install vs. look at the
+# named failures). 3 is the next free rung above the script's 0/1/2.
 if (-not $VenvPython) {
-    Write-Host "ERROR: no venv with weaviate-client installed. Probed:" -ForegroundColor Red
-    foreach ($cand in $Candidates) {
-        if ($cand) { Write-Host "  - $cand" -ForegroundColor Red }
+    # PARITY (v0.2.92 delivery audit m8): the refusal goes to STDERR, exactly
+    # like the bash sibling's `>&2` block. Write-Host writes the HOST stream,
+    # which stderr consumers (2>/dev/null, CI capture, the launcher's error
+    # scraping) never see - a refused run was indistinguishable from a silent
+    # one on every surface that reads error streams.
+    [Console]::Error.WriteLine("kg-sync: ERROR - no Python environment with VCO's KG dependencies.")
+    [Console]::Error.WriteLine("kg-sync: A candidate qualifies only when BOTH 'weaviate' and")
+    [Console]::Error.WriteLine("kg-sync: 'weaviate_mcp' import from it. Probed, in order:")
+    if ($Candidates.Count -eq 0) {
+        [Console]::Error.WriteLine("kg-sync:   (none - no VCT_VENV, no VCT_INSTALL_ROOT, no")
+        [Console]::Error.WriteLine("kg-sync:    VCT_ORCHESTRATOR_ROOT in $ScriptDir\..\env, and")
+        [Console]::Error.WriteLine("kg-sync:    $ProjectRoot is not a VCO orchestrator clone)")
+    } else {
+        foreach ($cand in $Candidates) { [Console]::Error.WriteLine("kg-sync:   - $cand") }
     }
-    Write-Host "Run install.ps1 first, or set VCT_INSTALL_ROOT to point at an installed orchestrator clone." -ForegroundColor Red
-    exit 1
+    [Console]::Error.WriteLine("kg-sync: Fix by any ONE of:")
+    [Console]::Error.WriteLine("kg-sync:   * run this from a launcher-managed session (it exports")
+    [Console]::Error.WriteLine("kg-sync:     VCT_INSTALL_ROOT);")
+    [Console]::Error.WriteLine("kg-sync:   * `$env:VCT_VENV = 'C:\path\to\orchestrator\.venv';")
+    [Console]::Error.WriteLine("kg-sync:   * `$env:VCT_INSTALL_ROOT = 'C:\path\to\orchestrator';")
+    [Console]::Error.WriteLine("kg-sync:   * re-run the orchestrator install so this project's")
+    [Console]::Error.WriteLine("kg-sync:     .claude\env carries VCT_ORCHESTRATOR_ROOT.")
+    [Console]::Error.WriteLine("kg-sync: Refusing to run with an unqualified interpreter - doing so")
+    [Console]::Error.WriteLine("kg-sync: fails later with a misleading ModuleNotFoundError.")
+    [Console]::Error.WriteLine("kg-sync: (exit 3 = did not run; 1 would mean the sync ran and")
+    [Console]::Error.WriteLine("kg-sync:  some nodes failed)")
+    exit 3
 }
 
 # v0.2.89 BUG 3 (plan §1.3 B): pin the target project root via the NEW
@@ -77,6 +189,16 @@ if (-not $VenvPython) {
 if (-not $env:KG_SYNC_PROJECT_ROOT) {
     $env:KG_SYNC_PROJECT_ROOT = "$ProjectRoot"
 }
+
+# PARITY (v0.2.92 delivery audit m8): export VIRTUAL_ENV like the bash
+# sibling (`export VIRTUAL_ENV="$VENV_PATH"`). Invoking the venv python
+# binary directly activates the interpreter, but subprocess libraries that
+# probe $VIRTUAL_ENV need it set to the venv ROOT. Both venv layouts
+# (`<root>\Scripts\python.exe`, `<root>/bin/python`) place the binary
+# exactly one directory inside the root, so two Split-Path -Parent hops
+# recover the root in either shape.
+$venvBinDir = Split-Path -Parent $VenvPython
+$env:VIRTUAL_ENV = Split-Path -Parent $venvBinDir
 
 & $VenvPython (Join-Path $ScriptDir "sync_knowledge_graph.py") @args
 exit $LASTEXITCODE

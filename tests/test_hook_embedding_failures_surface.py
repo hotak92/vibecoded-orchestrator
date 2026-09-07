@@ -22,7 +22,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SH = REPO_ROOT / "templates" / "hooks" / "embedding-failures-surface.sh"
@@ -91,12 +90,30 @@ def test_ps1_hook_handles_disable_flag():
 
 
 def test_ps1_hook_uses_userprofile_for_home():
-    """The .ps1 must resolve $HOME via USERPROFILE on Windows."""
+    """The .ps1 must resolve the user's home the Windows-native way.
+
+    v0.2.92 W7 moved the metrics path decision — and with it the home
+    resolution — out of this hook and into `_lib/metrics-dir.ps1`, the ONE
+    PowerShell-side resolver the six metrics hooks share (before it, three
+    different conventions were in use across them). So the property this test
+    names is now asserted where it lives: the hook must SOURCE the helper, and
+    the helper must do the Windows-native resolution.
+
+    Following the property to its new home rather than deleting the test: a
+    test whose subject moved and that stops asserting anything is worse than
+    no test, because its name still promises coverage.
+    """
     body = HOOK_PS1.read_text(encoding="utf-8")
+    assert "_lib/metrics-dir.ps1" in body, (
+        "ps1 must resolve the metrics dir through the shared "
+        "_lib/metrics-dir.ps1 helper (v0.2.92 W7)"
+    )
+    helper = HOOK_PS1.parent / "_lib" / "metrics-dir.ps1"
+    helper_body = helper.read_text(encoding="utf-8")
     # Either GetFolderPath('UserProfile') or $env:USERPROFILE is fine.
-    assert ("UserProfile" in body) or ("USERPROFILE" in body), (
-        "ps1 must use Windows-native home resolution (USERPROFILE / "
-        "GetFolderPath('UserProfile'))"
+    assert ("UserProfile" in helper_body) or ("USERPROFILE" in helper_body), (
+        "_lib/metrics-dir.ps1 must use Windows-native home resolution "
+        "(USERPROFILE / GetFolderPath('UserProfile'))"
     )
 
 

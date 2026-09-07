@@ -171,7 +171,7 @@ def content_signature(text: str) -> str:
 
 
 def chunk_plan(content: str, model_id: str) -> List[Tuple[int, str]]:
-    """Replicate ``sync_node``'s chunk decision for *content* under *model_id*.
+    """Reproduce ``sync_node``'s chunk decision for *content* under *model_id*.
 
     Returns ``[(chunk_num, chunk_text), ...]`` with ``chunk_num`` 1-indexed:
 
@@ -182,24 +182,28 @@ def chunk_plan(content: str, model_id: str) -> List[Tuple[int, str]]:
         one entry per ``chunk.content`` (the stripped chunk text the
         multi-chunk insert loop embeds), ``chunk_num = chunk.chunk_number+1``.
 
-    Mirrors ``_max_chunk_tokens_for`` (preset max via
-    ``chunking_preset_for_model``) + ``_chunker_for`` (``Chunker.for_model``).
+    W8 (v0.2.92 wiring audit): this is the THIRD producer of the same plan
+    (the MCP ``store_knowledge_node`` write and kg-sync's ``_plan_for`` are
+    the other two), and a sidecar planned differently from what the consumer
+    stores is a sidecar that never ingests. So it calls the ONE shared
+    computation they call, ``weaviate_mcp.kg_chunk_plan.plan_node_chunks`` —
+    not the primitives underneath it, which is how the previous version
+    could drift while still looking correct. ``tests/test_v0292_chunk_plan_
+    shared.py`` pins the output against the primitives directly, so the
+    delegation cannot silently change the answer.
+
+    ``chunk_plan`` takes a bare ``model_id`` rather than kg-sync's live
+    ``server`` (this tool has none; it iterates known shipped slot model
+    ids, which are never empty) — the shared function's own signature.
     """
-    mod = _sync_module()
-    from weaviate_mcp.chunking import chunking_preset_for_model
+    from weaviate_mcp.kg_chunk_plan import plan_node_chunks
 
-    token_count = mod.TokenCounter.count_tokens(content)
-    _min_t, max_t, _tgt_t = chunking_preset_for_model(model_id)
-    if token_count <= max_t:
-        return [(1, content)]
-
-    chunker = mod.Chunker.for_model(model_id)
-    chunks = chunker.chunk_text(
-        text=content,
-        source_id="shipped-embeddings-plan",
-        metadata={},
+    plan = plan_node_chunks(
+        content, model_id, source_id="shipped-embeddings-plan", metadata={},
     )
-    return [(c.chunk_number + 1, c.content) for c in chunks]
+    if plan.is_single:
+        return [(1, content)]
+    return [(c.chunk_number + 1, c.content) for c in plan.chunks]
 
 
 def iter_shipped_nodes() -> List[Path]:

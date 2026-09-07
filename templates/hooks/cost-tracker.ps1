@@ -5,7 +5,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
-# cost-tracker.ps1 — Stop hook: append token/cost data to ~/.claude/metrics/costs.jsonl
+# cost-tracker.ps1 — Stop hook: append token/cost data to <metrics dir>/costs.jsonl
 # Reads Claude's stdin JSON payload (stop event) and logs cost data.
 # Mirror of cost-tracker.sh; delegates the heavy lifting to a Python heredoc
 # inline so we keep parity with the bash version's pricing table.
@@ -14,6 +14,10 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # per-token cost. We record auth_mode in each entry; cost_usd is only
 # populated when auth_mode == "api". Subscription rows still log token
 # counts (useful for usage analysis) but cost_usd is null.
+#
+# v0.2.92 W7: the metrics directory is resolved by `_lib/metrics-dir.ps1` (the
+# ONE PowerShell-side home, lockstep sibling of `_lib/metrics-dir.sh`) and
+# passed INTO the Python via the environment. It is no longer under ~/.claude.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
@@ -22,6 +26,14 @@ $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 if (-not $PY) { exit 0 }
 
+# Missing helper => silent no-op, same discipline as the missing-Python case:
+# a partial install must not make the hook guess a path.
+$MetricsLib = Join-Path $LibDir "metrics-dir.ps1"
+if (-not (Test-Path -LiteralPath $MetricsLib -PathType Leaf)) { exit 0 }
+. $MetricsLib
+$CostsDir = Get-VcoMetricsDir
+if (-not $CostsDir) { exit 0 }
+
 $Payload = ""
 try { $Payload = [Console]::In.ReadToEnd() } catch { }
 if (-not $Payload) { exit 0 }
@@ -29,7 +41,7 @@ if (-not $Payload) { exit 0 }
 # Pass the payload as a single argv element to a small Python program
 # (matches the cost-tracker.sh approach of `python3 - "$PAYLOAD"`).
 $pyCode = @'
-import sys, json, pathlib
+import os, sys, json, pathlib
 from datetime import datetime, timezone
 
 payload_str = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -88,13 +100,16 @@ record = {
     "cost_usd": cost_usd,
 }
 
-metrics_dir = pathlib.Path.home() / ".claude" / "metrics"
+# Resolved by _lib/metrics-dir.ps1 and handed in via the environment — the ONE
+# home for the decision. No inline reconstruction here.
+metrics_dir = pathlib.Path(os.environ["COSTS_DIR"])
 metrics_dir.mkdir(parents=True, exist_ok=True)
 with open(metrics_dir / "costs.jsonl", "a", encoding="utf-8") as f:
     f.write(json.dumps(record) + "\n")
 '@
 
 try {
+    $env:COSTS_DIR = $CostsDir
     & $PY -c $pyCode $Payload 2>$null | Out-Null
 } catch { }
 exit 0

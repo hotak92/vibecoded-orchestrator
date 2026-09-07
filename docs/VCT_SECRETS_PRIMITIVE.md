@@ -48,7 +48,9 @@ Every sanctioned resolver walks the SAME chain, in this order:
    isn't registered, or the key isn't active there: `$VCT_SECRETS_DIR`
    (default `~/.vct-secrets`), `projects/<NAME>/<key>` first, then
    `shared/<key>` (see [Storage layout](#storage-layout) below — the
-   `vct` CLI manages this tier).
+   `vct` CLI manages this tier). The `shared/<key>` leg is SKIPPED for a
+   project holding the `.no-shared-fallback` marker
+   ([Design choices](#design-choices) #1).
 3. **Project `.env` (tier 3, READ-ONLY, lowest priority)** — the
    requesting project's own root `.env`. Line-oriented parse: `KEY=VALUE`
    and `export KEY=VALUE`, one matching pair of quotes stripped, NO
@@ -280,13 +282,63 @@ This is the order INSIDE the file store — the second tier of the
 above. For each requested `--secret KEY`, the `vct` CLI resolves:
 
 1. `~/.vct-secrets/projects/<PROJECT>/<KEY>` — project-specific (first priority)
-2. `~/.vct-secrets/shared/<KEY>` — cross-project fallback
+2. `~/.vct-secrets/shared/<KEY>` — cross-project fallback, **unless**
+   `~/.vct-secrets/projects/<PROJECT>/.no-shared-fallback` exists, in which
+   case step 2 is skipped entirely ([Design choices](#design-choices) #1)
 3. Fail fast (exit 2, clear error message)
 
 Project always wins, so e.g. one project's `openai_api_key` is its own,
 period. (The hub-first resolvers — `vct_secrets_resolve.sh` / `.ps1` /
 `agent_secrets.py` — consult the hub before this tier and the project
 `.env` after it.)
+
+### What the launcher's Secrets panel shows (v0.3.0)
+
+The panel reads BOTH launcher-managed stores and labels each key with the
+one that actually answers:
+
+| badge | meaning |
+|---|---|
+| `set` | the OS keychain (tier 1) holds it and readers are ungated |
+| `unset` | the keychain holds it but the launcher has it paused |
+| `set — file store` | no keychain entry; `$VCT_SECRETS_DIR` (tier 2) holds it, so `vct`, `agent_secrets.get` and `vct_secrets_resolve.sh` all resolve it |
+| `unknown` | a store could not be read (locked keychain, unreadable directory) — **not** the same as absent |
+| `not set` | neither store has it |
+
+The per-project **Secret refs** tab renders the same five badges from the
+same probe (`get_secret_status_v2` → `badgeOf`). Before v0.3.0 it rendered
+the `project_secret_refs.is_set` COLUMN instead — a snapshot written once
+at registration and never revised — so it reported "set" for deleted keys
+and "missing" for keys that resolve from the file store. One probe, two
+surfaces: if you change the badge vocabulary, change it in `badgeOf` and
+both follow.
+
+A per-project ref's file-store probe looks in `projects/<NAME>/`, which is
+that ref's own home. A key held ONLY in `shared/` therefore badges as
+`not set` on that tab even though tier-2 fallback would resolve it — the
+tab reports where the ref's own value is, not the full fallback chain.
+
+Two extra badges cover the overlap: `⚠ also in file store` when both
+stores hold the key and agree, and `⚠ copies differ` when they hold
+DIFFERENT values. That second one is the fork this document's stores are
+designed to avoid — the keychain copy wins at runtime and the file copy
+becomes dead weight that misleads the next reader.
+
+Before v0.3.0 the badge came from a keychain-only probe, so a key that
+lived only in the file store displayed as **not set** while every consumer
+resolved it. The panel was, in effect, inviting the user to re-type a
+working key into the *other* store and create the fork.
+
+Two consequences worth stating outright:
+
+- **Saving from the panel writes the keychain, never the file store.** If
+  a file-store copy exists, saving here creates the second copy.
+- **Remove does not delete a file-store copy.** It removes the keychain
+  entry and the launcher's own record; the file at
+  `~/.vct-secrets/**` is yours. The confirmation dialog says so, the row
+  stays visible afterwards (because the key still resolves), and a row
+  that exists ONLY as a file gets no Remove button at all — use
+  `vct revoke`.
 
 ### Permissions
 
@@ -484,7 +536,45 @@ Windows and macOS keychain access is unchanged.
 
 1. **Shared secret fallback is on by default.** Projects can opt out
    by placing a `~/.vct-secrets/projects/<NAME>/.no-shared-fallback`
-   marker file.
+   marker file. All four file-store readers honour it — `vct`
+   (`get` / `exec` / `can-read` / `resolve`),
+   `vco_lib.agent_secrets.get`, `vct_secrets_resolve.sh` and its `.ps1`
+   sibling — so an opted-out project resolves ONLY its own
+   `projects/<NAME>/<key>` files from the file store.
+
+   The launcher's status surfaces honour it too, and must: the
+   SecretsPanel and the per-project Secret-refs tab report a key
+   satisfied only by `shared/<key>` as **"set — shared file store"**
+   (because every resolver above would find it), and an opted-out
+   project is shown **"not set"** for that same key — the file exists,
+   but nothing this project runs will read it. A badge that ignored the
+   marker would be describing another project's resolution.
+
+   Scope, precisely, because it differs from the keychain-side gate:
+
+   * It covers the **whole** `shared/` namespace for that project,
+     `github_pat` included. The file store has one flat shared directory
+     with no "user" vs "infrastructure" distinction to honour, and a
+     privacy control with a carve-out is not one.
+   * It gates **reads**. `vct revoke` resolves its write scope
+     separately, so an opted-out project can still delete its own keys.
+   * It does **not** apply to the shared scope itself. `vct` defaults to
+     `--project shared` when the flag is omitted, so a stray
+     `projects/shared/.no-shared-fallback` would otherwise disable every
+     shared read on the machine; that pseudo-name is excluded.
+   * `git push` is unaffected either way: `git-credential-vct` reads
+     `~/.vct-secrets/shared/github_pat` directly rather than through
+     these resolvers.
+
+   The launcher writes and removes the marker from the per-project
+   "Disable shared secrets for this project" toggle
+   (`secrets_cmd.rs::set_shared_secrets_read_disabled`), alongside the
+   keychain-side `SHARED_SECRETS_READ_DISABLED` gate. The two tiers have
+   deliberately different reach — the keychain gate drops only the
+   user-shared bucket, leaving module-declared secrets alone, because
+   there the two are distinguishable. Absent the marker, resolution is
+   byte-identical to a store that never had one, so nothing changes for
+   a project that has not opted in.
 2. **Cross-project copy requires confirmation.** `vct copy`
    prompts unless `--yes`. Prevents accidental token leaks.
 3. **`vct get --trusted` is required in a TTY** (interactive

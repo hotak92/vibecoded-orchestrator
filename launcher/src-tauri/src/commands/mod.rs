@@ -1,8 +1,18 @@
 pub mod app_state_cmd;
+// Machine-global Artifact-tool switch. Edits Claude Code's OWN user-scope
+// settings file (`~/.claude/settings.json`) rather than launcher.db, because
+// the harness reads that file — see the module docs for why the state is
+// always read back from disk and never mirrored into a launcher row.
+pub mod artifact_tool;
 pub mod audit;
 // F3 (v0.2.72 pre-gate audit): spawn_blocking seam for env re-projections
 // triggered from async Tauri commands (see blocking.rs module docs).
 pub mod blocking;
+// v0.2.92 WP-D (R27 fourth surface): READ-ONLY GUI wrapper around
+// `python -m vco_lib.bundle_staleness --json` — the per-project bundle
+// staleness census. Three-state (current/stale/unknown); a probe that
+// could not run reports "could not determine", never "all current".
+pub mod bundle_staleness;
 pub mod changes_cmd;
 pub mod claude_env;
 pub mod gpu;
@@ -22,6 +32,12 @@ pub mod codegraph_settings;
 // UPDATE_DEFERRED.md row when an upgrade crosses the v0.2.46 chunker
 // boundary so the user re-syncs KG / codegraph against the new presets.
 pub mod chunker_revision_deferral;
+// v0.2.92 WP-11: the version-keyed chat-model context table (migration 043)
+// plus its seed loader and its export to
+// `<vct_root>/model-gateway/chat_model_context.json`, which the model gateway
+// reads to decide which model ids to advertise to Claude Code as `<id>[1m]`.
+// NOT `weaviate_mcp.chunking.MODEL_TOKEN_LIMITS` — see the module doc.
+pub mod chat_model_context;
 pub mod coordination;
 pub mod dashboard;
 pub mod desktop_shortcut;
@@ -65,6 +81,14 @@ pub mod embedding_slot_counts;
 // names are redacted to "" before reaching std::env::var; the FE never
 // sees credential-looking values.
 pub mod env_cmd;
+// v0.2.92 WP-13: the ONE git runner + the ONE branch resolver. `installer.rs`
+// normalised a detached `"HEAD"` → `main` at five inline sites while
+// `self_update.rs` did it at zero, so the two update surfaces gave OPPOSITE
+// answers about the same repo — a duplicated SYSTEM (no shared lines, one
+// question) that let a real install sit five weeks behind while reporting
+// healthy. Every branch/behind-count/remote-tag question now goes through
+// here.
+pub mod git_cmd;
 // v0.2.24 §A0 (2026-05-22): per-path 3-way merge for known
 // user-editable files during orchestrator-root updates. Sits between
 // `installer::{update_orchestrator, merge_orchestrator_with_upstream}`
@@ -91,6 +115,13 @@ pub mod licensing;
 pub mod logging_prefs;
 pub mod maintenance;
 pub mod manifest;
+// v0.2.92 WP-12: the model gateway's GUI surface — lifecycle (start / stop /
+// boot autostart), a `/health` status probe whose "cannot determine" is its
+// own state, and the two VS Code panel actions ("point at gateway" and the
+// "native" reset). The panel actions do not edit JSON from Rust: they shell
+// to `python -m vco_lib.vscode_settings`, which owns the byte layout of that
+// user-owned file.
+pub mod model_gateway;
 // v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
 // catalog metadata from the launcher-controlled Supabase edge function with
 // retry-with-backoff + 15min app_state-backed cache + schema_version
@@ -218,6 +249,10 @@ pub mod self_update;
 // file rather than inside either 12k-line command module.
 pub mod single_flight;
 pub mod storage_ux;
+// v0.2.92: "a child's stdout is a machine contract" helpers — the STRICT
+// parse's diagnostic, shared by every site that reads JSON off a subprocess
+// (projects_v2's three migrate-schema parses, bundle_staleness's census).
+pub mod subprocess_contract;
 pub mod telemetry_cmd;
 // V52-AI (v0.2.52): MCP fork-bomb mitigation. Lockfile at
 // <vct_root>/.update-in-progress.json that MCP servers + ensure-containers

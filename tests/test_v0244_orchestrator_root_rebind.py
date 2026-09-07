@@ -28,10 +28,8 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -40,49 +38,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    connect,
+    create_empty_launcher_db,
+    make_launcher_db,
+)
 import install  # noqa: E402
 
 
 # ─── DB fixture helpers ───────────────────────────────────────────────────────
-
-
-# Mirrors the schema columns the rebind helper reads/writes. We do not
-# include every column the real launcher.db has — only the ones the code
-# under test interacts with.
-_PROJECTS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS projects (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    folder_path  TEXT NOT NULL,
-    host         TEXT NOT NULL,
-    slug         TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    updated_at   INTEGER NOT NULL
-);
-"""
-
-_BINDINGS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS project_kg_bindings (
-    project_id        TEXT NOT NULL,
-    role              TEXT NOT NULL,
-    collection_name   TEXT NOT NULL,
-    embedding_model   TEXT,
-    embedding_dim     INTEGER,
-    kg_dir_path       TEXT,
-    weaviate_url      TEXT,
-    config_json       TEXT,
-    updated_at        INTEGER NOT NULL,
-    PRIMARY KEY (project_id, role)
-);
-"""
-
-_APP_STATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS app_state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-"""
 
 
 def _make_launcher_db_with_root(
@@ -97,34 +61,29 @@ def _make_launcher_db_with_root(
     The bindings table is seeded with one primary + one shared row pointing
     at potentially-divergent collection names so the rebind helper has
     something to update.
+
+    Schema comes from the shipped migrations (``tests/common/
+    launcher_db_fixture``); the three hand-rolled CREATE TABLEs this
+    replaced covered only the columns the helper touches, so any column the
+    rebind path grows next would have gone untested here.
     """
-    db_path = tmp / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript(_PROJECTS_SCHEMA + _BINDINGS_SCHEMA + _APP_STATE_SCHEMA)
-    now = int(time.time() * 1000)
-    conn.execute(
-        "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at) "
-        "VALUES (?, 'VCODev', ?, 'orchestrator_root', 'vcodev', ?, ?)",
-        (project_id, str(tmp), now, now),
+    return make_launcher_db(
+        tmp / "launcher.db",
+        projects=[{
+            "project_id": project_id,
+            "name": "VCODev",
+            "folder_path": str(tmp),
+            "slug": "vcodev",
+            "host": "orchestrator_root",
+            "kg_primary": primary_collection,
+            "kg_shared": shared_collection,
+        }],
     )
-    conn.execute(
-        "INSERT INTO project_kg_bindings "
-        "(project_id, role, collection_name, updated_at) VALUES (?, 'primary', ?, ?)",
-        (project_id, primary_collection, now),
-    )
-    conn.execute(
-        "INSERT INTO project_kg_bindings "
-        "(project_id, role, collection_name, updated_at) VALUES (?, 'shared', ?, ?)",
-        (project_id, shared_collection, now),
-    )
-    conn.commit()
-    conn.close()
-    return db_path
 
 
 def _read_binding(db_path: Path, project_id: str, role: str) -> str | None:
     """Return ``collection_name`` for ``(project_id, role)`` or ``None``."""
-    conn = sqlite3.connect(str(db_path))
+    conn = connect(db_path)
     try:
         row = conn.execute(
             "SELECT collection_name FROM project_kg_bindings "
@@ -409,11 +368,7 @@ class OrchestratorRootRebindTest(unittest.TestCase):
 
         # Use an app_state DB (for the _write_app_state_key calls) but point
         # the rebind helper at a nonexistent launcher.db.
-        app_state_db = self.tmp / "app_state.db"
-        conn = sqlite3.connect(str(app_state_db))
-        conn.executescript(_APP_STATE_SCHEMA)
-        conn.commit()
-        conn.close()
+        app_state_db = create_empty_launcher_db(self.tmp / "app_state.db")
 
         os.environ["VCT_LAUNCHER_DB_PATH"] = str(
             self.tmp / "definitely-does-not-exist.db"

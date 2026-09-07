@@ -107,7 +107,10 @@ pub(crate) fn strip_named_keys_from_env_object(
         .cloned()
         .collect();
     for k in to_remove {
-        env_obj.remove(&k);
+        // `shift_remove`, never `remove` — see `json_file`'s module docs.
+        // `remove` is `swap_remove` under `preserve_order` and would
+        // relocate the user's last env key on every strip.
+        env_obj.shift_remove(&k);
         removed.insert(k);
     }
     removed.into_iter().collect()

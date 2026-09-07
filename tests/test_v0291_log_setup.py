@@ -53,6 +53,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
 from vco_lib import log_setup
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +78,7 @@ def _run_in_subprocess(script: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=30,
+        env=child_env(),
     )
 
 
@@ -241,6 +243,28 @@ _BASICCONFIG_LEVEL_RE = re.compile(r"logging\.basicConfig\(\s*level\s*=", re.MUL
 _SCAN_DIRS = ("vco_lib", "claude_mcp_servers")
 _SELF_EXEMPT_PATH = Path("vco_lib") / "log_setup.py"
 
+#: The ONE shipped file whose fallback may call ``basicConfig(level=...)``,
+#: with the reason it is not a bypass.
+#:
+#: v0.2.92 BLOCKER-1: this gate's premise — *vco_lib is importable, so route
+#: through configure_logging and VCO_LOG_LEVEL is honoured* — is false for
+#: ``code_embedding_service/server.py`` alone. That file also runs INSIDE the
+#: code_embed container image, whose Dockerfiles COPY only
+#: ``requirements.txt`` + ``image_source.py`` + ``server.py`` onto a pytorch
+#: base; the compose build context is the service directory, so a ``COPY``
+#: cannot reach ``vco_lib/`` and it is absent BY DESIGN. Before v0.2.92 the
+#: bare import made the image unstartable (ModuleNotFoundError at import,
+#: under ``restart: unless-stopped`` = crash loop) — invisible only because
+#: nothing ever rebuilt the image.
+#:
+#: The exemption is narrow and cannot hide a regression: the companion
+#: assertion below requires the exempted file to STILL call
+#: ``configure_logging`` on its normal path, so a future edit that quietly
+#: drops vco_lib routing altogether turns this gate red again.
+_CONTAINER_FALLBACK_EXEMPT = {
+    Path("claude_mcp_servers") / "code_embedding_service" / "server.py",
+}
+
 
 def _iter_python_files():
     for scan_dir in _SCAN_DIRS:
@@ -262,6 +286,16 @@ def test_no_bare_basicconfig_level_outside_log_setup():
             continue
         if rel == _SELF_EXEMPT_PATH:
             found_self = True
+            continue
+        if rel in _CONTAINER_FALLBACK_EXEMPT:
+            # Narrow, and not a free pass: the exempted file must still route
+            # its NORMAL path through configure_logging. Only the
+            # vco_lib-absent arm may fall back.
+            assert "configure_logging" in text, (
+                f"{rel} is exempt only because vco_lib may be absent inside "
+                "its container image — it must still call configure_logging "
+                "on the path where vco_lib IS importable"
+            )
             continue
         offenders.append(str(rel))
 

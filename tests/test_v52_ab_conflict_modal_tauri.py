@@ -202,14 +202,36 @@ class RustTauriCommandsTests(unittest.TestCase):
                 helper_body,
                 f"resolve_conflict_and_resume must invoke `git {verb}`",
             )
-        # Count silent() occurrences as a sanity check (~6 expected: 3 git
-        # subprocess calls + extra audit/state probes; ≥3 is the floor).
-        silent_count = helper_body.count(".silent()")
-        self.assertGreaterEqual(
-            silent_count,
-            3,
-            "resolve_conflict_and_resume should pipe every git subprocess through "
-            f".silent() (found {silent_count}, expected ≥3)",
+        # v0.2.92 (MAJOR-7): the git spawns moved OUT of this body and into the
+        # one runner in `git_cmd.rs`, which applies `.silent()` itself. Counting
+        # `.silent()` here would now measure the wrong layer — it would go red
+        # for a change that strengthened the invariant, and green again if a
+        # future edit re-inlined a raw spawn that merely happened to sit near
+        # some other `.silent()` call. So assert the two halves that actually
+        # carry the guarantee.
+        #
+        # Half 1: this body reaches git only through the runner.
+        self.assertIn(
+            "run_git_raw",
+            helper_body,
+            "resolve_conflict_and_resume must invoke git through the "
+            "git_cmd runner, not a raw Command::new(\"git\")",
+        )
+        self.assertNotIn(
+            'Command::new("git")',
+            helper_body,
+            "resolve_conflict_and_resume must not spawn git directly — "
+            "route it through git_cmd (pinned repo-wide by git_spawn_lint.rs)",
+        )
+        # Half 2: the runner it delegates to is itself silent, which is the
+        # property this test exists to protect (no Windows console window).
+        git_cmd = (INSTALLER_RS.parent / "git_cmd.rs").read_text(encoding="utf-8")
+        self.assertIn(
+            'TokioCommand::new("git").silent()',
+            git_cmd,
+            "the git_cmd runner must apply .silent() — every caller, including "
+            "resolve_conflict_and_resume, inherits the Windows-console "
+            "suppression from it",
         )
 
     # -- helpers -----------------------------------------------------------

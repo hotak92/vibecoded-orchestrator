@@ -33,13 +33,13 @@ from claude_mcp_servers.rl_client.telemetry_writer import RLTelemetryWriter
 
 
 # ----------------------------------------------------------------------
-# 1. Schema version is now 3 and split-brain is closed.
+# 1. Schema version is now 4 (v3 fields + v4 emb_truncated) and split-brain is closed.
 # ----------------------------------------------------------------------
 
 
 class TestSchemaVersionAlignment:
-    def test_mcp_logger_schema_version_is_3(self) -> None:
-        assert RLDataLogger.SCHEMA_VERSION == 3
+    def test_mcp_logger_schema_version_is_4(self) -> None:
+        assert RLDataLogger.SCHEMA_VERSION == 4
 
     def test_telemetry_writer_inherits_schema_version_from_logger(self) -> None:
         """RLTelemetryWriter references RLDataLogger.SCHEMA_VERSION directly
@@ -58,7 +58,7 @@ class TestSchemaVersionAlignment:
             session_id="",
             query_emb=None,
         )
-        assert payload["schema_version"] == 3
+        assert payload["schema_version"] == 4
 
 
 # ----------------------------------------------------------------------
@@ -86,7 +86,7 @@ class TestCitationV3Fields:
                 citations={"A": True, "B": False},
             )
             event = json.loads((td_path / "ev.jsonl").read_text().strip())
-            assert event["schema_version"] == 3
+            assert event["schema_version"] == 4
             assert "literal_cited" not in event
             assert "cross_encoder_cited" not in event
 
@@ -298,7 +298,7 @@ class TestTelemetryWriterPassThrough:
         )
         assert payload["literal_cited"] == {"A": True}
         assert payload["cross_encoder_cited"] == {"A": False}
-        assert payload["schema_version"] == 3
+        assert payload["schema_version"] == 4
 
     def test_build_retrieval_payload_includes_v3_node_fields(self) -> None:
         w, _ = self._writer_with_captured_posts()
@@ -540,7 +540,7 @@ class TestHubCutoverEnvelopeShape:
         assert len(captured) == 1
         env = captured[0]
         assert env["event_type"] == "retrieval"
-        assert env["schema_version"] == 3
+        assert env["schema_version"] == 4
         assert env["project_id"] == "uuid-fake-project"
         assert env["project_name"] == "VCO_dev"
         assert env["task_id"] == "t1"
@@ -551,7 +551,7 @@ class TestHubCutoverEnvelopeShape:
         # payload_json is the full v3 event JSON.
         event = json.loads(env["payload_json"])
         assert event["event"] == "retrieval"
-        assert event["schema_version"] == 3
+        assert event["schema_version"] == 4
         assert event["task_id"] == "t1"
         assert event["session_id"] == "sess-1"
 

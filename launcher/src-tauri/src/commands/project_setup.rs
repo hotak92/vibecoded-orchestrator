@@ -101,8 +101,12 @@ pub struct SetupOutcome {
     /// bootstrap) AND no genuine failure occurred. Drives the
     /// `deferred` (amber) vs `done` (clean) terminal status.
     pub deferred: bool,
-    /// True iff a genuine subprocess failure occurred. Drives the `failed`
-    /// (red + Retry) terminal status, which wins over `deferred`.
+    /// True iff a genuine failure occurred in a REQUIRED phase (bootstrap /
+    /// bundle). Drives the `failed` (red + Retry) terminal status, which wins
+    /// over `deferred`. v0.2.92: an Error-severity warning from the ADVISORY
+    /// post-bundle phase does NOT set this — the project is added and usable,
+    /// so claiming "Setup failed." would misinform the user about whether
+    /// their project exists. See [`record_setup_warning`].
     pub failed: bool,
     /// Failure message recorded on the row + emitted on the terminal event
     /// when `failed`. None otherwise.
@@ -407,6 +411,54 @@ pub fn classify_warning(raw: &str) -> (SetupWarningSeverity, bool) {
         // `deferred`.
         (SetupWarningSeverity::Info, false)
     }
+}
+
+/// Fold ONE raw phase warning into the accumulating [`SetupOutcome`] fields.
+///
+/// v0.2.92 (2026-09-05 field bug). `phase_required` is the structural
+/// discriminator this function exists for. [`classify_warning`] only reads
+/// PROSE — it substring-matches `"error"` / `"unparseable"` / `"failed to
+/// start"` — so on its own it cannot tell "the bundle did not install" from
+/// "a background probe soft-failed and said so". Before this split, ANY
+/// Error-severity warning flipped the whole setup to `failed`, and the user
+/// who added a project saw
+///
+/// > Setup failed.  ERROR schema-migration runner produced unparseable
+/// > output … Bundle install will proceed.
+///
+/// for a project that had in fact been created, bundled and registered
+/// correctly. The message left them unable to tell whether the project was
+/// added at all — worse than no message.
+///
+/// * `phase_required = true`  — bootstrap / bundle. An Error means the project
+///   may genuinely be half-installed → `failed` + the Retry button.
+/// * `phase_required = false` — the post-bundle pipeline, which the banner
+///   itself labels "Indexing — continues in the background…". Every step there
+///   is an idempotent background action that re-runs on the next update or via
+///   its own deferral. The warning is still recorded and still rendered RED in
+///   the details list; it just may not claim the setup failed.
+pub fn record_setup_warning(
+    raw: String,
+    phase_required: bool,
+    warnings: &mut Vec<SetupWarning>,
+    deferred: &mut bool,
+    failed: &mut bool,
+    first_error: &mut Option<String>,
+) {
+    let (severity, is_deferral) = classify_warning(&raw);
+    if is_deferral {
+        *deferred = true;
+    }
+    if severity == SetupWarningSeverity::Error && phase_required {
+        *failed = true;
+        if first_error.is_none() {
+            *first_error = Some(raw.clone());
+        }
+    }
+    warnings.push(SetupWarning {
+        message: raw,
+        severity,
+    });
 }
 
 /// Launcher-boot resume sweep (Defect B). Mirrors
@@ -767,5 +819,77 @@ mod tests {
             "bootstrap-collections error on Example_KnowledgeGraph: connection refused",
         );
         assert_eq!(sev, SetupWarningSeverity::Error);
+    }
+
+    // ── v0.2.92 field bug (2026-09-05): severity != fatality ─────────────
+    // The reported string, verbatim from the user's banner. Same input, two
+    // phases, two different terminal statuses — that IS the decision under
+    // test, so both legs are pinned (act + leave-alone).
+
+    const FIELD_BUG_WARNING: &str =
+        "schema-migration runner (`python -m vco_lib.project_init          migrate-schema`) produced unparseable output (trailing characters at          line 1 column 2): first stdout line was `4_to_5: X at v5 shape`;          stderr tail: . Bundle install will proceed — the project is added          and usable.";
+
+    fn record_one(raw: &str, phase_required: bool) -> (bool, Option<String>, SetupWarningSeverity) {
+        let mut warnings = Vec::new();
+        let mut deferred = false;
+        let mut failed = false;
+        let mut first_error = None;
+        record_setup_warning(
+            raw.to_string(),
+            phase_required,
+            &mut warnings,
+            &mut deferred,
+            &mut failed,
+            &mut first_error,
+        );
+        assert_eq!(warnings.len(), 1, "the warning is never dropped");
+        (failed, first_error, warnings[0].severity)
+    }
+
+    #[test]
+    fn advisory_phase_error_warning_does_not_fail_the_setup() {
+        let (failed, first_error, severity) = record_one(FIELD_BUG_WARNING, false);
+        assert!(
+            !failed,
+            "a post-bundle (advisory) warning must not make the banner say              \"Setup failed.\" — the project IS added and usable"
+        );
+        assert!(first_error.is_none());
+        // …and it is NOT silently downgraded: still red in the details list.
+        assert_eq!(severity, SetupWarningSeverity::Error);
+    }
+
+    #[test]
+    fn required_phase_error_warning_still_fails_the_setup() {
+        let (failed, first_error, severity) = record_one(
+            "install-bundle subprocess failed to start: no such file",
+            true,
+        );
+        assert!(failed, "a bundle-phase failure is a genuine setup failure");
+        assert_eq!(
+            first_error.as_deref(),
+            Some("install-bundle subprocess failed to start: no such file")
+        );
+        assert_eq!(severity, SetupWarningSeverity::Error);
+    }
+
+    #[test]
+    fn deferral_is_recorded_in_both_phase_kinds() {
+        for required in [true, false] {
+            let mut warnings = Vec::new();
+            let mut deferred = false;
+            let mut failed = false;
+            let mut first_error = None;
+            record_setup_warning(
+                "bootstrap deferred: collections will be created when Weaviate                  is ready"
+                    .to_string(),
+                required,
+                &mut warnings,
+                &mut deferred,
+                &mut failed,
+                &mut first_error,
+            );
+            assert!(deferred, "deferral detection is phase-independent");
+            assert!(!failed);
+        }
     }
 }

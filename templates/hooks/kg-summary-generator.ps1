@@ -29,6 +29,8 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (
 # Shared helper refuses that fallback. PR-25 / v0.2.12 dual-layout history
 # preserved in the helper's docstring.
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+# The ONE guarded detached-spawn home (Start-VcoDetachedProcess).
+. (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
 $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 $generator = Join-Path $ProjectRoot ".claude/scripts/generate-kg-summary.py"
 
@@ -119,9 +121,18 @@ $logsDir = Join-Path $ProjectRoot ".claude/logs"
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
 $logFile = Join-Path $logsDir "kg-summary-generator.log"
 
-Start-Process -FilePath $venvPy -ArgumentList @($generator, $FilePath) `
-    -RedirectStandardOutput $logFile -RedirectStandardError $logFile `
-    -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+# Through the ONE guarded spawn home (_lib/resolve-powershell.ps1). TWO
+# cmdlet-level parameter rejections were killing this spawn outright:
+#   * `-WindowStyle Hidden` is rejected by non-Windows PowerShell editions;
+#   * naming the SAME file for -RedirectStandardOutput and
+#     -RedirectStandardError is rejected on EVERY edition ("...are same"),
+#     which is what this call did — so on Windows too the generator has never
+#     actually started. The `.sh` sibling's `>> log 2>&1` has no such limit;
+#     the helper diverts stderr to `<log>.err`, which is also the shape
+#     `stop-drain-citations.ps1` already uses.
+Start-VcoDetachedProcess -FilePath $venvPy -ArgumentList @($generator, $FilePath) `
+    -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+    -WorkingDirectory $ProjectRoot
 
 Write-Output "KG summary generation queued for $(Split-Path $FilePath -Leaf)"
 exit 0

@@ -228,6 +228,16 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_hooks.disabled_entry_json (v0.2.91, decision #27 — the Hooks tab stops being a placebo). Until now register/toggle/delete on the Hooks tab wrote project_hooks rows that NOTHING read: Claude Code's hook engine reads <project>/.claude/settings.json directly, so unchecking a hook never stopped it firing and registering one never made it fire (review v0291-wave5-phase2-ux-completeness P2-B2; apply_fs_disable_hook never existed while its agent/skill siblings did). Enforcement is now a real edit to that file through the single writer `python -m vco_lib.hooks_settings`, which means DISABLING removes the entry — so the removed entry needs a home to make re-enable exact. This nullable TEXT column is that home: the parked entry (schema 1 — event, matcher, group/hook indices, the inner hook item verbatim, plus the group's other keys when the whole group was emptied). NULL = not parked (the common case); NOT NULL = VCO holds this entry out of settings.json and can restore it. `enabled = 0` alone remains the legacy advisory mirror flag; the parked column is the enforcing signal, and the truth about what RUNS is always settings.json itself. A column rather than a table: 1:1 with its hook row, dies with it via the existing ON DELETE CASCADE. No index — tens of rows per project and every read is already a per-project scan. Untouched by populate's UPSERT (which overwrites only source/source_module/timeout_ms/config_json/updated_at), so Re-scan from disk cannot lose a parked entry. Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 41->42 atomically with this migration (B-2).",
         sql: include_str!("migrations/042_project_hooks_disabled_entry.sql"),
     },
+    Migration {
+        version: 43,
+        description: "chat_model_context (v0.2.92, WP-11 — the version-keyed CHAT-model context table). Orchestrator-wide, keyed by FULL model id: glm-5.2 has a 1M window while glm-5.1 has 200K, so a family wildcard would overstate the smaller by 5x — which is why the table exists instead of a regex. Read by the model gateway (claude_mcp_servers/model_router/) through the exported JSON at <vct_root>/model-gateway/chat_model_context.json; rows with window_1m=1 are advertised to Claude Code as `<id>[1m]` so its context indicator and /compact thresholds size correctly. `source` is NON-EMPTY BY CHECK (R10: no row without a cited official source — guessing a window is what a version-keyed table exists to prevent), and `source_note` carries the honest caveats (glm-4.5-air has no page of its own; third-party 1M listings of it are not official) so they survive the DB round-trip into the export. `user_edited` is the reseed guard: `chat_model_context_reseed` re-applies shipped rows ONLY where it is 0. NOT `weaviate_mcp.chunking.MODEL_TOKEN_LIMITS` — that covers EMBEDDING models, sets Ollama num_ctx for the chunker, partial-matches on purpose, and is a wire-format input to stored embeddings; see EXTENSION plan §3.19. No seed rows in SQL: the seed is ONE file (model_router/chat_model_context.seed.json, which the gateway also reads as its fallback) loaded at first boot by commands::chat_model_context. Plain CREATE TABLE IF NOT EXISTS — idempotent by construction AND by the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 42->43 atomically with this migration (B-2).",
+        sql: include_str!("migrations/043_chat_model_context.sql"),
+    },
+    Migration {
+        version: 44,
+        description: "project_moves (v0.2.92, WP-17/W3 — the project-move ledger). A move rewrites a project's path across launcher.db, its .claude/ state and its collection bindings; the risk is not the write but the INTERRUPTION, so the move gets a durable state machine instead of hope. Two things a sentinel FILE cannot do, which is why this is a table: (1) SINGLE-FLIGHT — the partial UNIQUE index on project_id WHERE status IN ('running','flipped') makes a second concurrent move of the same project fail in SQLite, not in application logic, so there is no check-then-act window between a GUI click and a CLI run; (2) SURVIVING THE FOLDER — a move whose destination was never created leaves no readable sentinel anywhere, while this row is what the launcher's boot sweep reads. The status machine IS the failure-semantics contract: 'running' = files may be copying INTO the destination but NOTHING in `projects` changed (the project still lives at src and works; the destination holds only ADDED files because the engine never overwrites); 'flipped' = the commit transaction succeeded — folder_path flipped, project_agents/project_skills/project_kg_bindings path columns re-pointed, code-graph rebuild queued, all atomically — so the project lives at dst and works while post-commit reconciliation may still be owed; 'completed' = reconciliation ran too; 'failed' = aborted before the flip, project never moved. There is deliberately no 'rolling_back' state: nothing is rolled back because nothing was overwritten or deleted, so undoing a refused move is a REPORT, not a state. Rows are never deleted — a completed move's row is the only durable record that this project used to live elsewhere, long after the dismissible ledger entry is gone; they die with their project via the FK cascade. Plain CREATE TABLE/INDEX IF NOT EXISTS — idempotent by construction AND by the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 43->44 atomically with this migration (B-2).",
+        sql: include_str!("migrations/044_project_moves.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2487,5 +2497,613 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         apply(&conn).expect("first apply");
         apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Migration 043 — chat_model_context (v0.2.92, WP-11)
+    //
+    // A migration is a destructive-CAPABLE change, so both branches are
+    // proven separately: applying it on a FRESH database, and applying it
+    // on a database that ALREADY HAS the table with user rows in it.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Column shape of `chat_model_context` after a fresh `apply()`:
+    /// (name, declared type, notnull, default, pk-position).
+    fn chat_model_context_columns(conn: &Connection) -> Vec<(String, String, i64, Option<String>, i64)> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(chat_model_context)")
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    /// FRESH-DB BRANCH: migration 043 runs as part of `apply()` and creates
+    /// the table with exactly the documented columns. Pinned by name +
+    /// nullability + default so a future edit to the .sql that silently
+    /// drops `source_note` (the column carrying the glm-4.5-air citation
+    /// caveat into the export) reds this test.
+    #[test]
+    fn migration_043_creates_chat_model_context_on_a_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let v: u32 = conn
+            .query_row("SELECT MAX(version) FROM _schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(v >= 43, "expected at least version 43, got {}", v);
+
+        let cols = chat_model_context_columns(&conn);
+        let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "model_id",
+                "vendor",
+                "context_window",
+                "max_output",
+                "window_1m",
+                "source",
+                "source_note",
+                "user_edited",
+                "updated_at",
+            ],
+            "column set (and order) of chat_model_context"
+        );
+
+        // model_id is the sole primary key — the EXACT-full-id rule lives in
+        // the schema, not only in a docstring.
+        let pk: Vec<&str> = cols
+            .iter()
+            .filter(|c| c.4 == 1)
+            .map(|c| c.0.as_str())
+            .collect();
+        assert_eq!(pk, vec!["model_id"], "model_id must be the only PK column");
+
+        // Defaults that make an older writer's INSERT well-defined.
+        let by_name = |n: &str| cols.iter().find(|c| c.0 == n).unwrap().clone();
+        assert_eq!(by_name("window_1m").3.as_deref(), Some("0"));
+        assert_eq!(by_name("user_edited").3.as_deref(), Some("0"));
+        assert_eq!(by_name("source_note").3.as_deref(), Some("''"));
+        // `source` is NOT NULL and has no default: an INSERT that forgets it
+        // fails loudly rather than defaulting to an uncited empty string.
+        assert_eq!(by_name("source").2, 1, "source must be NOT NULL");
+        assert_eq!(by_name("source").3, None, "source must have no default");
+    }
+
+    /// UPGRADE BRANCH: a database stopped at v42 (a user on v0.2.91) gains
+    /// the table on the next `apply()`, and rows written by the older
+    /// launcher into an unrelated table are untouched.
+    #[test]
+    fn migration_043_applies_on_upgrade_from_v42_preserving_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 42).expect("apply up to v42");
+
+        // The table does not exist yet at v42.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='chat_model_context'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "chat_model_context must not exist before 043");
+
+        // Pre-existing user data written by the older launcher.
+        seed_project_row_for_mig(&conn, "p-upgrade");
+
+        apply(&conn).expect("apply remaining migrations (043)");
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='chat_model_context'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "043 must create chat_model_context");
+
+        // Fresh table starts EMPTY — the seed is a file read by the
+        // launcher at boot, never SQL (one copy of the shipped data).
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_model_context", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "043 must not seed rows from SQL");
+
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id='p-upgrade'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "p-upgrade", "pre-043 project row must survive");
+    }
+
+    /// ALREADY-HAS-THE-TABLE BRANCH — the one that matters for a
+    /// destructive-capable change. Re-executing 043's SQL against a
+    /// database that already holds user rows must be a NO-OP on those
+    /// rows: never a DROP, never a rebuild.
+    ///
+    /// This is not hypothetical. `apply_one` records the version in a
+    /// separate statement from the batch, and the module docstring
+    /// already documents the crash window in which a migration re-runs on
+    /// the next open. `CREATE TABLE IF NOT EXISTS` is what makes that
+    /// window safe here, and this test is what keeps it that way.
+    #[test]
+    fn migration_043_reapplied_over_populated_table_preserves_every_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, source_note, user_edited, updated_at) \
+             VALUES ('glm-5.2', 'zai', 1000000, 128000, 1, \
+                     'https://docs.z.ai/guides/llm/glm-5.2', '', 0, \
+                     '2026-09-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, source_note, user_edited, updated_at) \
+             VALUES ('my-local-model', 'zai', 42000, 8000, 0, \
+                     'internal wiki', 'hand added', 1, \
+                     '2026-09-02T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Re-run the migration body verbatim, as the crash-window replay
+        // would.
+        let sql = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 43)
+            .expect("migration 43 registered")
+            .sql;
+        conn.execute_batch(sql)
+            .expect("re-running 043 on a populated table must succeed");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_model_context", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "re-applying 043 must not drop user rows");
+
+        // The USER-EDITED row survives byte-identically — the value most
+        // expensive to lose.
+        let (window, max_out, note, edited): (i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT context_window, max_output, source_note, user_edited \
+                 FROM chat_model_context WHERE model_id='my-local-model'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((window, max_out, note.as_str(), edited), (42000, 8000, "hand added", 1));
+    }
+
+    /// Migration 043 is idempotent through the runner (version-gate).
+    #[test]
+    fn migration_043_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 43",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "043 recorded exactly once");
+    }
+
+    /// R10 AT THE SCHEMA LEVEL: a row with a blank citation is REFUSED by
+    /// the database, so no code path (GUI, reseed, importer, hand-written
+    /// UPDATE) can produce one. The reader ignores uncited rows and warns;
+    /// this makes sure our own writer never hands it one to ignore.
+    #[test]
+    fn migration_043_check_refuses_an_uncited_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        // The tab/CR cases are not padding: SQLite's ONE-argument `trim()`
+        // strips SPACES ONLY, so `length(trim(x)) > 0` would accept a
+        // tab-only "citation" — which the gateway reader's `str.strip()`
+        // then drops as uncited, producing a row the launcher shows and the
+        // gateway ignores. The .sql spells out the whitespace character set
+        // for exactly this reason; these cases are its regression net.
+        for blank in ["", "   ", "\t\n", "\r", "\u{0b}\u{0c}"] {
+            let err = conn
+                .execute(
+                    "INSERT INTO chat_model_context \
+                     (model_id, vendor, context_window, max_output, window_1m, \
+                      source, user_edited, updated_at) \
+                     VALUES ('guessed-model', 'zai', 999, 99, 0, ?1, 0, 'now')",
+                    rusqlite::params![blank],
+                )
+                .expect_err("an uncited row must be refused by the CHECK");
+            assert!(
+                err.to_string().to_uppercase().contains("CHECK"),
+                "expected a CHECK-constraint failure, got: {}",
+                err
+            );
+        }
+
+        // ACT half: the same row WITH a citation is accepted, so the test
+        // proves the constraint discriminates rather than refusing
+        // everything.
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, user_edited, updated_at) \
+             VALUES ('cited-model', 'zai', 999, 99, 0, \
+                     'https://docs.z.ai/guides/llm/glm-5.2', 0, 'now')",
+            [],
+        )
+        .expect("a cited row is accepted");
+    }
+
+    /// The remaining value CHECKs are backstops behind the Rust validator.
+    /// Each is asserted individually so a dropped constraint names itself.
+    #[test]
+    fn migration_043_check_refuses_impossible_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let insert = |model_id: &str, window: i64, max_out: i64, w1m: i64, edited: i64, vendor: &str| {
+            conn.execute(
+                "INSERT INTO chat_model_context \
+                 (model_id, vendor, context_window, max_output, window_1m, \
+                  source, user_edited, updated_at) \
+                 VALUES (?1, ?6, ?2, ?3, ?4, 'https://example.invalid/doc', ?5, 'now')",
+                rusqlite::params![model_id, window, max_out, w1m, edited, vendor],
+            )
+        };
+
+        assert!(insert("a", 0, 100, 0, 0, "zai").is_err(), "context_window > 0");
+        assert!(insert("b", 100, 0, 0, 0, "zai").is_err(), "max_output > 0");
+        assert!(insert("c", 100, 100, 2, 0, "zai").is_err(), "window_1m IN (0,1)");
+        assert!(insert("d", 100, 100, 0, 7, "zai").is_err(), "user_edited IN (0,1)");
+        assert!(insert("", 100, 100, 0, 0, "zai").is_err(), "model_id non-blank");
+        assert!(insert("e", 100, 100, 0, 0, "  ").is_err(), "vendor non-blank");
+        // Leave-alone: a fully valid row still inserts.
+        assert!(insert("f", 100, 100, 1, 1, "zai").is_ok(), "valid row accepted");
+    }
+
+    // ─── Migration 044 — project_moves (v0.2.92 WP-17 / W3) ──────────────
+    //
+    // A destructive-capable migration gets all three branches: fresh, upgrade
+    // over a populated DB, and re-applied. The one that matters is the middle
+    // one — this table's whole purpose is to survive an interruption, so a
+    // migration that dropped it on upgrade would delete the record of exactly
+    // the state it exists to describe.
+
+    fn project_moves_columns(conn: &Connection) -> Vec<(String, String, i64, Option<String>, i64)> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(project_moves)")
+            .expect("prepare table_info");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("query table_info");
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn seed_project(conn: &Connection, id: &str, folder: &str) {
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+             VALUES (?1, ?1, ?2, 'base', ?1, 0, 0)",
+            rusqlite::params![id, folder],
+        )
+        .expect("seed project");
+    }
+
+    /// FRESH BRANCH: a brand-new database gets the table with the documented
+    /// columns and, crucially, the PARTIAL unique index that IS the
+    /// single-flight gate.
+    #[test]
+    fn migration_044_creates_project_moves_on_a_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let v: u32 = conn
+            .query_row("SELECT MAX(version) FROM _schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(v >= 44, "expected at least version 44, got {}", v);
+
+        let cols = project_moves_columns(&conn);
+        let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "project_id",
+                "src",
+                "dst",
+                "status",
+                "error",
+                "started_at",
+                "flipped_at",
+                "finished_at",
+            ],
+            "column set (and order) of project_moves"
+        );
+
+        let pk: Vec<&str> = cols
+            .iter()
+            .filter(|c| c.4 == 1)
+            .map(|c| c.0.as_str())
+            .collect();
+        assert_eq!(pk, vec!["id"], "the caller-supplied move id is the PK");
+
+        // `flipped_at` / `finished_at` MUST be nullable: a running move has
+        // neither, and that absence is the signal the boot sweep reads.
+        let by_name = |n: &str| cols.iter().find(|c| c.0 == n).unwrap().clone();
+        assert_eq!(by_name("flipped_at").2, 0, "flipped_at must be nullable");
+        assert_eq!(by_name("finished_at").2, 0, "finished_at must be nullable");
+        assert_eq!(by_name("started_at").2, 1, "started_at must be NOT NULL");
+
+        // The partial UNIQUE index is the single-flight gate. Without the
+        // WHERE clause it would also forbid HISTORY rows, so the predicate is
+        // asserted, not just the index's existence.
+        let idx_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' \
+                 AND name='idx_project_moves_live'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the single-flight index must exist");
+        assert!(
+            idx_sql.contains("UNIQUE"),
+            "the gate must be UNIQUE, else two moves can claim at once: {}",
+            idx_sql
+        );
+        assert!(
+            idx_sql.contains("WHERE") && idx_sql.contains("running"),
+            "the gate must be PARTIAL, else terminal history rows collide: {}",
+            idx_sql
+        );
+    }
+
+    /// UPGRADE BRANCH: a database stopped at v43 gains the table, and rows a
+    /// v43 launcher wrote are byte-for-byte untouched.
+    #[test]
+    fn migration_044_applies_on_upgrade_from_v43_preserving_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 43).expect("apply up to v43");
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='project_moves'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "project_moves must not exist at v43");
+
+        seed_project(&conn, "p-existing", "/w/existing");
+        conn.execute(
+            "INSERT INTO project_agents (project_id, agent_name, source, enabled,
+                                         file_path, installed_at, updated_at)
+             VALUES ('p-existing','planner','bundled',1,'/w/existing/.claude/agents/planner.md',7,7)",
+            [],
+        )
+        .expect("seed pre-existing agent row");
+
+        apply(&conn).expect("upgrade to the latest version");
+
+        let (folder, file_path, updated): (String, String, i64) = conn
+            .query_row(
+                "SELECT p.folder_path, a.file_path, a.updated_at
+                   FROM projects p JOIN project_agents a ON a.project_id = p.id
+                  WHERE p.id = 'p-existing'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(folder, "/w/existing", "the migration must not touch projects");
+        assert_eq!(
+            file_path, "/w/existing/.claude/agents/planner.md",
+            "the migration must not touch agent rows"
+        );
+        assert_eq!(updated, 7, "not even the timestamp moves");
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='project_moves'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "project_moves must exist after the upgrade");
+    }
+
+    /// RE-APPLY BRANCH: running the migration again over a POPULATED table
+    /// keeps every row. `CREATE TABLE IF NOT EXISTS` makes this true by
+    /// construction; the test exists because "by construction" has been wrong
+    /// before, and a dropped move row is a lost record of a real move.
+    #[test]
+    fn migration_044_reapplied_over_a_populated_table_preserves_every_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        seed_project(&conn, "p1", "/w/new");
+        conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at,
+                                        flipped_at, finished_at)
+             VALUES ('mv-1','p1','/w/old','/w/new','completed',100,200,300)",
+            [],
+        )
+        .expect("seed a completed move");
+
+        // Re-run the raw SQL directly — the runner's version check would skip
+        // it, and the point here is that the SQL ITSELF is idempotent.
+        let sql = include_str!("migrations/044_project_moves.sql");
+        conn.execute_batch(sql).expect("re-apply 044 raw");
+        conn.execute_batch(sql).expect("re-apply 044 raw, twice");
+
+        let (src, dst, status, flipped): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT src, dst, status, flipped_at FROM project_moves WHERE id='mv-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the seeded move row must survive");
+        assert_eq!((src.as_str(), dst.as_str(), status.as_str(), flipped),
+                   ("/w/old", "/w/new", "completed", 200));
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM project_moves", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "no duplicate, no loss");
+    }
+
+    /// The status CHECK is the state machine. A typo'd status would let a
+    /// move sit in a state nothing recognises, which is indistinguishable
+    /// from the half-moved state this feature exists to prevent.
+    #[test]
+    fn migration_044_status_check_rejects_an_unknown_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+        seed_project(&conn, "p1", "/w/p");
+
+        let bad = conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-bad','p1','/a','/b','rolling_back',1)",
+            [],
+        );
+        assert!(bad.is_err(), "an unknown status must be refused");
+
+        // Leave-alone: every documented state is accepted.
+        for (i, st) in ["running", "flipped", "completed", "failed"].iter().enumerate() {
+            // Terminal states can coexist; 'running'/'flipped' cannot, so give
+            // each its own project to keep this test about the CHECK only.
+            let pid = format!("p-{}", i);
+            seed_project(&conn, &pid, &format!("/w/{}", i));
+            conn.execute(
+                "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+                 VALUES (?1, ?2, '/a', '/b', ?3, 1)",
+                rusqlite::params![format!("mv-{}", i), pid, st],
+            )
+            .unwrap_or_else(|e| panic!("status '{}' must be accepted: {}", st, e));
+        }
+    }
+
+    /// The single-flight gate, from both sides.
+    #[test]
+    fn migration_044_partial_index_blocks_a_second_live_move_and_allows_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+        seed_project(&conn, "p1", "/w/p");
+
+        conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-1','p1','/a','/b','running',1)",
+            [],
+        )
+        .expect("first claim");
+
+        // ACT: a second LIVE claim for the same project is refused by SQLite.
+        let second = conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-2','p1','/a','/c','running',2)",
+            [],
+        );
+        assert!(
+            second.is_err(),
+            "a second concurrent move must be refused by the index, not by \
+             application logic that another writer can slip between"
+        );
+
+        // LEAVE ALONE: terminal history rows accumulate freely.
+        conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-old-1','p1','/x','/y','completed',3)",
+            [],
+        )
+        .expect("a completed history row must be allowed");
+        conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-old-2','p1','/x','/z','failed',4)",
+            [],
+        )
+        .expect("a failed history row must be allowed");
+    }
+
+    /// Rows die with their project (the FK cascade every per-project table
+    /// uses) and NEVER by any other route.
+    #[test]
+    fn migration_044_move_rows_cascade_with_their_project() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+        seed_project(&conn, "p1", "/w/p");
+        seed_project(&conn, "p2", "/w/q");
+        conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-1','p1','/a','/b','completed',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+             VALUES ('mv-2','p2','/c','/d','completed',1)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM projects WHERE id='p1'", []).unwrap();
+
+        let remaining: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM project_moves ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            remaining,
+            vec!["mv-2".to_string()],
+            "the deleted project's move rows cascade; the OTHER project's row \
+             is untouched"
+        );
     }
 }

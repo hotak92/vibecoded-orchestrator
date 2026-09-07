@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import install  # noqa: E402  — back-compat surface
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 
 
@@ -228,6 +229,7 @@ class CliEntryPointTests(unittest.TestCase):
             text=True,
             cwd=str(REPO_ROOT),
             timeout=10,
+            env=child_env(),
         )
         self.assertEqual(result.returncode, 0, msg=f"stderr={result.stderr}")
         # Stdout must be parseable JSON (Rust does serde_json::from_str).
@@ -247,6 +249,7 @@ class CliEntryPointTests(unittest.TestCase):
             text=True,
             cwd=str(REPO_ROOT),
             timeout=10,
+            env=child_env(),
         )
         self.assertEqual(result.returncode, 0)
         # Human form is `key=value` lines.
@@ -260,6 +263,7 @@ class CliEntryPointTests(unittest.TestCase):
             text=True,
             cwd=str(REPO_ROOT),
             timeout=10,
+            env=child_env(),
         )
         # argparse exits with code 2 on missing required arg.
         self.assertEqual(result.returncode, 2)

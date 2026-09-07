@@ -4118,6 +4118,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap 2.13.0",
  "itoa",
  "memchr",
  "serde",
@@ -5525,7 +5526,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vct-hub"
-version = "0.2.91"
+version = "0.2.92"
 dependencies = [
  "axum",
  "chrono",
@@ -5552,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "vct-launcher-core"
-version = "0.2.91"
+version = "0.2.92"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5587,7 +5588,7 @@ dependencies = [
 
 [[package]]
 name = "vct-launcher-temp"
-version = "0.2.91"
+version = "0.2.92"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5631,7 +5632,7 @@ dependencies = [
 
 [[package]]
 name = "vct-updater"
-version = "0.2.91"
+version = "0.2.92"
 dependencies = [
  "hex",
  "serde",

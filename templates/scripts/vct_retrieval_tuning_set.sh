@@ -181,6 +181,10 @@ body = (
 
 os.makedirs(os.path.dirname(target), exist_ok=True)
 # Atomic write: tmp + rename. Same posture as the Rust writer.
+# DOCUMENTED COPY of vco_lib.atomic.atomic_write_text (v0.2.92 duplication-
+# merge, PLAN-EXTENSION §3.13): this heredoc runs under whatever python3 is
+# on PATH with NO orchestrator root resolved, so vco_lib is unreachable
+# here. Pinned by tests/test_v0292_atomic_one_home.py.
 fd, tmp = tempfile.mkstemp(
     prefix='retrieval-tuning.', suffix='.tmp',
     dir=os.path.dirname(target),

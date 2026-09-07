@@ -37,16 +37,19 @@ Run: pytest tests/test_env_template_resolve_shared.py -v
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    add_kg_binding,
+    create_corrupt_launcher_db,
+    create_empty_launcher_db,
+    make_launcher_db,
+)
 from vco_lib.config_projection import (  # noqa: E402
     _LAST_RESORT_SHARED_KG_NAME,
     _resolve_shared_kg_default_from_launcher_db,
@@ -63,59 +66,34 @@ def _make_db(
     *,
     orchestrator_primary_name: str | None = None,
 ) -> None:
-    """Build a minimal launcher.db.
-
-    The schema must match what ``_resolve_shared_kg_default_from_launcher_db``
-    reads (``projects.id``, ``projects.slug``,
-    ``project_kg_bindings.project_id``, ``.role``, ``.collection_name``).
+    """Build a launcher.db (REAL schema — v0.2.92 §3.4).
 
     When ``orchestrator_primary_name`` is provided, seeds an
     ``orchestrator-root`` project row + a primary binding row pointing
     at the given name. ``None`` → no orchestrator-root row (forces the
     last-resort fallback).
+
+    The binding is written with :func:`add_kg_binding` rather than
+    ``add_project(kg_primary=...)`` on purpose: two tests below pass ``""``
+    and ``"   "`` to pin "row EXISTS but its collection_name is blank", and
+    the ``add_project`` shortcut skips falsy collection names — which would
+    silently degrade those cases into "no binding row at all" (a DIFFERENT
+    branch of the resolver that another test already covers).
     """
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        # Schema must mirror the production launcher.db tables the
-        # resolver reads. Keep it minimal — only the columns the
-        # resolver SELECTs.
-        cur.executescript(
-            """
-            CREATE TABLE projects (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                folder_path TEXT NOT NULL,
-                slug TEXT NOT NULL
-            );
-            CREATE TABLE project_kg_bindings (
-                project_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                collection_name TEXT NOT NULL,
-                embedding_model TEXT,
-                PRIMARY KEY (project_id, role)
-            );
-            """
-        )
-        if orchestrator_primary_name is not None:
-            cur.execute(
-                "INSERT INTO projects (id, name, folder_path, slug) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "root-id-001",
-                    "VibeCoded Orchestrator",
-                    "/tmp/fake-orch-root",
-                    "orchestrator-root",
-                ),
-            )
-            cur.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name) VALUES (?, ?, ?)",
-                ("root-id-001", "primary", orchestrator_primary_name),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    if orchestrator_primary_name is None:
+        create_empty_launcher_db(db_path)
+        return
+    make_launcher_db(
+        db_path,
+        projects=[{
+            "project_id": "root-id-001",
+            "name": "VibeCoded Orchestrator",
+            "folder_path": "/tmp/fake-orch-root",
+            "slug": "orchestrator-root",
+            "host": "orchestrator_root",
+        }],
+    )
+    add_kg_binding(db_path, "root-id-001", "primary", orchestrator_primary_name)
 
 
 def _make_db_with_project(
@@ -129,84 +107,33 @@ def _make_db_with_project(
     project_shared_binding: str | None = None,
 ) -> None:
     """Build a launcher.db with a TARGET project row + optional
-    orchestrator-root seed.
+    orchestrator-root seed, on the REAL launcher schema (v0.2.92 §3.4).
 
-    Mirrors ``_make_launcher_db`` from ``test_env_template.py`` but
-    keeps schema minimal (only the columns the W40-C resolver reads).
     Used for the integration tests that round-trip through
     ``project_env_from_db`` / ``project_env_template_from_db``.
     """
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cur = conn.cursor()
-        cur.executescript(
-            """
-            CREATE TABLE projects (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                folder_path TEXT NOT NULL,
-                slug TEXT NOT NULL
-            );
-            CREATE TABLE project_kg_bindings (
-                project_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                collection_name TEXT NOT NULL,
-                embedding_model TEXT,
-                PRIMARY KEY (project_id, role)
-            );
-            CREATE TABLE kg_collection_access (
-                project_id TEXT NOT NULL,
-                collection_name TEXT NOT NULL,
-                access_level TEXT NOT NULL,
-                PRIMARY KEY (project_id, collection_name)
-            );
-            CREATE TABLE codegraph_access (
-                grantor_project_id TEXT NOT NULL,
-                grantee_project_id TEXT NOT NULL,
-                access_level TEXT NOT NULL,
-                granted_at INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (grantor_project_id, grantee_project_id)
-            );
-            CREATE TABLE module_settings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT NOT NULL,
-                module_id TEXT NOT NULL,
-                setting_key TEXT NOT NULL,
-                setting_value TEXT NOT NULL,
-                UNIQUE(project_id, module_id, setting_key)
-            );
-            """
+    projects: list[dict[str, object]] = [{
+        "project_id": project_id,
+        "name": project_name,
+        "folder_path": project_folder,
+        "slug": project_slug,
+    }]
+    if orchestrator_primary_name is not None:
+        projects.append({
+            "project_id": "root-id-001",
+            "name": "VibeCoded Orchestrator",
+            # Distinct folder_path/slug: both are UNIQUE in the real schema.
+            "folder_path": "/tmp/fake-orch-root-2",
+            "slug": "orchestrator-root",
+            "host": "orchestrator_root",
+        })
+    make_launcher_db(db_path, projects=projects)
+    if project_shared_binding is not None:
+        add_kg_binding(db_path, project_id, "shared", project_shared_binding)
+    if orchestrator_primary_name is not None:
+        add_kg_binding(
+            db_path, "root-id-001", "primary", orchestrator_primary_name,
         )
-        cur.execute(
-            "INSERT INTO projects (id, name, folder_path, slug) "
-            "VALUES (?, ?, ?, ?)",
-            (project_id, project_name, project_folder, project_slug),
-        )
-        if project_shared_binding is not None:
-            cur.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name) VALUES (?, ?, ?)",
-                (project_id, "shared", project_shared_binding),
-            )
-        if orchestrator_primary_name is not None:
-            cur.execute(
-                "INSERT INTO projects (id, name, folder_path, slug) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "root-id-001",
-                    "VibeCoded Orchestrator",
-                    "/tmp/fake-orch-root-2",
-                    "orchestrator-root",
-                ),
-            )
-            cur.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name) VALUES (?, ?, ?)",
-                ("root-id-001", "primary", orchestrator_primary_name),
-            )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # ─── _resolve_shared_kg_default_from_launcher_db direct tests ────────────
@@ -289,48 +216,24 @@ class TestResolverDirect:
         """orchestrator-root project row exists but has NO primary
         binding row at all → resolver returns the bundled const."""
         db = tmp_path / "launcher.db"
-        # Hand-build DB with project row only (no binding row).
-        conn = sqlite3.connect(str(db))
-        try:
-            cur = conn.cursor()
-            cur.executescript(
-                """
-                CREATE TABLE projects (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    folder_path TEXT NOT NULL,
-                    slug TEXT NOT NULL
-                );
-                CREATE TABLE project_kg_bindings (
-                    project_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    collection_name TEXT NOT NULL,
-                    embedding_model TEXT,
-                    PRIMARY KEY (project_id, role)
-                );
-                """
-            )
-            cur.execute(
-                "INSERT INTO projects (id, name, folder_path, slug) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "root-id-002",
-                    "VibeCoded Orchestrator",
-                    "/tmp/fake-orch-root-3",
-                    "orchestrator-root",
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        # Project row only — deliberately NO project_kg_bindings row.
+        make_launcher_db(
+            db,
+            projects=[{
+                "project_id": "root-id-002",
+                "name": "VibeCoded Orchestrator",
+                "folder_path": "/tmp/fake-orch-root-3",
+                "slug": "orchestrator-root",
+                "host": "orchestrator_root",
+            }],
+        )
         out = _resolve_shared_kg_default_from_launcher_db(db_path=db)
         assert out == _LAST_RESORT_SHARED_KG_NAME
 
     def test_never_raises_on_corrupt_db(self, tmp_path: Path) -> None:
         """Soft-fail: a corrupt / malformed DB returns the const
         rather than propagating the sqlite3 error."""
-        db = tmp_path / "launcher.db"
-        db.write_bytes(b"this is not a sqlite database, even slightly")
+        db = create_corrupt_launcher_db(tmp_path / "launcher.db")
         out = _resolve_shared_kg_default_from_launcher_db(db_path=db)
         assert out == _LAST_RESORT_SHARED_KG_NAME
 

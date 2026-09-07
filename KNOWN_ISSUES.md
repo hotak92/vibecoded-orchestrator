@@ -17,6 +17,41 @@ flagging for early adopters and the next iteration.
       enrollment is still pending. Workarounds in
       [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
 
+- [ ] **The arctic SECONDARY embedding slot has an uncovered-text gap on
+      oversized chunks** (v0.2.92, accepted). When dual embedding is enabled and
+      qwen3 is the active model, a chunk larger than arctic's window is embedded
+      from its leading sub-window; the tail influences no arctic vector and the
+      row is tagged `emb_truncated`.
+
+      **No user's retrieval is affected.** Chunks are sized to the ACTIVE model,
+      so a qwen3-active install retrieves on full-coverage qwen3 vectors, and a
+      low-power arctic-active install has chunks sized to arctic. The gap exists
+      only in the dual-write telemetry configuration (off by default), and only
+      for the secondary slot.
+
+      What it does affect is the arctic TRAINING corpus. Measured 2026-09-04:
+      17.0% of chunks (12.9% of text) in a real project's `knowledge/`, and
+      53.2% of chunks (50.9% of text) in this repo's `docs/`.
+
+      The fix is pooling — embedding an oversized chunk as several consecutive
+      sub-windows pooled into one vector, which gives full coverage without
+      moving chunk boundaries (boundaries are frozen because both named vectors
+      share one Weaviate object and the RL replay pairs slots by `chunk_num`).
+      Deferred deliberately: a pooled vector is not the same object as a
+      single-window embedding, so the change carries a modelling question that
+      deserves its own consideration rather than a late-cycle decision.
+
+      **Shipped as-is with explicit user approval (2026-09-04).** The owner
+      reviewed the measured gap and ruled: *"if ONLY the secondary gets a
+      hole, I'd say it's kind of ok"* (2026-09-04); per the design record
+      (R44 RESOLVED) pooled multi-window embedding is a modelling decision,
+      not an engineering defect, so it does not block a release. Retrieval is
+      unaffected — chunks are sized to the ACTIVE model, so no user's search
+      reads a truncated vector — and with the round-4 refusal-halving loop
+      the secondary still gets a prefix (leading-window) vector for every
+      piece of content, none dropped, each tagged `emb_truncated` on the
+      dual-log RL event.
+
 ## Install / first-run
 
 - [ ] **macOS support is experimental** — only minimal smoke-tested on a single Apple

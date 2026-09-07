@@ -14,6 +14,15 @@
 // The modal owns the reactive `$state` bindings; this module owns the *logic*
 // of turning an ordered event stream into a keyed, ordered progress list.
 
+import type { KgSyncView } from '$lib/types/launcher';
+// v0.2.92 (review MAJOR-9): the KG-sync phase VOCABULARY and the
+// "an intentional skip is done" counting rule have ONE home — the module the
+// banner + pill already classify through. This surface used to carry a second,
+// older copy of both, so WP-B1's `finalize` stage and its skip-inclusive counts
+// reached the banner and not the Update-all modal. Importing is the fix; a
+// second copy here is what created the defect.
+import { kgSyncDoneCount, kgSyncPhaseKind } from './kg-sync-banner-logic';
+
 /**
  * Mirror of the Rust `UpdateAllProgressEvent` payload. Field names are
  * snake_case to match the serialised struct — keep in sync with the Rust
@@ -160,18 +169,16 @@ export function progressIcon(s: ProgressRow['status']): string {
 // return null so the reducer clears any lingering sub-detail.
 
 /**
- * Mirror of the Rust `KgSyncView` payload (`kg-sync-progress` event). Only the
- * fields we render are typed here; extra fields on the wire are ignored.
+ * The `kg-sync-progress` event payload — an ALIAS of the shared `KgSyncView`
+ * mirror, not a second hand-written subset.
+ *
+ * v0.2.92 (review MAJOR-9): this used to declare 7 of the Rust struct's
+ * fields "because they're the ones we render". That is exactly how
+ * `kg_skipped` / `docs_skipped` came to exist on the wire, be typed for the
+ * banner, and be invisible here — a payload with two type homes drifts at the
+ * one that nobody edits. `KgSyncView` in `$lib/types/launcher` is the home.
  */
-export type KgSyncProgress = {
-  project_id: string;
-  status: string;
-  kg_total: number;
-  kg_succeeded: number;
-  docs_total: number;
-  docs_succeeded: number;
-  current_phase: string | null;
-};
+export type KgSyncProgress = KgSyncView;
 
 /**
  * Mirror of the Rust `CodeGraphBuildView` payload
@@ -185,29 +192,60 @@ export type CodeGraphBuildProgress = {
 };
 
 /**
+ * Files fully accounted for on ONE side of the sync (knowledge/ or docs/),
+ * routed through the shared "an intentional skip is done" rule rather than
+ * re-adding it here. The other side is zeroed because this label is
+ * per-phase, where the banner's counter is whole-run.
+ */
+function sideDone(succeeded: number, skipped: number | undefined): number {
+  return kgSyncDoneCount({
+    kg_succeeded: succeeded,
+    kg_skipped: skipped,
+    docs_succeeded: 0,
+    docs_skipped: 0,
+  });
+}
+
+/**
  * Condensed sub-label for a `kg-sync-progress` event, or `null` when the event
  * is terminal / uninformative (so the row's sub-line clears). Deterministic:
  * no clock / randomness — the label is a pure function of the payload.
+ *
+ * v0.2.92 (review MAJOR-9) — three defects closed, all of them WP-B1's, all of
+ * them present here only because this was a second copy of the banner's logic:
+ *   * `finalize` had no case, so a run whose `.node_formats.json` regen takes
+ *     up to 600 s sat on a completed-looking count for ten minutes;
+ *   * skips were not counted as done, so 100 nodes with 60 archived froze the
+ *     row at `40/100` — the census's own remedy ("Projects → Update all")
+ *     demonstrating the bug the census reports;
+ *   * an unrecognized phase fell through to the generic line rather than being
+ *     named, hiding a new Rust stage instead of showing it.
+ * Phase classification is `kgSyncPhaseKind`'s job — this function only chooses
+ * wording, so a new stage string is one edit for every KG-sync surface.
  */
 export function kgSyncSubLabel(evt: KgSyncProgress): string | null {
   // Only surface while the sync is actually running; a terminal status means
   // this phase is done and the row should stop showing a sub-line.
   if (evt.status !== 'running') return null;
 
-  const phase = evt.current_phase ?? null;
+  const kind = kgSyncPhaseKind(evt.current_phase);
+  if (kind === 'scan') return 'scanning knowledge graph…';
+  if (kind === 'queued') return 'waiting for the embed lane…';
+  if (kind === 'finalize') return 'finalizing summaries…';
+  // Neutral, never a confident wrong label: name the stage this build does not
+  // know rather than calling it "syncing knowledge".
+  if (kind === 'unknown') return `${evt.current_phase}…`;
   // Docs re-embedding is the long tail the Windows field report flagged as
   // "looks frozen" — show the running count so it visibly advances.
-  if (phase === 'docs' && evt.docs_total > 0) {
-    return `syncing docs ${evt.docs_succeeded}/${evt.docs_total}`;
+  if (kind === 'docs' && evt.docs_total > 0) {
+    const done = sideDone(evt.docs_succeeded, evt.docs_skipped);
+    return `syncing docs ${done}/${evt.docs_total}`;
   }
-  if (phase === 'knowledge' && evt.kg_total > 0) {
-    return `syncing knowledge ${evt.kg_succeeded}/${evt.kg_total}`;
+  if (kind === 'embed' && evt.kg_total > 0) {
+    const done = sideDone(evt.kg_succeeded, evt.kg_skipped);
+    return `syncing knowledge ${done}/${evt.kg_total}`;
   }
-  if (phase === 'scan') {
-    return 'scanning knowledge graph…';
-  }
-  // Running but no count yet / unknown phase: a generic-but-alive line beats a
-  // static spinner.
+  // Running but no count yet: a generic-but-alive line beats a static spinner.
   return 'syncing knowledge graph…';
 }
 

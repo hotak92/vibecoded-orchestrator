@@ -17,7 +17,6 @@ Covers:
 """
 from __future__ import annotations
 
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -25,16 +24,12 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    connect,
+    create_empty_launcher_db,
+    set_app_state,
+)
 import install  # type: ignore  # noqa: E402
-
-
-_APP_STATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS app_state (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  INTEGER NOT NULL
-);
-"""
 
 
 def _sysinfo(has_gpu: bool, vram_gb: float, ram_gb: float,
@@ -143,16 +138,12 @@ class SeedAppStateConcurrencyTests(unittest.TestCase):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
-        db = root / "launcher.db"
-        conn = sqlite3.connect(str(db))
-        conn.executescript(_APP_STATE_SCHEMA)
-        conn.commit()
-        conn.close()
+        db = create_empty_launcher_db(root / "launcher.db")
         self._state_dir = root
         return db
 
     def _read(self, db: Path) -> dict:
-        conn = sqlite3.connect(str(db))
+        conn = connect(db)
         try:
             return {k: v for k, v in conn.execute(
                 "SELECT key, value FROM app_state"
@@ -205,13 +196,7 @@ class SeedAppStateConcurrencyTests(unittest.TestCase):
     def test_preserves_prior_user_tuned_value(self):
         db = self._fresh_db()
         # A prior GUI selection of 6 exists.
-        conn = sqlite3.connect(str(db))
-        conn.execute(
-            "INSERT INTO app_state (key, value, updated_at) VALUES (?,?,?)",
-            ("embedding.update_all_max_parallel", "6", 1),
-        )
-        conn.commit()
-        conn.close()
+        set_app_state(db, "embedding.update_all_max_parallel", "6")
         cfg = dict(install.EMBEDDING_CONFIGS["gpu"])
         cfg["code_embed_max_concurrent"] = 4
         cfg["update_all_max_parallel"] = 2

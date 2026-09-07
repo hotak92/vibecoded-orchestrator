@@ -488,6 +488,18 @@ fn format_label(snap: &ServiceSnapshot, externally_managed: bool) -> String {
 ///   - available, count == 1       → "⚠ Update available (1 commit behind)"
 ///   - available, count >  1       → "⚠ Update available (N commits behind)"
 fn format_update_label(status: &UpdateStatus) -> String {
+    // v0.2.92 WP-13: THREE labels, not two.
+    //
+    // Pre-fix, "an update is waiting" and "I could not find out whether an
+    // update is waiting" both rendered as the neutral "Check for updates" —
+    // an invitation, not a warning — so the tray gave a user in a broken
+    // state exactly the same affordance as a user in a healthy one. During
+    // the five-week outage this menu item said "Check for updates" every
+    // single day, and clicking it changed nothing, because the check
+    // underneath could not succeed.
+    if status.remote_check.is_unknown() {
+        return "⚠ Couldn't check for updates".to_string();
+    }
     if !status.available || status.commit_count == 0 {
         return "Check for updates".to_string();
     }
@@ -549,6 +561,8 @@ mod tests {
         assert_eq!(format_label(&s, false), "Services: 1/3 (Ollama)");
     }
 
+    /// A status whose remote check SUCCEEDED — so `available` / `count` are
+    /// a verdict the label may act on.
     fn upd(available: bool, count: u32) -> UpdateStatus {
         UpdateStatus {
             available,
@@ -556,8 +570,22 @@ mod tests {
             remote_sha: None,
             commit_count: count,
             branch: String::new(),
+            head_detached: false,
+            remote_check: vct_launcher_core::check_state::CheckState::Ok,
+            latest_source_release_check: vct_launcher_core::check_state::CheckState::Ok,
             last_checked: None,
             error: None,
+        }
+    }
+
+    /// A status whose remote check could NOT complete — the state the tray
+    /// spent five weeks rendering as a neutral invitation.
+    fn upd_unknown() -> UpdateStatus {
+        UpdateStatus {
+            remote_check: vct_launcher_core::check_state::CheckState::unknown(
+                "rev-list: fatal: ambiguous argument",
+            ),
+            ..upd(false, 0)
         }
     }
 
@@ -565,6 +593,31 @@ mod tests {
     fn update_label_no_update() {
         assert_eq!(format_update_label(&upd(false, 0)), "Check for updates");
         assert_eq!(format_update_label(&upd(true, 0)), "Check for updates");
+    }
+
+    /// v0.2.92 WP-13: "couldn't check" must be its OWN label, visibly
+    /// different from "up to date". Pre-fix both rendered "Check for
+    /// updates".
+    #[test]
+    fn update_label_unknown_is_distinct_from_up_to_date() {
+        let unknown = format_update_label(&upd_unknown());
+        let up_to_date = format_update_label(&upd(false, 0));
+        assert_eq!(unknown, "⚠ Couldn't check for updates");
+        assert_ne!(
+            unknown, up_to_date,
+            "an undetermined check must not render as the healthy label"
+        );
+    }
+
+    /// An UNKNOWN check outranks a stale cached count: we do not know that
+    /// the count still holds, and claiming a specific number we could not
+    /// verify is the more confident of the two lies.
+    #[test]
+    fn update_label_unknown_wins_over_a_stale_count() {
+        let mut s = upd(true, 7);
+        s.remote_check =
+            vct_launcher_core::check_state::CheckState::unknown("network unreachable");
+        assert_eq!(format_update_label(&s), "⚠ Couldn't check for updates");
     }
 
     #[test]

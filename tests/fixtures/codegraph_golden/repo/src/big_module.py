@@ -3,11 +3,17 @@ from __future__ import annotations
 
 
 def enormous_computation(seed: int) -> int:
-    """A deliberately large function body (> chunk budget of 7168 chars).
+    """A deliberately large function body (> the codesage chunk budget).
 
     The body is padded with many repetitive but valid statements so the
-    function_body property crosses the codesage 2048-token (~7168 char)
-    budget and the analyzer emits multiple chunk rows.
+    function_body property crosses the codesage budget and the analyzer
+    emits multiple chunk rows. The budget is DERIVED from the SSOT
+    (chunking.MODEL_TOKEN_LIMITS) and has moved before — it was 8192
+    tokens, then 2048, and since the v0.2.92 W1 served-window correction
+    it is 1024 tokens (~3584 chars). This fixture deliberately states no
+    number: it only has to exceed whatever the SSOT currently says, and a
+    hard-coded figure here would silently go stale on the next bump (the
+    exact defect W1 was).
     """
     total = seed
     total = total + 0 * 3 - (0 % 7) + (seed ^ 0)

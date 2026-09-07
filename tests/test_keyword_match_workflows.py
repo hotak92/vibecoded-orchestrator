@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MATCHER_PATH = REPO_ROOT / "templates" / "scripts" / "agent-skill-keyword-match.py"
 
@@ -159,7 +161,7 @@ def _run_cli(matcher_path: Path, root: Path, prompt: str, *args: str) -> str:
         input=prompt,
         capture_output=True,
         text=True,
-        env=env,
+        env=child_env(env),
         timeout=30,
     )
     assert res.returncode == 0

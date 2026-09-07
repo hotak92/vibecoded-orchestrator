@@ -745,10 +745,28 @@ def _apply_subprocess_edge(
         )
         return EdgeResult(ok=False)
     stdout = proc.stdout or ""
-    # Echo the edge's captured stdout to the parent's stdout so the install-log
-    # narrative (the "6_to_7: purged N rows" lines) is preserved for the user.
+    # Echo the edge's captured stdout so the install-log narrative (the
+    # "6_to_7: purged N rows" lines) is preserved for the user — on STDERR.
+    #
+    # v0.2.92 field bug (2026-09-05, maintainer add of a project with "safe
+    # add"): this echo used to go to the parent's STDOUT. But this runner is
+    # reached from `python -m vco_lib.project_init migrate-schema`, whose
+    # stdout is a MACHINE CONTRACT — the launcher does
+    # `serde_json::from_str::<Value>(&stdout)` over the WHOLE stream
+    # (projects_v2.rs run_schema_migration / probe_stale_derived_collections /
+    # apply_stale_derived_choice). Prepending the edge narrative made the very
+    # first byte `4` of "4_to_5: ..." parse as a complete JSON number, so serde
+    # reported `trailing characters at line 1 column 2` and the whole
+    # (successful) migration was surfaced to the user as "Setup failed".
+    # Same defect class as the v0.2.84 adoption-NOTICE incident: stdout carries
+    # ONLY the JSON document; every human-facing line goes to stderr, which the
+    # launcher already tails and install.py already shows on the console.
     if stdout:
-        print(stdout, end="" if stdout.endswith("\n") else "\n")
+        print(
+            stdout,
+            end="" if stdout.endswith("\n") else "\n",
+            file=sys.stderr,
+        )
     if proc.returncode != 0:
         logger.warning(
             "_apply_subprocess_edge: %s exited rc=%s (non-zero)",

@@ -33,11 +33,36 @@ CLI_SRC = REPO_ROOT / "templates" / "scripts" / "query_code_graph.py"
 
 def _load_cli_module():
     """Import templates/scripts/query_code_graph.py as a module."""
+
+# v0.2.92 WP-1 — pin the orchestrator root to the REPO UNDER TEST while the
+# script is exec'd.
+#
+# These CLIs resolve `$VCT_ORCHESTRATOR_ROOT` (that is the fix: it is the
+# canonical channel, and without it an installed project can never find
+# `kg_access`). `kg_access` then does `sys.path.insert(0, <that root>)`
+# (claude_mcp_servers/scripts/kg_access.py:113). `claude_mcp_servers` is a
+# NAMESPACE package, so on a machine that has a SECOND orchestrator clone and
+# an ambient `$VCT_ORCHESTRATOR_ROOT` pointing at it, merely importing this
+# script re-points `claude_mcp_servers.*` for the whole pytest process — and a
+# later `import claude_mcp_servers.weaviate_mcp.server` gets the OTHER clone's
+# code. That is a test whose meaning depends on the developer's shell.
+#
+# Pinning here is the same discipline as pinning PYTHONPATH: a repo's own
+# suite tests THAT repo. Production behaviour is unchanged and correct — a real
+# machine has one orchestrator and the env var names it.
     sys.path.insert(0, str(REPO_ROOT / "claude_mcp_servers"))
     sys.path.insert(0, str(REPO_ROOT))
-    spec = importlib.util.spec_from_file_location("_qcg_v0270", CLI_SRC)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    _saved = os.environ.get("VCT_ORCHESTRATOR_ROOT")
+    os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+    try:
+        spec = importlib.util.spec_from_file_location("_qcg_v0270", CLI_SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        if _saved is None:
+            os.environ.pop("VCT_ORCHESTRATOR_ROOT", None)
+        else:
+            os.environ["VCT_ORCHESTRATOR_ROOT"] = _saved
     return mod
 
 
@@ -202,19 +227,83 @@ def test_anchor_empty_or_no_client_is_none(cli_mod) -> None:
 # C1c — None-guard on the structure references path (static)
 # --------------------------------------------------------------------------
 def test_c1c_references_none_guard_present() -> None:
-    """The structure path must guard `references` being None before .get."""
+    """The structure path must guard `references` being None before .get.
+
+    v0.2.92 re-pin — the GUARANTEE is unchanged, the SHAPE it is expressed in
+    changed for the callers branch. C1c originally pinned the literal
+    ``(obj.references or {}).get("calls"`` there. That expression was doing its
+    job and the branch was STILL broken: the fetch requested no
+    ``return_references``, so ``obj.references`` was always None, the guard
+    always yielded ``{}`` and ``callers`` answered "Found 0 callers" for every
+    input, silently, always. The callers branch now reads the edge through
+    ``vco_lib.codegraph_references.read_cross_reference``, which FUSES the C1c
+    None-guard with the ``_CrossReference`` shape normalisation — so the
+    v0.2.70 regression (an ``AttributeError`` on ``None.get``) remains
+    impossible, and :func:`test_callers_branch_requests_and_reads_references`
+    below pins the half that C1c could not see.
+    """
     src = CLI_SRC.read_text(encoding="utf-8")
-    # All three reference reads must use the `(... or {})` guard.
+    # All three reference reads must be None-safe.
     assert "(response.objects[0].references or {}).get" in src or \
            "_refs = response.objects[0].references or {}" in src, (
         "dependencies path missing the None-references guard"
     )
-    assert "(obj.references or {}).get(\"calls\"" in src, (
-        "callers path missing the None-references guard"
+    assert 'read_cross_reference(obj, "calls")' in src, (
+        "callers path no longer reads the `calls` reference through the shared "
+        "None-safe reader"
     )
     assert "(response.objects[0].references or {}).get(\"extends\"" in src, (
         "extends path missing the None-references guard"
     )
+
+
+def test_c1c_none_references_still_cannot_raise() -> None:
+    """The v0.2.70 guarantee itself, exercised rather than grepped: reading the
+    `calls` edge off an object whose `references` is None yields no callers and
+    raises nothing."""
+    from vco_lib.codegraph_references import read_cross_reference
+
+    class _NoRefs:
+        references = None
+
+    assert read_cross_reference(_NoRefs(), "calls") == []
+
+
+def test_callers_branch_requests_and_reads_references() -> None:
+    """v0.2.92: the two defects that made `structure callers` always answer 0.
+
+    1. the candidate fetch must REQUEST the `calls` link — without
+       ``return_references`` the reference mapping is None on every row and no
+       amount of None-guarding can produce a caller;
+    2. the candidate pool must be FILTERED server-side on ``call_names``. The
+       pre-fix ``fetch_objects(limit=50)`` with no filter drew an arbitrary 50
+       rows out of the collection (25 837 live on the maintainer machine), so
+       even with the references resolved a caller outside that slice could
+       never be found — fixing (1) alone still answers 0 in practice.
+    """
+    src = CLI_SRC.read_text(encoding="utf-8")
+    assert 'return_references=QueryReference(link_on="calls")' in src, (
+        "callers fetch does not request the `calls` link — obj.references will "
+        "be None on every row and the branch answers 0 forever"
+    )
+    assert '_caller_match_terms(target)' in src, (
+        "callers fetch is not filtered on call_names via the shared "
+        "_caller_match_terms helper (the MCP branch's proven filter)"
+    )
+    # The unfiltered whole-collection scan must not come back.
+    assert "caller_response = coll.query.fetch_objects(\n                    limit=" not in src, (
+        "the unfiltered `fetch_objects(limit=…)` candidate scan is back"
+    )
+
+
+def test_callers_branch_reuses_mcp_helpers(cli_mod) -> None:
+    """Identity, not equality: the CLI must run the MCP's OWN caller-matching
+    and chunk-collapsing helpers. A per-surface fork is how `callers` came to
+    behave differently on the two surfaces in the first place."""
+    from weaviate_mcp import server as mcp_server
+
+    assert cli_mod._caller_match_terms is mcp_server._caller_match_terms
+    assert cli_mod._dedup_objects_by_full_name is mcp_server._dedup_objects_by_full_name
 
 
 # --------------------------------------------------------------------------
@@ -395,3 +484,174 @@ def test_m2_m4_server_formatters_emit_fields() -> None:
     for src_text in (tier_src, rank_src):
         assert "_get_code_format" in src_text
         assert "n_callers" in src_text
+
+
+# ---------------------------------------------------------------------------
+# v0.2.92 — `structure callers` BEHAVIOUR (what nobody was testing)
+#
+# Every assertion above about the callers branch is a source grep, and the
+# branch stayed source-plausible while answering "Found 0 callers" for every
+# input. These tests drive the real `query_structure` code against a fake
+# collection that behaves like the client does on the two points that matter:
+#
+#   * `references` is None on a fetched object unless the fetch REQUESTED the
+#     link — a fake that always populates references cannot see the defect,
+#     which is exactly how it survived;
+#   * a resolved link is the REAL `_CrossReference` wrapper, whose `len()` and
+#     `iter()` raise and whose `bool()` is True even when empty.
+#
+# The fake also EVALUATES the filter (EQUAL / CONTAINS_ANY) rather than
+# ignoring it, so "the candidate pool is filtered server-side" is exercised
+# rather than asserted.
+# ---------------------------------------------------------------------------
+_XREF = pytest.importorskip("weaviate.collections.classes.internal")._CrossReference
+
+
+class _FakeObj:
+    def __init__(self, uuid: str, properties: dict, references=None) -> None:
+        self.uuid = uuid
+        self.properties = properties
+        self.references = references
+
+
+class _FakeResponse:
+    def __init__(self, objects: list) -> None:
+        self.objects = objects
+
+
+def _filter_matches(flt, props: dict) -> bool:
+    """Evaluate the two filter shapes the CLI builds. ``None`` matches
+    everything — which is precisely what the pre-fix candidate scan did."""
+    if flt is None:
+        return True
+    target = getattr(flt, "target", None)
+    operator = str(getattr(flt, "operator", ""))
+    value = getattr(flt, "value", None)
+    actual = props.get(target)
+    if "CONTAINS_ANY" in operator:
+        return bool(set(actual or []) & set(value or []))
+    if operator.endswith("EQUAL"):
+        return actual == value
+    raise AssertionError(f"fake does not model filter {operator!r}")
+
+
+class _FakeQuery:
+    def __init__(self, rows: list, edges: dict) -> None:
+        self._rows = rows          # [(uuid, properties), ...]
+        self._edges = edges        # uuid -> [target uuid, ...]
+
+    def fetch_objects(self, filters=None, limit=100, return_references=None,
+                      return_properties=None, **_kw):
+        hits = [(u, p) for (u, p) in self._rows if _filter_matches(filters, p)]
+        out = []
+        for uuid, props in hits[:limit]:
+            refs = None
+            if return_references is not None:
+                link_on = return_references.link_on
+                targets = [_FakeObj(t, {}) for t in self._edges.get(uuid, [])] \
+                    if link_on == "calls" else []
+                # The client omits the key entirely when nothing resolved.
+                refs = {link_on: _XREF._from(targets)} if targets else {}
+            out.append(_FakeObj(uuid, dict(props), refs))
+        return _FakeResponse(out)
+
+
+class _FakeCollection:
+    def __init__(self, rows: list, edges: dict) -> None:
+        self.query = _FakeQuery(rows, edges)
+
+
+class _FakeCollections:
+    def __init__(self, coll) -> None:
+        self._coll = coll
+
+    def get(self, _name):
+        return self._coll
+
+
+class _FakeClient:
+    def __init__(self, rows: list, edges: dict) -> None:
+        self.collections = _FakeCollections(_FakeCollection(rows, edges))
+
+
+# A tiny call graph: `caller_one` calls the target and the analyzer RESOLVED
+# the edge; `caller_two` names it but has no stored edge (short-name resolution
+# is lossy and the whole cross-ref pass soft-fails); `unrelated` calls
+# something else; `lonely` is called by nobody.
+_ROWS = [
+    ("t1", {"full_name": "pkg.mod.helper", "signature": "helper()",
+            "call_names": []}),
+    ("c1", {"full_name": "pkg.a.caller_one", "signature": "caller_one()",
+            "call_names": ["helper"]}),
+    ("c2", {"full_name": "pkg.b.caller_two", "signature": "caller_two()",
+            "call_names": ["helper"]}),
+    ("c3", {"full_name": "pkg.c.unrelated", "signature": "unrelated()",
+            "call_names": ["something_else"]}),
+    ("l1", {"full_name": "pkg.d.lonely", "signature": "lonely()",
+            "call_names": []}),
+]
+_EDGES = {"c1": ["t1"]}
+
+
+def _caller_lines(out: str) -> list:
+    """Just the result rows — the explanatory footnote quotes the same marker
+    text, so a bare substring check over the whole output cannot tell the two
+    apart."""
+    return [ln for ln in out.splitlines() if ln.startswith("   - ")]
+
+
+def _run_callers(cli_mod, target: str, capsys, edges=None) -> str:
+    q = cli_mod.CodeGraphQuery(project="Alpha")
+    q.client = _FakeClient(_ROWS, _EDGES if edges is None else edges)
+    q.query_structure("callers", target)
+    return capsys.readouterr().out
+
+
+def test_callers_returns_the_callers(cli_mod, capsys) -> None:
+    """THE ACT. Pre-fix this printed 'Found 0 callers' — the branch's only
+    possible answer, for every input."""
+    out = _run_callers(cli_mod, "pkg.mod.helper", capsys)
+    assert "Found 2 callers" in out
+    assert "pkg.a.caller_one" in out
+    assert "pkg.b.caller_two" in out
+    assert "pkg.c.unrelated" not in out, "a non-caller leaked into the result"
+    assert "Traceback" not in out
+
+
+def test_callers_marks_the_uuid_confirmed_edge(cli_mod, capsys) -> None:
+    """A resolved `calls` edge is uuid-precise and says so; a name-only match
+    is still reported (a missing edge is not evidence of absence) but is not
+    claimed to be confirmed."""
+    out = _run_callers(cli_mod, "pkg.mod.helper", capsys)
+    confirmed = [ln for ln in _caller_lines(out) if "[call edge]" in ln]
+    assert len(confirmed) == 1
+    assert "pkg.a.caller_one" in confirmed[0]
+    assert "matched the call NAME only" in out
+
+
+def test_callers_with_no_callers_is_zero_not_an_error(cli_mod, capsys) -> None:
+    """THE LEAVE-ALONE. A real function nothing calls answers zero, quietly —
+    no traceback, and none of the caveat lines that only make sense when there
+    ARE rows."""
+    out = _run_callers(cli_mod, "pkg.d.lonely", capsys)
+    assert "Found 0 callers" in out
+    assert "Traceback" not in out
+    assert _caller_lines(out) == []
+    assert "matched the call NAME only" not in out
+    assert "Capped at the first" not in out
+
+
+def test_callers_unknown_target_reports_not_found(cli_mod, capsys) -> None:
+    out = _run_callers(cli_mod, "pkg.z.missing", capsys)
+    assert "not found" in out
+    assert "Found" not in out
+
+
+def test_callers_survives_unresolved_references(cli_mod, capsys) -> None:
+    """The v0.2.70 C1c guarantee end-to-end: with NO edge stored anywhere the
+    reference mapping is empty and the branch must still report the
+    name-matched callers rather than raise."""
+    out = _run_callers(cli_mod, "pkg.mod.helper", capsys, edges={})
+    assert "Found 2 callers" in out
+    assert not any("[call edge]" in ln for ln in _caller_lines(out))
+    assert "Traceback" not in out

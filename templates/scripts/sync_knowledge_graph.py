@@ -15,6 +15,29 @@ Usage:
     python .claude/scripts/sync_knowledge_graph.py --project-root <path> --all
         # v0.2.89: pin the TARGET project root explicitly (outranks every
         # env channel — the supported way to run a manual cross-project sync)
+
+v0.2.92 WP-B1 — the COMPLETE flag vocabulary (any other `-`-prefixed argv
+token is a hard usage error, exit 2, BEFORE any backend connection):
+
+    --all            sync knowledge/ + docs/ trees, then refresh summaries
+    --all-docs       sync docs/ only
+    --check-drift    read-only drift scan (detect, never repairs)
+    --rechunk        force the chunk-plan comparison for this run even when
+                     NO chunker-revision crossing is pending in the deferral
+                     ledger — the by-hand remedy for a re-cloned /
+                     manifest-deleted project, which the revision gate
+                     classifies as fresh and therefore never arms via the
+                     ledger (MAJOR-R5-4). Entries whose stored plan already
+                     matches still skip; only stale plans re-embed.
+    --project-root <path> | --project-root=<path>   pin the target root
+                     (consumed at import; at most once)
+    -h | --help      print usage
+
+Exit codes: 0 = clean (skips are fine) · 1 = per-node/per-doc sync
+failures · 2 = usage error or refused project root. Positional args are
+sync targets (file list). The `.sh`/`.ps1` wrappers are dumb forwarders —
+flags are validated HERE, in ONE home, so the vocabulary cannot drift
+between the three entry points.
 """
 
 import sys
@@ -53,13 +76,32 @@ from typing import Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
+# v0.2.92 (R4/R21) — INSTALL-TIME BAKED ROOT. `vco_lib/rewire.py` substitutes
+# the placeholder below when this file is installed into a project, so the
+# installed script can reach its orchestrator clone with NOTHING in the
+# environment (the `_PROJECT_HOME` fallback below is the USER project root on
+# an install, which has no vco_lib/). In the clone the placeholder stays
+# literal, `Path("{{ORCHESTRATOR_ROOT}}")/"vco_lib"` is not a directory, and
+# this block is inert — the validation IS the placeholder guard.
+# It is used ONLY when NEITHER env pin ($VCT_ORCHESTRATOR_ROOT,
+# $VCT_INSTALL_ROOT) names a real orchestrator root — a VALID pin always
+# wins, a provably stale one is healed — and the ladder below is unchanged.
+_VCO_BAKED_ORCHESTRATOR_ROOT = "{{ORCHESTRATOR_ROOT}}"
+_vco_env_pins = [os.environ.get(_k, "").strip()
+                 for _k in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT")]
+if (Path(_VCO_BAKED_ORCHESTRATOR_ROOT) / "vco_lib").is_dir() and not any(
+    _p and (Path(_p) / "vco_lib").is_dir() for _p in _vco_env_pins
+):
+    os.environ["VCT_ORCHESTRATOR_ROOT"] = _VCO_BAKED_ORCHESTRATOR_ROOT
+
 # Resolve vco_lib (lives next to claude_mcp_servers/ in the orchestrator clone).
 # EmbeddingService is the v0.2.18 central dispatcher for embedding calls.
 #
 # weaviate_mcp is pip-installed as an editable package by install.py
-# (A1, v0.2.38), so `from weaviate_mcp.chunking import Chunker` works
-# without a sys.path entry.  We still need the vco_lib parent on sys.path
-# because vco_lib is not yet a standalone package.
+# (A1, v0.2.38), so `from weaviate_mcp.chunking import TokenCounter` works
+# without a sys.path entry.  vco_lib IS pip-installable too (pyproject
+# `packages = ["vco_lib"]`), so this arm is the fallback for a Python that
+# is NOT the install's venv — a bare `python3 .claude/scripts/...`.
 # Resolution order for vco_lib:
 #   1. $VCT_ORCHESTRATOR_ROOT               (set by .claude/env)
 #   2. <project_home> in-tree fallback      (orchestrator clone)
@@ -145,6 +187,53 @@ def _extract_cli_project_root(argv: "List[str]") -> "Optional[Path]":
 _CLI_PROJECT_ROOT: "Optional[Path]" = _extract_cli_project_root(sys.argv)
 
 
+def _extract_rechunk_flag(argv: "List[str]") -> bool:
+    """Extract and REMOVE every ``--rechunk`` token from *argv* (mutates
+    the list in place). Returns True when the flag was present.
+
+    Why the flag exists: the plan comparison that re-chunks stale-boundary
+    entries is armed by :func:`_chunker_resync_pending`, which reads the
+    deferral ledger — and a re-cloned / manifest-deleted project is
+    classified FRESH by the revision gate, never receives that entry, and
+    so was told by an old KNOWN_ISSUES remedy (``kg-sync --all``) to run a
+    repair that hash-skipped everything. ``--rechunk`` makes the remedy
+    TRUE for every population: the comparison runs for THIS run; entries
+    whose stored plan already matches the current chunker still skip (no
+    blind re-embed), everything else re-chunks under the current revision.
+
+    Runs at module import — same pattern as ``--project-root`` — so the
+    token is gone before ``_validate_argv_flags`` and ``main()``'s manual
+    dispatch. Repeat occurrences are idempotent (all removed, one boolean).
+
+    The ``tok == "--flag"`` comparison below is deliberate, not incidental:
+    this script has no argparse, so the emitted-remediation gate
+    (``tests/test_deferral_command_argparse_sweep.py``) recovers its accepted
+    flags by SOURCE-MATCHING that exact idiom on the pre-scanners. Written any
+    other way the flag is real at runtime but invisible to the gate, and the
+    gate then reports every doc that names it as an invalid remediation — which
+    is exactly what happened when this function first landed. Keep the shape
+    aligned with :func:`_extract_cli_project_root`.
+    """
+    saw = False
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--rechunk":
+            del argv[i]
+            saw = True
+            continue
+        i += 1
+    return saw
+
+
+#: True when this run was invoked with ``--rechunk`` (MAJOR-R5-4): forces
+#: the chunk-plan comparison even with no revision crossing pending in the
+#: deferral ledger. Set ONCE at import by :func:`_extract_rechunk_flag`,
+#: which also removes the token from ``sys.argv`` so ``main()``'s dispatch
+#: and flag validation never see it.
+_RECHUNK_FORCED = _extract_rechunk_flag(sys.argv)
+
+
 def _resolve_project_root() -> "Tuple[Path, str]":
     """Resolve the target project root with the v0.2.89 layered precedence.
 
@@ -200,7 +289,12 @@ except ImportError:
 # import-time side effect, not the bound name.
 import weaviate  # noqa: F401
 from weaviate.classes.query import Filter
-from weaviate_mcp.chunking import TokenCounter, Chunker
+# W8 (v0.2.92): `Chunker` is no longer imported here — this script does not
+# construct one any more. The plan (gate + boundaries) comes from
+# `kg_chunk_plan.plan_node_chunks`, which binds its OWN sibling `Chunker`;
+# a second binding here could resolve to a different checkout's chunking
+# module and re-open the very divergence W8 closed.
+from weaviate_mcp.chunking import TokenCounter
 
 # v0.2.18: central embedding dispatcher. Replaces the inline Ollama call
 # that was hardcoded to qwen3-embedding (and threw RuntimeError when
@@ -213,6 +307,15 @@ from vco_lib.embedding_service import (
     EmbeddingService,
     NoEmbeddingBackendError,
 )
+# W3 (v0.2.92 wiring audit): the truncation-tag properties are derived by the
+# ONE shared stamper (vco_lib home — importable from every writer layer), so
+# kg-sync, the MCP store, and the single-slot patch writers cannot drift.
+from vco_lib.kg_truncation_tags import truncation_tag_properties
+# v0.2.92 WP-B1 (D13): the canonical file_path shape helper. `to_posix_rel`
+# is pure + dependency-free (see its docstring); importing it loudly here
+# (never an inline copy) because every Weaviate write below must store ONE
+# shape so delete-by-file_path upserts stay idempotent across OSes.
+from vco_lib.paths import to_posix_rel
 
 # Try to import query logger.
 #
@@ -319,63 +422,198 @@ DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == 
 
 # Chunking configuration for embedding limits.
 #
-# v0.2.28 (2026-05-23): legacy constant kept ONLY as a fallback when
-# the EmbeddingService instance isn't yet available (early-init code
-# paths, error logging). The actual chunker used in the sync paths is
-# now `_chunker_for(server)` below, which delegates to
-# `Chunker.for_model(server.embedding_service.text_model_id)` so that
-# every embedding model gets a chunk size tuned to its context window
-# (see `claude_mcp_servers/weaviate_mcp/chunking.py::chunking_preset_for_model`).
+# v0.2.28 (2026-05-23): every embedding model gets a chunk size tuned to its
+# context window instead of the pre-v0.2.28 hardcoded `max_tokens=2500`
+# (correct for qwen3-embedding:0.6b, but over-chunking a 512-token model ~5x
+# and under-using a 32k one).
 #
-# Pre-v0.2.28 this script hardcoded `max_tokens=2500` everywhere, which
-# was correct for qwen3-embedding:0.6b (8k context, 2500 working limit)
-# but wrong for 512-token models (would over-chunk by ~5x) and wasteful
-# for 32k+ models (under-uses capacity). The hardcoded constant survives
-# for any code path that runs before the server / EmbeddingService is
-# constructed.
-MAX_EMBEDDING_TOKENS = 2500  # Legacy fallback; prefer _chunker_for(server).
+# W8 (v0.2.92 wiring audit): the plan itself — the single-vs-multi gate AND
+# the boundaries — is `_plan_for(server, content)` below, one call into
+# `weaviate_mcp.kg_chunk_plan.plan_node_chunks`, shared with the MCP
+# `store_knowledge_node` write, the `--rechunk` plan comparison and the
+# shipped-sidecar generator. The old module-level `MAX_EMBEDDING_TOKENS = 2500`
+# fallback lives there now as `LEGACY_FALLBACK_MAX_TOKENS`: two writers with
+# two *different* no-model fallbacks (2 500 here vs 2 000 in the MCP) is
+# exactly the divergence W8 removed, so there is one number and it is not
+# here.
 
 
-def _chunker_for(server) -> "Chunker":
-    """Return a Chunker pre-configured for the active embedding model.
+def _active_model_id(server) -> str:
+    """The ACTIVE text model id this sync embeds with, or ``""``.
 
-    Resolves the model id via `server.embedding_service.text_model_id`
-    (the canonical channel — set by EmbeddingService.for_project() from
-    env / hub). Falls back to the legacy hardcoded preset when the
-    server / embedding_service is None (e.g. test harnesses that
-    construct chunks directly).
+    ONE resolution home for every plan helper below. The channel is
+    ``server.embedding_service.text_model_id`` — the id the service will
+    actually embed with, which ``EmbeddingService.for_project()`` sets from
+    ``resolve_active_text_model_id()``, the SAME resolver the MCP store's
+    ``_active_chunk_model_id()`` uses. So both W8 writers plan for the
+    model that embeds, and for the same one. ``""`` (no server / no
+    service — test harnesses that construct chunks directly) selects the
+    shared module's legacy fallback preset.
     """
     try:
-        model_id = server.embedding_service.text_model_id  # type: ignore[attr-defined]
+        return server.embedding_service.text_model_id  # type: ignore[attr-defined]
     except Exception:
-        model_id = ""
-    if not model_id:
-        # Legacy preset — matches the pre-v0.2.28 hardcoded numbers.
-        return Chunker(
-            min_tokens=1500,
-            max_tokens=MAX_EMBEDDING_TOKENS,
-            target_tokens=2500,
+        return ""
+
+
+def _plan_for(server, content: str, *, source_id: str = "",
+              metadata: "Optional[dict]" = None):
+    """The chunk plan for ``content`` — W8's ONE computation.
+
+    Both KG WRITE paths in this script (``sync_node``, ``sync_doc``) call
+    THIS, and so does the MCP ``store_knowledge_node`` and the
+    ``--rechunk`` plan comparison (``_stored_plan_matches_current``), via
+    ``weaviate_mcp.kg_chunk_plan.plan_node_chunks``. Deriving the gate and
+    the boundaries from two separate calls is what let the two writers
+    drift in the first place; there is now one call and one answer.
+    """
+    from weaviate_mcp.kg_chunk_plan import plan_node_chunks as _shared_plan
+    return _shared_plan(
+        content, _active_model_id(server),
+        source_id=source_id, metadata=metadata or {},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.92 — chunk-plan transition repair (revision-crossing re-chunk).
+#
+# `_CHUNKER_REVISION` (weaviate_mcp/chunking.py) moved from v0.2.88 to
+# v0.2.92 with the qwen3 chunk budget clamped 13 500 → 8 192 counter-units.
+# Rows written under the old budget keep their old boundaries (for content
+# between the two budgets: silently Ollama-truncated vectors). The embed-skip
+# gate above cannot see this: `chunk_count_ok` compares the stored rows
+# against THEMSELVES, so a boundary change is invisible and every entry is
+# skipped forever. While the project's deferral ledger carries
+# `chunker_preset_overhaul_pending` — emitted by the revision gate
+# (`vco_lib.chunker_revision.gate` / the launcher's R2-4 boot flow) exactly
+# when the sentinel crossed — the skip additionally requires the stored
+# plan to match what the CURRENT chunker would produce for this content.
+# Entries whose plan is unchanged still skip (the overwhelming majority:
+# measured 17 of 998 across templates/knowledge + the maintainer's private
+# knowledge/ + repo docs/ for this transition); only changed plans pay an
+# embed. The per-run plan CPU for all 998 files measured 11 ms total.
+# ──────────────────────────────────────────────────────────────────────
+
+#: The deferral condition the revision gate emits on a `_CHUNKER_REVISION`
+#: crossing. Its presence in the project ledger is the ONE durable signal
+#: that a boundary change is pending repair — no new app_state key or
+#: kg_syncs column is needed: the ledger already carries exactly this
+#: "crossing detected, remedy owed" state, and it is what the user is told
+#: to act on. It clears through its existing lifecycle (next update
+#: reconcile), at which point the comparison stops being paid.
+_CHUNKER_RESYNC_CID = "chunker_preset_overhaul_pending"
+
+#: Lazily-filled per-process cache of the ledger probe (the ledger does not
+#: change during one sync run; a fresh process re-probes).
+_resync_pending_cache: "Optional[bool]" = None
+
+#: Run-level count of entries re-embedded ONLY because their stored chunk
+#: plan predates the current chunker revision (mirrors _SHARED_ROUTED_COUNT).
+_RECHUNKED_COUNT = 0
+
+
+def _chunker_resync_pending() -> bool:
+    """True while a chunker-revision crossing is pending repair for THIS
+    project (the deferral ledger carries `chunker_preset_overhaul_pending`),
+    OR this run passed ``--rechunk`` (MAJOR-R5-4).
+
+    Scoped to the transition by design (brief constraint): an install
+    already at the current revision has no such entry — the revision gate
+    emits it only on a crossing — so the plan comparison is never paid
+    there. An UNREADABLE ledger is "cannot determine whether a repair is
+    owed", and the conservative direction is to run the comparison (pure
+    CPU, milliseconds; it can only repair, never damage) rather than skip
+    it and freeze stale boundaries.
+
+    ``--rechunk`` overrides the ledger signal for ONE run: a re-cloned /
+    manifest-deleted project never receives the entry (the revision gate
+    classifies it fresh), so the by-hand remedy must be able to arm the
+    comparison without it. The comparison is still a comparison — entries
+    whose stored plan matches the current chunker keep skipping.
+    """
+    global _resync_pending_cache
+    if _RECHUNK_FORCED:
+        # Checked BEFORE the cache: the cache is only ever written on the
+        # ledger path, and --rechunk must arm the comparison even when the
+        # cached ledger answer is False.
+        return True
+    if _resync_pending_cache is not None:
+        return _resync_pending_cache
+    try:
+        from vco_lib.deferral_report import DeferralReport
+
+        pending = DeferralReport.read(PROJECT_ROOT).has_condition(
+            _CHUNKER_RESYNC_CID
         )
-    return Chunker.for_model(model_id)
+    except Exception:  # noqa: BLE001 — cannot determine → compare (cheap)
+        pending = True
+    _resync_pending_cache = pending
+    return pending
 
 
-def _max_chunk_tokens_for(server) -> int:
-    """Token threshold above which a node/doc must be chunked.
+def _stored_plan_matches_current(
+    server: "WeaviateMCPServer",
+    collection,
+    canonical_fp: str,
+    content: str,
+    stored_row_count: int,
+) -> bool:
+    """True only when the STORED chunk rows are provably identical to what
+    the CURRENT chunker would produce for ``content``.
 
-    Mirrors `_chunker_for` so the "fits in one chunk?" branch decision
-    and the actual chunk size come from the SAME preset. Falls back to
-    the legacy `MAX_EMBEDDING_TOKENS` when the embedding service is
-    not yet available.
+    Compares the chunk DECISION (single vs multi, via the same
+    ``_plan_for`` gate the write path uses) and, for multi-chunk
+    plans, the boundaries themselves (stored chunk contents vs the current
+    chunker's chunk contents, chunk_num by chunk_num) — a budget change can
+    move boundaries WITHOUT changing the count, and a count-only check
+    would skip exactly those rows (measured: a 20 763-unit node re-plans
+    3→3 chunks with different boundaries).
+
+    "Could not determine" is NOT "current": a missing/non-int ``chunk_num``,
+    a row-set that changed between the two fetches, or ANY planner error
+    returns False, so the caller falls through to re-embed — the repair
+    runs rather than a skip that would freeze stale boundaries. Raises are
+    NOT caught here on purpose: the embed-skip block's existing soft-fail
+    ``except`` turns any raise into the same conservative fall-through.
     """
-    try:
-        model_id = server.embedding_service.text_model_id  # type: ignore[attr-defined]
-        if model_id:
-            from weaviate_mcp.chunking import chunking_preset_for_model
-            _min, max_t, _tgt = chunking_preset_for_model(model_id)
-            return max_t
-    except Exception:
-        pass
-    return MAX_EMBEDDING_TOKENS
+    # W8: the comparison plans through the SAME call the two WRITE paths in
+    # this script make (``_plan_for`` → ``kg_chunk_plan.plan_node_chunks``,
+    # which the MCP store also calls), so what this judges "current" against
+    # is by construction what either writer stored.
+    _plan = _plan_for(server, content, source_id="plan-check")
+    plan_total = _plan.total
+    plan_contents: List[str] = (
+        [] if _plan.is_single else [c.content for c in _plan.chunks]
+    )
+
+    if stored_row_count != plan_total:
+        return False
+    if plan_total == 1:
+        return True
+
+    # Multi-chunk plan with a matching row COUNT — the boundaries must
+    # match too. Second fetch pulls just this entry's chunk contents.
+    fetched = collection.query.fetch_objects(
+        filters=_file_path_filter(canonical_fp),
+        limit=100,
+        return_properties=["chunk_num", "content"],
+    )
+    numbered: List[Tuple[int, str]] = []
+    for obj in fetched.objects:
+        props = obj.properties or {}
+        num = props.get("chunk_num")
+        if not isinstance(num, int) or isinstance(num, bool):
+            return False  # cannot order the rows → cannot judge → re-embed
+        numbered.append((num, props.get("content")))
+    if len(numbered) != plan_total:
+        return False  # row set changed between fetches → not judgeable
+    numbered.sort(key=lambda pair: pair[0])
+    if [n for n, _ in numbered] != list(range(1, plan_total + 1)):
+        return False  # duplicate/gap in chunk_num → not judgeable
+    return all(
+        stored_content == plan_content
+        for (_, stored_content), plan_content in zip(numbered, plan_contents)
+    )
 
 # Project root — resolved ONCE at module top (v0.2.89 BUG 3, see
 # `_resolve_project_root` above) with the layered precedence
@@ -483,6 +721,27 @@ class WeaviateWrapper:
         """
         return self.embedding_service.embed_text_all_configured(text)
 
+    def _get_all_kg_embeddings_tagged(
+        self, text: str
+    ) -> "Tuple[Dict[str, List[float]], List[str]]":
+        """Tagged variant: the vectors AND the per-call truncation record.
+
+        W3 (v0.2.92 wiring audit): ``_build_vector_arg`` persists the
+        record as the ``truncated_slots`` / ``secondary_truncated_slots``
+        chunk properties, so EVERY kg-sync-written row (the install-time
+        seed, every post-file-edit hook sync, the ``--rechunk`` remedy)
+        carries the partition capability — pre-fix only the MCP
+        multi-chunk branch tagged, which is ~no rows a real user has.
+
+        Delegates to ``EmbeddingService.embed_text_all_configured_tagged``
+        — the ONE atomic capture (same call, before returning), NEVER the
+        derived ``last_*_truncated`` properties (race-prone under
+        concurrency). Under DUAL_EMBEDDING_ENABLED=false the underlying
+        fan-out returns exactly the ACTIVE slot, so the flat-vector legacy
+        branch uses this too and gains the same record.
+        """
+        return self.embedding_service.embed_text_all_configured_tagged(text)
+
 
 # For backward compatibility
 WeaviateMCPServer = WeaviateWrapper
@@ -521,18 +780,56 @@ def _sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
 
+def _embedding_failures_jsonl_hint() -> str:
+    """The jsonl path to name in a failure message — and MAKE TRUE.
+
+    Two things were wrong with the literal this replaces. It named
+    ``~/.claude/metrics/embedding_failures.jsonl``, which v0.2.92 W7 turned
+    into a FROZEN ARCHIVE (the live stream is ``vct_metrics_dir()``, i.e.
+    ``~/.vct/metrics/``), and the file it named contains outage rows written
+    only when ``EmbeddingService.for_project()`` raises at CONSTRUCTION —
+    never the case here, where construction SUCCEEDED and every per-slot
+    embed failed at call time. So the pointer was doubly false for exactly
+    the population it was shown to.
+
+    This resolves the real path AND appends the matching outage row through
+    the shared writer, so the message and the file agree. Soft-fails to the
+    canonical string if either step is unavailable — a broken hint must
+    never replace the caller's real error.
+    """
+    try:
+        from vco_lib.embedding_fidelity import append_outage_row
+        from vco_lib.paths import vct_metrics_dir
+
+        append_outage_row(
+            "kg-sync: no embedding backend produced a vector for a KG write "
+            "(service constructed, every configured slot failed at call time)"
+        )
+        return str(vct_metrics_dir() / "embedding_failures.jsonl")
+    except Exception:  # noqa: BLE001 — never mask the real failure
+        return "<vct-state-dir>/metrics/embedding_failures.jsonl"
+
+
 def _build_vector_arg(
     server: "WeaviateMCPServer",
     text: str,
-) -> Tuple[object, Mapping[str, List[float]]]:
+) -> "Tuple[object, Mapping[str, List[float]], Optional[List[str]]]":
     """Embed *text* and shape it for `Weaviate.collection.data.insert(vector=)`.
 
-    Returns ``(vector_arg, slots_map)``.
+    Returns ``(vector_arg, slots_map, truncated_slots)`` (W3: the third
+    element is the per-call truncation record — the sorted names of every
+    slot whose vector came from a bounded leading sub-window, the ACTIVE
+    slot included — captured ATOMICALLY with the vectors; the caller stamps
+    it on the stored row via ``truncation_tag_properties``). The record
+    names ONLY slots this call actually STORES, and is ``None`` when the
+    stored vector did not come from the tagged capture at all (see the
+    legacy branch below) — the stamper then writes no property and the row
+    resolves UNKNOWN rather than claiming a fidelity nobody measured.
 
     Behaviour:
       * ``DUAL_EMBEDDING_ENABLED=true`` (default) → multi-slot write.
-        Calls ``server._get_all_kg_embeddings()`` which fans out to every
-        reachable backend (qwen3 always tried; openai if the key is
+        Calls ``server._get_all_kg_embeddings_tagged()`` which fans out to
+        every reachable backend (qwen3 always tried; openai if the key is
         valid). The returned ``vector_arg`` is a ``{slot: vec}`` dict,
         and ``slots_map`` is the same dict (so the caller can log which
         slots got populated).
@@ -545,18 +842,37 @@ def _build_vector_arg(
       * ``DUAL_EMBEDDING_ENABLED=false`` (legacy) → single flat vector
         from the active backend. ``vector_arg`` is a ``list[float]``,
         ``slots_map`` is ``{slot_name: vec}`` so logging stays uniform.
+        The tagged capture still runs (with the default write-all-slots
+        toggle OFF the fan-out IS exactly the ACTIVE embed the flat path
+        took), so the record is persisted in this mode too — narrowed to
+        the ACTIVE slot, because that is the only vector this branch
+        stores; a secondary the fan-out happened to embed has no vector on
+        this row and must not appear in its record. On a total failure the
+        original flat-path behaviour (raise) is preserved, and when the
+        untagged fallback embed supplies the vector the record is ``None``
+        (no honest answer exists for it).
     """
     if DUAL_EMBEDDING_ENABLED:
-        slots = server._get_all_kg_embeddings(text)
+        slots, truncated = server._get_all_kg_embeddings_tagged(text)
         if not slots:
             raise RuntimeError(
                 "No embedding backend produced a vector. "
-                "See ~/.claude/metrics/embedding_failures.jsonl for details."
+                f"See {_embedding_failures_jsonl_hint()} for details."
             )
-        return slots, slots
+        return slots, slots, list(truncated)
     # Legacy flat-vector path (DUAL_EMBEDDING_ENABLED=false).
-    vec = server._get_embedding(text)
-    return vec, {server.text_vector_slot: vec}
+    slots, truncated = server._get_all_kg_embeddings_tagged(text)
+    active_slot = server.text_vector_slot
+    vec = slots.get(active_slot) if slots else None
+    if vec is None:
+        # Tagged gather produced no active-slot vector (service down →
+        # inline fallback shapes, or a total failure): fall back to the
+        # original flat embed, whose failure semantics (raise) the caller
+        # has always relied on. That embed is NOT covered by the capture,
+        # so no honest record exists for the vector actually stored.
+        fallback_vec = server._get_embedding(text)
+        return fallback_vec, {active_slot: fallback_vec}, None
+    return vec, {active_slot: vec}, [s for s in truncated if s == active_slot]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1292,7 +1608,7 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     result = {
         "title": title,
         "content": content,
-        "file_path": str(file_path.relative_to(PROJECT_ROOT)),
+        "file_path": _canonical_file_path(file_path),
         "node_type": node_type,
         "tags": tags,
         "links": links,
@@ -1365,6 +1681,17 @@ _KG_NODE_SCALAR_PROPERTIES: dict[str, str] = {
     "chunk_num":       "INT",
     "total_chunks":    "INT",
     "source_node_id":  "TEXT",
+    # W3 (v0.2.92 wiring audit): the per-slot truncation record — the
+    # complete ``truncated_slots`` list (presence = the row can answer for
+    # every slot) and the frozen-meaning ``secondary_truncated_slots`` view.
+    # Declared here so FRESH collections get them up-front and EXISTING
+    # collections additively migrate them (the same A4 invariant path as
+    # every other scalar prop; autoschema remains the belt-and-braces).
+    "truncated_slots":             "TEXT_ARRAY",
+    "secondary_truncated_slots":   "TEXT_ARRAY",
+    # The slots the write MEASURED — what scopes the record above from a
+    # "presence means complete" claim to "answers for exactly these".
+    "truncation_measured_slots":   "TEXT_ARRAY",
 }
 
 
@@ -1541,13 +1868,6 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
               f"({len(named_vectors)} named vectors + index_null_state=True)")
         return True
 
-        if result["success"]:
-            print(f"✓ Created collection '{COLLECTION_NAME}'")
-            return True
-        else:
-            print(f"❌ Failed to create collection: {result.get('message')}")
-            return False
-
     except Exception as e:
         print(f"❌ Error ensuring collection: {e}")
         return False
@@ -1706,15 +2026,10 @@ def parse_doc_file(content: str, file_path: Path) -> Dict:
         now = datetime.now(timezone.utc)
         created_at = now
         updated_at = now
-    rel_path = ""
-    try:
-        rel_path = str(file_path.relative_to(PROJECT_ROOT))
-    except ValueError:
-        rel_path = str(file_path)
     return {
         "title": title,
         "content": content,
-        "file_path": rel_path,
+        "file_path": _canonical_file_path(file_path),
         "created_at": created_at.isoformat(),
         "updated_at": updated_at.isoformat(),
         # Empty KG-specific fields — kept for symmetry with sync_node's
@@ -1728,7 +2043,109 @@ def parse_doc_file(content: str, file_path: Path) -> Dict:
     }
 
 
-def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.92 WP-B1 — per-node outcome + run tally (terminal honesty).
+#
+# Field report (D12): archived / frontmatter-skipped nodes returned True
+# and were counted as SUCCEEDED, so "117/117 succeeded" could hide nodes
+# that are intentionally absent from Weaviate, and no run ever listed
+# WHICH paths failed or were skipped or WHY. `sync_node`/`sync_doc` now
+# return a `SyncOutcome` carrying the category + path + reason; the
+# `--all` / file-list drivers tally them into a `SyncTally` whose summary
+# line appends ", K skipped" and whose details block names every
+# non-synced path. `SyncOutcome.__bool__` preserves the historical
+# truthiness contract (skip == not-a-failure) for external callers such
+# as `maintain_knowledge_graph.py`'s `if sync_node(...):`.
+# ──────────────────────────────────────────────────────────────────────
+
+#: Outcome categories. The first five are non-failures; only "failed"
+#: makes a run exit 1.
+OUTCOME_SYNCED = "synced"
+OUTCOME_EMBED_SKIPPED = "embed-skipped"          # unchanged, already current in Weaviate
+OUTCOME_ARCHIVED_SKIPPED = "archived-skipped"    # path or frontmarker: intentionally not indexed
+OUTCOME_FRONTMATTER_SKIPPED = "frontmatter-skipped"
+OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset
+OUTCOME_FAILED = "failed"
+
+_NON_FAILURE_OUTCOMES = frozenset({
+    OUTCOME_SYNCED,
+    OUTCOME_EMBED_SKIPPED,
+    OUTCOME_ARCHIVED_SKIPPED,
+    OUTCOME_FRONTMATTER_SKIPPED,
+    OUTCOME_EXCLUDED_SKIPPED,
+})
+
+
+class SyncOutcome:
+    """What happened to ONE node/doc during a sync_node/sync_doc call.
+
+    ``status`` is one of the ``OUTCOME_*`` constants, ``path`` the
+    canonical relative file_path (best effort), ``reason`` a one-line
+    human explanation for the tally's details block (empty for plain
+    successes). Boolean truth == "not a failure" — identical to the
+    pre-v0.2.92 ``bool`` return for every caller that only asked
+    "did this file fail?".
+    """
+
+    __slots__ = ("status", "path", "reason")
+
+    def __init__(self, status: str, path: str = "", reason: str = "") -> None:
+        self.status = status
+        self.path = path
+        self.reason = reason
+
+    def __bool__(self) -> bool:
+        return self.status != OUTCOME_FAILED
+
+    def __repr__(self) -> str:  # pragma: no cover — debugging aid
+        return f"SyncOutcome({self.status!r}, {self.path!r}, {self.reason!r})"
+
+
+class SyncTally:
+    """Aggregated per-run outcomes for one tree (`--all`) or file list.
+
+    ``succeeded`` counts real writes only; ``failed`` counts failures;
+    ``skipped`` sums every intentional non-sync (embed-skip because the
+    content hash matched, archived, frontmarker, excluded). ``records``
+    keeps every non-synced outcome so the terminal details block and the
+    run log can name paths WITH reasons.
+    """
+
+    def __init__(self) -> None:
+        self.counts: Dict[str, int] = {c: 0 for c in _NON_FAILURE_OUTCOMES}
+        self.counts[OUTCOME_FAILED] = 0
+        self.records: List[SyncOutcome] = []
+
+    def add(self, outcome: SyncOutcome) -> None:
+        self.counts[outcome.status] = self.counts.get(outcome.status, 0) + 1
+        if outcome.status != OUTCOME_SYNCED:
+            self.records.append(outcome)
+
+    @property
+    def succeeded(self) -> int:
+        return self.counts[OUTCOME_SYNCED]
+
+    @property
+    def failed(self) -> int:
+        return self.counts[OUTCOME_FAILED]
+
+    @property
+    def skipped(self) -> int:
+        return (
+            self.counts[OUTCOME_EMBED_SKIPPED]
+            + self.counts[OUTCOME_ARCHIVED_SKIPPED]
+            + self.counts[OUTCOME_FRONTMATTER_SKIPPED]
+            + self.counts[OUTCOME_EXCLUDED_SKIPPED]
+        )
+
+    def summary_fragment(self) -> str:
+        """`S succeeded, F failed, K skipped` — the exact fragment the
+        launcher's ``parse_summary_line`` reads (which accepts both this
+        and the legacy two-count shape)."""
+        return f"{self.succeeded} succeeded, {self.failed} failed, {self.skipped} skipped"
+
+
+def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """Sync a single docs/ file to the development collection.
 
     Mirrors `sync_node` minus the KG-specific concerns (no frontmatter
@@ -1754,14 +2171,22 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
     """
     if not DEV_COLLECTION_NAME:
         print(f"⊘ DEVELOPMENT_COLLECTION not set — skipping {file_path}")
-        return True
+        return SyncOutcome(
+            OUTCOME_EXCLUDED_SKIPPED,
+            _relative_file_path(file_path),
+            "DEVELOPMENT_COLLECTION not set — dev collection sync disabled",
+        )
 
     start_time = time.time()
 
     try:
         if not file_path.exists():
             print(f"❌ File not found: {file_path}")
-            return False
+            return SyncOutcome(
+                OUTCOME_FAILED,
+                _relative_file_path(file_path),
+                "file not found",
+            )
 
         # Same archive-skip logic as KG (path contains 'archive/' segment).
         archived, reason = _is_archived_node(file_path)
@@ -1777,7 +2202,9 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                     print(f"  ↳ Removed {removed} prior dev entry(ies) for '{fp_value}'")
             except Exception as e:
                 print(f"  ↳ Could not remove prior dev entry: {e}")
-            return True
+            return SyncOutcome(
+                OUTCOME_ARCHIVED_SKIPPED, fp_value, f"archived doc: {reason}"
+            )
 
         content = file_path.read_text(encoding="utf-8")
         doc_data = parse_doc_file(content, file_path)
@@ -1810,12 +2237,10 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
         # a dict keyed by slot name for named-vector collections.
         try:
             existing = coll.query.fetch_objects(
-                filters=Filter.by_property("file_path").equal(
-                    doc_data["file_path"]
-                ),
+                filters=_file_path_filter(doc_data["file_path"]),
                 limit=100,
                 return_properties=[
-                    "content_hash", "chunk_num", "total_chunks",
+                    "file_path", "content_hash", "chunk_num", "total_chunks",
                 ],
                 include_vector=True,
             )
@@ -1828,12 +2253,10 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                   f"{fetch_err}; falling back to hash-only check)")
             try:
                 existing = coll.query.fetch_objects(
-                    filters=Filter.by_property("file_path").equal(
-                        doc_data["file_path"]
-                    ),
+                    filters=_file_path_filter(doc_data["file_path"]),
                     limit=100,
                     return_properties=[
-                        "content_hash", "chunk_num", "total_chunks",
+                        "file_path", "content_hash", "chunk_num", "total_chunks",
                     ],
                 )
             except Exception:
@@ -1848,6 +2271,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
             try:
                 existing_hashes: List[str] = []
                 existing_total_chunks: List[int] = []
+                existing_file_paths: List[str] = []
                 active_slot_populated: List[bool] = []
                 for obj in existing.objects:
                     props = obj.properties or {}
@@ -1857,6 +2281,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                         existing_total_chunks.append(int(tc) if tc is not None else 0)
                     except (TypeError, ValueError):
                         existing_total_chunks.append(0)
+                    existing_file_paths.append(props.get("file_path", "") or "")
                     # `obj.vector` is a dict {slot: list[float]} for
                     # named-vector collections; missing/None when the
                     # fetch didn't include vectors (older client).
@@ -1886,8 +2311,38 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                     and all(h == current_content_hash for h in existing_hashes)
                     and all(h for h in existing_hashes)  # no empty strings
                 )
+                # v0.2.92 WP-B1 (D13): skip only when no found row
+                # reports a NON-canonical (legacy backslash) file_path —
+                # same rule as sync_node's fast path. A row not reporting
+                # a file_path at all cannot be judged and keeps the
+                # pre-v0.2.92 skip semantics (conservative default).
+                shapes_ok = all(
+                    fp in ("", doc_data["file_path"]) for fp in existing_file_paths
+                )
                 slots_ok = all(active_slot_populated)
-                if chunk_count_ok and hashes_ok and slots_ok:
+                # v0.2.92 chunk-plan transition repair — same rule as
+                # sync_node's fast path (see the block above it): while a
+                # chunker-revision crossing is pending, a self-consistent
+                # row set must ALSO match the CURRENT chunker's plan for
+                # this content, or the doc re-chunks.
+                _self_consistent = (
+                    chunk_count_ok and hashes_ok and slots_ok and shapes_ok
+                )
+                _plan_ok = True
+                if _self_consistent and _chunker_resync_pending():
+                    _plan_ok = _stored_plan_matches_current(
+                        server, coll, doc_data["file_path"], content,
+                        len(existing_hashes),
+                    )
+                    if not _plan_ok:
+                        global _RECHUNKED_COUNT
+                        _RECHUNKED_COUNT += 1
+                        print(
+                            f"   ♻️  Re-chunking: stored chunk plan predates "
+                            f"the current chunker revision "
+                            f"(revision-crossing repair)"
+                        )
+                if _self_consistent and _plan_ok:
                     elapsed = time.time() - start_time
                     print(
                         f"   ⏭️  Embed-skip: content_hash matches "
@@ -1896,7 +2351,11 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                         f"in {active_slot or '<no-slot>'} "
                         f"({elapsed*1000:.0f} ms)"
                     )
-                    return True
+                    return SyncOutcome(
+                        OUTCOME_EMBED_SKIPPED,
+                        doc_data["file_path"],
+                        "content_hash match — already current in Weaviate",
+                    )
             except Exception as skip_err:  # noqa: BLE001
                 # Soft-fail: fall through to the delete-and-re-embed path.
                 print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
@@ -1908,13 +2367,23 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
             for obj in existing.objects:
                 coll.data.delete_by_id(obj.uuid)
 
-        token_count = TokenCounter.count_tokens(content)
         source_id = str(uuid.uuid4())
-        # v0.2.28: per-model chunk threshold instead of hardcoded 2500.
-        _max_tokens = _max_chunk_tokens_for(server)
+        # W8: ONE shared plan — same computation as `sync_node` and the MCP
+        # store (see `_plan_for`); the gate and the boundaries below are the
+        # same call's answer, never two. (The separate `token_count` /
+        # `_max_tokens` locals this replaced had no reader on the docs path
+        # once the plan carried the decision.)
+        _plan = _plan_for(
+            server, content,
+            source_id=source_id,
+            metadata={
+                "title": doc_data["title"],
+                "file_path": doc_data["file_path"],
+            },
+        )
 
-        if token_count <= _max_tokens:
-            vec_arg, slots_written = _build_vector_arg(server, content)
+        if _plan.is_single:
+            vec_arg, slots_written, truncated_slots = _build_vector_arg(server, content)
             data_obj = {
                 "title": doc_data["title"],
                 "content": doc_data["content"],
@@ -1930,27 +2399,27 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 # over the whole file content above).
                 "content_hash": current_content_hash,
             }
+            # W3: persist the per-call truncation record (the shared stamper
+            # derives BOTH properties from the ONE atomic capture).
+            data_obj.update(
+                truncation_tag_properties(
+                    truncated_slots, server.text_vector_slot,
+                    measured_slots=slots_written,
+                )
+            )
             coll.data.insert(properties=data_obj, vector=vec_arg)
             print(f"   ✓ Stored doc as single chunk (vectors={sorted(slots_written)})")
-            return True
+            return SyncOutcome(OUTCOME_SYNCED, doc_data["file_path"])
 
-        # Chunked path — mirrors `sync_node` chunked branch.
-        # v0.2.28: per-model chunker preset (qwen3 → large_context;
-        # arctic / 512-token → small_context; etc.) instead of hardcoded
-        # 2500-token chunks regardless of model.
-        chunker = _chunker_for(server)
-        chunks = chunker.chunk_text(
-            text=content,
-            source_id=source_id,
-            metadata={
-                "title": doc_data["title"],
-                "file_path": doc_data["file_path"],
-            },
-        )
+        # Chunked path — mirrors `sync_node` chunked branch. W8: the
+        # boundaries are the SAME plan the gate above decided on.
+        chunks = _plan.chunks
         print(f"   Split into {len(chunks)} chunks", flush=True)
         last_slots: Mapping[str, List[float]] = {}
         for i, chunk in enumerate(chunks):
-            vec_arg, last_slots = _build_vector_arg(server, chunk.content)
+            vec_arg, last_slots, truncated_slots = _build_vector_arg(
+                server, chunk.content
+            )
             data_obj = {
                 "title": doc_data["title"],
                 "content": chunk.content,
@@ -1968,6 +2437,15 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 # keeps that invariant.
                 "content_hash": current_content_hash,
             }
+            # W3: per-chunk truncation record — a chunk whose SECONDARY (or,
+            # on a runner refusal, ACTIVE) vector came from a bounded leading
+            # sub-window is distinguishable from STORED DATA alone.
+            data_obj.update(
+                truncation_tag_properties(
+                    truncated_slots, server.text_vector_slot,
+                    measured_slots=last_slots,
+                )
+            )
             coll.data.insert(properties=data_obj, vector=vec_arg)
             # v0.2.69 FIX 3 (review SHOULD-FIX): per-chunk heartbeat. The
             # launcher's kg-sync stall watchdog re-arms on every output
@@ -1985,12 +2463,14 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 flush=True,
             )
         print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})", flush=True)
-        return True
+        return SyncOutcome(OUTCOME_SYNCED, doc_data["file_path"])
     except Exception as e:
         import traceback
-        print(f"❌ Error syncing doc: {e}")
+        print(f"❌ Error syncing doc {file_path}: {e}")
         traceback.print_exc()
-        return False
+        return SyncOutcome(
+            OUTCOME_FAILED, _relative_file_path(file_path), f"error: {e}"
+        )
 
 
 def _delete_doc_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
@@ -2005,7 +2485,7 @@ def _delete_doc_by_file_path(server: WeaviateMCPServer, file_path_value: str) ->
     try:
         coll = server.client.collections.get(DEV_COLLECTION_NAME)
         existing = coll.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(file_path_value),
+            filters=_file_path_filter(file_path_value),
             limit=100,
         )
         n = 0
@@ -2017,29 +2497,27 @@ def _delete_doc_by_file_path(server: WeaviateMCPServer, file_path_value: str) ->
         return 0
 
 
-def sync_all_docs(server: WeaviateMCPServer) -> Tuple[int, int]:
+def sync_all_docs(server: WeaviateMCPServer) -> "SyncTally":
     """Walk DOCS_ROOT and sync every .md to the dev collection."""
+    tally = SyncTally()
     if not DEV_COLLECTION_NAME:
         print("ℹ️  DEVELOPMENT_COLLECTION not set — skipping dev sync")
-        return (0, 0)
+        return tally
     if not DOCS_ROOT.exists():
         print(f"ℹ️  No docs/ at {DOCS_ROOT} — skipping")
-        return (0, 0)
+        return tally
     md_files = list(DOCS_ROOT.rglob("*.md"))
     total = len(md_files)
     print(f"📚 Found {total} markdown files in docs/")
-    success = fail = 0
     # v0.2.70 FIX C: running "doc M/N" counter (flush=True), same rationale as
     # sync_all_nodes — visibility for a long re-embed, no watchdog/timeout.
     for idx, md in enumerate(sorted(md_files), start=1):
         print(f"[{idx}/{total}] {md.name}", flush=True)
-        if sync_doc(server, md):
-            success += 1
-        else:
-            fail += 1
+        tally.add(sync_doc(server, md))
         print(f"  → progress: {idx}/{total} docs processed "
-              f"({success} ok, {fail} failed)", flush=True)
-    return success, fail
+              f"({tally.succeeded} ok, {tally.failed} failed, "
+              f"{tally.skipped} skipped)", flush=True)
+    return tally
 
 
 def infer_tags_from_typed_links(
@@ -2169,22 +2647,61 @@ def resolve_wikilinks_to_uuids(
         return []
 
 
-def _relative_file_path(file_path: Path) -> str:
+def _canonical_file_path(file_path: Path) -> str:
     """Return the project-relative file_path string used as a node's
-    Weaviate dedup key.
+    Weaviate dedup key, in canonical POSIX form (forward slashes).
 
-    MUST match the value stored in the ``file_path`` property by
-    ``parse_markdown_node`` / ``parse_doc_file`` (``str(file_path.
-    relative_to(PROJECT_ROOT))``) so a delete-by-file_path query hits the
-    exact rows written for this file. Falls back to ``str(file_path)`` when
-    the path isn't under PROJECT_ROOT (defensive — should not happen for
-    files discovered under KNOWLEDGE_ROOT / DOCS_ROOT, but a symlinked or
-    out-of-tree path shouldn't crash the cleanup).
+    v0.2.92 WP-B1 (D13, Windows field audit): pre-fix this returned
+    ``str(file_path.relative_to(PROJECT_ROOT))`` — host-OS-shaped, i.e.
+    BACKSLASHES on Windows — while the MCP ``store_knowledge_node`` path
+    stores the caller's POSIX spelling (server.py C-7 has normalized to
+    POSIX at write since v0.2.75). Two shapes for one file meant the
+    delete-by-file_path leg of this script's upsert MISSED the other
+    writer's rows, so every alternating write INSERTED a duplicate set
+    instead of replacing — exactly the 4x/2x duplicate objects observed
+    in the field. ONE canonical shape (``vco_lib.paths.to_posix_rel``,
+    the repo's shared normalizer) closes the class at the source.
+
+    Every write site (``parse_markdown_node``, ``parse_doc_file``) and
+    every delete/lookup site (``_relative_file_path`` → here,
+    ``_file_path_filter``) routes through THIS function so they cannot
+    drift apart again. Falls back to ``str(file_path)`` (POSIX-swapped)
+    when the path isn't under PROJECT_ROOT — defensive, same as before.
     """
     try:
-        return str(file_path.relative_to(PROJECT_ROOT))
+        rel = file_path.relative_to(PROJECT_ROOT)
     except ValueError:
-        return str(file_path)
+        rel = file_path
+    return to_posix_rel(rel)
+
+
+def _relative_file_path(file_path: Path) -> str:
+    """Canonical (POSIX) project-relative file_path — see
+    :func:`_canonical_file_path`. Kept as the named entry point the
+    archived-node cleanup and shared-scope migration already call."""
+    return _canonical_file_path(file_path)
+
+
+def _file_path_filter(canonical: str):
+    """Weaviate filter matching ``file_path`` rows for *canonical* — BOTH
+    spellings when a legacy backslash variant exists.
+
+    v0.2.92 WP-B1 transition rule (state-keyed, not version-keyed): rows
+    written by a pre-canonical Windows sync carry ``knowledge\\concepts\\
+    foo.md``. A POSIX-only exact filter would MISS them, so the delete
+    that accompanies every re-write would leave them behind and the
+    insert would add a duplicate set — the exact defect this closes.
+    Mirrors server.py's C-7 delete filter (OR of two EXACT ``.equal()``
+    predicates — never ``contains_any``, which is token-based) so the
+    sync script and the MCP delete with the same semantics.
+    """
+    backslash_variant = canonical.replace("/", "\\")
+    if backslash_variant != canonical:
+        return Filter.any_of([
+            Filter.by_property("file_path").equal(canonical),
+            Filter.by_property("file_path").equal(backslash_variant),
+        ])
+    return Filter.by_property("file_path").equal(canonical)
 
 
 def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
@@ -2205,7 +2722,7 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
     try:
         coll = server.client.collections.get(COLLECTION_NAME)
         existing = coll.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(file_path_value),
+            filters=_file_path_filter(file_path_value),
             limit=100,
         )
         n = 0
@@ -2376,7 +2893,7 @@ def _notice_leftover_shared_rows(server: "WeaviateMCPServer", fp_value: str) -> 
     try:
         coll = server.client.collections.get(SHARED_COLLECTION_NAME)
         existing = coll.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(fp_value),
+            filters=_file_path_filter(fp_value),
             limit=100,
         )
         n = len(existing.objects)
@@ -2506,7 +3023,7 @@ def _normalize_typed_links(typed_links: object, context: str = "") -> list:
     return normalized
 
 
-def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
+def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """
     Sync a single knowledge node to Weaviate (with chunking support)
 
@@ -2515,7 +3032,9 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         file_path: Path to markdown file
 
     Returns:
-        True if successful
+        SyncOutcome — truthy (bool(outcome) is True) when the file did not
+        FAIL; see the v0.2.92 WP-B1 block above `sync_doc` for why the
+        plain-bool return became a categorized outcome.
     """
     start_time = time.time()
     chunks_created = 0
@@ -2525,7 +3044,9 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         if not file_path.exists():
             print(f"❌ File not found: {file_path}")
             error_msg = "File not found"
-            return False
+            return SyncOutcome(
+                OUTCOME_FAILED, _relative_file_path(file_path), "file not found"
+            )
 
         # Skip archived nodes — see _is_archived_node docstring. Do this
         # BEFORE the timestamp-update side effect so editing an archived
@@ -2561,7 +3082,12 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     )
             except Exception:
                 pass
-            return True  # not a sync failure — intentional skip
+            return SyncOutcome(
+                OUTCOME_ARCHIVED_SKIPPED,
+                _relative_file_path(file_path),
+                f"archived node: {reason}",
+            )  # not a sync failure — intentional skip (now counted as
+            # "skipped", never "succeeded" — v0.2.92 WP-B1 / D12)
 
         # Read, auto-update `updated:` timestamp, write back, then parse
         content = file_path.read_text(encoding='utf-8')
@@ -2598,7 +3124,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     )
             except Exception:
                 pass
-            return True
+            return SyncOutcome(
+                OUTCOME_FRONTMATTER_SKIPPED,
+                node_data.get("file_path") or _relative_file_path(file_path),
+                f"archived node (frontmatter): {reason2}",
+            )
 
         # ── v0.2.89 BUG 6: per-node target selection (`scope:` frontmatter).
         # See the routing-contract comment block above `_node_scope`.
@@ -2627,13 +3157,18 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             # would log this refused write as success=True.
             error_msg = "shared KG writes disabled (SHARED_KG_WRITE_DISABLED)"
             print(
-                "❌ scope: shared refused — shared KG writes are disabled for "
+                f"❌ {_relative_file_path(file_path)}: scope: shared refused — "
+                "shared KG writes are disabled for "
                 "this project (SHARED_KG_WRITE_DISABLED). Either set "
                 "SHARED_KG_WRITE_DISABLED=false to enable shared writes, or "
                 "drop the `scope: shared` frontmatter key to keep the node "
                 "project-scoped. Not rerouting to the project collection."
             )
-            return False
+            return SyncOutcome(
+                OUTCOME_FAILED,
+                _relative_file_path(file_path),
+                "scope: shared refused — SHARED_KG_WRITE_DISABLED",
+            )
         if targets_shared:
             matrix_allowed, matrix_note = _shared_write_matrix_allows(
                 SHARED_COLLECTION_NAME
@@ -2645,12 +3180,18 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 # row — see the write-gate branch above.
                 error_msg = "access matrix denies shared write"
                 print(
-                    f"❌ scope: shared refused — the launcher's access matrix "
+                    f"❌ {_relative_file_path(file_path)}: scope: shared refused — "
+                    f"the launcher's access matrix "
                     f"denies this project write access to "
                     f"'{SHARED_COLLECTION_NAME}'. Grant write access in the "
                     f"launcher GUI, or drop the `scope: shared` key."
                 )
-                return False
+                return SyncOutcome(
+                    OUTCOME_FAILED,
+                    _relative_file_path(file_path),
+                    f"scope: shared refused — access matrix denies writes to "
+                    f"'{SHARED_COLLECTION_NAME}'",
+                )
         target_collection_name = (
             SHARED_COLLECTION_NAME if targets_shared else COLLECTION_NAME
         )
@@ -2699,12 +3240,15 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         # read the wrong store.
         collection = server.client.collections.get(target_collection_name)
 
-        # Query for existing nodes with same file_path
-        where_filter = Filter.by_property("file_path").equal(node_data["file_path"])
+        # Query for existing nodes with same file_path — BOTH spellings
+        # (v0.2.92 WP-B1 / D13): a legacy Windows-written row carries the
+        # backslash variant; an exact POSIX-only filter would miss it, the
+        # delete below would skip it, and the insert would duplicate it.
+        where_filter = _file_path_filter(node_data["file_path"])
         existing = collection.query.fetch_objects(
             filters=where_filter,
             limit=100,
-            return_properties=["content_hash", "chunk_num", "total_chunks"],
+            return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
         )
 
         # v0.2.17 (plan 0.2): EMBED-SKIP fast path. If every existing
@@ -2727,6 +3271,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         try:
             existing_hashes: List[str] = []
             existing_total_chunks: List[int] = []
+            existing_file_paths: List[str] = []
             for obj in existing.objects:
                 props = obj.properties or {}
                 existing_hashes.append(props.get("content_hash", "") or "")
@@ -2737,17 +3282,54 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     existing_total_chunks.append(int(tc) if tc is not None else 0)
                 except (TypeError, ValueError):
                     existing_total_chunks.append(0)
+                existing_file_paths.append(props.get("file_path", "") or "")
 
             chunk_count_ok = (
                 len(existing_total_chunks) > 0
                 and all(tc == len(existing_total_chunks) for tc in existing_total_chunks)
             )
-            all_match = (
+            # v0.2.92 WP-B1 (D13): the skip may only fire when no found
+            # row reports a NON-canonical (legacy backslash) spelling — a
+            # legacy-shaped row reached through the dual-shape filter must
+            # NOT be preserved by the fast path; it falls through to
+            # delete-and-rewrite so the row shape itself heals. A row that
+            # does not report a file_path at all (older clients / fixtures
+            # that ignore return_properties) cannot be judged and keeps
+            # the pre-v0.2.92 skip semantics (conservative default: no
+            # new re-embed on unverifiable data).
+            shapes_canonical = all(
+                fp in ("", node_data["file_path"]) for fp in existing_file_paths
+            )
+            # v0.2.92 chunk-plan transition repair: a revision crossing is
+            # pending when the deferral ledger carries
+            # `chunker_preset_overhaul_pending`. In that state a
+            # self-consistent row set is NOT sufficient to skip — compare
+            # the stored plan against what the CURRENT chunker produces for
+            # this content. Unchanged plan → still skip (the overwhelming
+            # majority); changed plan → fall through to delete-and-re-embed
+            # so this entry re-chunks. No crossing pending → exactly the
+            # pre-v0.2.92 semantics (no plan CPU paid).
+            _self_consistent = (
                 len(existing_hashes) > 0
                 and all(h == current_content_hash for h in existing_hashes)
                 and all(h for h in existing_hashes)  # no empty strings
                 and chunk_count_ok
+                and shapes_canonical
             )
+            _plan_ok = True
+            if _self_consistent and _chunker_resync_pending():
+                _plan_ok = _stored_plan_matches_current(
+                    server, collection, node_data["file_path"], content,
+                    len(existing_hashes),
+                )
+                if not _plan_ok:
+                    global _RECHUNKED_COUNT
+                    _RECHUNKED_COUNT += 1
+                    print(
+                        f"   ♻️  Re-chunking: stored chunk plan predates the "
+                        f"current chunker revision (revision-crossing repair)"
+                    )
+            all_match = _self_consistent and _plan_ok
             if all_match:
                 elapsed = time.time() - start_time
                 print(
@@ -2767,7 +3349,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 # already up to date.
                 if targets_shared:
                     _finish_shared_scope_write(server, node_data["file_path"])
-                return True
+                return SyncOutcome(
+                    OUTCOME_EMBED_SKIPPED,
+                    node_data["file_path"],
+                    "content_hash match — already current in Weaviate",
+                )
         except Exception as skip_err:  # noqa: BLE001 — soft-fail by design
             # Fall through to delete-and-re-embed. Log so future
             # debugging knows the fast path tried but didn't apply.
@@ -2781,13 +3367,27 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         if deleted_count > 0:
             print(f"   ✓ Deleted {deleted_count} old version(s)")
 
-        # Check if content needs chunking
+        # Check if content needs chunking.
+        # W8 (v0.2.92 wiring audit): the gate AND the boundaries come from
+        # the ONE shared plan (`_plan_for` → `kg_chunk_plan.plan_node_chunks`)
+        # that the MCP `store_knowledge_node` and the `--rechunk` comparison
+        # also use — two separate calls here (threshold, then chunker) is
+        # what let the two writers drift for the same node.
+        source_node_id = str(uuid.uuid4())
+        _plan = _plan_for(
+            server, content,
+            source_id=source_node_id,
+            metadata={
+                "title": node_data["title"],
+                "file_path": node_data["file_path"],
+                "node_type": node_data["node_type"],
+            },
+        )
         token_count = TokenCounter.count_tokens(content)
         print(f"   Content size: {token_count} tokens")
-        # v0.2.28: per-model chunk threshold instead of hardcoded 2500.
-        _max_tokens = _max_chunk_tokens_for(server)
+        _max_tokens = _plan.threshold
 
-        if token_count <= _max_tokens:
+        if _plan.is_single:
             # Single chunk - store as-is
             print("   Storing as single object")
 
@@ -2802,6 +3402,10 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             )
             if _shipped is not None:
                 vec_arg, slots_written = _shipped
+                # Shipped sidecar vectors carry NO truncation record (computed
+                # elsewhere, at release time) — the row deliberately gets NO
+                # truncated_slots property, so its state resolves UNKNOWN for
+                # every slot (never a guessed False). Do not stamp here.
                 print(
                     f"   📦 Ingested shipped vector(s) "
                     f"(slots={sorted(slots_written)}, no embed call)"
@@ -2810,7 +3414,9 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 # v0.2.18: build vector arg via EmbeddingService. With
                 # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
                 # reachable text backend so multiple slots get populated.
-                vec_arg, slots_written = _build_vector_arg(server, content)
+                vec_arg, slots_written, truncated_slots = _build_vector_arg(
+                    server, content
+                )
 
             # Prepare data object
             data_obj = {
@@ -2831,11 +3437,21 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "updated_at": node_data["updated_at"],
                 "chunk_num": 1,
                 "total_chunks": 1,
-                "source_node_id": str(uuid.uuid4()),
+                "source_node_id": source_node_id,
                 # v0.2.17 (plan 0.2): persist content_hash so the next
                 # re-sync can skip the embed pipeline when unchanged.
                 "content_hash": current_content_hash,
             }
+            # W3: persist the per-call truncation record on the COMPUTED
+            # embed path only — a shipped-sidecar ingest leaves the row
+            # without the property (UNKNOWN, never a guessed False).
+            if _shipped is None:
+                data_obj.update(
+                    truncation_tag_properties(
+                        truncated_slots, server.text_vector_slot,
+                        measured_slots=slots_written,
+                    )
+                )
 
             # Add temporal metadata if present
             for field in ['created', 'updated', 'valid_from', 'valid_until', 'status']:
@@ -2896,24 +3512,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             # Multiple chunks needed
             print(f"   ⚠️  Content exceeds {_max_tokens} tokens - chunking required")
 
-            # Generate source_node_id for all chunks
-            source_node_id = str(uuid.uuid4())
-
-            # v0.2.28: per-model chunker preset instead of hardcoded
-            # max_tokens=2500 (which was qwen3-specific). The same
-            # `_max_tokens` value used in the gate above drives the
-            # chunker's max — they MUST stay in sync.
-            chunker = _chunker_for(server)
-
-            chunks = chunker.chunk_text(
-                text=content,
-                source_id=source_node_id,
-                metadata={
-                    "title": node_data["title"],
-                    "file_path": node_data["file_path"],
-                    "node_type": node_data["node_type"]
-                }
-            )
+            # W8: the boundaries come from the SAME plan the gate above
+            # decided on (one `_plan_for` call), and `source_node_id` is the
+            # per-write id that plan was built with — so the gate, the chunk
+            # sizes and the stored ids cannot disagree.
+            chunks = _plan.chunks
 
             print(f"   Split into {len(chunks)} chunks")
 
@@ -2937,10 +3540,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 )
                 if _shipped is not None:
                     vec_arg, last_slots = _shipped
+                    # Shipped sidecar vector — no truncation record: the row
+                    # keeps NO truncated_slots property (UNKNOWN for every
+                    # slot, never a guessed False). See the single-chunk
+                    # path's shipped note.
                 else:
                     # v0.2.18: embed via EmbeddingService (multi-slot when
                     # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
-                    vec_arg, last_slots = _build_vector_arg(server, chunk.content)
+                    vec_arg, last_slots, truncated_slots = _build_vector_arg(
+                        server, chunk.content
+                    )
 
                 # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
                 data_obj = {
@@ -2968,6 +3577,15 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     # writing the same value here keeps that invariant.
                     "content_hash": current_content_hash,
                 }
+                # W3: per-chunk truncation record on the COMPUTED embed path
+                # only (shipped-ingest chunks stay record-less → UNKNOWN).
+                if _shipped is None:
+                    data_obj.update(
+                        truncation_tag_properties(
+                            truncated_slots, server.text_vector_slot,
+                            measured_slots=last_slots,
+                        )
+                    )
 
                 # Add temporal metadata if present
                 for field in ['created', 'updated', 'valid_from', 'valid_until', 'status']:
@@ -3025,14 +3643,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             _notice_leftover_shared_rows(server, node_data["file_path"])
 
         print(f"✅ Successfully synced {node_data['title']}")
-        return True
+        return SyncOutcome(OUTCOME_SYNCED, node_data["file_path"])
 
     except Exception as e:
         error_msg = str(e)
-        print(f"❌ Error syncing node: {e}")
+        print(f"❌ Error syncing node {file_path}: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return SyncOutcome(
+            OUTCOME_FAILED, _relative_file_path(file_path), f"error: {e}"
+        )
 
     finally:
         # Log usage
@@ -3061,7 +3681,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             )
 
 
-def sync_all_nodes(server: WeaviateMCPServer) -> Tuple[int, int]:
+def sync_all_nodes(server: WeaviateMCPServer) -> "SyncTally":
     """
     Sync all knowledge graph markdown files
 
@@ -3069,16 +3689,27 @@ def sync_all_nodes(server: WeaviateMCPServer) -> Tuple[int, int]:
         server: Weaviate MCP server instance
 
     Returns:
-        (success_count, fail_count)
+        SyncTally — succeeded counts real writes only; archived /
+        frontmarker / excluded / embed-skipped nodes are counted as
+        SKIPPED, never as succeeded (v0.2.92 WP-B1 / D12).
     """
-    success_count = 0
-    fail_count = 0
+    tally = SyncTally()
 
     # Find all .md files in knowledge/
     md_files = list(KNOWLEDGE_ROOT.rglob("*.md"))
 
     # Exclude meta files (schema/reference documentation, not searchable content)
     EXCLUDED_FILES = {'TAG_HIERARCHY.md', 'VOCABULARY.md'}
+    # v0.2.92 WP-B1: excluded meta files are recorded in the tally (with a
+    # reason) instead of silently vanishing from every count — "Found N"
+    # below deliberately still reports the post-exclusion total, unchanged.
+    for f in md_files:
+        if f.name in EXCLUDED_FILES:
+            tally.add(SyncOutcome(
+                OUTCOME_EXCLUDED_SKIPPED,
+                _relative_file_path(f),
+                f"excluded meta file ({f.name}) — never synced by design",
+            ))
     md_files = [f for f in md_files if f.name not in EXCLUDED_FILES]
 
     total = len(md_files)
@@ -3093,15 +3724,13 @@ def sync_all_nodes(server: WeaviateMCPServer) -> Tuple[int, int]:
     # finer-grained signal for big single nodes.
     for idx, md_file in enumerate(sorted(md_files), start=1):
         print(f"[{idx}/{total}] {md_file.name}", flush=True)
-        if sync_node(server, md_file):
-            success_count += 1
-        else:
-            fail_count += 1
+        tally.add(sync_node(server, md_file))
         print(f"  → progress: {idx}/{total} nodes processed "
-              f"({success_count} ok, {fail_count} failed)", flush=True)
+              f"({tally.succeeded} ok, {tally.failed} failed, "
+              f"{tally.skipped} skipped)", flush=True)
         print()  # Blank line between nodes
 
-    return success_count, fail_count
+    return tally
 
 
 def _classify_sync_target(raw: str) -> Tuple[Path, bool, bool]:
@@ -3155,6 +3784,83 @@ def _classify_sync_target(raw: str) -> Tuple[Path, bool, bool]:
     return file_path, in_knowledge, in_docs
 
 
+#: Cap on per-path detail lines printed to stdout at the end of a run —
+#: the FULL list always goes to the run log (below), so a 400-node drift
+#: fix doesn't bury the terminal in lines it can't act on anyway.
+_DETAILS_PRINT_CAP = 50
+
+
+def _details_log_path() -> "Optional[Path]":
+    """`<vct_root>/logs/kg-sync-<UTC ts>.log` — the full-list sink for a
+    run's not-synced details. Honors ``VCT_STATE_DIR`` through
+    ``vco_lib.paths.vct_root_dir()``. Returns None (and never raises) when
+    the state root can't be resolved."""
+    try:
+        from vco_lib.paths import vct_root_dir
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return vct_root_dir() / "logs" / f"kg-sync-{ts}.log"
+    except Exception:  # noqa: BLE001 — diagnostics must never break the run
+        return None
+
+
+def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
+    """End-of-run honesty block (v0.2.92 WP-B1 / D12).
+
+    Names every path that did NOT end in a real sync — failures with their
+    reason, and every skip category with its reason — instead of letting
+    them hide inside a "succeeded" count. Bounded to
+    ``_DETAILS_PRINT_CAP`` stdout lines; the complete list is written to
+    the run log under ``<vct_root>/logs/`` (soft-fail: if the log can't be
+    written, the bounded stdout block still prints).
+
+    ``tallies`` may be empty (nothing to report → no output at all).
+    """
+    records: List[SyncOutcome] = [r for t in tallies for r in t.records]
+    if not records:
+        return
+
+    counts: Dict[str, int] = {}
+    for r in records:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    breakdown = ", ".join(
+        f"{counts[c]} {c}" for c in (
+            OUTCOME_FAILED, OUTCOME_EMBED_SKIPPED, OUTCOME_ARCHIVED_SKIPPED,
+            OUTCOME_FRONTMATTER_SKIPPED, OUTCOME_EXCLUDED_SKIPPED,
+        ) if counts.get(c)
+    )
+    print(f"📋 {len(records)} not-synced item(s) this run ({run_kind}): {breakdown}")
+
+    log_path = None
+    try:
+        log_path = _details_log_path()
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            header = [
+                f"kg-sync run {datetime.now(timezone.utc).isoformat()} "
+                f"(project root: {PROJECT_ROOT})",
+                f"not-synced records: {len(records)} ({breakdown})",
+                "",
+            ]
+            body = [
+                f"[{r.status}] {r.path} — {r.reason or '(no reason recorded)'}"
+                for r in records
+            ]
+            log_path.write_text("\n".join(header + body) + "\n", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — soft-fail, see docstring
+        log_path = None
+        print(f"   (could not write the full-list log: {e})", file=sys.stderr)
+
+    glyph = {OUTCOME_FAILED: "✗"}.get
+    for r in records[:_DETAILS_PRINT_CAP]:
+        print(f"   {glyph(r.status, '⊘')} {r.path} — {r.reason or '(no reason recorded)'}")
+    if len(records) > _DETAILS_PRINT_CAP:
+        print(f"   … and {len(records) - _DETAILS_PRINT_CAP} more "
+              f"(full list in the run log)")
+    if log_path is not None:
+        print(f"   full list: {log_path}")
+
+
 def _regen_node_formats_after_full_sync() -> None:
     """KG-4 (v0.2.75): after a `--all` sync, refresh the
     `knowledge/.node_formats.json` sidecar so retrieval summaries don't stay
@@ -3182,7 +3888,16 @@ def _regen_node_formats_after_full_sync() -> None:
         # Cap the whole regen so a slow/hung summary backend can't wedge the
         # sync exit. --all over a large KG can be slow but is bounded here.
         py = sys.executable or "python3"
-        print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...")
+        # v0.2.92 WP-B1: this exact line is the STAGE MARKER the launcher's
+        # kg_sync.rs maps to phase "finalize" (the regen below can legitimately
+        # run for up to 600 s AFTER the 📊 summary lines — without this signal
+        # the GUI showed a stalled "embedding (N/N)" while the process was
+        # honestly still working). Text is load-bearing: change it only with
+        # the Rust matcher in kg_sync.rs. flush=True so the marker reaches the
+        # launcher's line reader BEFORE the (potentially long) regen starts,
+        # including on direct-CLI runs without PYTHONUNBUFFERED.
+        print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...",
+              flush=True)
         proc = subprocess.run(
             [py, str(gen), "--all"],
             cwd=str(PROJECT_ROOT),
@@ -3203,6 +3918,163 @@ def _regen_node_formats_after_full_sync() -> None:
         print(f"   (node-format refresh skipped: {e} — non-fatal)", file=sys.stderr)
 
 
+def _run_check_drift() -> None:
+    """``--check-drift``: detect (never repair) knowledge/ content that
+    never reached Weaviate — both "no KG collection binding at all" (a
+    setup gap: this script's own `_resolve_collections()` silently falls
+    back to the literal default `"KnowledgeGraph"` when nothing is
+    configured, which `check_kg_binding` does NOT trust — it independently
+    verifies a REAL binding was resolved) and "binding exists, some
+    node(s) unsynced or stale" (drift; see `vco_lib.kg_sync_drift` module
+    docstring for the double-sided finding this closes).
+
+    Read-only end to end: no embedding calls, no Weaviate writes. Surfaces
+    findings through the SAME deferral ledger every other soft-fail
+    condition in this script uses (`kg_sync_no_embedding_backend`,
+    `residue_cleanup_pending`) — see `vco_lib.kg_sync_drift.surface_drift` /
+    `surface_binding_gap` for why the surfaced entries are explicitly
+    `action_required` rather than `auto_retryable`. Always exits 0: every
+    outcome here (unbound, drift, ok, could-not-determine) is a successful
+    completion of a read-only scan, not a script failure — a non-zero exit
+    would wrongly signal "this run failed" to a caller like install.py.
+
+    NOTE this entry point is BUNDLE-DEPENDENT (it only exists where
+    `.claude/scripts/sync_knowledge_graph.py` was installed) — it is NOT
+    reachable for a "registered but unbundled" project, which is precisely
+    the scenario `vco_lib.kg_sync_drift`'s own `python -m` CLI exists to
+    cover instead (see that module's docstring).
+    """
+    from vco_lib.kg_sync_drift import check_kg_binding, scan_drift, surface_binding_gap, surface_drift
+
+    # Pass the RAW env var (not COLLECTION_NAME, which _resolve_collections()
+    # already defaulted to the literal "KnowledgeGraph" when nothing is
+    # configured) — an operator-provided real value is honored as "bound"
+    # without a hub/local-file round-trip; a genuinely absent env var still
+    # falls through to check_kg_binding's own hub/local-config resolution.
+    binding = check_kg_binding(
+        PROJECT_ROOT, KNOWLEDGE_ROOT,
+        kg_collection=os.environ.get("KG_COLLECTION", "").strip(),
+    )
+    b_icon = {"bound": "✅", "unbound": "⚠️ ", "ok": "✅"}.get(binding.status, "•")
+    print(f"{b_icon} KG binding check: {binding.status} — {binding.detail}")
+    surface_binding_gap(PROJECT_ROOT, binding)
+
+    if binding.status == "unbound":
+        print(
+            "   → no drift scan possible without a binding. Register/"
+            "bundle this project, then re-run --check-drift."
+        )
+        sys.exit(0)
+
+    report = scan_drift(
+        KNOWLEDGE_ROOT,
+        weaviate_url=WEAVIATE_URL,
+        kg_collection=binding.kg_collection or COLLECTION_NAME,
+        shared_kg_collection=SHARED_COLLECTION_NAME,
+    )
+    icon = {"ok": "✅", "drift": "⚠️ ", "unknown": "❓"}.get(report.status, "•")
+    print(f"{icon} KG sync drift check: {report.status} — {report.detail}")
+    print(
+        f"   scanned={report.scanned} archived_skipped={report.archived_skipped} "
+        f"excluded_skipped={report.excluded_skipped} "
+        f"shared_scope_skipped={report.shared_scope_skipped}"
+    )
+    if report.missing:
+        print(f"   missing from Weaviate ({len(report.missing)}):")
+        for p in report.missing:
+            print(f"     - {p}")
+    if report.stale:
+        print(f"   stale in Weaviate ({len(report.stale)}):")
+        for p in report.stale:
+            print(f"     - {p}")
+    if report.status == "drift":
+        print(
+            "   → run `.claude/scripts/kg-sync --all` to reconcile "
+            "(content-hash gated: unaffected nodes are skipped, nothing "
+            "is deleted)."
+        )
+    surface_drift(PROJECT_ROOT, report)
+    sys.exit(0)
+
+
+#: The complete flag vocabulary `main()` accepts after import-time
+#: ``--project-root`` extraction. ONE home, HERE — the ``.sh``/``.ps1``
+#: wrappers stay dumb forwarders so the vocabulary cannot drift between
+#: three entry points (v0.2.92 WP-B1; field report: "unknown flags
+#: degrade into sync targets").
+_ACCEPTED_MODE_FLAGS = ("--all", "--all-docs", "--check-drift")
+_ACCEPTED_HELP_FLAGS = ("-h", "--help")
+
+
+def _print_usage(stream=None) -> None:
+    """The usage block — printed for no-args (exit 2), `-h`/`--help`
+    (exit 0), and every flag-validation failure (exit 2). Lists EXACTLY
+    the accepted flags; a printed contract is shipped code."""
+    if stream is None:
+        stream = sys.stdout
+    print("Usage: sync_knowledge_graph.py <file_path>", file=stream)
+    print("       sync_knowledge_graph.py --all              (knowledge/ + docs/)", file=stream)
+    print("       sync_knowledge_graph.py --all-docs         (docs/ only)", file=stream)
+    print("       sync_knowledge_graph.py --check-drift      (detect unsynced nodes, never repairs)", file=stream)
+    print("       sync_knowledge_graph.py <f1> <f2> ...      (explicit file list)", file=stream)
+    print("       (any form accepts --project-root <path> to pin the target project)", file=stream)
+    print("       (any form accepts --rechunk to force the chunk-plan comparison even", file=stream)
+    print("        with no revision crossing pending — repairs stale chunk boundaries)", file=stream)
+    print("Exit codes: 0 clean · 1 per-node/per-doc failures · 2 usage error or refused root", file=stream)
+
+
+def _validate_argv_flags(argv: "List[str]") -> None:
+    """Reject every argv token `main()` does not understand — exit 2.
+
+    v0.2.92 WP-B1 (field report: unknown flags degrade into sync targets):
+    pre-fix, ``--typo value`` fell into the file-list branch (both tokens
+    became "sync targets", each reported "not under knowledge/ or docs/ —
+    skipping", exit 0 with ``0 succeeded, 0 failed``) and a LONE
+    ``--typo`` matched NO dispatch branch at all — the script connected
+    to Weaviate, printed nothing after the banner, and exited 0. Both
+    silent-success shapes are now hard usage errors BEFORE any backend
+    connection: this runs after the import-time ``--project-root``
+    extraction and before ``EmbeddingService.for_project``.
+
+    Exit 2 = usage (distinct from 1 = per-node failures, and the same
+    code the wrong-root tree check uses). ``-h``/``--help`` print usage
+    and exit 0 from here.
+    """
+    # Mode flags take NO file arguments — pre-fix `--all extra.md` silently
+    # ignored the extra token and synced the whole tree (same silent-drop
+    # class as the unknown-flag bug above).
+    mode = argv[1] if len(argv) > 1 else ""
+    if mode in _ACCEPTED_MODE_FLAGS and len(argv) > 2:
+        print(
+            f"❌ {mode} takes no file arguments (got: {' '.join(argv[2:])})",
+            file=sys.stderr,
+        )
+        _print_usage(sys.stderr)
+        sys.exit(2)
+
+    for tok in argv[1:]:
+        if not tok.startswith("-"):
+            continue  # positional sync targets are classified downstream
+        if tok in _ACCEPTED_MODE_FLAGS:
+            continue
+        if tok in _ACCEPTED_HELP_FLAGS:
+            _print_usage(sys.stdout)
+            sys.exit(0)
+        if tok == "--project-root" or tok.startswith("--project-root="):
+            # Import-time extraction consumed the FIRST --project-root and
+            # removed it; a leftover one means it appeared twice.
+            print(
+                "❌ --project-root may appear at most once (the first "
+                "occurrence was already consumed)",
+                file=sys.stderr,
+            )
+            _print_usage(sys.stderr)
+            sys.exit(2)
+        print(f"❌ Unrecognized option: {tok}", file=sys.stderr)
+        _print_usage(sys.stderr)
+        sys.exit(2)
+
+
 def main():
     """Main entry point.
 
@@ -3211,14 +4083,21 @@ def main():
       - file under docs/       → sync_doc (development collection)
       - --all                  → sync_all_nodes + sync_all_docs
       - --all-docs             → sync_all_docs only (dev collection bootstrap)
+
+    Every `-`-prefixed token must be in the accepted vocabulary (see
+    `_validate_argv_flags`); unknown flags exit 2 BEFORE any backend
+    connection. Exit codes: 0 clean (skips are fine) · 1 per-node
+    failures · 2 usage error / refused root.
     """
     if len(sys.argv) < 2:
-        print("Usage: sync_knowledge_graph.py <file_path>")
-        print("       sync_knowledge_graph.py --all              (knowledge/ + docs/)")
-        print("       sync_knowledge_graph.py --all-docs         (docs/ only)")
-        print("       sync_knowledge_graph.py <f1> <f2> ...      (explicit file list)")
-        print("       (any form accepts --project-root <path> to pin the target project)")
-        sys.exit(1)
+        _print_usage(sys.stderr)
+        # v0.2.92 WP-B1: aligned with the exit contract (usage = 2, distinct
+        # from 1 = per-node failures). Was exit 1.
+        sys.exit(2)
+
+    # v0.2.92 WP-B1: reject unknown flags BEFORE the banner and before any
+    # backend construction — see _validate_argv_flags.
+    _validate_argv_flags(sys.argv)
 
     # v0.2.89 BUG 3: loud, unconditional resolution banner — names WHICH
     # root won and via WHICH channel, so a misrouted run is diagnosable
@@ -3229,6 +4108,17 @@ def main():
         f"→ KG={COLLECTION_NAME} DEV={DEV_COLLECTION_NAME or '(unset)'}",
         flush=True,
     )
+
+    # v0.2.92: --check-drift is a READ-ONLY reconciliation (compares on-disk
+    # knowledge/ content hashes against what Weaviate actually holds) — it
+    # never embeds anything, so it's handled BEFORE the EmbeddingService
+    # construction below and works even when the embedding backend is down
+    # (Weaviate itself still needs to be reachable; scan_drift degrades to
+    # status="unknown" — never a false "everything is missing" — when it
+    # isn't). See vco_lib.kg_sync_drift for the full contract.
+    if sys.argv[1] == "--check-drift":
+        _run_check_drift()
+        return
 
     # v0.2.89 BUG 3 validation leg: refuse to run a TREE sync against a
     # root that has neither knowledge/ nor a docs root — the exact shape of
@@ -3251,8 +4141,10 @@ def main():
     try:
         # v0.2.18: construct EmbeddingService at script entry. Probes all
         # configured backends once; raises NoEmbeddingBackendError when
-        # zero are reachable (auto-writes ~/.claude/metrics/embedding_failures.jsonl
-        # + .claude/context/EMBEDDING_FAILURES.md for Claude diagnostic).
+        # zero are reachable (auto-writes the embedding-failure jsonl under
+        # <vct_root_dir()>/metrics + .claude/context/EMBEDDING_FAILURES.md for
+        # Claude diagnostic). The path is RESOLVED, never restated — see
+        # `embedding_fidelity.failures_jsonl_display_path`.
         try:
             embedding_service = EmbeddingService.for_project(PROJECT_ROOT)
         except NoEmbeddingBackendError as e:
@@ -3262,7 +4154,14 @@ def main():
             # exit 0 — KG sync simply won't happen this run.
             _emit_sync_deferral_no_backend(PROJECT_ROOT, e)
             print(f"⚠️  KG sync skipped: {e}", file=sys.stderr)
-            print("   See .claude/context/EMBEDDING_FAILURES.md + ~/.claude/metrics/embedding_failures.jsonl",
+            # Resolved, not restated. Deliberately NOT this file's
+            # `_embedding_failures_jsonl_hint()`: that helper APPENDS an outage
+            # row, and the NoEmbeddingBackendError capture has already written
+            # one — reusing it here would double-count the same outage.
+            from vco_lib.embedding_fidelity import failures_jsonl_display_path
+
+            print("   See .claude/context/EMBEDDING_FAILURES.md + "
+                  f"{failures_jsonl_display_path()}",
                   file=sys.stderr)
             sys.exit(0)
 
@@ -3283,20 +4182,42 @@ def main():
 
         # Sync files
         if sys.argv[1] == "--all":
-            kg_success, kg_fail = sync_all_nodes(server)
-            doc_success, doc_fail = sync_all_docs(server)
-            total_success = kg_success + doc_success
-            total_fail = kg_fail + doc_fail
+            kg_tally = sync_all_nodes(server)
+            doc_tally = sync_all_docs(server)
+            total_fail = kg_tally.failed + doc_tally.failed
             # v0.2.89 BUG 6: surface how many nodes routed to the shared
             # collection via `scope: shared` frontmatter.
             _shared_note = (
                 f" ({_SHARED_ROUTED_COUNT} → shared)"
                 if _SHARED_ROUTED_COUNT else ""
             )
-            print(f"📊 KG:   {kg_success} succeeded, {kg_fail} failed{_shared_note}")
-            print(f"📊 Docs: {doc_success} succeeded, {doc_fail} failed")
+            # v0.2.92 WP-B1: skipped (archived / frontmarker / excluded /
+            # embed-skip) is now part of the terminal line. The `📊 KG:` /
+            # `📊 Docs:` prefixes and the "N succeeded, M failed" fragment
+            # are load-bearing — kg_sync.rs::parse_summary_line parses them
+            # (and accepts both this and the legacy two-count shape).
+            print(f"📊 KG:   {kg_tally.summary_fragment()}{_shared_note}")
+            print(f"📊 Docs: {doc_tally.summary_fragment()}")
+            # v0.2.92 chunk-plan transition repair: name how many entries
+            # re-embedded ONLY because their stored chunk plan predates the
+            # current chunker revision — distinct from ordinary content
+            # re-syncs, so the revision-crossing repair is visible as such
+            # in the run report (and in the launcher's log_tail).
+            if _RECHUNKED_COUNT:
+                print(
+                    f"♻️ Re-chunked {_RECHUNKED_COUNT} entrie(s) whose stored "
+                    f"chunk plan predates the current chunker revision "
+                    f"(boundaries rewritten; unchanged entries were skipped)"
+                )
+            # v0.2.92 WP-B1 / D12: name every non-synced path (failures AND
+            # skips, with reasons) instead of burying them in the counts.
+            _print_run_details(kg_tally, doc_tally, run_kind="--all")
             # KG-4 (v0.2.75): refresh the .node_formats.json summaries after a
             # full resync (soft-fail — never changes the sync exit code).
+            # v0.2.92 WP-B1: this step prints the `📝 Refreshing …` STAGE
+            # MARKER the launcher maps to phase "finalize" — the regen can
+            # run up to 600 s AFTER these final counts, and without the
+            # marker the GUI showed a stalled bar on an honest, live process.
             _regen_node_formats_after_full_sync()
             # v0.2.91 WP-B: the paired clear (decision #12 — NARROW home). A
             # tree sync that completed with zero failures is the proof the
@@ -3304,11 +4225,36 @@ def main():
             # PARTIAL sync deliberately does not clear: the next clean run will.
             if total_fail == 0:
                 _clear_sync_deferral_no_backend(PROJECT_ROOT)
+                # v0.2.92 D17: a clean tree sync also retires the owed-work
+                # entry a failing run left behind — same narrow-clear rule:
+                # only a FULLY successful --all proves the failed nodes
+                # from an earlier run actually landed.
+                _clear_sync_failures_deferral(PROJECT_ROOT)
+            else:
+                # v0.2.92 D17: record the per-node failures as owed,
+                # auto-retryable work — pre-fix, failed nodes were counted
+                # (WP-B1) but NOTHING ever retried them.
+                _emit_sync_failures_deferral(
+                    PROJECT_ROOT, total_fail, run_kind="--all",
+                    detail=(
+                        f"{kg_tally.failed} knowledge node(s), "
+                        f"{doc_tally.failed} doc(s)"
+                    ),
+                )
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
-            doc_success, doc_fail = sync_all_docs(server)
-            print(f"📊 Docs: {doc_success} succeeded, {doc_fail} failed")
-            sys.exit(0 if doc_fail == 0 else 1)
+            doc_tally = sync_all_docs(server)
+            print(f"📊 Docs: {doc_tally.summary_fragment()}")
+            _print_run_details(doc_tally, run_kind="--all-docs")
+            # v0.2.92 D17: docs-only failures are owed work too. NO clear
+            # on a clean docs-only run — it proves nothing about knowledge
+            # nodes an earlier run failed on (narrow clear lives in --all).
+            if doc_tally.failed:
+                _emit_sync_failures_deferral(
+                    PROJECT_ROOT, doc_tally.failed, run_kind="--all-docs",
+                    detail=f"{doc_tally.failed} doc(s)",
+                )
+            sys.exit(0 if doc_tally.failed == 0 else 1)
         elif len(sys.argv) > 2 or (len(sys.argv) == 2 and not sys.argv[1].startswith("--")):
             # v0.2.42 CI-10: accept a list of file paths as positional args.
             # When multiple files are given, sync only those files rather than
@@ -3317,14 +4263,13 @@ def main():
             # Single-file path (the original behaviour) also falls through here
             # when it has no `--` prefix.
             raw_args = sys.argv[1:]
-            success_count = 0
-            fail_count = 0
+            tally = SyncTally()
             for raw in raw_args:
                 file_path, in_knowledge, in_docs = _classify_sync_target(raw)
                 if in_knowledge:
-                    ok = sync_node(server, file_path)
+                    outcome = sync_node(server, file_path)
                 elif in_docs:
-                    ok = sync_doc(server, file_path)
+                    outcome = sync_doc(server, file_path)
                 else:
                     # v0.2.89 BUG 3: name the resolved root + its source —
                     # the bare "not in knowledge/ or docs/" message was
@@ -3334,15 +4279,26 @@ def main():
                         f"root '{PROJECT_ROOT}' "
                         f"(source: {_PROJECT_ROOT_SOURCE}) — skipping"
                     )
-                    continue
-                if ok:
-                    success_count += 1
-                else:
-                    fail_count += 1
+                    outcome = SyncOutcome(
+                        OUTCOME_EXCLUDED_SKIPPED,
+                        to_posix_rel(raw),
+                        "not under knowledge/ or docs/ of the resolved project root",
+                    )
+                tally.add(outcome)
 
             if len(raw_args) > 1:
-                print(f"📊 List: {success_count} succeeded, {fail_count} failed")
-            sys.exit(0 if fail_count == 0 else 1)
+                print(f"📊 List: {tally.summary_fragment()}")
+            _print_run_details(tally, run_kind="file list")
+            # v0.2.92 D17: explicit-file sync failures (the kg-sync-on-edit
+            # hook path) are owed work too. NO clear on a clean list run —
+            # it proves nothing about nodes an earlier run failed on
+            # (narrow clear lives in --all).
+            if tally.failed:
+                _emit_sync_failures_deferral(
+                    PROJECT_ROOT, tally.failed, run_kind="file list",
+                    detail=f"{tally.failed} sync target(s)",
+                )
+            sys.exit(0 if tally.failed == 0 else 1)
 
     except Exception as e:
         print(f"❌ Fatal error: {e}")
@@ -3364,6 +4320,14 @@ def main():
 #: The one condition id this script owns. Named once so the emitter and the
 #: paired clear can never drift apart (the v0.2.91 WP-B pairing).
 _SYNC_NO_BACKEND_CID = "kg_sync_no_embedding_backend"
+
+#: v0.2.92 D17: owed-work condition for per-node write FAILURES (distinct
+#: from ``_SYNC_NO_BACKEND_CID``, which records the seed being SKIPPED
+#: entirely). Registered in ``vco_lib/deferral_conditions.toml`` as
+#: ``auto_retryable`` with ``retry_action = "retry:py:kg_seed"`` — a real
+#: retry: the WP-H dispatcher re-runs this script's ``--all`` for the
+#: project once the backend answers. Named once, same discipline.
+_SYNC_FAILURES_CID = "kg_sync_failures_pending"
 
 
 def _clear_sync_deferral_no_backend(install_root: Path) -> None:
@@ -3415,6 +4379,11 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
         # of file), but the emitter isn't needed in the happy path — keep
         # it lazy.
         from vco_lib.deferral_emit import DeferralEntry, emit
+        # Same laziness, same reason. The jsonl path is RESOLVED here rather
+        # than restated: it moved out of ~/.claude in W7 and four shipped
+        # scripts kept printing the old location.
+        from vco_lib.embedding_fidelity import failures_jsonl_display_path
+
         entry = DeferralEntry(
             condition_id=_SYNC_NO_BACKEND_CID,
             title="KG sync skipped: no embedding backend reachable",
@@ -3432,7 +4401,7 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
                 "next `install.py --update` runs for you once a backend is "
                 "reachable. Nothing else clears it: a backend simply being "
                 "up again does not mean the seed ran. See "
-                "~/.claude/metrics/embedding_failures.jsonl for the "
+                f"{failures_jsonl_display_path()} for the "
                 "per-backend diagnostic written by EmbeddingService."
             ),
             command_to_apply=(
@@ -3449,6 +4418,89 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
     except Exception as inner:
         # Soft-fail — don't escalate. The failure JSONL written by
         # NoEmbeddingBackendError already captures the diagnostic.
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+def _clear_sync_failures_deferral(install_root: Path) -> None:
+    """Resolve ``kg_sync_failures_pending`` after a FULLY successful tree sync.
+
+    v0.2.92 D17 — the recovery half the field report was missing: ~210
+    nodes existed as ``.md`` files with no Weaviate object and nothing ever
+    retried them. The emit side (``_emit_sync_failures_deferral``) records
+    the owed work as ``auto_retryable``; THIS narrow clear is its
+    paired resolution, the same decision-#12 shape as
+    ``_clear_sync_deferral_no_backend``: only the end of an ``--all`` run
+    with ZERO failures proves the failed nodes from an earlier run actually
+    landed, so only that run may retire the entry. A clean file-list or
+    docs-only run proves nothing about those nodes and deliberately does
+    not clear.
+
+    Soft-fail: the sync's exit code must never depend on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        resolve_conditions(install_root, (_SYNC_FAILURES_CID,))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _emit_sync_failures_deferral(
+    install_root: Path,
+    failed: int,
+    run_kind: str,
+    detail: str = "",
+) -> None:
+    """Record per-node write FAILURES as owed, auto-retryable work (D17).
+
+    Fired at the end of any run shape (``--all``, ``--all-docs``, file
+    list) whose tally counted at least one ``OUTCOME_FAILED``. The entry
+    names the failure count; its registry row
+    (``kg_sync_failures_pending``) declares ``retry_action =
+    "retry:py:kg_seed"`` so the WP-H retry dispatcher re-runs this
+    script's ``--all`` for this project on its own — the retry this
+    defect never had. Last-write-wins per condition_id: a later failing
+    run refreshes the count rather than stacking entries.
+
+    Soft-fail on any IO / import error — the run's own exit code and
+    ``_print_run_details`` output already carry the failure facts.
+    """
+    try:
+        from vco_lib.deferral_emit import DeferralEntry, emit
+
+        breakdown = f" ({detail})" if detail else ""
+        entry = DeferralEntry(
+            condition_id=_SYNC_FAILURES_CID,
+            title=(
+                f"KG sync left {failed} node(s)/doc(s) unsynced — retry pending"
+            ),
+            detected=(
+                f"A `{run_kind}` sync run finished with {failed} per-node "
+                f"write failure(s){breakdown}. Those files exist on disk but "
+                f"have no Weaviate object — they are invisible to KG "
+                f"retrieval until a later sync succeeds. The failing paths "
+                f"and reasons are named in this run's output and its "
+                f"kg-sync log."
+            ),
+            why_deferred=(
+                "Soft-fail policy: a tree sync never aborts on per-node "
+                "errors — one failed write must not block the rest of the "
+                "tree. This entry records the owed work so it is retried "
+                "instead of forgotten: the condition is auto-retryable, and "
+                "VCO's retry dispatcher re-runs "
+                "`sync_knowledge_graph.py --all` for this project once the "
+                "backend answers (content-hash gated — only what never "
+                "landed is re-embedded). It clears at the end of the next "
+                "FULLY successful `--all` tree sync; nothing else clears it."
+            ),
+            command_to_apply=(
+                "# Re-run the tree sync (content-hash gated — unaffected nodes skip):\n"
+                "python templates/scripts/sync_knowledge_graph.py --all"
+            ),
+            severity="warning",
+        )
+        emit(install_root, entry)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral emit failed: {inner})", file=sys.stderr)
 
 

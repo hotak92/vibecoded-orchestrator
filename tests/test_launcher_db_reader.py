@@ -17,7 +17,6 @@ Coverage:
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -28,6 +27,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    add_project,
+    create_corrupt_launcher_db,
+    create_empty_launcher_db,
+    create_foreign_schema_launcher_db,
+)
 from vco_lib import launcher_db_reader  # noqa: E402
 from vco_lib.launcher_db_reader import (  # noqa: E402
     _discover_db_path,
@@ -51,52 +56,40 @@ def _seed_launcher_db(
     shared_collection: str | None = "VibeCodedOrchestrator_KnowledgeGraph",
     extra_projects: list[tuple[str, str, str]] | None = None,
 ) -> None:
-    """Create a minimal launcher.db with the schema columns we touch.
+    """Create a REAL-schema launcher.db seeded for the reader's queries.
 
-    Only the columns the reader actually queries are present (id, host,
-    project_id, role, collection_name) — keeps the fixture small and
-    explicit about its dependencies.
+    The schema is the shipped migration set (see
+    ``tests/common/launcher_db_fixture``), not a hand-picked column subset:
+    the old inline DDL declared only ``(id, host, name)`` on ``projects`` and
+    so silently dropped the NOT NULL ``folder_path`` / ``created_at`` /
+    ``updated_at`` columns and the ``host`` CHECK the real table enforces.
+
+    ``extra_projects`` rows are ``(project_id, host, name)``. ``host`` must be
+    one of the real CHECK values — ``base`` | ``mao`` | ``orchestrator_root``.
+    Folder paths and slugs are derived per project because the real schema
+    makes both UNIQUE.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "CREATE TABLE projects ("
-            "id TEXT PRIMARY KEY, host TEXT NOT NULL, name TEXT"
-            ")"
+    create_empty_launcher_db(db_path)
+    if with_orchestrator_root:
+        add_project(
+            db_path,
+            project_id="root-pid-001",
+            name="orchestrator",
+            folder_path=db_path.parent / "orchestrator-root",
+            slug="orchestrator-root",
+            host="orchestrator_root",
+            kg_primary=primary_collection,
+            kg_shared=shared_collection,
         )
-        conn.execute(
-            "CREATE TABLE project_kg_bindings ("
-            "project_id TEXT NOT NULL, role TEXT NOT NULL, "
-            "collection_name TEXT NOT NULL, "
-            "PRIMARY KEY (project_id, role)"
-            ")"
+    for pid, host, name in extra_projects or []:
+        add_project(
+            db_path,
+            project_id=pid,
+            name=name,
+            folder_path=db_path.parent / f"project-{pid}",
+            slug=pid,
+            host=host,
         )
-        if with_orchestrator_root:
-            conn.execute(
-                "INSERT INTO projects (id, host, name) VALUES (?, ?, ?)",
-                ("root-pid-001", "orchestrator_root", "orchestrator"),
-            )
-            if primary_collection is not None:
-                conn.execute(
-                    "INSERT INTO project_kg_bindings "
-                    "(project_id, role, collection_name) VALUES (?, ?, ?)",
-                    ("root-pid-001", "primary", primary_collection),
-                )
-            if shared_collection is not None:
-                conn.execute(
-                    "INSERT INTO project_kg_bindings "
-                    "(project_id, role, collection_name) VALUES (?, ?, ?)",
-                    ("root-pid-001", "shared", shared_collection),
-                )
-        for pid, host, name in extra_projects or []:
-            conn.execute(
-                "INSERT INTO projects (id, host, name) VALUES (?, ?, ?)",
-                (pid, host, name),
-            )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 @pytest.fixture
@@ -179,7 +172,7 @@ class TestOpenDbReadonly:
         # the platform. Either way the helpers above must return None.
         bad = tmp_path / ".vct" / "launcher.db"
         bad.parent.mkdir(parents=True, exist_ok=True)
-        bad.write_bytes(b"not a real sqlite database \x00\x01\x02")
+        create_corrupt_launcher_db(bad)
         # The reader-level functions must soft-fail; verify via them.
         assert get_orchestrator_root_project_id() is None
         assert get_orchestrator_root_bindings() == (None, None)
@@ -201,10 +194,15 @@ class TestGetOrchestratorRootProjectId:
 
     def test_returns_none_when_no_orchestrator_root_row(self, isolated_env, tmp_path):
         default_db = tmp_path / ".vct" / "launcher.db"
+        # host="base" is the real schema's value for an ordinary user project
+        # (CHECK: base|mao|orchestrator_root). The pre-migration fixture wrote
+        # "user_project", a host string production cannot write; the property
+        # under test — a non-orchestrator_root project is never returned — is
+        # unchanged.
         _seed_launcher_db(
             default_db,
             with_orchestrator_root=False,
-            extra_projects=[("other-pid", "user_project", "Some Project")],
+            extra_projects=[("other-pid", "base", "Some Project")],
         )
         assert get_orchestrator_root_project_id() is None
 
@@ -213,16 +211,16 @@ class TestGetOrchestratorRootProjectId:
         # reader uses LIMIT 1, so this must not raise.
         default_db = tmp_path / ".vct" / "launcher.db"
         _seed_launcher_db(default_db)
-        # Add a duplicate row directly (bypassing the fixture's "only seed once" guard)
-        conn = sqlite3.connect(default_db)
-        try:
-            conn.execute(
-                "INSERT INTO projects (id, host, name) VALUES (?, ?, ?)",
-                ("root-pid-dupe", "orchestrator_root", "dupe"),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        # A SECOND orchestrator_root row (the fixture seeds only one). Distinct
+        # folder_path/slug because the real schema makes both UNIQUE.
+        add_project(
+            default_db,
+            project_id="root-pid-dupe",
+            name="dupe",
+            folder_path=tmp_path / "dupe-root",
+            slug="dupe-root",
+            host="orchestrator_root",
+        )
         result = get_orchestrator_root_project_id()
         assert result in {"root-pid-001", "root-pid-dupe"}
 
@@ -330,7 +328,11 @@ def test_corrupt_db_soft_fails_everywhere(isolated_env, tmp_path):
     """
     bad = tmp_path / ".vct" / "launcher.db"
     bad.parent.mkdir(parents=True, exist_ok=True)
-    bad.write_bytes(b"\x00" * 4096)  # plausibly-sized garbage
+    # DELIBERATELY a different corruption shape from
+    # create_corrupt_launcher_db()'s byte blob: an all-zero, page-sized file
+    # (the partial-write / sparse-restore case), which SQLite rejects at a
+    # different point than a non-zero non-header blob.
+    bad.write_bytes(b"\x00" * 4096)
 
     # None of these may raise
     assert get_orchestrator_root_project_id() is None
@@ -343,13 +345,11 @@ def test_table_missing_soft_fails(isolated_env, tmp_path):
     """When the DB exists but the expected tables are absent, return None."""
     db = tmp_path / ".vct" / "launcher.db"
     db.parent.mkdir(parents=True, exist_ok=True)
-    # Valid sqlite DB but with the wrong schema
-    conn = sqlite3.connect(db)
-    try:
-        conn.execute("CREATE TABLE unrelated (x INTEGER)")
-        conn.commit()
-    finally:
-        conn.close()
+    # DELIBERATELY not a launcher.db: a valid SQLite file carrying one
+    # unrelated table and NONE of the launcher tables, so every reader query
+    # hits "no such table". Built by the shared helper rather than by local
+    # DDL — it is the same degraded shape, named once.
+    create_foreign_schema_launcher_db(db)
 
     assert get_orchestrator_root_project_id() is None
     assert get_kg_binding("pid", "primary") is None

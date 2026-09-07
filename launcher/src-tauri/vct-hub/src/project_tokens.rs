@@ -404,26 +404,14 @@ fn cleanup_stale_project_tokens(live_ids: &std::collections::HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Token-file tests mutate VCT_STATE_DIR at process scope. Serialise
-    // them so parallel cargo-test runs don't observe each other. Mirrors
-    // the pattern in auth.rs / paths.rs.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn with_state_dir<F: FnOnce(&std::path::Path)>(f: F) {
-        let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Safety: tests are serialised by SERIALIZE; no thread
-        // concurrently observes/mutates VCT_STATE_DIR.
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
-        f(tmp.path());
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
-    }
+    use vct_launcher_core::test_env::with_state_dir;
+    // v0.2.92: `with_state_dir` + the file-local SERIALIZE mutex used to
+    // be defined here — one of five near-identical copies. Every copy
+    // ended by UNSETTING `VCT_STATE_DIR` instead of restoring the prior
+    // value, which destroyed any outer redirect for every test that ran
+    // after it in the same binary. The shared helper restores, and its
+    // `GLOBAL_ENV_MUTEX` serialises across the whole workspace rather
+    // than only within this file.
 
     fn seed_project(db: &Db, id: &str, name: &str, folder: &str) {
         let now = chrono::Utc::now().timestamp_millis();

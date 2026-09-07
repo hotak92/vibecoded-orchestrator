@@ -5,7 +5,724 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.92] - 2026-09-07
+
+### Fixed
+
+#### Project identity and collection safety
+- **A moved or renamed project could be told to DELETE its own live
+  collections.** The legacy-collection detectors derived the project's
+  identity from the FOLDER BASENAME instead of the registered name and the
+  live launcher bindings, so any project whose folder name differs from its
+  registered name (a move, or simply adding an existing folder under a
+  different display name) could have its own knowledge-graph and code-graph
+  classes reported as foreign "legacy" data — complete with copy-paste
+  migration and drop commands. Identity now resolves from one source
+  (`vco_lib/project_identity.py`) built on the registered row and the live
+  bindings, with the folder basename only as a last resort for a genuinely
+  unregistered folder; when launcher.db cannot be read, the detectors and the
+  drift baseline now do nothing rather than guess.
+- **The emitted code-graph drop command had no run-time guard**, unlike its
+  knowledge-graph sibling. It now re-validates against the live bindings on
+  the user's machine at execution time and refuses when the keep-set cannot
+  be resolved. A command printed for a user is a code path we ship.
+- **The guard's keep-set could not protect `*_Development` / `*_Diagrams`
+  classes** — they are derived by suffix-swap from the primary binding, so
+  `project_kg_bindings` has no row for them and an exact-name keep-set could
+  never contain one. The keep-set now combines exact bound-and-derived names
+  with normalised-prefix tokens.
+- **The code-graph family was matched with the knowledge-graph sanitizer**
+  (which drops underscores) instead of the underscore-preserving prefix rule,
+  a second independent way for a project's own classes to look non-canonical
+  on any underscored project name.
+- **The knowledge-graph remediation command prepared the wrong collection.**
+  It passed a class name to `bootstrap-collections --name`, which takes a raw
+  project name and re-sanitizes it, so the canonical collection was never
+  created — making the re-embed step useless and the drop that followed a
+  real data loss.
+
+#### Update reliability
+
+- **The launcher could not tell you an update existed if your clone was in
+  detached HEAD** — and said "up to date" instead. The branch was resolved with
+  `rev-parse --abbrev-ref HEAD`, which returns the literal string `HEAD`; the
+  behind-count then queried a `vco_upstream/HEAD` ref that is never created, and
+  a `.unwrap_or(0)` turned that hard git failure into the number zero. The
+  verdict required `> 0`, so it was structurally always false, at any distance.
+  Compounding it, the "latest source release" was resolved with
+  `git describe --tags` — the closest tag reachable *from HEAD* — so a clone
+  parked on a release tag reported that tag as the newest release. One field
+  install took no source updates for five weeks while every surface read
+  healthy. Branch resolution is now shared with the orchestrator-update path
+  (which was already correct), the release tag is read from the remote, and a
+  check that could not run reports "couldn't determine" rather than "fine".
+- **Updating from detached HEAD pulled new source and silently skipped the
+  rebuild**, because the same broken ref made the pre-pull diff empty and the
+  `cargo`/`npm` steps read that as "nothing changed". An unreadable diff now
+  rebuilds everything.
+- **"Resync now" could not work in the state it exists for** — it reset against
+  the same nonexistent ref and hard-failed.
+- **There was no launcher log file on any OS.** Tracing went to stderr only, and
+  release Windows builds ship with no console — so every honest "couldn't check"
+  diagnostic added in v0.2.83 was written into nothing, which is why the field
+  incident left no trail. A size-capped daily log now lands under
+  `<vct_root>/logs/`.
+- **The recovery docs asked for `~/.vct/update.log` as step 0 of a recipe
+  labelled "any version".** That file only exists after a binary-swap handoff,
+  so a user who had never completed one was told their diagnostics were missing.
+  The docs now name the artefacts that always exist.
+- **`vco doctor` had no probe for whether your source was current**, so the tool
+  positioned as the post-update health check could not see a multi-week update
+  outage. It also compared the running launcher binary to the tree's binary —
+  both frozen together on a stale clone, so the answer was always "matches".
+
+#### Data safety
+
+- **Orphan detection failed OPEN and widened a destructive recommendation.**
+  The set of live Weaviate classes is used to *exclude* directories from the
+  reclaim list; when the schema could not be read the set was empty, so nothing
+  was excluded and the list grew. The empty set was then persisted as the
+  detect-time snapshot, and the later filesystem reclaim — which runs with
+  Weaviate down and cannot re-fetch — read it back as "nothing was live" and
+  passed its own re-check. A transient outage could therefore widen a reclaim
+  command a user pastes. The detector now refuses, and — because a poisoned
+  snapshot may already be on disk and its command already in a user's ledger —
+  **the guard is at the read**: a snapshot without a positive
+  `live_schema_resolvable` marker is treated as unknown.
+- **Class listing conflated "I could not reach Weaviate" with "the class does
+  not exist"** in four places. There is now one tri-state probe whose misuse is
+  fatal rather than discouraged — truthiness, iteration and `len()` all raise —
+  so a caller cannot silently degrade "unknown" into "absent".
+- **The test suite started a real `vct-hub` against your live `~/.vct`**,
+  migrating your real `launcher.db`, and separately SIGTERM'd any process named
+  `vct-hub` on the machine. Test binaries are now detected structurally (cargo
+  places them in a `deps/` directory) rather than by an opt-in env var that two
+  tests remembered to set.
+- **Installing or updating any project created `~/.claude/retrieval_rl_data`**
+  on the user's real home. The corpus home is now `<vct_root>/retrieval_rl_data`;
+  the pre-existing archive is left byte-identical and is deleted by nobody.
+
+#### Code graph
+
+- **The CLI resolved collection prefixes with a rule that diverged from the
+  writer's**, so any project whose name contains a space queried classes that do
+  not exist and got silent empty results — including the orchestrator itself.
+- **On every installed project the cross-project access matrix failed to load**
+  and silently dropped every granted peer, because its import path assumed the
+  orchestrator checkout layout.
+- **Entity line numbers were wrong in five languages.** C#, Java, C++,
+  PowerShell and Rust each derived a declaration's start line from a raw regex
+  match that begins in the preceding token's whitespace, so entities were stored
+  on the previous member's closing brace, on an attribute, or on the enclosing
+  `namespace` line — one C++ class took the entire namespace as its body. A
+  multi-line comment scrub that collapsed comments to a single space desynced
+  line numbers from the source in nine extractors, compounding it. Seven
+  extractors also recorded `end_line` one past the closing line.
+- **Every C# generic method was missing**, while the owning class still listed
+  it — so the graph disagreed with itself. C# positional records produced no
+  entity, conversion operators were stored under the target type's name, and
+  statements such as `return new Item(...)` minted function rows.
+- **Every Ruby class and method body ran to end of file**, because the extractor
+  counted braces in a language that has none; every Ruby class listed every
+  method in the file; a reopened class kept only its last definition; and
+  classes at any indentation — `module X` wrapping `class Y`, the commonest Ruby
+  layout — produced no row at all.
+- **Java never emitted interface or abstract methods**, so an interface's class
+  row disagreed with the graph's own function rows.
+- **C++ free functions are now captured**, at namespace and file scope, without
+  minting rows for control-flow headers, lambdas, prototypes or the most vexing
+  parse.
+- Duplicate type names in one file kept only the last declaration in seven
+  languages.
+
+#### Install, hooks and platform
+
+- **The per-edit knowledge-graph sync hook had been dead since v0.2.65** — it
+  built a command as a string and ran it under `setsid sh -c`, which exited 127.
+- **`install.py` undid its own editable install.** A later step ran
+  `pip install <root>[codegraph-ts]` without `-e`, replacing the editable
+  install with a file copy, so every user ran a frozen `vco_lib` until the next
+  full install.
+- **Every Windows logon task since v0.2.14 ran with the literal `{{LOG_FILE}}`
+  as its log path** — the placeholder was never substituted. XML escaping also
+  covered only one field, so an install path containing `&` produced a task file
+  Windows rejects.
+- **Unregistering a boot service resolved the real user home**, so a test that
+  omitted the override could delete the developer's own systemd unit.
+- **`template_review_pending` fired forever, for three independent reasons**:
+  the live file contains VCO's own injected reminder block; a project VCO
+  created is written wrapped in managed-region markers while its reference copy
+  is written unwrapped; and the orchestrator root's CLAUDE.md was compared
+  against the *project* template. All three are corrected, and existing projects
+  clear on their next update with no user action.
+- The security scanner no longer blocks reading a localhost-service token file
+  into a variable used in a loopback auth header; every adjacent shape — echoing
+  it, sending it to a remote host, `curl -v` — still blocks.
+
+#### Other
+
+- **`tests/test_v0291_dist_binary_repair.py`** asserted that no process named
+  `vct-launcher` was running on the test host, via a real process scan, so the
+  suite failed for anyone running it with the launcher GUI open. The scan is
+  now patched; the assertion also proves the fallback path ran, which the
+  host-dependent version could not distinguish from the scan never running.
+
+### Added
+
+- **Artifacts on/off toggle in global Preferences.** Turns the Claude Code
+  `Artifact` tool off machine-wide by writing `enableArtifact: false` plus a
+  bare `"Artifact"` entry in `permissions.deny` to the user's
+  `~/.claude/settings.json` — the bare form is what removes the tool
+  description from the system prompt (a scoped `Artifact(*)` rule blocks calls
+  but keeps the description, saving nothing). The panel defaults to the file's
+  current state, merges rather than overwrites, takes a one-time backup, and
+  refuses to touch a file it cannot parse. Note: a write re-serialises the
+  document, so top-level keys come back alphabetised.
+- **Model gateway** (`vct-model-gateway`): one local Anthropic-shaped endpoint
+  serving both a Claude subscription and a vendor subscription in a single
+  `/model` picker. Vendor models are namespaced so the id always names the model
+  that answers — a third-party endpoint will otherwise accept any `claude-*`
+  name and silently answer with its own small model. Adding a vendor is a config
+  row. Ships with cross-OS boot registration (opt-in, off by default), a
+  version-keyed context-window table with a GUI editor, and a Services card with
+  a one-click "point panel at gateway" that writes only routing keys — never a
+  tier or subagent slot, so the model a request is dispatched under is the model
+  that answers it.
+- **`vco project move`** — change a registered project's path, re-pointing the
+  registry, `.claude/` state and bindings together. Identity stays row-keyed, so
+  a move never changes which collections a project owns. Resumable with one
+  durable commit point; an interrupted move stays visible as such.
+- **`vco project rename-collections`** — give a project a new name and carry its
+  whole collection family (knowledge graph, development, diagrams and the five
+  code-graph classes) to the names that name derives. **Vectors are copied
+  verbatim, never re-embedded**, and the old classes are retained; retiring them
+  is a separate, guarded, explicitly-confirmed step. Resumable with one durable
+  commit point, and no phase whose interruption reads as success.
+- **`vco doctor`** gains source-currency, diagnostics-inventory and
+  stale-CLI-deployment probes, each with a real "could not determine" outcome.
+- A **"Reattach to `main`"** action for a clone in detached HEAD, guarded by a
+  clean-tree check and an ancestry check.
+- An **install-time rewriter** for the `VCO-REWIRE` regions, so installed
+  scripts resolve the orchestrator root with no environment variable set.
+- A **golden-corpus auditor** that checks each stored code-graph row against its
+  own fixture source rather than against the snapshot.
+- Shared `crate::json_file` lock / read / atomic-write-with-backup primitives,
+  extracted from the `~/.claude.json` writer and reused by it (behaviour
+  preserved, including its every-write `.bak`).
+
+### Changed
+
+- **JSON written by the launcher now preserves key order.** Previously any
+  read-modify-write re-alphabetised the user's file.
+- **VCO telemetry moved out of `~/.claude/` to `~/.vct/metrics/`.** History is
+  COPIED, never moved: the originals stay byte-identical as a frozen archive
+  that nothing deletes, readers merge both locations, and writers switch only
+  after a verified copy.
+- **Module cards now show real install progress.** The Home card and the
+  right-rail panel render the backend's existing install-progress events
+  instead of a static "…", and disable re-entry while a pull is running.
+- **Modules are no longer offered an "Update" a project cannot perform.** The
+  catalog's installed-state is computed host-wide, so a project with no
+  install row could be shown Update and then hit a raw backend error; the
+  surfaces now cross-check the selected project's own install rows and offer
+  Install instead. While that per-project state is still loading the action is
+  shown disabled rather than guessed, and a failed load is surfaced rather
+  than left looking like an indefinite spinner.
+
+### Documentation
+
+- The project CLAUDE.md move protocol gains two steps: check `.mcp.json` at
+  the destination (it takes precedence over `.claude/settings.json` for MCP
+  env and an adopted checkout may carry another machine's values), and re-read
+  the deferral ledger with suspicion after a move, verifying against the live
+  bindings before running any collection command.
+- The orchestrator CLAUDE.md template points at that protocol as the single
+  source rather than forking a copy, and carries the orchestrator-side
+  caveats.
+
+#### Windows hooks and update-report honesty (v0.2.92, late wave)
+
+- **Two shipped PowerShell hooks had never parsed** and were therefore dead on
+  every Windows install since they were written.
+  `templates/hooks/code-graph-incremental.ps1` placed `param()` below executable
+  code (PowerShell requires a script's `param()` to be its first statement, so
+  the whole file failed to parse), and
+  `templates/hooks/context-size-check.ps1` used `$Label:` inside an expandable
+  here-string, which PowerShell reads as a scope qualifier like `$env:`. Both
+  fixed; BOMs preserved.
+- **Added a repo-wide PowerShell parse gate** (`tests/test_v0292_powershell_parses.py`)
+  covering every shipped `.ps1`. There was none before: the only existing check
+  parsed two `_lib` files, and sibling-parity gates cannot catch this class —
+  parity proves a `.ps1` exists and moved when its `.sh` moved, never that it
+  runs. The gate refuses to skip in CI rather than reporting a pass when no
+  interpreter is present.
+- **An adoption-only bundle update reported "Project bundle already up to
+  date"** while backing up and replacing every file the user had edited. The
+  Rust `UpdateSummary` has always carried an `adopted` count — added expressly
+  so this could not happen — but the TypeScript mirror never declared the field
+  and no frontend code read it, so it was dropped at the type boundary. The
+  count is now declared, surfaced in the toast, and included in the
+  "did anything happen?" test.
+- **Extracted the toast decision** to `launcher/src/lib/stores/bundle-summary-logic.ts`
+  with unit tests. The defect survived because the logic was inline in a store
+  method that could not be called without a Tauri runtime.
+- **Corrected user-facing update copy** in `SettingsTab.svelte` and
+  `UpdateAllProjectsModal.svelte`, which still told users their modified files
+  are "preserved". Since v0.2.84 only `knowledge/**` is preserved; every other
+  user-modified file is backed up to `.claude/backups/bundle-adoptions/<ts>/`
+  and replaced with the shipped version.
+
+#### KG sync honesty (v0.2.92, wave 3)
+
+- **`kg-sync` accepted unknown flags silently.** An unrecognised `--flag` fell
+  through to the file-list branch and became a sync target, and a *lone*
+  unknown flag matched no branch at all — connecting to Weaviate, printing
+  nothing and exiting 0. Both now exit 2 with an explicit error. `--all` given
+  a positional argument (e.g. `kg-sync --all extra.md`) previously ignored the
+  argument silently; it is now rejected.
+  **Contract change**: invoking the script with no arguments now exits **2**
+  (usage) rather than 1. Exit codes are now: 0 clean · 1 per-node failures ·
+  2 usage or wrong project root · 3 the wrapper refused to start (no venv
+  with the KG dependencies). `3` is separate from `1` on purpose: a refusal
+  means the sync never ran, which is not the same as running and having some
+  nodes fail.
+- **A partial sync reported success.** Frontmatter/archived skips returned
+  "succeeded", so `success` could not distinguish 117/117 from 111/117, and no
+  per-path failure list was emitted. The run now carries a real tally
+  (succeeded / failed / skipped) plus a details block and a run log.
+- **`file_path` is now written canonically as POSIX**, matching what the MCP
+  write path has always stored. Previously the sync script wrote host-shaped
+  paths, so on Windows one node could exist under two path shapes — which is
+  why delete-by-`file_path` missed and duplicates accumulated. Deletes now match
+  both shapes, so an affected project heals on its next sync. (Pre-existing
+  duplicates still need the separate reconcile tool.)
+- **The GUI showed a confident wrong label during the final stage.** After
+  printing its counts the script runs node-format generation synchronously, and
+  that phase rendered as `"KG sync: embedding (17/17)"`. There is now a
+  `finalize` phase, and an unrecognised phase degrades to a neutral label
+  instead of asserting the wrong one. The phase vocabulary moved to one shared
+  module (`kg-sync-banner-logic.ts`) consumed by both the banner and the pill.
+- Corrected `kg_sync.rs`'s idempotency docstring, which claimed Weaviate UUIDs
+  are derived from the node title — false on two counts.
+
+
+#### KG summary generation (v0.2.92, wave 3)
+
+- **43% of generated summaries on Windows were the model's "what would you like
+  me to do?" reply, stored as knowledge.** The prompt was passed as a command
+  argument; `claude` on Windows is an npm `.cmd` shim, so `cmd.exe` re-parsed
+  the arguments and the first newline in the prompt ended the command. The model
+  received a truncated fragment, answered conversationally, and the answer was
+  embedded as the node's summary. The prompt now travels on **stdin** on every
+  OS, and a non-answer detector rejects the conversational shapes rather than
+  storing them.
+- **A backend that was rate-limited or out of capacity was retried for every
+  remaining node.** There is now a circuit breaker with a cross-process latch:
+  an auth or rate-limit failure demotes the backend on first occurrence, and
+  repeated capacity failures (529/503/timeout) do the same. A 117-node backfill
+  during a provider outage no longer pays 117 full timeouts.
+- **A forced backend (`KG_SUMMARY_BACKEND=…`) could be silently substituted.**
+  An explicit choice is now honoured or refused, never quietly replaced.
+
+#### Retrieval query enrichment (v0.2.92, wave 3)
+
+- **Hook-driven KG and code-graph lookups now include the current turn's
+  context** — the user's prompt and the previous assistant turn — so a retrieval
+  fired by a tool call is scoped to what the user is actually doing rather than
+  to the bare tool argument. Off by default per surface; disable entirely with
+  `VCO_QUERY_ENRICH=0`.
+- The enrichment budget is derived from the **embedding** model's input window
+  (not the chat model's context), and transcript text never reaches a log, a
+  command line, telemetry, or a cache key.
+
+#### Bundle staleness (v0.2.92, wave 3)
+
+- **A project could sit on an old bundle indefinitely with nothing saying so.**
+  Updating the orchestrator does not update the projects installed from it, and
+  there was no surface that reported the gap. A census now records, per project,
+  whether its bundle is current, stale, or **undeterminable** — the third state
+  being the point: a project VCO could not read is never reported as current.
+  `python -m vco_lib.bundle_staleness` prints it; a ledger entry names the
+  projects and the command that fixes them.
+
+#### Remote Control and the model gateway (v0.2.92)
+
+- **Added the `rc-native` skill.** Remote Control is endpoint-gated: a session whose
+  `ANTHROPIC_BASE_URL` points anywhere other than `api.anthropic.com` cannot use it,
+  and signing in with claude.ai does not change that. So a gateway-pointed VS Code
+  panel can never host it. The skill runs a detached native-auth Remote Control server
+  alongside the panel instead, auto-starting on invocation. Ships as genuine
+  cross-platform siblings (`rc-native.sh` + `rc-native.ps1`).
+- **The launcher now discloses that limitation at the point of action** — pointing the
+  panel at the gateway always reports it — and TROUBLESHOOTING maps the
+  "Remote Control initialization failed" toast to this cause. No downgrade is
+  suggested anywhere; a downgrade below v2.1.196 is reverted by auto-update.
+- **Switching models could trigger an immediate auto-compact.** Tier-slot overrides are
+  literal strings that never pass through the gateway's model catalog, so a slot
+  holding a plain `glm-5.3-flash` got the client's conservative default window even
+  though the model is 1M — and a session sized under a 1M assumption compacted on the
+  next turn. Pointing the panel at the gateway now appends the `[1m]` hint to the SAME
+  model id, from an exact version-specific table, and names every healed slot in the
+  done message instead of reporting "PRESERVED (unchanged)" while values changed.
+  It never changes which model a slot names.
+
+#### Hub auto-start (v0.2.92, wave 3)
+
+- **Three copies of "find the vct-hub binary and start it if it is not
+  running" became one.** The two session-start hooks and the launcher now call
+  a single Python implementation instead of each carrying their own binary
+  resolution and spawn.
+- **Behaviour change worth knowing:** because the launcher now calls that
+  implementation rather than duplicating it, a launcher boot on an install
+  with **no resolvable Python interpreter** no longer auto-starts the hub,
+  where previously its own native copy would have. This is deliberate. The
+  hub's consumers are the Python MCPs and the Python hooks — if the
+  interpreter cannot be resolved, those are already down, so there is nothing
+  left for the hub to serve. The alternative was a native code path that keeps
+  one subsystem looking healthy while everything it exists to serve is broken.
+  The loss is logged explicitly to the launcher log file.
+- The hooks also report their failures on **stdout** now, for the same reason
+  the container hooks do: a session-start hook's stderr is discarded when it
+  exits 0, so the previous report reached nobody.
+
+#### Upgrading to v0.2.92 — expect one re-sync prompt per project
+
+- **The first v0.2.92 bundle update writes a re-sync entry into every existing
+  project's deferral ledger at once.** This is intended, not a fault: the qwen3
+  chunk budget changed (the previous value sat 32% above the model's context
+  window and was silently truncating), so knowledge graphs built earlier are
+  chunked differently from what the current version produces.
+- The entry is `info` severity and nothing is applied automatically. Re-syncing
+  is your choice of moment, and searches keep working meanwhile.
+- The knowledge-graph half re-chunks **only the entries whose chunk plan
+  actually differs** — on the corpora measured, 17 of 998 — so it is far
+  cheaper than it sounds. The code-graph half (`--force-recreate`) does re-embed
+  every entity, which is the expensive part. Run the cheap half first; the two
+  are independent.
+- If a project's bundle manifest was deleted, or it was re-cloned without one,
+  the automatic signal cannot see it. `kg-sync --all --rechunk` forces the
+  chunk-plan comparison for that case (it still re-embeds only entries whose
+  plan changed — it is not a blind re-embed).
+- **The code-graph half of that re-sync is now a correctness fix, not only a
+  re-chunk.** On an install with the GPU code tier, entities larger than roughly
+  3 500 characters had their vectors computed from only their leading ~1 024
+  tokens. Measured on a 31 400-row code graph: **4.6% of stored function rows**
+  carry such a vector, each missing 258 tokens on average, and every
+  maximal-size entity was affected. Those rows remain searchable — they simply
+  cannot match on anything in their second half.
+  `code-graph-analyze . --force-recreate` rebuilds them correctly. Row count
+  grows by about 6% as over-budget entities split into more, smaller chunks;
+  nothing is lost in the split. On a repository of that size the rebuild is
+  roughly 30 minutes of embedding; a 6 000-row project is 5-6 minutes.
+- **Knowledge-graph bindings**: a binding naming a class that does not exist has
+  been rebound onto the populated one automatically since v0.2.40, on every
+  `install.py --update`. The case that mechanism cannot see — a binding naming a
+  class that DOES exist while the project's data demonstrably lives elsewhere —
+  is now handled too. `vco doctor` reports it, naming all three values (bound
+  class, evidence class, name-derived class), and every `install.py --update`
+  now RE-POINTS the binding at the class holding the data **where the evidence
+  is unambiguous**: a class has at least 2 of its distinct sampled `file_path`s
+  existing under the project folder AND at least 80% of the sample, no other
+  class comes close to it (either it is alone, or it leads the runner-up by more
+  than 2x AND by more than 10 matched paths — the shape the historical
+  dual-write divergence leaves, one class with the corpus and another with a
+  handful of nodes), and it is not the class already bound. The candidate always
+  comes from that measurement, never from the project's name — a name-derived
+  guess is worthless exactly when the name is what went wrong, and re-stamps
+  the ghost.
+  Each repoint is recorded in the update ledger
+  (`kg_binding_evidence_repointed`) naming the old class, the new class and the
+  evidence, and is reversible from the launcher's Identity tab (the previous
+  value is also kept in the binding row's `config_json`).
+  Nothing is written when the evidence is ambiguous (two or more classes clear
+  the bar and none leads decisively — including when the bound class is one of
+  them), when the binding carries a `manual_override` sentinel, when the target
+  class is already named by another binding row, or when Weaviate or launcher.db
+  cannot be read — those stay reported for a human to resolve from the Identity
+  tab. The ambiguous case is no longer silent: it raises
+  `kg_binding_ambiguous_evidence` in the ledger, naming every class that holds
+  the project's data with its matched/sampled path counts and how far short of
+  the decisive margin the leader fell, and it clears itself once the split is
+  settled (one class dominates, the leftover is emptied, or the row records a
+  deliberate pick). Saving a DIFFERENT collection in the launcher's project
+  KG tab now records that pick on the binding row (`manual_override`), so
+  the ask clears on the next update — model/URL-only edits leave the row
+  machine-repairable — and the printed SQL stanza merges into `config_json`
+  (`json_set`) instead of overwriting keys the row may already carry. A bound
+  class the evidence puts decisively on top is left
+  alone — never repointed away from, and never asked about.
+  No Weaviate data is moved or deleted in any case: objects already written to
+  the previously-named class stay there, that class stays in the keep-set the
+  legacy-collection drop detector consults (an automatic repair must never turn
+  live data into a drop candidate), and migrating the objects remains a
+  separate decision.
+
+#### Embedding budgets and Ollama context windows (v0.2.92)
+
+- **Large chunks were silently truncated at index time.** The `qwen3-embedding:0.6b`
+  chunk budget was 13,500 tokens against a 10,240 `num_ctx` — 32% over. Ollama
+  embedded the first 10,239 tokens of an oversized chunk and returned **HTTP 200**,
+  so roughly a quarter of every large chunk never influenced its vector and nothing
+  downstream could tell. Chunk budgets are now `min(policy_ceiling, model_window)`,
+  and the policy ceiling is a named constant (8,192) with its reason attached: chunks
+  are held deliberately below the model's capacity because an oversized chunk matches
+  on a fragment and then returns the whole thing.
+- **Four Ollama embedding paths never set `num_ctx` at all**, so they inherited
+  Ollama's 2,048 default. One was losing data today: the legacy arctic text-embed path
+  sent 3,200-token budgets into a 2,048 window. All now set it explicitly, resolved
+  from the same table that sizes the chunks, so the window we request and the chunks
+  we produce cannot drift apart. A new gate scans for outbound Ollama embedding calls
+  and fails on any that omit it — it found a site the hand-audit had missed.
+- **Over-window embed input is now REFUSED instead of silently truncated, and
+  every path shrinks and retries.** Ollama's behaviour here is per-model:
+  measured 2026-09-04, `qwen3-embedding` and `jina` accept an oversized input,
+  drop the tail and return HTTP 200; `snowflake-arctic-embed2` refuses. Every
+  outbound embed now sends `truncate: false`, which makes all three refuse
+  uniformly — a caller can react to a refusal, but nothing downstream can
+  detect a silent truncation. Each embed path then shrinks the input and
+  retries until the runner accepts, so a dense chunk yields a leading-window
+  vector that is KNOWN to be one, never a lost vector. **You will see new
+  WARNING lines** for chunks denser than the token counter assumed; that is the
+  mechanism disclosing itself, not a new failure. The gate that pins `num_ctx`
+  at every request site now pins `truncate` there too.
+- **The default GPU code tier was silently discarding half of every large
+  entity, and this release's own remedy re-indexed everything through it.**
+  `codesage-large-v2`'s token limit was recorded as 2 048 — the *architectural*
+  cap from the model's `config.json` — but sentence-transformers serves the
+  shipped snapshot at `sentence_bert_config.json`'s `max_seq_length` of
+  **1 024**, and `model.encode` drops everything past it at **HTTP 200**, with
+  no warning and nothing to tag. Measured on the live service: appending 500
+  tokens past position 1 024 leaves the vector identical to six decimal places,
+  while the same append below 1 024 moves it. Every code-entity budget derived
+  from the wrong number, so the shipped 7 168-char budget was 2.1x the served
+  window — on real repository Python, **100% of maximal entities** exceeded it,
+  by a median of 932 tokens. The limit is now the served window; the per-entity
+  budget follows it (7 168 -> 3 584 chars) and the split tier clamps from
+  (550, 1 600, 1 100) to (550, 921, 921).
+- **The CodeEmbed service now refuses over-window input instead of truncating
+  it** — the same trade `truncate: false` already made on the Ollama side:
+  HTTP 400 carrying the phrase the shared overflow detector already
+  recognises, raised *before* `encode` runs. Both callers (the per-entity path
+  the code-graph analyzer uses, and the batched path the launcher's slot
+  enrichment uses) route that refusal through the one existing
+  shrink-and-retry loop and record the result as truncated, so an over-dense
+  entity yields a tagged leading-window vector — never a silent halving, never
+  a dropped entity. This also closes the `CODE_EMBED_BACKEND=ollama` case,
+  where the 502 wrapping the identical phrase used to reach the analyzer as a
+  generic "embedding generation error" and the row was written with no vector.
+- **`CODE_EMBED_MAX_SEQ_LEN` could not change the window it documented.** It
+  was passed inside `model_kwargs`, which sentence-transformers forwards to
+  `AutoModel.from_pretrained` — the transformer's kwargs, not the
+  `max_seq_length` attribute that governs truncation (and which is not an
+  `__init__` parameter at all). It now sets the attribute.
+- **A dense chunk could lose its primary vector entirely.** The refusal above
+  was caught on the batch and secondary paths but not on the single-embed path
+  that `kg-sync` and the MCP `store_knowledge_node` write actually use — so a
+  chunk the runner refused stored no vector at all, where the previous release
+  stored a leading-window one. Latin-script prose never hit it (0 of 96
+  oversized chunks refused on the measured corpus); CJK text, box-drawing
+  architecture diagrams and symbolic tables did, at sizes well inside the
+  normal chunk range. All three shrink paths now share one implementation.
+- **A re-cloned project is no longer mistaken for a new one.** The chunk-boundary
+  resync gate identifies a pre-existing project by its bundle manifest; a project
+  whose manifest was deleted, or that was re-cloned without it, read as a fresh
+  install and was never told its knowledge graph predated the new boundaries.
+  When the manifest is absent the gate now also asks whether the project's
+  registered collection already holds objects, and treats a non-empty one as
+  evidence of a prior install. If Weaviate cannot be reached it records nothing
+  and re-decides next run, rather than stamping a guess. `kg-sync` also gained
+  `--rechunk`, which forces the chunk-plan comparison for projects the automatic
+  signal cannot see (a CLI-only project the launcher has never registered).
+- **The token counter's "chat model" path was dead.** It was documented as counting
+  with a chat tokenizer, but `langchain_ollama` is in no shipped requirements file, so
+  every install used the character heuristic. Where langchain *is* present, the call
+  silently substitutes a GPT-2 fallback — a third unit, 16-87% above the embedding
+  model's true count. The counter is now one deterministic documented unit.
+
+#### Secrets status and telemetry completeness (v0.2.92, final review)
+
+- **The Secrets panel reported keys as `NOT SET` that resolved perfectly
+  well.** The status probe read the OS keychain only, while the sanctioned
+  resolvers are hub-first with an automatic file-store fallback — so a user
+  seeing "not set" for a working key would re-enter it, forking the divergent
+  second copy the documentation warns about. Two defects were behind it: the
+  keychain-only probe, and an unreadable keychain (the ordinary state after
+  boot) collapsing to "no saved value" rather than "unknown". The panel now
+  reports what a consumer would actually get, across the keychain, the
+  project's own file-store namespace and the shared tier, saying WHERE the
+  value lives; an unreadable store renders `unknown`, never "not set".
+  `is_set` keeps its keychain × active-flag meaning, because it is also the
+  permission gate and widening it would extend a permission decision over a
+  store the matrix has no authority over.
+- **`.no-shared-fallback` was a documented opt-out that nothing read.** The
+  launcher wrote the marker and the docs promised it, but all four resolvers
+  fell through to the shared tier unconditionally — so a project that opted out
+  of shared-secret visibility still resolved shared secrets. Now honoured by
+  every resolver, with the GUI hint corrected: the file-store tier is gated
+  wholesale, including infrastructure keys, because a privacy control with
+  exceptions is not one.
+- **A per-project ref's status ignored the shared tier**, and a stored
+  `is_set` column was rendered as live truth though nothing kept it current.
+  Both now derive from the same probe as the sibling panel.
+- **The truncation tag reached storage from one of four writers.** kg-sync (the
+  install seed, every hook-driven sync, and the `--rechunk` remedy), the
+  launcher's enrich path, the dual-log backfill and the MCP single-chunk branch
+  all skipped it — the property was not in a live collection's schema at all.
+  All four now route through one shared tagger, and the ACTIVE slot's
+  truncation is persisted alongside the secondaries and carried on the RL event.
+  A second property records which slots a row can answer for, so a slot a
+  later single-slot patch filled resolves UNKNOWN instead of a confident
+  `False` into the training pipeline.
+- **Multi-chunk nodes were reassembled by `title` alone**, and colliding titles
+  exist live in 3 of 21 collections (one with 10), so unrelated nodes' chunks
+  could interleave on retrieval. Assembly now keys on `file_path`, populated on
+  every row measured (1545/1545). Two further title-keyed assemblers were found
+  and fixed, one of which read `chunk_number` where the schema property is
+  `chunk_num` and so returned nothing for every node — per-chunk KG summaries
+  had never been generated.
+- **The MCP store and kg-sync disagreed on the chunk plan for identical
+  input.** They now share one plan computation, so the `--rechunk` comparison
+  that decides what to re-embed cannot disagree with the writer.
+- **A sibling module was imported by its absolute path**, which on a machine
+  with a second checkout binds the OTHER tree's constants — silently restoring
+  the code-entity budget this release had just corrected. Sibling imports are
+  now sibling-first, pinned by a test that plants a hostile module at the
+  absolute name.
+- **Shipped scripts pointed users at a metrics file the rows are not in.**
+  `~/.claude/metrics/` became a read-only archive earlier in this release; four
+  messages still named it, all copied from a docstring that had not been
+  updated. Both the docstring and the call sites now resolve the path.
+
+#### Delivery of the embedding fixes (v0.2.92, final review)
+
+- **The code-embedding service's over-window refusal was reaching nobody.**
+  `code_embed` is the only VCO service whose image is BUILT from the checkout,
+  and both `docker compose up` and `podman-compose up` build an image only when
+  it is MISSING — a changed build context is not a rebuild trigger, and
+  `--force-recreate` replaces the *container* from the *same* image. So this
+  release's fix was live in git and absent from every existing GPU-tier install.
+  Measured on a machine updated through the ordinary path every release: image
+  built 2026-05-16, container force-recreated 2026-07-12, and a 13 450-character
+  POST still answering HTTP 200 with `cosine(text, text + tail) = 1.000000`.
+  `python install.py --update` now adds `--build` — and names `code_embed` for
+  `--force-recreate`, so the rebuilt image reaches the running container —
+  whenever the image is not provably built from the current source. With
+  matching source the flag is not added at all.
+- **The shipped `server.py` could not start in a freshly built image.** Two
+  module-level imports (`vco_lib.log_setup`; `_lib.bootstrap` in `__main__`)
+  reference packages the Dockerfiles do not COPY, so a rebuild would have
+  crash-looped under `restart: unless-stopped`. It was invisible only because
+  nothing ever rebuilt the image — the two defects hid each other, and fixing
+  the rebuild alone would have taken every GPU install from "silently
+  truncating" to "service dead". Both now degrade with an announced warning,
+  pinned by a test that runs `server.py` with those packages unimportable.
+- **Image staleness is checkable, not hoped for.** The service publishes
+  `source_sha` on `/health` — a digest of the files it actually loaded, computed
+  by a module that is itself COPYed into the image so host and container share
+  one rule. `vco doctor` compares it against the checkout and defers
+  `code_embed_image_stale`; the SessionStart hook prints one line when a running
+  service is stale; `python -m vco_lib.code_embed_image --json` answers directly.
+  A `/health` with no `source_sha` identifies a pre-v0.2.92 image.
+- **A printed remedy could rebuild — or delete — the wrong project's code
+  graph.** The re-sync entry emitted `code-graph-analyze . --force-recreate`;
+  the wrapper is a bare pass-through, `--from-resolver` was opt-in, and with no
+  `CODE_GRAPH_PROJECT` in a plain terminal the analyzer fell back to the folder
+  BASENAME and then dropped `<basename>_Code*` with no keep-set guard. Measured
+  against this machine's real registry, **5 of 7 registered projects would have
+  rebuilt the wrong family**, and one basename resolved to `Python` — generic
+  enough to collide with another project on many installs. The destructive call
+  now refuses unless the resolved identity matches the live bindings (positive
+  evidence only: an unreadable launcher DB refuses, an absent one — the
+  standalone case — allows), and every emitted and executed invocation passes
+  `--from-resolver`. Nothing is permanently lost in either case: a code graph is
+  derived from a source walk, so recovery is a re-analyze.
+- **PowerShell: a one-token compose command invoked itself as its own
+  argument.** Four hook sites split `$ComposeCmd` with
+  `$parts[1..($parts.Length - 1)]`; for a single token that range is `1..0`,
+  which PowerShell evaluates DESCENDING as `@($null, 'podman-compose')` — so
+  standalone-compose Windows hosts ran `podman-compose podman-compose up -d …`
+  and could not bring a service up from these hooks at all.
+- **A PowerShell `Start-Job` child is torn down when the hook exits**, so the
+  every-10-edits duplicate scan never wrote its report — on Windows, even where
+  bash was present. Long-running hook children are now spawned detached through
+  one shared helper. The Windows duplicate-detection wrapper itself shipped but
+  was never wired: the hook still gated on bash and carried a comment saying the
+  sibling "has never shipped".
+- **The embedding-fidelity notice failed silently when it failed.** Its
+  invocation swallowed both a non-zero exit and an unresolvable interpreter, so
+  a broken import meant permanent, undiagnosable silence. It now prints a short
+  diagnostic naming the error and a remedy, on the stream a SessionStart hook is
+  actually read from, and repeats until the underlying problem is fixed.
+
+#### Container runtime (v0.2.92, wave 3)
+
+- **`VCT_CONTAINER_RUNTIME` is a pin, not a preference.** A pinned runtime that
+  is unusable is now REFUSED, with a hint naming what you pinned, why it is
+  unusable, and whether the other runtime is usable — instead of silently
+  falling through to that other runtime. The fall-through was a data-plane
+  fork: podman and docker keep **separate named volumes**, so
+  `docker compose up -d` on behalf of a podman user stood up an EMPTY Weaviate
+  on :8081 that every downstream heal then read as their knowledge graph —
+  while the launcher, strict since PR-43, reported no runtime at all on the
+  same machine in the same minute. Python (`vco_lib/containers.py`) and Rust
+  (`services/runtime.rs`) now agree on every arm.
+- **The session-start hooks print the refusal on stdout.** A hook's stderr is
+  discarded on exit 0, so the previous "loud" report reached nobody on the one
+  path that runs every session. The `.ps1` siblings also stopped discarding the
+  resolver's stderr, so a resolver crash on Windows now says why instead of
+  printing a bare return code.
+- **The uninstaller stopped detecting the runtime itself.** It was a fourth
+  independent copy of runtime + compose resolution, so it ignored your pin and
+  could print `volume rm` commands naming the wrong runtime — and a printed
+  command is shipped code. It now resolves through the same one home, and says
+  explicitly when it skipped stopping containers rather than doing nothing
+  silently.
+- The launcher's install preflight returns `pinned` / `pinned_installed` /
+  `alternative_usable`, so the runtime modal can say "podman is pinned but
+  unusable" rather than "no container runtime is installed".
+
+#### Version and git-command resolution (v0.2.92, wave 3)
+
+- **The version string was defined in several places** and could disagree
+  between the launcher, the installer and the Python packages. It now resolves
+  from one source.
+- **Git invocations in the launcher went through several independent
+  resolutions** of which binary to run and with what environment, so a fix
+  applied to one path did not reach the others. They now share one runner, with
+  a lint that fails the build if a new raw spawn is added.
+
+#### Windows spawn transport and one-shot CLI sessions (v0.2.92, final review)
+
+- **`Start-Process -ArgumentList` joins the array with spaces and lets the
+  child re-split it** — so every detached PowerShell spawn in the shipped
+  hooks that passed whitespace-bearing elements delivered a corrupted argv.
+  The commit-review agent was rejected by the Claude CLI at the diff's first
+  `---` token on every non-empty Windows commit (the process started, exited
+  at option parsing, and only its `.err` log showed why), and four other
+  spawns delivered truncated paths wherever a project, repo or transcript
+  path contains a space. The one shared helper now encodes each element per
+  the `CommandLineToArgvW` rule — whitespace, embedded quotes, trailing
+  backslashes and empty elements all survive the round-trip, pinned by a
+  driven argv-echo test — and the commit-review prompt rides on stdin via
+  `-RedirectStandardInput` instead of a command line that was approaching
+  the 32 767-character Windows limit.
+- **Every KG-summary and code-graph summary call persisted a session
+  transcript into the user's chat picker.** Both `claude -p` spawn sites in
+  `summary_backends.py` — the CLI-availability probe and the summary call
+  itself — now pass `--no-session-persistence`. On the machine that found
+  this, 943 machine-generated transcripts (1.05 GB) sat in one project's
+  session list, plus one "say ok" probe chat per generator run. The shipped
+  commit-review hooks already carried the flag.
+- **Three telemetry hooks computed a wrong Unix epoch** — the mixed-
+  `DateTimeKind` subtraction is shifted by the UTC offset, and these write
+  millisecond stamps into JSONL files their `.sh` siblings write
+  `time.time()*1000` into, so cross-sibling durations were off by hours east
+  of UTC. All three now use
+  `[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()`, pinned by the parity
+  gate at millisecond tolerance.
+- **A code-path truncation verdict could leak across calls** — the
+  truncation record was reset only on the text fan-out. Both code entry
+  points reset it now, pinned behaviourally in both directions.
 
 ## [0.2.91] - 2026-08-28
 
@@ -1062,7 +1779,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the 117 curated knowledge-graph template nodes were reviewed and brought
   in line with the shipped v0.2.85 behavior. Counts, ports, model names, MCP
   surface, and install-flow descriptions now match the source of truth
-  (44 agents / 53 skills / 45 hooks / 4 MCP servers + playwright).
+  (44 agents / 54 skills / 45 hooks / 4 MCP servers + playwright).
 - **README rewritten for accessibility** — same coverage, ~10% shorter, with a
   per-system "what you feel" framing; telemetry-deletion contact routes to the
   wired `team@` alias.
@@ -4332,7 +5049,7 @@ A **public-repo cleanup release** triggered by a critical UX regression discover
 ### Changed
 
 - **Bug B — modal-anchor consistency across all hand-rolled modals**: `OrchestratorUpdateDivergenceModal`, `OrchestratorUpdateConflictModal`, `OrchestratorUpdateProgressModal` now anchor flush to viewport-top (`align-items: flex-start` + `padding: 16px` + scrollable body) instead of vertically-centered (which clipped above the window-top on short viewports). The other 15 `*Modal.svelte` files delegate to `DialogRoot` + native `<dialog>` and were already correctly positioned.
-- **Bug D — count drift**: stale `27 hooks` / `52 skills` / `45 agents` references corrected to verified `31 hooks` / `53 skills` / `45 agents` across `README.md`, `BOOTSTRAP.md`, `docs/features/INDEX.md`, `docs/features/03-agents-skills-hooks.md`, `docs/features/06-license-and-commercial.md`, `docs/GETTING_STARTED.md`, `templates/ORCHESTRATOR-CLAUDE.md.template`, KG `hook-discipline-vct-disable-hooks.md`.
+- **Bug D — count drift**: stale `27 hooks` / `52 skills` / `45 agents` references corrected to verified `31 hooks` / `54 skills` / `45 agents` across `README.md`, `BOOTSTRAP.md`, `docs/features/INDEX.md`, `docs/features/03-agents-skills-hooks.md`, `docs/features/06-license-and-commercial.md`, `docs/GETTING_STARTED.md`, `templates/ORCHESTRATOR-CLAUDE.md.template`, KG `hook-discipline-vct-disable-hooks.md`.
 - **Bug E — npx fallback for fnm/nvm setups**: `install.py`'s `shutil.which("npx")` probe now falls through to `dirname(realpath(which("npm")))/npx` when the direct lookup fails. Affects ~5% of users with hand-managed Node installations (fnm/nvm/asdf) where `npm` is symlinked but `npx` isn't. Empirically verified: returns the correct fnm path + `npx --version` succeeds on the reproducer.
 - **KG collection name canonicalization**: stale `VibeCodedTools_KnowledgeGraph` → `VibeCodedOrchestrator_KnowledgeGraph` (with lowercase-c "Vibecoded" typo fix) in `docs/CONFIGURATION.md`, `docs/GETTING_STARTED.md`, `docs/TROUBLESHOOTING.md`, `docs/USER_GUIDE_TABS.md`, KG `shared-knowledge-graph.md`.
 - **Port `11438` → `11440`** (code-embed service): documented port matches the actual default in 3 KG nodes (`orchestrator-hook-system.md`, `codesage-large-v2.md`) + cross-references.
@@ -8757,7 +9474,7 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.92...HEAD
 [0.2.3]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.0...v0.2.1

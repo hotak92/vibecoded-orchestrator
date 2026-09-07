@@ -51,9 +51,23 @@ param(
 )
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-# Mirrors templates/scripts/vct_project_config.sh — kept in lockstep by
-# the template-drift gate. Both copies share the same logic; the hub
-# owns the project-root lookup.
+# NOTHING IS BAKED HERE, AND THAT IS THE ANSWER — not an omission.
+#
+# This script needs no orchestrator root: the hub owns every lookup and is
+# found through $env:VCT_HUB_PORT / $env:VCT_HUB_TOKEN or through the
+# hub.port / hub.token files under the VCT state dir — all resolvable at run
+# time on any machine. Baking a clone path here would add a variable nothing
+# reads. `tests/test_v0292_cli_root_resolution_and_prefix.py::
+# TestTheShellPairDecision` pins the absence.
+#
+# The sentinels stay because they declare the span `vco_lib/rewire.py` owns;
+# it walks this file at install time and, finding no placeholder, returns it
+# byte-identical. Prior text here said this file is "kept in lockstep by the
+# template-drift gate" with its .sh sibling. That gate was REMOVED in PR-39 /
+# v0.2.12 and nothing enforced the claim; what IS enforced is that the pair
+# both EXIST (`TestTheShellPairDecision::test_both_flavours_stay_in_lockstep`
+# — a missing .ps1 sibling is a Windows outage). The two are separate
+# languages and were never byte-identical to each other.
 # VCO-REWIRE-END: orchestrator-root-resolution
 
 $ErrorActionPreference = 'Stop'

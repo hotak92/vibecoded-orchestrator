@@ -29,6 +29,22 @@ continue with production code; a first-marker file cutoff would silently
 blind the scan to everything after it (found in review of the first version
 of this test: ~17 files, including boot-relevant sweeps).
 
+That skip, and the Rust lexer it needs, live in ``tests/common/rust_source.py``
+— the shared home for the three ``.rs`` architectural lints (v0.2.92; see that
+module's docstring). The private copy this file used to carry stripped only
+``//`` tails, so a brace inside a multi-line string literal was counted as
+code: on the real tree it ended four ``#[cfg(test)] mod`` spans EARLY
+(``config.rs`` at line 317 of 416, ``secrets.rs`` at 3337 of 4559,
+``secrets_ss_connection.rs`` at 650 of 1059) and ran one to EOF
+(``db/access.rs``), so the scan was reading test code as production in the
+first three and skipping ~17 lines of production in the last.
+
+STRICT test-gate reading (``include_any_test=False``): an item is skipped only
+when it is absent from EVERY non-test build. ``#[cfg(all(unix, any(test,
+debug_assertions)))]`` — which ``secrets.rs`` uses — compiles into a debug
+binary, so its ``tokio::spawn`` calls could panic in a developer's launcher
+exactly like a release one; this scan must keep seeing them.
+
 Scope: ``launcher/src-tauri/src`` (the Tauri app — has a non-runtime main
 thread) and ``launcher/src-tauri/vct-launcher-core/src`` (library consumed by
 the app, so its sync fns can be called from the same contexts). ``vct-hub``
@@ -45,11 +61,19 @@ If you genuinely need that shape, extract the async body into an ``async fn``
 from __future__ import annotations
 
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.common.rust_source import (  # noqa: E402
+    cfg_test_line_numbers,
+    scrub_rust_lines,
+)
 
 SCAN_ROOTS = (
     REPO_ROOT / "launcher" / "src-tauri" / "src",
@@ -61,78 +85,48 @@ _FN_DECL = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(async\s+)?"
     r"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+(\w+)"
 )
-_CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]")
-_ATTR = re.compile(r"^\s*#\[")
 _BARE_SPAWN = re.compile(r"\btokio::(?:task::)?spawn(?:_blocking|_local)?\(")
-
-
-def _strip_line_comment(line: str) -> str:
-    return line.split("//", 1)[0]
-
-
-def _skip_cfg_test_item(lines: list[str], i: int) -> int:
-    """``lines[i]`` is a ``#[cfg(test)]`` attribute line. Return the index
-    just past the gated item: any further attribute lines, then either a
-    semicolon-terminated item (``mod tests;``, ``use ...;``, ``const ...;``)
-    or one brace-balanced block (fn/mod/impl/struct alike). Brace counting
-    ignores ``//`` line-comment tails; string literals containing braces
-    inside test code could in principle skew it — acceptable for a scan
-    whose failure mode is then a human-reviewed false positive/negative on
-    one file, not silent whole-file blindness."""
-    j = i + 1
-    while j < len(lines) and _ATTR.match(lines[j]):
-        j += 1
-    depth = 0
-    seen_open = False
-    while j < len(lines):
-        code = _strip_line_comment(lines[j])
-        depth += code.count("{") - code.count("}")
-        if "{" in code:
-            seen_open = True
-        if seen_open and depth <= 0:
-            return j + 1
-        if not seen_open and code.rstrip().endswith(";"):
-            return j + 1
-        j += 1
-    return j
 
 
 def _scan_file(path: Path) -> list[str]:
     """Return violation descriptions for one .rs file."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    # Code-only view: strings, char literals and comments removed with
+    # cross-line lexer state. Both the spawn match and the enclosing-fn
+    # lookup read THIS, so a `tokio::spawn(` inside a doc comment or an
+    # error-message template cannot be mistaken for a call.
+    code = scrub_rust_lines(source)
+    # STRICT reading — see the module docstring: an item gated behind a
+    # predicate that still compiles in a debug build is production here.
+    skipped = cfg_test_line_numbers(source, include_any_test=False)
     try:
         rel = path.relative_to(REPO_ROOT)
     except ValueError:
         rel = path
 
     violations: list[str] = []
-    i = 0
-    while i < len(lines):
-        if _CFG_TEST.match(lines[i]):
-            i = _skip_cfg_test_item(lines, i)
+    for i in range(len(lines)):
+        if (i + 1) in skipped:
             continue
-        line = lines[i]
-        stripped = line.lstrip()
-        if not stripped.startswith("//") and _BARE_SPAWN.search(
-            _strip_line_comment(line)
-        ):
-            # Nearest preceding fn declaration decides the context.
-            enclosing_async = None
-            enclosing_name = "<module scope>"
-            for back in range(i, -1, -1):
-                m = _FN_DECL.match(lines[back])
-                if m:
-                    enclosing_async = bool(m.group(1))
-                    enclosing_name = m.group(2)
-                    break
-            if enclosing_async is False:
-                violations.append(
-                    f"{rel}:{i + 1}: bare tokio spawn in SYNC fn "
-                    f"`{enclosing_name}` — panics when called without a "
-                    f"reactor context (setup()/main thread; v0.2.89 boot "
-                    f"incident). Use tauri::async_runtime::spawn."
-                )
-        i += 1
+        if not _BARE_SPAWN.search(code[i]):
+            continue
+        # Nearest preceding fn declaration decides the context.
+        enclosing_async = None
+        enclosing_name = "<module scope>"
+        for back in range(i, -1, -1):
+            m = _FN_DECL.match(code[back])
+            if m:
+                enclosing_async = bool(m.group(1))
+                enclosing_name = m.group(2)
+                break
+        if enclosing_async is False:
+            violations.append(
+                f"{rel}:{i + 1}: bare tokio spawn in SYNC fn "
+                f"`{enclosing_name}` — panics when called without a "
+                f"reactor context (setup()/main thread; v0.2.89 boot "
+                f"incident). Use tauri::async_runtime::spawn."
+            )
     return violations
 
 
@@ -212,6 +206,58 @@ class ScannerBehavior(unittest.TestCase):
             "fn c() { tokio::task::spawn_local(async {}); }\n"
         )
         self.assertEqual(len(v), 3, v)
+
+    def test_debug_assertions_gate_is_still_scanned(self) -> None:
+        """STRICT reading: `any(test, debug_assertions)` is NOT test-only.
+
+        The item compiles into a debug build, so its spawn can panic in a
+        developer's launcher exactly like a release one. This is the case the
+        shared module's first strict rule got wrong (it asked
+        ``predicate.startswith("all(")``), and the case that decides whether
+        migrating this lint onto that module preserved its gate: the private
+        copy this file used to carry matched only the literal
+        ``#[cfg(test)]``, so it scanned these regions.
+        """
+        v = self._scan_source(
+            "#[cfg(all(unix, any(test, debug_assertions)))]\n"
+            "pub fn debug_helper() {\n    tokio::spawn(async {});\n}\n"
+        )
+        self.assertEqual(len(v), 1, v)
+        self.assertIn("debug_helper", v[0])
+
+        v = self._scan_source(
+            "#[cfg(any(test, debug_assertions))]\n"
+            "pub fn debug_helper2() {\n    tokio::spawn(async {});\n}\n"
+        )
+        self.assertEqual(len(v), 1, v)
+
+    def test_all_test_and_whitespace_variants_are_skipped(self) -> None:
+        """The other side of the same knob: a predicate that IS absent from
+        every non-test build is skipped, including forms the old literal
+        `#[cfg(test)]` regex missed (`all(test, …)`, spaced attributes)."""
+        for gate in (
+            "#[cfg(all(test, unix))]",
+            "#[cfg(all(unix, test))]",
+            "#[ cfg ( test ) ]",
+        ):
+            with self.subTest(gate=gate):
+                v = self._scan_source(
+                    f"{gate}\nfn helper() {{\n    tokio::spawn(async {{}});\n}}\n"
+                )
+                self.assertEqual(v, [], v)
+
+    def test_string_literal_braces_do_not_end_the_skip_early(self) -> None:
+        """The private copy counted braces on a `//`-stripped view, so a brace
+        inside a string literal unbalanced it and ended a `#[cfg(test)]` span
+        early — on the real tree that mis-read four files (see module
+        docstring). The shared lexer removes literals first."""
+        v = self._scan_source(
+            "#[cfg(test)]\nmod tests {\n"
+            '    const SNIPPET: &str = "fn main() {";\n'
+            "    fn helper() {\n        tokio::spawn(async {});\n    }\n"
+            "}\n"
+        )
+        self.assertEqual(v, [], v)
 
     def test_comment_mentions_are_ignored(self) -> None:
         v = self._scan_source(

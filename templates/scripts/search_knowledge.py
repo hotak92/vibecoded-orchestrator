@@ -10,11 +10,12 @@ Handles chunked nodes automatically - reassembles all chunks from same source.
 
 import sys
 import os
+import re
 import requests
 import weaviate
 import time
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 from weaviate.classes.query import Filter
 
@@ -51,11 +52,7 @@ def _resolve_kg_collections() -> tuple[str, str]:
         # Local import keeps the module importable in contexts where
         # vco_lib isn't on the path (e.g. minimal CI installs); the
         # except below still degrades to env.
-        from vco_lib.project_config import (
-            ProjectNotFound,
-            ResolverError,
-            resolve,
-        )
+        from vco_lib.project_config import resolve
         cfg = resolve(Path(__file__).resolve().parent.parent.parent)
         return (
             cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
@@ -73,8 +70,121 @@ def _resolve_kg_collections() -> tuple[str, str]:
 KG_COLLECTION, SHARED_KG_COLLECTION = _resolve_kg_collections()
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
-# Query token limit (same as embedding limit)
+
+# VCO-SHARED-BEGIN: _resolve_orchestrator_root (verbatim across templates/scripts/*.py)
+def _resolve_orchestrator_root() -> "Path | None":
+    """Return the orchestrator clone root — the directory that CONTAINS
+    ``claude_mcp_servers/`` — or ``None`` when it cannot be located.
+
+    THE one shape for this question across ``templates/scripts/*.py``. It is
+    copied VERBATIM into every shipped script that asks it and pinned
+    byte-identical by
+    ``tests/test_v0292_cli_root_resolution_and_prefix.py::test_root_resolver_bodies_identical``
+    — a DOCUMENTED class-C mirror with an enforcing test rather than a silent
+    copy, because these scripts must answer "where is the orchestrator?"
+    BEFORE they can import anything from it (importing ``vco_lib`` to find
+    ``vco_lib`` is circular).
+
+    Candidate order — the first candidate that actually CONTAINS
+    ``claude_mcp_servers/`` wins; a candidate that does not is SKIPPED, never
+    returned:
+
+      1. ``$VCT_ORCHESTRATOR_ROOT`` — canonical; written into ``.claude/env``
+         and ``.claude/settings.json`` by the bundle installer
+         (``vco_lib/config_projection.py``).
+      2. ``$VCT_INSTALL_ROOT`` — legacy alias carrying the same value; some
+         launcher subprocess spawns set only this one.
+      3. ``<script>/../..`` — the in-tree layout, correct ONLY when the script
+         sits in the orchestrator clone's own ``.claude/scripts/`` (or in
+         ``templates/scripts/`` in the clone). On an INSTALLED project this
+         resolves to the USER project root, which has no
+         ``claude_mcp_servers/`` — which is exactly why every rung is
+         validated and why this rung is LAST.
+
+    Never raises. Path joins go through ``pathlib`` so no separator is
+    assumed (a Windows ``\\``-separator bug shipped once already, v0.2.81).
+    """
+    for _candidate in (
+        os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip(),
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+        str(Path(__file__).resolve().parent.parent.parent),
+    ):
+        if not _candidate:
+            continue
+        try:
+            _root = Path(_candidate)
+            if (_root / "claude_mcp_servers").is_dir():
+                return _root
+        except (OSError, ValueError):
+            continue
+    return None
+# VCO-SHARED-END: _resolve_orchestrator_root
+
+# Query token limit (same as embedding limit).
+#
+# v0.2.92 (WP-E): this used to be a flat constant, independent of which
+# embedding model was actually resolved (see `_ACTIVE_EMBEDDING_MODEL`
+# below) — a qwen3 install and a jina/CPU-tier install got the SAME cap
+# even though their real budgets differ by up to 5x. `_max_query_tokens()`
+# now resolves the cap from the query-budget SSOT
+# (`claude_mcp_servers.rl_client.query_chunking.model_max_tokens`, which
+# itself reads `chunking.py`'s `MODEL_TOKEN_LIMITS` — the same SSOT
+# `query_code_graph.py` and `code_truncation.py` use) and falls back to
+# this constant only when the SSOT can't resolve a model (partial
+# install without the orchestrator venv on the path).
 MAX_QUERY_TOKENS = 2500
+
+# Standalone-only default for the chars-per-token ratio. MUST MATCH
+# `claude_mcp_servers/weaviate_mcp/chunking.py::CHARS_PER_TOKEN_TEXT`, which is
+# the ONE home; this is only reached when that module is not importable (a
+# free-tier / partial install running this script without the orchestrator
+# packages). See `_chars_per_token()` below.
+CHARS_PER_TOKEN_FALLBACK = 4
+
+# Standalone-only default for the num_ctx of the DEFAULT text model
+# (qwen3-embedding:0.6b). MUST MATCH that model's entry in
+# `claude_mcp_servers/weaviate_mcp/chunking.py::MODEL_TOKEN_LIMITS`; only
+# reached when the SSOT resolver isn't importable — same literal discipline
+# as CHARS_PER_TOKEN_FALLBACK above. See `_num_ctx_for_model()` below.
+NUM_CTX_FALLBACK = 10_240
+
+
+def _num_ctx_for_model(model: str) -> int:
+    """Resolve the Ollama ``num_ctx`` for *model* from the ONE SSOT.
+
+    Routed through ``vco_lib.embedding_providers.ollama._num_ctx_for_model``
+    (the same resolver the canonical adapter uses; it reads
+    ``chunking.MODEL_TOKEN_LIMITS``) whenever the orchestrator packages are
+    importable, so the value tracks the table instead of mirroring it
+    (v0.2.92 m-R5-5 — this was a second hardcoded copy of 10_240). Falls
+    back to ``NUM_CTX_FALLBACK`` when this script runs standalone with no
+    vco_lib on sys.path — never raises. Same lazy/soft-fail shape as
+    ``_max_query_tokens()`` and ``_chars_per_token()``.
+    """
+    try:
+        from vco_lib.embedding_providers.ollama import (
+            _num_ctx_for_model as _ssot_resolver,
+        )
+        return int(_ssot_resolver(model))
+    except Exception:
+        return NUM_CTX_FALLBACK
+
+
+def _max_query_tokens() -> int:
+    """Resolve the query-token cap for the currently-active text model.
+
+    Falls back to the flat ``MAX_QUERY_TOKENS`` default when the SSOT
+    resolver isn't importable (e.g. this script running standalone on a
+    free-tier install without the orchestrator venv) — never raises.
+    """
+    try:
+        from claude_mcp_servers.rl_client.query_chunking import model_max_tokens
+        resolved = model_max_tokens(_ACTIVE_EMBEDDING_MODEL)
+        if resolved:
+            return int(resolved)
+    except Exception:
+        pass
+    return MAX_QUERY_TOKENS
 
 # Import shared tier helpers from the MCP server (single source of truth).
 # PR-2 portability (2026-05-06): the orchestrator clone is resolved via
@@ -99,8 +209,41 @@ except Exception:
 # self-only inline implementation if the helper isn't on sys.path
 # (e.g. user hand-edited their venv). The fallback yields the
 # pre-P1-D behaviour: just self [+ shared].
+#
+# v0.2.92: put the helper's directory on sys.path. `kg_access` lives at
+# `<orchestrator>/claude_mcp_servers/scripts/kg_access.py`; the editable
+# install of `weaviate_mcp` only puts `<orchestrator>/claude_mcp_servers` on
+# the path, so a bare `import kg_access` could never resolve from an installed
+# project — the except-branch fired on EVERY install and the launcher's
+# per-project KG access matrix (`VCT_KG_ACCESS_LIST`, granted through the
+# Identity tab) was silently ignored by this CLI. `kg_access`'s own docstring
+# already specifies this resolution ("Resolution requires $VCT_ORCHESTRATOR_ROOT
+# (set in .claude/env)"); it just was not implemented on the consumer side.
+# The try/except is RETAINED: the helper is genuinely optional for a
+# project installed without the orchestrator clone reachable.
+#
+# The root ladder itself is `_resolve_orchestrator_root()` above — the ONE
+# shape across templates/scripts/*.py. Taking it here adds the
+# `$VCT_INSTALL_ROOT` rung (some launcher spawns set only that alias) and
+# validates the env value instead of trusting it.
 try:
-    from kg_access import kg_collections_to_search as _kg_collections_to_search  # type: ignore[import-not-found]
+    _kg_access_dir = (
+        (_resolve_orchestrator_root() or Path(__file__).resolve().parent.parent.parent)
+        / "claude_mcp_servers" / "scripts"
+    )
+    # APPEND, not insert(0): nothing else on the path provides `kg_access`, and
+    # this directory holds a dozen loose script modules — putting it first
+    # would let any of them shadow a same-named import for the whole process.
+    if _kg_access_dir.is_dir() and str(_kg_access_dir) not in sys.path:
+        sys.path.append(str(_kg_access_dir))
+except Exception:
+    pass
+
+try:
+    from kg_access import (  # type: ignore[import-not-found]
+        kg_collections_to_search as _kg_collections_to_search,
+        sanitize_collection_prefix as _sanitize_kg_prefix,
+    )
 except Exception:
     def _kg_collections_to_search(  # type: ignore[no-redef]
         self_kg: str,
@@ -113,18 +256,139 @@ except Exception:
             out.append(shared_kg)
         return out
 
+    _sanitize_kg_prefix = None  # type: ignore[assignment]
+
+
+# ─── v0.2.92: explicit search scope (`--project` / `--collection` /
+# `--shared-only` / `--no-shared`) ──────────────────────────────────────
+#
+# The requirement is "search both the shared and the project's KG by default,
+# UNLESS optionally specified". The default half was already correct; the
+# optional half did not exist — `kg-search`'s whole flag surface was
+# `--limit/--type/--tags/--content/--files-only/--detail/--days`, with no way
+# to name a project or a collection. `code-graph-query` already had
+# `--project/-p` and `--collection/-c`, so this reuses that vocabulary rather
+# than inventing a third convention.
+
+_KG_SUFFIX = "_KnowledgeGraph"
+#: A Weaviate class name usable verbatim (letter, then word chars).
+_CLASS_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class ScopeError(ValueError):
+    """An impossible / contradictory combination of scope flags."""
+
+
+def _project_to_kg_collection(name: str) -> str:
+    """Map a project NAME to its canonical ``<Prefix>_KnowledgeGraph`` class.
+
+    Uses the underscore-DROPPING KG sanitizer (`kg_access`, which delegates to
+    `vco_lib.codegraph_naming.sanitize_for_weaviate_class`) — the same rule the
+    WRITER names KG collections with. It is deliberately NOT the code-graph
+    rule: KG names drop underscores (`Acme_Tools` → `AcmeTools`) while
+    code-graph class names preserve them (`Acme_Tools` → `Acme_Tools`).
+    Mixing the two is the defect family that mislabelled live collections as
+    orphans, so this never guesses: when the sanitizer is unavailable, an
+    already-canonical name is accepted verbatim and anything else is refused
+    with a pointer to `--collection`.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ScopeError("--project needs a non-empty project name")
+    if name.endswith(_KG_SUFFIX):
+        # Tolerate a full collection name — users copy/paste it from the logs.
+        return name
+    if _sanitize_kg_prefix is not None:
+        return f"{_sanitize_kg_prefix(name)}{_KG_SUFFIX}"
+    if _CLASS_TOKEN_RE.match(name):
+        return f"{name}{_KG_SUFFIX}"
+    raise ScopeError(
+        f"cannot derive a collection name for --project {name!r} on this "
+        "install (the kg_access sanitizer is not importable and the name is "
+        "not already a valid class prefix). Pass the collection explicitly: "
+        f"--collection <Prefix>{_KG_SUFFIX}"
+    )
+
+
+def resolve_kg_scope(
+    projects=None,
+    collections=None,
+    shared_only: bool = False,
+    no_shared: bool = False,
+    self_kg: str = "",
+    shared_kg: str = "",
+    include_peers: bool = True,
+) -> list:
+    """Return the ordered, de-duplicated list of KG collections to query.
+
+    Pure function (env is read only through ``_kg_collections_to_search``'s
+    access-matrix lookup) so the flag semantics are unit-testable without
+    Weaviate. Raises :class:`ScopeError` on a contradictory combination —
+    silently picking a winner is how a user ends up searching something other
+    than what they asked for.
+
+    Defaults (no flags): self + shared + access-matrix peers — unchanged.
+    ``--project`` selects explicitly and therefore SUPPRESSES the implicit
+    peer fan-out; ``--collection`` bypasses resolution entirely.
+    """
+    projects = [p for p in (projects or []) if p and p.strip()]
+    collections = [c for c in (collections or []) if c and c.strip()]
+
+    if collections and (projects or shared_only or no_shared):
+        raise ScopeError(
+            "--collection names the collections to search outright; it cannot "
+            "be combined with --project / --shared-only / --no-shared"
+        )
+    if shared_only and no_shared:
+        raise ScopeError("--shared-only and --no-shared are contradictory")
+    if shared_only and projects:
+        raise ScopeError(
+            "--shared-only searches only the shared KG; drop it or drop --project"
+        )
+
+    if collections:
+        return list(dict.fromkeys(c.strip() for c in collections))
+
+    if shared_only:
+        if not shared_kg:
+            raise ScopeError(
+                "--shared-only requested but no shared KG is configured "
+                "(SHARED_KG_COLLECTION is unset for this project)"
+            )
+        return [shared_kg]
+
+    effective_shared = "" if no_shared else shared_kg
+
+    if projects:
+        out = [_project_to_kg_collection(p) for p in projects]
+        if effective_shared and effective_shared not in out:
+            out.append(effective_shared)
+        return list(dict.fromkeys(out))
+
+    if not include_peers:
+        out = [self_kg] if self_kg else []
+        if effective_shared and effective_shared not in out:
+            out.append(effective_shared)
+        return out
+
+    return _kg_collections_to_search(
+        self_kg=self_kg,
+        shared_kg=effective_shared,
+        include_dev=False,
+    )
+
 # v0.2.18: EmbeddingService is the single source of truth for which
 # named-vector slot to target on queries (and which model to embed
 # with). Import is graceful — if vco_lib isn't on sys.path (rare; user
 # pip-installed an older venv), the legacy `get_embedding()` /
 # `target_vector = "ollama_embed"` path still works.
 try:
-    _env_root_for_vco = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if _env_root_for_vco:
-        _vco_lib_parent = Path(_env_root_for_vco)
-    else:
-        _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
-    if str(_vco_lib_parent) not in sys.path:
+    # v0.2.92: the third copy of the orchestrator-root ladder in this file.
+    # Routed through the shared resolver; when it cannot answer, insert
+    # NOTHING rather than a directory that has already been shown not to
+    # contain `vco_lib/` (the pre-fix arm inserted the user project root).
+    _vco_lib_parent = _resolve_orchestrator_root()
+    if _vco_lib_parent is not None and str(_vco_lib_parent) not in sys.path:
         sys.path.insert(0, str(_vco_lib_parent))
     from vco_lib.embedding_service import (
         EmbeddingService,
@@ -154,7 +418,7 @@ except Exception:
 try:
     from weaviate_mcp.query_logger import ToolUsageLogger
     HAS_LOGGER = True
-except Exception as e:
+except Exception:
     HAS_LOGGER = False
 
 
@@ -300,11 +564,29 @@ def get_embedding(text: str) -> list:
     # EmbeddingService now owns; the fallback uses os.getenv to stay
     # outside that pattern). Anyone hitting this fallback should re-run
     # install.py --update to rebundle the vco_lib package.
+    # v0.2.92 R40: num_ctx was UNSET here, so this fallback inherited Ollama's
+    # 2048 default. Queries are short, so nothing was being lost in practice —
+    # but an unset window is an omission, not a decision, and the next caller
+    # to send something longer would have lost its tail with an HTTP 200.
+    # v0.2.92 (m-R5-5): the value is now resolved from the ONE SSOT (the
+    # `_num_ctx_for_model` resolver over `chunking.MODEL_TOKEN_LIMITS` —
+    # same resolver the canonical adapter uses) whenever the orchestrator
+    # packages are importable, so it tracks the table instead of mirroring
+    # it. The literal below is the documented standalone fallback for the
+    # case this comment block describes (script running with NO vco_lib on
+    # sys.path); it MUST MATCH chunking.MODEL_TOKEN_LIMITS for the default
+    # model.
+    fallback_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+    _fallback_num_ctx = _num_ctx_for_model(fallback_model)
     response = requests.post(
         f"{OLLAMA_URL}/api/embeddings",
         json={
-            "model": os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
+            "model": fallback_model,
             "prompt": text,
+            "options": {"num_ctx": _fallback_num_ctx},
+            # v0.2.92 R40: never let Ollama truncate silently — a loud 400
+            # the caller raises beats a 200 that dropped the query tail.
+            "truncate": False,
         }
     )
 
@@ -314,9 +596,34 @@ def get_embedding(text: str) -> list:
     return response.json()["embedding"]
 
 
+def _chars_per_token() -> int:
+    """The chars-per-token heuristic, read from its ONE home.
+
+    v0.2.92 (register #50): the value is
+    ``claude_mcp_servers.weaviate_mcp.chunking.CHARS_PER_TOKEN_TEXT``. Four
+    sites in this file carried a bare ``4`` — ``count_tokens`` plus the three
+    truncation slices — so a change to the ratio would have moved the "is this
+    query too long?" decision without moving the trim that answers it.
+
+    Read lazily and soft-failed, exactly like ``_max_query_tokens()`` above
+    and for the same reason: this script SHIPS into every project's
+    ``.claude/scripts/`` and its wrapper only guarantees ``import weaviate``
+    (``templates/scripts/kg-search``), not the orchestrator packages. The
+    fallback is the single documented default for the
+    standalone/partial-install case — a class-C mirror of ONE number, not a
+    second policy — and it is the same value the home declares, so a divergence
+    can only be introduced deliberately.
+    """
+    try:
+        from claude_mcp_servers.weaviate_mcp.chunking import CHARS_PER_TOKEN_TEXT
+        return int(CHARS_PER_TOKEN_TEXT)
+    except Exception:
+        return CHARS_PER_TOKEN_FALLBACK
+
+
 def count_tokens(text: str) -> int:
     """Simple token counting (approximate)"""
-    return len(text) // 4
+    return len(text) // _chars_per_token()
 
 
 def reassemble_chunks(collection, source_node_id: str) -> Dict[str, Any]:
@@ -371,6 +678,7 @@ def search_knowledge(
     show_content: bool = False,
     files_only: bool = False,
     detail: str = "auto",
+    collections: list = None,
 ):
     """
     Search knowledge graph using semantic search.
@@ -379,6 +687,9 @@ def search_knowledge(
     Truncates queries exceeding MAX_QUERY_TOKENS.
 
     Args:
+        collections: Explicit collection list (from :func:`resolve_kg_scope`).
+            ``None`` keeps the default fan-out: self + shared + access-matrix
+            peers.
         detail: Verbosity tier per result. "auto" (default) picks per-result tier
             from the relevance score using the same 5-tier system as hybrid_search
             ("discard" / "summary" / "single_chunk" / "three_chunks" / "full").
@@ -396,13 +707,29 @@ def search_knowledge(
     result_count = 0
     error_msg = None
 
-    # Truncate query if too long
+    # Truncate query if too long. v0.2.92 (WP-E): both the cap AND the
+    # truncation itself are now token-aware — the cap comes from the
+    # SSOT (`_max_query_tokens()`, model-derived, not a flat constant),
+    # and the truncated text is the SHARED chunker's first chunk (reuses
+    # `query_chunking.chunk_query`, the same oversized-query machinery
+    # the KG hook path and `query_code_graph.py` use) rather than a raw
+    # `text[:n*4]` character slice that could cut mid-token/mid-word.
     query_tokens = count_tokens(query)
-    if query_tokens > MAX_QUERY_TOKENS:
-        # Roughly trim to max tokens (4 chars per token)
-        max_chars = MAX_QUERY_TOKENS * 4
-        query = query[:max_chars]
-        print(f"⚠️  Query truncated from {query_tokens} to {MAX_QUERY_TOKENS} tokens", file=sys.stderr)
+    max_query_tokens = _max_query_tokens()
+    if query_tokens > max_query_tokens:
+        try:
+            from claude_mcp_servers.rl_client.query_chunking import chunk_query
+            chunks = chunk_query(query, _ACTIVE_EMBEDDING_MODEL)
+            query = chunks[0] if chunks else query[
+                : max_query_tokens * _chars_per_token()
+            ]
+        except Exception:
+            # Roughly trim to max tokens — last-resort fallback when the
+            # shared chunker itself is unavailable. The ratio still comes
+            # from `_chars_per_token()`, so this trim and `count_tokens`'
+            # estimate above cannot disagree about what a token costs.
+            query = query[: max_query_tokens * _chars_per_token()]
+        print(f"⚠️  Query truncated from {query_tokens} to {max_query_tokens} tokens", file=sys.stderr)
 
     client = get_weaviate_client()
 
@@ -435,10 +762,19 @@ def search_knowledge(
         # env vars, and self/shared collisions defensively. include_dev=False
         # because this CLI doesn't currently render development-collection
         # results (mirrors the semantic_graph_search MCP semantics).
-        collections_to_query = _kg_collections_to_search(
-            self_kg=KG_COLLECTION,
-            shared_kg=SHARED_KG_COLLECTION,
-            include_dev=False,
+        #
+        # v0.2.92: an explicit `collections` list (from the new --project /
+        # --collection / --shared-only / --no-shared flags) overrides the
+        # default fan-out. Passing None keeps the pre-v0.2.92 behaviour
+        # byte-for-byte.
+        collections_to_query = (
+            list(collections)
+            if collections
+            else _kg_collections_to_search(
+                self_kg=KG_COLLECTION,
+                shared_kg=SHARED_KG_COLLECTION,
+                include_dev=False,
+            )
         )
 
         fetch_limit = limit * 3
@@ -468,7 +804,7 @@ def search_knowledge(
                 for obj in response.objects:
                     obj._collection_source = coll_name
                     all_results.append(obj)
-            except Exception as e:
+            except Exception:
                 # Collection might not exist, skip silently
                 pass
 
@@ -572,9 +908,21 @@ def search_knowledge(
             # Tier-aware formatting via the shared helpers when available.
             collections_searched = len(collections_to_query)
             if collections_searched > 1:
-                print(f"\n🔍 Found {len(unique_results)} results for: \"{query}\" (searched {collections_searched} collections)\n")
+                # v0.2.92: NAME the collections, don't just count them. "which
+                # collections am I actually searching" was the question users
+                # were (mis)reading the MCP module's import-time INFO line to
+                # answer; this answers it from the process that actually ran
+                # the query.
+                print(
+                    f"\n🔍 Found {len(unique_results)} results for: \"{query}\" "
+                    f"(searched {collections_searched} collections: "
+                    f"{', '.join(collections_to_query)})\n"
+                )
             else:
-                print(f"\n🔍 Found {len(unique_results)} results for: \"{query}\"\n")
+                print(
+                    f"\n🔍 Found {len(unique_results)} results for: \"{query}\" "
+                    f"(searched {collections_to_query[0] if collections_to_query else 'nothing'})\n"
+                )
             print("=" * 60)
 
             sidecar_db = _load_node_formats() if HAS_TIER_HELPERS else {}
@@ -684,32 +1032,44 @@ def search_knowledge(
             )
 
 
-def list_all_nodes():
+def list_all_nodes(collections: list = None):
     """List all nodes in knowledge graph.
 
     v0.2.46 V46-D: cursor-paginates so collections > 1000 nodes are
     fully listed (previously the display silently truncated past 1000).
+
+    v0.2.92: takes an explicit collection list so the scope flags work here
+    too. The DEFAULT is unchanged — self only, no shared, no peers — because
+    `list` answers "what is in MY graph"; widening it is opt-in via
+    ``--project`` / ``--shared-only`` / ``--collection``.
     """
+    collections = list(collections) if collections else [KG_COLLECTION]
     client = get_weaviate_client()
 
     try:
-        collection = client.collections.get(KG_COLLECTION)
-
-        # Cursor-paginate to fetch every object.
+        # Cursor-paginate to fetch every object, across every scoped collection.
         all_objects = []
-        cursor = None
-        PAGE_SIZE = 1000
-        while True:
-            if cursor is not None:
-                response = collection.query.fetch_objects(limit=PAGE_SIZE, after=cursor)
-            else:
-                response = collection.query.fetch_objects(limit=PAGE_SIZE)
-            if not response.objects:
-                break
-            all_objects.extend(response.objects)
-            if len(response.objects) < PAGE_SIZE:
-                break
-            cursor = response.objects[-1].uuid
+        for coll_name in collections:
+            try:
+                collection = client.collections.get(coll_name)
+            except Exception:
+                continue
+            cursor = None
+            PAGE_SIZE = 1000
+            while True:
+                try:
+                    if cursor is not None:
+                        response = collection.query.fetch_objects(limit=PAGE_SIZE, after=cursor)
+                    else:
+                        response = collection.query.fetch_objects(limit=PAGE_SIZE)
+                except Exception:
+                    break
+                if not response.objects:
+                    break
+                all_objects.extend(response.objects)
+                if len(response.objects) < PAGE_SIZE:
+                    break
+                cursor = response.objects[-1].uuid
 
         # Group by type
         nodes_by_type = {}
@@ -719,7 +1079,10 @@ def list_all_nodes():
                 nodes_by_type[node_type] = []
             nodes_by_type[node_type].append(obj.properties['title'])
 
-        print(f"\n📚 Knowledge Graph: {len(all_objects)} nodes\n")
+        print(
+            f"\n📚 Knowledge Graph: {len(all_objects)} nodes "
+            f"({', '.join(collections)})\n"
+        )
         print("=" * 60)
 
         for node_type in sorted(nodes_by_type.keys()):
@@ -735,13 +1098,15 @@ def list_all_nodes():
         client.close()
 
 
-def search_recent(days: int = 7, node_type: str = None):
-    """Search for recently updated nodes"""
+def search_recent(days: int = 7, node_type: str = None, collections: list = None):
+    """Search for recently updated nodes.
+
+    v0.2.92: honours the scope flags (default unchanged — self only).
+    """
+    collections = list(collections) if collections else [KG_COLLECTION]
     client = get_weaviate_client()
 
     try:
-        collection = client.collections.get(KG_COLLECTION)
-
         # Calculate cutoff date
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
@@ -750,20 +1115,25 @@ def search_recent(days: int = 7, node_type: str = None):
         if node_type:
             date_filter = date_filter & Filter.by_property("node_type").equal(node_type)
 
-        # Query
-        response = collection.query.fetch_objects(
-            filters=date_filter,
-            limit=100
-        )
+        objects = []
+        for coll_name in collections:
+            try:
+                response = client.collections.get(coll_name).query.fetch_objects(
+                    filters=date_filter,
+                    limit=100,
+                )
+            except Exception:
+                continue
+            objects.extend(response.objects)
 
         # Sort by updated_at
         sorted_nodes = sorted(
-            response.objects,
+            objects,
             key=lambda obj: obj.properties.get('updated_at', ''),
             reverse=True
         )
 
-        print(f"\n📅 Recently updated (last {days} days): {len(sorted_nodes)} nodes\n")
+        print(f"\n📅 Recently updated (last {days} days): {len(sorted_nodes)} nodes ({', '.join(collections)})\n")
         print("=" * 60)
 
         for obj in sorted_nodes:
@@ -780,13 +1150,15 @@ def search_recent(days: int = 7, node_type: str = None):
         client.close()
 
 
-def search_created(days: int = 7, node_type: str = None):
-    """Search for recently created nodes"""
+def search_created(days: int = 7, node_type: str = None, collections: list = None):
+    """Search for recently created nodes.
+
+    v0.2.92: honours the scope flags (default unchanged — self only).
+    """
+    collections = list(collections) if collections else [KG_COLLECTION]
     client = get_weaviate_client()
 
     try:
-        collection = client.collections.get(KG_COLLECTION)
-
         # Calculate cutoff date
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
@@ -795,20 +1167,25 @@ def search_created(days: int = 7, node_type: str = None):
         if node_type:
             date_filter = date_filter & Filter.by_property("node_type").equal(node_type)
 
-        # Query
-        response = collection.query.fetch_objects(
-            filters=date_filter,
-            limit=100
-        )
+        objects = []
+        for coll_name in collections:
+            try:
+                response = client.collections.get(coll_name).query.fetch_objects(
+                    filters=date_filter,
+                    limit=100,
+                )
+            except Exception:
+                continue
+            objects.extend(response.objects)
 
         # Sort by created_at
         sorted_nodes = sorted(
-            response.objects,
+            objects,
             key=lambda obj: obj.properties.get('created_at', ''),
             reverse=True
         )
 
-        print(f"\n📅 Recently created (last {days} days): {len(sorted_nodes)} nodes\n")
+        print(f"\n📅 Recently created (last {days} days): {len(sorted_nodes)} nodes ({', '.join(collections)})\n")
         print("=" * 60)
 
         for obj in sorted_nodes:
@@ -849,9 +1226,67 @@ if __name__ == "__main__":
     )
     parser.add_argument("--days", type=int, default=7, help="Days to look back")
 
+    # ── Scope flags (v0.2.92) ────────────────────────────────────────
+    # Default (no flags) = this project's KG + the shared KG + every peer the
+    # launcher's access matrix has granted. These make the "unless optionally
+    # specified" half of the requirement real. Flag names/short forms mirror
+    # `code-graph-query` so the two CLIs share one vocabulary.
+    scope = parser.add_argument_group("scope")
+    scope.add_argument(
+        "--project", "-p", action="append", default=None, metavar="NAME",
+        help=(
+            "Search this project's KG instead of the current one. Repeatable. "
+            "Naming projects explicitly also suppresses the implicit "
+            "access-matrix peer fan-out."
+        ),
+    )
+    scope.add_argument(
+        "--collection", "-c", action="append", default=None, metavar="CLASS",
+        help=(
+            "Search this exact Weaviate collection. Repeatable. Bypasses all "
+            "resolution; cannot be combined with the other scope flags."
+        ),
+    )
+    shared_group = scope.add_mutually_exclusive_group()
+    shared_group.add_argument(
+        "--shared-only", action="store_true",
+        help="Search ONLY the shared cross-project KG.",
+    )
+    shared_group.add_argument(
+        "--no-shared", action="store_true",
+        help="Exclude the shared cross-project KG.",
+    )
+
     args = parser.parse_args()
 
     tags_list = args.tags.split(",") if args.tags else None
+
+    # `search` fans out by default (project + shared + granted peers);
+    # list/recent/created are self-only by default (they answer "what is in MY
+    # graph"). Both keep those defaults byte-for-byte when no flag is given —
+    # the resolver only runs when the user actually specified a scope.
+    explicit_scope = bool(
+        args.project or args.collection or args.shared_only or args.no_shared
+    )
+    scoped = None
+    if explicit_scope:
+        try:
+            scoped = resolve_kg_scope(
+                projects=args.project,
+                collections=args.collection,
+                shared_only=args.shared_only,
+                no_shared=args.no_shared,
+                self_kg=KG_COLLECTION,
+                shared_kg=SHARED_KG_COLLECTION,
+                include_peers=(args.command == "search"),
+            )
+        except ScopeError as e:
+            parser.error(str(e))  # exit 2, argparse-consistent
+
+    # For `search`, None keeps the untouched legacy fan-out path.
+    search_scope = scoped
+    # For the other three, the default list is self-only.
+    listing_scope = scoped if scoped else [KG_COLLECTION]
 
     try:
         if args.command == "search":
@@ -859,13 +1294,17 @@ if __name__ == "__main__":
                 print("Error: search requires a query")
                 sys.exit(1)
             files_only = getattr(args, 'files_only', False)
-            search_knowledge(args.query, args.limit, args.node_type, tags_list, args.content, files_only, args.detail)
+            search_knowledge(
+                args.query, args.limit, args.node_type, tags_list,
+                args.content, files_only, args.detail,
+                collections=search_scope,
+            )
         elif args.command == "list":
-            list_all_nodes()
+            list_all_nodes(collections=listing_scope)
         elif args.command == "recent":
-            search_recent(args.days, args.node_type)
+            search_recent(args.days, args.node_type, collections=listing_scope)
         elif args.command == "created":
-            search_created(args.days, args.node_type)
+            search_created(args.days, args.node_type, collections=listing_scope)
     except Exception as e:
         print(f"❌ Error: {e}", file=sys.stderr)
         sys.exit(1)

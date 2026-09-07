@@ -7,7 +7,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # post-compact.ps1
 # Fires on PostCompact event — after context compaction completes.
-# Logs the event to ~/.claude/metrics/compactions.jsonl and notifies.
+# Logs the event to <metrics dir>/compactions.jsonl and notifies.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
@@ -141,15 +141,20 @@ if ($SessionId) {
     }
 }
 
-# Log compaction event under the user's home metrics dir.
-$UserHome = [System.Environment]::GetFolderPath('UserProfile')
-$LogDir = Join-Path $UserHome ".claude/metrics"
-if (-not (Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+# Log the compaction event. v0.2.92 W7: the metrics home moved out of
+# ~/.claude; `_lib/metrics-dir.ps1` is the ONE PowerShell-side resolver
+# (lockstep sibling of `_lib/metrics-dir.sh`). A missing helper skips the log
+# line rather than guessing a path — the notification below still fires.
+$MetricsLib = Join-Path $PSScriptRoot "_lib/metrics-dir.ps1"
+if (Test-Path -LiteralPath $MetricsLib -PathType Leaf) {
+    . $MetricsLib
+    $LogDir = Get-VcoMetricsDir
+    if ($LogDir) {
+        $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $line = "{""timestamp"":""$ts"",""project"":""$ProjectName"",""trigger"":""$Trigger""}"
+        try { Add-Content -Path (Join-Path $LogDir "compactions.jsonl") -Value $line } catch { }
+    }
 }
-$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$line = "{""timestamp"":""$ts"",""project"":""$ProjectName"",""trigger"":""$Trigger""}"
-try { Add-Content -Path (Join-Path $LogDir "compactions.jsonl") -Value $line } catch { }
 
 # Cross-platform desktop notification.
 $NotifyScript = Join-Path $ProjectDir ".claude/scripts/notify.py"

@@ -275,11 +275,19 @@ class ProcessNodeCallSiteTest(unittest.TestCase):
             )
 
             rel = str(node.relative_to(td))
+            # v0.2.92 WP-Q2: the description/summary must be PLAUSIBLE
+            # summaries, not the one-character placeholders this fixture used
+            # to carry. `has_formats` now rejects a stored NON-ANSWER (empty,
+            # sub-8-character, or refusal-shaped) so a poisoned row heals
+            # instead of being frozen by the matching content hash — and "d" /
+            # "s" are indistinguishable from exactly that. The assertion below
+            # is about the HASH SCHEME, so the fixture must satisfy every
+            # OTHER precondition of the skip.
             db = {
                 rel: {
                     "title": "Call Site Node",
-                    "description": "d",
-                    "summary": "s",
+                    "description": "Describes the call-site node under test.",
+                    "summary": "A plausible summary of the call-site node.",
                     "content_hash": canonical,  # seeded under CANONICAL scheme
                     "total_chunks": 1,
                 }

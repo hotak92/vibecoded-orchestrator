@@ -10,8 +10,10 @@ and ``CodeGraphAnalyzer._analyze_js_file`` — one extractor serves BOTH the
 ``lang_dispatch`` table wired it. Only body edits: the mechanical ``self.``
 -> ``ctx.`` rename and the analyzer-resident ``embed_class`` /
 ``embed_function`` / ``generate_embedding`` / ``_shape_for_insert`` seams
-reached via ``ctx.``. Behavior is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+reached via ``ctx.``. The MOVE was verbatim; behaviour has since been
+CORRECTED here (v0.2.92 and WP-5b), so it is no longer byte-identical to
+the analyzer's original. ``tests/test_codegraph_golden.py`` pins what it
+does TODAY.
 """
 from __future__ import annotations
 
@@ -25,7 +27,6 @@ from vco_lib.codegraph_entities import (
     CodeEntity,
     FileExtraction,
     InteractionGroup,
-    KIND_API,
     KIND_CLASS,
     KIND_FUNCTION,
     ModuleDescriptor,
@@ -33,6 +34,8 @@ from vco_lib.codegraph_entities import (
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
+    blank_block_comments_preserving_lines,
+    build_api_entity,
     run_pure_extractor,
 )
 
@@ -277,8 +280,9 @@ def extract_js_file(
     """
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines
-               if l.strip() and not l.strip().startswith('//') and not l.strip().startswith('*')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('//')
+               and not line.strip().startswith('*')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
@@ -291,7 +295,7 @@ def extract_js_file(
 
     # Strip single-line and multi-line comments for cleaner pattern matching
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-    content_clean = re.sub(r'/\*.*?\*/', ' ', content_clean, flags=re.DOTALL)
+    content_clean = blank_block_comments_preserving_lines(content_clean)
 
     # --- Imports ---
     imports: List[str] = []
@@ -308,12 +312,20 @@ def extract_js_file(
         r'(?:export\s+(?:default\s+)?)?class\s+([\w]+)\s*(?:extends\s+([\w.]+)\s*)?{',
         re.MULTILINE
     )
-    class_info: Dict[str, Tuple[int, Optional[str]]] = {}  # name -> (start_line, base_class)
+    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
+    # see the same change in `ruby.py`, where the fixture proves the loss.
+    # Two same-named classes in ONE module are legal in different BLOCK
+    # scopes (`if (a) { class Cfg {} } else { class Cfg {} }`, or two
+    # factory functions each declaring one), and the dict silently kept
+    # only the last.
+    # The writer's occurrence disambiguator keys on `(kind, identity_key)` and
+    # already covers KIND_CLASS, so the second declaration lands as `<name>#2`.
+    class_decls: List[Tuple[str, int, Optional[str]]] = []
     for m in class_pattern.finditer(content_clean):
         cname = m.group(1)
         base = m.group(2)
         start_line = content_clean[:m.start()].count('\n') + 1
-        class_info[cname] = (start_line, base)
+        class_decls.append((cname, start_line, base))
         class_names.append(cname)
 
     # --- Functions ---
@@ -348,7 +360,10 @@ def extract_js_file(
 
     # --- Fastify route definitions ---
     # Pattern: { secure: true/false, method: 'POST', url: '/tx/build', handler, schema }
-    # May span multiple lines
+    # May span multiple lines.
+    # NOT a comment scrub (v0.2.92 §3.3): a READ over `content` with no
+    # substitution and no line derivation — exempt from the newline-preserving
+    # rule that governs `blank_block_comments_preserving_lines`.
     route_pattern = re.compile(
         r'\{[^}]*method:\s*[\'"](\w+)[\'"][^}]*url:\s*[\'"]([^\'"]+)[\'"][^}]*\}',
         re.DOTALL
@@ -424,7 +439,13 @@ def extract_js_file(
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0, 'apis': 0}
 
     # --- Store classes ---
-    for cname, (start_line, base_class) in class_info.items():
+    # v0.2.92 — the `end_line` convention. `_extract_balanced_block` returns
+    # the 1-indexed CLOSING line, and its docstring states that IS the
+    # `end_line` at every caller site. This loop used to store
+    # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
+    # FUNCTION loop below already used the returned value directly. One
+    # convention now; the golden corpus had ratified the +1 across 7 languages.
+    for cname, start_line, base_class in class_decls:
         _class_end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 80)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
@@ -453,7 +474,7 @@ def extract_js_file(
             signature=signature,
             doc="",
             start_line=start_line,
-            end_line=start_line + len(class_lines),
+            end_line=_class_end_line,
             project=helpers.project_name,
             extras={"methods": methods[:20]},
             deferred_embed=(
@@ -510,23 +531,19 @@ def extract_js_file(
         if proxy_target:
             description += f" [proxies to {proxy_target}]"
 
-        # v0.2.82 (G1 task 2): defer the API embed — a zero-arg closure instead
-        # of an eager vector, so `_resolve_deferred_embed` SKIP/STAMPs a
+        # v0.2.82 (G1 task 2): the API embed is DEFERRED — a zero-arg closure
+        # instead of an eager vector, so `_resolve_deferred_embed` SKIP/STAMPs a
         # hash-matched API row on a metadata-only revision bump (ZERO re-embeds).
-        entities.append(CodeEntity(
-            kind=KIND_API, file_path_rel=relative_path,
-            extras={
-                "endpoint": route['url'],
-                "method": route['method'],
-                "api_description": description,
-                "parameters": [],
-                "returns": "",
-                "project": helpers.project_name,
-                "proxy_target": proxy_target or "",
-            },
-            deferred_embed=(
-                lambda d=description: helpers.generate_embedding(d)
-            ),
+        # v0.2.92: constructed by the ONE shared builder (was a hand-rolled
+        # CodeEntity here, in csharp and in proto).
+        entities.append(build_api_entity(
+            file_path_rel=relative_path,
+            endpoint=route['url'],
+            method=route['method'],
+            description=description,
+            project=helpers.project_name,
+            proxy_target=proxy_target or "",
+            embed=helpers.generate_embedding,
         ))
         stats['apis'] += 1
 

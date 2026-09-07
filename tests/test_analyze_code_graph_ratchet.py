@@ -57,7 +57,50 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # to read `code_vector_slot` / `code_model_id` off the EmbeddingService. Net
 # 7361 -> 7314 INCLUDING the new operation. Re-pinned DOWNWARD to the measured
 # value.
-_ANALYZER_LINES_MAX = 7314
+#
+# v0.2.92: the cross-reference family moved to `vco_lib/codegraph_references.py`
+# — the pure edge RESOLUTION (short-name / base-class / import-name -> target
+# id), the add-if-absent WRITE, and the beacon READ that
+# `create_cross_references` needs before it can decide what is missing. The
+# analyzer keeps the loops that own the caches and the collections. Net
+# 7314 -> 7292. Re-pinned DOWNWARD to the measured value, per this ratchet's
+# own rule that an extraction must tighten the pin (the extraction landed
+# without the re-pin, leaving 22 lines of stale slack).
+#
+# v0.2.92 code-graph write-path (the two reported-but-untaken defects). Both
+# fixes ADD analyzer lines — the Defect-A chunk-plan hoist + seam and the
+# Defect-B per-file identity disambiguation + its once-per-walk accounting —
+# so the ratchet was answered by EXTRACTION, not by re-pinning upward. Moved to
+# `vco_lib/codegraph_guards.py` (which already owned `chunk_identities` /
+# `build_chunk_write_params`, so the two identity key spaces `::i` and `#n` now
+# sit under one banner where a future editor sees both):
+#   * `plan_chunk_texts`        — the chunk DECISION, split from the WRITE
+#   * `dispatch_deferred_embed` — the 3-way deferred-embed routing
+#   * `fan_out_chunk_writes`    — the N-object chunk write loop
+#   * `skip_or_stamp_all_chunks`— the all-SKIP-then-STAMP ordering + memoized
+#     reads that `_maybe_stamp_all_chunks` used to hold inline
+#   * `stamp_single_chunk_props`— the chunk_num=0/total=1 stamp
+#   * `all_chunks_skippable`    — MOVED from `codegraph_extractor_generation`
+#     (it lived there only because this file was held by another lane in
+#     v0.2.91; its own docstring named guards as the natural home)
+# Net, including both fixes: 7292 measured 7227 before the change and 7227
+# after. Re-pinned DOWNWARD from 7292 to the measured value.
+# v0.2.92 BLOCKER-2 (the force-drop identity guard). The fix ADDS analyzer
+# lines — the guard call at the `create_collections` chokepoint, the
+# `project_prefix` field the guard checks, `repo_path` threading, and the
+# refusal's distinct exit — so, per this ratchet's own rule, it was answered by
+# EXTRACTION rather than an upward re-pin:
+#   * the decision itself, its `DropVerdict` type and `CodeGraphDropRefused`
+#     live in the new `vco_lib/codegraph_drop_guard.py`; the analyzer holds
+#     ONE call (`_enforce_drop_guard`) and nothing else;
+#   * `_WORKTREE_PATH_SEGMENTS` + `_worktree_segment_in_value` MOVED to
+#     `vco_lib/codegraph_naming.py` — they answer "is this string a canonical
+#     project name?", which is that module's whole subject, and they are pure.
+#     The analyzer imports both under their historical private aliases.
+# Net, including the fix: 7227 measured 7227 — the pin holds UNCHANGED. (It is
+# also pinned by EXACT equality in tests/test_v0292_n35_rewire_transform.py
+# ::TestTheRatchetHeld, so a change here must move both.)
+_ANALYZER_LINES_MAX = 7227
 
 
 def _measure() -> int:

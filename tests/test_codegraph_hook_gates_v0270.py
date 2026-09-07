@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env  # noqa: E402
 from tests.conftest import resolve_analyzer_python  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -258,7 +259,8 @@ def test_g5_guard_refuses_worktree_basename_without_project(tmp_path: Path) -> N
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     r = subprocess.run(
         [_analyzer_python(), str(analyzer), "."],
-        cwd=str(wt), capture_output=True, text=True, timeout=60, env=env,
+        cwd=str(wt), capture_output=True, text=True, timeout=60,
+        env=child_env(env),
     )
     assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
     assert "refusing to mint" in r.stderr, r.stderr[-400:]
@@ -277,7 +279,8 @@ def test_g5_guard_allows_explicit_project_from_worktree(tmp_path: Path) -> None:
     try:
         r = subprocess.run(
             [_analyzer_python(), str(analyzer), ".", "--project", "CanonicalProj"],
-            cwd=str(wt), capture_output=True, text=True, timeout=60, env=env,
+            cwd=str(wt), capture_output=True, text=True, timeout=60,
+            env=child_env(env),
         )
         assert "refusing to mint" not in r.stderr, (
             f"guard wrongly fired with an explicit --project: {r.stderr[-400:]}"
@@ -308,7 +311,8 @@ def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     r = subprocess.run(
         [_analyzer_python(), str(analyzer), "."],
-        cwd=str(legit), capture_output=True, text=True, timeout=60, env=env,
+        cwd=str(legit), capture_output=True, text=True, timeout=60,
+        env=child_env(env),
     )
     assert "refusing to mint" not in r.stderr, (
         f"guard FALSE-REFUSED a legitimately-named 'wt-foo' project: {r.stderr[-400:]}"
@@ -327,7 +331,8 @@ def test_g5_guard_refuses_explicit_worktree_relative_project(tmp_path: Path) -> 
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     r = subprocess.run(
         [_analyzer_python(), str(analyzer), ".", "--project", "vco-wt/bug1"],
-        cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
+        cwd=str(plain), capture_output=True, text=True, timeout=60,
+        env=child_env(env),
     )
     assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
     assert "refusing to mint" in r.stderr, r.stderr[-400:]
@@ -348,7 +353,8 @@ def test_g5_guard_allows_explicit_legit_wt_substring_project(tmp_path: Path) -> 
     try:
         r = subprocess.run(
             [_analyzer_python(), str(analyzer), ".", "--project", "SwiftlyTyped"],
-            cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
+            cwd=str(plain), capture_output=True, text=True, timeout=60,
+            env=child_env(env),
         )
         assert "refusing to mint" not in r.stderr, (
             f"guard FALSE-REFUSED an explicit legit 'wt'-substring project: {r.stderr[-400:]}"

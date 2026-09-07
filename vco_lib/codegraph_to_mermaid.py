@@ -58,8 +58,8 @@ import logging
 import os
 import re
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Optional
+from dataclasses import dataclass
+from typing import Literal, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)

@@ -581,26 +581,14 @@ pub fn release_owned() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // The lockfile-touching tests mutate VCT_STATE_DIR at process
-    // scope. Serialise them so parallel cargo-test runs don't observe
-    // each other's pid files. Same pattern as auth::tests.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn with_state_dir<F: FnOnce(&std::path::Path)>(f: F) {
-        let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Safety: tests are serialized by SERIALIZE; no thread
-        // concurrently observes/mutates VCT_STATE_DIR.
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
-        f(tmp.path());
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
-    }
+    use vct_launcher_core::test_env::with_state_dir;
+    // v0.2.92: `with_state_dir` + the file-local SERIALIZE mutex used to
+    // be defined here — one of five near-identical copies. Every copy
+    // ended by UNSETTING `VCT_STATE_DIR` instead of restoring the prior
+    // value, which destroyed any outer redirect for every test that ran
+    // after it in the same binary. The shared helper restores, and its
+    // `GLOBAL_ENV_MUTEX` serialises across the whole workspace rather
+    // than only within this file.
 
     #[test]
     fn read_pid_returns_none_when_file_absent() {

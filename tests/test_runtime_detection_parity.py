@@ -14,6 +14,14 @@ contract documented in the v0.2.21 ship plan §27 property (12a):
     watcher (Step 24 supervisor port preserves the behaviour) AND by
     install.py's container-bootstrap code path.
 
+    v0.2.92 (BLOCKER-4) sharpens the first rung: the env override is a
+    PIN, not a preference. When it names a runtime, that runtime is the
+    ONLY candidate, and an unusable one is REFUSED with an actionable
+    message — never swapped for the other one, because the two runtimes
+    hold separate named volumes and a swap forks the data plane. Python
+    and Rust are byte-identical on every arm of `candidate_order`; the
+    shared fixture `tests/fixtures/container_runtime_parity.json` pins it.
+
 Existing coverage in ``test_install_runtime_and_naming.py`` covers
 PATH-only auto-detection but not the env-override layer. This file fills
 those gaps so the install.py side stays consistent with the Rust side.
@@ -214,11 +222,49 @@ class DetectContainerRuntimeEnvOverrideTests(unittest.TestCase):
                                side_effect=_make_run_ok):
             self.assertEqual(install._detect_container_runtime(), "podman")
 
-    def test_env_preferred_unreachable_falls_through_to_autodetect(self):
-        """VCT_CONTAINER_RUNTIME=podman, podman on PATH but
-        `podman version` fails → fall through to docker rather than
-        returning "". The Rust side's resolve_runtime has equivalent
-        graceful-degradation; we mirror it."""
+    def _detect_capturing_stderr(self, *, pref: str, on_path: set,
+                                 run_side_effect) -> "tuple[str, str]":
+        """Run the detector on a scripted host, returning (result, stderr).
+
+        WHY STDERR HERE, WHEN THE HOOKS ASSERT STDOUT (v0.2.92 MAJOR-6): the
+        two surfaces genuinely differ and both are correct. ``install.py`` runs
+        in the user's terminal, so its stderr is read as it is written (and the
+        same text is mirrored into the install log by ``_log_install_event``).
+        A SessionStart HOOK exits 0 and its stderr is discarded by the harness,
+        so the hooks had to move the identical report to stdout. Same message,
+        two channels, chosen per surface — not an inconsistency.
+        """
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with _EnvOverride(pref), \
+             mock.patch.object(install.shutil, "which",
+                               side_effect=_make_which(on_path)), \
+             mock.patch.object(install.subprocess, "run",
+                               side_effect=run_side_effect), \
+             contextlib.redirect_stderr(buf):
+            result = install._detect_container_runtime()
+        return result, buf.getvalue()
+
+    def test_env_preferred_unreachable_is_refused_not_swapped(self):
+        """VCT_CONTAINER_RUNTIME=podman, podman on PATH but `podman version`
+        fails → REFUSE (return ""), do not run on docker instead.
+
+        v0.2.92 BLOCKER-4. This test previously pinned the opposite — it
+        asserted "docker" and justified it with "the Rust side's
+        resolve_runtime has equivalent graceful-degradation; we mirror it".
+        That claim was never true: ``runtime.rs::candidate_order`` has always
+        returned ``[pref]`` alone, which is precisely why the fall-through was
+        a SPLIT-BRAIN and not a symmetric design — the installer/hooks drove
+        docker while the launcher reported no runtime. It is also not a
+        rescue: podman and docker keep separate named volumes
+        (``infrastructure/docker-compose.yml``), so the swap forks the data
+        plane and stands an EMPTY Weaviate up on :8081. Both surfaces now
+        refuse, and ``tests/fixtures/container_runtime_parity.json``'s
+        ``env_pref_unusable_is_refused_not_substituted`` row records their
+        AGREEMENT rather than a tolerated divergence.
+        """
         calls: list[str] = []
 
         def fake_run(args, *_a, **_kw):
@@ -227,30 +273,39 @@ class DetectContainerRuntimeEnvOverrideTests(unittest.TestCase):
                 return _make_run_fail()
             return _make_run_ok()
 
-        with _EnvOverride("podman"), \
-             mock.patch.object(install.shutil, "which",
-                               side_effect=_make_which({"podman", "docker"})), \
-             mock.patch.object(install.subprocess, "run", side_effect=fake_run):
-            result = install._detect_container_runtime()
-        # The override branch fails its probe, then we re-enter the
-        # auto-detect loop, which also probes podman first (it's still
-        # on PATH and returncode=1), so podman gets probed twice in
-        # total before docker wins. Pin both behaviours.
-        self.assertEqual(result, "docker",
-                         "preferred runtime unreachable → fall through to "
-                         f"docker; got {result!r}, probes={calls!r}")
-        self.assertIn("docker", calls,
-                      "docker must be probed in the fallthrough chain")
+        result, err = self._detect_capturing_stderr(
+            pref="podman", on_path={"podman", "docker"}, run_side_effect=fake_run,
+        )
+        self.assertEqual(result, "", f"pinned runtime must not be swapped; got {result!r}")
+        # The pin is the WHOLE candidate order, so podman is probed exactly
+        # once. Pre-fix it was probed twice — once as the preference, then
+        # again in its canonical slot — before docker won.
+        self.assertEqual(calls.count("podman"), 1,
+                         f"the pin is the whole order; probes={calls!r}")
+        # docker IS probed once, but only to answer "is the alternative
+        # usable?" for the hint. That it never becomes the result is the point.
+        self.assertEqual(calls.count("docker"), 1, f"probes={calls!r}")
+        # "" alone cannot distinguish a deliberate refusal from a crashed
+        # resolver returning nothing. The hint is what makes it a refusal, so
+        # assert the facts a user acts on.
+        self.assertIn("VCT_CONTAINER_RUNTIME=podman is set but", err)
+        self.assertIn("podman version` failed", err)
+        self.assertIn("docker is usable", err)
+        self.assertIn("SEPARATE named volumes", err)
+        self.assertIn("unset VCT_CONTAINER_RUNTIME", err)
 
-    def test_env_preferred_not_on_path_falls_through_to_autodetect(self):
-        """VCT_CONTAINER_RUNTIME=docker but docker not installed →
-        fall through to podman (which IS on PATH)."""
-        with _EnvOverride("docker"), \
-             mock.patch.object(install.shutil, "which",
-                               side_effect=_make_which({"podman"})), \
-             mock.patch.object(install.subprocess, "run",
-                               side_effect=_make_run_ok):
-            self.assertEqual(install._detect_container_runtime(), "podman")
+    def test_env_preferred_not_on_path_is_refused_not_swapped(self):
+        """VCT_CONTAINER_RUNTIME=docker but docker not installed → refuse,
+        naming podman as the usable alternative rather than silently using
+        it. Same ruling; the remedy differs (install/repin, not "start it"),
+        which is why the hint says "is not on PATH"."""
+        result, err = self._detect_capturing_stderr(
+            pref="docker", on_path={"podman"}, run_side_effect=_make_run_ok,
+        )
+        self.assertEqual(result, "", f"pinned runtime must not be swapped; got {result!r}")
+        self.assertIn("VCT_CONTAINER_RUNTIME=docker is set but docker is not on PATH", err)
+        self.assertIn("podman is usable", err)
+        self.assertIn("set it to podman", err)
 
     def test_returns_empty_string_when_env_set_but_no_runtimes(self):
         """VCT_CONTAINER_RUNTIME set but NEITHER runtime is on PATH —

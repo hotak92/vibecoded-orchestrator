@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tauri::{command, AppHandle, Emitter, Manager, Runtime, State, Window};
@@ -6,12 +7,17 @@ use tauri::{command, AppHandle, Emitter, Manager, Runtime, State, Window};
 use crate::commands::git_user_editable_merge::{
     write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
 };
+use crate::commands::git_cmd::{run_git_raw, run_git_raw_env};
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
 // v0.2.21 Step 12: liveness check for the detached vct-hub during the
 // update flow's stop-before-pull sequence. Same symbol the boot sweep
 // uses, sourced from the core crate so the re-export visibility in
 // `lib.rs` (`pub(crate) use`) doesn't matter here.
+// v0.2.92 WP-13: the shared "what did this probe establish?" tri-state.
+// Replaces this module's `remote_check_ok: bool` + `remote_check_error`
+// pair — see `UpdateStatus::remote_check`.
+use vct_launcher_core::check_state::CheckState;
 use vct_launcher_core::process::pid_is_alive;
 use vct_launcher_core::process::CommandExt as _;
 
@@ -828,12 +834,8 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
         return Err("Not a git repository".to_string());
     }
 
-    let tag_output = tokio::process::Command::new("git").silent()
-        .args(["describe", "--tags", "--abbrev=0"])
-        .current_dir(&p)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let tag_output =
+        run_git_raw(&p, &["describe", "--tags", "--abbrev=0"]).await?;
 
     if tag_output.status.success() {
         let tag = String::from_utf8_lossy(&tag_output.stdout).trim().to_string();
@@ -842,12 +844,7 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
         }
     }
 
-    let hash_output = tokio::process::Command::new("git").silent()
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&p)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let hash_output = run_git_raw(&p, &["rev-parse", "--short", "HEAD"]).await?;
 
     if hash_output.status.success() {
         return Ok(String::from_utf8_lossy(&hash_output.stdout).trim().to_string());
@@ -923,20 +920,36 @@ pub struct UpdateStatus {
     /// the sidecar metadata is absent (e.g. dev build running from
     /// `cargo run` with no dist artifacts staged).
     pub on_disk_binary_version: String,
-    /// NEW v0.2.83 (D2 / A-RC1): honest remote-check health. `false` means the
-    /// remote signal is UNKNOWN — the fetch / rev-parse / rev-list chain could
-    /// not complete — NOT "up to date". Pre-v0.2.83 every failure in the remote
-    /// section silently left `remote_ahead=false`, indistinguishable from a
-    /// genuine "no update"; the frontend then rendered nothing (the first-start
-    /// bug). `true` on the success path AND for non-git installs (remote check
-    /// is not applicable there — `install_stale`/`binary_stale` carry the
-    /// banner, and retrying a non-checkout is pointless).
-    pub remote_check_ok: bool,
-    /// NEW v0.2.83 (D2 / A-RC1): concise last-stderr-line / stage label for the
-    /// failure that set `remote_check_ok=false`. `None` on success and for
-    /// non-git installs. The frontend surfaces this in the badge popover
-    /// ("Couldn't check for updates — <error>") and schedules fast retries.
-    pub remote_check_error: Option<String>,
+    /// Honest remote-check health, as a THREE-way answer (v0.2.92 WP-13).
+    ///
+    /// v0.2.83 (D2 / A-RC1) introduced this concept here first, as a
+    /// `remote_check_ok: bool` + `remote_check_error: Option<String>` pair —
+    /// the right instinct, one state short. A bool cannot say "not
+    /// applicable", so a non-git install (where there is no remote and never
+    /// will be) had to report `ok = true`, and the frontend collapsed
+    /// "checked, fine" and "nothing to check" into the same green.
+    ///
+    /// [`CheckState`] makes all three states expressible, and the same type
+    /// now carries the identical concept on `self_update::UpdateStatus` —
+    /// which is the point: v0.2.83's fix was correct and simply never
+    /// travelled to the other update surface, and a local bool pair is
+    /// exactly the shape that does not travel.
+    ///
+    /// * `Ok` — fetch + rev-parse + rev-list all completed; `remote_ahead`
+    ///   is a verdict.
+    /// * `NotApplicable` — this install is not a git checkout;
+    ///   `install_stale`/`binary_stale` carry the banner and retrying is
+    ///   pointless.
+    /// * `Unknown { error }` — the chain broke. `remote_ahead` is NOT a
+    ///   verdict; the frontend shows amber "couldn't check — <error>" and
+    ///   schedules fast retries.
+    pub remote_check: CheckState,
+    /// NEW v0.2.92 (WP-13): `true` when the install's clone has a detached
+    /// HEAD. The five inline `b == "HEAD" → "main"` normalisations this
+    /// struct's producer used to carry were each correct AND each destroyed
+    /// this fact, so the GUI could only ever say `Branch: main` about a repo
+    /// whose HEAD points at no branch at all.
+    pub head_detached: bool,
 }
 
 /// Check for updates across all three signals (git, manifest, binary).
@@ -950,14 +963,14 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
 
     // Defaults — populated below when sources are available.
     let mut remote_ahead = false;
-    // v0.2.83 (D2): honest remote-check health. Default ok=true / error=None so
-    // a non-git install (which never enters the remote section) reports
-    // "not applicable, no retry needed". The git branch below flips these to
-    // false + a concise error on ANY failure so the frontend can render an
-    // amber "couldn't check" state and schedule retries instead of a silent
-    // false "up to date" (A-RC1).
-    let mut remote_check_ok = true;
-    let mut remote_check_error: Option<String> = None;
+    // v0.2.92 WP-13: the default is `NotApplicable`, which is the literal
+    // truth for the path that skips the whole `if p.join(".git").exists()`
+    // block below. Pre-fix the default was `ok = true`, i.e. a non-git
+    // install claimed a successful remote check it never performed — a small
+    // lie that the frontend then rendered as green. The git block flips this
+    // to `Ok` or `Unknown{error}`.
+    let mut remote_check = CheckState::NotApplicable;
+    let mut head_detached = false;
     let mut source_version = String::new();
     let mut installed_version = String::new();
     let running_version = env!("CARGO_PKG_VERSION").to_string();
@@ -982,7 +995,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         // (health field) and let the install_stale / binary_stale signals
         // carry the banner. v0.2.83 (D2): this used to leave remote_ahead at
         // false SILENTLY — now every failure branch populates
-        // remote_check_ok/error so the frontend can honestly show
+        // `remote_check` so the frontend can honestly show
         // "couldn't check" and retry.
         if let Err(e) = crate::commands::self_update::ensure_upstream_remote(&p).await {
             tracing::warn!(
@@ -990,8 +1003,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                 p.display(),
                 e
             );
-            remote_check_ok = false;
-            remote_check_error = Some(format!("ensure_upstream_remote: {}", e));
+            remote_check = CheckState::unknown(format!("ensure_upstream_remote: {}", e));
         } else if let Err(e) =
             // v0.2.83 (D5): the SINGLE serialized fetch home — Quick policy
             // (short retry, `--no-write-fetch-head`, process-wide mutex) so
@@ -1015,46 +1027,40 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                 p.display(),
                 e
             );
-            remote_check_ok = false;
-            remote_check_error = Some(e);
+            remote_check = CheckState::unknown(e);
         } else {
-            // Detect the current branch so we know which upstream ref
-            // to compare against. Default to `main` on any error —
-            // matches the convention everywhere else in self_update.rs.
+            // Detect the current branch so we know which upstream ref to
+            // compare against. v0.2.92 WP-13: through the ONE resolver
+            // (`git_cmd::resolve_branch`) — this was one of the five inline
+            // `b == "HEAD" → "main"` copies, and the fact that this surface
+            // had the rule while `self_update.rs` did not is the divergence
+            // that produced the field incident.
             // v0.2.83 (D2): a rev-parse SPAWN error used to `?` out of the
-            // whole command (A-RC4). It is now a soft-fail: we mark the
-            // health field, but STILL fall back to `main` and proceed — the
+            // whole command (A-RC4). Still a soft-fail: we mark the health
+            // field, but STILL fall back to `main` and proceed — the
             // rev-list below is the real signal and may well succeed.
-            let branch = match tokio::process::Command::new("git")
-                .silent()
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .current_dir(&p)
-                .output()
-                .await
-            {
-                Ok(branch_output) => {
-                    if branch_output.status.success() {
-                        let b = String::from_utf8_lossy(&branch_output.stdout)
-                            .trim()
-                            .to_string();
-                        if b.is_empty() || b == "HEAD" {
-                            "main".to_string()
-                        } else {
-                            b
-                        }
-                    } else {
-                        "main".to_string()
+            let branch = match crate::commands::git_cmd::resolve_branch(&p).await {
+                Ok(state) => {
+                    head_detached = state.detached;
+                    if state.detached {
+                        tracing::warn!(
+                            "[vct] check_for_updates: {} has a DETACHED HEAD — comparing \
+                             against {}/{}",
+                            p.display(),
+                            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                            state.name,
+                        );
                     }
+                    state.name
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "[vct] check_for_updates: branch rev-parse spawn failed at {} ({}), assuming main",
+                        "[vct] check_for_updates: branch resolution failed at {} ({}), assuming main",
                         p.display(),
                         e
                     );
-                    remote_check_ok = false;
-                    remote_check_error = Some(format!("branch rev-parse: {}", e));
-                    "main".to_string()
+                    remote_check = CheckState::unknown(format!("branch rev-parse: {}", e));
+                    crate::commands::git_cmd::FALLBACK_BRANCH.to_string()
                 }
             };
 
@@ -1066,21 +1072,12 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
             // v0.2.83 (D2): spawn error, non-zero exit, AND count-parse
             // failure each used to be COMPLETELY SILENT (remote_ahead stayed
             // false with no log). All three now populate the health fields.
-            match tokio::process::Command::new("git")
-                .silent()
-                .args([
-                    "rev-list",
-                    "--count",
-                    &format!(
-                        "HEAD..{}/{}",
-                        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-                        branch
-                    ),
-                ])
-                .current_dir(&p)
-                .output()
-                .await
-            {
+            let revlist_spec = format!(
+                "HEAD..{}/{}",
+                crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                branch
+            );
+            match run_git_raw(&p, &["rev-list", "--count", revlist_spec.as_str()]).await {
                 Ok(revlist) if revlist.status.success() => {
                     let raw = String::from_utf8_lossy(&revlist.stdout)
                         .trim()
@@ -1088,6 +1085,14 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                     match raw.parse::<u32>() {
                         Ok(n) => {
                             remote_ahead = n > 0;
+                            // Only NOW is the chain complete. Do not
+                            // overwrite an `Unknown` recorded earlier in this
+                            // block (the branch-resolution soft-fail above):
+                            // that failure is still true even though we got a
+                            // count out the other side.
+                            if remote_check.is_known() {
+                                remote_check = CheckState::Ok;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1096,9 +1101,8 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                                 raw,
                                 e
                             );
-                            remote_check_ok = false;
-                            remote_check_error =
-                                Some(format!("rev-list count parse: {}", e));
+                            remote_check =
+                                CheckState::unknown(format!("rev-list count parse: {}", e));
                         }
                     }
                 }
@@ -1111,8 +1115,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                         p.display(),
                         stderr
                     );
-                    remote_check_ok = false;
-                    remote_check_error = Some(if stderr.is_empty() {
+                    remote_check = CheckState::unknown(if stderr.is_empty() {
                         "rev-list exited non-zero".to_string()
                     } else {
                         format!("rev-list: {}", stderr)
@@ -1124,8 +1127,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                         p.display(),
                         e
                     );
-                    remote_check_ok = false;
-                    remote_check_error = Some(format!("rev-list spawn: {}", e));
+                    remote_check = CheckState::unknown(format!("rev-list spawn: {}", e));
                 }
             }
         }
@@ -1199,8 +1201,8 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         installed_version,
         running_version,
         on_disk_binary_version,
-        remote_check_ok,
-        remote_check_error,
+        remote_check,
+        head_detached,
     })
 }
 
@@ -4100,18 +4102,16 @@ impl<'a> WaitForBinaryRefresh<'a> {
 /// retries on the next iteration. Same `.silent()` wrapper the rest
 /// of installer.rs uses so the Windows console window stays hidden.
 async fn run_git_pull_ff_only(install_path: &Path, branch: &str) -> Result<(), String> {
-    let out = tokio::process::Command::new("git")
-        .silent()
-        .args([
+    let out = run_git_raw(
+        install_path,
+        &[
             "pull",
             "--ff-only",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             branch,
-        ])
-        .current_dir(install_path)
-        .output()
-        .await
-        .map_err(|e| format!("git pull spawn failed: {}", e))?;
+        ],
+    )
+    .await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(stderr.trim().to_string());
@@ -4260,20 +4260,12 @@ pub async fn update_orchestrator<R: Runtime>(
     };
     // Capture pull_branch for the _start entry (read before the pull so the
     // row is accurate even if the pull later fails).
-    let start_branch = {
-        let out = tokio::process::Command::new("git").silent()
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&install_path)
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => {
-                let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if b.is_empty() || b == "HEAD" { "main".to_string() } else { b }
-            }
-            _ => "main".to_string(),
-        }
-    };
+    // v0.2.92 WP-13: through the ONE resolver (was an inline copy of the
+    // `HEAD → main` rule).
+    let start_branch = crate::commands::git_cmd::resolve_branch(&install_path)
+        .await
+        .map(|s| s.name)
+        .unwrap_or_else(|_| crate::commands::git_cmd::FALLBACK_BRANCH.to_string());
     write_audit(
         "update_orchestrator_start",
         serde_json::json!({
@@ -4372,26 +4364,25 @@ pub async fn update_orchestrator<R: Runtime>(
 
     // Detect the current branch so the explicit `git pull <remote>
     // <branch>` invocation below doesn't depend on upstream tracking
-    // config (which would point at `origin/<branch>` on a fork). Default
-    // to `main` on any error — matches the convention in self_update.rs.
-    let pull_branch_output = tokio::process::Command::new("git").silent()
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&install_path)
-        .output()
+    // config (which would point at `origin/<branch>` on a fork).
+    // v0.2.92 WP-13: through the ONE resolver (was an inline copy of the
+    // `HEAD → main` rule). A detached HEAD is logged, not blocked: the pull
+    // fast-forwards a detached HEAD perfectly well — verified empirically,
+    // see the comment on the `GitPullFailed` arm below.
+    let pull_branch_state = crate::commands::git_cmd::resolve_branch(&install_path)
         .await
         .map_err(|e| format!("git rev-parse failed: {}", e))?;
-    let pull_branch = if pull_branch_output.status.success() {
-        let b = String::from_utf8_lossy(&pull_branch_output.stdout)
-            .trim()
-            .to_string();
-        if b.is_empty() || b == "HEAD" {
-            "main".to_string()
-        } else {
-            b
-        }
-    } else {
-        "main".to_string()
-    };
+    let pull_branch = pull_branch_state.name.clone();
+    if pull_branch_state.detached {
+        tracing::warn!(
+            "[vct] update_orchestrator: {} has a DETACHED HEAD — pulling {}/{}. The pull \
+             advances HEAD but leaves it detached; Preferences → Launcher updates offers a \
+             one-click reattach.",
+            install_path.display(),
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            pull_branch,
+        );
+    }
 
     // v0.2.24 §A0 (2026-05-22): pre-merge user-editable files BEFORE
     // `git pull --ff-only`. Without this step, ANY local uncommitted
@@ -4617,10 +4608,7 @@ pub async fn update_orchestrator<R: Runtime>(
         == crate::commands::git_user_editable_merge::PullPlan::RealMerge;
     let pull_args =
         pull_plan.pull_args(crate::commands::self_update::VCO_UPSTREAM_REMOTE, &pull_branch);
-    let pull = tokio::process::Command::new("git").silent()
-        .args(&pull_args)
-        .current_dir(&install_path)
-        .output()
+    let pull = run_git_raw(&install_path, &pull_args)
         .await
         .map_err(|e| format!("git pull failed: {}", e))?;
 
@@ -4756,10 +4744,23 @@ pub async fn update_orchestrator<R: Runtime>(
             ));
         }
         // v0.2.55 (audit R1): any OTHER git-pull failure (not a conflict,
-        // not a non-FF divergence) — e.g. a broken local git, a detached
-        // HEAD, a missing upstream remote. PRE-v0.2.55 this returned a
-        // GUI-only error string with no durable trace; a 3rd-party's Claude
-        // couldn't see it at session start. Write a durable deferral too.
+        // not a non-FF divergence) — e.g. a broken local git, a missing or
+        // misconfigured upstream remote, an interrupted prior git operation
+        // leaving `.git/MERGE_HEAD` / `.git/rebase-*`, or an unreadable
+        // object store. PRE-v0.2.55 this returned a GUI-only error string
+        // with no durable trace; a 3rd-party's Claude couldn't see it at
+        // session start. Write a durable deferral too.
+        //
+        // v0.2.92 WP-13 — CORRECTION. This comment used to list "a detached
+        // HEAD" among the causes. It is not one: `git pull --ff-only
+        // <remote> main` fast-forwards a detached HEAD perfectly well
+        // (verified empirically in a throwaway repo — HEAD advances and
+        // stays detached). Nothing in this block detects detachment either;
+        // the attribution was a guess, and it survived long enough to be
+        // repeated verbatim in user-facing recovery text, sending a real
+        // user to check a state that was not their problem. A comment
+        // naming a cause is a claim about behaviour, and it gets verified
+        // like one.
         write_launcher_update_diverged_deferral(
             &install_path,
             &pull_branch,
@@ -4998,7 +4999,29 @@ pub async fn update_orchestrator<R: Runtime>(
     // Abort cleanly, write a durable deferral so a terminal Claude can see the
     // update didn't land, and return a plain error (NOT the Merge/Rebase modal
     // — that path is what failed; routing back to it would loop).
-    if let Err(e) = assert_head_reached_upstream(&install_path).await {
+    match assert_head_reached_upstream(&install_path).await {
+        Ok(HeadAdvanceOutcome::Reached) => {}
+        // v0.2.92 WP-13 (item 8): the guard fail-opens, but no longer in
+        // silence. The update continues — see the rationale on the enum — and
+        // a durable `launcher_update_post_pull_unverified` entry tells the
+        // user (and their terminal Claude at session start) that the one check
+        // proving the pull landed could not run.
+        Ok(HeadAdvanceOutcome::Unverified { error }) => {
+            crate::commands::git_user_editable_merge::write_launcher_update_post_pull_unverified_deferral(
+                &install_path,
+                &pull_branch,
+                &error,
+            );
+            write_audit(
+                "update_orchestrator_post_pull_unverified",
+                serde_json::json!({
+                    "branch": pull_branch,
+                    "error": error,
+                    "install_path": path,
+                }),
+            );
+        }
+        Err(e) => {
         abort_update_restore_binaries_and_hub(
             &install_path,
             pre_pull_renamed.as_deref(),
@@ -5023,6 +5046,7 @@ pub async fn update_orchestrator<R: Runtime>(
             }),
         );
         return Err(e);
+        }
     }
 
     // Stage 2: Re-run install.py with --update flag
@@ -5339,12 +5363,7 @@ pub async fn update_orchestrator<R: Runtime>(
 /// Best-effort: read HEAD's full SHA. Returns None on any failure (offline,
 /// detached HEAD, corrupted repo). The frontend renders "—" in that slot.
 async fn read_head_sha(repo: &Path) -> Option<String> {
-    let out = tokio::process::Command::new("git").silent()
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .await
-        .ok()?;
+    let out = run_git_raw(repo, &["rev-parse", "HEAD"]).await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -5361,16 +5380,16 @@ async fn read_head_sha(repo: &Path) -> Option<String> {
 /// caller may not have fetched recently — `ls-remote` always hits the
 /// network and reports the current upstream tip.
 async fn read_remote_sha(repo: &Path, branch: &str) -> Option<String> {
-    let out = tokio::process::Command::new("git").silent()
-        .args([
+    let out = run_git_raw(
+        repo,
+        &[
             "ls-remote",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             branch,
-        ])
-        .current_dir(repo)
-        .output()
-        .await
-        .ok()?;
+        ],
+    )
+    .await
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -5409,11 +5428,7 @@ async fn collect_diverged_files(
     // Find the merge-base. If this fails (e.g. unrelated histories,
     // which shouldn't happen for any real VCO clone), fall back to the
     // pre-v0.2.27 behaviour rather than blocking the modal.
-    let merge_base = match tokio::process::Command::new("git").silent()
-        .args(["merge-base", "HEAD", &upstream_ref])
-        .current_dir(repo)
-        .output()
-        .await
+    let merge_base = match run_git_raw(repo, &["merge-base", "HEAD", upstream_ref.as_str()]).await
     {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -5429,11 +5444,7 @@ async fn collect_diverged_files(
     let run_diff = |spec: String| {
         let repo = repo.to_path_buf();
         async move {
-            let out = tokio::process::Command::new("git").silent()
-                .args(["diff", "--name-only", &spec])
-                .current_dir(&repo)
-                .output()
-                .await;
+            let out = run_git_raw(&repo, &["diff", "--name-only", spec.as_str()]).await;
             match out {
                 Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
                     .lines()
@@ -5472,19 +5483,12 @@ async fn collect_diverged_files(
 /// unrelated histories — shouldn't happen for any real VCO clone but
 /// guard against it anyway).
 async fn legacy_collect_diverged_files(repo: &Path, branch: &str) -> Vec<String> {
-    let out = tokio::process::Command::new("git").silent()
-        .args([
-            "diff",
-            "--name-only",
-            &format!(
-                "HEAD..{}/{}",
-                crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-                branch
-            ),
-        ])
-        .current_dir(repo)
-        .output()
-        .await;
+    let legacy_spec = format!(
+        "HEAD..{}/{}",
+        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+        branch
+    );
+    let out = run_git_raw(repo, &["diff", "--name-only", legacy_spec.as_str()]).await;
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
@@ -5500,11 +5504,7 @@ async fn legacy_collect_diverged_files(repo: &Path, branch: &str) -> Vec<String>
 /// merge or rebase. `git diff --name-only --diff-filter=U` lists every
 /// path with unresolved merge markers.
 async fn collect_conflicted_files(repo: &Path) -> Vec<String> {
-    let out = tokio::process::Command::new("git").silent()
-        .args(["diff", "--name-only", "--diff-filter=U"])
-        .current_dir(repo)
-        .output()
-        .await;
+    let out = run_git_raw(repo, &["diff", "--name-only", "--diff-filter=U"]).await;
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
@@ -6073,25 +6073,20 @@ fn is_merge_or_rebase_conflict(err: &str) -> bool {
     crate::commands::git_user_editable_merge::is_pull_conflict(err)
 }
 
-/// Resolve the current pull branch. Defaults to "main" on any error.
-/// Mirrors the in-place logic in `update_orchestrator` so the two paths
-/// can't disagree.
+/// Resolve the current pull branch. Defaults to `main` on any error.
+///
+/// v0.2.92 WP-13: this used to be a hand-written copy of the `HEAD → main`
+/// rule whose doc comment said it "mirrors the in-place logic in
+/// `update_orchestrator` so the two paths can't disagree" — a promise kept
+/// by hand, within one file, while the OTHER update surface
+/// (`self_update.rs`) disagreed with both. The mirror is gone; there is one
+/// resolver, and the thin wrapper survives only because ~6 call sites want
+/// the name rather than the `BranchState`.
 async fn resolve_pull_branch(install_path: &Path) -> String {
-    let out = tokio::process::Command::new("git").silent()
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(install_path)
-        .output()
-        .await;
-    let out = match out {
-        Ok(o) if o.status.success() => o,
-        _ => return "main".to_string(),
-    };
-    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if b.is_empty() || b == "HEAD" {
-        "main".to_string()
-    } else {
-        b
-    }
+    crate::commands::git_cmd::resolve_branch(install_path)
+        .await
+        .map(|s| s.name)
+        .unwrap_or_else(|_| crate::commands::git_cmd::FALLBACK_BRANCH.to_string())
 }
 
 /// v0.2.24 §A0 (2026-05-22): orchestrate the pre-merge user-editable
@@ -6165,19 +6160,22 @@ async fn run_pre_merge_user_editable(
     let mut merged_any = false;
     for outcome in &outcomes {
         if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
-            let status = tokio::process::Command::new("git").silent()
-                .args(["add", "--"])
-                .arg(&outcome.path)
-                .current_dir(install_path)
-                .status()
-                .await;
+            let status = run_git_raw(
+                install_path,
+                &[
+                    OsStr::new("add"),
+                    OsStr::new("--"),
+                    outcome.path.as_os_str(),
+                ],
+            )
+            .await;
             match status {
-                Ok(s) if s.success() => merged_any = true,
+                Ok(s) if s.status.success() => merged_any = true,
                 Ok(s) => {
                     tracing::error!(
                         "[vct] pre_merge: git add failed for {} (exit {:?})",
                         outcome.path.display(),
-                        s.code(),
+                        s.status.code(),
                     );
                 }
                 Err(e) => {
@@ -6219,8 +6217,9 @@ async fn run_pre_merge_user_editable(
     if merged_any {
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         let msg = format!("vco: pre-merge user-editable files via A0 ({})", ts);
-        let commit_result = tokio::process::Command::new("git").silent()
-            .args([
+        let commit_result = run_git_raw(
+            install_path,
+            &[
                 "-c",
                 "user.name=VCO Orchestrator",
                 "-c",
@@ -6228,11 +6227,10 @@ async fn run_pre_merge_user_editable(
                 "commit",
                 "--no-verify",
                 "-m",
-                &msg,
-            ])
-            .current_dir(install_path)
-            .output()
-            .await;
+                msg.as_str(),
+            ],
+        )
+        .await;
         match commit_result {
             Ok(out) if out.status.success() => {
                 // Commit landed — pre-merge cleanliness is satisfied,
@@ -6253,18 +6251,25 @@ async fn run_pre_merge_user_editable(
                 );
                 for outcome in &outcomes {
                     if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
-                        let _ = tokio::process::Command::new("git").silent()
-                            .args(["restore", "--staged", "--"])
-                            .arg(&outcome.path)
-                            .current_dir(install_path)
-                            .status()
-                            .await;
-                        let _ = tokio::process::Command::new("git").silent()
-                            .args(["checkout", "--"])
-                            .arg(&outcome.path)
-                            .current_dir(install_path)
-                            .status()
-                            .await;
+                        let _ = run_git_raw(
+                            install_path,
+                            &[
+                                OsStr::new("restore"),
+                                OsStr::new("--staged"),
+                                OsStr::new("--"),
+                                outcome.path.as_os_str(),
+                            ],
+                        )
+                        .await;
+                        let _ = run_git_raw(
+                            install_path,
+                            &[
+                                OsStr::new("checkout"),
+                                OsStr::new("--"),
+                                outcome.path.as_os_str(),
+                            ],
+                        )
+                        .await;
                     }
                 }
             }
@@ -6637,21 +6642,45 @@ async fn finalize_update_and_restart<R: Runtime>(
 /// v0.2.63: after a pull/merge reported success (and wasn't "Already up to
 /// date"), confirm local HEAD actually reached the upstream tip BEFORE running
 /// install.py. If HEAD is still behind `vco_upstream/<branch>`, the upstream
+/// What the post-pull HEAD-advance backstop established. Three outcomes, not
+/// two — see [`assert_head_reached_upstream`]'s `Err` arm for the third.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeadAdvanceOutcome {
+    /// `HEAD` is at (or past) the upstream tip — the pull landed.
+    Reached,
+    /// The behind-count could not be computed, so whether the pull landed is
+    /// UNKNOWN. Non-blocking by design; the caller records it durably.
+    Unverified { error: String },
+}
+
 /// changes did NOT land (a non-FF that slipped through, an odd partial git
 /// state) and running install.py would execute the STALE source tree — the
 /// exact failure that crashed VCO_dev's v0.2.62 GUI update (old install.py,
 /// pre-fix line numbers). Returns `Err` so the caller aborts before install.py.
 ///
-/// Conservative: behind-count 0 → Ok. A count ERROR (a transient git hiccup on
-/// the just-fetched refs — rare) → Ok with a loud log, so a flaky `rev-list`
-/// never blocks an otherwise-healthy update. The pre-existing non-FF modal is
-/// the PRIMARY divergence guard; this is the backstop that the merge actually
-/// landed. Called from BOTH install.py choke points (`update_orchestrator`
-/// inline + `run_post_pull_install_and_restart`) — one concern, one home.
-async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String> {
+/// Three outcomes:
+///   * behind-count 0            → `Ok(Reached)`;
+///   * behind-count > 0          → `Err` (caller aborts before install.py);
+///   * behind-count ERRORED      → `Ok(Unverified { error })` — fail-OPEN, so
+///     a flaky `rev-list` never blocks an otherwise-healthy update, but the
+///     caller is TOLD rather than left to assume success (v0.2.92 WP-13).
+///
+/// The pre-existing non-FF modal is the PRIMARY divergence guard; this is the
+/// backstop that the merge actually landed. Called from BOTH install.py choke
+/// points (`update_orchestrator` inline + `run_post_pull_install_and_restart`)
+/// — one concern, one home.
+async fn assert_head_reached_upstream(
+    install_path: &Path,
+) -> Result<HeadAdvanceOutcome, String> {
     let branch = resolve_pull_branch(install_path).await;
-    match crate::commands::self_update::count_commits_behind_upstream(install_path, &branch).await {
-        Ok(0) => Ok(()),
+    match crate::commands::git_cmd::commits_behind(
+        install_path,
+        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+        &branch,
+    )
+    .await
+    {
+        Ok(0) => Ok(HeadAdvanceOutcome::Reached),
         Ok(behind) => Err(format!(
             "Update aborted before install.py: local HEAD is still {behind} commit(s) behind \
              {remote}/{branch} after the pull/merge — the upstream changes did not land, so \
@@ -6661,11 +6690,24 @@ async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String>
             remote = crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         )),
         Err(e) => {
+            // v0.2.92 WP-13 (WFT cross-cutting item 8). The fail-OPEN decision
+            // is DELIBERATE and unchanged: this is a backstop, and blocking an
+            // otherwise-healthy update on a transient `rev-list` hiccup would
+            // do more harm than the case it guards against.
+            //
+            // What changed is that it no longer fail-opens SILENTLY. Returning
+            // `Ok(())` made "the pull definitely landed" and "I could not tell
+            // whether the pull landed" the same value — so the one guard
+            // designed to catch "the update did not actually apply" was
+            // disarmed by exactly the failure mode that produces the outage it
+            // guards against. The caller now receives `Unverified` and records
+            // it durably; the update still proceeds.
             tracing::warn!(
                 "[vct] assert_head_reached_upstream: behind-count failed ({e}) — proceeding \
-                 (cannot confirm staleness; not blocking a healthy update on a git hiccup)."
+                 UNVERIFIED (cannot confirm the pull landed; not blocking a healthy update \
+                 on a git hiccup, but recording it)."
             );
-            Ok(())
+            Ok(HeadAdvanceOutcome::Unverified { error: e })
         }
     }
 }
@@ -6753,13 +6795,27 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     // the upstream tip before install.py, else we'd run the STALE tree (the
     // v0.2.62 update-crash class). Abort cleanly — revert binaries + restart
     // hub — and surface the error to the modal flow instead of running install.
-    if let Err(e) = assert_head_reached_upstream(install_path).await {
-        abort_update_restore_binaries_and_hub(
-            install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        return Err(e);
+    match assert_head_reached_upstream(install_path).await {
+        Ok(HeadAdvanceOutcome::Reached) => {}
+        // v0.2.92 WP-13 (item 8): same non-blocking-but-recorded treatment as
+        // the `update_orchestrator` call site. This surface has no `write_audit`
+        // closure in scope, so the durable ledger entry is the whole record.
+        Ok(HeadAdvanceOutcome::Unverified { error }) => {
+            let branch = resolve_pull_branch(install_path).await;
+            crate::commands::git_user_editable_merge::write_launcher_update_post_pull_unverified_deferral(
+                install_path,
+                &branch,
+                &error,
+            );
+        }
+        Err(e) => {
+            abort_update_restore_binaries_and_hub(
+                install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
+            return Err(e);
+        }
     }
 
     emit_progress(window, "install", "Applying updates...", 40.0);
@@ -6809,28 +6865,9 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     // Self-contained branch detection so this helper doesn't need
     // a branch parameter ripped through both call sites
     // (`merge_orchestrator_with_upstream` /
-    // `rebase_orchestrator_onto_upstream`). Defaults to "main" on
-    // any git failure — matches the convention used by the
-    // sibling `pull_branch` detection in `update_orchestrator`.
-    let v45b_branch = {
-        let out = tokio::process::Command::new("git")
-            .silent()
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(install_path)
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => {
-                let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if b.is_empty() || b == "HEAD" {
-                    "main".to_string()
-                } else {
-                    b
-                }
-            }
-            _ => "main".to_string(),
-        }
-    };
+    // `rebase_orchestrator_onto_upstream`).
+    // v0.2.92 WP-13: through the ONE resolver (was the fifth inline copy).
+    let v45b_branch = resolve_pull_branch(install_path).await;
 
     // v0.2.54 Track C (P0-7): shared finalize tail — V45-B binary wait,
     // V52-AI disarm, V52-AH staging + handoff, hub restart (no-handoff
@@ -7052,19 +7089,19 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // a bare error. (The update_orchestrator auto-merge arm already proves
     // --autostash is acceptable on this path.)
     emit_progress(&window, "update", "Merging upstream into local...", 10.0);
-    let pull = tokio::process::Command::new("git").silent()
-        .args([
+    let pull = run_git_raw(
+        &install_path,
+        &[
             "pull",
             "--no-rebase",
             "--no-edit",
             "--autostash",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ])
-        .current_dir(&install_path)
-        .output()
-        .await
-        .map_err(|e| format!("git pull (merge) failed: {}", e))?;
+            pull_branch.as_str(),
+        ],
+    )
+    .await
+    .map_err(|e| format!("git pull (merge) failed: {}", e))?;
 
     if !pull.status.success() {
         let stderr = String::from_utf8_lossy(&pull.stderr);
@@ -7346,12 +7383,12 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
     // have unstaged changes") and dead-ended the modal. --autostash stashes,
     // rebases, then pops; a pop-conflict is caught as a conflict below and
     // routed to the conflict modal + UPDATE_DEFERRED, not a bare error.
-    let rebase = tokio::process::Command::new("git").silent()
-        .args(["rebase", "--autostash", &upstream_ref])
-        .current_dir(&install_path)
-        .output()
-        .await
-        .map_err(|e| format!("git rebase failed: {}", e))?;
+    let rebase = run_git_raw(
+        &install_path,
+        &["rebase", "--autostash", upstream_ref.as_str()],
+    )
+    .await
+    .map_err(|e| format!("git rebase failed: {}", e))?;
 
     if !rebase.status.success() {
         let stderr = String::from_utf8_lossy(&rebase.stderr);
@@ -7501,10 +7538,7 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     let mut last_err: Option<String> = None;
 
     if in_merge {
-        let out = tokio::process::Command::new("git").silent()
-            .args(["merge", "--abort"])
-            .current_dir(&install_path)
-            .output()
+        let out = run_git_raw(&install_path, &["merge", "--abort"])
             .await
             .map_err(|e| format!("git merge --abort failed to spawn: {}", e))?;
         if !out.status.success() {
@@ -7521,10 +7555,7 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     }
 
     if in_rebase {
-        let out = tokio::process::Command::new("git").silent()
-            .args(["rebase", "--abort"])
-            .current_dir(&install_path)
-            .output()
+        let out = run_git_raw(&install_path, &["rebase", "--abort"])
             .await
             .map_err(|e| format!("git rebase --abort failed to spawn: {}", e))?;
         if !out.status.success() {
@@ -8009,17 +8040,7 @@ fn clear_update_resume_deferral_if_solo(install_path: &Path) {
 /// the tree is clean. Reads file contents via `git grep` so the scan
 /// covers tracked files only (no node_modules / target / etc).
 async fn detect_remaining_conflict_markers(repo: &Path) -> Vec<String> {
-    let out = tokio::process::Command::new("git")
-        .silent()
-        .args([
-            "grep",
-            "--name-only",
-            "-E",
-            "^(<{7}|={7}|>{7}) ",
-        ])
-        .current_dir(repo)
-        .output()
-        .await;
+    let out = run_git_raw(repo, &["grep", "--name-only", "-E", "^(<{7}|={7}|>{7}) "]).await;
     let out = match out {
         Ok(o) => o,
         Err(_) => return Vec::new(),
@@ -8240,8 +8261,9 @@ pub async fn resume_orchestrator_update<R: Runtime>(
         // DEFECT 3 exists to kill, resurfacing on the error path. An
         // unverifiable end state must be treated as NOT-verified, not as
         // up-to-date. Capture the Result and branch on Err below.
-        let behind_res = crate::commands::self_update::count_commits_behind_upstream(
+        let behind_res = crate::commands::git_cmd::commits_behind(
             &install_path,
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             &resume_branch,
         )
         .await;
@@ -8687,11 +8709,7 @@ async fn resolve_conflict_and_resume<R: Runtime>(
     //    blowing past argv length limits on Windows when there are
     //    many conflicted files).
     for file in &conflicted {
-        let out = tokio::process::Command::new("git")
-            .silent()
-            .args(["checkout", flag, "--", file])
-            .current_dir(&install_path)
-            .output()
+        let out = run_git_raw(&install_path, &["checkout", flag, "--", file.as_str()])
             .await
             .map_err(|e| {
                 format!(
@@ -8724,11 +8742,7 @@ async fn resolve_conflict_and_resume<R: Runtime>(
 
     // 2. `git add <files>`. Same per-file split for the same reason.
     for file in &conflicted {
-        let out = tokio::process::Command::new("git")
-            .silent()
-            .args(["add", "--", file])
-            .current_dir(&install_path)
-            .output()
+        let out = run_git_raw(&install_path, &["add", "--", file.as_str()])
             .await
             .map_err(|e| format!("git add -- {} failed to spawn: {}", file, e))?;
         if !out.status.success() {
@@ -8774,14 +8788,13 @@ async fn resolve_conflict_and_resume<R: Runtime>(
     );
 
     if in_merge {
-        let out = tokio::process::Command::new("git")
-            .silent()
-            .env("GIT_EDITOR", "true")
-            .args(["commit", "--no-edit"])
-            .current_dir(&install_path)
-            .output()
-            .await
-            .map_err(|e| format!("git commit failed to spawn: {}", e))?;
+        let out = run_git_raw_env(
+            &install_path,
+            &["commit", "--no-edit"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .await
+        .map_err(|e| format!("git commit failed to spawn: {}", e))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             write_audit(
@@ -8802,14 +8815,13 @@ async fn resolve_conflict_and_resume<R: Runtime>(
         // Rebase. `--continue` will pause if there are MORE conflicted
         // commits to replay — in that case the caller (the modal) will
         // see a fresh conflict modal pop and can resolve again.
-        let out = tokio::process::Command::new("git")
-            .silent()
-            .env("GIT_EDITOR", "true")
-            .args(["rebase", "--continue"])
-            .current_dir(&install_path)
-            .output()
-            .await
-            .map_err(|e| format!("git rebase --continue failed to spawn: {}", e))?;
+        let out = run_git_raw_env(
+            &install_path,
+            &["rebase", "--continue"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .await
+        .map_err(|e| format!("git rebase --continue failed to spawn: {}", e))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             write_audit(
@@ -8940,12 +8952,11 @@ pub(crate) fn tracked_gate_refuses(t: Trackedness) -> bool {
 /// missing/unspawnable) is Unknown — NOT conflated with "exit 1 = untracked" —
 /// letting the destructive delete gate fail closed (refuse on Unknown).
 async fn file_trackedness(install_path: &Path, rel_path: &str) -> Trackedness {
-    let out = tokio::process::Command::new("git")
-        .silent()
-        .args(["ls-files", "--error-unmatch", "--", rel_path])
-        .current_dir(install_path)
-        .output()
-        .await;
+    let out = run_git_raw(
+        install_path,
+        &["ls-files", "--error-unmatch", "--", rel_path],
+    )
+    .await;
     match out {
         Ok(o) if o.status.success() => Trackedness::Tracked,
         Ok(_) => Trackedness::Untracked,
@@ -9361,11 +9372,8 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
         // Backing up the DISCARDED stage for both arms fixes the asymmetry: the
         // user's WIP is never the unbacked side.
         let discarded_stage = autostash_discarded_stage(side);
-        let show = tokio::process::Command::new("git")
-            .silent()
-            .args(["show", &format!(":{}:{}", discarded_stage, file)])
-            .current_dir(&install_path)
-            .output()
+        let show_spec = format!(":{}:{}", discarded_stage, file);
+        let show = run_git_raw(&install_path, &["show", show_spec.as_str()])
             .await
             .map_err(|e| {
                 format!(
@@ -9391,11 +9399,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
             backup_paths.push(backup_path.to_string_lossy().to_string());
         }
 
-        let checkout = tokio::process::Command::new("git")
-            .silent()
-            .args(["checkout", flag, "--", file])
-            .current_dir(&install_path)
-            .output()
+        let checkout = run_git_raw(&install_path, &["checkout", flag, "--", file.as_str()])
             .await
             .map_err(|e| format!("git checkout {} -- {} failed to spawn: {}", flag, file, e))?;
         if !checkout.status.success() {
@@ -9419,11 +9423,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
             ));
         }
 
-        let add = tokio::process::Command::new("git")
-            .silent()
-            .args(["add", "--", file])
-            .current_dir(&install_path)
-            .output()
+        let add = run_git_raw(&install_path, &["add", "--", file.as_str()])
             .await
             .map_err(|e| format!("git add -- {} failed to spawn: {}", file, e))?;
         if !add.status.success() {
@@ -9459,12 +9459,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
         );
     } else {
         // Positive-evidence check: only drop when a stash entry actually exists.
-        let list = tokio::process::Command::new("git")
-            .silent()
-            .args(["stash", "list"])
-            .current_dir(&install_path)
-            .output()
-            .await;
+        let list = run_git_raw(&install_path, &["stash", "list"]).await;
         let stash_present = matches!(
             &list,
             Ok(o) if o.status.success() && !o.stdout.is_empty()
@@ -9479,12 +9474,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
         } else {
             // Record the SHA of stash@{0} BEFORE dropping so the audit trail
             // can point `git fsck` at it if the drop ever turns out wrong.
-            let sha = tokio::process::Command::new("git")
-                .silent()
-                .args(["rev-parse", "stash@{0}"])
-                .current_dir(&install_path)
-                .output()
-                .await;
+            let sha = run_git_raw(&install_path, &["rev-parse", "stash@{0}"]).await;
             if let Ok(o) = &sha {
                 if o.status.success() {
                     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -9493,12 +9483,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
                     }
                 }
             }
-            let drop = tokio::process::Command::new("git")
-                .silent()
-                .args(["stash", "drop"])
-                .current_dir(&install_path)
-                .output()
-                .await;
+            let drop = run_git_raw(&install_path, &["stash", "drop"]).await;
             match drop {
                 Ok(o) if o.status.success() => {}
                 Ok(o) => tracing::warn!(
@@ -9828,26 +9813,15 @@ const APP_STATE_KEY_GITHUB_PAT_MIGRATED: &str = "github_pat.file_to_keychain.v1"
 const APP_STATE_KEY_PAT_MODULE_ID_MIGRATED: &str =
     "github_pat.installer_to_user_module_id.v1";
 
-fn vct_secrets_dir() -> Option<PathBuf> {
-    // Honour `VCT_SECRETS_DIR` for parity with the user-facing `vct` CLI
-    // under `tools/vct-secrets/vct` (the Phase 1 primitive treats this
-    // env var as the authoritative root). Test isolation also rides on
-    // this — the `github_pat_keychain_tests` set `VCT_SECRETS_DIR` to a
-    // per-test temp dir so the legacy file paths don't collide with the
-    // real user's `~/.vct-secrets/` or with sibling tests that mutate
-    // `HOME` (e.g. `commands::dashboard::tests`).
-    if let Some(v) = std::env::var_os("VCT_SECRETS_DIR") {
-        let p = PathBuf::from(v);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
-    }
-    directories::UserDirs::new().map(|u| u.home_dir().join(".vct-secrets"))
-}
-
-fn vct_secrets_shared_dir() -> Option<PathBuf> {
-    vct_secrets_dir().map(|d| d.join("shared"))
-}
+// v0.3.0: the file-store root/shared-dir resolution moved to
+// `vct_launcher_core::secrets_file_store` — the ONE home shared with
+// `secrets_import` and `secrets_cmd`, which each carried a divergent copy
+// that ignored `$VCT_SECRETS_DIR`. These are import aliases, not a second
+// implementation: the local names are kept only so the ~30 call sites in
+// this file stay untouched. Test isolation still rides on `VCT_SECRETS_DIR`
+// (`github_pat_keychain_tests` point it at a per-test temp dir).
+use crate::secrets_file_store::secrets_root as vct_secrets_dir;
+use crate::secrets_file_store::shared_dir as vct_secrets_shared_dir;
 
 fn github_pat_path_shared() -> Option<PathBuf> {
     vct_secrets_shared_dir().map(|d| d.join("github_pat"))
@@ -12949,10 +12923,21 @@ MemAvailable:   23456789 kB
             body.contains("claude_json.exists()"),
             "~/.claude.json scrub must be guarded by .exists()"
         );
-        // Container ops are gated by container_runtime is not None.
+        // Container ops are gated by a RESOLVED compose command plus the
+        // compose directory existing. v0.2.92 (MAJOR-3): the uninstaller no
+        // longer detects the runtime itself — it was a fourth independent copy
+        // that ignored VCT_CONTAINER_RUNTIME and could print `volume rm`
+        // commands naming the wrong runtime. It now resolves through
+        // vco_lib.containers, so the guard is the resolved compose argv.
+        // Both the definition and the use are pinned: a guard that is computed
+        // but never consulted would satisfy either one alone.
         assert!(
-            body.contains("container_runtime is not None"),
-            "container ops must be guarded by runtime detection"
+            body.contains("will_stop_containers = compose_argv is not None"),
+            "container ops must be guarded by a RESOLVED compose command"
+        );
+        assert!(
+            body.contains("if will_stop_containers:"),
+            "the resolved-compose guard must actually gate the container op"
         );
     }
 
@@ -16644,7 +16629,93 @@ MemAvailable:   23456789 kB
                 .unwrap()
                 .success());
             let res = assert_head_reached_upstream(&local).await;
-            assert!(res.is_ok(), "HEAD at upstream tip → guard must pass: {:?}", res);
+            assert_eq!(
+                res.expect("HEAD at upstream tip → guard must pass"),
+                HeadAdvanceOutcome::Reached,
+                "reaching the tip must be `Reached`, distinguishable from `Unverified`"
+            );
+        }
+
+        /// v0.2.92 WP-13 (WFT cross-cutting item 8). When the behind-count
+        /// cannot be computed, the guard still fails OPEN — that is
+        /// deliberate — but it must report `Unverified` rather than the
+        /// `Ok(())` it used to return, and the caller must leave a durable
+        /// record.
+        ///
+        /// The fixture removes the `vco_upstream` remote so `rev-list
+        /// HEAD..vco_upstream/main` cannot resolve: the same class of
+        /// unresolvable-ref failure the field incident hit, reached here from
+        /// a different direction and reproducible on any OS.
+        #[tokio::test]
+        async fn assert_head_reached_upstream_unknown_writes_deferral() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["remote", "remove", "vco_upstream"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            // Drop the tracking refs too, so the ref genuinely cannot resolve.
+            let _ = std::fs::remove_dir_all(local.join(".git/refs/remotes/vco_upstream"));
+
+            let outcome = assert_head_reached_upstream(&local)
+                .await
+                .expect("an unresolvable ref must NOT block the update (fail-open)");
+            let error = match outcome {
+                HeadAdvanceOutcome::Unverified { error } => error,
+                HeadAdvanceOutcome::Reached => panic!(
+                    "an unresolvable ref must be `Unverified`, never `Reached` — that \
+                     collapse is the defect"
+                ),
+            };
+            assert!(
+                error.contains("rev-list"),
+                "the outcome must carry git's own reason, got: {error}"
+            );
+
+            // …and the caller's record lands where a terminal Claude reads it.
+            crate::commands::git_user_editable_merge::write_launcher_update_post_pull_unverified_deferral(
+                &local, "main", &error,
+            );
+            let ledger = std::fs::read_to_string(local.join(".claude/context/UPDATE_DEFERRED.md"))
+                .expect("the deferral file must exist");
+            assert!(
+                ledger.contains("launcher_update_post_pull_unverified"),
+                "ledger must name the condition id:\n{ledger}"
+            );
+            assert!(
+                ledger.contains("rev-list"),
+                "ledger must carry git's reason so the user is not guessing:\n{ledger}"
+            );
+            assert!(
+                ledger.contains("rev-list --count HEAD..vco_upstream/main"),
+                "the printed recovery command must be the one that settles it:\n{ledger}"
+            );
+        }
+
+        /// Leave-alone half: a healthy repo writes NO ledger entry. A guard
+        /// that emitted on the happy path would train users to ignore it.
+        #[tokio::test]
+        async fn assert_head_reached_upstream_writes_no_deferral_when_verified() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["merge", "--no-edit", "vco_upstream/main"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            assert_eq!(
+                assert_head_reached_upstream(&local).await.unwrap(),
+                HeadAdvanceOutcome::Reached
+            );
+            assert!(
+                !local.join(".claude/context/UPDATE_DEFERRED.md").exists(),
+                "a verified pull must leave no ledger entry"
+            );
         }
 
         #[tokio::test]
@@ -17910,8 +17981,14 @@ severity_max: critical\n\
     //
     // A rev-list failure used to be COMPLETELY SILENT (remote_ahead stayed
     // false, indistinguishable from "up to date"). These tests pin that the
-    // health fields (remote_check_ok / remote_check_error) are now populated
-    // on the failure branches, and left ok=true/None for a non-git install.
+    // health field (`remote_check`) is populated on the failure branches,
+    // and reports the non-git install as its own state.
+    //
+    // v0.2.92 WP-13: the `remote_check_ok: bool` + `remote_check_error` pair
+    // these tests were written against became `remote_check: CheckState`.
+    // The non-git assertion changed MEANING, not just spelling: it used to
+    // require `ok == true` (a successful check that never happened) and now
+    // requires `NotApplicable` (the truth).
     //
     // The rev-list-failure pin uses a PATH-shim fake `git` (Unix only) that
     // passes remote/fetch/rev-parse and fails rev-list — mirroring the Python
@@ -17922,32 +17999,45 @@ severity_max: critical\n\
         use super::super::*;
 
         #[tokio::test]
-        async fn non_git_dir_reports_remote_check_ok_true_no_error() {
+        async fn non_git_dir_reports_remote_check_not_applicable() {
             // No `.git/` → the remote section is skipped entirely. That is
-            // "not applicable", not a failure: ok=true, error=None, and there
-            // is nothing to retry. install_stale / binary_stale carry the
+            // "not applicable", not a failure and NOT a success: there is
+            // nothing to retry, and install_stale / binary_stale carry the
             // banner instead.
+            //
+            // v0.2.92 WP-13 (WFT cross-cutting item 7): pre-fix this
+            // reported `remote_check_ok = true`, i.e. it claimed a
+            // successful remote check it had never performed, because a
+            // bool has no third value. The frontend then rendered "checked,
+            // fine" green for an install with no remote at all.
             let tmp = tempfile::tempdir().expect("tempdir");
             let status = check_for_updates(tmp.path().to_str().unwrap().to_string())
                 .await
                 .expect("check_for_updates should not hard-fail on a non-git dir");
-            assert!(
-                status.remote_check_ok,
-                "non-git dir must report remote_check_ok=true (not applicable)"
+            assert_eq!(
+                status.remote_check,
+                CheckState::NotApplicable,
+                "a non-git install must report NotApplicable — not Ok (which would claim a \
+                 check that never ran) and not Unknown (which would invite pointless retries)"
             );
-            assert!(
-                status.remote_check_error.is_none(),
-                "non-git dir must have no remote_check_error, got {:?}",
-                status.remote_check_error
+            assert_ne!(
+                status.remote_check,
+                CheckState::Ok,
+                "'nothing to check' must be distinguishable from 'checked, fine'"
             );
+            assert!(status.remote_check.is_known());
             assert!(
                 !status.remote_ahead,
                 "non-git dir cannot be remote_ahead"
             );
+            assert!(
+                !status.head_detached,
+                "a non-git dir has no HEAD to be detached"
+            );
         }
 
-        /// REGRESSION PIN (A-RC1): a rev-list failure must set
-        /// remote_check_ok=false + populate remote_check_error — NOT silently
+        /// REGRESSION PIN (A-RC1): a rev-list failure must leave
+        /// `remote_check` Unknown, carrying git's reason — NOT silently
         /// leave remote_ahead=false. A PATH-shim fake `git` passes
         /// remote/fetch/rev-parse and fails ONLY rev-list.
         ///
@@ -18022,12 +18112,16 @@ exit 0
             let status = status.into_inner().expect("status captured");
 
             assert!(
-                !status.remote_check_ok,
-                "rev-list failure MUST set remote_check_ok=false (was silent pre-v0.2.83)"
+                status.remote_check.is_unknown(),
+                "rev-list failure MUST leave remote_check Unknown (was silent pre-v0.2.83), \
+                 got {:?}",
+                status.remote_check
             );
             let err = status
-                .remote_check_error
-                .expect("rev-list failure MUST populate remote_check_error");
+                .remote_check
+                .error()
+                .expect("an Unknown remote_check MUST carry its reason")
+                .to_string();
             assert!(
                 err.contains("rev-list"),
                 "error must name the rev-list stage, got: {}",

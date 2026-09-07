@@ -508,13 +508,18 @@ def test_no_unconditional_method_finditer_in_csharp_class_loop() -> None:
     # `method_pattern.finditer(content_clean)` (see
     # knowledge/concepts/test-regex-anchoring-fragility-2026-06-10.md); binding
     # to the loop boundary keeps the guard scoped to the class loop body.
-    window_start = max(0, anchor_pos - 1500)
+    # v0.2.92: bind to the loop header itself rather than a fixed char
+    # count. The magic window drifted twice this cycle as comments moved;
+    # an anchor that needs re-tuning is not an anchor.
+    _hdr = "for cname, start_line, _class_end_line in class_decls:"
+    _hdr_pos = src.rfind(_hdr, 0, anchor_pos)
+    window_start = _hdr_pos if _hdr_pos != -1 else max(0, anchor_pos - 1500)
     next_for = src.find("\n    for ", anchor_pos)
     window_end = next_for if next_for != -1 else min(len(src), anchor_pos + 200)
     window = src[window_start:window_end]
 
     # Sanity: window must contain the C# class-loop's `for cname` header.
-    assert "for cname, start_line in class_info.items():" in window, (
+    assert "for cname, start_line, _class_end_line in class_decls:" in window, (
         "C# class-loop anchor isn't inside a class-iteration loop — "
         "file shape has changed unexpectedly."
     )

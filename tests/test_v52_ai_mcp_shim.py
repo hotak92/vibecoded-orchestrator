@@ -27,6 +27,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "claude_mcp_servers"))
 
+from tests.common.child_env import child_env  # noqa: E402
+
 
 class ShimParityTests(unittest.TestCase):
     """The MCP shim must agree with vco_lib on schema + exit code."""
@@ -132,7 +134,7 @@ class ShimSubprocessExitCodeTests(unittest.TestCase):
         )
         completed = subprocess.run(
             [sys.executable, "-c", script],
-            env={**os.environ, **env},
+            env=child_env({**os.environ, **env}),
             capture_output=True,
             text=True,
         )

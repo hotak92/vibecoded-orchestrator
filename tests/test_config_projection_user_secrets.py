@@ -48,15 +48,18 @@ Run: pytest tests/test_config_projection_user_secrets.py -v
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+from tests.common.launcher_db_fixture import (
+    connect,
+    insert_rows,
+    make_launcher_db,
+)
 from vco_lib.config_projection import (
     CLAUDE_ENV_MANAGED_BEGIN,
     CLAUDE_ENV_MANAGED_END,
@@ -72,6 +75,27 @@ from vco_lib.config_projection import (
 # ─── DB fixture (secret_active_state schema) ────────────────────────────
 
 
+def _secret_row(
+    scope: str, project_id: str, key: str, *, active: int,
+) -> dict[str, object]:
+    """One ``secret_active_state`` row in the shape migration 009 backfills:
+    shared/global rows carry the ``'*'`` any-requester sentinel, per_project
+    rows carry the owning project id. (The pre-merge hand-rolled DDL gave the
+    column ``DEFAULT '*'`` and let every row take the sentinel — a shape the
+    launcher never writes for a per-project secret. The resolver under test
+    reads only (scope, project_id, module_id, key), so the assertions are
+    unaffected; the seed is now simply legal.)"""
+    return {
+        "scope": scope,
+        "project_id": project_id,
+        "module_id": "user",
+        "key": key,
+        "requester_project_id": "*" if scope in ("shared", "global") else project_id,
+        "active": active,
+        "updated_at": 0,
+    }
+
+
 def _make_launcher_db_with_secrets(
     db_path: Path,
     *,
@@ -85,10 +109,12 @@ def _make_launcher_db_with_secrets(
     inactive_keys: list[tuple[str, str, str]] | None = None,
     create_secret_table: bool = True,
 ) -> None:
-    """Build a minimal launcher.db with the secret_active_state schema.
+    """Build a launcher.db (REAL schema) seeded for the secrets resolver.
 
-    Mirrors the launcher migrations 007 + 009 schema enough for the
-    Phase 0.E resolver to read.
+    v0.2.92 §3.4: the schema is the shipped migration set applied verbatim
+    by ``tests.common.launcher_db_fixture`` — migrations 007 + 009 own
+    ``secret_active_state``, so this file no longer restates (and no longer
+    has to keep in sync with) its column list.
 
     Args:
         per_project_keys: KEY names to insert at (scope='per_project',
@@ -102,81 +128,49 @@ def _make_launcher_db_with_secrets(
             resolver INCLUDES them in the strip set regardless of
             active flag (mirroring the Rust ``list_*_user_secret_keys``
             family, which always returns every observed key).
-        create_secret_table: if False, omit the secret_active_state
-            table entirely (test soft-fail on pre-migration DBs).
+        create_secret_table: if False, DROP secret_active_state after the
+            migrations have run, modelling a pre-migration-007 launcher.db
+            (test soft-fail on such DBs).
     """
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT NOT NULL
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            PRIMARY KEY (project_id, role)
-        );
-        """
+    make_launcher_db(
+        db_path,
+        projects=[{
+            "project_id": project_id,
+            "name": project_name,
+            "folder_path": project_folder,
+            "slug": project_slug,
+        }],
     )
-    if create_secret_table:
-        # Mirror migration 007 (post-009 shape). The Python resolver
-        # only reads (scope, project_id, module_id, key), so the
-        # requester_project_id column isn't required for these
-        # tests — but we include it to match production schema.
-        cur.executescript(
-            """
-            CREATE TABLE secret_active_state (
-                scope TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                module_id TEXT NOT NULL,
-                key TEXT NOT NULL,
-                requester_project_id TEXT NOT NULL DEFAULT '*',
-                active INTEGER NOT NULL DEFAULT 1,
-                updated_at INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (scope, project_id, module_id, key, requester_project_id)
-            );
-            """
-        )
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-        (project_id, project_name, project_folder, project_slug),
+    if not create_secret_table:
+        # DELIBERATE degraded shape: a launcher.db that pre-dates migration
+        # 007 has no secret_active_state at all. Built by dropping the real
+        # table rather than by hand-rolling a partial schema, so every OTHER
+        # table stays exactly what production has.
+        conn = connect(db_path)
+        try:
+            conn.execute("DROP TABLE secret_active_state")
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    rows: list[dict[str, object]] = [
+        _secret_row("per_project", project_id, key, active=1)
+        for key in per_project_keys or []
+    ]
+    rows.extend(
+        _secret_row("shared", "_user_shared_", key, active=1)
+        for key in shared_keys or []
     )
-    if create_secret_table:
-        for key in per_project_keys or []:
-            cur.execute(
-                "INSERT INTO secret_active_state "
-                "(scope, project_id, module_id, key, active, updated_at) "
-                "VALUES (?, ?, ?, ?, 1, 0)",
-                ("per_project", project_id, "user", key),
-            )
-        for key in shared_keys or []:
-            cur.execute(
-                "INSERT INTO secret_active_state "
-                "(scope, project_id, module_id, key, active, updated_at) "
-                "VALUES (?, ?, ?, ?, 1, 0)",
-                ("shared", "_user_shared_", "user", key),
-            )
-        for key in global_keys or []:
-            cur.execute(
-                "INSERT INTO secret_active_state "
-                "(scope, project_id, module_id, key, active, updated_at) "
-                "VALUES (?, ?, ?, ?, 1, 0)",
-                ("global", "_global_", "user", key),
-            )
-        for scope, pid, key in inactive_keys or []:
-            cur.execute(
-                "INSERT INTO secret_active_state "
-                "(scope, project_id, module_id, key, active, updated_at) "
-                "VALUES (?, ?, ?, ?, 0, 0)",
-                (scope, pid, "user", key),
-            )
-    conn.commit()
-    conn.close()
+    rows.extend(
+        _secret_row("global", "_global_", key, active=1)
+        for key in global_keys or []
+    )
+    rows.extend(
+        _secret_row(scope, pid, key, active=0)
+        for scope, pid, key in inactive_keys or []
+    )
+    if rows:
+        insert_rows(db_path, "secret_active_state", rows)
 
 
 # ─── user_secret_known_keys_from_db tests ───────────────────────────────
@@ -301,14 +295,10 @@ def test_known_keys_filters_other_projects_per_project_bucket(tmp_path: Path) ->
     db = tmp_path / "launcher.db"
     _make_launcher_db_with_secrets(db, per_project_keys=["MY_KEY"])
     # Inject a row for a DIFFERENT project at per_project scope.
-    conn = sqlite3.connect(str(db))
-    conn.execute(
-        "INSERT INTO secret_active_state "
-        "(scope, project_id, module_id, key, active, updated_at) "
-        "VALUES ('per_project', 'OTHER_PROJ', 'user', 'OTHER_KEY', 1, 0)"
+    insert_rows(
+        db, "secret_active_state",
+        [_secret_row("per_project", "OTHER_PROJ", "OTHER_KEY", active=1)],
     )
-    conn.commit()
-    conn.close()
 
     keys = user_secret_known_keys_from_db("proj-1", db_path=db)
     assert keys == ["MY_KEY"]
@@ -710,11 +700,9 @@ def test_apply_project_env_user_bundle_writes_no_user_secret_section(
 def _run_cli(*args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Run ``python -m vco_lib.config_projection`` and capture output."""
     cmd = [sys.executable, "-m", "vco_lib.config_projection", *args]
-    env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
-    repo_root = Path(__file__).resolve().parent.parent
-    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    # child_env() puts the repo root FIRST on PYTHONPATH so the child imports
+    # the CHECKOUT's vco_lib, never a stale site-packages copy (§3.16).
+    env = child_env(**(env_extra or {}))
     return subprocess.run(cmd, capture_output=True, text=True, env=env)
 
 

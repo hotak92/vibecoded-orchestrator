@@ -53,6 +53,13 @@ exits 0 (sidecar untouched; the renderer keeps today's behaviour).
 Staleness + GC (D4): stale entries (hash mismatch) regenerate (count toward
 the cap); entries whose key matches no live canonical row are pruned at the
 end of a run; renames regenerate under the new key (old key GC'd).
+
+v0.2.92 WP-Q: an entry whose stored text is a model NON-ANSWER also counts
+as stale, even when its hash still matches — a row that never held a valid
+summary must not be treated as satisfied by it. And when every ladder tier
+has been demoted (usage limit / auth / sustained capacity), the run STOPS
+rather than walking the rest of the worklist raising: that walk is what
+turned one capped account into hundreds of doomed `claude -p` spawns.
 """
 
 from __future__ import annotations
@@ -150,16 +157,39 @@ def is_trivial(body: str) -> bool:
     return len(body or "") < TRIVIAL_BODY_CHARS
 
 
+def entry_is_poisoned(entry: "dict | None") -> bool:
+    """True when a cached entry's stored text is a model NON-ANSWER.
+
+    v0.2.92 WP-Q. An EMPTY ``summary`` is legitimate here — a trivial body
+    gets a ``one_liner`` only (see ``is_trivial``) — so only a NON-EMPTY
+    summary is validated. ``one_liner`` is always required.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if _sb.is_non_answer(entry.get("one_liner")):
+        return True
+    summary = entry.get("summary")
+    if isinstance(summary, str) and summary.strip() and _sb.is_non_answer(summary):
+        return True
+    return False
+
+
 def needs_generation(existing_entry: "dict | None", row_content_hash: str,
                      force: bool) -> bool:
-    """Missing entry, hash drift, or --force → regenerate.
+    """Missing entry, POISONED entry, hash drift, or --force → regenerate.
 
     No stored row hash (pre-v0.2.61 rows) → generate only when the entry is
     missing (we cannot cheaply detect staleness without a hash; never churn).
+
+    The poisoned check sits ABOVE the hash comparison on purpose: a
+    non-answer row is stale regardless of whether the source row changed,
+    which is exactly the case the hash gate alone froze forever.
     """
     if force:
         return True
     if existing_entry is None:
+        return True
+    if entry_is_poisoned(existing_entry):
         return True
     if not row_content_hash:
         return False
@@ -219,19 +249,31 @@ def gc_dead_keys(formats: dict, live_keys: set,
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
-    """Atomic write: vco_lib.atomic if importable, else tmp+rename inline."""
+    """Atomic write through :func:`vco_lib.atomic.atomic_write_text`.
+
+    v0.2.92 (duplication-merge): this used to carry an inline tmp+rename
+    fallback "if vco_lib is not importable". That branch was DEAD: every
+    path that reaches this writer has already gone through
+    `_collection_prefix()`, which imports `vco_lib` from the same ladder
+    (``VCT_ORCHESTRATOR_ROOT`` → the clone root) and makes `run()` a no-op
+    when it cannot. A quiet inline copy behind an import that cannot fail
+    here is exactly the drift the one-home rule forbids, so the import is
+    now HARD and names the ladder it searched.
+    """
     payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    env_root = os.getenv("VCT_ORCHESTRATOR_ROOT", "").strip()
+    for root in (env_root, str(_DEFAULT_ROOT)):
+        if root and (Path(root) / "vco_lib").is_dir() and root not in sys.path:
+            sys.path.insert(0, root)
     try:
         from vco_lib.atomic import atomic_write_text  # type: ignore
-
-        atomic_write_text(path, payload)
-        return
-    except Exception:
-        pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    os.replace(tmp, path)
+    except ImportError as exc:  # pragma: no cover — broken install, say so
+        raise ImportError(
+            "generate-code-summary: vco_lib is not importable "
+            f"(VCT_ORCHESTRATOR_ROOT={env_root!r}, default root {_DEFAULT_ROOT}); "
+            "this is a broken VCO install — re-run install.py"
+        ) from exc
+    atomic_write_text(path, payload)
 
 
 def load_formats(path: Path) -> dict:
@@ -440,7 +482,10 @@ def run(project: str, *, project_root: Path, max_per_run: int,
 
         generated = 0
         failures = 0
+        exhausted = False
         for base in BASE_COLLECTIONS:
+            if exhausted:
+                break
             kind = "function" if base == "CodeFunction" else "class"
             for row in plan_work(all_rows[base], formats, force=force):
                 if generated >= max_per_run:
@@ -465,6 +510,17 @@ def run(project: str, *, project_root: Path, max_per_run: int,
                 except Exception as exc:  # noqa: BLE001 — per-entity isolation
                     failures += 1
                     log(f"  code-summary: {full_name} failed: {exc}")
+                    # v0.2.92 WP-Q: when every tier has been demoted there
+                    # is nothing left to try, and continuing would walk the
+                    # remaining worklist raising once per entity. Stop and
+                    # say so; the next run picks up where this one left off
+                    # (the sidecar is written incrementally).
+                    if select_backend() == "skip":
+                        log("  code-summary: no backend left — every tier is "
+                            "cooling down; stopping this run early "
+                            "(resumes next run)")
+                        exhausted = True
+                        break
                     continue
                 key = entry_key(str(row.get("file_path") or ""), full_name)
                 formats[key] = build_entry(
@@ -484,7 +540,8 @@ def run(project: str, *, project_root: Path, max_per_run: int,
         if generated or removed or force:
             atomic_write_json(formats_path, formats)
         log(f"  code-summary: {generated} generated, {removed} pruned, "
-            f"{failures} failed (cap {max_per_run}) → {formats_path}")
+            f"{failures} failed{' (backends exhausted)' if exhausted else ''} "
+            f"(cap {max_per_run}) → {formats_path}")
         return 0
     finally:
         try:

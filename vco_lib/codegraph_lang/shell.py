@@ -5,8 +5,9 @@
 Moved VERBATIM from ``templates/scripts/analyze_code_graph.py``:
 ``CodeGraphAnalyzer._analyze_shell_file`` — only body edits are the mechanical ``self.`` -> ``ctx.`` rename
 (``ctx`` IS the analyzer instance) and the analyzer-resident embedding
-seams reached via ``ctx.``. Behavior is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+seams reached via ``ctx.``. ``tests/test_codegraph_golden.py`` pins what
+this extractor does TODAY — read it as evidence of behaviour, not of
+parity with the pre-move analyzer.
 """
 from __future__ import annotations
 
@@ -36,7 +37,8 @@ def extract_shell_file(
     """Pure producer: parse a Shell script, RETURN a :class:`FileExtraction`."""
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('#')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('#')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 

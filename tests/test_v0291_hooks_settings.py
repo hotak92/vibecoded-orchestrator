@@ -25,6 +25,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import hooks_settings as hs  # noqa: E402
 
 
@@ -620,6 +621,7 @@ class UnregisterTests(_TempProject):
             text=True,
             cwd=str(REPO_ROOT),
             timeout=60,
+            env=child_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -1047,6 +1049,7 @@ class CliTests(_TempProject):
             text=True,
             cwd=str(REPO_ROOT),
             timeout=60,
+            env=child_env(),
         )
 
     def test_list_emits_exactly_one_json_object(self) -> None:

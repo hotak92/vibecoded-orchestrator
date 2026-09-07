@@ -144,7 +144,7 @@ def test_powershell_helper_counts_correctly(tmp_path: Path):
         f"pwsh helper failed: rc={out.returncode}, stderr={out.stderr!r}"
     )
     # Parse last numeric line from stdout.
-    numeric_lines = [l.strip() for l in out.stdout.splitlines() if l.strip().lstrip("-").isdigit()]
+    numeric_lines = [line.strip() for line in out.stdout.splitlines() if line.strip().lstrip("-").isdigit()]
     assert numeric_lines, f"no numeric output from pwsh: {out.stdout!r}"
     count = int(numeric_lines[-1])
     assert count == 7, f"pwsh helper returned {count}, expected 7"

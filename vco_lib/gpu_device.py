@@ -57,7 +57,6 @@ import platform
 import re
 import shutil
 import subprocess  # noqa: S404 — probing GPU CLIs is the whole point
-import sys
 from dataclasses import dataclass
 from typing import Optional
 

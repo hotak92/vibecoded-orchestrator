@@ -81,9 +81,22 @@ param(
 )
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-# Mirrors `templates/scripts/vct_secrets_resolve.sh` — kept in lockstep
-# by the template-drift gate. Both copies (templates/ + .claude/) are
-# byte-identical; the hub owns the project-root lookup.
+# NOTHING IS BAKED HERE, AND THAT IS THE ANSWER — not an omission.
+#
+# This script needs no orchestrator root: the hub owns every lookup and is
+# found through $env:VCT_HUB_PORT / $env:VCT_HUB_TOKEN or through the
+# hub.port / hub.token files under the VCT state dir — all resolvable at run
+# time on any machine. Baking a clone path here would add a variable nothing
+# reads. `tests/test_v0292_cli_root_resolution_and_prefix.py::
+# TestTheShellPairDecision` pins the absence.
+#
+# The sentinels stay because they declare the span `vco_lib/rewire.py` owns;
+# it walks this file at install time and, finding no placeholder, returns it
+# byte-identical. Prior text here said the templates/ and .claude/ copies are
+# "byte-identical" and "kept in lockstep by the template-drift gate". That
+# gate was REMOVED in PR-39 / v0.2.12 and this repo tracks no
+# `.claude/scripts/` at all, so neither half of that claim had a mechanism
+# behind it.
 # VCO-REWIRE-END: orchestrator-root-resolution
 
 function Write-Err {
@@ -587,6 +600,38 @@ function Read-FileStripOneNewline {
     return $raw
 }
 
+# Per-project opt-out marker for the tier-2 SHARED fallback. MIRRORED,
+# byte-for-byte, in vco_lib/agent_secrets.py (NO_SHARED_FALLBACK_MARKER),
+# templates/scripts/vct_secrets_resolve.sh (VCT_NO_SHARED_FALLBACK_MARKER)
+# and tools/vct-secrets/vct — and WRITTEN by the launcher's shared-secrets
+# toggle in launcher/src-tauri/src/commands/secrets_cmd.rs. The five
+# spellings are locked by tests/test_no_shared_fallback_marker_parity.py;
+# the BEHAVIOUR is pinned by tests/test_vct_secrets_resolve_ps1.py.
+$VctNoSharedFallbackMarker = ".no-shared-fallback"
+
+function Test-SharedFallbackDisabled {
+    # $Name = file-store project NAME (may be empty), $Root = store root.
+    # True when that project has opted out of shared\.
+    #
+    # An empty name means the caller has no project identity, so there is
+    # nothing to opt out of. The literal name "shared" is excluded too:
+    # opting the shared scope out of itself is meaningless, and honouring a
+    # stray projects\shared\ orphan there would silently kill every shared
+    # read. Must match agent_secrets._shared_fallback_disabled,
+    # shared_fallback_disabled (.sh) and vct::shared_fallback_disabled.
+    #
+    # `-ceq`, not `-eq`: PowerShell's `-eq` is case-INSENSITIVE on strings,
+    # so `-eq "shared"` would also swallow a project genuinely NAMED
+    # "Shared", which the bash/Python siblings (case-sensitive `=`/`==`)
+    # would happily gate. That divergence would make the opt-out silently
+    # inert for that project on Windows only. Parity is achieved by
+    # matching the strict siblings, never by loosening them (R42).
+    param([string]$Name, [string]$Root)
+    if (-not $Name -or $Name -ceq "shared") { return $false }
+    $marker = Join-Path (Join-Path (Join-Path $Root "projects") $Name) $VctNoSharedFallbackMarker
+    return (Test-Path -LiteralPath $marker)
+}
+
 function Get-FileStoreValue {
     # Returns @{ Found = $true/$false; Value = ... }
     param([string]$ProjectArg, [string]$Key)
@@ -598,6 +643,12 @@ function Get-FileStoreValue {
             $v = Read-FileStripOneNewline -FilePath $f
             if ($null -ne $v) { return @{ Found = $true; Value = $v } }
         }
+    }
+    # Tier-2 half of the launcher's per-project "Disable shared secrets"
+    # gate. Without it the toggle silenced tier 1 while tier 2 kept serving
+    # the very values the user opted out of.
+    if (Test-SharedFallbackDisabled -Name $name -Root $root) {
+        return @{ Found = $false }
     }
     $f = Join-Path (Join-Path $root "shared") $Key
     if (Test-Path -LiteralPath $f -PathType Leaf) {

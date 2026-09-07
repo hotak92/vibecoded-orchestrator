@@ -125,9 +125,10 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 ///      normal case for an installed project.
 ///   2. **Env override** — `$VCT_LAUNCHER_SCRIPTS_DIR/<bin>`. Lets a dev
 ///      launcher point at an in-development scripts dir.
-///   3. **Sibling-of-exe** — walk `.`, `..`, `../..` from the launcher
-///      binary's directory, probing `<hop>/.claude/scripts/<bin>` at each.
-///      Covers a launcher run from inside / next to the orchestrator clone.
+///   3. **Sibling-of-exe** — walk `ORCHESTRATOR_HOP_SUFFIXES` from the
+///      launcher binary's directory, probing `<hop>/.claude/scripts/<bin>`
+///      at each. Covers a launcher run from inside / next to the
+///      orchestrator clone.
 ///   4. **PATH** — `<path-dir>/<bin>` for each `$PATH` entry (a globally
 ///      installed copy).
 ///
@@ -140,6 +141,25 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 /// that guard (`analyzer_wrapper_is_resilient`) is codegraph-specific and
 /// deliberately stays in `commands::codegraph`, which layers it on top of
 /// its own tier-1 check before falling through to the shared tiers.
+/// Relative hops from the launcher binary's own directory to a candidate
+/// orchestrator-clone root, probed as `<exe_dir>/<hop>/.claude/scripts/<bin>`.
+///
+/// v0.2.92 (field bug 2026-09-05) — the list used to stop at `../..`, and the
+/// SHIPPED layout puts the binary at `<root>/launcher/dist/<target>/vct-launcher`,
+/// whose root is `../../..`. So on a standard install this tier could never
+/// resolve anything: the three probes landed on `dist/<target>/.claude/scripts`,
+/// `dist/.claude/scripts` and `launcher/.claude/scripts`, none of which exist.
+/// With `$VCT_LAUNCHER_SCRIPTS_DIR` unset and `.claude/scripts` not on `$PATH`
+/// — the default for every user — the whole "fall back to the orchestrator
+/// copy" mechanism was unreachable, and the code-graph build that relied on it
+/// died with "script not found" while a deferral asserted "builds still work".
+///
+/// `../../..` covers the shipped `launcher/dist/<target>/` layout;
+/// `../../../..` covers a cargo dev build at `launcher/src-tauri/target/<profile>/`.
+/// Order is nearest-first: a genuinely adjacent clone still wins.
+pub const ORCHESTRATOR_HOP_SUFFIXES: [&str; 5] =
+    [".", "..", "../..", "../../..", "../../../.."];
+
 pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> Option<PathBuf> {
     // 1. Project-local.
     let p1 = project_folder.join(".claude").join("scripts").join(bin);
@@ -158,7 +178,7 @@ pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> 
     // 3. Sibling-of-exe convention.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            for hop in [".", "..", "../.."].iter() {
+            for hop in ORCHESTRATOR_HOP_SUFFIXES.iter() {
                 let p3 = parent.join(hop).join(".claude").join("scripts").join(bin);
                 if p3.is_file() {
                     return Some(p3);
@@ -200,6 +220,63 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    /// v0.2.92 field bug (2026-09-05): the hop list stopped at `../..`, so on
+    /// the SHIPPED layout (`<root>/launcher/dist/<target>/vct-launcher`) tier 3
+    /// could never find `<root>/.claude/scripts/<bin>` — and with
+    /// `$VCT_LAUNCHER_SCRIPTS_DIR` unset and `.claude/scripts` off `$PATH`
+    /// (the default for every user) the whole orchestrator-fallback mechanism
+    /// was unreachable. A code-graph build died with "script not found" while
+    /// a deferral asserted the fallback was carrying it.
+    ///
+    /// Mutation check: drop `"../../.."` from `ORCHESTRATOR_HOP_SUFFIXES` and
+    /// this test fails on the shipped layout.
+    #[test]
+    fn orchestrator_hops_reach_both_real_launcher_layouts() {
+        let root = std::env::temp_dir().join(format!(
+            "vct-hops-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let scripts = root.join(".claude").join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("kg-sync"), b"# $VCT_INSTALL_ROOT\n").unwrap();
+
+        let reaches = |exe_dir: &std::path::Path| -> bool {
+            ORCHESTRATOR_HOP_SUFFIXES.iter().any(|hop| {
+                exe_dir
+                    .join(hop)
+                    .join(".claude")
+                    .join("scripts")
+                    .join("kg-sync")
+                    .is_file()
+            })
+        };
+
+        // Shipped release layout: <root>/launcher/dist/<target>/vct-launcher
+        let dist = root.join("launcher").join("dist").join("linux-x64");
+        std::fs::create_dir_all(&dist).unwrap();
+        assert!(
+            reaches(&dist),
+            "shipped launcher/dist/<target>/ layout must reach the clone root"
+        );
+
+        // Cargo dev layout: <root>/launcher/src-tauri/target/<profile>/vct-launcher
+        let devdir = root
+            .join("launcher")
+            .join("src-tauri")
+            .join("target")
+            .join("debug");
+        std::fs::create_dir_all(&devdir).unwrap();
+        assert!(
+            reaches(&devdir),
+            "cargo target/<profile>/ layout must reach the clone root"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

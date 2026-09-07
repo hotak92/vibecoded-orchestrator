@@ -56,7 +56,7 @@ import sys
 import time
 from pathlib import Path
 
-from vco_lib.atomic import exclusive_file_lock
+from vco_lib.atomic import exclusive_file_lock, rotate_tail_lines
 from vco_lib.paths import vct_root_dir
 
 
@@ -185,30 +185,11 @@ def _maybe_rotate(jsonl: Path) -> None:
     Best-effort: an error during rotation is swallowed (the JSONL keeps
     growing, but the next append still works).
     """
-    try:
-        size = jsonl.stat().st_size
-    except OSError:
-        return
-    if size <= ROTATION_THRESHOLD_BYTES:
-        return
-
-    try:
-        with open(jsonl, encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
-        return
-
-    keep = lines[-ROTATION_KEEP_LINES:] if len(lines) > ROTATION_KEEP_LINES else lines
-    tmp = jsonl.with_suffix(jsonl.suffix + ".rot.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(keep)
-        os.replace(tmp, jsonl)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    # v0.2.92 (duplication-merge): one rotation routine, shared with
+    # `access_resolver` — `vco_lib.atomic.rotate_tail_lines` (soft-fail).
+    rotate_tail_lines(
+        jsonl, max_bytes=ROTATION_THRESHOLD_BYTES, keep_lines=ROTATION_KEEP_LINES,
+    )
 
 
 def _append_row(jsonl: Path, row: dict) -> None:

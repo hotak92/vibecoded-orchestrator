@@ -39,7 +39,7 @@ vco_codegraph_cli() {
     return 1
 }
 
-# codegraph_query_block <query> <project_arg> <limit> <exclude_path> [anchor]
+# codegraph_query_block <query> <project_arg> <limit> <exclude_path> [anchor] [prompt_id] [transcript]
 # Echo the raw "CODE:"-prefixed --hook-format block(s) for <query>, or nothing.
 #   $1 query        — the search query (symbol / module name / bash symbol token)
 #   $2 project_arg  — "--project Foo" or "" (already shell-token-shaped)
@@ -54,6 +54,29 @@ vco_codegraph_cli() {
 #                     `--anchor` so the CLI's shared retrieval pipeline biases
 #                     the rerank toward call-linked / same-module / shared-type
 #                     code (v0.2.72 P2). Empty → pure semantic (MCP parity).
+#   $6 prompt_id    — WP-E (v0.2.92): cache-key scoping ONLY, "" when absent
+#                     (older Claude Code builds). The query text here is always
+#                     the raw, unenriched trigger (a short symbol/query
+#                     string); enrichment happens INSIDE query_code_graph.py
+#                     from --transcript, so two different turns issuing the
+#                     identical short query would otherwise collide on the
+#                     same cache key despite embedding different enriched
+#                     text. Same rationale as vco_kg_search_cached's prompt_id
+#                     (see query-cache.sh). NEVER put transcript CONTENTS in
+#                     the key — see $7.
+#   $7 transcript   — WP-E (v0.2.92): a PATH, never text. Forwarded to the CLI
+#                     as `--transcript <path>` so the code-graph query gets
+#                     the SAME backwards-scan enrichment as the KG leg when
+#                     the raw query is short relative to the code embedding
+#                     model's budget (vco_lib/query_enrichment.py via
+#                     query_code_graph.py:search_by_concept). The path is read
+#                     by the CLI process, in-process — this shell layer never
+#                     opens the transcript file, and the path is deliberately
+#                     EXCLUDED from the cache key (only prompt_id scopes it)
+#                     so transcript content/location never becomes part of a
+#                     cache filename, log line, or telemetry record. Empty →
+#                     today's exact behaviour (zero functionality change for
+#                     callers that don't pass it).
 # Soft-fail: CLI absent / error / empty → echo nothing, return 0. Never writes to
 # stderr-bound context, never exits non-zero. Bounded by an inner timeout so a
 # hung subprocess can't blow the caller's settings.json budget.
@@ -63,6 +86,8 @@ codegraph_query_block() {
     local limit="${3:-2}"
     local exclude_path="${4:-}"
     local anchor="${5:-}"
+    local prompt_id="${6:-}"
+    local transcript="${7:-}"
 
     [ -n "$query" ] || return 0
 
@@ -74,9 +99,12 @@ codegraph_query_block() {
     # so cached replays stay dedup-accurate. Cache key namespaces on the code-
     # graph surface + all query-shaping args so a different anchor/project/limit
     # is a distinct entry. Best-effort: any cache miss/error runs the query live.
+    # WP-E (v0.2.92): prompt_id joins the key (enrichment makes the SAME raw
+    # query embed differently turn-to-turn); transcript is deliberately NOT
+    # in the key — see the $7 doc above.
     local _qc_key=""
     if command -v vco_query_cache_key >/dev/null 2>&1; then
-        _qc_key="$(vco_query_cache_key "cg" "$query" "$project_arg" "$limit" "$exclude_path" "$anchor")"
+        _qc_key="$(vco_query_cache_key "cg" "$query" "$project_arg" "$limit" "$exclude_path" "$anchor" "$prompt_id")"
     fi
     if [ -n "$_qc_key" ] && command -v vco_query_cache_get >/dev/null 2>&1; then
         local _qc_hit
@@ -113,13 +141,27 @@ codegraph_query_block() {
     # Inner hard bound. Prefer `timeout` (coreutils / busybox); when absent,
     # fall back to a bg-pid + sleep-kill guard so Git-Bash-on-Windows (no
     # timeout) still can't hang the hook.
+    #
+    # WP-E (v0.2.92): --transcript is appended as a LITERAL token on the
+    # invocation line itself (a conditional pair of fully-literal calls, NOT
+    # folded into the "$@" chain built above) so a textual regression test can
+    # pin its presence on the producer call — the same discipline used to fix
+    # the pre-edit/pre-tool-use KG-side --hook-format regression this cycle.
     local raw=""
     if command -v timeout >/dev/null 2>&1; then
-        raw="$(timeout 4 "$cli" "$@" 2>/dev/null || true)"
+        if [ -n "$transcript" ]; then
+            raw="$(timeout 4 "$cli" "$@" --transcript "$transcript" 2>/dev/null || true)"
+        else
+            raw="$(timeout 4 "$cli" "$@" 2>/dev/null || true)"
+        fi
     else
         local _tmp
         _tmp="$(mktemp 2>/dev/null || printf '%s' "/tmp/cg_$$_$RANDOM")"
-        ( "$cli" "$@" >"$_tmp" 2>/dev/null ) &
+        if [ -n "$transcript" ]; then
+            ( "$cli" "$@" --transcript "$transcript" >"$_tmp" 2>/dev/null ) &
+        else
+            ( "$cli" "$@" >"$_tmp" 2>/dev/null ) &
+        fi
         local _pid=$!
         ( sleep 4; kill -9 "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
         local _watchdog=$!

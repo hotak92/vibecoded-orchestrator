@@ -78,11 +78,24 @@ set -euo pipefail
 readonly RESOLVER_PROTOCOL_VERSION=1
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-# This file is byte-identical between `templates/scripts/` (shipped to
-# user projects) and `.claude/scripts/` (orchestrator's own copy). The
-# template-drift gate (`scripts/check_template_drift.py`) enforces that.
-# No project-root resolution divergence — the hub owns the lookup, so
-# both copies need the same logic.
+# NOTHING IS BAKED HERE, AND THAT IS THE ANSWER — not an omission.
+#
+# This script needs no orchestrator root at all: the hub owns every lookup,
+# and the hub is found through $VCT_HUB_PORT / $VCT_HUB_TOKEN or through
+# ${VCT_STATE_DIR:-$HOME/.vct}/hub.{port,token} — all resolvable at run time
+# on any machine. Baking a clone path here would add a variable nothing
+# reads. `tests/test_v0292_cli_root_resolution_and_prefix.py::
+# TestTheShellPairDecision` pins the absence: adding a VCT_ORCHESTRATOR_ROOT
+# ladder to this pair goes red on purpose.
+#
+# The sentinels stay because they declare the span `vco_lib/rewire.py` owns;
+# that module walks this file at install time and, finding no placeholder,
+# returns it byte-identical. Prior text here claimed the template-drift gate
+# `scripts/check_template_drift.py` "enforces" byte-identity with the
+# orchestrator's own `.claude/scripts/` copy. That gate was REMOVED in
+# PR-39 / v0.2.12 (see `.github/workflows/hook-parity.yml`) and this repo
+# tracks no `.claude/scripts/` at all, so the claim had been false for
+# eighteen releases.
 # VCO-REWIRE-END: orchestrator-root-resolution
 
 err() { printf '[vct-project-config] %s\n' "$*" >&2; }

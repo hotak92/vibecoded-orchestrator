@@ -61,19 +61,30 @@ class _FakeFilter:
 
     Records (prop_name, value) match pairs and AND-combines them so the
     real ``sync_node`` filter expressions resolve against a dict store.
+    v0.2.92 WP-B1: also implements ``any_of`` (the sync script's
+    dual-shape file_path filter — canonical POSIX OR legacy backslash).
     """
 
-    def __init__(self, matchers=None):
+    def __init__(self, matchers=None, subfilters=None):
         self.matchers = matchers or []
+        self.subfilters = subfilters
 
     @staticmethod
     def by_property(name: str) -> "_FakeProp":
         return _FakeProp(name)
 
+    @staticmethod
+    def any_of(filters) -> "_FakeFilter":
+        f = _FakeFilter()
+        f.subfilters = list(filters)
+        return f
+
     def __and__(self, other: "_FakeFilter") -> "_FakeFilter":
         return _FakeFilter(self.matchers + other.matchers)
 
     def matches(self, props: dict) -> bool:
+        if self.subfilters is not None:
+            return any(sf.matches(props) for sf in self.subfilters)
         return all(props.get(name) == value for name, value in self.matchers)
 
 
@@ -167,6 +178,10 @@ class _FakeServer:
     def _get_all_kg_embeddings(self, text):  # noqa: ARG002
         return {"qwen3_embed": [0.1, 0.2, 0.3]}
 
+    def _get_all_kg_embeddings_tagged(self, text):  # noqa: ARG002
+        # W3: the tagged capture the sync write path now persists.
+        return {"qwen3_embed": [0.1, 0.2, 0.3]}, []
+
 
 # ─── Module loader (fresh import per project root) ────────────────────────
 
@@ -246,7 +261,10 @@ class BatchTitleCollisionTest(unittest.TestCase):
 
         mod = _load_sync_module(self.root)
         server = _FakeServer()
-        success, fail = mod.sync_all_nodes(server)
+        # v0.2.92 WP-B1: sync_all_nodes returns a SyncTally (succeeded
+        # counts real writes only; skips are separate) instead of a
+        # (success, fail) tuple.
+        fail = mod.sync_all_nodes(server).failed
 
         fps = self._kg_file_paths(mod, server)
         self.assertIn(

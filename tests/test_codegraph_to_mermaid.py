@@ -434,7 +434,7 @@ class TestRenderMermaid:
         # PRE-ALPHA banner comments lead every render.
         assert out.startswith("%% [PRE-ALPHA]")
         # `flowchart TD` is the first non-comment line.
-        non_comment = [l for l in out.splitlines() if not l.startswith("%%")]
+        non_comment = [line for line in out.splitlines() if not line.startswith("%%")]
         assert non_comment[0] == "flowchart TD"
         assert "%% empty subgraph" in out
         # Ends with a newline.
@@ -477,7 +477,7 @@ class TestRenderMermaid:
         assert 'title: demo' in out
         # Header block boundaries: `---` opening + closing, AFTER the
         # PRE-ALPHA banner comment lines.
-        non_comment = [l for l in out.splitlines() if not l.startswith("%%")]
+        non_comment = [line for line in out.splitlines() if not line.startswith("%%")]
         assert non_comment[0] == "---"
 
     def test_minority_edge_kinds_get_labels(self) -> None:

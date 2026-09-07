@@ -218,17 +218,42 @@ pub struct ServicesRuntimeSnapshot {
     pub degraded: bool,
 }
 
-/// Canonical service-name + default-port pairs. Pinned to match
-/// `canonical_services()` in `src/commands/lifecycle.rs`. The default
-/// ports come from `CLAUDE.md`'s "Default ports" line — Weaviate
-/// 8081, Ollama 11435, code-embed 11440 — which is the same source
-/// the launcher reads. Pulled into a separate `fn` so the test below
-/// can re-use the names without recomputing them.
+/// Canonical service-name + default-port pairs. The default ports come from
+/// `CLAUDE.md`'s "Default ports" line — Weaviate 8081, Ollama 11435,
+/// code-embed 11440, model gateway 11436 — which is the same source the
+/// launcher reads. Pulled into a separate `fn` so the test below can re-use
+/// the names without recomputing them.
+///
+/// This list is a SUPERSET of `canonical_services()` in
+/// `src/commands/lifecycle.rs`, and v0.2.92 is where they stopped being
+/// identical. The launcher's list drives compose invocations, container
+/// adoption and volume management, so it holds containers only; this one
+/// answers "what runs on this machine?" for `/services/status`, where a
+/// process belongs. The comment used to claim the two were pinned to each
+/// other; they are not, and the difference is the container/process
+/// boundary rather than drift.
+///
+/// v0.2.92 (WP-12): `model_gateway` joins the table and is the FIRST row
+/// that is not a container. Two consequences, both deliberate:
+///
+///   * It is bound to loopback, so its health URL says `127.0.0.1` rather
+///     than `localhost`. The gateway REFUSES a non-loopback bind and
+///     rejects any request whose peer is not loopback; `localhost` can
+///     resolve to a routable address on a misconfigured host, and a probe
+///     URL that does not match the bind is a probe that reports the wrong
+///     thing.
+///   * The infra watchdog does NOT gain a row for it and needs no
+///     exclusion: `infra_watchdog::CANONICAL_INFRA_SERVICES` is its own
+///     ALLOWLIST of `(compose_service, container_name)` pairs, and the
+///     watchdog acts only on names in that list — it never derives its
+///     work from this table. A process is not something `compose up` can
+///     heal, so the correct action there is to add nothing.
 fn canonical_service_skeletons() -> Vec<ServiceRuntimeState> {
     [
         ("weaviate", 8081u16, "http://localhost:8081/v1/meta"),
         ("ollama", 11435u16, "http://localhost:11435/api/tags"),
         ("code_embed", 11440u16, "http://localhost:11440/health"),
+        ("model_gateway", 11436u16, "http://127.0.0.1:11436/health"),
     ]
     .iter()
     .map(|(name, port, url)| ServiceRuntimeState {
@@ -672,7 +697,7 @@ mod tests {
             .get("services")
             .and_then(|v| v.as_array())
             .expect("services array");
-        assert_eq!(services.len(), 3, "expected 3 canonical services");
+        assert_eq!(services.len(), 4, "expected 4 canonical services");
 
         let by_name: std::collections::HashMap<&str, &serde_json::Value> = services
             .iter()
@@ -682,8 +707,12 @@ mod tests {
             })
             .collect();
 
-        for (name, expected_port) in [("weaviate", 8081), ("ollama", 11435), ("code_embed", 11440)]
-        {
+        for (name, expected_port) in [
+            ("weaviate", 8081),
+            ("ollama", 11435),
+            ("code_embed", 11440),
+            ("model_gateway", 11436),
+        ] {
             let s = by_name.get(name).unwrap_or_else(|| {
                 panic!("missing canonical service {} in: {:?}", name, by_name.keys())
             });
@@ -961,8 +990,7 @@ mod tests {
     /// duration of the test. Drops the tempdir on guard drop so the
     /// next test starts fresh.
     struct VctStateDirGuard {
-        _td: tempfile::TempDir,
-        previous: Option<String>,
+        _state: vct_launcher_core::test_env::StateDirGuard,
     }
 
     impl VctStateDirGuard {
@@ -976,26 +1004,17 @@ mod tests {
                 .get_or_init(|| Mutex::new(()))
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let td = tempfile::tempdir().expect("tempdir");
-            let previous = std::env::var("VCT_STATE_DIR").ok();
-            std::env::set_var("VCT_STATE_DIR", td.path());
-            // _g releases here; the guard holds the lock again by
-            // reacquiring it on drop.
-            drop(_g);
-            Self { _td: td, previous }
+            // v0.2.92: same fix as `module_supervisor`'s copy of this guard —
+            // the shared guard HOLDS `GLOBAL_ENV_MUTEX` for its whole life
+            // (the old code dropped the lock immediately after `set_var`) and
+            // RESTORES the prior value rather than unsetting.
+            Self {
+                _state: vct_launcher_core::test_env::state_dir_guard(),
+            }
         }
 
         fn vct_root(&self) -> PathBuf {
-            self._td.path().to_path_buf()
-        }
-    }
-
-    impl Drop for VctStateDirGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-                None => std::env::remove_var("VCT_STATE_DIR"),
-            }
+            self._state.path().to_path_buf()
         }
     }
 

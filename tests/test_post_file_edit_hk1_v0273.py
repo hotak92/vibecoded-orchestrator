@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,8 @@ def test_stdin_parsed_by_single_interpreter(tmp_path):
     # find-python.sh resolves `python3` first — shadow it on PATH with a
     # counting wrapper that delegates to the real interpreter.
     shim = bindir / "python3"
+    # §3.16: deliberately unpinned — this shim IS the subject; the test counts how
+    # many interpreters find-python.sh resolves, and the hook's $PY -c is stdlib-only.
     shim.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "call" >> "{counter}"\n'
@@ -230,6 +233,58 @@ def test_pending_duplicate_report_is_surfaced(tmp_path):
     assert "KG duplicate scan" in result.stdout, result.stdout
     # Consumed (removed) so it shows once.
     assert not report.exists()
+
+
+def test_every10_scan_report_keeps_the_error_line(tmp_path):
+    """D-8 filter pin: the every-10-edits report keeps the ❌ error line.
+
+    The staged wrapper (stand-in for ``.claude/scripts/kg-duplicates``)
+    prints one ⚠️ candidate line and the ``❌ Error during duplicate
+    detection`` line detect_duplicates.py emits when the scan itself fails
+    — the line the ``⚠️ Scan did NOT complete … See the error above.``
+    verdict points at. The report filter must carry BOTH: a report that
+    names an error the reader cannot see is the dropped-stdout defect D-8
+    fixed, one level down. The wrapper sleeps so the report lands after the
+    hook exits, like the real whole-collection scan always does.
+    """
+    _skeleton(tmp_path)
+    (tmp_path / "knowledge").mkdir()
+    (tmp_path / ".claude" / "scripts").mkdir(parents=True, exist_ok=True)
+    wrapper = tmp_path / ".claude" / "scripts" / "kg-duplicates"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "sleep 1\n"
+        "printf '⚠️  possible dup: SH-WRAPPER-RAN ~ other (0.97)\\n'\n"
+        "printf '❌ Error during duplicate detection: STAGED-FAILURE\\n'\n",
+        encoding="utf-8",
+    )
+    os.chmod(wrapper, 0o755)
+    # The NINTH edit has happened; this hook fire is the tenth.
+    (tmp_path / ".claude" / "logs" / ".kg_edit_count").write_text(
+        "9", encoding="utf-8")
+    f = tmp_path / "knowledge" / "node.md"
+    f.write_text("# a node\n")
+    payload = {"tool_input": {"file_path": str(f)}, "session_id": "s"}
+    result = _run(tmp_path, payload)
+    assert result.returncode == 0, result.stderr
+
+    report = tmp_path / ".claude/state/kg_duplicates_report.txt"
+    deadline = time.monotonic() + 30.0
+    body = ""
+    while time.monotonic() < deadline:
+        if report.is_file():
+            body = report.read_text(encoding="utf-8", errors="replace")
+            if body.strip():
+                break
+        time.sleep(0.2)
+    assert "SH-WRAPPER-RAN" in body, (
+        f"the every-10-edits scan never ran or wrote nothing: {body!r}"
+    )
+    assert "❌ Error during duplicate detection" in body, (
+        "the report filter dropped the scan's error line — the 'See the "
+        "error above.' verdict would point at a line the report does not "
+        f"carry. report={body!r}"
+    )
 
 
 # --------------------------------------------------------------------------- #

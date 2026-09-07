@@ -45,7 +45,6 @@ v0.2.47 extras (knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md):
 
 import argparse
 import ast
-import hashlib
 import json
 import logging
 import os
@@ -156,97 +155,13 @@ def _strip_chunk_header(text: str) -> str:
     return _CHUNK_HEADER_RE.sub("", text, count=1)
 
 
-# v0.2.61 (Track E): per-object content-hash fields for the tombstone-skip.
-# Maps the bare collection base-name to the ORDERED list of property keys
-# whose values define an object's semantically-meaningful content. The hash
-# is computed over ONLY these fields (in this fixed order) so that:
-#   * the SAME content yields the SAME hash across runs (stable skip key), and
-#   * volatile / run-derived fields (last_modified, project_source, language,
-#     file_path) are EXCLUDED — backfilling those on an otherwise-unchanged
-#     object must NOT change the hash, or we'd re-`replace()` (re-tombstone)
-#     every row on the migration run that stamps them.
-#
-# Field choice rationale (only fields that drive the embedding vector or the
-# searchable body, plus the identity key, so a genuine change is always
-# reflected; references/UUIDs are derived from these same fields so they need
-# not be hashed separately):
-#   CodeModule      → path + module_summary + imports
-#   CodeClass       → full_name + signature + class_body + methods + composes
-#   CodeFunction    → full_name + signature + function_body + type_uses
-#                     (+ cfg_summary + data_flow_vars — v0.2.73 CG-3 INERT
-#                      tombstone padding; always "" now, kept only so existing
-#                      rows don't re-hash. See _CONTENT_HASH_FIELDS below.)
-#   CodeAPI         → endpoint + method + api_description + parameters + returns
-#   CodeInteraction → interaction_type + protocol + endpoint + raw_target
-#                     + direction + description
-# A collection whose name isn't recognised falls back to hashing ALL scalar/
-# list properties (excluding the volatile set) — fail-safe toward "include
-# more", which can only cause an extra (correct) write, never a wrong skip.
-_CONTENT_HASH_FIELDS = {
-    "CodeModule": ["path", "module_summary", "import_names"],
-    # v0.2.72 (P3): chunk_num is part of the content hash for chunkable
-    # entities so two chunks of the same entity — which share full_name but
-    # carry different chunk bodies AND a different chunk_num — always hash
-    # distinctly (defense-in-depth; their bodies already differ). The
-    # tombstone-skip then compares like-for-like per chunk.
-    "CodeClass": ["full_name", "signature", "class_body", "methods", "composes", "chunk_num"],
-    "CodeFunction": [
-        "full_name", "signature", "function_body",
-        "type_uses",
-        # v0.2.73 (CG-3) TOMBSTONE: cfg_summary + data_flow_vars are RETAINED here
-        # as INERT PADDING even though the Joern CFG/PDG extractor that populated
-        # them was removed. WHY keep them: the content hash mixes each listed
-        # field's value; a row indexed BEFORE CG-3 stored these as "" / [] and its
-        # stored content_hash includes them. If we DROPPED them from this list, the
-        # next walk on every existing install would recompute a DIFFERENT hash for
-        # EVERY function -> a one-time WHOLE-COLLECTION re-replace() (a large write
-        # burst — the exact I/O the v0.2.73 read/write-reduction work exists to
-        # avoid). Because the analyzer no longer EMITS these props, `properties.get`
-        # returns None and `_stable_scalar(None)` == `_stable_scalar("")` == "", so
-        # keeping the names makes the post-CG-3 hash BYTE-IDENTICAL to the stored
-        # one -> ZERO rewrite. The names hash as a constant "" forever; remove them
-        # only alongside a deliberate, batched re-hash migration.
-        "cfg_summary", "data_flow_vars",
-        "chunk_num",
-    ],
-    "CodeAPI": ["endpoint", "method", "api_description", "parameters", "returns"],
-    "CodeInteraction": [
-        "interaction_type", "protocol", "endpoint",
-        "raw_target", "direction", "description",
-    ],
-}
-
-# Fields that are deterministic-but-derived or volatile — NEVER part of the
-# content hash even on the all-fields fallback path. `content_hash` itself is
-# excluded so the hash is a fixed point (hashing-in the prior hash would make
-# it unstable). `last_modified` is a filesystem mtime (changes on touch with
-# no content change). `project_source` / `language` / `file_path` are stamped
-# by `_dedup_insert` and are pure functions of (file, source-root) — including
-# them would force a one-time re-write whenever a backfill migration first
-# stamps them, defeating the skip.
-# KNOWN LIMITATION (Stage-1 correctness SEV-3 #2, pre-existing v0.2.61 tradeoff):
-# `start_line`/`end_line` are EXCLUDED from the content hash, so a function whose
-# body is byte-identical but whose line range SHIFTED (an edit above it in the
-# file) is content-hash-unchanged → the per-object skip (and, since FIX-B2, the
-# embed) is skipped, leaving the STORED start_line/end_line stale until a full
-# reanalyze. The VECTOR stays correct (body unchanged); only the display line
-# range drifts. Accepted tradeoff: including line ranges would force a re-write
-# of every function below any edit on every keystroke — the exact write
-# amplification the skip exists to avoid. A full `code-graph-analyze` (no
-# --only-file) re-stamps the ranges.
-_CONTENT_HASH_EXCLUDE = frozenset({
-    "content_hash", "last_modified", "project_source", "language",
-    "file_path", "start_line", "end_line",
-    # v0.2.72 (P7): the embedding-revision marker is generation metadata, not
-    # semantic content — excluding it keeps the content hash a fixed point so
-    # stamping/bumping the revision never triggers a spurious content-hash
-    # rewrite on the unknown-collection fallback path.
-    "embed_revision",
-    # v0.2.73 (M1/M4): generation metadata, same rationale — `is_test` is a
-    # pure function of the excluded `file_path`; `n_callers` is recomputed by
-    # every cross-reference pass. Neither belongs in _CONTENT_HASH_FIELDS.
-    "is_test", "n_callers",
-})
+# v0.2.61 (Track E) content-hash rule — EXTRACTED to
+# `vco_lib/codegraph_content_hash.py` in v0.2.92 (one home, next to its
+# consumer `codegraph_guards.classify_row`). It is imported with the other
+# vco_lib names further down, inside the ONE loud-fail block, and re-exported
+# there under the historical private names so every call site and test here is
+# unaffected. The digest is a WIRE FORMAT: changing it re-writes and re-embeds
+# every row on every install.
 
 
 # ── v0.2.72 (P7): code-graph embedding-revision sentinel + forced resync ─────
@@ -355,72 +270,6 @@ def _note_written_uuid(analyzer, collection_name: str, uid: str) -> None:
     if pending is not None:
         pending[1].setdefault(collection_name, set()).add(str(uid))
 
-
-def _stable_scalar(value: Any) -> str:
-    """Render a property value into a stable, order-independent string.
-
-    Lists are rendered element-wise (each element coerced to str) WITHOUT
-    sorting — the analyzer emits these lists deterministically per parse, so
-    preserving order keeps the hash byte-stable while a genuine reorder (which
-    is a real content change in source) correctly changes the hash. None and
-    missing values render as the empty string so an absent field and an
-    explicitly-empty field hash identically (avoids spurious re-writes when a
-    property is omitted vs. set to "").
-    """
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return "\x1e".join(_stable_scalar(v) for v in value)
-    if isinstance(value, bool):
-        # Render bools before the int branch (bool is a subclass of int) so
-        # True/False hash distinctly from 1/0 textual collisions are avoided.
-        return "true" if value else "false"
-    return str(value)
-
-
-def _content_hash_for_object(collection_name: str, properties: Mapping[str, Any]) -> str:
-    """Return a stable SHA-256 over an object's semantically-meaningful content.
-
-    v0.2.61 (Track E) — mirrors the KG-sync `content_hash` discipline
-    (templates/scripts/sync_knowledge_graph.py) for the code graph. Used by
-    `_dedup_insert` to SKIP a `replace()` when the object is byte-identical to
-    what's already indexed, eliminating needless HNSW vector tombstones.
-
-    Args:
-        collection_name: full per-project collection name (e.g.
-            ``MyProject_CodeFunction``) OR a bare base name. We match on the
-            base suffix so the per-project prefix is irrelevant.
-        properties: the ``insert_params["properties"]`` dict for this object.
-
-    Returns:
-        Hex SHA-256 digest. Deterministic for identical content across runs,
-        OSes, and machines (uses POSIX-normalized inputs the callers already
-        produce). Never raises — a malformed value degrades into its ``str()``.
-
-    Field selection: per `_CONTENT_HASH_FIELDS` for the recognised base names;
-    otherwise every scalar/list property except `_CONTENT_HASH_EXCLUDE`. The
-    fallback errs toward hashing MORE fields, which can only cause an extra
-    (correct) write — never an incorrect skip.
-    """
-    base = ""
-    for known in _CONTENT_HASH_FIELDS:
-        if collection_name == known or collection_name.endswith(known):
-            base = known
-            break
-
-    if base:
-        fields = _CONTENT_HASH_FIELDS[base]
-    else:
-        # Unknown collection → hash all non-excluded keys in sorted order so
-        # the digest is stable regardless of dict insertion order.
-        fields = sorted(k for k in properties.keys() if k not in _CONTENT_HASH_EXCLUDE)
-
-    parts = [base]
-    for key in fields:
-        parts.append(key)
-        parts.append(_stable_scalar(properties.get(key)))
-    blob = "\x1f".join(parts)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +401,11 @@ try:
     from vco_lib.codegraph_naming import (
         canonical_class_prefix as _canonical_class_prefix,
     )
+    # v0.2.92: the G5/Q1 worktree-name rule now sits with the other rules.
+    from vco_lib.codegraph_naming import (  # noqa: F401 — historical aliases
+        WORKTREE_PATH_SEGMENTS as _WORKTREE_PATH_SEGMENTS,
+        worktree_segment_in_value as _worktree_segment_in_value,
+    )
     from vco_lib.codegraph_row_classify import (
         CODEGRAPH_IGNORE_PARTS as _VCO_CODEGRAPH_IGNORE_PARTS,
         CODEGRAPH_SKIP_SUFFIXES as _VCO_CODEGRAPH_SKIP_SUFFIXES,
@@ -565,6 +419,23 @@ try:
     # alias — its `classify_row` (embed decision SKIP/STAMP/EMBED) is DISTINCT
     # from codegraph_row_classify.classify_row (prune owed/not_owed/purgeable).
     from vco_lib import codegraph_guards as _guards
+    # v0.2.92: extractor-generation re-index — the force-rewalk flag
+    # resolution, the all-chunks-SKIP verdict, and the completion stamp all
+    # live there; this file keeps only the I/O seams.
+    from vco_lib import codegraph_extractor_generation as _extractor_gen
+    # v0.2.92 (BLOCKER-2): "may this run DROP the five <prefix>_Code* classes?"
+    # — composes the W8 identity SSOT; no second identity rule lives here.
+    from vco_lib.codegraph_drop_guard import (  # noqa: F401 — re-export
+        CodeGraphDropRefused, enforce as _enforce_drop_guard,
+    )
+    # v0.2.92: the content-hash rule (see the note near `_strip_chunk_header`).
+    # Re-exported under its historical private names for existing call sites.
+    from vco_lib.codegraph_content_hash import (  # noqa: F401 — re-export
+        _CONTENT_HASH_EXCLUDE,
+        _CONTENT_HASH_FIELDS,
+        _content_hash_for_object,
+        _stable_scalar,
+    )
     # P2f (v0.2.76): the CodeEntity IR + its insert_params/identity mapping.
     # Extractors emit a typed entity and call `self.store_entity(...)` instead
     # of hand-building the `insert_params` dict + repeating the identity-key
@@ -615,6 +486,16 @@ try:
     from vco_lib.paths import (
         looks_like_orchestrator_root as _looks_like_orchestrator_root_impl,
     )
+    # v0.2.92: ONE home for resolving / reading / writing cross-reference
+    # edges, shared with the MCP (`query_code_structure`) and the query CLI.
+    from vco_lib.codegraph_references import (
+        add_missing_reference_edges as _add_missing_reference_edges,
+        build_module_name_index as _build_module_name_index,
+        build_short_name_index as _build_short_name_index,
+        reference_target_uuids as _reference_target_uuids,
+        resolve_base_class_targets as _resolve_base_class_targets,
+        resolve_import_target_path as _resolve_import_target_path,
+    )
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -643,38 +524,6 @@ def _sanitize_collection_prefix(name: str) -> str:
     collision then wedged the analyzer indefinitely (bug 0.7 / v0.2.15).
     """
     return _canonical_class_prefix(name)
-
-
-# v0.2.70 G5 / v0.2.73 Q1: git-worktree-container directory names. A canonical
-# project name NEVER contains one of these as a path segment; when one appears
-# it means the analyzer is being pointed at a throwaway per-track worktree
-# (`<repo>/.wt/<track>`, `worktrees/<name>`, or the older `vco-wt/<track>`
-# layout) whose relative name would mint a `<Worktree>_Code*` pollution
-# collection that never gets cleaned up.
-_WORKTREE_PATH_SEGMENTS = (".wt", "worktrees", "vco-wt")
-
-
-def _worktree_segment_in_value(value: Optional[str]) -> Optional[str]:
-    """Return the offending worktree-container segment if `value` (an EXPLICIT
-    --project / CODE_GRAPH_PROJECT string) contains one as a WHOLE path-ish
-    segment, else None.
-
-    Splits on '/', '\\', and whitespace and compares each resulting segment
-    EXACTLY (case-insensitive) against `_WORKTREE_PATH_SEGMENTS`. This is a
-    segment match, NOT a substring match — a legit project name that merely
-    contains the substring "wt" ("SwiftUI", "MyWtfProject", "Growth") or even
-    the substring ".wt" inside a larger token is NOT flagged; only a bare
-    segment equal to '.wt' / 'worktrees' / 'vco-wt' is.
-    """
-    if not value:
-        return None
-    # Split on the two path separators + any whitespace run.
-    segments = re.split(r"[\\/\s]+", value.strip())
-    wanted = {s.lower() for s in _WORKTREE_PATH_SEGMENTS}
-    for seg in segments:
-        if seg and seg.lower() in wanted:
-            return seg
-    return None
 
 
 def _collection_name(base: str, project_name: str) -> str:
@@ -1233,7 +1082,7 @@ except ImportError:
 try:
     import weaviate
     from weaviate.classes.config import Configure, Property, DataType, ReferenceProperty
-    from weaviate.classes.query import Filter
+    from weaviate.classes.query import Filter, QueryReference
 except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
@@ -1262,33 +1111,33 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # weaviate_mcp is pip-installed as an editable package by install.py
 # (A1, v0.2.38) — no sys.path entry needed for weaviate_mcp.code_truncation.
-# vco_lib (EmbeddingService) still needs its parent on sys.path because
-# vco_lib is not yet a standalone package.
+# vco_lib IS pip-installable too; this arm is the fallback for a Python
+# that is NOT the install's venv (a bare `python3 .claude/scripts/...`).
 #
-# v0.2.57: use the SINGLE validated bootstrap helper (defined near the top
-# of this module). Previously this site read ONLY $VCT_ORCHESTRATOR_ROOT
-# with an unvalidated parent.parent.parent fallback — which broke under
-# the launcher (it sets $VCT_INSTALL_ROOT, not $VCT_ORCHESTRATOR_ROOT) and
-# fell back to the user-project root, crashing the `from
-# vco_lib.embedding_service import` below with ModuleNotFoundError. The
-# helper honors both env-var names + validates the candidate contains
-# vco_lib/, so the two sites can no longer drift.
-# v0.2.61: assert the bootstrap succeeded BEFORE the bare `from
-# vco_lib...` imports below (531 embedding_service, and later 6915
-# project_config / 7204 deferral_report). Those are top-level imports
-# with no try/except — if the helper couldn't find a dir containing
-# `vco_lib/`, they crash with a bare `ModuleNotFoundError: No module
-# named 'vco_lib'` deep in the file, which surfaces in the launcher as
-# an opaque "Code graph: build failed". Failing here instead gives an
-# actionable message naming the actual fix (the missing install root).
-# The companion launcher fix (codegraph.rs resolving VCT_INSTALL_ROOT
-# via resolve_orchestrator_root) makes this branch unreachable for a
-# correctly-installed orchestrator; this is the defense-in-depth so a
-# resolution miss never again hard-crashes mid-file.
+# v0.2.57: this site uses the SINGLE validated bootstrap helper defined near
+# the top of this module. It honors BOTH env-var names ($VCT_INSTALL_ROOT is
+# what the launcher sets; reading only $VCT_ORCHESTRATOR_ROOT was the v0.2.57
+# bug) and VALIDATES that a candidate really contains vco_lib/, so the two
+# sites cannot drift back apart.
+# v0.2.61: assert the bootstrap succeeded BEFORE the bare `from vco_lib...`
+# imports below — they carry no try/except, so a miss used to surface in the
+# launcher as an opaque "Code graph: build failed" from deep in the file.
+# v0.2.92 (R4/R21): INSTALL-TIME BAKED ROOT. `vco_lib/rewire.py` substitutes
+# the placeholder below when this file is installed into a project, giving an
+# installed copy a candidate that needs NOTHING in the environment. It is
+# consulted only AFTER the helper has already failed, so every env pin still
+# wins; in the clone the placeholder stays literal, the vco_lib/ check rejects
+# it, and the retry is inert. The helper is RE-ASKED, never re-implemented.
+_VCO_BAKED_ORCHESTRATOR_ROOT = "{{ORCHESTRATOR_ROOT}}"
 if not _ensure_vco_lib_on_path():
+    if (Path(_VCO_BAKED_ORCHESTRATOR_ROOT) / "vco_lib").is_dir():
+        os.environ["VCT_ORCHESTRATOR_ROOT"] = _VCO_BAKED_ORCHESTRATOR_ROOT
+if not _ensure_vco_lib_on_path():
+    _baked = _VCO_BAKED_ORCHESTRATOR_ROOT
     _tried = [
         ("VCT_INSTALL_ROOT", os.environ.get("VCT_INSTALL_ROOT", "").strip() or "(unset)"),
         ("VCT_ORCHESTRATOR_ROOT", os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip() or "(unset)"),
+        ("baked-at-install", "(not baked)" if "{" in _baked else _baked),
         ("<script_dir>/../..", str(Path(__file__).resolve().parent.parent.parent)),
     ]
     _detail = "; ".join(f"{name}={val}" for name, val in _tried)
@@ -1419,6 +1268,49 @@ def _resolve_code_model_id() -> str:
     return "codesage/codesage-large-v2"
 
 
+def _plan_chunk_texts_for(
+    ctx, collection, insert_params: dict, identity_key: str,
+    soft: bool = True,
+) -> Optional[List[str]]:
+    """Analyzer seam over ``guards.plan_chunk_texts`` (v0.2.92, Defect A).
+
+    Supplies the module-level chunkers + the active code model, each resolved
+    by BARE NAME at call time so the long-standing ``analyzer_mod.*``
+    monkeypatch seams still govern. Module-level (not a method) so the legacy
+    stubs that bind ``_dedup_insert`` unbound stay unaffected — there is no new
+    attribute for them to be missing. ``soft=True`` is the HOIST: any failure
+    falls back to today's exact order (a probe must never become a new failure
+    point) but is COUNTED AND WARNED, never swallowed silently; the fan-out
+    passes ``soft=False`` so a chunker raise propagates exactly as it always has.
+    """
+    try:
+        return _guards.plan_chunk_texts(
+            getattr(collection, "name", "") or "",
+            insert_params.get("properties")
+            if isinstance(insert_params, dict) else None,
+            identity_key,
+            language_fallback=getattr(ctx, "_current_language", "") or "",
+            model_fn=_resolve_code_model_id,
+            chunk_fn=chunk_or_truncate_for_embedding,
+            chunk_class_fn=chunk_or_truncate_class_for_embedding,
+        )
+    except Exception as exc:  # noqa: BLE001 — see the ``soft`` contract above
+        if not soft:
+            raise
+        try:
+            ctx._chunk_plan_failures = _n = int(getattr(ctx, "_chunk_plan_failures", 0)) + 1
+            _msg = _guards.chunk_plan_degrade_warning(
+                _n, exc, coll_name=getattr(collection, "name", "") or "",
+                identity_key=identity_key,
+                language=getattr(ctx, "_current_language", "") or "",
+            )
+            if _msg:
+                logger.warning("%s", _msg)
+        except Exception:  # noqa: BLE001 — a warning must never break the probe
+            pass
+        return None
+
+
 def generate_embedding(text: str) -> Optional[Any]:
     """Embed *text* via the EmbeddingService.
 
@@ -1506,6 +1398,10 @@ class CodeGraphAnalyzer:
         self.named_vectors = named_vectors
         self.client = None
 
+        # The sanitized class prefix the five names below are built from —
+        # one field so the drop guard checks the SAME string the delete uses.
+        self.project_prefix = _sanitize_collection_prefix(project_name)
+
         # Per-project collection names
         self.coll_module = _collection_name("CodeModule", project_name)
         self.coll_class = _collection_name("CodeClass", project_name)
@@ -1590,6 +1486,12 @@ class CodeGraphAnalyzer:
         # root-autodetect). Read by every `_find_*_files` via
         # `_ignore_dirs_for(lang, self.index_dot_claude)`.
         self.index_dot_claude: bool = False
+
+        # v0.2.92 — EXTRACTOR-GENERATION force re-walk: bypass the per-FILE
+        # gate in `_get_existing_module` ONLY, leaving every per-object gate
+        # intact. Set by main() from `--force-rewalk` / its env transport.
+        # Full rationale: `vco_lib/codegraph_extractor_generation.py`.
+        self.force_rewalk: bool = False
 
     def connect(self):
         """Connect to Weaviate."""
@@ -1756,11 +1658,23 @@ class CodeGraphAnalyzer:
         assert last_exc is not None, "loop must have set last_exc"
         raise last_exc
 
-    def create_collections(self, force: bool = False):
-        """Create Weaviate collections for code graph (per-project names)."""
+    def create_collections(self, force: bool = False, *,
+                           repo_path: Optional[Path] = None):
+        """Create Weaviate collections for code graph (per-project names).
+
+        ``force=True`` DELETES all five ``<prefix>_Code*`` classes first, so it
+        is gated by ``vco_lib.codegraph_drop_guard`` (v0.2.92 BLOCKER-2) — which
+        owns the decision table and raises ``CodeGraphDropRefused`` before any
+        delete — and ``repo_path``, the folder whose registered identity the
+        target family is checked against, is REQUIRED with it. THE chokepoint:
+        every force path reaches the delete through here.
+        """
 
         if not self.client:
             raise RuntimeError("Not connected to Weaviate")
+
+        if force:
+            _enforce_drop_guard(repo_path, self.project_prefix)
 
         collections_created = []
 
@@ -2181,40 +2095,37 @@ class CodeGraphAnalyzer:
             project_source=current_source_for_uuid,
         )
 
-        # ── v0.2.73 (FIX-B2): HOIST the content-hash skip BEFORE the embed ──
-        # Walkers now pass a zero-arg embed callable via
-        # `insert_params['_deferred_embed']` instead of an eager `vector`. This
-        # resolver point-reads the stored fingerprint and, when the object is
-        # byte-identical + at the current embed_revision, SKIPS the embed
-        # entirely (a 1-line edit to a 50-func file runs 1 embed, not ~51).
-        # No-op for call sites that still set `vector` eagerly (no
-        # `_deferred_embed` key). Fail-safe: embeds on any read/hash
-        # uncertainty. Clears any prior turn's stashed skip-fingerprint so it
-        # can't leak into an object that DID embed (the stash is consumed once
-        # in _write_one_object). GUARD on the key's presence AND on the method
-        # existing so legacy test stubs that bind `_dedup_insert` as an unbound
-        # method (without the FIX-B2 helpers) keep the pre-fix behaviour — the
-        # deferred path only ever engages for the real analyzer's walker sites.
+        # ── v0.2.73 (FIX-B2) + v0.2.92 (Defect A): resolve the deferred embed ─
+        # Walkers pass a zero-arg embed callable as
+        # `insert_params['_deferred_embed']` instead of an eager `vector`; the
+        # three-way routing lives in `guards.dispatch_deferred_embed` and the
+        # stash cleared here is consumed once in `_write_one_object`.
+        # Defect A: plan the chunk texts FIRST, because the resolver's
+        # full-body hash can never match a multi-chunk entity's stored chunk-0
+        # hash — so it always embedded and the fan-out always threw that vector
+        # away. Only the DECISION moves: the WRITE stays below the
+        # property-stamping block, whose language/project_source/file_path/
+        # is_test/doc stamps every chunk row copies out of `props`. Planning
+        # soft-fails to None → today's exact order. See
+        # `guards.plan_chunk_texts`.
         self._embed_skip_fingerprint = None
-        if isinstance(insert_params, dict) and "_deferred_embed" in insert_params:
-            _resolver = getattr(self, "_resolve_deferred_embed", None)
-            if callable(_resolver):
-                _resolver(
+        _planned_chunks = _plan_chunk_texts_for(
+            self, collection, insert_params, identity_key,
+        )
+        _resolver = getattr(self, "_resolve_deferred_embed", None)
+        _guards.dispatch_deferred_embed(
+            insert_params,
+            is_multi_chunk=(
+                _planned_chunks is not None and len(_planned_chunks) > 1
+            ),
+            resolver=(
+                (lambda: _resolver(
                     collection, insert_params, identity_key, file_path_rel,
                     current_source_for_uuid,
-                )
-            else:
-                # No resolver (minimal stub) → don't strand the callable in the
-                # Weaviate kwargs: pop it and best-effort embed eagerly.
-                _deferred = insert_params.pop("_deferred_embed", None)
-                if callable(_deferred):
-                    try:
-                        _emb = _deferred()
-                    except Exception:  # noqa: BLE001
-                        _emb = None
-                    _shaped = _shape_for_insert(_emb)
-                    if _shaped:
-                        insert_params["vector"] = _shaped
+                )) if callable(_resolver) else None
+            ),
+            eager_shape_fn=_shape_for_insert,
+        )
 
         # v0.2.18 (Plan C): stamp the canonical language ID on every insert
         # so the language-scoped prune filter can match each row. The
@@ -2333,7 +2244,7 @@ class CodeGraphAnalyzer:
         # `_find_*` method edits.
         chunk_uuid = self._maybe_chunk_and_write(
             collection, insert_params, identity_key, file_path_rel,
-            current_source_for_uuid,
+            current_source_for_uuid, chunk_texts=_planned_chunks,
         )
         if chunk_uuid is not None:
             return chunk_uuid
@@ -2455,8 +2366,30 @@ class CodeGraphAnalyzer:
         # the UUID it just wrote. Missing target → drop the handler ref (the
         # imperative code never produced an API without its handler, so this is
         # purely defensive — never fabricate an edge).
+        #
+        # ── v0.2.92 (Defect B): disambiguate same-named symbols in ONE file ──
+        # `full_name` is `{file_stem}.{symbol}` in every producer, so two
+        # same-named symbols in one file shared a deterministic UUID and the
+        # later write silently overwrote the earlier (11 × `secrets.drop`; the
+        # systemd/launchd/Windows impls of `boot.register` collapsed onto one
+        # row each). Occurrence 1 keeps the BARE key, so every UUID stored today
+        # is still written by this walk — a PURE ADD that orphans nothing and
+        # engages no delete path. Rule + key-space rationale: the identity
+        # banner in `vco_lib/codegraph_guards`.
+        _dup_ids = _guards.assign_duplicate_identity_suffixes(
+            [(e.kind, e.identity_key()) for e in fx.entities]
+        )
+        _n_dup = sum(1 for s in _dup_ids if s is not None)
+        if _n_dup:
+            self._identity_collisions = getattr(self, "_identity_collisions", 0) + _n_dup
+            self._identity_collision_files = getattr(
+                self, "_identity_collision_files", 0) + 1
         written_by_full_name: Dict[str, str] = {}
-        for entity in fx.entities:
+        for _i, entity in enumerate(fx.entities):
+            if _dup_ids[_i] is not None:
+                # Copy before mutating: producers may reuse an extras dict.
+                entity.extras = dict(entity.extras)
+                entity.extras["_identity_key"] = _dup_ids[_i]
             entity.references = dict(entity.references)
             # Reference shape is KIND-SPECIFIC and byte-identity-critical:
             #   * CLASS / FUNCTION → references={"module": module_uuid} (every
@@ -2535,22 +2468,13 @@ class CodeGraphAnalyzer:
         return _shape_for_insert(*args, **kwargs)
 
     def _stamp_single_chunk_props(self, collection, insert_params: dict) -> None:
-        """Stamp chunk_num=0/total_chunks=1 on a single-object Function/Class write.
-
-        Only Function/Class carry chunk props (they're the chunkable entities);
-        Module/API/Interaction are left untouched. Defensive: don't clobber a
-        caller-preset value, and no-op on non-Function/Class collections.
-        """
-        coll_name = getattr(collection, "name", "") or ""
-        if not (coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass")):
-            return
-        props = insert_params.get("properties")
-        if not isinstance(props, dict):
-            return
-        if "chunk_num" not in props:
-            props["chunk_num"] = 0
-        if "total_chunks" not in props:
-            props["total_chunks"] = 1
+        """Test/monkeypatch seam over ``guards.stamp_single_chunk_props`` — the
+        chunk_num=0/total_chunks=1 stamp for a single-object Function/Class
+        write. See the guard for the full contract."""
+        _guards.stamp_single_chunk_props(
+            getattr(collection, "name", "") or "",
+            insert_params.get("properties"),
+        )
 
     def _delete_stale_chunk_rows(
         self, collection, full_name: str, file_path_rel: str,
@@ -2586,15 +2510,10 @@ class CodeGraphAnalyzer:
             _fp = file_path_rel or ""
 
             def _is_stale_tail(raw_full_name: str, props: dict) -> bool:
-                if raw_full_name != _target:
-                    return False
-                # file_path scoping (exact) when known — belongs to THIS entity.
-                if _fp and (props.get("file_path") or "") != _fp:
-                    return False
-                try:
-                    return int(props.get("chunk_num")) >= _min
-                except (TypeError, ValueError):
-                    return False  # NULL/non-int chunk_num → never a tail row
+                return _guards.is_stale_tail_row(
+                    raw_full_name, props, full_name=_target,
+                    file_path_rel=_fp, min_chunk_num=_min,
+                )
 
             _extra = ["chunk_num"]
             if _fp:
@@ -2655,25 +2574,13 @@ class CodeGraphAnalyzer:
                 pass
             for obj in collection.iterator(return_properties=_read):
                 props = getattr(obj, "properties", None) or {}
-                if (props.get("full_name") or "") != full_name:
+                if not _guards.survivor_needs_total_patch(
+                    props, full_name=full_name,
+                    project=self.project_name or "",
+                    project_source=current_source or "",
+                    file_path_rel=file_path_rel or "", new_total=new_total,
+                ):
                     continue
-                if self.project_name and (props.get("project") or "") != self.project_name:
-                    continue
-                if current_source and (props.get("project_source") or "") != current_source:
-                    continue
-                if file_path_rel and (props.get("file_path") or "") != file_path_rel:
-                    continue
-                try:
-                    cn = int(props.get("chunk_num"))  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    continue
-                if cn >= new_total:
-                    continue  # a tail row (should already be deleted) — skip
-                try:
-                    if int(props.get("total_chunks")) == new_total:  # type: ignore[arg-type]
-                        continue  # already correct — idempotent no-op
-                except (TypeError, ValueError):
-                    pass  # NULL/non-int stored total → patch it
                 try:
                     collection.data.update(
                         uuid=obj.uuid,
@@ -2682,7 +2589,7 @@ class CodeGraphAnalyzer:
                 except Exception as exc:  # noqa: BLE001 — per-row soft-fail
                     print(
                         f"⚠️  total_chunks patch failed for {full_name} "
-                        f"chunk {cn}: {exc}",
+                        f"chunk {props.get('chunk_num')}: {exc}",
                         file=sys.stderr,
                     )
         except Exception as exc:  # noqa: BLE001 — cosmetic patch, never fatal
@@ -2694,6 +2601,7 @@ class CodeGraphAnalyzer:
     def _maybe_chunk_and_write(
         self, collection, insert_params: dict, identity_key: str,
         file_path_rel: str, current_source_for_uuid: str,
+        chunk_texts: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Chunk an over-budget Function/Class into N objects and write them.
 
@@ -2706,60 +2614,42 @@ class CodeGraphAnalyzer:
           * the collection is not CodeFunction/CodeClass, OR
           * the properties lack the body/signature needed to re-derive chunks, OR
           * the entity fits in one chunk (the common 91%+ case).
+
+        v0.2.92 (Defect A): ``chunk_texts`` is the list `_dedup_insert` planned
+        BEFORE the embed-skip resolver, passed down and never recomputed so the
+        hoisted DECISION and this WRITE cannot disagree; ``None`` means a direct
+        caller (tests / legacy stubs) and it is derived here as before. This
+        method stays BELOW `_dedup_insert`'s property-stamping block on purpose:
+        every chunk row copies language/project_source/file_path/is_test/doc out
+        of `props`, and the language-scoped `--prune-stale` filter plus the
+        prune anchor resolution key on exactly those.
         """
-        # v0.2.76 (R1): the `_CHUNKING_AVAILABLE` gate is gone — the
-        # code_truncation import is now loud-fail (a broken install exits at
-        # import), so chunking support is always present here.
+        # v0.2.76 (R1): no `_CHUNKING_AVAILABLE` gate — the code_truncation
+        # import is loud-fail, so chunking is always present (see that import).
         coll_name = getattr(collection, "name", "") or ""
-        is_function = coll_name.endswith("CodeFunction")
-        is_class = coll_name.endswith("CodeClass")
-        if not (is_function or is_class):
-            return None
-        props = insert_params.get("properties")
-        if not isinstance(props, dict):
-            return None
-
-        signature = props.get("signature") or ""
-        language = props.get("language") or getattr(self, "_current_language", "") or "python"
-        model = _resolve_code_model_id()
-
-        if is_function:
-            body = props.get("function_body") or ""
-            if not body:
-                return None
-            chunk_texts = chunk_or_truncate_for_embedding(
-                signature, body, language=language, model=model,
-                full_name=identity_key,
+        props = insert_params.get("properties") if isinstance(insert_params, dict) else None
+        if chunk_texts is None:
+            chunk_texts = _plan_chunk_texts_for(
+                self, collection, insert_params, identity_key, soft=False,
             )
-        else:  # class
-            body = props.get("class_body") or ""
-            if not body:
-                return None
-            methods = props.get("methods") or None
-            chunk_texts = chunk_or_truncate_class_for_embedding(
-                signature, body, methods=methods, language=language, model=model,
-                full_name=identity_key,
-            )
-
-        # Single chunk → the entity fits; not our path. Return None so the
-        # caller does the ordinary single-object write (the deferred-embed
-        # resolver decides SKIP/STAMP/EMBED there — no needless re-embed).
-        if len(chunk_texts) <= 1:
+        # Not chunkable / no body / single chunk → the entity fits; not our
+        # path. Return None so the caller does the ordinary single-object write
+        # (the deferred-embed resolver decides SKIP/STAMP/EMBED there).
+        if not chunk_texts or len(chunk_texts) <= 1 or not isinstance(props, dict):
             return None
-
         total = len(chunk_texts)
+        is_function = coll_name.endswith("CodeFunction")
 
         # Derive per-chunk UUIDs + content hashes ONCE (reused by the stamp
         # precheck AND the embed loop). The guard stays I/O-free; inject the
         # analyzer's module-local UUID + content-hash seeds.
-        _coll_name = getattr(collection, "name", "") or ""
         chunk_uuids, chunk_hashes = _guards.chunk_identities(
             chunk_texts, props, is_function, identity_key, total,
             uuid_fn=lambda key: _deterministic_uuid(
                 self.project_name, file_path_rel, key,
                 project_source=current_source_for_uuid,
             ),
-            hash_fn=lambda cp: _content_hash_for_object(_coll_name, cp),
+            hash_fn=lambda cp: _content_hash_for_object(coll_name, cp),
         )
 
         # v0.2.82 (G1 task 3): multi-chunk STAMP precheck — a metadata-only
@@ -2772,29 +2662,29 @@ class CodeGraphAnalyzer:
         ):
             return chunk_uuids[0]
 
-        canonical_uuid: Optional[str] = None
-        for i, chunk_text in enumerate(chunk_texts):
-            # Re-embed THIS chunk (own vector); guards builds its insert_params.
-            chunk_vec = _shape_for_insert(generate_embedding(chunk_text))
-            chunk_params = _guards.build_chunk_write_params(
-                insert_params, props, chunk_text, is_function, i, total,
-                chunk_vec,
-            )
-            written = self._write_one_object(
-                collection, chunk_uuids[i], chunk_params, identity_key,
-            )
-            if i == 0:
-                canonical_uuid = written
-        return canonical_uuid
+        # Re-embed each chunk (own vector, never the parent's full-body one);
+        # the guard owns the loop + params build, this supplies the two I/O
+        # callables. Both resolved by bare name at call time, so the existing
+        # `generate_embedding` / `_shape_for_insert` monkeypatch seams hold.
+        return _guards.fan_out_chunk_writes(
+            insert_params, props, chunk_texts, chunk_uuids, is_function,
+            embed_fn=lambda t: _shape_for_insert(generate_embedding(t)),
+            write_fn=lambda cu, cp: self._write_one_object(
+                collection, cu, cp, identity_key,
+            ),
+        )
 
     def _maybe_stamp_all_chunks(
         self, collection, chunk_uuids: List[str], chunk_hashes: List[str],
         total: int,
     ) -> bool:
-        """v0.2.82 (G1 task 3): thin seam over ``guards.stamp_all_chunks`` (which
-        owns the read-all-first / patch-only-if-all-stampable discipline). This
-        supplies the I/O: fingerprint read + the per-chunk revision PATCH (also
-        marks the row visited). True → all stamped (skip embeds); False → embed.
+        """v0.2.82 (G1 task 3) + v0.2.92: thin I/O seam over
+        ``guards.skip_or_stamp_all_chunks``, which owns the all-SKIP-then-STAMP
+        ordering, the memoized fingerprint reads and the never-half-stamp
+        discipline. This supplies the three I/O callables: the point-read, the
+        per-chunk ``embed_revision`` PATCH, and the visited-mark every branch
+        owes ``--prune-stale`` / the per-file reconcile. True → no embed needed
+        (skipped or stamped); False → the caller re-embeds every chunk.
         """
         def _patch(cu: str) -> bool:
             try:
@@ -2810,7 +2700,7 @@ class CodeGraphAnalyzer:
             )
             return True
 
-        return _guards.stamp_all_chunks(
+        return _guards.skip_or_stamp_all_chunks(
             chunk_uuids, chunk_hashes, total,
             current_revision=CODEGRAPH_EMBED_REVISION,
             floor_revision=_EMBED_SPACE_COMPATIBLE_FROM_REVISION,
@@ -2819,6 +2709,9 @@ class CodeGraphAnalyzer:
                 collection, cu, want_total_chunks=True,
             ),
             patch_rev=_patch,
+            note_visited=lambda cu: _note_written_uuid(
+                self, getattr(collection, "name", ""), cu,
+            ),
         )
 
     def _read_existing_object_fingerprint(
@@ -2862,31 +2755,23 @@ class CodeGraphAnalyzer:
         skip saved the ``replace()`` but NOT the embed compute (~50× wasted
         Ollama load).
 
-        THE FIX: the walkers now pass a ZERO-ARG embed callable via
-        ``insert_params['_deferred_embed']`` instead of a pre-computed
-        ``vector``. This method — called at the very top of ``_dedup_insert``,
-        before chunking / writing — decides whether the object is unchanged
-        (content_hash + embed_revision match the stored row) using the SAME
-        point-read ``_write_one_object`` will reuse, and:
+        THE FIX: walkers pass a zero-arg embed callable and this method decides
+        whether the object is unchanged (content_hash + embed_revision match the
+        stored row) using the SAME point-read ``_write_one_object`` reuses:
           * unchanged → SKIP the embed entirely (no ``vector`` set; the
             downstream write also skips), AND stash the fingerprint so
-            ``_write_one_object`` doesn't re-read.
-          * changed / absent / uncertain → CALL the deferred embedder now,
-            shape it into ``insert_params['vector']`` (fail-safe: embed on ANY
-            doubt), so the write proceeds exactly as before.
+            ``_write_one_object`` doesn't re-read;
+          * stale-but-valid → PATCH ``embed_revision`` (D1, below);
+          * changed / absent / uncertain → embed NOW (fail-safe on ANY doubt).
+        ``guards.dispatch_deferred_embed`` owns WHEN this runs and pops the key
+        so it can never reach Weaviate's ``replace()``/``insert()`` splat; since
+        v0.2.82 all five entity types defer, so this path covers every
+        collection and a metadata-only revision bump re-embeds NOTHING.
 
-        The ``_deferred_embed`` key is popped here so it never reaches
-        Weaviate's ``replace()``/``insert()`` splat. v0.2.82 (G1 task 2): ALL
-        five entity types now defer (Module/API/Interaction converted from eager
-        ``vector`` to a deferred closure), so this resolver's SKIP/STAMP path
-        covers every collection — a metadata-only revision bump re-embeds
-        NOTHING. Still a no-op when ``_deferred_embed`` is absent (test stub).
-
-        CONSERVATIVE: for chunkable entities the precheck stamps
-        ``chunk_num=0``/``total_chunks=1`` onto a scratch props copy so the
-        computed hash matches the stored canonical (chunk-0) hash exactly — an
-        over-budget (multi-chunk) entity's total differs → no spurious match →
-        it correctly re-embeds.
+        v0.2.92: an over-budget (multi-chunk) entity NO LONGER REACHES HERE —
+        the dispatcher pops its callable and embeds nothing, because this
+        precheck's single-chunk hash could never match a stored chunk-0 row and
+        so always burned an embed the fan-out then discarded.
         """
         deferred = insert_params.pop("_deferred_embed", None)
         if deferred is None:
@@ -2909,14 +2794,10 @@ class CodeGraphAnalyzer:
         )
 
         # Compute the content_hash the SAME way _write_one_object will, so a
-        # match here guarantees a match there (single-read reuse). For a
-        # single-object write, _write_one_object stamps chunk_num=0/total=1 via
-        # _stamp_single_chunk_props BEFORE hashing; mirror that on a scratch
-        # props copy so the precheck hash equals the eventual stored hash for
-        # the common (fits-in-one-chunk) case. If the entity is actually
-        # over-budget (chunkable), the real chunk 0 body differs from the full
-        # body → the hashes won't match → we correctly embed. Fail-safe either
-        # way: a hash mismatch only ever causes an embed, never a wrong skip.
+        # match here guarantees a match there (single-read reuse). It stamps
+        # chunk_num=0/total=1 via _stamp_single_chunk_props BEFORE hashing;
+        # mirror that on a SCRATCH props copy (never `props` — the fan-out
+        # reads it). Fail-safe: a hash mismatch only ever causes an embed.
         try:
             hash_props = props
             if is_chunkable:
@@ -3840,6 +3721,8 @@ class CodeGraphAnalyzer:
             # the Weaviate-500 "subtract prop lengths" signature). Non-zero =>
             # stale rows remain => build status flips success→partial.
             'prune_failures': 0,
+            # v0.2.92: entities embedded UN-CHUNKED (chunk plan uncomputable).
+            'chunk_plan_failures': 0,
         }
 
         # Language dispatch: auto-detect from extensions, or filter by --language
@@ -4126,6 +4009,28 @@ class CodeGraphAnalyzer:
         # standalone insert (cross-reference creation in the post-loop)
         # doesn't accidentally re-stamp the last extra's path.
         self._current_source = ""
+
+        # v0.2.92 (Defect A): chunk-planning degrades. The per-entity warnings
+        # name WHICH entities; this total makes a walk that degraded 400 of them
+        # visibly different from one that degraded none — and `--json-progress`
+        # forwards it, so a machine consumer sees it too.
+        stats['chunk_plan_failures'] = _n_cp = int(getattr(self, "_chunk_plan_failures", 0))
+        if _n_cp:
+            print(
+                f"   ⚠️  {_n_cp} entity(ies) could not be chunk-planned and were "
+                "embedded UN-CHUNKED — retrieval for them is DEGRADED "
+                "(per-entity warnings above name each one)",
+                file=sys.stderr,
+            )
+
+        # v0.2.92 (Defect B): ONE accounting line per walk, never per
+        # occurrence — one project measured ~4,000 of these.
+        if int(getattr(self, "_identity_collisions", 0)):
+            print(
+                f"   ⚠️  {self._identity_collisions} same-named symbol(s) in "
+                f"{self._identity_collision_files} file(s) shared an identity "
+                "with an earlier symbol in the same file — disambiguated"
+            )
 
         # v0.2.76 (CG-4 sweep-guarantee — respawn-loop edge): the deleted-primary
         # sweep lives inside `_build_stale_file_set`, which only runs when the
@@ -5368,7 +5273,14 @@ class CodeGraphAnalyzer:
         consults the per-run stale-file set: any file owning a stale-revision
         row of ANY file-anchored type re-walks, even with an unchanged hash.
         Probe unavailable → fall back to the M0-only behaviour (fail-open).
+
+        v0.2.92: ``self.force_rewalk`` bypasses this gate — the ONLY gate that
+        must yield for an EXTRACTOR-only fix to reach an existing graph (the
+        file hash and the module revision are both still correct after such a
+        fix, so every other signal says "skip"). Nothing downstream is relaxed.
         """
+        if getattr(self, "force_rewalk", False):
+            return None
         try:
             stale_files = self._get_stale_file_set()
         except Exception:  # noqa: BLE001 — stub analyzers / probe failure
@@ -5694,12 +5606,19 @@ class CodeGraphAnalyzer:
         # Load modules (including import_names for cross-ref linking)
         # C-12 (v0.2.75 P2c): key by (project_source, path) so two extra-path
         # roots sharing a relpath don't collide (see _create_or_update_module).
+        # v0.2.92: resolve the stored `imports` beacons in THIS scan (no extra
+        # round-trip; the R4 read-amp rule) — `reference_add` is not idempotent,
+        # so the linking pass must know what is already stored or it re-adds
+        # every edge on every analyze. See vco_lib/codegraph_references.py.
+        self._xref_stored_import_refs: Dict[str, List[str]] = {}
         try:
-            for obj in self.modules_collection.iterator():
+            for obj in self.modules_collection.iterator(
+                    return_references=QueryReference(link_on="imports")):
                 path = str(obj.properties.get("path", "") or "")
                 if path:
                     src = str(obj.properties.get("project_source", "") or "")
                     self.module_cache[(src, path)] = str(obj.uuid)
+                    self._xref_stored_import_refs[str(obj.uuid)] = _reference_target_uuids(obj, "imports")
                     # Populate module_imports from stored import_names
                     import_names = obj.properties.get("import_names")
                     if import_names:
@@ -5732,8 +5651,12 @@ class CodeGraphAnalyzer:
         self._xref_file_path: Dict[str, str] = {}
         self._xref_stored_calls: Dict[str, Any] = {}
         self._xref_stored_ncallers: Dict[str, Any] = {}
+        # v0.2.92: the stored `calls` BEACONS (distinct from `call_names`, the
+        # text property); same single-scan sourcing as the modules loop above.
+        self._xref_stored_call_refs: Dict[str, List[str]] = {}
         try:
-            for obj in self.functions_collection.iterator():
+            for obj in self.functions_collection.iterator(
+                    return_references=QueryReference(link_on="calls")):
                 full_name = obj.properties.get("full_name", "")
                 if full_name and self._prefer_canonical_chunk(
                     self.function_cache, full_name, obj
@@ -5744,6 +5667,7 @@ class CodeGraphAnalyzer:
                     self._xref_file_path[_u] = _p.get("file_path") or ""
                     self._xref_stored_calls[_u] = _p.get("call_names")
                     self._xref_stored_ncallers[_u] = _p.get("n_callers")
+                    self._xref_stored_call_refs[_u] = _reference_target_uuids(obj, "calls")
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
 
@@ -5835,19 +5759,11 @@ class CodeGraphAnalyzer:
 
         # Build reverse lookups for matching
         # function name (short) -> list of full_names that end with that name
-        func_name_to_full: Dict[str, List[str]] = {}
-        for full_name in self.function_cache:
-            short_name = full_name.rsplit(".", 1)[-1]
-            func_name_to_full.setdefault(short_name, []).append(full_name)
+        # v0.2.92: the index builders + the two name→target resolvers moved to
+        # vco_lib/codegraph_references.py (pure decisions, now unit-testable).
+        func_name_to_full = _build_short_name_index(self.function_cache)
+        class_name_to_full = _build_short_name_index(self.class_cache)
 
-        # class name (short) -> list of full_names
-        class_name_to_full: Dict[str, List[str]] = {}
-        for full_name in self.class_cache:
-            short_name = full_name.rsplit(".", 1)[-1]
-            class_name_to_full.setdefault(short_name, []).append(full_name)
-
-        # import module name -> module path (match last component of path)
-        # e.g. import "foo.bar" matches path "src/foo/bar.py" or module "bar"
         # C-12: module_cache is (project_source, path)-keyed; this project-wide
         # relationship resolution works by BARE path (module_imports carries no
         # source), so project a bare-path→UUID view. Last-writer-wins on a path
@@ -5857,16 +5773,7 @@ class CodeGraphAnalyzer:
         for _k, _uuid in self.module_cache.items():
             _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
             module_uuid_by_path[_p] = _uuid
-        module_name_to_path: Dict[str, List[str]] = {}
-        for path in module_uuid_by_path:
-            # "src/foo/bar.py" -> stem "bar"
-            stem = Path(path).stem
-            module_name_to_path.setdefault(stem, []).append(path)
-            # Also index dotted path: "src/foo/bar.py" -> "foo.bar"
-            parts = Path(path).with_suffix("").parts
-            if len(parts) > 1:
-                dotted = ".".join(parts[-2:])
-                module_name_to_path.setdefault(dotted, []).append(path)
+        module_name_to_path = _build_module_name_index(module_uuid_by_path)
 
         # --- 1. Function calls ---
         print("   Linking function calls...")
@@ -5893,6 +5800,9 @@ class CodeGraphAnalyzer:
         stored_call_names: Dict[str, Any] = dict(
             getattr(self, "_xref_stored_calls", {}) or {}
         )
+        # v0.2.92: stored `calls` beacons; empty ⇒ "nothing known to be stored",
+        # which degrades to adding everything, never to skipping a real edge.
+        stored_call_refs: Dict[str, Any] = dict(getattr(self, "_xref_stored_call_refs", {}) or {})
         _file_by_uuid: Dict[str, str] = getattr(self, "_xref_file_path", {}) or {}
         for full_name, func_uuid in self.function_cache.items():
             try:
@@ -6025,14 +5935,13 @@ class CodeGraphAnalyzer:
                     inbound[ref_uuid] = inbound.get(ref_uuid, 0) + 1
 
                 if refs_to_add:
+                    # v0.2.92: add ONLY edges not stored yet — `reference_add`
+                    # is not idempotent, so the pre-fix loop grew the stored set
+                    # on every analyze. `stats` now counts edges CREATED.
                     try:
-                        for ref_uuid in refs_to_add:
-                            self.functions_collection.data.reference_add(
-                                from_uuid=func_uuid,
-                                from_property="calls",
-                                to=ref_uuid,
-                            )
-                            stats['calls'] += 1
+                        stats['calls'] += _add_missing_reference_edges(
+                            self.functions_collection, func_uuid, "calls",
+                            refs_to_add, existing=stored_call_refs.get(func_uuid, ()))
                     except Exception as e:
                         logger.debug(f"Failed to add call refs for {full_name}: {e}")
 
@@ -6078,87 +5987,60 @@ class CodeGraphAnalyzer:
         print("   Linking class inheritance...")
         for full_name, class_uuid in self.class_cache.items():
             try:
-                resp = self.classes_collection.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(full_name),
-                    limit=1,
-                )
-                if not resp.objects:
+                # v0.2.92: point-read the CANONICAL row by uuid — same single
+                # read, but `fetch_objects(full_name==, limit=1)` returned an
+                # ARBITRARY chunk, so both `signature` and the stored `extends`
+                # beacons could come from a row other than the write target.
+                canonical = self.classes_collection.query.fetch_object_by_id(
+                    class_uuid, return_references=QueryReference(link_on="extends"))
+                if canonical is None:
                     continue
-                props = resp.objects[0].properties
-                signature = props.get("signature", "")
-                # Extract base class names from signature: "class Foo(Bar, Baz)"
-                base_match = re.search(r'\(([^)]+)\)', signature)
-                if not base_match:
-                    continue
-                base_names = [b.strip() for b in base_match.group(1).split(",")]
-
-                for base_name in base_names:
-                    # Skip common non-project bases (builtins, stdlib, popular libs)
-                    if base_name in ('object', 'Exception', 'BaseException',
-                                     'ABC', 'Protocol', 'TypedDict', 'Enum',
-                                     'IntEnum', 'StrEnum', 'BaseModel',
-                                     'unittest.TestCase', 'TestCase',
-                                     'str', 'int', 'float', 'bytes', 'dict',
-                                     'list', 'tuple', 'set', 'frozenset',
-                                     'type', 'Generic', 'NamedTuple',
-                                     'Thread', 'Process', 'Handler',
-                                     'logging.Handler'):
-                        continue
-                    # Try exact match
-                    if base_name in self.class_cache:
-                        ref_uuid = self.class_cache[base_name]
-                    else:
-                        # Try short name
-                        candidates = class_name_to_full.get(base_name, [])
-                        if not candidates:
-                            continue
-                        ref_uuid = self.class_cache[candidates[0]]
-
+                bases_to_add = _resolve_base_class_targets(
+                    (canonical.properties or {}).get("signature", ""),
+                    self.class_cache, class_name_to_full)
+                # v0.2.92: one add-if-absent write per class (was: one
+                # unconditional add per base — 506 live duplicates on one row).
+                if bases_to_add:
                     try:
-                        self.classes_collection.data.reference_add(
-                            from_uuid=class_uuid,
-                            from_property="extends",
-                            to=ref_uuid,
-                        )
-                        stats['extends'] += 1
+                        stats['extends'] += _add_missing_reference_edges(
+                            self.classes_collection, class_uuid, "extends",
+                            bases_to_add,
+                            existing=_reference_target_uuids(canonical, "extends"))
                     except Exception as e:
-                        logger.debug(f"Failed to add extends ref {full_name}->{base_name}: {e}")
+                        logger.debug(f"Failed to add extends refs for {full_name}: {e}")
 
             except Exception as e:
                 logger.debug(f"Error processing extends for {full_name}: {e}")
 
         # --- 3. Module imports ---
         print("   Linking module imports...")
+        # v0.2.92: stored `imports` beacons per module uuid (same contract).
+        stored_import_refs: Dict[str, Any] = dict(getattr(self, "_xref_stored_import_refs", {}) or {})
         for mod_path, import_names in self.module_imports.items():
             mod_uuid = module_uuid_by_path.get(mod_path)  # C-12: bare-path view
             if not mod_uuid or not import_names:
                 continue
+            imports_to_add: List[str] = []
             for imp_name in import_names:
-                # Try matching import name to a module in cache
-                # "os.path" -> try "path", "os.path", "os"
-                target_path = None
-                # Direct stem match: import "bar" -> "bar.py"
-                candidates = module_name_to_path.get(imp_name, [])
-                if not candidates:
-                    # Try last component: "foo.bar" -> "bar"
-                    last = imp_name.rsplit(".", 1)[-1]
-                    candidates = module_name_to_path.get(last, [])
-                if candidates:
-                    target_path = candidates[0]
-
+                target_path = _resolve_import_target_path(imp_name, module_name_to_path)
                 if target_path and target_path != mod_path:
                     target_uuid = module_uuid_by_path.get(target_path)  # C-12
                     if target_uuid:
-                        try:
-                            self.modules_collection.data.reference_add(
-                                from_uuid=mod_uuid,
-                                from_property="imports",
-                                to=target_uuid,
-                            )
-                            stats['imports'] += 1
-                        except Exception as e:
-                            logger.debug(f"Failed to add import ref {mod_path}->{target_path}: {e}")
+                        imports_to_add.append(target_uuid)
 
+            # v0.2.92: one add-if-absent write per module. Worst live site
+            # (1518 beacons / 4 distinct targets) — BOTH multipliers apply:
+            # re-linked on every analyze, and several import names in one file
+            # routinely resolve to the same module row.
+            if imports_to_add:
+                try:
+                    stats['imports'] += _add_missing_reference_edges(
+                        self.modules_collection, mod_uuid, "imports",
+                        imports_to_add, existing=stored_import_refs.get(mod_uuid, ()))
+                except Exception as e:
+                    logger.debug(f"Failed to add import refs for {mod_path}: {e}")
+
+        # Counts are edges CREATED this pass (zeros on a no-op re-analyze).
         print(f"   Done: {stats['calls']} call refs, {stats['extends']} extends refs, {stats['imports']} import refs")
         return stats
 
@@ -6662,6 +6544,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                        action='store_false',
                        help='Exclude the `.claude/` directory from analysis '
                             '(the launcher passes this for every non-root project).')
+    # v0.2.92: see `vco_lib/codegraph_extractor_generation.py`.
+    parser.add_argument('--force-rewalk', action='store_true', default=False,
+                       help='Re-extract every file even when unchanged (delivers '
+                            'extractor fixes to an existing graph). Per-entity '
+                            'content-hash gating is unaffected: unchanged entities '
+                            'are neither re-written nor re-embedded. Env: '
+                            'VCT_CODEGRAPH_FORCE_REWALK=1.')
     # v0.2.91 wave-3 (MAJOR-A): the LEDGER-root seam — see
     # `_resolve_deferral_root`. Absent ⇒ resolution is exactly what it was.
     parser.add_argument('--deferral-root', type=Path, default=None,
@@ -6929,11 +6818,11 @@ def main():
     except NoEmbeddingBackendError as e:
         _deferral_op("emit_no_backend", deferral_root, e)
         print(f"⚠️  Code-graph analysis skipped: {e}", file=sys.stderr)
-        print(
-            "   See .claude/context/EMBEDDING_FAILURES.md + "
-            "~/.claude/metrics/embedding_failures.jsonl",
-            file=sys.stderr,
-        )
+        # The path is RESOLVED (v0.2.92): the literal that used to be here
+        # named ~/.claude/metrics, which W7 turned into a read-only archive.
+        from vco_lib.embedding_fidelity import failures_jsonl_display_path
+        print("   See .claude/context/EMBEDDING_FAILURES.md + "
+              + failures_jsonl_display_path(), file=sys.stderr)
         return 0
 
     if not embedding_service.code_backend_ready():
@@ -6968,6 +6857,11 @@ def main():
     analyzer.index_dot_claude = _resolve_index_dot_claude(
         args.index_dot_claude, repo_path
     )
+    # v0.2.92: CLI flag OR its env transport (ONE resolver, in vco_lib).
+    analyzer.force_rewalk = _extractor_gen.resolve_force_rewalk(args.force_rewalk)
+    if analyzer.force_rewalk:
+        print("🔁 Force re-walk: re-extracting every file (per-entity "
+              "content-hash gating unchanged — unchanged rows do NOT re-embed).")
 
     # Connect to Weaviate
     if not analyzer.connect():
@@ -6990,7 +6884,13 @@ def main():
         # (analyzer's "Analyzing codebase..." appears before the
         # actual error if we didn't bail explicitly here).
         try:
-            analyzer.create_collections(force=args.force_recreate)
+            analyzer.create_collections(force=args.force_recreate,
+                                        repo_path=repo_path)
+        except CodeGraphDropRefused as refusal:
+            # BLOCKER-2: guard refused, NOTHING deleted. Exit 5 is distinct
+            # from generic failure (1), collision (2), no-files (3), inserts (4).
+            print(f"❌ {refusal.verdict.message}", file=sys.stderr)
+            return 5
         except Exception as e:
             msg = str(e)
             if "found similar class" in msg.lower():
@@ -7122,6 +7022,9 @@ def main():
                 # stale rows => the launcher must render this build as
                 # `partial`, not `success`, so the operator sees stale data.
                 "prune_failures": stats.get("prune_failures", 0),
+                # v0.2.92: non-zero => N entities embedded UN-CHUNKED because
+                # their chunk plan could not be computed => retrieval degraded.
+                "chunk_plan_failures": stats.get("chunk_plan_failures", 0),
                 "language": args.language or "",
                 "prune_stale": bool(args.prune_stale),
             }
@@ -7159,6 +7062,18 @@ def main():
             print(f"   Prune failures: {prune_failures}")
         print(f"   Cross-references: {ref_stats['calls']} calls, {ref_stats['extends']} extends, {ref_stats['imports']} imports")
         print()
+
+        # v0.2.92: record COMPLETION of a force re-walk (never earlier — an
+        # interrupted run must leave NO stamp so it stays owed). Rules + soft
+        # fail live in vco_lib; see `stamp_after_walk`.
+        _stamped = _extractor_gen.stamp_after_walk(
+            repo_path, force_rewalk=getattr(analyzer, "force_rewalk", False),
+            only_file=args.only_file, only_files_from=args.only_files_from,
+            language=args.language, insert_errors=stats.get("insert_errors", 0),
+            files_analyzed=stats.get("files_analyzed", 0),
+        )
+        if _stamped:
+            print(f"   Extractor generation: recorded {_stamped}")
 
         # v0.2.73 (C-11 / RT-3): machine-readable summary line the launcher's
         # stdout reader parses to flip the code_graph_builds row status

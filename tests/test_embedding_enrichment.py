@@ -1017,7 +1017,7 @@ class CliTests(unittest.TestCase):
                     "--stream-progress",
                 ])
         self.assertEqual(rc, 0)
-        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+        lines = [line for line in buf.getvalue().splitlines() if line.strip()]
         # Expect two progress lines + one final report.
         self.assertEqual(len(lines), 3)
         # Each progress line parses to a {"progress","message"} dict.

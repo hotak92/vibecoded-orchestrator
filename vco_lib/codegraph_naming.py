@@ -53,11 +53,14 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from typing import Optional
 
 __all__ = [
     "sanitize_for_weaviate_class",
     "canonical_class_prefix",
+    "worktree_segment_in_value",
     "FALLBACK_PREFIX",
+    "WORKTREE_PATH_SEGMENTS",
 ]
 
 # ---------------------------------------------------------------------------
@@ -80,6 +83,39 @@ _NON_ALNUM_OR_UNDERSCORE = re.compile(r"[^A-Za-z0-9_]")
 # out-of-domain inputs (empty / all-non-alnum / leading-digit) that used to
 # diverge — the ``divergent`` fixture class is retired.
 FALLBACK_PREFIX = "vct"
+
+# v0.2.70 G5 / v0.2.73 Q1: git-worktree-container directory names. A canonical
+# project name NEVER contains one of these as a path segment; when one appears
+# the analyzer is being pointed at a throwaway per-track worktree
+# (``<repo>/.wt/<track>``, ``worktrees/<name>``, or the older ``vco-wt/<track>``
+# layout) whose relative name would mint a ``<Worktree>_Code*`` pollution
+# collection that never gets cleaned up.
+#
+# Lives here (v0.2.92) rather than in the analyzer: it is a rule about whether
+# a string is a CANONICAL PROJECT NAME, which is this module's whole subject,
+# and it is pure. The analyzer imports both names and re-exports them under
+# their historical private aliases.
+WORKTREE_PATH_SEGMENTS = (".wt", "worktrees", "vco-wt")
+
+
+def worktree_segment_in_value(value: Optional[str]) -> Optional[str]:
+    """Return the offending worktree-container segment in ``value``, else None.
+
+    ``value`` is an EXPLICIT ``--project`` / ``CODE_GRAPH_PROJECT`` string.
+    Splits on ``/``, ``\\`` and whitespace and compares each resulting segment
+    EXACTLY (case-insensitive) against :data:`WORKTREE_PATH_SEGMENTS`. A
+    segment match, NOT a substring match — a legit name that merely contains
+    "wt" ("SwiftUI", "MyWtfProject", "Growth"), or ".wt" inside a larger token,
+    is NOT flagged; only a bare segment equal to one of the three is.
+    """
+    if not value:
+        return None
+    segments = re.split(r"[\\/\s]+", value.strip())
+    wanted = {s.lower() for s in WORKTREE_PATH_SEGMENTS}
+    for seg in segments:
+        if seg and seg.lower() in wanted:
+            return seg
+    return None
 
 
 # ---------------------------------------------------------------------------

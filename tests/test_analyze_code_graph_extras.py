@@ -29,6 +29,8 @@ from unittest import mock
 
 import pytest
 
+from tests.common.child_env import child_env
+
 
 # ─── Module loader (same pattern as test_code_graph_analyzer.py) ────────
 
@@ -103,6 +105,7 @@ def test_help_contains_new_flags() -> None:
         capture_output=True,
         text=True,
         timeout=15,
+        env=child_env(),
     )
     # Argparse exits 0 on --help. If imports fail before the parser is
     # constructed, we'd see a SystemExit with a different code. Either
@@ -469,7 +472,7 @@ def test_argparse_extra_path_repeatable() -> None:
             "--extra-path", "/extra-2",
             "--since-commit", "abc1234",
         ],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, timeout=15, env=child_env(),
     )
     # Argparse rejection would exit 2. Repo-path validation exits 1.
     # Either path means argparse accepted the shape.

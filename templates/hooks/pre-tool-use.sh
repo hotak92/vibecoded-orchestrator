@@ -100,6 +100,17 @@ SESSION_ID_FROM_STDIN=""
 # v0.2.77 9-bis. Empty string when the field is absent (parent context).
 AGENT_ID=""
 AGENT_TYPE=""
+# WP-E (v0.2.92): transcript_path + prompt_id, same two fields threaded
+# through pre-bash-context-inject.sh / pre-edit-context-inject.sh's stdin
+# parses. transcript_path is a PATH ONLY (never read here in bash — see
+# Section 5 below, which passes it straight through to rl_kg_search.py's
+# --transcript flag; the shared vco_lib/transcript_context.py reader does
+# every byte of the actual reading, in-process, per R31). prompt_id scopes
+# the query-cache key (query-cache.sh) so two turns issuing the same short
+# trigger don't collide on one cache entry when their enriched text
+# differs. MUST MATCH the two sibling hooks' parses.
+TRANSCRIPT_PATH=""
+PROMPT_ID=""
 _PTU_IDX=0
 while IFS= read -r -d '' _PTU_VAL; do
     case "$_PTU_IDX" in
@@ -109,6 +120,8 @@ while IFS= read -r -d '' _PTU_VAL; do
         3) SESSION_ID_FROM_STDIN="$_PTU_VAL" ;;
         4) AGENT_ID="$_PTU_VAL" ;;
         5) AGENT_TYPE="$_PTU_VAL" ;;
+        6) TRANSCRIPT_PATH="$_PTU_VAL" ;;
+        7) PROMPT_ID="$_PTU_VAL" ;;
     esac
     _PTU_IDX=$((_PTU_IDX + 1))
 done < <(printf '%s' "$HOOK_STDIN" | "$PY" -c "
@@ -122,9 +135,11 @@ try:
         d.get('session_id', '') or '',
         d.get('agent_id', '') or '',
         d.get('agent_type', '') or '',
+        d.get('transcript_path', '') or '',
+        d.get('prompt_id', '') or '',
     ]
 except Exception:
-    fields = ['', '{}', '', '', '', '']
+    fields = ['', '{}', '', '', '', '', '', '']
 # Trailing NUL after EACH field so the reader loop terminates cleanly.
 sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 " 2>/dev/null)
@@ -308,7 +323,7 @@ _cg_inject() {
     fi
 
     local _raw
-    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" "$_anchor" 2>/dev/null || true)"
+    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" "$_anchor" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
     [ -n "$_raw" ] || return 0
     local _inj="" _rd=""
     if command -v vco_seen_store_path >/dev/null 2>&1; then
@@ -457,59 +472,117 @@ if [[ "$TOOL_NAME" != "Edit" ]] && [[ "$TOOL_NAME" != "Write" ]]; then
     exit 0
 fi
 
-CONCEPTS=$(echo "$USER_MESSAGE" | grep -oE "(caching|authentication|database|API|search|optimization|validation|testing|deployment|VRAM|quantization|inference|embedding|MCP|agent|workflow|pattern)" | head -3 | tr '\n' ' ')
+# WP-E (v0.2.92) REVIVAL: this branch originally gated on a topic-keyword
+# regex (CONCEPTS) scanned out of the hook payload's `user_message` field.
+# That field NEVER ARRIVES in the real Claude Code v2.1.x PreToolUse
+# payload — `d.get('user_message', '')` in the single-decode prelude above
+# is always '' on a live install — so `$CONCEPTS` was always empty and this
+# entire branch has been dead code since it was written: the
+# `[ -n "$CONCEPTS" ]` gate never passed.
+#
+# DECISION (plan requirement — documented here + in the WP-E report):
+# the keyword-substring pre-filter is DROPPED, not revived verbatim, in
+# favour of the existing MATCH_COUNT-based threshold below. Rationale:
+#   1. It duplicated gating this branch already had — MATCH_COUNT -ge 2
+#      below already requires two-plus REAL KG matches before a suggestion
+#      surfaces. A second, cruder pre-filter (a fixed 17-word vocabulary)
+#      added no precision, only false negatives for any topic outside that
+#      list.
+#   2. R30's enrichment pipeline (vco_lib/query_enrichment.py, reached via
+#      rl_kg_search.py's --transcript flag) is now the ONE mechanism this
+#      repo uses to turn "recent text" into a properly-budgeted embeddable
+#      query. A second, hand-rolled bash gate second-guessing that
+#      pipeline before it even runs is exactly the two-mechanisms problem
+#      R31 exists to prevent.
+# The trigger passed to rl_kg_search.py below is built ONLY from tool-call
+# metadata (tool name + edited file's basename) — never conversation text,
+# so nothing privacy-sensitive is composed in this shell. Being short, it
+# sits well under query_enrichment.py's default 24-token threshold, so
+# build_query() fills the rest of the embedding budget by walking backward
+# through the transcript (last user prompt, then recent assistant
+# chat/thinking) — this IS "read the last user prompt from the transcript
+# via the shared reader" (plan §3 WP-E item 4), just composed in-process by
+# the shared component rather than assembled here in bash (R31:
+# TRANSCRIPT_PATH is a PATH, never text — the file's CONTENTS are read
+# in-process by vco_lib/transcript_context.py, never in this shell).
+_KG5_FILE=$(_get_field "file_path")
+if [ -n "$_KG5_FILE" ]; then
+    TRIGGER="${TOOL_NAME}: $(basename "$_KG5_FILE")"
+else
+    TRIGGER="$TOOL_NAME"
+fi
 
-if [ -n "$CONCEPTS" ]; then
-    # V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
-    # hook shares the canonical chokepoint with the pre-edit-context-
-    # inject hook + the MCP hybrid_search tool. Same Weaviate fan-out,
-    # same RL rerank, same v3 retrieval-event emit. Pre-V52-J this branch
-    # called kg-search (search_knowledge.py CLI), which until Edit B
-    # produced zero telemetry — switching here closes the redundancy at
-    # the same time as Edit B closes the silent hole.
-    #
-    # rl_kg_search.py --hook-format emits headers of the shape
-    #   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
-    # Title (not file_path) is what we surface to the user since it's
-    # the human-readable identifier; the pre-edit hook's dedup logic
-    # also keys on title.
-    #
-    # Venv resolution mirrors pre-edit-context-inject.sh — uses the
-    # shared _lib/resolve-vco-venv.sh helper so we never accidentally
-    # activate the USER's project venv (which lacks weaviate-client).
-    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
-    . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
-    resolve_vco_venv_python "$SCRIPT_DIR"
-    VENV="${VCO_VENV_PYTHON:-}"
-    RL_SCRIPT="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py"
+# V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
+# hook shares the canonical chokepoint with the pre-edit-context-
+# inject hook + the MCP hybrid_search tool. Same Weaviate fan-out,
+# same RL rerank, same v3 retrieval-event emit. Pre-V52-J this branch
+# called kg-search (search_knowledge.py CLI), which until Edit B
+# produced zero telemetry — switching here closes the redundancy at
+# the same time as Edit B closes the silent hole.
+#
+# rl_kg_search.py --hook-format emits headers of the shape
+#   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
+# Title (not file_path) is what we surface to the user since it's
+# the human-readable identifier; the pre-edit hook's dedup logic
+# also keys on title.
+#
+# Venv resolution mirrors pre-edit-context-inject.sh — uses the
+# shared _lib/resolve-vco-venv.sh helper so we never accidentally
+# activate the USER's project venv (which lacks weaviate-client).
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+resolve_vco_venv_python "$SCRIPT_DIR"
+VENV="${VCO_VENV_PYTHON:-}"
+RL_SCRIPT="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py"
 
-    MATCHES=""
-    MATCH_COUNT=0
-    if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
-        # Extract only the per-result HEADER lines (start with "KG: " and
-        # carry the " | " separator) — strips body chunks that would
-        # otherwise inflate the suggestion. Filter out the "no-results"
-        # sentinel rl_kg_search emits when nothing matched.
-        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$CONCEPTS" --limit 3 --hook-format 2>/dev/null \
+MATCHES=""
+MATCH_COUNT=0
+if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
+    # Extract only the per-result HEADER lines (start with "KG: " and
+    # carry the " | " separator) — strips body chunks that would
+    # otherwise inflate the suggestion. Filter out the "no-results"
+    # sentinel rl_kg_search emits when nothing matched.
+    #
+    # WP-E (v0.2.92): route through the shared TTL cache (query-cache.sh)
+    # when available so repeat Edit/Write calls within the same turn
+    # (same PROMPT_ID, same tool+file trigger, same TRANSCRIPT_PATH) reuse
+    # one live search instead of paying an embed+Weaviate round trip per
+    # edit — PROMPT_ID scopes the key so a DIFFERENT turn issuing the same
+    # trigger does not collide with this turn's enriched result. Falls
+    # back to a direct call (with --transcript appended only when
+    # non-empty, preserving pre-WP-E argv on older Claude Code builds that
+    # never send transcript_path) when the cache helper isn't sourced.
+    if command -v vco_kg_search_cached >/dev/null 2>&1; then
+        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" vco_kg_search_cached "$VENV" "$RL_SCRIPT" "$TRIGGER" 3 "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null \
             | grep "^KG: " \
             | grep -v "^KG: no-results" \
             | head -3 || echo "")
-        MATCH_COUNT=$(printf '%s\n' "$MATCHES" | grep -c "^KG: " 2>/dev/null || echo "0")
+    elif [ -n "$TRANSCRIPT_PATH" ]; then
+        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$TRIGGER" --limit 3 --hook-format --transcript "$TRANSCRIPT_PATH" 2>/dev/null \
+            | grep "^KG: " \
+            | grep -v "^KG: no-results" \
+            | head -3 || echo "")
+    else
+        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$TRIGGER" --limit 3 --hook-format 2>/dev/null \
+            | grep "^KG: " \
+            | grep -v "^KG: no-results" \
+            | head -3 || echo "")
     fi
+    MATCH_COUNT=$(printf '%s\n' "$MATCHES" | grep -c "^KG: " 2>/dev/null || echo "0")
+fi
 
-    if [ "$MATCH_COUNT" -ge 2 ]; then
-        # PreToolUse hooks must wrap LLM-bound stdout in
-        # `hookSpecificOutput.additionalContext` — plain stdout is silently
-        # discarded by Claude Code's hook runner. Pre-fork-sweep this
-        # branch printed plaintext that never reached the LLM. Same fix
-        # class as pre-edit-context-inject (PR #168). The shared helper
-        # in _lib/emit-context.sh handles the JSON envelope, the 10k char
-        # cap, and (defense-in-depth) the whitespace-only-content guard.
-        SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$CONCEPTS" "$(echo "$MATCHES" | sed 's/^/   /')")
-        # Defense: if the helper failed to load, skip emission rather
-        # than crash. Other branches of this hook are unaffected.
-        if command -v emit_additional_context >/dev/null 2>&1; then
-            emit_additional_context "$SUGGESTION_TEXT" PreToolUse
-        fi
+if [ "$MATCH_COUNT" -ge 2 ]; then
+    # PreToolUse hooks must wrap LLM-bound stdout in
+    # `hookSpecificOutput.additionalContext` — plain stdout is silently
+    # discarded by Claude Code's hook runner. Pre-fork-sweep this
+    # branch printed plaintext that never reached the LLM. Same fix
+    # class as pre-edit-context-inject (PR #168). The shared helper
+    # in _lib/emit-context.sh handles the JSON envelope, the 10k char
+    # cap, and (defense-in-depth) the whitespace-only-content guard.
+    SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$TRIGGER" "$(echo "$MATCHES" | sed 's/^/   /')")
+    # Defense: if the helper failed to load, skip emission rather
+    # than crash. Other branches of this hook are unaffected.
+    if command -v emit_additional_context >/dev/null 2>&1; then
+        emit_additional_context "$SUGGESTION_TEXT" PreToolUse
     fi
 fi

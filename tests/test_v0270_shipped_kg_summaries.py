@@ -46,6 +46,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_KNOWLEDGE = REPO_ROOT / "templates" / "knowledge"
 SIDECAR = TEMPLATES_KNOWLEDGE / ".node_formats.json"
@@ -231,8 +233,13 @@ class ConsumeShippedSidecarLifecycleTest(unittest.TestCase):
                     {
                         "knowledge/concepts/x.md": {
                             "title": "X Node",
-                            "description": "d",
-                            "summary": "s",
+                            # v0.2.92 WP-Q: REALISTIC stand-ins. The old
+                            # one-character "d"/"s" are now classified as
+                            # model non-answers, so the skip path would not
+                            # fire and this test would pass for the wrong
+                            # reason (its assertion is a substring match).
+                            "description": "Describes the X node and its role.",
+                            "summary": "X is the node under test here.",
                             "content_hash": c_hash,
                             "total_chunks": 1,
                         }
@@ -249,16 +256,21 @@ class ConsumeShippedSidecarLifecycleTest(unittest.TestCase):
             try:
                 r = subprocess.run(
                     [sys.executable, str(RUNTIME_SUMMARIZER), str(node)],
-                    env=env, capture_output=True, text=True, timeout=60,
+                    env=child_env(env), capture_output=True, text=True,
+                    timeout=60,
                 )
             except FileNotFoundError as exc:
                 raise unittest.SkipTest(f"cannot run summarizer ({exc})")
             self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
+            # Match the FULL skip sentence, not the bare words "hash
+            # match": the v0.2.92 non-answer branch also mentions a hash and
+            # would otherwise satisfy a looser assertion while regenerating.
             self.assertIn(
-                "hash match", r.stdout,
+                "unchanged (hash match), skipping", r.stdout,
                 "runtime summarizer did NOT take the shipped-entry skip path — "
                 f"it would regenerate, defeating the pre-ship. stdout={r.stdout!r}",
             )
+            self.assertNotIn("Generating summaries for", r.stdout)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ import importlib
 import sys
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_PARENT = REPO_ROOT / "claude_mcp_servers"
 if str(PKG_PARENT) not in sys.path:
@@ -124,6 +126,7 @@ def test_proxy_tracks_the_callers_import_path_not_a_fixed_key():
     )
     r = subprocess.run(
         [sys.executable, "-c", driver], capture_output=True, text=True, timeout=90,
+        env=child_env(),
     )
     assert r.returncode == 0 and "DUAL_IMPORT_OK" in r.stdout, (
         "rl_enrichment.server must resolve the server under its own package "
@@ -161,6 +164,7 @@ def test_server_py_imports_when_run_as_a_bare_script():
         [sys.executable, str(server_py)],
         cwd=str(server_py.parent),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=child_env(),
     )
     try:
         out, _ = proc.communicate(timeout=45)

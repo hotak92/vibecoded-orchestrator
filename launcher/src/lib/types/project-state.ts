@@ -10,6 +10,8 @@
 
 // ─── Project state rows ──────────────────────────────────────────────────
 
+import type { StorePresence } from '$lib/stores/secrets';
+
 export interface ProjectAgent {
   project_id: string;
   agent_name: string;
@@ -203,8 +205,13 @@ export interface CoordinationConfig {
   installed: boolean;
   enabled: boolean;
   supabase_url: string | null;
-  supabase_key_set: boolean;
-  telegram_bot_token_set: boolean;
+  /** Tri-state, not a boolean: a locked/erroring keychain reports
+   * `'unknown'`, never `'absent'`. Rendering "not set" for a store we
+   * could not read is what prompts a user to re-paste a secret they
+   * already have. Same vocabulary as `StorePresence` in
+   * `$lib/stores/secrets`. */
+  supabase_key_presence: StorePresence;
+  telegram_bot_token_presence: StorePresence;
   username: string | null;
   user_aliases: string[];
   channels_enabled: string[];

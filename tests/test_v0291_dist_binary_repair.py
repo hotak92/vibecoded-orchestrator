@@ -27,12 +27,14 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vco_lib import dist_binary_repair  # noqa: E402
 from vco_lib.dist_binary_repair import (  # noqa: E402
     RepairOutcome,
     dist_dirty_paths,
@@ -364,9 +366,22 @@ class RunRepairLegTests(unittest.TestCase):
 
     def test_pid_env_is_parsed_and_a_garbage_value_falls_back_to_the_scan(self) -> None:
         (self.repo / BIN_REL).write_bytes(b"STALE")
-        # Garbage env ⇒ parse fails ⇒ scan runs ⇒ no launcher named
-        # "vct-launcher" is running under the test host, so no restart entry.
-        self._leg(launcher_driven=False, launcher_pid_env="not-a-pid")
+        # Garbage env ⇒ parse fails ⇒ the SCAN runs ⇒ with no launcher found,
+        # no restart entry is emitted.
+        #
+        # HERMETICITY (2026-08-31): this test used to assert the outcome while
+        # relying on the host having no process named "vct-launcher" — a real
+        # `pgrep` against the developer's machine. It therefore failed for
+        # anyone running the suite with the launcher GUI open, which is the
+        # normal state on a dogfooding machine. Patching the scan pins the
+        # branch instead of the host, and asserting the call proves the
+        # fallback path was actually taken (the previous version could not
+        # distinguish "scan ran and found nothing" from "scan never ran").
+        with mock.patch.object(
+            dist_binary_repair, "scan_for_launcher_pid", return_value=None
+        ) as scan:
+            self._leg(launcher_driven=False, launcher_pid_env="not-a-pid")
+        self.assertEqual(scan.call_count, 1)
         self.assertEqual([c[0] for c in self.calls], [])
 
 

@@ -268,11 +268,142 @@ owner = "vco_lib.kg_binding_heal"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 
+[conditions.kg_binding_evidence_repointed]
+class = "informational_record"
+owner = "vco_lib.kg_binding_heal"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92 D18 HEAL (the writing half of kg_binding_evidence_mismatch). \
+A project's primary binding named an existing class while file-backed \
+evidence showed its objects living in a DIFFERENT class no binding row \
+named; the binding was re-pointed at the class holding the data. The \
+eligibility input is `kg_binding_doctor`'s ownership verdict \
+(`ProjectBindingVerdict.evidence`, with BOUND classes counted — a bound \
+class that also holds the files is an AMBIGUITY the heal refuses, not a \
+candidate) and NOTHING else — never the \
+name-derived class, which is the guess R38 rejected precisely because it \
+re-stamps the ghost when the NAME is what went wrong. Written only when one \
+class clears the bar with NO RIVAL — alone, or leading the runner-up by the \
+decisive margin (EVIDENCE_MARGIN_FACTOR 2.0x AND EVIDENCE_MARGIN_ABS +10 \
+matched paths, both strict, ranked on the doctor's own numbers); a closer \
+split writes nothing and raises `kg_binding_ambiguous_evidence`, and zero \
+cleared classes leaves `kg_binding_evidence_mismatch` to carry the \
+diagnosis. A \
+`manual_override` row, a row changed since the scan, and a class another \
+binding row names are each refused at write time under the same cursor. \
+INFORMATIONAL because the action is already complete and nothing is pending \
+— but it is never silent: a repoint changes which collection a project reads \
+and writes, so the entry names the old class, the new class, the evidence \
+that chose it, and the Identity-tab reversal (the previous value is also in \
+the row's config_json under `evidence_repoint.from`). NO Weaviate data is \
+moved or deleted; objects in the previously-named class stay put. \
+Idempotent by construction: once re-pointed the class IS bound, so the one \
+class that clears the bar is the already-bound one and the gate cannot \
+fire again."""
+
+[conditions.kg_binding_ambiguous_evidence]
+class = "action_required"
+owner = "vco_lib.kg_binding_heal"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92 D18 HEAL, the ASK half. Two or more Weaviate classes clear \
+`kg_binding_doctor`'s ownership bar for one project and none leads by the \
+decisive margin (kg_binding_heal.EVIDENCE_MARGIN_FACTOR = 2.0x AND \
+EVIDENCE_MARGIN_ABS = +10 matched paths over the runner-up, both strict), so \
+the heal writes nothing. Before v0.2.92 that refusal was SILENT — \
+REFUSE_AMBIGUOUS was recorded in the install log and nowhere the user reads; \
+this entry is that state surfaced, naming every candidate class with its \
+matched/sampled path counts and object count, the currently-bound one, and \
+how far short of the margin the leader fell. ACTION_REQUIRED, not \
+environmental: the project's KG corpus is split across classes and it reads \
+and writes only the one its binding names, so data is unreachable — and no \
+mechanism VCO runs can choose for the user. CLEARED (owned-drop-when-absent, \
+family A: emitted from INSIDE the install.py run whose finalize rebuilds the \
+ledger, so it is re-detected every run) when the next `install.py --update` \
+no longer refuses — the evidence stops being ambiguous because one class now \
+dominates (a merge/re-sync), the leftover class is emptied or removed, or the \
+primary binding row carries a `manual_override` sentinel, which \
+`resolve_evidence_heal_plan` reads as "a human already chose" and which the \
+write-time gate honours identically. Since v0.2.92 the launcher's picker \
+writes that sentinel itself: a GUI save (`set_project_kg_binding`) that \
+CHANGES — or first sets — the row's collection_name stamps \
+`manual_override: true` into the row's config_json (merged, other keys \
+preserved), so the remedy's step 1 is now self-recording and the ask clears \
+on the next update run; a same-collection save (model/URL-only edit) writes \
+NO sentinel, keeping the row machine-repairable, so the copy-paste SQL \
+stanza remains the route for headless machines and for confirming the \
+already-bound class. EMITTED from the read-only plan site \
+(install.py's `_self_heal_kg_bindings_on_update`, right after \
+`resolve_evidence_heal_plan`), NOT beside `kg_binding_evidence_repointed` in \
+the RW heal pass: an ambiguous project owes no write, so the RW pass is never \
+entered for it and an emit sited there would be inert in exactly the case it \
+exists for. Adjacent to `kg_binding_evidence_mismatch` (the doctor's \
+diagnosis of data outside a binding, dismissible) but distinct: this one says \
+the automated repair LOOKED and declined, and shows the numbers behind the \
+decline — including for the shape the doctor's entry cannot see, where every \
+candidate is a bound class."""
+
 [conditions.multi_candidate_prefix_adopt]
 class = "action_required"
 owner = "vco_lib.kg_binding_heal"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
+
+[conditions.kg_unclaimed_populated_classes]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "probe:py:kg_unclaimed_classes_still_present"
+emit_surfaces = ["ledger"]
+dismiss_key = ["classes"]
+notes = """v0.2.92 (reported-not-fixed item 3): a populated *_KnowledgeGraph \
+class that NO registered project's binding row names (any role) AND whose \
+sampled file_paths anchor to no registered project's folder — data with no \
+reader, e.g. a removed project's leftover class. Adjacent to but distinct \
+from kg_binding_evidence_mismatch (a REGISTERED project's data outside its \
+binding) and from the hardcoded legacy-name detectors. Detection extends the \
+SAME kg_binding_doctor scan (no new IO); the canonical shared class named by \
+app_state orchestrator_root_kg_collection is exempt (its lifecycle belongs \
+to the shared-KG surfaces). Diagnosis only: the entry NEVER prints a drop \
+command — re-adding the project, re-binding via the Identity tab, or \
+migrate-collections are the named remedies, and dismissal records 'expected \
+leftover'."""
+
+[conditions.kg_binding_evidence_mismatch]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "probe:py:kg_binding_evidence_still_mismatched"
+emit_surfaces = ["ledger"]
+dismiss_key = ["projects", "evidence_classes"]
+notes = """v0.2.92 D18 re-closure (Fable round 6, MAJOR-R6-1). The \
+existing-ghost case: a registered project's KG objects demonstrably live in \
+a class its primary binding does not name. The update-time prefix-adopt pass \
+(`kg_binding_heal`) rebinds only a binding whose class is ABSENT from \
+Weaviate, so a ghost that has already received the project's writes exists \
+and is skipped by construction — nothing named that state until this probe. \
+DETECTION: `vco_lib.kg_binding_doctor.scan_kg_binding_evidence` compares, per \
+registered project with a real primary binding row, (1) the binding, (2) \
+file-backed evidence of where the data lives (a populated *_KnowledgeGraph \
+class whose sampled file_paths exist under the project folder, at >= 80% of \
+distinct sampled paths and >= 2 matches), (3) the name-derived expected \
+class. EMITTED by the doctor's `kg_binding_evidence` probe (full scope: \
+install/update end-of-run + `vco doctor`); one aggregated entry names every \
+mismatching project's three values. CLEARED by the same reading — the \
+registry probe re-runs the identical scan, and the doctor self-resolves the \
+cid on a clean no-sink pass. CLASS: action_required, NOT environmental — the \
+reviewer's round-5 sketch said environmental, but the registry's own \
+environmental definition is 'nothing is broken'; here the project's KG \
+writes land outside its binding (data-bearing) and the remedy is a human \
+action (pick the right class in the launcher's Identity tab), which is \
+action_required's definition verbatim. The doctor never writes a binding \
+(R38: the previous automatic 'fix' would have re-stamped the ghost); the \
+SEPARATE v0.2.92 heal (kg_binding_evidence_repointed, owner \
+vco_lib.kg_binding_heal) acts only on the UNAMBIGUOUS subset, so what \
+survives to THIS entry is what it refused — a split with no decisive leader \
+(itself surfaced as kg_binding_ambiguous_evidence), a manual_override row, \
+or a target another binding row names. \
+dismiss_key: (projects, evidence_classes) — a dismissal holds while the same \
+projects stay mismatched against the same classes and re-fires when either \
+set changes."""
 
 [conditions.launcher_install_path_seed_unavailable]
 class = "action_required"
@@ -388,6 +519,42 @@ instead. Owned/drop-when-absent: the doctor re-probes on every install/update \
 run, so installing Node makes the entry disappear by itself. The launcher's \
 registration badge renders the same fact (gui_badge) via \
 `python -m vco_lib.npx_resolver --json`."""
+
+[conditions.code_embed_image_stale]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "probe:py:code_embed_image_still_stale"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92 BLOCKER-1. `code_embed` is the ONLY VCO service that ships \
+as a container image BUILT from the checkout \
+(infrastructure/docker-compose.yml::code_embed.build), and both `docker \
+compose up` and `podman-compose up` build an image only when it is MISSING — \
+a changed build context is not a rebuild trigger, and `--force-recreate` \
+replaces the CONTAINER from the SAME image. So a source fix could be correct \
+in server.py, pinned by its own tests, green in CI, and running NOWHERE. It \
+was: measured on the maintainer's machine, image built 2026-05-16, container \
+recreated 2026-07-12, and the live service still answering HTTP 200 with a \
+silently truncated leading window for over-window code — while v0.2.92's \
+source refuses it at HTTP 400 so the caller can shrink and retry. \
+action_required because the exit is an install/update run: `_start_services` \
+now adds `--build` (and names code_embed for `--force-recreate`) whenever the \
+image is not PROVABLY current, and the doctor re-probes at the end of the \
+same run — so the entry is dropped by the run that fixes it. The evidence is \
+the service's own: it hashes the source files it loaded and publishes the \
+digest as /health.source_sha (vco_lib.code_embed_image + the image_source.py \
+that is COPYed into the image), so "we hope it rebuilt" became checkable. A \
+/health WITHOUT the field identifies a pre-v0.2.92 image. The clear probe \
+re-runs that same comparison, so a user who rebuilds by hand and re-runs \
+`vco doctor` sees the entry go. ORDER MATTERS in the remedy: rebuild the \
+image BEFORE any code-graph re-sync — re-walking the graph first embeds every \
+entity through the old, truncating service and then reports success."""
+
+[conditions.vco_lib_shadowed_by_venv_copy]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92. `import vco_lib` from a NEUTRAL cwd does not reach <install_root>/vco_lib — it reaches a copy in the venv's site-packages, or a third location entirely. Cause of the shipped case: the codegraph-ts step ran `pip install <root>[codegraph-ts]` without `-e`, which made pip uninstall step 4's EDITABLE install of the same distribution and replace it with a real copy of vco_lib/. Nothing errored; every hook, MCP and `python -m vco_lib.X` fired outside a repo root then ran a snapshot frozen at install time, and because later updates change the checkout and not the copy, the user's fixes silently never took effect. action_required because the exit is an install/update run: step 4's `pip install -e .` removes the pip-OWNED copy, and install_companions.repair_shadowed_vco_lib sweeps the UNOWNED residue (a copy whose dist-info was lost, which pip cannot see and therefore never removes). Owned/drop-when-absent on the npx_missing_mcp_unspawnable precedent: the doctor re-probes at the end of every install/update, AFTER that repair, so the entry is dropped by the same run that fixes it. It persists only for the arm VCO must not touch — an editable install owned by a DIFFERENT checkout — where deleting anything would break that other install. No dismiss_key: a shadowed vco_lib is a real break, not a machine description to acknowledge."""
 
 [conditions.stale_mcp_entry]
 class = "action_required"
@@ -624,6 +791,25 @@ resolves the entry; the dispatcher only RECORDS that resolution, after \
 re-reading the ledger to confirm it happened (v0.2.91 wave-3: a zero exit is \
 not proof — this script's skip path exits 0 too)."""
 
+[conditions.kg_sync_failures_pending]
+class = "auto_retryable"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92 D17 (field report: ~210 knowledge nodes existed only as \
+.md files across 12 of 13 projects — the sync had counted its per-node \
+failures but NOTHING ever retried them, so the nodes stayed invisible to \
+retrieval forever). Emitted at the end of ANY sync run shape (`--all`, \
+`--all-docs`, file list) that finished with per-node write failures, \
+naming the failure count. `auto_retryable` with a REAL retry_action — \
+the SAME handler `kg_sync_no_embedding_backend` uses (`retry:py:kg_seed` \
+re-runs `sync_knowledge_graph.py --all` with the project root pinned, \
+content-hash gated so the retry re-embeds only what never landed). The \
+paired clear is NARROW by design (decision #12 shape): only the end of a \
+FULLY successful `--all` tree sync resolves it — a clean file-list or \
+docs-only run proves nothing about the nodes an earlier run failed on."""
+
 [conditions.codegraph_embed_resync_pending]
 class = "auto_retryable"
 owner = "vco_lib.codegraph_resync"
@@ -656,6 +842,40 @@ owner = "vco_lib.knowledge_residue"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
 
+[conditions.kg_sync_drift_detected]
+class = "action_required"
+owner = "vco_lib.kg_sync_drift"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92: knowledge/ node(s) exist on disk with no matching row \
+in Weaviate, or a stored row's content hash no longer matches the file \
+(scan_drift — the hash-diff GraphQL query already used by install.py's \
+CI-10 gate, reused rather than a third hash scheme). Cleared by \
+`surface_drift` calling `resolve_conditions` at the end of a scan that \
+finds zero missing/stale nodes — the same paired-resolution shape as \
+`kg_sync_no_embedding_backend`. Deliberately NOT `auto_retryable`: no \
+dispatcher handler is wired for this cid (adding one requires a HANDLERS \
+entry in vco_lib/deferral_retry.py, outside the work package that added \
+this row) — claiming a retry without a wired handler would tell the \
+reader "this resolves itself" when nothing does, which is worse than the \
+silent-drift gap this condition exists to close."""
+
+[conditions.kg_binding_missing]
+class = "action_required"
+owner = "vco_lib.kg_sync_drift"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92: knowledge/ has non-archived content but no KG \
+collection binding could be resolved anywhere (check_kg_binding) — a \
+project registered with the orchestrator/hub but never bundled has no \
+`.claude/` tree at all, so a Claude Code write to knowledge/ succeeds and \
+nothing errors, but nothing ever syncs either (field report: "it says it \
+wrote 40 nodes, search returns nothing", every individual signal green). \
+Distinct from `kg_sync_drift_detected`: this fires when there is no \
+collection to compare against AT ALL, not when some nodes within an \
+existing binding are unsynced — no per-node hash comparison could ever \
+detect it. Cleared by `surface_binding_gap` once a binding resolves."""
+
 [conditions.compose_override_renamed]
 class = "informational_record"
 owner = "vco_lib.project_init"
@@ -687,7 +907,26 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "Settled by the Rust chunker-revision flow once the re-sync lands."
+notes = "Settled by the Rust chunker-revision flow once the re-sync lands. v0.2.92 WP-D: the PER-PROJECT state-keyed gate (`vco_lib.chunker_revision.gate` on the `.claude/state/chunker-revision.json` sentinel) now fires inside the ONE bundle engine on all four install/update surfaces; this row's lifecycle is unchanged."
+
+[conditions.project_bundles_stale]
+class = "action_required"
+owner = "vco_lib.bundle_staleness"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92 WP-D (WFT's D15). The PAIR: emitted by the bundle-staleness \
+census (`vco_lib.bundle_staleness.refresh_root_ledger`) into the ORCHESTRATOR \
+ROOT's ledger whenever a full census finds stale > 0 OR unknown > 0 — runs at \
+the end of every root install/update (doctor probe `bundle_staleness`) and on \
+demand via `python -m vco_lib.bundle_staleness`; cleared by the same refresh \
+when a census (or the in-engine census-state flip at the end of any project \
+bundle update, `record_project_now_current`) finds stale == 0 AND unknown == 0 \
+— an undetermined population never clears it. The rendered text names the two \
+populations separately (stale bundles; undetermined projects + each one's \
+reason) and carries the remedy for whichever is present, so an unknown-only \
+entry is cleared by fixing/removing the named registry row rather than by \
+running a bundle update that would change nothing. Verdicts are \
+state-keyed on engine dry-run file hashes (R26), never version deltas."""
 
 [conditions.launcher_update_diverged]
 class = "action_required"
@@ -695,6 +934,19 @@ owner = "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger", "gui_modal"]
 notes = "Re-probed by the install.py re-probe pass (version caught up ⇒ resolved)."
+
+[conditions.launcher_update_post_pull_unverified]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.92 WP-13. The post-pull HEAD-advance backstop \
+(installer.rs::assert_head_reached_upstream) could not compute a behind-count, so whether \
+the pull landed is UNKNOWN. It fail-OPENs by design — a git hiccup must not block a healthy \
+update — but pre-v0.2.92 it fail-opened SILENTLY, i.e. the one guard that proves an update \
+applied was disarmed by exactly the failure mode it guards against. action_required, not \
+auto_retryable: nothing can confirm after the fact that a PAST pull landed; only checking \
+the repo now settles it. Cleared by the next update whose verification succeeds."""
 
 [conditions.generated_files_reconciled]
 class = "informational_record"
@@ -811,6 +1063,22 @@ owner = "launcher/src-tauri/src/commands/binding_reconcile.rs"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
 notes = "Same boot-time record class as kg_access_phantom_repaired."
+
+[conditions.shared_kg_binding_repaired]
+class = "informational_record"
+owner = "launcher/src-tauri/src/commands/project_state_populate/shared_kg_binding.rs"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
+notes = """v0.2.92 W12. A `role='shared'` KG binding row naming a class that does \
+not exist (pre-W12 the row was seeded from the last-resort CONSTANT, which is \
+wrong on any install whose orchestrator KG was re-pointed) is repaired at \
+launcher boot once the old name is confirmed ABSENT and the DB-resolved \
+replacement confirmed PRESENT in one schema snapshot. Same boot-time record \
+class, same emitter sweep and the same ownership rationale as \
+kg_access_phantom_repaired: emitted from binding_reconcile at BOOT, never \
+inside an install.py run, so install ownership expires it one-shot on the next \
+update instead of demanding a manual dismissal for an entry whose own body \
+says no action is needed."""
 
 [conditions.hard_cut_performed]
 class = "informational_record"
@@ -932,6 +1200,19 @@ class = "action_required"
 owner = "vco_lib.kg_binding_heal"
 clear_probe = "manual-dismiss"
 emit_surfaces = ["ledger"]
+notes = """v0.2.92 m-R6-4: ABSENCE IS NOT DISAGREEMENT on both evidence \
+sources. An absent `last_installed_shared_kg_collection` (fresh DB: migration \
+028 seeds the pointer, only a successful KG seed records `last`) and ZERO \
+role='shared' binding rows (root-only machine: the root binds role='primary' \
+only) are NORMAL states, not drift — the heal leaves them alone instead of \
+nagging. The entry now fires only when RECORDED values genuinely disagree: \
+`last` names a class that is not live, or a nonempty shared-binding set has \
+no single `last`-matching consensus. v0.2.92 remedy fix: an Identity-tab \
+pick (`shared_kg.collection_name`) that names a LIVE class now converges the \
+pointer, the seed snapshot and the root's shared binding directly — the \
+printed remedy (pick, then re-run install.py --update) is the thing that \
+clears the entry. A pick naming a dead class still defers, with the dead \
+pick named in the reasons."""
 
 [conditions.schema_migration_refuse_downgrade]
 class = "action_required"
@@ -1014,3 +1295,182 @@ class = "action_required"
 owner = "claude_mcp_servers/weaviate_mcp/server.py"
 clear_probe = "manual-dismiss"
 emit_surfaces = ["ledger"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Project move (v0.2.92 W3 / WP-17) — owner `vco_lib.project_move`
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A move performs ZERO deletions and ZERO overwrites at the destination, so
+# every conflict it meets becomes a ledger entry rather than a merge. The
+# project's own Claude picks them up at session start — which is the whole
+# point of delegating the merge instead of guessing it.
+#
+# NONE of these rows is `owned-drop-when-absent`: install.py does not emit
+# them and must not own them. An install run that did not re-detect an
+# install-owned cid DROPS it, which for a move record would silently delete
+# the only surviving pointer to a conflict nobody has merged yet.
+
+[conditions."project_move_conflict_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger", "gui_modal"]
+notes = """One entry PER FILE that existed at the destination with different \
+content. The destination's file was left byte-identical and the previous \
+folder's version landed beside it as `<name>.vco-moved`; the entry names both \
+plus the origin path under the old folder. `manual-dismiss` is the honest \
+mechanism: no probe can know whether a human merged two versions of a file, \
+and a probe that guessed would delete the reminder while the merge was still \
+owed. The prefix family follows the `stale_unit_retired_` precedent."""
+
+[conditions.project_move_stale_path_reference]
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """A managed surface at the new folder (`.claude/env`, \
+`.claude/settings.json`, `.env`, a legacy `.vscode` block, or the deferral \
+ledger itself) still contains the OLD folder path after the move's rewrite \
+passes. The file is NOT edited: VCO rewrites managed values by re-deriving \
+them from the database, so a surface it could not re-derive is a signal that \
+a rewrite pass missed an entry class — sed-ing it would hide exactly that. \
+PAIRED SITE: `vco_lib.project_move.verify_move`, re-runnable at any time via \
+`vco project move --verify --folder <path>`; it re-scans the same surfaces \
+and calls `resolve_conditions` when no occurrence remains. The design named a \
+`probe:py:project_move_stale_paths` probe for this; the probe callable exists \
+as `vco_lib.project_move.scan_files_for_path` but its one-line registration \
+in `deferral_probes.PROBES` is owed (see the WP-17 report), so the row \
+declares the mechanism that IS wired rather than one that is not."""
+
+[conditions.project_move_stale_db_path]
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """The read-only launcher.db sweep found the OLD folder path in a \
+column whose policy says it should not be there. Two meanings, both needing a \
+human: a column with a fixer still carrying the path means the fixer did not \
+reach those rows; a column classified `not-path-bearing` in \
+`vco_lib/path_bearing_keys.py` carrying it means the REGISTRY is wrong. \
+`manual-dismiss` because there is nothing to re-run — the fix is a code \
+change plus a re-classified column, and the schema-coverage test makes the \
+same omission fail CI from then on. Columns classified `historical` \
+(log tails, telemetry payloads, audit details) are expected to carry the old \
+path and are never reported here."""
+
+[conditions."project_move_extra_codegraph_path_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """The project's code graph also indexes a USER-DESIGNATED extra path \
+that lies inside the old folder. The row is left byte-identical: the user may \
+well intend the old checkout (a public-repo clone walked under a private \
+project's collection is the shipped use case for that table). Only the user \
+knows, so only the user re-points it."""
+
+[conditions.project_move_codegraph_reanalyze_pending]
+class = "auto_retryable"
+owner = "vco_lib.project_move"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """Emitted as `auto_retryable` ONLY when the committing writer \
+actually inserted the `code_graph_builds` pending row inside the flip \
+transaction. When the enqueue fails, the SAME cid is emitted with \
+disposition `action_required` and the manual analyze command instead — a \
+row that says "VCO retries this itself" with nothing scheduled behind it is \
+the exact defect `codegraph_embed_resync_pending` documented. \
+NO `retry_action` ON PURPOSE: the scheduled work is the launcher's own build \
+runner consuming the pending row, and a WP-H retry handler would be a SECOND \
+scheduler racing it into a double walk. PAIRED SITE: \
+`vco_lib.project_move.verify_move` clears the entry once no pending or \
+running build row remains for the project."""
+
+[conditions.project_move_old_folder_retained]
+class = "informational_record"
+owner = "vco_lib.project_move"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """The move deleted NOTHING. The previous folder is intact, including \
+everything VCO deliberately did not copy (the project's own source, `.git`, \
+venvs, `.env`, run logs). Designing a VCO-initiated recursive delete needs \
+its own destructive-gate review, so no command here removes anything. PAIRED \
+SITE: `vco_lib.project_move.verify_move` clears this record once the old \
+folder is gone from disk — the user's own cleanup is what ends it, and until \
+then the record is the only place the old path is written down."""
+
+[conditions.project_move_harness_state_review]
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """Claude Code keys per-project memory, permissions and transcripts \
+by ABSOLUTE path, and none of it follows a move: sessions at the new folder \
+start with empty memory while the old-path state lingers orphaned. \
+`~/.claude/` is harness-owned — VCO writes nothing there (W7) and never \
+touches `~/.claude.json` (house rule 4) — so the entry SURFACES the copy \
+command rather than running it, and the command is `cp`, never `mv`. Emitted \
+ONLY when the old slug directory actually exists; a project that never \
+hosted a session gets no entry at all."""
+
+# ── v0.2.92 WP-18 / W14: `vco project rename-collections` ──────────────────
+#
+# NONE of these is `owned-drop-when-absent`. install.py does not emit them and
+# must not own them: an install run that did not re-detect an install-owned cid
+# DROPS it, and for a rename record that would delete the only surviving
+# pointer to a retired collection family while the classes are still on disk.
+# Same reasoning W3 recorded for the move family directly above.
+
+[conditions.collections_renamed_old_retained]
+class = "informational_record"
+owner = "vco_lib.collection_rename"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """The rename copied every object to the new class family and dropped \
+NOTHING. The previous classes are intact and still hold their data, so this \
+entry is a RECORD of a completed action, not owed work — which is why it is \
+`informational_record` and `info` severity. It is also the only place the \
+retired class names are written down in prose, which is why it must not \
+auto-expire while they exist. `command_to_apply` is the ONE guarded drop: \
+`vco project rename-collections --drop-retired --confirm --folder <path>` \
+re-derives the live schema, the current bindings and the current object \
+counts AT RUN TIME and refuses per class if the old class is still bound \
+anywhere, if its replacement is missing, or if the replacement no longer \
+holds at least as many objects — never the unguarded codegraph drop that \
+BUG-M2 was. PAIRED SITE: `vco_lib.collection_rename.drop_retired` resolves \
+this cid once every retired class is gone from the live schema; the user's \
+own decision is what ends it, and until then the record is the pointer."""
+
+[conditions.collection_rename_reconcile_pending]
+class = "action_required"
+owner = "vco_lib.collection_rename"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """The flip COMMITTED — the collections were copied and verified and \
+the project's bindings name them — but a post-flip step did not finish (env \
+re-projection, the code-graph prefix generation record, or the identity \
+re-mint). The project works; what is stale is a surface that re-derives from \
+the database, so re-running is safe and idempotent. `action_required` rather \
+than `auto_retryable` because nothing is scheduled behind it: a row claiming \
+"VCO retries this itself" with no runner is the defect \
+`codegraph_embed_resync_pending` documented. PAIRED SITE: \
+`vco project rename-collections --resume --folder <path>` re-runs exactly the \
+steps that did not complete and clears this entry."""
+
+[conditions.collection_rename_identity_remint_incomplete]
+class = "action_required"
+owner = "vco_lib.collection_rename"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """Code-graph rows carry a `project` property that is mixed into the \
+analyzer's deterministic UUID seed, so a prefix change requires re-keying \
+them (`vco_lib.codegraph_vector_copy.migrate_project_identity`, which REUSES \
+each stored vector verbatim — never a re-embed). Rows whose identity key \
+cannot be reconstructed from their stored properties are LEFT in place and \
+counted, never guessed at and never deleted. `manual-dismiss` is the honest \
+mechanism: the remedy is a full code-graph analysis, which is the user's \
+decision because it costs compute, and a probe that cleared the entry when \
+the count happened to reach zero could not distinguish "analyzed" from \
+"someone deleted the rows"."""

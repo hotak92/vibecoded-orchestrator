@@ -214,7 +214,34 @@ Usage: `.claude/scripts/kg-sync FILE | --all`. Backed by `sync_knowledge_graph.p
 ### `kg-duplicates` CLI
 Detect near-duplicate KG nodes above a similarity threshold.
 
-Usage: `.claude/scripts/kg-duplicates [--threshold 0.95]`. `--auto-merge` flag merges high-confidence duplicates. Backed by `detect_duplicates.py`. Triggered automatically every 10 edits by the `post-file-edit.sh` hook.
+Usage: `.claude/scripts/kg-duplicates [--threshold 0.95]` (`kg-duplicates.ps1` on Windows). `--auto-merge` flag merges high-confidence duplicates. Backed by `detect_duplicates.py`. Triggered automatically every 10 edits by the `post-file-edit.sh` hook and, since v0.2.92, by its `post-file-edit.ps1` sibling — which calls the `.ps1` wrapper first and falls back to the bash one, so native-Windows machines without bash get the scan too.
+
+### `kg-dedup` CLI
+
+Different problem from `kg-duplicates`, despite the similar name. `kg-duplicates`
+finds nodes whose *content* is semantically near-identical — two write-ups of the
+same idea. `kg-dedup` reconciles **duplicate Weaviate objects for the same source
+file**: one `.md` node stored two, three or four times, which retrieval then
+surfaces repeatedly and which no content check would flag, because the content is
+not merely similar, it is the same row written twice.
+
+Usage: `.claude/scripts/kg-dedup` (dry run — reports, changes nothing) and
+`.claude/scripts/kg-dedup --apply` to delete. Backed by `vco_lib/kg_dedup.py`;
+the `.sh`/`.ps1` wrappers only forward.
+
+Objects are grouped by `(canonical POSIX file_path, chunk_num)` and the newest
+`updated_at` is kept. **`chunk_num` is part of the key on purpose**: a chunked
+node legitimately has several objects for one path, and grouping on path alone
+would delete every chunk after the first.
+
+It refuses — non-zero, with a named reason, printing no report — when Weaviate is
+unreachable, the collection is missing, or the collection is empty, so a run that
+could not read anything can never be misread as "0 duplicates found".
+
+Since v0.2.92 the sync path writes `file_path` canonically and deletes match both
+path shapes, so newly-synced nodes reconcile themselves. `kg-dedup` exists for
+the objects that predate that fix and would otherwise stay duplicated until their
+node happens to be edited again.
 
 ### `kg-infer` CLI (roadmap — not shipped)
 Removed from the bundle in v0.2.54 (Track G parity sweep): the wrapper shipped without its backing `infer_knowledge.py` module, so it was broken-on-arrival on every OS. The intent — infer typed WikiLink relationships using a local LLM and apply tag-propagation rules from `TAG_HIERARCHY.md` — remains roadmap; the wrapper returns together with `infer_knowledge.py` when that lands.
@@ -255,7 +282,7 @@ Backfill `valid_from` / `created` / `updated` fields in KG node YAML frontmatter
 Point-in-time KG queries — "what did the knowledge graph look like on date X?" — using `valid_from` / `valid_until` Weaviate filters.
 
 ### `maintain_knowledge_graph.py`
-Integrity checks: orphaned nodes, broken WikiLinks, missing required frontmatter fields.
+Integrity checks: orphaned nodes, broken WikiLinks, missing required frontmatter fields. `--fix` / `--rebuild` are refused on the SHARED KG collection (other projects' nodes would read as orphans); `VCO_MAINTAIN_SHARED_KG_CONSENT=1` overrides, accepting that loss.
 
 ### `process_documents.py`
 Auto-chunk uploaded documents in `documents/` to Weaviate `DocumentChunks` collection and create a KG node for the source.

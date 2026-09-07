@@ -59,26 +59,52 @@ $FIRST_THRESHOLD = if ($env:KG_NUDGE_FIRST) { $env:KG_NUDGE_FIRST } else { "1750
 $INTERVAL        = if ($env:KG_NUDGE_INTERVAL) { $env:KG_NUDGE_INTERVAL } else { "50000" }
 $METRIC_VERSION  = "v10"
 
-# Resolve metrics dir (cross-OS via $HOME).
-$metricsDir = Join-Path $HOME ".claude/metrics"
-if (-not (Test-Path $metricsDir)) {
-    New-Item -ItemType Directory -Force -Path $metricsDir | Out-Null
-}
+# Resolve the metrics dir. v0.2.92 W7: ONE PowerShell-side resolver
+# (`_lib/metrics-dir.ps1`, lockstep sibling of `_lib/metrics-dir.sh`) — the
+# home moved out of ~/.claude, and this hook used a THIRD home-directory
+# convention ($HOME) from its two siblings before the helper existed.
+# Missing helper => silent no-op, same discipline as the missing-Python case.
+$MetricsLib = Join-Path $PSScriptRoot "_lib/metrics-dir.ps1"
+if (-not (Test-Path -LiteralPath $MetricsLib -PathType Leaf)) { exit 0 }
+. $MetricsLib
+$metricsDir = Get-VcoMetricsDir
+if (-not $metricsDir) { exit 0 }
 $metricsFile = Join-Path $metricsDir "kg_update_tokens.jsonl"
 
-# Find a Python launcher: probe `py` / `python3` / `python` in order.
+# Counter continuity across the W7 move: when the new file does not exist yet
+# but the frozen archive holds one, seed FROM the archive (a plain read + copy;
+# the archive is never written to and never deleted). Without this a machine
+# that updates mid-session restarts its work-unit baseline at zero and the
+# nudge fires late. Mirrors the .sh sibling.
+if (-not (Test-Path -LiteralPath $metricsFile -PathType Leaf)) {
+    $legacyCounter = Get-VcoMetricsReadFile -Name "kg_update_tokens.jsonl"
+    if ($legacyCounter -and $legacyCounter -ne $metricsFile) {
+        try { Copy-Item -LiteralPath $legacyCounter -Destination $metricsFile -ErrorAction Stop } catch { }
+    }
+}
+
+# Find a Python launcher via the shared `_lib/find-python.ps1`.
 # (Pre-0.2.11 this hook tried to read a venv path from BASH_ENV set by
 # the legacy lean-ctx shim — that shim is gone, see lean-ctx-shim-disabled
-# KG node. Just walk the standard names now.)
-$pythonCmd = $null
-foreach ($candidate in @("py", "python3", "python")) {
-    $resolved = Get-Command $candidate -ErrorAction SilentlyContinue
-    if ($resolved) { $pythonCmd = $resolved.Source; break }
-}
-if (-not $pythonCmd) {
+# KG node.)
+#
+# v0.2.92 W7 (R23, pre-existing defect fixed in place): the header comment at
+# the top of this file has claimed since 2026-05-10 that this hook "already
+# used _lib/find-python.ps1 — true parity". It did not. It probed
+# `py` / `python3` / `python` inline — a FOURTH copy of the resolution, in the
+# wrong order: `_lib/find-python.ps1` deliberately tries `python` FIRST because
+# default Windows installs register `python.exe` and the `py` launcher but not
+# `python3` (portability audit 2026-04-30, finding F6). So on a stock Windows
+# box this hook could pick a different interpreter from every other hook. The
+# comment is now true because the code moved, not because the comment was
+# softened.
+$FindPy = Join-Path $PSScriptRoot "_lib/find-python.ps1"
+if (Test-Path -LiteralPath $FindPy -PathType Leaf) { . $FindPy }
+if (-not $PY) {
     # No Python available — fail silently (hook must not block the prompt).
     exit 0
 }
+$pythonCmd = $PY
 
 # Hand the payload to Python via stdin; pass thresholds + paths via env.
 # Note (audit fix 2026-05-07): the .ps1 sibling already passes INPUT via env

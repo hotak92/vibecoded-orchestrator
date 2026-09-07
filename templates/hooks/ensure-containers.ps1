@@ -56,6 +56,7 @@ if (Test-Path $VctUpdateLockfile) {
 #   $env:LOCALAPPDATA\vct\container-recovery.jsonl for audit.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+. "$PSScriptRoot/_lib/compose-invocation.ps1"
 
 $ScriptDir = $PSScriptRoot
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
@@ -104,38 +105,65 @@ if ($OrchRoot) {
     if (Test-Path $candidate) { $WrapperScript = $candidate }
 }
 
-# Container runtime: prefer podman, fallback docker.
-$Runtime = $env:VCT_CONTAINER_RUNTIME
-if (-not $Runtime) {
-    if (Get-Command podman -ErrorAction SilentlyContinue) { $Runtime = "podman" }
-    elseif (Get-Command docker -ErrorAction SilentlyContinue) { $Runtime = "docker" }
-    else {
-        [Console]::Error.WriteLine("ensure-containers: neither podman nor docker found, skipping")
-        exit 0
-    }
+# Container runtime + compose: ONE home — `python -m vco_lib.containers resolve`
+# (v0.2.92 PLAN-EXTENSION §3.5 / R13). This hook used to mirror the
+# podman/docker + compose-form detection inline (as did two sibling hooks,
+# install.py and the launcher), and the four copies had drifted in their
+# compose preference order. Class A of the A>B>C rule: one Python
+# implementation, called via a ~50 ms subprocess on this session-start path.
+# Loud-fail: if the resolver cannot run at all (no interpreter, broken
+# install), say so on stderr and skip — never fall back to an inline copy.
+$LibDir = Join-Path $PSScriptRoot "_lib"
+$FindPy = Join-Path $LibDir "find-python.ps1"
+if (Test-Path $FindPy) { . $FindPy }
+$RunPy = $PY
+$VenvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+if (Test-Path $VenvLib) {
+    . $VenvLib
+    try {
+        $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+        if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) { $RunPy = $VcoVenvPython }
+    } catch { }
 }
-
-# Compose binary: detect both v2 plugin and v1 standalone.
-$ComposeCmd = $env:VCT_COMPOSE_CMD
-if (-not $ComposeCmd) {
-    if ($Runtime -eq "podman") {
-        try {
-            & podman compose version 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { $ComposeCmd = "podman compose" }
-        } catch { }
-        if (-not $ComposeCmd -and (Get-Command podman-compose -ErrorAction SilentlyContinue)) {
-            $ComposeCmd = "podman-compose"
-        }
-    } elseif ($Runtime -eq "docker") {
-        try {
-            & docker compose version 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { $ComposeCmd = "docker compose" }
-        } catch { }
-        if (-not $ComposeCmd -and (Get-Command docker-compose -ErrorAction SilentlyContinue)) {
-            $ComposeCmd = "docker-compose"
-        }
-    }
+if (-not $RunPy) {
+    Write-Output "ensure-containers: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
+    exit 0
 }
+$VcoRt = $null
+$VcoRtRc = $null
+# Capture the resolver's stderr instead of discarding it (v0.2.92 MAJOR-6):
+# `2>$null` used to throw the reason away, so a crash on Windows printed
+# "resolve failed (rc=N)" with nothing to act on while the .sh sibling
+# printed the stderr tail.
+$VcoRtErr = Join-Path ([System.IO.Path]::GetTempPath()) "vco-containers-resolve.$PID.err"
+try {
+    $VcoRtJson = & $RunPy -m vco_lib.containers resolve --json 2>$VcoRtErr
+    $VcoRtRc = $LASTEXITCODE
+    if ($VcoRtRc -in 0, 3, 4) { $VcoRt = ($VcoRtJson | Out-String) | ConvertFrom-Json }
+} catch { $VcoRt = $null }
+if (-not $VcoRt) {
+    $VcoRtWhy = ""
+    if (Test-Path $VcoRtErr) { $VcoRtWhy = ((Get-Content $VcoRtErr -Tail 3) -join " ").Trim() }
+    Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
+    Write-Output "ensure-containers: vco_lib.containers resolve failed (rc=$VcoRtRc): $VcoRtWhy; skipping"
+    exit 0
+}
+Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
+# v0.2.92 BLOCKER-4 + MAJOR-6: the resolver REFUSES a pinned-but-unusable
+# runtime (podman and docker have per-runtime named volumes, so driving the
+# one the user did not pin brings the stack up EMPTY) and hands back the
+# refusal as its reason. Report it on STDOUT, not stderr: a SessionStart
+# hook's stderr is not surfaced to the user when the hook exits 0 - only
+# stdout is injected as session context, and an unread report is not a report.
+if ($VcoRt.state -ne "resolved") {
+    # `absent` is a true fact (nothing installed / daemon down / a refused
+    # pin); `unknown` means a probe could not run. Both are skips, both said.
+    Write-Output "ensure-containers: $($VcoRt.reason); skipping"
+    exit 0
+}
+$Runtime = $VcoRt.runtime
+# User can override the compose invocation via VCT_COMPOSE_CMD.
+$ComposeCmd = if ($env:VCT_COMPOSE_CMD) { $env:VCT_COMPOSE_CMD } elseif ($VcoRt.compose) { ($VcoRt.compose -join " ") } else { "" }
 
 # ---------------------------------------------------------------------------
 # Windows reserved-port-range warning (v0.2.64).
@@ -205,7 +233,13 @@ function Test-VcoReservedPorts {
                 [Console]::Error.WriteLine("[ensure-containers] WARNING: $($t.Label) port $($t.Port) is inside a Windows reserved TCP range ($($r[0])-$($r[1])). The container will start but the host port WILL NOT bind, and the knowledge graph will go silently mute.")
                 [Console]::Error.WriteLine("[ensure-containers] To fix, run this in an ELEVATED (Administrator) terminal:")
                 [Console]::Error.WriteLine("    netsh int ipv4 add excludedportrange protocol=tcp startport=$($t.Port) numberofports=1 store=persistent")
-                [Console]::Error.WriteLine("    net stop winnat && net start winnat")
+                # R42 sweep: two lines, never `net stop winnat && net start
+                # winnat`. This advice is introduced as "run this in an
+                # ELEVATED terminal", and the elevated terminal Windows 10/11
+                # opens by default is PowerShell 5.1 — which rejects `&&` as a
+                # syntax error. Mirrors vco_lib/windows_reserved_ports.py.
+                [Console]::Error.WriteLine("    net stop winnat")
+                [Console]::Error.WriteLine("    net start winnat")
                 break
             }
         }
@@ -312,9 +346,9 @@ function Invoke-WrapperOrCompose {
     if ($ComposeCmd -and $ComposeDir -and (Test-Path $ComposeDir)) {
         Push-Location $ComposeDir
         try {
-            $parts = $ComposeCmd -split '\s+'
-            $cmdHead = $parts[0]
-            $cmdRest = $parts[1..($parts.Length - 1)]
+            $composeInvocation = Split-VcoComposeCommand -ComposeCmd $ComposeCmd
+            $cmdHead = $composeInvocation.Head
+            $cmdRest = @($composeInvocation.Rest)
             & $cmdHead @cmdRest up -d
         } finally { Pop-Location }
         Write-Output "Ran '$ComposeCmd up -d' in $ComposeDir ($Reason)"
@@ -391,6 +425,10 @@ $started = 0
 $recovered = 0
 $needsCompose = $false
 $needsGpuWrapper = $false
+# v0.2.92 BLOCKER-1 (parity with needs_code_embed_build in the .sh sibling):
+# code_embed is the ONE compose service BUILT from the checkout, so a stale
+# image survives every update. Set only when THAT container is missing.
+$needsCodeEmbedBuild = $false
 # v0.2.50 audit F6 (2026-06-08): zombie detection (running status with
 # dead PID per Get-Process) is Podman-specific. On Docker the State.Pid
 # value carries different host-side semantics (containerd PID, VM PID on
@@ -436,6 +474,7 @@ foreach ($container in $VcoRequiredContainers) {
     } elseif ($status -eq "missing") {
         $needsCompose = $true
         if (Test-IsGpuContainer -Name $container) { $needsGpuWrapper = $true }
+        if ($container -like "*code_embed*") { $needsCodeEmbedBuild = $true }
     } else {
         try {
             & $Runtime start $container 2>$null | Out-Null
@@ -456,12 +495,36 @@ if ($needsCompose) {
     } elseif ($ComposeCmd -and $ComposeDir -and (Test-Path $ComposeDir)) {
         Push-Location $ComposeDir
         try {
-            $parts = $ComposeCmd -split '\s+'
-            $cmdHead = $parts[0]
-            $cmdRest = $parts[1..($parts.Length - 1)]
-            & $cmdHead @cmdRest up -d
+            $composeInvocation = Split-VcoComposeCommand -ComposeCmd $ComposeCmd
+            $cmdHead = $composeInvocation.Head
+            $cmdRest = @($composeInvocation.Rest)
+            # v0.2.92 BLOCKER-1 (parity with ensure-containers.sh): `--build`
+            # only when the code_embed container is among the missing ones -
+            # it is the one service whose image is BUILT from the checkout, and
+            # we are creating it anyway. An unconditional `--build` on a
+            # session-start hook would rebuild a 6 GB CUDA image every time any
+            # container went away.
+            $buildRan = $false
+            if ($needsCodeEmbedBuild) {
+                & $cmdHead @cmdRest up -d --build
+                if ($LASTEXITCODE -eq 0) {
+                    $buildRan = $true
+                } else {
+                    & $cmdHead @cmdRest up -d
+                }
+            } else {
+                & $cmdHead @cmdRest up -d
+            }
         } finally { Pop-Location }
-        Write-Output "Ran '$ComposeCmd up -d' in $ComposeDir (missing containers detected)"
+        # Report which invocation ACTUALLY ran (parity with the .sh sibling):
+        # claiming "--build" after falling back would be a promise not kept.
+        if ($buildRan) {
+            Write-Output "Ran '$ComposeCmd up -d --build' in $ComposeDir (missing containers incl. the code-embedding service, whose image is built from source)"
+        } elseif ($needsCodeEmbedBuild) {
+            Write-Output "Ran '$ComposeCmd up -d' in $ComposeDir ('--build' was rejected, so the code-embedding image was NOT refreshed - run 'python install.py --update' from the orchestrator root)"
+        } else {
+            Write-Output "Ran '$ComposeCmd up -d' in $ComposeDir (missing containers detected)"
+        }
     } elseif (-not $ComposeCmd) {
         [Console]::Error.WriteLine("ensure-containers: $Runtime has no compose available (tried '$Runtime compose' and standalone) -- install $Runtime-compose or the compose plugin")
     } elseif (-not $ComposeDir) {

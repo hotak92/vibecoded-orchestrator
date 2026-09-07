@@ -50,6 +50,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import diagram_delete_parser  # noqa: E402
 
 extract = diagram_delete_parser.extract_diagram_delete_targets
@@ -344,7 +345,7 @@ class CLIIntegrationTests(unittest.TestCase):
             [sys.executable, "-m", "vco_lib.diagram_delete_parser"],
             input=stdin,
             capture_output=True, text=True, timeout=30,
-            cwd=str(REPO_ROOT),
+            cwd=str(REPO_ROOT), env=child_env(),
         )
         return result.returncode, result.stdout, result.stderr
 
@@ -352,14 +353,14 @@ class CLIIntegrationTests(unittest.TestCase):
         rc, out, _ = self._run("rm .claude/diagrams/gui/x.mmd")
         self.assertEqual(rc, 0)
         # Trailing newline is normal; split + filter empty.
-        lines = [l for l in out.split("\n") if l]
+        lines = [line for line in out.split("\n") if line]
         self.assertEqual(lines, [".claude/diagrams/gui/x.mmd"])
 
     def test_cli_chain_b4_regression(self) -> None:
         """The literal B4 regression case as a CLI invocation."""
         rc, out, _ = self._run("cd /tmp && rm .claude/diagrams/gui/x.mmd")
         self.assertEqual(rc, 0)
-        lines = [l for l in out.split("\n") if l]
+        lines = [line for line in out.split("\n") if line]
         self.assertEqual(lines, [".claude/diagrams/gui/x.mmd"])
 
     def test_cli_silent_on_empty(self) -> None:

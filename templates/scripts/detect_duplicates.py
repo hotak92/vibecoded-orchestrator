@@ -25,7 +25,24 @@ import re
 # weaviate_mcp is pip-installed as an editable package by install.py (A1, v0.2.38).
 # This script uses the weaviate client directly, not weaviate_mcp symbols,
 # so no sys.path manipulation is needed for claude_mcp_servers/.
-sys.path.insert(0, str(Path.home() / ".claude" / "workflow" / "scripts"))
+#
+# The legacy `~/.claude/workflow/scripts` entry below predates that layout and
+# nothing in this file imports from it — but removing a sys.path entry is a
+# shipped-behaviour claim, so it is only made STEERABLE here (v0.2.92
+# W-CLAUDE), not deleted. Steerable matters because a sys.path entry outlives
+# the import: once this module loads, EVERY later import in the process scans
+# that directory, which under pytest meant scanning the developer's real home.
+#
+# `$VCT_CLAUDE_DIR` is parsed inline rather than imported from
+# `vco_lib.paths.claude_user_dir` (its single source of truth) because unlike
+# `query_code_graph.py` this script has no other vco_lib import to guarantee
+# importability — a hard import here would be a NEW dependency for a shipped
+# script that currently needs none. Same env key, same default: keep them equal.
+_vct_claude_dir = os.environ.get("VCT_CLAUDE_DIR", "").strip()
+sys.path.insert(0, str(
+    (Path(_vct_claude_dir) if _vct_claude_dir else Path.home() / ".claude")
+    / "workflow" / "scripts"
+))
 
 # v0.2.52 (Known Issue 6, Sub-issue A): silence
 # ``AuthlibDeprecationWarning`` from ``weaviate-client``'s transitive
@@ -112,8 +129,52 @@ def title_similarity(title1: str, title2: str) -> float:
     return similarity
 
 
+# ─── stdout is a MACHINE CONTRACT under --json (v0.2.92) ────────────────
+#
+# `--json` promises ONE JSON document on stdout; the launcher's
+# `orchestrator_core::kg_check_duplicates` parses it. Until v0.2.92 the
+# progress/diagnostic lines below were printed to stdout UNCONDITIONALLY,
+# so every `--json` run emitted 4+ prose lines in front of the payload —
+# in direct contradiction of this file's own comments ("Machine-readable
+# mode: ONLY the JSON document on stdout"). Verified live 2026-09-05: a
+# real `--json` run produced 5 prose lines before `{"threshold": ...}`.
+#
+# It "worked" only because the launcher salvaged with `stdout.find('{')`.
+# That salvage is one exception away from being wrong: the error branch in
+# `find_duplicates` prints `str(exc)` to this stream, and any exception
+# whose text contains a `{` (a dict/JSON fragment — routine in HTTP/gRPC
+# client errors) would make the salvage slice into the ERROR TEXT.
+#
+# Fix per the standing rule: human-facing lines go to STDERR when stdout
+# is a document. Human (non-`--json`) runs are unchanged — the stream stays
+# stdout — so nothing a terminal user sees moves.
+_PROGRESS_TO_STDERR = False
+
+
+def _progress(message: str = "") -> None:
+    """Emit a human-facing progress/diagnostic line.
+
+    Routed to stderr while ``--json`` is active so the JSON document is the
+    only thing on stdout. Never use bare ``print()`` for progress in this
+    module — that is the defect this exists to prevent.
+    """
+    print(message, file=sys.stderr if _PROGRESS_TO_STDERR else sys.stdout)
+
+
 class DuplicateDetector:
     """Detect potential duplicate nodes in knowledge graph"""
+
+    #: Set to the exception text when `find_duplicates` could not complete.
+    #:
+    #: v0.2.92: `find_duplicates` catches every exception, prints it and
+    #: returns `[]`. That made a FAILED scan indistinguishable from a CLEAN
+    #: one — the CLI exited 0 and reported "no duplicates" after a query
+    #: error, and the launcher's modal read the same empty list as a verdict.
+    #: Absent is not decided. The attribute is the evidence; `main` turns it
+    #: into a non-zero exit so no caller can mistake one for the other.
+    #: Class-level default so a doubles-based test that bypasses `__init__`
+    #: still sees the attribute.
+    scan_error: "str | None" = None
 
     def __init__(self, similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
         """Initialize detector"""
@@ -142,8 +203,8 @@ class DuplicateDetector:
         Returns:
             List of duplicate groups with metadata
         """
-        print(f"🔍 Scanning for duplicates (threshold: {self.threshold})")
-        print(f"   Collection: {COLLECTION_NAME}\n")
+        _progress(f"🔍 Scanning for duplicates (threshold: {self.threshold})")
+        _progress(f"   Collection: {COLLECTION_NAME}\n")
 
         # Get all nodes (first chunks only - they have full metadata)
         # v0.2.46 V46-D: cursor-paginate so collections > 1000 nodes are
@@ -177,14 +238,14 @@ class DuplicateDetector:
                     break
                 cursor = page.objects[-1].uuid
 
-            print(f"📊 Found {len(nodes)} nodes to analyze\n")
+            _progress(f"📊 Found {len(nodes)} nodes to analyze\n")
 
             duplicates = []
             checked_pairs = set()
 
             for i, node in enumerate(nodes):
                 if (i + 1) % 10 == 0:
-                    print(f"   Progress: {i+1}/{len(nodes)} nodes checked")
+                    _progress(f"   Progress: {i+1}/{len(nodes)} nodes checked")
 
                 # Get node metadata
                 node_title = node.properties.get("title", "Unknown")
@@ -238,11 +299,12 @@ class DuplicateDetector:
                             "confidence": max(semantic_similarity, title_sim)
                         })
 
-            print(f"\n✅ Analysis complete\n")
+            _progress("\n✅ Analysis complete\n")
             return duplicates
 
         except Exception as e:
-            print(f"❌ Error during duplicate detection: {e}")
+            self.scan_error = str(e)
+            _progress(f"❌ Error during duplicate detection: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -327,12 +389,26 @@ def main():
     # v0.2.20 (Stream 2 follow-up, 2026-05-19): --json emits the duplicate
     # pairs as a single JSON document on stdout INSTEAD of the markdown
     # report. Used by the launcher's orchestrator_core::kg_check_duplicates
-    # Tauri command (parses pairs into a modal). Stays mutually-exclusive
-    # with the human-readable summary print to keep stdout machine-parsable.
+    # Tauri command (parses pairs into a modal).
+    #
+    # v0.2.92: this comment used to claim --json "stays mutually-exclusive
+    # with the human-readable summary print to keep stdout machine-parsable".
+    # It was not true — `find_duplicates()` runs BEFORE this branch and printed
+    # its banner/progress/error lines to stdout on every run. The property is
+    # now ENFORCED rather than asserted: all such lines go through `_progress`,
+    # which switches to stderr as soon as `--json` is parsed.
     parser.add_argument("--json", action="store_true",
                        help="Emit duplicate pairs as JSON on stdout (machine-readable)")
 
     args = parser.parse_args()
+
+    # v0.2.92: flip the progress stream BEFORE anything runs. `--json` makes
+    # stdout a document, so every human-facing line this module emits must go
+    # to stderr from here on — including `find_duplicates`'s scan banner and
+    # its error branch, which used to land on stdout and were salvaged over by
+    # the launcher's `stdout.find('{')`.
+    global _PROGRESS_TO_STDERR
+    _PROGRESS_TO_STDERR = bool(args.json)
 
     detector = DuplicateDetector(similarity_threshold=args.threshold)
 
@@ -351,7 +427,10 @@ def main():
             }
             json.dump(payload, sys.stdout)
             sys.stdout.write("\n")
-            return
+            # Non-zero when the scan could not complete. The launcher checks
+            # the exit status BEFORE parsing, so this is what stops an empty
+            # `pairs` list from rendering as "0 duplicates" after a failure.
+            return 1 if detector.scan_error else 0
 
         if duplicates:
             output_path = PROJECT_ROOT / args.output
@@ -364,12 +443,19 @@ def main():
             print(f"   High confidence (≥98%): {high_confidence}")
             print(f"   Probable (≥95%): {sum(1 for d in duplicates if 0.95 <= d['confidence'] < 0.98)}")
             print(f"\n💡 Next: Review {output_path}")
+        elif detector.scan_error:
+            # NOT "clean". The scan did not finish, so there is no verdict to
+            # report — saying otherwise is the same lie the JSON branch above
+            # stopped telling.
+            print("⚠️  Scan did NOT complete — no verdict. See the error above.")
         else:
             print("✅ No duplicates detected - knowledge graph is clean!")
+
+        return 1 if detector.scan_error else 0
 
     finally:
         detector.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

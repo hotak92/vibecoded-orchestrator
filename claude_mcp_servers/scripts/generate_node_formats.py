@@ -51,6 +51,58 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
 FORMATS_FILE = KNOWLEDGE_DIR / ".node_formats.json"
 
+# ──────────────────────────────────────────────────────────────────────
+# Response validity — THE SAME predicate the runtime generator uses
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.92 WP-Q2. This script and `templates/scripts/generate-kg-summary.py`
+# write the SAME file (`knowledge/.node_formats.json`). WP-Q taught the
+# runtime generator to reject a model NON-ANSWER and to treat a stored one
+# as not-satisfied, so poisoned rows heal on the next ordinary run. This
+# script reaches the same file on the orchestrator-root layout via
+# `sync_knowledge_graph._regen_node_formats_after_full_sync()` — so without
+# the same gate, one path heals a row and the other re-poisons it.
+#
+# ONE implementation, not a mirror (project rule A > B > C): the predicate
+# is imported from the shared ladder rather than copied. That is reachable
+# HERE — unlike in an installed project's `.claude/scripts/` — because this
+# script only ever runs from an orchestrator CLONE: its own PROJECT_ROOT is
+# `<clone>/`, `_regen_node_formats_after_full_sync` requires
+# `<clone>/claude_mcp_servers/scripts/generate_node_formats.py` to exist
+# before it will spawn this at all (falling back to the runtime generator
+# otherwise), and `docs/CONFIGURATION.md` documents the manual `--all`
+# backfill from the clone. `templates/scripts/` is therefore always a
+# sibling.
+#
+# The import is HARD on purpose. A soft `except ImportError: is_non_answer
+# = lambda _t: False` would restore the exact re-poisoning bug this closes,
+# silently — the failure mode VCO's no-silent-fallback rule exists for.
+_LADDER_CANDIDATES = (
+    PROJECT_ROOT / "templates" / "scripts",   # orchestrator clone (canonical)
+    PROJECT_ROOT / ".claude" / "scripts",     # materialized bundle beside it
+)
+for _cand in _LADDER_CANDIDATES:
+    if (_cand / "summary_backends.py").is_file():
+        if str(_cand) not in sys.path:
+            sys.path.insert(0, str(_cand))
+        break
+else:  # no break — nothing to import from; say so, don't degrade quietly
+    raise ImportError(
+        "generate_node_formats.py cannot find the shared summary ladder "
+        "(summary_backends.py). Looked in: "
+        + ", ".join(str(p) for p in _LADDER_CANDIDATES)
+        + ". This script runs from an orchestrator clone, where "
+        "templates/scripts/ is a sibling — a missing ladder means a broken "
+        "checkout, not a supported layout."
+    )
+# pyright cannot follow the sys.path insertion above (the ladder lives in a
+# sibling directory, resolved at runtime); the guaranteed-sibling argument is
+# in the block above, and the ImportError branch is the runtime check.
+import summary_backends as _sb  # noqa: E402  # pyright: ignore[reportMissingImports]
+
+#: Re-exported so callers/tests can reach the predicate through THIS
+#: module's namespace, and so the identity (not a copy) is assertable.
+is_non_answer = _sb.is_non_answer
+
 
 def get_available_models() -> list[str]:
     """Return list of model names available in Ollama."""
@@ -200,11 +252,25 @@ def generate_chunk_summary(title: str, chunk_num: int, total: int, chunk_content
     return call_llm(prompt, max_tokens=200).strip()
 
 
-def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
-    """Fetch chunks for a node by title from Weaviate.
+def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int, str]]:
+    """Fetch this node's stored chunks from Weaviate, sorted by chunk number.
 
-    Returns sorted list of (chunk_number, content) tuples. Empty list if
-    the node is single-chunk or Weaviate is unreachable.
+    Returns a sorted list of ``(chunk_number, content)``. Empty list if the
+    node is single-chunk or Weaviate is unreachable.
+
+    Two v0.2.92 W7 corrections, both of which made this return ``[]``
+    or the WRONG rows:
+
+    * the stored property is ``chunk_num`` (that is the schema name every
+      writer uses); this read ``chunk_number``, which is only the name the
+      MCP's *result formatter* gives it, so the ``cn is not None`` guard
+      below rejected EVERY row and the per-chunk summaries were never
+      generated for any node. ``chunk_number`` is still accepted as a
+      fallback in case a caller passes formatter-shaped objects.
+    * the filter keyed on ``title`` alone. A title is not a node identity —
+      measured live, two titles per collection map to two file_paths each —
+      so a colliding node's chunks were blended into this node's summaries.
+      An empty ``file_path`` degrades to the pre-fix title-only filter.
     """
     try:
         # Add the project package to the path so we can import weaviate.
@@ -226,14 +292,16 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
         client = weaviate.connect_to_local(host="localhost", port=8081, grpc_port=50052)
         try:
             coll = client.collections.get(kg_collection)
-            resp = coll.query.fetch_objects(
-                filters=Filter.by_property("title").equal(title),
-                limit=20,
-            )
+            chunk_filter = Filter.by_property("title").equal(title)
+            if file_path:
+                chunk_filter = chunk_filter & Filter.by_property(
+                    "file_path"
+                ).equal(file_path)
+            resp = coll.query.fetch_objects(filters=chunk_filter, limit=20)
             chunks: list[tuple[int, str]] = []
             for obj in resp.objects:
                 props = obj.properties or {}
-                cn = props.get("chunk_number")
+                cn = props.get("chunk_num", props.get("chunk_number"))
                 content = props.get("content", "")
                 if cn is not None and content:
                     chunks.append((int(cn), content))
@@ -389,44 +457,51 @@ def save_formats_db(db: dict) -> None:
     script.
     """
     import json
-    import os
-    import tempfile
+    # v0.2.92 (duplication-merge): this was a verbatim copy of
+    # `vco_lib.atomic.atomic_write_text`. This script only ever runs from an
+    # orchestrator CLONE (PROJECT_ROOT is asserted above), so `vco_lib` is a
+    # sibling package and the import is HARD — a broken checkout raises.
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
 
     payload = json.dumps(db, indent=2, ensure_ascii=False)
-    parent = FORMATS_FILE.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=FORMATS_FILE.name + ".",
-        suffix=".tmp",
-        dir=str(parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            f.write(payload)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                # fsync can fail on pseudo-filesystems; don't fail the write.
-                pass
-        os.replace(tmp_path, str(FORMATS_FILE))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(FORMATS_FILE, payload)
 
 
 def has_formats(rel_path: str, db: dict, c_hash: str | None = None) -> bool:
-    """Return True if the entry is complete and (optionally) content-hash matches.
+    """Return True if the entry is USABLE and (optionally) content-hash matches.
 
-    Complete = has description + summary. If `c_hash` is provided, also
-    requires the stored content_hash to match (so edits trigger regen).
+    Usable = description and summary are both present AND are actually
+    summaries. v0.2.92 WP-Q2: the old test was truthiness, so a stored
+    ``"Ready. What do you need summarized?"`` satisfied it — and because
+    the content hash of the unchanged source file also matched, the row was
+    frozen forever. WP-Q root-caused those strings to a Windows argv defect
+    and taught the runtime generator to reject them; this is the SAME gate
+    on the second writer of the same file, so a row healed by one path is
+    not reported as satisfied (and thus left poisoned) by the other.
+
+    Chunk summaries are ENRICHMENT, and the asymmetry is deliberate: a
+    STORED non-answer chunk invalidates the entry, a MISSING one does not.
+    Treating absent-as-poisoned would re-run the two whole-node LLM calls on
+    every pass for any node whose Weaviate chunk fetch keeps failing —
+    churn bought for a retrieval-tier nicety. Mirrors
+    ``generate-kg-summary.stored_entry_is_usable``.
+
+    If `c_hash` is provided, the stored content_hash must also match (so
+    edits trigger regen).
     """
     entry = db.get(rel_path, {})
-    if not (entry.get("description") and entry.get("summary")):
+    if not isinstance(entry, dict):
         return False
+    if is_non_answer(entry.get("description")):
+        return False
+    if is_non_answer(entry.get("summary")):
+        return False
+    chunk_summaries = entry.get("chunk_summaries")
+    if isinstance(chunk_summaries, dict) and chunk_summaries:
+        if any(is_non_answer(v) for v in chunk_summaries.values()):
+            return False
     if c_hash is not None and entry.get("content_hash") != c_hash:
         return False
     return True
@@ -519,21 +594,44 @@ def process_node(
     except RuntimeError as e:
         return f"error:{e}"
 
+    # v0.2.92 WP-Q2 — the WRITE half of the same gate. `call_llm` here is
+    # this script's own Ollama/Haiku router, not the shared ladder, so it
+    # does not raise on a non-answer the way `summary_backends.call_llm`
+    # does. Without this check a fresh refusal ("I cannot summarize...", an
+    # empty generation) would be stored, and the content-hash gate would
+    # then freeze it — re-poisoning a row the runtime generator may have
+    # just healed. Reported as an error (never cached): the run's tally
+    # shows it, the next run retries, and no bad row is written.
+    for field, value in (("description", description), ("summary", summary)):
+        if is_non_answer(value):
+            return (
+                f"error:{field} came back a non-answer "
+                f"({(value or '').strip()[:80]!r}) — not cached"
+            )
+
     # Multi-chunk handling: fetch chunks from Weaviate; if N>1, generate
     # per-chunk summaries so auto-tier retrieval can surface them.
     chunk_summaries: dict | None = None
     total_chunks: int | None = None
-    chunks = get_chunks_from_weaviate(title)
+    chunks = get_chunks_from_weaviate(title, rel_path)
     if len(chunks) > 1:
         total_chunks = len(chunks)
         chunk_summaries = {}
         for cn, chunk_content in chunks:
             try:
                 cs = generate_chunk_summary(title, cn, total_chunks, chunk_content)
-                chunk_summaries[str(cn)] = cs
             except RuntimeError as e:
                 # Don't fail the whole node if one chunk summary fails — just skip it.
                 print(f"  WARN: chunk {cn} summary failed for {title!r}: {e}", file=sys.stderr)
+                continue
+            if is_non_answer(cs):
+                # DROP, don't store: absent is recoverable, poisoned is not
+                # (has_formats treats a stored non-answer chunk as invalid,
+                # a missing one as fine). Same asymmetry, both halves.
+                print(f"  WARN: chunk {cn} summary for {title!r} was a "
+                      f"non-answer — dropped, not cached", file=sys.stderr)
+                continue
+            chunk_summaries[str(cn)] = cs
 
     store_formats(
         rel_path,
@@ -608,7 +706,7 @@ def main() -> None:
             print("ERROR: ANTHROPIC_API_KEY not set. Required for --provider haiku.", file=sys.stderr)
             sys.exit(1)
         model = "claude-haiku-4-5"
-        print(f"Using provider: Haiku (API)")
+        print("Using provider: Haiku (API)")
     else:
         available = get_available_models()
         model = pick_model(MODEL_CANDIDATES, available)

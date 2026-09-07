@@ -56,8 +56,10 @@ if (Test-Path $DebounceLib) {
         $psExe = if ($script:PsExe) { $script:PsExe } else { "pwsh" }
         $wdEsc = ($WorkingDir -replace "'", "''")
         $child = "if ('$wdEsc') { Set-Location -LiteralPath '$wdEsc' -ErrorAction SilentlyContinue }; try { $Command } catch { }"
-        $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
-        Start-Process -FilePath $psExe -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$enc) -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+        # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1,
+        # dot-sourced above): an unguarded `-WindowStyle Hidden` is REJECTED
+        # on non-Windows PowerShell and takes the whole spawn with it.
+        Start-VcoDetachedPwsh -Command $child -PowerShellExe $psExe
     }
 }
 
@@ -140,9 +142,17 @@ if (-not $EditedFile) { exit 0 }
 # Mirrors templates/hooks/post-file-edit.sh's _kg_write_allowed shell
 # function. Resolver discovery: templates/scripts/vct_access_check.ps1
 # (orchestrator-root) → .claude/scripts/vct_access_check.ps1
-# (user-project install). Resolver script lives at
-# templates/scripts/vct_access_check.ps1 and is byte-equivalent to the
-# bash sibling (shipped together by bundle install).
+# (user-project install) — the bundle install writes that copy, so the
+# two are byte-identical the moment they are written; nothing gates the
+# copy afterwards (a copy the user has since edited is backed up to
+# .claude/backups/bundle-adoptions/<ts>/ and replaced on the next
+# bundle update). Prior text here also called this resolver
+# "byte-equivalent to the bash sibling". It is not and never was: the
+# .sh and .ps1 resolvers are two separate languages. What IS pinned is
+# that BOTH flavours exist (a missing .ps1 sibling is a Windows
+# outage) and that they stay logically equivalent — the
+# `.github/workflows/hook-parity.yml` gate, which is what survived the
+# PR-39 / v0.2.12 removal of `scripts/check_template_drift.py`.
 # v0.2.49 SB1: emit a dropped_writes.jsonl row when the gate falls
 # back to silent-allow because VCT_PROJECT_ID is missing. Mirrors
 # templates/hooks/post-file-edit.sh::_kg_emit_gate_skipped_metric and
@@ -261,6 +271,21 @@ python install.py --update
 # The empty-project_id metric+deferral surfaces are emitted by
 # Build-GatedSyncCommand directly. Keep this function for the contract it
 # documents; do not assume it is on the live sync path.
+#
+# v0.2.92: the .sh sibling now matches this design exactly. Pre-v0.2.92,
+# the .sh sibling embedded a call to its `_kg_write_allowed` bash function
+# by NAME inside the eval'd command string, on the (incorrect) assumption
+# that the detached flusher shares function scope with post-file-edit.sh —
+# it does not (the v0.2.65 "Item 1" hardening pass made the flusher spawn
+# via `setsid bash -c '...'`, a genuinely separate process that sources
+# only _lib/kg-sync-debounce.sh). That silently broke the ENTIRE
+# hook-triggered KG/docs auto-sync path on the bash side for ~2.5 months
+# (verified via isolated repro). The fix, `_kg_build_gated_sync_cmd` in
+# post-file-edit.sh, now mirrors this file's Build-GatedSyncCommand: the
+# empty-project_id branch is decided synchronously at schedule time, and
+# only the access-matrix decision itself is embedded as a self-contained
+# POSIX snippet that calls vct_access_check.sh directly (no function-name
+# dependency).
 function Test-KgWriteAllowed {
     param(
         [string]$Project,
@@ -322,13 +347,15 @@ if (-not $VctProjectId) {
 }
 
 # Resolve the access-matrix checker path once for the debounced (gate
-# runs at SYNC time) command strings below. The .sh sibling calls the
-# in-scope _kg_write_allowed bash function inside its backgrounded
-# flusher; PowerShell Start-Job spawns a SEPARATE process that does NOT
-# inherit functions, so the deferred command must re-run the gate via
-# the EXTERNAL resolver script (vct_access_check.ps1). Fall-open
-# semantics mirror Test-KgWriteAllowed exactly: empty project_id OR
-# missing resolver OR non-"write" parse failure → allow.
+# runs at SYNC time) command strings below. The detached child that
+# eventually evals these commands is a SEPARATE process that does NOT
+# inherit functions defined here, so the deferred command must re-run the
+# gate via the EXTERNAL resolver script (vct_access_check.ps1) rather than
+# calling a function by name. (The .sh sibling now does the equivalent —
+# see the v0.2.92 note on Test-KgWriteAllowed above; pre-v0.2.92 it
+# incorrectly assumed its detached flusher shared function scope.)
+# Fall-open semantics mirror Test-KgWriteAllowed exactly: empty
+# project_id OR missing resolver OR non-"write" parse failure → allow.
 $AccessCheckPs1 = $null
 foreach ($c in @(
     (Join-Path $ProjectRoot "templates/scripts/vct_access_check.ps1"),
@@ -418,30 +445,59 @@ if ($EditedFile.StartsWith($KnowledgeRootSep, [StringComparison]::OrdinalIgnoreC
     Set-Content -Path $editCountFile -Value $count -Encoding ascii
 
     if (($count % 10) -eq 0) {
-        # v0.2.54 Track G (G-6): the old first-choice probe for
-        # kg-duplicates.ps1 was dead code - that sibling has never shipped
-        # (only the bash kg-duplicates wrapper exists in templates/scripts/).
-        # Probe the bash wrapper directly; native-Windows-without-bash
-        # machines skip dup-detection until a .ps1 wrapper actually ships.
         # D-8 (v0.2.73): capture the summary into a report file (previously
         # the scan ran hidden and its output was discarded — inert feature).
         # The next KG-file edit surfaces + consumes the report.
+        #
+        # v0.2.92 (R42 / MAJOR-1): the PowerShell wrapper SHIPS now
+        # (templates/scripts/kg-duplicates.ps1 -> .claude/scripts/), so it is
+        # the FIRST branch — same shape the kg-sync spawn above uses. The
+        # comment this replaced denied the sibling's existence and gated
+        # the whole feature on `Get-Command bash`, which left every
+        # native-Windows-without-bash machine with no duplicate detection at
+        # all while a written, tested .ps1 sat beside it. Parity is achieved by
+        # CALLING the .ps1, not by narrowing the feature; the bash wrapper
+        # stays as the fallback for a project whose bundle predates the
+        # sibling.
+        #
+        # DETACHED via Start-Process, NOT Start-Job: a job's child is torn
+        # down when this hook's PowerShell host exits (measured on Linux pwsh
+        # 7 — a 300 ms job never ran), and the scan is a whole-collection
+        # Weaviate query that always outlives the hook, so the report was
+        # never written even on machines that DID have bash. This is the same
+        # reasoning _lib/kg-sync-debounce.ps1 records for its flusher; the
+        # bash sibling's `( ... ) &` subshell already survives, so this also
+        # restores .sh/.ps1 parity.
+        $dupPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates.ps1"
         $dupSh = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates"
-        if ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-            $dupReport = Join-Path $ProjectRoot ".claude/state/kg_duplicates_report.txt"
+        $dupReport = Join-Path $ProjectRoot ".claude/state/kg_duplicates_report.txt"
+        $dupExpr = $null
+        if (Test-Path $dupPs1) {
+            $psEscape = $PsExe -replace "'", "''"
+            $dupEsc = $dupPs1 -replace "'", "''"
+            $dupExpr = "& '$psEscape' -NoProfile -File '$dupEsc' '--threshold' '0.95' 2>&1"
+        } elseif ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+            $shEsc = $dupSh -replace "'", "''"
+            $dupExpr = "& bash '$shEsc' '--threshold' '0.95' 2>&1"
+        }
+        if ($dupExpr) {
             $stateDir = Split-Path $dupReport -Parent
             if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
-            Start-Job -ScriptBlock {
-                param($bashDup, $root, $reportPath)
-                try {
-                    $out = & bash $bashDup '--threshold' '0.95' 2>&1 |
-                        Select-String -Pattern '✅|⚠️|📊' | ForEach-Object { $_.ToString() }
-                    if ($out) {
-                        $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                        Set-Content -Path $reportPath -Value (@("# KG duplicate scan (every-10-edits, $ts)") + $out) -Encoding utf8
-                    }
-                } catch {}
-            } -ArgumentList $dupSh, $ProjectRoot, $dupReport | Out-Null
+            $reportEsc = $dupReport -replace "'", "''"
+            $rootEsc = $ProjectRoot -replace "'", "''"
+            $dupChild = @"
+Set-Location -LiteralPath '$rootEsc' -ErrorAction SilentlyContinue
+try {
+    # ❌ kept too — the scan's failure line is what the ⚠️ "See the error
+    # above." verdict points at (parity with the bash sibling's filter).
+    `$out = $dupExpr | Select-String -Pattern '✅|⚠️|📊|❌' | ForEach-Object { `$_.ToString() }
+    if (`$out) {
+        `$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        Set-Content -Path '$reportEsc' -Value (@("# KG duplicate scan (every-10-edits, `$ts)") + `$out) -Encoding utf8
+    }
+} catch { }
+"@
+            Start-VcoDetachedPwsh -Command $dupChild -PowerShellExe $PsExe
         }
     }
 
@@ -504,7 +560,15 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
     }
     $throttleFile = Join-Path $throttleDir "diagram_idx_${diagramHash}.ts"
 
-    $nowTs = [int][double]::Parse(((Get-Date) - (Get-Date "1970-01-01Z")).TotalSeconds)
+    # TRUE Unix seconds. MUST MATCH the .sh sibling's `date +%s` — both write
+    # and read the SAME `.claude/state/diagram_idx_<hash>.ts` file, so a
+    # timezone-shifted value here breaks the throttle across siblings (on a
+    # WSL/mixed install the .ps1 read a .sh stamp as `now - last == +offset`
+    # and re-indexed on EVERY edit). `(Get-Date) - (Get-Date "1970-01-01Z")`
+    # subtracts a UTC instant from a LOCAL one and is off by the UTC offset;
+    # .NET subtracts raw ticks and ignores DateTimeKind, so mixing kinds never
+    # errors, it just silently returns the wrong number.
+    $nowTs = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $lastTs = 0
     if (Test-Path $throttleFile) {
         try {
@@ -536,24 +600,45 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
                 $diagArgs += @('--diagrams-collection', $env:DIAGRAMS_COLLECTION)
             }
 
-            # Serialized index + snapshot in a single background job.
+            # Serialized index + snapshot in ONE detached child.
+            #
             # R2 (code review 2026-05-25): previously two separate
             # Start-Process calls ran in parallel; the snapshot CLI's
             # `project_diagrams WHERE file_path=?` query returned no
             # row on first-edit-per-file because the indexer UPSERT
             # hadn't committed yet → first-version snapshot lost
-            # forever. Use Start-Job to run the two CLIs sequentially
-            # (index → snapshot) without blocking the hook itself.
+            # forever. SEQUENCING IS LOAD-BEARING: index must complete
+            # before snapshot runs. The two CLIs are therefore emitted
+            # as consecutive statements in a single child process.
+            #
+            # v0.2.92 R2: that fix used Start-Job, which reintroduced the
+            # loss by a different route — a job's child is torn down when
+            # the host process exits, and this hook exits within
+            # milliseconds while the indexer's Weaviate upsert takes
+            # seconds. So on Windows NEITHER CLI completed. Identical
+            # defect to the duplicate-scan branch above; same remedy, and
+            # the same one home for the spawn (`Start-VcoDetachedPwsh`).
+            # The .sh sibling's `( ... ) &` subshell already survives, so
+            # this also restores .sh/.ps1 parity.
             $snapArgs = @(
                 '-m', 'vco_lib.diagram_indexer',
                 'snapshot', 'create', $EditedFile, '--quiet'
             )
-            Start-Job -ScriptBlock {
-                param($vp, $iargs, $sargs, $cwd)
-                Set-Location $cwd
-                & $vp @iargs *> $null
-                & $vp @sargs *> $null
-            } -ArgumentList $diagVenv, $diagArgs, $snapArgs, $ProjectRoot | Out-Null
+            $diagPyEsc = $diagVenv -replace "'", "''"
+            $diagRootEsc = $ProjectRoot -replace "'", "''"
+            $idxLit = ($diagArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
+            $snapLit = ($snapArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
+            $diagChild = @"
+Set-Location -LiteralPath '$diagRootEsc' -ErrorAction SilentlyContinue
+`$vp = '$diagPyEsc'
+`$ia = @($idxLit)
+`$sa = @($snapLit)
+try {
+    & `$vp @ia *> `$null
+    & `$vp @sa *> `$null
+} catch { }
+"@
+            Start-VcoDetachedPwsh -Command $diagChild -PowerShellExe $PsExe
         }
 
         # Live UI refresh in DiagramsTab is driven by the launcher's

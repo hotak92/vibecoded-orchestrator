@@ -25,6 +25,25 @@ VCT_SECRETS_DIR="${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
 AUDIT_LOG="$VCT_SECRETS_DIR/audit.log"
 VERSION="0.1.0-phase1"
 
+# Capability stamp — the guards THIS copy of the CLI actually implements.
+#
+# WHY a capability list and not a bumped VERSION: `vct` is deployed by COPY
+# (the documented setup is "copy it from tools/vct-secrets/"), and nothing in
+# install.py refreshes that copy — so a deployed CLI can be arbitrarily far
+# behind the repo while still printing a plausible version string. A version
+# number tells you what the author CLAIMED; this list tells you which guards
+# are present in the bytes that are about to run. `vct version` prints it and
+# `vct doctor` greps a second deployed copy for it (see
+# _doctor_check_deployed_copy), which is how a stale deployment is DETECTED
+# instead of silently trusted.
+#
+# Append a token when you add a guard; never remove one.
+#   value-shape      — write-time blob/multi-line predicate (v0.2.80)
+#   name-shape       — credential-shaped KEY/PROJECT name refusal
+#   shared-scope     — `set --shared` writes the real shared namespace
+#   symlink-self     — resolves its own symlink before locating lib/
+VCT_GUARDS="value-shape name-shape shared-scope symlink-self"
+
 # ---------- Shared secret-shape predicate (bash mirror of the Python SSOT) ----------
 # tools/vct-secrets/lib/secret_shape.sh defines _is_single_line_secret() and
 # _classify_secret_value(), the bash mirror of vco_lib/secret_value_shape.py
@@ -32,19 +51,65 @@ VERSION="0.1.0-phase1"
 # by both this CLI and migrate-shared.sh (SHARED-CODE RULE — no duplication).
 # The lib lives next to this script even when `vct` is deployed to
 # ~/.vct-secrets/vct (install materialises the whole tools/vct-secrets tree).
+
+# _vct_resolve_self_dir — echo the directory holding the REAL script file,
+# following the script's own symlink chain first.
+#
+# WHY: `dirname "${BASH_SOURCE[0]}"` yields the SYMLINK's directory, not the
+# target's. The documented way to put this CLI on PATH is a symlink (e.g.
+# ~/.local/bin/vct -> <checkout>/tools/vct-secrets/vct), and under that setup
+# the un-resolved form looked for ~/.local/bin/lib/secret_shape.sh, did not
+# find it, and hard-exited "broken install" — i.e. the ONE delivery mechanism
+# that cannot go stale was the one that could not start. Resolving the chain
+# makes symlink deployment work, which is what lets a user point at the
+# checkout instead of taking a copy that then rots.
+#
+# `readlink` WITHOUT -f on purpose: `readlink -f` is GNU-only (macOS ships the
+# BSD one, which has no -f), and this CLI must run on Linux + macOS + WSL2.
+# The loop is bounded at 16 hops so a symlink cycle terminates.
 # CDPATH= prefixes the `cd` (neutralises a user CDPATH); not a var assignment.
 # shellcheck disable=SC1007
-_VCT_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)
+_vct_resolve_self_dir() {
+    local src="${BASH_SOURCE[0]:-$0}" dir="" hops=0
+    while [ -L "$src" ] && [ "$hops" -lt 16 ]; do
+        dir=$(CDPATH= cd -- "$(dirname -- "$src")" && pwd) || break
+        src=$(readlink -- "$src") || break
+        case "$src" in
+            /*) ;;                 # absolute link target — use as-is
+            *)  src="$dir/$src" ;; # relative link target — resolve against the link's dir
+        esac
+        hops=$((hops + 1))
+    done
+    CDPATH= cd -- "$(dirname -- "$src")" && pwd
+}
+_VCT_SELF_DIR=$(_vct_resolve_self_dir)
+# BOTH shared predicate libs are REQUIRED:
+#   lib/secret_shape.sh      — secret VALUE shape (line structure); mirror of
+#                              vco_lib/secret_value_shape.py.
+#   lib/credential_shapes.sh — credential SHAPE vocabulary, `argv_name`
+#                              context; mirror of vco_lib/credential_shapes.py.
+# Sourced through ONE loop so the broken-install message has a single home
+# (SHARED-CODE RULE) and a third lib cannot later ship without the same guard.
 # shellcheck source=lib/secret_shape.sh
-if [ -r "$_VCT_SELF_DIR/lib/secret_shape.sh" ]; then
-    . "$_VCT_SELF_DIR/lib/secret_shape.sh"
-else
-    # Loud-fail: a broken deployment missing the shared predicate must NOT
-    # silently write unguarded (the write-time guard is the whole point).
-    printf 'vct: error: shared predicate missing at %s/lib/secret_shape.sh — broken install\n' \
-        "$_VCT_SELF_DIR" >&2
-    exit 1
-fi
+# shellcheck source=lib/credential_shapes.sh
+for _vct_lib in secret_shape.sh credential_shapes.sh; do
+    if [ -r "$_VCT_SELF_DIR/lib/$_vct_lib" ]; then
+        # shellcheck disable=SC1090
+        . "$_VCT_SELF_DIR/lib/$_vct_lib"
+    else
+        # Loud-fail: a broken deployment missing a shared predicate must NOT
+        # silently run unguarded (the write-time and name-shape guards are the
+        # whole point). Name BOTH supported deployments — a partial copy of
+        # just the `vct` file is the common way to land here.
+        printf 'vct: error: shared predicate missing at %s/lib/%s — broken install.\n' \
+            "$_VCT_SELF_DIR" "$_vct_lib" >&2
+        printf 'vct: this CLI needs the whole tools/vct-secrets/ tree, not the single file. Either\n' >&2
+        printf 'vct:   symlink it (preferred, never goes stale):  ln -sfn <checkout>/tools/vct-secrets/vct ~/.local/bin/vct\n' >&2
+        printf 'vct:   or copy the tree:                          cp -a <checkout>/tools/vct-secrets/. ~/.vct-secrets/\n' >&2
+        exit 1
+    fi
+done
+unset _vct_lib
 
 # Env vars to preserve into child when not --preserve-env.
 # Covers locale, terminal, PATH, home — drops everything else.
@@ -241,8 +306,25 @@ hub_has_key() {
 #                                  avoid. Point at the resolver instead, noting
 #                                  the probe couldn't confirm.
 #   * soft-fail (1)              → hub couldn't answer → classic `vct set` hint.
+#
+# CREDENTIAL-SHAPED KEY (name-shape guard): a `vct get --key <the token>` typo
+# is the read-side twin of the `vct set` swap. The read paths do NOT fail
+# closed on a credential-shaped name (they may be operating on an already-
+# damaged store), so this function has to withhold the two things that would
+# turn the miss into an exposure:
+#   (a) the hub probe, which interpolates the key into a URL query string and
+#       hands it to curl — a real credential would land in the hub's request
+#       log and in the process table; and
+#   (b) the key itself in the diagnostic text.
+# Both are suppressed and the caller is told to rotate.
 die_miss() {
     local verb="$1" code="$2" project="$3" key="$4"
+    if is_credential_shaped_name "$key" || is_credential_shaped_name "$project"; then
+        die_code "$code" "$verb: not found, and the name you passed has the shape of a live credential, so \
+it was NOT sent to the hub probe and is not echoed here. You most likely swapped the VALUE into the NAME \
+position. If you pasted a real credential, it reached argv (shell history + process table) — treat it as \
+EXPOSED and rotate it."
+    fi
     hub_has_key "$project" "$key"
     local probe=$?
     if [ "$probe" -eq 0 ]; then
@@ -261,24 +343,114 @@ Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."
     die_code "$code" "$verb: secret not found — project=$project key=$key. Fix: vct set --project $project --key $key"
 }
 
+# ---------- Credential-shaped NAME guard ----------
+#
+# THE HAZARD: `validate_name` below rejects empty / over-long / path-traversal
+# / out-of-charset names. It says nothing about whether the name IS a live
+# credential. A swapped argument — the VALUE typed where the NAME belongs,
+# `vct set --key <the token>` — sails through every one of those checks,
+# because the common token shapes are entirely `[A-Za-z0-9_.-]` and well under
+# 128 chars. The credential then becomes (a) a FILENAME on disk and (b) a
+# cleartext entry in audit.log's `secrets` field. Both survive the shell
+# history the user knows to clear.
+#
+# VOCABULARY SOURCE (one concern, one home): the shapes are NOT defined here.
+# They come from the credential-shape vocabulary SSOT
+# vco_lib/credential_shapes.py, via this tool's bash mirror
+# lib/credential_shapes.sh (sourced above), `argv_name` context. Adding a shape
+# to the SSOT propagates here automatically; the parity fixture
+# tests/fixtures/credential_shape_parity.json fails every mirror that drifts.
+# Do NOT re-inline a literal alternation here — that is precisely the fork this
+# indirection removed.
+#
+# WHY `argv_name` AND NOT A FILE-SCANNING CONTEXT: a name is one complete
+# token, not a line of file content, so every arm is whole-string anchored and
+# the `sk-` arm can stay WIDE. The file-scan contexts narrow that arm only to
+# avoid matching vendored Excalidraw locale asset names (`sk-SK-<hash>-<hash>`,
+# still present in this repo) during repo-wide scanning; that haystack cannot
+# occupy a `--key` argument, and the narrow form would MISS the whole
+# `sk-<vendor>-<tail>` family — i.e. the shape that motivated this guard.
+# Prefix families keep EXACT lengths so `github_pat_personal` stays a legal
+# name. See the SSOT docstring for the full per-context rationale.
+#
+# NO OVERRIDE FLAG, by design: a `--force`-shaped escape hatch is a thing a
+# user pastes into a script once and then carries forever, which permanently
+# re-enables the exact hazard. A false positive has a real remedy that keeps
+# the guard intact — pick a name that is not credential-shaped (names are
+# arbitrary; prefix it) — and the error message says so.
+_VCT_CREDENTIAL_NAME_SHAPES="$_CREDSHAPES_ARGV_NAME_RE"
+
+# The placeholder that stands in for a credential-shaped name in any message,
+# audit row or report. Never interpolate the name itself alongside it.
+_VCT_REDACTED_NAME='<redacted:credential-shaped-name>'
+
+# is_credential_shaped_name NAME → exit 0 if NAME has the shape of a live
+# credential, 1 otherwise. NEVER prints the input (not even truncated).
+# Pure predicate: no side effects, no logging, safe to call anywhere.
+is_credential_shaped_name() {
+    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_VCT_CREDENTIAL_NAME_SHAPES"
+}
+
+# redact_name NAME → echo NAME, or the fixed placeholder when NAME is
+# credential-shaped. Use at EVERY point a name reaches a message, a log line
+# or a report, so an already-stored credential-shaped name cannot re-leak.
+redact_name() {
+    if is_credential_shaped_name "${1:-}"; then
+        printf '%s' "$_VCT_REDACTED_NAME"
+    else
+        printf '%s' "${1:-}"
+    fi
+}
+
+# assert_name_not_credential_shaped KIND NAME — hard refusal for the boundaries
+# that CREATE or RENAME a binding (`set`, `copy`, `migrate-from-env`'s project,
+# `recover-blob`'s scope). MUST be called before ANY filesystem or audit
+# side-effect, so nothing bearing the name is ever created or recorded.
+#
+# NOT called from `revoke` / `list` / `get` / `resolve` / `can-read`: those
+# operate on a binding that ALREADY exists, and `revoke` in particular is the
+# remediation path — failing closed there would lock a victim out of deleting
+# the artifact with the tool that created it. Those paths get redaction
+# (redact_name) rather than refusal.
+assert_name_not_credential_shaped() {
+    local kind=$1 val=$2
+    is_credential_shaped_name "$val" || return 0
+    # NOTE: not one byte of $val appears below, on any line.
+    printf 'vct: error: refusing to use that as a %s NAME — it has the shape of a live credential.\n' "$kind" >&2
+    printf 'vct: Nothing was written and nothing was logged.\n' >&2
+    printf 'vct: This is almost always a swapped argument. The VALUE goes on stdin, the NAME on --key:\n' >&2
+    printf 'vct:     printf %%s "$TOKEN" | vct set --shared --key github_pat\n' >&2
+    printf 'vct: If this really is meant to be a name, choose one that is not credential-shaped\n' >&2
+    printf 'vct: (prefix it, e.g. "svc_<name>"). There is deliberately no override flag.\n' >&2
+    printf 'vct: IMPORTANT: if you just pasted a real credential here it reached argv, so it is in\n' >&2
+    printf 'vct: your shell history and was visible in the process table — treat it as EXPOSED and rotate it.\n' >&2
+    exit 1
+}
+
 # Reject keys/projects with path-traversal or control chars.
 # Allow: [A-Za-z0-9_.-], length 1..128.
+#
+# NONE of these messages may echo $val. The rejected input is, by definition,
+# something the caller got wrong — and the way it is most often wrong is that
+# it is a secret VALUE in the NAME position. Printing it turns the check that
+# EXISTS to prevent an exposure into a second exposure (stderr, CI logs, the
+# terminal scrollback). Say what was wrong structurally; never quote the input.
 validate_name() {
     local kind=$1 val=$2
     if [ -z "$val" ]; then
         die "$kind cannot be empty"
     fi
     if [ "${#val}" -gt 128 ]; then
-        die "$kind too long (>128 chars)"
+        die "$kind too long (>128 chars) — value not echoed; check the argument you passed"
     fi
     case "$val" in
         *..*|*/*|*$'\n'*|*$'\t'*|.*|-*)
-            die "$kind contains invalid characters: $val"
+            die "$kind contains invalid characters (path separator, '..', control char, or a leading '.'/'-') — value not echoed"
             ;;
     esac
     # Reject anything outside [A-Za-z0-9_.-]
     if printf '%s' "$val" | LC_ALL=C grep -q '[^A-Za-z0-9_.-]'; then
-        die "$kind contains invalid characters: $val"
+        die "$kind contains invalid characters (allowed: A-Z a-z 0-9 _ . -) — value not echoed"
     fi
 }
 
@@ -475,7 +647,7 @@ audit() {
     line=$(printf '{"ts":"%s","op":"%s","project":"%s","secrets":%s,"caller_pid":%d,"caller_cmd":"%s"}' \
         "$ts" \
         "$(json_escape "$op")" \
-        "$(json_escape "$project")" \
+        "$(json_escape "$(redact_name "$project")")" \
         "$keys" \
         "$$" \
         "$(json_escape "$caller_cmd")")
@@ -483,15 +655,134 @@ audit() {
 }
 
 # Build JSON array from space-separated list.
+#
+# Names are REDACTED here rather than at each call site because this is the
+# single chokepoint every audit row's `secrets` field passes through (every
+# caller is `audit ... "$(json_array_from_list ...)"`). The create-time guard
+# means a credential-shaped name can no longer ENTER the store — but a store
+# damaged before the guard existed would otherwise re-leak the name into
+# audit.log on every subsequent get/exec/revoke. audit.log is an append-only
+# artifact that outlives the incident and is read by other tooling, so it gets
+# redaction; `vct list`, which prints names to stdout on explicit request and
+# is how a user finds the damage in order to revoke it, deliberately does not.
 json_array_from_list() {
     local first=1 out='['
     local k
     for k in "$@"; do
         if [ $first -eq 1 ]; then first=0; else out+=','; fi
-        out+='"'$(json_escape "$k")'"'
+        out+='"'$(json_escape "$(redact_name "$k")")'"'
     done
     out+=']'
     printf '%s' "$out"
+}
+
+# ---------- Write-scope resolution (the shared-namespace write path) ----------
+#
+# THE BUG THIS FIXES: `set` used to hardcode projects/<project>/<key>, so
+# `vct set --project shared --key K` created a PROJECT literally named
+# "shared" at projects/shared/K. Nothing that CONSUMES the shared namespace
+# reads that path — not resolve_secret's per-project order
+# (projects/<NAME>/ then shared/), not templates/scripts/vct_secrets_resolve.sh,
+# not vco_lib/agent_secrets.py, not tools/vct-secrets/git-credential-vct. The
+# write was accepted, reported as "stored shared/K", and inert everywhere it
+# mattered. The only readers that could see it were `vct get`/`vct list` run
+# with the SAME wrong invocation — which is precisely what made it look like
+# it had worked.
+#
+# `--project shared` is ALIASED to the shared namespace rather than REFUSED.
+# The instruction to spell it that way is emitted from two places this file
+# cannot fix in lockstep — the shared-store README that install materialises
+# into the user's own secrets directory
+# (templates/vct-secrets-shared-readme.template) and the miss message in
+# vco_lib/agent_secrets.py. Refusing would turn both into hard-failing advice
+# the moment this lands; aliasing makes both correct immediately. The
+# trade-off is that a project literally named "shared" can no longer be
+# written — acceptable, because the store layout already reserves that name
+# for the shared namespace at its top level.
+#
+# ONE implementation, called by every subcommand that resolves a WRITE scope
+# (`set`, `revoke`), so `--project shared` cannot come to mean one thing in
+# one subcommand and something else in another.
+#
+# WRITE-ONLY, deliberately. The READ subcommands (`get`, `exec`, `can-read`,
+# `resolve`, `list`) are NOT routed through here, and that is a decision, not
+# an oversight:
+#   * resolve_secret() already tries projects/<NAME>/ then shared/, so a read
+#     with `--project shared` finds the shared file today via the fallback.
+#     Nothing is broken on the read side; only the write path was.
+#   * `vct list --project shared` is the one command that ENUMERATES a
+#     damaged store's projects/shared/ orphans. Aliasing it would make the
+#     misfiled set invisible from inside the tool at exactly the moment a
+#     user is trying to clean it up. (`vct doctor` names each path too, so
+#     the information exists in two places rather than none.)
+# The cost is that `--project shared` reaches projects/shared/ in `list` and
+# the shared namespace in `set`/`revoke`. That asymmetry is bounded to a
+# store that is already damaged, and it disappears entirely once
+# `doctor --fix-shared-scope` has emptied projects/shared/.
+#
+# Out-vars (bash 3.2 has no namerefs; documented rather than returned):
+#   _VCT_SCOPE_DIR        absolute directory the key lives in
+#   _VCT_SCOPE_PROJECT    normalised scope label ("shared" or the project name)
+#   _VCT_SCOPE_IS_SHARED  1 when the shared namespace, else 0
+#   _VCT_SCOPE_FLAG       the canonical flag to quote back in messages
+_VCT_SCOPE_DIR=""
+_VCT_SCOPE_PROJECT=""
+_VCT_SCOPE_IS_SHARED=0
+_VCT_SCOPE_FLAG=""
+resolve_write_scope() {
+    local subcmd="$1" shared="$2" project="$3"
+    if [ "$shared" -eq 1 ] && [ -n "$project" ] && [ "$project" != "shared" ]; then
+        die "$subcmd: --shared and --project $project are mutually exclusive — pick one scope"
+    fi
+    if [ "$shared" -eq 0 ] && [ "$project" = "shared" ]; then
+        warn "$subcmd: '--project shared' means the SHARED namespace, not a project called \
+'shared'. Using the shared namespace; the canonical spelling is '--shared'."
+        shared=1
+    fi
+    [ "$shared" -eq 1 ] || [ -n "$project" ] \
+        || die "$subcmd: --project NAME (or --shared) required"
+    if [ "$shared" -eq 1 ]; then
+        _VCT_SCOPE_DIR="$VCT_SECRETS_DIR/shared"
+        _VCT_SCOPE_PROJECT="shared"
+        _VCT_SCOPE_IS_SHARED=1
+        _VCT_SCOPE_FLAG="--shared"
+    else
+        validate_name "project" "$project"
+        _VCT_SCOPE_DIR="$VCT_SECRETS_DIR/projects/$project"
+        _VCT_SCOPE_PROJECT="$project"
+        _VCT_SCOPE_IS_SHARED=0
+        _VCT_SCOPE_FLAG="--project $project"
+    fi
+    # NOTE: the credential-shaped-NAME refusal is deliberately NOT applied
+    # here. This function is the scope MECHANISM; whether a credential-shaped
+    # name is fatal is per-boundary POLICY — fatal for `set` (a CREATE), not
+    # for `revoke` (the remediation path). Each caller applies its own.
+}
+
+# Per-project opt-out marker for the SHARED fallback. MIRRORED,
+# byte-for-byte, in vco_lib/agent_secrets.py (NO_SHARED_FALLBACK_MARKER),
+# templates/scripts/vct_secrets_resolve.sh (NO_SHARED_FALLBACK_MARKER)
+# and templates/scripts/vct_secrets_resolve.ps1 ($VctNoSharedFallbackMarker)
+# — and WRITTEN by the launcher's shared-secrets toggle in
+# launcher/src-tauri/src/commands/secrets_cmd.rs. The five spellings are
+# locked by tests/test_no_shared_fallback_marker_parity.py; the BEHAVIOUR
+# is pinned by tests/vct_secrets_cli_suite.sh.
+NO_SHARED_FALLBACK_MARKER=".no-shared-fallback"
+
+# shared_fallback_disabled — true when $1 has opted out of shared/.
+#
+# An empty project means the caller has no project identity, so there is
+# nothing to opt out of. The literal name "shared" is excluded too: it is
+# this CLI's own default scope label (`get`/`exec`/`can-read`/`resolve`
+# fall back to project="shared" when --project is omitted), so honouring a
+# marker there would let one stray projects/shared/ orphan disable every
+# shared read on the machine. Must match
+# agent_secrets._shared_fallback_disabled, shared_fallback_disabled (.sh)
+# and Test-SharedFallbackDisabled (.ps1).
+shared_fallback_disabled() {
+    local project=$1
+    [ -n "$project" ] && [ "$project" != "shared" ] || return 1
+    [ -e "$VCT_SECRETS_DIR/projects/$project/$NO_SHARED_FALLBACK_MARKER" ]
 }
 
 # Resolve path for a secret. Prints the path on stdout; exit 0 if found, 2 if not.
@@ -502,6 +793,12 @@ resolve_secret() {
     if [ -f "$p_path" ]; then
         printf '%s' "$p_path"
         return 0
+    fi
+    # Read-side half of the launcher's per-project "Disable shared secrets"
+    # gate. READS only: `revoke` routes through resolve_write_scope, so an
+    # opted-out project can still delete its own keys.
+    if shared_fallback_disabled "$project"; then
+        return 2
     fi
     if [ -f "$s_path" ]; then
         printf '%s' "$s_path"
@@ -524,10 +821,17 @@ SUBCOMMANDS:
   list [--project NAME]
         List secret keys (names only) for a project, or shared if no --project.
 
-  set --project NAME --key KEY [--confirm-tty] [--allow-multiline]
+  set (--project NAME | --shared) --key KEY [--confirm-tty] [--allow-multiline]
         Store a secret. Value read from stdin ONLY (never from argv).
         Refuses interactive TTY stdin unless --confirm-tty given.
-        --project stays REQUIRED for writes (writing should be deliberate).
+        A scope stays REQUIRED for writes (writing should be deliberate):
+        --project NAME → projects/NAME/KEY, --shared → shared/KEY.
+        '--project shared' is accepted as an alias for --shared (it used to
+        create a project literally called "shared" at projects/shared/KEY,
+        which no resolver ever reads).
+        Refuses a KEY or PROJECT whose NAME has the shape of a live
+        credential — the swapped-argument accident that turns a token into
+        a filename. There is no override flag; pick another name.
         Rejects a multi-secret BLOB (a bare token + KEY=value continuation
         lines) at the write boundary — a single file must hold ONE secret.
         A legitimate multi-line secret (PEM/cert/OpenSSH) is accepted
@@ -556,8 +860,11 @@ SUBCOMMANDS:
         scope wins over shared). Exit 2 if the key resolves nowhere.
         Never prints the secret value.
 
-  revoke --project NAME --key KEY [--yes]
-        Delete a project's secret file. Prompts unless --yes.
+  revoke (--project NAME | --shared) --key KEY [--yes]
+        Delete a secret file from a project or the shared namespace.
+        Prompts unless --yes. Same scope vocabulary as 'set'.
+        Deliberately NOT blocked on credential-shaped names — this is the
+        remediation path for a store damaged before that guard existed.
 
   copy --from-project SRC --to-project DST --key KEY [--yes]
         Explicit cross-project copy. Prompts unless --yes.
@@ -578,8 +885,16 @@ SUBCOMMANDS:
         is a no-op. Never prints a secret value.
         --key targets one file; --all scans the scope for blobs.
 
-  doctor [--fix-shape]
+  doctor [--fix-shape] [--fix-shared-scope]
         Audit dir/file permissions. Fixes chmod to 700/600 where needed.
+        Also reports two store-integrity conditions it never auto-repairs:
+          * secrets misfiled under projects/shared/ (the pre-fix
+            'set --project shared' landing spot, which no resolver reads).
+            --fix-shared-scope moves each one to the real shared namespace
+            with an atomic rename, and REFUSES on collision — it never
+            overwrites and never deletes.
+          * a SECOND deployed copy of this CLI inside the store that is
+            missing guards this one has. Reported only; never overwritten.
         Also shape-checks GitHub token files (any key named github_pat
         or github_pat.*): classifies each as ok / blob / length_corruption
         / legit_multiline and warns with the right remediation (blob →
@@ -609,6 +924,12 @@ EOF
 
 cmd_version() {
     printf 'vct %s\n' "$VERSION"
+    # Capability stamp — see VCT_GUARDS at the top of this file. A deployed
+    # COPY that predates a guard prints a shorter list (or, if it predates the
+    # stamp entirely, no `guards:` line at all), which is what makes staleness
+    # detectable without a version registry anywhere.
+    printf 'guards: %s\n' "$VCT_GUARDS"
+    printf 'source: %s\n' "$_VCT_SELF_DIR"
 }
 
 cmd_list() {
@@ -643,10 +964,13 @@ cmd_list() {
 }
 
 cmd_set() {
-    local project="" key="" confirm_tty=0 allow_multiline=0
+    local project="" key="" confirm_tty=0 allow_multiline=0 shared=0
     while [ $# -gt 0 ]; do
         case $1 in
             --project) project=$2; shift 2 ;;
+            # --shared: write the real SHARED namespace ($VCT_SECRETS_DIR/shared).
+            # Same flag name and meaning as `recover-blob --shared`.
+            --shared) shared=1; shift ;;
             --key) key=$2; shift 2 ;;
             --confirm-tty) confirm_tty=1; shift ;;
             --allow-multiline) allow_multiline=1; shift ;;
@@ -657,20 +981,31 @@ cmd_set() {
             *) die "set: unknown arg: $1" ;;
         esac
     done
-    [ -n "$project" ] || die "set: --project required"
-    [ -n "$key" ]     || die "set: --key required"
-    validate_name "project" "$project"
+
+    resolve_write_scope "set" "$shared" "$project"
+    shared=$_VCT_SCOPE_IS_SHARED
+    project=$_VCT_SCOPE_PROJECT
+    [ -n "$key" ] || die "set: --key required"
     validate_name "key" "$key"
+    # CREATE boundary — must precede ensure_root, mkdir, mktemp and audit so a
+    # credential-shaped name never becomes a filename or an audit row. The next
+    # statement that touches the filesystem is ensure_root, two lines below;
+    # nothing above this point has written to disk (resolve_write_scope only
+    # computes paths, and its one output is a stderr warning naming the literal
+    # string "shared").
+    assert_name_not_credential_shaped "project" "$project"
+    assert_name_not_credential_shaped "key" "$key"
     ensure_root
 
     if [ -t 0 ] && [ $confirm_tty -eq 0 ]; then
         die "set: stdin is a TTY — pipe the value in, e.g. 'printf %s \"\$TOKEN\" | vct set ...' (or pass --confirm-tty to type it interactively)"
     fi
 
-    local proj_dir="$VCT_SECRETS_DIR/projects/$project"
-    mkdir -p "$proj_dir"
-    chmod 700 "$proj_dir"
-    local target="$proj_dir/$key"
+    local scope_dir="$_VCT_SCOPE_DIR"
+    mkdir -p "$scope_dir"
+    chmod 700 "$scope_dir"
+    local proj_dir="$scope_dir"
+    local target="$scope_dir/$key"
 
     # Read stdin into temp file (never echo), rename atomically.
     local tmp
@@ -685,14 +1020,15 @@ cmd_set() {
     # and later handed multi-line to git/gh. A legit PEM passes without the flag
     # (the predicate accepts the allowlisted format); --allow-multiline is the
     # escape hatch for a multi-line format the allowlist doesn't yet recognise.
-    local _val _reason
+    local _val _reason _scope_flag
+    if [ "$shared" -eq 1 ]; then _scope_flag="--shared"; else _scope_flag="--project $project"; fi
     _val=$(cat -- "$tmp"; printf x); _val=${_val%x}
     if ! _reason=$(_is_single_line_secret "$_val" "$key" "$allow_multiline"); then
         rm -f "$tmp"
         die "set: refusing to store a malformed/blob value for $project/$key (reason: $_reason). \
 A single secret file must hold ONE secret. If this is a legitimate multi-line secret the \
 allowlist doesn't recognise, re-run with --allow-multiline. If this is several secrets glued \
-together (a blob), recover them with 'vct recover-blob --project $project --key $key' after \
+together (a blob), recover them with 'vct recover-blob $_scope_flag --key $key' after \
 storing the raw file, or split them into separate keys."
     fi
     unset _val
@@ -700,7 +1036,11 @@ storing the raw file, or split them into separate keys."
     mv "$tmp" "$target"
     chmod 600 "$target"
     audit "set" "$project" "$(json_array_from_list "$key")" ""
-    printf 'vct: stored %s/%s\n' "$project" "$key" >&2
+    # Report the RESOLVED PATH, not just "<scope>/<key>". The old message
+    # printed "vct: stored shared/K" for a write that had landed in
+    # projects/shared/K — wording that matched exactly what the user expected
+    # while describing a different location. A path cannot be ambiguous.
+    printf 'vct: stored %s\n' "$target" >&2
 }
 
 cmd_get() {
@@ -736,28 +1076,40 @@ cmd_get() {
 }
 
 cmd_revoke() {
-    local project="" key="" yes=0
+    local project="" key="" yes=0 shared=0
     while [ $# -gt 0 ]; do
         case $1 in
             --project) project=$2; shift 2 ;;
+            # Same scope vocabulary as `set` and `recover-blob`. `revoke` had
+            # NO way to delete a shared-namespace secret before this; more
+            # importantly, routing it through resolve_write_scope keeps
+            # '--project shared' from meaning the shared namespace in `set`
+            # and projects/shared/ in `revoke`.
+            --shared) shared=1; shift ;;
             --key) key=$2; shift 2 ;;
             --yes|-y) yes=1; shift ;;
             -h|--help) cmd_help; return 0 ;;
             *) die "revoke: unknown arg: $1" ;;
         esac
     done
-    [ -n "$project" ] || die "revoke: --project required"
-    [ -n "$key" ]     || die "revoke: --key required"
-    validate_name "project" "$project"
+    resolve_write_scope "revoke" "$shared" "$project"
+    project=$_VCT_SCOPE_PROJECT
+    [ -n "$key" ] || die "revoke: --key required"
     validate_name "key" "$key"
     ensure_root
 
-    local target="$VCT_SECRETS_DIR/projects/$project/$key"
+    local target="$_VCT_SCOPE_DIR/$key"
     if [ ! -f "$target" ]; then
-        die_code 2 "revoke: not found — $project/$key"
+        die_code 2 "revoke: not found — $(redact_name "$project")/$(redact_name "$key")"
     fi
+    # NOTE: `revoke` is deliberately NOT guarded by
+    # assert_name_not_credential_shaped. It is the remediation path for a store
+    # damaged before the guard existed — failing closed here would leave the
+    # victim unable to delete the artifact with the tool that created it. The
+    # name is REDACTED in the prompt, the confirmation and the audit row
+    # instead, so removing the artifact does not reprint it.
     if [ $yes -eq 0 ]; then
-        printf 'Revoke %s/%s? [y/N] ' "$project" "$key" >&2
+        printf 'Revoke %s/%s? [y/N] ' "$(redact_name "$project")" "$(redact_name "$key")" >&2
         local ans=""
         read -r ans </dev/tty || die "revoke: cannot read confirmation"
         case "$ans" in
@@ -767,7 +1119,7 @@ cmd_revoke() {
     fi
     rm -f -- "$target"
     audit "revoke" "$project" "$(json_array_from_list "$key")" ""
-    printf 'vct: revoked %s/%s\n' "$project" "$key" >&2
+    printf 'vct: revoked %s/%s\n' "$(redact_name "$project")" "$(redact_name "$key")" >&2
 }
 
 cmd_copy() {
@@ -788,6 +1140,14 @@ cmd_copy() {
     validate_name "project" "$src"
     validate_name "project" "$dst"
     validate_name "key" "$key"
+    # CREATE boundary — `copy` writes projects/<dst>/<key>, so all three names
+    # are guarded. The SOURCE is guarded too: copying out of a credential-shaped
+    # binding would propagate the bad name to a second location rather than
+    # remediate it (the remediation is `revoke`, which is deliberately not
+    # guarded). Must precede ensure_root / mkdir / cp / audit.
+    assert_name_not_credential_shaped "project" "$src"
+    assert_name_not_credential_shaped "project" "$dst"
+    assert_name_not_credential_shaped "key" "$key"
     ensure_root
 
     local src_path="$VCT_SECRETS_DIR/projects/$src/$key"
@@ -923,6 +1283,10 @@ cmd_migrate_from_env() {
     [ -n "$file" ]    || die "migrate-from-env: FILE required"
     [ -n "$project" ] || die "migrate-from-env: --project required"
     validate_name "project" "$project"
+    # CREATE boundary (scope). Per-KEY guarding happens in the parse loop below
+    # and SKIPS rather than dies — one malformed line must not abort a whole
+    # dotenv migration.
+    assert_name_not_credential_shaped "project" "$project"
     [ -f "$file" ]    || die "migrate-from-env: no such file: $file"
     ensure_root
 
@@ -956,9 +1320,21 @@ cmd_migrate_from_env() {
         esac
         # Strip trailing whitespace on key
         key=${key%"${key##*[![:space:]]}"}
-        # Validate key
+        # Validate key. The warning does NOT echo the key: a dotenv line whose
+        # LHS is credential-shaped is the same swapped-argument accident as
+        # `vct set --key <token>`, and the message that reports it must not
+        # become the leak. Non-credential invalid keys are named (useful, and
+        # they are by construction not credential-shaped).
         if [ -z "$key" ] || printf '%s' "$key" | LC_ALL=C grep -q '[^A-Za-z0-9_.-]'; then
-            warn "skipping invalid key: $key"
+            warn "skipping invalid key: $(redact_name "$key")"
+            skipped=$((skipped+1))
+            continue
+        fi
+        # CREATE boundary (per key) — skip, never write, never name it.
+        if is_credential_shaped_name "$key"; then
+            warn "skipping a key whose NAME has the shape of a live credential (name not echoed). \
+That dotenv line is almost certainly 'VALUE=...' with the value in the key position — fix the \
+source file. Nothing was written or logged for it."
             skipped=$((skipped+1))
             continue
         fi
@@ -1171,10 +1547,20 @@ _recover_extract_kv() {
         return 0
     fi
     case "$ekey" in
-        *..*|*/*|.*|-*) warn "recover-blob: skipping unsafe extracted key: $ekey"; return 0 ;;
+        *..*|*/*|.*|-*) warn "recover-blob: skipping unsafe extracted key: $(redact_name "$ekey")"; return 0 ;;
     esac
     if printf '%s' "$ekey" | LC_ALL=C grep -q '[^A-Za-z0-9_.-]'; then
-        warn "recover-blob: skipping extracted key with invalid chars: $ekey"
+        warn "recover-blob: skipping extracted key with invalid chars: $(redact_name "$ekey")"
+        return 0
+    fi
+    # CREATE boundary — the extracted key becomes a FILENAME. A blob whose
+    # continuation line reads `<token>=<something>` would otherwise mint a
+    # credential-shaped filename out of file content. Skip it; the full
+    # original stays in the backup for manual inspection.
+    if is_credential_shaped_name "$ekey"; then
+        warn "recover-blob: skipping an extracted key whose NAME has the shape of a live \
+credential (name not echoed). Inspect the backup by hand — that line is probably a value, not a \
+KEY=VALUE pair."
         return 0
     fi
     printf '%s' "$eval" > "$work/$ekey"
@@ -1321,8 +1707,21 @@ cmd_resolve() {
 #   * ok                → fall through to the known-GitHub-shape regex.
 _doctor_check_github_pat_shape() {
     local f=$1
-    local raw val len key
+    local raw val len key scope_flag
     key=$(basename "$f")
+    # The scope flag to quote back in every remediation below, derived ONCE
+    # from the file's own location. Two of these strings used to be wrong:
+    # the length_corruption arm emitted `vct set --key KEY` with no scope at
+    # all (dies "--project required"), and the embedded-whitespace arm
+    # hardcoded `--project shared` — the exact misfiling invocation this
+    # release fixes, recommended by the tool's own doctor even for a
+    # project-scoped file. A remediation you cannot paste is not a
+    # remediation.
+    if [ "${f#*/shared/}" != "$f" ]; then
+        scope_flag="--shared"
+    else
+        scope_flag="--project $(basename "$(dirname "$f")")"
+    fi
     # Read the RAW content (control chars / newlines intact) for the taxonomy;
     # never print it.
     raw=$(cat -- "$f"; printf x); raw=${raw%x}
@@ -1343,13 +1742,13 @@ _doctor_check_github_pat_shape() {
         blob)
             warn "token-shape: $f is a BLOB (several secrets glued together, $len+ chars). gh/git \
 gets a multi-line 'password' and auth fails silently. Recover the embedded keys with: \
-vct recover-blob --key $key $([ "${f#*/shared/}" != "$f" ] && printf -- '--shared' || printf -- '--project <name>')"
+vct recover-blob --key $key $scope_flag"
             return 1
             ;;
         length_corruption)
             warn "token-shape: $f is LENGTH-CORRUPTION (a single-line malformed/partial token, \
 $len chars — nothing to split). Manual fix: re-issue or delete the token, then re-set with: \
-printf %s \"\$TOKEN\" | vct set --key $key"
+printf %s \"\$TOKEN\" | vct set $scope_flag --key $key"
             return 1
             ;;
         legit_multiline)
@@ -1364,7 +1763,7 @@ under a github_pat name — unusual but structurally valid; not a GitHub token."
     # still breaks gh/git) then the known-GitHub-shape regex.
     case "$val" in
         *' '*|*$'\t'*|*$'\n'*|*$'\r'*)
-            warn "token-shape: $f contains embedded whitespace/newlines ($len chars) — gh/git will reject it. Re-set with: printf %s \"\$TOKEN\" | vct set --project shared --key $key"
+            warn "token-shape: $f contains embedded whitespace/newlines ($len chars) — gh/git will reject it. Re-set with: printf %s \"\$TOKEN\" | vct set $scope_flag --key $key"
             return 1
             ;;
     esac
@@ -1375,13 +1774,173 @@ under a github_pat name — unusual but structurally valid; not a GitHub token."
     return 1
 }
 
+# ---------- doctor: misfiled shared-scope secrets (already-damaged stores) ----------
+#
+# Before `set --shared` existed, `vct set --project shared --key K` wrote
+# projects/shared/K. No consumer of the shared namespace reads that path, so
+# such a secret is inert: present, reported as stored, and never served.
+# Stores created before this release may hold any number of them.
+#
+# WHY DETECT-AND-TELL BY DEFAULT, NEVER AUTO-MIGRATE:
+#   1. `doctor` without an explicit --fix-* flag never mutates a secret. That
+#      invariant predates this change (--fix-shape established it) and is
+#      documented in `vct help`; quietly moving credentials would break it.
+#   2. projects/shared/ is AMBIGUOUS. It is the misfiling spot, but it is
+#      also where a project legitimately named "shared" would live. Nothing
+#      on disk distinguishes the two. Only the user knows, so only the user
+#      can authorise the move — which is exactly what passing the flag is.
+#   3. A collision is a human decision. If shared/K already exists with a
+#      different value, no rule picks the winner. The store's established
+#      answer for that class (recover-blob) is: keep what is there, never
+#      overwrite, report. Same answer here.
+#
+# WHY OFFER THE MOVE AT ALL, rather than detect-only: the alternative the user
+# would otherwise type is `vct get ... | vct set ...` followed by a delete —
+# which routes the value through a pipe, leaves it in two places mid-way, and
+# can lose it if the second step fails. `mv` inside one store root is a
+# rename(2): one inode, atomic, cannot duplicate, cannot lose, and never reads
+# the value. Handing the user the safe move is strictly better than leaving
+# them to improvise an unsafe one.
+#
+# Returns the number of misfiled keys still needing attention.
+_doctor_check_misfiled_shared() {
+    local do_fix="$1"
+    local misdir="$VCT_SECRETS_DIR/projects/shared"
+    [ -d "$misdir" ] || { printf '0'; return 0; }
+
+    local f base pending=0 moved=0 collided=0
+    for f in "$misdir"/*; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        case "$base" in .*|_README.md) continue ;; esac
+        local dest="$VCT_SECRETS_DIR/shared/$base"
+        if [ "$do_fix" -eq 1 ]; then
+            if [ -e "$dest" ]; then
+                # NEVER overwrite. Both copies are preserved; the user decides.
+                warn "shared-scope: $misdir/$(redact_name "$base") and $dest BOTH exist and were \
+not compared — refusing to overwrite. Keep the correct one by hand, then delete the other."
+                collided=$((collided + 1))
+                pending=$((pending + 1))
+            else
+                mkdir -p "$VCT_SECRETS_DIR/shared"
+                chmod 700 "$VCT_SECRETS_DIR/shared"
+                # Atomic rename inside one store root: one inode, never two
+                # copies, never zero. The value is never read.
+                if mv -- "$f" "$dest"; then
+                    chmod 600 "$dest"
+                    audit "promote-shared" "shared" "$(json_array_from_list "$base")" "from=projects/shared"
+                    printf 'vct: shared-scope: moved %s → %s\n' \
+                        "$(redact_name "$base")" "$dest" >&2
+                    moved=$((moved + 1))
+                else
+                    warn "shared-scope: could not move $misdir/$(redact_name "$base") → $dest \
+(left untouched)"
+                    pending=$((pending + 1))
+                fi
+            fi
+        else
+            warn "shared-scope: $f is misfiled — nothing that reads the SHARED namespace looks \
+in projects/shared/ (not the per-project resolver, not vct_secrets_resolve.sh, not \
+agent_secrets, not git-credential-vct). It was almost certainly written by the pre-fix \
+'vct set --project shared'. Move it with: vct doctor --fix-shared-scope"
+            pending=$((pending + 1))
+        fi
+    done
+
+    if [ "$do_fix" -eq 1 ] && [ $((moved + collided)) -gt 0 ]; then
+        printf 'vct: shared-scope: %d moved, %d collision(s) left for you to reconcile.\n' \
+            "$moved" "$collided" >&2
+        # Only remove the directory when it is genuinely empty — rmdir refuses
+        # otherwise, which is the behaviour we want (never recursive).
+        rmdir -- "$misdir" 2>/dev/null || true
+    fi
+    printf '%d' "$pending"
+    return 0
+}
+
+# ---------- doctor: a SECOND, possibly stale, deployed copy of this CLI ----------
+#
+# `vct` is deployed by COPY (the documented setup is "copy it from
+# tools/vct-secrets/"), and NOTHING refreshes that copy — not install.py, not
+# the launcher, not `--update`. A copy taken once and never touched keeps
+# working, keeps printing a plausible version, and silently lacks every guard
+# added since. A user whose store copy predates the write-time guards should
+# learn that from this tool, not from an incident.
+#
+# The check is CODE-only: it compares the running script with the copy in the
+# store by content and by capability stamp. It never reads a secret, and it
+# NEVER overwrites the deployed copy — that file lives in the user's secrets
+# directory, and refreshing it is the user's deliberate act, so we print the
+# exact command instead of running it.
+#
+# Returns the number of issues found.
+_doctor_check_deployed_copy() {
+    local store_cli="$VCT_SECRETS_DIR/vct"
+    [ -f "$store_cli" ] || { printf '0'; return 0; }
+
+    local running="$_VCT_SELF_DIR/vct"
+    # Same file (the normal case when running the deployed copy itself) → done.
+    if [ "$store_cli" -ef "$running" ] 2>/dev/null; then
+        # Running FROM the store. Then the store copy is the live one, and the
+        # thing worth checking is whether it can even find its predicate lib.
+        printf '0'
+        return 0
+    fi
+
+    local issues=0
+    if cmp -s -- "$store_cli" "$running" 2>/dev/null; then
+        printf '0'
+        return 0
+    fi
+
+    warn "deployed-copy: a SECOND copy of this CLI lives at $store_cli and differs from the one \
+you just ran ($running). Whichever one is first on your PATH decides which guards apply."
+    issues=$((issues + 1))
+
+    # Capability diff — name the guards the deployed copy is missing. A copy
+    # predating the stamp has no VCT_GUARDS line at all, which is itself the
+    # loudest possible signal.
+    local g
+    if ! grep -q '^VCT_GUARDS=' -- "$store_cli" 2>/dev/null; then
+        warn "deployed-copy: $store_cli predates the guard capability stamp entirely — it is \
+missing ALL of: $VCT_GUARDS"
+    else
+        local missing=""
+        for g in $VCT_GUARDS; do
+            grep -q -- "$g" "$store_cli" 2>/dev/null || missing="$missing $g"
+        done
+        [ -n "$missing" ] && warn "deployed-copy: $store_cli is missing guard(s):$missing"
+    fi
+
+    # A copy of the single file without lib/ cannot start at all on a current
+    # release — worth naming, because "I copied vct" is the usual way to get here.
+    # BOTH shared libs are required; a deployed copy predating
+    # lib/credential_shapes.sh hits the same loud-fail gate, so name whichever
+    # one is actually missing.
+    for _dc_lib in secret_shape.sh credential_shapes.sh; do
+        if [ ! -r "$VCT_SECRETS_DIR/lib/$_dc_lib" ]; then
+            warn "deployed-copy: $VCT_SECRETS_DIR/lib/$_dc_lib is absent, so a current \
+release copied into the store would refuse to start. Copy the TREE, not the file."
+        fi
+    done
+    unset _dc_lib
+
+    warn "deployed-copy: not touching it — it is inside your secrets directory. Refresh it \
+yourself with EITHER of:
+    ln -sfn $_VCT_SELF_DIR/vct ~/.local/bin/vct        # preferred: cannot go stale
+    cp -a $_VCT_SELF_DIR/. $VCT_SECRETS_DIR/           # copy the whole tree, incl. lib/"
+    printf '%d' "$issues"
+    return 0
+}
+
 cmd_doctor() {
-    local fix_shape=0
+    local fix_shape=0 fix_shared_scope=0
     while [ $# -gt 0 ]; do
         case $1 in
             --fix-shape) fix_shape=1; shift ;;
+            --fix-shared-scope) fix_shared_scope=1; shift ;;
             -h|--help) cmd_help; return 0 ;;
-            *) die "doctor: unknown arg: $1 (expected [--fix-shape])" ;;
+            *) die "doctor: unknown arg: $1 (expected [--fix-shape] [--fix-shared-scope])" ;;
         esac
     done
     ensure_root
@@ -1464,6 +2023,34 @@ cmd_doctor() {
         fi
     done < <(find "$VCT_SECRETS_DIR/shared" "$VCT_SECRETS_DIR/projects" \
                   -type f \( -name 'github_pat' -o -name 'github_pat.*' \) 2>/dev/null)
+
+    # Credential-shaped key NAMES already on disk (a store damaged before the
+    # name-shape guard existed). Report the COUNT and the containing directory
+    # only — never the name, which IS the credential. `vct list` still prints
+    # names verbatim, so the user has a way to see and revoke them; this is the
+    # detection that tells them to go look.
+    local shaped=0 sf sdir
+    while IFS= read -r sf; do
+        [ -z "$sf" ] && continue
+        if is_credential_shaped_name "$(basename "$sf")"; then
+            shaped=$((shaped + 1))
+            sdir=$(dirname "$sf")
+        fi
+    done < <(find "$VCT_SECRETS_DIR/shared" "$VCT_SECRETS_DIR/projects" -type f 2>/dev/null)
+    if [ "$shaped" -gt 0 ]; then
+        warn "name-shape: $shaped secret file(s) have a NAME with the shape of a live credential \
+(names not echoed; last seen under $sdir). That happens when a VALUE was passed where the --key \
+NAME belongs. Those credentials are on disk as FILENAMES and in older audit.log rows. \
+Rotate them, then remove each with: vct list [--project NAME] ; vct revoke ... --key <name> --yes"
+        issues=$((issues + shaped))
+    fi
+
+    # Store-integrity checks that are reported, and only repaired on request.
+    local misfiled deployed
+    misfiled=$(_doctor_check_misfiled_shared "$fix_shared_scope")
+    issues=$((issues + misfiled))
+    deployed=$(_doctor_check_deployed_copy)
+    issues=$((issues + deployed))
 
     if [ "$fix_shape" -eq 1 ]; then
         printf 'vct doctor: %d perms fixed, %d shape issue(s) found, %d blob(s) recovered.\n' \

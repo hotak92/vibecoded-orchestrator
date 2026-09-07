@@ -166,8 +166,17 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 # the user gets the WARNING from the resolver client about the deny.
 #
 # The resolver script lives at templates/scripts/vct_access_check.sh
-# (orchestrator-root) and is byte-identical to .claude/scripts/
-# vct_access_check.sh in user projects (template-drift gate enforces).
+# (orchestrator-root); the bundle install writes it to
+# .claude/scripts/vct_access_check.sh in each user project, so the two
+# are byte-identical the moment they are written. Prior text here said
+# the "template-drift gate enforces" that identity. It does not: the
+# gate `scripts/check_template_drift.py` was REMOVED in PR-39 / v0.2.12
+# (see `.github/workflows/hook-parity.yml`) and this repo tracks no
+# `.claude/scripts/` at all — so the citation was already false on the
+# day this v0.2.49 block was written. What actually holds afterwards is
+# the bundle-update contract: a copy the user has since edited is backed
+# up to .claude/backups/bundle-adoptions/<ts>/ and replaced with the
+# shipped one. Nothing gates the copy in between.
 # v0.2.49 SB1: emit a `dropped_writes.jsonl` row when the gate falls
 # back to silent-allow because VCT_PROJECT_ID is empty. Mirrors the
 # Python-side `_emit_gate_skipped_metric` shape and the existing
@@ -248,6 +257,36 @@ _kg_emit_gate_skipped_deferral() {
     } >> "$deferred" 2>/dev/null || true
 }
 
+# v0.2.92 FIX (silent-KG-sync-drop): this synchronous function is RETAINED
+# for the contract it documents (mirrors post-file-edit.ps1's
+# Test-KgWriteAllowed, which carries the identical caveat), but it is NOT
+# on the live sync path — do not assume calling it here has any effect on
+# whether a sync actually runs. The v0.2.65 Track B "Item 1" hardening pass
+# made the debounce flusher spawn via `setsid bash -c '...'` for
+# crash-safety (see _lib/kg-sync-debounce.sh) — a genuinely separate
+# process that sources ONLY that lib, never this script. Before that pass
+# the flusher was an in-process `( ... ) &` subshell (shares function
+# scope); after it, a bash function defined in THIS script is invisible
+# there. Every command string built with `_kg_write_allowed <args> && ...`
+# (the pattern this function was designed for) therefore failed with
+# "_kg_write_allowed: command not found" (exit 127) at EVAL time inside the
+# detached flusher — and because it's the LHS of `&&`, the sync on the RHS
+# never ran. The failure was invisible: `_kg_debounce_run_claimed` redirects
+# the eval to `>/dev/null 2>&1`, so nothing was printed, logged, or left as
+# residue anywhere (the claimed work dir is `rm -rf`'d regardless of the
+# eval's exit code). This silently broke the ENTIRE hook-triggered KG/docs
+# auto-sync path (both the debounced flusher/reaper path AND the
+# lock-ceiling/window=0 immediate-`sh -c` fallback, which doesn't even
+# source kg-sync-debounce.sh) for every project on every install since the
+# v0.2.65 debounce-hardening pass — verified via an isolated repro (a
+# non-exported bash function called from a `setsid bash -c` child reports
+# "command not found"). The existing debounce test suite
+# (tests/test_kg_sync_debounce_cap_throttle.py) never caught it because it
+# drives `_kg_debounce_schedule` with a trivial self-contained test command
+# ("echo ... >> log"), never the real gated command built below — see
+# tests/test_v0292_kg_sync_gate_selfcontained.py for the integration-level
+# regression test this fix adds. See knowledge/concepts/
+# debounced-hook-commands-must-be-self-contained-2026-09-01.md.
 _kg_write_allowed() {
     local proj="${1:-}"
     local coll="${2:-}"
@@ -287,6 +326,57 @@ if [ -z "$VCT_PROJECT_ID" ] && [ -f "$PROJECT_ROOT/.claude/env" ]; then
         | head -1 | sed -E 's/^[[:space:]]*VCT_PROJECT_ID=//; s/^"//; s/"$//')
 fi
 
+# Resolve the access-matrix checker path ONCE, synchronously, here — mirrors
+# post-file-edit.ps1's $AccessCheckPs1 resolution. Safe to do at schedule
+# time (not eval time): the checker script is a static repo file that
+# cannot appear/disappear within a debounce window.
+_KG_ACCESS_CHECKER=""
+if [ -x "$PROJECT_ROOT/templates/scripts/vct_access_check.sh" ]; then
+    _KG_ACCESS_CHECKER="$PROJECT_ROOT/templates/scripts/vct_access_check.sh"
+elif [ -x "$PROJECT_ROOT/.claude/scripts/vct_access_check.sh" ]; then
+    _KG_ACCESS_CHECKER="$PROJECT_ROOT/.claude/scripts/vct_access_check.sh"
+fi
+
+# v0.2.92 FIX: build a SELF-CONTAINED "gate THEN sync" command string —
+# the actual replacement for the broken `_kg_write_allowed <args> && ...`
+# pattern (see the extended comment above `_kg_write_allowed`). Mirrors
+# post-file-edit.ps1's Build-GatedSyncCommand:
+#   * The "no project_id" branch is decided SYNCHRONOUSLY, right here,
+#     because VCT_PROJECT_ID cannot change within a debounce window — so
+#     the metric + deferral emission (the real side effects that matter)
+#     fire immediately instead of being embedded in a string that would
+#     need its own file-I/O logic re-derived at eval time.
+#   * The "no collection" / "no resolver on disk" branches fall open here
+#     too, for the same reason (both are schedule-time-stable facts).
+#   * ONLY the genuinely time-sensitive part — the access-matrix decision
+#     itself — is embedded as a plain POSIX `[ ]`/`if` snippet that calls
+#     the checker SCRIPT directly (not a shell function), so it is
+#     evaluable by ANY shell that ends up running it: the bash flusher/
+#     reaper (_lib/kg-sync-debounce.sh) OR the plain `sh -c` immediate-
+#     detach fallback (window=0 / lock-ceiling overflow), which sources
+#     nothing at all.
+#   $1 = project id, $2 = target collection, $3 = sync command string
+_kg_build_gated_sync_cmd() {
+    local proj="$1" coll="$2" sync_expr="$3"
+    if [ -z "$proj" ]; then
+        if [ -n "$coll" ]; then
+            _kg_emit_gate_skipped_metric "$coll"
+            _kg_emit_gate_skipped_deferral "$coll"
+        fi
+        printf '%s' "$sync_expr"
+        return 0
+    fi
+    if [ -z "$coll" ] || [ -z "$_KG_ACCESS_CHECKER" ]; then
+        printf '%s' "$sync_expr"
+        return 0
+    fi
+    printf '_p=%s; _c=%s; _lvl=$(%s "$_p" "$_c" 2>/dev/null || echo write); if [ "$_lvl" = write ]; then %s; fi' \
+        "$(_kg_debounce_shquote "$proj")" \
+        "$(_kg_debounce_shquote "$coll")" \
+        "$(_kg_debounce_shquote "$_KG_ACCESS_CHECKER")" \
+        "$sync_expr"
+}
+
 # 1. Auto-sync knowledge graph files (background side-effect).
 # D-9 (v0.2.73): match on "<root>/" not "<root>" so sibling directories
 # (knowledge_base/, knowledge-old/) don't sync into the KG collection.
@@ -303,7 +393,10 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"/* ]]; then
     # the latest content lands. All interpolated values are shquote'd so
     # a space- or quote-bearing path survives the eval (and the reaper's
     # re-eval from the recorded cmd file).
-    _KG_SYNC_CMD="_kg_write_allowed $(_kg_debounce_shquote "$VCT_PROJECT_ID") $(_kg_debounce_shquote "${KG_COLLECTION:-}") && .claude/scripts/kg-sync $(_kg_debounce_shquote "$REL_PATH")"
+    # v0.2.92 FIX: build via _kg_build_gated_sync_cmd, NOT a
+    # `_kg_write_allowed ... && ...` string — see the extended comment
+    # above _kg_write_allowed for why the latter silently never ran.
+    _KG_SYNC_CMD="$(_kg_build_gated_sync_cmd "$VCT_PROJECT_ID" "${KG_COLLECTION:-}" ".claude/scripts/kg-sync $(_kg_debounce_shquote "$REL_PATH")")"
     _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_KG_SYNC_CMD" "kg"
 
     EDIT_COUNT_FILE="$PROJECT_ROOT/.claude/logs/.kg_edit_count"
@@ -331,9 +424,13 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"/* ]]; then
         _DUP_REPORT="$PROJECT_ROOT/.claude/state/kg_duplicates_report.txt"
         mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
         (
+            # ❌ is kept too: the scan's failure line (`❌ Error during
+            # duplicate detection: …`) is what the ⚠️ "See the error above."
+            # verdict points at — filtering it out would surface a report
+            # that names an error the reader cannot see.
             _dup_out=$(.claude/scripts/kg-duplicates --threshold 0.95 2>&1 \
                 | head -c 204800 | head -200 \
-                | grep -E "(✅|⚠️|📊)" || true)
+                | grep -E "(✅|⚠️|📊|❌)" || true)
             if [ -n "$_dup_out" ]; then
                 {
                     printf '# KG duplicate scan (every-10-edits, %s)\n' \
@@ -369,7 +466,9 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"/* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     # 2026-06-18: debounced (same coalesce-rapid-repeats semantics as the
     # knowledge/ branch above; gate runs at sync time, latest content
     # lands).
-    _DOCS_SYNC_CMD="_kg_write_allowed $(_kg_debounce_shquote "$VCT_PROJECT_ID") $(_kg_debounce_shquote "${DEVELOPMENT_COLLECTION:-}") && .claude/scripts/kg-sync $(_kg_debounce_shquote "$REL_PATH")"
+    # v0.2.92 FIX: build via _kg_build_gated_sync_cmd — see the extended
+    # comment above _kg_write_allowed / the knowledge/ branch above.
+    _DOCS_SYNC_CMD="$(_kg_build_gated_sync_cmd "$VCT_PROJECT_ID" "${DEVELOPMENT_COLLECTION:-}" ".claude/scripts/kg-sync $(_kg_debounce_shquote "$REL_PATH")")"
     _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_DOCS_SYNC_CMD" "docs"
 fi
 

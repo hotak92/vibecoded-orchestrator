@@ -263,7 +263,8 @@ def test_symlink_safe_redirects_when_ancestor_is_symlink(tmp_path):
     the ancestor level (`.vco-new` sibling of the symlinked ancestor, tail
     replicated) — NEVER at the leaf, which would still resolve INSIDE the
     symlinked directory and land bytes in the link's target. Mirrors the
-    NEW-8 convention at project_init._write_file_atomic:4540-4590."""
+    NEW-8 convention held once in vco_lib.atomic._symlink_safe_redirect_target
+    (v0.2.92: project_init._write_file_atomic is a thin wrapper over it)."""
     # real_dir/ is the true directory; linked_dir -> real_dir.
     real_dir = tmp_path / "real_dir"
     real_dir.mkdir()

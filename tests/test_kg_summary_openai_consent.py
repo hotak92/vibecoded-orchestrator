@@ -24,13 +24,16 @@ state surgically.
 from __future__ import annotations
 
 import importlib.util
-import os
-import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests.common.launcher_db_fixture import (
+    create_empty_launcher_db,
+    set_app_state,
+)
 
 
 # Resolve the script path relative to the repo root. Each test loads
@@ -61,31 +64,19 @@ def _seed_app_state_db(
     consent: "bool | None" = None,
     model: "str | None" = None,
 ) -> None:
-    """Create launcher.db with the canonical app_state schema and seed it."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS app_state ("
-            "key TEXT PRIMARY KEY, "
-            "value TEXT, "
-            "updated_at INTEGER NOT NULL DEFAULT 0)"
+    """Create launcher.db on the REAL launcher schema and seed app_state.
+
+    v0.2.92 §3.4: ``app_state`` is a real launcher table, so it now comes from
+    the shipped migrations rather than from a hand-rolled ``CREATE TABLE``
+    that (unlike production) let ``value`` be NULL.
+    """
+    create_empty_launcher_db(db_path)
+    if consent is not None:
+        set_app_state(
+            db_path, "kg_summary_openai_consent", "true" if consent else "false",
         )
-        if consent is not None:
-            conn.execute(
-                "INSERT OR REPLACE INTO app_state(key, value, updated_at) "
-                "VALUES (?, ?, ?)",
-                ("kg_summary_openai_consent", "true" if consent else "false", 0),
-            )
-        if model is not None:
-            conn.execute(
-                "INSERT OR REPLACE INTO app_state(key, value, updated_at) "
-                "VALUES (?, ?, ?)",
-                ("kg_summary_openai_model", model, 0),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    if model is not None:
+        set_app_state(db_path, "kg_summary_openai_model", model)
 
 
 @pytest.fixture
@@ -139,20 +130,8 @@ class TestConsentRowReading:
         for raw in ["true", "TRUE", "True", "1", "yes", "YES"]:
             db_path = isolated_state / "launcher.db"
             db_path.unlink(missing_ok=True)
-            conn = sqlite3.connect(str(db_path))
-            try:
-                conn.execute(
-                    "CREATE TABLE app_state ("
-                    "key TEXT PRIMARY KEY, value TEXT, "
-                    "updated_at INTEGER NOT NULL DEFAULT 0)"
-                )
-                conn.execute(
-                    "INSERT INTO app_state(key, value, updated_at) VALUES (?, ?, 0)",
-                    ("kg_summary_openai_consent", raw),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            create_empty_launcher_db(db_path)
+            set_app_state(db_path, "kg_summary_openai_consent", raw)
             mod = _load_script_module(name=f"kgu_{raw}")
             assert mod.openai_consent_granted() is True, (
                 f"expected {raw!r} → True"
@@ -163,20 +142,8 @@ class TestConsentRowReading:
         for raw in ["false", "0", "no", "", "maybe", "off"]:
             db_path = isolated_state / "launcher.db"
             db_path.unlink(missing_ok=True)
-            conn = sqlite3.connect(str(db_path))
-            try:
-                conn.execute(
-                    "CREATE TABLE app_state ("
-                    "key TEXT PRIMARY KEY, value TEXT, "
-                    "updated_at INTEGER NOT NULL DEFAULT 0)"
-                )
-                conn.execute(
-                    "INSERT INTO app_state(key, value, updated_at) VALUES (?, ?, 0)",
-                    ("kg_summary_openai_consent", raw),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            create_empty_launcher_db(db_path)
+            set_app_state(db_path, "kg_summary_openai_consent", raw)
             mod = _load_script_module(name=f"kgu_neg_{raw or 'empty'}")
             assert mod.openai_consent_granted() is False, (
                 f"expected {raw!r} → False"

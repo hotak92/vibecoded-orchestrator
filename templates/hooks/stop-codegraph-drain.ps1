@@ -241,7 +241,10 @@ foreach ($h in @($byRoot.Keys)) {
     # stale-lock breaker can tell a live long run from a dead holder (SEV-2 #3).
     $pidStamp = "try { Set-Content -LiteralPath '$lock/pid' -Value `$PID -ErrorAction SilentlyContinue } catch {}; "
     $inner = $pidStamp + "& '$python' " + (($argList | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ' ') + " *> `$null; $cleanup"
-    Start-Process -FilePath $PsExe -ArgumentList @('-NoProfile','-Command',$inner) -WindowStyle Hidden | Out-Null
+    # Through the ONE guarded spawn home: an unguarded `-WindowStyle Hidden`
+    # is REJECTED on non-Windows PowerShell, which kills the drain outright
+    # AND leaves the per-root lock dir behind (the cleanup runs in the child).
+    Start-VcoDetachedPwsh -Command $inner -PowerShellExe $PsExe
 }
 
 Set-Content -LiteralPath $lastTsFile -Value "$now" -NoNewline -ErrorAction SilentlyContinue

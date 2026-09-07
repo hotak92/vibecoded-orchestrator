@@ -171,11 +171,11 @@ def _wait_for_lines(log: Path, want: int, tries: int = 60) -> list:
     import time
     for _ in range(tries):
         if log.exists():
-            lines = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+            lines = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
             if len(lines) >= want:
                 return lines
         time.sleep(0.05)
-    return [json.loads(l) for l in log.read_text().splitlines() if l.strip()] if log.exists() else []
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()] if log.exists() else []
 
 
 def test_drain_batches_all_files_in_one_run(tmp_path: Path) -> None:

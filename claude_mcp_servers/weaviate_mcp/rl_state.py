@@ -47,6 +47,12 @@ from __future__ import annotations
 import asyncio
 import os
 
+# v0.2.92 (register #50): the chars-per-token heuristic has ONE home, beside
+# the token budgets it multiplies. The two back-compat char aliases below used
+# to spell it `* 4` locally. `chunking` is a pure leaf (stdlib + one optional
+# import) and does not import this module, so the edge adds no cycle.
+from .chunking import CHARS_PER_TOKEN_TEXT
+
 # ─── Over-fetch / packing ───────────────────────────────────────────────
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL
 # server for reranking.
@@ -137,8 +143,11 @@ _RL_MONITOR_POLL_INTERVAL: float = 2.0
 # answer has enough signal to pass the gate.
 _RL_MONITOR_ANSWER_THRESHOLD_TOKENS: int = 25_000  # V52-N: align with citation gate
 # Back-compat char alias for any test/external caller still importing the
-# old name. 1 token ~= 4 chars (qwen3 BPE empirical average).
-_RL_MONITOR_ANSWER_THRESHOLD: int = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
+# old name. The ratio comes from `chunking.CHARS_PER_TOKEN_TEXT` (register
+# #50) rather than a local `* 4`.
+_RL_MONITOR_ANSWER_THRESHOLD: int = (
+    _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * CHARS_PER_TOKEN_TEXT
+)
 _RL_TOOL_CONTENT_LIMIT: int = 20_000         # per tool_use input, chars
 # V52-N: hard timeout raised from 10 min -> 60 min. The new accumulator
 # stops either at the 25 000-token threshold or when the PreCompact hook
@@ -173,7 +182,9 @@ _RL_MIN_ANSWER_TOKENS_FOR_CITATION: int = int(
 )
 # Back-compat alias for any test or downstream caller still importing
 # the chars-based name. The actual gate uses the tokens version below.
-_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = _RL_MIN_ANSWER_TOKENS_FOR_CITATION * 4
+_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = (
+    _RL_MIN_ANSWER_TOKENS_FOR_CITATION * CHARS_PER_TOKEN_TEXT
+)
 # Minimum title length for the literal-citation regex. Below this we skip
 # the per-node regex entirely — two-letter titles like "AI" / "RL" produce
 # enough false-positives ("curl", "url", "fail") to swamp any signal.

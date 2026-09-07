@@ -37,7 +37,14 @@
   //  visual grouping and keys solely by KEY name.
 
   import { onMount } from 'svelte';
-  import { secrets, lifecycleOf, type SecretEntry, type SecretScope } from '$lib/stores/secrets';
+  import {
+    secrets,
+    lifecycleOf,
+    badgeOf,
+    isForked,
+    type SecretEntry,
+    type SecretScope,
+  } from '$lib/stores/secrets';
   import { selectedProject, projects } from '$lib/stores/projects';
   import {
     listGrantsForProject,
@@ -589,26 +596,96 @@
       <div class="entries-list">
         {#each visibleEntries as entry (entryDomKey(entry))}
           {@const lifecycle = lifecycleOf(entry)}
+          {@const badge = badgeOf(entry)}
           <div class="entry-row" class:row-inactive={lifecycle === 'inactive'}>
             <div class="entry-info">
               <span class="entry-key mono">{entry.key}</span>
               <span class="entry-meta">
-                <!-- Lifecycle badge:
-                       active   → "set"     (teal, value readable)
-                       inactive → "unset"   (amber, value preserved but gated)
-                       empty    → "not set" (grey, no saved value)
-                     The value-still-in-keychain part of inactive is NOT
-                     surfaced as a preview — readers are gated on active. -->
-                {#if lifecycle === 'active'}
+                <!-- Presence badge (v0.3.0). Derived from BOTH sanctioned
+                     stores, not from the keychain alone:
+                       set        → keychain has it and readers are ungated
+                       unset      → keychain has it, paused (value preserved)
+                       file store → no keychain entry, but this row's own
+                                    $VCT_SECRETS_DIR namespace holds it —
+                                    so `vct`, `agent_secrets.get` and
+                                    `vct_secrets_resolve.sh` all resolve it
+                       shared file→ neither the keychain nor
+                                    projects/<NAME>/ has it, but shared/
+                                    does, which is where the resolvers look
+                                    NEXT — so it still resolves, from a copy
+                                    other projects share
+                       unknown    → a store could not be read (locked
+                                    keychain / unreadable directory)
+                       not set    → no sanctioned store serves it
+                     Pre-v0.3.0 the badge read only the keychain, so the
+                     "file store" case printed "not set" for keys that
+                     worked — and users re-typed them here, forking the
+                     value across two stores exactly as CLAUDE.md warns. -->
+                {#if badge === 'set'}
                   <span class="badge badge-set">set</span>
-                {:else if lifecycle === 'inactive'}
-                  <span class="badge badge-inactive" title="Value preserved in keychain. Readers gated until you Reactivate.">unset</span>
+                {:else if badge === 'unset'}
+                  <!-- Only reachable once BOTH tier-2 legs are known ABSENT.
+                       The resolvers fall through to the file store on
+                       `key_not_active`, so a paused key with a file copy
+                       still resolves and badges as the store that serves
+                       it — this branch is the case where nothing does. -->
+                  <span class="badge badge-inactive" title="Value preserved in the keychain, and readers are gated until you Reactivate. No file-store copy serves this key either, so every consumer currently sees it as unset.">unset</span>
+                {:else if badge === 'shared-opted-out'}
+                  <!-- The value is there; this project has opted out of the
+                       shared tier, so it does not reach here. Neither "set"
+                       (no consumer in this project gets it) nor "not set"
+                       (it exists, and one checkbox brings it back), and the
+                       remedy is neither Reactivate nor re-entering it. -->
+                  <span
+                    class="badge badge-shared-opted-out"
+                    title={`"Disable shared secrets for this project" is on for the project this view is showing${formProjectId ? ` (${formProjectId})` : ''}, so it does not read the shared tier at all — whatever the shared keychain bucket and ~/.vct-secrets/shared/ hold does not reach it. Nothing is paused and nothing needs re-entering: clear that checkbox in the project's Secret references tab and the key resolves again. Other projects are unaffected, and per-project and global secrets are untouched by the toggle.`}
+                  >
+                    not read here
+                  </span>
+                {:else if badge === 'file-store'}
+                  <span
+                    class="badge badge-file-store"
+                    title={`No keychain entry, but this key RESOLVES from the file store${entry.file_store_path ? ` at ${entry.file_store_path}` : ''}. vct, agent_secrets.get and vct_secrets_resolve.sh all read it. Saving here would create a SECOND copy in the keychain, which takes precedence and can then drift from the file — edit the file with 'vct set' instead unless you mean to migrate it.`}
+                  >
+                    set — file store
+                  </span>
+                {:else if badge === 'shared-file-store'}
+                  <!-- The tier-2 fall-through. A DISTINCT badge from
+                       "file store" on purpose: the copy is not this
+                       project's own, so deleting it hits every project
+                       that leans on it, and the per-project
+                       "Disable shared secrets" toggle takes it away. -->
+                  <span
+                    class="badge badge-shared-file-store"
+                    title={`No keychain entry and nothing in this project's own file-store namespace, but this key RESOLVES from the SHARED file store${entry.shared_file_store_path ? ` at ${entry.shared_file_store_path}` : ''} — the next place vct, agent_secrets.get and vct_secrets_resolve.sh look. That copy is shared with every other project on this machine: deleting it breaks them too, and turning on "Disable shared secrets" for this project stops it reaching this one.`}
+                  >
+                    set — shared file store
+                  </span>
+                {:else if badge === 'unknown'}
+                  <span
+                    class="badge badge-unknown"
+                    title="Could not read one of the stores (a locked OS keychain, or an unreadable ~/.vct-secrets). This is NOT the same as 'not set' — unlock the keychain or open the launcher and refresh before assuming the key is missing."
+                  >
+                    unknown
+                  </span>
                 {:else}
                   <span class="badge badge-unset">not set</span>
                 {/if}
-                {#if lifecycle === 'active' && entry.preview}
+                {#if isForked(entry)}
+                  <span
+                    class="badge"
+                    class:badge-shadow-loser={entry.values_diverge === true}
+                    class:badge-shadow-winner={entry.values_diverge !== true}
+                    title={entry.values_diverge === true
+                      ? `The keychain copy and the file-store copy${entry.file_store_path ? ` (${entry.file_store_path})` : ''} hold DIFFERENT values. The keychain wins at runtime (tier 1); the file copy is dead weight that will confuse the next reader. Reconcile them, or delete the one you do not want.`
+                      : `This key exists in BOTH the keychain and the file store${entry.file_store_path ? ` (${entry.file_store_path})` : ''}. They agree right now. Updating here changes only the keychain copy, so they will drift the moment you edit either one.`}
+                  >
+                    {entry.values_diverge === true ? '⚠ copies differ' : '⚠ also in file store'}
+                  </span>
+                {/if}
+                {#if badge === 'set' && entry.preview}
                   <span class="entry-preview mono">{entry.preview}</span>
-                {:else if lifecycle === 'active' && entry.sensitive}
+                {:else if badge === 'set' && entry.sensitive}
                   <span class="entry-preview mono">••••••••</span>
                 {/if}
                 {#if entry.sensitive}
@@ -620,17 +697,23 @@
                      resolver's `per_project > shared > global` precedence
                      so the user sees which value is in effect at runtime. -->
                 {#if entry.is_shadowed}
+                  <!-- v0.3.0: the precedence sentence names the winning
+                       STORE too. Tier 1 (keychain) is exhausted across all
+                       three scopes before tier 2 (the file store) is
+                       consulted at all, so "the shared value wins" means
+                       something different depending on which store holds
+                       it — and the scope name alone could not say which. -->
                   {#if entry.scope === entry.winning_scope}
                     <span
                       class="badge badge-shadow-winner"
-                      title={`This entry's value wins. The same KEY also exists at: ${shadowOtherScopes(entry).join(', ')}. Resolver precedence: per_project > shared > global.`}
+                      title={`This entry's value wins${entry.winning_store === 'file_store' ? ', from the file store' : ''}. The same KEY also exists at: ${shadowOtherScopes(entry).join(', ')}. Resolver precedence: keychain (per_project > shared > global), then the file store (projects/<NAME> > shared).`}
                     >
                       ⚠ shadows {shadowOtherScopes(entry).join(' + ')}
                     </span>
                   {:else}
                     <span
                       class="badge badge-shadow-loser"
-                      title={`Shadowed by the ${formatScope(entry.winning_scope)} value for this project. The resolver returns the higher-precedence value at runtime (precedence: per_project > shared > global).`}
+                      title={`Shadowed by the ${formatScope(entry.winning_scope)} value${entry.winning_store === 'file_store' ? ' in the file store' : ' in the keychain'} for this project. Resolver precedence: keychain (per_project > shared > global), then the file store (projects/<NAME> > shared).`}
                     >
                       ⚠ shadowed by {formatScope(entry.winning_scope)}
                     </span>
@@ -691,23 +774,52 @@
                 >
                   Set as new value
                 </button>
-                <button
-                  class="btn-3d btn-3d-ghost btn-3d-sm danger"
-                  onclick={() => (removeConfirm = entry)}
-                  title="Drop this entry from the registry entirely (forgets the entry exists, deletes from keychain)."
-                  disabled={busy}
-                >
-                  Remove
-                </button>
+                <!-- v0.3.0: Remove deletes the KEYCHAIN entry and the
+                     launcher's row. It cannot delete a file in
+                     $VCT_SECRETS_DIR — that file is the user's, written by
+                     `vct set`. So a row that exists ONLY because of such a
+                     file gets no Remove button: offering one would claim a
+                     removal that never happens, and the key would keep
+                     resolving afterwards. -->
+                {#if entry.has_launcher_row}
+                  <button
+                    class="btn-3d btn-3d-ghost btn-3d-sm danger"
+                    onclick={() => (removeConfirm = entry)}
+                    title="Drop this entry from the registry entirely (forgets the entry exists, deletes from keychain)."
+                    disabled={busy}
+                  >
+                    Remove
+                  </button>
+                {:else}
+                  <span
+                    class="badge-hint"
+                    title={`This entry exists only as a file${entry.file_store_path ? ` at ${entry.file_store_path}` : ''}, which the launcher does not own and will not delete. Remove it with 'vct revoke' if you want it gone.`}
+                  >
+                    file-store only
+                  </span>
+                {/if}
               {:else}
                 <!-- Active or Empty: classic flow. The button label
                      swaps between Update and Set based on whether the
                      keychain has a value. Unset only appears when there
                      is something to pause. -->
+                <!-- v0.3.0: on a row that already RESOLVES from a file,
+                     this button is the exact click that creates the
+                     divergent copy CLAUDE.md warns about — it writes the
+                     KEYCHAIN, leaving the file untouched and outranked.
+                     Say so in the tooltip rather than letting the user
+                     discover it later. Both file-backed badges qualify:
+                     the shared one even more so, since the copy the
+                     keychain entry starts shadowing is one other projects
+                     also read. -->
                 <button
                   class="btn-3d btn-3d-primary btn-3d-sm"
                   onclick={() => startEdit(entry)}
-                  title={lifecycle === 'active' ? 'Update the stored value' : 'Set a value'}
+                  title={badge === 'file-store' || badge === 'shared-file-store'
+                    ? `Writes a keychain entry for ${entry.key}. The ${badge === 'shared-file-store' ? 'SHARED ' : ''}file-store copy${(entry.file_store_path ?? entry.shared_file_store_path) ? ` at ${entry.file_store_path ?? entry.shared_file_store_path}` : ''} is NOT replaced or removed — you will have two copies, the keychain one will win here, and they can drift.${badge === 'shared-file-store' ? ' Every other project keeps reading the shared file, so the two will diverge silently.' : ''} To change the value in place, edit the file with 'vct set' instead.`
+                    : lifecycle === 'active'
+                      ? 'Update the stored value'
+                      : 'Set a value'}
                 >
                   {lifecycle === 'active' ? 'Update' : 'Set'}
                 </button>
@@ -721,14 +833,30 @@
                     Unset
                   </button>
                 {/if}
-                <button
-                  class="btn-3d btn-3d-ghost btn-3d-sm danger"
-                  onclick={() => (removeConfirm = entry)}
-                  title="Drop this entry from the registry entirely (forgets the entry exists, deletes from keychain)."
-                  disabled={busy}
-                >
-                  Remove
-                </button>
+                <!-- v0.3.0: Remove deletes the KEYCHAIN entry and the
+                     launcher's row. It cannot delete a file in
+                     $VCT_SECRETS_DIR — that file is the user's, written by
+                     `vct set`. So a row that exists ONLY because of such a
+                     file gets no Remove button: offering one would claim a
+                     removal that never happens, and the key would keep
+                     resolving afterwards. -->
+                {#if entry.has_launcher_row}
+                  <button
+                    class="btn-3d btn-3d-ghost btn-3d-sm danger"
+                    onclick={() => (removeConfirm = entry)}
+                    title="Drop this entry from the registry entirely (forgets the entry exists, deletes from keychain)."
+                    disabled={busy}
+                  >
+                    Remove
+                  </button>
+                {:else}
+                  <span
+                    class="badge-hint"
+                    title={`This entry exists only as a file${entry.file_store_path ? ` at ${entry.file_store_path}` : ''}, which the launcher does not own and will not delete. Remove it with 'vct revoke' if you want it gone.`}
+                  >
+                    file-store only
+                  </span>
+                {/if}
               {/if}
             </div>
           </div>
@@ -938,6 +1066,42 @@
           Use <strong>Unset</strong> instead if you just want to clear the current value
           (the entry stays visible so you can re-set it).
         </p>
+        <!-- v0.3.0: never let Remove imply more than it does. It deletes
+             the keychain entry + the launcher row; the tier-2 file is the
+             user's and is left alone, so the key KEEPS RESOLVING for vct /
+             agent_secrets.get / vct_secrets_resolve.sh afterwards. Saying
+             so here is the difference between an informed choice and a
+             surprise. -->
+        {#if removeConfirm.file_store === 'present'}
+          <p class="confirm-hint">
+            <strong>A file-store copy will survive this.</strong>
+            <code>{removeConfirm.file_store_path ?? removeConfirm.key}</code>
+            is not touched by Remove, so <code>{removeConfirm.key}</code> will
+            still resolve for <code>vct</code>, <code>agent_secrets.get</code> and
+            <code>vct_secrets_resolve.sh</code>. Delete it yourself if you want the
+            key fully gone.
+          </p>
+        {:else if removeConfirm.shared_file_store === 'present'}
+          <!-- The SECOND survivor. Remove leaves `shared/<key>` in place
+               too, and for a per-project row that file is exactly what
+               keeps answering afterwards. Saying only "the keychain entry
+               is gone" would let the user believe the key stopped
+               resolving. -->
+          <p class="confirm-hint">
+            <strong>A shared file-store copy will keep resolving.</strong>
+            <code>{removeConfirm.shared_file_store_path ?? removeConfirm.key}</code>
+            is the next place <code>vct</code>, <code>agent_secrets.get</code> and
+            <code>vct_secrets_resolve.sh</code> look, so <code>{removeConfirm.key}</code>
+            still resolves for this project after Remove. It is shared with every
+            other project — delete it only if you mean to break them too.
+          </p>
+        {:else if removeConfirm.file_store === 'unknown' || removeConfirm.shared_file_store === 'unknown'}
+          <p class="confirm-hint">
+            The file store could not be read, so it is not known whether a
+            copy of <code>{removeConfirm.key}</code> survives there. Remove
+            only affects the OS keychain and the launcher's own record.
+          </p>
+        {/if}
         {#if sState.error}
           <!-- P2-M4: a failed Remove used to only reach the panel-level
                .msg-error banner, which renders BEHIND this overlay
@@ -1153,6 +1317,52 @@
   .badge-unset {
     color: var(--color-muted);
     background: rgba(255, 255, 255, 0.04);
+  }
+
+  /* v0.3.0: the value RESOLVES, but from the tier-2 file store rather
+   * than the OS keychain. Purple (the brand's secondary accent) so it
+   * reads as "live, but not from here" — clearly distinct from the teal
+   * "set" (keychain, launcher-managed) without borrowing the amber the
+   * panel already uses for "needs attention". */
+  .badge-file-store {
+    color: var(--color-purple, #7b5fff);
+    background: rgba(123, 95, 255, 0.14);
+    border: 1px solid rgba(123, 95, 255, 0.32);
+    text-transform: none;
+    letter-spacing: 0.2px;
+    cursor: help;
+  }
+
+  /* v0.3.0: a store could not be read. Deliberately NOT styled like
+   * "not set" — the whole point of the state is that we do not know. */
+  /* The shared fall-through leg — same teal family as .badge-file-store
+     (both mean "this resolves"), one step dimmer so the two never read as
+     the same fact. */
+  .badge-shared-file-store {
+    background: rgba(0, 191, 166, 0.10);
+    color: #6fd3c6;
+    border: 1px solid rgba(0, 191, 166, 0.22);
+  }
+
+  .badge-unknown {
+    color: #ffb300;
+    background: rgba(255, 179, 0, 0.1);
+    border: 1px dashed rgba(255, 179, 0, 0.45);
+    cursor: help;
+  }
+
+  /* v0.3.0: the shared tier is switched off for the project being viewed.
+   * Muted like "not set" — because nothing resolves here — but outlined,
+   * because unlike "not set" the value exists and one checkbox restores
+   * it. It must not borrow the teal of the states that mean "this
+   * resolves", nor the amber of "needs attention": nothing is wrong. */
+  .badge-shared-opted-out {
+    color: var(--color-muted);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    text-transform: none;
+    letter-spacing: 0.2px;
+    cursor: help;
   }
 
   /* 0.2.x backlog #3: shared-tab key-collision badges.

@@ -30,9 +30,19 @@ import asyncio
 import logging
 from typing import Any, Callable, Optional
 
+# W3 (v0.2.92 wiring audit): the ONE shared single-slot truncation-record
+# merger — the same home the enrichment flush uses, so the two patch
+# writers cannot drift on the merge rule. vco_lib is part of every healthy
+# install; a failed import is a broken install, never a fallback case.
+from vco_lib.kg_truncation_tags import merge_slot_truncation
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["regenerate_node_vector", "ensure_slot_embedding"]
+__all__ = [
+    "regenerate_node_vector",
+    "regenerate_node_vector_tagged",
+    "ensure_slot_embedding",
+]
 
 # v0.2.71 Sweep-C Piece 2: strong refs for fire-and-forget store-back tasks.
 # Mirrors the ``_rl_monitor_tasks`` pattern in search_pipeline.py — without a
@@ -99,8 +109,34 @@ def regenerate_node_vector(
         The regenerated vector (in ``model_name``'s space), or None when the
         text is empty / no embedding service / the embed call fails.
     """
+    vec, _truncated = regenerate_node_vector_tagged(
+        text, model_name, embedding_service=embedding_service, embed_fn=embed_fn
+    )
+    return vec
+
+
+def regenerate_node_vector_tagged(
+    text: str,
+    model_name: str,
+    *,
+    embedding_service=None,
+    embed_fn: Optional[Callable[[str], "list[float] | None"]] = None,
+) -> "tuple[Optional[list[float]], bool]":
+    """``regenerate_node_vector`` + the leading-window verdict (W3).
+
+    Same computation, same arguments, same failure modes — split out so the
+    dual-log backfill (``ensure_slot_embedding``) can persist the verdict
+    without re-deriving the sized window. Returns ``(vec, truncated)`` where
+    ``truncated`` is True exactly when the embedded text was cut to the
+    model preset's leading window (``len(sized_text) < len(text)``) — a
+    POSITIVE fact about what WE sent. A False means "no positive evidence
+    of truncation", which the shared merge treats as no change, never as a
+    provable full-fidelity claim (a runner-side refusal retry inside the
+    service is not visible here; that deeper case stays UNKNOWN rather
+    than being asserted either way).
+    """
     if not text or not text.strip():
-        return None
+        return None, False
 
     svc = embedding_service
     if svc is None and embed_fn is None:
@@ -109,9 +145,9 @@ def regenerate_node_vector(
             svc = _get_embedding_service()
         except Exception as exc:  # noqa: BLE001
             logger.debug("embed_regen: cannot resolve EmbeddingService (%s)", exc)
-            return None
+            return None, False
     if svc is None and embed_fn is None:
-        return None
+        return None, False
 
     # Size to the model-aware chunk preset so we embed the same shape the sync
     # pipeline stored. A single representative chunk is enough for the
@@ -120,6 +156,7 @@ def regenerate_node_vector(
     try:
         from claude_mcp_servers.weaviate_mcp.chunking import (
             chunking_preset_for_model,
+            CHARS_PER_TOKEN_TEXT,
             TokenCounter,
         )
         try:
@@ -133,17 +170,20 @@ def regenerate_node_vector(
         except Exception:
             max_tokens = None
         if max_tokens and TokenCounter.count_tokens(text) > max_tokens:
-            # Truncate by chars (1 token ≈ 4 chars) — cheap, dependency-light.
-            sized_text = text[: max_tokens * 4]
+            # Truncate by chars — cheap, dependency-light. The ratio is
+            # `chunking.CHARS_PER_TOKEN_TEXT` (v0.2.92 register #50), read from
+            # the SAME import that already brought in the preset + counter, so
+            # the budget and the count cannot disagree.
+            sized_text = text[: max_tokens * CHARS_PER_TOKEN_TEXT]
     except Exception:
         pass
 
     try:
         vec = embed_fn(sized_text) if embed_fn is not None else svc.embed_text(sized_text)
-        return vec if vec else None
+        return (vec if vec else None), len(sized_text) < len(text)
     except Exception as exc:  # noqa: BLE001
         logger.debug("embed_regen: embed call failed (%s)", exc)
-        return None
+        return None, False
 
 
 def ensure_slot_embedding(
@@ -155,6 +195,7 @@ def ensure_slot_embedding(
     svc: Any,
     *,
     embed_fn: Optional[Callable[[str], "list[float] | None"]] = None,
+    existing_props: "Optional[dict]" = None,
 ) -> "list[float] | None":
     """v0.2.71 Sweep-C Piece 2 — compute a missing slot vector AND store it back.
 
@@ -165,6 +206,15 @@ def ensure_slot_embedding(
       * STORE: ``collection.data.update(uuid=obj_uuid, vector={slot: vec})`` —
         the canonical single-named-vector enrichment patch (the same call shape
         ``vco_lib/embedding_enrichment.py`` already uses in production).
+
+    W3 (v0.2.92 wiring audit): the store-back also merges the leading-window
+    verdict into the row's stored truncation record via the SHARED merger
+    (``vco_lib.kg_truncation_tags.merge_slot_truncation``) when the caller
+    supplies ``existing_props`` (the row's current properties) — the same
+    one-home merge the enrichment flush uses, so the two single-slot patch
+    writers cannot drift. A row without a complete ``truncated_slots``
+    record merges to NOTHING (state stays UNKNOWN, never a guessed False);
+    the vector is still stored exactly as before.
 
     Sync use, async store: the computed vector is RETURNED immediately for this
     request's cosine / dual-log event; the Weaviate write is scheduled
@@ -184,6 +234,9 @@ def ensure_slot_embedding(
             ``embed_fn`` is None — the active-slot self-heal path).
         embed_fn: Optional explicit embed callable for a NON-active model's
             space (other-slot backfill). None → active model via ``svc``.
+        existing_props: The row's CURRENT properties (for the W3
+            truncation-record merge). None → no merge (vector-only store,
+            the row's state stays as-is).
 
     Returns:
         The freshly-computed vector, or None on soft-fail (no text / embed down).
@@ -193,7 +246,7 @@ def ensure_slot_embedding(
     if not content_text or not content_text.strip():
         return None
 
-    vec = regenerate_node_vector(
+    vec, truncated = regenerate_node_vector_tagged(
         content_text,
         model_id,
         embedding_service=svc,
@@ -201,6 +254,36 @@ def ensure_slot_embedding(
     )
     if not vec:
         return None
+
+    # W3: the shared single-slot merge. ``None`` back from it means "no
+    # honest merge" (the row predates the complete record, the active slot
+    # name is unavailable, or the verdict below is unprovable) and the store
+    # writes the vector ONLY.
+    #
+    # The VERDICT is tri-state, and which branch produced the vector decides
+    # whether a negative is provable:
+    #   * ``truncated`` True  — WE cut the text to the model preset's leading
+    #                           window before embedding. Provable either way.
+    #   * ``embed_fn`` set    — the OTHER-slot backfill embeds through
+    #                           ``_embed_text_in_other_model``, which does NOT
+    #                           shrink: an over-window input comes back None
+    #                           and nothing is stored. So a vector in hand
+    #                           means the whole sized text reached the runner
+    #                           → a PROVEN False.
+    #   * otherwise           — the active-slot self-heal goes through
+    #                           ``svc.embed_text`` → ``_embed_shrinking_on_
+    #                           overflow``, which can shrink invisibly to us.
+    #                           Not provable → None → slot stays UNMEASURED,
+    #                           so the reader answers UNKNOWN, not False.
+    active_text_slot = ""
+    try:
+        active_text_slot = str(getattr(svc, "text_vector_slot", "") or "")
+    except Exception:  # noqa: BLE001 — never break the backfill
+        active_text_slot = ""
+    verdict = True if truncated else (False if embed_fn is not None else None)
+    trunc_patch = merge_slot_truncation(
+        existing_props, slot, verdict, active_text_slot
+    )
 
     # Schedule the store-back fire-and-forget. If there is no running event loop
     # (CLI / sync test context) we skip the store entirely rather than block —
@@ -225,23 +308,42 @@ def ensure_slot_embedding(
             if len(_stored_slots) >= _STORE_DEDUP_MAX:
                 _stored_slots.clear()  # bounded; a cleared key re-stores once (still idempotent)
             _stored_slots.add(dedup_key)
-            task = loop.create_task(_store_slot_vector(collection, obj_uuid, slot, vec))
+            task = loop.create_task(
+                _store_slot_vector(collection, obj_uuid, slot, vec, trunc_patch)
+            )
             _store_back_tasks.add(task)
             task.add_done_callback(_store_back_tasks.discard)
     return vec
 
 
-async def _store_slot_vector(collection: Any, obj_uuid: Any, slot: str, vec: "list[float]") -> None:
+async def _store_slot_vector(
+    collection: Any,
+    obj_uuid: Any,
+    slot: str,
+    vec: "list[float]",
+    properties: "Optional[dict]" = None,
+) -> None:
     """Fire-and-forget Weaviate single-slot patch. Soft-fail, off the hot-path.
 
     The actual ``col.data.update`` is synchronous (Weaviate v4 client); run it in
     a thread so the store never blocks the event loop. A failed store logs at
     debug and is dropped — the in-request vector was already used, so a missed
     persist only means the next search re-backfills (idempotent).
+    ``properties`` (W3) is the merged truncation-record patch, or None for a
+    vector-only update; Weaviate's ``data.update`` MERGES the given properties
+    into the existing object.
     """
     try:
-        await asyncio.to_thread(
-            collection.data.update, uuid=obj_uuid, vector={slot: vec}
-        )
+        if properties is not None:
+            await asyncio.to_thread(
+                collection.data.update,
+                uuid=obj_uuid,
+                vector={slot: vec},
+                properties=properties,
+            )
+        else:
+            await asyncio.to_thread(
+                collection.data.update, uuid=obj_uuid, vector={slot: vec}
+            )
     except Exception as exc:  # noqa: BLE001
         logger.debug("ensure_slot_embedding: store-back failed for %s (%s)", slot, exc)

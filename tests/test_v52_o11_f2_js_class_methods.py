@@ -424,7 +424,7 @@ def test_no_inline_method_finditer_in_js_class_loop() -> None:
     # the anchor is inside the JS class loop, not some other reference). Search
     # the whole prefix up to the anchor — refactor-size-independent.
     prefix = src[:anchor_pos]
-    assert "for cname, (start_line, base_class) in class_info.items():" in prefix, (
+    assert "for cname, start_line, base_class in class_decls:" in prefix, (
         "JS `_js_methods_for_class` call isn't preceded by the JS "
         "class-iteration loop header — file shape has changed unexpectedly."
     )

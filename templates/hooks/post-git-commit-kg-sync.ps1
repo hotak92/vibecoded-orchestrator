@@ -22,6 +22,8 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 # KG nodes / docs to keep everything in sync. Mirror of post-git-commit-kg-sync.sh.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# $PsExe + the ONE guarded detached-spawn home (Start-VcoDetachedProcess).
+. "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { exit 0 }
 
@@ -95,14 +97,41 @@ Skip if the commit is purely cosmetic or test-only.
 
     $logFile = Join-Path $LogDir "kg-commit-review.log"
     $allowedTools = "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit"
-    $proc = Start-Process -FilePath "claude" `
-        -ArgumentList @('-p', $prompt, '--model', 'haiku', '--max-turns', '10', '--no-session-persistence', '--allowedTools', $allowedTools) `
-        -RedirectStandardOutput $logFile -RedirectStandardError $logFile `
-        -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru
+    # The prompt rides on STDIN, never on the command line, for two reasons:
+    #   * Start-Process joins an ARRAY -ArgumentList with spaces and the child
+    #     re-splits it (QUIRK 3 in _lib/resolve-powershell.ps1) — this prompt
+    #     embeds `git diff` output, and the CLI parsed the diff's `---` token
+    #     as an option ("error: unknown option '---'", exit 1) on every
+    #     non-empty commit, so the review never actually ran;
+    #   * the Windows command line is capped at 32 767 chars, and this prompt
+    #     carries the first 300 lines of the unified diff.
+    # `claude -p` with no prompt argument reads the prompt from stdin — the
+    # same stdin shape summary_backends.call_cli adopted.
+    # [IO.File]::WriteAllText, not Set-Content -Encoding utf8: on Windows
+    # PowerShell 5.1 the cmdlet form prepends a UTF-8 BOM, which would then
+    # be the first bytes of the model's prompt.
+    $PromptFile = Join-Path $LogDir "kg-commit-review.prompt"
+    [System.IO.File]::WriteAllText($PromptFile, $prompt)
+    # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1). TWO
+    # cmdlet-level parameter rejections were killing this spawn outright:
+    #   * `-WindowStyle Hidden` is rejected by non-Windows PowerShell editions;
+    #   * naming the SAME file for -RedirectStandardOutput and
+    #     -RedirectStandardError is rejected on EVERY edition ("...are same"),
+    #     which is what this call did — so the commit review has never started
+    #     on Windows either. stderr goes to `<log>.err` instead.
+    $proc = Start-VcoDetachedProcess -FilePath "claude" `
+        -ArgumentList @('-p', '--model', 'haiku', '--max-turns', '10', '--no-session-persistence', '--allowedTools', $allowedTools) `
+        -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+        -RedirectStandardInput $PromptFile `
+        -WorkingDirectory $ProjectRoot -PassThru
 
     $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $msgEsc = $CommitMsg -replace '\\', '\\\\' -replace '"', '\"'
-    $line = "{""timestamp"":""$ts"",""commit"":""$CommitHash"",""message"":""$msgEsc"",""pid"":$($proc.Id)}"
+    # A failed spawn leaves $proc null; interpolating $proc.Id then emitted
+    # `"pid":}` — a malformed line in a JSONL telemetry file that every later
+    # reader has to survive. Record a null instead.
+    $pidVal = if ($proc) { $proc.Id } else { "null" }
+    $line = "{""timestamp"":""$ts"",""commit"":""$CommitHash"",""message"":""$msgEsc"",""pid"":$pidVal}"
     try { Add-Content -Path (Join-Path $LogDir "kg-commit-reviews.jsonl") -Value $line -ErrorAction Stop } catch { }
 
 # No stdout: PostToolUse plain stdout is dropped per the v2.1.x

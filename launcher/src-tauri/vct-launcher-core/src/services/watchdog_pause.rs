@@ -110,34 +110,22 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// Redirect `vct_root_dir()` at a temp dir for the duration of a test
-    /// by setting `VCT_STATE_DIR`. Tests are `#[serial]` because they
-    /// mutate a process-global env var.
-    struct TempRoot {
-        _dir: tempfile::TempDir,
-        prev: Option<std::ffi::OsString>,
-    }
-    impl TempRoot {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let prev = std::env::var_os("VCT_STATE_DIR");
-            std::env::set_var("VCT_STATE_DIR", dir.path());
-            TempRoot { _dir: dir, prev }
-        }
-    }
-    impl Drop for TempRoot {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-                None => std::env::remove_var("VCT_STATE_DIR"),
-            }
-        }
+    /// Redirect `vct_root_dir()` at a temp dir for the duration of a test.
+    ///
+    /// v0.2.92: was a local `TempRoot` RAII struct that hand-rolled the
+    /// save/restore and took NO lock — `#[serial]` only serialises tests
+    /// within this binary that also carry the attribute. The shared guard
+    /// additionally holds `GLOBAL_ENV_MUTEX`.
+    use crate::test_env::{state_dir_guard, StateDirGuard};
+
+    fn temp_root() -> StateDirGuard {
+        state_dir_guard()
     }
 
     #[test]
     #[serial]
     fn marker_path_is_under_watchdog_paused_dir() {
-        let _root = TempRoot::new();
+        let _root = temp_root();
         let p = pause_marker_path("weaviate");
         assert!(p.ends_with("state/watchdog-paused/weaviate"), "got {:?}", p);
     }
@@ -145,7 +133,7 @@ mod tests {
     #[test]
     #[serial]
     fn create_then_present_then_remove_then_absent() {
-        let _root = TempRoot::new();
+        let _root = temp_root();
         assert!(!is_service_paused("ollama"), "must start absent");
         create_pause_marker("ollama").expect("create marker");
         assert!(is_service_paused("ollama"), "must be present after create");
@@ -161,7 +149,7 @@ mod tests {
     #[test]
     #[serial]
     fn markers_are_per_service_independent() {
-        let _root = TempRoot::new();
+        let _root = temp_root();
         create_pause_marker("weaviate").unwrap();
         assert!(is_service_paused("weaviate"));
         assert!(!is_service_paused("code_embed"));

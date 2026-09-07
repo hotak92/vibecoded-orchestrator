@@ -63,7 +63,6 @@ use std::path::Path;
 use tauri::{command, State};
 
 use crate::db::Db;
-use vct_launcher_core::process::CommandExt;
 
 /// Module id under which the orchestrator's own per-project settings live.
 const MODULE_ID: &str = "orchestrator-core";
@@ -375,18 +374,12 @@ fn find_nested_git_repos(root: &Path) -> Vec<String> {
 
 // ─── v0.2.91 (#30) — "Connect an existing repo" ─────────────────────────────
 
-/// One home for the module's `git` invocations (spawn + output capture via
-/// the shared `.silent()` wrapper). `Err` is a SPAWN failure only; a
-/// non-zero git exit comes back as `Ok(output)` for the caller to judge.
-async fn run_git(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    tokio::process::Command::new("git")
-        .silent()
-        .args(args)
-        .current_dir(root)
-        .output()
-        .await
-        .map_err(|e| format!("git {} spawn failed: {}", args.first().unwrap_or(&""), e))
-}
+// v0.2.92 WP-13: this module's private `run_git` MOVED to
+// `commands::git_cmd::run_git_raw` — same contract (`Err` is a SPAWN failure
+// only; a non-zero git exit comes back as `Ok(output)` for the caller to
+// judge), one home. Imported under the old local name so the call sites in
+// this file did not churn.
+use crate::commands::git_cmd::run_git_raw as run_git;
 
 /// Shape-validate a git remote URL. Accepted shapes (and ONLY these — a
 /// plain local path belongs in the local-folder arm):

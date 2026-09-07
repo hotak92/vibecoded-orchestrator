@@ -189,7 +189,12 @@ def _load_cg_module(cg_script: Path):
 
 
 def _cg_argv(
-    query: str, limit: int, project: str, exclude_file: str, anchor: str
+    query: str,
+    limit: int,
+    project: str,
+    exclude_file: str,
+    anchor: str,
+    transcript: str = "",
 ) -> "list[str]":
     """The argv (minus argv[0]) the `code-graph-query search ...` CLI receives."""
     argv = ["search", query, "--limit", str(limit), "--hook-format"]
@@ -199,6 +204,11 @@ def _cg_argv(
         argv += ["--exclude-file", exclude_file]
     if anchor:
         argv += ["--anchor", anchor]
+    if transcript:
+        # WP-E: query_code_graph.py's `search` subparser accepts --transcript
+        # (added alongside the SSOT-derived query-token cap); omitted when
+        # empty so today's argv is reproduced byte-for-byte.
+        argv += ["--transcript", transcript]
     return argv
 
 
@@ -253,6 +263,12 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--cg-project", default="", help="value for the CLI's --project")
     ap.add_argument("--cg-exclude-file", default="", help="value for --exclude-file")
     ap.add_argument("--cg-anchor", default="", help="value for --anchor")
+    # WP-E (v0.2.92): a PATH, never text — forwarded verbatim to both legs so
+    # each producer can enrich its own copy of the query in-process (see
+    # vco_lib.query_enrichment). Optional: an empty/absent value reproduces
+    # today's argv on both legs exactly (the "zero functionality change"
+    # contract this driver documents above).
+    ap.add_argument("--transcript", default="", help="path to the live JSONL transcript")
     args = ap.parse_args(argv)
 
     _ensure_sys_path()
@@ -288,7 +304,14 @@ def main(argv: "list[str] | None" = None) -> int:
 
     # Pin each leg's argv to its OWN list (no shared sys.argv → no race).
     if want_kg:
-        _pin_argv(kg_mod, [args.query, "--limit", str(args.kg_limit), "--hook-format"])
+        _kg_argv = [args.query, "--limit", str(args.kg_limit), "--hook-format"]
+        if args.transcript:
+            # WP-E: optional trailing flag — an empty/absent --transcript
+            # reproduces today's argv byte-for-byte (rl_kg_search.py's own
+            # --transcript default is "", so appending nothing here is a
+            # true no-op, not just an equivalent one).
+            _kg_argv += ["--transcript", args.transcript]
+        _pin_argv(kg_mod, _kg_argv)
     if want_cg:
         _pin_argv(
             cg_mod,
@@ -298,6 +321,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 args.cg_project,
                 args.cg_exclude_file,
                 args.cg_anchor,
+                args.transcript,
             ),
         )
 

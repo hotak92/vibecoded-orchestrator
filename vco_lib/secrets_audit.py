@@ -58,15 +58,14 @@ exact shape).
 from __future__ import annotations
 
 import os
+import stat
 import platform
 import re
-import shutil
-import stat
-import sys
-import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
+
+from vco_lib.atomic import atomic_write_text
 
 # Mirror install.py::_SECRET_SHAPED_SUBSTRINGS. Substring matches inside
 # ``[_\\-]``-delimited segments — avoids false positives like ``PYTHONPATH``
@@ -363,37 +362,19 @@ def rewrite_env_with_sentinels(
     if text.endswith("\n"):
         new_text += "\n"
 
-    # Atomic write: write to sibling temp file, copystat, replace.
-    parent = env_path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_path_str = tempfile.mkstemp(
-        prefix=".env.vco-migrate-",
-        dir=str(parent),
-    )
-    tmp_path = Path(tmp_path_str)
-    try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(new_text)
-        # Preserve mode (especially important on Unix where the env file
-        # may already be 0o600; we don't want a permissive temp file to
-        # leak the sentinel-replaced file briefly into a world-readable
-        # state during the swap).
-        if env_path.exists():
-            try:
-                shutil.copystat(env_path, tmp_path)
-            except OSError:
-                # Best-effort — proceed even if copystat fails (e.g. on
-                # filesystems that don't preserve all attrs).
-                pass
-        os.replace(tmp_path, env_path)
-    except Exception:
-        # Best-effort cleanup; re-raise to surface the failure.
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
+    # Atomic write: sibling tempfile, replace, then restore the mode.
+    # Preserve the existing mode (especially important on Unix where the
+    # env file may already be 0o600). v0.2.92 (duplication-merge): through
+    # the ONE atomic writer — its mkstemp tempfile is 0600, so the swapped
+    # file is never briefly MORE permissive than before; `mode=` then
+    # restores the original bits after the rename.
+    mode: Optional[int] = None
+    if env_path.exists():
+        try:
+            mode = stat.S_IMODE(env_path.stat().st_mode)
+        except OSError:
+            mode = None
+    atomic_write_text(env_path, new_text, mode=mode)
 
     return replaced_count, missed
 

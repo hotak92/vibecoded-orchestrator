@@ -20,13 +20,24 @@
   // protected paths). Per-project entries deliberately do NOT appear here;
   // each project's ledger renders on its own Settings tab.
   import DeferralLedgerPanel from '$lib/components/DeferralLedgerPanel.svelte';
+  import { renderCheck, checkError, type CheckState } from '$lib/stores/orchestrator';
 
+  /** Mirror of Rust `self_update::UpdateStatus`. */
   type UpdateStatus = {
+    /** Only meaningful when `remote_check.state === 'ok'`. */
     available: boolean;
     current_sha: string | null;
     remote_sha: string | null;
+    /** Only meaningful when `remote_check.state === 'ok'`. */
     commit_count: number;
+    /** Normalised — never the literal `"HEAD"`. See `head_detached`. */
     branch: string;
+    /** v0.2.92 (WP-13). */
+    head_detached: boolean;
+    /** v0.2.92 (WP-13): what the remote-currency probe established. */
+    remote_check: CheckState;
+    /** v0.2.92 (WP-13): what the release-tag probe established. */
+    latest_source_release_check: CheckState;
     last_checked: string | null;
     error: string | null;
   };
@@ -65,6 +76,13 @@
   let runningVersion = $state<string | null>(null);
   let latestSourceTag = $state<string | null>(null);
   let binaryLagDismissed = $state(false);
+  // v0.2.92 (WP-13): whether the release-tag lookup SUCCEEDED, which is a
+  // different question from whether it returned a tag. Pre-fix the two were
+  // conflated into `latestSourceTag = null`, so a failed lookup and a
+  // tagless remote both silently hid the line.
+  let latestTagLookupFailed = $state(false);
+  // v0.2.92 (WP-13): reattach affordance state.
+  let reattaching = $state(false);
 
   let unlisten: (() => void) | null = null;
 
@@ -154,12 +172,16 @@
     try {
       const tag = await invoke<string | null>('get_latest_source_release_tag');
       latestSourceTag = tag ?? null;
+      latestTagLookupFailed = false;
     } catch (e) {
-      // No-git or no-tags is the common path; warn quietly so the
-      // banner just stays hidden rather than producing an error toast
-      // the user has no action for.
-      console.warn('[updates] get_latest_source_release_tag skipped:', e);
+      // v0.2.92 (WP-13): an ERROR here is not "no tags". The Rust command
+      // now distinguishes `Ok(None)` (the remote genuinely has no tags) from
+      // `Err` (we could not ask), and this page must too — otherwise a
+      // failed lookup renders identically to a healthy repo with nothing to
+      // report, which is the shape of the whole incident.
+      console.warn('[updates] get_latest_source_release_tag failed:', e);
       latestSourceTag = null;
+      latestTagLookupFailed = true;
     }
 
     // Apply per-tag dismissal. If the user previously dismissed the
@@ -201,8 +223,22 @@
       const result = await invoke<UpdateStatus>('check_for_launcher_update');
       if (result) {
         status = result;
+        // v0.2.92 (WP-13): the toast follows the tri-state, in this order.
+        // "Launcher is up to date" is now reachable ONLY from a check that
+        // actually completed. Pre-fix it was the else-branch of
+        // `result.available`, so every failed check congratulated the user.
+        const check = renderCheck(result.remote_check);
         if (result.error) {
           toast.error(result.error);
+        } else if (check === 'unknown') {
+          const why = checkError(result.remote_check);
+          toast.error(
+            why
+              ? `Couldn't check for updates — ${why}`
+              : "Couldn't check for updates",
+          );
+        } else if (check === 'not_applicable') {
+          toast.success('No git remote to check on this install');
         } else if (result.available) {
           toast.success(`Update available: ${result.commit_count} commit${result.commit_count === 1 ? '' : 's'} behind`);
         } else {
@@ -252,6 +288,27 @@
       toast.error(`Resync failed: ${e}`);
     } finally {
       resyncing = false;
+    }
+  }
+
+  /**
+   * v0.2.92 (WP-13): return HEAD to its branch.
+   *
+   * The one GUI path out of a detached HEAD. Guarded entirely in Rust
+   * (`reattach_orchestrator_branch`: detached + clean tree + the commit is an
+   * upstream ancestor); this handler only relays the refusal, verbatim,
+   * because the refusal text names what the user has to do.
+   */
+  async function reattachBranch() {
+    reattaching = true;
+    try {
+      const branch = await invoke<string>('reattach_orchestrator_branch');
+      toast.success(`Reattached to ${branch}`);
+      await checkNow();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      reattaching = false;
     }
   }
 
@@ -364,10 +421,22 @@
         <p class="upd-version-line">
           <span class="upd-version-label">Running:</span>
           <code>v{runningVersion}</code>
+          <!-- v0.2.92 (WP-13): three renderings, because there are three
+               answers. This line is where the incident hid: the tag came from
+               `git describe` (closest tag reachable FROM HEAD), so an install
+               detached on its own release tag read
+               `Running: v0.2.88 | Latest source release: v0.2.88` — a
+               truthful answer to a question nobody asked, and the only place
+               the five-week gap could have been seen. The tag now comes from
+               the REMOTE, and a failed lookup says so instead of vanishing. -->
           {#if latestSourceTag}
             <span class="upd-version-sep">|</span>
             <span class="upd-version-label">Latest source release:</span>
             <code>{latestSourceTag}</code>
+          {:else if latestTagLookupFailed}
+            <span class="upd-version-sep">|</span>
+            <span class="upd-version-label">Latest source release:</span>
+            <span class="upd-unknown">couldn't check</span>
           {/if}
         </p>
       {/if}
@@ -408,9 +477,39 @@
         </div>
       {/if}
 
+      <!-- v0.2.92 (WP-13): "✓ Up to date" is reachable ONLY from a check
+           that completed. Pre-fix it was the final `else` — so a repo whose
+           behind-count could not be computed at all landed here, in green,
+           with a tick. -->
       {#if status?.error}
         <div class="upd-error">
           <strong>Check failed:</strong> {status.error}
+        </div>
+      {:else if status && !status.last_checked}
+        <!-- Nothing has been checked yet on this install (the cached status
+             reports `unknown` for exactly this reason). Show the neutral
+             prompt rather than the amber "couldn't check" — the check has not
+             failed, it has not run. Both are honest; this one is also
+             actionable, and it is what a first launch should say. -->
+        <p class="upd-empty">No check has run yet — click "Check now" to query the remote.</p>
+      {:else if status && renderCheck(status.remote_check) === 'unknown'}
+        <div class="upd-banner upd-banner-unknown">
+          <strong>⚠ Couldn't check for updates</strong>
+          <span>
+            This is <em>not</em> "up to date" — the launcher could not
+            determine whether new commits exist.
+            {#if checkError(status.remote_check)}
+              <br />git said: <code>{checkError(status.remote_check)}</code>
+            {/if}
+          </span>
+        </div>
+      {:else if status && renderCheck(status.remote_check) === 'not_applicable'}
+        <div class="upd-banner upd-banner-unknown">
+          <strong>No remote to check</strong>
+          <span>
+            This install is not a git checkout, so there is no upstream to
+            compare against.
+          </span>
         </div>
       {:else if status?.available}
         <div class="upd-banner upd-banner-warn">
@@ -428,15 +527,61 @@
         <p class="upd-empty">Click "Check now" to query the remote.</p>
       {/if}
 
+      <!-- v0.2.92 (WP-13): detached HEAD, named and actionable.
+           Before this, the page printed `Branch: HEAD` (self-update surface)
+           or `Branch: main` (installer surface) and there was no in-GUI way
+           back to a branch at all — every other `git checkout` in the
+           launcher is path-scoped and cannot move HEAD, so a GUI-first user
+           was told to open a terminal. -->
+      {#if status?.head_detached}
+        <div class="upd-banner upd-banner-detached">
+          <div class="upd-detached-text">
+            <strong>Detached HEAD — this clone is not on a branch</strong>
+            <span>
+              Update checks compare against
+              <code>vco_upstream/{status.branch || 'main'}</code> and updates
+              still apply, but the clone stays detached afterwards. Reattaching
+              is safe when the working tree is clean and your current commit is
+              already contained in the upstream branch; the button refuses (and
+              says why) otherwise.
+            </span>
+          </div>
+          <button
+            class="upd-btn"
+            disabled={reattaching || checking || applying}
+            onclick={reattachBranch}
+          >
+            {reattaching ? 'Reattaching…' : `Reattach to ${status.branch || 'main'}`}
+          </button>
+        </div>
+      {/if}
+
       <dl class="upd-meta">
         <dt>Current</dt>
         <dd><code>{shortSha(status?.current_sha ?? null)}</code></dd>
         <dt>Remote</dt>
         <dd><code>{shortSha(status?.remote_sha ?? null)}</code></dd>
         <dt>Branch</dt>
-        <dd><code>{status?.branch || '—'}</code></dd>
+        <dd>
+          <code>{status?.branch || '—'}</code>
+          {#if status?.head_detached}
+            <span class="upd-unknown">(detached HEAD)</span>
+          {/if}
+        </dd>
         <dt>Commits behind</dt>
-        <dd>{status?.commit_count ?? 0}</dd>
+        <dd>
+          <!-- v0.2.92 (WP-13): the count is a VERDICT and only exists when
+               the probe completed. Rendering the sentinel `0` for a failed
+               probe is precisely how a crashed `rev-list` came to read as
+               "you are current". -->
+          {#if status && renderCheck(status.remote_check) === 'ok'}
+            {status.commit_count}
+          {:else if status}
+            <span class="upd-unknown">unknown</span>
+          {:else}
+            —
+          {/if}
+        </dd>
         <dt>Last checked</dt>
         <dd>{formatTime(status?.last_checked ?? null)}</dd>
       </dl>
@@ -608,6 +753,15 @@
   .upd-banner { padding: 10px 12px; border-radius: 4px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; font-size: 12px; }
   .upd-banner-ok { background: rgba(60, 180, 100, 0.1); border: 1px solid rgba(60, 180, 100, 0.3); }
   .upd-banner-warn { background: rgba(220, 170, 50, 0.12); border: 1px solid rgba(220, 170, 50, 0.4); }
+  /* v0.2.92 (WP-13): "couldn't determine" gets its OWN colour. Amber, not
+     green and not the red of a hard error — the check did not fail loudly,
+     it failed to conclude, and the visual language has to say so. */
+  .upd-banner-unknown { background: rgba(220, 140, 40, 0.12); border: 1px solid rgba(220, 140, 40, 0.45); align-items: flex-start; flex-direction: column; }
+  /* Detached HEAD: purple, because it is a STATE rather than a problem —
+     distinct from both "update available" (amber) and "couldn't check". */
+  .upd-banner-detached { background: rgba(123, 95, 255, 0.10); border: 1px solid rgba(123, 95, 255, 0.40); align-items: flex-start; justify-content: space-between; }
+  .upd-detached-text { display: flex; flex-direction: column; gap: 4px; }
+  .upd-unknown { color: rgba(220, 140, 40, 0.95); font-style: italic; }
   .upd-error { padding: 10px 12px; border-radius: 4px; margin-bottom: 12px; background: rgba(220, 80, 80, 0.12); border: 1px solid rgba(220, 80, 80, 0.4); font-size: 12px; }
   .upd-empty { color: #888; font-size: 12px; margin: 0 0 12px; }
 

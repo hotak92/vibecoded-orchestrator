@@ -8,6 +8,16 @@
 # parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
+# `param()` MUST be the first statement in a PowerShell script: anything
+# executable above it makes `param` parse as a command call and the whole
+# file fails to parse. It sat below the env-scrub and the dot-sources, so
+# this hook had never run on Windows. Keep it here.
+param(
+    [Parameter(Position=0,Mandatory=$true)] [string]$EditedFile,
+    [Parameter(Position=1)] [string]$RepoPath = "",
+    [Parameter(Position=2)] [string]$ProjectName = ""
+)
+
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
@@ -28,12 +38,6 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
 # PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
-
-param(
-    [Parameter(Position=0,Mandatory=$true)] [string]$EditedFile,
-    [Parameter(Position=1)] [string]$RepoPath = "",
-    [Parameter(Position=2)] [string]$ProjectName = ""
-)
 
 if (-not $RepoPath) {
     $RepoPath = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
@@ -278,8 +282,12 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 $IndexDotClaude = Resolve-IndexDotClaude -Root $CanonRoot
 $DotClaudeFlag = if ($IndexDotClaude) { '--index-dot-claude' } else { '--no-index-dot-claude' }
 $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
-Start-Process -FilePath $Python -ArgumentList $analyzerArgs `
-    -WorkingDirectory $RepoPath -WindowStyle Hidden | Out-Null
+# Through the ONE guarded spawn home (_lib/resolve-powershell.ps1, dot-sourced
+# at the top of this file): an unguarded `-WindowStyle Hidden` is REJECTED on
+# non-Windows PowerShell editions, so the analyzer spawn never happens and the
+# edited file's code-graph rows silently stay stale.
+Start-VcoDetachedProcess -FilePath $Python -ArgumentList $analyzerArgs `
+    -WorkingDirectory $RepoPath
 
 Write-Output "Code graph incremental update queued for $ProjectName"
 exit 0

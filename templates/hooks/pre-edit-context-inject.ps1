@@ -55,12 +55,25 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
 $ToolArgs = ""
 $SessionId = ""
+# WP-E (v0.2.92): also extract transcript_path + prompt_id. transcript_path is
+# a PATH ONLY -- threaded to the producer's -Transcript/--transcript flag below;
+# the file's CONTENTS are read in-process by the shared
+# vco_lib/transcript_context.py reader there, never in this script (R31
+# privacy discipline: thinking/output text must never reach argv, `ps`, or a
+# hook log). prompt_id scopes the query-cache key (query-cache.ps1) so two
+# turns issuing the same short trigger don't collide on one cache entry when
+# their enriched text differs. MUST MATCH pre-edit-context-inject.sh's parse
+# and pre-bash-context-inject.ps1's parse.
+$TranscriptPath = ""
+$PromptId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
-        if ($payload.tool_name)   { $ToolName = [string]$payload.tool_name }
-        if ($payload.tool_input)  { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
-        if ($payload.session_id)  { $SessionId = [string]$payload.session_id }
+        if ($payload.tool_name)       { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input)      { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+        if ($payload.session_id)      { $SessionId = [string]$payload.session_id }
+        if ($payload.transcript_path) { $TranscriptPath = [string]$payload.transcript_path }
+        if ($payload.prompt_id)       { $PromptId = [string]$payload.prompt_id }
     }
 } catch {
     # Empty/malformed stdin — keep variables at defaults
@@ -410,9 +423,12 @@ $ProjArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' 
 $DualDone = $false
 if (Get-Command Invoke-VcoDualSearchCached -ErrorAction SilentlyContinue) {
     try {
+        # WP-E (v0.2.92): PromptId scopes the cache key; TranscriptPath threads
+        # to BOTH legs' -Transcript flag inside the driver. MUST MATCH the .sh
+        # sibling's dual-search call.
         $dual = Invoke-VcoDualSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query `
             -KgLimit 1 -WantKg $true -WantCg $IsCode -CgProjectArg $ProjArg -CgLimit 2 `
-            -CgExcludeFile $FilePath -CgAnchor $FilePath
+            -CgExcludeFile $FilePath -CgAnchor $FilePath -PromptId $PromptId -TranscriptPath $TranscriptPath
         if ($dual.Ok) {
             $DualDone = $true
             if ($dual.Kg) { Set-Content -Path $KgTmp.FullName -Value $dual.Kg }
@@ -427,8 +443,13 @@ if (-not $DualDone -and $VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScri
         # wrapper so a repeat query is served from disk. Falls back to the
         # direct call when the cache helper is absent (partial install).
         if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
-            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1
+            # WP-E (v0.2.92): PromptId/TranscriptPath — same rationale as the
+            # dual-search leg above. MUST MATCH the .sh sibling.
+            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1 -PromptId $PromptId -TranscriptPath $TranscriptPath
             if ($kgOut) { Set-Content -Path $KgTmp.FullName -Value $kgOut }
+        } elseif ($TranscriptPath) {
+            # --hook-format prepends "KG: " to each result header so dedup can match by title.
+            & $VenvPy $RlScript $Query --limit 1 --hook-format --transcript $TranscriptPath 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
         } else {
             # --hook-format prepends "KG: " to each result header so dedup can match by title.
             & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
@@ -445,7 +466,7 @@ if (-not $DualDone -and $IsCode) {
     # code relative to the file being edited. MUST MATCH pre-edit-context-inject.sh.
     if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
         $projArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
-        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath -Anchor $FilePath
+        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath -Anchor $FilePath -PromptId $PromptId -TranscriptPath $TranscriptPath
         if ($out) { Set-Content -Path $CodeTmp.FullName -Value $out }
     } else {
         $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"

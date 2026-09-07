@@ -71,6 +71,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+from vco_lib.fs_prune import rmdir_if_empty
 from typing import Any, Callable, Iterable, Optional
 
 from vco_lib import weaviate_helpers as _wh
@@ -361,16 +363,11 @@ def _prune_empty_curated_subdirs(knowledge_root: Path) -> list[str]:
             reverse=True,
         )
         for d in [*subdirs, base]:
-            try:
-                next(d.iterdir())
-            except StopIteration:
-                try:
-                    d.rmdir()
-                    pruned.append(str(d.relative_to(knowledge_root.parent)))
-                except OSError:
-                    pass
-            except OSError:
-                pass
+            # ONE home for "remove it only if it is empty" (vco_lib.fs_prune);
+            # the traversal above is this function's own, the per-node decision
+            # is shared with the orphan-deletion pruner.
+            if rmdir_if_empty(d):
+                pruned.append(str(d.relative_to(knowledge_root.parent)))
     return pruned
 
 

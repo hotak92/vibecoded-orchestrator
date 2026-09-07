@@ -673,6 +673,83 @@ run_test "recover-blob line0-is-KEY= handled"         t_recover_blob_line0_key_e
 run_test "doctor taxonomy (blob/length/ok)"           t_doctor_taxonomy
 run_test "doctor --fix-shape recovers blob"           t_doctor_fix_shape
 
+# --- Test (v0.3.0): `.no-shared-fallback` per-project opt-out -----------
+#
+# docs/VCT_SECRETS_PRIMITIVE.md §"Design choices" promises a project can opt
+# out of the SHARED tier by placing `projects/<NAME>/.no-shared-fallback`,
+# and the launcher's "Disable shared secrets for this project" toggle WRITES
+# that marker (secrets_cmd.rs::set_shared_secrets_read_disabled). Until
+# v0.3.0 no reader consulted it — `resolve_secret` fell through to shared/
+# unconditionally — so the documented privacy control did nothing here.
+#
+# Driven through the CLI's own read verbs (`get`, `resolve`, `can-read`,
+# `exec`), not by calling `resolve_secret` directly: a test that sourced the
+# function would still pass if the verbs stopped using it.
+t_no_shared_fallback_marker() {
+    local root="$TMP/optout-store"
+    rm -rf "$root"
+    mkdir -p "$root/shared" "$root/projects/optdemo" "$root/projects/optother"
+    printf 'shared-only-value' > "$root/shared/OPTOUT_KEY"
+    printf 'own-value'         > "$root/projects/optdemo/OWN_KEY"
+    chmod 600 "$root/shared/OPTOUT_KEY" "$root/projects/optdemo/OWN_KEY"
+
+    local out
+    # LEAVE-ALONE half: no marker → shared still resolves for the project.
+    out=$(VCT_SECRETS_DIR="$root" "$VCT" get --project optdemo --key OPTOUT_KEY 2>/dev/null) \
+        || { echo "    no-marker get failed"; return 1; }
+    [ "$out" = "shared-only-value" ] || { echo "    no-marker got: $out"; return 1; }
+
+    # ACT half: marker present → the shared copy must NOT resolve.
+    : > "$root/projects/optdemo/.no-shared-fallback"
+    if out=$(VCT_SECRETS_DIR="$root" "$VCT" get --project optdemo --key OPTOUT_KEY 2>/dev/null); then
+        echo "    opted-out get still resolved: $out"; return 1
+    fi
+    # ...and the refusal must not print the value it withheld.
+    VCT_SECRETS_DIR="$root" "$VCT" get --project optdemo --key OPTOUT_KEY \
+        > "$TMP/optout.out" 2>&1
+    assert_absent_file "$TMP/optout.out" "shared-only-value" || return 1
+
+    # Every read verb agrees — a gate honoured by `get` alone would still
+    # leak through `exec`, which CLAUDE.md names as the PREFERRED API.
+    if VCT_SECRETS_DIR="$root" "$VCT" resolve --project optdemo --key OPTOUT_KEY >/dev/null 2>&1; then
+        echo "    resolve ignored the marker"; return 1
+    fi
+    if VCT_SECRETS_DIR="$root" "$VCT" can-read --project optdemo --key OPTOUT_KEY 2>/dev/null; then
+        echo "    can-read ignored the marker"; return 1
+    fi
+    if VCT_SECRETS_DIR="$root" "$VCT" exec --project optdemo \
+        --secret OPTOUT_KEY=OPTOUT_VAL -- true 2>/dev/null; then
+        echo "    exec ignored the marker"; return 1
+    fi
+
+    # The project's OWN keys are untouched by the opt-out.
+    out=$(VCT_SECRETS_DIR="$root" "$VCT" get --project optdemo --key OWN_KEY 2>/dev/null) \
+        || { echo "    own-key get failed"; return 1; }
+    [ "$out" = "own-value" ] || { echo "    own-key got: $out"; return 1; }
+
+    # The marker is scoped to the project that placed it.
+    out=$(VCT_SECRETS_DIR="$root" "$VCT" get --project optother --key OPTOUT_KEY 2>/dev/null) \
+        || { echo "    sibling project lost shared"; return 1; }
+    [ "$out" = "shared-only-value" ] || { echo "    sibling got: $out"; return 1; }
+
+    # A stray projects/shared/ orphan must not disable every shared read:
+    # `get`/`exec`/`can-read`/`resolve` default to project="shared" when
+    # --project is omitted, so a marker there would be machine-wide.
+    mkdir -p "$root/projects/shared"
+    : > "$root/projects/shared/.no-shared-fallback"
+    out=$(VCT_SECRETS_DIR="$root" "$VCT" get --key OPTOUT_KEY 2>/dev/null) \
+        || { echo "    default shared scope lost its keys"; return 1; }
+    [ "$out" = "shared-only-value" ] || { echo "    default scope got: $out"; return 1; }
+
+    # revoke routes through resolve_write_scope, NOT resolve_secret — an
+    # opted-out project must still be able to delete its own keys.
+    VCT_SECRETS_DIR="$root" "$VCT" revoke --project optdemo --key OWN_KEY --yes >/dev/null 2>&1 \
+        || { echo "    revoke blocked by the read gate"; return 1; }
+    [ ! -f "$root/projects/optdemo/OWN_KEY" ] || { echo "    revoke did not delete"; return 1; }
+}
+
+run_test "no-shared-fallback marker gates shared reads" t_no_shared_fallback_marker
+
 printf '\n=== Results: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 if [ $FAIL -gt 0 ]; then
     printf 'Failed tests:\n'

@@ -71,7 +71,11 @@ _probe_venv_python() {
         "$venv_dir/bin/python" \
         "$venv_dir/bin/python3" \
         "$venv_dir/Scripts/python.exe"; do
-        if [ -x "$candidate" ]; then
+        # `-f` before `-x`: see the tier-1 note in resolve_vco_venv_python.
+        # These candidates always name a file INSIDE a venv, so a directory
+        # here is far less likely than in tier 1 — but the rule for "is this
+        # an interpreter?" must be one rule, not two.
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
             VCO_VENV_PYTHON="$candidate"
             return 0
         fi
@@ -90,14 +94,24 @@ resolve_vco_venv_python() {
     local script_dir="${1:-}"
     VCO_VENV_PYTHON=""
 
-    # Tier 1: $VCT_VENV explicit override.
+    # Tier 1: $VCT_VENV explicit override. The last candidate is $VCT_VENV
+    # itself, for a user who pointed the variable at the interpreter directly.
+    #
+    # `-f` BEFORE `-x` is load-bearing (v0.2.92 R2 / R42): a DIRECTORY
+    # satisfies `-x` (that is the search permission bit), so a $VCT_VENV that
+    # names a venv whose bin/python is missing used to "resolve" to the venv
+    # DIRECTORY — and every spawn built on it then died with exit 126, a
+    # failure whose message says nothing about the misconfiguration. Only a
+    # regular file (or a symlink to one, which is the usual shape of a venv
+    # python) can be an interpreter. The .ps1 sibling already had this right:
+    # it tests `-PathType Leaf`.
     if [ -n "${VCT_VENV:-}" ]; then
         for candidate in \
             "$VCT_VENV/bin/python" \
             "$VCT_VENV/bin/python3" \
             "$VCT_VENV/Scripts/python.exe" \
             "$VCT_VENV"; do
-            if [ -x "$candidate" ]; then
+            if [ -f "$candidate" ] && [ -x "$candidate" ]; then
                 VCO_VENV_PYTHON="$candidate"
                 return 0
             fi

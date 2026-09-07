@@ -20,7 +20,11 @@ N HTTP calls for a batch of N — slower but functionally equivalent.
 Embedding-capable models on Ollama (as of 2026-05):
 
   * ``qwen3-embedding:0.6b`` — 1024 dim, the VCO default for KG.
-    Requires ``options.num_ctx=8192`` to use its full 32k context.
+    Window 10 240 (arch supports 32k): VCO sends ``num_ctx=10240``
+    (see ``MODEL_TOKEN_LIMITS``) while the chunk policy caps chunks at
+    8 192 units — deliberate headroom, because the unit counter
+    under-counts real tokens by 1.5-18% and an equal window would
+    truncate the largest chunks (R40).
   * ``snowflake-arctic-embed2:latest`` — 1024 dim, legacy default
     preserved by the multi-slot schema (``ollama_embed`` slot).
   * ``snowflake-arctic-embed-l-v2.0`` / ``arctic-embed:*`` — 1024 dim,
@@ -254,7 +258,12 @@ class OllamaAdapter:
         ``MODEL_TOKEN_LIMITS`` in ``claude_mcp_servers.weaviate_mcp.chunking``
         so it matches the chunker's per-model target. Pre-v0.2.47 default
         was a hard 8192 which silently truncated longer inputs for
-        qwen3-embedding (whose chunker preset wants up to ~13.5k).
+        qwen3-embedding: the then-preset packed chunks up to ~13.5k tokens,
+        32% above qwen3's 10 240 num_ctx — the overflow bug the v0.2.47
+        chunker overhaul fixed. Chunks are now capped at the 8192 R39
+        policy ceiling (``CHUNK_TOKEN_POLICY_CEILING`` in chunking), below
+        qwen3's window, so the auto-resolved num_ctx never truncates a
+        legal chunk.
 
         Raises:
             RuntimeError: On non-2xx responses other than the 404 that
@@ -275,6 +284,18 @@ class OllamaAdapter:
                     "model": model,
                     "input": text,
                     "options": {"num_ctx": num_ctx},
+                    # v0.2.92: NEVER let Ollama truncate silently.
+                    # Measured 2026-09-04 across the three shipped
+                    # models: with the default (truncate=true) qwen3
+                    # and jina return HTTP 200 having DROPPED the
+                    # tail — data loss with no signal — while arctic
+                    # refuses regardless (it cannot truncate at all).
+                    # truncate=false makes all three behave the same:
+                    # an explicit 400 "the input length exceeds the
+                    # context length", which the caller catches and
+                    # retries at the provable fallback budget. An
+                    # error we handle beats a success that lied.
+                    "truncate": False,
                 }),
                 timeout=self.timeout,
             )
@@ -283,7 +304,7 @@ class OllamaAdapter:
 
         if response.status_code == 404:
             # Old Ollama — fall back to /api/embeddings (single-item only).
-            return self._embed_legacy(model, text)
+            return self._embed_legacy(model, text, num_ctx)
 
         if response.status_code != 200:
             raise RuntimeError(
@@ -350,6 +371,18 @@ class OllamaAdapter:
                     "model": model,
                     "input": texts,
                     "options": {"num_ctx": num_ctx},
+                    # v0.2.92: NEVER let Ollama truncate silently.
+                    # Measured 2026-09-04 across the three shipped
+                    # models: with the default (truncate=true) qwen3
+                    # and jina return HTTP 200 having DROPPED the
+                    # tail — data loss with no signal — while arctic
+                    # refuses regardless (it cannot truncate at all).
+                    # truncate=false makes all three behave the same:
+                    # an explicit 400 "the input length exceeds the
+                    # context length", which the caller catches and
+                    # retries at the provable fallback budget. An
+                    # error we handle beats a success that lied.
+                    "truncate": False,
                 }),
                 timeout=self.timeout,
             )
@@ -358,7 +391,7 @@ class OllamaAdapter:
 
         if response.status_code == 404:
             # Legacy Ollama: loop per-item over /api/embeddings.
-            return [self._embed_legacy(model, t) for t in texts]
+            return [self._embed_legacy(model, t, num_ctx) for t in texts]
 
         if response.status_code != 200:
             raise RuntimeError(
@@ -395,15 +428,39 @@ class OllamaAdapter:
 
     # ---- legacy fallback ----------------------------------------------------
 
-    def _embed_legacy(self, model: str, text: str) -> list[float]:
-        """Single-item embed via legacy ``/api/embeddings`` endpoint."""
+    def _embed_legacy(
+        self, model: str, text: str, num_ctx: int | None = None
+    ) -> list[float]:
+        """Single-item embed via legacy ``/api/embeddings`` endpoint.
+
+        Carries the SAME window and truncation policy as ``/api/embed``
+        (round-6). This path shipped with neither ``num_ctx`` nor
+        ``truncate``, so on an older Ollama daemon — the only condition
+        under which it runs — every embed silently truncated at the
+        server's default window and returned HTTP 200. That is precisely
+        the defect R40 and R45 exist to remove, surviving on the
+        compatibility path because the gate that scans embed request sites
+        could not see this file (its URL is built from an attribute, and it
+        is passed as ``bounded_post``'s SECOND argument).
+
+        The legacy endpoint answers an over-window input with HTTP **500**
+        rather than 400, carrying the same message — which is why the
+        overflow detector matches on the message, not the status.
+        """
+        if num_ctx is None:
+            num_ctx = _num_ctx_for_model(model)
         # v0.2.70 FIX A: bounded total deadline, same per-request granularity.
         try:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embeddings",
                 # task 6: keep_alive on the legacy endpoint too.
-                json=_with_keep_alive({"model": model, "prompt": text}),
+                json=_with_keep_alive({
+                    "model": model,
+                    "prompt": text,
+                    "options": {"num_ctx": num_ctx},
+                    "truncate": False,
+                }),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:

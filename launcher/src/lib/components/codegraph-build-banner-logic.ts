@@ -40,10 +40,17 @@ export function isPruneFailurePartial(
  * flag — validated by tests/test_deferral_command_argparse_sweep.py (which now
  * scans .svelte + this .ts via the launcher/src root).
  *
- * A missing/blank project name degrades to a `<project>` placeholder so the
- * command shape is still correct (the user substitutes their project name).
+ * v0.2.92 (BLOCKER-2): identity comes from `--from-resolver`, not from the
+ * DISPLAY name. `--force-recreate` DROPS the five `<prefix>_Code*` classes,
+ * and the analyzer sanitizes whatever `--project` receives into that prefix —
+ * so passing the display name targeted `VibeCodedOrchestrator_Code*` on a
+ * project whose binding says `VCODev_Code*`, rebuilding a family the project
+ * does not read (and, on a collision, dropping one another project does).
+ * `--from-resolver` asks vct-hub for `collection_prefix`, which is exactly
+ * what the per-edit hooks and the launcher's own analyzer spawns use. It also
+ * removes the unquoted-`${name}` bug: a display name with spaces produced a
+ * command that parsed as a different project.
  */
-export function buildDropRecreateCommand(projectName: string | null | undefined): string {
-  const name = (projectName ?? '').trim() || '<project>';
-  return `code-graph-analyze . --project ${name} --force-recreate`;
+export function buildDropRecreateCommand(): string {
+  return 'code-graph-analyze . --from-resolver --force-recreate';
 }

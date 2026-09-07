@@ -81,7 +81,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -91,9 +91,11 @@ from vco_lib.embedding_providers import (
     OpenAIAdapter,
 )
 from vco_lib.embedding_providers.ollama import KNOWN_OLLAMA_DIMS
+from vco_lib.embedding_providers.ollama_truncation import TruncationAwareOllamaAdapter
 from vco_lib.embedding_providers.openai import (
     KNOWN_OPENAI_EMBEDDING_MODELS,
 )
+from vco_lib.paths import claude_metrics_dir
 
 logger = logging.getLogger(__name__)
 
@@ -407,8 +409,8 @@ def _resolve_code_model_with_fallback(
             "jina_embed",
             768,
             (
-                f"CodeEmbed + qwen3 both unavailable; "
-                f"using ollama:jina-embeddings-v2-base-code (slot=jina_embed)"
+                "CodeEmbed + qwen3 both unavailable; "
+                "using ollama:jina-embeddings-v2-base-code (slot=jina_embed)"
             ),
         )
 
@@ -537,8 +539,25 @@ def _redacted_env_snapshot() -> dict[str, str]:
 
 
 def _failure_jsonl_path() -> Path:
-    """``~/.claude/metrics/embedding_failures.jsonl``. Cross-OS via Path.home()."""
-    return Path.home() / ".claude" / "metrics" / "embedding_failures.jsonl"
+    """The embedding-failure jsonl, resolved — NOT a fixed path.
+
+    It is NO LONGER under ``~/.claude``: v0.2.92 W7 moved the metrics home to
+    ``<vct_root_dir()>/metrics`` and ``paths.claude_metrics_dir`` became a
+    deprecated ALIAS that moved with it. This docstring used to name the old
+    location, and four shipped scripts copied that string into messages they
+    printed at users — pointing them at a file the rows are not in. Interpolate
+    this function; never restate the path.
+
+    Routed through :func:`vco_lib.paths.claude_metrics_dir` rather than
+    reconstructing ``Path.home() / ".claude"`` inline, because inline was
+    unsteerable: with no override anywhere in the chain, the test suite's
+    fixture failures appended to the maintainer's REAL telemetry stream on
+    every local ``pytest tests/`` (v0.2.92 W-CLAUDE; rows identifiable by
+    ``"attempted_backends": []`` / ``"install_root": null``). Import is
+    hard — a failing ``vco_lib`` import means a broken install, and this
+    module is itself ``vco_lib``.
+    """
+    return claude_metrics_dir() / "embedding_failures.jsonl"
 
 
 def _failure_markdown_path(install_root: Path | None) -> Path | None:
@@ -801,9 +820,25 @@ def _detect_project_root(explicit: Path | None = None) -> Path | None:
 # and the MCP server — keeping them in one place avoids the historical
 # fragmentation that motivated this whole refactor.
 DEFAULT_OLLAMA_URL = "http://localhost:11435"
+#: Kept for callers that import it; the RESOLUTION of the code-embed base URL
+#: now lives in ``vco_lib.code_embed_image.service_base_url`` (see
+#: ``_shared_service_base_url`` below), which also honours ``CODE_EMBED_PORT``.
 DEFAULT_CODE_EMBED_URL = "http://localhost:11440"
 DEFAULT_TEXT_MODEL = "qwen3-embedding:0.6b"
 DEFAULT_CODE_MODEL = "codesage-large-v2"
+
+
+def _shared_service_base_url(explicit: "str | None" = None) -> str:
+    """The code-embed base URL, from the ONE shared resolver.
+
+    Imported lazily and wrapped in a thin function so the two call sites in
+    this module name a single thing (per the one-concern-one-home rule) rather
+    than repeating an import + call. ``code_embed_image`` imports only stdlib
+    at module level, so there is no cycle back into this module.
+    """
+    from vco_lib.code_embed_image import service_base_url
+
+    return service_base_url(explicit)
 
 
 # v0.2.69 FIX 3: per-embed-REQUEST timeout (the correct granularity).
@@ -984,22 +1019,261 @@ def _resolve_arctic_secondary() -> bool:
 # Ollama and letting it SILENTLY truncate at num_ctx. The sub-window boundary is
 # EXPLICIT and the fact is reported to the caller as ``truncated=True``. The KG
 # write path (``store_knowledge_node``) reads the per-call truncated set via
-# ``embed_text_all_configured_tagged`` and PERSISTS it as the
-# ``secondary_truncated_slots`` Weaviate chunk property (R3-2), so per-model
-# dataset assembly can partition/filter the truncated secondary vectors from
-# stored data alone (a truncated arctic vector is no longer indistinguishable
-# from a full-fidelity one in the DB). This is strictly better than the
-# silent-Ollama-truncation status quo (same coverage, now labelled AND
-# persisted) AND keeps the ACTIVE slot full-fidelity.
+# ``embed_text_all_configured_tagged`` and PERSISTS it on THREE surfaces:
+#   1. the ``truncated_slots`` Weaviate chunk property (v0.2.92, m-R6-1) — the
+#      COMPLETE per-call record: every configured slot, the ACTIVE one
+#      included, whose vector was embedded from a bounded leading sub-window.
+#      Its PRESENCE is the era marker a reader uses to tell "this row records
+#      all slots" from "this row records only secondaries" — see
+#      ``rl_enrichment.TRUNCATED_SLOTS_PROP``.
+#   2. the ``secondary_truncated_slots`` Weaviate chunk property (R3-2) — the
+#      SECONDARY-only view, derived from the SAME single capture by dropping
+#      the active slot, byte-identical to what R3-2 wrote. A truncated arctic
+#      vector is no longer indistinguishable from a full-fidelity one in the
+#      vector DB; and
+#   3. the per-node ``emb_truncated`` field on the v4 RL retrieval events
+#      (rl_logger schema v4) — the surface the TRAINER reads (launcher.db
+#      ``rl_events``) — on BOTH the dual-log (other-slot) event AND, since
+#      v0.2.92, the MAIN (active-slot) event, so per-model dataset assembly
+#      can partition truncated-vs-full vectors from the RL event ALONE, with
+#      no Weaviate join. The field is tri-state on the wire: true / false
+#      when known, ABSENT (= unknown) for pre-v4 events, on-the-fly
+#      backfilled vectors, and rows/events that predate the state they are
+#      asked for — see ``rl_logger.resolve_emb_truncation_state``.
+#      Absence must never be read as "not truncated".
+# This is strictly better than the silent-Ollama-truncation status quo (same
+# coverage, now labelled AND persisted). The ACTIVE slot is no longer
+# guaranteed full-fidelity: since round-5 its shrink-on-refusal is recorded in
+# the SAME per-call record as the secondaries' bounding, so the active fact is
+# persisted like the secondary fact instead of living in a WARNING log.
 #
 # We approximate the num_ctx-worth of text by a CHARACTER budget derived from
-# num_ctx (chars ≈ tokens × _CHARS_PER_TOKEN). This is a conservative UNDER-count
-# clamp — a few hundred chars short of the true token window is harmless (the
-# embedder simply sees slightly less than its max), whereas an over-count would
-# reintroduce the silent Ollama truncation we're eliminating. Exactness is not
-# required: the goal is "don't feed 13 500 tokens to a 4 096-ctx model", not
-# "fill the 4 096-ctx window to the last token".
-_CHARS_PER_TOKEN = 4  # conservative English heuristic (real ratio ~3.5-4.5)
+# num_ctx. v0.2.92 defect-1 fix (2026-09-04): the budget uses PER-MODEL
+# MEASURED-MINIMUM chars/token ratios — NOT the chunker's model-agnostic
+# ``CHARS_PER_TOKEN_TEXT`` (4), which is a chunking unit and over-counts the
+# chars a dense tokenizer actually fits (arctic measured as low as 2.30
+# chars/token, so a "4 096-token" 16 384-char budget was really 4 158-7 124
+# true tokens against a 4 096 window). The MINIMUM is used, not the median,
+# because the minimum is what overflows. A 25% safety margin (user-set
+# 2026-09-04; do NOT widen it without a new measurement) is then taken OFF the
+# top: char_budget = num_ctx × ratio_min × (1 − 0.25).
+#
+# Measured real-content ratios behind the table (defect-1 investigation,
+# 2026-09-04): snowflake-arctic-embed2 min/median/max = 2.30 / 3.195 / 3.87;
+# qwen3-embedding = 2.547 / 3.977 / 4.669.
+#
+# ONE HOME for these ratios: this table. A drifted duplicate token table
+# already caused a live 4x over-budget bug this cycle — do not copy these
+# numbers anywhere else. This is DELIBERATELY a different table from
+# ``chunking.CHARS_PER_TOKEN_TEXT`` (frozen, the chunk-boundary unit): the
+# chunker sizes chunk boundaries; this table bounds what is HANDED to a
+# secondary embedder, and the two must not be coupled.
+#
+# Unmeasured-but-registered models (bge-m3, text-embedding-3-small, …) get the
+# measured FLOOR (the smallest ratio measured across the shipped models): an
+# unmeasured tokenizer is a genuine unknown, and under-filling a window is a
+# fidelity cost while over-filling it is the silent truncation this bound
+# exists to prevent.
+# MEDIAN, not minimum — and the reason is measured, not preferential.
+#
+# Declaring the measured MINIMUM ratio makes the bound safe for the densest
+# conceivable chunk, but it truncates everything else far too early: on a real
+# project corpus the minimum-ratio bound truncated 312 of 859 chunks (36.3%),
+# against 40 (4.7%) before — roughly 300 chunks losing text that would have
+# fitted the window comfortably. For the SECONDARY slot, whose whole purpose is
+# to be a faithful training corpus, that is a large self-inflicted loss.
+#
+# Declaring the MEDIAN is safe because a denser-than-median chunk is not lost
+# silently: every embed sends `truncate: false`, so the runner REFUSES it, and
+# the caller shrinks and retries until it fits
+# (`_embed_secondary_with_refusal_retry`).
+#
+# CORRECTED (round-3/4). This block previously claimed truncation was "detected
+# EXACTLY" from `prompt_eval_count` pinning at `num_ctx`, and concluded "so
+# there is no retry". Both halves were wrong:
+#   * a pinned count means the window was FILLED — an exact fit and a
+#     truncation produce the identical number, and under `truncate: false` an
+#     over-window input never returns 200 at all, so the pinned case is almost
+#     always an exact FIT. Reporting it as truncation flagged the inputs that
+#     fit best;
+#   * there IS a retry, and there had to be: without one, `truncate: false`
+#     turned an over-window chunk into a refusal that was logged and dropped —
+#     no vector at all, strictly worse than the truncated-and-tagged vector it
+#     replaced.
+# Truncation is now known LOCALLY — we tagged it because we sent less than we
+# were given — not inferred from the response.
+#
+# TIERS, because the runner REFUSES rather than truncates (measured
+# 2026-09-04, this Ollama build):
+#   /api/embed      over-window -> HTTP 400 {"error":"the input length exceeds
+#                                            the context length"}
+#   /api/embeddings over-window -> HTTP 500, SAME message (legacy endpoint)
+# A refusal is worse than a truncation: the soft-fail logs a warning and
+# persists NOTHING, so the secondary slot gets no vector at all for that chunk.
+#
+# Tier 1 (MEDIAN) is what we ATTEMPT: it lets typical content embed in full.
+# (The cost of declaring the minimum instead is measured in the block above.)
+# Tier 2 (MIN) is the FIRST shrink on a refusal. It is NOT a floor, and an
+# earlier version of this comment wrongly claimed it was "provably <= num_ctx,
+# so it cannot be refused again". That arithmetic used a minimum ratio measured
+# on PROSE (2.30 chars/token). Real KG content is much denser — markdown tables
+# 1.41, box-drawing 1.61, CJK 1.35 — and refuses at this tier too. With only
+# two attempts the second refusal propagated and the slot got NO vector, which
+# is the failure the retry exists to prevent, on the dominant non-prose
+# content.
+#
+# So the retry does not STOP at tier 2; it continues by HALVING until the
+# runner accepts or reaches `_EMBED_RETRY_FLOOR_CHARS`. That terminates for any
+# density, because each step strictly shrinks and the floor cannot exceed any
+# supported window. The guarantee comes from the loop, not from a constant.
+#
+# Tier 2 earns its place by being the LARGEST useful first shrink, not by being
+# safe. Halving straight from the attempt over-shrinks exactly the content the
+# MIN ratio was measured on: arctic refused at 9 815 would go to 4 907 chars
+# (~2 133 tokens at 2.30) when 7 065 (~3 072 tokens) is accepted — a third of
+# the window given up. `_shrink_step` therefore takes the larger of {MIN tier,
+# half} that is strictly below the current attempt, and once the attempt is at
+# or below the MIN tier the sequence is plain halving.
+_EMBED_BOUND_CHARS_PER_TOKEN_ATTEMPT: dict[str, float] = {
+    "snowflake-arctic-embed2": 3.195,  # measured MEDIAN, real content
+    "qwen3-embedding": 3.977,          # measured MEDIAN, real content
+    # W1 (2026-09-05): measured with the CodeSage tokenizer inside the
+    # code-embed container on real repo Python — budget-window slices
+    # aggregate 3.46-3.48 chars/token. Sizes the CODE legs' attempt budget
+    # and the first-shrink tier now that the CodeEmbed service leg shrinks.
+    "codesage": 3.46,
+}
+_EMBED_BOUND_MIN_CHARS_PER_TOKEN: dict[str, float] = {
+    # Measured MINIMUM over the sampled corpus — the first shrink tier, NOT a
+    # proof. Denser content exists (see the block above); the halving loop, not
+    # this number, is what guarantees termination.
+    "snowflake-arctic-embed2": 2.30,
+    "qwen3-embedding": 2.547,
+    # Densest budget-window slice observed on the same W1 measurement
+    # (the head of a dense module: 3 584 chars -> 1 193 tokens).
+    "codesage": 2.96,
+}
+# First-shrink ratio for models with no measurement: stay on the low side for
+# the unknown. Like the table above, a starting point for the loop, not a bound.
+_EMBED_BOUND_MIN_CHARS_PER_TOKEN_FLOOR: float = 2.30
+# User-set safety margin (2026-09-04). Do NOT exceed 0.25.
+_EMBED_BOUND_SAFETY_MARGIN: float = 0.25
+#: Chars below which an overflow is not a window problem. Every shrink path
+#: (primary single embed, secondary fan-out, batch single-item) reaches it
+#: through the ONE helper `_embed_shrinking_on_overflow`, so they cannot drift.
+_EMBED_RETRY_FLOOR_CHARS: int = 512
+
+
+def _min_chars_per_token_for(model_id: str, conservative: bool = False) -> float:
+    """Measured-minimum chars/token for ``model_id`` (defect-1 ratio home).
+
+    Partial-match lookup mirrors the rule ``chunking._num_ctx_for_model``
+    uses (``"qwen3-embedding"`` matches ``"qwen3-embedding:0.6b"`` and vice
+    versa). Unmeasured models resolve to the measured FLOOR — the
+    conservative side, see the table's comment block.
+    """
+    table = (_EMBED_BOUND_MIN_CHARS_PER_TOKEN if conservative
+             else _EMBED_BOUND_CHARS_PER_TOKEN_ATTEMPT)
+    val = table.get(model_id)
+    if val is None:
+        for key, registered in table.items():
+            if key in model_id or model_id in key:
+                val = registered
+                break
+    return float(val) if val is not None else _EMBED_BOUND_MIN_CHARS_PER_TOKEN_FLOOR
+
+
+# NOTE (round-5): there was a second overflow detector here —
+# ``is_length_refusal`` plus an ``_OLLAMA_LENGTH_REFUSAL`` phrase constant —
+# added in round 4 without checking that ``_is_context_overflow_error`` (below,
+# same file) already existed. It matched NARROWER, returning False for two
+# documented older Ollama phrasings, so an older runner's refusal would have
+# propagated instead of triggering a retry. Round 4 made it delegate; round 5
+# deleted it, because a delegating alias with no production caller is a second
+# name for one concern that the next editor has to keep in sync for nothing.
+# ``_is_context_overflow_error`` is the one home. Its markers cover the two
+# HTTP codes the same cause produces (400 on /api/embed, 500 on the legacy
+# /api/embeddings), which is why they match on the MESSAGE, not the status.
+
+
+def _char_budget_for_model(
+    model_id: str,
+    conservative: bool = False,
+    *,
+    full_coverage: bool = True,
+) -> int:
+    """Char budget for ``model_id``'s num_ctx (0 when the model is unregistered).
+
+    ``num_ctx × chars/token × (1 − 0.25 margin)`` — the defect-1 bound, using
+    the MEDIAN ratio by default and the measured-MINIMUM one under
+    ``conservative=True``.
+
+    This is an ESTIMATE, not a guarantee. At the measured minimum ratio it
+    lands at 75% of the true token window *for content as dense as the sample*
+    — and denser content exists (markdown tables 1.41 chars/token, box-drawing
+    1.61, CJK 1.35), so a budgeted text CAN still overflow. Nothing may rely on
+    this value being unrefusable; the caller shrinks on refusal
+    (``_embed_shrinking_on_overflow``).
+    """
+    num_ctx = _num_ctx_for_secondary(model_id)
+    if not num_ctx or num_ctx <= 0:
+        return 0
+    ratio = _min_chars_per_token_for(model_id, conservative=conservative)
+    budget = int(num_ctx * ratio * (1.0 - _EMBED_BOUND_SAFETY_MARGIN))
+    if conservative or not full_coverage:
+        # The shrink tier is never widened by the primary's chunker-max floor.
+        #
+        # `full_coverage=False` is the SECONDARY role. The own-chunker-max
+        # floor below is a PRIMARY guarantee — "never truncate chunks this
+        # model sized itself". A secondary receives text chunked for the
+        # ACTIVE model, so its own chunker maximum is not a meaningful
+        # floor there, and applying it swallowed the user-set 25% margin
+        # whole: arctic's attempt became 12 800 chars = 4 006 tokens
+        # against a 4 096 window, an effective margin of 2.2%. The margin
+        # exists to keep refusals rare; a floor that erases it turns every
+        # dense secondary chunk into a refusal-plus-retry round trip.
+        return budget
+    # PRIMARY FULL COVERAGE (WP-O, restated 2026-09-04): a slot must never be
+    # bounded below what its OWN chunker already produced for it. The chunker
+    # sizes chunks to this model's preset; re-bounding them more tightly here
+    # would truncate the ACTIVE slot's own correctly-sized chunks — a coverage
+    # loss on the primary retrieval path to satisfy a margin meant for the
+    # SECONDARY (whose window is smaller) and for legacy corpora chunked for a
+    # different model.
+    #
+    # So the attempt budget is at least the chunker's own maximum for this
+    # model. The bound remains a real safety net for the case WP-R was built
+    # for — chunks sized for a LARGER model reaching a smaller one after a
+    # model switch — while never firing on a chunk this model's chunker made.
+    try:
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            CHARS_PER_TOKEN_TEXT,
+            _preset_for_limit,
+        )
+        _min_t, max_t, _target_t = _preset_for_limit(num_ctx)
+        own_chunker_max_chars = int(max_t) * int(CHARS_PER_TOKEN_TEXT)
+        budget = max(budget, own_chunker_max_chars)
+    except Exception:
+        # chunking unimportable (standalone script context) — keep the ratio
+        # budget. Conservative, and never silently wrong: the worst case is a
+        # tighter bound, which is tagged, not a silent overflow.
+        pass
+    return budget
+
+
+
+def _chars_per_token_text() -> int:
+    from claude_mcp_servers.weaviate_mcp.chunking import CHARS_PER_TOKEN_TEXT
+    return CHARS_PER_TOKEN_TEXT
+
+
+def __getattr__(name: str):
+    # PEP 562: `_CHARS_PER_TOKEN` stays importable by name for the two tests
+    # that pin the char-budget arithmetic, but it is the SAME object as
+    # `chunking.CHARS_PER_TOKEN_TEXT`, not a second literal.
+    if name == "_CHARS_PER_TOKEN":
+        return _chars_per_token_text()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _num_ctx_for_secondary(model_id: str) -> "int | None":
@@ -1017,7 +1291,13 @@ def _num_ctx_for_secondary(model_id: str) -> "int | None":
         return None
 
 
-def _bounded_for_model(text: str, model_id: str) -> "tuple[str, bool]":
+def _bounded_for_model(
+    text: str,
+    model_id: str,
+    conservative: bool = False,
+    *,
+    full_coverage: bool = True,
+) -> "tuple[str, bool]":
     """Return ``(text_or_subwindow, truncated)`` bounded to ``model_id``'s num_ctx.
 
     ONE shared home for the "don't feed an over-num_ctx chunk to Ollama" rule
@@ -1027,14 +1307,28 @@ def _bounded_for_model(text: str, model_id: str) -> "tuple[str, bool]":
     If ``text`` fits within ``model_id``'s num_ctx character budget (or the model
     is unregistered / measurement unavailable), returns ``(text, False)`` — a
     faithful full vector. If it exceeds, returns the LEADING sub-window
-    (num_ctx × _CHARS_PER_TOKEN chars) and ``True`` so the caller can react
-    (tag/log). Never raises.
+    (``_char_budget_for_model``: num_ctx × the model's MEASURED-MINIMUM
+    chars/token × 0.75 safety margin — see the ratio table above for why the
+    chunker's model-agnostic constant is not used here) and ``True`` so the
+    caller can react (tag/log). Never raises.
+
+    This char budget is the pre-embed ESTIMATE, and it is an estimate that can
+    be WRONG in the unsafe direction: it is derived from a median chars/token
+    ratio, and denser-than-median content (markdown tables 1.41, box-drawing
+    1.61, CJK 1.35) overflows the window at a length this budget allows.
+    Such a text is not silently truncated — every embed sends ``truncate:
+    false``, so the runner REFUSES it and ``_embed_secondary_with_refusal_retry``
+    halves until it is accepted, tagging the result truncated because WE sent
+    less than we were given. Truncation is known locally, from our own
+    bounding; it is not inferred from the response (see the corrected
+    ``_EMBED_BOUND`` block above for why ``prompt_eval_count`` cannot say it).
 
     Two callers, same rule, different intent:
-      * SECONDARY-slot embed (WP-O): records the truncated slot in
-        ``_last_secondary_truncated``, which ``store_knowledge_node`` persists as
-        the ``secondary_truncated_slots`` chunk property (R3-2); the ACTIVE slot
-        stays full-fidelity.
+      * SECONDARY-slot embed (WP-O): records the truncated slot in the
+        per-call truncation record (``_last_truncated_slots``), which
+        ``store_knowledge_node`` persists as the ``truncated_slots`` /
+        ``secondary_truncated_slots`` chunk properties (R3-2 + v0.2.92); the
+        ACTIVE slot stays full-fidelity on this bound.
       * ACTIVE-slot batch embed (WP-R): prevents the Ollama ``/api/embed`` HTTP
         400 ("input exceeds context length") + whole-batch rejection that a
         small-num_ctx ACTIVE model (arctic 4 096, granite, embeddinggemma, …)
@@ -1044,7 +1338,9 @@ def _bounded_for_model(text: str, model_id: str) -> "tuple[str, bool]":
     num_ctx = _num_ctx_for_secondary(model_id)
     if not num_ctx or num_ctx <= 0:
         return text, False
-    char_budget = num_ctx * _CHARS_PER_TOKEN
+    char_budget = _char_budget_for_model(
+        model_id, conservative=conservative, full_coverage=full_coverage
+    )
     if len(text) <= char_budget:
         return text, False
     return text[:char_budget], True
@@ -1054,6 +1350,207 @@ def _bounded_for_model(text: str, model_id: str) -> "tuple[str, bool]":
 # name. It is THE SAME rule (bound to the model's num_ctx) — a rename with an
 # alias, not a fork. Prefer ``_bounded_for_model`` in new code.
 _bounded_for_secondary = _bounded_for_model
+
+
+def _shrink_step(current_len: int, floor: int, min_tier: int) -> int:
+    """Next attempt length: the LARGEST candidate strictly below ``current_len``.
+
+    Candidates are the measured-MIN tier (only while it is below the current
+    length) and half. Preferring the MIN tier on the first shrink is what keeps
+    code-dense content from over-shrinking — see the ``_EMBED_BOUND`` block.
+    Once the attempt is at or below the MIN tier the candidate is half, so the
+    sequence still strictly shrinks and therefore terminates at ``floor``.
+    """
+    candidate = current_len // 2
+    if 0 < min_tier < current_len and min_tier > candidate:
+        candidate = min_tier
+    return max(floor, candidate)
+
+
+def _note_fidelity(kind: str, model_id: str, *args: Any) -> None:
+    """Record a fidelity event for the SessionStart notice. Never raises.
+
+    Telemetry must never be able to fail an embed — the whole point of the
+    shrink ladder is that a dense chunk still produces a vector. Import is
+    lazy and the whole call is guarded: on any failure the embed proceeds and
+    the only loss is one summary row.
+    """
+    try:
+        from vco_lib import embedding_fidelity
+
+        if kind == "shrink":
+            embedding_fidelity.note_shrink(model_id, *args)
+        else:
+            embedding_fidelity.note_floor_refusal(model_id, *args)
+    except Exception:  # noqa: BLE001 — telemetry never breaks the embed
+        pass
+
+
+def _embed_shrinking_on_overflow(
+    embed_fn: Callable[[str], Any],
+    text: str,
+    *,
+    model_id: str,
+    floor: int = _EMBED_RETRY_FLOOR_CHARS,
+    on_shrink: Optional[Callable[[str, int], None]] = None,
+) -> "tuple[Any, int]":
+    """Call ``embed_fn(attempt)``, shrinking on a context overflow until accepted.
+
+    Returns ``(result, sent_len)`` — ``sent_len`` is how many characters were
+    actually embedded, so the caller decides truncation LOCALLY (we know we
+    sent less than we were given) rather than inferring it from the response.
+
+    THE one home for this loop (v0.2.92 round-5). Three paths need it and it
+    existed as two near-identical copies while the third — the PRIMARY single
+    embed — had none. That gap was a P1 regression: R45 sends
+    ``truncate: false`` on every Ollama embed, which turns a silent tail loss
+    into a hard refusal, and R45's own text credited "the caller catches and
+    retries". On the primary, no caller caught: a dense chunk (CJK, a
+    box-drawing diagram, a symbolic table — all inside the normal preset range)
+    lost its ACTIVE vector entirely, where v0.2.91 had stored a leading-window
+    one. A third copy of the loop would have been the same defect waiting to
+    happen on the fourth path.
+
+    Termination: each iteration returns, raises, or strictly shrinks
+    (``_shrink_step`` is < current whenever current > floor), and at or below
+    ``floor`` an overflow is re-raised — an overflow that small is not a window
+    problem. Non-overflow exceptions propagate untouched: shrinking is the
+    remedy for "too long", and applying it to an auth error would turn a
+    diagnosable failure into a silent half-answer.
+    """
+    min_tier = _char_budget_for_model(model_id, conservative=True)
+    attempt = text
+    while True:
+        try:
+            result = embed_fn(attempt), len(attempt)
+        except Exception as exc:  # noqa: BLE001 — re-raised unless retriable
+            overflowed = _is_context_overflow_error(exc)
+            if not overflowed or len(attempt) <= floor:
+                if overflowed:
+                    # At/below the floor and STILL refused: this slot gets no
+                    # vector. Rare by construction and actionable, so it is
+                    # recorded for the SessionStart fidelity notice — the
+                    # non-overflow arm is NOT recorded, because propagating an
+                    # auth or network error untouched is correct behaviour,
+                    # not a fidelity loss.
+                    _note_fidelity(
+                        "floor_refusal", model_id, len(attempt), str(exc)
+                    )
+                raise
+            attempt = attempt[: _shrink_step(len(attempt), floor, min_tier)]
+            if on_shrink is not None:
+                try:
+                    on_shrink(model_id, len(attempt))
+                except Exception:  # noqa: BLE001 — logging must never break the embed
+                    pass
+        else:
+            # Record the OUTCOME, not each rung: a three-step ladder is ONE
+            # input that lost text, not three shrinks. Counting per iteration
+            # would inflate the summary by the ladder depth and make a single
+            # pathological chunk look like a corpus-wide problem.
+            if len(attempt) < len(text):
+                _note_fidelity("shrink", model_id, len(text), len(attempt))
+            return result
+
+
+def _embed_secondary_with_refusal_retry(
+    ollama: Any,
+    model_id: str,
+    text: str,
+) -> "tuple[list[float], bool]":
+    """Embed a SECONDARY slot, shrinking on a context overflow until it fits.
+
+    v0.2.92 round-4. The previous form had exactly TWO tiers — attempt at the
+    secondary budget, then one fallback at the "measured minimum" ratio — and
+    claimed to terminate by arithmetic. It did not. That floor was derived from
+    PROSE (2.30 chars/token); real KG content is far denser: markdown tables
+    measure 1.41, box-drawing 1.61, CJK 1.35. For those, the single fallback
+    ALSO overflowed, the second refusal propagated, and the slot got no vector
+    at all — the very outcome the retry existed to prevent, on the dominant
+    non-prose content.
+
+    So the tier count is not fixed: shrink until the runner accepts or the
+    floor is reached. The first shrink drops to the measured-MIN tier and every
+    shrink after that halves (``_shrink_step``) — going straight to half would
+    give up about a third of the window on exactly the code-dense content the
+    MIN ratio was measured on. It terminates for ANY density, because each step
+    is strictly smaller and ``_EMBED_RETRY_FLOOR_CHARS`` cannot exceed any
+    supported window.
+
+    The shrink loop itself lives in ``_embed_shrinking_on_overflow`` — the one
+    home shared with the batch path and the two ACTIVE-slot paths — and keys on
+    ``_is_context_overflow_error`` rather than a second detector: the round-4
+    review found the private one I had added matched NARROWER than the existing
+    helper (False on two documented older Ollama phrasings), so an older
+    runner's refusal would have propagated instead of retrying. One home, one
+    behaviour.
+
+    Non-overflow exceptions propagate untouched: shrinking is a remedy for
+    "too long", and applying it to an auth error would turn a diagnosable
+    failure into a silent half-answer.
+    """
+    sub, bounded = _bounded_for_model(text, model_id, full_coverage=False)
+
+    def _attempt(candidate: str) -> "tuple[list[float], Optional[bool]]":
+        return _embed_with_exact_truncation(
+            ollama, model_id, candidate, bounded or len(candidate) < len(text)
+        )
+
+    def _log(model: str, new_len: int) -> None:
+        logger.info(
+            "%s secondary overflowed its window; retrying under a tighter "
+            "%d-char sub-window", model, new_len,
+        )
+
+    (vec, _exact), sent = _embed_shrinking_on_overflow(
+        _attempt, sub, model_id=model_id, on_shrink=_log,
+    )
+    # Truncated iff we sent less than the caller gave us — known locally and
+    # exactly, not inferred from the response.
+    return vec, sent < len(text)
+
+def _embed_with_exact_truncation(
+    ollama: Any,
+    model_id: str,
+    bounded_text: str,
+    ratio_truncated: bool,
+) -> "tuple[list[float], bool]":
+    """Embed a secondary slot's text, consulting the response's
+    ``prompt_eval_count`` where it is available (v0.2.92 defect-3, corrected
+    round-3/4).
+
+    Returns ``(vector, truncated)``. The count is a ONE-WAY signal, and only
+    the negative direction is sound: ``count < window`` proves the runner saw
+    the input WHOLE. A count pinned AT the window proves only that the window
+    was filled — an exact fit and a truncation produce the identical number —
+    so ``_prompt_eval_truncated`` returns ``None`` there rather than guessing,
+    and this function keeps the ratio verdict. (Under ``truncate: false`` an
+    over-window input never returns 200 at all, so a pinned count is in
+    practice an exact FIT; the retired form tagged precisely the inputs that
+    used the window best.) The ratio verdict is OR-ed in, never overridden: a
+    text this bound already sub-windowed stays truncated even though the
+    smaller input fit.
+
+    When the adapter lacks the capability (injected test stubs, a custom
+    adapter) the ratio estimate stands unchanged — the "response not
+    available" fallback leg. The ACTIVE-slot WP-R batch path also stays on
+    the estimate: ``/api/embed`` batches return one aggregate count for the
+    whole batch, so a per-item verdict cannot be read from it.
+
+    Raises exactly what ``ollama.embed`` raises — the caller's existing
+    per-slot exception handling is unchanged.
+    """
+    embed_with_truncation = (
+        ollama.embed_with_truncation
+        if isinstance(ollama, TruncationAwareOllamaAdapter)
+        else None
+    )
+    if embed_with_truncation is None:
+        return ollama.embed(model_id, bounded_text), bool(ratio_truncated)
+    vector, exact = embed_with_truncation(model_id, bounded_text)
+    if exact is None:
+        return vector, bool(ratio_truncated)
+    return vector, bool(ratio_truncated or exact)
 
 
 # WP-R: Ollama's ``/api/embed`` returns HTTP 400 with a body naming the context
@@ -1373,11 +1870,32 @@ class EmbeddingService:
         # single hung embed call aborts at the configured cap. (Health /
         # discovery probes inside the adapters clamp to min(timeout, 5s),
         # so a large embed timeout never slows liveness checks.)
-        self.ollama: OllamaAdapter = ollama_adapter or OllamaAdapter(
-            base_url=ollama_url,
-            session=self.session,
-            timeout=self.embed_request_timeout,
-        )
+        #
+        # The DEFAULT Ollama adapter is the truncation-aware subclass (v0.2.92
+        # defect-3): identical behaviour to the base adapter, plus
+        # ``embed_with_truncation`` so the secondary-slot fan-out can determine
+        # truncation EXACTLY from the Ollama response's ``prompt_eval_count``
+        # instead of the char-ratio estimate. The default is built through the
+        # ``OllamaAdapter`` name first (the long-standing test/injection seam —
+        # patching that name must keep yielding the patched object verbatim)
+        # and upgraded only when it really is a plain base instance; anything
+        # injected — mock, subclass, custom adapter — is kept EXACTLY as given,
+        # and the exact path is feature-detected at the call site via
+        # isinstance, so a plain adapter silently keeps the estimate-only
+        # behaviour.
+        if ollama_adapter is None:
+            ollama_adapter = OllamaAdapter(
+                base_url=ollama_url,
+                session=self.session,
+                timeout=self.embed_request_timeout,
+            )
+            if type(ollama_adapter) is OllamaAdapter:
+                ollama_adapter = TruncationAwareOllamaAdapter(
+                    base_url=ollama_url,
+                    session=self.session,
+                    timeout=self.embed_request_timeout,
+                )
+        self.ollama: OllamaAdapter = ollama_adapter
         self.codeembed: CodeEmbedAdapter = code_adapter or CodeEmbedAdapter(
             base_url=code_embed_url,
             session=self.session,
@@ -1411,12 +1929,25 @@ class EmbeddingService:
         self._embed_memo_code: dict[str, list[float]] = {}
         self._embed_memo_cap: int = 512
 
-        # WP-O rework: per-call record of SECONDARY slots that were embedded from a
-        # bounded sub-window (chunk > that model's num_ctx). Reset at the start of
-        # every ``embed_text_all_configured`` call; read via
-        # ``last_secondary_truncated`` immediately after. The ACTIVE slot never
-        # appears here (it is always full-fidelity).
-        self._last_secondary_truncated: dict[str, bool] = {}
+        # v0.2.92: ONE per-call record of EVERY slot — the ACTIVE text/code
+        # slots included — whose embed used a bounded leading sub-window
+        # (chunk exceeded that model's num_ctx, or the runner REFUSED the full
+        # text and the shrink loop fell back to a leading window). Reset at the
+        # start of every ``embed_text_all_configured`` / ``embed_code_all_configured``
+        # / ``embed_code`` call. TWO views are
+        # DERIVED from it and must stay derived — a second parallel record here
+        # is exactly how the active and secondary stories would drift apart:
+        #   * ``last_secondary_truncated`` — every slot except the active
+        #     text/code slots. This is the pre-v0.2.92
+        #     ``secondary_truncated_slots`` property's meaning, FROZEN for
+        #     back-compat: widening a stored property's meaning would silently
+        #     reinterpret every row written before this release.
+        #   * ``last_active_truncated`` — the ACTIVE text slot's own verdict.
+        # ``embed_text_all_configured_tagged`` captures the COMPLETE record
+        # atomically with the vectors; the KG write persists it as the
+        # ``truncated_slots`` chunk property and derives the secondary-only
+        # view from it (see the WP-O block above).
+        self._last_truncated_slots: dict[str, bool] = {}
 
     # ---- construction --------------------------------------------------
 
@@ -1464,10 +1995,14 @@ class EmbeddingService:
         """
         resolved_root = _detect_project_root(project_root)
         ollama_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip() or DEFAULT_OLLAMA_URL
-        code_embed_url = (
-            os.environ.get("CODE_EMBED_SERVICE_URL", DEFAULT_CODE_EMBED_URL).strip()
-            or DEFAULT_CODE_EMBED_URL
-        )
+        # ONE home for the three-step order (v0.2.92 R2): explicit →
+        # CODE_EMBED_SERVICE_URL → http://localhost:<CODE_EMBED_PORT|11440>.
+        # It was inlined here, at ``configured_code_models`` below, and in
+        # ``vco_lib/codegraph_resync.py``. Both copies here also IGNORED
+        # ``CODE_EMBED_PORT``, so moving the service off 11440 with that
+        # variable (the knob compose and install.py both honour) left this
+        # probing the old port and silently demoting to an Ollama code tier.
+        code_embed_url = _shared_service_base_url()
 
         # v0.2.52 V52-AJ: the active-profile resolution (env → launcher.db
         # app_state → "qwen3" default; env always wins) is now encapsulated
@@ -1553,7 +2088,7 @@ class EmbeddingService:
             raise NoEmbeddingBackendError(
                 "No embedding backend is reachable. Tried: "
                 + ", ".join(attempted)
-                + ". See ~/.claude/metrics/embedding_failures.jsonl for details.",
+                + f". See {_failure_jsonl_path()} for details.",
                 attempted_backends=attempted,
                 error_per_backend=error_per_backend,
                 install_root=resolved_root,
@@ -1628,22 +2163,63 @@ class EmbeddingService:
     def last_secondary_truncated(self) -> "dict[str, bool]":
         """SECONDARY slots embedded from a bounded sub-window on the last call.
 
-        Populated by ``embed_text_all_configured``: maps each secondary slot whose
-        embed used a bounded leading sub-window (chunk exceeded that model's
-        num_ctx) to ``True``. Empty when no secondary was truncated. The ACTIVE
-        slot is never present (always full-fidelity). A COPY is returned so callers
-        can't mutate instance state.
+        A VIEW over the single per-call record ``_last_truncated_slots`` (every
+        configured slot, the active ones included), excluding the ACTIVE text
+        and code slots. Populated by ``embed_text_all_configured``: maps each
+        secondary slot whose embed used a bounded leading sub-window (chunk
+        exceeded that model's num_ctx) to ``True``. Empty when no secondary was
+        truncated. The ACTIVE slot is never present. A COPY is returned so
+        callers can't mutate instance state.
 
         NOTE: for PERSISTING the tag alongside the vectors (the KG write path),
-        prefer ``embed_text_all_configured_tagged`` — it captures this set
-        ATOMICALLY with the vectors so a concurrent call from another task can't
-        reset the dict between the embed and this read (R3-2). This property is the
-        low-level in-process record; ``store_knowledge_node`` persists it as the
-        ``secondary_truncated_slots`` Weaviate chunk property, which lets stored
-        arctic (and other secondary) vectors be partitioned truncated-vs-full from
-        stored data alone.
+        prefer ``embed_text_all_configured_tagged`` — it captures the COMPLETE
+        record ATOMICALLY with the vectors so a concurrent call from another
+        task can't reset the per-instance record between the embed and this read
+        (R3-2). This property is the low-level in-process SECONDARY view;
+        ``store_knowledge_node`` persists the complete record as the
+        ``truncated_slots`` Weaviate chunk property and derives the
+        secondary-only ``secondary_truncated_slots`` property from it, which
+        lets stored arctic (and other secondary) vectors be partitioned
+        truncated-vs-full from stored data alone.
         """
-        return dict(self._last_secondary_truncated)
+        return {
+            name: flag
+            for name, flag in self._last_truncated_slots.items()
+            if name not in (self._text_slot, self._code_slot)
+        }
+
+    @property
+    def last_active_truncated(self) -> bool:
+        """Whether the ACTIVE TEXT slot's last embed was shrunk after a refusal.
+
+        A VIEW over the single per-call record ``_last_truncated_slots``: the
+        ACTIVE TEXT slot's own entry. Normally False: chunks are sized to the
+        active model's own preset, so the primary sees the whole chunk. It goes
+        True when the runner refused the full text and
+        ``_embed_shrinking_on_overflow`` fell back to a leading sub-window — a
+        real fidelity loss on the slot retrieval reads, already logged at
+        WARNING.
+
+        Scope, stated exactly because a looser sentence here would be wrong:
+        the entry is ASSIGNED (not raised) by every text embed that actually
+        reaches the active Ollama backend, so it describes THAT embed and
+        cannot latch across later ones. Two consequences worth knowing —
+
+        * ``embed_text`` is memoised, so a cache HIT does not re-embed and
+          leaves the entry describing the last real embed;
+        * the OpenAI active leg has no shrink path at all, so the entry stays
+          at whatever the last Ollama embed set.
+
+        ``embed_text_all_configured`` resets the whole record up front, which
+        is why the tagged variant reads cleanly per call. The ACTIVE CODE leg
+        records its verdict in the SAME record under ``_code_slot``; this
+        property deliberately surfaces only the TEXT slot's entry (the KG
+        write path it serves embeds text), and a code-active embed whose slot
+        name differs from the text slot's is not visible through it — the
+        tagged capture resets the record anyway, so a code verdict never
+        reaches a persisted text tag.
+        """
+        return bool(self._last_truncated_slots.get(self._text_slot, False))
 
     @property
     def text_dim(self) -> int:
@@ -1854,6 +2430,11 @@ class EmbeddingService:
             RuntimeError: If the active backend is unreachable or
                 returns an error.
         """
+        # Reset the per-call truncation record before anything else (even a
+        # memo hit): this call's verdict must not inherit an entry a previous
+        # fan-out call left — the record describes THIS embed, same contract
+        # as ``embed_text_all_configured`` / ``embed_code_all_configured``.
+        self._last_truncated_slots = {}
         key = _memo_key(code)
         cached = self._embed_memo_code.get(key)
         if cached is not None:
@@ -1990,30 +2571,130 @@ class EmbeddingService:
         Already-bounded ``text`` is embedded once; on a context-overflow error
         (Ollama HTTP 400 "input exceeds context length" — the char heuristic can
         still under-shoot on very dense content, exactly what WP-P's live arctic
-        backfill hit) the text is halved and retried, down to a small floor.
+        backfill hit) it shrinks and retries down to ``_EMBED_RETRY_FLOOR_CHARS``.
         Raises the last error if even the floor sub-window overflows, so the
         caller's per-object soft-fail records THIS item and continues.
+
+        The shrink itself lives in ``_embed_shrinking_on_overflow`` (round-5).
+        This used to be its own copy of the loop with a literal 512 floor, one
+        of the two copies that existed while the PRIMARY single-embed path had
+        none — which is how a P1 regression hid in a file that already
+        contained its fix twice.
         """
-        attempt = text
-        floor = 512  # chars; below this an overflow is not a window problem
-        while True:
-            try:
-                return self._retry_once_on_503(
-                    self.ollama.embed, model_id, attempt
+        def _log(model: str, new_len: int) -> None:
+            logger.debug(
+                "Ollama single embed context overflow with model %r; "
+                "retrying under a tighter %d-char sub-window", model, new_len,
+            )
+
+        vec, _sent = _embed_shrinking_on_overflow(
+            lambda candidate: self._retry_once_on_503(
+                self.ollama.embed, model_id, candidate
+            ),
+            text,
+            model_id=model_id,
+            on_shrink=_log,
+        )
+        return vec
+
+    def _embed_codeembed_one_bounded(self, code: str) -> "tuple[list[float], bool]":
+        """Embed ONE code entity via the CodeEmbed service, shrinking on the
+        service's over-window refusal. Returns ``(vector, truncated)``.
+
+        W1 / MAJOR-W2 (wiring audit, 2026-09-05): the service's gpu backend
+        refuses over-window input with HTTP 400 ("input length exceeds the
+        context length"); its ``ollama`` backend 502s wrapping the IDENTICAL
+        Ollama phrase. Both surface through the CodeEmbedAdapter as a
+        RuntimeError whose text ``_is_context_overflow_error`` matches, so
+        the ONE shared detector covers both backend modes and the shrink
+        loop is the same one every other leg uses — no fourth copy.
+        """
+        def _log(model: str, new_len: int) -> None:
+            logger.debug(
+                "CodeEmbed service embed context overflow with model %r; "
+                "retrying under a tighter %d-char sub-window", model, new_len,
+            )
+
+        vec, sent = _embed_shrinking_on_overflow(
+            lambda candidate: self._retry_once_on_503(
+                self.codeembed.embed, candidate
+            ),
+            code,
+            model_id=self.code_model_id,
+            on_shrink=_log,
+        )
+        return vec, sent < len(code)
+
+    def _embed_codeembed_batch_bounded(
+        self, codes: list[str]
+    ) -> list[list[float]]:
+        """CodeEmbed-service batch embed with sub-window bounding + failure
+        isolation — the twin of ``_embed_ollama_batch_bounded`` (W1).
+
+        The service's ``/embed`` rejects the WHOLE batch when any single
+        text is over-window, exactly like Ollama's ``/api/embed``, so the
+        same two layers apply:
+
+          1. PRE-BOUND every input to the model's num_ctx budget
+             (``_bounded_for_model``); a per-batch trimmed count is logged
+             at WARNING (loud degradation — same contract as the Ollama
+             twin).
+          2. ISOLATE a whole-batch failure PER ITEM through the shared
+             shrink loop (``_embed_codeembed_one_bounded``); a genuinely
+             un-embeddable item yields the EMPTY-VECTOR sentinel (``[]``)
+             for that index only, which the consumer
+             (``embedding_enrichment._flush_batch``) already treats as a
+             per-object failure.
+
+        Before W1 the batch leg was a bare ``embed_batch`` call: one
+        over-window entity either 400/502'd the entire batch, or — gpu
+        backend, pre-refusal — was silently half-embedded at HTTP 200.
+        """
+        model_id = self.code_model_id
+        bounded_pairs = [_bounded_for_model(t, model_id) for t in codes]
+        bounded = [text for text, _ in bounded_pairs]
+        trimmed_count = sum(1 for _, truncated in bounded_pairs if truncated)
+        if trimmed_count:
+            logger.warning(
+                "CodeEmbed batch embed: %d/%d input(s) exceeded model %r's "
+                "num_ctx and were embedded from a bounded leading sub-window "
+                "(fidelity loss on those items) to avoid a whole-batch "
+                "context-overflow rejection.",
+                trimmed_count, len(bounded), model_id,
+            )
+        try:
+            return self._retry_once_on_503(self.codeembed.embed_batch, bounded)
+        except Exception as batch_exc:  # noqa: BLE001 — isolate to per-item
+            logger.warning(
+                "CodeEmbed batch embed failed for %d input(s) with model %r "
+                "(%s); isolating to per-item embed so one un-embeddable item "
+                "can't fail the survivors",
+                len(bounded), model_id, batch_exc,
+            )
+            results: list[list[float]] = []
+            hard_failures = 0
+            for text in bounded:
+                try:
+                    vec, _trunc = self._embed_codeembed_one_bounded(text)
+                    results.append(vec)
+                except Exception as item_exc:  # noqa: BLE001 — isolate per item
+                    hard_failures += 1
+                    logger.warning(
+                        "CodeEmbed per-item embed failed for one input with "
+                        "model %r (%s); marking that item failed "
+                        "(empty-vector sentinel) and preserving the batch's "
+                        "survivors",
+                        model_id, item_exc,
+                    )
+                    results.append([])
+            if hard_failures:
+                logger.warning(
+                    "CodeEmbed per-item fallback: %d/%d input(s) still "
+                    "un-embeddable after the tighter sub-window retry "
+                    "(marked failed); %d survivor(s) embedded",
+                    hard_failures, len(bounded), len(bounded) - hard_failures,
                 )
-            except Exception as exc:  # noqa: BLE001
-                # Only a genuine context overflow is retriable via a tighter
-                # window; anything else (network, model-not-found) propagates.
-                # At/below the floor, stop retrying and surface the error for
-                # THIS item so the caller's per-object soft-fail records it.
-                if not _is_context_overflow_error(exc) or len(attempt) <= floor:
-                    raise
-                attempt = attempt[: max(floor, len(attempt) // 2)]
-                logger.debug(
-                    "Ollama single embed context overflow with model %r; "
-                    "retrying under a tighter %d-char sub-window",
-                    model_id, len(attempt),
-                )
+            return results
 
     def embed_code_batch(self, codes: list[str]) -> list[list[float]]:
         """Batched code embedding. Empty input → empty output.
@@ -2022,6 +2703,10 @@ class EmbeddingService:
         ``jina_embed`` AND the service is reachable; falls back to
         Ollama (which can serve jina or qwen3) when the service is down.
         OpenAI goes through ``openai`` adapter directly.
+
+        W1 (2026-09-05): the CodeEmbed leg is bounded + failure-isolated
+        like the Ollama twin — one over-window entity can neither silently
+        truncate (gpu backend pre-refusal) nor 400/502 the whole batch.
         """
         if not codes:
             return []
@@ -2030,12 +2715,11 @@ class EmbeddingService:
                 self.openai.embed_batch, self.code_model_id, codes
             )
         if self._code_slot in ("codesage_embed", "jina_embed"):
-            # Try service first; on failure fall back to Ollama using the
-            # configured code model id. The fallback is best-effort —
-            # if Ollama doesn't have a matching model the call will fail
-            # cleanly and the caller's exception handler kicks in.
+            # Service when reachable (bounded + isolated, W1); otherwise
+            # fall through to the Ollama leg using the configured code model
+            # id — best-effort, and it shares the same bounded helper.
             if self.codeembed.is_reachable():
-                return self._retry_once_on_503(self.codeembed.embed_batch, codes)
+                return self._embed_codeembed_batch_bounded(codes)
         # WP-R: the Ollama code fallback (e.g. jina/qwen3 code embeds served via
         # Ollama on a CPU/low-VRAM floor) shares the same num_ctx/whole-batch
         # hazard as the text path, so route it through the SAME bounded + isolated
@@ -2071,15 +2755,25 @@ class EmbeddingService:
         line is emitted. The caller can choose to retry just those.
         """
         result: dict[str, list[float]] = {}
-        # WP-O rework: per-call record of which SECONDARY slots were embedded from
-        # a BOUNDED sub-window (chunk exceeded that model's num_ctx). The ACTIVE
-        # slot is never here — it is always full-fidelity. Callers (dual-log
-        # tagging) read this via ``last_secondary_truncated`` right after the call.
-        self._last_secondary_truncated = {}
+        # ONE per-call record of every slot embedded from a bounded leading
+        # sub-window — the SECONDARY legs (chunk exceeded that model's num_ctx)
+        # and, since round-5, the ACTIVE leg (the runner REFUSED the full text,
+        # which chunk sizing normally prevents) all write here under their slot
+        # name. ``embed_text_all_configured_tagged`` captures the COMPLETE
+        # record atomically with the vectors; the KG write persists it as the
+        # ``truncated_slots`` chunk property and derives the secondary-only
+        # legacy view from it. The ACTIVE slot's truncation is therefore
+        # persisted like the secondaries' (v0.2.92 m-R6-1) — no longer a
+        # WARNING-log-only fact.
+        self._last_truncated_slots = {}
         # Active backend — ALWAYS written (this is the slot reads target), from the
         # FULL text. Active-slot fidelity is never reduced by the secondary fan-out
         # (no-functionality-loss rule): chunk boundaries already follow the
-        # active model's own preset, and here the active embed sees the whole chunk.
+        # active model's own preset, and here the active embed sees the whole
+        # chunk. The one exception is the runner REFUSING that whole chunk
+        # (denser than the token counter assumed), in which case
+        # ``_embed_text_via_active`` shrinks, warns, and sets
+        # ``last_active_truncated`` — a leading-window vector, never no vector.
         try:
             result[self._text_slot] = self._embed_text_via_active(text)
         except Exception as exc:
@@ -2097,10 +2791,15 @@ class EmbeddingService:
         # contract holds for every secondary.
         if self._text_slot != "qwen3_embed" and self.ollama.is_reachable():
             try:
-                sub, trunc = _bounded_for_secondary(text, DEFAULT_TEXT_MODEL)
-                result["qwen3_embed"] = self.ollama.embed(DEFAULT_TEXT_MODEL, sub)
+                # Attempt at the secondary budget, then shrink on a LENGTH
+                # refusal until the runner accepts (round-3 BLOCKER-B:
+                # truncate=false makes an over-window chunk a hard 400, so an
+                # unhandled refusal loses the vector entirely).
+                result["qwen3_embed"], trunc = _embed_secondary_with_refusal_retry(
+                    self.ollama, DEFAULT_TEXT_MODEL, text
+                )
                 if trunc:
-                    self._last_secondary_truncated["qwen3_embed"] = True
+                    self._last_truncated_slots["qwen3_embed"] = True
                     logger.info(
                         "qwen3 secondary embedded from a bounded sub-window "
                         "(chunk exceeded qwen3 num_ctx); slot tagged truncated"
@@ -2128,10 +2827,13 @@ class EmbeddingService:
             and self.ollama.is_reachable()
         ):
             try:
-                sub, trunc = _bounded_for_secondary(text, ARCTIC_SECONDARY_MODEL)
-                result["arctic2_embed"] = self.ollama.embed(ARCTIC_SECONDARY_MODEL, sub)
+                # Attempt at the secondary budget, then shrink on a LENGTH
+                # refusal until the runner accepts (round-3 BLOCKER-B).
+                result["arctic2_embed"], trunc = _embed_secondary_with_refusal_retry(
+                    self.ollama, ARCTIC_SECONDARY_MODEL, text
+                )
                 if trunc:
-                    self._last_secondary_truncated["arctic2_embed"] = True
+                    self._last_truncated_slots["arctic2_embed"] = True
                     logger.info(
                         "arctic secondary embedded from a bounded sub-window "
                         "(chunk %d chars exceeded arctic num_ctx); slot tagged "
@@ -2159,12 +2861,32 @@ class EmbeddingService:
                     # tighter than qwen3's 10 240) — explicit sub-window + tag,
                     # never a silent OpenAI-side truncation. (This is also the R2-4
                     # boundary case; the active slot stays full-fidelity.)
-                    sub, trunc = _bounded_for_secondary(text, openai_model)
+                    #
+                    # ``full_coverage=False`` because this is a SECONDARY role
+                    # (round-5 MAJOR-R5-3). Reaching the shared bound through the
+                    # ``_bounded_for_secondary`` alias hid that the DEFAULT is the
+                    # primary tier, whose own-chunker-max floor (25 600 chars for
+                    # this model) overrides the ratio bound entirely — so a
+                    # 32 768-char qwen3 chunk was sent as 25 600 chars, ~10 240
+                    # tokens on table-dense content against an 8 191 window.
+                    # The secondary tier is 14 129.
+                    #
+                    # Estimate-only by necessity: the OpenAI adapter exposes no
+                    # token count on its response, so no exact verdict exists here
+                    # — and unlike Ollama there is no shrink-on-refusal either.
+                    # OpenAI's over-length error text is its own; matching it with
+                    # `_is_context_overflow_error` would be a guess, so an
+                    # over-length OpenAI secondary is dropped with a warning rather
+                    # than silently half-embedded. The bound is what keeps that
+                    # rare; it is not a guarantee.
+                    sub, trunc = _bounded_for_secondary(
+                        text, openai_model, full_coverage=False
+                    )
                     result["openai_text_embed"] = self.openai.embed(
                         openai_model, sub
                     )
                     if trunc:
-                        self._last_secondary_truncated["openai_text_embed"] = True
+                        self._last_truncated_slots["openai_text_embed"] = True
                         logger.info(
                             "OpenAI secondary embedded from a bounded sub-window "
                             "(chunk exceeded openai num_ctx); slot tagged truncated"
@@ -2176,26 +2898,31 @@ class EmbeddingService:
     def embed_text_all_configured_tagged(
         self, text: str
     ) -> "tuple[dict[str, list[float]], list[str]]":
-        """Like ``embed_text_all_configured`` but returns the truncated-slot tag
-        ATOMICALLY with the vectors (R3-2).
+        """Like ``embed_text_all_configured`` but returns the truncation record
+        ATOMICALLY with the vectors (R3-2; widened v0.2.92 to every slot).
 
-        Returns ``(slots, truncated_slot_names)`` where ``truncated_slot_names`` is
-        the sorted list of SECONDARY slot names whose vector was embedded from a
-        bounded leading sub-window on THIS call (a subset of ``slots``' keys; the
-        active slot is never included — it is always full-fidelity).
+        Returns ``(slots, truncated_slot_names)`` where ``truncated_slot_names``
+        is the sorted list of EVERY configured slot — the ACTIVE slot included —
+        whose vector was embedded from a bounded leading sub-window on THIS call
+        (a subset of ``slots``' keys). This is the ONE per-call capture the KG
+        write persists: ``store_knowledge_node`` stores it verbatim as the
+        ``truncated_slots`` chunk property (the COMPLETE record; its presence
+        marks a row that can answer for every slot) and derives the narrower
+        ``secondary_truncated_slots`` property from it by dropping the active
+        slot, whose pre-v0.2.92 meaning is frozen for back-compat (see
+        ``rl_enrichment.TRUNCATED_SLOTS_PROP``).
 
-        Reading ``last_secondary_truncated`` as a separate property call is
-        race-prone under concurrency (a second ``embed_text_all_configured`` from
-        another task resets the per-instance dict between the embed and the read).
-        Capturing it here — same call, before returning — closes that window so the
-        KG write can persist a truncated tag that FAITHFULLY matches the vectors it
-        stores. Callers that persist the tag (``store_knowledge_node`` writes it as
-        the ``secondary_truncated_slots`` chunk property) MUST use this, not the
-        property.
+        Reading ``last_secondary_truncated`` / ``last_active_truncated`` as
+        separate property calls is race-prone under concurrency (a second
+        ``embed_text_all_configured`` from another task resets the per-instance
+        record between the embed and the read). Capturing here — same call,
+        before returning — closes that window so the KG write can persist a
+        truncated tag that FAITHFULLY matches the vectors it stores. Callers
+        that persist the tag MUST use this, not the properties.
         """
         slots = self.embed_text_all_configured(text)
         truncated = sorted(
-            name for name, flag in self._last_secondary_truncated.items() if flag
+            name for name, flag in self._last_truncated_slots.items() if flag
         )
         return slots, truncated
 
@@ -2209,6 +2936,11 @@ class EmbeddingService:
         ``{active_code_slot: vector}`` dict — a valid named-vector write.
         """
         result: dict[str, list[float]] = {}
+        # Reset the per-call truncation record, mirroring the text side: the
+        # secondary ``codesage_embed`` entry is only ever WRITTEN True (never
+        # assigned False), so without this reset one sub-windowed secondary
+        # latches into every later code fan-out's verdict.
+        self._last_truncated_slots = {}
         # Active backend — ALWAYS written.
         try:
             result[self._code_slot] = self._embed_code_via_active(code)
@@ -2225,7 +2957,21 @@ class EmbeddingService:
             and self.codeembed.is_reachable()
         ):
             try:
-                result["codesage_embed"] = self.codeembed.embed(code)
+                # W1 (2026-09-05): shrink on the service's over-window
+                # refusal and TAG it, like every secondary leg. Without this
+                # the service's new 400 refusal would DROP the slot where
+                # the gpu backend used to silently half-embed it — a
+                # refusal with no catcher is strictly worse than the silent
+                # truncation it replaces.
+                vec, trunc = self._embed_codeembed_one_bounded(code)
+                result["codesage_embed"] = vec
+                if trunc:
+                    self._last_truncated_slots["codesage_embed"] = True
+                    logger.info(
+                        "codesage secondary embedded from a bounded sub-window "
+                        "(entity exceeded the served window); slot tagged "
+                        "truncated"
+                    )
             except Exception as exc:
                 logger.warning("CodeEmbed fallback embedding failed: %s", exc)
         # OpenAI — same prefix-strip defense as embed_text_all_configured
@@ -2254,12 +3000,52 @@ class EmbeddingService:
         (``"openai-text-embedding-3-small"``); strip the prefix at the
         HTTP-call boundary because OpenAI's API rejects the prefixed form
         with HTTP 400.
+
+        The Ollama leg attempts the WHOLE text — the primary slot is never
+        pre-bounded (R45 primary full coverage; chunks are already sized to
+        this model's own preset) — and shrinks ONLY if the runner refuses it.
+
+        Why the shrink is here at all (v0.2.92 round-5 BLOCKER): R45 sends
+        ``truncate: false`` on every Ollama embed, so an over-window input is
+        a hard refusal instead of a silent tail loss. That is the right trade
+        ONLY where something catches it. The batch path caught it; this path,
+        which is what kg-sync and the MCP ``store_knowledge_node`` write use,
+        did not — so a chunk denser than the counter assumed (CJK, a
+        box-drawing diagram, a symbolic table, all inside the normal preset
+        range) lost its ACTIVE vector entirely and the node stored nothing,
+        where v0.2.91 had stored a leading-window vector. Losing the P1
+        retrieval vector is strictly worse than the tail loss it replaced.
+
+        A shrink here is a real fidelity loss on the slot retrieval reads, so
+        it logs at WARNING (not info) and sets ``last_active_truncated``.
         """
         if "openai" in self._text_slot:
             return self.openai.embed(
                 _to_openai_api_model(self.text_model_id), text
             )
-        return self.ollama.embed(self.text_model_id, text)
+
+        def _warn(model: str, new_len: int) -> None:
+            logger.warning(
+                "ACTIVE text embed refused by %s for a %d-char input "
+                "(num_ctx exceeded); retrying under a tighter %d-char "
+                "sub-window — this chunk's primary vector covers only its "
+                "leading window",
+                model, len(text), new_len,
+            )
+
+        vec, sent = _embed_shrinking_on_overflow(
+            lambda candidate: self.ollama.embed(self.text_model_id, candidate),
+            text,
+            model_id=self.text_model_id,
+            on_shrink=_warn,
+        )
+        # Record under the ACTIVE TEXT slot, in the SAME per-call record the
+        # secondary legs write (assign, never latch: a shrink on one chunk must
+        # not make the next chunk's full-fidelity vector report as truncated).
+        # The tagged fan-out captures this atomically, so the active slot's
+        # truncation is PERSISTED like the secondaries' (v0.2.92 m-R6-1).
+        self._last_truncated_slots[self._text_slot] = sent < len(text)
+        return vec
 
     def _embed_code_via_active(self, code: str) -> list[float]:
         """Route a single code embed to the configured backend.
@@ -2267,15 +3053,79 @@ class EmbeddingService:
         For codesage_embed / jina_embed slots, prefer the FastAPI service
         when reachable; fall back to Ollama otherwise. OpenAI path applies
         the same catalog-id-prefix strip as ``_embed_text_via_active``.
+
+        The Ollama leg shrinks on refusal for the same reason the text leg
+        does (round-6 BLOCKER, the twin of round-5's): `truncate: false` makes
+        an over-window input a hard 400, and this is the path the code-graph
+        analyzer uses PER ENTITY — so without a catcher an entity the runner
+        refuses gets no vector at all.
+
+        W1 (wiring audit, 2026-09-05): the CodeEmbed SERVICE leg — the
+        DEFAULT GPU tier's path — gets the same treatment. It could not even
+        refuse before: sentence-transformers truncated silently at the
+        SERVED window (sentence_bert_config.json max_seq_length = 1 024,
+        not the 2 048 architectural cap every budget was sized for), so a
+        maximal entity lost roughly half its text at HTTP 200 with no
+        warning and no tag. The service now refuses over-window input with
+        HTTP 400 carrying the phrase `_is_context_overflow_error` already
+        matches, and this leg routes that refusal through the ONE shared
+        shrink loop — a tagged leading-window vector, never a silent
+        halving and never a dropped entity. The same wiring also covers the
+        service's ``ollama`` backend mode (MAJOR-W2), whose 502 wraps the
+        identical Ollama phrase.
+
+        It is not a rare case here. Entities are pre-sized by
+        ``code_truncation`` at ``num_ctx × CHARS_PER_TOKEN_CODE`` with
+        CHARS_PER_TOKEN_CODE = 3.5, while real code measures ~2.8-2.95
+        chars/token on the Ollama code tiers (measured 2026-09-04: jina
+        1 719 tokens for 4 800 chars, qwen3 9 491 for 28 000) and
+        2.96-3.47 on CodeSage budget-window slices (measured 2026-09-05,
+        W1). A maximal entity therefore overflows its own budget on
+        ORDINARY code. The shrink makes that correct rather than fatal;
+        retuning the 3.5 constant would move code-graph boundaries and
+        force a re-embed, so it is a separate, user-owned decision and is
+        deliberately NOT taken here.
         """
+        def _warn(model: str, new_len: int) -> None:
+            logger.warning(
+                "ACTIVE code embed refused by %s for a %d-char entity "
+                "(num_ctx exceeded); retrying under a tighter %d-char "
+                "sub-window — this entity's vector covers only its leading "
+                "window",
+                model, len(code), new_len,
+            )
+
         if "openai" in self._code_slot:
             return self.openai.embed(
                 _to_openai_api_model(self.code_model_id), code
             )
         if self._code_slot in ("codesage_embed", "jina_embed"):
             if self.codeembed.is_reachable():
-                return self.codeembed.embed(code)
-        return self.ollama.embed(self.code_model_id, code)
+                # W1: through the ONE shared shrink loop — see docstring.
+                # Records under the ACTIVE CODE slot exactly like the
+                # Ollama leg below (assign, never latch).
+                vec, sent = _embed_shrinking_on_overflow(
+                    lambda candidate: self.codeembed.embed(candidate),
+                    code,
+                    model_id=self.code_model_id,
+                    on_shrink=_warn,
+                )
+                self._last_truncated_slots[self._code_slot] = sent < len(code)
+                return vec
+
+        vec, sent = _embed_shrinking_on_overflow(
+            lambda candidate: self.ollama.embed(self.code_model_id, candidate),
+            code,
+            model_id=self.code_model_id,
+            on_shrink=_warn,
+        )
+        # Record under the ACTIVE CODE slot, in the same per-call record the
+        # text legs write (assign, never latch — same contract as the text
+        # leg). The KG write path never captures this key (its record resets
+        # on every ``embed_text_all_configured``), so a code verdict cannot
+        # leak into a persisted text tag.
+        self._last_truncated_slots[self._code_slot] = sent < len(code)
+        return vec
 
     # ---- catalogue discovery (classmethods) ----------------------------
 
@@ -2342,11 +3192,8 @@ class EmbeddingService:
             or os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip()
             or DEFAULT_OLLAMA_URL
         )
-        code_embed_url = (
-            code_embed_url
-            or os.environ.get("CODE_EMBED_SERVICE_URL", DEFAULT_CODE_EMBED_URL).strip()
-            or DEFAULT_CODE_EMBED_URL
-        )
+        # Same ONE home as ``for_project`` above (v0.2.92 R2).
+        code_embed_url = _shared_service_base_url(code_embed_url)
         openai_api_key = (
             openai_api_key
             if openai_api_key is not None
@@ -2422,7 +3269,11 @@ class EmbeddingService:
         # `_to_openai_catalog_id` for the boundary rationale.
         if openai_api_key:
             oa = OpenAIAdapter(openai_api_key, session=session)
-            valid_for_small = oa.validate("text-embedding-3-small")
+            # v0.2.92: a `validate("text-embedding-3-small")` pre-probe sat
+            # here with its result never read. Not a dropped branch — that id
+            # is a KEY of KNOWN_OPENAI_EMBEDDING_MODELS, so the loop below
+            # probes it anyway (and OpenAIAdapter caches per model). Don't
+            # re-add it; the code sibling never had one.
             for raw_model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
                 catalog_id = _to_openai_catalog_id(raw_model_id)
                 slot, _ = _resolve_text_slot(raw_model_id)

@@ -1,14 +1,14 @@
 [
   {
     "complexity": 1.0,
-    "content_hash": "10572197804055f50fdefe4ad93662debe0f6d73cc90d4b91049ee16bbace429",
+    "content_hash": "f366f077cbe8422b50a1679a6598fe5943700240aadb873bcc0e822f2b8f6d35",
     "embed_revision": 0,
-    "file_hash": "a7be79b60ef69a0d5c3428e8b43f454f1d96bb0c122cc0158402ea0c2bc06472",
+    "file_hash": "cc057cd6c20a6399cf58156f3d4231dc6d624c3ea0a647a53205082cb8b99f43",
     "import_names": [],
     "is_test": false,
     "language": "java",
-    "loc": 13,
-    "module_summary": "Java module: src/Account.java\nPackage: golden\nClasses: Account",
+    "loc": 23,
+    "module_summary": "Java module: src/Account.java\nPackage: golden\nClasses: Account, Ledger, BaseAccount",
     "path": "src/Account.java",
     "project": "GoldenProj"
   },
@@ -30,7 +30,7 @@
   },
   {
     "complexity": 1.0,
-    "content_hash": "44b1ad26ff7cd7b37e8eabf0b1a607c538570a2c3d8905df877383330d1dd8d2",
+    "content_hash": "9fc8a657a526a51fdc9c199a8790096aec18fc8cb0c94ccefdf4a4d9821b5410",
     "embed_revision": 0,
     "file_hash": "9aaf29c94e9fc4efc69e28ec11f430f7b34675374f6fc4b9d8530f3fd8c3dd78",
     "import_names": [
@@ -40,7 +40,7 @@
     "is_test": false,
     "language": "csharp",
     "loc": 33,
-    "module_summary": "C# module: src/Inventory.cs (namespace Warehouse)\nInventory module for the golden-fixture repo (C#, regex-parsed).\nClasses: IRepository, InventoryController",
+    "module_summary": "C# module: src/Inventory.cs (namespace Warehouse)\nInventory module for the golden-fixture repo (C#, regex-parsed).\nClasses: IRepository, Item, InventoryController",
     "path": "src/Inventory.cs",
     "project": "GoldenProj"
   },
@@ -66,13 +66,13 @@
     "complexity": 1.0,
     "content_hash": "cbbb8f578acde6d9bcb730fa3381701b7762c8271d2cd172eabaaeca207e4b86",
     "embed_revision": 0,
-    "file_hash": "d2091c2d83b6a2156a6d727a022c0dbfa4bb31597c30c2abc1abf47817cef6a6",
+    "file_hash": "c4750b354676fc0dc8e9788268b6debfe4048d1ac7ba17b427dc5c0c7d3c5a62",
     "import_names": [
       "__future__"
     ],
     "is_test": false,
     "language": "python",
-    "loc": 210,
+    "loc": 216,
     "module_summary": "Module: src/big_module.py\nLong module: contains one very large function to exercise chunking.",
     "path": "src/big_module.py",
     "project": "GoldenProj"
@@ -136,10 +136,10 @@
     "project": "GoldenProj"
   },
   {
-    "complexity": 1.0,
-    "content_hash": "7aea930924794009bd1ed87a215acc18e8537aa10af191b3d397a1c7cb79a180",
+    "complexity": 4.0,
+    "content_hash": "c944fb0bebb29b1252d38250272a6b1b1592b33253f3d539995e90f60664ad44",
     "embed_revision": 0,
-    "file_hash": "17a2fee895d62575133d9a80793e66deb3b02c77ebb9dd7b3a683b3a622d1a45",
+    "file_hash": "0640a9066f19e194fe6ec697cff8fb020f0a2cd462f6460baa80820fe76d71b5",
     "import_names": [
       "vector",
       "string",
@@ -147,24 +147,24 @@
     ],
     "is_test": false,
     "language": "cpp",
-    "loc": 34,
-    "module_summary": "C++ module: src/geometry.cpp\nGeometry module for the golden-fixture repo (C++, regex-parsed).\nClasses: Circle, Point, Box",
+    "loc": 67,
+    "module_summary": "C++ module: src/geometry.cpp\nGeometry module for the golden-fixture repo (C++, regex-parsed).\nClasses: Circle, Point, Box, Tally",
     "path": "src/geometry.cpp",
     "project": "GoldenProj"
   },
   {
-    "complexity": 1.0,
-    "content_hash": "6571b32c1b192b774997931cef2a7f5cc4f09035074508155b7fa780c286f931",
+    "complexity": 4.0,
+    "content_hash": "c9ffc6bda9accf28a1afa6e8c5d1c91fd4b5db0c50d20dc88517b587b6dd60e4",
     "embed_revision": 0,
-    "file_hash": "5b798a46f013f92082bfd89c0dcecce3c8d9da3ceb26b205289d75b67d68fcf4",
+    "file_hash": "9bccb6f713cb4c04a540367cb2f91561f39f27263262542bf377010fefa9517a",
     "import_names": [
       "set",
       "helpers"
     ],
     "is_test": false,
     "language": "ruby",
-    "loc": 28,
-    "module_summary": "Ruby module: src/ledger.rb\nLedger module for the golden-fixture repo (Ruby, regex-parsed).\nClasses: Accounting, Account, SavingsAccount",
+    "loc": 47,
+    "module_summary": "Ruby module: src/ledger.rb\nLedger module for the golden-fixture repo (Ruby, regex-parsed).\nClasses: Accounting, Account, SavingsAccount, Vault, Reporting, Summary",
     "path": "src/ledger.rb",
     "project": "GoldenProj"
   },

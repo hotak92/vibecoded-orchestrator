@@ -78,25 +78,24 @@ describe('isPruneFailurePartial', () => {
 
 describe('buildDropRecreateCommand', () => {
   it('builds the analyzer drop+recreate command with --force-recreate', () => {
-    expect(buildDropRecreateCommand('MyProject')).toBe(
-      'code-graph-analyze . --project MyProject --force-recreate',
+    expect(buildDropRecreateCommand()).toBe(
+      'code-graph-analyze . --from-resolver --force-recreate',
     );
   });
 
-  it('degrades a blank/missing name to a <project> placeholder', () => {
-    expect(buildDropRecreateCommand('')).toBe(
-      'code-graph-analyze . --project <project> --force-recreate',
-    );
-    expect(buildDropRecreateCommand(null)).toBe(
-      'code-graph-analyze . --project <project> --force-recreate',
-    );
-    expect(buildDropRecreateCommand('   ')).toBe(
-      'code-graph-analyze . --project <project> --force-recreate',
-    );
+  // v0.2.92 (BLOCKER-2): the DISPLAY name must never reach --project here.
+  // The analyzer sanitizes --project into the class prefix it DROPS, so a
+  // display name that differs from the project's bound `collection_prefix`
+  // rebuilt the wrong family (and could drop another project's). Identity
+  // now comes from the resolver, which is what the hooks already use.
+  it('never derives the dropped family from a display name', () => {
+    const cmd = buildDropRecreateCommand();
+    expect(cmd).toContain('--from-resolver');
+    expect(cmd).not.toContain('--project');
   });
 
   it('always uses the real --force-recreate flag (never a bogus --force)', () => {
-    const cmd = buildDropRecreateCommand('X');
+    const cmd = buildDropRecreateCommand();
     expect(cmd).toContain('--force-recreate');
     expect(cmd).not.toMatch(/--force(?!-recreate)/);
   });

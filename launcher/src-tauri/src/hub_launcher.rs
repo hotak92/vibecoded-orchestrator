@@ -8,19 +8,28 @@
 //! own the hub's lifecycle past spawning — `vct-hub --stop` from
 //! launcher quit would defeat the "hub outlives launcher GUI" goal.
 //!
-//! Discovery chain (must match the SessionStart hook in
-//! `templates/hooks/session-start-ensure-hub.sh`):
+//! Discovery chain — **owned by `vco_lib/hub_ensure.py`**, not by this file.
+//! v0.2.92 (ruling R20) merged the three copies of it (this module, the
+//! `.sh` SessionStart hook and its `.ps1` sibling) into that ONE Python home;
+//! [`find_hub_binary`] now asks it via
+//! `python -m vco_lib.hub_ensure resolve --json`. The chain is unchanged:
 //!   1. `$VCT_HUB_BIN` env override (highest priority — dev builds).
 //!   2. `<dir of this launcher binary>/vct-hub` (the INSTALL-FOLDER copy
 //!      — the hub that shipped WITH this exact launcher; populated by
 //!      `build-bundled-launcher.sh`), then the arch-less fallback one dir
-//!      up. **Preferred** over PATH/`~/.vct/bin` (v0.2.63): the sibling
-//!      copy is guaranteed to match this launcher's version, whereas PATH
-//!      or `~/.vct/bin` can point at a stale dev build or an older
+//!      up. This is the one step Python cannot derive on its own, so the
+//!      launcher passes it down via [`launcher_install_dirs`] as
+//!      `--extra-dir`. **Preferred** over PATH/`~/.vct/bin` (v0.2.63): the
+//!      sibling copy is guaranteed to match this launcher's version, whereas
+//!      PATH or `~/.vct/bin` can point at a stale dev build or an older
 //!      install. user request 2026-06-19: "we should always use the installed
 //!      copy from the launcher's install folder."
 //!   3. First `vct-hub` on PATH.
 //!   4. `$HOME/.vct/bin/vct-hub` (install.py default install location).
+//!
+//! What stays HERE is what is launcher-only and therefore NOT duplicated
+//! anywhere: the update gate, the stale/foreign-binary identity swap, and
+//! the `CREATE_NO_WINDOW` spawn.
 //!
 //! Invocation: `vct-hub --start-if-not-running`. The CLI returns 0
 //! whether the hub started fresh OR was already running; both are
@@ -39,71 +48,126 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Find the vct-hub binary on disk, returning the first hit from the
-/// documented discovery chain. Returns `None` if no candidate exists.
+/// Find the vct-hub binary on disk, delegating to the ONE home.
+///
+/// v0.2.92, ruling R20: the four-step discovery chain used to be mirrored
+/// here, in `templates/hooks/session-start-ensure-hub.sh` and in its `.ps1`
+/// sibling — three hand-maintained copies of one question, which had already
+/// drifted on arch-slot naming. The chain now lives in `vco_lib/hub_ensure.py`
+/// and this function asks it via
+/// `python -m vco_lib.hub_ensure resolve --json`. Class A of the repo's A>B>C
+/// cross-language rule: every caller of this function is a user action or a
+/// once-per-boot step (launcher setup, `hub_status::stop`, the boot-autostart
+/// toggles, the install/update flow), never a poll loop — so a ~100 ms
+/// subprocess is affordable and a mirror is not justified.
+///
+/// The launcher contributes the one input Python cannot derive: the
+/// install-folder anchors relative to its OWN running binary
+/// ([`launcher_install_dirs`]). Everything else — `$VCT_HUB_BIN`, the
+/// `launcher/dist/<arch>/` slots, `$PATH`, `~/.vct/bin` — is resolved
+/// by the module, from the environment this process passes down.
+///
+/// Returns `None` in two distinguishable-in-the-log situations:
+///   * the module answered `binary_not_found` — a true fact about this
+///     machine; callers degrade to hub-unavailable mode as they always did;
+///   * the module could not be RUN at all — a BROKEN install. That is logged
+///     at ERROR with the reason and still returns `None`. It is deliberately
+///     NOT patched over with an inline re-derivation of the chain: a silent
+///     fallback copy is exactly the drift this consolidation removes, and it
+///     would mask an install that needs repairing.
 pub fn find_hub_binary() -> Option<PathBuf> {
-    // 1. Explicit override.
-    if let Ok(p) = std::env::var("VCT_HUB_BIN") {
-        let path = PathBuf::from(&p);
-        if is_executable(&path) {
-            return Some(path);
-        }
-        tracing::warn!(
-            "[vct] VCT_HUB_BIN set to {} but not executable; falling through",
-            p
+    let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() else {
+        tracing::error!(
+            "[vct] no Python interpreter could be resolved for \
+             `vco_lib.hub_ensure` — this is a BROKEN VCO install, not a \
+             fallback case. The hub cannot be located; run install.py."
         );
-    }
+        return None;
+    };
 
-    // NOTE on hub freshness during an update (v0.2.55): the hub is kept
-    // fresh by TWO mechanisms —
-    //   (1) install.py Step 8c starts the freshly-deployed dist hub by its
-    //       ABSOLUTE path (`[<dist>/vct-hub, --start-if-not-running]`,
-    //       install.py ~21468) before control returns to the launcher; and
-    //   (2) `WaitForBinaryRefresh` (installer.rs) now gates the post-update
-    //       restart on the on-disk hub METADATA version (read from the dist
-    //       sidecar, not from PATH), so the restart can't proceed into a
-    //       stale-hub state.
-    // An earlier v0.2.55 draft added an in-process dist-preference branch
-    // here gated on `VCT_AUTO_RESTART_LAUNCHER=1`; that env var is set only
-    // on the install.py CHILD (installer.rs cmd.env), never on the launcher
-    // process that runs find_hub_binary(), so the branch was dead in
-    // production. Dropped. v0.2.63 makes the dist-sibling preference the
-    // steady-state default below (NOT env-gated) — see step 2.
-
-    // 2. INSTALL-FOLDER copy (v0.2.63): the `vct-hub` sibling of THIS
-    // launcher binary, then the arch-less fallback one dir up. Preferred
-    // over PATH/`~/.vct/bin` because it is guaranteed to be the hub that
-    // shipped with this exact launcher build. A stale `vct-hub` on PATH
-    // (a leftover dev build, an old global install) must NOT win over the
-    // copy install.py just deployed next to the launcher. Honours the
-    // `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY` test-isolation gate.
-    if let Some(sibling) = find_hub_dist_sibling() {
-        return Some(sibling);
+    let mut cmd = Command::new(&python);
+    // `--no-repo-dist`: the launcher anchors step 2 on its OWN binary's
+    // directory, NOT on the checkout's `launcher/dist/`. In a shipped install
+    // those are the same directory; in a dev tree they are not, and letting a
+    // `cargo run` launcher fall back to the checkout's dist/ would hand it a
+    // hub it never used to find. Consolidating the chain must not quietly add
+    // a discovery source to one of its callers.
+    cmd.args([
+        "-m",
+        "vco_lib.hub_ensure",
+        "resolve",
+        "--json",
+        "--no-repo-dist",
+    ]);
+    for dir in launcher_install_dirs() {
+        cmd.arg("--extra-dir").arg(dir);
     }
-
-    // 3. PATH lookup.
-    if let Some(on_path) = find_on_path("vct-hub") {
-        return Some(on_path);
+    // Run from the orchestrator checkout so `-m vco_lib...` imports even when
+    // the resolved interpreter is a bare PATH python rather than the install's
+    // venv. This sets only the CWD — it is deliberately NOT passed as
+    // `--repo-root` (see `--no-repo-dist` above). Best-effort: an unresolvable
+    // root just means we rely on the venv having `vco_lib` installed.
+    if let Ok(root) = crate::commands::installer::find_local_repo_root() {
+        cmd.current_dir(&root);
     }
-
-    // 4. User-install location.
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let candidate = home.join(".vct").join("bin").join(hub_binary_name());
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    // Windows: USERPROFILE rather than HOME.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
-    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-        let candidate = profile.join(".vct").join("bin").join(hub_binary_name());
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
 
-    None
+    let out = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::error!(
+                "[vct] could not run `{} -m vco_lib.hub_ensure resolve`: {} \
+                 — BROKEN VCO install; the hub cannot be located.",
+                python.display(),
+                e
+            );
+            return None;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                "[vct] `vco_lib.hub_ensure resolve` produced unparseable output \
+                 (exit {:?}): {} — stderr: {}",
+                out.status.code(),
+                e,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+    };
+
+    match parsed.get("state").and_then(|s| s.as_str()) {
+        Some("resolved") => parsed
+            .get("binary")
+            .and_then(|b| b.as_str())
+            .map(PathBuf::from),
+        Some("binary_not_found") => None,
+        other => {
+            tracing::error!(
+                "[vct] `vco_lib.hub_ensure resolve` reported unexpected state \
+                 {:?}: {}",
+                other,
+                parsed
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("(no reason)")
+            );
+            None
+        }
+    }
 }
+
 
 /// True if `a` and `b` resolve to the same on-disk executable. Canonicalizes
 /// both (resolving symlinks); on unix also treats an equal `(dev, inode)` pair
@@ -179,89 +243,111 @@ fn running_hub_is_stale(
     }
 }
 
-/// v0.2.55: resolve the in-tree dist `vct-hub` sibling relative to the
-/// running launcher binary (the layout `build-bundled-launcher.sh`
-/// produces). Returns the first executable of:
-///   4. `<dir of current_exe>/vct-hub` (sibling)
-///   5. `<dir of current_exe>/../vct-hub` (arch-less fallback)
-/// or `None`.
+/// The launcher's own install-folder anchors, handed to the SSOT resolver as
+/// `--extra-dir` (highest-priority install-folder candidates).
 ///
-/// v0.2.53 test-isolation gate is honoured here: when running under
-/// `cargo test`, `current_exe()` points into `target/debug/deps/` whose
-/// grandparent is `target/debug/` — and sibling cargo invocations leave a
-/// real `vct-hub` binary there, making deterministic "no hub anywhere"
-/// tests impossible. Setting `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1`
-/// makes this return `None`; production never sets it so it's a no-op
-/// there.
-fn find_hub_dist_sibling() -> Option<PathBuf> {
+/// These are the ONE input `vco_lib.hub_ensure` cannot derive for itself: the
+/// directory of the RUNNING launcher binary, and its parent. That is the
+/// layout `build-bundled-launcher.sh` produces, and it is preferred over
+/// `$PATH` / `~/.vct/bin` (v0.2.63) because the sibling copy is guaranteed to
+/// be the hub that shipped with this exact launcher build — a stale `vct-hub`
+/// on PATH (a leftover dev build, an old global install) must not win over
+/// the copy install.py just deployed next to the launcher.
+///
+/// Returns an EMPTY list under a cargo test harness (or when
+/// `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY` is set), so tests never resolve
+/// `target/debug/vct-hub`.
+///
+/// v0.2.53's test-isolation env var is honoured here; v0.2.92 made the gate
+/// DEFAULT-ON under a test harness rather than opt-in. The env var was the
+/// only protection, and only the tests in THIS module ever set it. Every
+/// other test in the workspace that reached `find_hub_binary()` resolved
+/// `target/debug/vct-hub`, and `ensure_hub_running()` then SPAWNED it —
+/// against the developer's real `~/.vct`, where `Db::open` ran migrations on
+/// their production `launcher.db`. Measured: a `cargo test --workspace` run
+/// produced a complete live state dir (`launcher.db`, `hub.pid`, `hub.token`,
+/// `logs/hub.<date>.log`) whose `hub.pid` identity line carried the working
+/// tree's `-dirty` suffix — i.e. it was this `target/debug` build, not the
+/// installed one.
+///
+/// "Remember to set the env var" is not a mechanism; [`exe_is_test_harness`]
+/// is. See its docs for why the check cannot produce a false positive in
+/// production.
+fn launcher_install_dirs() -> Vec<PathBuf> {
     if std::env::var_os("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY").is_some() {
-        return None;
+        return Vec::new();
     }
-    let exe = std::env::current_exe().ok()?;
-    let parent = exe.parent()?;
-    // Sibling layout: same dir as the launcher binary contains vct-hub too.
-    let sibling = parent.join(hub_binary_name());
-    if is_executable(&sibling) {
-        return Some(sibling);
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    if exe_is_test_harness(&exe) {
+        return Vec::new();
     }
+    let Some(parent) = exe.parent() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![parent.to_path_buf()];
     // Arch-less fallback one dir up (some packaging layouts).
     if let Some(grandparent) = parent.parent() {
-        let fallback = grandparent.join(hub_binary_name());
-        if is_executable(&fallback) {
-            return Some(fallback);
-        }
+        dirs.push(grandparent.to_path_buf());
     }
-    None
+    dirs
 }
 
-/// `vct-hub` on POSIX, `vct-hub.exe` on Windows.
-fn hub_binary_name() -> &'static str {
-    if cfg!(windows) {
-        "vct-hub.exe"
-    } else {
-        "vct-hub"
-    }
+
+/// True when `exe` is a cargo TEST binary rather than a shipped launcher.
+///
+/// Cargo puts every test / bench / example binary in `<target>/<profile>/deps/`
+/// — a hash-suffixed file whose PARENT DIRECTORY is named `deps`. That holds
+/// for unit tests (`--lib`), integration tests (`tests/*.rs`), doc-tests and
+/// `cargo nextest`, on all three OSes, and it does not depend on anyone
+/// remembering to set anything.
+///
+/// It cannot fire in production. Shipped layouts are
+/// `<install>/launcher/dist/<os>-<arch>/vct-launcher` (parent
+/// `linux-x64` / `darwin-arm64` / `windows-x64`) and the packaged app bundles;
+/// none is named `deps`. A dev `cargo run` is `<target>/<profile>/vct-launcher`
+/// — parent `debug`, not `deps` — so the dev workflow of "my `cargo run`
+/// launcher uses my `cargo build` hub" is preserved deliberately.
+///
+/// Tri-OS: `Path::parent` / `Path::file_name` are platform-native, so the same
+/// comparison reads `...\target\debug\deps\foo-abc.exe` on Windows. Nothing
+/// here is case-sensitive beyond the directory name cargo itself creates.
+///
+/// Worst case if a user really does install into a directory named `deps`:
+/// discovery falls through to `$VCT_HUB_BIN`, `$PATH` and `~/.vct/bin`, which
+/// is a degraded lookup — never a wrong action.
+fn exe_is_test_harness(exe: &std::path::Path) -> bool {
+    exe.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n == std::ffi::OsStr::new("deps"))
+        .unwrap_or(false)
 }
 
-/// Is `path` an executable regular file? On Unix we also check the
-/// owner-execute bit; on Windows we only check existence + is_file
-/// (file association determines runnability).
-fn is_executable(path: &std::path::Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+/// [`exe_is_test_harness`] applied to THIS process.
+///
+/// The ONE home for "am I a cargo test binary?" — used by the hub-discovery
+/// gate above and by
+/// [`crate::commands::update_gate::pre_update_hub_kill_sweep`], which reaps
+/// hub processes by exe basename and is therefore blind to `VCT_STATE_DIR`
+/// isolation. Do not add a second copy of this predicate.
+///
+/// Conservative on error: an unresolvable `current_exe()` reads as "not a
+/// test", i.e. production behaviour, because the production consequence of a
+/// wrong `false` (a hub spawn) is milder than the consequence of a wrong
+/// `true` (an update that silently skips stopping the hub).
+pub(crate) fn running_under_test_harness() -> bool {
+    std::env::current_exe()
+        .map(|exe| exe_is_test_harness(&exe))
+        .unwrap_or(false)
 }
 
-/// Walk `$PATH` looking for `name` (with `.exe` suffix on Windows).
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let Some(path_env) = std::env::var_os("PATH") else {
-        return None;
-    };
-    let needle = if cfg!(windows) && !name.ends_with(".exe") {
-        format!("{}.exe", name)
-    } else {
-        name.to_string()
-    };
-    for dir in std::env::split_paths(&path_env) {
-        let candidate = dir.join(&needle);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
+// v0.2.92 (R20): `hub_binary_name()`, `is_executable()` and `find_on_path()`
+// used to live here. They were the Rust third of a three-way mirror of hub
+// binary discovery; all three now have ONE home in `vco_lib/hub_ensure.py`
+// (`hub_binary_names()`, `_is_executable()`, and the `$PATH` step of
+// `find_hub_binary()`). Do not re-add a Rust copy — call the module.
+
 
 /// Outcome of an attempted start.
 #[derive(Debug, PartialEq, Eq)]
@@ -455,17 +541,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn is_executable_returns_false_for_missing_path() {
-        assert!(!is_executable(std::path::Path::new(
-            "/definitely/not/a/real/path/vct-hub"
-        )));
-    }
-
-    #[test]
-    fn is_executable_returns_false_for_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(!is_executable(tmp.path()));
+    /// An ABSOLUTE python interpreter path, resolved from the REAL `$PATH`
+    /// before a test constrains it.
+    ///
+    /// Needed because v0.2.92 (R20) made `find_hub_binary` delegate to
+    /// `vco_lib.hub_ensure`, which means `$PATH` now feeds TWO things: step 3
+    /// of the hub-discovery chain (what these tests want to control) and the
+    /// last-resort tier of interpreter discovery (what they must not break).
+    /// Pinning the interpreter through `$VCT_VENV` — tier 1 of the RT-4
+    /// ladder, ahead of `$PATH` — decouples them, so a test can still nuke
+    /// `$PATH` to isolate the chain.
+    ///
+    /// Panics if no interpreter exists: a machine that cannot run Python
+    /// cannot run VCO at all (`install.py` IS the installer), so that is a
+    /// broken environment to report loudly, not to skip over.
+    fn absolute_python_for_tests() -> String {
+        let names: &[&str] = if cfg!(windows) {
+            &["python.exe", "py.exe", "python3.exe"]
+        } else {
+            &["python3", "python"]
+        };
+        let path_env = std::env::var_os("PATH").expect("PATH must be set");
+        for dir in std::env::split_paths(&path_env) {
+            for name in names {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
+        }
+        panic!(
+            "no python interpreter on PATH; hub discovery is delegated to \
+             vco_lib.hub_ensure and cannot be exercised without one"
+        );
     }
 
     #[test]
@@ -479,11 +587,13 @@ mod tests {
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        let py = absolute_python_for_tests();
         with_env(
             &[
                 ("VCT_HUB_BIN", Some(exe.to_str().unwrap())),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),
+                ("VCT_VENV", Some(&py)),
             ],
             || {
                 let found = find_hub_binary().expect("override resolves");
@@ -496,6 +606,7 @@ mod tests {
     fn find_hub_binary_falls_through_when_override_is_not_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let nonexec = tmp.path().join("does-not-exist");
+        let py = absolute_python_for_tests();
         with_env(
             &[
                 ("VCT_HUB_BIN", Some(nonexec.to_str().unwrap())),
@@ -505,6 +616,7 @@ mod tests {
                 // `target/debug/vct-hub` binary other cargo runs leave behind
                 // doesn't poison this test. Production never sets this var.
                 ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+                ("VCT_VENV", Some(&py)),
             ],
             || {
                 // No legitimate hub anywhere → None.
@@ -515,12 +627,14 @@ mod tests {
 
     #[test]
     fn find_hub_binary_returns_none_when_nothing_resolves() {
+        let py = absolute_python_for_tests();
         with_env(
             &[
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),
                 ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+                ("VCT_VENV", Some(&py)),
             ],
             || {
                 assert_eq!(find_hub_binary(), None);
@@ -528,27 +642,100 @@ mod tests {
         );
     }
 
+    // ─── v0.2.92: the default-on test-harness gate ───────────────────────
+
     #[test]
-    fn find_hub_dist_sibling_respects_test_isolation_gate() {
-        // The extracted helper must honour the test-isolation gate the
-        // same way the inlined steps 4+5 did (else cargo-test cross-talk
-        // poisons the "nothing resolves" tests).
+    fn exe_in_a_cargo_deps_dir_is_recognised_as_a_test_harness() {
+        // Exactly the shape `cargo test` produces, for the three build
+        // layouts a harness binary can appear in.
+        for p in [
+            "/repo/launcher/src-tauri/target/debug/deps/vct_launcher_temp-1a2b3c",
+            "/repo/target/release/deps/integration_test-9f8e7d",
+            "/custom/CARGO_TARGET_DIR/debug/deps/doctest-0000",
+        ] {
+            assert!(
+                exe_is_test_harness(std::path::Path::new(p)),
+                "must be recognised as a harness: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_and_dev_launcher_layouts_are_not_test_harnesses() {
+        // If ANY of these read as a harness, a real user's launcher would
+        // stop finding its install-folder hub — the guard's only failure
+        // mode that matters.
+        for p in [
+            // Shipped: `build-bundled-launcher.sh` layout.
+            "/opt/vct/launcher/dist/linux-x64/vct-launcher",
+            "/Applications/VCT.app/Contents/MacOS/vct-launcher",
+            "/home/u/.local/share/vct/vct-launcher",
+            // Dev: `cargo run` / `cargo build` output (NOT under deps/).
+            "/repo/launcher/src-tauri/target/debug/vct-launcher",
+            "/repo/launcher/src-tauri/target/release/vct-launcher",
+            // A path with no parent at all.
+            "vct-launcher",
+        ] {
+            assert!(
+                !exe_is_test_harness(std::path::Path::new(p)),
+                "must NOT be treated as a harness: {p}"
+            );
+        }
+    }
+
+    /// The gate is only worth anything if it fires for the process actually
+    /// running these assertions. If cargo ever changes its output layout,
+    /// this fails and says so — rather than the protection quietly lapsing.
+    #[test]
+    fn this_very_test_binary_is_detected_as_a_test_harness() {
+        let exe = std::env::current_exe().expect("current_exe");
+        assert!(
+            exe_is_test_harness(&exe),
+            "the running test binary must be detected as a harness; \
+             current_exe() = {}",
+            exe.display()
+        );
+        assert!(running_under_test_harness());
+    }
+
+    /// Default-on: with the opt-in env var ABSENT, the launcher must still
+    /// hand the resolver NO install-folder anchors under the harness. This is
+    /// the assertion that would have caught the original incident — the
+    /// pre-v0.2.92 code returned `Some(target/debug/vct-hub)` here.
+    #[test]
+    fn launcher_install_dirs_are_empty_under_a_test_harness_without_the_env_gate() {
+        with_env(&[("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", None)], || {
+            assert!(
+                launcher_install_dirs().is_empty(),
+                "install-folder anchors must be OFF by default under cargo \
+                 test, not merely off when a test remembers to set the env var"
+            );
+        });
+    }
+
+    #[test]
+    fn launcher_install_dirs_respect_test_isolation_gate() {
+        // The helper must honour the test-isolation gate the same way the
+        // inlined steps 4+5 did (else cargo-test cross-talk poisons the
+        // "nothing resolves" tests).
         with_env(
             &[("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1"))],
             || {
-                assert_eq!(find_hub_dist_sibling(), None);
+                assert!(launcher_install_dirs().is_empty());
             },
         );
     }
 
     #[test]
     fn ensure_hub_running_reports_binary_not_found_in_clean_env() {
+        let py = absolute_python_for_tests();
         with_env(
             &[
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),
                 ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+                ("VCT_VENV", Some(&py)),
             ],
             || {
                 assert_eq!(ensure_hub_running(), SpawnOutcome::BinaryNotFound);
@@ -623,13 +810,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hub_binary_name_picks_per_platform_extension() {
-        let n = hub_binary_name();
-        #[cfg(windows)]
-        assert_eq!(n, "vct-hub.exe");
-        #[cfg(not(windows))]
-        assert_eq!(n, "vct-hub");
+    /// Filename a test FIXTURE must use on this platform. Not a resolution
+    /// primitive — the real per-platform name list is
+    /// `vco_lib.hub_ensure.hub_binary_names()` (pinned by
+    /// `tests/test_v0292_hub_ensure.py`), which this only has to agree with
+    /// well enough to create a file the resolver will find.
+    fn test_hub_filename() -> &'static str {
+        if cfg!(windows) {
+            "vct-hub.exe"
+        } else {
+            "vct-hub"
+        }
     }
 
     // ── v0.2.63: same_binary identity check (drives the boot-time swap) ──
@@ -684,19 +875,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("pathdir");
         std::fs::create_dir(&dir).unwrap();
-        let exe = dir.join(hub_binary_name());
+        let exe = dir.join(test_hub_filename());
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let py = absolute_python_for_tests();
         with_env(
             &[
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some(dir.to_str().unwrap())),
                 ("HOME", Some("/nonexistent-home")),
                 ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+                ("VCT_VENV", Some(&py)),
             ],
             || {
                 assert_eq!(find_hub_binary(), Some(exe.clone()));
@@ -747,19 +940,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bindir = tmp.path().join(".vct").join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
-        let exe = bindir.join(hub_binary_name());
+        let exe = bindir.join(test_hub_filename());
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let py = absolute_python_for_tests();
         with_env(
             &[
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some(tmp.path().to_str().unwrap())),
                 ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+                ("VCT_VENV", Some(&py)),
             ],
             || {
                 assert_eq!(find_hub_binary(), Some(exe.clone()));

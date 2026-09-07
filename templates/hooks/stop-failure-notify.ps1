@@ -39,15 +39,21 @@ if ($PY -and $Payload) {
     } catch { }
 }
 
-# Log the failure under the user's home metrics dir.
-$UserHome = [System.Environment]::GetFolderPath('UserProfile')
-$LogDir = Join-Path $UserHome ".claude/metrics"
-if (-not (Test-Path $LogDir)) {
-    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+# Log the failure. v0.2.92 W7: the metrics home moved out of ~/.claude;
+# `_lib/metrics-dir.ps1` is the ONE PowerShell-side resolver (lockstep sibling
+# of `_lib/metrics-dir.sh`). A missing helper skips the log line rather than
+# guessing a path — the urgent notification below still fires, which is the
+# part the user actually depends on.
+$MetricsLib = Join-Path $PSScriptRoot "_lib/metrics-dir.ps1"
+if (Test-Path -LiteralPath $MetricsLib -PathType Leaf) {
+    . $MetricsLib
+    $LogDir = Get-VcoMetricsDir
+    if ($LogDir) {
+        $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $line = "{""timestamp"":""$ts"",""project"":""$ProjectName"",""session_id"":""$SessionId"",""error_type"":""$ErrorType"",""error_message"":""$ErrorMsg""}"
+        try { Add-Content -Path (Join-Path $LogDir "failures.jsonl") -Value $line } catch { }
+    }
 }
-$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$line = "{""timestamp"":""$ts"",""project"":""$ProjectName"",""session_id"":""$SessionId"",""error_type"":""$ErrorType"",""error_message"":""$ErrorMsg""}"
-try { Add-Content -Path (Join-Path $LogDir "failures.jsonl") -Value $line } catch { }
 
 # Urgent cross-platform notification.
 $NotifyScript = Join-Path $ProjectDir ".claude/scripts/notify.py"

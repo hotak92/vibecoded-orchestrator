@@ -48,7 +48,10 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   KG_NUDGE_INTERVAL=<int>  overrides the 50_000 subsequent interval
 #   KG_NUDGE_GC_DAYS=<int>   overrides the 14-day stale-session GC window
 #
-# State: ~/.claude/metrics/kg_update_tokens.jsonl
+# State: <metrics dir>/kg_update_tokens.jsonl  (v0.2.92 W7: `_lib/metrics-dir.sh`
+#   resolves it — `$VCT_STATE_DIR/metrics`, default `~/.vct/metrics`; it used to
+#   be `~/.claude/metrics`, which is now a frozen archive we still READ so a
+#   counter that predates the move is not silently reset to zero.)
 #   {session_id, baseline, last_nudge_at, last_seen_total, fired_once, updated_at}
 #   HK-4/D-7 (v0.2.73): the whole read-modify-write is guarded by a flock on
 #   a STABLE sidecar lockfile (kg_update_tokens.jsonl.lock) — real mutual
@@ -77,10 +80,30 @@ INPUT="$(cat 2>/dev/null || true)"
 FIRST_THRESHOLD="${KG_NUDGE_FIRST:-175000}"
 INTERVAL="${KG_NUDGE_INTERVAL:-50000}"
 METRIC_VERSION="v10"
-METRICS_DIR="$HOME/.claude/metrics"
+
+# v0.2.92 W7: ONE shell-side resolver for the metrics home (sibling:
+# `_lib/metrics-dir.ps1`). Missing helper => silent no-op, same discipline as
+# the missing-Python case above.
+_KGN_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/metrics-dir.sh"
+[ -f "$_KGN_LIB" ] || exit 0
+# shellcheck source=_lib/metrics-dir.sh disable=SC1091
+. "$_KGN_LIB"
+METRICS_DIR="$(vco_metrics_dir 2>/dev/null || printf '')"
+[ -n "$METRICS_DIR" ] || exit 0
 METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
-mkdir -p "$METRICS_DIR" 2>/dev/null || exit 0
+# Counter continuity across the W7 move: when the new file does not exist yet
+# but the frozen archive holds one, seed FROM the archive (a plain read + copy;
+# the archive is never written to and never deleted). Without this a machine
+# that updates mid-session restarts its work-unit baseline at zero and the
+# nudge fires late. This is a per-file convenience on the hot path — the full
+# COPY of every stream is `vco_lib.metrics_migration`.
+if [ ! -f "$METRICS_FILE" ]; then
+    _KGN_LEGACY="$(vco_metrics_read_file "kg_update_tokens.jsonl" 2>/dev/null || printf '')"
+    if [ -n "$_KGN_LEGACY" ] && [ "$_KGN_LEGACY" != "$METRICS_FILE" ]; then
+        cp "$_KGN_LEGACY" "$METRICS_FILE" 2>/dev/null || true
+    fi
+fi
 
 # Pass INPUT (untrusted JSON payload) via env var — payload containing """,
 # backslashes, or shell metacharacters can no longer break the Python parser.

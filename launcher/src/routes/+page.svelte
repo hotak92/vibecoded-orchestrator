@@ -18,11 +18,16 @@
   import RuntimeMissingBanner from '$lib/components/RuntimeMissingBanner.svelte';
   import { auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
-  import { modules } from '$lib/stores/modules';
+  import { modules, installedIds } from '$lib/stores/modules';
   import { ui } from '$lib/stores/ui';
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
-  import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
+  import {
+    detectModuleErrorAfterAction,
+    installProgressLabel,
+    resolveProjectScopedAction,
+  } from '$lib/module-status-display';
+  import type { ModuleCatalogAction } from '$lib/module-status-display';
   import { getColorRgb } from '$lib/color-rgb';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
 
@@ -39,9 +44,34 @@
     // sees so triggering here avoids the brief "no banner yet" window.
     void orchestrator.detectSystem();
     modules.loadCatalog();
+    // v0.2.92: proactively load the per-project install rows (not just
+    // after an action resolves) so `resolveProjectScopedAction` can gate
+    // the card's button correctly BEFORE the user ever clicks it — see
+    // the `$effect` below for the project-change case (mirrors the same
+    // onMount + $effect pattern ModuleCatalog.svelte already uses).
+    // `loadInstalledSpeculative` (not the plain `loadInstalled`) — this
+    // call isn't part of a user action that already narrates its own
+    // outcome, so a failure needs its own one-shot toast (see the
+    // store's docstring); until it resolves (or if it fails),
+    // `hasInstallRowForProject` below reads `null` (unknown) rather than
+    // guessing `false`.
+    if ($selectedProject) {
+      void modules.loadInstalledSpeculative($selectedProject.id);
+    }
     const handleFocus = () => auth.refreshProfile();
     window.addEventListener('focus', handleFocus);
     return () => window.removeEventListener('focus', handleFocus);
+  });
+
+  // v0.2.92: reload the per-project install rows whenever the selected
+  // project changes, so switching projects doesn't leave a stale
+  // "Update"/"Retry" button pointed at a project that has no row for
+  // this module (see `resolveProjectScopedAction`).
+  $effect(() => {
+    const project = $selectedProject;
+    if (project) {
+      void modules.loadInstalledSpeculative(project.id);
+    }
   });
 
   const orchState = $derived($orchestrator);
@@ -63,6 +93,15 @@
       | 'broken'
       | 'subcomponent'
       | 'coming_soon';
+    // v0.2.92: the project-aware action for this card, resolved once
+    // here so the template and `handleCardModuleAction` agree on exactly
+    // what clicking the button does (see `resolveProjectScopedAction`).
+    action: ModuleCatalogAction | null;
+    // v0.2.92: true while we don't yet know whether the selected project
+    // has an install row for this module (store still loading / errored
+    // / not yet requested). The template renders `action` DISABLED while
+    // this is true, rather than guessing which operation is correct.
+    pending: boolean;
   }
 
   function colorFor(e: ModuleCatalogEntry): 'teal' | 'purple' | 'pink' {
@@ -98,14 +137,48 @@
     return 'Available';
   }
 
+  // v0.2.92: tri-state signal for "does the SELECTED project have an
+  // install row for module X" — `null` (unknown) unless the store's
+  // `installed` array demonstrably reflects THIS project (matched by id)
+  // from a load that actually succeeded. Computed once per render rather
+  // than per-card so every card in the same render agrees on whether the
+  // project's state is known yet.
+  //
+  // CLAUDE.md "Conservative defaults on best-effort paths": a project
+  // switch racing ahead of `loadInstalledSpeculative`'s resolve, or that
+  // load failing outright, must NOT be read as "loaded and empty" — both
+  // leave `modulesState.installedProjectId` NOT matching the selected
+  // project, which is exactly what this check guards against.
+  let installedKnownForSelectedProject = $derived(
+    $selectedProject !== null && modulesState.installedProjectId === $selectedProject.id,
+  );
+
   let cards = $derived<AppCard[]>(
-    modulesState.catalog.map((entry) => ({
-      entry,
-      color: colorFor(entry),
-      icon: iconFor(entry),
-      badge: badgeFor(entry),
-      badgeKind: entry.kind,
-    }))
+    modulesState.catalog.map((entry) => {
+      // v0.2.92: cross-check the catalog's (cross-project) `kind` against
+      // this project's actual install rows before deciding what the
+      // button does — see `resolveProjectScopedAction` for the full rationale.
+      const hasRowForProject: boolean | null = installedKnownForSelectedProject
+        ? $installedIds.has(entry.id)
+        : null;
+      const { kindOverride, action, pending } = resolveProjectScopedAction(
+        entry.kind,
+        hasRowForProject,
+      );
+      // `badgeFor` already owns every kind → text mapping (including
+      // 'available' → 'Available'); route the override THROUGH it rather
+      // than hardcoding the override's display text a second time here.
+      const effectiveEntry = kindOverride ? { ...entry, kind: kindOverride } : entry;
+      return {
+        entry,
+        color: colorFor(entry),
+        icon: iconFor(entry),
+        badge: badgeFor(effectiveEntry),
+        badgeKind: entry.kind,
+        action,
+        pending,
+      };
+    })
   );
 
   let selectedCard = $state<AppCard | null>(null);
@@ -137,18 +210,26 @@
     selectCard(c);
   }
 
-  // Per-card action (Reinstall / Retry / Update) for actionable kinds. The
-  // catalog `kind` → {label, method} mapping is centralised in
-  // `moduleActionForKind` so Home, RightSidebar, and ModuleCatalog stay in
-  // lockstep. install/update are per-project, so a project must be selected
-  // (the button is disabled + tooltipped otherwise). UPSERT-safe commands,
-  // so a double-click can't corrupt the row.
+  // Per-card action (Reinstall / Retry / Update / Install) for actionable
+  // kinds. The catalog `kind` → {label, method} mapping is centralised in
+  // `resolveProjectScopedAction` (which itself wraps `moduleActionForKind` with
+  // a project-scoped override — see its docstring) so Home, RightSidebar,
+  // and ModuleCatalog stay in lockstep. install/update are per-project, so
+  // a project must be selected (the button is disabled + tooltipped
+  // otherwise). UPSERT-safe commands, so a double-click can't corrupt the
+  // row. `c.action` (not a fresh `moduleActionForKind` call) is used here
+  // so the dispatched command always matches what the button rendered.
   let cardActionBusyId = $state<string | null>(null);
 
   async function handleCardModuleAction(e: MouseEvent, c: AppCard) {
     e.stopPropagation(); // don't also toggle the right sidebar
-    const action = moduleActionForKind(c.badgeKind);
+    const action = c.action;
     if (!action) return;
+    // v0.2.92: backstop — the button is already rendered `disabled` while
+    // `c.pending` is true (see the template), but a click that somehow
+    // slips through (e.g. a queued event from just before the disabled
+    // attribute landed) must not fire a guessed operation.
+    if (c.pending) return;
     const project = $selectedProject;
     if (!project) {
       toast.error('Select a project first to install or update modules.');
@@ -192,10 +273,18 @@
       if (errMsg) {
         toast.error(`${c.entry.name}: ${errMsg}`, { key: toastKey });
       } else {
-        toast.success(
-          `${c.entry.name} ${action.method === 'install' ? 'reinstalled' : 'updated'}`,
-          { key: toastKey },
-        );
+        // v0.2.92: word the success toast off `action.label`, not just
+        // `action.method` — the fresh-install fallback (no row for this
+        // project) and the broken/error Reinstall/Retry paths all share
+        // method:'install', but only the latter two are actually
+        // "re"-installs from this project's point of view.
+        const successVerb =
+          action.method === 'update'
+            ? 'updated'
+            : action.label === 'Install'
+              ? 'installed'
+              : 'reinstalled';
+        toast.success(`${c.entry.name} ${successVerb}`, { key: toastKey });
       }
     } catch (err) {
       console.error('[home] module action threw', { module: c.entry.id, err });
@@ -290,20 +379,54 @@
                   >
                     Open dashboard
                   </button>
-                {:else if moduleActionForKind(c.badgeKind)}
-                  <!-- Actionable status (broken/error/update_available):
-                       expose the action button here too, not just on the
-                       /modules page. Disabled + tooltipped when no project
-                       is selected (install/update are per-project). -->
+                {:else if cardActionBusyId === c.entry.id}
+                  <!-- v0.2.92: in-flight install/retry/update. The field
+                       report (2026-08-31) was that this state gave NO
+                       visual feedback for ~3 real minutes (the RL Reranker
+                       image pull) — the button just showed a static "…"
+                       and the card kept showing the old version the whole
+                       time. Mirrors the exact spinner + live-stage idiom
+                       ModuleCatalog.svelte already uses on the /modules
+                       page (`status-badge status-badge-bundled` +
+                       `.spinner-sm`), fed by the SAME
+                       `module://install-progress` events the backend
+                       already emits for both `run_install` and
+                       `run_upgrade` (installer_engine.rs) — real phases
+                       ("Fetching updated source", "Running pre-upgrade
+                       step 1/2", "Applying module DB migrations", …), not
+                       an invented progress sequence. Falls back to a
+                       plain "Installing…"/"Updating…" before the first
+                       event arrives (network latency to the first emit). -->
+                  <span class="app-card-status app-card-status-busy">
+                    <span class="spinner-sm" aria-hidden="true"></span>
+                    {installProgressLabel(modulesState.installProgress[c.entry.id] ?? null) ??
+                      (c.action?.method === 'update' ? 'Updating…' : 'Installing…')}
+                  </span>
+                {:else if c.action}
+                  <!-- Actionable status (broken/error/update_available, or
+                       the project-scoped Install fallback resolved by
+                       `resolveProjectScopedAction`): expose the action button
+                       here too, not just on the /modules page. Disabled +
+                       tooltipped when no project is selected (install/
+                       update are per-project), OR while `c.pending` is
+                       true — v0.2.92: we don't yet know whether this
+                       project has an install row for the module (the
+                       store's per-project load hasn't resolved yet, or
+                       it failed), so rather than guess Update vs Install
+                       we render the un-overridden action disabled until
+                       the answer is known (CLAUDE.md "Conservative
+                       defaults on best-effort paths"). -->
                   <button
                     class="btn-3d btn-3d-primary btn-3d-sm"
-                    disabled={cardActionBusyId === c.entry.id || !$selectedProject}
-                    title={!$selectedProject ? 'Select a project first' : ''}
+                    disabled={!$selectedProject || c.pending}
+                    title={!$selectedProject
+                      ? 'Select a project first'
+                      : c.pending
+                        ? "Checking this project's install status…"
+                        : ''}
                     onclick={(e) => handleCardModuleAction(e, c)}
                   >
-                    {cardActionBusyId === c.entry.id
-                      ? '…'
-                      : moduleActionForKind(c.badgeKind)?.label}
+                    {c.action.label}
                   </button>
                 {:else}
                   <span class="app-card-status app-card-installed">{c.badge}</span>
@@ -566,6 +689,38 @@
   .app-card-installed {
     color: var(--color-teal);
     background: rgba(0, 191, 166, 0.1);
+  }
+
+  /* v0.2.92: in-flight install/update badge. Same purple "working"
+     vocabulary as ModuleCatalog.svelte's `.status-badge-bundled` (the
+     /modules page tile) so the two surfaces read consistently — a
+     module mid-install looks the same whether the user is on the Home
+     Library grid or the Modules page. */
+  .app-card-status-busy {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--color-purple, #b29bff);
+    background: rgba(123, 95, 255, 0.12);
+    border: 1px solid rgba(123, 95, 255, 0.3);
+    white-space: nowrap;
+  }
+
+  .spinner-sm {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    border: 2px solid rgba(123, 95, 255, 0.25);
+    border-top-color: var(--color-purple, #b29bff);
+    border-radius: 50%;
+    animation: app-card-spin 0.6s linear infinite;
+  }
+
+  @keyframes app-card-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   /* Coming-soon visual state: dimmer card, pink badge — same pattern as

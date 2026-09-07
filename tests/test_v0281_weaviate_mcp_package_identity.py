@@ -35,6 +35,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_PY = REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
 PKG_PARENT = REPO_ROOT / "claude_mcp_servers"
@@ -49,6 +51,7 @@ def _run_driver(driver: str, timeout: int = 90) -> subprocess.CompletedProcess:
         text=True,
         timeout=timeout,
         cwd=str(SERVER_PY.parent),
+        env=child_env(),
     )
 
 
@@ -68,6 +71,7 @@ def test_bare_script_load_emits_no_importwarning_and_no_import_error():
         stderr=subprocess.STDOUT,
         text=True,
         stdin=subprocess.DEVNULL,
+        env=child_env(),
     )
     try:
         out, _ = proc.communicate(timeout=45)

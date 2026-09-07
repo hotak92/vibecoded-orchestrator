@@ -1088,3 +1088,78 @@ def test_iterate_failure_counts_into_failures():
         client, "P", "Old Name", "NewName", dry_run=True,
     )
     assert summary.failures >= 1, summary.summary_line()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.2.92 (Defect B / B-RISK-7) — occurrence-suffixed rows must MIGRATE
+#
+# The writer disambiguates same-named symbols in ONE file as `<key>#n` for the
+# 2nd..Nth occurrence (occurrence 1 keeps the BARE key). `_plan_one_row`
+# reconstructs the identity key from STORED PROPS, so it can only ever build
+# the bare form — before this fix a `#n` row reproduced no candidate UUID and
+# was LEFT BEHIND on an identity migration. Honest (never deleted, never given
+# a wrong destination) but a real gap: the rows that most needed carrying over
+# are exactly the ones the previous release had been clobbering.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _fake_uuid_builder(identity: str, file_path_rel: str, identity_key: str,
+                       *, project_source: str = "") -> str:
+    """Stand-in for the analyzer's `_deterministic_uuid` — same ARG SHAPE, so a
+    signature drift in the real builder surfaces here rather than silently
+    producing plausible-looking uuids."""
+    seed = f"{identity}|{file_path_rel}|{identity_key}|{project_source}"
+    return str(_uuid_mod.uuid5(_uuid_mod.NAMESPACE_URL, seed))
+
+
+def _plan_for(identity_key_used: str, *, chunk_num: int = 0):
+    """Mint a source uuid the way the WRITER would have, then ask the planner to
+    reconstruct it. `identity_key_used` is what actually seeded the stored row."""
+    props = {
+        "full_name": "engine.reset",
+        "file_path": "src/engine.rs",
+        "project_source": "",
+    }
+    if chunk_num:
+        props["chunk_num"] = chunk_num
+    src_uuid = _fake_uuid_builder("OLD", "src/engine.rs", identity_key_used)
+    return vc._plan_one_row(
+        "CodeFunction", src_uuid, props, "OLD", "NEW", _fake_uuid_builder,
+    )
+
+
+def test_B_RISK7_occurrence_1_bare_key_still_migrates():
+    """LEAVE-ALONE half: the ~99% of rows that never collided are unaffected,
+    and still match on the FIRST candidate tried (bare key, first path form)."""
+    plan = _plan_for("engine.reset")
+    assert plan is not None, "an ordinary un-suffixed row must still migrate"
+
+
+def test_B_RISK7_occurrence_2_suffixed_row_now_migrates():
+    """ACT half: a `#2` row is reproducible and therefore carried over.
+
+    RED before the cross-product fix — the planner only ever built the bare
+    key, so this row reproduced nothing and was left behind.
+    """
+    plan = _plan_for("engine.reset#2")
+    assert plan is not None, (
+        "a `#n` occurrence row must be reconstructable — otherwise an identity "
+        "migration silently strands exactly the rows Defect B recovered"
+    )
+
+
+def test_B_RISK7_suffix_composes_before_the_chunk_key():
+    """`#n` is composed BEFORE `::chunk_num`, matching the order the writer
+    emits (`chunk_identities` appends `::i` to whatever key it is given). The
+    two alphabets are disjoint on purpose: `::<int>` is the chunk space."""
+    assert _plan_for("engine.reset#2::1", chunk_num=1) is not None
+    # ...and the WRONG order must NOT accidentally resolve.
+    assert _plan_for("engine.reset::1#2", chunk_num=1) is None
+
+
+def test_B_RISK7_beyond_the_bound_is_left_not_mis_migrated():
+    """An occurrence past `_MAX_DUPLICATE_OCCURRENCES` is LEFT IN PLACE (counted),
+    exactly like any other unreproducible row — never deleted, never given a
+    wrong destination uuid. Bounding the search must fail SAFE, not silently
+    mint something plausible."""
+    beyond = vc._MAX_DUPLICATE_OCCURRENCES + 1
+    assert _plan_for(f"engine.reset#{beyond}") is None

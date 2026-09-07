@@ -16,7 +16,7 @@
 
 import { writable, get } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
-import { orchestrator, cancelScheduledRetry } from './orchestrator';
+import { orchestrator, cancelScheduledRetry, renderCheck, checkError } from './orchestrator';
 // M-P1-5: scope the seen-version flag by install_root so two clones
 // on the same machine maintain independent dismissal state. The
 // helper transparently migrates the legacy unscoped key on first
@@ -163,14 +163,14 @@ interface UpdaterState {
    *  install/update/restart is running. */
   checking: boolean;
   /** v0.2.83 (WP-A2 / D3): the last `check_for_updates` could NOT determine
-   *  remote state (`remote_check_ok === false`) AND there is no real pending
-   *  update to show (kind === null). When true, `UpdateBadge` renders the
-   *  amber "couldn't check, retrying" state instead of nothing — the badge
+   *  remote state (`remote_check.state === 'unknown'`) AND there is no real
+   *  pending update to show (kind === null). When true, `UpdateBadge` renders
+   *  the amber "couldn't check, retrying" state instead of nothing — the badge
    *  must NEVER silently imply "up to date" when the check actually failed.
    *  Derived in `syncFromOrchestrator()` from the orchestrator store. */
   remoteCheckFailed: boolean;
   /** v0.2.83 (WP-A2 / D3): the concise error/stage label from the failed
-   *  remote check (`updateStatus.remote_check_error`), surfaced in the
+   *  remote check (`checkError(updateStatus.remote_check)`), surfaced in the
    *  amber popover copy. Null when the check succeeded or is not applicable. */
   remoteCheckError: string | null;
 }
@@ -364,16 +364,16 @@ function createUpdaterStore() {
     // a prior poll must not paint amber over a genuine update badge.
     //
     // N-4: derive from the orchestrator store's EXPLICIT `lastCheckFailed`, NOT
-    // from the live `updateStatus`. The old `!!us && us.remote_check_ok===false`
+    // from the live `updateStatus`. The old `!!us && <probe failed>`
     // derivation rendered NOTHING when the check itself soft-failed to a null
     // `updateStatus` (the command errored) — the exact silent gap N-4 closes.
     // `lastCheckFailed` is `true` for BOTH a null-status completed check AND an
-    // explicit `remote_check_ok===false`; `null` before the first completed
+    // an `unknown` remote_check; `null` before the first completed
     // check (so no amber flash during startup); `false` on success.
     const us = o.updateStatus;
     const remoteCheckFailed = o.lastCheckFailed === true && kind === null;
     const remoteCheckError = remoteCheckFailed
-      ? (us?.remote_check_error ?? null)
+      ? checkError(us?.remote_check)
       : null;
     if (kind !== null) {
       // v0.2.16 (W4): the dismissal marker now keys on
@@ -428,10 +428,12 @@ function createUpdaterStore() {
      *   - sets `checking: true` for the duration (drives the button label);
      *   - awaits `orchestrator.checkStatus()` — after A-F3 this never throws,
      *     so we don't need a try/catch here; a failed backend probe surfaces
-     *     as a null updateStatus or remote_check_ok===false, both handled;
+     *     as a null updateStatus or an `unknown` remote_check, both handled;
      *   - reads the freshly-updated orchestrator store: a null updateStatus
-     *     OR remote_check_ok===false ⇒ 'check_failed' (we couldn't determine
-     *     remote state — never report 'up_to_date' in that case);
+     *     OR an `unknown` remote_check ⇒ 'check_failed' (we couldn't determine
+     *     remote state — never report 'up_to_date' in that case). A
+     *     `not_applicable` remote_check is NOT a failure: there is no remote
+     *     on this install, so the other signals decide;
      *   - syncs our derived state; a real pending update (kind !== null) ⇒
      *     un-dismiss the badge so it re-shows even if previously dismissed,
      *     and report 'available';
@@ -461,10 +463,14 @@ function createUpdaterStore() {
       }
       const o = get(orchestrator);
       const us = o.updateStatus;
-      // Couldn't determine remote state ⇒ honest 'check_failed'. A missing
-      // remote_check_ok (older Rust) is treated as healthy — only an explicit
-      // false, or a null status (command soft-failed), is a failure.
-      if (us === null || us.remote_check_ok === false) {
+      // Couldn't determine remote state ⇒ honest 'check_failed'.
+      // v0.2.92 (WP-13): driven by the tri-state. `unknown` is a failure;
+      // `not_applicable` is not (nothing to check here, so `pickKind` below
+      // decides from install_stale / binary_stale); a null status (the command
+      // itself soft-failed) is a failure for the same reason `unknown` is.
+      // The old "a MISSING field is healthy" branch is gone — see
+      // `orchestrator.ts::renderCheck`.
+      if (us === null || renderCheck(us.remote_check) === 'unknown') {
         // Refresh derived state (paints the amber remote-check-failed badge
         // when appropriate) before reporting.
         doSync();

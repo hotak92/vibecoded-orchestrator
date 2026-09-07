@@ -102,6 +102,16 @@ impl ContainerRuntime {
             ContainerRuntime::Docker => "Docker",
         }
     }
+
+    /// The OTHER runtime. Used by the install preflight to answer "you
+    /// pinned podman and it is unusable — is docker usable?" without
+    /// hardcoding the pair at the call site.
+    pub fn other(self) -> ContainerRuntime {
+        match self {
+            ContainerRuntime::Podman => ContainerRuntime::Docker,
+            ContainerRuntime::Docker => ContainerRuntime::Podman,
+        }
+    }
 }
 
 /// Whether the runtime exposes compose as a subcommand of the main
@@ -701,24 +711,47 @@ pub async fn detect_runtime() -> Option<RuntimeInfo> {
     resolved
 }
 
-async fn resolve_runtime() -> Option<RuntimeInfo> {
-    // PR-43 (v0.2.12): honor VCT_CONTAINER_RUNTIME env override so the
-    // GUI matches the hooks' behavior (templates/hooks/ensure-containers.sh,
-    // verify-container-ports.sh, ensure-code-embed-service.sh all check
-    // this var first). Without this, a user setting the var to force a
-    // specific runtime would see hooks pick one and the launcher GUI pick
-    // another — silent split-brain.
-    //
-    // Accepted values: "podman", "docker", "auto" (or unset → auto).
-    // Invalid values fall through to auto-detection with a clear stderr.
-    let override_pref = std::env::var("VCT_CONTAINER_RUNTIME")
-        .ok()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty() && s != "auto");
+// ---------------------------------------------------------------------------
+// The DECISION, separated from the PROBES (v0.2.92 PLAN-EXTENSION §3.5 / R13)
+// ---------------------------------------------------------------------------
+//
+// `vco_lib/containers.py::resolve()` is the Python home for "which runtime,
+// which compose?" — install.py and the three session-start hook pairs go
+// through it. This module is the DECLARED CLASS-C MIRROR for the launcher
+// (a compiled binary cannot shell out to Python on every services-watcher
+// tick). What keeps the two from drifting is ONE fixture,
+// `tests/fixtures/container_runtime_parity.json`, describing hosts and the
+// expected decision; `tests/test_container_runtime_ssot.py` drives the Python
+// side and `tests::parity_fixture_*` below drives `candidate_order` +
+// `select_runtime`. The async probes stay here; the decision they feed is a
+// pure function so the fixture can exercise it without podman or docker.
+//
+// The pin arm USED to diverge (v0.2.92 merge-lane ASK #1 let the Python side
+// fall through to the other runtime, loudly, while this module stayed strict).
+// BLOCKER-4 overturned that: a pinned runtime that is unusable is REFUSED on
+// both surfaces, because podman and docker have PER-RUNTIME NAMED VOLUMES
+// (`infrastructure/docker-compose.yml`) — driving the runtime the user did not
+// pin does not rescue them, it stands an EMPTY Weaviate up on :8081 that every
+// downstream heal then reads as their knowledge graph, while this module (and
+// so the GUI) reports no runtime at all. That split-brain is exactly what the
+// PR-43 override comment in `resolve_runtime` below was written to prevent.
+// `candidate_order` here and `vco_lib.containers.runtime_candidate_order` are
+// now identical for EVERY arm, and the fixture's
+// `env_pref_unusable_is_refused_not_substituted` scenario pins both sides to
+// the same answer (`expect.state = absent` for Python, `expect_rust = null`
+// here). What still differs — deliberately — is a usable runtime WITHOUT
+// compose: Python returns `resolved` with `compose: null` so install.py can
+// print compose's own error; this module returns `None` because it has
+// nothing to drive.
 
+/// Parse `VCT_CONTAINER_RUNTIME` into the probe order. MUST MATCH
+/// `vco_lib.containers.runtime_candidate_order` for the auto / unset /
+/// unrecognised arms (pinned by the parity fixture); see the divergence note
+/// above for the explicit-preference arm.
+pub(crate) fn candidate_order(override_pref: Option<&str>) -> Vec<ContainerRuntime> {
     // Preference order: env override first; else Podman > Docker.
     // Per user policy: "check for availability on podman first".
-    let order: Vec<ContainerRuntime> = match override_pref.as_deref() {
+    match override_pref {
         Some("podman") => vec![ContainerRuntime::Podman],
         Some("docker") => vec![ContainerRuntime::Docker],
         Some(other) => {
@@ -731,47 +764,135 @@ async fn resolve_runtime() -> Option<RuntimeInfo> {
             vec![ContainerRuntime::Podman, ContainerRuntime::Docker]
         }
         None => vec![ContainerRuntime::Podman, ContainerRuntime::Docker],
-    };
+    }
+}
+
+/// Normalise the raw env value the way `resolve_runtime` always has:
+/// trimmed, lower-cased, and `""` / `auto` → no preference.
+pub(crate) fn normalise_override(raw: Option<&str>) -> Option<String> {
+    raw.map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s != "auto")
+}
+
+/// One candidate after probing. Fields are short-circuited the way the
+/// lazy probe loop short-circuits (a binary not on PATH has `version_ok ==
+/// false`, etc.), so the pure decision below sees exactly what the probes
+/// established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbedCandidate {
+    pub runtime: ContainerRuntime,
+    pub on_path: bool,
+    pub version_ok: bool,
+    pub daemon_ok: bool,
+    pub compose: Option<ComposeForm>,
+}
+
+/// The pure decision: the FIRST candidate that is on PATH, whose client
+/// binary runs, whose daemon answers, AND that has a compose invocation.
+/// A usable runtime WITHOUT compose is skipped (a Podman 3.x without
+/// compose cannot bring the stack up) — which is also why this returns
+/// `None` where the Python side returns `resolved` + `compose: null`
+/// (install.py wants to print compose's own error, the launcher has
+/// nothing to drive).
+pub(crate) fn select_runtime(
+    probed: &[ProbedCandidate],
+) -> Option<(ContainerRuntime, ComposeForm)> {
+    probed
+        .iter()
+        .find(|c| c.on_path && c.version_ok && c.daemon_ok && c.compose.is_some())
+        .map(|c| (c.runtime, c.compose.expect("checked is_some")))
+}
+
+async fn resolve_runtime() -> Option<RuntimeInfo> {
+    // PR-43 (v0.2.12): honor VCT_CONTAINER_RUNTIME env override so the
+    // GUI matches the hooks' behavior (templates/hooks/ensure-containers.sh,
+    // verify-container-ports.sh, ensure-code-embed-service.sh — since
+    // v0.2.92 all three go through `vco_lib.containers`, which reads the
+    // same variable). Without this, a user setting the var to force a
+    // specific runtime would see hooks pick one and the launcher GUI pick
+    // another — silent split-brain.
+    //
+    // Accepted values: "podman", "docker", "auto" (or unset → auto).
+    // Invalid values fall through to auto-detection with a clear stderr.
+    let override_pref = normalise_override(
+        std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref(),
+    );
+    let order = candidate_order(override_pref.as_deref());
 
     for runtime in order {
-        let bin_path = match which_on_path(runtime.binary()) {
-            Some(p) => p,
-            None => continue,
-        };
-        if !version_probe(&bin_path).await {
-            continue;
+        // Probe lazily (stop at the first acceptable runtime), but feed the
+        // result through the SAME pure decision the parity fixture pins.
+        if let Some(info) = probe_runtime(runtime).await {
+            return Some(info);
         }
-        // PR-15 G1 (v0.2.11): daemon-access check. version_probe only
-        // confirms the binary runs; daemon_usable_probe confirms the
-        // daemon socket is actually reachable. Without this check, the
-        // launcher could pick a runtime whose every subsequent compose
-        // call fails silently with "permission denied". Mirrors the
-        // bash _runtime_usable() that PR-12 added to
-        // scripts/launch-claude-mcp-stack.sh::detect_runtime().
-        if !daemon_usable_probe(&bin_path, runtime).await {
-            continue;
-        }
-        let compose_form = match detect_compose_form(&bin_path, runtime).await {
-            Some(f) => f,
-            None => {
-                // Binary exists but no compose support — skip and try
-                // the next runtime (a Podman 3.x without compose is
-                // useless to us).
-                continue;
-            }
-        };
-        let needs_machine_start = match runtime {
-            ContainerRuntime::Podman => detect_podman_machine_needed(&bin_path).await,
-            ContainerRuntime::Docker => false,
-        };
-        return Some(RuntimeInfo {
-            runtime,
-            compose_form,
-            needs_machine_start,
-            binary_path: bin_path,
-        });
     }
     None
+}
+
+/// Whether a runtime's binary is on PATH at all, regardless of whether it
+/// works. Splits "you pinned podman and it is not installed" (install it, or
+/// repin) from "you pinned podman and it is installed but down" (start it).
+pub fn runtime_on_path(runtime: ContainerRuntime) -> bool {
+    which_on_path(runtime.binary()).is_some()
+}
+
+/// The runtime the user PINNED via `VCT_CONTAINER_RUNTIME`, normalised the
+/// same way `resolve_runtime` normalises it (`""` / `auto` / unrecognised →
+/// no pin). Exposed so the install preflight can say "podman is pinned but
+/// unusable; docker is usable" instead of "no runtime installed" (BLOCKER-4).
+pub fn pinned_runtime() -> Option<ContainerRuntime> {
+    match normalise_override(std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref())
+        .as_deref()
+    {
+        Some("podman") => Some(ContainerRuntime::Podman),
+        Some("docker") => Some(ContainerRuntime::Docker),
+        _ => None,
+    }
+}
+
+/// Probe ONE named runtime end-to-end — PATH, `version`, daemon, compose —
+/// and return what to drive, or `None` when any rung fails.
+///
+/// This is the body `resolve_runtime`'s loop used to inline; it is a function
+/// so the install preflight can ask about a SPECIFIC runtime (the one the
+/// user did not pin) without a second copy of the ladder. Uncached by design:
+/// both callers are user-initiated (an Install click), where freshness beats
+/// the ~50 ms probe.
+pub async fn probe_runtime(runtime: ContainerRuntime) -> Option<RuntimeInfo> {
+    let bin_path = which_on_path(runtime.binary())?;
+    if !version_probe(&bin_path).await {
+        return None;
+    }
+    // PR-15 G1 (v0.2.11): daemon-access check. version_probe only
+    // confirms the binary runs; daemon_usable_probe confirms the
+    // daemon socket is actually reachable. Without this check, the
+    // launcher could pick a runtime whose every subsequent compose
+    // call fails silently with "permission denied". Mirrors the
+    // bash _runtime_usable() that PR-12 added to
+    // scripts/launch-claude-mcp-stack.sh::detect_runtime().
+    if !daemon_usable_probe(&bin_path, runtime).await {
+        return None;
+    }
+    let probed = ProbedCandidate {
+        runtime,
+        on_path: true,
+        version_ok: true,
+        daemon_ok: true,
+        compose: detect_compose_form(&bin_path, runtime).await,
+    };
+    // Binary exists but no compose support → `None` (a Podman 3.x without
+    // compose is useless to us), so the caller tries the next runtime.
+    let (_, compose_form) = select_runtime(&[probed])?;
+    let needs_machine_start = match runtime {
+        ContainerRuntime::Podman => detect_podman_machine_needed(&bin_path).await,
+        ContainerRuntime::Docker => false,
+    };
+    Some(RuntimeInfo {
+        runtime,
+        compose_form,
+        needs_machine_start,
+        binary_path: bin_path,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +903,159 @@ async fn resolve_runtime() -> Option<RuntimeInfo> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // -----------------------------------------------------------------
+    // Parity fixture (v0.2.92 §3.5 / R13) — the same JSON drives
+    // tests/test_container_runtime_ssot.py on the Python side.
+    // -----------------------------------------------------------------
+
+    fn parity_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/container_runtime_parity.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        serde_json::from_str(&text).expect("fixture parses")
+    }
+
+    fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
+        v[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture scenario lacks `{}`", key))
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn runtime_from(name: &str) -> ContainerRuntime {
+        match name {
+            "podman" => ContainerRuntime::Podman,
+            "docker" => ContainerRuntime::Docker,
+            other => panic!("unknown runtime in fixture: {}", other),
+        }
+    }
+
+    fn form_name(f: ComposeForm) -> &'static str {
+        match f {
+            ComposeForm::Subcommand => "subcommand",
+            ComposeForm::Standalone => "standalone",
+        }
+    }
+
+    #[test]
+    fn parity_fixture_has_scenarios_and_every_one_names_a_rust_expectation() {
+        let fx = parity_fixture();
+        let scenarios = fx["scenarios"].as_array().expect("scenarios array");
+        assert!(scenarios.len() >= 10, "fixture shrank: {}", scenarios.len());
+        for sc in scenarios {
+            assert!(
+                sc.get("expect_rust").is_some(),
+                "scenario {} lacks expect_rust",
+                sc["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn parity_fixture_select_runtime_matches_every_scenario() {
+        let fx = parity_fixture();
+        for sc in fx["scenarios"].as_array().unwrap() {
+            let name = sc["name"].as_str().unwrap();
+            let env = sc["env"].as_str();
+            let order = candidate_order(normalise_override(env).as_deref());
+            let on_path = names(sc, "on_path");
+            let version_ok = names(sc, "version_ok");
+            let daemon_ok = names(sc, "daemon_ok");
+            let sub_ok = names(sc, "compose_subcommand_ok");
+            let standalone = names(sc, "standalone_on_path");
+            let probed: Vec<ProbedCandidate> = order
+                .iter()
+                .map(|rt| {
+                    let b = rt.binary().to_string();
+                    let compose = if sub_ok.contains(&b) {
+                        Some(ComposeForm::Subcommand)
+                    } else if standalone.contains(&format!("{}-compose", b)) {
+                        Some(ComposeForm::Standalone)
+                    } else {
+                        None
+                    };
+                    ProbedCandidate {
+                        runtime: *rt,
+                        on_path: on_path.contains(&b),
+                        version_ok: version_ok.contains(&b),
+                        daemon_ok: daemon_ok.contains(&b),
+                        compose,
+                    }
+                })
+                .collect();
+            let got = select_runtime(&probed);
+            let want = &sc["expect_rust"];
+            match (got, want.is_null()) {
+                (None, true) => {}
+                (Some((rt, form)), false) => {
+                    assert_eq!(
+                        rt,
+                        runtime_from(want["runtime"].as_str().unwrap()),
+                        "scenario {}: runtime",
+                        name
+                    );
+                    assert_eq!(
+                        form_name(form),
+                        want["compose_form"].as_str().unwrap(),
+                        "scenario {}: compose form",
+                        name
+                    );
+                }
+                (got, _) => panic!(
+                    "scenario {}: got {:?}, fixture expect_rust = {}",
+                    name, got, want
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn normalise_override_matches_the_python_parser() {
+        assert_eq!(normalise_override(None), None);
+        assert_eq!(normalise_override(Some("")), None);
+        assert_eq!(normalise_override(Some(" AUTO ")), None);
+        assert_eq!(normalise_override(Some(" Docker ")).as_deref(), Some("docker"));
+        assert_eq!(normalise_override(Some("bogus")).as_deref(), Some("bogus"));
+    }
+
+    #[test]
+    fn other_runtime_is_the_pair() {
+        assert_eq!(ContainerRuntime::Podman.other(), ContainerRuntime::Docker);
+        assert_eq!(ContainerRuntime::Docker.other(), ContainerRuntime::Podman);
+    }
+
+    #[test]
+    #[serial]
+    fn pinned_runtime_reads_the_pin_and_ignores_non_pins() {
+        // Mirrors `vco_lib.containers.runtime_preference_from_env`: only the
+        // two known names pin; `auto` / empty / garbage do not.
+        struct Guard(Option<String>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("VCT_CONTAINER_RUNTIME", v),
+                    None => std::env::remove_var("VCT_CONTAINER_RUNTIME"),
+                }
+            }
+        }
+        let _g = Guard(std::env::var("VCT_CONTAINER_RUNTIME").ok());
+        for (value, want) in [
+            ("podman", Some(ContainerRuntime::Podman)),
+            (" Docker ", Some(ContainerRuntime::Docker)),
+            ("auto", None),
+            ("", None),
+            ("bogus", None),
+        ] {
+            std::env::set_var("VCT_CONTAINER_RUNTIME", value);
+            assert_eq!(pinned_runtime(), want, "value = {:?}", value);
+        }
+        std::env::remove_var("VCT_CONTAINER_RUNTIME");
+        assert_eq!(pinned_runtime(), None);
+    }
 
     #[test]
     fn binary_names_match_runtimes() {

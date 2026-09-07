@@ -120,12 +120,26 @@ class DelegatedCopiesScriptsBytewiseTest(unittest.TestCase):
                         continue
                     shipped.add(src.name)
             self.assertGreater(len(shipped), 0, "no scripts matched the globs")
+            from vco_lib.rewire import has_rewire_region, rewire_bytes  # noqa: PLC0415
             for name in shipped:
                 src = scripts_src / name
                 dst = scripts_dst / name
                 self.assertTrue(dst.is_file(), f"missing shipped script: {name}")
-                self.assertTrue(filecmp.cmp(src, dst, shallow=False),
-                                f"script content drift: {name}")
+                raw = src.read_bytes()
+                if has_rewire_region(raw):
+                    # v0.2.92 WP-16: a `VCO-REWIRE`-marked script ships
+                    # REWRITTEN — the install-time rewriter bakes the
+                    # orchestrator root into the marked region so the installed
+                    # copy resolves the clone with no env var set. The contract
+                    # for these files is POST-TRANSFORM identity; asserting raw
+                    # identity here would assert the unbaked bug back in.
+                    self.assertEqual(
+                        dst.read_bytes(),
+                        rewire_bytes(raw, REPO_ROOT, filename=name),
+                        f"rewired script drift: {name}")
+                else:
+                    self.assertTrue(filecmp.cmp(src, dst, shallow=False),
+                                    f"script content drift: {name}")
 
 
 class DelegatedRendersSettingsTest(unittest.TestCase):

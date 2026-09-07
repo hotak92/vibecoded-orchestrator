@@ -150,18 +150,13 @@ fn env_file_allowlist(db: &Db) -> Vec<PathBuf> {
     out
 }
 
-/// Resolve the `~/.vct-secrets/shared/` directory in a cross-OS way.
-/// Returns None if the home directory can't be resolved. We don't pull
-/// in the `dirs` crate just for one path — `$HOME` (Unix) or
-/// `%USERPROFILE%` (Windows) covers every case the launcher targets.
-fn vct_secrets_shared_dir() -> Option<PathBuf> {
-    let home = if cfg!(target_os = "windows") {
-        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-    } else {
-        std::env::var_os("HOME")
-    }?;
-    Some(PathBuf::from(home).join(".vct-secrets").join("shared"))
-}
+// v0.3.0: import alias onto the ONE file-store path resolver
+// (`vct_launcher_core::secrets_file_store`). The copy that lived here
+// resolved `$HOME/.vct-secrets/shared` DIRECTLY and ignored
+// `$VCT_SECRETS_DIR` — so with that variable set (as the `vct` CLI, the
+// resolvers and the launcher's own installer tests all honour it) the
+// importer enumerated a directory nobody reads.
+use crate::secrets_file_store::shared_dir as vct_secrets_shared_dir;
 
 /// Enumerate keys (NOT values) from the canonical sources. Returns one
 /// row per (source, key). Sources that don't exist on disk are silently
@@ -217,14 +212,13 @@ pub async fn list_importable_secret_keys(
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                // Skip historical recovery markers — the user's MEMORY.md
-                // notes that `github_pat` is broken and `.broken-*` /
-                // `.recovered-*` variants are deprecated. We don't want
-                // these surfaced as importable.
-                if fname.starts_with('.') {
-                    continue;
-                }
-                if fname.contains(".broken-") || fname.contains(".recovered-") {
+                // Skip dotfile markers, historical recovery copies
+                // (`.broken-*` / `.recovered-*`) and the store's own
+                // `_README.md`. v0.3.0: the rule moved to
+                // `secrets_file_store::is_secret_filename` so the SecretsPanel's
+                // file-store enumeration and this importer cannot disagree
+                // about what counts as a secret.
+                if !crate::secrets_file_store::is_secret_filename(&fname) {
                     continue;
                 }
                 // Filename = key. No transformation.
@@ -410,10 +404,10 @@ fn build_source_allowlist(db: &Db) -> Vec<String> {
                         Some(s) => s.to_string(),
                         None => continue,
                     };
-                    if fname.starts_with('.')
-                        || fname.contains(".broken-")
-                        || fname.contains(".recovered-")
-                    {
+                    // Same predicate as the enumeration above — a
+                    // divergence here would either reject a source the
+                    // user was just offered, or admit one they were not.
+                    if !crate::secrets_file_store::is_secret_filename(&fname) {
                         continue;
                     }
                     out.push(format!("vct_secrets_shared:{}", entry.display()));
@@ -881,45 +875,44 @@ mod tests {
         fs::remove_dir_all(&folder).ok();
     }
 
-    /// Synthesize a fake ~/.vct-secrets/shared/-style directory and
-    /// validate that enumeration finds the keys but skips `.broken-*` /
-    /// `.recovered-*` / dotfile variants.
+    /// Synthesize a `$VCT_SECRETS_DIR/shared/` directory and validate that
+    /// the PRODUCTION enumerator finds the keys but skips `.broken-*` /
+    /// `.recovered-*` / dotfile / `_README.md` variants.
+    ///
+    /// v0.3.0: this test used to REIMPLEMENT the filename filter inline
+    /// ("we can't override HOME ... test the directory-walk level by
+    /// reimplementing it inline"), so it proved a copy of the rule rather
+    /// than the rule — mutating the shipped filter left it green. Two
+    /// things changed to make the real call reachable: the path resolver
+    /// now honours `$VCT_SECRETS_DIR` (as the `vct` CLI and the resolvers
+    /// always did), and `test_env::env_guard` serialises env mutation
+    /// workspace-wide, so the HOME race that motivated the reimplementation
+    /// no longer applies.
     #[test]
     fn enumerate_vct_secrets_shared_skips_deprecated_variants() {
-        // We can't override HOME for the `cfg`'d allowlist resolver
-        // (it'd require modifying env, which races in parallel tests).
-        // Instead test the enumeration step at the directory-walk level
-        // by reimplementing it inline with our tmp dir.
-        let dir = tmp();
+        let root = tmp();
+        let dir = root.join("shared");
+        fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("github_pat"), "ghp_x").unwrap();
         fs::write(dir.join("vercel_token"), "vcp_y").unwrap();
         fs::write(dir.join(".broken-github_pat-2026-04-01"), "old").unwrap();
         fs::write(dir.join(".recovered-old"), "old2").unwrap();
         fs::write(dir.join(".hidden"), "x").unwrap();
+        fs::write(dir.join("_README.md"), "docs").unwrap();
 
-        // Replay the same filename filter the enumerator uses.
-        let mut out: Vec<String> = Vec::new();
-        let mut entries: Vec<PathBuf> = Vec::new();
-        for ent in fs::read_dir(&dir).unwrap().flatten() {
-            entries.push(ent.path());
-        }
-        entries.sort();
-        for entry in entries {
-            if !entry.is_file() {
-                continue;
-            }
-            let fname = entry.file_name().and_then(|f| f.to_str()).unwrap().to_string();
-            if fname.starts_with('.') {
-                continue;
-            }
-            if fname.contains(".broken-") || fname.contains(".recovered-") {
-                continue;
-            }
-            out.push(fname);
-        }
-        out.sort();
-        assert_eq!(out, vec!["github_pat".to_string(), "vercel_token".to_string()]);
-        fs::remove_dir_all(&dir).ok();
+        let _g = vct_launcher_core::test_env::env_guard(&[(
+            "VCT_SECRETS_DIR",
+            Some(root.to_str().unwrap()),
+        )]);
+        // The production enumerator, reached through the same
+        // `vct_secrets_shared_dir()` alias `list_importable_secret_keys`
+        // uses.
+        assert_eq!(
+            crate::secrets_file_store::list_shared_keys(),
+            vec!["github_pat".to_string(), "vercel_token".to_string()]
+        );
+        drop(_g);
+        fs::remove_dir_all(&root).ok();
     }
 
     // ── Cross-language parity (v0.2.80 Part A) ───────────────────────────

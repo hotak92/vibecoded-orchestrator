@@ -1623,6 +1623,7 @@ pub async fn apply_default_weights_after_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vct_launcher_core::test_env::state_dir_guard;
 
     #[test]
     fn sanitize_path_component_blocks_traversal_and_separators() {
@@ -1719,8 +1720,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Isolate VCT_STATE_DIR so the test's writes go to a tmp dir.
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let tmp = state_dir_guard();
 
         // Bind two ephemeral ports: one for the edge function mock,
         // one for the download blob server. Use tokio::net so the
@@ -1819,7 +1819,6 @@ mod tests {
         assert!(result.local_path.ends_with("qwen3-v42.pt"));
 
         // Cleanup the env override so we don't leak into adjacent tests.
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     // ─── v0.2.75 RL-11: bucket-populated capability probe ────────────────
@@ -1923,8 +1922,7 @@ mod tests {
     async fn download_to_module_dir_rejects_sha_mismatch() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         let blob_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let blob_port = blob_listener.local_addr().unwrap().port();
@@ -1962,7 +1960,6 @@ mod tests {
         let target = weights_file_path("vct-rl-reranker", "qwen3", "v1");
         assert!(!target.exists(), "tmp file must not have been promoted");
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     // ─── v0.2.40 R5: first-install auto-trigger tests ───────────────────
@@ -2196,8 +2193,7 @@ mod tests {
     #[cfg(unix)] // symlink fallback to copy on Windows tested separately.
     #[tokio::test]
     async fn t1_link_global_makes_pt_visible_at_container_mount() {
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         // Simulate a successful global download: write a .pt at the
         // module_weights_dir path.
@@ -2241,7 +2237,6 @@ mod tests {
         let bytes = tokio::fs::read(&linked).await.unwrap();
         assert_eq!(bytes, b"fake-weights-bytes");
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     /// T2: A per-project override (user replaces the symlink with a real
@@ -2250,8 +2245,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn t2_override_real_file_survives_relink() {
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         // Global download.
         let global = weights_file_path("vct-rl-reranker", "qwen3", "v1");
@@ -2297,7 +2291,6 @@ mod tests {
             "override should stay a real file"
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     /// T3: "Reset to latest released weights" wipes any override (real
@@ -2305,8 +2298,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn t3_reset_wipes_override_and_relinks_to_global() {
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         // Global download.
         let global = weights_file_path("vct-rl-reranker", "qwen3", "v2");
@@ -2348,7 +2340,6 @@ mod tests {
         let bytes = tokio::fs::read(&linked).await.unwrap();
         assert_eq!(bytes, b"global-v2-content");
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     /// Edge case: refreshing an existing managed symlink. The first
@@ -2357,8 +2348,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn relink_refreshes_existing_symlink() {
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         // Two distinct global files (same source, different versions).
         let g1 = weights_file_path("vct-rl-reranker", "qwen3", "v1");
@@ -2387,7 +2377,6 @@ mod tests {
         let bytes = tokio::fs::read(&target).await.unwrap();
         assert_eq!(bytes, b"updated");
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     // ─── v0.2.42 RT-3: unsupported_embedding_source UX + cooldown ─────────
@@ -2590,8 +2579,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_copy_is_replaced_by_symlink_on_relink() {
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         let global = weights_file_path("vct-rl-reranker", "qwen3", "v5");
         tokio::fs::create_dir_all(global.parent().unwrap()).await.unwrap();
@@ -2626,7 +2614,6 @@ mod tests {
         let bytes = tokio::fs::read(&linked).await.unwrap();
         assert_eq!(bytes, b"updated-weights");
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     /// A regular file WITHOUT a `.vct-managed` marker is treated as a user
@@ -2634,8 +2621,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn user_override_without_marker_is_preserved() {
-        let tmp = tempfile::tempdir().expect("mkdtemp");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = state_dir_guard();
 
         let global = weights_file_path("vct-rl-reranker", "qwen3", "v7");
         tokio::fs::create_dir_all(global.parent().unwrap()).await.unwrap();
@@ -2668,6 +2654,5 @@ mod tests {
             "user override must remain a regular file"
         );
 
-        std::env::remove_var("VCT_STATE_DIR");
     }
 }

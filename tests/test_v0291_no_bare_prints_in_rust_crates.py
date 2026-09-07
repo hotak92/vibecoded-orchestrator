@@ -54,11 +54,20 @@ release tags.
 from __future__ import annotations
 
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.common.rust_source import (  # noqa: E402
+    cfg_test_gate_indices,
+    cfg_test_item_resume_index,
+    cfg_test_line_numbers,
+)
 
 SCAN_ROOTS = (
     REPO_ROOT / "launcher" / "src-tauri" / "src",
@@ -82,8 +91,6 @@ _TOP_LEVEL_ITEM = re.compile(
     r"^(?:pub\b|fn\b|const\b|static\b|struct\b|enum\b|impl\b|trait\b"
     r"|type\b|mod\b|use\b|async\b|unsafe\b|extern\b|#\[)"
 )
-_CFG_ATTR = re.compile(r"^\s*#\[\s*cfg\s*\((?P<pred>.*)$")
-_ATTR = re.compile(r"^\s*#\[")
 _LINE_COMMENT = re.compile(r"^\s*//")
 
 
@@ -243,46 +250,6 @@ def _strip_strings_and_comments(line: str) -> str:
     return _strip_line(line, (_ST_CODE,))[0]
 
 
-def _cfg_predicate_mentions_test(lines: list[str], code: list[str], i: int) -> bool:
-    """True when ``lines[i]`` starts a ``#[cfg(...)]`` whose predicate names
-    the ``test`` cfg. Reads forward for multi-line attributes.
-
-    Judged on the CODE view, so ``#[cfg(feature = "test-support")]`` is read
-    for its cfg names and not for the text inside the quotes.
-    """
-    if not _CFG_ATTR.match(lines[i]):
-        return False
-    pred = code[i]
-    j = i
-    # Multi-line attribute: keep reading until brackets balance.
-    while pred.count("[") > pred.count("]") and j + 1 < len(lines):
-        j += 1
-        pred += " " + code[j]
-    return re.search(r"\btest\b", pred) is not None
-
-
-def _skip_gated_item(lines: list[str], code: list[str], i: int) -> int:
-    """``lines[i]`` is a test-gated attribute. Return the index just past the
-    item it gates: any further attribute lines, then either a
-    semicolon-terminated item (``mod tests;``, ``use ...;``) or one
-    brace-balanced block (fn/mod/impl alike)."""
-    j = i + 1
-    while j < len(lines) and _ATTR.match(lines[j]):
-        j += 1
-    depth = 0
-    seen_open = False
-    while j < len(lines):
-        depth += code[j].count("{") - code[j].count("}")
-        if "{" in code[j]:
-            seen_open = True
-        if seen_open and depth <= 0:
-            return j + 1
-        if not seen_open and code[j].rstrip().endswith(";"):
-            return j + 1
-        j += 1
-    return j
-
-
 def _comment_text(line: str, code: str) -> str:
     """The ``//`` comment tail of a line, or ``""`` when it has none.
 
@@ -338,9 +305,13 @@ def _has_contract_marker(
 
 def _scan_file(path: Path, rel: str | None = None) -> list[str]:
     """Return violation descriptions for one .rs file."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
     code = _strip_file(lines)
     in_code_state = _code_state_line_starts(lines)
+    # Test-gated regions come from the shared home (v0.2.92) — see the module
+    # docstring for why THIS lint passes include_any_test=True.
+    skipped = cfg_test_line_numbers(source, include_any_test=True)
     if rel is None:
         try:
             rel = str(path.relative_to(REPO_ROOT))
@@ -348,10 +319,8 @@ def _scan_file(path: Path, rel: str | None = None) -> list[str]:
             rel = str(path)
 
     violations: list[str] = []
-    i = 0
-    while i < len(lines):
-        if _cfg_predicate_mentions_test(lines, code, i):
-            i = _skip_gated_item(lines, code, i)
+    for i in range(len(lines)):
+        if (i + 1) in skipped:
             continue
         if not _LINE_COMMENT.match(lines[i]) and _PRINT_MACRO.search(code[i]):
             if not _has_contract_marker(lines, code, i, in_code_state):
@@ -364,7 +333,6 @@ def _scan_file(path: Path, rel: str | None = None) -> list[str]:
                     f"annotate it `// {CONTRACT_MARKER}` on this line or in "
                     f"the comment block above, saying who consumes it."
                 )
-        i += 1
     return violations
 
 
@@ -612,14 +580,18 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
                 f"another large file whose #[cfg(test)] module closes mid-file "
                 f"with production code after it."
             )
-        lines = path.read_text(encoding="utf-8").splitlines()
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
         code = _strip_file(lines)
 
         # Last top-level test gate that is immediately followed by `mod … {`.
+        # Gate DISCOVERY comes from the shared module; the END oracle below
+        # deliberately does not (see this method's docstring) — it stays
+        # column-0 structural, and now also runs on a DIFFERENT lexer
+        # (`_strip_file`) from the code under test, which strengthens rather
+        # than weakens the independence the class is built on.
         gate = None
-        for i in range(len(lines)):
-            if not _cfg_predicate_mentions_test(lines, code, i):
-                continue
+        for i in cfg_test_gate_indices(source, include_any_test=True):
             nxt = code[i + 1] if i + 1 < len(lines) else ""
             if re.match(r"^\s*(?:pub\s+)?mod\s+\w+\s*\{", nxt):
                 gate = i
@@ -650,7 +622,7 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
                 f"top-level production code after its test module (the shape "
                 f"this fixture pins) — repoint FIXTURE at a file that does."
             )
-        return path, lines, code, gate, close, tail
+        return path, source, lines, code, gate, close, tail
 
     def _probe(self, lines: list[str], at: int) -> bool:
         """Insert a bare print before index `at`; is it reported at that line?"""
@@ -666,8 +638,14 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
         self.assertEqual(_scan_file(path), [])
 
     def test_skip_resumes_before_eof_instead_of_cutting_to_eof(self) -> None:
-        _, lines, code, gate, _close, _tail = self._load()
-        end = _skip_gated_item(lines, code, gate)
+        _, source, lines, _code, gate, _close, _tail = self._load()
+        end = cfg_test_item_resume_index(source, gate, include_any_test=True)
+        self.assertIsNotNone(
+            end,
+            "the shared skip did not delimit the gated item at all — it fails "
+            "CLOSED (skips nothing), which is safe for the scan but means this "
+            "fixture is no longer exercising the property it exists for.",
+        )
         self.assertLess(
             end,
             len(lines),
@@ -686,8 +664,9 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
         skip should land at or before it (blank lines and comments may sit
         between), and never before the module actually closed.
         """
-        _, lines, code, gate, _close, tail = self._load()
-        end = _skip_gated_item(lines, code, gate)
+        _, source, _lines, _code, gate, _close, tail = self._load()
+        end = cfg_test_item_resume_index(source, gate, include_any_test=True)
+        self.assertIsNotNone(end, "the shared skip delimited nothing")
         self.assertLessEqual(
             end,
             tail,
@@ -705,7 +684,7 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
         """The false-NEGATIVE guard: a bare print anywhere in the production
         tail must be reported. Probes at the start, middle and end of the
         tail, so a skip that overruns by any amount is caught."""
-        _, lines, _, _, _close, tail_start = self._load()
+        _, _source, lines, _, _, _close, tail_start = self._load()
         clean = _code_state_line_starts(lines)
         tail = [i for i in range(tail_start, len(lines)) if i in clean]
         self.assertGreaterEqual(
@@ -731,7 +710,7 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
         # item: the gap between them (blank lines, a section comment) is
         # already production territory, and probing there would assert the
         # opposite of the truth. Caught by this very test on first run.
-        _, lines, _, gate, close, _tail = self._load()
+        _, _source, lines, _, gate, close, _tail = self._load()
         clean = _code_state_line_starts(lines)
         inside = [i for i in range(gate + 2, close) if i in clean]
         if len(inside) < 3:
@@ -760,7 +739,7 @@ class RealTreeCfgTestSkipFixture(unittest.TestCase):
         false blind spot.) So the fixture file must actually CONTAIN such
         a construct, or these probes are not being filtered by anything.
         """
-        _, lines, _, _, _close, _tail = self._load()
+        _, _source, lines, _, _, _close, _tail = self._load()
         clean = _code_state_line_starts(lines)
         interiors = [i for i in range(len(lines)) if i not in clean]
         self.assertGreater(

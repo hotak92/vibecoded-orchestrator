@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from claude_mcp_servers.weaviate_mcp.chunking import (
+    CHUNK_TOKEN_POLICY_CEILING,
     CHUNKING_PRESETS,
     MODEL_TOKEN_LIMITS,
     chunking_preset_for_model,
@@ -62,9 +63,11 @@ class TestModelTokenLimits:
             == 2_048
         )
 
-    def test_codesage_stays_at_2k(self) -> None:
-        # Hard architectural cap.
-        assert MODEL_TOKEN_LIMITS["codesage/codesage-large-v2"] == 2_048
+    def test_codesage_at_served_window(self) -> None:
+        # W1 (wiring audit, 2026-09-05): the SERVED window, not the 2 048
+        # architectural cap — sentence_bert_config.json max_seq_length=1024,
+        # verified live (the vector is identical past position 1 024).
+        assert MODEL_TOKEN_LIMITS["codesage/codesage-large-v2"] == 1_024
 
     def test_openai_text_3_small_at_8191(self) -> None:
         assert MODEL_TOKEN_LIMITS["text-embedding-3-small"] == 8_191
@@ -105,16 +108,16 @@ class TestChunkingPresets:
         [
             ("granite-embedding:278m-fp16", "xsmall_context"),
             ("embeddinggemma:300m-bf16", "small_context"),
-            ("codesage-large-v2", "small_context"),
             ("jina-embeddings-v2-base-code", "small_context"),
             ("unclemusclez/jina-embeddings-v2-base-code:latest", "small_context"),
             ("snowflake-arctic-embed2:latest", "medium_context"),
             ("snowflake-arctic-embed2", "medium_context"),
             ("text-embedding-3-small", "large_context"),
             ("bge-m3:latest", "large_context"),
-            ("qwen3-embedding:0.6b", "xlarge_context"),
-            # Unknown model falls through to large_context (the safe default).
-            ("unknown-model-foo", "large_context"),
+            # Unknown model UNDER-fills to the tightest general tier (D16,
+            # v0.2.92) — the old large_context guess could over-fill an unknown
+            # model whose real window is smaller than the 8k-class tier assumes.
+            ("unknown-model-foo", "small_context"),
         ],
     )
     def test_routing(self, model_name: str, expected_preset_name: str) -> None:
@@ -122,6 +125,59 @@ class TestChunkingPresets:
         expected = CHUNKING_PRESETS[expected_preset_name]
         assert actual == expected, (
             f"{model_name} routed to {actual}, expected {expected_preset_name}={expected}"
+        )
+
+    def test_codesage_routes_to_small_clamped_to_its_measured_window(self) -> None:
+        """Wiring-audit W1 (v0.2.92): CodeSage's served window is 1 024, not
+        the 2 048 its architectural cap advertises — measured, and confirmed
+        by the snapshot's own ``sentence_bert_config.json``.
+
+        It therefore no longer routes to an UNCLAMPED ``small_context``: that
+        tier's 1 600-token max exceeds the real window, which is exactly the
+        over-budgeting that silently halved every maximal code entity at
+        HTTP 200. R39's rule applies — the retrieval-quality policy bounds
+        the chunk, the model's own window can only tighten it further — so
+        the tier is kept and clamped componentwise to
+        ``int(1024 * (1 - _BUDGET_SAFETY_MARGIN_RATIO))``.
+
+        Kept OUT of the generic routing table above and given its own test
+        for the same reason qwen3 is: the table asserts "routes to tier X"
+        and a clamped model does not equal its tier's published tuple.
+        """
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            _BUDGET_SAFETY_MARGIN_RATIO,
+            MODEL_TOKEN_LIMITS,
+        )
+
+        window = MODEL_TOKEN_LIMITS["codesage-large-v2"]
+        assert window == 1_024, (
+            "the measured served window; if this changes, re-measure the "
+            "plateau rather than trusting the architectural cap"
+        )
+        budget = int(window * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
+        min_t, max_t, target_t = CHUNKING_PRESETS["small_context"]
+        assert chunking_preset_for_model("codesage-large-v2") == (
+            min(min_t, budget), min(max_t, budget), min(target_t, budget)
+        )
+        # And the load-bearing property, stated independently of the formula:
+        # nothing the chunker emits may exceed the window the model serves.
+        assert max(chunking_preset_for_model("codesage-large-v2")) <= window
+
+    def test_qwen3_routes_to_xlarge_clamped_to_its_own_window(self) -> None:
+        # D16 + R39 (v0.2.92): qwen3-embedding's num_ctx is 10 240 — the
+        # xlarge tier SHAPE (max 13 500) was cut for a ~16k window. The
+        # resolver keeps the tier but clamps it componentwise to
+        # min(CHUNK_TOKEN_POLICY_CEILING 8 192, the model's own window
+        # budget int(10 240 * 0.9) = 9 216) — the R39 retrieval-quality
+        # policy binds for qwen3 (8 192 < 9 216), so a max-packed chunk
+        # can never exceed the embedding window (silent Ollama truncation)
+        # NOR the retrieval-quality ceiling.
+        capacity = int(MODEL_TOKEN_LIMITS["qwen3-embedding:0.6b"] * (1 - 0.1))
+        budget = min(capacity, CHUNK_TOKEN_POLICY_CEILING)
+        assert chunking_preset_for_model("qwen3-embedding:0.6b") == (
+            4_600, 8_192, 8_192
+        ) == (
+            min(4_600, budget), min(13_500, budget), min(9_500, budget)
         )
 
 

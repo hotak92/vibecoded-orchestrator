@@ -222,7 +222,7 @@ class TestRunLightweight(unittest.TestCase):
             # Lightweight events were logged.
             log = (fx.root / "state" / "logs" / "install.jsonl").read_text(
                 encoding="utf-8")
-            events = [json.loads(l) for l in log.splitlines() if l]
+            events = [json.loads(line) for line in log.splitlines() if line]
             steps = {e["step"] for e in events}
             self.assertIn("lightweight", steps)
             # Triage logged "skip" (means no pip install was triggered).

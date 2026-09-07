@@ -26,27 +26,38 @@ NOT require the sets to be equal.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 _RUST_SRC = REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs"
 
+from tests.common.rust_source import strip_rust_comments  # noqa: E402
 from vco_lib.config_projection import list_canonical_keys  # noqa: E402
 
 
 def _extract_rust_canonical_keys() -> list[str]:
     """Parse the ``CANONICAL_INSTALL_ENV_KEYS`` array literal from the Rust
-    source. Returns the string-literal key names in order."""
-    text = _RUST_SRC.read_text(encoding="utf-8")
+    source. Returns the string-literal key names in order.
+
+    The array is extracted from a comment-stripped view
+    (``strip_rust_comments`` — string literals kept verbatim). The previous
+    inline ``re.sub(r"//[^\\n]*", ...)`` handled line comments only, so a
+    block comment holding a quoted example key (``/* see "EXAMPLE_KEY" */``)
+    was parsed as a LIVE key and failed the subset gate on inert prose — the
+    comment/literal blindness class register-34 exists for. It also ate
+    everything after a ``//`` even inside a string literal, which would have
+    truncated a key value if one ever contained a slash pair.
+    """
+    code = "\n".join(strip_rust_comments(_RUST_SRC.read_text(encoding="utf-8")))
     marker = "pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &["
-    start = text.index(marker) + len(marker)
-    end = text.index("];", start)
-    body = text[start:end]
-    # Match "KEY_NAME" literals; skip // comments (comments may contain
-    # quoted example strings, but those are rare and would be flagged — so
-    # strip line comments first).
-    no_comments = re.sub(r"//[^\n]*", "", body)
-    return re.findall(r'"([A-Z0-9_]+)"', no_comments)
+    start = code.index(marker) + len(marker)
+    end = code.index("];", start)
+    body = code[start:end]
+    return re.findall(r'"([A-Z0-9_]+)"', body)
 
 
 def test_rust_source_snapshot_present() -> None:

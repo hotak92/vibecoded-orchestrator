@@ -23,26 +23,114 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+# VCO-SHARED-BEGIN: _resolve_orchestrator_root (verbatim across templates/scripts/*.py)
+def _resolve_orchestrator_root() -> "Path | None":
+    """Return the orchestrator clone root — the directory that CONTAINS
+    ``claude_mcp_servers/`` — or ``None`` when it cannot be located.
+
+    THE one shape for this question across ``templates/scripts/*.py``. It is
+    copied VERBATIM into every shipped script that asks it and pinned
+    byte-identical by
+    ``tests/test_v0292_cli_root_resolution_and_prefix.py::test_root_resolver_bodies_identical``
+    — a DOCUMENTED class-C mirror with an enforcing test rather than a silent
+    copy, because these scripts must answer "where is the orchestrator?"
+    BEFORE they can import anything from it (importing ``vco_lib`` to find
+    ``vco_lib`` is circular).
+
+    Candidate order — the first candidate that actually CONTAINS
+    ``claude_mcp_servers/`` wins; a candidate that does not is SKIPPED, never
+    returned:
+
+      1. ``$VCT_ORCHESTRATOR_ROOT`` — canonical; written into ``.claude/env``
+         and ``.claude/settings.json`` by the bundle installer
+         (``vco_lib/config_projection.py``).
+      2. ``$VCT_INSTALL_ROOT`` — legacy alias carrying the same value; some
+         launcher subprocess spawns set only this one.
+      3. ``<script>/../..`` — the in-tree layout, correct ONLY when the script
+         sits in the orchestrator clone's own ``.claude/scripts/`` (or in
+         ``templates/scripts/`` in the clone). On an INSTALLED project this
+         resolves to the USER project root, which has no
+         ``claude_mcp_servers/`` — which is exactly why every rung is
+         validated and why this rung is LAST.
+
+    Never raises. Path joins go through ``pathlib`` so no separator is
+    assumed (a Windows ``\\``-separator bug shipped once already, v0.2.81).
+    """
+    for _candidate in (
+        os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip(),
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+        str(Path(__file__).resolve().parent.parent.parent),
+    ):
+        if not _candidate:
+            continue
+        try:
+            _root = Path(_candidate)
+            if (_root / "claude_mcp_servers").is_dir():
+                return _root
+        except (OSError, ValueError):
+            continue
+    return None
+# VCO-SHARED-END: _resolve_orchestrator_root
+
+
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
+# v0.2.92 (R4/R21) — INSTALL-TIME BAKED ROOT. `vco_lib/rewire.py` substitutes
+# the placeholder below when this file is installed into a project, so the
+# installed script can reach its orchestrator clone with NOTHING in the
+# environment (rung 3, `<script>/../..`, resolves to the USER project root on
+# an install and is correctly rejected there). In the clone the placeholder
+# stays literal, `Path("{{ORCHESTRATOR_ROOT}}")/"vco_lib"` is not a directory,
+# and this block is inert — the validation IS the placeholder guard, so no
+# separate "was it substituted?" test can drift from it.
+# It is used ONLY when NEITHER env pin ($VCT_ORCHESTRATOR_ROOT,
+# $VCT_INSTALL_ROOT) names a real orchestrator root — a VALID pin always
+# wins, and a PROVABLY stale one (the clone moved, .claude/env still names
+# the old path) is healed rather than left to fall through to the user
+# project root. Same stale-pin discipline as the v0.2.91 hub-token retry.
+# Writing it into os.environ rather than a local is deliberate — child
+# processes this script spawns inherit the same answer.
+_VCO_BAKED_ORCHESTRATOR_ROOT = "{{ORCHESTRATOR_ROOT}}"
+_vco_env_pins = [os.environ.get(_k, "").strip()
+                 for _k in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT")]
+if (Path(_VCO_BAKED_ORCHESTRATOR_ROOT) / "vco_lib").is_dir() and not any(
+    _p and (Path(_p) / "vco_lib").is_dir() for _p in _vco_env_pins
+):
+    os.environ["VCT_ORCHESTRATOR_ROOT"] = _VCO_BAKED_ORCHESTRATOR_ROOT
+
 # Add paths.
 #
 # PR-2 portability (2026-05-06): claude_mcp_servers/ ONLY exists in the
 # orchestrator clone, never bundled to user projects. Resolution order:
-#   1. $VCT_ORCHESTRATOR_ROOT/claude_mcp_servers (set by .claude/env)
-#   2. $CLAUDE_PROJECT_ROOT/claude_mcp_servers   (legacy override)
-#   3. <project>/claude_mcp_servers              (orchestrator clone fallback)
+#   1. $VCT_ORCHESTRATOR_ROOT   (canonical, set by .claude/env)  \
+#   2. $VCT_INSTALL_ROOT        (legacy alias, same value)        > shared
+#   3. <script>/../..           (orchestrator clone in-tree)     /  resolver
+#   4. $CLAUDE_PROJECT_ROOT/claude_mcp_servers   (legacy override, below)
+# Rungs 1-3 are `_resolve_orchestrator_root()` above — the ONE shape across
+# templates/scripts/*.py; each is VALIDATED (must contain claude_mcp_servers/)
+# so a stale env value is skipped rather than returned.
 # The MCP module is imported as a pure utility (chunking + collection
 # bootstrap) — no service runtime needed. See PR-2 for the design notes.
+#
+# PROJECT_ROOT answers a DIFFERENT question — it is the USER PROJECT root and
+# is what DOCUMENTS_ROOT / KNOWLEDGE_ROOT / `resolve(...)` /
+# `EmbeddingService.for_project(...)` below are keyed on. Before v0.2.92 the
+# same name served both questions; on the orchestrator clone the two answers
+# coincide, which is why the conflation was invisible.
 PROJECT_ROOT = Path(os.environ.get("CLAUDE_PROJECT_ROOT", str(Path(__file__).resolve().parent.parent.parent)))
 
 
 def _resolve_mcp_servers_dir() -> Path:
     """Return the Path to claude_mcp_servers/, or raise with a hint."""
-    env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if env_root:
-        candidate = Path(env_root) / "claude_mcp_servers"
-        if candidate.is_dir():
-            return candidate
+    root = _resolve_orchestrator_root()
+    if root is not None:
+        return root / "claude_mcp_servers"
+    # Legacy explicit override, RETAINED (v0.2.92): $CLAUDE_PROJECT_ROOT names
+    # a tree whose claude_mcp_servers/ should be used. Nothing in VCO writes
+    # this key today — only this script and maintain_knowledge_graph.py READ it
+    # — so it is kept because removing a documented user-facing override is a
+    # behaviour change, and it is LAST because the two canonical env keys and
+    # the in-tree layout are all checked (and validated) above. It is only
+    # reachable at all when it points somewhere none of those three do.
     candidate = PROJECT_ROOT / "claude_mcp_servers"
     if candidate.is_dir():
         return candidate
@@ -618,11 +706,11 @@ def main():
             embedding_service = EmbeddingService.for_project(PROJECT_ROOT)
         except NoEmbeddingBackendError as e:
             print(f"⚠️  Document processing skipped: {e}", file=sys.stderr)
-            print(
-                "   See .claude/context/EMBEDDING_FAILURES.md + "
-                "~/.claude/metrics/embedding_failures.jsonl",
-                file=sys.stderr,
-            )
+            # The path is RESOLVED (v0.2.92): the literal that used to be here
+            # named ~/.claude/metrics, which W7 turned into a read-only archive.
+            from vco_lib.embedding_fidelity import failures_jsonl_display_path
+            print("   See .claude/context/EMBEDDING_FAILURES.md + "
+                  + failures_jsonl_display_path(), file=sys.stderr)
             sys.exit(0)
 
         # Initialize Weaviate client + bind to the embedding service

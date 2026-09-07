@@ -204,17 +204,74 @@ def test_no_inline_reconstructions_outside_paths_module():
         ``allowed`` set (with documented design rationale for the inline
         construction); flagging the gitignored copy is double-counting.
     """
+    import ast
     import re
 
     repo_root = Path(__file__).resolve().parent.parent
     # Patterns that mark a REAL inline reconstruction (not a docstring).
     # The canonical resolver lives in ``vco_lib/paths.py`` so it's
     # allowed; everything else in production code is forbidden.
+    #
+    # v0.2.92 (review m20): the first three patterns only ever matched the
+    # ``Path.home() / ".vct"`` spelling and the ONE ``expanduser`` spelling
+    # that ends in ``launcher.db``. Every other shape of the same
+    # reconstruction walked straight through — ``os.path.join(
+    # os.path.expanduser("~"), ".vct", ...)`` (three live sites in
+    # ``weaviate_mcp/server.py``), ``expanduser("~/.vct")`` with any other
+    # tail (``weaviate_mcp/query_logger.py``), and the whole ``~/.claude``
+    # resource, whose own canonical resolvers
+    # (``vco_lib.paths.claude_user_dir`` / ``claude_metrics_dir``) had no
+    # lint behind them at all. A pattern list that cannot match the shapes
+    # actually in the tree is not a lint; these are the shapes.
     bad_patterns = [
         re.compile(r'Path\.home\(\)\s*/\s*"\.vct"'),
         re.compile(r"Path\.home\(\)\s*/\s*'\.vct'"),
-        re.compile(r'os\.path\.expanduser\(\s*["\']~/\.vct/launcher\.db'),
+        # Broadened from ``~/.vct/launcher.db``: ANY ``~/.vct`` tail is the
+        # same reconstruction (``~/.vct/cache``, ``~/.vct/logs``, bare).
+        re.compile(r'expanduser\(\s*["\']~/\.vct'),
+        # os.path.join(os.path.expanduser("~"), ".vct", …)
+        re.compile(r'expanduser\(\s*["\']~["\']\s*\)\s*,\s*["\']\.vct["\']'),
+        # ── the same three shapes for the OTHER home root, ``~/.claude`` ──
+        # ``".claude"`` with its closing quote deliberately required, so the
+        # sibling FILE ``~/.claude.json`` (a different resource with a
+        # different lever, ``user_home()``) is not swept in here.
+        re.compile(r'Path\.home\(\)\s*/\s*"\.claude"'),
+        re.compile(r"Path\.home\(\)\s*/\s*'\.claude'"),
+        re.compile(r'expanduser\(\s*["\']~/\.claude["\'/]'),
+        re.compile(r'expanduser\(\s*["\']~["\']\s*\)\s*,\s*["\']\.claude["\']'),
     ]
+
+    def _docstring_line_numbers(text: str) -> set[int]:
+        """Line numbers covered by a docstring / bare string expression.
+
+        The pre-existing prose filter was a startswith-triple-quote test,
+        which only skips the line carrying the opening quotes. That was
+        survivable while the patterns only matched a shape nobody writes in
+        prose; the ``~/.claude`` patterns match a shape that IS written in
+        prose constantly (``vco_lib/paths.py``, ``embedding_service.py`` and
+        ``rl_logger.py`` all explain the leak they closed by quoting it), so
+        the filter has to be able to tell a docstring BODY from code.
+
+        Only ``ast.Expr``-wrapped string constants count — i.e. docstrings and
+        bare string statements. A string used as a VALUE
+        (``expanduser("~/.vct")``) is left visible, which is the whole point:
+        those are the offenders.
+        """
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return set()  # fall back to the cheap heuristic below
+        covered: set[int] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                covered.update(
+                    range(node.lineno, (node.end_lineno or node.lineno) + 1)
+                )
+        return covered
     # Files that are allowed to contain the literal reconstruction.
     allowed = {
         repo_root / "vco_lib" / "paths.py",
@@ -224,6 +281,16 @@ def test_no_inline_reconstructions_outside_paths_module():
         # extraction from generate-kg-summary.py into summary_backends.py
         # (`_read_app_state_value`). Same exception, new home.
         repo_root / "templates" / "scripts" / "summary_backends.py",
+        # v0.2.92 W7: same exception, same reason, one more file. The metrics
+        # home moved to `<vct_root>/metrics`, so `cost-summary.py` — which
+        # ships into every project's `.claude/scripts/` and must run on a bare
+        # stdlib interpreter with no VCO packages installed — has to resolve
+        # `~/.vct` inline. The mirror is not unenforced: `metrics_dirs()` is
+        # compared to `vco_lib.paths.metrics_read_dirs()` by
+        # `tests/test_v0292_wp8_cost_summary_reader.py::
+        # test_the_inline_rule_agrees_with_vco_lib_paths`, which reds if
+        # either side moves. Documented class-C mirror, not drift.
+        repo_root / "templates" / "scripts" / "cost-summary.py",
         # v0.2.53: bootstrap exception. install.py runs BEFORE vco_lib is
         # importable in some flows (it sets up the venv that contains
         # vco_lib). Diagnostic-output functions that reconstruct ~/.vct
@@ -248,6 +315,33 @@ def test_no_inline_reconstructions_outside_paths_module():
         # this is a diagnostic operator script that must work even on a
         # half-broken install. Documented exception.
         repo_root / "scripts" / "trainability_check.py",
+        # ── v0.2.92 (review m20): pre-existing occurrences the widened
+        # patterns now reach. Each is allowlisted with its reason; none of
+        # these source files is edited here (they belong to other lanes).
+        #
+        # MCP self-isolation, same reason already granted to
+        # `_lib/update_gate.py`: the MCP venv has no vco_lib on its path.
+        # Three `os.path.join(os.path.expanduser("~"), ".vct", "cache")`
+        # sites (dropped-writes journal) + one `~/.vct` state dir.
+        repo_root / "claude_mcp_servers" / "weaviate_mcp" / "server.py",
+        # Same isolation, and the inline form here IS the documented
+        # `except` fallback for when `_lib.update_gate._vct_root_dir` (the
+        # allowlisted mirror above) cannot be imported at all.
+        repo_root / "claude_mcp_servers" / "weaviate_mcp" / "query_logger.py",
+        # Claude Code's OWN transcript dir (`~/.claude/projects/<slug>`), not
+        # a VCO state root. Documented mirror of
+        # `vco_lib.project_config.claude_session_dir_for`, inlined for the
+        # `_HAS_PROJECT_CONFIG=False` branch (MCP without vco_lib).
+        repo_root / "claude_mcp_servers" / "weaviate_mcp" / "rl_enrichment.py",
+        # `claude_session_dir_for` is the CANONICAL resolver for that same
+        # Claude-Code-owned transcript dir — the thing the mirror above
+        # mirrors. Same standing as `vco_lib/paths.py` for `~/.vct`.
+        repo_root / "vco_lib" / "project_config.py",
+        # Shipped script, `$VCT_CLAUDE_DIR`-steered: the env key is parsed
+        # inline (not imported from `vco_lib.paths.claude_user_dir`) because
+        # this script has no other vco_lib import and a hard one would be a
+        # NEW dependency for a per-project script. Its own comment says so.
+        repo_root / "templates" / "scripts" / "detect_duplicates.py",
     }
 
     # Walk production code only (skip tests/, .venv/, archive/).
@@ -301,11 +395,15 @@ def test_no_inline_reconstructions_outside_paths_module():
             text = py_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        docstring_lines = _docstring_line_numbers(text)
         for lineno, line in enumerate(text.splitlines(), start=1):
             # Skip lines that are clearly comments or docstrings about
             # the path — only flag lines that look like real code
-            # constructing a Path. The cheap heuristic: skip if the
-            # line is just inside a triple-quoted docstring block.
+            # constructing a Path. Docstring BODIES come from the AST
+            # (see `_docstring_line_numbers`); the startswith checks stay
+            # as the fallback for files that don't parse.
+            if lineno in docstring_lines:
+                continue
             stripped = line.strip()
             if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''"):
                 continue

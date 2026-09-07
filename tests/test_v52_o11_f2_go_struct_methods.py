@@ -370,7 +370,7 @@ def test_no_unconditional_func_finditer_in_go_struct_loop() -> None:
 
     # Sanity: window must contain the Go struct-loop's `for sname`
     # header somewhere. Otherwise the anchor is in some other code block.
-    assert "for sname, start_line in struct_info.items():" in window, (
+    assert "for sname, start_line in struct_decls:" in window, (
         "Go signature anchor isn't inside a struct-iteration loop — "
         "file shape has changed unexpectedly."
     )

@@ -57,6 +57,17 @@ import os
 from pathlib import Path
 from typing import Optional
 
+# W3 (v0.2.92 wiring audit): the truncation property NAMES are defined ONCE
+# in the writer-side home (``vco_lib.kg_truncation_tags``) and re-exported
+# here so every reader AND every writer shares one definition. Import is
+# module-level and loud — vco_lib is part of every healthy install (a failed
+# import means a broken install, never a fallback case).
+from vco_lib.kg_truncation_tags import (  # noqa: E402
+    MEASURED_SLOTS_PROP,
+    SECONDARY_TRUNCATED_SLOTS_PROP,
+    TRUNCATED_SLOTS_PROP,
+)
+
 # The 29 functions below read server-module state as ``server.<name>`` (a
 # module global). Rather than an EAGER ``from . import server`` — which binds
 # ONE specific server module object at import time and desyncs if ``server`` is
@@ -2263,6 +2274,135 @@ def _rl_find_representative_obj(
             return link_obj
     return None
 
+# ── Per-slot truncation state off STORED chunk rows (v0.2.92, m-R6-1) ──────
+#
+# The KG dual-write persists the per-call truncation record as TWO chunk
+# properties, BOTH derived from the ONE atomic capture
+# (``EmbeddingService.embed_text_all_configured_tagged`` — the complete
+# per-call record — see the store site in ``server.store_knowledge_node``):
+#
+#   * ``truncated_slots`` (v0.2.92) — the COMPLETE record: every configured
+#     slot, the ACTIVE one included, whose stored vector was embedded from a
+#     bounded leading sub-window. Its PRESENCE is the era marker: only rows
+#     written after it landed can answer for the ACTIVE slot.
+#   * ``secondary_truncated_slots`` (R3-2) — the SECONDARY-only view, kept
+#     byte-for-byte for back-compat. It records no active-slot state EVER:
+#     whether the read-time ACTIVE slot was a secondary at write time is not
+#     recorded, so this property CANNOT answer for the active slot. Asking
+#     ``active_slot in secondary_truncated_slots`` of an old row yields False
+#     — a confident wrong answer, exactly the coercion
+#     ``rl_logger.resolve_emb_truncation_state`` exists to prevent.
+
+#: COMPLETE per-slot truncation record; presence marks a row that can answer
+#: for EVERY slot (the ACTIVE slot included).
+#: W3: defined ONCE in ``vco_lib.kg_truncation_tags`` (the writer-side home)
+#: and imported above — every writer and reader shares this one definition.
+#: R3-2 property: SECONDARY slots only. Never answers for the ACTIVE slot
+#: (``SECONDARY_TRUNCATED_SLOTS_PROP``, same import).
+
+
+def _stored_slot_truncation_state(
+    rep_obj,
+    slot: str,
+    *,
+    legacy_property_covers_slot: bool,
+) -> "bool | None":
+    """ONE reader: was ``slot``'s stored vector a bounded leading window?
+
+    Used by BOTH truncation legs — the dual-log OTHER slot (v4) and the
+    ACTIVE slot (v0.2.92 m-R6-1) — so the membership rule cannot drift
+    between two separate expressions. Returns a tri-state:
+
+      * ``True`` / ``False`` — the row positively knows the answer for
+        ``slot`` (an explicit ``False`` is a real full-fidelity answer);
+      * ``None`` — UNKNOWN. The caller must leave the state UNSET so the
+        event resolves ``TRUNCATION_UNKNOWN`` downstream — never a guessed
+        False (see ``rl_logger.resolve_emb_truncation_state``).
+
+    Resolution order:
+      1. ``truncated_slots`` (v0.2.92+ rows), scoped by
+         ``truncation_measured_slots``: a real answer for every slot the
+         writer MEASURED — the ACTIVE one included. A slot the row does NOT
+         list as measured is UNKNOWN, not False: that is the case of a
+         single-slot backfill adding a vector the original full write never
+         looked at, whose absence from the truncated list would otherwise
+         read as a confident full-fidelity claim.
+      2. ``secondary_truncated_slots`` (pre-v0.2.92 rows): answers only for
+         slots that property covers, which the caller asserts via
+         ``legacy_property_covers_slot``. The dual-log OTHER slot passes
+         True (that property was written for exactly those slots, so an
+         unlisted slot on a row that HAS the property is full-fidelity).
+         The ACTIVE slot passes False: an old row records nothing about
+         its active-at-write-time slot, so the honest answer is UNKNOWN —
+         even when the read-time active slot happens to appear in the
+         legacy list, that coincidence is not a recorded fact.
+
+    Rows carrying NEITHER property (pre-R3-2) are UNKNOWN for every slot.
+    Soft-fail: a missing/odd-shaped ``rep_obj`` or property container is
+    UNKNOWN, never an exception.
+    """
+    try:
+        props = rep_obj.properties or {}
+    except (AttributeError, TypeError):
+        return None
+    if not isinstance(props, dict):
+        return None
+    complete = props.get(TRUNCATED_SLOTS_PROP)
+    if isinstance(complete, (list, tuple)):
+        measured = props.get(MEASURED_SLOTS_PROP)
+        if isinstance(measured, (list, tuple)) and slot not in measured:
+            return None  # never measured on this row → UNKNOWN, not False
+        return slot in complete
+    if not legacy_property_covers_slot:
+        return None
+    legacy = props.get(SECONDARY_TRUNCATED_SLOTS_PROP)
+    if isinstance(legacy, (list, tuple)):
+        return slot in legacy
+    return None
+
+
+def _rl_attach_active_truncation_for_node(
+    node: dict,
+    rep_obj,
+    active_slot: str,
+) -> None:
+    """Attach the ACTIVE slot's persisted truncation state (v0.2.92 m-R6-1).
+
+    The SECONDARY slots' truncation state has reached the RL event since
+    schema v4 (``emb_other_truncated`` → the dual-log second event's
+    ``emb_truncated``); the ACTIVE slot's equivalent — set at the embed site
+    when the runner refused the full text — had NO reader: a WARNING log was
+    its only consumer. Under the user's priority ordering (P1 retrieval
+    correctness > P2 main-embedder telemetry > P3 secondary telemetry) that
+    was inverted, so the active state is now PERSISTED like the secondary's
+    (the ``truncated_slots`` chunk property) and carried on the MAIN
+    retrieval event's per-node ``emb_truncated``.
+
+    Reads the node's representative chunk row through the ONE shared reader
+    (``_stored_slot_truncation_state`` — the same helper the other-slot leg
+    uses) with ``legacy_property_covers_slot=False``: a row written before
+    ``truncated_slots`` existed cannot answer for the active slot, so the
+    state stays UNSET → ``TRUNCATION_UNKNOWN`` downstream, never a False
+    coerced out of ``secondary_truncated_slots``.
+
+    Fidelity note, stated because a looser claim would be wrong: the state
+    describes the chunk row ``_rl_find_representative_obj`` selects (the
+    matched chunk, first sibling, or title-keyed link object — the same
+    deterministic selection ``_rl_refetch_node_vector`` uses to pick a
+    vector). For a node whose active vector was REGENERATED at retrieval
+    time (the refetch path's step-4 regen) the fresh embed's verdict is not
+    persisted anywhere yet; the stored-row state is the best available
+    answer and is used as-is.
+    """
+    if rep_obj is None or not active_slot:
+        return
+    state = _stored_slot_truncation_state(
+        rep_obj, active_slot, legacy_property_covers_slot=False
+    )
+    if state is not None:
+        node["emb_truncated"] = state
+
+
 def _rl_attach_other_slot_for_node(
     node: dict,
     rep_obj,
@@ -2282,10 +2422,29 @@ def _rl_attach_other_slot_for_node(
     async store-back) — the lazy "fill it" that replaces the "skip it" path. When
     backfill is off, a missing other slot leaves the node without ``emb_other``
     (the second event then drops it). Soft-fail throughout.
+
+    v4 (2026-09-04): a STORAGE-read vector additionally attaches
+    ``emb_other_truncated`` (bool) read through the ONE shared reader
+    ``_stored_slot_truncation_state`` (the same helper the ACTIVE-slot leg
+    uses): from the chunk's ``truncated_slots`` record on v0.2.92+ rows, else
+    from the legacy ``secondary_truncated_slots`` property, so the dual-log
+    second event can identify truncated secondary vectors from the EVENT
+    ALONE. A backfilled vector leaves the state unset (unknown) — see the
+    inline note at the ``from_storage`` assignment.
     """
     if rep_obj is None or not other_slot:
         return
     emb_other = server._extract_obj_vector(rep_obj, other_slot)
+    # v4 (2026-09-04): a vector read from STORAGE has a KNOWABLE truncation
+    # state — the KG write persisted it as the chunk's
+    # ``secondary_truncated_slots`` property (R3-2). A vector generated by
+    # the backfill below does NOT (the backfill computes its leading-window
+    # verdict and MERGES it into the STORED row's truncation record via the
+    # shared merger — W3 — but THIS event still reflects the pre-patch row,
+    # whose state was not recorded), so it stays unset → the event resolves
+    # TRUNCATION_UNKNOWN, never a guessed False (see
+    # rl_logger.resolve_emb_truncation_state).
+    from_storage = bool(emb_other)
     if not emb_other and backfill_other and other_model_name:
         # Lazy on-use backfill: compute the OTHER slot's vector from the
         # representative object's stored content (full chunk) sized to the
@@ -2323,6 +2482,15 @@ def _rl_attach_other_slot_for_node(
                     coll_for_backfill,
                     svc,
                     embed_fn=_other_embed,
+                    # W3: hand the row's CURRENT properties to the store-back
+                    # so the leading-window verdict merges into the stored
+                    # truncation record (shared merger; None-safe — a row
+                    # without a complete record stays UNKNOWN).
+                    existing_props=(
+                        rep_obj.properties
+                        if isinstance(rep_obj.properties, dict)
+                        else None
+                    ),
                 )
         except Exception as exc:  # noqa: BLE001
             server.logger.debug(
@@ -2332,6 +2500,23 @@ def _rl_attach_other_slot_for_node(
     if not emb_other:
         return
     node["emb_other"] = emb_other
+    # v4: attach the OTHER slot's truncation state when it came from storage
+    # (see the from_storage note above). ``secondary_truncated_slots`` is the
+    # list of slot names whose stored vector was embedded from a bounded
+    # sub-window; a MISSING property (pre-R3-2 rows, single-slot schema)
+    # leaves the state unset → TRUNCATION_UNKNOWN downstream.
+    if from_storage:
+        # ONE shared reader — the same helper the ACTIVE-slot leg uses
+        # (v0.2.92 m-R6-1) — so the membership rule cannot drift between the
+        # two legs. ``legacy_property_covers_slot=True``: the R3-2 property
+        # was written for exactly these secondary slots, so an unlisted slot
+        # on a row that HAS the property is a real full-fidelity answer
+        # (behaviour identical to the pre-v0.2.92 inline membership check).
+        state = _stored_slot_truncation_state(
+            rep_obj, other_slot, legacy_property_covers_slot=True
+        )
+        if state is not None:
+            node["emb_other_truncated"] = state
     if other_query_emb:
         try:
             node["cos_qn_other"] = server._cosine(other_query_emb, emb_other)
@@ -2468,6 +2653,13 @@ def _rl_enrich_nodes_with_linked_embs(
         populated from Weaviate's returned object). Logging both ``emb``
         AND ``n_emb`` is redundant but cheap; offline_trainer prefers
         ``n_emb`` when both are present (v3 contract).
+      - ``emb_truncated`` (v0.2.92 m-R6-1): the ACTIVE slot's persisted
+        truncation state, read off the node's representative chunk row via
+        the ONE shared reader ``_stored_slot_truncation_state``. Tri-state:
+        True/False where the row's ``truncated_slots`` property can answer,
+        ABSENT (→ ``TRUNCATION_UNKNOWN``) on rows that predate it — never a
+        False coerced out of ``secondary_truncated_slots``, which records
+        secondaries only.
       - ``linked_embs``: MAX_LINKED packed vectors built by
         ``_rl_pack_linked_embs_for_node`` (extras_of_this_node + actual_links,
         truncated).
@@ -2752,6 +2944,28 @@ def _rl_enrich_nodes_with_linked_embs(
             if n_emb:
                 n["n_emb"] = n_emb
 
+            # v0.2.92 (m-R6-1): ONE representative chunk object per node,
+            # shared by BOTH truncation-state legs — the ACTIVE slot's state
+            # attached just below and the dual-log other-slot attach further
+            # down. Same deterministic selection the vector refetch uses
+            # (matched chunk, first sibling, title-keyed fallback), so the
+            # state is read off the same row the representative vector comes
+            # from. Soft-fail: no representative → state stays unset →
+            # TRUNCATION_UNKNOWN downstream.
+            try:
+                _rep_obj = server._rl_find_representative_obj(
+                    n, sibling_objs_by_source_id, link_objs_by_title
+                )
+            except Exception:  # noqa: BLE001 — selection is best-effort
+                _rep_obj = None
+            # The ACTIVE slot's persisted truncation state → the MAIN event's
+            # per-node ``emb_truncated`` (set only when the stored row can
+            # answer, i.e. it carries ``truncated_slots``).
+            if n_emb:
+                server._rl_attach_active_truncation_for_node(
+                    n, _rep_obj, active_slot
+                )
+
             # cos_qn (re-)compute when we have both inputs.
             if query_emb and n_emb and "cos_qn" not in n:
                 try:
@@ -2782,12 +2996,9 @@ def _rl_enrich_nodes_with_linked_embs(
             # on-the-fly + store back (lazy fill replacing skip). Soft-fail.
             if other_slot:
                 try:
-                    rep_obj = server._rl_find_representative_obj(
-                        n, sibling_objs_by_source_id, link_objs_by_title
-                    )
                     server._rl_attach_other_slot_for_node(
                         n,
-                        rep_obj,
+                        _rep_obj,
                         other_slot=other_slot,
                         other_query_emb=other_query_emb,
                         other_model_name=other_model_name,

@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Test config
@@ -215,7 +217,7 @@ def test_analyze_fails_fast_on_case_insensitive_class_collision(
             text=True,
             timeout=MAX_FAIL_FAST_SECONDS + 10,  # safety net: a real hang
                                                   # propagates as TimeoutExpired
-            env=env,
+            env=child_env(env),
         )
         elapsed = time.monotonic() - start
 

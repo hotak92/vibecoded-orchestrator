@@ -29,6 +29,7 @@ import {
   updateAllModalDismissable,
   type UpdateAllPhase,
 } from './update-all-progress';
+import { kgSyncPhaseKind } from './kg-sync-banner-logic';
 import { isErrorWarning } from '$lib/warning-severity';
 
 function started(
@@ -78,10 +79,19 @@ function kgSync(
 ): KgSyncProgress {
   return {
     status: 'running',
+    started_at_iso: null,
+    finished_at_iso: null,
+    duration_ms: null,
     kg_total: 0,
     kg_succeeded: 0,
+    kg_failed: 0,
+    kg_skipped: 0,
     docs_total: 0,
     docs_succeeded: 0,
+    docs_failed: 0,
+    docs_skipped: 0,
+    error_message: null,
+    log_tail: null,
     current_phase: null,
     ...overrides,
   };
@@ -228,13 +238,116 @@ describe('kgSyncSubLabel — condensed KG-sync sub-progress label', () => {
   });
 
   it('returns null for terminal statuses (clears the sub-line)', () => {
-    for (const status of ['success', 'failed', 'skipped', 'pending']) {
+    const terminal = ['success', 'failed', 'skipped', 'pending'] as const;
+    for (const status of terminal) {
       expect(
         kgSyncSubLabel(
           kgSync({ project_id: 'a', status, current_phase: 'docs', docs_total: 5 }),
         ),
       ).toBeNull();
     }
+  });
+});
+
+// ── v0.2.92 review MAJOR-9 — the second KG-sync mirror, reconciled ─────────
+//
+// The banner/pill got WP-B1's skip-aware counts and its `finalize` stage; this
+// surface (the one the bundle-staleness census tells users to open) did not.
+// These pin the two scenarios the review named, plus the shared-vocabulary
+// contract that stops a third copy appearing.
+describe('kgSyncSubLabel — WP-B1 parity (review MAJOR-9)', () => {
+  it('counts intentional skips as done: 100 nodes, 60 skipped, does not freeze at 40/100', () => {
+    // THE REGRESSION. Pre-fix this rendered `syncing knowledge 40/100` and
+    // stayed there for the rest of the run, because 60 archived/excluded nodes
+    // are never "succeeded" — the row read as frozen while nothing was wrong.
+    expect(
+      kgSyncSubLabel(
+        kgSync({
+          project_id: 'a',
+          current_phase: 'knowledge',
+          kg_total: 100,
+          kg_succeeded: 40,
+          kg_skipped: 60,
+        }),
+      ),
+    ).toBe('syncing knowledge 100/100');
+  });
+
+  it('counts docs-side skips the same way', () => {
+    expect(
+      kgSyncSubLabel(
+        kgSync({
+          project_id: 'a',
+          current_phase: 'docs',
+          docs_total: 35,
+          docs_succeeded: 20,
+          docs_skipped: 15,
+        }),
+      ),
+    ).toBe('syncing docs 35/35');
+  });
+
+  it('treats an older launcher payload (no skip fields) as 0 skipped', () => {
+    expect(
+      kgSyncSubLabel(
+        kgSync({
+          project_id: 'a',
+          current_phase: 'knowledge',
+          kg_total: 10,
+          kg_succeeded: 4,
+          kg_skipped: undefined,
+          docs_skipped: undefined,
+        }),
+      ),
+    ).toBe('syncing knowledge 4/10');
+  });
+
+  it('names the finalize stage instead of sitting on a completed-looking count', () => {
+    // The `.node_formats.json` regen runs AFTER the final counts and can take
+    // up to 600 s. Pre-fix: `syncing knowledge 100/100`, indistinguishable
+    // from a hang.
+    expect(
+      kgSyncSubLabel(
+        kgSync({
+          project_id: 'a',
+          current_phase: 'finalize',
+          kg_total: 100,
+          kg_succeeded: 40,
+          kg_skipped: 60,
+        }),
+      ),
+    ).toBe('finalizing summaries…');
+  });
+
+  it('surfaces the queued phase (waiting on the global embed lane)', () => {
+    expect(
+      kgSyncSubLabel(kgSync({ project_id: 'a', current_phase: 'queued' })),
+    ).toBe('waiting for the embed lane…');
+  });
+
+  it('renders an unknown phase NEUTRALLY, never as "syncing knowledge"', () => {
+    expect(
+      kgSyncSubLabel(
+        kgSync({
+          project_id: 'a',
+          current_phase: 'cooldown',
+          kg_total: 10,
+          kg_succeeded: 10,
+        }),
+      ),
+    ).toBe('cooldown…');
+  });
+
+  it('classifies through the SHARED phase vocabulary (no second copy)', () => {
+    // Not a re-test of kgSyncPhaseKind — a contract that this surface and the
+    // banner agree by construction. Every phase string the shared classifier
+    // knows must produce a label here; a fall-through to the generic line for
+    // a KNOWN phase would mean the copies had drifted again.
+    for (const phase of ['scan', 'queued', 'finalize', 'docs', 'knowledge', 'embed']) {
+      expect(kgSyncPhaseKind(phase)).not.toBe('unknown');
+    }
+    // …and the classifier's 'unknown' verdict is what drives the neutral arm.
+    expect(kgSyncPhaseKind('cooldown')).toBe('unknown');
   });
 });
 

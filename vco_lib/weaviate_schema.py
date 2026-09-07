@@ -5,8 +5,17 @@
 v0.2.18 introduces a canonical named-vector slot catalog that's shared across
 schema creation (`vco_lib/project_init.py::kg_class_definition` etc.) and
 schema migration (`vco_lib/project_init.py::migrate_collections` + a new
-`migrate_collections_to_v0218_schema` helper exposed via the
-`migrate-collections` CLI subcommand).
+`migrate_collections_to_v0218_schema` helper).
+
+PROMISE CORRECTION (v0.2.92 W18): this used to say the helper was "exposed via
+the `migrate-collections` CLI subcommand". It is not — the CLI at
+`vco_lib/project_init.py:14012` imports `enumerate_kg_collections`,
+`enumerate_code_collections` and `migrate_collection_to_target` and re-implements
+the helper's loop inline (it adds per-collection dry-run entries the helper does
+not model). Both paths now inherit the same "could not read the live schema"
+failure from `_list_all_classes`, so they cannot disagree about WHICH
+collections exist; folding the inline loop back onto the helper is a
+duplication-merge item in `project_init.py`, which this module does not own.
 
 The design constraint: **schema changes are additive**. Adding a new slot to
 an existing collection must preserve all data already in the existing slots.
@@ -77,7 +86,6 @@ pre-computed vectors. Weaviate never invokes a vectorizer module.
 from __future__ import annotations
 
 import enum
-import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -88,6 +96,13 @@ from vco_lib import weaviate_helpers as _wh
 # so this module stays import-cheap (weaviate_helpers is pure stdlib) while the
 # constant no longer has an independent copy that could drift.
 DEFAULT_WEAVIATE_PORT = _wh.DEFAULT_WEAVIATE_PORT
+
+# v0.2.92 W18: re-exported so a caller of `enumerate_*` /
+# `migrate_collections_to_v0218_schema` can catch the "could not read the live
+# schema" failure without also importing `weaviate_helpers`. Same object, not a
+# copy — `except weaviate_schema.ProbeUnavailable` and
+# `except weaviate_helpers.ProbeUnavailable` catch identically.
+ProbeUnavailable = _wh.ProbeUnavailable
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +916,15 @@ def enumerate_kg_collections(
 
     Filters out collections that don't actually exist on the server
     (the per-project triple includes Dev which is sometimes absent).
+
+    Raises:
+        vco_lib.weaviate_helpers.ProbeUnavailable: the live schema could not
+            be READ. v0.2.92 W18 — audited and CHANGED deliberately: this
+            function's whole job is "which of these exist on the server", so
+            an empty answer derived from a server we never reached is a false
+            negative, and its only callers use the result to decide what to
+            migrate. A migration that visits nothing because Weaviate blinked
+            must not look like a migration that had nothing to do.
     """
     base = (weaviate_url or _weaviate_url_default()).rstrip("/")
     listed = _list_all_classes(weaviate_url=base)
@@ -956,6 +980,11 @@ def enumerate_code_collections(
     collections from pre-multi-project orchestrator) are included when
     `project_name` is None — they may still hold data that the
     multi-slot migration should cover.
+
+    Raises:
+        vco_lib.weaviate_helpers.ProbeUnavailable: the live schema could not
+            be READ (same audited change as :func:`enumerate_kg_collections`).
+            A genuinely empty server still yields ``[]``.
     """
     base = (weaviate_url or _weaviate_url_default()).rstrip("/")
     listed = _list_all_classes(weaviate_url=base)
@@ -977,21 +1006,30 @@ def enumerate_code_collections(
 
 
 def _list_all_classes(*, weaviate_url: Optional[str] = None) -> list[str]:
-    """GET /v1/schema -> sorted list of class names. Returns [] on
-    transport failure (Weaviate down).
+    """GET /v1/schema -> sorted list of class names.
+
+    **Raises** :class:`vco_lib.weaviate_helpers.ProbeUnavailable` when the
+    schema could NOT be read (Weaviate down, non-200, unparsable payload).
+
+    v0.2.92 W18 — this used to return ``[]`` on a transport failure, which made
+    "Weaviate is unreachable" and "this server has no classes" the same answer
+    and let both :func:`enumerate_kg_collections` and
+    :func:`enumerate_code_collections` report a clean, empty result for a
+    server they never reached. The listing itself now comes from the ONE home
+    (:func:`vco_lib.weaviate_helpers.probe_class_listing`), and this wrapper's
+    documented decision for the unknown state is to RAISE — an exception cannot
+    be mistaken for an empty list by any caller.
+
+    A genuinely empty server still returns ``[]`` (the probe's ``absent``
+    state), so a caller distinguishing "no collections to migrate" from
+    "could not look" gets the truth in both directions.
+
+    Kept as a module-level function (rather than inlining the probe at the two
+    call sites) because it is the seam ``tests/test_weaviate_schema.py`` patches
+    to drive the enumerators against a fixed class list.
     """
     base = (weaviate_url or _weaviate_url_default()).rstrip("/")
-    try:
-        status, body = _http_request("GET", f"{base}/v1/schema", timeout=10)
-        if status != 200:
-            return []
-        payload = json.loads(body.decode("utf-8"))
-        return sorted(
-            c.get("class", "") for c in payload.get("classes", [])
-            if c.get("class")
-        )
-    except Exception:
-        return []
+    return sorted(_wh.probe_class_listing(base, timeout=10).require())
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1067,15 @@ def migrate_collections_to_v0218_schema(
         One `MigrationReport` per collection visited. The caller
         prints a human-readable summary; the CLI wrapper exits
         non-zero if any report has errors.
+
+    Raises:
+        vco_lib.weaviate_helpers.ProbeUnavailable: the live schema could not
+            be read, so the set of collections to migrate is UNKNOWN. Raised
+            before any collection is touched — this function performs zero
+            schema writes on that path. Previously the enumerators returned
+            ``[]`` here and the caller received an empty, successful-looking
+            report list (``format_reports_table`` printed "(no collections
+            matched)") for a server it never reached.
     """
     reports: list[MigrationReport] = []
 
@@ -1104,4 +1151,6 @@ __all__ = [
     "enumerate_code_collections",
     "format_reports_table",
     "is_code_collection",
+    # failure surface (v0.2.92 W18) — re-export of the one home's exception
+    "ProbeUnavailable",
 ]

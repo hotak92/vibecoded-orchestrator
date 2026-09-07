@@ -1896,16 +1896,16 @@ def code_embed_service_healthy(
     """Return True iff the code-embedding service answers ``/health`` < 400.
 
     Resolution order for the base URL: explicit arg → ``CODE_EMBED_SERVICE_URL``
-    env → ``http://localhost:<CODE_EMBED_PORT|11440>``. Never raises — any
-    failure (connection refused, timeout, DNS) returns False so the caller
-    degrades to the deferral path rather than crashing the update.
+    env → ``http://localhost:<CODE_EMBED_PORT|11440>``, resolved by the ONE
+    shared home ``vco_lib.code_embed_image.service_base_url`` (v0.2.92 R2 —
+    this order was previously inlined here and twice in
+    ``vco_lib/embedding_service.py``). Never raises — any failure (connection
+    refused, timeout, DNS) returns False so the caller degrades to the
+    deferral path rather than crashing the update.
     """
-    base = (
-        code_embed_url
-        or os.environ.get("CODE_EMBED_SERVICE_URL")
-        or f"http://localhost:{os.environ.get('CODE_EMBED_PORT', DEFAULT_CODE_EMBED_PORT)}"
-    )
-    base = base.rstrip("/")
+    from vco_lib.code_embed_image import service_base_url
+
+    base = service_base_url(code_embed_url)
     health = base if base.endswith("/health") else f"{base}/health"
     try:
         resp = urllib.request.urlopen(health, timeout=timeout)
@@ -2481,6 +2481,7 @@ def run_resync_and_verify(
     analyzer_path: Path,
     *,
     prune_stale: bool = False,
+    force_rewalk: bool = False,
     index_dot_claude: bool = True,
     log_path: "Path | str | None" = None,
 ) -> int:
@@ -2542,6 +2543,14 @@ def run_resync_and_verify(
     ]
     if prune_stale:
         argv.append("--prune-stale")
+    # v0.2.92: the extractor-generation re-index needs the analyzer's per-FILE
+    # skip gate bypassed (an extractor-only fix leaves every file hash
+    # unchanged, so every signal says "skip"). Travels as EXPLICIT ARGV across
+    # both process hops rather than ambient env — the env var remains supported
+    # by `resolve_force_rewalk` for manual invocation, but no VCO code path
+    # relies on inheritance any more.
+    if force_rewalk:
+        argv.append("--force-rewalk")
     print(f"[resync-driver] running: {' '.join(argv)}", flush=True)
     analyzer_started = time.monotonic()
     start_error: Optional[str] = None
@@ -2831,6 +2840,7 @@ def spawn_background_resync(
     code_embed_url: Optional[str] = None,
     check_service: bool = True,
     check_owed: bool = True,
+    force_rewalk: bool = False,
     index_dot_claude: bool = True,
 ) -> ResyncTriggerResult:
     """Launch a BACKGROUND, revision-gated full re-analyze of ``repo_root``.
@@ -2998,6 +3008,9 @@ def spawn_background_resync(
     # or vice versa — for `.claude/**` rows on user projects).
     if index_dot_claude:
         argv.append("--index-dot-claude")
+    # v0.2.92: forwarded to the driver, which forwards it to the analyzer.
+    if force_rewalk:
+        argv.append("--force-rewalk")
 
     # Detached background spawn. stdout/stderr go to a per-spawn log file
     # under <vct_root_dir>/logs/ (R-5 / RT-2 — pre-fix they went to DEVNULL,
@@ -3251,6 +3264,10 @@ def _main(argv: Optional[list] = None) -> int:
     parser.add_argument("--prune-stale", action="store_true",
                         help="forward --prune-stale to the analyzer "
                              "(--run-resync; spawn passes it only when safe)")
+    parser.add_argument("--force-rewalk", action="store_true",
+                        help="forward --force-rewalk to the analyzer, bypassing "
+                             "its per-file skip gate (--run-resync; set by the "
+                             "extractor-generation re-index trigger)")
     parser.add_argument("--log-path",
                         help="the spawn's shared per-run log file "
                              "(--run-resync; stats source for the #31 "
@@ -3276,6 +3293,7 @@ def _main(argv: Optional[list] = None) -> int:
             Path(args.repo_root),
             Path(args.analyzer),
             prune_stale=args.prune_stale,
+            force_rewalk=args.force_rewalk,
             index_dot_claude=args.index_dot_claude,
             log_path=Path(args.log_path) if args.log_path else None,
         )

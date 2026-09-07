@@ -26,6 +26,7 @@ use tauri::{command, State};
 use crate::commands::dashboard::require_tier;
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
+use vct_launcher_core::secrets_file_store::Presence;
 use vct_launcher_core::process::CommandExt as _;
 
 const MODULE_ID: &str = "vct-coordination";
@@ -46,12 +47,51 @@ pub struct CoordinationConfig {
     pub installed: bool,
     pub enabled: bool,
     pub supabase_url: Option<String>,      // URL is not a secret — we return it
-    pub supabase_key_set: bool,            // key presence only, never value
-    pub telegram_bot_token_set: bool,
+    /// Presence only, never a value — and TRI-state, not a boolean.
+    ///
+    /// A locked or erroring keychain used to collapse to `false` here,
+    /// which the page rendered as "Required." for a key that was in fact
+    /// set. The user's response to that is to re-paste the secret, which
+    /// overwrites a perfectly good entry — "we could not look" and "it is
+    /// not there" ask for opposite actions, so they cannot share a state.
+    /// Same `Presence` type the secrets panel's `StoreReport` uses.
+    pub supabase_key_presence: Presence,
+    pub telegram_bot_token_presence: Presence,
     pub username: Option<String>,
     pub user_aliases: Vec<String>,
     pub channels_enabled: Vec<String>,
     pub telegram_group_id: Option<String>,
+}
+
+/// Probe the keychain for one key's PRESENCE, tri-state.
+///
+/// Extracted from `coordination_get_config`'s body so the Err arm is
+/// unit-testable against the mock keychain — the decision this function
+/// exists to make cannot be reached from the command without a Tauri
+/// `State<Db>` and a licensed tier.
+///
+/// WHY TRI-STATE: this used to return `bool`, mapping a locked or erroring
+/// keychain to `false`. The page rendered that as "Required." for a key that
+/// was in fact set, and the user's response to "Required." is to paste the
+/// secret again — overwriting a working entry. A check that could not run
+/// must not read as absence
+/// (`knowledge/concepts/a-check-that-could-not-run-reads-as-absence-2026-09-03.md`).
+///
+/// `Background` context is deliberate: a page-mount fetch must never pop an
+/// OS unlock dialog. That is exactly why `Err` is common enough here to
+/// matter — a locked login keychain is the ordinary state on a fresh boot.
+fn keychain_presence(scope: SecretScope<'_>, key: &str) -> Presence {
+    match secrets::is_set_with_context(scope, MODULE_ID, key, secrets::CallContext::Background) {
+        Ok(true) => Presence::Present,
+        Ok(false) => Presence::Absent,
+        Err(e) => {
+            tracing::warn!(
+                "[vct-coordination] keychain read for {key:?} unavailable \
+                 ({e}); reporting UNKNOWN (not absent) for this page load"
+            );
+            Presence::Unknown
+        }
+    }
 }
 
 #[command]
@@ -92,23 +132,10 @@ pub async fn coordination_get_config(
     // Secrets (presence only for key + telegram token; URL is returned).
     //
     // v0.2.82 (WP-4a): this is a page-mount fetch (Background) — it must NEVER
-    // pop an OS unlock dialog. A locked/errored keychain must not be conflated
-    // with "secret set" either; on such an error we report the field as
-    // not-present (this is a display-only presence indicator, not a security
-    // gate) and log the reason, rather than prompting or erroring the page.
+    // pop an OS unlock dialog. See `keychain_presence` for why an errored read
+    // is `Unknown` rather than the `false` this used to report.
     let bg = secrets::CallContext::Background;
-    let read_presence = |key: &str| -> bool {
-        match secrets::is_set_with_context(scope, MODULE_ID, key, bg) {
-            Ok(present) => present,
-            Err(e) => {
-                tracing::warn!(
-                    "[vct-coordination] keychain read for {key:?} unavailable \
-                     ({e}); reporting not-set for this page load"
-                );
-                false
-            }
-        }
-    };
+    let read_presence = |key: &str| -> Presence { keychain_presence(scope, key) };
     let supabase_url = match secrets::get_with_context(scope, MODULE_ID, "SUPABASE_URL", bg) {
         Ok(v) => v,
         Err(e) => {
@@ -119,16 +146,16 @@ pub async fn coordination_get_config(
             None
         }
     };
-    let supabase_key_set = read_presence("SUPABASE_KEY");
-    let telegram_bot_token_set = read_presence("TELEGRAM_BOT_TOKEN");
+    let supabase_key_presence = read_presence("SUPABASE_KEY");
+    let telegram_bot_token_presence = read_presence("TELEGRAM_BOT_TOKEN");
 
     Ok(CoordinationConfig {
         project_id,
         installed: install_row.is_some(),
         enabled: install_row.map(|r| r.enabled).unwrap_or(false),
         supabase_url,
-        supabase_key_set,
-        telegram_bot_token_set,
+        supabase_key_presence,
+        telegram_bot_token_presence,
         username,
         user_aliases,
         channels_enabled,
@@ -545,6 +572,44 @@ mod tests {
     /// The per-command call sites are pinned mechanically by
     /// `tests/test_v0291_pro_route_enforcement.py` (a source ratchet — a
     /// new `#[command]` added here without the gate fails it).
+    /// v0.3.0 — the coordination page reported `supabase_key_set: false`
+    /// whenever the keychain READ FAILED, so a locked login keychain (the
+    /// ordinary state right after a boot, and the reason this probe runs in
+    /// `Background` context at all) rendered "Required." for a key that was
+    /// set. The user's response to that is to paste the secret again,
+    /// overwriting a working entry — so the collapse was not cosmetic.
+    ///
+    /// Driven through the REAL probe against the mock keychain, including
+    /// its error arm, so removing the `Err => Unknown` mapping reddens this.
+    #[test]
+    fn errored_keychain_read_is_unknown_not_absent() {
+        let _g = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let scope = SecretScope::PerProject { project_id: "coord-proj" };
+
+        // ABSENT: the store answered, and the answer was "no such key".
+        assert_eq!(
+            keychain_presence(scope, "SUPABASE_KEY"),
+            Presence::Absent,
+            "a store that answered 'no' must report Absent"
+        );
+
+        // PRESENT: the store answered, and it holds a value.
+        vct_launcher_core::secrets::set(scope, MODULE_ID, "SUPABASE_KEY", "sb_secret_synthetic")
+            .expect("mock set");
+        assert_eq!(keychain_presence(scope, "SUPABASE_KEY"), Presence::Present);
+
+        // UNKNOWN: the store could not be read. The value is STILL THERE —
+        // which is precisely why reporting Absent here is a lie that costs
+        // the user their stored secret.
+        vct_launcher_core::secrets::for_tests::fail_next_get("SUPABASE_KEY");
+        assert_eq!(
+            keychain_presence(scope, "SUPABASE_KEY"),
+            Presence::Unknown,
+            "an unreadable keychain must NOT be reported as absence"
+        );
+        assert_ne!(keychain_presence(scope, "SUPABASE_KEY"), Presence::Absent);
+    }
+
     #[test]
     fn free_tier_is_refused_and_licensed_tiers_are_unchanged() {
         let db = Db::open_in_memory().expect("in-memory db");

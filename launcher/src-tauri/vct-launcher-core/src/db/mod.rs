@@ -99,6 +99,20 @@ pub mod codegraph_extras;
 // `commands::project_hooks_settings` (launcher crate).
 pub mod project_hooks_settings;
 
+// Migration 043 — the version-keyed CHAT-model context table (v0.2.92,
+// WP-11). Orchestrator-wide (a model's window is a property of the model,
+// not of a project), keyed by FULL model id because `glm-5.2` is 1M while
+// `glm-5.1` is 200K. The launcher exports it to
+// `<vct_root>/model-gateway/chat_model_context.json`, which the model gateway
+// reads to decide which ids to advertise to Claude Code as `<id>[1m]`. This
+// module also owns the export DOCUMENT builder, because `vct-hub` serves the
+// same shape on `GET /api/v1/chat-model-context` and both crates depend on
+// this one. NOT `weaviate_mcp.chunking.MODEL_TOKEN_LIMITS` (embedding
+// num_ctx, partial match, chunker wire input) — see the module docstring and
+// EXTENSION plan §3.19. Tauri command surface:
+// `commands::chat_model_context` (launcher crate).
+pub mod chat_model_context;
+
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
     crate::paths::vct_root_dir().join("launcher.db")
@@ -330,23 +344,14 @@ mod close_reopen_tests {
     //! against `db_path()`, so they mutate the process-wide `VCT_STATE_DIR`
     //! and MUST be serialised (same pattern as `lockfile::tests`).
     use super::*;
-    use std::sync::Mutex as StdMutex;
-
-    static SERIALIZE: StdMutex<()> = StdMutex::new(());
-
-    fn with_state_dir<F: FnOnce(&std::path::Path)>(f: F) {
-        let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: serialised by SERIALIZE; no other thread observes/mutates
-        // VCT_STATE_DIR concurrently.
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
-        f(tmp.path());
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
-    }
+    use crate::test_env::with_state_dir;
+    // v0.2.92: `with_state_dir` + the file-local SERIALIZE mutex used to
+    // be defined here — one of five near-identical copies. Every copy
+    // ended by UNSETTING `VCT_STATE_DIR` instead of restoring the prior
+    // value, which destroyed any outer redirect for every test that ran
+    // after it in the same binary. The shared helper restores, and its
+    // `GLOBAL_ENV_MUTEX` serialises across the whole workspace rather
+    // than only within this file.
 
     #[test]
     fn close_for_update_releases_file_handle_for_a_second_writer() {

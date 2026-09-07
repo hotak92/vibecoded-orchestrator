@@ -27,7 +27,7 @@ from weaviate_mcp.code_truncation import (  # noqa: E402
 )
 from weaviate_mcp.server import _parse_chunk_header  # noqa: E402
 
-_MODEL = "codesage/codesage-large-v2"  # ~8000-char budget
+_MODEL = "codesage/codesage-large-v2"  # 3 584-char budget (1 024 num_ctx × 3.5)
 _HEADER_RE = re.compile(r"^\[chunk (\d+)/(\d+)\]\n\n")
 
 
@@ -114,3 +114,95 @@ def test_empty_body_returns_signature_only():
     out = chunk_or_truncate_for_embedding("def f()", "", language="python", model=_MODEL)
     assert len(out) == 1
     assert "def f" in out[0]
+
+
+def test_v0292_jina_budget_matches_chunking_ssot_not_stale_8192():
+    """WP-E (v0.2.92): CODE_MODEL_TOKEN_LIMITS used to hand-duplicate
+    chunking.py's MODEL_TOKEN_LIMITS and had drifted — jina was pinned at
+    the OLD 8192 tokens (28672 chars) here while chunking.py had already
+    been corrected to 2048 tokens (jina-v2 is trained at 512; 2048 is the
+    shipped conservative ceiling). CPU-tier installs (install.py's "cpu"
+    EMBEDDING_CONFIGS profile) actively select jina as the code model, so
+    the stale value silently over-budgeted truncation for real installs.
+
+    This pins the CORRECT (SSOT-derived) value so the drift cannot silently
+    reopen. Red-proofed against the pre-fix file
+    (/tmp/wp-e-redproof/pre/code_truncation_pre.py, git HEAD copy): the old
+    hardcoded dict resolves both jina keys to 8192 tokens / 28672 chars,
+    which fails the assertions below.
+    """
+    from weaviate_mcp.chunking import _num_ctx_for_model
+
+    jina_keys = (
+        "unclemusclez/jina-embeddings-v2-base-code:latest",
+        "jina-embeddings-v2-base-code",
+    )
+    ssot_tokens = _num_ctx_for_model(jina_keys[0])
+    assert ssot_tokens == 2048, (
+        "chunking.py's SSOT itself changed — update this test's expectation, "
+        "not code_truncation.py's derivation"
+    )
+    for key in jina_keys:
+        # 2048 tokens * 3.5 chars/token = 7168, NOT the stale 8192 * 3.5 = 28672.
+        assert _max_chars_for_model(key) == 7168
+        assert _max_chars_for_model(key) != 28672
+
+
+def test_v0292_w1_codesage_budget_is_the_served_window_not_the_arch_cap():
+    """W1 (wiring audit, 2026-09-05): the budget must derive from the SERVED
+    1 024-token window (sentence_bert_config.json max_seq_length), not the
+    2 048 architectural cap in config.json.
+
+    The old 2 048 entry budgeted 7 168 chars ≈ 2 193 real CodeSage tokens
+    (measured on real repo Python) — 2.1x the served window, silently
+    truncated at HTTP 200. 1 024 × 3.5 = 3 584 chars. Red-proof: reverting
+    the SSOT entry to 2 048 fails this (and the chunking tests) while the
+    behaviour-level guard (the shrink tests in
+    test_secondary_window_exact_bound.py) catches the runtime half.
+    """
+    from weaviate_mcp.chunking import _num_ctx_for_model
+
+    cs_keys = ("codesage/codesage-large-v2", "codesage-large-v2")
+    for key in cs_keys:
+        assert _num_ctx_for_model(key) == 1024, (
+            "chunking.py's SSOT itself changed — update this test's "
+            "expectation, not code_truncation.py's derivation"
+        )
+        assert _max_chars_for_model(key) == 3584
+        assert _max_chars_for_model(key) != 7168, (
+            "the 2 048-derived budget fed CodeSage 2.1x its served window"
+        )
+
+
+def test_v0292_w1_codesage_single_entity_capped_at_the_new_budget():
+    """A maximal entity's assembled priority text must come out AT the new
+    3 584-char budget (not the old 7 168) — the truncation actually caps at
+    the served-window-derived size.
+
+    Density arithmetic (measured 2026-09-05, W1): real repo Python
+    tokenises at 3.46-3.48 c/t on budget-window slices, so 3 584 chars is
+    ~1 036 CodeSage tokens — at the served 1 024 window. Denser windows
+    (2.96 c/t observed) can still overflow; that residual is the service's
+    refusal + the caller's shrink (tagged), pinned in
+    test_secondary_window_exact_bound.py.
+    """
+    sig = "def big(x):"
+    lines = [
+        f"    y_{i} = compute_value(input_{i}) + offset_{i} * scale_{i}"
+        for i in range(200)
+    ]
+    body = sig + ":\n" + "\n".join(lines)
+    assert len(body) > 7_168, "fixture must exceed even the OLD budget"
+
+    text = truncate_function_for_embedding(
+        sig, body, language="python", model=_MODEL
+    )
+    assert len(text) <= 3_584, (
+        "the assembled text is capped at the served-window budget; the old "
+        "cap let 7 168 chars through (≈ 2 193 real tokens vs a 1 024 window)"
+    )
+    # And the over-budget twin splits instead of truncating.
+    parts = chunk_or_truncate_for_embedding(
+        sig, body, language="python", model=_MODEL, full_name="mod.big"
+    )
+    assert len(parts) >= 2, "an old-budget-sized entity now chunks"

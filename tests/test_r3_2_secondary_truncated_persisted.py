@@ -40,12 +40,15 @@ for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
 
 from vco_lib.embedding_service import (  # noqa: E402
     EmbeddingService,
-    _CHARS_PER_TOKEN,
+    _char_budget_for_model,
 )
 
 _ARCTIC_MODEL = "snowflake-arctic-embed2:latest"
-_ARCTIC_NUM_CTX = 4096
-_ARCTIC_CHAR_BUDGET = _ARCTIC_NUM_CTX * _CHARS_PER_TOKEN
+# Defect-1 bound (v0.2.92), PRIMARY role — the default `_char_budget_for_model`
+# value: 12 800 for arctic. The secondary role takes a smaller attempt tier
+# (`full_coverage=False` → 9 815) and a smaller fallback (`conservative=True`
+# → 7 065); this constant is the default, so it is the primary number.
+_ARCTIC_CHAR_BUDGET = _char_budget_for_model(_ARCTIC_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +223,14 @@ def _big_multichunk_text() -> str:
     # arctic's num_ctx (so its arctic secondary truncates) and the small trailing
     # chunk fits (so its arctic secondary does NOT) — a mixed corpus that PROVES
     # per-chunk partitioning.
+    # 560 items (defect-1 bound, v0.2.92): chunks are ≈ 33.8k / 33.6k / 1.4k
+    # chars — the first two exceed arctic's 7 065-char budget (truncated),
+    # the 1.4k tail fits (full fidelity). At the previous 640 items the tail
+    # was 11.2k chars and ALSO exceeded the budget, collapsing the partition.
     sentence = "The retrieval model scores each candidate node against the query. "
     return " ".join(
         f"{sentence}Item {i} details here and more words to pad this nicely."
-        for i in range(700)
+        for i in range(560)
     )
 
 

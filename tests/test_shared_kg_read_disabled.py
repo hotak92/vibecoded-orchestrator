@@ -28,11 +28,8 @@ monkeypatch for the MCP-side resolver.
 
 from __future__ import annotations
 
-import importlib
 import json
-import sqlite3
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -40,6 +37,8 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -65,77 +64,35 @@ def _make_launcher_db_with_read_disabled(
     shared: str | None,
     read_disabled: bool | None,
 ) -> Path:
-    """Create a minimal launcher.db with a project row, primary/shared
-    bindings, and (optionally) a `module_settings` row carrying the
-    ``shared_kg_read_disabled`` flag for orchestrator-core. Pass
+    """Create a launcher.db (REAL schema — v0.2.92 §3.4) with a project row,
+    primary/shared bindings, and (optionally) a `module_settings` row carrying
+    the ``shared_kg_read_disabled`` flag for orchestrator-core. Pass
     ``read_disabled=None`` to skip seeding the row entirely (exercises
     the default-on-missing-row path)."""
-    db_path = state_dir / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL UNIQUE,
-            host TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            slug TEXT
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            embedding_model TEXT,
-            embedding_dim INTEGER,
-            kg_dir_path TEXT,
-            weaviate_url TEXT,
-            config_json TEXT NOT NULL DEFAULT '{}',
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (project_id, role)
-        );
-        CREATE TABLE module_settings (
-            project_id TEXT NOT NULL,
-            module_id TEXT NOT NULL,
-            setting_key TEXT NOT NULL,
-            setting_value TEXT NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (project_id, module_id, setting_key)
-        );
-        """
-    )
     pid = "00000000-0000-0000-0000-000000000001"
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug) "
-        "VALUES (?, ?, ?, ?, 0, 0, ?)",
-        (pid, "Test", str(project_folder.resolve()), "base", "test"),
-    )
-    cur.execute(
-        "INSERT INTO project_kg_bindings "
-        "(project_id, role, collection_name, config_json, updated_at) "
-        "VALUES (?, 'primary', ?, '{}', 0)",
-        (pid, primary),
-    )
-    if shared is not None:
-        cur.execute(
-            "INSERT INTO project_kg_bindings "
-            "(project_id, role, collection_name, config_json, updated_at) "
-            "VALUES (?, 'shared', ?, '{}', 0)",
-            (pid, shared),
-        )
-    if read_disabled is not None:
+    db_path = make_launcher_db(
+        state_dir / "launcher.db",
+        projects=[{
+            "project_id": pid,
+            "name": "Test",
+            "folder_path": str(project_folder.resolve()),
+            "slug": "test",
+            "kg_primary": primary,
+            "kg_shared": shared,
+            "created_at": 0,
+            "updated_at": 0,
+        }],
         # Boolean → JSON-encoded value (matches Rust's
         # `serde_json::Value::Bool` shape used by `db.set_setting`).
-        cur.execute(
-            "INSERT INTO module_settings "
-            "(project_id, module_id, setting_key, setting_value, updated_at) "
-            "VALUES (?, 'orchestrator-core', 'shared_kg_read_disabled', ?, 0)",
-            (pid, json.dumps(bool(read_disabled))),
-        )
-    conn.commit()
-    conn.close()
+        module_settings=(
+            []
+            if read_disabled is None
+            else [(
+                pid, "orchestrator-core", "shared_kg_read_disabled",
+                json.dumps(bool(read_disabled)),
+            )]
+        ),
+    )
     return db_path
 
 

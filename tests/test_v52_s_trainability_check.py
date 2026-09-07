@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "trainability_check.py"
 
@@ -144,6 +146,7 @@ def _run_script(db_path: Path) -> tuple[int, dict]:
         capture_output=True,
         text=True,
         timeout=15,
+        env=child_env(),
     )
     try:
         parsed = json.loads(result.stdout)

@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vibecoded-orchestrator"
-version = "0.2.91"
+version = "0.2.92"
 description = "VibeCoded Orchestrator — local-first agentic infrastructure for Claude Code"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -172,3 +172,16 @@ include = [
     "CHANGELOG.md",
     "pyproject.toml",
 ]
+
+# ---------------------------------------------------------------------------
+# ruff — target version
+# ---------------------------------------------------------------------------
+# `requires-python = ">=3.11"` is ACCURATE: all SHIPPED code is 3.11-clean, and
+# that claim should keep being enforced. But every CI job pins python 3.12 and
+# there is no 3.11 leg, so a test file may use 3.12 syntax (PEP 701 backslashes
+# inside f-strings). Without this, ruff infers py311 repo-wide and reports those
+# as `invalid-syntax` — a false positive that made ruff's output untrustworthy.
+# Scoped to tests/ deliberately: do NOT blanket-bump to py312, or shipped code
+# silently loses its 3.11 guarantee.
+[tool.ruff.per-file-target-version]
+"tests/**" = "py312"

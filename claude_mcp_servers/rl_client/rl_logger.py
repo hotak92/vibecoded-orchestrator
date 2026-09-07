@@ -9,7 +9,13 @@ Global RL data logger for retrieval training data collection.
 Logs retrieval events (query + nodes presented with scores) and citation
 feedback (which nodes were actually cited by agents) to a single JSONL file.
 
-Default path: ~/.claude/retrieval_rl_data/rl_events.jsonl
+Default path: ``<vco_lib.paths.vct_root_dir()>/retrieval_rl_data/rl_events.jsonl``
+— i.e. ``~/.vct/retrieval_rl_data/rl_events.jsonl`` unless ``$VCT_STATE_DIR``
+says otherwise. It moved there in v0.2.92 (register item 28); see
+:func:`default_rl_data_dir` for the leak that motivated the move. A machine that
+predates v0.2.92 has its corpus under ``~/.claude/retrieval_rl_data/`` and it
+STAYS there — nothing here reads, moves or deletes it (see the "Already-damaged"
+note on :func:`default_rl_data_dir`).
 
 This file accumulates data from ALL projects on the machine, enabling:
   1. Offline RL batch training / replay-buffer replay.
@@ -34,8 +40,9 @@ retrieval event::
                 "title": "Foo",
                 "score": 0.812,
                 "tier":  "top_k",
-                "emb":   [0.1234, ...]               # optional: node embedding (1024-dim)
-            },
+                "emb":   [0.1234, ...],              # optional: node embedding (1024-dim)
+                "emb_truncated": false               # v4+: tri-state (both event paths) —
+            },                                       # true/false when known, ABSENT = unknown
             {"title": "Bar", "score": 0.341, "tier": "extra_reference"}
         ]
     }
@@ -64,16 +71,126 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
 # Rotation defaults: 10 000 events ≈ 50-80 MB with embeddings.
 _DEFAULT_MAX_EVENTS = 10_000
 _DEFAULT_MAX_ARCHIVES = 5
+
+#: Subdirectory name for the JSONL corpus, under whichever root resolves it.
+#: The pre-v0.2.92 archive uses the SAME name under ``~/.claude`` — only the
+#: root differs — but nothing here resolves that archive, so there is
+#: deliberately no second helper to keep in step (see ``default_rl_data_dir``:
+#: the archive's four remaining consumers all address it themselves).
+_RL_DATA_DIRNAME = "retrieval_rl_data"
+
+
+def default_rl_data_dir() -> Path:
+    """Resolve the default directory for the JSONL corpus. **Called lazily.**
+
+    ``<vco_lib.paths.vct_root_dir()>/retrieval_rl_data`` — so ``$VCT_STATE_DIR``
+    steers it, like every other piece of VCO state (launcher.db, the hub
+    token/port files, ``~/.vct/logs/``, ``~/.vct/metrics/``).
+
+    v0.2.92, register item 28. This used to be
+    ``Path.home() / ".claude" / "retrieval_rl_data"``, evaluated ONCE in the
+    class body of :class:`RLDataLogger`, and it was wrong twice over:
+
+    1. **It wrote under ``~/.claude``.** The standing directive (2026-08-29) is
+       that VCO writes NOTHING under ``~/.claude`` except what the harness
+       itself requires; that directory is Claude Code's. The metrics streams
+       moved out for the same reason (:func:`vco_lib.paths.vct_metrics_dir`);
+       this was the call site that lane missed.
+    2. **No override could steer it**, because ``Path.home()`` was reconstructed
+       inline with no root. Setting ``$VCT_CLAUDE_DIR`` or ``$VCT_STATE_DIR``
+       moved nothing — measured, both False — so the test suite's redirects
+       could not protect the maintainer's real home, and constructing
+       ``RLDataLogger()`` with no arguments ``mkdir``'d the real directory.
+
+    **Why lazily, and why this is not just an import-time one-liner.** The old
+    form was a CLASS ATTRIBUTE, so its value froze at import. Any redirect
+    established afterwards — which is every redirect a pytest fixture sets, and
+    every env change a long-lived MCP subprocess sees — was ignored, and a guard
+    written against the frozen value would have passed while the leak continued.
+    Resolving per access is what makes the override real; see
+    ``tests/test_v0292_leakscan_rl_data_home.py::
+    test_default_dir_follows_a_redirect_set_after_import``, which fails against
+    the pre-v0.2.92 shape.
+
+    **Already-damaged machines: the old corpus stays exactly where it is.** On
+    this maintainer's box that is 2.6 GB under ``~/.claude/retrieval_rl_data/``.
+    Nothing here copies, moves, reads or deletes it — deliberately, and unlike
+    :mod:`vco_lib.metrics_migration`, which DID copy. The difference is that the
+    metrics streams have live readers (``cost-summary.py``) that must see one
+    continuous history at the new home, whereas this corpus is frozen (v0.2.47
+    replaced the JSONL sink with the vct-hub ``rl_events`` table) and its only
+    remaining consumers all address the old location by name: the paid RL
+    container's ``{HOME}/.claude/retrieval_rl_data`` bind mount, the launcher
+    dashboard's ``rl_events_<slug>.jsonl`` reader, the Preferences "delete local
+    retrieval data" action, and the one-shot
+    ``claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py``. Copying gigabytes
+    to a location nothing reads would cost disk and buy nothing; MOVING it would
+    break all four. So the archive is left frozen and byte-identical, and it is
+    deleted by nobody but the user — the same posture the metrics archive has,
+    reached without the copy.
+
+    **Cross-OS**: inherits :func:`vco_lib.paths.vct_root_dir`, so Windows and
+    macOS pick up its per-OS branches when they land. Nothing here expands
+    ``~`` or joins with a separator literal.
+
+    Raises:
+        ImportError: if :mod:`vco_lib` is not importable. Deliberate and loud —
+            ``vco_lib`` ships in every healthy VCO install, so a failure here
+            means a broken one, and guessing a path would hide it. This module
+            is also VENDORED into the paid RL module's container image, which
+            has no ``vco_lib``; the import is inside this function (not at
+            module scope) precisely so that image can still import the module
+            and use ``serialize_node_record`` / ``SCHEMA_VERSION`` / an
+            explicitly-pathed ``RLDataLogger(log_path=...)``. It passes
+            ``--log-path`` today, so it never reaches this function; if a future
+            version relies on the default, it gets a named error telling it to
+            pass one — not a silent write to an unexpected path.
+    """
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / _RL_DATA_DIRNAME
+
+
+def default_rl_log_path() -> Path:
+    """``default_rl_data_dir() / "rl_events.jsonl"`` — the default sink file."""
+    return default_rl_data_dir() / "rl_events.jsonl"
+
+
+class _LazyClassPath:
+    """Class attribute that re-resolves its :class:`Path` on every access.
+
+    One home for the two lazy attributes below. A plain ``X: Path = f()`` in a
+    class body evaluates once at import; this defers to ``resolve`` at each
+    access, so ``RLDataLogger.DEFAULT_DIR`` (owner access) and
+    ``self.DEFAULT_PATH`` (instance access) both see the CURRENT environment.
+
+    Non-data descriptor (``__get__`` only): it does not shadow an instance
+    attribute of the same name, and it is read-only at the class level in the
+    way that matters — a test that wants a different path passes ``log_path=``
+    or sets ``$VCT_STATE_DIR`` rather than reassigning the attribute.
+
+    It carries no per-attribute ``__doc__``: class-level access runs
+    ``__get__`` and hands back a :class:`Path`, so a docstring stored here
+    would have no reader. The attributes are documented at their definition
+    site instead.
+    """
+
+    __slots__ = ("_resolve",)
+
+    def __init__(self, resolve: "Callable[[], Path]") -> None:
+        self._resolve = resolve
+
+    def __get__(self, instance: "object | None", owner: "type | None" = None) -> Path:
+        return self._resolve()
 
 
 def _now() -> str:
@@ -119,11 +236,14 @@ def serialize_node_record(
     **Byte/insertion-order contract**: JSON preserves dict insertion order, so
     the on-wire/on-disk record is order-sensitive. Field insertion order here
     is FIXED:
-    ``title, score, tier, emb, linked_embs, linked_type_names,
-    node_type, [links], [cos_qn, cos_ql, cos_nl], [shown_rank],
-    [chunks_matched], [best_chunk_number], [collection, file_path,
-    rerank_score, boost_delta, boost_signals]``. Bracketed groups are gated by
-    the keyword flags.
+    ``title, score, tier, emb, [emb_truncated], linked_embs,
+    linked_type_names, node_type, [links], [cos_qn, cos_ql, cos_nl],
+    [shown_rank], [chunks_matched], [best_chunk_number], [collection,
+    file_path, rerank_score, boost_delta, boost_signals]``. Bracketed groups
+    are gated by the keyword flags — except ``emb_truncated`` (v4), which is
+    gated by the STATE being known (present in ``n`` as a bool), not by a
+    keyword: an explicit ``False`` is a real answer and must survive, while
+    an absent state must stay absent (= unknown downstream).
 
     **v0.2.73 n_emb payload-dedup**: the node vector is written ONCE, under
     ``emb`` (the field the offline trainer reads). Pre-dedup this record emitted
@@ -188,6 +308,13 @@ def serialize_node_record(
     _node_vec = n.get("emb") or n.get("n_emb")
     if _node_vec:
         rec["emb"] = _round_emb(_node_vec)
+    # v4: per-node emb truncation state. Emitted ONLY when the caller KNOWS it
+    # (bool, including an explicit False — a known full-fidelity vector is a
+    # real answer, not a default). ABSENT = unknown (pre-v4 events, on-the-fly
+    # backfilled other-slot vectors, active-slot events) — resolve with
+    # `resolve_emb_truncation_state`, never `.get(..., False)`.
+    if n.get("emb_truncated") is not None:
+        rec["emb_truncated"] = bool(n["emb_truncated"])
     # v3+: MAX_LINKED packed linked-slot embeddings.
     if n.get("linked_embs"):
         rec["linked_embs"] = [_round_emb(e) for e in n["linked_embs"] if e]
@@ -227,6 +354,74 @@ def serialize_node_record(
     return rec
 
 
+# ── v4: per-node emb-truncation tri-state (2026-09-04) ──────────────────────
+#
+# Months of rl_events rows predate the `emb_truncated` field. A boolean
+# read of a MISSING field would mislabel that entire back-catalogue — and the
+# rows that are actually truncated are exactly the ones that would poison
+# secondary-slot (arctic) training — so the state is THREE-VALUED and absence
+# is self-describing:
+
+#: The node's ``emb`` vector was embedded over a bounded sub-window (the
+#: chunk exceeded the slot model's num_ctx). Partial-text vector.
+TRUNCATION_TRUE = "true"
+#: The node's ``emb`` vector is full-fidelity (the whole chunk fit).
+TRUNCATION_FALSE = "false"
+#: The state is not knowable from this event: a pre-v4 event (the field could
+#: not have been present — the schema_version is the evidence), a v4 event
+#: whose other-slot vector was backfilled on the fly, or an active-slot event.
+#: A later backfill may fill this in; it is never a real answer.
+TRUNCATION_UNKNOWN = "unknown"
+
+#: The schema version at which ``emb_truncated`` could first appear.
+_EMB_TRUNCATION_SINCE_SCHEMA = 4
+
+
+def resolve_emb_truncation_state(
+    node: "dict[str, Any]",
+    schema_version: "int | None" = None,
+) -> str:
+    """Resolve a serialized per-node record's emb-truncation state (tri-state).
+
+    Args:
+        node: ONE serialized node record (an element of a retrieval event's
+            ``nodes`` list — the shape :func:`serialize_node_record` emits,
+            i.e. what ``payload_json`` in ``launcher.db.rl_events`` holds).
+        schema_version: the ENCLOSING event's ``schema_version``. When the
+            caller has the event in hand, pass it — a pre-v4 version is
+            itself the evidence that ``emb_truncated`` could not have been
+            present, so the field is not trusted even if a stray copy exists.
+            ``None`` (default) skips the version gate and reads the field
+            alone.
+
+    Returns:
+        ``TRUNCATION_TRUE`` / ``TRUNCATION_FALSE`` when the event positively
+        knows the state; ``TRUNCATION_UNKNOWN`` when it does not.
+
+    The CONSUMER policy for ``unknown`` rows (include / exclude / weight /
+    partition / backfill) is a deliberate trainer-side decision, deferred to
+    the training code that consumes these events — this function only reports
+    the state honestly. Do NOT bypass it with
+    ``node.get("emb_truncated", False)``: that coerces every historical
+    unknown to "not truncated" and is precisely the mislabelling this
+    tri-state exists to prevent.
+    """
+    if not isinstance(node, dict):
+        return TRUNCATION_UNKNOWN
+    try:
+        version = int(schema_version)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        version = _EMB_TRUNCATION_SINCE_SCHEMA  # None → field trusted as-is
+    if version < _EMB_TRUNCATION_SINCE_SCHEMA:
+        return TRUNCATION_UNKNOWN
+    value = node.get("emb_truncated")
+    if value is True:
+        return TRUNCATION_TRUE
+    if value is False:
+        return TRUNCATION_FALSE
+    return TRUNCATION_UNKNOWN
+
+
 class RLDataLogger:
     """
     Append-only JSONL data logger for RL retrieval training.
@@ -236,13 +431,22 @@ class RLDataLogger:
     use, JSONL line-level appends are atomic on Linux ext4/xfs (< 4KB write).
 
     Args:
-        log_path: Path to the JSONL log file.
-                  Defaults to ``~/.claude/retrieval_rl_data/rl_events.jsonl``.
+        log_path: Path to the JSONL log file. Defaults to
+                  :func:`default_rl_log_path` — ``$VCT_STATE_DIR`` (or ``~/.vct``)
+                  ``/retrieval_rl_data/rl_events.jsonl``. Callers that run
+                  without ``vco_lib`` on the path (the vendored container copy)
+                  MUST pass this explicitly.
         project:  Project name tag written to every event.
     """
 
-    DEFAULT_DIR: Path = Path.home() / ".claude" / "retrieval_rl_data"
-    DEFAULT_PATH: Path = DEFAULT_DIR / "rl_events.jsonl"
+    # Resolved on every access, NOT frozen at import — see `_LazyClassPath` and
+    # `default_rl_data_dir` above for why the previous class-body form
+    # (`Path.home() / ".claude" / "retrieval_rl_data"`) was both unsteerable and
+    # in the wrong root. Reading either attribute imports `vco_lib.paths`.
+    #: Default directory for the JSONL corpus (``$VCT_STATE_DIR``-steerable).
+    DEFAULT_DIR = _LazyClassPath(default_rl_data_dir)
+    #: Default JSONL sink file inside :attr:`DEFAULT_DIR`.
+    DEFAULT_PATH = _LazyClassPath(default_rl_log_path)
 
     # Schema versioning. v1 was the pre-2026-05-05 format with no embedding
     # source metadata — events recorded query_emb / per-node emb as raw float
@@ -263,7 +467,40 @@ class RLDataLogger:
     # unified-target formula in vco_lib.rl_training_targets). Pre-v3
     # readers ignore unknown fields; v3 readers default missing fields to
     # all-False / empty (lossless vs pre-v3 behavior).
-    SCHEMA_VERSION: int = 3
+    #
+    # v4 (2026-09-04, secondary-truncation visibility; widened v0.2.92
+    # m-R6-1 to the active slot): retrieval-event nodes may carry
+    # `emb_truncated` (bool) — True iff this node's `emb` vector was
+    # embedded over a BOUNDED SUB-WINDOW because the chunk exceeded the
+    # slot model's num_ctx, False iff it is a full-fidelity vector.
+    # Emitted by BOTH event paths — the dual-log (other-slot) event since
+    # v4, the MAIN (active-slot) event since v0.2.92 — and only where the
+    # state is KNOWN: the enrichment reads the persisted Weaviate chunk
+    # properties off the row the vector came from, through the ONE shared
+    # reader `rl_enrichment._stored_slot_truncation_state` (the complete
+    # `truncated_slots` record on v0.2.92+ rows, else the legacy
+    # `secondary_truncated_slots` property for slots it covers), and the
+    # KG write side records the fact exactly at the embed site (it knows
+    # locally that it sent less than it was given — the bounded sub-window
+    # and the shrink-on-refusal loop both tag it).
+    # ABSENT means UNKNOWN, in three distinct situations: (a) pre-v4
+    # events, which predate the field — the schema_version itself is the
+    # evidence; (b) v4 events whose other-slot vector was BACKFILLED
+    # on the fly at retrieval time (the state is not determinable at the
+    # attach site); (c) ACTIVE-slot nodes on rows/events that predate the
+    # persisted active-slot state (v0.2.92): those rows record secondaries
+    # only, and `secondary_truncated_slots` cannot answer for the active
+    # slot — its absence there is not evidence of full fidelity. Readers MUST resolve the three states
+    # via `resolve_emb_truncation_state` (true / false / unknown) and MUST
+    # NOT read absence as False: a naive `node.get("emb_truncated", False)`
+    # silently mislabels the entire pre-v4 corpus — and the rows that are
+    # actually truncated are exactly the ones that would poison secondary-
+    # slot training. What a consumer DOES with `unknown` rows (include /
+    # exclude / weight / later backfill) is a deliberate trainer-side
+    # decision, deliberately NOT encoded here. Pre-v4 readers ignore the
+    # field (additive, like every prior bump); a later backfill may fill
+    # unknown states in — `unknown` is never conflated with a real answer.
+    SCHEMA_VERSION: int = 4
 
     def __init__(
         self,

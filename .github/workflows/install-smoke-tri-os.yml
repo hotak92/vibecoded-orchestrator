@@ -444,6 +444,22 @@ jobs:
               echo "  [ok] $d/"
             fi
           done
+          # v0.2.92 delivery audit m5: the directories only prove the
+          # install RAN. One sentinel per bundle file-kind proves it
+          # DELIVERED — a Windows regression in hook/script/skill
+          # delivery would otherwise pass the only Windows CI leg.
+          for f in \
+            .claude/hooks/pre-tool-use.sh \
+            .claude/scripts/kg-sync \
+            .claude/scripts/kg-sync.ps1 \
+            .claude/skills/rc-native/SKILL.md; do
+            if [ ! -f "$f" ]; then
+              echo "::error::MISSING bundle file: $f"
+              missing=$((missing + 1))
+            else
+              echo "  [ok] $f"
+            fi
+          done
           if [ ! -f .env ]; then
             echo "::error::MISSING .env"
             missing=$((missing + 1))
@@ -487,6 +503,28 @@ jobs:
             set /a MISSING+=1
           ) else (
             echo   [ok] state\
+          )
+          REM v0.2.92 delivery audit m5: one sentinel per bundle file-kind --
+          REM hook, script wrapper, script ps1 sibling, skill. The directory
+          REM checks below only prove the install RAN; these prove it
+          REM DELIVERED. Paren-free echo text per the G-1 cmd.exe rule.
+          if not exist .claude\hooks\pre-tool-use.ps1 (
+            echo ::error::MISSING bundle file: .claude\hooks\pre-tool-use.ps1
+            set /a MISSING+=1
+          ) else (
+            echo   [ok] .claude\hooks\pre-tool-use.ps1
+          )
+          if not exist .claude\scripts\kg-sync.ps1 (
+            echo ::error::MISSING bundle file: .claude\scripts\kg-sync.ps1
+            set /a MISSING+=1
+          ) else (
+            echo   [ok] .claude\scripts\kg-sync.ps1
+          )
+          if not exist .claude\skills\rc-native\SKILL.md (
+            echo ::error::MISSING bundle file: .claude\skills\rc-native\SKILL.md
+            set /a MISSING+=1
+          ) else (
+            echo   [ok] .claude\skills\rc-native\SKILL.md
           )
           REM NOTE: claude_mcp_servers\.venv is a STALE LEGACY PATH; the canonical
           REM venv lives at PROJECT_ROOT\.venv -- see install.py step 4 and the

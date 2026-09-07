@@ -44,6 +44,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 import install  # type: ignore  # noqa: E402
 
+from tests.common.rust_source import strip_rust_comments  # noqa: E402
+
 # Import the SAME expected-set the Python unit test uses, so the two
 # tests stay in lockstep. The Rust test file (``installer.rs``)
 # duplicates this list in its own array literal; if you change one
@@ -119,7 +121,14 @@ class ManagedPathsConsistencyTests(unittest.TestCase):
             / "installer.rs"
         )
         self.assertTrue(installer_rs.is_file(), f"Missing {installer_rs}")
-        src = installer_rs.read_text(encoding="utf-8")
+        # Comment-stripped view (string literals kept verbatim — see
+        # tests/common/rust_source.py): the forbidden-construct scan below
+        # must not fire on a commented-out historical note, while the
+        # include_str! pin reads CODE + a string literal, which stripping
+        # preserves byte-for-byte.
+        src = "\n".join(
+            strip_rust_comments(installer_rs.read_text(encoding="utf-8"))
+        )
 
         # The include_str! must reference the repo-root .txt. Path is
         # 4 levels up from installer.rs (commands → src → src-tauri →

@@ -185,9 +185,14 @@ def test_wheel_packages_cover_all_vco_lib_modules():
 
 
 def test_mcp_extras_listed_when_required_by_install_py():
-    """install.py's `_install_requirements` uses `pip install -e .[mcp]`
-    to pull the full server stack. Verify the `mcp` extra exists and
-    pins the headline server-side deps.
+    """The `mcp` extra must exist and pin the headline server-side deps.
+
+    CORRECTED v0.2.92: install.py's `_install_requirements` does NOT use
+    `pip install -e .[mcp]` — it runs `pip install -e .` for the root and a
+    separate `pip install -e claude_mcp_servers/` for the MCP package, with the
+    server deps coming from `requirements.txt`. The extra is a supported manual
+    install path (`pip install -e '.[mcp]'`), not the one install.py takes, so
+    this test guards the extra's CONTENTS, not an install.py call site.
     """
     project = _load_pyproject()["project"]
     extras = project.get("optional-dependencies", {})

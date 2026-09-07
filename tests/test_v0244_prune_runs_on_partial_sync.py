@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -35,34 +34,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 import install  # noqa: E402
 
 
-_APP_STATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS app_state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-"""
-
-
 def _make_app_state_db(tmp: Path, **rows) -> Path:
-    """Create a temp launcher.db with app_state seeded so the diff-gate
-    has a "context unchanged" baseline and proceeds to the diff path.
+    """Create a temp launcher.db (REAL schema, from the shipped migrations)
+    with app_state seeded so the diff-gate has a "context unchanged"
+    baseline and proceeds to the diff path.
     """
-    db_path = tmp / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript(_APP_STATE_SCHEMA)
-    now = 1_000_000
-    for k, v in rows.items():
-        conn.execute(
-            "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
-            (k, v, now),
-        )
-    conn.commit()
-    conn.close()
-    return db_path
+    return make_launcher_db(tmp / "launcher.db", app_state=rows)
 
 
 def _make_args(update: bool = True, skip_seed: bool = False) -> argparse.Namespace:

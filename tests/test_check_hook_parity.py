@@ -194,20 +194,115 @@ def test_blocking_when_ps1_exists_and_new_sh_lacks_sibling(tmp_path: Path):
     assert "missing .ps1 sibling" in result.stdout
 
 
-def test_lib_subdir_files_excluded(tmp_path: Path):
+def test_lib_sh_without_ps1_now_fails_existence_parity(tmp_path: Path):
+    """v0.2.92 delivery audit m2: `_lib/` is IN existence parity — the
+    sourced helpers ship per-OS like every other shipped file, so a
+    missing sibling there is the same defect. Pre-fix the gate skipped
+    `_lib` entirely and 2 new + 5 modified `_lib` pairs landed ungated.
+    """
     repo = init_repo(tmp_path)
-    # Sourced helper under _lib/ — should be ignored by the gate.
+    # A sourced helper under _lib/ with NO sibling + a real pair so we're
+    # past warn-only.
     write_hook(repo, "templates/hooks/_lib/helpers.sh")
-    # Plus a real pair so we're past warn-only.
     write_hook(repo, "templates/hooks/foo.sh")
     write_hook(repo, "templates/hooks/foo.ps1", "# pwsh\n")
     commit_all(repo, "add lib + pair on main")
     make_branch_with_changes(repo)
-    # Modify the _lib helper alone — must not trigger modification parity.
+    (repo / "README.md").write_text("# x\n")
+    commit_all(repo, "docs")
+    result = run_script(repo)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "_lib/helpers.sh" in result.stdout
+    assert "missing .ps1 sibling" in result.stdout
+
+
+def test_lib_modification_parity_still_excluded(tmp_path: Path):
+    """The other half of the m2 split: modification parity still skips
+    `_lib/` (helpers are sourced by their siblings, not registered as
+    hooks) — a paired `_lib` helper modified alone must not fail."""
+    repo = init_repo(tmp_path)
+    write_hook(repo, "templates/hooks/_lib/helpers.sh")
+    write_hook(repo, "templates/hooks/_lib/helpers.ps1", "# pwsh\n")
+    write_hook(repo, "templates/hooks/foo.sh")
+    write_hook(repo, "templates/hooks/foo.ps1", "# pwsh\n")
+    commit_all(repo, "add lib pair + hook pair on main")
+    make_branch_with_changes(repo)
+    # Modify the _lib .sh alone — must not trigger modification parity.
     (repo / "templates/hooks/_lib/helpers.sh").write_text(
         "#!/bin/bash\necho new\n"
     )
     commit_all(repo, "modify lib only")
+    result = run_script(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_declared_ps1_only_lib_helper_passes(tmp_path: Path):
+    """`resolve-powershell.ps1` is a Windows-only helper (it discovers
+    which PowerShell edition runs the sibling hooks) with nothing to
+    mirror on POSIX — declared in PS1_ONLY_LIB, so it must not fail
+    existence parity. An UNDECLARED lonely `_lib` .ps1 must still fail."""
+    repo = init_repo(tmp_path)
+    write_hook(
+        repo,
+        "templates/hooks/_lib/resolve-powershell.ps1",
+        "# resolves the PowerShell edition for sibling hooks\n",
+    )
+    write_hook(repo, "templates/hooks/foo.sh")
+    write_hook(repo, "templates/hooks/foo.ps1", "# pwsh\n")
+    commit_all(repo, "add declared ps1-only helper + pair on main")
+    make_branch_with_changes(repo)
+    (repo / "README.md").write_text("# x\n")
+    commit_all(repo, "docs")
+    result = run_script(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # And the negative: an undeclared one fails.
+    write_hook(repo, "templates/hooks/_lib/lonely.ps1", "# pwsh\n")
+    commit_all(repo, "add undeclared lonely ps1")
+    result = run_script(repo)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "_lib/lonely.ps1" in result.stdout
+    assert "missing .sh sibling" in result.stdout
+
+
+def test_extensionless_wrapper_modified_without_ps1_fails(tmp_path: Path):
+    """v0.2.92 delivery audit m2: modification parity only paired
+    `.sh`/`.ps1` suffixes, so `kg-sync` (extension-less bash wrapper)
+    could be modified while `kg-sync.ps1` stayed put — silent drift
+    between the OS flavours of the SAME script. The gate must treat the
+    wrapper like a `.sh`."""
+    repo = init_repo(tmp_path)
+    write_hook(repo, "templates/scripts/kg-sync")
+    write_hook(repo, "templates/scripts/kg-sync.ps1", "# pwsh\n")
+    write_hook(repo, "templates/hooks/foo.sh")
+    write_hook(repo, "templates/hooks/foo.ps1", "# pwsh\n")
+    commit_all(repo, "add wrapper pair on main")
+    make_branch_with_changes(repo)
+    (repo / "templates/scripts/kg-sync").write_text(
+        "#!/bin/bash\necho new wrapper only\n"
+    )
+    commit_all(repo, "modify wrapper only")
+    result = run_script(repo)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "modified without its sibling" in result.stdout
+    assert "kg-sync.ps1" in result.stdout
+
+
+def test_extensionless_wrapper_modified_with_ps1_passes(tmp_path: Path):
+    repo = init_repo(tmp_path)
+    write_hook(repo, "templates/scripts/kg-sync")
+    write_hook(repo, "templates/scripts/kg-sync.ps1", "# pwsh\n")
+    write_hook(repo, "templates/hooks/foo.sh")
+    write_hook(repo, "templates/hooks/foo.ps1", "# pwsh\n")
+    commit_all(repo, "add wrapper pair on main")
+    make_branch_with_changes(repo)
+    (repo / "templates/scripts/kg-sync").write_text(
+        "#!/bin/bash\necho new wrapper\n"
+    )
+    (repo / "templates/scripts/kg-sync.ps1").write_text(
+        "# pwsh\nWrite-Host new\n"
+    )
+    commit_all(repo, "modify both flavours")
     result = run_script(repo)
     assert result.returncode == 0, result.stdout + result.stderr
 

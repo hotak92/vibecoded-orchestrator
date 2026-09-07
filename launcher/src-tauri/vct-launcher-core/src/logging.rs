@@ -44,10 +44,13 @@
 //! valid or garbage, can silence the process. `Level` converts into
 //! `LevelFilter` at the subscriber boundary, so nothing is lost.
 
-use std::sync::OnceLock;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use tracing::Level;
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -168,17 +171,244 @@ pub fn resolve_process_log_level() -> Level {
 /// Handle to the installed level filter, so [`set_log_level`] can raise
 /// or lower verbosity after the subscriber is in place. `None` until an
 /// [`init_tracing`] call actually wins the global-subscriber race.
-static RELOAD_HANDLE: OnceLock<
-    reload::Handle<LevelFilter, tracing_subscriber::Registry>,
-> = OnceLock::new();
-
-/// Install the process-wide `tracing` subscriber: compact format, to
-/// stderr, capped at `level` through a *reloadable* filter.
 ///
-/// stderr (not stdout) because stdout is a machine contract on several
-/// surfaces — `vct-hub --status` prints `running pid=N` there, the CLI
-/// helpers emit parse-target lines, and diagnostics interleaved into
-/// those streams would corrupt them.
+/// The type parameter is `Registry` (the subscriber the reload layer is
+/// installed ON), not the fully-layered stack — adding the file layer in
+/// v0.2.92 therefore did not change this type, and `set_log_level` still
+/// reaches the same filter it always did.
+static RELOAD_HANDLE: OnceLock<reload::Handle<LevelFilter, tracing_subscriber::Registry>> =
+    OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// File sink (v0.2.92, WP-13)
+// ---------------------------------------------------------------------------
+//
+// ## Why a file sink was not optional
+//
+// Until v0.2.92 `init_tracing` installed a stderr layer and NOTHING ELSE, on
+// every OS. Meanwhile `launcher/src-tauri/src/main.rs` carries
+// `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`, which
+// means a RELEASE launcher on Windows has no console and no stderr sink at
+// all. So every honest diagnostic the codebase emits — including the whole
+// v0.2.83 "couldn't check for updates, here is why" family — was written,
+// correctly, into nothing.
+//
+// That is why a five-week silent-no-update incident on a real user's machine
+// produced ZERO diagnostic trail: the launcher had been saying the right
+// things the entire time, to a stream that did not exist. Fixing the checks
+// without fixing the sink would have made the next incident equally
+// unreadable.
+//
+// ## Why a hand-rolled writer instead of `tracing-appender`
+//
+// `tracing-appender` is the obvious dependency and we deliberately did not
+// take it:
+//
+//   * it is absent from both the workspace `Cargo.lock` and the local cargo
+//     registry cache, so adding it requires a network fetch at build time —
+//     a poor trade for ~60 lines;
+//   * its `rolling::daily` has NO retention policy, so the 14-file sweep
+//     below would have had to be written by hand anyway;
+//   * its recommended non-blocking writer hands back a `WorkerGuard` that the
+//     caller must hold for the process lifetime, which would push a new
+//     return value through `init_tracing`'s two call sites and create a
+//     "logging silently stopped because the guard was dropped" failure mode.
+//
+// The writer below is blocking, line-buffered by `tracing`'s formatter, and
+// opens in append mode. Blocking writes to a local file are microseconds; the
+// launcher is not a high-throughput logger.
+//
+// ## Cross-OS
+//
+// Everything here is `std::fs` + `std::path` — no POSIX-only primitives, no
+// `flock`, no path-separator assumptions, no permission bits. The date stamp
+// comes from `chrono` (already a dependency). Two processes appending to the
+// same file is fine on all three platforms for the small, single-`write_all`
+// records `tracing` produces; the launcher and hub write to DIFFERENT files
+// anyway (`launcher.log` / `hub.log`).
+
+/// Directory holding the rotated diagnostic logs: `<vct_root>/logs/`.
+///
+/// Resolved through [`crate::paths::vct_root_dir`] — the ONE home for that
+/// root — so `VCT_STATE_DIR` redirection works for tests and for users who
+/// relocate their state dir.
+pub fn log_dir() -> PathBuf {
+    crate::paths::vct_root_dir().join("logs")
+}
+
+/// How many daily log files to keep.
+///
+/// **These are VCO-owned diagnostics, not user data**, so VCO deletes its own
+/// rotated files. Fourteen days is chosen against the incident that motivated
+/// the sink: the field report arrived roughly five weeks after the outage
+/// began, and no retention would have covered that — but two weeks does cover
+/// "it broke, I noticed within a fortnight, here are the logs", which is the
+/// realistic reporting window, at a bounded disk cost (a chatty session
+/// writes single-digit MB/day).
+///
+/// **The sweep is stem-scoped, and that is load-bearing, not defensive
+/// styling.** `<vct_root>/logs/` is a SHARED directory that predates this
+/// sink: the Python deferral-retry driver already writes
+/// `deferral-retry-<timestamp>.log` there (a live install had 1,600+ of
+/// them), and other VCO tooling has parked one-off `*.log` files there too.
+/// A sweep that deleted "the oldest N files in the directory" would eat
+/// them. `prune_old_logs` only ever deletes `<stem>.<date>.log` files it
+/// wrote itself; `prune_leaves_files_it_does_not_own` pins that.
+pub const LOG_RETENTION_FILES: usize = 14;
+
+/// A day-rotating, append-mode file writer.
+///
+/// Rotation is checked per write batch by comparing the current UTC date
+/// stamp against the one the open handle was created for — no background
+/// thread, no timer. UTC (not local time) so a machine that changes timezone
+/// or crosses DST cannot produce a file that sorts before its predecessor.
+struct DailyFile {
+    dir: PathBuf,
+    stem: String,
+    /// `(date-stamp, handle)` for the currently-open file.
+    current: Mutex<Option<(String, File)>>,
+}
+
+impl DailyFile {
+    fn new(dir: PathBuf, stem: &str) -> Self {
+        Self {
+            dir,
+            stem: stem.to_string(),
+            current: Mutex::new(None),
+        }
+    }
+
+    fn today() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    fn file_name(stem: &str, stamp: &str) -> String {
+        format!("{stem}.{stamp}.log")
+    }
+
+    /// Open (or reuse) today's file and run `f` against it.
+    ///
+    /// Soft-fail by construction: if the directory cannot be created or the
+    /// file cannot be opened, the write is dropped and the process carries
+    /// on. Diagnostics failing must never be a reason the launcher fails.
+    fn with_file<F: FnOnce(&mut File)>(&self, f: F) {
+        let stamp = Self::today();
+        let mut guard = match self.current.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let needs_open = match guard.as_ref() {
+            Some((open_stamp, _)) => open_stamp != &stamp,
+            None => true,
+        };
+        if needs_open {
+            if std::fs::create_dir_all(&self.dir).is_err() {
+                return;
+            }
+            let path = self.dir.join(Self::file_name(&self.stem, &stamp));
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => *guard = Some((stamp, file)),
+                Err(_) => return,
+            }
+            // A new day's file just appeared — prune older ones now. Doing it
+            // here (rather than only at startup) means a launcher left running
+            // for a month still rotates.
+            prune_old_logs(&self.dir, &self.stem, LOG_RETENTION_FILES);
+        }
+        if let Some((_, file)) = guard.as_mut() {
+            f(file);
+        }
+    }
+}
+
+/// `MakeWriter` adaptor. `tracing`'s formatter asks for a writer per event;
+/// we hand back a thin handle that funnels into the shared [`DailyFile`].
+struct DailyFileMakeWriter(std::sync::Arc<DailyFile>);
+
+struct DailyFileHandle(std::sync::Arc<DailyFile>);
+
+impl std::io::Write for DailyFileHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.with_file(|f| {
+            let _ = f.write_all(buf);
+        });
+        // Always report the full length: a diagnostic sink that reports a
+        // short write would make `write_all` spin.
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.with_file(|f| {
+            let _ = f.flush();
+        });
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for DailyFileMakeWriter {
+    type Writer = DailyFileHandle;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DailyFileHandle(self.0.clone())
+    }
+}
+
+/// Delete all but the newest `keep` files matching `<stem>.<date>.log` in
+/// `dir`.
+///
+/// Only files this module writes are considered: the name must start with
+/// `<stem>.` and end with `.log`. Anything else in the directory is left
+/// alone, so a user who parks a note there does not lose it.
+///
+/// Sorting is by NAME, which for a `%Y-%m-%d` stamp is chronological — no
+/// mtime reads, so a `cp -p` or a restored backup cannot reorder the sweep.
+pub fn prune_old_logs(dir: &Path, stem: &str, keep: usize) {
+    let prefix = format!("{stem}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".log"))
+        .collect();
+    if names.len() <= keep {
+        return;
+    }
+    names.sort();
+    let doomed = names.len() - keep;
+    for name in names.into_iter().take(doomed) {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
+
+/// Install the process-wide `tracing` subscriber for a named process:
+/// compact format, to a daily FILE **and** to stderr, capped at `level`
+/// through a *reloadable* filter.
+///
+/// `name` is the log-file stem — `"launcher"` → `<vct_root>/logs/
+/// launcher.YYYY-MM-DD.log`, `"hub"` → `hub.YYYY-MM-DD.log`. Both binaries
+/// call this one function; giving them separate files keeps two processes
+/// from interleaving into one.
+///
+/// stderr is KEPT (not replaced) because stdout is a machine contract on
+/// several surfaces — `vct-hub --status` prints `running pid=N` there, the
+/// CLI helpers emit parse-target lines — and a developer running the binary
+/// in a terminal should still see output without tailing a file.
+///
+/// The FILE layer is the v0.2.92 addition, and the reason is in the module
+/// section above: a release Windows launcher has no stderr at all, so the
+/// stderr-only subscriber meant every diagnostic on that platform went
+/// nowhere. See [`init_tracing`] for the compatibility wrapper.
+///
+/// ## Eager creation is deliberate
+///
+/// The file is opened and a banner line written IMMEDIATELY, not lazily on
+/// the first `warn!`. Two reasons: an empty-but-present file cannot occur
+/// (so "does the file exist?" is a meaningful question with a meaningful
+/// answer), and the file's APPEARANCE is itself an observable when a user is
+/// told "update, then send me the log".
 ///
 /// Idempotent: a second call is a silent no-op rather than a panic, so a
 /// binary that initialises early in `main` and again from a later setup
@@ -207,10 +437,28 @@ static RELOAD_HANDLE: OnceLock<
 /// Without step 2 the app_state preference would be unreadable by the
 /// process that persists it, which is the exact "shipped a preference
 /// nothing consumes" defect this work exists to fix.
-pub fn init_tracing(level: Level) {
+pub fn init_tracing_named(level: Level, name: &str) {
     let (filter, handle) = reload::Layer::new(LevelFilter::from(level));
+
+    let dir = log_dir();
+    let sink = std::sync::Arc::new(DailyFile::new(dir.clone(), name));
+    // Open eagerly so the file exists before the first event, and prune on
+    // the way in so a launcher that is restarted daily still rotates.
+    sink.with_file(|_| {});
+    prune_old_logs(&dir, name, LOG_RETENTION_FILES);
+    let log_path = dir.join(DailyFile::file_name(name, &DailyFile::today()));
+
     let installed = tracing_subscriber::registry()
         .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                // No ANSI in the file: escape sequences make a log a user
+                // pastes into an issue unreadable. (The stderr layer has none
+                // either — the `ansi` feature is not enabled on the
+                // dependency at all.)
+                .with_writer(DailyFileMakeWriter(sink)),
+        )
         .with(
             tracing_subscriber::fmt::layer()
                 .compact()
@@ -223,7 +471,28 @@ pub fn init_tracing(level: Level) {
         // some other subscriber won the race, ours is inert and reloading
         // it would silently do nothing while looking like it worked.
         let _ = RELOAD_HANDLE.set(handle);
+        // The banner is at ERROR level ON PURPOSE. It is not an error; it is
+        // the one line that must appear even when the user has set
+        // `VCO_LOG_LEVEL=error` to quieten a noisy session — otherwise the
+        // "does this file exist and does it have content?" invariant holds
+        // only at INFO and above, and the quietest setting produces the
+        // emptiest evidence exactly when someone is debugging.
+        tracing::error!(
+            "[vct] {} {} started — diagnostics: {} (keeping the newest {} daily files)",
+            name,
+            env!("CARGO_PKG_VERSION"),
+            log_path.display(),
+            LOG_RETENTION_FILES,
+        );
     }
+}
+
+/// Backwards-compatible entry point: `init_tracing_named(level, "launcher")`.
+///
+/// Kept because several call sites (including tests that only care about the
+/// level filter) name it, and because the launcher IS the majority caller.
+pub fn init_tracing(level: Level) {
+    init_tracing_named(level, "launcher");
 }
 
 /// Change the level of the filter installed by [`init_tracing`].
@@ -407,16 +676,276 @@ mod tests {
 
     #[test]
     fn init_and_reload_are_idempotent_and_never_panic() {
-        init_tracing(Level::WARN);
-        // A second install must be a no-op, not a panic.
-        init_tracing(Level::DEBUG);
-        // Reload across every level, in both directions.
-        for lvl in [Level::ERROR, Level::DEBUG, Level::INFO, Level::WARN] {
-            set_log_level(lvl);
+        // v0.2.92 WP-13: `with_state_dir` is now MANDATORY here. Since
+        // `init_tracing` gained a file sink it has a filesystem side effect,
+        // and without the redirect this test creates
+        // `~/.vct/logs/launcher.<today>.log` on the developer's real machine
+        // — a test writing into live user state, which is precisely the
+        // class of defect this cycle spent a review round on. (It also
+        // silently destroys a planned dogfood observable: the FIRST
+        // appearance of that file is supposed to be evidence that the new
+        // build ran.)
+        crate::test_env::with_state_dir(|_root| {
+            init_tracing(Level::WARN);
+            // A second install must be a no-op, not a panic.
+            init_tracing(Level::DEBUG);
+            // Reload across every level, in both directions.
+            for lvl in [Level::ERROR, Level::DEBUG, Level::INFO, Level::WARN] {
+                set_log_level(lvl);
+            }
+            // And a reload with no preceding successful install (the case
+            // where another subscriber owns the process) must also be inert.
+            set_log_level(Level::ERROR);
+        });
+    }
+
+    /// Guard for the mistake above, so the next person cannot repeat it
+    /// silently: with `VCT_STATE_DIR` redirected, NOTHING the sink does may
+    /// resolve outside that dir.
+    #[test]
+    fn the_file_sink_never_escapes_a_redirected_state_dir() {
+        crate::test_env::with_state_dir(|root| {
+            let dir = log_dir();
+            assert!(
+                dir.starts_with(root),
+                "log_dir() escaped the redirected state dir: {} not under {}",
+                dir.display(),
+                root.display()
+            );
+            with_file_subscriber(&dir, "launcher", || {
+                tracing::error!("scoped");
+            });
+            let produced = dir.join(DailyFile::file_name("launcher", &DailyFile::today()));
+            assert!(produced.starts_with(root), "{}", produced.display());
+            assert!(produced.exists());
+        });
+    }
+
+    // ── The file sink (v0.2.92 WP-13) ──
+    //
+    // These are the OS-INDEPENDENT proof for a defect whose worst symptom is
+    // Windows-only. The `windows_subsystem = "windows"` stderr void cannot be
+    // reproduced on Linux and needs no test; what needs proving is that a
+    // SINK other than stderr exists and receives output. That is assertable
+    // anywhere.
+
+    /// Build the same layer stack `init_tracing_named` installs, but scoped
+    /// to this thread via `with_default` instead of `try_init`.
+    ///
+    /// Necessary because `tracing`'s global subscriber can be installed only
+    /// ONCE per process: a test that called `init_tracing_named` would either
+    /// lose the race to whichever test ran first (asserting nothing) or win
+    /// it and change every other test's logging. `with_default` gives this
+    /// test its own subscriber for the duration of the closure.
+    fn with_file_subscriber<F: FnOnce()>(dir: &Path, name: &str, f: F) {
+        let sink = std::sync::Arc::new(DailyFile::new(dir.to_path_buf(), name));
+        sink.with_file(|_| {});
+        let subscriber = tracing_subscriber::registry()
+            .with(LevelFilter::from(Level::INFO))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_writer(DailyFileMakeWriter(sink)),
+            );
+        tracing::subscriber::with_default(subscriber, f);
+    }
+
+    #[test]
+    fn init_creates_log_file_and_writes_banner() {
+        crate::test_env::with_state_dir(|_root| {
+            let dir = log_dir();
+            let name = "launcher";
+            with_file_subscriber(&dir, name, || {
+                tracing::error!(
+                    "[vct] {} {} started — diagnostics test banner",
+                    name,
+                    env!("CARGO_PKG_VERSION")
+                );
+                tracing::info!("a second line so ordering is observable");
+            });
+
+            let path = dir.join(DailyFile::file_name(name, &DailyFile::today()));
+            assert!(
+                path.exists(),
+                "the log file must EXIST after init: {}",
+                path.display()
+            );
+            let body = std::fs::read_to_string(&path).expect("read log");
+            let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert!(
+                !lines.is_empty(),
+                "the log file must have at least one line — an empty-but-present file is \
+                 the failure mode eager creation exists to prevent"
+            );
+            assert!(
+                body.contains(env!("CARGO_PKG_VERSION")),
+                "the banner must carry the running version so a pasted log identifies the \
+                 build; got:\n{body}"
+            );
+            assert!(
+                body.contains("a second line so ordering is observable"),
+                "subsequent events must reach the same file, not just the banner"
+            );
+        });
+    }
+
+    #[test]
+    fn file_sink_captures_a_warning_that_stderr_would_have_swallowed() {
+        // The point of the whole exercise: the "couldn't check for updates"
+        // family of diagnostics must land somewhere a user can send us.
+        crate::test_env::with_state_dir(|_root| {
+            let dir = log_dir();
+            with_file_subscriber(&dir, "launcher", || {
+                tracing::warn!(
+                    "[vct] check_for_launcher_update: behind-count failed (git rev-list: \
+                     fatal: ambiguous argument) — remote currency is UNKNOWN"
+                );
+            });
+            let body = std::fs::read_to_string(
+                dir.join(DailyFile::file_name("launcher", &DailyFile::today())),
+            )
+            .expect("read log");
+            assert!(body.contains("remote currency is UNKNOWN"), "got:\n{body}");
+        });
+    }
+
+    #[test]
+    fn log_dir_follows_the_state_dir_override() {
+        crate::test_env::with_state_dir(|root| {
+            assert_eq!(
+                log_dir(),
+                root.join("logs"),
+                "the log dir must resolve through paths::vct_root_dir, so VCT_STATE_DIR \
+                 redirection (tests, relocated state) works"
+            );
+        });
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_and_deletes_the_rest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // 20 days, written out of order so the sweep cannot be passing by
+        // accident of creation order.
+        let days: Vec<String> = (1..=20).map(|d| format!("2026-01-{d:02}")).collect();
+        for d in days.iter().rev() {
+            std::fs::write(dir.join(DailyFile::file_name("launcher", d)), b"x\n").unwrap();
         }
-        // And a reload with no preceding successful install (the case
-        // where another subscriber owns the process) must also be inert.
-        set_log_level(Level::ERROR);
+        prune_old_logs(dir, "launcher", LOG_RETENTION_FILES);
+
+        let mut left: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left.len(),
+            LOG_RETENTION_FILES,
+            "expected exactly {LOG_RETENTION_FILES} survivors, got {left:?}"
+        );
+        assert_eq!(
+            left.first().unwrap(),
+            &DailyFile::file_name("launcher", "2026-01-07"),
+            "the survivors must be the NEWEST 14 (07..20), not the first 14 read"
+        );
+        assert_eq!(
+            left.last().unwrap(),
+            &DailyFile::file_name("launcher", "2026-01-20")
+        );
+    }
+
+    #[test]
+    fn prune_leaves_files_it_does_not_own() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        for d in 1..=20 {
+            std::fs::write(
+                dir.join(DailyFile::file_name("launcher", &format!("2026-01-{d:02}"))),
+                b"x\n",
+            )
+            .unwrap();
+        }
+        // Not ours: a different stem, a non-.log file, and a subdirectory.
+        std::fs::write(dir.join(DailyFile::file_name("hub", "2026-01-01")), b"x\n").unwrap();
+        std::fs::write(dir.join("notes-from-the-user.txt"), b"important\n").unwrap();
+        std::fs::create_dir(dir.join("a-directory.log")).unwrap();
+
+        prune_old_logs(dir, "launcher", LOG_RETENTION_FILES);
+
+        assert!(
+            dir.join(DailyFile::file_name("hub", "2026-01-01")).exists(),
+            "a sweep for `launcher` must not touch `hub` files"
+        );
+        assert!(
+            dir.join("notes-from-the-user.txt").exists(),
+            "the sweep must only ever delete files it wrote"
+        );
+        assert!(
+            dir.join("a-directory.log").is_dir(),
+            "the sweep must not attempt directories"
+        );
+    }
+
+    #[test]
+    fn prune_is_a_no_op_below_the_retention_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        for d in 1..=3 {
+            std::fs::write(
+                dir.join(DailyFile::file_name("launcher", &format!("2026-01-{d:02}"))),
+                b"x\n",
+            )
+            .unwrap();
+        }
+        prune_old_logs(dir, "launcher", LOG_RETENTION_FILES);
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            3,
+            "leave-alone half: under the limit, nothing is deleted"
+        );
+    }
+
+    #[test]
+    fn prune_on_a_missing_directory_is_silent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Must not panic: the sweep runs on a path that may not exist yet.
+        prune_old_logs(&tmp.path().join("nope"), "launcher", LOG_RETENTION_FILES);
+    }
+
+    #[test]
+    fn daily_file_names_sort_chronologically() {
+        // The sweep sorts by NAME, so the name format must be sortable.
+        let mut names = vec![
+            DailyFile::file_name("launcher", "2026-01-09"),
+            DailyFile::file_name("launcher", "2025-12-31"),
+            DailyFile::file_name("launcher", "2026-01-10"),
+        ];
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                DailyFile::file_name("launcher", "2025-12-31"),
+                DailyFile::file_name("launcher", "2026-01-09"),
+                DailyFile::file_name("launcher", "2026-01-10"),
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_append_rather_than_truncate() {
+        // A launcher restart must not erase the morning's diagnostics.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let path = dir.join(DailyFile::file_name("launcher", &DailyFile::today()));
+        std::fs::write(&path, b"earlier session\n").unwrap();
+
+        with_file_subscriber(dir, "launcher", || {
+            tracing::error!("later session");
+        });
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("earlier session"), "got:\n{body}");
+        assert!(body.contains("later session"), "got:\n{body}");
     }
 
     #[test]

@@ -938,6 +938,51 @@ pub fn set_project_kg_binding_row_with_db(
         .flatten()
         .map(|p| p.slug)
         .unwrap_or_default();
+
+    // v0.2.92 D18 follow-up — record the human pick. This core is reached
+    // only from the launcher GUI's KG-tab save (`set_project_kg_binding`;
+    // every automated flow writes through the plain Db methods instead),
+    // and the picker sends `config: {}`. A save that CHANGES (or first
+    // sets) the row's collection_name is a human choosing a class, so it
+    // stamps `manual_override: true` — the sentinel `kg_binding_heal`'s
+    // evidence repoint refuses to move and its ambiguous-evidence ask
+    // reads as "a human already chose". Without the stamp the next
+    // update's heal could legitimately move the pick back. A save that
+    // keeps the SAME collection (embedding-model/URL-only edit) expresses
+    // no class preference and stays machine-repairable: no stamp.
+    //
+    // The write below upserts config_json wholesale, so the stamp MERGES:
+    // start from the row's current config, overlay the request's keys
+    // (caller wins), and only insert the sentinel when it is not already
+    // truthy — a pre-existing pick (or an audit sentinel like
+    // `v0.2.46-sync-shared-to-primary`) survives a re-save unchanged.
+    let existing_row = db
+        .list_project_kg_bindings(project_id)
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|b| b.role == req.role));
+    let collection_changed = existing_row
+        .as_ref()
+        .map(|b| b.collection_name != req.collection_name)
+        .unwrap_or(true); // no row yet: the save is creating it — a pick.
+    let mut config_map = existing_row
+        .as_ref()
+        .and_then(|b| b.config.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(req_cfg) = req.config.as_object() {
+        for (k, v) in req_cfg {
+            config_map.insert(k.clone(), v.clone());
+        }
+    }
+    if collection_changed
+        && !crate::commands::project_state_populate::shared_kg_binding::has_manual_override(
+            &JsonValue::Object(config_map.clone()),
+        )
+    {
+        config_map.insert("manual_override".to_string(), JsonValue::Bool(true));
+    }
+    let merged_config = JsonValue::Object(config_map);
+
     let row = db.set_project_kg_binding_with_root_sync(
         project_id,
         &project_slug,
@@ -947,7 +992,7 @@ pub fn set_project_kg_binding_row_with_db(
         req.embedding_dim,
         req.kg_dir_path.as_deref(),
         req.weaviate_url.as_deref(),
-        &req.config,
+        &merged_config,
     )?;
     db.audit(
         "project_kg_binding_set",
@@ -1360,6 +1405,86 @@ mod tests {
         assert!(!row.is_set, "explicit Some(false) must clear");
     }
 
+    /// A ref may declare a resolution OUTSIDE both launcher stores.
+    ///
+    /// The Secret-refs column renders `'declared-elsewhere'` ("not checked")
+    /// for a `file` / `env` ref that no store copy satisfies, instead of the
+    /// confident "not set" it used to print — because those two resolutions
+    /// name a location nothing here probes. That state is only worth having
+    /// if such a ref can EXIST, and the question was previously answered
+    /// "no in-tree writer emits one", which is a fact about today's writers,
+    /// not about what the surface can be handed.
+    ///
+    /// It can: `VALID_RESOLUTION` admits all five values, the
+    /// `project_secret_refs` CHECK admits the same five, and vct-hub's
+    /// `POST /api/v1/projects/{id}/secrets` (`project_state_api::set_secret`,
+    /// mounted in `server.rs` and `cli_api.rs`, documented in
+    /// `docs/features/01-launcher.md`) takes `resolution` as a free string
+    /// and passes it straight to this function. This pins that, so removing
+    /// either value from the allow-list turns the frontend state into
+    /// provably dead code here rather than silently.
+    #[test]
+    fn a_ref_can_declare_a_file_or_env_resolution_the_stores_do_not_cover() {
+        let db = make_db();
+        seed_project(&db, "p-sr-elsewhere", "Elsewhere");
+
+        let file_row = db
+            .set_project_secret_ref(
+                "p-sr-elsewhere",
+                "FROM_A_FILE",
+                "file",
+                Some("/etc/example/token"),
+                None,
+                Some("user"),
+                &[],
+                "",
+                Some(true),
+            )
+            .expect("a `file` resolution must be accepted");
+        assert_eq!(file_row.resolution, "file");
+        assert_eq!(file_row.file_path.as_deref(), Some("/etc/example/token"));
+
+        let env_row = db
+            .set_project_secret_ref(
+                "p-sr-elsewhere",
+                "FROM_THE_ENV",
+                "env",
+                None,
+                Some("EXAMPLE_TOKEN_VAR"),
+                Some("user"),
+                &[],
+                "",
+                Some(true),
+            )
+            .expect("an `env` resolution must be accepted");
+        assert_eq!(env_row.resolution, "env");
+        assert_eq!(env_row.env_name.as_deref(), Some("EXAMPLE_TOKEN_VAR"));
+
+        // Both come back from the list the tab renders, so the column really
+        // does have to answer for them.
+        let listed = db.list_project_secret_refs("p-sr-elsewhere").unwrap();
+        let mut resolutions: Vec<&str> =
+            listed.iter().map(|r| r.resolution.as_str()).collect();
+        resolutions.sort();
+        assert_eq!(resolutions, vec!["env", "file"]);
+
+        // …and the allow-list is still a closed set, so this is a licence
+        // for five values, not for anything.
+        assert!(db
+            .set_project_secret_ref(
+                "p-sr-elsewhere",
+                "MADE_UP",
+                "telepathy",
+                None,
+                None,
+                Some("user"),
+                &[],
+                "",
+                Some(true),
+            )
+            .is_err());
+    }
+
     // ─── F5 (v0.2.72): KG-binding writes re-project env ────────────────
 
     /// `set_project_kg_binding_row_with_db` upserts the binding AND
@@ -1431,6 +1556,199 @@ mod tests {
             result.kg_access_list,
             vec!["PeerProj".to_string()],
             "the delete must re-project env after the write",
+        );
+    }
+
+    // ─── v0.2.92 D18 follow-up: a GUI class-pick records the human ────
+    // ─── choice (manual_override) on the binding row ──────────────────
+
+    fn kg_req(collection: &str, model: Option<&str>, config: JsonValue) -> SetKgBindingReq {
+        SetKgBindingReq {
+            role: "primary".to_string(),
+            collection_name: collection.to_string(),
+            embedding_model: model.map(str::to_string),
+            embedding_dim: None,
+            kg_dir_path: None,
+            weaviate_url: None,
+            config,
+        }
+    }
+
+    /// The stored config_json for (project, role='primary'), or `null`
+    /// when no such row exists — the assert-friendly view of the row the
+    /// automated heals read.
+    fn stored_kg_config(db: &Db, project_id: &str) -> JsonValue {
+        db.list_project_kg_bindings(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.role == "primary")
+            .map(|b| b.config)
+            .unwrap_or(JsonValue::Null)
+    }
+
+    /// (a) A save that CHANGES the bound collection is a human choosing a
+    /// class: the row must come back carrying `manual_override: true` —
+    /// the sentinel `kg_binding_heal`'s evidence repoint refuses to move
+    /// and the D18 ambiguous-evidence ask reads as "a human already
+    /// chose". Without it the next update's heal could move the pick back.
+    #[test]
+    fn set_project_kg_binding_collection_change_stamps_manual_override() {
+        let db = make_db();
+        seed_project(&db, "p-d18-pick", "D18Pick");
+        // The row an automated pass left: bound, no sentinel.
+        db.set_project_kg_binding(
+            "p-d18-pick",
+            "primary",
+            "D18Pick_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        // The GUI's save — exactly the payload the picker sends
+        // (`config: {}`), naming a different class.
+        set_project_kg_binding_row_with_db(
+            &db,
+            "p-d18-pick",
+            &kg_req("Picked_KnowledgeGraph", None, serde_json::json!({})),
+        )
+        .expect("binding write must succeed");
+
+        let cfg = stored_kg_config(&db, "p-d18-pick");
+        assert_eq!(
+            cfg.get("manual_override"),
+            Some(&JsonValue::Bool(true)),
+            "a changed collection is a human pick — the row must stop \
+             being machine-writable",
+        );
+    }
+
+    /// (b) A model-only edit (collection UNCHANGED) expresses no class
+    /// preference — the row must stay machine-repairable, so no sentinel
+    /// may be stamped by it.
+    #[test]
+    fn set_project_kg_binding_model_only_edit_is_not_stamped() {
+        let db = make_db();
+        seed_project(&db, "p-d18-model", "D18Model");
+        db.set_project_kg_binding(
+            "p-d18-model",
+            "primary",
+            "D18Model_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        set_project_kg_binding_row_with_db(
+            &db,
+            "p-d18-model",
+            &kg_req(
+                "D18Model_KnowledgeGraph",
+                Some("snowflake-arctic-embed2"),
+                serde_json::json!({}),
+            ),
+        )
+        .expect("binding write must succeed");
+
+        let cfg = stored_kg_config(&db, "p-d18-model");
+        assert!(
+            cfg.get("manual_override").is_none(),
+            "a model-only edit is not a class pick — stamping it would \
+             freeze the row against legitimate automated repair; got {}",
+            cfg,
+        );
+    }
+
+    /// (c) A pre-existing sentinel survives a model-only edit. The GUI
+    /// always sends `config: {}`, so a write that replaced config_json
+    /// wholesale would silently strip the human pick on an embedding-model
+    /// tweak and hand the row back to the automated heal — the exact
+    /// regression this pins.
+    #[test]
+    fn set_project_kg_binding_manual_override_survives_model_only_edit() {
+        let db = make_db();
+        seed_project(&db, "p-d18-keep", "D18Keep");
+        db.set_project_kg_binding(
+            "p-d18-keep",
+            "primary",
+            "D18Keep_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({"manual_override": true}),
+        )
+        .unwrap();
+
+        set_project_kg_binding_row_with_db(
+            &db,
+            "p-d18-keep",
+            &kg_req(
+                "D18Keep_KnowledgeGraph",
+                Some("qwen3-embedding:0.6b"),
+                serde_json::json!({}),
+            ),
+        )
+        .expect("binding write must succeed");
+
+        let cfg = stored_kg_config(&db, "p-d18-keep");
+        assert_eq!(
+            cfg.get("manual_override"),
+            Some(&JsonValue::Bool(true)),
+            "the human pick must survive a model-only edit; got {}",
+            cfg,
+        );
+    }
+
+    /// (d) The stamp MERGES, never clobbers: keys already on the row
+    /// (e.g. the `evidence_repoint` audit record) and keys the caller
+    /// sent must all survive alongside the new sentinel.
+    #[test]
+    fn set_project_kg_binding_stamp_preserves_other_config_keys() {
+        let db = make_db();
+        seed_project(&db, "p-d18-merge", "D18Merge");
+        db.set_project_kg_binding(
+            "p-d18-merge",
+            "primary",
+            "D18Merge_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({"evidence_repoint": {"from": "Old_KnowledgeGraph"}}),
+        )
+        .unwrap();
+
+        set_project_kg_binding_row_with_db(
+            &db,
+            "p-d18-merge",
+            &kg_req(
+                "Picked_KnowledgeGraph",
+                None,
+                serde_json::json!({"user_note": "keep me"}),
+            ),
+        )
+        .expect("binding write must succeed");
+
+        let cfg = stored_kg_config(&db, "p-d18-merge");
+        assert_eq!(cfg.get("manual_override"), Some(&JsonValue::Bool(true)));
+        assert_eq!(
+            cfg.get("evidence_repoint"),
+            Some(&serde_json::json!({"from": "Old_KnowledgeGraph"})),
+            "row-resident audit keys must survive the stamping write; got {}",
+            cfg,
+        );
+        assert_eq!(
+            cfg.get("user_note"),
+            Some(&serde_json::json!("keep me")),
+            "caller-sent keys must survive the merge; got {}",
+            cfg,
         );
     }
 

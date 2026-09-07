@@ -26,6 +26,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import agent_secrets  # noqa: E402
 from vco_lib import project_config  # noqa: E402
 from vco_lib.agent_secrets import (  # noqa: E402
@@ -288,7 +289,7 @@ def test_cli_probe_never_prints_value(offline_hub, file_store):
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
-        env=env,
+        env=child_env(env),
     )
     combined = cp.stdout + cp.stderr
     assert "shared-token-value" not in combined
@@ -419,3 +420,148 @@ def test_dotenv_values_never_in_exception(
         assert leaked not in msg
     # The message names the tiers consulted.
     assert "tier 3" in msg and ".env" in msg
+
+
+# ─── Tier 2: the `.no-shared-fallback` per-project opt-out ──────────────
+#
+# `docs/VCT_SECRETS_PRIMITIVE.md` §"Design choices" promises a project can
+# opt out of the SHARED file-store tier by placing
+# `projects/<NAME>/.no-shared-fallback`, and the launcher's
+# "Disable shared secrets for this project" toggle WRITES that marker
+# (`secrets_cmd.rs::set_shared_secrets_read_disabled`). Until v0.3.0 no
+# resolver READ it, so the toggle gated tier 1 (keychain) while tier 2 kept
+# serving the very values the user had opted out of — a privacy control
+# that was documented, written, and inert.
+#
+# These exercise the production entry point `get()`, not the private
+# predicate: a test that called `_shared_fallback_disabled` directly would
+# still pass if `_file_store_get` stopped consulting it.
+
+
+@pytest.fixture()
+def opted_out_store(monkeypatch, tmp_path):
+    """File store where project `demo` has opted out of `shared/`.
+
+    `shared/` holds a key `demo` does NOT have its own copy of, so a
+    resolution that reaches shared is unambiguous evidence the gate did
+    not fire.
+    """
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    (root / "projects" / "demo").mkdir(parents=True)
+    (root / "projects" / "other").mkdir(parents=True)
+    (root / "shared" / "shared_only_key").write_text("shared-only-value\n")
+    (root / "projects" / "demo" / "own_key").write_text("demo-own-value")
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+    return root
+
+
+def _opt_out(root: Path, name: str) -> None:
+    (root / "projects" / name / agent_secrets.NO_SHARED_FALLBACK_MARKER).write_text("")
+
+
+def test_marker_absent_shared_still_resolves(offline_hub, opted_out_store):
+    """LEAVE-ALONE half — without the marker nothing changes."""
+    assert get("shared_only_key", project="demo") == "shared-only-value"
+
+
+def test_marker_blocks_the_shared_tier(offline_hub, opted_out_store):
+    """ACT half — with the marker the shared copy must NOT resolve."""
+    _opt_out(opted_out_store, "demo")
+    with pytest.raises(SecretNotFound):
+        get("shared_only_key", project="demo")
+
+
+def test_marker_leaves_the_projects_own_keys_alone(offline_hub, opted_out_store):
+    """The opt-out is about `shared/`, not about the project's own tier."""
+    _opt_out(opted_out_store, "demo")
+    assert get("own_key", project="demo") == "demo-own-value"
+
+
+def test_marker_is_scoped_to_the_project_that_placed_it(
+    offline_hub, opted_out_store
+):
+    """`other` must keep resolving shared even though `demo` opted out."""
+    _opt_out(opted_out_store, "demo")
+    assert get("shared_only_key", project="other") == "shared-only-value"
+
+
+def test_marker_applies_via_the_vct_project_marker_path(
+    offline_hub, opted_out_store, tmp_path, monkeypatch
+):
+    """Name detection by `.vct-project` walk-up honours the opt-out too.
+
+    The launcher writes the marker under the project NAME; a caller
+    passing a PATH must reach the same decision, or the gate would hold
+    for `get(project="demo")` and leak for a hook running inside the
+    checkout.
+    """
+    _opt_out(opted_out_store, "demo")
+    checkout = tmp_path / "checkout"
+    (checkout / "sub").mkdir(parents=True)
+    (checkout / ".vct-project").write_text("demo\n")
+    monkeypatch.chdir(checkout / "sub")
+    with pytest.raises(SecretNotFound):
+        get("shared_only_key")
+
+
+def test_no_project_identity_cannot_opt_out(
+    offline_hub, opted_out_store, tmp_path, monkeypatch
+):
+    """No name → no marker to consult → shared resolves, as documented."""
+    _opt_out(opted_out_store, "demo")
+    nowhere = tmp_path / "unmarked"
+    nowhere.mkdir()
+    monkeypatch.chdir(nowhere)
+    assert get("shared_only_key") == "shared-only-value"
+
+
+def test_shared_pseudo_name_never_opts_itself_out(
+    offline_hub, opted_out_store
+):
+    """A stray `projects/shared/` orphan must not kill every shared read.
+
+    `vct get` defaults to `project="shared"` when `--project` is omitted,
+    so a marker there would disable the shared tier machine-wide.
+    """
+    (opted_out_store / "projects" / "shared").mkdir(parents=True, exist_ok=True)
+    _opt_out(opted_out_store, "shared")
+    assert get("shared_only_key", project="shared") == "shared-only-value"
+
+
+def test_opt_out_also_gates_exec_injection(
+    offline_hub, opted_out_store, tmp_path
+):
+    """The gate must hold on the injection path, not just plain `get`.
+
+    `exec_with_secrets` is the PREFERRED consumer API (CLAUDE.md §Secrets),
+    so a gate that only covered `get` would leave the recommended path open.
+    """
+    _opt_out(opted_out_store, "demo")
+    with pytest.raises(SecretNotFound):
+        exec_with_secrets(
+            [sys.executable, "-c", "pass"],
+            secrets={"shared_only_key": "SHARED_ONLY"},
+            project="demo",
+        )
+
+
+def test_opt_out_error_never_names_the_value(offline_hub, opted_out_store):
+    """The refusal must not leak what it refused to serve."""
+    _opt_out(opted_out_store, "demo")
+    try:
+        get("shared_only_key", project="demo")
+    except SecretNotFound as e:
+        assert "shared-only-value" not in str(e)
+
+
+def test_pseudo_name_exclusion_is_case_sensitive(offline_hub, opted_out_store):
+    """A project literally NAMED "Shared" is a real project, not the scope.
+
+    Sibling of `test_ps1_pseudo_name_exclusion_is_case_sensitive` — the
+    PowerShell resolver needs `-ceq` to reach this same verdict.
+    """
+    (opted_out_store / "projects" / "Shared").mkdir(parents=True, exist_ok=True)
+    _opt_out(opted_out_store, "Shared")
+    with pytest.raises(SecretNotFound):
+        get("shared_only_key", project="Shared")

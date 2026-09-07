@@ -107,14 +107,22 @@ function Get-KgDebouncePsExe {
 # would kill a job still in its Start-Sleep window and leave the file
 # un-synced. Start-Process spawns an independent process that survives the
 # hook's exit, matching the POSIX sibling's reparent-to-init subshell.
+#
+# The spawn itself goes through `Start-VcoDetachedPwsh` in
+# _lib/resolve-powershell.ps1 — the ONE home for the `-WindowStyle Hidden`
+# capability guard. Unguarded, that parameter is REJECTED by non-Windows
+# PowerShell editions and the whole spawn dies, which both loses the work and
+# makes this helper untestable on a Linux/macOS host.
 function Start-KgDebounceChild {
     param([string]$ChildScript)
     $psExe = Get-KgDebouncePsExe
-    $bytes = [System.Text.Encoding]::Unicode.GetBytes($ChildScript)
-    $encoded = [Convert]::ToBase64String($bytes)
-    Start-Process -FilePath $psExe `
-        -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) `
-        -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+    # Usable standalone: parent hooks dot-source resolve-powershell.ps1 before
+    # this file, but a direct caller may not have.
+    if (-not (Get-Command Start-VcoDetachedPwsh -ErrorAction SilentlyContinue)) {
+        $lib = Join-Path $PSScriptRoot "resolve-powershell.ps1"
+        if (Test-Path -LiteralPath $lib) { . $lib }
+    }
+    Start-VcoDetachedPwsh -Command $ChildScript -PowerShellExe $psExe
 }
 
 # Shared child-script fragment that ATOMICALLY CLAIMS a work dir, runs its
@@ -304,7 +312,18 @@ function Invoke-KgDebounceReapStale {
             if ($raw -match '^[0-9]+$') { $lastReap = [long]$raw }
         } catch { $lastReap = 0 }
     }
-    $nowEpoch = [long][Math]::Floor(($now.ToUniversalTime() - [datetime]'1970-01-01T00:00:00Z').TotalSeconds)
+    # TRUE Unix seconds. MUST MATCH the .sh sibling's `date +%s` — both
+    # siblings write and read the SAME `.last_reap.ts` (see the comment just
+    # above), so a timezone-shifted value here breaks the throttle across
+    # them. `$now.ToUniversalTime() - [datetime]'1970-01-01T00:00:00Z'` was
+    # off by one UTC offset: [datetime]'...Z' parses to a LOCAL-kind instant,
+    # and .NET subtracts raw ticks ignoring DateTimeKind, so mixing kinds
+    # never errors — it silently returns the wrong number. East of UTC the
+    # .ps1 then read a .sh stamp as `now - last == -offset`, which is below
+    # the throttle, so the reaper NEVER ran and orphaned lock dirs
+    # accumulated. [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() has no kind
+    # to get wrong (.NET 4.6+ / PS 5.1 on Win10+).
+    $nowEpoch = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     if ($lastReap -gt 0 -and (($nowEpoch - $lastReap) -lt $script:KgDebounceReapThrottleSeconds)) {
         return
     }

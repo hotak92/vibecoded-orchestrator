@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DETECT = REPO_ROOT / "templates" / "scripts" / "detect_workflow_needs.py"
 GENERATE = REPO_ROOT / "templates" / "scripts" / "generate_workflow.py"
@@ -23,7 +25,7 @@ def _run(script: Path, *args: str, cwd: Path) -> subprocess.CompletedProcess:
     env["CLAUDE_PROJECT_DIR"] = str(cwd)
     return subprocess.run(
         [sys.executable, str(script), *args],
-        capture_output=True, text=True, env=env, cwd=cwd, timeout=60,
+        capture_output=True, text=True, env=child_env(env), cwd=cwd, timeout=60,
     )
 
 

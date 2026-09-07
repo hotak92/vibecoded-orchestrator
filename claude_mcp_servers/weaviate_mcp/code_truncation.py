@@ -13,9 +13,20 @@ Priority order for code embedding text:
   3. Method/field names (for classes)
   4. Body — truncated at statement boundaries, not mid-line
 
-Token budget is model-aware:
-  - CodeSage-Large-v2: 2048 tokens (~8000 chars)
-  - jina-v2-base-code: 8192 tokens (~32000 chars)
+Token budget is model-aware. The source of truth for per-model token limits
+is ``chunking.py``'s ``MODEL_TOKEN_LIMITS`` (via ``_num_ctx_for_model``) —
+this module no longer keeps its own copy (see v0.2.92 WP-E note below):
+  - CodeSage-Large-v2: 1024 tokens (3 584 chars at 3.5 chars/token — the
+    SERVED window per sentence_bert_config.json, not the 2 048
+    architectural cap; wiring-audit W1, 2026-09-05). The 3.5 ratio is an
+    ESTIMATE that does not bound real code: CodeSage tokenises real repo
+    Python at 2.96–3.47 chars/token on budget-window slices, so a maximal
+    entity can still exceed the served window. That case is the service's
+    HTTP-400 refusal + the caller's shrink-on-refusal (tagged leading
+    window), never a silent truncation.
+  - jina-v2-base-code: 2048 tokens (~7168 chars; v2 is trained at 512, 2048
+    is the shipped conservative ceiling — NOT 8192, a stale value this
+    module carried until v0.2.92 WP-E)
   - Fallback: 2048 tokens (conservative)
 """
 
@@ -24,24 +35,64 @@ from __future__ import annotations
 import os
 import re
 
-# Model token limits for code embedding models.
-# Chars-per-token ratio for code is ~3.5 (more punctuation than prose).
-CODE_MODEL_TOKEN_LIMITS: dict[str, int] = {
-    "codesage/codesage-large-v2": 2048,
-    "codesage-large-v2": 2048,
-    "unclemusclez/jina-embeddings-v2-base-code:latest": 8192,
-    "jina-embeddings-v2-base-code": 8192,
-}
+# Chars-per-token ratio for code is ~3.5 (more punctuation than prose). This
+# dimension (chars, for pre-embedding body truncation) is local to this
+# module and not part of the chunking.py SSOT, which works in tokens.
+# v0.2.92: the value lives in chunking.py beside the token budgets it
+# multiplies (register #50 — one home for the heuristic, two domain values).
+# SIBLING FIRST, absolute only as the fallback (v0.2.92). The order is
+# load-bearing, not stylistic: the absolute path resolves against whatever
+# `sys.path` offers, and on a machine with a SECOND orchestrator checkout on
+# the path it binds the OTHER tree's `chunking` — a different
+# `MODEL_TOKEN_LIMITS`. That is not hypothetical: it was reproduced live on
+# this repo's dev box, where the other checkout still carries
+# `codesage-large-v2: 2048` against this tree's measured 1024, silently
+# restoring the very over-budgeting the W1 fix removed. A sibling import can
+# only ever resolve inside THIS package, so it cannot be shadowed.
+try:
+    from .chunking import (  # noqa: E402
+        CHARS_PER_TOKEN_CODE as _CHARS_PER_TOKEN,
+    )
+except ImportError:  # pragma: no cover - bare-module import path (tests load
+    # this file by path, where there is no package to be a sibling of).
+    from claude_mcp_servers.weaviate_mcp.chunking import (  # type: ignore[no-redef]  # noqa: E402
+        CHARS_PER_TOKEN_CODE as _CHARS_PER_TOKEN,
+    )
 
-_CHARS_PER_TOKEN = 3.5  # conservative for code
-_DEFAULT_TOKEN_LIMIT = 2048
+#: Budget for a model NOT in the token table. Conservative by design: an
+#: unknown model's real window is a genuine unknown, and over-filling it is
+#: silently lossy at index time while under-filling only costs a little
+#: recall. 1024 is the smallest window any shipped code tier serves
+#: (codesage's measured value); it was 2048 until v0.2.92, which was
+#: over-budget for that very tier.
+_DEFAULT_TOKEN_LIMIT = 1024
 
 
 def _max_chars_for_model(model: str | None = None) -> int:
-    """Return max character budget for a given code embedding model."""
+    """Return max character budget for a given code embedding model.
+
+    v0.2.92 (WP-E): used to look the model up in a locally-declared
+    ``CODE_MODEL_TOKEN_LIMITS`` dict that hand-duplicated chunking.py's
+    ``MODEL_TOKEN_LIMITS`` and had drifted — this file's jina entries were
+    still pinned at the OLD 8192 tokens while chunking.py had already been
+    corrected to 2048 (jina-v2 is trained at 512 tokens; 2048 is the
+    shipped conservative ceiling). CPU-tier installs (install.py's "cpu"
+    EMBEDDING_CONFIGS profile) actively select jina as the code model, so
+    the stale value silently over-budgeted truncation for real installs.
+    Now delegates straight to the SSOT (``chunking._num_ctx_for_model``)
+    so there is exactly one place these numbers are declared.
+    """
     if model is None:
         model = os.getenv("CODE_EMBED_MODEL", "codesage/codesage-large-v2")
-    token_limit = CODE_MODEL_TOKEN_LIMITS.get(model, _DEFAULT_TOKEN_LIMIT)
+    try:
+        # Sibling first — see the module-level note: the absolute path can bind
+        # another checkout's chunking and silently swap MODEL_TOKEN_LIMITS.
+        from .chunking import _num_ctx_for_model
+    except ImportError:  # pragma: no cover - bare-module import path.
+        from claude_mcp_servers.weaviate_mcp.chunking import (  # type: ignore[no-redef]
+            _num_ctx_for_model,
+        )
+    token_limit = _num_ctx_for_model(model) or _DEFAULT_TOKEN_LIMIT
     return int(token_limit * _CHARS_PER_TOKEN)
 
 

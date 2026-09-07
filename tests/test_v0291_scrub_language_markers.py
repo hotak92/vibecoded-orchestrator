@@ -640,11 +640,17 @@ def test_only_the_python_extractor_bypasses_the_balanced_block_helper() -> None:
 
     with_calls = {m for m in modules if _balanced_block_calls(_module_source(m))}
     without_calls = set(modules) - with_calls
-    assert without_calls == {"vco_lib.codegraph_lang.python"}, (
-        f"expected python.py to be the ONLY extractor not using "
+    assert without_calls == {
+        "vco_lib.codegraph_lang.python",
+        # v0.2.92 WP-5b: ruby and lua moved to extract_end_keyword_block —
+        # brace counting ran their bodies to EOF in a braceless language.
+        "vco_lib.codegraph_lang.ruby",
+        "vco_lib.codegraph_lang.lua",
+    }, (
+        f"expected only python/ruby/lua to bypass "
         f"_extract_balanced_block; modules without a call: {sorted(without_calls)}"
     )
-    assert len(with_calls) == 12
+    assert len(with_calls) == 10
 
 
 def test_every_call_site_threads_a_language_valid_for_its_module() -> None:

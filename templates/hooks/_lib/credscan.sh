@@ -6,33 +6,54 @@
 # post-tool-security.sh and the V52-L.1 SubagentStop reconciler.
 #
 # Background:
-#   Post-tool-security.sh has historically hosted the canonical list of
-#   credential regexes. The SubagentStop reconciler needs the same logic
-#   applied to every file the subagent modified during its run (so a
-#   `Bash` shell-out that wrote a credential isn't missed — Bash writes
-#   don't trigger PostToolUse on file edits). Rather than duplicate the
-#   patterns, extract them into this helper that both consumers source.
+#   The SubagentStop reconciler needs credential scanning applied to every file
+#   a subagent modified during its run (a `Bash` shell-out that wrote a
+#   credential isn't caught by PostToolUse, which only fires on file edits).
+#   Rather than duplicate the logic, both consumers source this helper.
+#
+# PATTERN SOURCE (changed — read this before adding a regex):
+#   The patterns are NOT defined here, and this file is no longer a hand-kept
+#   mirror of post-tool-security.sh. Both now read the SAME vocabulary from
+#   _lib/credshapes.sh (`content_scan` context), whose SSOT is
+#   vco_lib/credential_shapes.py. The old arrangement — "post-tool-security.sh
+#   is canonical, this file mirrors it" — is exactly what let this copy fall
+#   behind: it was missing the GitHub fine-grained PAT shape and the unquoted
+#   dotenv-style generic-secret shape long after post-tool-security.sh gained
+#   them, so the reconciler was blind to the token type VCO's own secrets flow
+#   provisions. Add shapes to the SSOT, never here.
 #
 # Functions:
 #   scan_file_for_credentials <file_path>
-#     Runs the credential patterns against $file_path. Echoes each
-#     matched label (newline-delimited) on stdout. Empty output → clean.
+#     Runs the content_scan patterns against $file_path. Echoes each matched
+#     label (newline-delimited) on stdout. Empty output → clean.
 #     Returns 0 always (caller checks output, not exit code).
 #
-# Patterns (kept in sync with post-tool-security.sh — the canonical
-# source of truth is post-tool-security.sh; this file mirrors it):
-#   - Anthropic/OpenAI API key
-#   - AWS access key
-#   - GitHub token
-#   - PEM private key
-#   - Generic SECRET / API_KEY / ACCESS_TOKEN / PRIVATE_KEY env-style
-#   - Hook leak-test marker (smoke-test only)
+# Never echoes any part of the file's contents — labels only.
+
+# Locate the vocabulary next to this helper. ${BASH_SOURCE[0]} is THIS file
+# even when sourced, so the lookup follows the deployed _lib/ directory.
+_CREDSCAN_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -r "$_CREDSCAN_LIB_DIR/credshapes.sh" ]; then
+    # shellcheck source=credshapes.sh disable=SC1091
+    . "$_CREDSCAN_LIB_DIR/credshapes.sh"
+fi
 
 scan_file_for_credentials() {
     local file_path="$1"
     local alerts=()
     [ -z "$file_path" ] && return 0
     [ ! -f "$file_path" ] && return 0
+
+    # A MISSING vocabulary must not look like a clean file. Callers treat empty
+    # output as "no credentials found", so degrading silently here would turn a
+    # broken install into a permanent all-clear. Emit a real alert label
+    # instead, so the miss surfaces through the same notification + JSONL path
+    # every other finding uses.
+    if ! command -v credshapes_for_context >/dev/null 2>&1; then
+        printf '%s\n' "credential scanner UNAVAILABLE (_lib/credshapes.sh missing)"
+        return 0
+    fi
+
     # Skip non-text files (binaries) — grep on a JPEG produces noise.
     # `file -b --mime` is portable across Linux + macOS.
     if command -v file >/dev/null 2>&1; then
@@ -59,28 +80,18 @@ scan_file_for_credentials() {
         return 0
     fi
 
-    # Pattern checks — mirror post-tool-security.sh verbatim. Keep the
-    # two lists in lockstep when adding new patterns; ideally factor
-    # post-tool-security.sh to source this helper too (deferred to a
-    # follow-up to avoid scope creep in V52-L.1).
-    if grep -qE 'sk-(ant-api03|[a-zA-Z0-9]{30,})-[a-zA-Z0-9]' "$file_path" 2>/dev/null; then
-        alerts+=("Anthropic/OpenAI API key")
+    # One pass per shape, in SSOT declaration order so the reported label
+    # sequence is stable.
+    if ! credshapes_for_context content_scan; then
+        printf '%s\n' "credential scanner UNAVAILABLE (content_scan context rejected)"
+        return 0
     fi
-    if grep -qE 'AKIA[A-Z0-9]{16}' "$file_path" 2>/dev/null; then
-        alerts+=("AWS access key")
-    fi
-    if grep -qE 'gh[pousr]_[a-zA-Z0-9]{36}' "$file_path" 2>/dev/null; then
-        alerts+=("GitHub token")
-    fi
-    if grep -qE 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY' "$file_path" 2>/dev/null; then
-        alerts+=("PEM private key")
-    fi
-    if grep -qE '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["'"'"'][a-zA-Z0-9+/=_\-]{32,}' "$file_path" 2>/dev/null; then
-        alerts+=("Generic secret")
-    fi
-    if grep -qE 'VCT_HOOK_LEAK_PROBE_a3f7c2' "$file_path" 2>/dev/null; then
-        alerts+=("Hook leak-test marker")
-    fi
+    local i
+    for i in "${!CREDSHAPES_PATTERNS[@]}"; do
+        if grep -qE -- "${CREDSHAPES_PATTERNS[$i]}" "$file_path" 2>/dev/null; then
+            alerts+=("${CREDSHAPES_LABELS[$i]}")
+        fi
+    done
 
     local label
     for label in "${alerts[@]}"; do

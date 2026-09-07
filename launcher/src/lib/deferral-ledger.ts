@@ -167,8 +167,19 @@ export function badgeCount(view: DeferralLedgerView | null): number {
  * conditions VCO retries itself.
  */
 export function retryingCount(view: DeferralLedgerView | null): number {
+  // v0.2.92 MAJOR-14 (residual): `disposition === 'auto_retryable'` alone was
+  // the same over-claim the row-level explanation had — four registry rows are
+  // classed auto_retryable with NO `retry_action`, so nothing retries them.
+  // Count only the rows a mechanism actually stands behind.
   return groupEntries(view).actionNeeded.filter(
-    (e) => e.disposition === 'auto_retryable',
+    (e) => e.disposition === 'auto_retryable' && autoRetryIsBacked(e),
+  ).length;
+}
+
+/** auto_retryable rows in the group that NOTHING retries. */
+export function unbackedRetryableCount(view: DeferralLedgerView | null): number {
+  return groupEntries(view).actionNeeded.filter(
+    (e) => e.disposition === 'auto_retryable' && !autoRetryIsBacked(e),
   ).length;
 }
 
@@ -179,10 +190,26 @@ export function retryingCount(view: DeferralLedgerView | null): number {
  */
 export function actionGroupNote(view: DeferralLedgerView | null): string | null {
   const n = retryingCount(view);
-  if (n === 0) return null;
-  return n === 1
-    ? '1 of these is a condition VCO retries itself — shown here, not counted in the badge.'
-    : `${n} of these are conditions VCO retries itself — shown here, not counted in the badge.`;
+  const u = unbackedRetryableCount(view);
+  if (n === 0 && u === 0) return null;
+  const parts: string[] = [];
+  if (n > 0) {
+    parts.push(
+      n === 1
+        ? '1 of these is a condition VCO retries itself'
+        : `${n} of these are conditions VCO retries itself`,
+    );
+  }
+  if (u > 0) {
+    // Never say "VCO retries this" for a row with no retry_action. Understating
+    // beats a promise nothing keeps.
+    parts.push(
+      u === 1
+        ? '1 is classed retryable but has no automatic retry — it clears when the thing it was waiting for comes back'
+        : `${u} are classed retryable but have no automatic retry — they clear when the thing they were waiting for comes back`,
+    );
+  }
+  return `${parts.join('; ')} — shown here, not counted in the badge.`;
 }
 
 /**
@@ -224,6 +251,64 @@ export function dispositionLabel(disposition: string): string {
   }
 }
 
+/**
+ * The `auto_retryable` conditions whose retry claim is BACKED by a mechanism.
+ *
+ * v0.2.92 (review MAJOR-14): the panel used to say "VCO retries this itself"
+ * for every row classed `auto_retryable`, but the class is a CLASSIFICATION,
+ * not an implementation. Five registry rows carry it with no `retry_action`,
+ * and for four of them nothing whatsoever is scheduled — the reader was told
+ * to wait for a retry that would never run. That is the same
+ * classification-mistaken-for-implementation state the registry itself exists
+ * to end (`codegraph_embed_resync_pending`'s own notes record the incident).
+ *
+ * Membership is decided by `vco_lib/deferral_conditions.toml` — the ground
+ * truth — and pinned to it by `deferral-ledger.test.ts`, which fails if a row
+ * grows or loses a `retry_action` without this list following. The wire
+ * carries no per-row retry field, so a shipped list read from the registry is
+ * the honest option; a `retry_action` field on `LedgerEntry` would be the
+ * better one and is a backend change this lane does not own.
+ *
+ * A cid NOT listed here gets the cautious wording even when it is classed
+ * `auto_retryable`. That direction is deliberate: understating is a smaller
+ * harm than the false promise, and the pin test converts an omission into a
+ * failing test rather than a lie in the GUI.
+ */
+export const AUTO_RETRY_BACKED_CONDITIONS: ReadonlySet<string> = new Set([
+  // `retry_action = "retry:py:…"` in the registry — vco_lib.deferral_retry
+  // re-runs the owed work once its precondition returns.
+  'kg_sync_no_embedding_backend',
+  'codegraph_embed_resync_pending',
+  'code_graph_no_embedding_backend',
+  'code_graph_code_backend_unreachable',
+  // v0.2.92 D17: a sync run with per-node failures leaves the failed
+  // nodes owed. `retry:py:kg_seed` re-runs `sync_knowledge_graph.py --all`,
+  // so the GUI's retry claim is true for this row.
+  'kg_sync_failures_pending',
+  // DOCUMENTED EXCEPTION — no `retry_action` ON PURPOSE. The work is already
+  // scheduled: the flip transaction inserted a `code_graph_builds` pending row
+  // and the launcher's own build runner consumes it. A WP-H handler here would
+  // be a SECOND scheduler racing it into a double walk. (This cid is emitted
+  // as `action_required` instead whenever that enqueue FAILED, so an
+  // `auto_retryable` instance of it always has a runner behind it.)
+  'project_move_codegraph_reanalyze_pending',
+]);
+
+/**
+ * Whether an `auto_retryable` entry actually has something retrying it.
+ *
+ * Only meaningful for `auto_retryable` rows; every other disposition answers
+ * `false` because the question does not apply to them.
+ */
+export function autoRetryIsBacked(
+  entry: Pick<LedgerEntry, 'condition_id' | 'disposition'>,
+): boolean {
+  return (
+    entry.disposition === 'auto_retryable' &&
+    AUTO_RETRY_BACKED_CONDITIONS.has(entry.condition_id)
+  );
+}
+
 /** One line explaining what the tier means for the reader. */
 export function dispositionExplanation(entry: LedgerEntry): string {
   if (entry.disposition_source === 'default') {
@@ -236,7 +321,11 @@ export function dispositionExplanation(entry: LedgerEntry): string {
     case 'action_required':
       return 'Run the command below (or dismiss it if it no longer applies).';
     case 'auto_retryable':
-      return 'VCO retries this itself when the thing it needs comes back up.';
+      return autoRetryIsBacked(entry)
+        ? 'VCO retries this itself when the thing it needs comes back up.'
+        : 'Classed as retryable, but VCO has no automatic retry for this ' +
+          'condition — it clears when the thing it was waiting for comes ' +
+          'back, or you can dismiss it.';
     case 'environmental':
       return 'A fact about this machine, not a task. Nothing to run.';
     case 'informational_record':

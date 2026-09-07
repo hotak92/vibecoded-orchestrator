@@ -678,10 +678,14 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
         if reason is not None:
             data["last_reason"] = str(reason)[:500]
         data["last_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z", _time.localtime())
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            _json.dump(data, fh)
-        _os.replace(tmp, path)
+        # v0.2.92: one home for tmp+os.replace (`vco_lib` is a hard
+        # dependency of every MCP process; a failure here is the
+        # counter's existing debug-logged soft-fail, not a silent copy).
+        from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
+
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        atomic_write_json(_Path(path), data, indent=None, fsync=False)
     except Exception as exc:  # noqa: BLE001
         logger.debug("_bump_rl_counter(%s): counter write failed (%s)", field, exc)
 
@@ -865,6 +869,22 @@ def _clamp_unit_score(value: Any) -> float:
     return s
 
 
+def _apply_emb_truncation(rec: "dict[str, Any]", state: Any) -> None:
+    """Carry a KNOWABLE truncation state onto a telemetry log record (v4).
+
+    ONE home for the only-when-known rule, used by BOTH log-node builders —
+    ``_build_log_nodes`` (the ACTIVE slot's state, v0.2.92 m-R6-1) and
+    ``_build_other_slot_log_nodes`` (the dual-log other slot's, v4) — so the
+    two cannot drift on it. ``state`` may be True / False (real answers: an
+    explicit False is a full-fidelity vector and must survive) or None /
+    absent (UNKNOWN — the field stays ABSENT so the event resolves
+    ``TRUNCATION_UNKNOWN`` downstream; see
+    ``rl_logger.resolve_emb_truncation_state`` — never ``.get(..., False)``).
+    """
+    if state is not None:
+        rec["emb_truncated"] = bool(state)
+
+
 def _build_log_nodes(
     candidates: list[dict[str, Any]], limit: int
 ) -> list[dict[str, Any]]:
@@ -893,6 +913,11 @@ def _build_log_nodes(
             rec["emb"] = n["emb"]
         if n.get("n_emb"):
             rec["n_emb"] = n["n_emb"]
+        # v4 (v0.2.92, m-R6-1): the ACTIVE slot's per-node truncation state,
+        # attached by the enrichment site from the chunk's persisted
+        # ``truncated_slots`` property — the MAIN event's twin of the dual-log
+        # second event's secondary-state carry below. Only-when-known.
+        _apply_emb_truncation(rec, n.get("emb_truncated"))
         if n.get("linked_embs"):
             rec["linked_embs"] = n["linked_embs"]
         if n.get("linked_type_names"):
@@ -982,6 +1007,14 @@ def _build_other_slot_log_nodes(
             "emb": emb_other,
             "n_emb": emb_other,
         }
+        # v4 (2026-09-04): carry the other slot's per-node truncation state so
+        # the second event identifies truncated secondary vectors from the
+        # EVENT ALONE — the trainer reads launcher.db, not Weaviate. Set by
+        # the enrichment site via the ONE shared reader
+        # (rl_enrichment._stored_slot_truncation_state); routed through the
+        # same only-when-known carry helper the MAIN builder uses, so the two
+        # legs cannot drift on the rule.
+        _apply_emb_truncation(rec, n.get("emb_other_truncated"))
         if n.get("node_type"):
             rec["node_type"] = n["node_type"]
         if n.get("links"):

@@ -48,37 +48,57 @@ BLOCKLIST=(
   "ltnlwh"
 )
 
-# High-signal live-credential SHAPES (regexes, grep -E). Unlike BLOCKLIST
-# (historical fixed strings), these catch NEW leaks by structure. Used by
-# the dist/ passes below (v0.2.75 P2c) — the paths the main pass excludes.
-# ONE list feeds both the dist text pass and the dist-binary strings pass;
-# do not fork it.
-TOKEN_SHAPES=(
-  # GitHub classic PAT: ghp_ + 36 alnum.
-  "ghp_[A-Za-z0-9]{36}"
-
-  # GitHub fine-grained PAT: github_pat_ + 22 alnum + _ + 59 alnum.
-  # MUST-MATCH anchor: this is the canonical token-shape anchor that
-  # templates/hooks/post-tool-security.sh (hooks plan D-13) must match —
-  # keep the two regexes identical so they cannot drift.
-  # NOTE: the looser shape github_pat_[A-Za-z0-9_]{60,} false-positives
-  # on Rust release binaries — rustc concatenates static strings into
-  # unseparated rodata tables, so command names like
-  # get_github_pat_preview + neighbours fuse into 100+-char word runs
-  # starting with "github_pat_". The exact-format shape matches every
-  # real token while skipping identifier soup (verified 2026-07-07
-  # against all 9 dist binaries).
-  "github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}"
-
-  # OpenAI-style secret key. Alnum-only tail unless a known prefix
-  # (proj/svcacct/admin) follows — the bare sk-[A-Za-z0-9_-]{20,} shape
-  # false-positives on locale asset chunk names in the vendored
-  # Excalidraw bundle (e.g. sk-SK-<hash> for the Slovak locale).
-  "sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}"
-
-  # PEM private key header (RSA/EC/OPENSSH/blank variants).
-  "-----BEGIN [A-Z ]*PRIVATE KEY-----"
-)
+# High-signal live-credential SHAPES, from the ONE vocabulary home.
+#
+# These are NOT defined here any more. They come from the credential-shape
+# vocabulary SSOT vco_lib/credential_shapes.py via its bash mirror
+# templates/hooks/_lib/credshapes.sh, `repo_scan` context. Previously this
+# block was a private fork that drifted from the hook scanners until they no
+# longer agreed on which vendors they could see.
+#
+# WHY `repo_scan` AND NOT ANOTHER CONTEXT — this passes over VENDORED bundles
+# and COMPILED BINARIES, the most false-positive-hostile haystack there is, so
+# it uses the most precision-biased context. Two collisions are proven present
+# in this repo and both live under a `dist/` path this script scans:
+#   * a Slovak locale chunk name `sk-SK-<hash>-<hash>` in the vendored
+#     Excalidraw bundle, which a loose `sk-` tail matches;
+#   * an `AKIA` + 16-upper-alnum run occurring BY CHANCE inside that bundle's
+#     base64 WASM/font payload.
+# That is why `repo_scan` narrows the `sk-` tail and omits the AWS / JWT /
+# Atlassian shapes that the file-content scanners do carry. A false positive
+# here fires on every commit and teaches people to ignore this script, which is
+# how a real alert gets missed. Do not "unify" these with the content-scan
+# patterns; see the SSOT docstring for the full per-context rationale.
+#
+# ONE list still feeds both the dist text pass and the dist-binary strings
+# pass; do not fork it.
+_CNS_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+_CNS_SHAPES_LIB="$_CNS_ROOT/templates/hooks/_lib/credshapes.sh"
+if [ ! -r "$_CNS_SHAPES_LIB" ]; then
+  # Fallback for an invocation whose CWD is not the repo root: resolve
+  # relative to this script's own directory.
+  _CNS_SHAPES_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/templates/hooks/_lib/credshapes.sh"
+fi
+if [ ! -r "$_CNS_SHAPES_LIB" ]; then
+  # Loud-fail. A secret scanner that cannot load its vocabulary must NEVER
+  # print "OK" — that is a silent all-clear over an unscanned tree.
+  echo "check-no-secrets: FATAL — credential-shape vocabulary not found at" >&2
+  echo "  $_CNS_SHAPES_LIB" >&2
+  echo "  (expected templates/hooks/_lib/credshapes.sh in this checkout)." >&2
+  exit 2
+fi
+# shellcheck source=../templates/hooks/_lib/credshapes.sh disable=SC1090,SC1091
+. "$_CNS_SHAPES_LIB"
+if ! credshapes_for_context repo_scan; then
+  echo "check-no-secrets: FATAL — credshapes_for_context rejected 'repo_scan'" >&2
+  exit 2
+fi
+TOKEN_SHAPES=("${CREDSHAPES_PATTERNS[@]}")
+if [ "${#TOKEN_SHAPES[@]}" -eq 0 ]; then
+  echo "check-no-secrets: FATAL — empty credential-shape list; refusing to" >&2
+  echo "  report a clean tree that was never actually scanned." >&2
+  exit 2
+fi
 
 # Files we don't want to scan (binaries, generated, vendored).
 EXCLUDE_PATHS=(

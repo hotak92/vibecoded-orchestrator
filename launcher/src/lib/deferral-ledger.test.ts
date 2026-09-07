@@ -9,8 +9,13 @@
 // sentence, and the scope-naming the decision-#6 UX rider requires.
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
+  unbackedRetryableCount,
   actionGroupNote,
+  AUTO_RETRY_BACKED_CONDITIONS,
+  autoRetryIsBacked,
   badgeCount,
   dismissConfirmMessage,
   dismissResultMessage,
@@ -116,7 +121,10 @@ describe('badgeCount', () => {
     const v = view({
       entries: [
         entry({ condition_id: 'a', disposition: 'action_required' }),
-        entry({ condition_id: 'b', disposition: 'auto_retryable' }),
+        // A REAL backed cid: `retryingCount` counts only rows a mechanism
+        // stands behind, so an arbitrary id here would assert the
+        // over-claim rather than the behaviour (v0.2.92 MAJOR-14).
+        entry({ condition_id: 'kg_sync_no_embedding_backend', disposition: 'auto_retryable' }),
         entry({ condition_id: 'c', disposition: 'informational_record' }),
       ],
     });
@@ -126,14 +134,17 @@ describe('badgeCount', () => {
     expect(badgeCount(v)).toBe(v.action_required_count);
     expect(v.actionable_count).toBe(2);
     // The group still renders both — membership and nagging are two questions.
-    expect(groupEntries(v).actionNeeded.map((e) => e.condition_id)).toEqual(['a', 'b']);
+    expect(groupEntries(v).actionNeeded.map((e) => e.condition_id)).toEqual([
+      'a',
+      'kg_sync_no_embedding_backend',
+    ]);
     expect(retryingCount(v)).toBe(1);
   });
 
   it('does not badge a ledger whose only open work is auto_retryable', () => {
     const v = view({
       entries: [
-        entry({ condition_id: 'k', disposition: 'auto_retryable' }),
+        entry({ condition_id: 'kg_sync_no_embedding_backend', disposition: 'auto_retryable' }),
         entry({ condition_id: 'r', disposition: 'informational_record' }),
       ],
     });
@@ -142,6 +153,22 @@ describe('badgeCount', () => {
     expect(groupEntries(v).actionNeeded).toHaveLength(1);
     expect(actionGroupNote(v)).toContain('VCO retries itself');
     expect(actionGroupNote(v)).toContain('not counted in the badge');
+  });
+
+  it('does NOT claim a retry for an auto_retryable row nothing retries', () => {
+    // `podman_daemon_start_failed` is classed auto_retryable in the registry
+    // but declares no retry_action. Saying "VCO retries this itself" about it
+    // is a promise with no mechanism — the defect MAJOR-14 was raised for.
+    const v = view({
+      entries: [
+        entry({ condition_id: 'podman_daemon_start_failed', disposition: 'auto_retryable' }),
+      ],
+    });
+    expect(retryingCount(v)).toBe(0);
+    expect(unbackedRetryableCount(v)).toBe(1);
+    const note = actionGroupNote(v);
+    expect(note).not.toContain('VCO retries itself');
+    expect(note).toContain('no automatic retry');
   });
 
   it('counts an UNREGISTERED condition, which the backend resolves to action_required', () => {
@@ -345,8 +372,15 @@ describe('disposition rendering', () => {
     expect(new Set(labels).size).toBe(4);
   });
 
-  it('tells an auto_retryable entry that VCO handles it', () => {
-    const e = entry({ condition_id: 'k', disposition: 'auto_retryable' });
+  it('tells an auto_retryable entry with a real retry handler that VCO handles it', () => {
+    const e = entry({
+      // A cid the registry gives `retry_action = "retry:py:kg_seed"` — the
+      // claim below is TRUE for it. (Pre-v0.2.92 this test used a made-up id,
+      // which is how the unconditional claim passed review: the fixture had
+      // no relationship to whether a mechanism existed.)
+      condition_id: 'kg_sync_no_embedding_backend',
+      disposition: 'auto_retryable',
+    });
     expect(dispositionExplanation(e)).toContain('VCO retries this itself');
   });
 
@@ -391,5 +425,155 @@ describe('findEntry', () => {
     );
     expect(findEntry(v, 'nope')).toBeNull();
     expect(findEntry(null, 'convergence_pending')).toBeNull();
+  });
+});
+
+// ── v0.2.92 review MAJOR-14 — never claim a retry that has no mechanism ────
+//
+// `auto_retryable` is a CLASSIFICATION. The panel used to read it as an
+// implementation and told every such row "VCO retries this itself", including
+// four registry rows with no `retry_action` and nothing scheduled behind them
+// (`kg_summary_no_backend`, `podman_daemon_start_failed`,
+// `weaviate_unreachable_at_bootstrap` — whose clear_probe is `manual-dismiss`,
+// i.e. it says outright that only a human clears it — and
+// `weaviate_unreachable_at_update`). The Python ledger renders retry history
+// honestly; this makes the GUI match.
+describe('auto_retryable honesty (review MAJOR-14)', () => {
+  it('claims a retry only when a mechanism exists', () => {
+    const backed = entry({
+      condition_id: 'code_graph_no_embedding_backend',
+      disposition: 'auto_retryable',
+    });
+    expect(autoRetryIsBacked(backed)).toBe(true);
+    expect(dispositionExplanation(backed)).toContain('VCO retries this itself');
+  });
+
+  it('does NOT claim a retry for an auto_retryable row with no mechanism', () => {
+    // THE DEFECT. Every one of these is classed `auto_retryable` and none has
+    // a `retry_action`; the reader was told to sit and wait for a retry that
+    // no code performs.
+    for (const cid of [
+      'kg_summary_no_backend',
+      'podman_daemon_start_failed',
+      'weaviate_unreachable_at_bootstrap',
+      'weaviate_unreachable_at_update',
+    ]) {
+      const e = entry({ condition_id: cid, disposition: 'auto_retryable' });
+      expect(autoRetryIsBacked(e)).toBe(false);
+      const text = dispositionExplanation(e);
+      expect(text).not.toContain('VCO retries this itself');
+      expect(text).toContain('no automatic retry');
+      // Still honest about how it DOES end, so the arm is not a dead end.
+      expect(text).toMatch(/dismiss/i);
+    }
+  });
+
+  it('an unregistered auto_retryable cid gets the cautious arm, not the promise', () => {
+    // Direction of the default matters: a new row that ships without reaching
+    // this list understates rather than lying, and the pin below turns the
+    // omission into a failing test.
+    const e = entry({ condition_id: 'some_future_cid', disposition: 'auto_retryable' });
+    expect(autoRetryIsBacked(e)).toBe(false);
+    expect(dispositionExplanation(e)).toContain('no automatic retry');
+  });
+
+  it('the question does not apply to other dispositions', () => {
+    for (const d of ['action_required', 'environmental', 'informational_record']) {
+      // Even for a cid that IS in the backed set — the disposition governs.
+      const e = entry({ condition_id: 'kg_sync_no_embedding_backend', disposition: d });
+      expect(autoRetryIsBacked(e)).toBe(false);
+    }
+  });
+});
+
+// The shipped list above is only honest while it matches the registry. This
+// pins it to `vco_lib/deferral_conditions.toml` — READ-ONLY ground truth,
+// owned elsewhere — so a row that gains or loses a `retry_action` fails here
+// instead of silently changing what the GUI promises.
+describe('AUTO_RETRY_BACKED_CONDITIONS is pinned to the deferral registry', () => {
+  /** launcher/src/lib → launcher/src → launcher → repo root. */
+  const REGISTRY = fileURLToPath(
+    new URL('../../../vco_lib/deferral_conditions.toml', import.meta.url),
+  );
+
+  interface RegistryRow {
+    cid: string;
+    klass: string | null;
+    retryAction: string | null;
+  }
+
+  /**
+   * Minimal TOML read: `[conditions.<id>]` tables and the two scalar keys we
+   * care about. Triple-quoted `notes` are stripped FIRST so their prose (which
+   * discusses `retry_action` at length) can never be mistaken for a key.
+   */
+  function readRegistry(): RegistryRow[] {
+    const raw = readFileSync(REGISTRY, 'utf-8').replace(/"""[\s\S]*?"""/g, '""');
+    const lines = raw.split('\n').filter((l) => !/^\s*#/.test(l));
+    const rows: RegistryRow[] = [];
+    let cur: RegistryRow | null = null;
+    for (const line of lines) {
+      const header = /^\[conditions\.(?:"([^"]+)"|([^\]"]+))\]/.exec(line);
+      if (header) {
+        cur = { cid: header[1] ?? header[2], klass: null, retryAction: null };
+        rows.push(cur);
+        continue;
+      }
+      if (/^\[/.test(line)) {
+        cur = null;
+        continue;
+      }
+      if (!cur) continue;
+      const klass = /^\s*class\s*=\s*"([^"]*)"/.exec(line);
+      if (klass) cur.klass = klass[1];
+      const retry = /^\s*retry_action\s*=\s*"([^"]*)"/.exec(line);
+      if (retry) cur.retryAction = retry[1];
+    }
+    return rows;
+  }
+
+  const rows = readRegistry();
+  const byCid = new Map(rows.map((r) => [r.cid, r]));
+  const autoRetryable = rows.filter((r) => r.klass === 'auto_retryable');
+
+  it('parsed a plausible registry (guards the reader itself)', () => {
+    expect(rows.length).toBeGreaterThan(100);
+    expect(autoRetryable.length).toBeGreaterThanOrEqual(5);
+    expect(autoRetryable.filter((r) => r.retryAction).length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('every row with a retry_action is claimed as backed', () => {
+    const withHandler = autoRetryable.filter((r) => r.retryAction).map((r) => r.cid);
+    const unclaimed = withHandler.filter((c) => !AUTO_RETRY_BACKED_CONDITIONS.has(c));
+    expect(unclaimed).toEqual([]);
+  });
+
+  it('the only backed row WITHOUT a retry_action is the documented exception', () => {
+    // `project_move_codegraph_reanalyze_pending` declares none on purpose: the
+    // launcher's build runner already consumes the pending row it enqueued,
+    // and a WP-H handler would be a second scheduler racing it.
+    const noHandler = [...AUTO_RETRY_BACKED_CONDITIONS].filter(
+      (c) => !byCid.get(c)?.retryAction,
+    );
+    expect(noHandler).toEqual(['project_move_codegraph_reanalyze_pending']);
+  });
+
+  it('every claimed cid exists in the registry and is classed auto_retryable', () => {
+    for (const cid of AUTO_RETRY_BACKED_CONDITIONS) {
+      expect(byCid.get(cid)?.klass).toBe('auto_retryable');
+    }
+  });
+
+  it('the rows the review named are still unbacked in the registry', () => {
+    for (const cid of [
+      'kg_summary_no_backend',
+      'podman_daemon_start_failed',
+      'weaviate_unreachable_at_bootstrap',
+      'weaviate_unreachable_at_update',
+    ]) {
+      expect(byCid.get(cid)?.klass).toBe('auto_retryable');
+      expect(byCid.get(cid)?.retryAction).toBeNull();
+      expect(AUTO_RETRY_BACKED_CONDITIONS.has(cid)).toBe(false);
+    }
   });
 });

@@ -195,7 +195,31 @@ _MAIN_SPAN_MAX = 1687
 #       correctly). install.py keeps a 5-line delegating wrapper so the name's
 #       existing call sites + monkeypatch contract keep resolving.
 # ALL outside main() (+0 span).
-_TOTAL_LINES_MAX = 24386
+#
+# v0.2.92 (WP-3, PLAN §I3) — re-pinned DOWN to the measured 24380 (-6). The
+# `vco_lib/install_companions.py` extraction (D-11 lean-ctx PATH discovery,
+# the doctor's venv-python resolver, and the codegraph-ts install plan — all
+# already delegated from install.py before this cycle) had grown by another
+# 6 lines' worth of thin call-site glue against the 24386 pin without a
+# re-pin. Re-pinned per the "TOTAL: strict — measured exactly" contract; see
+# `vco_lib/install_companions.py` for the extraction that owns this bulk.
+# ALL outside main() (+0 span).
+#
+# v0.2.92 (WP-10, PLAN §2) — re-pinned DOWN to the measured 24202 (-178).
+# `vco_lib/boot_service.py` now owns boot-service registration: the three
+# renderers `_materialize_boot_service_{linux,macos,windows}` (296 lines)
+# plus `_render_template` and `_backup_and_write_idempotent` moved there, and
+# `_read_template` became a delegating wrapper. install.py keeps only the
+# three same-named thin call sites (their names are the monkeypatch contract
+# of two test files) and the container-stack dispatcher, which is
+# install-specific. Against that -270 the package added back +92: the
+# uninstall's model-gateway unregister + `~/.vct` state scrub (install.py
+# had NO state-root scrub before this release, so a gateway's token, pid,
+# port, log and exported context table survived an uninstall), the
+# `--update` re-render of an existing gateway registration, and the
+# per-OS artefact name for the uninstall plan.
+# ALL outside main() (+0 span).
+_TOTAL_LINES_MAX = 24202
 
 
 def _measure() -> tuple:

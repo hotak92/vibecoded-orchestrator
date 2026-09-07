@@ -44,6 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 from vco_lib import config_projection as cp  # noqa: E402
 
 _RUST_CASCADE_SRC = (
@@ -209,22 +210,9 @@ def _cascade_conn(
     log_global: bool,
     arctic_global: bool,
 ) -> sqlite3.Connection:
-    """A launcher.db slim enough for the cascade, seeded to one case."""
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.executescript(
-        """
-        CREATE TABLE module_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT,
-            module_id TEXT NOT NULL,
-            setting_key TEXT NOT NULL,
-            setting_value TEXT NOT NULL
-        );
-        CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        """
-    )
+    """A launcher.db on the REAL schema (v0.2.92 §3.4), seeded to one case
+    of the truth table, returned as an open ``sqlite3.Row`` connection —
+    ``_resolve_dual_flags_cascade`` takes a live connection."""
     rows = [
         (
             write_explicit,
@@ -238,24 +226,30 @@ def _cascade_conn(
             cp._DUAL_SETTING_KEY_ARCTIC_SECONDARY,
         ),
     ]
-    for value, module_id, key in rows:
-        if value is None:
-            continue
-        conn.execute(
-            "INSERT INTO module_settings (project_id, module_id, setting_key, "
-            "setting_value) VALUES (?, ?, ?, ?)",
-            ("p1", module_id, key, "true" if value else "false"),
-        )
-    for value, key in (
-        (write_global, cp.APP_STATE_KEY_DUAL_WRITE_DEFAULT),
-        (log_global, cp.APP_STATE_KEY_DUAL_RL_LOG_DEFAULT),
-        (arctic_global, cp.APP_STATE_KEY_DUAL_ARCTIC_DEFAULT),
-    ):
-        conn.execute(
-            "INSERT INTO app_state (key, value) VALUES (?, ?)",
-            (key, "true" if value else "false"),
-        )
-    conn.commit()
+    db_path = make_launcher_db(
+        tmp_path / "launcher.db",
+        projects=[{
+            "project_id": "p1",
+            "name": "Cascade Project",
+            "folder_path": str(tmp_path / "p1"),
+            "slug": "cascade-project",
+        }],
+        module_settings=[
+            ("p1", module_id, key, "true" if value else "false")
+            for value, module_id, key in rows
+            if value is not None
+        ],
+        app_state={
+            key: "true" if value else "false"
+            for value, key in (
+                (write_global, cp.APP_STATE_KEY_DUAL_WRITE_DEFAULT),
+                (log_global, cp.APP_STATE_KEY_DUAL_RL_LOG_DEFAULT),
+                (arctic_global, cp.APP_STATE_KEY_DUAL_ARCTIC_DEFAULT),
+            )
+        },
+    )
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     return conn
 
 

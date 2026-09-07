@@ -24,15 +24,21 @@ from vco_lib.install_companions import (  # noqa: E402
 )
 
 
-def test_install_path_returns_extra_argv() -> None:
+def test_install_path_returns_editable_extra_argv() -> None:
     """ACT: pyproject present + no opt-out → install with the
-    ``<root>[codegraph-ts]`` pip target (pins sourced from pyproject)."""
+    ``-e <root>[codegraph-ts]`` pip target (pins sourced from pyproject).
+
+    v0.2.92: the ``-e`` is load-bearing. Without it pip treats this as a plain
+    install of the SAME distribution step 4 installed editably, uninstalls the
+    editable install and leaves a frozen copy of ``vco_lib/`` in site-packages.
+    Full evidence + the repair: ``tests/test_v0292_install_editable_*.py``.
+    """
     should, reason, argv = codegraph_ts_install_plan(
         pyproject_exists=True, skip_env=False, project_root="/opt/vco",
     )
     assert should is True
     assert reason is None
-    assert argv == ["/opt/vco[codegraph-ts]"]
+    assert argv == ["-e", "/opt/vco[codegraph-ts]"]
 
 
 def test_env_opt_out_skips() -> None:

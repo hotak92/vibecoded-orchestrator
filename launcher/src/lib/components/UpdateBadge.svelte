@@ -39,6 +39,16 @@
   const orchState = $derived($orchestrator);
   const upd = $derived($updater);
 
+  // v0.2.92 (WP-13): the install's clone has a detached HEAD.
+  //
+  // Surfaced HERE, not only on the Updates page, because this badge is where
+  // a user looks when they wonder about updates — and detached HEAD is the
+  // state in which the update machinery is at its most misleading. It is not
+  // itself an error (an orchestrator update fast-forwards a detached HEAD
+  // fine), so it never suppresses or replaces a real update kind; it is an
+  // extra line inside whichever popover is already showing.
+  const headDetached = $derived(orchState.updateStatus?.head_detached === true);
+
   // v0.2.16 (W4 / 0.5): copy + action per kind. Drives both popover
   // header text and primary button label/handler.
   // v0.2.51 (Bug A): added 'merge_resolved_incomplete' kind — highest
@@ -296,6 +306,14 @@
           <span class="popover-title">{kindCopy.title}</span>
         </div>
         <p class="popover-desc">{kindCopy.desc}</p>
+        {#if headDetached}
+          <p class="popover-note">
+            This clone is on a <strong>detached HEAD</strong> — it is not on a
+            branch. Updates still apply, but the clone stays detached
+            afterwards. Preferences → Launcher updates has a one-click
+            reattach.
+          </p>
+        {/if}
         {#if upd.error}
           <div class="popover-error">{upd.error}</div>
         {/if}
@@ -354,6 +372,13 @@
             Couldn't check for updates. Retrying automatically.
           {/if}
         </p>
+        {#if headDetached}
+          <p class="popover-note">
+            This clone is on a <strong>detached HEAD</strong>. That alone does
+            not break the check, but it is worth fixing — Preferences →
+            Launcher updates has a one-click reattach.
+          </p>
+        {/if}
         <div class="popover-actions">
           <button
             class="btn-3d btn-3d-primary btn-3d-sm"
@@ -375,6 +400,19 @@
 <style>
   .update-wrapper {
     position: relative;
+  }
+
+  /* v0.2.92 (WP-13): the detached-HEAD note. Deliberately quieter than
+     `.popover-error` — this is a state worth naming, not a failure. */
+  .popover-note {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: rgba(255, 255, 255, 0.75);
+    background: rgba(255, 255, 255, 0.04);
+    border-left: 2px solid rgba(123, 95, 255, 0.6);
+    border-radius: 4px;
   }
 
   .update-trigger {

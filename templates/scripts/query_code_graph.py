@@ -40,35 +40,84 @@ except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
 
+
+# VCO-SHARED-BEGIN: _resolve_orchestrator_root (verbatim across templates/scripts/*.py)
+def _resolve_orchestrator_root() -> "Path | None":
+    """Return the orchestrator clone root — the directory that CONTAINS
+    ``claude_mcp_servers/`` — or ``None`` when it cannot be located.
+
+    THE one shape for this question across ``templates/scripts/*.py``. It is
+    copied VERBATIM into every shipped script that asks it and pinned
+    byte-identical by
+    ``tests/test_v0292_cli_root_resolution_and_prefix.py::test_root_resolver_bodies_identical``
+    — a DOCUMENTED class-C mirror with an enforcing test rather than a silent
+    copy, because these scripts must answer "where is the orchestrator?"
+    BEFORE they can import anything from it (importing ``vco_lib`` to find
+    ``vco_lib`` is circular).
+
+    Candidate order — the first candidate that actually CONTAINS
+    ``claude_mcp_servers/`` wins; a candidate that does not is SKIPPED, never
+    returned:
+
+      1. ``$VCT_ORCHESTRATOR_ROOT`` — canonical; written into ``.claude/env``
+         and ``.claude/settings.json`` by the bundle installer
+         (``vco_lib/config_projection.py``).
+      2. ``$VCT_INSTALL_ROOT`` — legacy alias carrying the same value; some
+         launcher subprocess spawns set only this one.
+      3. ``<script>/../..`` — the in-tree layout, correct ONLY when the script
+         sits in the orchestrator clone's own ``.claude/scripts/`` (or in
+         ``templates/scripts/`` in the clone). On an INSTALLED project this
+         resolves to the USER project root, which has no
+         ``claude_mcp_servers/`` — which is exactly why every rung is
+         validated and why this rung is LAST.
+
+    Never raises. Path joins go through ``pathlib`` so no separator is
+    assumed (a Windows ``\\``-separator bug shipped once already, v0.2.81).
+    """
+    for _candidate in (
+        os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip(),
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+        str(Path(__file__).resolve().parent.parent.parent),
+    ):
+        if not _candidate:
+            continue
+        try:
+            _root = Path(_candidate)
+            if (_root / "claude_mcp_servers").is_dir():
+                return _root
+        except (OSError, ValueError):
+            continue
+    return None
+# VCO-SHARED-END: _resolve_orchestrator_root
+
+
 # Import the shared rank-tier formatter from the MCP server module so the
 # CLI emits results identically to `search_code_graph` MCP. The script
 # lives at .claude/scripts/query_code_graph.py and the MCP module at
-# claude_mcp_servers/weaviate_mcp/server.py — derive the project root
-# from this file's location so the layout works without hardcoded paths.
+# <orchestrator>/claude_mcp_servers/weaviate_mcp/server.py.
 #
-# v0.2.37 (Gap 6c): when this script ships into a 3rd-party project
-# via install-bundle, parents[2] resolves to the USER PROJECT root,
-# which has no `claude_mcp_servers/` directory. Honor
-# $VCT_ORCHESTRATOR_ROOT (set by install-bundle's .claude/env writer)
-# and $VCT_INSTALL_ROOT (legacy alias) before falling back to the
-# script-relative location. Mirrors sync_knowledge_graph.py's
-# `_resolve_mcp_servers_dir()` pattern.
+# v0.2.37 (Gap 6c): when this script ships into a 3rd-party project via
+# install-bundle, the script-relative guess resolves to the USER PROJECT
+# root, which has no `claude_mcp_servers/` directory. v0.2.92: the env-arm
+# ladder that fixed that is no longer written out here — it is
+# `_resolve_orchestrator_root()` above, the ONE shape every script in this
+# directory uses (three copies lived in THIS FILE alone before v0.2.92).
 # A1 (v0.2.38): weaviate_mcp is pip-installed as an editable package by
 # install.py, so `from weaviate_mcp.server import ...` works without a
-# sys.path entry.  _MCP_SERVERS_PATH is still resolved for the `scripts/`
-# subdirectory (used below by kg_access.py via the P1-D block) and for the
-# fallback error message.
+# sys.path entry.  _MCP_SERVERS_PATH survives ONLY to name a concrete path in
+# the two ImportError messages below (the P1-D block derives its own
+# `scripts/` directory from `_ORCHESTRATOR_ROOT`).
+#
+# _PROJECT_ROOT is the USER PROJECT root (this script's `.claude/scripts/`
+# grandparent) and answers a DIFFERENT question than
+# `_resolve_orchestrator_root()` — do not collapse the two.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_MCP_SERVERS_PATH: Optional[Path] = None
-for _env_var in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT"):
-    _env_root = os.environ.get(_env_var, "").strip()
-    if _env_root:
-        _candidate = Path(_env_root) / "claude_mcp_servers"
-        if _candidate.is_dir():
-            _MCP_SERVERS_PATH = _candidate
-            break
-if _MCP_SERVERS_PATH is None:
-    _MCP_SERVERS_PATH = _PROJECT_ROOT / "claude_mcp_servers"
+_ORCHESTRATOR_ROOT: Optional[Path] = _resolve_orchestrator_root()
+# When the root cannot be located, keep the script-relative guess so the
+# ImportError message below still names a concrete path.
+_MCP_SERVERS_PATH: Optional[Path] = (
+    _ORCHESTRATOR_ROOT or _PROJECT_ROOT
+) / "claude_mcp_servers"
 
 # v0.2.72 (P1/P2/P4 CLI parity): besides the rank/tier FORMATTERS, import the
 # shared pipeline ADAPTER factories (`make_code_collapse_fn` / `make_code_tier_fn`)
@@ -78,15 +127,30 @@ if _MCP_SERVERS_PATH is None:
 # Do NOT reimplement them per-surface.
 try:
     from weaviate_mcp.server import (
+        _caller_match_terms,
+        # v0.2.92 (B1): the ONE code-graph prefix rule, shared with the MCP.
+        # The underscore-PRESERVING `canonical_class_prefix` the ANALYZER
+        # writes `<prefix>_Code*` with, with the MCP's runtime posture for a
+        # pathological project name (ValueError -> the "vct" sentinel from the
+        # dropping rule) so a bad `--project` degrades instead of crashing.
+        # This CLI used to compute the prefix a SECOND way with a private
+        # regex, which turned every space in a project name into `_`:
+        # 'VibeCoded Orchestrator' -> 'VibeCoded_Orchestrator_CodeFunction',
+        # a class that does not exist, read silently as zero results.
+        _code_sanitize_collection_prefix,
+        _dedup_objects_by_full_name,
         _format_code_result_by_rank,
         _format_code_result_by_tier,
         _format_code_result_ref,
         _self_project_chunk_fetcher,
         make_code_collapse_fn,
         make_code_tier_fn,
-        CODE_SIBLINGS_RANK_1,
-        CODE_SIBLINGS_RANK_2,
     )
+    # NOT imported: CODE_SIBLINGS_RANK_1 / _2. The sibling budget is decided by
+    # the SHARED formatter (`_format_code_result_by_rank`, server.py) which
+    # computes `max_total` and passes it INTO the fetcher this CLI supplies.
+    # Importing them here would be a second, unenforced copy of a decision the
+    # shared code already owns — v0.2.92 removed them as dead.
 except ImportError as exc:  # pragma: no cover — surface a clear error
     print(
         f"Error: could not import weaviate_mcp.server rank-tier helper: {exc}\n"
@@ -97,14 +161,77 @@ except ImportError as exc:  # pragma: no cover — surface a clear error
     )
     sys.exit(1)
 
-# P1-D (2026-05-08): centralized access-matrix helper. Resolved via
-# $VCT_ORCHESTRATOR_ROOT (the orchestrator clone is where
-# claude_mcp_servers/scripts/kg_access.py lives) with an in-tree
-# fallback for the orchestrator self path. The graceful fallback is a
-# self-only no-op so the CLI keeps working on a hand-edited venv.
+# v0.2.92 — the ONE home for reading a Weaviate cross-reference off a fetched
+# object. `structure dependencies` / `structure extends` below resolve one, and
+# `weaviate_mcp.server.query_code_structure` + the analyzer's
+# `create_cross_references` write pass resolve the same shapes; a third inline
+# copy here is what CLAUDE.md's modularity rule forbids.
+#
+# Import discipline: this is NOT a new dependency. The `from
+# weaviate_mcp.server import ...` above is already a HARD requirement of this
+# script (it exits 1 on failure), and that module imports `vco_lib.log_setup`
+# at module scope — so vco_lib is importable wherever this CLI can run at all.
+# A failure here therefore means a BROKEN install and must surface loudly
+# (traceback + non-zero exit), never degrade to a silent inline copy.
+from vco_lib.codegraph_references import (  # noqa: E402 — must follow the
+    # weaviate_mcp import above, which is what guarantees vco_lib is importable
+    dedup_ref_targets,
+    normalize_reference_targets,
+    read_cross_reference,
+)
+
+# P1-D (2026-05-08): centralized access-matrix helper. `kg_access` lives at
+# <orchestrator>/claude_mcp_servers/scripts/kg_access.py; the editable install
+# of `weaviate_mcp` only puts <orchestrator>/claude_mcp_servers on sys.path, so
+# the directory has to be added explicitly.
+#
+# v0.2.92 (B2): this site used to hardcode the SCRIPT-RELATIVE guess with no
+# env arm at all. On an installed project that guess is the USER PROJECT root,
+# which has no `claude_mcp_servers/scripts` — so the import ALWAYS failed there
+# and the self-only fallback below silently dropped the launcher's
+# cross-project code-graph grants (`VCT_CODE_GRAPH_ACCESS_LIST`). Routed
+# through `_resolve_orchestrator_root()` (env arms first, validated in-tree
+# last) it resolves on installed projects and on the orchestrator clone alike.
+#
+# The try/except is RETAINED: the helper is genuinely optional for a project
+# whose orchestrator clone is not reachable. What the fallback loses is the
+# ACCESS MATRIX (peers), never the prefix rule — the prefix comes from the
+# same shared home the MCP uses (imported above).
 try:
     # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers" / "scripts"))
+    # v0.2.92 (R4/R21) — INSTALL-TIME BAKED ROOT. `vco_lib/rewire.py`
+    # substitutes the placeholder below when this file is installed into a
+    # project, so an installed copy still finds `kg_access` (and therefore the
+    # launcher's cross-project code-graph grants) with NOTHING in the
+    # environment. In the clone the placeholder stays literal,
+    # `Path("{{ORCHESTRATOR_ROOT}}")/"vco_lib"` is not a directory, and this
+    # block is inert — the validation IS the placeholder guard. It is used
+    # ONLY when NEITHER env pin ($VCT_ORCHESTRATOR_ROOT, $VCT_INSTALL_ROOT)
+    # names a real orchestrator root — a VALID pin always wins, a provably
+    # stale one is healed.
+    #
+    # `_ORCHESTRATOR_ROOT` was resolved near the top of the module, BEFORE
+    # this region runs, so re-ask the ONE resolver once the env arm can
+    # answer — do not re-implement the ladder here. Only `_MCP_SERVERS_PATH`
+    # consumed the earlier value, and only to name a path inside an
+    # ImportError message.
+    _VCO_BAKED_ORCHESTRATOR_ROOT = "{{ORCHESTRATOR_ROOT}}"
+    _vco_env_pins = [os.environ.get(_k, "").strip()
+                     for _k in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT")]
+    if (Path(_VCO_BAKED_ORCHESTRATOR_ROOT) / "vco_lib").is_dir() and not any(
+        _p and (Path(_p) / "vco_lib").is_dir() for _p in _vco_env_pins
+    ):
+        os.environ["VCT_ORCHESTRATOR_ROOT"] = _VCO_BAKED_ORCHESTRATOR_ROOT
+        _ORCHESTRATOR_ROOT = _resolve_orchestrator_root() or _ORCHESTRATOR_ROOT
+    _kg_access_dir = (
+        (_ORCHESTRATOR_ROOT or _PROJECT_ROOT) / "claude_mcp_servers" / "scripts"
+    )
+    # APPEND, not insert(0): nothing else on the path provides `kg_access`, and
+    # this directory holds a dozen loose script modules — putting it first
+    # would let any of them shadow a same-named import for the whole process.
+    # (Same reasoning, same words, as search_knowledge.py's P1-D block.)
+    if _kg_access_dir.is_dir() and str(_kg_access_dir) not in sys.path:
+        sys.path.append(str(_kg_access_dir))
     # VCO-REWIRE-END: orchestrator-root-resolution
     from kg_access import code_graph_collections_to_query as _code_graph_collections_to_query  # type: ignore[import-not-found]
 except Exception:
@@ -117,19 +244,27 @@ except Exception:
         )
         if not self_project:
             return [(b, "") for b in bases_t]
-        # Mirror code_sanitize_collection_prefix's contract (the
-        # underscore-PRESERVING code-graph rule = canonical_class_prefix)
-        # for the fallback path. Best-effort only — this branch fires when
-        # the helper isn't on sys.path, which means the user is in a
-        # degraded environment anyway.
-        import re as _re
-        _parts = self_project.strip().split()
-        _pascal = "".join(p[:1].upper() + p[1:] for p in _parts)
-        prefix = _re.sub(r"[^A-Za-z0-9_]", "_", _pascal)
+        # Self-only fan-out (no access matrix). The PREFIX still comes from the
+        # one shared home — no inline copy of the rule lives here.
+        prefix = _code_sanitize_collection_prefix(self_project)
         return [(f"{prefix}_{b}", self_project) for b in bases_t]
 
-# Load MCP config
-CONFIG_PATH = Path.home() / ".claude/workflow/config/mcp-config.json"
+# Load MCP config.
+#
+# Routed through `vco_lib.paths.claude_user_dir` (v0.2.92 W-CLAUDE) instead of
+# reconstructing `Path.home() / ".claude"` inline, so `$VCT_CLAUDE_DIR` steers
+# it. Why that matters here even though this is a READ: this block runs at
+# MODULE IMPORT and, when the file exists, replaces the WEAVIATE_URL /
+# GRPC_PORT / OLLAMA_URL defaults with whatever the developer's machine has.
+# 11 tests across 6 files import this module, so on a box that happens to have
+# `~/.claude/workflow/config/mcp-config.json` they exercised the machine's
+# values while CI (no such file) exercised the defaults — a test that means
+# something different per machine. The import is hard for the same reason the
+# `vco_lib.codegraph_references` import above is: this script already requires
+# `weaviate_mcp.server`, which imports vco_lib at module scope.
+from vco_lib.paths import claude_user_dir  # noqa: E402 — see import discipline above
+
+CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
 
 if CONFIG_PATH.exists():
     config = json.loads(CONFIG_PATH.read_text())
@@ -142,20 +277,33 @@ else:
     OLLAMA_URL = "http://localhost:11435"
 
 
-def _sanitize_collection_prefix(name: str) -> str:
-    """Sanitize project name for use as Weaviate collection prefix."""
-    import re
-    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    if sanitized and not sanitized[0].isupper():
-        sanitized = sanitized[0].upper() + sanitized[1:]
-    return sanitized
-
-
 def _collection_name(base: str, project: str = None) -> str:
-    """Return per-project collection name if project is set."""
+    """Return the per-project code-graph collection name for ``base``.
+
+    Routed through ``weaviate_mcp.server._code_sanitize_collection_prefix`` —
+    the ONE home for the code-graph prefix rule, shared with the MCP and
+    delegating to ``vco_lib.codegraph_naming.canonical_class_prefix``, which
+    is what the ANALYZER (``templates/scripts/analyze_code_graph.py``) writes
+    ``<prefix>_Code*`` classes with.
+
+    v0.2.92 (B1) — this used to call a PRIVATE `_sanitize_collection_prefix`
+    defined in this file: ``re.sub(r'[^a-zA-Z0-9_]', '_', name)`` + upper-first.
+    That rule maps WHITESPACE to ``_`` where the canonical rule drops it and
+    capitalises the next word, so every project name containing a space
+    resolved to a class that has never existed:
+
+        'VibeCoded Orchestrator' -> 'VibeCoded_Orchestrator_CodeFunction'  (0 live classes)
+        canonical/analyzer       -> 'VibeCodedOrchestrator_CodeFunction'   (the real one)
+
+    The failure was SILENT — an absent class yields no results, not an error —
+    and it drove every CLI mode (search, similar, all `structure` modes).
+    The two rules that legitimately coexist in this repo are the
+    underscore-DROPPING KG rule and the underscore-PRESERVING code rule; this
+    is the CODE family, so it takes the preserving one. Do not "unify" them.
+    """
     if not project:
         return base
-    return f"{_sanitize_collection_prefix(project)}_{base}"
+    return f"{_code_sanitize_collection_prefix(project)}_{base}"
 
 
 # Code embedding configuration — v0.2.18: centralised via
@@ -164,10 +312,21 @@ def _collection_name(base: str, project: str = None) -> str:
 CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
 
 # Import EmbeddingService — graceful fallback for half-installed venvs.
+#
+# v0.2.92: the `sys.path.insert(0, _PROJECT_ROOT)` that used to guard this
+# import is GONE, for two reasons.
+#   * It was DEAD. `from vco_lib.codegraph_references import ...` above is
+#     unguarded and runs first, so if `vco_lib` were not already importable
+#     this module would have died before reaching here. The insert could
+#     never be what made the import below work.
+#   * It was HARMFUL. Inserting a whole orchestrator root at sys.path[0]
+#     re-points `claude_mcp_servers` (and anything else that root ships) for
+#     the ENTIRE process, so merely importing this CLI changed which clone a
+#     later `import claude_mcp_servers...` resolved to. On a machine with two
+#     clones that is a silent cross-repo import.
+# The try/except stays: `vco_lib.embedding_service` has optional deps of its
+# own, and --detail must degrade rather than crash when they are missing.
 try:
-    _vco_lib_parent = _PROJECT_ROOT
-    if str(_vco_lib_parent) not in sys.path:
-        sys.path.insert(0, str(_vco_lib_parent))
     from vco_lib.embedding_service import (
         EmbeddingService,
         NoEmbeddingBackendError,
@@ -233,7 +392,7 @@ def _active_code_vector_slot() -> str:
 # remediation message.
 try:
     from weaviate_mcp.code_ranking import (
-        CODE_FLOOR_BY_SLOT,
+        CODE_FLOOR_BY_SLOT,  # noqa: F401 — pinned re-export, see below
         resolve_post_rerank_floor,
         resolve_retrieval_floor,
         run_code_retrieval_pipeline,
@@ -387,7 +546,7 @@ class CodeGraphQuery:
         except Exception:
             return None
 
-    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False, anchor: str = None, exclude_file: str = None):
+    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False, anchor: str = None, exclude_file: str = None, transcript: str = None):
         """Semantic search for code by concept.
 
         P1-D (2026-05-08): when ``self.project`` is set, fan out across
@@ -440,10 +599,57 @@ class CodeGraphQuery:
           injections by entity name across a session via the regex
           ``^(KG|CODE):\\ (.+)$``. Body lines follow as ordinary indented
           content; blank lines separate blocks.
+
+        transcript (WP-E, v0.2.92): optional path to the live JSONL
+          transcript. Only the EMBEDDED vector is affected — the raw
+          ``query`` string keeps flowing to the banner, the no-results line,
+          and the retrieval telemetry unchanged (never persist enriched or
+          thinking text). See ``vco_lib.query_enrichment.build_query`` for
+          the shared enrich-or-cap decision (one home, also used by the KG
+          hook leg in ``rl_kg_search.py``).
         """
+        # WP-E query-budget SSOT: enrich a SHORT query by walking backwards
+        # through the agent's own prior output (never tool payloads), or cap
+        # an OVERSIZED one via the EXISTING query_chunking machinery — never
+        # both (build_query's own budget gate picks one). The embedding-model
+        # list is THIS CLI's own resolved code model — never invented — so
+        # the budget matches the vector actually generated below.
+        effective_query = query
+        try:
+            _svc = _get_or_create_embedding_service()
+            _code_model = _svc.code_model_id if _svc is not None else DEFAULT_CODE_MODEL
+            from vco_lib.query_enrichment import build_query as _build_query
+
+            effective_query = _build_query(
+                query, transcript_path=transcript, embedding_models=[_code_model]
+            ).text
+
+            from claude_mcp_servers.rl_client import query_chunking as _qc
+
+            if _qc.is_oversized(effective_query, _code_model):
+                # Oversized even unenriched (or enrichment made no
+                # difference — build_query never enriches when there is no
+                # budget room): cap via the shared chunker's FIRST chunk.
+                # This CLI has no multi-chunk-retrieve/union wiring for code
+                # graph — that path (query_chunking.combine_codegraph_results)
+                # is deliberately reserved scaffolding until a real
+                # oversized-codegraph-query surface needs it; a single-chunk
+                # cap mirrors search_knowledge.py's existing truncation shape
+                # instead of half-wiring the reserved union path.
+                _chunks = _qc.chunk_query(effective_query, _code_model)
+                if _chunks:
+                    effective_query = _chunks[0]
+                    print(
+                        f"⚠️  Query truncated to fit {_code_model}'s budget",
+                        file=sys.stderr,
+                    )
+        except Exception as _exc:  # noqa: BLE001 — enrichment is best-effort
+            print(f"⚠️  Query enrichment skipped: {_exc}", file=sys.stderr)
+            effective_query = query
+
         try:
             # Generate query embedding
-            query_embedding = generate_code_embedding(query)
+            query_embedding = generate_code_embedding(effective_query)
             if not query_embedding:
                 print("❌ Failed to generate query embedding")
                 return
@@ -1110,11 +1316,29 @@ class CodeGraphQuery:
                     print(f"❌ Module '{target}' not found")
                     return
 
-                # v0.2.70 C1c: `references` is None when the object carries no
-                # linked refs — guard before .get to avoid 'NoneType' has no
-                # attribute 'get'. Soft-fall to an empty dict.
+                # Two DIFFERENT guards, both required — v0.2.70 C1c added only
+                # the first, which is why this branch stayed broken on the
+                # SUCCESS path until v0.2.92:
+                #   1. `references` is None when the object carries no linked
+                #      refs — guard before .get to avoid 'NoneType' has no
+                #      attribute 'get'. Soft-fall to an empty dict.
+                #   2. when a link DOES resolve, `.get()` hands back a
+                #      `_CrossReference`, NOT a list. Verified on
+                #      weaviate-client 4.21.0: `len()` and `iter()` both raise
+                #      TypeError (and `bool()` is always True, so an `if refs:`
+                #      guard looks fine while doing nothing), so the
+                #      `len(imports)` line below crashed BEFORE the loop was
+                #      ever reached. The targets live on `.objects`;
+                #      normalize_reference_targets is the shared home for that.
+                # The dedup matches the MCP: the analyzer stored one beacon per
+                # discovered edge per analyze, so a re-analyzed repo carries
+                # duplicate beacons for one edge (live data: 1518 `imports`
+                # beacons on a single module). Printing them raw answers "what
+                # does X import?" with N copies of the same path.
                 _refs = response.objects[0].references or {}
-                imports = _refs.get("imports", [])
+                imports = dedup_ref_targets(
+                    normalize_reference_targets(_refs.get("imports")), ("path",)
+                )
                 print(f"\n🔗 Dependencies of module '{target}':")
                 print(f"   Imports {len(imports)} modules:\n")
 
@@ -1122,52 +1346,106 @@ class CodeGraphQuery:
                     print(f"   - {imp.properties.get('path')}")
 
             elif query_type == "callers":
-                # Find callers of function
+                # Find callers of function.
+                #
+                # v0.2.92 — this branch answered "Found 0 callers" for EVERY
+                # input, silently, always. TWO independent defects, and fixing
+                # only the first still answers 0:
+                #
+                #   1. the candidate fetch requested no `return_references`, so
+                #      `obj.references` was ALWAYS None -> `(… or {}).get(
+                #      "calls", [])` -> `[]` -> the `any(...)` test could never
+                #      be True. (The `or {}` guard from v0.2.70 C1c was doing
+                #      its job; there was simply nothing to read.)
+                #   2. the candidate pool was `fetch_objects(limit=50)` with NO
+                #      filter — an ARBITRARY 50 rows out of the collection
+                #      (25 837 on the maintainer machine, i.e. 0.19%). Even
+                #      with the references resolved, a caller outside that
+                #      arbitrary slice can never be found.
+                #
+                # The fix filters SERVER-SIDE on `call_names`, exactly as the
+                # working `query_code_structure("callers", …)` MCP branch does
+                # (same `_caller_match_terms` / `_dedup_objects_by_full_name`
+                # helpers, imported — not re-implemented). The limit now caps
+                # MATCHING rows rather than candidates, which is also what
+                # makes the truncation signal below meaningful.
                 coll = self.client.collections.get(self._coll("CodeFunction"))
+                # The target's own row(s). `full_name` is NOT unique: a chunked
+                # function is N rows, and (live data) the same qualified name
+                # legitimately exists in several files. Collect every uuid —
+                # the call edge below is confirmed against the whole set.
+                TARGET_ROWS_LIMIT = 32
                 response = coll.query.fetch_objects(
                     filters=Filter.by_property("full_name").equal(target),
-                    limit=1
+                    limit=TARGET_ROWS_LIMIT,
+                    return_properties=["full_name"],
                 )
 
                 if not response.objects:
                     print(f"❌ Function '{target}' not found")
                     return
 
-                func_uuid = response.objects[0].uuid
+                target_uuids = {str(obj.uuid) for obj in response.objects}
 
-                # Find references — Pattern B (intentional top-N cap, but
-                # the truncation signal is emitted so the user can
-                # re-run with --limit). v0.2.46 V46-D: previously
-                # `limit=50` was hard-coded and the user had no signal
-                # that the candidate-callers pool was capped at 50
-                # total functions.
+                # Pattern B (intentional top-N cap, with a truncation signal so
+                # the user knows when the list is capped — v0.2.46 V46-D).
                 CALLERS_FETCH_LIMIT = 50
                 caller_response = coll.query.fetch_objects(
-                    limit=CALLERS_FETCH_LIMIT
+                    filters=Filter.by_property("call_names").contains_any(
+                        _caller_match_terms(target)
+                    ),
+                    limit=CALLERS_FETCH_LIMIT,
+                    return_references=QueryReference(link_on="calls"),
                 )
 
-                # Filter for functions that call target
-                callers = []
+                # `call_names` holds BARE leaf names, so a name match alone can
+                # point at a same-named function elsewhere. A resolved `calls`
+                # EDGE is uuid-precise and settles it — where one exists. It is
+                # a CORROBORATION, never a gate: the analyzer resolves an
+                # ambiguous short name to a single candidate and its whole
+                # cross-reference pass soft-fails, so a missing edge is not
+                # evidence that the call is not there, and filtering on it
+                # would drop real callers (live check: 11/11 confirmed for one
+                # target, 0/50 for another whose leaf name is shared).
+                # read_cross_reference is the shared home for the two shape
+                # guards — `references is None` (v0.2.70 C1c) AND the
+                # `_CrossReference` that `.get()` returns once a link actually
+                # resolves (`bool()` of it is True even when empty, so a
+                # hand-rolled `if refs:` looks right while doing nothing).
+                confirmed_names = set()
                 for obj in caller_response.objects:
-                    # v0.2.70 C1c: guard None references before .get.
-                    calls_refs = (obj.references or {}).get("calls", [])
-                    if any(ref.uuid == func_uuid for ref in calls_refs):
-                        callers.append(obj)
+                    for ref in read_cross_reference(obj, "calls"):
+                        if str(getattr(ref, "uuid", "")) in target_uuids:
+                            confirmed_names.add(
+                                (obj.properties or {}).get("full_name") or ""
+                            )
+                            break
 
-                fetched_count = len(caller_response.objects)
-                truncated = fetched_count >= CALLERS_FETCH_LIMIT
+                # `call_names` is replicated on every chunk row of a chunked
+                # caller — collapse to one row per full_name (same as the MCP).
+                callers = _dedup_objects_by_full_name(caller_response.objects)
+                truncated = len(caller_response.objects) >= CALLERS_FETCH_LIMIT
 
                 print(f"\n🔗 Callers of function '{target}':")
                 print(f"   Found {len(callers)} callers:\n")
 
                 for caller in callers:
-                    print(f"   - {caller.properties.get('full_name')}")
+                    full_name = caller.properties.get('full_name')
+                    mark = "  [call edge]" if full_name in confirmed_names else ""
+                    print(f"   - {full_name}{mark}")
                     print(f"     {caller.properties.get('signature')}")
+
+                if callers and len(confirmed_names) < len(callers):
+                    print(
+                        "\nℹ️  Rows without [call edge] matched the call NAME "
+                        "only — a same-named function elsewhere may be the "
+                        "actual callee."
+                    )
 
                 if truncated:
                     print(
-                        f"\n⚠️  Searched only the first {CALLERS_FETCH_LIMIT} "
-                        f"candidate functions. Some callers may be missing."
+                        f"\n⚠️  Capped at the first {CALLERS_FETCH_LIMIT} "
+                        f"matching rows. Some callers may be missing."
                     )
                     print(
                         "   For a thorough scan, use the MCP "
@@ -1207,8 +1485,19 @@ class CodeGraphQuery:
                     print(f"❌ Class '{target}' not found")
                     return
 
-                # v0.2.70 C1c: guard None references before .get.
-                extends = (response.objects[0].references or {}).get("extends", [])
+                # v0.2.70 C1c guards the None `references`; v0.2.92
+                # normalize_reference_targets guards the `_CrossReference`
+                # shape `.get()` returns once a link actually resolves
+                # (`len()`/`iter()` on it raise TypeError — same defect as the
+                # dependencies branch above, same shared home). The dedup
+                # collapses the analyzer's duplicate beacons (live data: 506
+                # `extends` beacons for one base class).
+                extends = dedup_ref_targets(
+                    normalize_reference_targets(
+                        (response.objects[0].references or {}).get("extends")
+                    ),
+                    ("full_name", "name"),
+                )
                 print(f"\n🔗 Base classes of '{target}':")
                 print(f"   Extends {len(extends)} classes:\n")
 
@@ -1217,7 +1506,6 @@ class CodeGraphQuery:
 
             elif query_type == "interactions":
                 # Find outbound cross-service interactions for a function or module
-                from weaviate.classes.query import QueryReference as QR
                 interactions_coll = self.client.collections.get(self._coll("CodeInteraction"))
                 func_coll = self.client.collections.get(self._coll("CodeFunction"))
                 func_resp = func_coll.query.fetch_objects(
@@ -1315,6 +1603,14 @@ def main():
                               help=('Drop candidates whose source file is this path BEFORE '
                                     'trimming to --limit (the Read/Edit hook passes the '
                                     'edited file here to avoid self-injection)'))
+    search_parser.add_argument('--transcript', type=str, default=None,
+                              help=('WP-E (v0.2.92): path to the live JSONL transcript — a '
+                                    'PATH, never text. When the query is short relative to '
+                                    "the code-embedding model's budget, the shared "
+                                    'vco_lib.query_enrichment component walks backwards '
+                                    "through the agent's own output (never tool payloads) "
+                                    'to enrich it. Omitted/absent reproduces the unenriched '
+                                    'query byte-for-byte.'))
 
     # Similar code
     similar_parser = subparsers.add_parser('similar', help='Find similar code')
@@ -1387,7 +1683,8 @@ def main():
             querier.search_by_concept(args.query, args.collection, args.limit, args.detail,
                                        hook_format=getattr(args, 'hook_format', False),
                                        anchor=getattr(args, 'anchor', None),
-                                       exclude_file=getattr(args, 'exclude_file', None))
+                                       exclude_file=getattr(args, 'exclude_file', None),
+                                       transcript=getattr(args, 'transcript', None))
         elif args.command == 'similar':
             querier.find_similar(args.reference, args.collection, args.limit)
         elif args.command == 'structure':

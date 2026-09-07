@@ -273,7 +273,8 @@ impl KeychainEntry {
 ///
 /// Exit is BOUNDED, not unconditional: `secrets_ss_connection::shutdown` uses a
 /// `try_lock` with a short (≤250ms) deadline, so if the keychain worker is
-/// mid-op — including parked on an unbounded user unlock prompt — the drain is
+/// mid-op — including parked on a user unlock prompt, which is itself bounded
+/// only at `SHARED_MAX_PROMPT_TIMEOUT_SECS` (120s) — the drain is
 /// SKIPPED and the process teardown closes the socket abruptly (today's
 /// pre-persistent-connection behaviour). It therefore never stalls exit waiting
 /// on a prompt. No-op on Windows / macOS.
@@ -962,7 +963,8 @@ impl Drop for TestPacePathGuard {
 // process touches gnome-keyring at a time machine-wide.
 //
 // Mechanics per call:
-//   1. flock(EXCLUSIVE) the pace file (blocks until we own it).
+//   1. flock(EXCLUSIVE) the pace file, bounded by `PACE_LOCK_ACQUIRE_DEADLINE`
+//      (LOCK_NB in a poll loop — NOT a blocking LOCK_EX; see the P0 note below).
 //   2. Read the last-call timestamp stored in the file; sleep any remaining
 //      `MIN_CALL_SPACING` (cross-process spacing, mirrors the in-process gate).
 //   3. Write the new timestamp.
@@ -974,9 +976,47 @@ impl Drop for TestPacePathGuard {
 // Fallbacks (each logs EXACTLY ONE warn, then degrades to in-process pacing =
 // today's behaviour):
 //   * pace file uncreatable (root dir unwritable) → per-process pacing only.
+//   * lock still held by a sibling VCO process after
+//     `PACE_LOCK_ACQUIRE_DEADLINE` → per-process pacing only.
 //   * non-unix (windows-native / apple-native have no crashy daemon) →
 //     per-process pacing only (the whole module is `cfg(unix)`; the
 //     `run_with_cross_process_pace` shim is a pass-through elsewhere).
+//
+// ─── Why the acquire is BOUNDED (P0 availability fix) ─────────────────────────
+//
+// Step 1 used to be a plain blocking `flock(fd, LOCK_EX)` justified by: "a held
+// keychain op is bounded by the caller's timeout worker, so the wait here is
+// bounded transitively." That justification was FALSE, and the failure it
+// allowed wedged the launcher AND the hub simultaneously with no self-heal:
+//
+//   * `KEYCHAIN_OP_TIMEOUT` bounds how long the CALLER waits for a result. It
+//     does NOT bound the op: `run_keychain_with_timeout` gives up on the
+//     result channel and returns `TimedOut`, but nothing cancels the job — the
+//     worker thread keeps running it, still holding this flock.
+//   * The op itself has no bound when it reaches an interactive unlock prompt.
+//     dbus-secret-service polls a prompt for `timeout.unwrap_or(ONE_YEAR)`
+//     seconds (`prompt.rs::execute_prompt`), and a human at a passphrase dialog
+//     is in any case slower than the 10s caller budget.
+//
+// So ONE unlock prompt parked the holder's single keychain worker while it held
+// this flock; every sibling VCO process then blocked FOREVER in step 1, its own
+// worker consumed, so every later keychain call in that process fast-failed
+// `WorkerStuck` permanently. Restarting the GUI did not help (it re-blocked on
+// the still-held flock); only killing the holder helped, because process death
+// is what released the lock.
+//
+// What is guaranteed NOW, and under which assumption:
+//   * GUARANTEED unconditionally: this acquire returns within
+//     `PACE_LOCK_ACQUIRE_DEADLINE`, so a waiter's worker thread is ALWAYS
+//     released — no cross-process wedge can outlive that deadline, whatever the
+//     holder is doing (prompt, wedged daemon, SIGSTOP).
+//   * ASSUMED (checkable, not inherited): that losing the lock costs only
+//     PACING, never correctness. That holds because the guard is inert data —
+//     `run_with_cross_process_pace` runs `op` identically with or without it,
+//     and only the completion STAMP is skipped when it is absent (we must not
+//     write the file we do not own). In-process `paced_call` still spaces this
+//     process's own calls. If a future change makes `op` depend on holding the
+//     guard, this deadline stops being safe and must be revisited.
 //
 // The `MIN_CALL_SPACING` test override (`with_test_spacing` / `TestSpacingGuard`)
 // extends here too via `current_spacing()`, so the suite stays fast.
@@ -1006,33 +1046,210 @@ mod cross_process_pace {
         crate::paths::vct_root_dir().join("keyring.pace")
     }
 
-    /// One-shot warn de-dup: we emit the "degraded to in-process pacing" warn
-    /// at most once per process to avoid log spam on a persistently-unwritable
-    /// root. `false` → not yet warned.
-    static WARNED_ONCE: std::sync::atomic::AtomicBool =
+    /// One-shot warn de-dup for the UNUSABLE-pace-file degrade: we emit that
+    /// warn at most once per process to avoid log spam on a persistently-
+    /// unwritable root. `false` → not yet warned.
+    static WARNED_ONCE_UNUSABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// One-shot warn de-dup for the CONTENDED-lock degrade (the acquire
+    /// deadline fired). Deliberately a SEPARATE latch from
+    /// `WARNED_ONCE_UNUSABLE`: the two degrades have different causes and
+    /// different urgency, and a single shared latch would let an early,
+    /// benign, static "pace file uncreatable" warn permanently SWALLOW the
+    /// report of a real cross-process wedge — silently conflating "could not
+    /// acquire the lock" with "there was never a lock to acquire". Each cause
+    /// gets its own one-shot.
+    static WARNED_ONCE_CONTENDED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
     /// Test-visible count of warns actually emitted (so T20 can assert
     /// "exactly one warn" without scraping stderr). Incremented in lock-step
-    /// with the real `eprintln`.
+    /// with the real `tracing::warn!`, for BOTH latches.
     #[cfg(any(test, debug_assertions))]
     pub(in crate::secrets) static WARN_COUNT: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
-    fn warn_once(msg: &str) {
-        if !WARNED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    /// Emit `msg` at WARN exactly once per `latch`, counting it for tests.
+    fn warn_once_latched(latch: &std::sync::atomic::AtomicBool, msg: &str) {
+        if !latch.swap(true, std::sync::atomic::Ordering::SeqCst) {
             #[cfg(any(test, debug_assertions))]
             WARN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tracing::warn!("[vct-secrets] {msg}");
         }
     }
 
-    /// Test-only reset of the one-shot warn latch (so consecutive test cases
+    /// One-shot warn for "the pace file itself is unusable" (open/create
+    /// failed, or flock returned a hard error).
+    fn warn_once(msg: &str) {
+        warn_once_latched(&WARNED_ONCE_UNUSABLE, msg);
+    }
+
+    /// One-shot warn for "another VCO process still holds the pace lock past
+    /// the acquire deadline". Separate latch — see `WARNED_ONCE_CONTENDED`.
+    fn warn_once_contended(msg: &str) {
+        warn_once_latched(&WARNED_ONCE_CONTENDED, msg);
+    }
+
+    /// Test-only reset of BOTH one-shot warn latches (so consecutive test cases
     /// each get a fresh "have we warned yet" state).
     #[cfg(any(test, debug_assertions))]
     pub(in crate::secrets) fn reset_warn_latch_for_test() {
-        WARNED_ONCE.store(false, std::sync::atomic::Ordering::SeqCst);
+        WARNED_ONCE_UNUSABLE.store(false, std::sync::atomic::Ordering::SeqCst);
+        WARNED_ONCE_CONTENDED.store(false, std::sync::atomic::Ordering::SeqCst);
         WARN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Upper bound on how long [`acquire_and_space`] waits for the exclusive
+    /// pace lock before degrading to in-process pacing.
+    ///
+    /// Chosen to sit BETWEEN the two timescales it has to separate:
+    ///   * ABOVE legitimate contention. A healthy holder keeps the lock for one
+    ///     `retry_with_backoff` chain — worst case 4 attempts × (150ms pacing +
+    ///     a ≤2s D-Bus call) + 1.3s of backoff ≈ 10s, and a realistic
+    ///     "Update all projects" burst queues a few seconds of short ops. 30s
+    ///     leaves ~3× headroom, so ordinary contention still WAITS and pacing
+    ///     is preserved — the G5 gnome-keyring SIGTRAP protection is not
+    ///     traded away for the common case.
+    ///   * BELOW human scale. The wedge this bounds is a holder parked on an
+    ///     interactive unlock prompt (or a hung daemon), which lasts tens of
+    ///     seconds to forever. 30s means a sibling process's keychain worker is
+    ///     released long before a person finishes at a passphrase dialog.
+    ///
+    /// Deliberately SHORTER than `SHARED_MAX_PROMPT_TIMEOUT_SECS` (the holder's
+    /// prompt bound, 120s): when a human really is typing, the right outcome is
+    /// that the SIBLING degrades to unpaced — which costs nothing real, since a
+    /// process sitting on a modal prompt is generating no daemon traffic to
+    /// pace against — rather than that the human gets cut off.
+    ///
+    /// Note this is NOT the "no global install timeout" rule's territory: that
+    /// rule forbids deadlines on WORK of unpredictable length. This bounds a
+    /// WAIT FOR A LOCK, where the fallback (proceed unpaced) is a documented,
+    /// correctness-preserving degrade.
+    const PACE_LOCK_ACQUIRE_DEADLINE: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    /// Poll interval while waiting for the contended pace lock. `LOCK_NB` never
+    /// parks, so we sleep between attempts instead of busy-spinning. The
+    /// uncontended path never sleeps (the first attempt succeeds), and a
+    /// contended holder keeps the lock ≥ `MIN_CALL_SPACING` (150ms), so a 25ms
+    /// granularity adds no measurable latency while costing ≤1200 wakeups
+    /// across the full 30s deadline.
+    const PACE_LOCK_ACQUIRE_POLL: std::time::Duration =
+        std::time::Duration::from_millis(25);
+
+    #[cfg(any(test, debug_assertions))]
+    static TEST_PACE_DEADLINE: std::sync::Mutex<Option<std::time::Duration>> =
+        std::sync::Mutex::new(None);
+
+    #[cfg(any(test, debug_assertions))]
+    fn current_pace_lock_deadline() -> std::time::Duration {
+        TEST_PACE_DEADLINE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or(PACE_LOCK_ACQUIRE_DEADLINE)
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn current_pace_lock_deadline() -> std::time::Duration {
+        PACE_LOCK_ACQUIRE_DEADLINE
+    }
+
+    /// Test-only RAII guard shortening the pace-lock acquire deadline so the
+    /// contention tests run in milliseconds instead of 30s. Restores the
+    /// previous value on drop.
+    ///
+    /// `#[cfg(test)]`, not `any(test, debug_assertions)`: the only callers are
+    /// this file's tests, so a plain debug build would report it dead. The READ
+    /// side (`TEST_PACE_DEADLINE` / `current_pace_lock_deadline`) stays
+    /// `any(test, debug_assertions)` so a debug build still compiles — it just
+    /// always observes `None`, i.e. exactly the production deadline.
+    #[cfg(test)]
+    pub(in crate::secrets) struct TestPaceDeadlineGuard {
+        prev: Option<std::time::Duration>,
+    }
+
+    #[cfg(test)]
+    impl TestPaceDeadlineGuard {
+        pub(in crate::secrets) fn new(deadline: std::time::Duration) -> Self {
+            let mut slot = TEST_PACE_DEADLINE.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::mem::replace(&mut *slot, Some(deadline));
+            Self { prev }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for TestPaceDeadlineGuard {
+        fn drop(&mut self) {
+            let mut slot = TEST_PACE_DEADLINE.lock().unwrap_or_else(|p| p.into_inner());
+            *slot = self.prev.take();
+        }
+    }
+
+    /// Outcome of a bounded exclusive-flock acquire. Three states, deliberately
+    /// distinct: "I own it", "someone else still owns it" and "the lock itself
+    /// is broken" are different facts and the caller warns differently for each.
+    /// Collapsing `Contended` into `Failed` would report a healthy-but-busy
+    /// sibling as a broken pace file.
+    #[derive(Debug)]
+    pub(in crate::secrets) enum FlockAcquire {
+        /// `fd` now holds LOCK_EX. Caller owns the unlock.
+        Acquired,
+        /// Still held by another open file description when the deadline
+        /// expired. Nothing was acquired; there is nothing to unlock.
+        Contended,
+        /// `flock` returned a real error (EBADF / EINVAL / ENOLCK …). Carries
+        /// the OS error for the warn message.
+        Failed(std::io::Error),
+    }
+
+    /// Take LOCK_EX on `fd`, waiting at most `deadline`.
+    ///
+    /// SSOT for every exclusive pace-lock acquire in this module (the runtime
+    /// path and the test-harness holder both call it), so the bound cannot
+    /// regress on one path while the other keeps it — and so the unit tests
+    /// that drive this function cover both call sites.
+    ///
+    /// Uses `LOCK_EX | LOCK_NB` in a poll loop rather than a blocking `LOCK_EX`
+    /// precisely because a blocking acquire is uninterruptible from user space:
+    /// once parked there is no deadline, no signal handling, and no way to give
+    /// up — which is how one held lock turned into a permanent two-process
+    /// wedge (see the module header). `EINTR` retries immediately (a signal is
+    /// not contention) but still respects the same deadline.
+    pub(in crate::secrets) fn flock_exclusive_within(
+        fd: std::os::unix::io::RawFd,
+        deadline: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> FlockAcquire {
+        let start = std::time::Instant::now();
+        loop {
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return FlockAcquire::Acquired;
+            }
+            let err = std::io::Error::last_os_error();
+            let code = err.raw_os_error().unwrap_or(0);
+            let interrupted = code == libc::EINTR;
+            if !interrupted && code != libc::EWOULDBLOCK && code != libc::EAGAIN {
+                // A genuine flock failure (bad fd, no lock support on this fs).
+                return FlockAcquire::Failed(err);
+            }
+            // Held by someone else (or we were signalled). Either way we are
+            // still waiting — and the DEADLINE APPLIES TO BOTH. An `EINTR`
+            // fast-path that skipped this check would be an unbounded spin
+            // under a signal storm: the very shape being removed here. (In
+            // practice `LOCK_NB` has nothing to interrupt, but "shouldn't
+            // happen in practice" is what the previous comment on this code
+            // assumed, and it was wrong.)
+            if start.elapsed() >= deadline {
+                return FlockAcquire::Contended;
+            }
+            // Retry immediately after a signal (no contention was observed);
+            // back off politely when the lock is genuinely held.
+            if !interrupted {
+                std::thread::sleep(poll);
+            }
+        }
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1109,8 +1326,16 @@ mod cross_process_pace {
         std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Acquire the exclusive lock and enforce cross-process spacing. Returns
-    /// the held lock guard on success, or `None` if the pace file is
-    /// uncreatable / flock fails (caller then degrades to in-process pacing).
+    /// the held lock guard on success, or `None` when we could not take the
+    /// lock — the pace file is uncreatable, `flock` failed outright, or another
+    /// VCO process still held it at `PACE_LOCK_ACQUIRE_DEADLINE`. The caller
+    /// then degrades to in-process pacing.
+    ///
+    /// `None` is a SUPPORTED degrade, not an error path: it costs cross-process
+    /// PACING only. `run_with_cross_process_pace` runs the op identically
+    /// either way, and the only other effect is that the completion stamp is
+    /// skipped — correctly, since a process that does not hold the lock must
+    /// not write the file another process is reading under it.
     ///
     /// `spacing` is threaded in (not read from the parent module directly) so
     /// the test override applies identically to the cross-process gate.
@@ -1152,16 +1377,47 @@ mod cross_process_pace {
             }
         };
         let fd = file.as_raw_fd();
-        // LOCK_EX blocks until acquired. A held keychain op is bounded by the
-        // caller's timeout worker, so the wait here is bounded transitively.
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            warn_once(&format!(
-                "flock(LOCK_EX) failed on {path:?}: {err} — cross-process \
-                 keyring pacing disabled (in-process pacing still active)"
-            ));
-            return None;
+        // BOUNDED exclusive acquire (P0). What this guarantees: we return
+        // within `deadline` no matter what the current holder is doing — the
+        // calling keychain worker thread is therefore always released, so one
+        // process parked on an unlock prompt can never wedge another. What it
+        // does NOT guarantee: that we got the lock. On expiry we degrade to
+        // in-process pacing, which is safe ONLY because the guard is inert
+        // data (see the module header's "what is guaranteed NOW" note) — a
+        // future change that makes `op` depend on holding it invalidates this.
+        //
+        // A blocking `LOCK_EX` here was the wedge: it cannot be deadlined from
+        // user space, and the comment that justified it ("bounded transitively
+        // by the caller's timeout worker") confused the CALLER's 10s wait for
+        // a result with a bound on the OP — `run_keychain_with_timeout` gives
+        // up on the channel but never cancels the job, so the holder kept this
+        // lock for as long as its prompt stayed open.
+        let deadline = current_pace_lock_deadline();
+        match flock_exclusive_within(fd, deadline, PACE_LOCK_ACQUIRE_POLL) {
+            FlockAcquire::Acquired => {}
+            FlockAcquire::Contended => {
+                // NOT "nothing to pace" — we know a sibling VCO process holds
+                // the lock and we chose to give up waiting. Say exactly that,
+                // on its own one-shot latch so this can never be swallowed by
+                // an earlier unrelated degrade warn.
+                warn_once_contended(&format!(
+                    "another VCO process has held the keyring pace lock \
+                     {path:?} for more than {}s (typically a keychain unlock \
+                     prompt awaiting the user, or a wedged Secret Service) — \
+                     proceeding WITHOUT cross-process pacing for this \
+                     operation so this process is not blocked (in-process \
+                     pacing still active). This warns once per process.",
+                    deadline.as_secs_f32()
+                ));
+                return None;
+            }
+            FlockAcquire::Failed(err) => {
+                warn_once(&format!(
+                    "flock(LOCK_EX) failed on {path:?}: {err} — cross-process \
+                     keyring pacing disabled (in-process pacing still active)"
+                ));
+                return None;
+            }
         }
         // We do all I/O on the ORIGINAL `file` (whose fd `fd` we locked), then
         // MOVE it into the guard so the very fd holding the flock stays open
@@ -1203,9 +1459,13 @@ mod cross_process_pace {
 
     /// Run `op` under the cross-process pace/lock. The lock is HELD for the
     /// whole `op` so no sibling VCO process interleaves a concurrent daemon
-    /// request. On any file-lock failure, `op` still runs (degraded to
-    /// in-process pacing) — a soft-fail, never a hard block on the user's
-    /// secret read.
+    /// request. When the lock could not be taken — file unusable, flock error,
+    /// or a sibling still holding it at the acquire deadline — `op` still runs
+    /// (degraded to in-process pacing): a soft-fail, never a hard block on the
+    /// user's secret read, and never a skipped or repeated op. The op runs
+    /// EXACTLY ONCE and its value is returned verbatim on both paths; the only
+    /// difference is that the degraded path writes no completion stamp,
+    /// because we do not own the file.
     pub(super) fn run_with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
         let spacing = super::current_spacing();
         // Hold the guard across `op`; drop (unlock) after.
@@ -1235,9 +1495,11 @@ mod cross_process_pace {
     /// re-acquiring the non-reentrant flock instead of self-deadlocking. Drop
     /// clears the flag and releases the flock (kernel also releases on close).
     ///
-    /// Returns `None` on any flock failure (unwritable root / no flock support) —
-    /// the caller degrades to the test lockfile + in-process serialization
-    /// (pre-T-1 behaviour; a soft degrade, never a block).
+    /// Returns `None` on any flock failure (unwritable root / no flock support)
+    /// AND when a live launcher still holds the production lock at
+    /// `PACE_LOCK_ACQUIRE_DEADLINE` — the caller degrades to the test lockfile
+    /// + in-process serialization (pre-T-1 behaviour; a soft degrade, never a
+    /// block, and never an unbounded hang).
     #[cfg(any(test, debug_assertions))]
     pub(in crate::secrets) struct TestProductionPaceGuard {
         _lock: PaceLock,
@@ -1270,11 +1532,20 @@ mod cross_process_pace {
             .open(&path)
             .ok()?;
         let fd = file.as_raw_fd();
-        // Blocking exclusive lock — the SAME LOCK_EX the launcher's
-        // `acquire_and_space` uses, so we queue behind its held-lock windows.
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if rc != 0 {
-            return None;
+        // BOUNDED exclusive lock via the SAME acquire SSOT the launcher's
+        // `acquire_and_space` uses, so we queue behind its held-lock windows
+        // but — like it — give up rather than park forever. This path had the
+        // identical blocking-`LOCK_EX` defect: a `cargo test` run started while
+        // a live launcher sat on an unlock prompt would hang here with no
+        // deadline and no output. `Contended` / `Failed` both degrade to the
+        // documented `None` (test lockfile + in-process serialization only).
+        match flock_exclusive_within(
+            fd,
+            current_pace_lock_deadline(),
+            PACE_LOCK_ACQUIRE_POLL,
+        ) {
+            FlockAcquire::Acquired => {}
+            FlockAcquire::Contended | FlockAcquire::Failed(_) => return None,
         }
         // Now that WE hold it, set the flag so this process's nested
         // `acquire_and_space` (the test's own `set`) skips re-acquisition.
@@ -1288,8 +1559,17 @@ mod cross_process_pace {
 /// Cross-process pacing shim. On unix, serializes the keychain op across ALL
 /// VCO processes via a held flock (see `cross_process_pace`). On non-unix it's
 /// a pass-through (those platforms lack the crashy daemon). Called from inside
-/// the bounded-timeout worker, wrapping the full `retry_with_backoff` op, so a
-/// wedged flock or op is still bounded by `KEYCHAIN_OP_TIMEOUT`.
+/// the bounded-timeout worker, wrapping the full `retry_with_backoff` op.
+///
+/// CORRECTION (P0): this used to claim "so a wedged flock or op is still
+/// bounded by `KEYCHAIN_OP_TIMEOUT`". It is not. `KEYCHAIN_OP_TIMEOUT` bounds
+/// how long the CALLER waits on the result channel; `run_keychain_with_timeout`
+/// abandons the result but never cancels the job, so a wedged flock or op keeps
+/// running on the worker thread — which is exactly how a single held lock
+/// wedged two processes indefinitely. What actually bounds the worker is the
+/// acquire deadline inside `cross_process_pace` (30s) plus, on Linux, the
+/// Secret-Service prompt bound (`SHARED_MAX_PROMPT_TIMEOUT_SECS`, 120s). The
+/// caller-side timeout only bounds the caller.
 #[inline]
 fn with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
@@ -3989,6 +4269,449 @@ mod tests {
         // A second attempt must NOT warn again (one-shot).
         with_cross_process_pace(|| ());
         assert_eq!(guard.warn_count(), 1, "the degrade warn is one-shot per latch");
+    }
+
+    // ─── P0: the pace-lock acquire must be BOUNDED ────────────────────────────
+    //
+    // A blocking `flock(LOCK_EX)` here let ONE process holding the lock (parked
+    // on an interactive unlock prompt, which dbus-secret-service polls for up
+    // to a YEAR) permanently wedge every OTHER VCO process: their keychain
+    // worker threads blocked in the acquire forever, so every later keychain
+    // call in those processes fast-failed `WorkerStuck` with no self-heal.
+    // Restarting the GUI did not help — only killing the lock HOLDER did,
+    // because process death is what released the lock.
+    //
+    // These pins cover the decision on BOTH sides: acquire when the lock is (or
+    // becomes) available, degrade when it does not — and prove the degrade
+    // costs pacing only, never the caller's result.
+
+    /// Hold an exclusive flock on `path` for `hold` on a background thread,
+    /// from a SEPARATE open file description (flock locks are per-OFD, so a
+    /// second `open()` in this same process contends exactly like a sibling
+    /// launcher/hub process would — the same technique the T-1 test uses).
+    ///
+    /// The returned receiver fires once the lock is genuinely held, so a test
+    /// never races the holder's startup. The holder releases on its OWN timer
+    /// rather than on a signal from the test: that way a REGRESSION to the
+    /// blocking acquire makes the test FAIL (it waits out the hold, then
+    /// acquires, then busts the assertions) instead of deadlocking the suite.
+    #[cfg(unix)]
+    fn hold_flock_for(
+        path: std::path::PathBuf,
+        hold: std::time::Duration,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        use std::os::unix::io::AsRawFd;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .expect("holder opens the pace file");
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            assert_eq!(rc, 0, "holder must take the exclusive lock");
+            tx.send(()).expect("signal that the lock is held");
+            std::thread::sleep(hold);
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        });
+        (handle, rx)
+    }
+
+    /// LEAVE-ALONE leg: with the lock FREE, the bounded acquire behaves exactly
+    /// as the blocking one did — it takes the lock immediately, paces, stamps
+    /// the completion timestamp, and does NOT warn. Guards against
+    /// over-correcting into a fix that degrades eagerly (a bare `LOCK_NB` with
+    /// no poll loop, or a zero deadline) and quietly loses cross-process pacing
+    /// for everyone.
+    #[cfg(unix)]
+    #[test]
+    fn pace_lock_uncontended_acquires_promptly_and_stamps() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
+        let deadline = std::time::Duration::from_millis(400);
+        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
+
+        let mut calls = 0u32;
+        let start = std::time::Instant::now();
+        let out = with_cross_process_pace(|| {
+            calls += 1;
+            "value".to_string()
+        });
+        let elapsed = start.elapsed();
+
+        assert_eq!(out, "value", "the op's value is returned verbatim");
+        assert_eq!(calls, 1, "the op runs exactly once");
+        assert!(
+            elapsed < deadline,
+            "an UNCONTENDED acquire must succeed on the first non-blocking \
+             attempt, not wait out the deadline; took {elapsed:?}"
+        );
+        assert!(
+            guard.pace_timestamp().is_some(),
+            "holding the lock must still stamp the completion timestamp"
+        );
+        assert_eq!(
+            guard.warn_count(),
+            0,
+            "a healthy uncontended acquire must not warn (no phantom degrade)"
+        );
+    }
+
+    /// ACT leg (the P0 fix): when another process holds the lock past the
+    /// acquire deadline, we WAIT the deadline, then DEGRADE — we do not block
+    /// until the holder releases. The op still runs exactly once, its value is
+    /// returned verbatim, the degrade is reported exactly once, and the pace
+    /// file we do NOT own is left byte-identical.
+    ///
+    /// RED-PROOF: restore the blocking `flock(fd, libc::LOCK_EX)` in
+    /// `acquire_and_space` and this test fails on three counts — `elapsed`
+    /// reaches the full 2.5s hold (busting the `elapsed < HOLD` bound), the
+    /// warn count is 0 (the wedge was silent), and the pace file is
+    /// overwritten with a real completion stamp.
+    #[cfg(unix)]
+    #[test]
+    fn pace_lock_contended_past_deadline_degrades_bounded_and_warns_once() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pace = dir.path().join("keyring.pace");
+        // Seed a recognisable stamp so we can prove the degraded path does not
+        // write a file it does not hold the lock on.
+        std::fs::write(&pace, b"12345").expect("seed the pace file");
+        let guard = TestPacePathGuard::new(pace.clone());
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
+        let deadline = std::time::Duration::from_millis(300);
+        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
+
+        // Hold far longer than the deadline — this stands in for a sibling
+        // process parked on an unlock prompt.
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
+        let (holder, held) = hold_flock_for(pace.clone(), HOLD);
+        held.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread must take the lock");
+
+        let mut calls = 0u32;
+        let start = std::time::Instant::now();
+        let out = with_cross_process_pace(|| {
+            calls += 1;
+            "secret-shaped-value".to_string()
+        });
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= deadline,
+            "the acquire must genuinely WAIT its budget before degrading \
+             (ordinary contention should still get paced); waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < HOLD,
+            "the acquire must give up at the deadline, NOT block until the \
+             holder releases; waited {elapsed:?} against a {HOLD:?} hold — \
+             this is the wedge that took down both the launcher and the hub"
+        );
+        assert_eq!(
+            out, "secret-shaped-value",
+            "the degrade must not alter the caller's result"
+        );
+        assert_eq!(calls, 1, "the degrade must not skip or repeat the op");
+        assert_eq!(
+            guard.warn_count(),
+            1,
+            "giving up on the lock must be OBSERVABLE — 'could not acquire' is \
+             not the same fact as 'nothing to pace'"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pace).expect("read pace file"),
+            "12345",
+            "the degraded path must NOT write the pace file — another process \
+             holds the lock and is reading it under that lock"
+        );
+
+        // One-shot: a second degrade in the same process does not warn again.
+        let out2 = with_cross_process_pace(|| "again".to_string());
+        assert_eq!(out2, "again");
+        assert_eq!(
+            guard.warn_count(),
+            1,
+            "the contended-degrade warn is one-shot per process"
+        );
+
+        holder.join().expect("holder thread joins");
+    }
+
+    /// LEAVE-ALONE leg: a lock held only BRIEFLY (released well within the
+    /// deadline) must be waited for and then acquired NORMALLY — no degrade, no
+    /// warn, and a real completion stamp proving we held it. This is what keeps
+    /// the G5 gnome-keyring protection intact for ordinary contention, which is
+    /// the overwhelmingly common case.
+    ///
+    /// RED-PROOF: shrink the deadline to `Duration::ZERO` (i.e. a bare
+    /// `LOCK_NB` with no poll loop) and this fails — warn count 1, no stamp.
+    #[cfg(unix)]
+    #[test]
+    fn pace_lock_released_within_deadline_acquires_without_degrading() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pace = dir.path().join("keyring.pace");
+        // A stamp of 1ns-since-epoch: any REAL completion stamp is astronomically
+        // larger, so a strict `>` proves the acquired path wrote it.
+        std::fs::write(&pace, b"1").expect("seed the pace file");
+        let guard = TestPacePathGuard::new(pace.clone());
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
+        let deadline = std::time::Duration::from_secs(5);
+        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
+
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(400);
+        let (holder, held) = hold_flock_for(pace.clone(), HOLD);
+        held.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread must take the lock");
+
+        let mut calls = 0u32;
+        let start = std::time::Instant::now();
+        let out = with_cross_process_pace(|| {
+            calls += 1;
+            7u32
+        });
+        let elapsed = start.elapsed();
+
+        assert_eq!(out, 7);
+        assert_eq!(calls, 1);
+        assert!(
+            elapsed >= HOLD - std::time::Duration::from_millis(80),
+            "the acquire must WAIT for a briefly-held lock rather than \
+             degrading on first contention; returned after only {elapsed:?}"
+        );
+        assert!(
+            elapsed < deadline,
+            "and it must acquire as soon as the holder releases, well inside \
+             the deadline; took {elapsed:?}"
+        );
+        assert_eq!(
+            guard.warn_count(),
+            0,
+            "a lock released inside the deadline is NOT a degrade — warning \
+             here would cry wolf on ordinary contention"
+        );
+        assert!(
+            guard.pace_timestamp().unwrap_or(0) > 1,
+            "we really held the lock, so the completion stamp must have been \
+             written (proving this was an acquire, not a silent degrade)"
+        );
+
+        holder.join().expect("holder thread joins");
+    }
+
+    /// The contended-degrade warn must have its OWN one-shot latch: an earlier,
+    /// unrelated "pace file unusable" warn must not silently swallow the report
+    /// of a real cross-process wedge. Same conflation family as `[]`-on-
+    /// transport-failure meaning "absent" — two different facts must not share
+    /// one suppression bit.
+    ///
+    /// RED-PROOF: point the contended branch at the shared `warn_once` (one
+    /// latch for both causes) and the final count stays 1 instead of 2.
+    #[cfg(unix)]
+    #[test]
+    fn contended_degrade_warn_is_not_swallowed_by_unusable_pace_warn() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
+        let deadline = std::time::Duration::from_millis(200);
+        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
+
+        // (1) Trip the UNUSABLE-pace-file degrade: a regular file used as a
+        // directory parent makes both create_dir_all and open fail.
+        let blocker = dir.path().join("iamafile");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let guard = TestPacePathGuard::new(blocker.join("sub").join("keyring.pace"));
+        with_cross_process_pace(|| ());
+        assert_eq!(
+            guard.warn_count(),
+            1,
+            "the unusable-pace-file degrade warns once"
+        );
+
+        // (2) WITHOUT resetting the latches (that is the whole point), switch to
+        // a usable but CONTENDED pace file and degrade again.
+        let pace = dir.path().join("keyring.pace");
+        let prev = cross_process_pace::set_test_pace_path(Some(pace.clone()));
+        let (holder, held) = hold_flock_for(pace.clone(), std::time::Duration::from_millis(1500));
+        held.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread must take the lock");
+        with_cross_process_pace(|| ());
+        let after = cross_process_pace::WARN_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        // Restore the path override before asserting so a failure still leaves
+        // the global seam in the state `guard`'s Drop expects.
+        cross_process_pace::set_test_pace_path(prev);
+        holder.join().expect("holder thread joins");
+
+        assert_eq!(
+            after, 2,
+            "a contended-lock degrade must still report itself after an \
+             unrelated degrade warn already fired — separate one-shot latches"
+        );
+    }
+
+    /// CALLER-LEVEL: the degrade must cost pacing ONLY. Drives the exact
+    /// production sandwich `with_cross_process_pace(|| retry_with_backoff(op))`
+    /// — the middle layer is the only thing that differs between the acquired
+    /// and degraded paths — and asserts the caller receives an IDENTICAL
+    /// outcome either way, for a hit, a genuine miss, and a transient blip that
+    /// recovers on retry. A degrade that dropped, duplicated, or reclassified
+    /// the op would show up here as a difference between the two columns.
+    #[cfg(unix)]
+    #[test]
+    fn degraded_pace_gives_the_caller_identical_results_to_the_acquired_path() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pace = dir.path().join("keyring.pace");
+        let _guard = TestPacePathGuard::new(pace.clone());
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(1));
+        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(
+            std::time::Duration::from_millis(150),
+        );
+
+        // The three outcomes a real keychain op can produce, exercised through
+        // the real `retry_with_backoff` (so pacing, classification and the
+        // attempt budget are the production ones).
+        fn exercise() -> (
+            (keyring::Result<String>, u32),
+            (keyring::Result<String>, u32),
+            (keyring::Result<String>, u32),
+        ) {
+            let mut hit_calls = 0u32;
+            let hit = with_cross_process_pace(|| {
+                retry_with_backoff(|| {
+                    hit_calls += 1;
+                    Ok("s3cret-value".to_string())
+                })
+            });
+            let mut miss_calls = 0u32;
+            let miss = with_cross_process_pace(|| {
+                retry_with_backoff(|| {
+                    miss_calls += 1;
+                    Err(keyring::Error::NoEntry)
+                })
+            });
+            let mut blip_calls = 0u32;
+            let blip = with_cross_process_pace(|| {
+                retry_with_backoff(|| {
+                    blip_calls += 1;
+                    if blip_calls == 1 {
+                        Err(keyring::Error::PlatformFailure(Box::new(
+                            std::io::Error::other("daemon hiccup"),
+                        )))
+                    } else {
+                        Ok("recovered-value".to_string())
+                    }
+                })
+            });
+            (
+                (hit, hit_calls),
+                (miss, miss_calls),
+                (blip, blip_calls),
+            )
+        }
+
+        // Column A: lock free → acquired path.
+        let (a_hit, a_miss, a_blip) = exercise();
+
+        // Column B: lock held for the whole run → degraded path.
+        let (holder, held) = hold_flock_for(pace.clone(), std::time::Duration::from_secs(3));
+        held.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread must take the lock");
+        let (b_hit, b_miss, b_blip) = exercise();
+        holder.join().expect("holder thread joins");
+
+        assert_eq!(
+            a_hit.0.as_deref().ok(),
+            Some("s3cret-value"),
+            "acquired path returns the value"
+        );
+        assert_eq!(
+            b_hit.0.as_deref().ok(),
+            a_hit.0.as_deref().ok(),
+            "the DEGRADED path must return the same value — losing the pace \
+             lock must never lose or alter a secret"
+        );
+        assert_eq!(
+            (a_hit.1, b_hit.1),
+            (1, 1),
+            "one attempt on both paths (no dropped or duplicated keychain op)"
+        );
+
+        assert!(
+            matches!(a_miss.0, Err(keyring::Error::NoEntry))
+                && matches!(b_miss.0, Err(keyring::Error::NoEntry)),
+            "a genuine miss stays a miss on both paths — a degrade must not \
+             turn 'absent' into an error or vice versa"
+        );
+        assert_eq!((a_miss.1, b_miss.1), (1, 1), "a miss is not retried");
+
+        assert_eq!(
+            b_blip.0.as_deref().ok(),
+            a_blip.0.as_deref().ok(),
+            "a transient blip recovers identically on both paths"
+        );
+        assert_eq!(
+            (a_blip.1, b_blip.1),
+            (2, 2),
+            "same attempt budget on both paths (degrading must not change \
+             retry semantics)"
+        );
+    }
+
+    /// PROMPT-TIMEOUT SEMANTICS (the second half of the P0 fix). When the
+    /// shared Secret-Service connection's `SHARED_MAX_PROMPT_TIMEOUT_SECS`
+    /// expires, dbus-secret-service returns `Error::Prompt`, which
+    /// `secrets_ss_connection::classify` maps to `Permanent` (pinned by that
+    /// module's `classify_matches_keyring_decode_error_split`). This test pins
+    /// the REST of the production chain: that a `Permanent` reaches the caller
+    /// as a clean, NON-transient failure attempted EXACTLY ONCE — so an expired
+    /// prompt frees the keychain worker instead of parking it, and no retry
+    /// re-pops the dialog the user just failed to answer.
+    ///
+    /// RED-PROOF: map `SsOpError::Permanent` to `PlatformFailure` in
+    /// `ss_error_to_keyring` and the attempt count becomes 4.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_unlock_prompt_fails_once_and_never_re_prompts() {
+        use crate::secrets_ss_connection::SsOpError;
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(1));
+
+        let mapped =
+            ss_error_to_keyring(SsOpError::Permanent("unlock prompt was dismissed".into()));
+        assert!(
+            matches!(mapped, keyring::Error::NoStorageAccess(_)),
+            "an expired/dismissed prompt is a storage-access failure, not a \
+             daemon hiccup"
+        );
+        assert!(
+            !is_transient(&mapped),
+            "it must be classified NON-transient so the retry loop leaves it alone"
+        );
+
+        let mut attempts = 0u32;
+        let out: keyring::Result<()> = retry_with_backoff(|| {
+            attempts += 1;
+            Err(ss_error_to_keyring(SsOpError::Permanent(
+                "unlock prompt was dismissed".into(),
+            )))
+        });
+        assert!(out.is_err(), "the op fails rather than hanging");
+        assert_eq!(
+            attempts, 1,
+            "an expired unlock prompt must fail the op ONCE — retrying would \
+             re-raise the dialog and re-park the worker for another full \
+             prompt timeout"
+        );
     }
 
     /// T-1 (v0.2.83): `keychain_serialize_lock()` holds the PRODUCTION

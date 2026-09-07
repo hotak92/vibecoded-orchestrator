@@ -3,13 +3,18 @@
 // v0.2.83 (WP-A2 / D3, A-RC2): REGRESSION PIN for the orchestrator store's
 // remote-check retry scheduling.
 //
-// When `checkStatus()` lands `remote_check_ok === false` (the remote probe
+// When `checkStatus()` lands an `unknown` remote_check (the remote probe
 // could not determine whether an update exists), the store schedules a short
 // burst of retries — 30s → 90s → 300s, capped at 3 per failure episode,
 // single-flight (one pending timer), and the episode RESETS the moment a
-// check lands `remote_check_ok !== false` (ok, OR the field MISSING — older
-// Rust back-compat). Without the fix a transient startup miss meant up to an
-// hour of false "no update".
+// check lands anything else (`ok`, or `not_applicable` — nothing to check).
+// Without the fix a transient startup miss meant up to an hour of false
+// "no update".
+//
+// v0.2.92 (WP-13): migrated from the `remote_check_ok`/`remote_check_error`
+// bool pair to `remote_check: CheckState`. Two contract changes, both
+// deliberate: `not_applicable` is now expressible (and schedules nothing),
+// and a MISSING field now reads as `unknown` rather than as healthy.
 //
 // We mock `$lib/tauri` so `checkStatus` runs against controllable fakes and
 // drive `setTimeout` with vitest fake timers to assert the cadence + caps.
@@ -57,10 +62,14 @@ vi.mock('$lib/tauri', () => ({
   isTauriRuntime: () => true,
 }));
 
+const CHECK_OK = { state: 'ok' } as const;
+const CHECK_NA = { state: 'not_applicable' } as const;
+const checkUnknown = (error: string) => ({ state: 'unknown', error }) as const;
+
 // A well-formed UpdateStatus with all required fields, parametrised on the
-// remote-check health fields.
+// remote-check tri-state. Defaults to `ok`.
 function status(
-  health: { remote_check_ok?: boolean; remote_check_error?: string | null } = {},
+  health: { remote_check?: Record<string, unknown> } = {},
 ): FakeStatus {
   return {
     remote_ahead: false,
@@ -70,6 +79,8 @@ function status(
     installed_version: '0.2.82',
     running_version: '0.2.82',
     on_disk_binary_version: '0.2.82',
+    remote_check: CHECK_OK,
+    head_detached: false,
     ...health,
   };
 }
@@ -99,8 +110,8 @@ function checkForUpdatesCalls(): number {
 }
 
 describe('orchestrator retry scheduling (D3)', () => {
-  it('schedules a retry when remote_check_ok === false', async () => {
-    nextUpdateStatus = status({ remote_check_ok: false, remote_check_error: 'fetch failed' });
+  it('schedules a retry when remote_check is unknown', async () => {
+    nextUpdateStatus = status({ remote_check: checkUnknown('fetch failed') });
 
     await orchestrator.checkStatus();
     expect(checkForUpdatesCalls()).toBe(1);
@@ -110,8 +121,8 @@ describe('orchestrator retry scheduling (D3)', () => {
     expect(checkForUpdatesCalls()).toBe(2);
   });
 
-  it('does NOT schedule a retry when remote_check_ok === true', async () => {
-    nextUpdateStatus = status({ remote_check_ok: true });
+  it('does NOT schedule a retry when remote_check is ok', async () => {
+    nextUpdateStatus = status({ remote_check: CHECK_OK });
 
     await orchestrator.checkStatus();
     expect(checkForUpdatesCalls()).toBe(1);
@@ -121,9 +132,27 @@ describe('orchestrator retry scheduling (D3)', () => {
     expect(checkForUpdatesCalls()).toBe(1);
   });
 
-  it('treats a MISSING remote_check_ok as healthy (older Rust — no retry)', async () => {
-    // No remote_check_ok / remote_check_error at all (pre-v0.2.83 binary).
-    nextUpdateStatus = status();
+  // v0.2.92 (WP-13): this test USED to assert that a MISSING field meant
+  // healthy-and-no-retry. Inverted deliberately — absence is now `unknown`,
+  // because the field always ships and silence is not evidence of health.
+  it('treats a MISSING remote_check as unknown (retries, does NOT assume healthy)', async () => {
+    const bare = status();
+    delete (bare as Record<string, unknown>).remote_check;
+    nextUpdateStatus = bare;
+
+    await orchestrator.checkStatus();
+    expect(checkForUpdatesCalls()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(checkForUpdatesCalls()).toBe(2);
+  });
+
+  // v0.2.92 (WP-13): the third state. "There is no remote here" must NOT
+  // schedule retries — retrying a non-git install forever is the storm the
+  // v0.2.83 `ok = true` fudge was avoiding; the tri-state gets the same
+  // outcome without claiming a check happened.
+  it('treats NOT_APPLICABLE as no-retry (but not as a successful check)', async () => {
+    nextUpdateStatus = status({ remote_check: CHECK_NA });
 
     await orchestrator.checkStatus();
     expect(checkForUpdatesCalls()).toBe(1);
@@ -134,7 +163,7 @@ describe('orchestrator retry scheduling (D3)', () => {
 
   it('walks the 30s / 90s / 300s ladder and caps at 3 retries per episode', async () => {
     // Remote stays unreachable across every attempt.
-    nextUpdateStatus = status({ remote_check_ok: false, remote_check_error: 'net down' });
+    nextUpdateStatus = status({ remote_check: checkUnknown('net down') });
 
     await orchestrator.checkStatus(); // initial (1)
     expect(checkForUpdatesCalls()).toBe(1);
@@ -154,7 +183,7 @@ describe('orchestrator retry scheduling (D3)', () => {
   });
 
   it('does NOT stack timers (single-flight): back-to-back failing checks arm ONE timer at the FIRST tier', async () => {
-    nextUpdateStatus = status({ remote_check_ok: false });
+    nextUpdateStatus = status({ remote_check: checkUnknown('probe failed') });
 
     // Two failing checks in a row while a timer is already pending. Without
     // the single-flight guard the 2nd check would (a) advance retryAttempt to
@@ -168,7 +197,7 @@ describe('orchestrator retry scheduling (D3)', () => {
     // The single pending timer must be at the FIRST tier (30s). After it
     // fires (and the retry recovers), stop the episode so any LEAKED timer
     // would betray itself.
-    nextUpdateStatus = status({ remote_check_ok: true }); // retry recovers
+    nextUpdateStatus = status({ remote_check: CHECK_OK }); // retry recovers
     await vi.advanceTimersByTimeAsync(30_000);
     expect(checkForUpdatesCalls()).toBe(3); // exactly ONE retry fired at 30s
 
@@ -179,12 +208,12 @@ describe('orchestrator retry scheduling (D3)', () => {
   });
 
   it('resets the episode on a subsequent healthy check (ok=true clears the ladder)', async () => {
-    nextUpdateStatus = status({ remote_check_ok: false });
+    nextUpdateStatus = status({ remote_check: checkUnknown('probe failed') });
     await orchestrator.checkStatus(); // (1) fail → arm 30s
 
     // The remote recovers before the first retry fires: a manual healthy
     // check resets the counter.
-    nextUpdateStatus = status({ remote_check_ok: true });
+    nextUpdateStatus = status({ remote_check: CHECK_OK });
     await orchestrator.checkStatus(); // (2) ok → cancelScheduledRetry()
 
     // The previously-armed 30s timer was cleared → no retry.
@@ -192,7 +221,7 @@ describe('orchestrator retry scheduling (D3)', () => {
     expect(checkForUpdatesCalls()).toBe(2);
 
     // And a NEW failure episode starts fresh at 30s (counter was reset).
-    nextUpdateStatus = status({ remote_check_ok: false });
+    nextUpdateStatus = status({ remote_check: checkUnknown('probe failed') });
     await orchestrator.checkStatus(); // (3) fail → arm 30s again
     await vi.advanceTimersByTimeAsync(30_000);
     expect(checkForUpdatesCalls()).toBe(4);
@@ -209,7 +238,7 @@ describe('orchestrator retry scheduling (D3)', () => {
   });
 
   it('cancelScheduledRetry() clears a pending timer and resets the counter', async () => {
-    nextUpdateStatus = status({ remote_check_ok: false });
+    nextUpdateStatus = status({ remote_check: checkUnknown('probe failed') });
     await orchestrator.checkStatus(); // arm 30s
 
     cancelScheduledRetry();
@@ -241,24 +270,36 @@ describe('orchestrator lastCheckFailed tracking (N-4)', () => {
     expect(get(orchestrator).updateStatus).toBeNull();
   });
 
-  it('is true after remote_check_ok === false', async () => {
-    nextUpdateStatus = status({ remote_check_ok: false, remote_check_error: 'fetch failed' });
+  it('is true after an unknown remote_check', async () => {
+    nextUpdateStatus = status({ remote_check: checkUnknown('fetch failed') });
 
     await orchestrator.checkStatus();
 
     expect(get(orchestrator).lastCheckFailed).toBe(true);
   });
 
-  it('is false after a successful check (remote_check_ok === true)', async () => {
-    nextUpdateStatus = status({ remote_check_ok: true });
+  it('is false after a successful check (remote_check ok)', async () => {
+    nextUpdateStatus = status({ remote_check: CHECK_OK });
 
     await orchestrator.checkStatus();
 
     expect(get(orchestrator).lastCheckFailed).toBe(false);
   });
 
-  it('is false after a MISSING remote_check_ok (older Rust — treated healthy)', async () => {
-    nextUpdateStatus = status(); // no health fields
+  // v0.2.92 (WP-13): inverted with the compat branch it pinned. See the
+  // retry-scheduling twin above.
+  it('is TRUE after a MISSING remote_check (absence is not evidence of health)', async () => {
+    const bare = status();
+    delete (bare as Record<string, unknown>).remote_check;
+    nextUpdateStatus = bare;
+
+    await orchestrator.checkStatus();
+
+    expect(get(orchestrator).lastCheckFailed).toBe(true);
+  });
+
+  it('is false after a NOT_APPLICABLE remote_check (nothing to check ≠ failed)', async () => {
+    nextUpdateStatus = status({ remote_check: CHECK_NA });
 
     await orchestrator.checkStatus();
 
@@ -275,15 +316,15 @@ describe('orchestrator lastCheckFailed tracking (N-4)', () => {
   });
 
   it('flips false→true→false as the remote check recovers then fails then recovers', async () => {
-    nextUpdateStatus = status({ remote_check_ok: true });
+    nextUpdateStatus = status({ remote_check: CHECK_OK });
     await orchestrator.checkStatus();
     expect(get(orchestrator).lastCheckFailed).toBe(false);
 
-    nextUpdateStatus = status({ remote_check_ok: false });
+    nextUpdateStatus = status({ remote_check: checkUnknown('probe failed') });
     await orchestrator.checkStatus();
     expect(get(orchestrator).lastCheckFailed).toBe(true);
 
-    nextUpdateStatus = status({ remote_check_ok: true });
+    nextUpdateStatus = status({ remote_check: CHECK_OK });
     await orchestrator.checkStatus();
     expect(get(orchestrator).lastCheckFailed).toBe(false);
   });

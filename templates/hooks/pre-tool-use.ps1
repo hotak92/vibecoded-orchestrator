@@ -64,15 +64,28 @@ $SessionIdFromStdin = ""
 # v0.2.77 9-bis. Empty string when absent (parent context).
 $AgentId = ""
 $AgentType = ""
+# WP-E (v0.2.92): also extract transcript_path + prompt_id, same two fields
+# pre-edit-context-inject.ps1 pulls from the same stdin payload shape.
+# transcript_path is a PATH ONLY — it is threaded straight through to
+# rl_kg_search.py's --transcript flag in Section 5 below; the shared
+# vco_lib/transcript_context.py reader does every byte of the actual
+# reading, in-process, per R31. Never logged, never echoed. prompt_id
+# scopes the query-cache key (query-cache.ps1) so two turns issuing the
+# same short trigger don't collide on one cache entry when their enriched
+# text differs. MUST MATCH pre-tool-use.sh's NUL-delimited parse.
+$TranscriptPath = ""
+$PromptId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
-        if ($payload.tool_name)    { $ToolName = [string]$payload.tool_name }
-        if ($payload.tool_input)   { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
-        if ($payload.user_message) { $UserMessage = [string]$payload.user_message }
-        if ($payload.session_id)   { $SessionIdFromStdin = [string]$payload.session_id }
-        if ($payload.agent_id)     { $AgentId = [string]$payload.agent_id }
-        if ($payload.agent_type)   { $AgentType = [string]$payload.agent_type }
+        if ($payload.tool_name)       { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input)      { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+        if ($payload.user_message)    { $UserMessage = [string]$payload.user_message }
+        if ($payload.session_id)      { $SessionIdFromStdin = [string]$payload.session_id }
+        if ($payload.agent_id)        { $AgentId = [string]$payload.agent_id }
+        if ($payload.agent_type)      { $AgentType = [string]$payload.agent_type }
+        if ($payload.transcript_path) { $TranscriptPath = [string]$payload.transcript_path }
+        if ($payload.prompt_id)       { $PromptId = [string]$payload.prompt_id }
     }
 } catch {
     # Empty/malformed stdin — keep variables at defaults
@@ -263,7 +276,7 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label, [string]$anc
         return
     }
 
-    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl -Anchor $anchor
+    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl -Anchor $anchor -PromptId $PromptId -TranscriptPath $TranscriptPath
     if (-not $raw) { return }
     $inj = ""
     $rd = ""
@@ -393,11 +406,40 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
 # === 5. KG SEARCH SUGGESTION (Edit/Write only) ===
 if ($ToolName -ne "Edit" -and $ToolName -ne "Write") { exit 0 }
 
-$conceptRe = '(caching|authentication|database|API|search|optimization|validation|testing|deployment|VRAM|quantization|inference|embedding|MCP|agent|workflow|pattern)'
-$matchesList = [regex]::Matches($UserMessage, $conceptRe, 'IgnoreCase')
-if ($matchesList.Count -lt 1) { exit 0 }
-$concepts = ($matchesList | Select-Object -First 3 | ForEach-Object { $_.Value }) -join ' '
-if (-not $concepts) { exit 0 }
+# WP-E (v0.2.92) REVIVAL: this branch originally gated on a topic-keyword
+# regex scanned out of $UserMessage (populated from the hook payload's
+# `user_message` field). That field NEVER ARRIVES in the real Claude Code
+# v2.1.x PreToolUse payload, so $UserMessage is always "" on a live
+# install and this branch has been dead code since it was written — the
+# regex match count was always 0.
+#
+# DECISION (MUST MATCH pre-tool-use.sh's Section 5 — documented there in
+# full + in the WP-E report): the keyword-substring pre-filter is DROPPED,
+# not revived verbatim, in favour of the existing match-count threshold
+# below. Rationale: (1) it duplicated gating this branch already had — the
+# `-ge 2` threshold already requires two-plus REAL KG matches before a
+# suggestion surfaces; a second, cruder pre-filter (a fixed 17-word
+# vocabulary) added no precision, only false negatives outside that list.
+# (2) R30's enrichment pipeline (vco_lib/query_enrichment.py, reached via
+# rl_kg_search.py's --transcript flag) is now the ONE mechanism this repo
+# uses to turn "recent text" into a properly-budgeted embeddable query. A
+# second, hand-rolled gate second-guessing that pipeline before it even
+# runs is exactly the two-mechanisms problem R31 exists to prevent.
+#
+# $Trigger is built ONLY from tool-call metadata (tool name + edited
+# file's basename) — never conversation text, so nothing privacy-sensitive
+# is composed in this script. Being short, it sits well under
+# query_enrichment.py's default 24-token threshold, so build_query() fills
+# the rest of the embedding budget by walking backward through the
+# transcript (last user prompt, then recent assistant chat/thinking) —
+# composed in-process by the shared component (R31: TranscriptPath is a
+# PATH, never text).
+$_kg5File = Get-Field "file_path"
+if ($_kg5File) {
+    $Trigger = "$($ToolName): $(Split-Path $_kg5File -Leaf)"
+} else {
+    $Trigger = $ToolName
+}
 
 # V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
 # hook shares the canonical chokepoint with the pre-edit-context-inject
@@ -428,7 +470,22 @@ if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
         $prevSessionEnv = $env:VCT_SESSION_ID
         try {
             $env:VCT_SESSION_ID = $SessionId
-            $rawOutput = & $VenvPy $RlScript $concepts --limit 3 --hook-format 2>$null
+            # WP-E (v0.2.92): route through the shared TTL cache
+            # (query-cache.ps1) when available so repeat Edit/Write calls
+            # within the same turn reuse one live search; PromptId scopes
+            # the key so a different turn with the same trigger doesn't
+            # collide with this turn's enriched result. Falls back to a
+            # direct call (with --transcript appended only when non-empty)
+            # when the cache helper isn't sourced. MUST MATCH
+            # pre-tool-use.sh's mirrored branch.
+            if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
+                $rawText = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Trigger -Limit 3 -PromptId $PromptId -TranscriptPath $TranscriptPath
+                $rawOutput = if ($rawText) { $rawText -split "`n" } else { @() }
+            } elseif ($TranscriptPath) {
+                $rawOutput = & $VenvPy $RlScript $Trigger --limit 3 --hook-format --transcript $TranscriptPath 2>$null
+            } else {
+                $rawOutput = & $VenvPy $RlScript $Trigger --limit 3 --hook-format 2>$null
+            }
         } finally {
             if ($null -eq $prevSessionEnv) {
                 Remove-Item Env:VCT_SESSION_ID -ErrorAction SilentlyContinue
@@ -459,7 +516,7 @@ if ($matchOutput) {
         # content guard.
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("")
-        [void]$sb.AppendLine("Found $($arr.Count) related patterns for: $concepts")
+        [void]$sb.AppendLine("Found $($arr.Count) related patterns for: $Trigger")
         foreach ($m in $arr) { [void]$sb.AppendLine("   $m") }
         [void]$sb.AppendLine("")
         [void]$sb.AppendLine("   Search more: 'Search knowledge graph for [concept]'")

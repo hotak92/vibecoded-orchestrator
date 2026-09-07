@@ -23,14 +23,14 @@ Run: pytest tests/test_env_template.py -v
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+from tests.common.launcher_db_fixture import add_kg_binding, make_launcher_db
 from vco_lib.config_projection import (
     DbUnreachable,
     ProjectNotFound,
@@ -61,93 +61,47 @@ def _make_launcher_db(
     codegraph_access: list[tuple[str, str]] | None = None,
     module_settings: list[tuple[str, str, str, str]] | None = None,
 ) -> None:
-    """Build a minimal launcher.db with the schema the resolver reads.
+    """Build a launcher.db with the REAL launcher schema, seeded for the
+    env-template resolver.
 
-    Identical to ``tests/test_config_projection.py::_make_launcher_db``;
-    intentionally duplicated rather than imported so the two test files
-    stay independently runnable (no cross-test-file fixture imports).
+    Same keyword shape as ``tests/test_config_projection.py::_make_launcher_db``
+    and still a separate body — but the SCHEMA is no longer restated here. It
+    comes from ``tests.common.launcher_db_fixture``, which applies the shipped
+    ``launcher/src-tauri/.../migrations/*.sql`` verbatim (v0.2.92 §3.4).
+
+    On "no cross-test-file fixture imports": the point of that rule was that
+    this file must not depend on ANOTHER TEST MODULE's private helper —
+    importing ``tests/test_config_projection.py`` would drag its collection
+    and its fixtures in, and either file's edits could break the other.
+    ``tests/common/`` is a shared helper PACKAGE, not a test module: pytest
+    never collects it, it defines no tests, and several test files already
+    import from it. So this file remains independently runnable — the rule
+    is satisfied, not bent.
     """
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT NOT NULL
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            embedding_model TEXT,
-            PRIMARY KEY (project_id, role)
-        );
-        CREATE TABLE kg_collection_access (
-            project_id TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            -- v0.2.49 Step F SF6 (L3-SF1): align test-only DDL with the
-            -- production schema. Migration 029 added these audit columns;
-            -- this fixture hand-rolls its own DDL and omitted them.
-            -- DEFAULT 0 matches migration 029's backfill of legacy rows.
-            created_at INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (project_id, collection_name)
-        );
-        CREATE TABLE codegraph_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE module_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT NOT NULL,
-            module_id TEXT NOT NULL,
-            setting_key TEXT NOT NULL,
-            setting_value TEXT NOT NULL,
-            UNIQUE(project_id, module_id, setting_key)
-        );
-        """
+    projects: list[dict[str, object]] = [{
+        "project_id": project_id,
+        "name": project_name,
+        "folder_path": project_folder,
+        "slug": project_slug,
+    }]
+    projects.extend(
+        {"project_id": pid, "name": name, "folder_path": folder, "slug": slug}
+        for pid, name, folder, slug in (extra_projects or [])
     )
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-        (project_id, project_name, project_folder, project_slug),
+    make_launcher_db(
+        db_path,
+        projects=projects,
+        module_settings=module_settings or [],
+        kg_access=[
+            (project_id, coll, level) for coll, level in (kg_access or [])
+        ],
+        codegraph_access=[
+            (grantor, project_id, level)
+            for grantor, level in (codegraph_access or [])
+        ],
     )
-    for row in extra_projects or []:
-        cur.execute(
-            "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-            row,
-        )
     for role, coll in (kg_bindings or {}).items():
-        cur.execute(
-            "INSERT INTO project_kg_bindings (project_id, role, collection_name) "
-            "VALUES (?, ?, ?)",
-            (project_id, role, coll),
-        )
-    for coll, level in kg_access or []:
-        cur.execute(
-            "INSERT INTO kg_collection_access (project_id, collection_name, access_level) "
-            "VALUES (?, ?, ?)",
-            (project_id, coll, level),
-        )
-    for grantor, level in codegraph_access or []:
-        cur.execute(
-            "INSERT INTO codegraph_access (grantor_project_id, grantee_project_id, "
-            "access_level, granted_at) VALUES (?, ?, ?, ?)",
-            (grantor, project_id, level, 0),
-        )
-    for pid, mid, key, value in module_settings or []:
-        cur.execute(
-            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value) "
-            "VALUES (?, ?, ?, ?)",
-            (pid, mid, key, value),
-        )
-    conn.commit()
-    conn.close()
+        add_kg_binding(db_path, project_id, role, coll)
 
 
 # ─── Subset invariant ───────────────────────────────────────────────────
@@ -566,11 +520,9 @@ def test_apply_creates_parent_dirs(tmp_path: Path) -> None:
 def _run_cli(*args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Run ``python -m vco_lib.env_template`` and capture output."""
     cmd = [sys.executable, "-m", "vco_lib.env_template", *args]
-    env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
-    repo_root = Path(__file__).resolve().parent.parent
-    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    # child_env() puts the repo root FIRST on PYTHONPATH so the child imports
+    # the CHECKOUT's vco_lib, never a stale site-packages copy (§3.16).
+    env = child_env(**(env_extra or {}))
     return subprocess.run(cmd, capture_output=True, text=True, env=env)
 
 

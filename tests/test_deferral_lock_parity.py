@@ -133,12 +133,12 @@ def test_lightweight_install_write_is_lock_wrapped() -> None:
     # NOTE: the with-statement uses the local import alias (`_xlock`), so key
     # on "with " + a lock-ish call rather than the imported symbol name.
     with_line = next(
-        l for l in window.splitlines()
-        if l.lstrip().startswith("with ") and "lock" in l.lower()
+        line for line in window.splitlines()
+        if line.lstrip().startswith("with ") and "lock" in line.lower()
     )
     with_indent = len(with_line) - len(with_line.lstrip())
     tail = src[start:start + 600]
-    write_line = next(l for l in tail.splitlines() if "_lightweight_deferral.write(_lightweight_folder)" in l)
+    write_line = next(line for line in tail.splitlines() if "_lightweight_deferral.write(_lightweight_folder)" in line)
     assert (len(write_line) - len(write_line.lstrip())) > with_indent, (
         "the write must be indented inside the exclusive_file_lock with-block"
     )

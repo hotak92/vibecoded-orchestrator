@@ -31,6 +31,7 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import schema_versions as sv  # noqa: E402
 
 
@@ -164,6 +165,7 @@ def test_regen_script_check_mode_succeeds_on_clean_state() -> None:
         capture_output=True,
         text=True,
         timeout=30,
+        env=child_env(),
     )
     assert result.returncode == 0, (
         f"regen_schema_versions_json.py --check failed:\n"
@@ -356,9 +358,7 @@ def test_launcher_db_table_set_version_matches_migration_count() -> None:
         / "migrations.rs"
     )
     src = migrations_rs.read_text(encoding="utf-8")
-    # Find every `version: N,` literal in the MIGRATIONS array.
     import re
-    versions = [int(m.group(1)) for m in re.finditer(r"version:\s*(\d+),", src)]
     # The MIGRATIONS array is the first chunk; defensively cap at the first
     # `];` so the test doesn't pick up versions in test fixtures further
     # down the file.
@@ -367,7 +367,34 @@ def test_launcher_db_table_set_version_matches_migration_count() -> None:
     versions_in_array = [
         int(m.group(1)) for m in re.finditer(r"version:\s*(\d+),", src_head)
     ]
-    assert versions_in_array, "no Migration entries found in MIGRATIONS array"
+    # ── Guard for the guard (v0.2.92) ────────────────────────────────────
+    # A non-empty check is NOT enough. If the `version: N,` shape changes,
+    # this scan can still match a handful of survivors, report a plausible
+    # wrong maximum, and PASS while the constant it exists to pin has
+    # silently stopped being pinned. The Rust twin
+    # (`launcher/src-tauri/tests/schema_versions_rust_parity.rs::
+    # the_migration_parse_is_not_vacuous`) has carried this floor since it
+    # was written; the Python side did not, and the asymmetry was the whole
+    # defect. Same floor, same anchor, same upper sanity bound — deliberately
+    # the same three assertions so a reader can diff them.
+    #
+    # If you are here because this failed after adding a migration: do NOT
+    # lower the floor. The array only grows; a SHRINKING parse means the
+    # scan broke or the array bounds moved.
+    assert len(versions_in_array) >= 40, (
+        f"parsed only {len(versions_in_array)} migration versions out of "
+        f"migrations.rs — the array has been growing since v0.2.x and cannot "
+        f"plausibly be this short. Either the `version: N,` shape changed or "
+        f"the `];` bound moved; fix the parse rather than lowering this floor."
+    )
+    assert 1 in versions_in_array, (
+        f"the initial migration (version 1) must be in the parsed set: "
+        f"{sorted(versions_in_array)}"
+    )
+    assert all(v <= 500 for v in versions_in_array), (
+        f"implausible version parsed — the scan escaped the MIGRATIONS "
+        f"array: {sorted(versions_in_array)}"
+    )
     max_version = max(versions_in_array)
     assert sv.LAUNCHER_DB_TABLE_SET_VERSION == max_version, (
         f"LAUNCHER_DB_TABLE_SET_VERSION = {sv.LAUNCHER_DB_TABLE_SET_VERSION} "

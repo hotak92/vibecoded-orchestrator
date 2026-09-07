@@ -28,9 +28,10 @@
 #      every modified file. On hit, append an entry to
 #      `.claude/logs/credential_alerts.jsonl` with the same schema
 #      post-tool-security.sh uses.
-#   5. Nudge counter — bump the parent session's row in
-#      `~/.claude/metrics/kg_update_tokens.jsonl` so the
-#      kg-update-nudge hook's threshold accounts for subagent work.
+#   5. Nudge counter — bump the parent session's row in the shared
+#      `kg_update_tokens.jsonl` (metrics dir resolved by
+#      `_lib/metrics-dir.sh`; v0.2.92 W7 moved it out of ~/.claude) so
+#      the kg-update-nudge hook's threshold accounts for subagent work.
 #      Work-unit estimate = file_count * 50 + total_diff_size_bytes/4
 #      (rough proxy for output tokens).
 #
@@ -212,8 +213,8 @@ fi
 
 # Tally diff stats for the nudge counter (computed before we mutate
 # the file set). file_count + total_bytes are the two inputs to the
-# work-unit estimate written into ~/.claude/metrics/kg_update_tokens.jsonl
-# at step 5.
+# work-unit estimate written into the shared kg_update_tokens.jsonl at
+# step 5.
 FILE_COUNT=0
 TOTAL_BYTES=0
 KG_FILES=()
@@ -402,18 +403,33 @@ fi
 
 # -------------------- Step 5: Nudge counter increment --------------------
 # Add subagent work to the parent session's row in the kg-update-nudge
-# counter file. The counter file lives under ~/.claude/metrics/ (not
-# .claude/) because nudge state is per-session not per-project; the
-# kg-update-nudge.sh hook reads from the same path.
+# counter file. The counter file lives under the machine-wide metrics dir
+# (not the project's .claude/) because nudge state is per-session, not
+# per-project; kg-update-nudge.sh resolves the same path through the same
+# `_lib/metrics-dir.sh` helper. v0.2.92 W7 moved that home out of
+# ~/.claude — both hooks moved together, which is why they still agree.
 #
 # Work-unit estimate proxy: file_count * 50 + total_bytes / 4. 50 per
 # file approximates the "agent had to think about it" overhead;
 # bytes/4 approximates output tokens (~4 chars/token English).
 # This is a rough metric — the nudge hook's threshold (175k first,
 # 50k interval) is order-of-magnitude-tolerant by design.
-if [ -n "$SESSION_ID" ] && [ "$FILE_COUNT" -gt 0 ]; then
-    NUDGE_FILE="$HOME/.claude/metrics/kg_update_tokens.jsonl"
-    mkdir -p "$(dirname "$NUDGE_FILE")" 2>/dev/null || true
+_SSR_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/metrics-dir.sh"
+if [ -n "$SESSION_ID" ] && [ "$FILE_COUNT" -gt 0 ] && [ -f "$_SSR_LIB" ]; then
+    # shellcheck source=_lib/metrics-dir.sh disable=SC1091
+    . "$_SSR_LIB"
+    NUDGE_DIR="$(vco_metrics_dir 2>/dev/null || printf '')"
+    NUDGE_FILE="${NUDGE_DIR:+$NUDGE_DIR/kg_update_tokens.jsonl}"
+    # Counter continuity across the W7 move — seed from the frozen archive
+    # when the new file does not exist yet, exactly as kg-update-nudge does,
+    # so a subagent's work is added to the session's real baseline instead of
+    # to a fresh zero. Read-only against the archive.
+    if [ -n "$NUDGE_FILE" ] && [ ! -f "$NUDGE_FILE" ]; then
+        _SSR_LEGACY="$(vco_metrics_read_file "kg_update_tokens.jsonl" 2>/dev/null || printf '')"
+        if [ -n "$_SSR_LEGACY" ] && [ "$_SSR_LEGACY" != "$NUDGE_FILE" ]; then
+            cp "$_SSR_LEGACY" "$NUDGE_FILE" 2>/dev/null || true
+        fi
+    fi
     WORK_UNITS=$(( FILE_COUNT * 50 + TOTAL_BYTES / 4 ))
     SESSION_ID_FOR_PY="$SESSION_ID" \
     WORK_UNITS_FOR_PY="$WORK_UNITS" \

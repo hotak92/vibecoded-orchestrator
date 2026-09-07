@@ -131,6 +131,7 @@
   ],
   "concepts/kg-summary-three-tier-pipeline.md": [
    "27af83fc4fe586d33bcb7ccfc8a2672c1c37734596b1fab840fc0f810c232b89",
+   "2f0c49d310c3dd17a1d7b078d1eefecd9c35c984527bb77d5ae97a63225f5123",
    "9c8c87a097d0477d5aee1bf74db80217c5418391e9078955c64d0fc0bcd0bdc6",
    "af9bf45e11782abc36284c901349421bfd6b877859dde1a4d17dbf5014c1d9ec",
    "eb259aba8e5dcc5308e3b4b00d6c9118fa37cd17b694b0587878aec9aea3f309",
@@ -450,6 +451,7 @@
   ],
   "models/qwen3-embedding.md": [
    "98ab0ddd813c10d5dc771ebf3b87ddda44265843422546debd5e41fbd8d39def",
+   "e331a05857ed55ef4e8de1a22c9efa9cb2fe001d73c4ce07ecbcbee3a16def5d",
    "f9d2d453f4e61bbda3315c891383f41a16656ae12b8b5378641a3aa35639ad53"
   ],
   "models/qwen3.5.md": [
@@ -516,6 +518,6 @@
    "f677af0f4e90801d9a080061d0abd443a6391316950bfa057e13466f11bf2b08"
   ]
  },
- "generated_at": "2026-08-28T15:11:02Z",
+ "generated_at": "2026-09-04T16:16:49Z",
  "schema_version": 1
 }

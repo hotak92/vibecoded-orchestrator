@@ -40,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 from vco_lib.config_projection import (  # noqa: E402
     list_canonical_keys,
     project_env_from_db,
@@ -61,77 +62,27 @@ def _make_launcher_db(
     module_settings: list[tuple[str, str, str, str]] | None = None,
     app_state: dict[str, str] | None = None,
 ) -> None:
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT NOT NULL
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            embedding_model TEXT,
-            PRIMARY KEY (project_id, role)
-        );
-        CREATE TABLE kg_collection_access (
-            project_id TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            created_at INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (project_id, collection_name)
-        );
-        CREATE TABLE codegraph_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE diagram_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE module_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT NOT NULL,
-            module_id TEXT NOT NULL,
-            setting_key TEXT NOT NULL,
-            setting_value TEXT NOT NULL,
-            UNIQUE(project_id, module_id, setting_key)
-        );
-        CREATE TABLE app_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        """
+    """Seed a launcher.db with the REAL launcher schema (v0.2.92 §3.4).
+
+    The DDL this replaces was a trimmed copy of
+    ``test_config_projection._make_launcher_db``'s copy — a guess at a guess.
+    ``tests.common.launcher_db_fixture`` applies the shipped migrations
+    instead, so ``projects.host``, ``app_state.updated_at`` and the
+    ``project_kg_bindings.role`` CHECK are all whatever production has.
+    """
+    make_launcher_db(
+        db_path,
+        projects=[{
+            "project_id": project_id,
+            "name": "Demo",
+            "folder_path": project_folder,
+            "slug": project_slug,
+        }],
+        module_settings=module_settings or [],
+        # v0.2.91 WP-L: host-wide defaults (and the diagnostic log level) live
+        # in app_state, so the fixture must be able to seed it.
+        app_state=app_state or {},
     )
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-        (project_id, "Demo", project_folder, project_slug),
-    )
-    for pid, mid, key, value in module_settings or []:
-        cur.execute(
-            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value) "
-            "VALUES (?, ?, ?, ?)",
-            (pid, mid, key, value),
-        )
-    # v0.2.91 WP-L: host-wide defaults (and the diagnostic log level) live in
-    # app_state, so the fixture must be able to seed it.
-    for key, value in (app_state or {}).items():
-        cur.execute(
-            "INSERT INTO app_state (key, value) VALUES (?, ?)", (key, value)
-        )
-    conn.commit()
-    conn.close()
 
 
 def _setting(conn: sqlite3.Connection, pid: str, mid: str, key: str) -> object | None:

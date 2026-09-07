@@ -22,6 +22,7 @@ import {
   detectModuleErrorAfterAction,
   installProgressLabel,
   moduleActionForKind,
+  resolveProjectScopedAction,
   resolveTileDisplay,
   semverLess,
   statusBadgeLabel,
@@ -395,6 +396,80 @@ describe('moduleActionForKind', () => {
     expect(moduleActionForKind(null)).toBeNull();
     expect(moduleActionForKind(undefined)).toBeNull();
     expect(moduleActionForKind('totally-unknown')).toBeNull();
+  });
+});
+
+describe('resolveProjectScopedAction', () => {
+  // Field report, 2026-08-31: Home page showed "Update" for a project
+  // that had never installed the module (catalog kind='update_available'
+  // came from a DIFFERENT project's older install), and clicking it hit
+  // the backend's per-project "not installed for project <uuid>" error.
+
+  it('update_available + LOADED and no row for this project (false) → falls back to Install, kind corrected to available', () => {
+    // Must not regress: this is the original fix's behaviour, now gated
+    // behind the tri-state param's `false` (positively-confirmed-absent)
+    // branch rather than any falsy value.
+    const result = resolveProjectScopedAction('update_available', false);
+    expect(result.action).toEqual({ label: 'Install', method: 'install' });
+    expect(result.kindOverride).toBe('available');
+    expect(result.pending).toBe(false);
+  });
+
+  it('update_available + row exists for this project (true) → normal Update action, no kind override', () => {
+    const result = resolveProjectScopedAction('update_available', true);
+    expect(result.action).toEqual({ label: 'Update', method: 'update' });
+    expect(result.kindOverride).toBeNull();
+    expect(result.pending).toBe(false);
+  });
+
+  // v0.2.92 coordinator follow-up: `null` ("we don't know yet" — the
+  // store hasn't finished loading this project's install rows, or the
+  // load failed) must NOT collapse into the `false` ("loaded, and
+  // genuinely absent") branch. CLAUDE.md "Conservative defaults on
+  // best-effort paths": an unconfirmed precondition must not be guessed.
+  it('update_available + UNKNOWN (null) → does NOT override kind, does NOT guess Install; returns the un-overridden action as pending', () => {
+    const result = resolveProjectScopedAction('update_available', null);
+    // Catalog kind is left alone (no 'available' override — the badge
+    // must keep reading "Update available", not silently flip to
+    // "Available" based on state we don't have).
+    expect(result.kindOverride).toBeNull();
+    // The action returned is the SAME one the catalog kind would produce
+    // un-overridden (Update) — NOT a guessed Install, and NOT null. The
+    // caller is responsible for rendering it disabled via `pending`.
+    expect(result.action).toEqual({ label: 'Update', method: 'update' });
+    expect(result.pending).toBe(true);
+  });
+
+  it('broken kind is untouched regardless of per-project row, including unknown (install is UPSERT-safe)', () => {
+    for (const hasRow of [false, true, null]) {
+      expect(resolveProjectScopedAction('broken', hasRow)).toEqual({
+        kindOverride: null,
+        action: { label: 'Reinstall', method: 'install' },
+        pending: false,
+      });
+    }
+  });
+
+  it('error kind is untouched regardless of per-project row, including unknown (install is UPSERT-safe)', () => {
+    for (const hasRow of [false, true, null]) {
+      expect(resolveProjectScopedAction('error', hasRow)).toEqual({
+        kindOverride: null,
+        action: { label: 'Retry install', method: 'install' },
+        pending: false,
+      });
+    }
+  });
+
+  it('non-actionable kinds return null action + no kind override + never pending, including unknown', () => {
+    for (const kind of ['bundled', 'installed', 'available', 'subcomponent', 'coming_soon']) {
+      for (const hasRow of [false, true, null]) {
+        expect(resolveProjectScopedAction(kind, hasRow)).toEqual({
+          kindOverride: null,
+          action: null,
+          pending: false,
+        });
+      }
+    }
   });
 });
 

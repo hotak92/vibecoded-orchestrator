@@ -5,7 +5,6 @@
 Verifies the modules added per docs/INSTALL_ARCHITECTURE_v2.md §7:
 * vco_lib.atomic     — atomic file writes (CORRECT-1 prep)
 * vco_lib.hashing    — sha256 helpers
-* vco_lib.settings_merge — settings.json merge (stub)
 * vco_lib.timeutil   — UTC ISO-8601 helpers
 * vco_lib.git_meta   — git HEAD / rev resolution
 
@@ -113,27 +112,6 @@ def test_sha256_file_matches_bytes(tmp_path):
     target.write_text("hello world")
     assert sha256_file(target) == sha256_bytes(b"hello world")
 
-
-# ---------------------------------------------------------------------------
-# vco_lib.settings_merge (stub)
-# ---------------------------------------------------------------------------
-
-def test_settings_merge_module_imports():
-    from vco_lib import settings_merge
-    assert hasattr(settings_merge, "merge_settings_template")
-    assert hasattr(settings_merge, "SettingsMergeResult")
-
-
-def test_settings_merge_template_stub_raises(tmp_path):
-    """v0.2.53 stub: calling the function raises NotImplementedError."""
-    from vco_lib.settings_merge import merge_settings_template
-    with pytest.raises(NotImplementedError):
-        merge_settings_template(tmp_path / "settings.json", {})
-
-
-# ---------------------------------------------------------------------------
-# vco_lib.timeutil
-# ---------------------------------------------------------------------------
 
 def test_timeutil_module_imports():
     from vco_lib import timeutil

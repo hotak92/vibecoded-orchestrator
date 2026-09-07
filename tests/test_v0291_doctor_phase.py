@@ -470,6 +470,39 @@ class ReportRenderingTests(unittest.TestCase):
             self.assertIn(f["status"], (doctor.STATUS_OK, doctor.STATUS_PROBLEM,
                                         doctor.STATUS_UNKNOWN))
 
+    def test_fix_directive_only_on_problems(self):
+        """v0.2.92 (reported-not-fixed item 1): the JSON contract omits `fix`
+        on every non-problem finding. `fix` is an action verb ("defer" /
+        "auto_fix"); an OK or unknown finding carrying "fix": "defer" is a
+        trap for any consumer that branches on the key — the same class of
+        defect as stdout-as-machine-contract. The only in-repo JSON consumer
+        (launcher summarize_boot_findings) reads `status` alone, verified
+        2026-09-05; absence is therefore the back-compat-safe, unambiguous
+        "nothing to do".
+
+        Red-proof: restoring the unconditional `"fix": f.fix` in
+        `DoctorReport.to_dict` makes this red."""
+        # A healthy machine: every non-problem finding must carry NO key.
+        report = doctor.run_doctor(Path("/tmp/x"), resolvers=_resolvers())
+        payload = json.loads(json.dumps(report.to_dict()))
+        self.assertTrue(payload["findings"])
+        for f in payload["findings"]:
+            if f["status"] != doctor.STATUS_PROBLEM:
+                self.assertNotIn("fix", f, f"{f['probe']} carries a fix")
+        # A machine with one problem: problems still carry the directive.
+        broken = _resolvers(
+            npx={"npx_present": False, "npx_path": "", "npm_present": False,
+                 "commands": {"npx": None, "npm": None}},
+            servers={"playwright": {"command": "npx"}},
+        )
+        report = doctor.run_doctor(Path("/tmp/x"), resolvers=broken)
+        payload = json.loads(json.dumps(report.to_dict()))
+        problems = [f for f in payload["findings"]
+                    if f["status"] == doctor.STATUS_PROBLEM]
+        self.assertTrue(problems)
+        for f in problems:
+            self.assertIn(f["fix"], (doctor.FIX_AUTO, doctor.FIX_DEFER))
+
     def test_problems_render_first(self):
         res = _resolvers(
             npx={"npx_present": False, "npx_path": "", "npm_present": False,
@@ -641,3 +674,44 @@ class InstallPyWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ─── v0.2.92 R42 follow-up: the npx remediation must be paste-able on Windows ─
+
+class NpxRemediationCrossOsTests(unittest.TestCase):
+    """The npm-present branch printed one POSIX recipe (ln -s + readlink -f +
+    command -v) to every OS — a Windows user reporting this class could not
+    paste any of it. It now branches; and the verify pair is two lines because
+    PowerShell 5.1 (the default powershell.exe on Windows 10/11) rejects `&&`."""
+
+    def test_windows_npm_present_names_windows_moves(self):
+        with mock.patch("vco_lib.doctor.sys.platform", "win32"):
+            block = doctor._npx_remediation(npm_present=True)
+        self.assertNotIn("ln -s", block)
+        self.assertNotIn("readlink", block)
+        self.assertNotIn("command -v", block)
+        self.assertIn("where.exe npm", block)   # paste-able in cmd AND PowerShell
+        self.assertNotIn("&&", block)           # PS 5.1 rejects &&
+        self.assertIn("reopen Claude Code", block)
+
+    def test_windows_npm_absent_two_line_verify(self):
+        with mock.patch("vco_lib.doctor.sys.platform", "win32"):
+            block = doctor._npx_remediation(npm_present=False)
+        self.assertIn("https://nodejs.org", block)
+        self.assertNotIn("&&", block)
+        self.assertIn("#   node --version\n", block)
+        self.assertIn("#   npx --version", block)
+
+    def test_posix_branch_keeps_the_symlink_recipe(self):
+        with mock.patch("vco_lib.doctor.sys.platform", "linux"):
+            block = doctor._npx_remediation(npm_present=True)
+        self.assertIn("ln -s", block)
+        self.assertIn("~/.local/bin/npx", block)
+        self.assertNotIn("&&", block)
+
+    def test_posix_branch_two_line_verify(self):
+        with mock.patch("vco_lib.doctor.sys.platform", "linux"):
+            block = doctor._npx_remediation(npm_present=False)
+        self.assertNotIn("&&", block)
+        self.assertIn("#   node --version\n", block)
+        self.assertIn("#   npx --version", block)

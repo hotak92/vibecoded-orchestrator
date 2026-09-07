@@ -44,8 +44,8 @@ import json
 import os
 import re
 import socket
-import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -56,6 +56,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    connect,
+    create_empty_launcher_db,
+)
 import install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
@@ -163,42 +167,31 @@ def _start_stub_weaviate(
 # ─── launcher.db helpers ──────────────────────────────────────────────────
 
 
-_PROJECT_KG_BINDINGS_DDL = """
-CREATE TABLE project_kg_bindings (
-    project_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    collection_name TEXT NOT NULL,
-    embedding_model TEXT,
-    embedding_dim INTEGER,
-    kg_dir_path TEXT,
-    weaviate_url TEXT,
-    config_json TEXT,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (project_id, role)
+_INSERT_BINDING_SQL = (
+    "INSERT INTO project_kg_bindings "
+    "(project_id, role, collection_name, embedding_model, "
+    "embedding_dim, kg_dir_path, weaviate_url, config_json, "
+    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)"
 )
-"""
 
 
 def _build_launcher_db(
     db_path: Path,
     rows: list[tuple[str, str, str, str]],
 ) -> None:
-    """Create launcher.db with project_kg_bindings seeded with rows.
+    """Create launcher.db (REAL schema) with project_kg_bindings seeded.
 
     Each row is ``(project_id, role, collection_name, config_json)``.
-    Use ``"{}"`` when no prior config_json is set.
+    Use ``"{}"`` when no prior config_json is set. ``role`` must satisfy the
+    real table's CHECK — ``primary`` | ``shared`` | ``archive``.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    create_empty_launcher_db(db_path)
+    conn = connect(db_path)
     try:
-        conn.execute(_PROJECT_KG_BINDINGS_DDL)
         now = int(time.time() * 1000)
         for project_id, role, collection_name, config_json in rows:
             conn.execute(
-                "INSERT INTO project_kg_bindings "
-                "(project_id, role, collection_name, embedding_model, "
-                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+                _INSERT_BINDING_SQL,
                 (project_id, role, collection_name, config_json, now),
             )
         conn.commit()
@@ -210,7 +203,7 @@ def _read_bindings(
     db_path: Path,
 ) -> list[tuple[str, str, str, str]]:
     """Return ``(project_id, role, collection_name, config_json)`` rows."""
-    conn = sqlite3.connect(str(db_path))
+    conn = connect(db_path)
     try:
         cur = conn.execute(
             "SELECT project_id, role, collection_name, config_json "
@@ -500,11 +493,20 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
 
     # ── T6 ───────────────────────────────────────────────────────────
     def test_t6_development_suffix_adoption(self):
-        """The same logic applies to ``_Development`` collections."""
+        """The same logic applies to ``_Development`` collections.
+
+        The role is ``archive``: that is what production binds a
+        ``_Development`` collection under (see the ``_ROLE_LEVEL`` mapping in
+        ``vco_lib.kg_binding_heal``, "role=archive → read (Development)"),
+        and it is one of the three values the real table's CHECK admits. The
+        pre-migration fixture used ``"dev"``, a role production cannot write.
+        Nothing about the property under test changes: the adopt pass selects
+        bindings ROLE-UNFILTERED and keys on the collection-name suffix.
+        """
         _build_launcher_db(
             self._db_path,
             rows=[
-                ("p1", "dev",
+                ("p1", "archive",
                  "VibeCodedOrchestrator_Development", "{}"),
             ],
         )
@@ -620,6 +622,62 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
         self.assertNotIn("kg_binding_self_healed", ids)
         self.assertNotIn("multi_candidate_prefix_adopt", ids)
 
+    # ── T10 (v0.2.92 D18) ────────────────────────────────────────────
+    def test_t10_primary_role_ghost_binding_is_adopted(self):
+        """D18 (KNOWN_ISSUES v0.2.92): a project renamed OUTSIDE VCO's
+        rename tool can leave the PRIMARY binding pointing at the
+        pre-rename ("ghost") class while a populated class lives under
+        the new prefix. The adopt pass selects ``project_kg_bindings``
+        with NO role filter, so a primary-row ghost is healed exactly
+        like the shared rows every other test in this class exercises.
+
+        This test pins PRIMARY coverage on purpose: every other adopt
+        test uses the ``shared`` role, so a future role filter would
+        keep the whole file green while silently reintroducing D18.
+        Run through ``install._self_heal_kg_bindings_on_update`` (the
+        production entry point) so the fix is proven WIRED, not merely
+        present in the helper.
+        """
+        _build_launcher_db(
+            self._db_path,
+            rows=[
+                ("p-d18", "primary", "GhostName_KnowledgeGraph", "{}"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["RealName_KnowledgeGraph"],
+            counts={"RealName_KnowledgeGraph": 421},
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Primary binding rebound to the populated class, tagged.
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            [(pid, role, coll) for (pid, role, coll, _cfg) in bindings],
+            [("p-d18", "primary", "RealName_KnowledgeGraph")],
+        )
+        cfg = json.loads(bindings[0][3])
+        self.assertEqual(
+            cfg.get("manual_override"), "v0.2.40-prefix-adopt"
+        )
+
+        # Informational deferral names the adoption.
+        entries = report.entries
+        ids = [e.condition_id for e in entries]
+        self.assertIn("kg_binding_self_healed", ids)
+        healed = next(
+            e for e in entries
+            if e.condition_id == "kg_binding_self_healed"
+        )
+        self.assertIn("RealName_KnowledgeGraph", healed.detected)
+        self.assertIn("GhostName_KnowledgeGraph", healed.detected)
+        self.assertIn("role=primary", healed.detected)
+        self.assertIn("421", healed.detected)  # row count surfaced
+        self.assertNotIn("multi_candidate_prefix_adopt", ids)
+
 
 # ─── Direct helper tests for _prefix_adopt_kg_bindings_pass ─────────────
 
@@ -638,9 +696,15 @@ class PrefixAdoptHelperTests(unittest.TestCase):
             counts={"Foo_KnowledgeGraph": 10, "Bar_KnowledgeGraph": 20},
         )
         self._weaviate_url = f"http://127.0.0.1:{self._port}"
-        self._conn = sqlite3.connect(":memory:")
+        # A file-backed DB, not ``:memory:``: the real schema is produced by
+        # APPLYING the shipped migration files, which needs a path. The helper
+        # under test takes a cursor, so this is otherwise equivalent.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._conn = connect(
+            create_empty_launcher_db(Path(self._tmp.name) / "launcher.db")
+        )
         self._cur = self._conn.cursor()
-        self._cur.execute(_PROJECT_KG_BINDINGS_DDL)
 
     def tearDown(self):
         self._conn.close()
@@ -650,10 +714,7 @@ class PrefixAdoptHelperTests(unittest.TestCase):
 
     def _insert(self, project_id, role, collection_name, config_json="{}"):
         self._cur.execute(
-            "INSERT INTO project_kg_bindings "
-            "(project_id, role, collection_name, embedding_model, "
-            "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-            "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+            _INSERT_BINDING_SQL,
             (project_id, role, collection_name, config_json,
              int(time.time() * 1000)),
         )

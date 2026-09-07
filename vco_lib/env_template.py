@@ -221,7 +221,6 @@ from vco_lib.atomic import atomic_write_text
 from vco_lib.config_projection import (
     ConfigProjectionError,
     DbUnreachable,
-    ProjectEnvBundle,
     ProjectNotFound,
     list_canonical_keys,
     project_env_from_db,

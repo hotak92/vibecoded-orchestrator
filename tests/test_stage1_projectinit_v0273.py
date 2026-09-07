@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -34,8 +35,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import seed_launcher_db  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 from vco_lib import launcher_db_reader  # noqa: E402
+
+
+def _seed_min_launcher_db(
+    db_path, *, project_name, folder_path, kg_primary, codegraph_prefix,
+):
+    """One registered project — the shared fixture, keyword-shaped."""
+    return seed_launcher_db(db_path, [{
+        "name": project_name,
+        "folder_path": folder_path,
+        "kg_primary": kg_primary,
+        "codegraph_prefix": codegraph_prefix,
+    }])
+
 
 URL = "http://localhost:8081"
 
@@ -167,19 +182,52 @@ class LegacyKgDropRevalidationTests(unittest.TestCase):
 
 
 class KgBindingKeepSetNormalisedTests(unittest.TestCase):
-    def test_soft_fail_on_reader_exception(self):
-        with mock.patch("vco_lib.launcher_db_reader.kg_binding_keep_set",
+    """v0.2.92 W8: the KG keep-set now comes from the identity SSOT
+    (``vco_lib.project_identity.resolve_snapshot``) rather than straight from
+    ``launcher_db_reader.kg_binding_keep_set``, because the binding table stores
+    NO row for the derived ``_Development`` / ``_Diagrams`` siblings a project
+    actually reads. These mocks follow the source; the contract they pin
+    (soft-fail → unresolvable, normalisation applied) is unchanged."""
+
+    def test_soft_fail_on_resolver_exception(self):
+        with mock.patch("vco_lib.project_identity.resolve_snapshot",
                         side_effect=RuntimeError("boom")):
             normed, resolvable = project_init._kg_binding_keep_set_normalised()
         self.assertEqual(normed, set())
         self.assertFalse(resolvable)
 
+    def test_unresolvable_snapshot_is_unresolvable_keepset(self):
+        from vco_lib import project_identity
+        with mock.patch("vco_lib.project_identity.resolve_snapshot",
+                        return_value=project_identity.IdentitySnapshot(
+                            resolvable=False, projects=())):
+            normed, resolvable = project_init._kg_binding_keep_set_normalised()
+        self.assertEqual(normed, set())
+        self.assertFalse(resolvable)
+
     def test_normalisation_applied(self):
-        with mock.patch("vco_lib.launcher_db_reader.kg_binding_keep_set",
-                        return_value=(["Foo_KnowledgeGraph", "Bar_Development"], True)):
+        from vco_lib import project_identity
+        snap = project_identity.IdentitySnapshot(
+            resolvable=True,
+            projects=(
+                project_identity.ProjectIdentity(
+                    name="Foo", project_id="p1", slug="foo",
+                    folder_path="/tmp/foo",
+                    kg_primary="Foo_KnowledgeGraph",
+                    development="Foo_Development",
+                    diagrams="Foo_Diagrams",
+                ),
+            ),
+        )
+        with mock.patch("vco_lib.project_identity.resolve_snapshot",
+                        return_value=snap):
             normed, resolvable = project_init._kg_binding_keep_set_normalised()
         self.assertTrue(resolvable)
         self.assertIn(project_init._normalise_prefix_for_match("Foo_KnowledgeGraph"), normed)
+        # W8 widening: the DERIVED siblings (no binding row of their own) and
+        # the shared family PREFIX are keep-tokens too.
+        self.assertIn(project_init._normalise_prefix_for_match("Foo_Development"), normed)
+        self.assertIn(project_init._normalise_prefix_for_match("Foo"), normed)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -207,7 +255,17 @@ def _make_fake_orchestrator(root: Path) -> None:
 
 
 class PrefixDriftThroughFlowTests(unittest.TestCase):
-    """F1: the wiring makes install_project_bundle actually invoke the detector."""
+    """F1: the wiring makes install_project_bundle actually invoke the detector.
+
+    v0.2.92 W8 — HERMETIC launcher.db. The bundle flow now resolves the
+    project's authoritative identity from launcher.db before running any
+    collection detector, and skips all of them when the DB is unreadable
+    (conservative: never guess from the folder basename). Without a pinned DB
+    these tests would read whatever launcher.db the developer's machine happens
+    to have and behave differently in CI, so the fixture registers the project
+    explicitly with a name that DIFFERS from the folder basename — which is also
+    the shape the W8 bug needed.
+    """
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-s1-"))
@@ -216,14 +274,28 @@ class PrefixDriftThroughFlowTests(unittest.TestCase):
         self.orch.mkdir()
         self.proj.mkdir()
         _make_fake_orchestrator(self.orch)
+        self.db = self.tmp / "launcher.db"
+        _seed_min_launcher_db(
+            self.db,
+            project_name="ACME_widget",
+            folder_path=str(self.proj),
+            kg_primary="ACMEWidget_KnowledgeGraph",
+            codegraph_prefix="ACME_widget",
+        )
+        self._env = mock.patch.dict(
+            os.environ, {"VCT_LAUNCHER_DB_PATH": str(self.db)},
+        )
+        self._env.start()
 
     def tearDown(self):
+        self._env.stop()
         import shutil
         shutil.rmtree(str(self.tmp), ignore_errors=True)
 
     def test_bundle_update_invokes_drift_detector_and_emits_deferral(self):
-        # Pre-seed a STALE prefix generation so the current prefix (derived from
-        # the project folder name "myproj") differs → drift.
+        # Pre-seed a STALE prefix generation so the current (BOUND) prefix
+        # differs → drift. "Oldprefix" is neither the binding nor the folder
+        # basename derivation, so it is genuine drift, not W8 poison.
         project_init._write_codegraph_prefix_generation(self.proj, "Oldprefix")
         # Weaviate down: legacy detectors soft-fail; the drift detector still
         # runs (it needs no network for detection).
@@ -236,6 +308,8 @@ class PrefixDriftThroughFlowTests(unittest.TestCase):
         self.assertIn("codegraph_prefix_drift", result)
         self.assertIsNotNone(result["codegraph_prefix_drift"])
         self.assertEqual(result["codegraph_prefix_drift"]["old_prefix"], "Oldprefix")
+        # W8: the NEW prefix is the BOUND one, not a folder-basename guess.
+        self.assertEqual(result["codegraph_prefix_drift"]["new_prefix"], "ACME_widget")
         # THE deferral actually landed on disk (the point of F1 — it was inert).
         md = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md").read_text()
         self.assertIn("codegraph_prefix_drift_detected", md)
@@ -249,12 +323,34 @@ class PrefixDriftThroughFlowTests(unittest.TestCase):
                 self.proj, orchestrator_root=self.orch, update_mode=True,
             )
         self.assertIsNone(result.get("codegraph_prefix_drift"))
-        # Baseline was recorded by the wired detector.
-        self.assertIsNotNone(
-            project_init._read_codegraph_prefix_generation(self.proj))
+        # Baseline was recorded by the wired detector — as the BOUND prefix.
+        self.assertEqual(
+            project_init._read_codegraph_prefix_generation(self.proj),
+            "ACME_widget")
         md_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
         if md_path.exists():
             self.assertNotIn("codegraph_prefix_drift_detected", md_path.read_text())
+
+    def test_unreadable_launcher_db_skips_every_collection_consumer(self):
+        # v0.2.92 W8 / R6: no launcher.db → we cannot tell live collections from
+        # dead ones, so nothing is detected, nothing is deferred, and NO prefix
+        # baseline is stamped (a guessed baseline is worse than none).
+        missing = self.tmp / "does-not-exist.db"
+        with mock.patch.dict(os.environ, {"VCT_LAUNCHER_DB_PATH": str(missing)}), \
+             mock.patch.object(project_init, "_http_request",
+                               side_effect=_http_mock(
+                                   ["Widget_KnowledgeGraph", "Widget_CodeFunction"],
+                                   counts={"Widget_KnowledgeGraph": 10,
+                                           "Widget_CodeFunction": 1692})):
+            result = project_init.install_project_bundle(
+                self.proj, orchestrator_root=self.orch, update_mode=True,
+            )
+        self.assertEqual(result["legacy_kg_candidates"], [])
+        self.assertEqual(result["legacy_codegraph_candidates"], [])
+        self.assertIsNone(result.get("codegraph_prefix_drift"))
+        self.assertIsNone(result.get("authoritative_identity"))
+        self.assertIsNone(
+            project_init._read_codegraph_prefix_generation(self.proj))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -366,11 +462,18 @@ class OrphanLivePrefixSnapshotTests(unittest.TestCase):
 class KeepSetSingleConnectionTests(unittest.TestCase):
 
     def test_mid_read_db_failure_yields_unresolvable_not_empty_true(self):
-        # The OUTER open succeeds (resolvable=True path), but the reads that
-        # populate the prefix list run on the SAME connection now. If we simulate
-        # the connection being unusable for the reads, we must NOT return
-        # (empty, True) — the fix keeps everything on one open, so a broken read
-        # cannot decouple resolvable from the prefixes.
+        # The OUTER open succeeds, but the read that populates the prefix list
+        # fails on that same connection.
+        #
+        # v0.2.92 F-1: this now returns (empty, FALSE). Until then it returned
+        # (empty, TRUE) — the very thing this test's NAME forbids — because
+        # `_codegraph_binding_prefixes_on_conn` mapped a failed query to `[]`,
+        # indistinguishable from a genuinely empty table. Downstream that reads
+        # as "no project holds any code-graph prefix", so
+        # `_legacy_codegraph_drop_revalidated` ALLOWED the drop of a live bound
+        # class. SQLite opens lazily, so this is not hypothetical: a non-SQLite
+        # blob (or a DB with no `project_codegraph_bindings` table) at
+        # VCT_LAUNCHER_DB_PATH opens fine and fails on first query.
         class _BrokenConn:
             def execute(self, *a, **k):
                 raise Exception("db vanished mid-read")
@@ -381,12 +484,26 @@ class KeepSetSingleConnectionTests(unittest.TestCase):
         with mock.patch.object(launcher_db_reader, "_open_db_readonly",
                                return_value=_BrokenConn()):
             prefixes, resolvable = launcher_db_reader.codegraph_binding_keep_set()
-        # One open established resolvable=True; the reads soft-fail to [] on the
-        # SAME conn — so the pair is (empty, True) ONLY because the SINGLE conn
-        # was reachable at open. The TOCTOU the fix closes is: reads no longer
-        # RE-OPEN, so they can't be True+empty due to a SECOND failed open.
-        self.assertTrue(resolvable)
+        self.assertFalse(
+            resolvable,
+            "a FAILED binding read must report unresolvable — an empty-and-"
+            "confirmed keep-set clears every live prefix for deletion")
         self.assertEqual(prefixes, [])
+
+    def test_kg_mid_read_db_failure_yields_unresolvable(self):
+        """The KG twin of the case above (v0.2.92 F-1, same conflation)."""
+        class _BrokenConn:
+            def execute(self, *a, **k):
+                raise Exception("db vanished mid-read")
+
+            def close(self):
+                pass
+
+        with mock.patch.object(launcher_db_reader, "_open_db_readonly",
+                               return_value=_BrokenConn()):
+            names, resolvable = launcher_db_reader.kg_binding_keep_set()
+        self.assertFalse(resolvable)
+        self.assertEqual(names, [])
 
     def test_db_unopenable_yields_unresolvable(self):
         with mock.patch.object(launcher_db_reader, "_open_db_readonly",

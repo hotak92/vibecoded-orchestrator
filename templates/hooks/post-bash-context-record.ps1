@@ -73,7 +73,7 @@ if ($ToolResponse.StartsWith('<tool_use_error>') -or
 
 $StateJson = ""
 try { $StateJson = (Get-Content -Path $StateFile -Raw -ErrorAction Stop) } catch { }
-$EndTsMs = [int64]((Get-Date) - (Get-Date "1970-01-01Z").ToUniversalTime()).TotalMilliseconds
+$EndTsMs = [long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
 # === Resolve venv + emit bash_outcome via Python helper ===
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")

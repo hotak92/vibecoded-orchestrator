@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import project_init as pi  # noqa: E402
 from vco_lib import artifact_version_registry as avr  # noqa: E402
 from vco_lib import schema_versions as sv  # noqa: E402
@@ -134,7 +135,7 @@ class CheckNodeFormatsSchemaSubcommandTests(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, "-m", "vco_lib.project_init", "check-node-formats-schema",
              "--folder", str(folder), "--db", str(db), "--now-ms", str(now_ms)],
-            capture_output=True, text=True, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, cwd=str(REPO_ROOT), env=child_env(),
         )
         return r, json.loads(r.stdout)
 

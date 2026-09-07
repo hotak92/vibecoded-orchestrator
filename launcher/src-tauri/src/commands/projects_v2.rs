@@ -691,7 +691,7 @@ pub(crate) fn create_setup_phases(
     safe_add: bool,
 ) -> crate::commands::project_setup::SetupPhaseFn {
     use crate::commands::project_setup::{
-        classify_warning, PhaseReporter, SetupOutcome, SetupWarning, SetupWarningSeverity,
+        record_setup_warning, PhaseReporter, SetupOutcome, SetupWarning,
     };
     use crate::db::project_setups::phase as setup_phase;
 
@@ -703,27 +703,11 @@ pub(crate) fn create_setup_phases(
             let mut failed = false;
             let mut first_error: Option<String> = None;
 
-            // Helper: classify + record one raw warning string.
-            let record = |raw: String,
-                              warnings: &mut Vec<SetupWarning>,
-                              deferred: &mut bool,
-                              failed: &mut bool,
-                              first_error: &mut Option<String>| {
-                let (severity, is_deferral) = classify_warning(&raw);
-                if is_deferral {
-                    *deferred = true;
-                }
-                if severity == SetupWarningSeverity::Error {
-                    *failed = true;
-                    if first_error.is_none() {
-                        *first_error = Some(raw.clone());
-                    }
-                }
-                warnings.push(SetupWarning {
-                    message: raw,
-                    severity,
-                });
-            };
+            // Classify + fold one raw warning string. The `phase_required`
+            // discriminator (v0.2.92 field bug) lives with `classify_warning`
+            // in project_setup.rs — see `record_setup_warning`'s doc comment
+            // for why severity alone must not decide "Setup failed."
+            let record = record_setup_warning;
 
             // Phase 1: bootstrap Weaviate collections. Ordered first because
             // the bundle drops hooks/scripts that depend on the collections
@@ -731,7 +715,10 @@ pub(crate) fn create_setup_phases(
             // cleanly — surfaced as an Info/amber warning + `deferred` status.
             reporter.enter(setup_phase::BOOTSTRAP);
             for w in run_bootstrap_collections(&folder, &project_name).await {
-                record(w, &mut warnings, &mut deferred, &mut failed, &mut first_error);
+                record(
+                    w, /* phase_required */ true,
+                    &mut warnings, &mut deferred, &mut failed, &mut first_error,
+                );
             }
 
             // Phase 2: install the per-project bundle (hooks/scripts/agents/
@@ -739,7 +726,10 @@ pub(crate) fn create_setup_phases(
             // schema-migration notices surface as Info/amber warnings.
             reporter.enter(setup_phase::BUNDLE);
             for w in run_install_bundle(&folder, safe_add).await {
-                record(w, &mut warnings, &mut deferred, &mut failed, &mut first_error);
+                record(
+                    w, /* phase_required */ true,
+                    &mut warnings, &mut deferred, &mut failed, &mut first_error,
+                );
             }
 
             // Phase 3: the V52-AF post-bundle pipeline (post-bundle populate,
@@ -765,7 +755,13 @@ pub(crate) fn create_setup_phases(
             )
             .await;
             for w in post {
-                record(w, &mut warnings, &mut deferred, &mut failed, &mut first_error);
+                // ADVISORY phase — see `record`'s doc comment. An Error here is
+                // still surfaced red in the details list, but the project IS
+                // added and usable, so the banner must not say "Setup failed."
+                record(
+                    w, /* phase_required */ false,
+                    &mut warnings, &mut deferred, &mut failed, &mut first_error,
+                );
             }
 
             SetupOutcome {
@@ -2516,6 +2512,14 @@ pub(crate) async fn run_node_formats_schema_check(
     warnings
 }
 
+// v0.2.92 (2026-09-05 field bug): the stdout-parse diagnostic lives in
+// `commands::subprocess_contract` — ONE home, because `bundle_staleness`'s
+// census parse needs the identical fragment. The three `migrate-schema`
+// parses below keep the STRICT `serde_json::from_str` over the WHOLE stdout;
+// strictness is what surfaced the field bug, and that module's docs carry
+// the full rationale.
+use crate::commands::subprocess_contract::stdout_parse_diagnostic;
+
 /// v0.2.60: version-gated schema-migration runner for ONE project's
 /// per-project artifacts. The sibling of `run_node_formats_schema_check`, but
 /// general over the whole `artifact_schema_versions` registry + the
@@ -2673,9 +2677,14 @@ pub(crate) async fn run_schema_migration_check(
         }
         Err(parse_err) => {
             warnings.push(format!(
-                "schema-migration runner produced unparseable output ({}): \
-                 stderr tail: {}. Bundle install will proceed.",
+                "schema-migration runner (`python -m vco_lib.project_init \
+                 migrate-schema`) produced unparseable output ({}): first \
+                 stdout line was `{}`; stderr tail: {}. This is a REPORTING \
+                 fault, not a setup failure — the migration itself may well \
+                 have completed; only its JSON summary could not be read. \
+                 Bundle install will proceed.",
                 parse_err,
+                stdout_parse_diagnostic(&stdout),
                 stderr
                     .lines()
                     .rev()
@@ -3916,8 +3925,12 @@ pub(crate) fn merge_env_object_canonical_with_user_secrets(
     //    calls) can't rely on residual state. The strip set is by
     //    construction disjoint from the user_secret_pairs key set, so
     //    removing then inserting is safe.
+    // `shift_remove`, never `remove`: under `preserve_order` (v0.2.92)
+    // `Map::remove` is `swap_remove`, which would pull the user's LAST env
+    // key into each stripped slot. This object is written back to a
+    // user-owned settings file.
     for k in user_secret_strip_keys {
-        env_obj.remove(*k);
+        env_obj.shift_remove(*k);
     }
 
     // 2. Overwrite canonical keys with the launcher's resolved values.
@@ -5563,7 +5576,10 @@ pub(crate) fn strip_canonical_keys_from_env_object(
         .cloned()
         .collect();
     for k in to_remove {
-        env_obj.remove(&k);
+        // `shift_remove`, never `remove` — see `json_file`'s module docs.
+        // `remove` is `swap_remove` under `preserve_order` and would
+        // relocate the user's last env key on every strip.
+        env_obj.shift_remove(&k);
         removed.insert(k);
     }
     removed.into_iter().collect()
@@ -5662,7 +5678,10 @@ pub(crate) fn surgically_strip_env_surfaces(
                             if obj.get("env").and_then(|x| x.as_object())
                                 .map(|o| o.is_empty()).unwrap_or(false)
                             {
-                                obj.remove("env");
+                                // `shift_remove`: `remove` is `swap_remove`
+                                // under `preserve_order` and would move the
+                                // user's last top-level key into this slot.
+                                obj.shift_remove("env");
                             }
                             match serde_json::to_string_pretty(&v) {
                                 Ok(pretty) => {
@@ -5710,7 +5729,10 @@ pub(crate) fn surgically_strip_env_surfaces(
                                 .and_then(|x| x.as_object())
                                 .map(|o| o.is_empty()).unwrap_or(false)
                             {
-                                obj.remove("claude-code.env");
+                                // `shift_remove`: `remove` is `swap_remove`
+                                // under `preserve_order` and would move the
+                                // user's last top-level key into this slot.
+                                obj.shift_remove("claude-code.env");
                             }
                             match serde_json::to_string_pretty(&v) {
                                 Ok(pretty) => {
@@ -5858,7 +5880,10 @@ pub(crate) fn surgically_strip_user_secret_keys(
                                 .map(|o| o.is_empty())
                                 .unwrap_or(false)
                             {
-                                obj.remove("env");
+                                // `shift_remove`: `remove` is `swap_remove`
+                                // under `preserve_order` and would move the
+                                // user's last top-level key into this slot.
+                                obj.shift_remove("env");
                             }
                             match serde_json::to_string_pretty(&v) {
                                 Ok(pretty) => {
@@ -5913,7 +5938,10 @@ pub(crate) fn surgically_strip_user_secret_keys(
                                 .map(|o| o.is_empty())
                                 .unwrap_or(false)
                             {
-                                obj.remove("claude-code.env");
+                                // `shift_remove`: `remove` is `swap_remove`
+                                // under `preserve_order` and would move the
+                                // user's last top-level key into this slot.
+                                obj.shift_remove("claude-code.env");
                             }
                             match serde_json::to_string_pretty(&v) {
                                 Ok(pretty) => {
@@ -6500,8 +6528,10 @@ pub async fn probe_stale_derived_collections(
 
     let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
         format!(
-            "migrate-schema --check produced unparseable output ({}); stderr: {}",
+            "`python -m vco_lib.project_init migrate-schema --check` produced \
+             unparseable output ({}); first stdout line was `{}`; stderr: {}",
             e,
+            stdout_parse_diagnostic(&stdout),
             String::from_utf8_lossy(&out.stderr)
         )
     })?;
@@ -6659,8 +6689,11 @@ pub async fn apply_stale_derived_choice(
 
     let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
         format!(
-            "migrate-schema produced unparseable output ({}); stderr: {}",
-            e, stderr
+            "`python -m vco_lib.project_init migrate-schema` produced \
+             unparseable output ({}); first stdout line was `{}`; stderr: {}",
+            e,
+            stdout_parse_diagnostic(&stdout),
+            stderr
         )
     })?;
 
@@ -6834,6 +6867,10 @@ pub(crate) fn update_should_skip_root_autobuild(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // v0.2.92: the three `stdout_parse_diagnostic` unit tests moved WITH the
+    // function to `commands::subprocess_contract::tests` (byte-identical), so
+    // the behaviour stays pinned from its new home rather than from here.
 
     // ─── v0.2.82: root-autobuild skip gate (act + leave-alone) ──────────
 
@@ -12708,4 +12745,607 @@ export BY_HAND_KEY=\"user_typed\"
             "the wet apply must reuse the precomputed auto_apply_additive flag"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Change project path (v0.2.92 WP-17 / W3) — the GUI's move surface
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Drives the SAME four-step sequence the CLI drives, against this process's
+// own `Db` handle instead of the hub route:
+//
+//     begin  →  engine: pre-flip  →  commit  →  engine: post-flip  →  finish
+//
+// The sequence is the safety property, not an implementation detail:
+//   * `begin` claims single-flight BEFORE a byte is copied, so a CLI run
+//     cannot start behind the GUI's back (and vice versa) — migration 044's
+//     partial UNIQUE index decides, not application logic.
+//   * The file phases are ADDITIVE at the destination and never touch the
+//     source, so any failure before `commit` is a clean refusal: the project
+//     is still registered where it was and still works.
+//   * `commit` is ONE transaction (flip + re-point + enqueue). The database
+//     is never in the half-moved state that motivated this work package.
+//   * `finish` runs only after post-commit reconciliation, so an interrupted
+//     move stays `flipped` and is visible rather than silently incomplete.
+//
+// The file work is NOT reimplemented here. `vco_lib.project_move` is the one
+// engine; this command shells into it with `--json`, exactly as the bundle
+// path shells into `install-bundle` (the D2 parity contract, 5th client).
+
+/// A move preview, as rendered by the engine's `--phase plan`.
+///
+/// Deliberately carried as an opaque `serde_json::Value` rather than a mirrored
+/// struct: the plan's shape has ONE owner (`MovePlan.to_json` in Python) and a
+/// Rust twin would be a schema to keep in lockstep for no benefit — the GUI
+/// renders the JSON directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeProjectPathResult {
+    pub ok: bool,
+    /// Set when the move was refused BEFORE anything was copied. A refusal
+    /// reason is a distinct machine key (`dst_not_empty`,
+    /// `dst_inside_registered_project`, …), never a prose blob, so the modal
+    /// can offer the right next action.
+    pub refused: Option<String>,
+    pub error: Option<String>,
+    pub plan: Option<serde_json::Value>,
+    pub pre_flip: Option<serde_json::Value>,
+    pub post_flip: Option<serde_json::Value>,
+    pub commit: Option<serde_json::Value>,
+    /// TRUE once the flip transaction landed. The GUI uses this to decide
+    /// whether a failure message may say "nothing changed": after the commit
+    /// it may not, and saying so would be the most expensive kind of wrong.
+    pub committed: bool,
+    pub warnings: Vec<String>,
+}
+
+impl ChangeProjectPathResult {
+    fn refused(reason: &str, error: String) -> Self {
+        Self {
+            ok: false,
+            refused: Some(reason.to_string()),
+            error: Some(error),
+            plan: None,
+            pre_flip: None,
+            post_flip: None,
+            commit: None,
+            committed: false,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// Run one phase of the move engine and parse its `--json` envelope.
+fn run_move_engine(args: &[String]) -> Result<serde_json::Value, String> {
+    let python = resolve_python_for_vco_lib_local().ok_or_else(|| {
+        "no python interpreter found for vco_lib.project_move (checked: \
+         $VCT_VENV, <VCT_INSTALL_ROOT>/.venv, \
+         <VCT_INSTALL_ROOT>/claude_mcp_servers/.venv, system python3)"
+            .to_string()
+    })?;
+    let mut cmd = std::process::Command::new(&python).silent();
+    cmd.arg("-m").arg("vco_lib.project_move");
+    for a in args {
+        cmd.arg(a);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run the move engine: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The envelope is parsed even on a non-zero exit: the engine prints an
+    // `{"ok": false, ...}` envelope for a refusal (exit 3) and for an error
+    // (exit 1), and that envelope carries the reason the GUI needs. Only an
+    // UNPARSEABLE stdout is treated as a hard failure — the soft-fail posture
+    // the bundle contract established.
+    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(v) => Ok(v),
+        Err(_) => Err(format!(
+            "move engine produced no readable result (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .rev()
+                .take(600)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        )),
+    }
+}
+
+fn envelope_ok(v: &serde_json::Value) -> bool {
+    v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false)
+}
+
+fn envelope_error(v: &serde_json::Value) -> String {
+    v.get("error")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown engine error")
+        .to_string()
+}
+
+/// Preview a move without changing anything. Read-only end to end.
+#[tauri::command]
+pub async fn preview_project_path_change(
+    project_id: String,
+    new_path: String,
+    into_existing: bool,
+    from_missing: bool,
+) -> Result<ChangeProjectPathResult, String> {
+    let mut args = vec![
+        "--phase".to_string(),
+        "plan".to_string(),
+        "--project-id".to_string(),
+        project_id,
+        "--to".to_string(),
+        new_path,
+    ];
+    if into_existing {
+        args.push("--into-existing".to_string());
+    }
+    if from_missing {
+        args.push("--from-missing".to_string());
+    }
+    let env = run_move_engine(&args)?;
+    if !envelope_ok(&env) {
+        let reason = env
+            .get("refused")
+            .and_then(|s| s.as_str())
+            .unwrap_or("plan_failed")
+            .to_string();
+        return Ok(ChangeProjectPathResult::refused(&reason, envelope_error(&env)));
+    }
+    Ok(ChangeProjectPathResult {
+        ok: true,
+        refused: None,
+        error: None,
+        plan: env.get("plan").cloned(),
+        pre_flip: None,
+        post_flip: None,
+        commit: None,
+        committed: false,
+        warnings: Vec::new(),
+    })
+}
+
+/// Execute a move. The GUI calls `preview_project_path_change` first and shows
+/// the conflict list; this is the confirmed run.
+#[tauri::command]
+pub async fn change_project_path_v2(
+    project_id: String,
+    new_path: String,
+    into_existing: bool,
+    from_missing: bool,
+    safe_add: bool,
+    db: State<'_, Db>,
+) -> Result<ChangeProjectPathResult, String> {
+    // ── plan ─────────────────────────────────────────────────────────────
+    let mut plan_args = vec![
+        "--phase".to_string(),
+        "plan".to_string(),
+        "--project-id".to_string(),
+        project_id.clone(),
+        "--to".to_string(),
+        new_path.clone(),
+    ];
+    if into_existing {
+        plan_args.push("--into-existing".to_string());
+    }
+    if from_missing {
+        plan_args.push("--from-missing".to_string());
+    }
+    let plan_env = run_move_engine(&plan_args)?;
+    if !envelope_ok(&plan_env) {
+        let reason = plan_env
+            .get("refused")
+            .and_then(|s| s.as_str())
+            .unwrap_or("plan_failed")
+            .to_string();
+        return Ok(ChangeProjectPathResult::refused(
+            &reason,
+            envelope_error(&plan_env),
+        ));
+    }
+    let plan = plan_env
+        .get("plan")
+        .cloned()
+        .ok_or_else(|| "move engine returned no plan".to_string())?;
+
+    // Persist the plan for the execute phases. A temp FILE rather than argv:
+    // the plan carries every conflicting relative path, and a project with a
+    // few hundred of them would blow past the platform argv limit — silently
+    // on some shells, which is the worst way to find out.
+    let plan_dir = tempfile::Builder::new()
+        .prefix("vct-move-")
+        .tempdir()
+        .map_err(|e| format!("could not create a temp dir for the move plan: {}", e))?;
+    let plan_path = plan_dir.path().join("plan.json");
+    std::fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("could not write the move plan: {}", e))?;
+    let plan_path_s = plan_path.to_string_lossy().to_string();
+
+    // ── begin: claim single-flight BEFORE any copying ────────────────────
+    let move_id = Uuid::new_v4().to_string();
+    if let Err(e) = db.begin_project_move(
+        &move_id,
+        &project_id,
+        &new_path,
+        MOVE_STALE_AFTER_MS,
+    ) {
+        return Ok(ChangeProjectPathResult::refused("move_in_flight", e));
+    }
+
+    // ── pre-flip: additive at the destination, source untouched ──────────
+    let mut pre_args = vec![
+        "--phase".to_string(),
+        "pre-flip".to_string(),
+        "--plan-json".to_string(),
+        plan_path_s.clone(),
+        "--move-id".to_string(),
+        move_id.clone(),
+    ];
+    if safe_add {
+        pre_args.push("--safe-add".to_string());
+    }
+    let pre_env = match run_move_engine(&pre_args) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = db.fail_project_move(&move_id, &e);
+            return Ok(ChangeProjectPathResult {
+                ok: false,
+                refused: None,
+                error: Some(e),
+                plan: Some(plan),
+                pre_flip: None,
+                post_flip: None,
+                commit: None,
+                committed: false,
+                warnings: vec![
+                    "Nothing in the database changed. The project is still \
+                     registered at its current folder."
+                        .to_string(),
+                ],
+            });
+        }
+    };
+    if !envelope_ok(&pre_env) {
+        let err = envelope_error(&pre_env);
+        let _ = db.fail_project_move(&move_id, &err);
+        return Ok(ChangeProjectPathResult {
+            ok: false,
+            refused: pre_env
+                .get("refused")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            error: Some(err),
+            plan: Some(plan),
+            pre_flip: None,
+            post_flip: None,
+            commit: None,
+            committed: false,
+            warnings: vec![
+                "Nothing in the database changed, and nothing at the \
+                 destination was overwritten — the move only ever ADDS files \
+                 there."
+                    .to_string(),
+            ],
+        });
+    }
+
+    // ── commit: one transaction ──────────────────────────────────────────
+    let commit_report = match db.commit_project_move(&move_id, &project_id) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = db.fail_project_move(&move_id, &e);
+            return Ok(ChangeProjectPathResult {
+                ok: false,
+                refused: Some("commit_failed".to_string()),
+                error: Some(e),
+                plan: Some(plan),
+                pre_flip: pre_env.get("result").cloned(),
+                post_flip: None,
+                commit: None,
+                committed: false,
+                warnings: vec![
+                    "The database change was rolled back in full. The project \
+                     is still registered at its current folder."
+                        .to_string(),
+                ],
+            });
+        }
+    };
+    let commit_json = serde_json::to_value(&commit_report).unwrap_or(serde_json::Value::Null);
+
+    // ── post-flip: the flip is durable; this is reconciliation ───────────
+    let post_args = vec![
+        "--phase".to_string(),
+        "post-flip".to_string(),
+        "--plan-json".to_string(),
+        plan_path_s,
+        "--move-id".to_string(),
+        move_id.clone(),
+        "--codegraph-enqueued".to_string(),
+        if commit_report.codegraph_enqueued { "true" } else { "false" }.to_string(),
+    ];
+    let post_env = match run_move_engine(&post_args) {
+        Ok(v) if envelope_ok(&v) => v,
+        other => {
+            let detail = match other {
+                Ok(v) => envelope_error(&v),
+                Err(e) => e,
+            };
+            return Ok(ChangeProjectPathResult {
+                ok: false,
+                refused: None,
+                error: Some(detail),
+                plan: Some(plan),
+                pre_flip: pre_env.get("result").cloned(),
+                post_flip: None,
+                commit: Some(commit_json),
+                committed: true,
+                warnings: vec![format!(
+                    "The project now lives at {} and the database is \
+                     consistent, but the follow-up reconciliation did not \
+                     finish. Re-run it with: vco project move --verify \
+                     --folder '{}'",
+                    new_path, new_path
+                )],
+            });
+        }
+    };
+
+    let mut warnings: Vec<String> = commit_report.reconcile_warnings.clone();
+    if let Err(e) = db.finish_project_move(&move_id) {
+        warnings.push(format!("could not mark the move complete: {}", e));
+    }
+
+    Ok(ChangeProjectPathResult {
+        ok: true,
+        refused: None,
+        error: None,
+        plan: Some(plan),
+        pre_flip: pre_env.get("result").cloned(),
+        post_flip: post_env.get("result").cloned(),
+        commit: Some(commit_json),
+        committed: true,
+        warnings,
+    })
+}
+
+/// Live (`running` / `flipped`) moves — the banner's data source.
+///
+/// A `running` row means a move was interrupted BEFORE the flip: the project
+/// is untouched. A `flipped` row means it was interrupted AFTER: the project
+/// moved and reconciliation is owed. The GUI needs the STATUS, not a boolean,
+/// because those two need opposite sentences.
+#[tauri::command]
+pub async fn list_live_project_moves_v2(
+    db: State<'_, Db>,
+) -> Result<Vec<vct_launcher_core::db::projects::ProjectMoveRow>, String> {
+    db.list_live_project_moves()
+}
+
+/// How long a `running` claim may sit with no progress before a new move may
+/// retire it. Matches the hub route's constant deliberately — the same
+/// threshold on both surfaces, or a GUI move and a CLI move would disagree
+/// about whether a claim is abandoned.
+const MOVE_STALE_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rename collections (v0.2.92 WP-18 / W14) — the GUI's flip surface
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `rename_project_v2` above is IDENTITY-PRESERVING by design (v0.2.89 BUG 4):
+// it changes the display name and the slug, and every collection keeps its
+// creation-time name. That is correct and stays correct — a display rename
+// must never move data behind the user's back.
+//
+// This is the OTHER operation: the explicitly consented one that moves the
+// data too. The GUI does NOT reimplement it. The copy, the verification and
+// the ledger entries all live in `vco_lib.collection_rename`, driven through
+// the same `vco project rename-collections` CLI the terminal user runs, so
+// the two surfaces cannot disagree about what a rename does — the divergence
+// that produced the half-renamed bindings this feature exists to prevent.
+//
+// What the GUI adds is the PREVIEW and the consent. `--dry-run --json` is the
+// preview; nothing here writes to Weaviate or to launcher.db directly.
+
+/// One class the rename would carry, as the GUI renders it.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RenameClassMove {
+    pub src: String,
+    pub dst: String,
+    /// `copy` | `create-empty` | `source-absent` | `resume` | `noop`
+    pub action: String,
+    pub src_count: Option<i64>,
+    pub note: String,
+}
+
+/// The `--dry-run` preview, or the outcome of a completed rename.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RenameCollectionsPreview {
+    pub project_id: String,
+    pub project_name: String,
+    pub new_name: String,
+    pub old_code_prefix: String,
+    pub new_code_prefix: String,
+    pub moves: Vec<RenameClassMove>,
+    pub carried_objects: i64,
+    /// The classes that will be KEPT. Never dropped by this operation.
+    pub retired_classes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// A refusal, surfaced with its machine-readable reason so the modal can
+/// explain rather than just fail.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RenameCollectionsResult {
+    pub ok: bool,
+    pub refused: Option<String>,
+    pub error: Option<String>,
+    pub preview: Option<RenameCollectionsPreview>,
+    /// Populated on a completed (non-dry-run) rename.
+    pub summary: Option<serde_json::Value>,
+}
+
+/// Run `python -m vco_lib.cli project rename-collections …` and return stdout.
+///
+/// Reuses the shared RT-4 interpreter ladder
+/// (`python_resolve::resolve_python_for_vco_lib`) and the cwd-is-the-clone-root
+/// rule every other `vco_lib` subprocess in this crate uses — a second
+/// resolver here is exactly the duplication the house rules forbid.
+///
+/// NO TIMEOUT, deliberately. Copying a large code family with its vectors is
+/// minutes-long, and a deadline that fires mid-copy would abandon the
+/// operation at its least observable point. The engine's own sentinel is what
+/// bounds an interrupted run; a wall-clock guard here would only convert a
+/// slow success into a mystery.
+async fn run_rename_cli(db: &Db, args: &[String]) -> Result<String, String> {
+    let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        .ok_or_else(|| {
+            "no Python interpreter found for vco_lib — the rename cannot run. \
+             Check the orchestrator venv."
+                .to_string()
+        })?;
+    let mut cmd = tokio::process::Command::new(&python).silent();
+    cmd.arg("-m").arg("vco_lib.cli");
+    for a in args {
+        cmd.arg(a);
+    }
+    if let Some(root) = crate::commands::installer::resolve_install_root_sync(db) {
+        cmd.current_dir(&root);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not start the rename CLI: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if stdout.trim().is_empty() {
+        return Err(format!(
+            "the rename CLI produced no output (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(stdout)
+}
+
+fn parse_rename_envelope(stdout: &str) -> Result<serde_json::Value, String> {
+    // The CLI emits exactly ONE JSON envelope on stdout under `--json`.
+    // Parsing the whole stream (rather than scanning for the last `{`) is
+    // deliberate: a surface that tolerates extra stdout invites a future
+    // writer to print progress there, which is how a machine contract breaks.
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .map_err(|e| format!("could not parse the CLI envelope: {} — {}", e, stdout.trim()))
+}
+
+fn rename_preview_from_json(v: &serde_json::Value) -> Option<RenameCollectionsPreview> {
+    let plan = v.get("plan")?;
+    let moves = plan
+        .get("moves")?
+        .as_array()?
+        .iter()
+        .map(|m| RenameClassMove {
+            src: m.get("src").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            dst: m.get("dst").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            action: m
+                .get("action")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            src_count: m.get("src_count").and_then(|x| x.as_i64()),
+            note: m.get("note").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        })
+        .collect();
+    Some(RenameCollectionsPreview {
+        project_id: plan.get("project_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        project_name: plan.get("project_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        new_name: plan.get("new_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        old_code_prefix: plan.get("old_code_prefix").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        new_code_prefix: plan.get("new_code_prefix").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        moves,
+        carried_objects: plan.get("carried_objects").and_then(|x| x.as_i64()).unwrap_or(0),
+        retired_classes: plan
+            .get("retired_classes")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        warnings: plan
+            .get("warnings")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// Preview or perform a collection rename by driving the shipped CLI.
+///
+/// `dry_run: true` is the modal's preview and writes nothing anywhere.
+/// `dry_run: false` performs the operation, which never drops a collection —
+/// the previous classes are retained and the ledger records the one guarded
+/// command that retires them.
+#[command]
+pub async fn rename_collections_v2(
+    id: String,
+    new_name: String,
+    dry_run: bool,
+    db: State<'_, Db>,
+) -> Result<RenameCollectionsResult, String> {
+    let row = db
+        .get_project(&id)?
+        .ok_or_else(|| format!("project {} not found", id))?;
+    // Refuse here as well as in the engine. A GUI that offers a button and
+    // then surfaces a backend refusal has already wasted the user's decision;
+    // the modal needs to know before it opens.
+    if row.host == ProjectHost::OrchestratorRoot {
+        return Ok(RenameCollectionsResult {
+            ok: false,
+            refused: Some("orchestrator_root".into()),
+            error: Some(
+                "The orchestrator-root project's slug is canonical and the KG \
+                 auto-heal paths match on it. Its collection family cannot be \
+                 renamed."
+                    .into(),
+            ),
+            preview: None,
+            summary: None,
+        });
+    }
+
+    let mut args: Vec<String> = vec![
+        "project".into(),
+        "rename-collections".into(),
+        id.clone(),
+        "--to".into(),
+        new_name.clone(),
+        "--json".into(),
+    ];
+    if dry_run {
+        args.push("--dry-run".into());
+    }
+
+    let out = run_rename_cli(&db, &args).await?;
+    let value = parse_rename_envelope(&out)?;
+    let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(RenameCollectionsResult {
+        ok,
+        refused: value
+            .get("refused")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        error: value.get("error").and_then(|v| v.as_str()).map(str::to_string),
+        preview: rename_preview_from_json(&value),
+        summary: if dry_run { None } else { Some(value.clone()) },
+    })
 }

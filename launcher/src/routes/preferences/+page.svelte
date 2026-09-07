@@ -18,6 +18,12 @@
   // with scope="global" for the HOST-WIDE DEFAULTS, and on each project's
   // Settings tab with scope="project" for that project's own choices.
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
+  // Machine-global Artifact-tool switch. Own component (this page is already
+  // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
+  // user-scope settings file rather than launcher.db — see
+  // `$lib/artifact-tool` for the decision logic and
+  // `commands/artifact_tool.rs` for the merge discipline that file demands.
+  import ArtifactToolPanel from '$lib/components/ArtifactToolPanel.svelte';
   import { focusOnMount, focusTrap } from '$lib/actions/focusManagement';
   import type {
     EmbeddingCatalog,
@@ -1999,6 +2005,21 @@
       {/if}
     </section>
 
+    <!-- Artifact tool (machine-global).
+
+         Sits with the other launcher-global sections, outside the project
+         guard, because it is global in the strongest sense on this page: it
+         edits Claude Code's OWN user-scope settings file
+         (`~/.claude/settings.json`), so it reaches every project AND every
+         Claude Code surface on this machine, launcher-managed or not. The
+         panel says so itself rather than relying on this placement.
+
+         No heading here on purpose — the component renders its own, next to
+         the copy that explains which two keys it writes and why both. -->
+    <section class="pr-section">
+      <ArtifactToolPanel />
+    </section>
+
     <!--
       Default embedding models for new projects (v0.2.18 Commit 8).
       App-level — applies to projects created from now on. Existing
@@ -2637,6 +2658,31 @@
           </span>
         </div>
         <button class="pr-btn" onclick={() => goto('/preferences/modules')}>
+          Open
+        </button>
+      </div>
+    </section>
+
+    <!-- v0.2.92 WP-11: the version-keyed CHAT-model context table. Editable
+         here, exported to the file the model gateway reads. Distinct from the
+         EMBEDDING-model token limits used by the chunker — different models,
+         different consumer, and deliberately opposite lookup rules. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Chat-model context windows</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Per-model context windows the gateway advertises</strong>
+          <span class="pr-onboarding-hint">
+            Claude Code assumes a conservative window for a model id it does not
+            recognise, so a 1M-context model reads as far fuller than it is and
+            <code>/compact</code> fires early. This table — keyed by full model
+            id, because one minor version can have five times the window of the
+            previous one — is what the model gateway uses to advertise the right
+            size. Shipped with the official vendor figures and their citations;
+            editable, and your edits survive a reseed.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/chat-model-context')}>
           Open
         </button>
       </div>

@@ -5,10 +5,14 @@
 Moved VERBATIM from ``templates/scripts/analyze_code_graph.py``:
 ``_java_methods_for_class`` (V52-O.11.F.2-JAVA per-class method
 attribution, + its ``_strip_nested_java_classes`` / ``_find_matching_brace``
-helpers) and ``CodeGraphAnalyzer._analyze_java_file`` — only body edits are the mechanical ``self.`` -> ``ctx.`` rename
-(``ctx`` IS the analyzer instance) and the analyzer-resident embedding
-seams reached via ``ctx.``. Behavior is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+helpers) and ``CodeGraphAnalyzer._analyze_java_file`` — the move itself was verbatim apart from
+the mechanical ``self.`` -> ``ctx.`` rename (``ctx`` IS the analyzer
+instance) and the analyzer-resident embedding seams reached via ``ctx.``.
+Behaviour has since been CORRECTED here (v0.2.92 and WP-5b — see the notes
+below), so it is no longer byte-identical to the analyzer's original;
+``tests/test_codegraph_golden.py`` pins what it does TODAY, and the
+corpus README explains why a snapshot is evidence of behaviour rather
+than of correctness.
 """
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
@@ -29,8 +33,43 @@ from vco_lib.codegraph_entities import (
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
+    blank_block_comments_preserving_lines,
     run_pure_extractor,
+    skip_leading_whitespace,
 )
+
+# v0.2.92 WP-5b — tokens that may not appear in a member declaration's
+# MODIFIER / RETURN-TYPE run. The mirror of C#'s ``_CSHARP_NON_DECL_TOKENS``,
+# needed for the SAME reason and introduced by the SAME change: once
+# ``method_pattern`` accepts ``;`` as a terminator (so that interface and
+# abstract methods finally produce a row), it also matches ordinary
+# STATEMENTS that end in one —
+#
+#     new Thread(runnable);        → run ``new``,    name ``Thread``
+#     return format(x);            → run ``return``, name ``format``
+#     throw wrap(e);               → run ``throw``,  name ``wrap``
+#
+# In each case the captured NAME is a valid identifier, so a keyword filter on
+# the name cannot see the problem; the tell is the run. ``new`` is here and is
+# NOT in the C# set, because C# has a legal ``public new int F()`` member
+# modifier and Java has no such form.
+_JAVA_NON_DECL_TOKENS = frozenset({
+    # statement keywords
+    "return", "throw", "new", "case", "assert", "yield",
+    # type-declaration keywords — a type is not a method
+    "class", "interface", "enum", "record", "package", "import",
+})
+
+
+def _java_declaration_run_is_a_member(
+    content_clean: str, decl_pos: int, name_pos: int
+) -> bool:
+    """True when ``content_clean[decl_pos:name_pos]`` is a member's modifier /
+    return-type run rather than a statement. Mirrors
+    ``csharp._csharp_declaration_run_is_a_member``."""
+    return not (_JAVA_NON_DECL_TOKENS & set(
+        re.findall(r"[A-Za-z_]\w*", content_clean[decl_pos:name_pos])
+    ))
 
 
 def _java_methods_for_class(
@@ -159,10 +198,13 @@ def _java_methods_for_class(
         r"\(([^)]*)\)\s*"
         # Optional throws clause
         r"(?:throws\s+[\w.,\s]+)?\s*"
-        # Opening brace (method body — `;` for abstract/interface is
-        # excluded here; abstract methods are intentionally captured only
-        # when they have a body).
-        r"\{",
+        # v0.2.92 WP-5b: `;` accepted alongside `{`. It used to be `\{` alone,
+        # with a comment claiming abstract methods were "intentionally captured
+        # only when they have a body" — which made this list DISAGREE WITH THE
+        # GRAPH the moment the entity loop started emitting a row for a
+        # bodiless declaration. An interface's `methods` list was empty for
+        # every interface in every project.
+        r"(?:\{|;)",
         re.MULTILINE,
     )
 
@@ -199,6 +241,20 @@ def _java_methods_for_class(
             if name in (
                 "if", "while", "for", "switch", "catch", "try", "else",
                 "return", "synchronized", "do", "throw",
+            ):
+                continue
+            # v0.2.92 WP-5b: and skip a STATEMENT whose captured name is a
+            # perfectly good identifier (`new Thread(runnable);` → `Thread`),
+            # which only became matchable when `;` joined the terminator set.
+            # The run is taken from the START OF THE DECLARATION'S OWN LINE
+            # rather than from `fm.start()`: this pattern's return-type group
+            # includes `\s`, so a raw match can begin many lines earlier and
+            # sweep an unrelated `return` into the run, rejecting a real
+            # method. A declaration split across lines therefore gets a short
+            # run and is ACCEPTED — the fail-safe direction for a methods list.
+            line_start = stripped_body.rfind("\n", 0, fm.start(1)) + 1
+            if not _java_declaration_run_is_a_member(
+                stripped_body, line_start, fm.start(1)
             ):
                 continue
             if name in seen:
@@ -304,14 +360,14 @@ def extract_java_file(
     """Pure producer: parse a Java file, RETURN a :class:`FileExtraction`."""
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines
-               if l.strip() and not l.strip().startswith('//')
-               and not l.strip().startswith('*')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('//')
+               and not line.strip().startswith('*')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-    content_clean = re.sub(r'/\*.*?\*/', ' ', content_clean, flags=re.DOTALL)
+    content_clean = blank_block_comments_preserving_lines(content_clean)
 
     # import statements
     imports = re.findall(r'import\s+([\w.]+);', content)
@@ -323,18 +379,48 @@ def extract_java_file(
         r'(?:\s+extends\s+[\w<>, ]+)?(?:\s+implements\s+[\w<>, ]+)?\s*\{',
         re.MULTILINE
     )
-    class_info: Dict[str, int] = {}
+    # v0.2.92 WP-5b: a LIST of (name, start_line, end_line), not a dict keyed
+    # by name — see the same change in `ruby.py`, where the fixture proves the
+    # loss. Java forbids two TOP-LEVEL types with one name, but not two nested
+    # ones (`class A { class Node {} } class B { class Node {} }` is legal and
+    # this pattern matches both), and the dict kept only the last. The writer's
+    # occurrence disambiguator keys on `(kind, identity_key)` and already
+    # covers KIND_CLASS, so the second lands as `Node#2`.
+    class_decls: List[Tuple[str, int, int]] = []
     for m in class_pattern.finditer(content_clean):
         name = m.group(1)
         if not name or name[0].islower():
             continue
-        start_line = content_clean[:m.start()].count('\n') + 1
-        class_info[name] = start_line
+        # v0.2.92: `class_pattern`'s leading `(?:public|…|\s)*` group starts
+        # matching at the whitespace after the previous token, so `m.start()`
+        # sits on the previous line — the golden fixture's `Account` class was
+        # stored starting on `package golden;`.
+        start_line = content_clean[
+            :skip_leading_whitespace(content_clean, m.start(), m.end())
+        ].count('\n') + 1
+        class_decls.append((
+            name, start_line,
+            _extract_balanced_block(source_lines, start_line, language="java"),  # V52-O.11.E (was: start_line + 60)
+        ))
+
+    #: Unique type names in source order — what the module summary lists.
+    class_names: List[str] = list(dict.fromkeys(n for n, _, _ in class_decls))
 
     # Methods
     method_pattern = re.compile(
         r'(?:public|private|protected|static|final|synchronized|native|abstract|\s)+'
-        r'(?:[\w<>\[\]]+\s+)+([\w]+)\s*\(([^)]*)\)\s*(?:throws\s+[\w, ]+)?\s*\{',
+        r'(?:[\w<>\[\]]+\s+)+([\w]+)\s*\(([^)]*)\)\s*(?:throws\s+[\w, ]+)?\s*'
+        # v0.2.92 WP-5b: the terminator is CAPTURED (group 3) and `;` is
+        # accepted. This pattern used to end in a bare `\{`, so EVERY BODILESS
+        # DECLARATION matched nothing: an interface's methods, an abstract
+        # method, a `native` method. A Java interface is the one construct a
+        # code-graph consumer most wants to find by name ("what implements
+        # this?"), and the graph contained none of them. `_extract_balanced_block`
+        # is meaningful only for the `{` branch — run it on a bodiless
+        # declaration and it finds no opener on that line, keeps scanning, and
+        # latches onto the NEXT member's braces (the same defect this release
+        # fixed for the Rust trait method and the C# interface method).
+        r'(\{|;)',
         re.MULTILINE
     )
 
@@ -344,8 +430,8 @@ def extract_java_file(
     summary_parts = [f"Java module: {relative_path}"]
     if pkg_name:
         summary_parts.append(f"Package: {pkg_name}")
-    if class_info:
-        summary_parts.append(f"Classes: {', '.join(list(class_info.keys())[:8])}")
+    if class_names:
+        summary_parts.append(f"Classes: {', '.join(class_names[:8])}")
     module_summary = '\n'.join(summary_parts)
 
     complexity = float(1 + sum(content_clean.count(kw)
@@ -359,8 +445,14 @@ def extract_java_file(
     entities: List[CodeEntity] = []
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
-    for cname, start_line in class_info.items():
-        _class_end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 60)
+    # v0.2.92 — the `end_line` convention. `_extract_balanced_block` returns
+    # the 1-indexed CLOSING line, and its docstring states that IS the
+    # `end_line` at every caller site. This loop used to store
+    # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
+    # FUNCTION loop below already used the returned value directly. One
+    # convention now; the golden corpus had ratified the +1 across 7 languages.
+    _methods_by_name: Dict[str, List[str]] = {}
+    for cname, start_line, _class_end_line in class_decls:
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         # V52-O.11.F.2-JAVA (v0.2.52, 2026-06-09): scope `methods` to
@@ -370,14 +462,20 @@ def extract_java_file(
         # that attributed EVERY method in the file to EVERY class.
         # Same antipattern audit a79152 flagged in Rust, fixed there
         # in V52-O.11.F. Java fix mirrors via `_java_methods_for_class`.
-        methods = _java_methods_for_class(content_clean, cname, source_lines)
+        # Computed once per NAME: the helper already unions every declaration
+        # with that name, so two rows for one name repeat no work.
+        if cname not in _methods_by_name:
+            _methods_by_name[cname] = _java_methods_for_class(
+                content_clean, cname, source_lines
+            )
+        methods = _methods_by_name[cname]
         signature = f"class {cname}"
         entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=cname,
             full_name=f"{pkg_name}.{cname}" if pkg_name else cname,
             body=class_body, signature=signature, doc="",
-            start_line=start_line, end_line=start_line + len(class_lines),
+            start_line=start_line, end_line=_class_end_line,
             project=helpers.project_name,
             extras={"methods": methods[:20]},
             deferred_embed=(
@@ -388,15 +486,31 @@ def extract_java_file(
         stats['classes'] += 1
 
     for m in method_pattern.finditer(content_clean):
-        mname, args_str = m.group(1), m.group(2)
+        mname, args_str, terminator = m.group(1), m.group(2), m.group(3)
         if mname in ('if', 'while', 'for', 'switch', 'catch', 'try', 'else', 'return'):
             continue
-        start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 50)
+        # v0.2.92: same leading-whitespace group as `class_pattern`. Before this
+        # fix `Account.deposit` and `Account.getBalance` were both stored
+        # starting on the PREVIOUS member's closing `}`, and their stored
+        # `body` began with that brace.
+        decl_pos = skip_leading_whitespace(content_clean, m.start(), m.end())
+        # v0.2.92 WP-5b: reject a match whose modifier/return-type run is
+        # actually a STATEMENT (`new Thread(runnable);`). Only reachable now
+        # that `;` is an accepted terminator — see `_JAVA_NON_DECL_TOKENS`.
+        if not _java_declaration_run_is_a_member(content_clean, decl_pos, m.start(1)):
+            continue
+        start_line = content_clean[:decl_pos].count('\n') + 1
+        # v0.2.92 WP-5b: branch on the terminator. A `;` declaration has no
+        # body and ends on its own line; only `{` opens a block a brace scan
+        # can measure.
+        if terminator == '{':
+            end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 50)
+        else:
+            end_line = content_clean[:m.end()].count('\n') + 1
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         # Find enclosing class
         enclosing = next(
-            (c for c, cl in sorted(class_info.items(), key=lambda x: x[1], reverse=True)
+            (c for c, cl, _ in sorted(class_decls, key=lambda d: d[1], reverse=True)
              if cl <= start_line), file_path.stem
         )
         full_name = f"{enclosing}.{mname}"

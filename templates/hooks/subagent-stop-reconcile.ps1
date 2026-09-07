@@ -214,10 +214,15 @@ if ($kgSyncScript -and $kgFiles.Count -gt 0) {
     foreach ($kf in $kgFiles) {
         $kfAbs = Join-Path $ProjectRoot $kf
         try {
+            # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1):
+            # an unguarded `-WindowStyle Hidden` is REJECTED on non-Windows
+            # PowerShell editions, so the spawn never happens and every KG file
+            # this subagent touched goes un-synced. -PassThru is kept — this
+            # site WAITS on the child (30s cap) rather than detaching.
             $proc = if ($kgSyncScript.EndsWith(".ps1")) {
-                Start-Process -FilePath $PsExe -ArgumentList @("-NoProfile","-File",$kgSyncScript,$kfAbs) -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @("-NoProfile","-File",$kgSyncScript,$kfAbs) -PassThru
             } else {
-                Start-Process -FilePath $kgSyncScript -ArgumentList $kfAbs -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                Start-VcoDetachedProcess -FilePath $kgSyncScript -ArgumentList @($kfAbs) -PassThru
             }
             if ($proc) {
                 # 30s timeout per kg-sync invocation.
@@ -303,24 +308,36 @@ if ((Get-Command Scan-FileForCredentials -ErrorAction SilentlyContinue) -and $al
 }
 
 # -------------------- Step 5: Nudge counter --------------------
-if ($SessionId -and $fileCount -gt 0) {
+# The counter file lives under the machine-wide metrics dir (not the project's
+# .claude/) because nudge state is per-session, not per-project;
+# kg-update-nudge.ps1 resolves the same path through the same
+# `_lib/metrics-dir.ps1` helper. v0.2.92 W7 moved that home out of ~/.claude —
+# both hooks moved together, which is why they still agree. Before the helper
+# this hook used a THIRD home-directory convention ($env:HOME then
+# $env:USERPROFILE) from its two .ps1 siblings.
+$MetricsLib = Join-Path $PSScriptRoot "_lib/metrics-dir.ps1"
+if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -PathType Leaf)) {
+    . $MetricsLib
     $workUnits = ($fileCount * 50) + [int]([math]::Floor($totalBytes / 4))
-    $nudgeDir = if ($env:HOME) {
-        Join-Path $env:HOME ".claude/metrics"
-    } else {
-        Join-Path $env:USERPROFILE ".claude\metrics"
-    }
-    $nudgeFile = Join-Path $nudgeDir "kg_update_tokens.jsonl"
-    try {
-        if (-not (Test-Path $nudgeDir)) {
-            New-Item -ItemType Directory -Path $nudgeDir -Force -ErrorAction Stop | Out-Null
-        }
-    } catch {
-        # Cannot create dir → skip step 5.
+    $nudgeDir = Get-VcoMetricsDir
+    if (-not $nudgeDir) {
+        # Cannot resolve/create the dir → skip step 5.
         if (Get-Command Cleanup-Snapshot -ErrorAction SilentlyContinue) {
             try { Cleanup-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot -SnapshotDir $StateDir } catch {}
         }
         exit 0
+    }
+    $nudgeFile = Join-Path $nudgeDir "kg_update_tokens.jsonl"
+
+    # Counter continuity across the W7 move — seed from the frozen archive when
+    # the new file does not exist yet, exactly as kg-update-nudge.ps1 does, so a
+    # subagent's work is added to the session's real baseline instead of to a
+    # fresh zero. Read-only against the archive.
+    if (-not (Test-Path -LiteralPath $nudgeFile -PathType Leaf)) {
+        $legacyCounter = Get-VcoMetricsReadFile -Name "kg_update_tokens.jsonl"
+        if ($legacyCounter -and $legacyCounter -ne $nudgeFile) {
+            try { Copy-Item -LiteralPath $legacyCounter -Destination $nudgeFile -ErrorAction Stop } catch { }
+        }
     }
 
     # Read existing rows, find/upsert ours, atomic rewrite.

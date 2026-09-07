@@ -7,8 +7,10 @@ the V52-O.11.B parser helpers
 (``_extract_svelte_script_blocks`` / ``_parse_svelte_functions`` + their
 regex constants) and ``CodeGraphAnalyzer._analyze_svelte_file`` — only body edits are the mechanical ``self.`` -> ``ctx.`` rename
 (``ctx`` IS the analyzer instance) and the analyzer-resident embedding
-seams reached via ``ctx.``. Behavior is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+seams reached via ``ctx.``. The MOVE was verbatim; behaviour has since
+been corrected here (v0.2.92), so it is no longer byte-identical to the
+analyzer's original. ``tests/test_codegraph_golden.py`` pins what it does
+TODAY.
 """
 from __future__ import annotations
 
@@ -243,7 +245,7 @@ def extract_svelte_file(
     """
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines if l.strip()])
+    loc = len([line for line in source_lines if line.strip()])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
@@ -262,6 +264,10 @@ def extract_svelte_file(
     # Component name + first non-empty HTML comment from the template,
     # if present (the Svelte convention is `<!-- ... -->` at file top).
     leading_doc = ''
+    # NOT a comment scrub (v0.2.92 §3.3): READS the leading HTML comment for the
+    # module summary; no substitution, no line derivation. This producer's
+    # `start_line` comes from the ORIGINAL `content` (see below), so it has no
+    # scrubbed-copy desync to fix.
     m_html_comment = re.search(r"<!--\s*(.*?)\s*-->", content, re.DOTALL)
     if m_html_comment:
         leading_doc = m_html_comment.group(1).strip().split('\n')[0][:200]

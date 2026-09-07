@@ -34,6 +34,8 @@ use tauri::{command, State};
 use crate::db::Db;
 use crate::db::{module_settings_keys, secret_scope_policy};
 use crate::secrets::{self, SecretScope};
+use crate::secrets_file_store::{self, Presence};
+use std::path::PathBuf;
 
 // ─── Secrets ────────────────────────────────────────────────────────────
 
@@ -475,13 +477,359 @@ pub async fn remove_secret_v2(
         db.forget_secret_active_state(&scope, &project_id, &module_id, &key)?;
     }
 
+    // v0.3.0 — Remove deletes the KEYCHAIN entry and the launcher row. It
+    // does NOT (and must not silently) touch the tier-2 file store: that
+    // file is the user's, written by `vct set`, and deleting it from a
+    // GUI action the user believes is scoped to the launcher would be a
+    // data loss they never consented to. So the honest thing is to RECORD
+    // that a copy survives — the panel's confirm dialog says so before the
+    // click, this says so afterwards, and the row stays visible because
+    // `list_user_secret_keys_impl` unions the file store in.
+    //
+    // Metadata only: presence + the path (which contains the key name,
+    // already in this same audit row). No value byte is read here.
+    let project_name = file_store_project_name(&db, &scope, &project_id);
     db.audit(
         "secret_remove",
         Some(&project_id),
         Some(&module_id),
-        &serde_json::json!({ "key": key, "scope": scope }),
+        &remove_audit_payload(&scope, &key, project_name.as_deref()),
     )?;
     Ok(())
+}
+
+/// The exact JSON `remove_secret_v2` records for a Remove — extracted so
+/// the SURVIVOR question is testable (a `#[command]` takes `State<'_, Db>`,
+/// which no unit test can construct, and the rest of that function performs
+/// keychain deletes and an env-surface refresh).
+///
+/// Two survivors, not one. Removing the keychain entry leaves BOTH tier-2
+/// legs untouched:
+///   * `projects/<NAME>/<key>` — this row's own namespace;
+///   * `shared/<key>` — the fall-through leg, which keeps serving a
+///     per-project key after its keychain entry is gone.
+/// Recording only the first logged "nothing survives" for a Remove that
+/// changed nothing any consumer can observe. The shared leg is
+/// MARKER-GATED, so a project that opted out is not told a file it never
+/// reads survives.
+///
+/// Metadata only: presence booleans and the KEY (already in this row). No
+/// value byte is read.
+fn remove_audit_payload(
+    scope: &str,
+    key: &str,
+    project_name: Option<&str>,
+) -> serde_json::Value {
+    let file_store_copy_remains = if scope == "global" {
+        // No global namespace exists in the file store.
+        false
+    } else {
+        file_store_dir_for_scope(scope, project_name)
+            .map(|d| secrets_file_store::probe_key(&d, key).is_present())
+            .unwrap_or(false)
+    };
+    let shared_file_store_copy_resolves = match (scope, project_name) {
+        ("per_project", Some(name)) => {
+            secrets_file_store::probe_shared_fallback(name, key).is_present()
+        }
+        _ => false,
+    };
+    serde_json::json!({
+        "key": key,
+        "scope": scope,
+        "file_store_copy_remains": file_store_copy_remains,
+        "shared_file_store_copy_resolves": shared_file_store_copy_resolves,
+    })
+}
+
+// ─── Where does the value actually LIVE? (v0.3.0) ─────────────────────
+//
+// Pre-v0.3.0 every presence surface in this file asked exactly one
+// question — "does the OS keychain have it?" — and rendered a `false` as
+// "not set". But the sanctioned RESOLVERS
+// (`vco_lib/agent_secrets.py::get`, `templates/scripts/vct_secrets_resolve.sh`
+// and its `.ps1` sibling) are a THREE-tier chain: hub/keychain, then the
+// file store at `$VCT_SECRETS_DIR` (default `~/.vct-secrets`), then the
+// project's own `.env`. A key held only in the file store resolves for
+// every consumer and rendered in the panel as "not set".
+//
+// That is not cosmetic. `CLAUDE.md` warns that a launcher-GUI save and a
+// `vct set` are DIFFERENT stores and that writing the same key to both
+// forks a divergent copy. A user shown "NOT SET" for a key that already
+// works re-types it in the GUI — which is precisely how the fork gets
+// created. The display was steering users into the documented failure
+// mode, so the fix has to show WHERE the value lives, not merely flip a
+// boolean.
+//
+// Tier 2 is TWO directories, not one, and both are probed: the
+// resolvers read `projects/<NAME>/<key>` and then `shared/<key>`, so a
+// per-project key held only in `shared/` resolves for every consumer.
+// `file_store` reports the first (one file, one row — attribution stays
+// answerable); `shared_file_store` reports the second, gated by the
+// `.no-shared-fallback` marker so an opted-out project is never told a
+// file it does not read satisfies its key.
+//
+// Tier 3 (`.env`) is deliberately NOT probed here: it is the project's
+// own file, outside the launcher's stores, and the panel offers no
+// lifecycle over it. Surfacing it would imply a management surface that
+// does not exist. The badge copy is written to match — "not set" is
+// worded as absence from the stores the launcher speaks for, never as a
+// claim that nothing anywhere resolves the key.
+
+/// Which store the runtime resolver would actually serve a key from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WinningStore {
+    /// Tier 1 — the OS keychain, via the hub.
+    Keychain,
+    /// Tier 2 — `$VCT_SECRETS_DIR/{projects/<NAME>,shared}/<key>`.
+    FileStore,
+    /// No sanctioned store holds a live value for this key.
+    NoStore,
+}
+
+/// The file-store directory a panel SCOPE maps onto.
+///
+/// * `shared`      → `<root>/shared`
+/// * `per_project` → `<root>/projects/<NAME>` (the project's DB `name`,
+///                   which is what the `.no-shared-fallback` marker
+///                   (`secrets_file_store::NO_SHARED_FALLBACK_MARKER`) and
+///                   `vct --project NAME` both use)
+///
+/// This is the row's OWN namespace only. The `shared/` leg the resolvers
+/// fall through to afterwards is a different question, answered by
+/// `secrets_file_store::probe_shared_fallback` and reported separately as
+/// [`StoreReport::shared_file_store`].
+/// * `global`      → `None`. The panel's "Global (this machine)" scope is
+///                   a keychain-only concept; the file store has no global
+///                   namespace, so there is nothing to probe.
+///
+/// `None` is also returned when the store root or the project name cannot
+/// be resolved — the caller distinguishes those cases from `global` and
+/// reports [`Presence::Unknown`] rather than a wrong "absent".
+fn file_store_dir_for_scope(scope: &str, project_name: Option<&str>) -> Option<PathBuf> {
+    match scope {
+        "shared" => secrets_file_store::shared_dir(),
+        "per_project" => project_name.and_then(secrets_file_store::project_dir),
+        _ => None,
+    }
+}
+
+/// One key's presence across every store the launcher can speak for:
+/// tier 1 (the keychain), tier 2's own-namespace leg, and — for a
+/// per-project row — tier 2's `shared/` fall-through leg.
+///
+/// Every field is metadata — presence, a path, and an equality bit. No
+/// value byte is present in this struct or reachable from it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreReport {
+    /// Tier 1. `Unknown` when the keychain is locked or errored — a store
+    /// that could not be read must never claim the key is absent.
+    pub keychain: Presence,
+    /// Tier 2. `Absent` for `global` scope (no such namespace); `Unknown`
+    /// when the store root could not be resolved or the directory could
+    /// not be read.
+    pub file_store: Presence,
+    /// `Some(true)` when BOTH stores hold the key and their values differ
+    /// — the divergent-copy state `CLAUDE.md` warns about, and the single
+    /// most useful thing the panel can tell the user. `Some(false)` when
+    /// both hold it and they agree. `None` whenever the comparison could
+    /// not be made (only one store has it, or the file was unreadable).
+    ///
+    /// Only the BOOLEAN crosses this boundary. Not the values, and not a
+    /// digest of them either: a hash of a low-entropy secret is a
+    /// brute-forceable oracle, so hashing would leak, not protect.
+    pub values_diverge: Option<bool>,
+    /// Absolute path of the file-store copy, when one exists. Contains the
+    /// KEY name (already user-visible) and never the value. Needed so the
+    /// Remove confirmation can name the file it is NOT going to delete.
+    pub file_store_path: Option<String>,
+    /// Tier 2, SECOND LEG — would `shared/<key>` satisfy this row?
+    ///
+    /// `file_store` above reports on ONE directory (this row's own
+    /// namespace), which is what makes "where does this value live?"
+    /// answerable. But the resolvers do not stop there: after
+    /// `projects/<NAME>/<key>` misses they read `shared/<key>`. A
+    /// per-project key held only in `shared/` therefore resolves for every
+    /// consumer while `file_store` is honestly `Absent` — and the badge,
+    /// reading only those two tiers, printed "not set" for it. This field
+    /// is that missing leg.
+    ///
+    /// [`Presence::Absent`] when the project holds
+    /// `.no-shared-fallback`: the file may exist, but it does NOT resolve
+    /// here, and claiming otherwise would describe another project's
+    /// resolution. See `secrets_file_store::probe_shared_fallback`.
+    ///
+    /// [`Presence::Absent`] for the `shared` and `global` scopes, and that
+    /// is a definition rather than a gap. A shared row's `file_store` IS
+    /// the `shared/` probe, so it has no further leg to fall through to;
+    /// and the panel's `global` scope is a keychain-only concept whose
+    /// `get_secret_status_v2` call carries the `_global_` SENTINEL rather
+    /// than a project id, so no marker could be evaluated for it. Both are
+    /// already covered where they arise: `list_user_secret_keys_v2` emits
+    /// the shared row alongside them and flags the collision.
+    pub shared_file_store: Presence,
+    /// Absolute path of the SHARED file-store copy, when one would serve
+    /// this row. KEY name and path only — never a value. Needed so the
+    /// Remove confirmation can name the file that keeps resolving after
+    /// the keychain entry is gone.
+    pub shared_file_store_path: Option<String>,
+    /// The requesting project has turned on "Disable shared secrets for
+    /// this project", so the KEYCHAIN's user-shared bucket is not resolved
+    /// for it (`db::secret_scope_policy::shared_secrets_read_disabled`, the
+    /// gate `resolve_active_user_secret_pairs_for_requester` applies before
+    /// it walks the shared bucket at all).
+    ///
+    /// `false` for every scope except `shared`: the gate drops ONLY that
+    /// bucket — per-project and global keychain rows are untouched by it,
+    /// and a per-project row's `shared/` fall-through leg is gated at the
+    /// source by [`StoreReport::shared_file_store`]'s marker probe.
+    ///
+    /// This is DISPLAY metadata and deliberately NOT folded into `is_set`.
+    /// `is_set` is the launcher's per-(secret × requester) permission gate,
+    /// and this bulk opt-out is a different question with a different
+    /// remedy; conflating them would silently widen the gate's meaning for
+    /// every reader that asks it (`is_secret_set`, the hub, module code).
+    pub shared_read_disabled: bool,
+    /// The requesting project holds `.no-shared-fallback`, so tier 2's
+    /// `shared/` directory is not read for it either
+    /// (`secrets_file_store::shared_fallback_disabled`).
+    ///
+    /// Reported SEPARATELY from `shared_read_disabled` even though one
+    /// toggle writes both, because the marker write is best-effort: when it
+    /// fails, `set_shared_secrets_read_disabled` returns a warning saying in
+    /// so many words that "file-store tier-2 shared fallback is not gated
+    /// until the marker exists". In that state the shared FILE still serves
+    /// this project, and a badge derived from the DB flag alone would tell
+    /// the user a key does not reach them when it does — the same
+    /// false-negative-about-resolution this whole report exists to remove.
+    ///
+    /// `false` for every scope except `shared`, for the same reason as
+    /// above.
+    pub shared_file_fallback_disabled: bool,
+}
+
+/// Probe both stores for one key. The ONE presence reader — every panel
+/// surface (`get_secret_status_v2`, `list_user_secret_keys_v2`) goes
+/// through it so they cannot disagree about where a value lives.
+///
+/// Exactly one keychain round-trip: the value is needed for the
+/// divergence comparison and `Option::is_some` already answers presence,
+/// so calling `secrets::is_set` first would have doubled the traffic.
+///
+/// `requester_project_id` is the project whose POINT OF VIEW is being
+/// rendered — the same requester the active-flag gate is asked about. It is
+/// NOT the owner: a shared row is owned by the `_user_shared_` sentinel but
+/// read by a real project, and the two shared-tier opt-outs below are
+/// properties of the READER, not of the row.
+fn read_store_report(
+    db: &Db,
+    scope: &str,
+    owner_project_id: &str,
+    module_id: &str,
+    key: &str,
+    project_name: Option<&str>,
+    requester_project_id: &str,
+) -> StoreReport {
+    let scope_enum = scope_from_manifest(scope, owner_project_id);
+    let (keychain, keychain_value) = match secrets::get(scope_enum, module_id, key) {
+        Ok(Some(v)) => (Presence::Present, Some(v)),
+        Ok(None) => (Presence::Absent, None),
+        // Locked store / daemon timeout / read error. NOT absence.
+        Err(_) => (Presence::Unknown, None),
+    };
+
+    let dir = file_store_dir_for_scope(scope, project_name);
+    let file_store = if scope == "global" {
+        // No global namespace exists in the file store, so "absent" is a
+        // complete and true answer rather than a failure to look.
+        Presence::Absent
+    } else {
+        match &dir {
+            Some(d) => secrets_file_store::probe_key(d, key),
+            None => Presence::Unknown,
+        }
+    };
+
+    // Divergence is only a question when BOTH stores hold the key.
+    let values_diverge = match (keychain, file_store, &dir, &keychain_value) {
+        (Presence::Present, Presence::Present, Some(d), Some(kv)) => {
+            secrets_file_store::read_key_value(d, key).map(|fv| fv != *kv)
+        }
+        _ => None,
+    };
+
+    let file_store_path = match (file_store, &dir) {
+        (Presence::Present, Some(d)) => Some(d.join(key).display().to_string()),
+        _ => None,
+    };
+
+    // The second tier-2 leg: `projects/<NAME>/` misses → `shared/` is read,
+    // unless this project opted out with `.no-shared-fallback`. Only the
+    // per_project scope has a leg to fall through to (see the field docs).
+    let (shared_file_store, shared_file_store_path) = if scope == "per_project" {
+        match project_name {
+            Some(name) => {
+                let p = secrets_file_store::probe_shared_fallback(name, key);
+                let path = match (p, secrets_file_store::shared_dir()) {
+                    (Presence::Present, Some(d)) => Some(d.join(key).display().to_string()),
+                    _ => None,
+                };
+                (p, path)
+            }
+            // No project name means no marker to evaluate and no identity to
+            // answer for. Unknown, never a confident Absent.
+            None => (Presence::Unknown, None),
+        }
+    } else {
+        (Presence::Absent, None)
+    };
+
+    // The per-project "Disable shared secrets" opt-out, evaluated for the
+    // READER. Only a `shared`-scope row has a shared tier to lose: the
+    // keychain gate drops that bucket and nothing else, and a per-project
+    // row's `shared/` leg is already marker-gated inside
+    // `probe_shared_fallback` above.
+    let (shared_read_disabled, shared_file_fallback_disabled) = if scope == "shared" {
+        let keychain_gate =
+            crate::db::secret_scope_policy::shared_secrets_read_disabled(db, requester_project_id);
+        // The marker is keyed by the reader's file-store NAME, which is the
+        // project's DB `name` (what `vct --project NAME` and
+        // `set_shared_secrets_read_disabled` both use). An unregistered
+        // requester (e.g. a caller that passed a sentinel because it does not
+        // know the reader) has no marker to evaluate — and no shared tier to
+        // describe either, so `false` leaves the pre-existing behaviour.
+        let file_gate = db
+            .get_project(requester_project_id)
+            .ok()
+            .flatten()
+            .map(|p| secrets_file_store::shared_fallback_disabled(&p.name))
+            .unwrap_or(false);
+        (keychain_gate, file_gate)
+    } else {
+        (false, false)
+    };
+
+    StoreReport {
+        keychain,
+        file_store,
+        values_diverge,
+        file_store_path,
+        shared_file_store,
+        shared_file_store_path,
+        shared_read_disabled,
+        shared_file_fallback_disabled,
+    }
+}
+
+/// The project NAME the file store keys per-project secrets under, for a
+/// launcher `project_id`. `None` for the shared/global sentinels and for
+/// an unregistered id.
+fn file_store_project_name(db: &Db, scope: &str, project_id: &str) -> Option<String> {
+    if scope != "per_project" {
+        return None;
+    }
+    db.get_project(project_id).ok().flatten().map(|p| p.name)
 }
 
 /// Combined status used by the secrets panel UI. `is_set` follows the
@@ -496,23 +844,73 @@ pub async fn remove_secret_v2(
 /// `secret_unset` / `secret_reactivate` already, so an attacker with DB
 /// read access can already reconstruct this fact; surfacing the boolean
 /// to the UI does not weaken the model.
+///
+/// v0.3.0: `is_set` / `has_saved_value` keep their exact pre-existing
+/// meaning (KEYCHAIN truth × the launcher's active flag) so every reader
+/// that gates on them — including `is_secret_set`, which answers the
+/// launcher's own permission matrix — is byte-identical. The store
+/// question the panel actually needs to answer is carried by the ADDED
+/// `stores` field, which reports both tiers honestly. Do not "simplify"
+/// by folding the file store into `has_saved_value`: the file store is
+/// not gated by the active flag, so that would silently widen the
+/// permission gate.
 #[derive(Debug, Serialize)]
 pub struct SecretStatus {
     pub is_set: bool,
     pub is_active: bool,
     pub has_saved_value: bool,
+    /// Presence across BOTH sanctioned stores. The panel renders its
+    /// badge from this, never from `has_saved_value` alone — a key held
+    /// only in the file store resolves for every consumer and must never
+    /// display as "not set".
+    #[serde(flatten)]
+    pub stores: StoreReport,
 }
 
+/// # This command is a shim on purpose
+///
+/// Same reasoning as [`list_user_secret_keys_v2`]: `#[command]` functions
+/// take `State<'_, Db>`, which a unit test cannot construct, so a behaviour
+/// test can only reach this path if the body lives somewhere callable.
+/// Before v0.3.0 the body was inline and consequently had NO behavioural
+/// test at all — the per-project Secret-refs tab's only backend, unproven.
+/// Keeping this wrapper to a single expression means
+/// [`get_secret_status_impl`] IS the production path, and mutating it turns
+/// the tests red. Pinned by `status_command_is_a_pure_shim_over_the_tested_impl`.
 #[command]
 pub async fn get_secret_status_v2(
     project_id: String,
     module_id: String,
     scope: String,
     key: String,
+    requester_project_id: Option<String>,
     db: State<'_, Db>,
 ) -> Result<SecretStatus, String> {
-    enforce_scope_invariants(&scope, &project_id, &db)?;
-    let scope_enum = scope_from_manifest(&scope, &project_id);
+    get_secret_status_impl(db.inner(), &project_id, &module_id, &scope, &key, requester_project_id.as_deref())
+}
+
+/// The production body of [`get_secret_status_v2`].
+///
+/// `requester_project_id` names the project whose point of view is being
+/// rendered. `None` means "the owner is the reader", which is exactly true
+/// for `per_project` rows and was the ONLY behaviour before v0.3.0 — so an
+/// omitted argument reproduces the previous answer byte-for-byte.
+///
+/// It matters for the other two scopes. A `shared` row is owned by the
+/// `_user_shared_` SENTINEL, which is not a project: asking the active-flag
+/// gate about it finds no per-requester row and falls back to the `*`
+/// sentinel row, i.e. the ALL-readers answer, while the panel is rendering
+/// one specific reader's view. The reader is also the only thing the two
+/// shared-tier opt-outs in [`StoreReport`] can be evaluated against.
+fn get_secret_status_impl(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    scope: &str,
+    key: &str,
+    requester_project_id: Option<&str>,
+) -> Result<SecretStatus, String> {
+    enforce_scope_invariants(scope, project_id, db)?;
     // 0.1.7 H3 (2026-05-08): the `is_set` field is the same boolean
     // contract as the `is_secret_set` command — readers (GUI badge,
     // any module testing presence) MUST see the cross-launcher view
@@ -526,17 +924,38 @@ pub async fn get_secret_status_v2(
     // consume the secret — same project_id the GUI already knows. For
     // per_project scope, owner == requester == project_id, so the
     // semantics are identical to the legacy single-row gate.
+    // v0.3.0: the reader is the caller's `requester_project_id` when it sent
+    // one, else the owner (identical for `per_project`, where owner ==
+    // requester, which is what every pre-v0.3.0 caller relied on).
+    let requester = requester_project_id.unwrap_or(project_id);
     let active_cross = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
-        &db, &scope, &project_id, &module_id, &key, &project_id,
+        db, scope, project_id, module_id, key, requester,
     );
-    let active_own = db.is_secret_active_for_requester(
-        &scope, &project_id, &module_id, &key, &project_id,
-    )?;
-    let has_saved_value = secrets::is_set(scope_enum, &module_id, &key)?;
+    let active_own =
+        db.is_secret_active_for_requester(scope, project_id, module_id, key, requester)?;
+    // v0.3.0: ONE probe of both stores (see `read_store_report`). This
+    // replaced a `secrets::is_set(...)?` — note the `?`: a locked or
+    // erroring keychain used to fail the WHOLE status call, leaving the
+    // panel showing whatever stale value it had (in practice the `false`
+    // its registry seeded), i.e. "not set". Now the keychain reports
+    // `Unknown` and the file store is still consulted, so a key that
+    // resolves can never render as absent because tier 1 was unreadable.
+    let project_name = file_store_project_name(db, scope, project_id);
+    let stores = read_store_report(
+        db,
+        scope,
+        project_id,
+        module_id,
+        key,
+        project_name.as_deref(),
+        requester,
+    );
+    let has_saved_value = stores.keychain.is_present();
     Ok(SecretStatus {
         is_set: active_cross && has_saved_value,
         is_active: active_own,
         has_saved_value,
+        stores,
     })
 }
 
@@ -918,20 +1337,61 @@ pub struct UserSecretKeyRow {
     /// state. Equals `scope` when this row IS the winner. Different from
     /// `scope` when another scope's row outranks this one.
     pub winning_scope: String,
+    /// v0.3.0: which STORE the winning value comes from. `winning_scope`
+    /// alone was ambiguous once the file store is visible — "shared wins"
+    /// means something different when the shared value lives in a file
+    /// than when it lives in the keychain.
+    pub winning_store: WinningStore,
+    /// v0.3.0: `true` when this row exists in `secret_active_state`, i.e.
+    /// the launcher manages it. `false` for a row synthesised purely from
+    /// a file-store file the launcher has never been told about.
+    ///
+    /// The panel gates its Remove button on this: `remove_secret_v2`
+    /// deletes a keychain entry and a DB row, and CANNOT delete a
+    /// file-store file. Offering Remove on a file-only row would claim a
+    /// removal that never happened.
+    pub has_launcher_row: bool,
+    /// v0.3.0: presence across both stores. `is_set` / `has_saved_value`
+    /// above stay keychain-only (unchanged gate semantics); this is what
+    /// the badge renders from.
+    #[serde(flatten)]
+    pub stores: StoreReport,
+}
+
+/// Lifecycle + store presence for one user-bucket entry.
+///
+/// `is_set` / `is_active` / `has_saved_value` keep their pre-v0.3.0
+/// meaning exactly (cross-launcher active gate × KEYCHAIN presence);
+/// `stores` is the added, honest two-store view.
+#[derive(Debug, Clone)]
+struct UserSecretStatus {
+    is_set: bool,
+    is_active: bool,
+    has_saved_value: bool,
+    stores: StoreReport,
 }
 
 /// Read the lifecycle state for a single user-bucket entry. Mirrors
 /// `get_secret_status_v2` semantics (cross-launcher gate, per-requester)
 /// but takes the same `(scope, project_id, key)` triple so we can call
 /// it in a tight loop.
+///
+/// v0.3.0: this function used to end with
+/// `secrets::is_set(...).unwrap_or(false)` — so a locked keychain, a
+/// daemon timeout, or any transient read error became "no saved value"
+/// and the panel rendered "not set". `read_store_report` reports
+/// [`Presence::Unknown`] for those instead, and the panel renders an
+/// explicit "unknown" badge. Silence about a failed probe is
+/// indistinguishable from a confident negative, and only one of the two
+/// tells the user to unlock their keychain.
 fn read_user_secret_status(
     db: &Db,
     scope: &str,
     project_id: &str,
     requester_project_id: &str,
     key: &str,
-) -> (bool, bool, bool) {
-    let scope_enum = scope_from_manifest(scope, project_id);
+    project_name: Option<&str>,
+) -> UserSecretStatus {
     let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
         db,
         scope,
@@ -943,36 +1403,84 @@ fn read_user_secret_status(
     let active_own = db
         .is_secret_active_for_requester(scope, project_id, "user", key, requester_project_id)
         .unwrap_or(true);
-    let has_saved_value = secrets::is_set(scope_enum, "user", key).unwrap_or(false);
-    // is_set follows the same gate as the read-time API: cross-launcher
-    // active AND keychain-present.
-    (active && has_saved_value, active_own, has_saved_value)
+    let stores = read_store_report(
+        db,
+        scope,
+        project_id,
+        "user",
+        key,
+        project_name,
+        requester_project_id,
+    );
+    let has_saved_value = stores.keychain.is_present();
+    UserSecretStatus {
+        // is_set follows the same gate as the read-time API: cross-launcher
+        // active AND keychain-present.
+        is_set: active && has_saved_value,
+        is_active: active_own,
+        has_saved_value,
+        stores,
+    }
 }
 
-/// Resolve which scope's value the runtime resolver would ACTUALLY serve
-/// for `(project_id, key)` given the active-state of each scope's row.
-/// Precedence: per_project > shared > global. A scope's row only competes
-/// when its `is_set` is true (active + keychain-present). If no scope wins,
-/// returns the row's own scope so the GUI shows "this is what you typed,
-/// even if no consumer reads it yet".
+/// Resolve which (scope, store) the runtime resolver would ACTUALLY serve
+/// for `(project_id, key)`.
+///
+/// The full precedence, read off the three resolver implementations
+/// (`agent_secrets.py::get`, `vct_secrets_resolve.sh`, `.ps1`): tier 1
+/// (hub → keychain) is consulted for EVERY scope before tier 2 (the file
+/// store) is consulted at all, and within tier 2 the order is
+/// `projects/<NAME>/` then `shared/`. So:
+///
+/// ```text
+///   1. keychain  per_project      (active + present)
+///   2. keychain  shared
+///   3. keychain  global
+///   4. file store  projects/<NAME>
+///   5. file store  shared
+/// ```
+///
+/// A keychain row only competes when its `is_set` is true (active AND
+/// present) — the active flag is the launcher's permission gate. The file
+/// store is NOT gated by that flag (nothing consults launcher.db to read a
+/// file), which is exactly why a "paused" key can still resolve and why
+/// the panel has to show the file-store copy.
+///
+/// `sh_file_serves_project` is the MARKER-GATED answer
+/// (`secrets_file_store::probe_shared_fallback`), not a raw
+/// `shared/<key>` probe. A project holding `.no-shared-fallback` never
+/// reads that file, so naming it the winner would describe a resolution
+/// that does not happen for the project being viewed.
+///
+/// If nothing is live, returns the row's own scope + [`WinningStore::NoStore`]
+/// so the GUI shows "this is what you typed, even if no consumer reads it
+/// yet" without needing a separate "no winner" branch.
 fn resolve_winning_scope(
     own_scope: &str,
     pp_set: bool,
     sh_set: bool,
     gl_set: bool,
-) -> String {
+    pp_file: bool,
+    sh_file_serves_project: bool,
+) -> (String, WinningStore) {
     if pp_set {
-        return "per_project".to_string();
+        return ("per_project".to_string(), WinningStore::Keychain);
     }
     if sh_set {
-        return "shared".to_string();
+        return ("shared".to_string(), WinningStore::Keychain);
     }
     if gl_set {
-        return "global".to_string();
+        return ("global".to_string(), WinningStore::Keychain);
     }
-    // No scope has a live value — keep the badge attached to the row the
-    // user is looking at so the UI doesn't need a "no winner" branch.
-    own_scope.to_string()
+    if pp_file {
+        return ("per_project".to_string(), WinningStore::FileStore);
+    }
+    if sh_file_serves_project {
+        return ("shared".to_string(), WinningStore::FileStore);
+    }
+    // No sanctioned store has a live value — keep the badge attached to
+    // the row the user is looking at.
+    (own_scope.to_string(), WinningStore::NoStore)
 }
 
 /// Enumerate every user-bucket secret KEY the launcher has observed for
@@ -983,18 +1491,80 @@ fn resolve_winning_scope(
 /// Soft-fail: a DB hiccup on one of the three lists yields an empty
 /// sub-list rather than failing the whole call — the panel always has
 /// something to render.
+///
+/// # This command is a shim on purpose
+///
+/// The body is one call to [`list_user_secret_keys_impl`]. `#[command]`
+/// functions take `State<'_, Db>`, which a unit test cannot construct, and
+/// the pre-existing tests in this module coped by REPLICATING the command
+/// body inline — proving a copy of the logic rather than the logic (the
+/// defect shape catalogued in
+/// `knowledge/concepts/credited-mechanisms-that-never-fire-2026-09-04.md`).
+/// Keeping this wrapper to a single expression means the impl below IS the
+/// production path, and mutating it turns the tests red.
 #[command]
 pub async fn list_user_secret_keys_v2(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<Vec<UserSecretKeyRow>, String> {
-    enforce_scope_invariants("per_project", &project_id, &db)?;
+    list_user_secret_keys_impl(db.inner(), &project_id)
+}
+
+/// Union of the launcher's own key list and the file store's, per scope.
+///
+/// Returns `(keys, db_keys)` — the ordered, de-duplicated union and the
+/// set that came from `secret_active_state`, so each row can report
+/// `has_launcher_row` honestly.
+fn union_db_and_file_keys(
+    db_keys: Vec<String>,
+    file_keys: Vec<String>,
+) -> (Vec<String>, std::collections::BTreeSet<String>) {
+    use std::collections::BTreeSet;
+    let owned: BTreeSet<String> = db_keys.iter().cloned().collect();
+    let mut all: BTreeSet<String> = owned.clone();
+    for k in file_keys {
+        all.insert(k);
+    }
+    (all.into_iter().collect(), owned)
+}
+
+/// The production body of [`list_user_secret_keys_v2`].
+///
+/// v0.3.0 change of contract: the row set is the UNION of the launcher's
+/// `secret_active_state` rows and the tier-2 file store's files. Before
+/// this, a secret that lived only in `~/.vct-secrets/` was invisible in
+/// the panel while every consumer resolved it — and after a `Remove` it
+/// would vanish from the panel while still resolving, which is the same
+/// lie in a different shape. The union is what makes "everything this
+/// panel can affect, and everything that resolves" one list.
+fn list_user_secret_keys_impl(
+    db: &Db,
+    project_id: &str,
+) -> Result<Vec<UserSecretKeyRow>, String> {
+    enforce_scope_invariants("per_project", project_id, db)?;
+
+    // The file store keys per-project secrets under the project's NAME
+    // (`vct --project NAME`), not its UUID.
+    let project_name = file_store_project_name(db, "per_project", project_id);
 
     // Three flat key lists. `list_*` helpers in db::secret_active soft-fail
-    // to empty Vec on DB error.
-    let pp_keys = db.list_user_secret_keys_for_project(&project_id);
-    let sh_keys = db.list_shared_user_secret_keys();
-    let gl_keys = db.list_global_user_secret_keys();
+    // to empty Vec on DB error; the file-store listers soft-fail the same
+    // way (an unreadable directory yields no rows, while the PER-KEY probe
+    // for keys we already know about still reports `Unknown`).
+    let (pp_keys, pp_db) = union_db_and_file_keys(
+        db.list_user_secret_keys_for_project(project_id),
+        match project_name.as_deref() {
+            Some(name) => secrets_file_store::list_project_keys(name),
+            None => Vec::new(),
+        },
+    );
+    let (sh_keys, sh_db) = union_db_and_file_keys(
+        db.list_shared_user_secret_keys(),
+        secrets_file_store::list_shared_keys(),
+    );
+    // The file store has no global namespace — see `file_store_dir_for_scope`.
+    let (gl_keys, gl_db) =
+        union_db_and_file_keys(db.list_global_user_secret_keys(), Vec::new());
 
     // Build a per-key collision index up front so a single key appearing in
     // 2 or 3 scopes is flagged on EVERY row, not just one. Each value is
@@ -1014,19 +1584,26 @@ pub async fn list_user_secret_keys_v2(
     // Pre-compute per-key lifecycle for each scope so we can resolve the
     // winning_scope without re-reading the same status three times. We
     // cache by (scope, key) — small cardinality, predictable cost.
-    let mut status_cache: BTreeMap<(String, String), (bool, bool, bool)> = BTreeMap::new();
-    let mut status_for = |scope: &str, key: &str| -> (bool, bool, bool) {
+    let mut status_cache: BTreeMap<(String, String), UserSecretStatus> = BTreeMap::new();
+    let mut status_for = |scope: &str, key: &str| -> UserSecretStatus {
         let cache_key = (scope.to_string(), key.to_string());
         if let Some(s) = status_cache.get(&cache_key) {
-            return *s;
+            return s.clone();
         }
         let (owner, requester) = match scope {
-            "global" => (SENTINEL_GLOBAL.to_string(), project_id.clone()),
-            "shared" => (SENTINEL_SHARED.to_string(), project_id.clone()),
-            _ => (project_id.clone(), project_id.clone()),
+            "global" => (SENTINEL_GLOBAL.to_string(), project_id.to_string()),
+            "shared" => (SENTINEL_SHARED.to_string(), project_id.to_string()),
+            _ => (project_id.to_string(), project_id.to_string()),
         };
-        let s = read_user_secret_status(&db, scope, &owner, &requester, key);
-        status_cache.insert(cache_key, s);
+        let s = read_user_secret_status(
+            db,
+            scope,
+            &owner,
+            &requester,
+            key,
+            project_name.as_deref(),
+        );
+        status_cache.insert(cache_key, s.clone());
         s
     };
 
@@ -1035,27 +1612,41 @@ pub async fn list_user_secret_keys_v2(
     // Emit one row per (scope, key) the launcher has observed. The badge
     // condition is `scope_map[key].len() >= 2` (a KEY in ≥2 scopes).
     let push_row = |scope: &str, owner: &str, key: &str,
+                    has_launcher_row: bool,
                     scope_map: &HashMap<&str, Vec<&str>>,
-                    status_for: &mut dyn FnMut(&str, &str) -> (bool, bool, bool),
+                    status_for: &mut dyn FnMut(&str, &str) -> UserSecretStatus,
                     out: &mut Vec<UserSecretKeyRow>| {
-        let (is_set, is_active, has_saved_value) = status_for(scope, key);
-        // Compute winner using all three scopes' is_set states.
-        let pp_set = if scope == "per_project" {
-            is_set
+        let own = status_for(scope, key);
+        // Compute winner using all three scopes' is_set states plus the two
+        // file-store namespaces (see `resolve_winning_scope` for the order).
+        let pp = if scope == "per_project" {
+            own.clone()
         } else {
-            status_for("per_project", key).0
+            status_for("per_project", key)
         };
-        let sh_set = if scope == "shared" {
-            is_set
+        let sh = if scope == "shared" {
+            own.clone()
         } else {
-            status_for("shared", key).0
+            status_for("shared", key)
         };
-        let gl_set = if scope == "global" {
-            is_set
+        let gl = if scope == "global" {
+            own.clone()
         } else {
-            status_for("global", key).0
+            status_for("global", key)
         };
-        let winning_scope = resolve_winning_scope(scope, pp_set, sh_set, gl_set);
+        let (winning_scope, winning_store) = resolve_winning_scope(
+            scope,
+            pp.is_set,
+            sh.is_set,
+            gl.is_set,
+            pp.stores.file_store.is_present(),
+            // NOT `sh.stores.file_store` (a raw `shared/<key>` probe): the
+            // question here is whether the SHARED file serves THIS project,
+            // which the `.no-shared-fallback` marker can answer no. The
+            // per_project row's own fall-through leg already carries that
+            // gated answer, so there is one computation, not two.
+            pp.stores.shared_file_store.is_present(),
+        );
         let collisions = scope_map
             .get(key)
             .map(|v| v.len())
@@ -1065,19 +1656,23 @@ pub async fn list_user_secret_keys_v2(
             project_id: owner.to_string(),
             module_id: "user".to_string(),
             key: key.to_string(),
-            is_set,
-            is_active,
-            has_saved_value,
+            is_set: own.is_set,
+            is_active: own.is_active,
+            has_saved_value: own.has_saved_value,
             is_shadowed: collisions >= 2,
             winning_scope,
+            winning_store,
+            has_launcher_row,
+            stores: own.stores,
         });
     };
 
     for k in &pp_keys {
         push_row(
             "per_project",
-            &project_id,
+            project_id,
             k,
+            pp_db.contains(k),
             &scope_map,
             &mut status_for,
             &mut out,
@@ -1088,6 +1683,7 @@ pub async fn list_user_secret_keys_v2(
             "shared",
             SENTINEL_SHARED,
             k,
+            sh_db.contains(k),
             &scope_map,
             &mut status_for,
             &mut out,
@@ -1098,6 +1694,7 @@ pub async fn list_user_secret_keys_v2(
             "global",
             SENTINEL_GLOBAL,
             k,
+            gl_db.contains(k),
             &scope_map,
             &mut status_for,
             &mut out,
@@ -1145,6 +1742,70 @@ mod tests {
     /// local; do NOT bind to `_` alone or RAII drops the lock immediately.
     fn keychain_test_lock() -> crate::secrets::test_serialize::KeychainGuard {
         crate::secrets::test_serialize::keychain_serialize_lock()
+    }
+
+    /// Point `$VCT_SECRETS_DIR` at a fresh, empty tier-2 file store for
+    /// the lifetime of the returned guard, restoring the prior value (set
+    /// or unset) on drop — including on panic.
+    ///
+    /// Deliberately does NOT take a lock of its own. Every caller already
+    /// holds [`keychain_test_lock`] (the store probe goes through
+    /// `secrets::get`), and that guard is what serialises this env
+    /// mutation against the other `VCT_SECRETS_DIR`-mutating tests in this
+    /// crate — `installer::tests::setup_temp_env` uses the identical
+    /// keychain-lock-then-set-env order. Acquiring a SECOND global mutex
+    /// here would introduce a lock-ordering hazard for no added safety.
+    struct FileStoreScratch {
+        root: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl FileStoreScratch {
+        fn shared(&self) -> std::path::PathBuf {
+            self.root.join("shared")
+        }
+        fn project(&self, name: &str) -> std::path::PathBuf {
+            self.root.join("projects").join(name)
+        }
+        /// Write a fake secret file. The bytes are a test canary, never a
+        /// real credential shape.
+        fn put(&self, dir: &std::path::Path, key: &str, value: &str) {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(key), value).unwrap();
+        }
+    }
+
+    impl Drop for FileStoreScratch {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("VCT_SECRETS_DIR", v),
+                    None => std::env::remove_var("VCT_SECRETS_DIR"),
+                }
+            }
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn file_store_scratch() -> FileStoreScratch {
+        let root = std::env::temp_dir().join(format!(
+            "vct-secrets-panel-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::create_dir_all(root.join("projects")).unwrap();
+        let prev = std::env::var_os("VCT_SECRETS_DIR");
+        unsafe {
+            std::env::set_var("VCT_SECRETS_DIR", &root);
+        }
+        FileStoreScratch { root, prev }
+    }
+
+    /// A scratch store with no files in it — for tests that assert a pure
+    /// tier-1 outcome and must not be perturbed by the developer's real
+    /// `~/.vct-secrets/`.
+    fn empty_file_store_guard() -> FileStoreScratch {
+        file_store_scratch()
     }
 
     fn seed_project(db: &Db, id: &str, name: &str) {
@@ -2058,24 +2719,73 @@ mod tests {
     // exercise it serialise via the shared
     // `crate::secrets::test_serialize::keychain_serialize_lock`.
 
+    /// Tier-1 (keychain) precedence, unchanged from pre-v0.3.0: every
+    /// original assertion is preserved verbatim; the two file-store
+    /// arguments are `false` throughout, so this pins that adding the
+    /// file store did not perturb keychain resolution.
     #[test]
     fn resolve_winning_scope_precedence_per_project_beats_shared_beats_global() {
+        let scope_of = |own: &str, pp: bool, sh: bool, gl: bool| {
+            resolve_winning_scope(own, pp, sh, gl, false, false)
+        };
         // All three set: per_project wins.
-        assert_eq!(resolve_winning_scope("per_project", true, true, true), "per_project");
-        assert_eq!(resolve_winning_scope("shared", true, true, true), "per_project");
-        assert_eq!(resolve_winning_scope("global", true, true, true), "per_project");
+        assert_eq!(scope_of("per_project", true, true, true),
+                   ("per_project".to_string(), WinningStore::Keychain));
+        assert_eq!(scope_of("shared", true, true, true),
+                   ("per_project".to_string(), WinningStore::Keychain));
+        assert_eq!(scope_of("global", true, true, true),
+                   ("per_project".to_string(), WinningStore::Keychain));
         // Per-project paused, shared+global active: shared wins.
-        assert_eq!(resolve_winning_scope("per_project", false, true, true), "shared");
-        assert_eq!(resolve_winning_scope("shared", false, true, true), "shared");
-        assert_eq!(resolve_winning_scope("global", false, true, true), "shared");
+        assert_eq!(scope_of("per_project", false, true, true),
+                   ("shared".to_string(), WinningStore::Keychain));
+        assert_eq!(scope_of("shared", false, true, true),
+                   ("shared".to_string(), WinningStore::Keychain));
+        assert_eq!(scope_of("global", false, true, true),
+                   ("shared".to_string(), WinningStore::Keychain));
         // Only global active.
-        assert_eq!(resolve_winning_scope("per_project", false, false, true), "global");
-        assert_eq!(resolve_winning_scope("shared", false, false, true), "global");
-        assert_eq!(resolve_winning_scope("global", false, false, true), "global");
+        assert_eq!(scope_of("per_project", false, false, true),
+                   ("global".to_string(), WinningStore::Keychain));
+        assert_eq!(scope_of("shared", false, false, true),
+                   ("global".to_string(), WinningStore::Keychain));
+        assert_eq!(scope_of("global", false, false, true),
+                   ("global".to_string(), WinningStore::Keychain));
         // No scope set → fall back to own (the row the user is looking at).
-        assert_eq!(resolve_winning_scope("per_project", false, false, false), "per_project");
-        assert_eq!(resolve_winning_scope("shared", false, false, false), "shared");
-        assert_eq!(resolve_winning_scope("global", false, false, false), "global");
+        assert_eq!(scope_of("per_project", false, false, false),
+                   ("per_project".to_string(), WinningStore::NoStore));
+        assert_eq!(scope_of("shared", false, false, false),
+                   ("shared".to_string(), WinningStore::NoStore));
+        assert_eq!(scope_of("global", false, false, false),
+                   ("global".to_string(), WinningStore::NoStore));
+    }
+
+    /// v0.3.0: the file store is tier 2 — it wins ONLY when no keychain
+    /// scope has a live value, and within tier 2 `projects/<NAME>/` beats
+    /// `shared/`. This mirrors `agent_secrets.py::get` /
+    /// `vct_secrets_resolve.sh`, where tier 1 is exhausted across all
+    /// scopes before tier 2 is consulted at all.
+    #[test]
+    fn file_store_is_tier_two_and_never_outranks_a_live_keychain_value() {
+        // Any live keychain scope outranks both file-store namespaces.
+        assert_eq!(
+            resolve_winning_scope("shared", false, false, true, true, true),
+            ("global".to_string(), WinningStore::Keychain),
+            "a file-store copy must not outrank a live keychain value"
+        );
+        // Keychain empty everywhere → project file beats shared file.
+        assert_eq!(
+            resolve_winning_scope("shared", false, false, false, true, true),
+            ("per_project".to_string(), WinningStore::FileStore)
+        );
+        // Only the shared file exists.
+        assert_eq!(
+            resolve_winning_scope("per_project", false, false, false, false, true),
+            ("shared".to_string(), WinningStore::FileStore)
+        );
+        // Nothing anywhere → own scope, no store.
+        assert_eq!(
+            resolve_winning_scope("shared", false, false, false, false, false),
+            ("shared".to_string(), WinningStore::NoStore)
+        );
     }
 
     /// Direct DB-only collision detection: write keys to two scopes via
@@ -2226,6 +2936,907 @@ mod tests {
         assert_eq!(scope_map["OPENAI_API_KEY"].len(), 1);
     }
 
+    // ─── v0.3.0: the panel must report where the value ACTUALLY lives ──
+    //
+    // Every test below drives `list_user_secret_keys_impl` — the exact
+    // body of the `list_user_secret_keys_v2` Tauri command, which is a
+    // one-expression shim over it. They are hermetic: the keychain arm
+    // runs on the thread-local `MockGuard`, and `$VCT_SECRETS_DIR` points
+    // at a per-test scratch store, so neither the developer's keychain nor
+    // their real `~/.vct-secrets/` can influence the outcome.
+
+    fn find<'a>(
+        rows: &'a [UserSecretKeyRow],
+        scope: &str,
+        key: &str,
+    ) -> Option<&'a UserSecretKeyRow> {
+        rows.iter().find(|r| r.scope == scope && r.key == key)
+    }
+
+    /// THE DEFECT. A key present only in the tier-2 file store resolves
+    /// for `vct`, `agent_secrets.get` and `vct_secrets_resolve.sh`, and
+    /// the panel rendered it as "not set" — steering the user into
+    /// re-typing it in the GUI and forking the value across two stores,
+    /// the failure mode `CLAUDE.md` explicitly warns about.
+    ///
+    /// After the fix the row EXISTS, reports `file_store: Present`, and
+    /// carries `has_launcher_row: false` so the panel can suppress a
+    /// Remove button that could not remove it.
+    #[test]
+    fn file_store_only_key_is_listed_and_never_reads_as_not_set() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pfs", "FileStoreProj");
+
+        // Only the file store has it — no keychain value, no launcher row.
+        fs.put(&fs.shared(), "FIELD_ONLY_IN_FILE_STORE", "canary-not-a-real-token");
+
+        let rows = list_user_secret_keys_impl(&db, "pfs").unwrap();
+        let row = find(&rows, "shared", "FIELD_ONLY_IN_FILE_STORE")
+            .expect("a key that resolves must appear in the panel's row list");
+        assert_eq!(row.stores.file_store, Presence::Present);
+        assert_eq!(
+            row.stores.keychain,
+            Presence::Absent,
+            "the mock keychain genuinely has no entry"
+        );
+        assert!(!row.is_set, "is_set stays the keychain × active gate");
+        assert!(!row.has_saved_value, "has_saved_value stays keychain-only");
+        assert!(
+            !row.has_launcher_row,
+            "no secret_active_state row exists for a file-only key"
+        );
+        assert_eq!(row.winning_store, WinningStore::FileStore);
+        assert_eq!(row.winning_scope, "shared");
+    }
+
+    /// The per-project file-store namespace is keyed by the project's
+    /// NAME (`vct --project NAME`), not its launcher UUID — and one
+    /// project must never see another's file-store keys.
+    #[test]
+    fn per_project_file_store_rows_use_the_project_name_namespace() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "id-mine", "MineProj");
+        seed_project(&db, "id-other", "OtherProj");
+
+        fs.put(&fs.project("MineProj"), "MINE_KEY", "canary");
+        fs.put(&fs.project("OtherProj"), "OTHER_KEY", "canary");
+
+        let rows = list_user_secret_keys_impl(&db, "id-mine").unwrap();
+        let mine = find(&rows, "per_project", "MINE_KEY")
+            .expect("the project's own file-store key must be listed");
+        assert_eq!(mine.stores.file_store, Presence::Present);
+        assert_eq!(mine.project_id, "id-mine");
+        assert!(
+            find(&rows, "per_project", "OTHER_KEY").is_none(),
+            "another project's file-store namespace must not leak into this list"
+        );
+    }
+
+    /// A project-scope row must report on its OWN namespace only in
+    /// `file_store`; attributing one file to two rows would make "where
+    /// does this live?" unanswerable. The resolvers' fall-through
+    /// `projects/<NAME>/` → `shared/` is reported by the SEPARATE
+    /// `shared_file_store` leg, asserted below — the two together are what
+    /// let the panel say both "yours does not hold it" and "it still
+    /// resolves, from shared". The global scope has no file-store
+    /// namespace at all, so `Absent` is a complete answer there rather
+    /// than a failure to look.
+    #[test]
+    fn shared_file_is_attributed_to_the_shared_row_only() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pattr", "AttrProj");
+        fs.put(&fs.shared(), "ATTR_KEY", "canary");
+        // Give the same KEY a per_project and a global launcher row so all
+        // three scopes emit a row for it.
+        db.mark_secret_active("per_project", "pattr", "user", "ATTR_KEY").unwrap();
+        db.mark_secret_active("global", SENTINEL_GLOBAL, "user", "ATTR_KEY").unwrap();
+
+        let rows = list_user_secret_keys_impl(&db, "pattr").unwrap();
+        assert_eq!(
+            find(&rows, "shared", "ATTR_KEY").unwrap().stores.file_store,
+            Presence::Present
+        );
+        assert_eq!(
+            find(&rows, "per_project", "ATTR_KEY").unwrap().stores.file_store,
+            Presence::Absent
+        );
+        assert_eq!(
+            find(&rows, "global", "ATTR_KEY").unwrap().stores.file_store,
+            Presence::Absent,
+            "the file store has no global namespace — Absent, not Unknown"
+        );
+        // Attribution unchanged; the fall-through is a separate answer, so
+        // the per-project row is not left implying the key is nowhere.
+        assert_eq!(
+            find(&rows, "per_project", "ATTR_KEY").unwrap().stores.shared_file_store,
+            Presence::Present
+        );
+    }
+
+    /// A keychain READ ERROR (locked login keyring, daemon timeout) must
+    /// report `Unknown`, never `Absent`. Pre-v0.3.0 this path was
+    /// `secrets::is_set(...).unwrap_or(false)`, so an unreadable store
+    /// rendered exactly like an empty one and the user was told to type in
+    /// a value they already had.
+    #[test]
+    fn keychain_read_error_reports_unknown_not_absent() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let _fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "perr", "ErrProj");
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "ERRING_KEY").unwrap();
+
+        crate::secrets::for_tests::fail_next_get("ERRING_KEY");
+        let rows = list_user_secret_keys_impl(&db, "perr").unwrap();
+        let row = find(&rows, "shared", "ERRING_KEY").expect("row must still render");
+        assert_eq!(
+            row.stores.keychain,
+            Presence::Unknown,
+            "a store we could not read must not claim the key is absent"
+        );
+        assert!(!row.is_set, "an unreadable keychain cannot claim the key is live");
+    }
+
+    /// The divergent-copy state: BOTH stores hold the key with DIFFERENT
+    /// values. This is the fork `CLAUDE.md` warns about, and the panel is
+    /// the only place a user could ever notice it.
+    ///
+    /// The detection compares in memory and emits one boolean — no value
+    /// and no digest of a value crosses the IPC boundary (a hash of a
+    /// low-entropy secret is a brute-forceable oracle, so hashing would
+    /// leak rather than protect).
+    #[test]
+    fn both_stores_holding_different_values_is_reported_as_divergent() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pdiv", "DivProj");
+
+        let shared = scope_from_manifest("shared", SENTINEL_SHARED);
+        crate::secrets::set(shared, "user", "DIV_KEY", "canary-keychain-side").unwrap();
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "DIV_KEY").unwrap();
+        fs.put(&fs.shared(), "DIV_KEY", "canary-file-side");
+
+        let row_of = |db: &Db| {
+            let rows = list_user_secret_keys_impl(db, "pdiv").unwrap();
+            find(&rows, "shared", "DIV_KEY").cloned().unwrap()
+        };
+
+        let diverged = row_of(&db);
+        assert_eq!(diverged.stores.keychain, Presence::Present);
+        assert_eq!(diverged.stores.file_store, Presence::Present);
+        assert_eq!(
+            diverged.stores.values_diverge,
+            Some(true),
+            "two stores, two different values — the user must be told"
+        );
+        assert_eq!(
+            diverged.winning_store,
+            WinningStore::Keychain,
+            "tier 1 wins, so the file copy is the one silently ignored"
+        );
+
+        // Same value in both → agreement, not divergence.
+        fs.put(&fs.shared(), "DIV_KEY", "canary-keychain-side");
+        assert_eq!(row_of(&db).stores.values_diverge, Some(false));
+
+        // The trailing-newline convention the resolvers use must not
+        // register as a difference: `vct set` writes `value\n` and every
+        // resolver strips exactly one.
+        fs.put(&fs.shared(), "DIV_KEY", "canary-keychain-side\n");
+        assert_eq!(
+            row_of(&db).stores.values_diverge,
+            Some(false),
+            "one trailing newline is stripped by every resolver — not a divergence"
+        );
+
+        // Only one store has it → nothing to compare.
+        std::fs::remove_file(fs.shared().join("DIV_KEY")).unwrap();
+        let single = row_of(&db);
+        assert_eq!(single.stores.file_store, Presence::Absent);
+        assert_eq!(single.stores.values_diverge, None);
+    }
+
+    /// Nothing in the row a consumer receives may carry value bytes. Pins
+    /// the serialized wire shape against a canary written into BOTH
+    /// stores.
+    #[test]
+    fn serialized_rows_never_carry_a_value() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pleak", "LeakProj");
+
+        let canary = format!("leak-canary-{}", uuid::Uuid::new_v4().simple());
+        let shared = scope_from_manifest("shared", SENTINEL_SHARED);
+        crate::secrets::set(shared, "user", "LEAK_KEY", &canary).unwrap();
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "LEAK_KEY").unwrap();
+        let file_canary = format!("{}-file", canary);
+        fs.put(&fs.shared(), "LEAK_KEY", &file_canary);
+
+        let rows = list_user_secret_keys_impl(&db, "pleak").unwrap();
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(
+            !json.contains(&canary),
+            "the keychain value (or the file value, which embeds it) reached the wire"
+        );
+        // The divergence bit itself must still be there — the guard above
+        // must not be satisfiable by simply omitting the comparison.
+        assert!(json.contains("\"values_diverge\":true"));
+        assert!(json.contains("\"file_store\":\"present\""));
+    }
+
+    /// `list_user_secret_keys_v2` must stay a one-expression delegate to
+    /// `list_user_secret_keys_impl`, because that impl is what every
+    /// behaviour test above drives. If the command grew logic of its own,
+    /// those tests would silently stop covering production.
+    ///
+    /// This is a STRUCTURAL pin, and its shape matters: it extracts the
+    /// command's BODY and asserts the body IS the delegate, rather than
+    /// grepping the file for the callee's name. A name-substring assertion
+    /// is satisfied by a comment — that exact defect is instance #8 in
+    /// `knowledge/concepts/credited-mechanisms-that-never-fire-2026-09-04.md`,
+    /// where a wiring guard was itself unwired. A `State<'_, Db>` cannot be
+    /// constructed in a unit test, so a behavioural pin on the `#[command]`
+    /// wrapper is not available; keeping the wrapper empty is what makes
+    /// the behavioural tests on the impl load-bearing.
+    #[test]
+    fn list_command_is_a_pure_shim_over_the_tested_impl() {
+        let src = include_str!("secrets_cmd.rs");
+        // Split literal: an `include_str!` of THIS file also contains the
+        // needle, so a contiguous spelling could match the TEST's own copy
+        // instead of the command. See
+        // `knowledge/concepts/source-shape-guard-tests-split-literal-needles-2026-07-02.md`.
+        let sig = concat!("pub async fn ", "list_user_secret_keys_v2(");
+        let at = src.find(sig).expect("the command must exist");
+        let open = src[at..].find(" {\n").expect("command body must open") + at + 3;
+        let close = src[open..].find("\n}\n").expect("command body must close") + open;
+        let body = src[open..close].trim();
+        assert_eq!(
+            body, "list_user_secret_keys_impl(db.inner(), &project_id)",
+            "list_user_secret_keys_v2 grew a body of its own — the behaviour \
+             tests in this module drive list_user_secret_keys_impl and would \
+             no longer cover what the panel calls"
+        );
+    }
+
+    // ─── The tier-2 SHARED fall-through leg (v0.3.0) ──────────────────
+    //
+    // `read_store_report` mapped `per_project` onto `projects/<NAME>/`
+    // and stopped. But the resolvers do not stop there: they read
+    // `shared/<key>` next. So a per-project ref whose value lives only in
+    // `shared/` resolved for every consumer and the panel called it
+    // "not set" — the same lie the two-store report was written to remove,
+    // one scope down. These drive the PRODUCTION entry points
+    // (`get_secret_status_impl`, `list_user_secret_keys_impl`).
+
+    /// Write the marker that opts a project out of the shared tier —
+    /// through the SAME constant the launcher's toggle joins and the four
+    /// resolvers read, so a rename cannot leave this test pinning a
+    /// filename nobody uses.
+    fn write_opt_out_marker(fs: &FileStoreScratch, project_name: &str) {
+        let dir = fs.project(project_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::secrets_file_store::NO_SHARED_FALLBACK_MARKER),
+            b"",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_per_project_key_living_only_in_shared_is_reported_as_resolving() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pfall", "FallProj");
+
+        // The residual, exactly: no keychain entry, nothing in the
+        // project's OWN file-store namespace, value present in `shared/`.
+        fs.put(&fs.shared(), "FALLTHROUGH_KEY", "canary");
+
+        let st = get_secret_status_impl(&db, "pfall", "user", "per_project", "FALLTHROUGH_KEY", None)
+            .expect("status must resolve");
+
+        assert_eq!(st.stores.keychain, Presence::Absent);
+        assert_eq!(
+            st.stores.file_store,
+            Presence::Absent,
+            "the OWN-namespace probe stays honest — one file, one row"
+        );
+        assert_eq!(
+            st.stores.shared_file_store,
+            Presence::Present,
+            "THE DEFECT: `projects/<NAME>/` misses and `shared/` hits, which \
+             is a resolving key — it must not read as absent"
+        );
+        assert_eq!(
+            st.stores.shared_file_store_path.as_deref(),
+            Some(fs.shared().join("FALLTHROUGH_KEY").display().to_string().as_str()),
+            "the path must name the SHARED file, so Remove can say what survives"
+        );
+        // The permission gate is untouched: the file store is not gated by
+        // the launcher's active flag, and `is_set` must not start claiming
+        // otherwise.
+        assert!(!st.is_set);
+        assert!(!st.has_saved_value);
+    }
+
+    #[test]
+    fn the_opt_out_marker_denies_the_shared_leg_for_that_project_only() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "popt", "OptedOutProj");
+        seed_project(&db, "pnorm", "NormalProj");
+        fs.put(&fs.shared(), "GATED_KEY", "canary");
+        write_opt_out_marker(&fs, "OptedOutProj");
+
+        let opted = get_secret_status_impl(&db, "popt", "user", "per_project", "GATED_KEY", None)
+            .expect("status");
+        assert_eq!(
+            opted.stores.shared_file_store,
+            Presence::Absent,
+            "this project's resolvers SKIP shared/ — telling it the value is \
+             there would describe someone else's resolution"
+        );
+        assert_eq!(opted.stores.shared_file_store_path, None);
+
+        let normal = get_secret_status_impl(&db, "pnorm", "user", "per_project", "GATED_KEY", None)
+            .expect("status");
+        assert_eq!(
+            normal.stores.shared_file_store,
+            Presence::Present,
+            "the marker is per-project — the neighbour still resolves it"
+        );
+    }
+
+    #[test]
+    fn the_own_namespace_outranks_the_shared_leg_just_as_the_resolvers_do() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pboth", "BothProj");
+        fs.put(&fs.project("BothProj"), "BOTH_KEY", "canary-own");
+        fs.put(&fs.shared(), "BOTH_KEY", "canary-shared");
+
+        let st = get_secret_status_impl(&db, "pboth", "user", "per_project", "BOTH_KEY", None)
+            .expect("status");
+        // BOTH legs report Present — that is the point: the panel must be
+        // able to say "yours wins, and there is another copy".
+        assert_eq!(st.stores.file_store, Presence::Present);
+        assert_eq!(st.stores.shared_file_store, Presence::Present);
+        assert_eq!(
+            st.stores.file_store_path.as_deref(),
+            Some(fs.project("BothProj").join("BOTH_KEY").display().to_string().as_str())
+        );
+    }
+
+    // ─── The project-wide shared opt-out reaches the DISPLAY (GAP-2) ──
+    //
+    // `set_shared_secrets_read_disabled` makes a project stop reading the
+    // shared tier: the DB flag drops the keychain's user-shared bucket
+    // inside `resolve_active_user_secret_pairs_for_requester`, and the
+    // companion `.no-shared-fallback` marker drops `~/.vct-secrets/shared/`
+    // for the four tier-2 resolvers.
+    //
+    // Neither gate was visible to the panel. `is_set` is the per-(secret ×
+    // requester) ACTIVE flag and does not model a bulk policy — correctly,
+    // and it must keep not modelling it — so a live shared row rendered
+    // "set" on a project that would never receive it. These pin the fix
+    // where it belongs: two DISPLAY booleans on the store report, computed
+    // for the READER.
+
+    /// Turn on the opt-out the way the production toggle does — through the
+    /// same `module_settings` row and the same constants, so a rename
+    /// cannot leave these tests pinning a key nothing reads.
+    fn opt_out_of_shared_secrets(db: &Db, project_id: &str) {
+        db.set_setting(
+            project_id,
+            module_settings_keys::ORCHESTRATOR_CORE_MODULE_ID,
+            module_settings_keys::SETTING_KEY_SHARED_SECRETS_READ_DISABLED,
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_opted_out_project_is_told_a_live_shared_row_does_not_reach_it() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "popt2", "OptedOut2");
+
+        // A perfectly healthy shared secret: keychain value, active flag on.
+        let shared = scope_from_manifest("shared", SENTINEL_SHARED);
+        crate::secrets::set(shared, "user", "TEAM_TOKEN", "canary").unwrap();
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "TEAM_TOKEN")
+            .unwrap();
+        // …and both halves of the opt-out, as the toggle writes them.
+        opt_out_of_shared_secrets(&db, "popt2");
+        write_opt_out_marker(&fs, "OptedOut2");
+
+        let st = get_secret_status_impl(
+            &db,
+            SENTINEL_SHARED,
+            "user",
+            "shared",
+            "TEAM_TOKEN",
+            Some("popt2"),
+        )
+        .expect("status");
+
+        assert!(
+            st.stores.shared_read_disabled,
+            "THE DEFECT: the reader has opted out of the shared keychain \
+             bucket, so this row does not reach it — the panel had no way to \
+             know and rendered it as set"
+        );
+        assert!(
+            st.stores.shared_file_fallback_disabled,
+            "the companion marker gates tier 2 for the same reader"
+        );
+        // The PERMISSION GATE is untouched, deliberately. `is_set` answers
+        // "may this requester read the keychain slot", which `is_secret_set`,
+        // the hub and module code all ask; folding a bulk display policy
+        // into it would silently widen that answer for every one of them.
+        assert!(
+            st.is_set,
+            "is_set must keep its exact pre-existing meaning (keychain value \
+             x the per-(secret x requester) active flag)"
+        );
+        assert!(st.has_saved_value);
+        assert_eq!(st.stores.keychain, Presence::Present);
+    }
+
+    #[test]
+    fn the_shared_gates_are_computed_for_the_reader_never_the_owner() {
+        // A shared row is OWNED by the `_user_shared_` sentinel, which is
+        // not a project and can hold neither a setting row nor a marker. So
+        // a status call that does not name the reader cannot evaluate
+        // either gate — and before v0.3.0 there was no way to name one.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "preader", "ReaderProj");
+        seed_project(&db, "pother", "OtherProj");
+        fs.put(&fs.shared(), "TEAM_TOKEN", "canary");
+        opt_out_of_shared_secrets(&db, "preader");
+        write_opt_out_marker(&fs, "ReaderProj");
+
+        let named = get_secret_status_impl(
+            &db, SENTINEL_SHARED, "user", "shared", "TEAM_TOKEN", Some("preader"),
+        )
+        .expect("status");
+        assert!(named.stores.shared_read_disabled);
+        assert!(named.stores.shared_file_fallback_disabled);
+
+        // A DIFFERENT reader never inherits its neighbour's opt-out.
+        let neighbour = get_secret_status_impl(
+            &db, SENTINEL_SHARED, "user", "shared", "TEAM_TOKEN", Some("pother"),
+        )
+        .expect("status");
+        assert!(!neighbour.stores.shared_read_disabled);
+        assert!(!neighbour.stores.shared_file_fallback_disabled);
+
+        // And an omitted reader reproduces the pre-v0.3.0 answer exactly:
+        // the owner sentinel has no opt-out, so nothing is suppressed.
+        let anonymous = get_secret_status_impl(
+            &db, SENTINEL_SHARED, "user", "shared", "TEAM_TOKEN", None,
+        )
+        .expect("status");
+        assert!(!anonymous.stores.shared_read_disabled);
+        assert!(!anonymous.stores.shared_file_fallback_disabled);
+    }
+
+    #[test]
+    fn a_failed_marker_write_leaves_the_file_tier_serving_and_the_report_says_so() {
+        // `set_shared_secrets_read_disabled` writes the DB flag, then the
+        // marker best-effort — and warns, in so many words, that "file-store
+        // tier-2 shared fallback is not gated until the marker exists". In
+        // that state the shared FILE still resolves for this project, so a
+        // report collapsing both gates into one boolean would tell the user
+        // a working key does not reach them.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "phalf", "HalfGated");
+        fs.put(&fs.shared(), "HALF_KEY", "canary");
+        opt_out_of_shared_secrets(&db, "phalf");
+        // …and NO marker on disk.
+
+        let st = get_secret_status_impl(
+            &db, SENTINEL_SHARED, "user", "shared", "HALF_KEY", Some("phalf"),
+        )
+        .expect("status");
+        assert!(st.stores.shared_read_disabled, "the keychain bucket IS gated");
+        assert!(
+            !st.stores.shared_file_fallback_disabled,
+            "the file tier is NOT gated until the marker file exists — the four \
+             resolvers stat it on disk, they do not read launcher.db"
+        );
+        assert_eq!(st.stores.file_store, Presence::Present);
+    }
+
+    #[test]
+    fn the_shared_opt_out_never_touches_per_project_or_global_rows() {
+        // The gate drops ONE bucket. Per-project secrets and the global
+        // machine-wide bucket keep resolving, and a row that claimed
+        // otherwise would send the user to a checkbox that changes nothing.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let _fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pscope", "ScopeProj");
+        opt_out_of_shared_secrets(&db, "pscope");
+
+        let pp = get_secret_status_impl(
+            &db, "pscope", "user", "per_project", "K", Some("pscope"),
+        )
+        .expect("status");
+        assert!(!pp.stores.shared_read_disabled);
+        assert!(!pp.stores.shared_file_fallback_disabled);
+
+        let gl = get_secret_status_impl(
+            &db, SENTINEL_GLOBAL, "user", "global", "K", Some("pscope"),
+        )
+        .expect("status");
+        assert!(!gl.stores.shared_read_disabled);
+        assert!(!gl.stores.shared_file_fallback_disabled);
+    }
+
+    #[test]
+    fn the_panel_list_carries_the_opt_out_on_its_shared_rows() {
+        // The list command is the surface that actually renders the Shared
+        // tab, and it is the one that knows the reader without being told.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "plist", "ListProj");
+
+        let shared = scope_from_manifest("shared", SENTINEL_SHARED);
+        crate::secrets::set(shared, "user", "LIST_TEAM_TOKEN", "canary").unwrap();
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "LIST_TEAM_TOKEN")
+            .unwrap();
+        opt_out_of_shared_secrets(&db, "plist");
+        write_opt_out_marker(&fs, "ListProj");
+
+        let rows = list_user_secret_keys_impl(&db, "plist").unwrap();
+        let sh = rows
+            .iter()
+            .find(|r| r.scope == "shared" && r.key == "LIST_TEAM_TOKEN")
+            .expect("the shared row must be listed");
+        assert!(sh.stores.shared_read_disabled);
+        assert!(sh.stores.shared_file_fallback_disabled);
+        assert!(sh.is_set, "the permission gate is unchanged");
+
+        // Every OTHER row in the same response keeps the gates off, so the
+        // flag cannot be read as a project-wide banner.
+        for r in rows.iter().filter(|r| r.scope != "shared") {
+            assert!(!r.stores.shared_read_disabled, "{} leaked the gate", r.key);
+            assert!(!r.stores.shared_file_fallback_disabled, "{} leaked the gate", r.key);
+        }
+    }
+
+    #[test]
+    fn a_shared_row_answers_about_the_readers_own_pause_not_the_all_readers_row() {
+        // Same plumbing, different consumer: `mark_secret_inactive_for_requester`
+        // pauses a shared key for ONE project. Asking with the sentinel as
+        // the requester finds no literal row and falls back to `*` — the
+        // all-readers answer — so the panel showed "set" for a key the
+        // project in view had explicitly paused.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let _fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "ppause", "PauseProj");
+
+        let shared = scope_from_manifest("shared", SENTINEL_SHARED);
+        crate::secrets::set(shared, "user", "PAUSED_TEAM_KEY", "canary").unwrap();
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "PAUSED_TEAM_KEY")
+            .unwrap();
+        db.mark_secret_inactive_for_requester(
+            "shared", SENTINEL_SHARED, "user", "PAUSED_TEAM_KEY", "ppause",
+        )
+        .unwrap();
+
+        let for_reader = get_secret_status_impl(
+            &db, SENTINEL_SHARED, "user", "shared", "PAUSED_TEAM_KEY", Some("ppause"),
+        )
+        .expect("status");
+        assert!(
+            !for_reader.is_set,
+            "this project paused the key; the row must not claim it is live here"
+        );
+        assert!(
+            for_reader.has_saved_value,
+            "the VALUE is still in the keychain — pausing preserves it"
+        );
+
+        // The all-readers view is unchanged, which is why the reader has to
+        // be named rather than inferred.
+        let all_readers = get_secret_status_impl(
+            &db, SENTINEL_SHARED, "user", "shared", "PAUSED_TEAM_KEY", None,
+        )
+        .expect("status");
+        assert!(all_readers.is_set);
+    }
+
+    // ─── Item 3: the shared-copy conflict, and who reports it ─────────
+
+    #[test]
+    fn a_shared_file_copy_collides_across_scopes_and_both_rows_say_so() {
+        // `isForked` (keychain x the row's OWN file-store namespace) does
+        // not fire when the second copy is `~/.vct-secrets/shared/<key>`.
+        // That is not a gap: the row set is the UNION of the launcher's rows
+        // and the file store's FILES, so the shared file becomes a
+        // shared-scope ROW and the collision surfaces as a cross-scope
+        // shadow on BOTH rows — with the winner named, which "⚠ also in
+        // file store" would not do. Verified here rather than assumed.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pfork", "ForkProj");
+
+        // The project's own keychain value…
+        let pp = scope_from_manifest("per_project", "pfork");
+        crate::secrets::set(pp, "user", "DUP_KEY", "canary-keychain").unwrap();
+        db.mark_secret_active("per_project", "pfork", "user", "DUP_KEY").unwrap();
+        // …and a second copy in the SHARED file store, which the launcher
+        // has never been told about.
+        fs.put(&fs.shared(), "DUP_KEY", "canary-shared-file");
+
+        let rows = list_user_secret_keys_impl(&db, "pfork").unwrap();
+        let own = rows
+            .iter()
+            .find(|r| r.scope == "per_project" && r.key == "DUP_KEY")
+            .expect("per-project row");
+        let shared_row = rows
+            .iter()
+            .find(|r| r.scope == "shared" && r.key == "DUP_KEY")
+            .expect("the shared FILE must produce a shared-scope row");
+
+        // Not a same-row fork: the project's own namespace holds nothing.
+        assert_eq!(own.stores.keychain, Presence::Present);
+        assert_eq!(
+            own.stores.file_store,
+            Presence::Absent,
+            "isForked's inputs — so it stays false, correctly"
+        );
+        // The conflict is carried, on BOTH rows, with the winner named.
+        assert!(own.is_shadowed, "the conflict must be visible from the row in view");
+        assert!(shared_row.is_shadowed, "…and from the other one");
+        assert_eq!(own.winning_scope, "per_project");
+        assert_eq!(own.winning_store, WinningStore::Keychain);
+        assert_eq!(shared_row.winning_scope, "per_project");
+        // The surviving copy is still nameable, which is what Remove needs.
+        assert_eq!(
+            shared_row.stores.file_store_path.as_deref(),
+            Some(fs.shared().join("DUP_KEY").display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn the_shared_gates_never_carry_a_value_onto_the_wire() {
+        // Two booleans and nothing else. A gate computed from a value —
+        // or a report that started shipping one alongside them — would be
+        // caught here.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pwire", "WireProj");
+
+        let canary = format!("wire-canary-{}", uuid::Uuid::new_v4().simple());
+        let shared = scope_from_manifest("shared", SENTINEL_SHARED);
+        crate::secrets::set(shared, "user", "WIRE_KEY", &canary).unwrap();
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", "WIRE_KEY").unwrap();
+        fs.put(&fs.shared(), "WIRE_KEY", &canary);
+        opt_out_of_shared_secrets(&db, "pwire");
+        write_opt_out_marker(&fs, "WireProj");
+
+        let rows = list_user_secret_keys_impl(&db, "pwire").unwrap();
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(!json.contains(&canary), "a value reached the wire");
+        assert!(json.contains("\"shared_read_disabled\":true"));
+        assert!(json.contains("\"shared_file_fallback_disabled\":true"));
+    }
+
+    #[test]
+    fn shared_and_global_rows_carry_no_fall_through_leg() {
+        // A definition pin, not an omission (see the field docs): the
+        // shared row's own `file_store` IS the `shared/` probe, so it has
+        // nothing to fall through TO; and `get_secret_status_v2` receives
+        // the `_global_` sentinel for global rows, so no project's marker
+        // could be evaluated for one.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pdef", "DefProj");
+        fs.put(&fs.shared(), "DEF_KEY", "canary");
+
+        let sh = get_secret_status_impl(&db, SENTINEL_SHARED, "user", "shared", "DEF_KEY", None)
+            .expect("status");
+        assert_eq!(sh.stores.file_store, Presence::Present);
+        assert_eq!(sh.stores.shared_file_store, Presence::Absent);
+
+        let gl = get_secret_status_impl(&db, SENTINEL_GLOBAL, "user", "global", "DEF_KEY", None)
+            .expect("status");
+        assert_eq!(gl.stores.file_store, Presence::Absent);
+        assert_eq!(gl.stores.shared_file_store, Presence::Absent);
+    }
+
+    #[test]
+    fn the_list_surface_reports_the_same_fall_through_leg() {
+        // One model, two surfaces. If the list path diverged from the status
+        // path the panel and the Secret-refs tab would disagree about the
+        // same key.
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "plist", "ListProj");
+        fs.put(&fs.shared(), "LIST_KEY", "canary");
+        // A launcher row with no keychain value — the shape a Remove or a
+        // hub-registered ref leaves behind.
+        db.mark_secret_active("per_project", "plist", "user", "LIST_KEY").unwrap();
+
+        let rows = list_user_secret_keys_impl(&db, "plist").unwrap();
+        let pp = find(&rows, "per_project", "LIST_KEY").expect("per-project row");
+        assert_eq!(pp.stores.file_store, Presence::Absent);
+        assert_eq!(pp.stores.shared_file_store, Presence::Present);
+        // …and the shared row still owns the file for attribution.
+        let sh = find(&rows, "shared", "LIST_KEY").expect("shared row");
+        assert_eq!(sh.stores.file_store, Presence::Present);
+        assert_eq!(sh.stores.shared_file_store, Presence::Absent);
+    }
+
+    #[test]
+    fn the_winner_follows_the_marker_gated_shared_leg_not_a_raw_probe() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pwinm", "WinMarkProj");
+        fs.put(&fs.shared(), "WIN_KEY", "canary");
+        db.mark_secret_active("per_project", "pwinm", "user", "WIN_KEY").unwrap();
+
+        let row_of = |db: &Db| {
+            find(&list_user_secret_keys_impl(db, "pwinm").unwrap(), "per_project", "WIN_KEY")
+                .cloned()
+                .expect("per-project row")
+        };
+
+        let open = row_of(&db);
+        assert_eq!(open.winning_scope, "shared");
+        assert_eq!(open.winning_store, WinningStore::FileStore);
+
+        // Opt out. The file has not moved — but this project no longer
+        // reads it, so naming it the winner would be a false statement
+        // about THIS project's runtime.
+        write_opt_out_marker(&fs, "WinMarkProj");
+        let gated = row_of(&db);
+        assert_eq!(
+            gated.winning_store,
+            WinningStore::NoStore,
+            "with the shared tier opted out, no sanctioned store serves this key"
+        );
+        assert_eq!(gated.winning_scope, "per_project");
+        assert_eq!(gated.stores.shared_file_store, Presence::Absent);
+    }
+
+    #[test]
+    fn status_serialization_never_carries_a_value_from_either_tier_2_leg() {
+        let _kc = keychain_test_lock();
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let fs = file_store_scratch();
+        let db = make_db();
+        seed_project(&db, "pleak2", "LeakTwoProj");
+
+        let canary = format!("leak-canary-{}", uuid::Uuid::new_v4().simple());
+        fs.put(&fs.shared(), "LEAK2_KEY", &canary);
+        fs.put(&fs.project("LeakTwoProj"), "LEAK2_OWN", &canary);
+
+        for key in ["LEAK2_KEY", "LEAK2_OWN"] {
+            let st = get_secret_status_impl(&db, "pleak2", "user", "per_project", key, None)
+                .expect("status");
+            let json = serde_json::to_string(&st).unwrap();
+            assert!(!json.contains(&canary), "a value reached the wire for {}", key);
+        }
+        // The guard must not be satisfiable by omitting the report.
+        let st = get_secret_status_impl(&db, "pleak2", "user", "per_project", "LEAK2_KEY", None)
+            .expect("status");
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains("\"shared_file_store\":\"present\""));
+    }
+
+    /// `get_secret_status_v2` must stay a one-expression delegate to
+    /// `get_secret_status_impl`, for the same reason the list command does:
+    /// a `State<'_, Db>` cannot be constructed in a unit test, so the
+    /// behavioural tests above only cover production while the wrapper
+    /// stays empty. Structural, and deliberately extracting the BODY
+    /// rather than grepping for the callee's name — a name-substring
+    /// assertion is satisfied by a comment (instance #8 in
+    /// `knowledge/concepts/credited-mechanisms-that-never-fire-2026-09-04.md`).
+    #[test]
+    fn status_command_is_a_pure_shim_over_the_tested_impl() {
+        let src = include_str!("secrets_cmd.rs");
+        // Split literal: this `include_str!` also contains the needle.
+        let sig = concat!("pub async fn ", "get_secret_status_v2(");
+        let at = src.find(sig).expect("the command must exist");
+        let open = src[at..].find(" {\n").expect("command body must open") + at + 3;
+        let close = src[open..].find("\n}\n").expect("command body must close") + open;
+        let body = src[open..close].trim();
+        assert_eq!(
+            body,
+            "get_secret_status_impl(db.inner(), &project_id, &module_id, &scope, &key, requester_project_id.as_deref())",
+            "get_secret_status_v2 grew a body of its own — the behaviour \
+             tests in this module drive get_secret_status_impl and would no \
+             longer cover what the Secret-refs tab calls"
+        );
+    }
+
+    // ─── Remove must not overstate what it deletes ─────────────────────
+
+    #[test]
+    fn remove_audit_records_both_surviving_tier_2_legs() {
+        let _kc = keychain_test_lock();
+        let fs = file_store_scratch();
+
+        // Own namespace only.
+        fs.put(&fs.project("RmProj"), "OWN_ONLY", "canary");
+        let own = remove_audit_payload("per_project", "OWN_ONLY", Some("RmProj"));
+        assert_eq!(own["file_store_copy_remains"], serde_json::json!(true));
+        assert_eq!(own["shared_file_store_copy_resolves"], serde_json::json!(false));
+
+        // Shared only — the case that used to audit as "nothing survives"
+        // for a Remove no consumer could observe.
+        fs.put(&fs.shared(), "SHARED_ONLY", "canary");
+        let shared = remove_audit_payload("per_project", "SHARED_ONLY", Some("RmProj"));
+        assert_eq!(shared["file_store_copy_remains"], serde_json::json!(false));
+        assert_eq!(
+            shared["shared_file_store_copy_resolves"],
+            serde_json::json!(true),
+            "Remove leaves shared/<key> in place and the key keeps resolving"
+        );
+
+        // Opted out → the shared file is NOT a survivor for this project.
+        write_opt_out_marker(&fs, "RmProj");
+        let gated = remove_audit_payload("per_project", "SHARED_ONLY", Some("RmProj"));
+        assert_eq!(gated["shared_file_store_copy_resolves"], serde_json::json!(false));
+
+        // Nowhere at all.
+        let none = remove_audit_payload("per_project", "ABSENT", Some("RmProj"));
+        assert_eq!(none["file_store_copy_remains"], serde_json::json!(false));
+        assert_eq!(none["shared_file_store_copy_resolves"], serde_json::json!(false));
+
+        // The payload carries the identifying metadata the audit reader
+        // needs, and nothing else.
+        assert_eq!(none["key"], serde_json::json!("ABSENT"));
+        assert_eq!(none["scope"], serde_json::json!("per_project"));
+    }
+
     /// Sanity: the keychain-backed end-to-end test. Skipped on CI hosts
     /// without libsecret. Pin: a row only counts as `is_set: true` when
     /// keychain has a value AND the cross-launcher active flag is set;
@@ -2260,18 +3871,23 @@ mod tests {
         db.mark_secret_active("per_project", "pwin", "user", &key)
             .unwrap();
 
-        // Use the same status helper list_user_secret_keys_v2 uses.
-        let (pp_set, _, _) = read_user_secret_status(&db, "per_project", "pwin", "pwin", &key);
-        let (sh_set, _, _) = read_user_secret_status(&db, "shared", SENTINEL_SHARED, "pwin", &key);
-        assert!(!pp_set, "per_project must be is_set=false (keychain empty)");
-        assert!(sh_set, "shared must be is_set=true (keychain holds canary)");
+        // Use the same status helper list_user_secret_keys_impl uses.
+        // v0.3.0: an empty file store keeps this a pure tier-1 assertion —
+        // the guard below pins that (if a stray file existed for this
+        // random key the winner could legitimately differ).
+        let _fs = empty_file_store_guard();
+        let pp = read_user_secret_status(&db, "per_project", "pwin", "pwin", &key, Some("pwin"));
+        let sh = read_user_secret_status(&db, "shared", SENTINEL_SHARED, "pwin", &key, None);
+        assert!(!pp.is_set, "per_project must be is_set=false (keychain empty)");
+        assert!(sh.is_set, "shared must be is_set=true (keychain holds canary)");
 
         // Winning scope: shared wins because per_project has no keychain value.
-        let winner = resolve_winning_scope("shared", pp_set, sh_set, false);
-        assert_eq!(winner, "shared");
+        let winner = resolve_winning_scope("shared", pp.is_set, sh.is_set, false, false, false);
+        assert_eq!(winner, ("shared".to_string(), WinningStore::Keychain));
         // Even from per_project's POV, the resolver still picks shared.
-        let winner_pp = resolve_winning_scope("per_project", pp_set, sh_set, false);
-        assert_eq!(winner_pp, "shared");
+        let winner_pp =
+            resolve_winning_scope("per_project", pp.is_set, sh.is_set, false, false, false);
+        assert_eq!(winner_pp, ("shared".to_string(), WinningStore::Keychain));
 
         // Cleanup.
         let _ = secrets::delete(shared_scope, "user", &key);
@@ -2737,15 +4353,15 @@ pub async fn set_shared_secrets_read_disabled(
     //    failure is a warning, never an Err (conservative soft-fail).
     if let Some(shared_dir) = vct_secrets_shared_dir_for_marker() {
         let proj_dir = shared_dir.join("projects").join(&row.name);
-        let marker = proj_dir.join(".no-shared-fallback");
+        let marker = proj_dir.join(secrets_file_store::NO_SHARED_FALLBACK_MARKER);
         if read_disabled {
             if let Err(e) = std::fs::create_dir_all(&proj_dir)
                 .and_then(|()| std::fs::write(&marker, b""))
             {
                 let msg = format!(
-                    "could not create the file-store .no-shared-fallback marker \
-                     at {}: {} (keychain-side gate is active; file-store tier-2 \
-                     shared fallback is not gated until the marker exists)",
+                    "could not create the file-store shared-fallback opt-out \
+                     marker at {}: {} (keychain-side gate is active; file-store \
+                     tier-2 shared fallback is not gated until the marker exists)",
                     marker.display(),
                     e
                 );
@@ -2755,9 +4371,9 @@ pub async fn set_shared_secrets_read_disabled(
         } else if marker.exists() {
             if let Err(e) = std::fs::remove_file(&marker) {
                 let msg = format!(
-                    "could not remove the file-store .no-shared-fallback marker \
-                     at {}: {} (keychain-side gate is off; file-store tier-2 may \
-                     still skip shared until the marker is removed)",
+                    "could not remove the file-store shared-fallback opt-out \
+                     marker at {}: {} (keychain-side gate is off; file-store \
+                     tier-2 may still skip shared until the marker is removed)",
                     marker.display(),
                     e
                 );
@@ -2781,17 +4397,11 @@ pub async fn set_shared_secrets_read_disabled(
     })
 }
 
-/// Resolve the `~/.vct-secrets/` root (parent of `shared/`) cross-OS for the
-/// per-project marker. Kept local to avoid coupling secrets_cmd to
-/// secrets_import's `shared/`-suffixed helper.
-fn vct_secrets_shared_dir_for_marker() -> Option<std::path::PathBuf> {
-    let home = if cfg!(target_os = "windows") {
-        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-    } else {
-        std::env::var_os("HOME")
-    }?;
-    Some(std::path::PathBuf::from(home).join(".vct-secrets"))
-}
+// v0.3.0: import alias onto the ONE file-store root resolver. The copy
+// that lived here ignored `$VCT_SECRETS_DIR`, so the `.no-shared-fallback`
+// marker could be written under `$HOME/.vct-secrets` while the resolvers
+// read a different root entirely.
+use crate::secrets_file_store::secrets_root as vct_secrets_shared_dir_for_marker;
 
 /// Atomic `.env` rewrite: write a sibling temp file (0o600 on Unix so the
 /// sentinel-replaced file never flashes world-readable), then rename into

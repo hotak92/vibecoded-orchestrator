@@ -13,14 +13,33 @@ import importlib.util
 import sys
 from pathlib import Path
 from unittest.mock import patch
-import io
 
 import pytest
 
 # ---------------------------------------------------------------------------
 # Import _normalize_typed_links from sync_knowledge_graph without running
 # the module's top-level setup (weaviate client, env parsing, etc.).
-# We use importlib with a targeted monkey-patch on the VCO-REWIRE block.
+#
+# The mechanism is importlib + `patch.dict("sys.modules", ...)` stubs for the
+# third-party and vco_lib imports the script performs at module scope.
+#
+# v0.2.92 (R23, found while landing WP-15/WP-16): this comment used to say the
+# patch targeted `_resolve_mcp_servers_dir` "so the VCO-REWIRE block doesn't
+# fail". No such function exists in sync_knowledge_graph.py (it lives in
+# process_documents.py / maintain_knowledge_graph.py) and nothing here patches
+# it — the comment named a mechanism that was not present.
+#
+# HERMETICITY (same change): this helper used to ALSO run
+# `sys.modules.setdefault(name, stub)` over the same stub map before entering
+# the `patch.dict` block. `patch.dict` restores what it changed; a bare
+# `setdefault` does not, so a stub `vco_lib` module object survived for the
+# WHOLE pytest session and every test file imported AFTER this one saw
+# `vco_lib` as a plain module rather than a package — `from
+# vco_lib.<anything> import ...` then raised
+# "No module named 'vco_lib.X'; 'vco_lib' is not a package". Running this file
+# together with tests/test_v0292_cli_root_resolution_and_prefix.py reproduced
+# 57 collection errors that neither file produces alone. The setdefault loop
+# was redundant with `patch.dict` (identical key set) and is gone.
 # ---------------------------------------------------------------------------
 
 def _import_sync_kg() -> object:
@@ -47,14 +66,12 @@ def _import_sync_kg() -> object:
     stubs["vco_lib.embedding_service"].EmbeddingService = object
     stubs["vco_lib.embedding_service"].NoEmbeddingBackendError = Exception
 
-    for name, mod in stubs.items():
-        # Register parent packages too (e.g. "weaviate")
-        sys.modules.setdefault(name, mod)
-
     spec = importlib.util.spec_from_file_location("sync_knowledge_graph", script_path)
     mod = importlib.util.module_from_spec(spec)
 
-    # Patch _resolve_mcp_servers_dir so the VCO-REWIRE block doesn't fail
+    # `patch.dict` installs every stub (parent packages included) for the
+    # duration of the exec and RESTORES sys.modules on the way out — no
+    # session-wide residue. See the hermeticity note above.
     with patch.dict("sys.modules", stubs):
         with patch(
             "importlib.util.spec_from_file_location",

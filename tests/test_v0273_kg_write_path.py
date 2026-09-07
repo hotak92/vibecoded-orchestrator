@@ -176,6 +176,15 @@ def _patch_server_for_store(monkeypatch, tmp_path, coll: _FakeCollection,
 
     monkeypatch.setattr(srv, "count_tokens_async", _count_tokens)
 
+    async def _tagged(_text):
+        # W3: the non-dual single-chunk branch consults the tagged gather
+        # before falling back to ``get_embedding``; return no slots so the
+        # PATCHED ``get_embedding`` below stays the load-bearing embed (and
+        # the test stays hermetic — no real EmbeddingService/inline gather).
+        return {}, []
+
+    monkeypatch.setattr(srv, "_get_all_kg_embeddings_tagged", _tagged)
+
     async def _embed(_text):
         if embed_raises:
             raise RuntimeError("simulated embed outage (Ollama down)")

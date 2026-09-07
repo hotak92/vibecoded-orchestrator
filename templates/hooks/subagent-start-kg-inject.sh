@@ -137,6 +137,18 @@ fi
 # embedding step without improving recall. 400 chars is enough to
 # capture the task description while staying well under the embedder's
 # small_context bucket (≤512 tokens for arctic1).
+#
+# WP-E (v0.2.92) query enrichment: this hook deliberately does NOT pass
+# --transcript, and that is a decision, not an omission. Three reasons, any
+# one sufficient: (1) enrichment only fires for a SHORT trigger (default 24
+# tokens, vco_lib/query_enrichment.py) and a 400-char task prompt is ~100 —
+# it would decline on every call, so the flag would be dead argv; (2) the
+# SubagentStart payload carries no transcript_path at all (see the parse
+# block above: prompt / session_id / agent_id / agent_type), so there is
+# nothing to forward; (3) the transcript that DOES exist is the PARENT's,
+# and a subagent is deliberately isolated from the parent's conversation —
+# enriching with it would widen what the subagent sees, not sharpen its
+# query. Revisit only if all three change. MUST MATCH the .ps1 sibling.
 QUERY="${PROMPT:0:400}"
 
 # Resolve VCO venv — the rl_kg_search.py module needs weaviate-client +

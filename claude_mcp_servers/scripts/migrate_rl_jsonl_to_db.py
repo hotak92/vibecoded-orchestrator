@@ -6,8 +6,8 @@
 Background
 ----------
 Through v0.2.45 the RL telemetry path appended one JSON line per event to
-``~/.claude/retrieval_rl_data/rl_events.jsonl`` (default; override via
-``RL_DATA_DIR``). v0.2.46 RL-4/RL-5 introduced ``launcher.db``'s
+``~/.claude/retrieval_rl_data/rl_events.jsonl``. v0.2.46 RL-4/RL-5 introduced
+``launcher.db``'s
 ``rl_events`` table + a hub POST endpoint, and the MCP-side writer
 switched to ``rl_client.hub_writer.post_rl_event``. The JSONL append path
 is dead going forward.
@@ -19,8 +19,11 @@ would remain readable on disk but invisible to the new query routes.
 
 Scope
 -----
-* Reads from ``~/.claude/retrieval_rl_data/rl_events.jsonl`` by default
-  (or a path passed positionally).
+* Reads from the FROZEN pre-v0.2.92 corpus —
+  ``vco_lib.paths.legacy_claude_rl_data_dir()``, i.e.
+  ``$VCT_CLAUDE_DIR/retrieval_rl_data`` (default
+  ``~/.claude/retrieval_rl_data``) — by default, or a path passed
+  positionally, or the directory named by ``$RL_DATA_DIR`` (see below).
 * Optionally also reads the qwen3 sibling file
   (``rl_events_qwen3.jsonl``) if present.
 * Validates each line as v2 or v3 schema (drops v1 / unparseable rows
@@ -52,14 +55,48 @@ Soft-fail
   exit only on per-row failure RATE above ``--max-error-rate`` (default
   10%).
 
+Where the corpus is looked for (v0.2.92)
+----------------------------------------
+Precedence, highest first:
+
+1. an explicit positional ``path`` argument — exactly that file, nothing else;
+2. ``$RL_DATA_DIR`` — the DIRECTORY holding ``rl_events.jsonl`` (+ its qwen3
+   sibling). Absolute; not ``~``-expanded, matching every other resolver in
+   :mod:`vco_lib.paths`;
+3. :func:`vco_lib.paths.legacy_claude_rl_data_dir` — the frozen archive at
+   ``$VCT_CLAUDE_DIR/retrieval_rl_data`` (default ``~/.claude/...``).
+
+Two things changed here in v0.2.92 and both were defects, not preferences:
+
+* The defaults used to be MODULE-LEVEL CONSTANTS built from
+  ``Path.home() / ".claude" / ...``, so they froze at import and no override
+  could steer them — the same unsteerable shape as register item 28 at the
+  WRITE end. They are functions now, and they resolve through
+  :func:`~vco_lib.paths.claude_user_dir`, so ``$VCT_CLAUDE_DIR`` moves them
+  and a test can point this importer at a fixture corpus.
+* ``$RL_DATA_DIR`` was DOCUMENTED by this module and read by nothing, anywhere
+  in the tree. Under ruling R24 a declared-but-unread knob gets a reader
+  rather than a deletion, so it has one — and a test that proves setting it
+  changes which file is read.
+
+This importer deliberately reads the OLD location: the corpus there is frozen
+(v0.2.47 replaced the JSONL sink with the hub's ``rl_events`` table) and is
+left byte-identical by everything in VCO. It is not the live logger's home —
+that is ``rl_client.rl_logger.default_rl_data_dir()``,
+``<vct_root_dir()>/retrieval_rl_data``.
+
 Usage
 -----
     # Dry-run (validate + count; no POST, no rename)
     python claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py --dry-run
 
-    # Default — process ~/.claude/retrieval_rl_data/rl_events.jsonl
-    # AND ~/.claude/retrieval_rl_data/rl_events_qwen3.jsonl if present.
+    # Default — process <archive>/rl_events.jsonl
+    # AND <archive>/rl_events_qwen3.jsonl if present.
     python claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py
+
+    # A corpus that lives somewhere else
+    RL_DATA_DIR=/mnt/backup/retrieval_rl_data \\
+        python claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py
 
     # Explicit path
     python claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py \\
@@ -69,6 +106,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -85,8 +123,59 @@ if str(_MCP_PKG) not in sys.path:
 
 from rl_client.hub_writer import post_rl_event  # noqa: E402
 
-_DEFAULT_PRIMARY = Path.home() / ".claude" / "retrieval_rl_data" / "rl_events.jsonl"
-_DEFAULT_QWEN3 = Path.home() / ".claude" / "retrieval_rl_data" / "rl_events_qwen3.jsonl"
+#: Env var naming the DIRECTORY that holds the corpus. Documented by this
+#: module since v0.2.46 and read by nothing until v0.2.92 (ruling R24: a
+#: declared knob gets a reader, not a deletion).
+RL_DATA_DIR_ENV = "RL_DATA_DIR"
+
+#: Basenames inside the corpus directory. The qwen3 sibling exists on machines
+#: that ran the dual-slot embedding config; its absence is normal.
+PRIMARY_BASENAME = "rl_events.jsonl"
+QWEN3_BASENAME = "rl_events_qwen3.jsonl"
+
+
+def archive_dir() -> Path:
+    """Directory holding the frozen JSONL corpus this importer reads.
+
+    ``$RL_DATA_DIR`` when set, else
+    :func:`vco_lib.paths.legacy_claude_rl_data_dir`. **Resolved on every call**,
+    not once at import: the pre-v0.2.92 form was a module-level constant built
+    from ``Path.home()``, which froze before any override existed and which no
+    test redirect could steer.
+
+    Raises:
+        SystemExit: when ``vco_lib`` cannot be imported AND no ``$RL_DATA_DIR``
+            was given. ``vco_lib`` ships in every healthy VCO install (``pip
+            install -e``), so a failure here means a BROKEN install; the
+            house rule is to fail loudly with the fix rather than degrade to an
+            inline ``~/.claude`` literal, which would re-create the very
+            unsteerable path this function replaced. The message names the
+            escape hatch so a user with an unusual layout is not stuck.
+    """
+    override = os.environ.get(RL_DATA_DIR_ENV, "").strip()
+    if override:
+        return Path(override)
+    try:
+        from vco_lib.paths import legacy_claude_rl_data_dir  # noqa: PLC0415
+    except ImportError as exc:
+        raise SystemExit(
+            f"ERROR: cannot import vco_lib ({exc}). vco_lib ships with every "
+            "VCO install, so this usually means a broken environment — re-run "
+            "`python install.py` from the orchestrator root, or point this "
+            f"script at the corpus directly with ${RL_DATA_DIR_ENV}=<dir> or a "
+            "positional path argument."
+        ) from exc
+    return legacy_claude_rl_data_dir()
+
+
+def default_primary() -> Path:
+    """``<archive_dir()>/rl_events.jsonl``."""
+    return archive_dir() / PRIMARY_BASENAME
+
+
+def default_qwen3() -> Path:
+    """``<archive_dir()>/rl_events_qwen3.jsonl``."""
+    return archive_dir() / QWEN3_BASENAME
 
 
 def _iter_jsonl(path: Path) -> Iterator[tuple[int, dict | None, str | None]]:
@@ -280,9 +369,12 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         type=Path,
         default=None,
-        help=f"Path to rl_events.jsonl (default: {_DEFAULT_PRIMARY}). The qwen3 "
-             f"sibling {_DEFAULT_QWEN3.name} is also picked up automatically when "
-             f"using the default.",
+        help=f"Path to {PRIMARY_BASENAME}. Default: <corpus dir>/"
+             f"{PRIMARY_BASENAME}, where <corpus dir> is ${RL_DATA_DIR_ENV} if "
+             f"set, else the frozen archive at $VCT_CLAUDE_DIR/"
+             f"retrieval_rl_data (default ~/.claude/retrieval_rl_data). The "
+             f"qwen3 sibling {QWEN3_BASENAME} is also picked up automatically "
+             f"when using the default.",
     )
     parser.add_argument(
         "--dry-run",
@@ -300,19 +392,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.path is not None:
         targets = [args.path]
+        checked = [args.path]
     else:
-        targets = []
-        if _DEFAULT_PRIMARY.is_file():
-            targets.append(_DEFAULT_PRIMARY)
-        if _DEFAULT_QWEN3.is_file():
-            targets.append(_DEFAULT_QWEN3)
+        # Resolved HERE, per run — see `archive_dir`. Both defaults come from
+        # one call so a run can never mix two directories.
+        primary, qwen3 = default_primary(), default_qwen3()
+        checked = [primary, qwen3]
+        targets = [p for p in checked if p.is_file()]
 
     if not targets:
         print(
-            "No JSONL files to migrate. Default paths checked:\n"
-            f"  - {_DEFAULT_PRIMARY}\n"
-            f"  - {_DEFAULT_QWEN3}\n"
-            "Nothing to do."
+            "No JSONL files to migrate. Paths checked:\n"
+            + "".join(f"  - {p}\n" for p in checked)
+            + "Nothing to do."
         )
         return 0
 
@@ -336,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     for target in targets:
         print(f"\n→ {target}")
         if not target.is_file():
-            print(f"  skipped: not a file")
+            print("  skipped: not a file")
             continue
         posted, skipped, errors, reasons = _process_file(
             target,
@@ -359,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
 
         total = posted + skipped + errors
         if total == 0:
-            print(f"  (file empty — nothing to rename)")
+            print("  (file empty — nothing to rename)")
             continue
         if total > 0 and (errors / total) > args.max_error_rate:
             print(f"  REFUSED to rename: error_rate > {args.max_error_rate:.1%}.")

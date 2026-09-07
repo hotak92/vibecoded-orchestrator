@@ -976,6 +976,15 @@ class _RowPlan:
     dest_uuid: str
 
 
+#: Upper bound on same-named symbols in ONE file that the identity migration
+#: will attempt to re-derive (`<key>#2` .. `<key>#N`). Measured maximum on a
+#: real machine: 11 (`secrets.rs` declares `drop` 11 times). 32 leaves ample
+#: headroom while bounding the per-row re-derivation cost; a row beyond it is
+#: LEFT IN PLACE and counted, exactly like any other unreproducible row —
+#: never deleted, never given a wrong destination UUID.
+_MAX_DUPLICATE_OCCURRENCES = 32
+
+
 def _plan_one_row(
     base: str,
     src_uuid: str,
@@ -1006,14 +1015,35 @@ def _plan_one_row(
 
     # Chunk-aware identity_key: chunk i>0 keys on ``<key>::<i>``. chunk_num is
     # stored only on chunkable collections; absent/0 → the bare (chunk-0) key.
-    per_chunk_key = identity_key
+    chunk_num = 0
     if base in _CHUNKABLE_BASES:
         try:
             chunk_num = int(props.get("chunk_num") or 0)
         except (TypeError, ValueError):
             chunk_num = 0
-        if chunk_num > 0:
-            per_chunk_key = f"{identity_key}::{chunk_num}"
+
+    # v0.2.92 (Defect B / B-RISK-7): two same-named symbols in ONE file used to
+    # share a UUID and clobber each other. The writer now disambiguates the
+    # 2nd..Nth occurrence as ``<key>#n`` (occurrence 1 keeps the BARE key, which
+    # is what makes that migration a pure add). This re-derivation reconstructs
+    # the identity key from STORED PROPS, so it can only ever produce the bare
+    # form — and a `#n` row would therefore find no matching candidate and be
+    # LEFT BEHIND on an identity migration. Honest, never wrong, but a real gap.
+    #
+    # So the candidate space is the CROSS PRODUCT of file-path form x occurrence,
+    # with `#n` composed BEFORE `::chunk_num` — the exact order the writer emits
+    # (`chunk_identities` appends `::i` to whatever key it is given).
+    #
+    # ORDER IS LOAD-BEARING for cost, not correctness: the bare key is tried
+    # first, so the ~99% of rows that never collided still match on the first
+    # iteration and pay nothing.
+    def _per_chunk(occ_key: str) -> str:
+        return occ_key if chunk_num == 0 else f"{occ_key}::{chunk_num}"
+
+    occurrence_keys = [identity_key] + [
+        f"{identity_key}#{n}"
+        for n in range(2, _MAX_DUPLICATE_OCCURRENCES + 1)
+    ]
 
     project_source = str(props.get("project_source") or "")
 
@@ -1022,16 +1052,22 @@ def _plan_one_row(
     # (i.e. the shape the original UUID was minted from).
     candidates = _candidate_file_paths(props, base)
     chosen_fp: Optional[str] = None
+    per_chunk_key: str = _per_chunk(identity_key)
     for fp in candidates:
-        try:
-            src_check = _dest_uuid_for(
-                builder, old_identity, fp, per_chunk_key, project_source,
-            )
-        except Exception as exc:  # noqa: BLE001 — bad seed inputs → try next
-            logger.debug("identity migration: source re-derive failed (%s): %s", fp, exc)
-            continue
-        if src_check == src_uuid:
-            chosen_fp = fp
+        for occ_key in occurrence_keys:
+            candidate_key = _per_chunk(occ_key)
+            try:
+                src_check = _dest_uuid_for(
+                    builder, old_identity, fp, candidate_key, project_source,
+                )
+            except Exception as exc:  # noqa: BLE001 — bad seed inputs → try next
+                logger.debug("identity migration: source re-derive failed (%s): %s", fp, exc)
+                continue
+            if src_check == src_uuid:
+                chosen_fp = fp
+                per_chunk_key = candidate_key
+                break
+        if chosen_fp is not None:
             break
     if chosen_fp is None:
         # No candidate reproduced the stored UUID. This means the row's UUID was

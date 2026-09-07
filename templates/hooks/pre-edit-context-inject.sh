@@ -98,7 +98,15 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # empirically 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 # Parse all fields we need in a single Python invocation (avoids re-parsing the
-# JSON 3+ times). Outputs three lines: tool_name, session_id, tool_input as JSON.
+# JSON 3+ times). Outputs five lines: tool_name, session_id, tool_input as JSON,
+# transcript_path, prompt_id.
+# WP-E (v0.2.92): transcript_path is a PATH ONLY — threaded to the producer's
+# --transcript flag below; the file's CONTENTS are read in-process by the
+# shared vco_lib/transcript_context.py reader there, never in this shell (R31
+# privacy discipline: thinking/output text must never reach argv, `ps`, or a
+# hook log). prompt_id scopes the query-cache key (query-cache.sh) so two
+# turns issuing the same short trigger don't collide on one cache entry when
+# their enriched text differs. MUST MATCH pre-bash-context-inject.sh's parse.
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
@@ -106,14 +114,20 @@ try:
     print(d.get('tool_name', ''))
     print(d.get('session_id', ''))
     print(json.dumps(d.get('tool_input', {})))
+    print(d.get('transcript_path', ''))
+    print(d.get('prompt_id', ''))
 except Exception:
     print('')
     print('')
     print('{}')
-" 2>/dev/null || printf '\n\n{}\n')
+    print('')
+    print('')
+" 2>/dev/null || printf '\n\n{}\n\n\n')
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 TOOL_ARGS=$(printf '%s' "$_PARSED" | sed -n '3p')
+TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '4p')
+PROMPT_ID=$(printf '%s' "$_PARSED" | sed -n '5p')
 
 # Only fire for Edit tool
 if [[ "$TOOL_NAME" != "Edit" ]]; then
@@ -507,10 +521,13 @@ DUAL_DONE=0
 if command -v vco_dual_search_cached >/dev/null 2>&1; then
     _DUAL_CG_OUT=""
     [[ "$IS_CODE" == "1" ]] && _DUAL_CG_OUT="$CODE_TMP"
+    # WP-E (v0.2.92): prompt_id ($11) scopes the cache key; transcript_path
+    # ($12) threads to BOTH legs' --transcript flag inside the driver.
     if vco_dual_search_cached \
         "$KG_TMP" "$_DUAL_CG_OUT" "$VENV" \
         "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" \
-        "$QUERY" 1 "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH"; then
+        "$QUERY" 1 "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" \
+        "$PROMPT_ID" "$TRANSCRIPT_PATH"; then
         DUAL_DONE=1
     fi
 fi
@@ -518,8 +535,14 @@ fi
 if [[ "$DUAL_DONE" == "0" ]]; then
     # --- Legacy two-process path (unchanged) -------------------------------
     # KG search with RL reranking — same pipeline as weaviate MCP.
+    # WP-E (v0.2.92): prompt_id/transcript_path as $5/$6 — same rationale as
+    # the dual-search leg above.
     if command -v vco_kg_search_cached >/dev/null 2>&1; then
-        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 > "$KG_TMP" 2>/dev/null ) &
+        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
+        KG_PID=$!
+    elif [ -n "$TRANSCRIPT_PATH" ]; then
+        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format --transcript "$TRANSCRIPT_PATH" 2>/dev/null \
+            | head -40 > "$KG_TMP") &
         KG_PID=$!
     else
         ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
@@ -539,7 +562,7 @@ if [[ "$DUAL_DONE" == "0" ]]; then
         # shared retrieval pipeline biases the rerank toward call-linked /
         # same-module / shared-type code relative to the file being edited.
         if command -v codegraph_query_block >/dev/null 2>&1; then
-            ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" > "$CODE_TMP" 2>/dev/null ) &
+            ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$CODE_TMP" 2>/dev/null ) &
             CODE_PID=$!
         else
             ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format --anchor "$FILE_PATH" 2>/dev/null \

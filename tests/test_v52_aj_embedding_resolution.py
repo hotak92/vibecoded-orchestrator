@@ -15,14 +15,13 @@ Three code paths covered:
   - Threading: subprocess.run env= argument carries the resolved values.
 
 All tests are pure-unit (no real Weaviate, no real Ollama, no real
-sqlite outside tmp_path). The shared _make_launcher_db fixture mirrors
-what the launcher's app_state migration produces — only the columns we
-read (key, value, updated_at).
+sqlite outside tmp_path). The file-local ``_make_launcher_db`` helper builds
+the REAL launcher schema via ``tests.common.launcher_db_fixture`` (the shipped
+migrations), so ``app_state`` here IS the launcher's ``app_state``.
 """
 from __future__ import annotations
 
 import os
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -33,14 +32,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-
-_APP_STATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS app_state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-"""
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    create_empty_launcher_db,
+    set_app_state,
+)
 
 
 def _make_launcher_db(tmp_dir: Path, *, active: str | None = None) -> Path:
@@ -50,21 +45,17 @@ def _make_launcher_db(tmp_dir: Path, *, active: str | None = None) -> Path:
     discovery (driven by VCT_STATE_DIR) resolves to it. Pass
     ``active=None`` for "no key present"; ``active=""`` for "key
     present but empty"; ``active="<profile>"`` for the populated case.
+
+    The schema is the launcher's own (all shipped migrations applied).
+    Migration 008 seeds ``orchestrator_root_kg_collection`` and nothing
+    else, so ``active=None`` still means "``embedding.active_profile`` is
+    absent" — the case these tests need.
     """
     state_dir = tmp_dir / ".vct"
     state_dir.mkdir(parents=True, exist_ok=True)
-    db_path = state_dir / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_APP_STATE_SCHEMA)
-        if active is not None:
-            conn.execute(
-                "INSERT INTO app_state (key, value, updated_at) VALUES (?,?,?)",
-                ("embedding.active_profile", active, 1000000),
-            )
-            conn.commit()
-    finally:
-        conn.close()
+    db_path = create_empty_launcher_db(state_dir / "launcher.db")
+    if active is not None:
+        set_app_state(db_path, "embedding.active_profile", active)
     return db_path
 
 

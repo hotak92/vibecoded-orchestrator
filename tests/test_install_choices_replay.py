@@ -253,8 +253,8 @@ class TestComputeDrift(unittest.TestCase):
                 log_path = root / "state" / "logs" / "install.jsonl"
                 lines = log_path.read_text(encoding="utf-8").splitlines()
                 state_events = [
-                    json.loads(l) for l in lines
-                    if l and json.loads(l).get("step") == "state-hashes"
+                    json.loads(line) for line in lines
+                    if line and json.loads(line).get("step") == "state-hashes"
                 ]
                 self.assertEqual(len(state_events), 1)
                 self.assertEqual(state_events[0]["phase"], "ok")

@@ -303,6 +303,8 @@ class NoVenvPresentSoftFailContract(unittest.TestCase):
             env.pop("VCT_VENV", None)
             env.pop("VCT_INSTALL_ROOT", None)
             env["CLAUDE_PROJECT_DIR"] = str(project)
+            # §3.16: deliberately unpinned — this suite IS the venv-resolution
+            # subject; pinning the child's path would mask the no-venv soft-fail.
             return subprocess.run(
                 [bash, str(hooks_dest / src_hook.name)],
                 input=stdin_json,
@@ -348,6 +350,8 @@ class NoVenvPresentSoftFailContract(unittest.TestCase):
             env.pop("VCT_VENV", None)
             env.pop("VCT_INSTALL_ROOT", None)
             (project / "test.py").write_text("# noop\n")
+            # §3.16: deliberately unpinned — asserts the hook soft-fails when NO
+            # venv resolves; a pinned child env would not exercise that path.
             cp = subprocess.run(
                 [bash, str(hooks_dest / src_hook.name), "test.py", str(project)],
                 env=env,
@@ -401,6 +405,8 @@ class VctVenvOverrideAcceptedWhenSet(unittest.TestCase):
                 '{"tool_name":"Edit","tool_input":{"file_path":"knowledge/x.md"},'
                 '"session_id":"t"}'
             )
+            # §3.16: deliberately unpinned — the hook must honour the fake
+            # $VCT_VENV it is handed; that override is exactly what is under test.
             cp = subprocess.run(
                 [bash, str(hooks_dest / src_hook.name)],
                 input=payload, env=env,

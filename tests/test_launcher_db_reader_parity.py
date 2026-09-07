@@ -14,12 +14,12 @@ install-hang during a performance-critical step (CORRECT-2).
 from __future__ import annotations
 
 import importlib.util
-import sqlite3
 import sys
-import time
 from pathlib import Path
 
 import pytest
+
+from tests.common.launcher_db_fixture import make_launcher_db
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PY = REPO_ROOT / "install.py"
@@ -36,22 +36,8 @@ def install_module():
 
 @pytest.fixture
 def launcher_db(tmp_path, monkeypatch):
-    """Create a minimal launcher.db with app_state table for tests."""
-    db = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db))
-    conn.execute("""
-        CREATE TABLE app_state (
-            key TEXT PRIMARY KEY,
-            value TEXT,
-            updated_at INTEGER
-        )
-    """)
-    conn.execute(
-        "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
-        ("test.key", "test_value", int(time.time() * 1000)),
-    )
-    conn.commit()
-    conn.close()
+    """A real-schema launcher.db carrying one app_state row."""
+    db = make_launcher_db(tmp_path, app_state={"test.key": "test_value"})
 
     # Point both install.py and launcher_db_reader at the temp DB via
     # the VCT_STATE_DIR env var (canonical override).

@@ -42,7 +42,11 @@ async fn main() {
     // predating `app_state`, DB locked by a busy launcher) resolves to
     // the default level rather than an error: logging setup must never be
     // a reason the hub fails to start.
-    logging::init_tracing(logging::resolve_process_log_level());
+    // v0.2.92 WP-13: `_named("hub")` so the hub's diagnostics land in
+    // `<vct_root>/logs/hub.YYYY-MM-DD.log` rather than interleaving into the
+    // launcher's file. Same subscriber installer, same retention; only the
+    // file stem differs.
+    logging::init_tracing_named(logging::resolve_process_log_level(), "hub");
 
     let cmd = cli::parse_env_args();
 

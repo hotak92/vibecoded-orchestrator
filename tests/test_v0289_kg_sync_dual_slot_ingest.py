@@ -63,17 +63,28 @@ class _FakeProp:
 
 
 class _FakeFilter:
-    def __init__(self, matchers=None):
+    def __init__(self, matchers=None, subfilters=None):
         self.matchers = matchers or []
+        # v0.2.92 WP-B1: Filter.any_of — the sync script's dual-shape
+        # file_path filter (canonical POSIX OR legacy backslash spelling).
+        self.subfilters = subfilters
 
     @staticmethod
     def by_property(name: str) -> "_FakeProp":
         return _FakeProp(name)
 
+    @staticmethod
+    def any_of(filters) -> "_FakeFilter":
+        f = _FakeFilter()
+        f.subfilters = list(filters)
+        return f
+
     def __and__(self, other: "_FakeFilter") -> "_FakeFilter":
         return _FakeFilter(self.matchers + other.matchers)
 
     def matches(self, props: dict) -> bool:
+        if self.subfilters is not None:
+            return any(sf.matches(props) for sf in self.subfilters)
         return all(props.get(name) == value for name, value in self.matchers)
 
 
@@ -164,6 +175,11 @@ class _CountingServer:
     def _get_all_kg_embeddings(self, text):  # noqa: ARG002
         self.embed_calls += 1
         return {self.text_vector_slot: list(COMPUTED_VEC)}
+
+    def _get_all_kg_embeddings_tagged(self, text):  # noqa: ARG002
+        # W3: the tagged capture the sync write path now persists.
+        self.embed_calls += 1
+        return {self.text_vector_slot: list(COMPUTED_VEC)}, []
 
 
 _ENV_KEYS = (

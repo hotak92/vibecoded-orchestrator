@@ -16,7 +16,7 @@ _(List the primary languages, frameworks, and infrastructure. Examples: "Python 
 
 - Project root: `{{PROJECT_ROOT}}`
 - Orchestrator (VibeCoded Orchestrator): `{{ORCHESTRATOR_ROOT}}` — source-of-truth for hooks, scripts, agents, skills shipped under `.claude/`.
-- KG nodes: `knowledge/` (per-project KG; the shared cross-project KG is auto-merged into every search — name set by `SHARED_KG_COLLECTION` env, default `VibeCodedOrchestrator_KnowledgeGraph`). The orchestrator's ~117 bundled *curated* nodes are NOT copied into this project — they live once in the shared collection (materialized into the orchestrator root's `knowledge/` at install time) and reach your searches via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` forgoes those bundled nodes for this project (deliberate accept-loss); your own `knowledge/` nodes are unaffected.
+- KG nodes: `knowledge/` (per-project KG; the shared cross-project KG is auto-merged into every search — name set by `SHARED_KG_COLLECTION` env, default `VibeCodedOrchestrator_KnowledgeGraph`). The orchestrator's bundled *curated* nodes (shipped from its `templates/knowledge/`) are NOT copied into this project — they live once in the shared collection (materialized into the orchestrator root's `knowledge/` at install time) and reach your searches via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` forgoes those bundled nodes for this project (deliberate accept-loss); your own `knowledge/` nodes are unaffected.
 - Active context: `.claude/CONTEXT_STATE.md` (current task, recent progress, blockers).
 - Active plans: `.claude/context/plans/` (referenced, not auto-loaded).
 
@@ -29,7 +29,7 @@ _(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 **Before answering any non-trivial question:**
 
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about. **Read each entry's `**Disposition**:` line first and triage by it**, not by severity: `action_required` (someone must act) and `auto_retryable` (transient; VCO retries it) are real work; `environmental` (a true description of this machine) and `informational_record` (already done, or a by-design skip) are context, not tasks — do not spend the user's attention on them. The CLAUDE.md reminder block gives you the split ("N actionable, M informational/records") before you open the file. Two entries to surface proactively when present: `update_resume_required` (an update halted at a conflict and needs a manual nudge — click **Continue Update** in the launcher or run `python install.py --update`) and `launcher_update_diverged` (a GUI update could not fast-forward / pull / fully refresh the binary — inspect `git status`, resolve the divergence, then re-run the update). Each entry's **For your Claude assistant** block has the specific recovery. An entry whose condition is genuinely over clears itself on the next `install.py --update` (the re-probe pass is read-only and always runs); an `environmental` one the user is happy with can be silenced with `python -m vco_lib.project_init dismiss-deferral --folder <project> --condition-id <id>`, and that dismissal holds until the underlying state actually changes.
+2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about. **Read each entry's `**Disposition**:` line first and triage by it**, not by severity: `action_required` (someone must act) and `auto_retryable` (transient; VCO retries it) are real work; `environmental` (a true description of this machine) and `informational_record` (already done, or a by-design skip) are context, not tasks — do not spend the user's attention on them. The CLAUDE.md reminder block gives you the split ("N actionable, M informational/records") before you open the file. Two entries to surface proactively when present: `update_resume_required` (an update halted at a conflict and needs a manual nudge — click **Continue Update** in the launcher or run `python install.py --update`) and `launcher_update_diverged` (a GUI update could not fast-forward / pull / fully refresh the binary — inspect `git status`, resolve the divergence, then re-run the update). Each entry's **For your Claude assistant** block has the specific recovery. Do not assume an entry clears itself: every condition declares its class and the mechanism that clears it in the orchestrator's `vco_lib/deferral_conditions.toml`, and an `action_required` entry stays until the named thing is done. An `environmental` entry the user is happy with can be silenced with `python -m vco_lib.project_init dismiss-deferral --folder <project> --condition-id <id>` (run from the orchestrator root); that dismissal holds until the underlying state actually changes.
 3. For architecture / system questions → search the KG **before** generating a response.
 4. For any other project question → search KG / code graph **before** answering.
 
@@ -69,14 +69,81 @@ Only use `Grep` / `Read` when the user provides an exact file path, you're hunti
 
 ---
 
+{{#if_module_active model_gateway}}
+## Model routing
+
+This section is here because a **model gateway is configured for this machine** (Services → Model gateway in the launcher). It would be absent otherwise — a project with no gateway reaches only Anthropic models, and routing advice for models you cannot call is noise. Turn it off per-project from the same card.
+
+**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter.
+
+**When you route to GLM, route to `claude-gw/glm-5.3`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.2 is 1M, glm-5.1 is 200K), so "the GLM one" is not a specification.
+
+⚠️ **Everything below is conditional on YOU having supplied the vendor's API
+key.** VCO ships no third-party key and never writes one. Without a key and a
+gateway, the `claude-gw/*` ids are unreachable and only the Anthropic rows apply.
+
+**The capability ladder, and it is one ordering, not five opinions**:
+**Fable 5.1 > Opus 5 > `glm-5.3` > `glm-5.3-flash` > Sonnet 5.** That is the
+Artificial Analysis Intelligence Index v4.1.1 composite read in order — 66, 63,
+60, 57, 55 — and it matches hands-on use on a large repository. Two consequences
+worth stating because they surprise people: **both GLM tiers rank above Sonnet
+5**, and `glm-5.3` sits nearer Opus than Sonnet. So **Sonnet should be a rare
+choice** — reach for it when the models above it are unavailable, not as the
+default middle rung.
+
+| Task class | Route to | Why |
+|---|---|---|
+| Final plans, adversarial review, hardest architecture | Fable 5.1 | Highest independent composite (Artificial Analysis Intelligence Index v4.1.1: 66, top of the five compared) |
+| Agentic coding on real repos, multi-file refactors | Opus 5 | 97.0% SWE-bench Verified, first of 86 models on that leaderboard (Vals AI) |
+| Bulk code generation, debugging, mid-tier implementation | `claude-gw/glm-5.3` | Sits between Sonnet 5 and Opus 5 and **nearer Opus** — slightly below it. Roughly 60% of Sonnet's price |
+| High-volume mechanical sweeps, first-pass triage | `claude-gw/glm-5.3-flash`, **behind a verifier** | **Slightly above Sonnet 5**, at ~1/15 the price |
+| Anything with an image, screenshot or diagram as input | a Claude model | GLM-5.3 (non-flash) is text-only |
+| Unsupervised edits to a green test suite | **not flash** | It broke an already-passing baseline test in 6.9% of agent rollouts (vs 4.4% for GLM-5.3) |
+
+**Where those placements come from, and which evidence wins.** The two GLM rows
+reflect hands-on use on a large real codebase, not a leaderboard: `glm-5.3` reads
+as an Opus-class model a little short of Opus, and flash as a little better than
+Sonnet 5. A published composite (Artificial Analysis Intelligence Index v4.1.1)
+scores them 60 and 57 against Sonnet 5's 55 — same ordering, but it compresses a
+gap that is wider in practice. Where the two disagree, **prefer the hands-on
+placement**: no public index measures agentic work on a repository of this size,
+and the index figures have no in-repo citation, while the placement above does.
+
+Two guardrails on flash, both from the same measurement: retries rescue it, more effort does not (longer runs helped it only 46% of the time — below chance), so cascade rather than escalate, and always verify its output against tests or a stronger second pass.
+
+**Do not propagate the circulating "GLM-5.3-Flash = 92% SWE-bench Verified" figure.** It is not on the leaderboard it cites and contradicts every other measurement of that model.
+
+**Window size is known. Competence across it is not. Keep the two apart.**
+
+*Capacity* is settled data, version-keyed and cited — never guess it and never
+infer it from a family name. The shipped table
+(`claude_mcp_servers/model_router/chat_model_context.seed.json`, one row per FULL
+model id, each with its vendor citation) is the source of truth: `glm-5.3`,
+`glm-5.3-flash` and `glm-5.2` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
+`glm-4.7` and `glm-4.6` are 200K/128K; `glm-4.5` and `glm-4.5-air` are 128K/96K.
+So `glm-5.2` has **five times** the window of `glm-5.1` — which is exactly why a
+`glm-5*` wildcard is forbidden. Claude models are deliberately absent from that
+table: the client already knows their windows natively, and overriding them
+would only introduce drift.
+
+*Competence* across a large window is the open question: *"1M tokens accepted"*
+is a capacity claim, not a quality one, and no vendor here publishes
+independently-verified retrieval or reasoning quality at the top of its range.
+Do not pick a model for long-context work on window size alone — but do not
+treat the window itself as unknown, because it is not.
+
+---
+
+{{/if_module_active}}
+
 {{#if_module_active diagrams}}
 ## Diagrams (Mermaid + Excalidraw)
 
 This project has the diagrams module active. When you sketch a flowchart, architecture diagram, GUI mockup, or any other visual:
 
 - Use the `mermaid` MCP (`render`, `save_diagram`) for text-based diagrams.
-- Use the `excalidraw` MCP (`create_scene`, `add_element`, …) for freehand whiteboard sketches.
-- **Save path is enforced**: `.claude/diagrams/<category>/<name>.{mmd,excalidraw}`. The MCP rejects saves outside this structure. Category is the primary tag (e.g. `gui/auth/`, `architecture/data-flow/`).
+- Use the `excalidraw` MCP (`create_element`, `update_element`, `export_scene`, …) for freehand whiteboard sketches.
+- **Save path is enforced**: `.claude/diagrams/<category>/<name>.{mmd,excalidraw}`. The MCP rejects saves outside this structure (mermaid `save_diagram`/`render`, excalidraw `export_scene`). Category is the primary tag (e.g. `gui/auth/`, `architecture/data-flow/`).
 - Don't worry about metadata: the launcher auto-derives title, tags, and indexes the diagram for retrieval. Just pick a sensible category path and filename.
 - To find an earlier diagram, use `hybrid_search("topic")` — diagrams are indexed alongside the KG. Results with `result_kind="diagram"` are diagrams; open them via `Read(file_path)` for Mermaid or `describe_excalidraw(file_path)` for Excalidraw.
 - Snapshots are automatic on every save (throttled 1/min, deduplicated). Delete a diagram via `rm` and the SQLite row + sidecar + Weaviate object cascade-clean automatically.
@@ -89,7 +156,7 @@ To disable diagrams for this project, toggle it off in the launcher's DiagramsTa
 {{/if_module_active}}
 ## VCO-Managed Files
 
-This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, run from the orchestrator root:
+This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, use the launcher (this project's Settings page → **Update bundle**, or the Projects page → **⟳ Update all** for every project) or run from the orchestrator root:
 
 ```bash
 python -m vco_lib.project_init install-bundle \
@@ -98,7 +165,7 @@ python -m vco_lib.project_init install-bundle \
   --update
 ```
 
-Add `--force` to accept the shipped versions for files you've intentionally modified. Files preserved by VCO are tracked in `.claude/.vco-manifest.json` under `preserved_files`.
+A shipped file you have edited locally is **adopted** on update: your bytes are backed up to `.claude/backups/bundle-adoptions/<timestamp>/` and the shipped version is written (`--force` does the same without the backup). Do not edit shipped files to change behaviour — disable the item from the launcher's per-project tabs instead. The one exception is `knowledge/**`: your KG nodes are your data and are always preserved, `--force` included. Files VCO could not adopt (backup failed) are listed in `.claude/.vco-manifest.json` under `preserved_files` and in `UPDATE_DEFERRED.md`.
 
 ## Moving this project to a different folder (manual protocol)
 
@@ -131,20 +198,18 @@ anything.
    `launcher.db`, then `UPDATE projects SET folder_path='<new>' WHERE
    id='<project-id>'`, then sweep EVERY table's path-like columns for the
    old path and CLASSIFY each hit: operational columns (rows future code
-   acts on — e.g. agent/skill `file_path`) get rewritten; historical
-   columns (`log_tail`, telemetry payloads) were TRUE at event time —
-   leave them untouched, never falsify history. `PRAGMA
+   acts on — `project_agents.file_path` and `project_skills.file_path`
+   carry absolute paths) get rewritten in the same launcher-closed window;
+   historical columns (`log_tail`, telemetry payloads) were TRUE at event
+   time — leave them untouched, never falsify history. `PRAGMA
    wal_checkpoint(TRUNCATE)` when done. Note: harness per-path state
    (`~/.claude.json` project entry, `~/.claude/projects/<path-slug>/`
    auto-memory + transcripts) does NOT follow a move — COPY (never move)
    the auto-memory directory to the new path's slug if the old path hosted
    sessions.
 6. **Re-point the toolchain**: relaunch the launcher; verify the hub resolves
-   the new path (`/api/v1/projects/by-path`); sweep path-like DB columns
-   beyond `projects.folder_path` too (`project_agents.file_path` and
-   `project_skills.file_path` carry absolute paths — rewrite them in the
-   same launcher-closed window). Then run kg-sync from the new root WITH
-   THE PROJECT'S OWN ENV and the VCO venv — a bare `kg-sync --all` can
+   the new path (`/api/v1/projects/by-path`). Then run kg-sync from the new
+   root WITH THE PROJECT'S OWN ENV and the VCO venv — a bare `kg-sync --all` can
    resolve the project's own `.venv` (no weaviate) or inherit another
    session's KG env:
    `cd <new-root> && set -a && source .claude/env && set +a && \
@@ -154,6 +219,28 @@ anything.
    convenient.
 7. **Never delete the old folder automatically** — leave it until a human
    confirms nothing was missed.
+8. **Check `.mcp.json` at the destination.** A project-scoped `.mcp.json`
+   (Anthropic's own config, often committed to the repo) takes PRECEDENCE
+   over `.claude/settings.json` for MCP env. A checkout you adopt may carry
+   its previous author's values — a different Weaviate URL, a foreign
+   `KG_COLLECTION`, no shared-KG entry — and every KG search then runs
+   against the wrong endpoint with no error. VCO detects and quarantines a
+   contradicting `weaviate-kg` block (backing the file up first), but check
+   it yourself when adopting an unfamiliar checkout. Restart Claude Code
+   afterwards so the MCP re-reads the corrected env.
+9. **After the move, re-read the deferral ledger with suspicion.** Before
+   v0.2.92, some VCO checks re-derived the project's identity from the FOLDER
+   BASENAME rather than the registered name, so a move could make a project's
+   own live collections look like foreign "legacy" data — complete with drop
+   commands. Identity now resolves from the registered row and the live
+   bindings, and an emitted drop command re-validates against those bindings
+   before it runs. A ledger entry written by an OLDER version can still carry
+   a command built on the old, wrong identity. So before running ANY
+   collection migration or drop command from
+   `UPDATE_DEFERRED.md`, verify against the live bindings: the launcher's
+   Identity tab, the hub's `/config` response, and the collections that
+   actually hold your objects. If the "legacy" class is the one your
+   project is reading, the detector is wrong, not your data.
 
 ---
 

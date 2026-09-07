@@ -9,6 +9,13 @@
 //! their respective Cargo.toml.
 
 pub mod bundled_versions;
+// v0.2.92 WP-13: the ONE "what did this probe establish?" shape —
+// `Ok | NotApplicable | Unknown{error}`. Replaces the `*_ok: bool` +
+// `*_error: Option<String>` pair that could not say "not applicable" and
+// whose ABSENCE the frontend read as healthy. Lives here (not in the
+// launcher app crate) because both the launcher's update surfaces and any
+// future hub-side probe need the same three-way answer.
+pub mod check_state;
 // v0.2.84 P2 (D1): the ONE collection-naming rule (KG / dev / diagrams),
 // binding-first + suffix-swap + slug-fallback, NO Weaviate probing. The
 // single Rust home; BOTH vct-hub's `config_api` AND the launcher app crate's
@@ -62,6 +69,12 @@ pub mod registry;
 // re-exports it from here. See `secret_value_shape.rs` header.
 pub mod secret_value_shape;
 pub mod secrets;
+// v0.3.0: tier-2 file-store (`$VCT_SECRETS_DIR`, default `~/.vct-secrets`)
+// location + presence probes. The ONE home for the launcher's knowledge of
+// the store the sanctioned resolvers fall back to when the keychain misses;
+// three divergent copies of the path resolution preceded it. See the module
+// header for why a keychain-only probe was actively harmful.
+pub mod secrets_file_store;
 // v0.3.0 (WP-K): Linux-only persistent Secret-Service connection for the
 // keychain arm. Holds ONE process-wide D-Bus session (mutex-guarded,
 // reconnect-on-broken) so the daemon sees a long-lived client reused across ops

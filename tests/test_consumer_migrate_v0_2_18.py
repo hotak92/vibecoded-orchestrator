@@ -65,6 +65,7 @@ class _FakeService:
         code_ready: bool = True,
         text_all_slots: Optional[dict] = None,
         code_all_slots: Optional[dict] = None,
+        truncated_slots: Optional[list] = None,
     ) -> None:
         self.text_vector_slot = text_slot
         self.code_vector_slot = code_slot
@@ -76,6 +77,7 @@ class _FakeService:
         self._code_ready = code_ready
         self._text_all_slots = text_all_slots
         self._code_all_slots = code_all_slots
+        self.truncated_slots = list(truncated_slots or [])
         self.embed_text_calls: list[str] = []
         self.embed_code_calls: list[str] = []
         self.closed = False
@@ -99,6 +101,17 @@ class _FakeService:
         if self._text_all_slots is not None:
             return self._text_all_slots
         return {self.text_vector_slot: [0.1, 0.2, 0.3]}
+
+    def embed_text_all_configured_tagged(self, text: str) -> tuple:
+        """Mirrors the REAL signature (W3, v0.2.92): the vectors AND the
+        per-call truncation record, captured atomically. A fake whose shape
+        drifts from production's is how a broken write path passes its
+        tests — see the same lesson in
+        ``tests/test_emb_truncated_event_field.py``."""
+        return (
+            self.embed_text_all_configured(text),
+            list(self.truncated_slots),
+        )
 
     def embed_code_all_configured(self, text: str) -> dict:
         self.embed_code_calls.append(text)
@@ -148,15 +161,20 @@ class SyncKnowledgeGraphTests(unittest.TestCase):
         svc = _FakeService(
             text_slot="qwen3_embed",
             text_all_slots={"qwen3_embed": [0.1, 0.2], "openai_text_embed": [0.3, 0.4]},
+            truncated_slots=["openai_text_embed"],
         )
         wrapper = MagicMock()
         wrapper._get_all_kg_embeddings = svc.embed_text_all_configured
+        wrapper._get_all_kg_embeddings_tagged = svc.embed_text_all_configured_tagged
         wrapper._get_embedding = svc.embed_text
         wrapper.text_vector_slot = svc.text_vector_slot
 
-        vec_arg, slots = mod._build_vector_arg(wrapper, "hello")
+        vec_arg, slots, truncated = mod._build_vector_arg(wrapper, "hello")
         self.assertIsInstance(vec_arg, dict)
         self.assertEqual(set(slots.keys()), {"qwen3_embed", "openai_text_embed"})
+        # W3 (v0.2.92): the third element is the per-call truncation record
+        # the caller stamps on the stored row.
+        self.assertEqual(truncated, ["openai_text_embed"])
 
     def test_build_vector_arg_legacy_mode_returns_flat_list(self):
         mod = self._import_module()
@@ -164,12 +182,17 @@ class SyncKnowledgeGraphTests(unittest.TestCase):
         svc = _FakeService(text_slot="qwen3_embed")
         wrapper = MagicMock()
         wrapper._get_all_kg_embeddings = svc.embed_text_all_configured
+        wrapper._get_all_kg_embeddings_tagged = svc.embed_text_all_configured_tagged
         wrapper._get_embedding = svc.embed_text
         wrapper.text_vector_slot = svc.text_vector_slot
 
-        vec_arg, slots = mod._build_vector_arg(wrapper, "hello")
+        vec_arg, slots, truncated = mod._build_vector_arg(wrapper, "hello")
         self.assertIsInstance(vec_arg, list)
         self.assertEqual(list(slots.keys()), ["qwen3_embed"])
+        self.assertEqual(truncated, [])
+        # Hermetic: the flat path takes its vector from the SAME tagged
+        # gather, so it must not need a second live embed call.
+        self.assertEqual(svc.embed_text_calls, ["hello"])
 
     def test_build_vector_arg_dual_mode_raises_on_empty_slots(self):
         mod = self._import_module()
@@ -177,6 +200,7 @@ class SyncKnowledgeGraphTests(unittest.TestCase):
         # service returns empty dict → no backend succeeded
         wrapper = MagicMock()
         wrapper._get_all_kg_embeddings = lambda text: {}
+        wrapper._get_all_kg_embeddings_tagged = lambda text: ({}, [])
         with self.assertRaises(RuntimeError) as cm:
             mod._build_vector_arg(wrapper, "hello")
         self.assertIn("No embedding backend", str(cm.exception))

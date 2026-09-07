@@ -1,0 +1,59 @@
+# {{INSTALLED_AT_PATH}}
+#
+# Starts the VCO model gateway (`vct-model-gateway`) at user-session start.
+#
+# DEFAULT OFF. Unlike the container-stack unit — which every install writes,
+# because everything else depends on the stack — this unit exists only after
+# the user asked for it, via `vct-model-gateway --register-boot` or the
+# launcher's gateway toggle. The gateway proxies under the user's Claude
+# login and any configured vendor subscription, so turning it into a
+# login-time daemon widens the machine's security surface; that is a
+# decision the user makes, not one an installer makes for them.
+# `install.py --update` re-renders an EXISTING unit (so a moved clone keeps a
+# working ExecStart) and never creates a first one.
+#
+# Written by vco_lib/boot_service.py — the one home that also registers the
+# container stack and unregisters both. Its Rust twin for the hub binary is
+# launcher/src-tauri/vct-hub/src/boot.rs; the two share a CLI contract
+# (--register-boot / --unregister-boot / --boot-status) but not code.
+#
+# Template substitutions:
+#   {{INSTALLED_AT_PATH}} — absolute path where this unit landed
+#   {{EXEC_START}}        — shell-quoted argv of the gateway entry point,
+#                           resolved at registration time (the console
+#                           script when present, else `<python> -m
+#                           model_router`), with the `serve` verb appended
+#   {{WORKING_DIR}}       — directory the daemon runs in
+#   {{STATE_DIR}}         — VCT state root pinned at registration time
+#   {{BOOT_LOG_FILE}}     — where systemd appends the PROCESS's own output
+#                           (startup refusals, tracebacks); the daemon's own
+#                           structured log is a separate file, so records
+#                           are never written twice
+#
+[Unit]
+Description=VCT model gateway (local Anthropic-shaped model picker)
+Documentation=https://github.com/hotak92/vibecoded-orchestrator
+# The gateway binds loopback and reads local files; it needs the user
+# session to exist, not the network.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={{EXEC_START}}
+WorkingDirectory={{WORKING_DIR}}
+# Restart on crash, not on a clean stop: exit 0 means the user (or the
+# launcher) asked it to stop, and restarting then would make `--stop`
+# impossible. RestartSec bounds a crash loop; systemd's default start-limit
+# then gives up rather than spinning.
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+# Pin the state dir chosen at registration time so a dev install with
+# VCT_STATE_DIR set does not silently contaminate production state on the
+# next login.
+Environment=VCT_STATE_DIR={{STATE_DIR}}
+StandardOutput=append:{{BOOT_LOG_FILE}}
+StandardError=append:{{BOOT_LOG_FILE}}
+
+[Install]
+WantedBy=default.target

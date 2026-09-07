@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-02T00:00:00Z",
+  "source": "shipped-seed",
+  "_comment": "Seed for the chat-model context table. Keys are FULL model ids, never family wildcards: glm-5.2 has a 1M window while glm-5.1 has 200K, so a 'glm-5*' pattern would misreport by 5x. Every row cites the official vendor page it was read from; a row without a citation is a test failure, not a data choice (tests/test_model_router_context_table.py). Claude-family ids are deliberately absent — Claude Code knows their windows natively. Window/output figures are the vendor's own decimal-K figures, not powers of two. This file is the FALLBACK: the launcher exports a user-editable table to <vct_root>/model-gateway/chat_model_context.json, and that export wins when present.",
+  "models": {
+    "glm-5.3": {
+      "vendor": "zai",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.z.ai/guides/llm/glm-5.3"
+    },
+    "glm-5.3-flash": {
+      "vendor": "zai",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
+      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there)."
+    },
+    "glm-5.2": {
+      "vendor": "zai",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.z.ai/guides/llm/glm-5.2"
+    },
+    "glm-5.1": {
+      "vendor": "zai",
+      "context_window": 200000,
+      "max_output": 128000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-5.1"
+    },
+    "glm-5": {
+      "vendor": "zai",
+      "context_window": 200000,
+      "max_output": 128000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-5"
+    },
+    "glm-5-turbo": {
+      "vendor": "zai",
+      "context_window": 200000,
+      "max_output": 128000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-5-turbo"
+    },
+    "glm-4.7": {
+      "vendor": "zai",
+      "context_window": 200000,
+      "max_output": 128000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-4.7"
+    },
+    "glm-4.6": {
+      "vendor": "zai",
+      "context_window": 200000,
+      "max_output": 128000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-4.6"
+    },
+    "glm-4.5": {
+      "vendor": "zai",
+      "context_window": 128000,
+      "max_output": 96000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-4.5"
+    },
+    "glm-4.5-air": {
+      "vendor": "zai",
+      "context_window": 128000,
+      "max_output": 96000,
+      "window_1m": false,
+      "source": "https://docs.z.ai/guides/llm/glm-4.5",
+      "source_note": "This model has no page of its own (https://docs.z.ai/guides/llm/glm-4.5-air returns 404); its specification sits on the GLM-4.5 card, which is what the cited URL is. Third-party listings of a 1M variant of this model are NOT official and are deliberately not reflected here."
+    }
+  }
+}

@@ -8,8 +8,10 @@ V52-O.11.N parser helpers (``_strip_powershell_comments`` /
 deep-indent fix, regression-tested in ``tests/test_powershell_parser.py``)
 and ``CodeGraphAnalyzer._analyze_powershell_file`` (only body edits: the
 mechanical ``self.`` -> ``ctx.`` rename and the analyzer-resident
-``embed_function`` seam reached as ``ctx.embed_function``). Behavior is
-pinned byte-identically by ``tests/test_codegraph_golden.py``.
+``embed_function`` seam reached as ``ctx.embed_function``). The MOVE was
+verbatim; behaviour has since been corrected here (v0.2.92), so it is no
+longer byte-identical to the analyzer's original.
+``tests/test_codegraph_golden.py`` pins what it does TODAY.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from vco_lib.codegraph_entities import (
 )
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
+    blank_block_comments_preserving_lines,
     run_pure_extractor,
 )
 
@@ -100,8 +103,16 @@ def _strip_powershell_comments(content: str) -> str:
     pattern. `#region` / `#endregion` markers are stripped via the
     single-line pass.
     """
-    # Block comments `<# ... #>` (greedy across lines).
-    stripped = re.sub(r"<#.*?#>", " ", content, flags=re.DOTALL)
+    # Block comments `<# ... #>` (non-greedy across lines).
+    #
+    # v0.2.92: routed through the ONE shared block-comment scrub. This producer
+    # is the only one of the nine that does NOT map offsets from the scrubbed
+    # copy to line numbers — it re-anchors on the ORIGINAL content (see
+    # `extract_powershell_file`), so its stored line numbers were never skewed.
+    # It is migrated for the single-implementation rule, not to fix a defect
+    # here; `tests/test_v0292_wp5_block_comment_scrub.py` pins that this
+    # producer's declaration/param parsing is UNCHANGED by the migration.
+    stripped = blank_block_comments_preserving_lines(content, "<#", "#>")
     # Single-line `#` to end-of-line. Includes `#region`, `#endregion`,
     # `#!` shebangs (not idiomatic in .ps1 but possible in cross-platform
     # scripts).
@@ -224,8 +235,8 @@ def extract_powershell_file(
     """
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines
-               if l.strip() and not l.strip().startswith('#')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('#')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
@@ -251,6 +262,9 @@ def extract_powershell_file(
     # --- Module summary ---
     # Look for a leading `<# .SYNOPSIS ... #>` block; fall back to
     # the first single-line comment.
+    # NOT a comment scrub (v0.2.92 §3.3): this READS the comment's text for the
+    # module summary rather than removing it, and derives no line number —
+    # exempt from the newline-preserving rule.
     synopsis = ''
     m_syn = re.search(
         r"<#\s*\.SYNOPSIS\s+(.*?)\s*(?:\.[A-Z]+|\#>)",
@@ -317,7 +331,14 @@ def extract_powershell_file(
         # collapses them or surfaces the dedup conflict downstream.
         scope_prefix = f"{scope}:" if scope else ""
         anchor = re.compile(
-            r"^\s*(?:function|filter)\s+"
+            # v0.2.92: `[ \t]*`, NOT `\s*`. Under re.MULTILINE `^` matches at
+            # every line start and `\s` matches a NEWLINE, so `^\s*` let the
+            # match begin on a preceding BLANK line and walk down to the
+            # keyword — `deploy.Invoke-Deploy` was stored starting on line 5,
+            # an empty line, instead of line 6. `[ \t]*` is what
+            # `_POWERSHELL_FUNCTION_DECL` above has always used; these two
+            # patterns describe the same declaration and now agree.
+            r"^[ \t]*(?:function|filter)\s+"
             + re.escape(scope_prefix)
             + re.escape(name)
             + r"\b",

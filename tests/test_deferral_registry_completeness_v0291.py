@@ -166,6 +166,43 @@ _V0291_OWNED_ADDITIONS = frozenset({
     "npx_missing_mcp_unspawnable",
 })
 
+# v0.2.92 W12 addition, same justification as the three `*_repaired` records
+# above: `shared_kg_binding_repaired` is emitted by the launcher's BOOT sweep
+# (`binding_reconcile` -> `shared_kg_binding::repair_shared_kg_bindings`),
+# never from inside an install.py run, so install ownership is the one-shot
+# auto-expiry the `stale_unit_retired_` precedent established — not a
+# same-run-drop hazard. Its body says "No action needed"; requiring a manual
+# dismissal to clear it is exactly the silting the class exists to prevent.
+#
+# `vco_lib_shadowed_by_venv_copy` is the OTHER v0.2.92 addition, and it is
+# family A on the `npx_missing_mcp_unspawnable` precedent directly above: the
+# doctor phase emits it from INSIDE the install.py run, into that run's own
+# report (sink=), never behind finalize's back — so install ownership means
+# "re-detected every run", which is exactly what is wanted. install step 4
+# repairs the repairable shapes BEFORE the doctor phase re-probes, so the entry
+# is dropped by the same run that fixes it; it survives only for the arm VCO
+# must not touch (an editable install owned by a different checkout).
+_V0292_OWNED_ADDITIONS = frozenset({
+    "shared_kg_binding_repaired",
+    "vco_lib_shadowed_by_venv_copy",
+    # D18 heal: emitted from `kg_binding_heal` INSIDE the install.py run
+    # whose finalize rebuilds the ledger — the same family (and the same
+    # justification) as `kg_binding_self_healed` beside it. Re-detected
+    # every run: once the binding is re-pointed the heal cannot fire again,
+    # so the record correctly disappears on the next update.
+    "kg_binding_evidence_repointed",
+    # D18 heal, the ASK half — same emitter, same family, and the ownership
+    # is what makes its clear routes REAL rather than documented: it is
+    # re-raised by every install run that still refuses, so the run after the
+    # user settles the split (merge, re-sync, or a `manual_override` sentinel
+    # on the row) simply does not re-detect it and finalize drops it. An
+    # `action_required` id owned this way is not the "record-class" exception
+    # its neighbours are — it is family A proper: the emitter runs INSIDE the
+    # install.py run and emits into that run's own report, never behind
+    # finalize's back, so drop-when-absent means "stopped being true".
+    "kg_binding_ambiguous_evidence",
+})
+
 
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
@@ -425,7 +462,18 @@ class TestRegistryCompleteness(unittest.TestCase):
         dismissal suppress the condition forever."""
         from vco_lib.deferral_dismissal import _FALLBACK_PROVIDERS  # noqa: PLC0415
 
-        emitter_supplied = {"dual_ollama_detected"}
+        # `dual_ollama_detected`: install.py's emitter attaches the (alt,
+        # canon) port pair itself. `kg_binding_evidence_mismatch`
+        # (v0.2.92 D18 re-closure): the doctor's entry builder attaches the
+        # affected projects + evidence classes from the finding's structured
+        # detail (doctor._kg_binding_dismiss_fields).
+        # `kg_unclaimed_populated_classes` (v0.2.92 item 3): same shape —
+        # the doctor's entry builder attaches the unclaimed class set
+        # (doctor._kg_unclaimed_entry's dismiss_fields).
+        emitter_supplied = {
+            "dual_ollama_detected", "kg_binding_evidence_mismatch",
+            "kg_unclaimed_populated_classes",
+        }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
                 continue
@@ -457,7 +505,7 @@ class TestOwnershipMigrationPin(unittest.TestCase):
     def test_additions_are_exactly_the_deliberate_ones(self):
         added = self.owned - _V0290_OWNED_IDS
         self.assertEqual(
-            added, _V0291_OWNED_ADDITIONS,
+            added, _V0291_OWNED_ADDITIONS | _V0292_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

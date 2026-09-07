@@ -164,8 +164,12 @@ async def get_ollama_embedding(text: str) -> list[float] | None:
         except Exception as e:
             server.logger.warning("EmbeddingService.embed_text failed (%s); falling back to inline Ollama", e)
     # Inline fallback: direct Ollama call (preserves pre-v0.2.18 path).
-    # num_ctx=8192 overrides Ollama's 4096 default, matching qwen3-
-    # embedding's actual capacity.
+    # R40 (2026-09-04): num_ctx must be EXPLICIT on every Ollama embed
+    # request — unset means Ollama's small default and silent truncation of
+    # chunk tails. The window is resolved per model from the ONE table that
+    # also sizes the chunks (R40 RESOLVED: 10 240 for qwen3), not hardcoded —
+    # two independent windows for one model is the drifted-duplicate-table
+    # shape that caused a live 4x over-budget bug earlier this cycle.
     # v0.2.77 Part 9 task 6: keep_alive pins the model resident so the hook
     # path's inline embed doesn't re-pay the ~1.9 s model reload after any idle
     # gap. Reuse the ONE resolver in vco_lib.embedding_providers.ollama (no
@@ -173,16 +177,32 @@ async def get_ollama_embedding(text: str) -> list[float] | None:
     # degrade to "no keep_alive" rather than break the embed.
     try:
         from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
     except Exception:
         def _ka(body):  # type: ignore[misc]
             return body
+
+        def _nctx(model: str) -> int:  # type: ignore[misc]
+            # v0.2.92 R40: never return None here. An UNSET num_ctx means
+            # Ollama's 2048 default, which silently truncates any longer input
+            # and returns HTTP 200 — the failure this fix exists to remove.
+            # 2048 is the conservative floor: it is what we would have got
+            # anyway, but now it is a stated choice rather than an omission.
+            return 2048
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{server.OLLAMA_URL}/api/embeddings",
+            # v0.2.92 round-3: was a HARDCODED 8192 with no `truncate`, which
+            # (a) contradicted R40 — the window must come from the one home
+            # that also sizes the chunks, or the two drift — and (b) let this
+            # path silently drop the tail, since qwen3 and jina truncate at
+            # HTTP 200 by default. Both corrected here rather than only
+            # reported, which is what an earlier pass did.
             json=_ka({
                 "model": server.EMBEDDING_MODEL,
                 "prompt": text,
-                "options": {"num_ctx": 8192},
+                "options": {"num_ctx": _nctx(server.EMBEDDING_MODEL)},
+                "truncate": False,
             }),
             timeout=aiohttp.ClientTimeout(total=30)
         ) as response:
@@ -201,15 +221,32 @@ async def get_legacy_text_embedding(text: str) -> list[float] | None:
     from . import server
     try:
         from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
     except Exception:
         def _ka(body):  # type: ignore[misc]
             return body
+
+        def _nctx(model: str) -> int:  # type: ignore[misc]
+            # v0.2.92 R40: never return None here. An UNSET num_ctx means
+            # Ollama's 2048 default, which silently truncates any longer input
+            # and returns HTTP 200 — the failure this fix exists to remove.
+            # 2048 is the conservative floor: it is what we would have got
+            # anyway, but now it is a stated choice rather than an omission.
+            return 2048
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
                 # task 6: keep_alive on the legacy text embed too.
-                json=_ka({"model": server.LEGACY_TEXT_EMBEDDING_MODEL, "prompt": text}),
+                # v0.2.92 R40: num_ctx was UNSET here, so this legacy path
+                # inherited Ollama's 2048 default while the arctic budget is
+                # 3200 — every longer input lost its tail with a 200 response.
+                json=_ka({
+                    "model": server.LEGACY_TEXT_EMBEDDING_MODEL,
+                    "prompt": text,
+                    "options": {"num_ctx": _nctx(server.LEGACY_TEXT_EMBEDDING_MODEL)},
+                    "truncate": False,  # v0.2.92: refuse, never silently drop the tail
+                }),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status != 200:
@@ -309,24 +346,52 @@ async def _get_both_embeddings(text: str) -> tuple[list[float] | None, list[floa
     return ollama_vec, openai_vec
 
 
+def _active_text_slot_name() -> str:
+    """The ACTIVE text slot name of the SESSION-cached EmbeddingService.
+
+    PURE read of ``server._cached_embed_service`` — never CONSTRUCTS a service
+    (unlike ``_get_embedding_service``), so the KG write path can call it per
+    chunk with no side effects, no probe, and no retry-window state changes.
+    Returns ``""`` when the cache is cold or the slot is unavailable.
+
+    Used by ``store_knowledge_node`` to derive the SECONDARY-only view of the
+    per-call truncation record (the legacy ``secondary_truncated_slots``
+    property keeps its pre-v0.2.92 meaning); the complete record is persisted
+    as ``truncated_slots`` (see ``rl_enrichment.TRUNCATED_SLOTS_PROP``). A
+    cold cache here means the capture itself could not have run through the
+    service (the inline fallback ran, whose record is empty), so the
+    active-slot exclusion is a no-op and the empty record stays honest.
+    """
+    from . import server
+    svc = getattr(server, "_cached_embed_service", None)
+    try:
+        return str(getattr(svc, "text_vector_slot", "") or "")
+    except Exception:  # noqa: BLE001 — defensive: never break the write
+        return ""
+
+
 async def _get_all_kg_embeddings_tagged(
     text: str,
 ) -> "tuple[dict[str, list[float]], list[str]]":
     """Like ``_get_all_kg_embeddings`` but also returns the truncated-slot tag.
 
-    Returns ``(slots, secondary_truncated_slots)`` where the second element is the
-    sorted list of SECONDARY slot names whose vector was embedded from a bounded
-    leading sub-window on THIS call (R3-2). ``store_knowledge_node`` persists that
-    list as the ``secondary_truncated_slots`` chunk property so stored secondary
-    (e.g. arctic) vectors can be partitioned truncated-vs-full from stored data.
+    Returns ``(slots, truncated_slot_names)`` where the second element is the
+    sorted list of EVERY configured slot — the ACTIVE one included — whose
+    vector was embedded from a bounded leading sub-window on THIS call (R3-2;
+    widened v0.2.92, m-R6-1, from secondary-only to the complete record).
+    ``store_knowledge_node`` persists that list verbatim as the
+    ``truncated_slots`` chunk property and derives the secondary-only
+    ``secondary_truncated_slots`` property from it (active slot dropped), so
+    stored vectors can be partitioned truncated-vs-full from stored data
+    alone — the ACTIVE slot included, which is the point of m-R6-1.
 
     The tag is captured ATOMICALLY with the vectors via
     ``EmbeddingService.embed_text_all_configured_tagged`` (inside the same
     ``to_thread`` boundary), so a concurrent write can't reset the per-instance
     truncated record between the embed and the read. The legacy inline-gather
-    fallback (EmbeddingService unavailable) has no per-model num_ctx bounding and
-    therefore reports an empty truncated list — no secondary was sub-windowed on
-    that path.
+    fallback (EmbeddingService unavailable) has no per-model num_ctx bounding
+    and therefore reports an empty record — nothing was sub-windowed on that
+    path.
     """
     from . import server
     svc = server._get_embedding_service()
@@ -346,7 +411,7 @@ async def _get_all_kg_embeddings_tagged(
                 "_get_all_kg_embeddings_tagged via EmbeddingService failed (%s); "
                 "falling back to inline gather", e
             )
-    # Inline fallback path bounds nothing → no secondary was truncated.
+    # Inline fallback path bounds nothing → nothing was sub-windowed.
     return (await _get_all_kg_embeddings(text)), []
 
 
@@ -560,24 +625,17 @@ async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float]
 
 async def count_tokens_async(text: str) -> int:
     """
-    Count tokens using Ollama qwen3.5:0.8b tokenizer.
-    Falls back to character approximation (len // 4) if Ollama is unavailable.
+    Count tokens in the chunker's ONE budget unit (D16, v0.2.92).
+
+    Delegates to ``chunking.TokenCounter.count_tokens`` — deterministic
+    character arithmetic. Pre-v0.2.92 this called Ollama's ``/api/tokenize``
+    with a CHAT model (``qwen3.5:0.8b``): wrong unit for an embedding-window
+    budget, and the endpoint no longer exists in current Ollama (404 on
+    0.20.2), so the call always fell through to the approximation anyway.
+    One home: this function and ``TokenCounter`` cannot disagree.
     """
-    from . import server
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{server.OLLAMA_URL}/api/tokenize",
-                json={"model": "qwen3.5:0.8b", "content": text},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return len(data.get("tokens", []))
-    except Exception:
-        pass
-    # Fallback: 1 token ≈ 4 chars
-    return len(text) // 4
+    from .chunking import TokenCounter
+    return TokenCounter.count_tokens(text)
 
 
 async def get_code_embedding(text: str) -> list[float] | None:
@@ -695,17 +753,39 @@ async def get_legacy_code_embedding(text: str) -> list[float] | None:
     from . import server
     try:
         from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
     except Exception:
         def _ka(body):  # type: ignore[misc]
             return body
+
+        def _nctx(model: str) -> int:  # type: ignore[misc]
+            # v0.2.92 R40: never return None here. An UNSET num_ctx means
+            # Ollama's 2048 default, which silently truncates any longer input
+            # and returns HTTP 200 — the failure this fix exists to remove.
+            # 2048 is the conservative floor: it is what we would have got
+            # anyway, but now it is a stated choice rather than an omission.
+            return 2048
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
                 # task 6: keep_alive on the legacy code embed too.
+                # v0.2.92 R40: num_ctx was UNSET. jina's 1600 budget happens to
+                # fit under Ollama's 2048 default — by luck, not by design. Set
+                # it so a future budget change cannot silently start truncating.
                 json=_ka({
                     "model": "unclemusclez/jina-embeddings-v2-base-code:latest",
-                    "prompt": text
+                    "prompt": text,
+                    "options": {
+                        "num_ctx": _nctx(
+                            "unclemusclez/jina-embeddings-v2-base-code:latest"
+                        )
+                    },
+                    # R45: refuse rather than silently drop the tail. jina is
+                    # one of the models MEASURED to truncate at HTTP 200 with
+                    # `truncate` unset, so without this the caller cannot tell
+                    # a full vector from a partial one.
+                    "truncate": False,
                 }),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:

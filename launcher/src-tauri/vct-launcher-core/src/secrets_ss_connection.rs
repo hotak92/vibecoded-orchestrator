@@ -171,6 +171,53 @@ pub(crate) fn inject_broken_connection_once() {
 /// backstop that keeps the shared `SecretService` sound).
 static CONNECTION: Mutex<Option<SecretService>> = Mutex::new(None);
 
+/// Upper bound (seconds) on how long an op on the SHARED connection will wait
+/// for the user to answer an interactive unlock prompt.
+///
+/// Why a bound at all: `SecretService::connect(Plain)` leaves
+/// `timeout: None`, and dbus-secret-service's `execute_prompt` then polls for
+/// `timeout.unwrap_or(ONE_YEAR_SECONDS)` — i.e. 365 days (prompt.rs). Only
+/// PROMPTS are affected; ordinary D-Bus method calls keep their own 2s bound
+/// from `new_proxy`. A prompt therefore parked the single keychain worker
+/// thread for what is, operationally, forever — and because the worker holds
+/// the cross-process pace flock across the op, that parked worker also wedged
+/// every OTHER VCO process (see `secrets.rs::cross_process_pace`). This bound
+/// makes the holder's own worker recover on its own.
+///
+/// Why 120s and not something tight: the timeout must never be the reason a
+/// real person fails to unlock their keyring. 120s comfortably covers noticing
+/// the dialog, fetching a passphrase from a password manager and typing it. The
+/// only case it cuts short is an ABANDONED prompt — nobody at the machine, or a
+/// dialog lost behind other windows — which is precisely the case that must not
+/// last a year.
+///
+/// What a timeout does and does not do: dbus-secret-service stops listening and
+/// returns `Error::Prompt` (its docs say it dismisses the prompt; the 4.1.0 code
+/// does NOT — `execute_prompt` only calls `match_stop`, never `Prompt.Dismiss`).
+/// So the dialog stays on screen and a late answer still unlocks the collection
+/// daemon-side; only OUR wait is abandoned. The op fails cleanly as
+/// `Permanent` → `NoStorageAccess` → not retried (no dialog re-pop), and the
+/// user's next attempt finds the store already unlocked. The cost of a
+/// too-short bound is therefore one spurious failure, not a lost secret — but
+/// 120s is chosen so even that does not happen to a slow typist.
+///
+/// Deliberately LONGER than `secrets.rs`'s 30s pace-lock acquire deadline: the
+/// sibling process should degrade to unpaced (harmless — a process sitting on a
+/// modal prompt generates no daemon traffic) rather than the human being cut
+/// off. The two timeouts bound different things and are not interchangeable.
+const SHARED_MAX_PROMPT_TIMEOUT_SECS: u64 = 120;
+
+/// Open a new shared Secret-Service session with the bounded prompt timeout.
+/// SSOT for the connection factory so the bound cannot be lost by someone
+/// reaching for the bare `SecretService::connect` (which means "wait a year").
+fn connect_shared() -> Result<SecretService, SsOpError> {
+    SecretService::connect_with_max_prompt_timeout(
+        EncryptionType::Plain,
+        SHARED_MAX_PROMPT_TIMEOUT_SECS,
+    )
+    .map_err(classify)
+}
+
 // ─── Reuse + reconnect state machine (SSOT, connection-type-generic) ──────────
 //
 // The reuse/reconnect DECISION LOGIC lives once in `run_reusing_connection`,
@@ -269,7 +316,7 @@ fn with_connection<T>(
         &mut guard,
         &CONNECTION_FACTORY_COUNT,
         inject,
-        || SecretService::connect(EncryptionType::Plain).map_err(classify),
+        connect_shared,
         op,
     )
 }
@@ -281,9 +328,10 @@ fn with_connection<T>(
 ///
 /// EXIT MUST NEVER STALL. The keychain worker holds `CONNECTION` for the FULL
 /// duration of an op, and an op can include `ensure_unlocked` / `unlock`, which
-/// can raise a user unlock prompt; `SecretService::connect(Plain)` sets no
-/// max-prompt-timeout, so that prompt wait is unbounded (only plain D-Bus method
-/// calls are bounded at 2s). A caller `KEYCHAIN_OP_TIMEOUT` bounds the CALLER,
+/// can raise a user unlock prompt. That prompt wait is bounded (at
+/// `SHARED_MAX_PROMPT_TIMEOUT_SECS` = 120s) but is far longer than any
+/// acceptable exit budget — bounded is not the same as short. A caller
+/// `KEYCHAIN_OP_TIMEOUT` bounds the CALLER,
 /// not the worker — so if we took a BLOCKING `CONNECTION.lock()` here, quitting
 /// while an interactive unlock prompt is open would block `RunEvent::Exit` /
 /// hub shutdown until the user answers the prompt. To guarantee exit is bounded
@@ -517,8 +565,9 @@ pub(crate) fn remove_secret(service: &str, key: &str) -> Result<(), SsOpError> {
 /// `collection.rs:41`, `lib.rs:261`). NEITHER unlocks NOR raises a prompt, so
 /// the `max_prompt_timeout = 0` isolation the ephemeral probe session used is
 /// not needed here — there is no prompt for a timeout to cancel. (The shared
-/// connection's `connect(Plain)` sets `timeout: None`; that only matters for op
-/// paths that call `unlock`/`ensure_unlocked`, which the probe never does.)
+/// connection sets `SHARED_MAX_PROMPT_TIMEOUT_SECS`; that only matters for op
+/// paths that call `unlock`/`ensure_unlocked`, which the probe never does. The
+/// probe's own bound is the 2s per-method-call D-Bus timeout.)
 ///
 /// Returns `Ok(Some(locked))` on a definite answer, `Ok(None)` when there is no
 /// default collection (`NoResult` → UNKNOWN), and `Err(_)` on a D-Bus failure so
@@ -610,6 +659,30 @@ mod tests {
         assert!(g.is_none(), "shutdown must leave the connection slot empty");
     }
 
+    /// This module's source with every `//`-comment stripped and all
+    /// whitespace removed, so the structural pins below scan EXECUTED code
+    /// only and never match their own explanatory prose. Shared by both
+    /// structural tests (one concern, one home).
+    ///
+    /// Comment-stripping is only half the protection: a needle spelled
+    /// contiguously inside a test's own STRING LITERAL still matches, so each
+    /// caller assembles its needle from split literals.
+    fn code_flat() -> String {
+        fn code_before_line_comment(line: &str) -> &str {
+            match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            }
+        }
+        include_str!("secrets_ss_connection.rs")
+            .lines()
+            .map(code_before_line_comment)
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
     /// M-5 STRUCTURAL PIN: keyring's `map_matching_legacy_items` applies `f`
     /// DIRECTLY and never unlocks a legacy item — only the MAIN service-wide
     /// search unlocks its locked matches. So `item.ensure_unlocked()` must appear
@@ -621,20 +694,7 @@ mod tests {
     /// self-matches.
     #[test]
     fn legacy_branch_does_not_unlock_matching_keyring() {
-        let src = include_str!("secrets_ss_connection.rs");
-        fn code_before_line_comment(line: &str) -> &str {
-            match line.find("//") {
-                Some(idx) => &line[..idx],
-                None => line,
-            }
-        }
-        let code_flat: String = src
-            .lines()
-            .map(code_before_line_comment)
-            .collect::<String>()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let code_flat = code_flat();
         // Needle for the item unlock CALL, assembled from split literals so no
         // line in THIS test's own code (comment-stripped) can form it.
         let unlock_needle = String::from("item.ensure_") + "unlocked(";
@@ -646,6 +706,80 @@ mod tests {
              LEGACY-fallback item (secret_service.rs:417-420) — re-adding an \
              unlock to the legacy branch diverges from keyring and risks an \
              unlock prompt where keyring would only error (M-5)"
+        );
+    }
+
+    // ─── P0: the shared connection's prompt wait must be BOUNDED ─────────────
+    //
+    // `SecretService::connect(Plain)` leaves `timeout: None`, and
+    // dbus-secret-service 4.1.0's `execute_prompt` then polls for
+    // `timeout.unwrap_or(ONE_YEAR_SECONDS)`. An `ensure_unlocked` / `unlock`
+    // that raised a user prompt therefore parked the single keychain worker
+    // thread for a YEAR — and since that worker holds the cross-process pace
+    // flock across the op, the parked worker also wedged every other VCO
+    // process. The shared connection now goes through `connect_shared`, which
+    // sets an explicit bound.
+
+    /// The bound must be a real bound AND survivable by a real person.
+    ///
+    /// Both edges matter and both are load-bearing:
+    ///   * 0 would mean "cancel every prompt before it is even shown"
+    ///     (`execute_prompt` early-returns `Err(Prompt)` when the timeout is 0)
+    ///     — that is correct for the never-prompt lock PROBE but would break
+    ///     every legitimate interactive unlock on the op paths.
+    ///   * `ONE_YEAR_SECONDS` (what `timeout: None` resolves to) is the wedge.
+    /// The floor of 90s is the "a slow typist must not be cut off" edge; the
+    /// ceiling keeps an ABANDONED prompt from parking the worker for an
+    /// operationally meaningless length of time.
+    #[test]
+    fn shared_prompt_timeout_is_bounded_and_human_survivable() {
+        assert!(
+            SHARED_MAX_PROMPT_TIMEOUT_SECS >= 90,
+            "the prompt bound ({SHARED_MAX_PROMPT_TIMEOUT_SECS}s) must outlast \
+             a real person noticing the dialog and typing a passphrase — a fix \
+             for a wedge must not become a fix that breaks unlocking"
+        );
+        assert!(
+            SHARED_MAX_PROMPT_TIMEOUT_SECS <= 600,
+            "the prompt bound ({SHARED_MAX_PROMPT_TIMEOUT_SECS}s) must still \
+             free the keychain worker on an ABANDONED prompt in a useful time"
+        );
+        // And it must be well under the year `connect(Plain)` implies.
+        const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
+        assert!(SHARED_MAX_PROMPT_TIMEOUT_SECS < ONE_YEAR_SECONDS / 100);
+    }
+
+    /// STRUCTURAL PIN: the shared connection factory must never reach for the
+    /// bare `SecretService::connect(` — that spelling silently means "wait a
+    /// year at a prompt", which is exactly the defect. Exactly one bounded
+    /// connect (`connect_shared`) may exist, and zero unbounded ones.
+    ///
+    /// Scans comment-stripped code and assembles its needles from split
+    /// literals so this test's own text cannot satisfy it. The ephemeral
+    /// 0-timeout probe lives in `secrets.rs`, not here, so it is unaffected.
+    ///
+    /// RED-PROOF: put `SecretService::connect(EncryptionType::Plain)` back as
+    /// the factory in `with_connection` and both assertions fail.
+    #[test]
+    fn shared_connection_never_uses_the_unbounded_connect() {
+        let code = code_flat();
+        let unbounded = String::from("SecretService::") + "connect(";
+        assert_eq!(
+            code.matches(unbounded.as_str()).count(),
+            0,
+            "no call site in this module may use the UNBOUNDED bare \
+             SecretService constructor — it leaves `timeout: None`, which \
+             dbus-secret-service turns into a ONE-YEAR prompt wait that parks \
+             the keychain worker and wedges every other VCO process. (This \
+             message deliberately avoids spelling the needle contiguously, or \
+             it would satisfy its own scan.)"
+        );
+        let bounded = String::from("SecretService::") + "connect_with_max_prompt_timeout(";
+        assert_eq!(
+            code.matches(bounded.as_str()).count(),
+            1,
+            "the shared connection must be created exactly once, through the \
+             bounded `connect_shared` factory"
         );
     }
 

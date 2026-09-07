@@ -155,8 +155,14 @@ pub const ENV_INTERVAL: &str = "VCT_HUB_INFRA_WATCHDOG_INTERVAL_SECS";
 /// `infrastructure/docker-compose.yml`). This is the ONLY source of
 /// service names the watchdog will act on — an arbitrary string can never
 /// reach a `compose up` invocation. Kept in lockstep with
-/// `canonical_services()` (launcher) / `canonical_service_skeletons()`
-/// (hub `lifecycle_api`) / the compose file's `container_name:` fields.
+/// `canonical_services()` (launcher) and the compose file's
+/// `container_name:` fields.
+///
+/// v0.2.92 (WP-12): NOT in lockstep with `canonical_service_skeletons()`
+/// (hub `lifecycle_api`) any more — that list gained `model_gateway`, which
+/// is a process rather than a `vco_*` container. This one must stay
+/// containers-only, because every name in it can reach `compose up <name>`.
+/// Pinned by `watchdog_never_supervises_the_model_gateway_process`.
 ///
 /// `(compose_service_name, container_name)`.
 pub const CANONICAL_INFRA_SERVICES: [(&str, &str); 3] = [
@@ -1214,6 +1220,27 @@ mod tests {
         assert_eq!(names, vec!["weaviate", "ollama", "code_embed"]);
     }
 
+    /// v0.2.92 (WP-12) LEAVE-ALONE: the model gateway is a PROCESS, and the
+    /// watchdog only knows how to heal containers.
+    ///
+    /// `lifecycle_api::canonical_service_skeletons` gained a `model_gateway`
+    /// row so the hub's `/services/status` reports it. This list is a
+    /// SEPARATE allowlist and must not follow: every name here reaches a
+    /// `compose up <service>` invocation, and `compose up model_gateway`
+    /// against a compose file that has no such service is at best an error
+    /// and at worst a build of something unrelated. The exclusion is
+    /// structural — nothing to add — and this test is what keeps it that
+    /// way when someone later "syncs the two lists".
+    #[test]
+    fn watchdog_never_supervises_the_model_gateway_process() {
+        let names: Vec<&str> = CANONICAL_INFRA_SERVICES.iter().map(|(s, _)| *s).collect();
+        assert!(
+            !names.contains(&"model_gateway"),
+            "model_gateway is a process, not a vco_* container; the watchdog \
+             must not try to heal it with a compose invocation"
+        );
+    }
+
     // ----- config from_env round-trip (defaults) -----
 
     #[test]
@@ -1400,9 +1427,7 @@ mod tests {
     fn is_service_paused_reads_shared_marker() {
         // Redirect vct_root_dir at a temp dir + verify the consumer here
         // sees a marker the shared PRODUCER created (same path → wired).
-        let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("VCT_STATE_DIR");
-        std::env::set_var("VCT_STATE_DIR", dir.path());
+        let _dir = vct_launcher_core::test_env::state_dir_guard();
 
         assert!(!is_service_paused("weaviate"));
         // Producer side (shared helper) drops the marker.
@@ -1412,10 +1437,5 @@ mod tests {
         assert!(pause_marker_path("weaviate").ends_with("watchdog-paused/weaviate"));
         watchdog_pause::remove_pause_marker("weaviate").unwrap();
         assert!(!is_service_paused("weaviate"));
-
-        match prev {
-            Some(p) => std::env::set_var("VCT_STATE_DIR", p),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 }

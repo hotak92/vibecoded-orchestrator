@@ -534,7 +534,15 @@ mod tests {
         // tests/test_deferral_command_argparse_sweep.py.
         assert!(content.contains("kg-sync --all"));
         assert!(!content.contains("kg-sync --all --force"));
-        assert!(content.contains("code-graph-analyze . --force-recreate"));
+        // v0.2.92 (BLOCKER-2): the analyzer half must carry `--from-resolver`.
+        // `--force-recreate` DROPS the five `<prefix>_Code*` classes, and with
+        // no identity flag the analyzer's last resolution rung is the folder
+        // BASENAME — which rebuilds the wrong family for a moved/renamed
+        // project and, on a basename collision, drops ANOTHER project's code
+        // graph. The `. --force-recreate` shape (relative positional, no
+        // identity flag) must never come back.
+        assert!(content.contains("--from-resolver --force-recreate"));
+        assert!(!content.contains("code-graph-analyze . --force-recreate"));
     }
 
     #[test]

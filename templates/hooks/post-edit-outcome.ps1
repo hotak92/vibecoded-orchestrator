@@ -76,7 +76,7 @@ $DiffSize = if ($ToolName -eq "Write") {
     [Math]::Abs($NewLen - $OldLen)
 }
 
-$NowTsMs = [int64]((Get-Date) - (Get-Date "1970-01-01Z").ToUniversalTime()).TotalMilliseconds
+$NowTsMs = [long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
 # === Resolve venv + emit ===
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")

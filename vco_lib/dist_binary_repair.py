@@ -64,7 +64,10 @@ import platform
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+
+from vco_lib import git_meta
+from vco_lib.atomic import atomic_write_bytes
+from typing import Callable, Iterable, Optional
 
 __all__ = [
     "RepairOutcome",
@@ -111,19 +114,6 @@ class RepairOutcome:
         return bool(self.restored or self.staged)
 
 
-def _run_git(
-    install_root: Path, args: Sequence[str]
-) -> subprocess.CompletedProcess:
-    """Run ``git <args>`` in ``install_root``. Never raises on non-zero."""
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(install_root),
-        capture_output=True,
-        timeout=_SUBPROCESS_TIMEOUT,
-        check=False,
-    )
-
-
 def staged_sibling(target: Path) -> Path:
     """``foo.exe`` -> ``foo.exe.new``.
 
@@ -145,15 +135,22 @@ def dist_dirty_paths(install_root: Path, dist_rel_dir: str) -> list[str]:
     target out of a git hiccup).
     """
     rel = dist_rel_dir if dist_rel_dir.endswith("/") else dist_rel_dir + "/"
-    try:
-        proc = _run_git(install_root, ["status", "--porcelain", "--", rel])
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if proc.returncode != 0:
+    # RAW bytes via run_git_binary, NOT the text-mode run_git: porcelain
+    # status lines are ``XY<space>path`` where a leading space is part of the
+    # STATUS CODE (e.g. `` M path`` for "modified, not staged"). run_git's
+    # whole-blob ``.strip()`` (correct for a SHA/branch-name single token)
+    # would eat that leading space on a single-line result and shift every
+    # `line[3:]` offset by one — this broke live against a real repo before
+    # the fix (RED-PROOFED: `test_hand_copied_stale_binary_is_reported_dirty`
+    # et al. failed with a leading char sheared off the path).
+    rc, out_bytes, _err_bytes = git_meta.run_git_binary(
+        install_root, ["status", "--porcelain", "--", rel], timeout=_SUBPROCESS_TIMEOUT
+    )
+    if rc is None or rc != 0:
         return []
 
     out: list[str] = []
-    text = proc.stdout.decode("utf-8", errors="replace")
+    text = out_bytes.decode("utf-8", errors="replace")
     for line in text.splitlines():
         if len(line) < 4:
             continue
@@ -199,25 +196,23 @@ def restore_paths_from_head(
     restored: list[str] = []
     failed: list[str] = []
     for rel in rel_paths:
-        try:
-            proc = _run_git(install_root, ["checkout", "HEAD", "--", rel])
-        except (OSError, subprocess.SubprocessError) as exc:
-            log(
-                "dist_repair",
-                "warn",
-                f"git checkout HEAD -- {rel} could not run: {exc}",
-            )
+        rc, _out, err = git_meta.run_git(
+            install_root, ["checkout", "HEAD", "--", rel], timeout=_SUBPROCESS_TIMEOUT
+        )
+        if rc is None:
+            # run_git's own error string is already "git <args> could not
+            # run: <exc>" — do not re-wrap it, that would double the prefix.
+            log("dist_repair", "warn", err)
             failed.append(rel)
             continue
-        if proc.returncode == 0:
+        if rc == 0:
             restored.append(rel)
             log("dist_repair", "ok", f"restored {rel} from HEAD")
         else:
-            detail = proc.stderr.decode("utf-8", errors="replace").strip()
             log(
                 "dist_repair",
                 "warn",
-                f"git checkout HEAD -- {rel} failed ({detail or 'no stderr'}); "
+                f"git checkout HEAD -- {rel} failed ({err or 'no stderr'}); "
                 "will try staging it for the stage1 updater instead",
             )
             failed.append(rel)
@@ -241,38 +236,42 @@ def stage_paths_from_head(
     staged: list[str] = []
     failed: list[str] = []
     for rel in rel_paths:
-        try:
-            proc = _run_git(install_root, ["show", f"HEAD:{rel}"])
-        except (OSError, subprocess.SubprocessError) as exc:
-            log("dist_repair", "warn", f"git show HEAD:{rel} could not run: {exc}")
+        # RAW bytes, no text decoding — see vco_lib.git_meta.run_git_binary's
+        # docstring for why this is a *different* runner than the text-mode
+        # calls above: a UTF-8-with-replace decode would silently corrupt any
+        # non-UTF-8 byte in the compiled binary blob ``git show`` returns.
+        rc, out_bytes, err_bytes = git_meta.run_git_binary(
+            install_root, ["show", f"HEAD:{rel}"], timeout=_SUBPROCESS_TIMEOUT
+        )
+        if rc is None:
+            log(
+                "dist_repair",
+                "warn",
+                err_bytes.decode("utf-8", errors="replace"),
+            )
             failed.append(rel)
             continue
-        if proc.returncode != 0:
-            detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        if rc != 0:
+            detail = err_bytes.decode("utf-8", errors="replace").strip()
             log("dist_repair", "warn", f"git show HEAD:{rel} failed: {detail}")
             failed.append(rel)
             continue
 
         target = install_root / rel
         staged_path = staged_sibling(target)
-        tmp_path = staged_path.with_name(staged_path.name + ".tmp")
         try:
-            staged_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path.write_bytes(proc.stdout)
-            os.replace(tmp_path, staged_path)
+            # One home for tmp+os.replace (v0.2.92): the shared writer
+            # creates the parent, fsyncs, and unlinks its tempfile on error.
+            atomic_write_bytes(staged_path, out_bytes)
         except OSError as exc:
             log("dist_repair", "warn", f"could not stage {staged_path}: {exc}")
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             failed.append(rel)
             continue
         staged.append(rel)
         log(
             "dist_repair",
             "ok",
-            f"staged HEAD's {rel} at {staged_path} ({len(proc.stdout)} bytes) "
+            f"staged HEAD's {rel} at {staged_path} ({len(out_bytes)} bytes) "
             "for the stage1 updater swap",
         )
     return staged, failed

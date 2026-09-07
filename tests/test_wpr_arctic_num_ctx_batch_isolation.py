@@ -37,14 +37,17 @@ if str(PROJECT_ROOT) not in sys.path:
 from vco_lib.embedding_service import (  # noqa: E402
     EmbeddingService,
     _bounded_for_model,
-    _CHARS_PER_TOKEN,
+    _char_budget_for_model,
     _is_context_overflow_error,
 )
 
 # arctic num_ctx (from MODEL_TOKEN_LIMITS) — the model the live backfill hit.
+# The char budget is the defect-1 bound in its PRIMARY role — the default
+# `_char_budget_for_model` value, 12 800 for arctic (median ratio × 0.75
+# margin, floored at arctic's own chunker max so the active slot keeps full
+# coverage). The secondary tiers are 9 815 / 7 065.
 ARCTIC_MODEL = "snowflake-arctic-embed2:latest"
-ARCTIC_NUM_CTX = 4096
-ARCTIC_CHAR_BUDGET = ARCTIC_NUM_CTX * _CHARS_PER_TOKEN  # what _bounded_for_model trims to
+ARCTIC_CHAR_BUDGET = _char_budget_for_model(ARCTIC_MODEL)
 
 
 class _StubOllama:

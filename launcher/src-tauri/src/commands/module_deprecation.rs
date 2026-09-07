@@ -320,8 +320,13 @@ fn write_or_strip_deprecation_env(
         // Strip our managed keys first so a deprecated=false call truly
         // removes them, and a deprecated=true call removes any stale
         // value before the canonical overwrite below.
+        //
+        // `shift_remove`, never `remove`: under `preserve_order` (v0.2.92)
+        // `Map::remove` is `swap_remove`, which would pull the user's LAST
+        // env key into the slot of each key we strip. This block rewrites a
+        // user-owned `.claude/settings.json`; it must not move their keys.
         for k in DEPRECATION_ENV_KEYS {
-            env_obj.remove(*k);
+            env_obj.shift_remove(*k);
         }
         for (k, v) in pairs {
             env_obj.insert((*k).to_string(), serde_json::Value::String(v.clone()));

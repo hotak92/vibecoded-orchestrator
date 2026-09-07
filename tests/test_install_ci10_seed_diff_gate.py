@@ -20,9 +20,7 @@ and subprocess.run so tests run quickly in CI.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -33,36 +31,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    connect,
+    create_empty_launcher_db,
+    make_launcher_db,
+)
 import install  # noqa: E402
 
 
 # ─── DB fixture helpers ───────────────────────────────────────────────────────
 
-_APP_STATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS app_state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-"""
-
 
 def _make_db_with_state(**kwargs) -> Path:
-    """Create a temp launcher.db with app_state rows."""
+    """Create a temp launcher.db (REAL schema) with app_state rows."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
-    p = Path(tmp.name)
-    conn = sqlite3.connect(str(p))
-    conn.executescript(_APP_STATE_SCHEMA)
-    now = 1000000
-    for k, v in kwargs.items():
-        conn.execute(
-            "INSERT INTO app_state (key, value, updated_at) VALUES (?,?,?)",
-            (k, v, now),
-        )
-    conn.commit()
-    conn.close()
-    return p
+    return make_launcher_db(Path(tmp.name), app_state=kwargs)
 
 
 # ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -200,7 +184,7 @@ class SeedDiffGateTest(unittest.TestCase):
             )
 
         # app_state should have been updated with the current context.
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect(self.db_path)
         try:
             rows = {
                 r[0]: r[1]
@@ -251,7 +235,7 @@ class SeedDiffGateTest(unittest.TestCase):
     def test_embedding_change_forces_full_sync(self):
         """When active_embedding changes, full --all sync is triggered."""
         # Store a DIFFERENT embedding in app_state.
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect(self.db_path)
         conn.execute(
             "UPDATE app_state SET value=? WHERE key=?",
             ("arctic2", install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
@@ -277,7 +261,7 @@ class SeedDiffGateTest(unittest.TestCase):
     def test_collection_rename_forces_full_sync(self):
         """When KG_COLLECTION changes, full --all sync is triggered."""
         # Store a DIFFERENT collection name in app_state.
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect(self.db_path)
         conn.execute(
             "UPDATE app_state SET value=? WHERE key=?",
             ("OldProject_KnowledgeGraph", install._APP_STATE_KEY_LAST_KG_COLLECTION),
@@ -395,7 +379,7 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             pass
 
     def _read_triple(self) -> dict:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect(self.db_path)
         try:
             return {
                 r[0]: r[1]
@@ -590,14 +574,7 @@ class ContentHashHelpersTest(unittest.TestCase):
         """_write_app_state_key + _read_app_state_key round-trips correctly."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["VCT_STATE_DIR"] = tmp
-            db_path = Path(tmp) / "launcher.db"
-            conn = sqlite3.connect(str(db_path))
-            conn.executescript(
-                "CREATE TABLE app_state "
-                "(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);"
-            )
-            conn.commit()
-            conn.close()
+            create_empty_launcher_db(Path(tmp) / "launcher.db")
 
             install._write_app_state_key("test_key", "hello_world")
             result = install._read_app_state_key("test_key")
@@ -615,14 +592,7 @@ class ContentHashHelpersTest(unittest.TestCase):
         """_read_app_state_key returns None when key is not in app_state."""
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["VCT_STATE_DIR"] = tmp
-            db_path = Path(tmp) / "launcher.db"
-            conn = sqlite3.connect(str(db_path))
-            conn.executescript(
-                "CREATE TABLE app_state "
-                "(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);"
-            )
-            conn.commit()
-            conn.close()
+            create_empty_launcher_db(Path(tmp) / "launcher.db")
 
             result = install._read_app_state_key("nonexistent_key")
             self.assertIsNone(result)
@@ -645,15 +615,7 @@ class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
     """
 
     def _make_db(self, tmp: str) -> Path:
-        db_path = Path(tmp) / "launcher.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(
-            "CREATE TABLE IF NOT EXISTS app_state "
-            "(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);"
-        )
-        conn.commit()
-        conn.close()
-        return db_path
+        return create_empty_launcher_db(Path(tmp) / "launcher.db")
 
     def test_skip_when_shared_kg_equals_per_project_kg(self):
         """V44-A: shared_kg == kg_collection on orchestrator-root →

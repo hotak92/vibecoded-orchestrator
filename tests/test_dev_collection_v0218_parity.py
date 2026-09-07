@@ -87,6 +87,11 @@ class _FakeWrapper:
         self.embed_calls.append(text)
         return self._all_slots
 
+    def _get_all_kg_embeddings_tagged(self, text: str) -> tuple[dict, list[str]]:
+        # W3: the tagged capture the sync write path now persists.
+        self.embed_calls.append(text)
+        return self._all_slots, []
+
     def _get_embedding(self, text: str) -> list:
         self.embed_calls.append(text)
         return self._all_slots[self.text_vector_slot]

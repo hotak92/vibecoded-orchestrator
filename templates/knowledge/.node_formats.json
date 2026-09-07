@@ -239,14 +239,6 @@
     "content_hash": "104c879be58832f8",
     "total_chunks": 1
   },
-  "knowledge/concepts/kg-summary-three-tier-pipeline.md": {
-    "title": "KG-Summary Three-Tier Generation Pipeline",
-    "description": "This pipeline automatically generates concise 2-3 sentence summaries for every knowledge graph node and stores them in a JSON file for retrieval clients. It intelligently selects backend models like local Ollama, Claude CLI, or OpenAI APIs based on availability and user consent. The system resolves node titles from YAML frontmatter or fallback headings to ensure malformed nodes still receive summaries. It matters because it enhances hybrid search capabilities while handling failures like timeouts and race conditions through sequential processing.",
-    "summary": "The KG-Summary Three-Tier Generation Pipeline automatically generates 2-3 sentence summaries for knowledge graph nodes, triggered by `PostToolUse` hooks and stored in `knowledge/.node_formats.json` for retrieval. The system selects a backend in priority order: `claude` CLI (gated by authentication), Ollama (default local model `qwen3.5:9b`), OpenAI API (opt-in), Anthropic direct API, or silent skip, with configuration controlled by `KG_SUMMARY_BACKEND` and specific Ollama parameters. Title resolution prioritizes YAML frontmatter `title:` fields, falling back to the body H1 to prevent skipping malformed nodes, while missing titles result in node exclusion. The implementation addresses failure modes such as timeouts for large nodes, race conditions during parallel writes (resolved via sequential backfill), and cross-platform issues like Windows `PATHEXT` handling and environment variable separation between project and orchestrator roots.",
-    "generated_at": "2026-07-20T18:51:24.369204+00:00",
-    "content_hash": "3cba444a0803d6fd",
-    "total_chunks": 1
-  },
   "knowledge/concepts/knowledge-graph.md": {
     "title": "Knowledge Graph",
     "description": "A knowledge graph is a structured data model representing real-world entities and their relationships as nodes and edges.\nIt encodes semantic meaning directly in its structure to enable multi-hop reasoning and inference over interconnected facts.\nThis technology supports enterprise AI, RAG systems, and multi-agent coordination by providing explicit, typed relationships unlike flat document stores.\nIt matters because it allows complex queries and deep insights that relational databases and vector databases cannot natively support.",
@@ -789,14 +781,6 @@
     "summary": "`jina-embeddings-v2-base-code` is a 161M-parameter JinaBert variant serving as the CPU fallback for code embeddings on hosts lacking CUDA GPUs. Trained on GitHub code and 150M+ code Q&A/docstring pairs across 30 languages, it supports 8192-token contexts and 768-dimensional embeddings. Deployed via the Ollama community tag `unclemusclez/jina-embeddings-v2-base-code:latest`, it is configured in the orchestrator by setting `CODE_EMBED_BACKEND=ollama` and `CODE_EMBED_MODEL` to the specific tag, enabling incremental code-graph indexing on CPU-only machines. The model operates within a dual-vector Weaviate setup alongside the `codesage_embed` slot and is released under the Apache 2.0 license.",
     "generated_at": "2026-07-20T18:56:44.211211+00:00",
     "content_hash": "577a6ca3df8da951",
-    "total_chunks": 1
-  },
-  "knowledge/models/qwen3-embedding.md": {
-    "title": "Qwen3 Embedding",
-    "description": "Qwen3 Embedding is Alibaba's text-embedding family built on the dense Qwen3 foundation models and released via Ollama and Hugging Face.\nIt features a Matryoshka-style truncation capability allowing user-defined output dimensions per request.\nThe family includes variants ranging from 0.6B to 8B parameters with context windows up to 40K tokens.\nThis model serves as the default active text embedder for knowledge-graph and document indexing flows within the orchestrator.\nIt matters because it ranks #1 on the MTEB multilingual leaderboard and maintains schema compatibility with legacy Snowflake embeddings.",
-    "summary": "Qwen3 Embedding is Alibaba's text-embedding family built on Qwen3 foundation models, released June 5, 2025, with the 8B variant ranking #1 on the MTEB multilingual leaderboard (score 70.58). The orchestrator primarily uses the 0.6B variant (`qwen3-embedding:0.6b`) as its default embedder, pinning output to 1024 dimensions to match legacy Snowflake schemas. Available variants include 0.6B (1024 dims, 32K context), 4B (2560 dims, 40K context), and 8B (4096 dims, 40K context); the 0.6B model requires an explicit 8192 context setting to achieve full quality. The model is licensed under Apache 2.0 and is integrated into the system via `weaviate_mcp` for active embedding, `install.py` for bootstrap, and migration scripts for re-vectorizing collections from legacy slots. It occupies the `qwen3_embed` named vector slot, coexisting with the legacy `snowflake-arctic-embed2` in the `ollama_embed` slot.",
-    "generated_at": "2026-07-20T18:56:49.130704+00:00",
-    "content_hash": "6512422188160fbe",
     "total_chunks": 1
   },
   "knowledge/models/qwen3.5.md": {

@@ -3180,16 +3180,30 @@ pub(crate) fn write_launcher_update_diverged_deferral(
             "The update did not apply — the launcher is unchanged. The git state needs \
              attention before the update can proceed."
                 .to_string(),
+            // v0.2.92 WP-13 — CORRECTED. This hint used to lead with
+            // "detached HEAD (check out `{branch}`)". A detached HEAD does
+            // NOT make `git pull --ff-only <remote> <branch>` fail — verified
+            // empirically in a throwaway repo: the pull fast-forwards and
+            // HEAD stays detached. The hint was inherited from the (also
+            // wrong) comment at the emitting call site in installer.rs, and
+            // it pointed a real user at a state that was not the cause of
+            // their failure. Recovery text is shipped code and is reviewed
+            // like code.
             format!(
                 "The user's orchestrator update could not `git pull` from upstream (not a \
                  conflict, not a non-FF). Recommended: surface at session start, then \
-                 inspect the repo state: `git -C {root} status`, `git -C {root} remote -v`, \
-                 `git -C {root} branch --show-current`. Common causes: detached HEAD (check \
-                 out `{branch}`), missing upstream remote, or an interrupted prior git op \
-                 (look for `.git/MERGE_HEAD` / `.git/rebase-*`). Fix the git state, then \
-                 click Update again or run `python install.py --update`.",
+                 inspect the repo state: `git -C {root} status`, `git -C {root} remote -v`. \
+                 Common causes: a missing or misconfigured `vco_upstream` remote, an \
+                 interrupted prior git op (look for `.git/MERGE_HEAD` / `.git/rebase-*`), no \
+                 network / an auth failure reaching the remote, or an unreadable object \
+                 store. Git's own message in **Detected** above names the actual cause — \
+                 read it first. (A detached HEAD is NOT a cause: `git pull --ff-only` \
+                 fast-forwards one fine. If `git -C {root} branch --show-current` prints \
+                 nothing the clone IS detached, which is worth fixing on its own — the \
+                 launcher's Preferences → Launcher updates page has a one-click reattach — \
+                 but it is not why this pull failed.) Fix the git state, then click Update \
+                 again or run `python install.py --update`.",
                 root = install_root_display,
-                branch = branch,
             ),
         ),
     };
@@ -3248,26 +3262,166 @@ python install.py --update\n\
         branch = branch,
     );
 
-    // Atomic write: temp file in the same directory, then rename.
+    write_update_deferred_atomically(parent, &target, "launcher_update_diverged", &content);
+}
+
+/// Atomic tmp-write + rename of `UPDATE_DEFERRED.md`. Extracted in v0.2.92
+/// (WP-13) so a SECOND standalone Rust emitter
+/// ([`write_launcher_update_post_pull_unverified_deferral`]) reuses the write
+/// mechanics rather than growing a copy of them.
+///
+/// Best-effort throughout: `condition_id` is used only to keep the log lines
+/// attributable to the emitter that failed. Callers must not depend on the
+/// write having happened.
+fn write_update_deferred_atomically(
+    parent: &Path,
+    target: &Path,
+    condition_id: &str,
+    content: &str,
+) {
     let tmp = parent.join(format!("UPDATE_DEFERRED.md.tmp.{}", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
         tracing::error!(
-            "[vct] launcher_update_diverged: write {} failed: {}",
+            "[vct] {}: write {} failed: {}",
+            condition_id,
             tmp.display(),
             e
         );
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    if let Err(e) = std::fs::rename(&tmp, &target) {
+    if let Err(e) = std::fs::rename(&tmp, target) {
         tracing::error!(
-            "[vct] launcher_update_diverged: rename {} → {} failed: {}",
+            "[vct] {}: rename {} → {} failed: {}",
+            condition_id,
             tmp.display(),
             target.display(),
             e
         );
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// Write a `launcher_update_post_pull_unverified` entry: the post-pull
+/// HEAD-advance backstop could not compute a behind-count, so whether the
+/// pull actually landed is UNKNOWN.
+///
+/// ## Why this emitter exists (v0.2.92, WP-13 — WFT cross-cutting item 8)
+///
+/// `installer::assert_head_reached_upstream` is the guard that stops
+/// `install.py` running against a tree the pull failed to advance. When its
+/// `rev-list` errors it fail-OPENs — deliberately, so a git hiccup cannot
+/// block a healthy update — but it used to fail open by returning `Ok(())`,
+/// which made "the pull landed" and "I could not tell whether the pull
+/// landed" the same value to every caller.
+///
+/// That is the whole shape of the incident this release exists to fix, and
+/// it had settled inside the very guard designed to catch it: the guard was
+/// disarmed by exactly the failure mode it guards against. The update still
+/// proceeds; what changed is that the user gets a durable record instead of
+/// silence.
+///
+/// Class `action_required` in `vco_lib/deferral_conditions.toml`
+/// (`clear_probe = "paired-resolution"`): nothing can auto-confirm after the
+/// fact that a past pull landed, so the entry clears when the NEXT update
+/// verifies HEAD reached upstream. Standalone Rust writer for the same
+/// reason as its sibling above — install.py may not have run.
+pub(crate) fn write_launcher_update_post_pull_unverified_deferral(
+    install_path: &Path,
+    branch: &str,
+    error: &str,
+) {
+    let target = install_path.join(".claude/context/UPDATE_DEFERRED.md");
+    let parent = match target.parent() {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "[vct] launcher_update_post_pull_unverified: target has no parent: {}",
+                target.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        tracing::warn!(
+            "[vct] launcher_update_post_pull_unverified: mkdir {} failed: {} — skipping",
+            parent.display(),
+            e
+        );
+        return;
+    }
+    let _deferral_lock =
+        vct_launcher_core::services::deferral_lock::lock_folder(install_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    let root = install_path.display();
+    let remote = crate::commands::self_update::VCO_UPSTREAM_REMOTE;
+
+    let content = format!(
+        "---\n\
+title: VCO Update Deferred\n\
+generated_at: {now}\n\
+condition_ids: [launcher_update_post_pull_unverified]\n\
+severity_max: warning\n\
+---\n\
+\n\
+# VCO Update Deferred\n\
+\n\
+The last orchestrator update (run from the launcher GUI) hit a condition it could not \
+auto-resolve safely. The section below names the condition and how to recover.\n\
+\n\
+## launcher_update_post_pull_unverified (warning)\n\
+\n\
+**Title**: Update proceeded WITHOUT confirming the pull landed\n\
+\n\
+**Detected**: after the git pull, the launcher could not compute how far `HEAD` is behind \
+`{remote}/{branch}`, so it could not confirm the upstream changes actually arrived. It did \
+NOT block the update — a transient git failure must not stop an otherwise-healthy update — \
+but the confirmation is missing. git said: `{error}`\n\
+\n\
+**Why deferred**: the check that proves an update applied is the one check that failed. The \
+install may be perfectly fine; it may equally be running install.py against a source tree \
+that never advanced. Nothing can settle that after the fact except checking now.\n\
+\n\
+**To apply**:\n\
+```bash\n\
+# 1. Confirm where this clone actually is:\n\
+git -C {root} fetch {remote}\n\
+git -C {root} rev-list --count HEAD..{remote}/{branch}   # 0 = the pull landed\n\
+git -C {root} status                                     # detached? mid-merge?\n\
+#\n\
+# 2a. If the count is 0, nothing is wrong — run one more update from the\n\
+#     launcher GUI (or `python install.py --update`) and this entry clears.\n\
+# 2b. If the count is >0, the update did NOT land. Re-run the update from the\n\
+#     launcher GUI; if it keeps failing, read the git error above.\n\
+# 2c. If `status` says \"HEAD detached\", use Preferences -> Launcher updates ->\n\
+#     Reattach in the launcher GUI (or `git -C {root} checkout {branch}` after\n\
+#     confirming you have no local commits to keep).\n\
+```\n\
+\n\
+**For your Claude assistant** (read this before continuing the user's task):\n\
+The user's orchestrator update ran WITHOUT the post-pull verification that normally proves \
+the source advanced. Recommended: surface at session start and settle it before doing work \
+that depends on the install being current — run the two commands above. If HEAD is behind, \
+the install is running OLD source with a NEW install manifest, which is the state that \
+produces \"the fix I just shipped is not in the file\" confusion. This entry clears when a \
+later update verifies HEAD reached upstream.\n\
+\n\
+**Detected at**: {now}\n\
+\n\
+---\n",
+        now = now,
+        root = root,
+        remote = remote,
+        branch = branch,
+        error = error.trim(),
+    );
+
+    write_update_deferred_atomically(
+        parent,
+        &target,
+        "launcher_update_post_pull_unverified",
+        &content,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3367,6 +3521,13 @@ mod tests {
         run_git(local, &["fetch", "vco_upstream"]);
     }
 
+    /// Test-only SYNCHRONOUS git helper for building fixtures. The
+    /// PRODUCTION home for git invocations is
+    /// `crate::commands::git_cmd::run_git` (async); this one exists solely
+    /// because fixture setup runs outside a tokio context and asserts on
+    /// success rather than returning a `Result`. It must not grow any
+    /// decision logic — anything a production path would want (branch
+    /// resolution, behind-counts, remote tags) belongs in `git_cmd`.
     fn run_git(cwd: &Path, args: &[&str]) {
         let out = StdCommand::new("git")
             .args(args)

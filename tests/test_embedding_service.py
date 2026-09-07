@@ -922,11 +922,21 @@ class CodeFallbackChainTests(unittest.TestCase):
     # --- 4. All down: keep requested triple, code_backend_ready==False. -
 
     def test_code_fallback_all_down(self):
-        # Patch Path.home() to a tempdir so the JSONL failure log doesn't
-        # touch the user's real ~/.claude/metrics/.
+        # Steer BOTH state roots at a tempdir so the JSONL failure log
+        # doesn't touch the user's real telemetry. v0.2.92 W7 moved the
+        # stream from ~/.claude/metrics to <VCT_STATE_DIR>/metrics, so both
+        # levers are pinned; the CLAUDE one still steers the frozen archive
+        # a reader may consult. Before that: this
+        # used to patch `vco_lib.embedding_service.Path.home` — a bet on
+        # WHICH symbol resolves the path, which expired the moment the
+        # resolution moved into `vco_lib.paths.claude_metrics_dir()`.
+        # `$VCT_CLAUDE_DIR` steers the RESOURCE, so it keeps working
+        # wherever the resolution lives (and, unlike the old patch, does
+        # not monkeypatch `Path.home` process-wide as a side effect).
         import tempfile
         with _EnvIsolation(), tempfile.TemporaryDirectory() as home_dir, \
-             patch("vco_lib.embedding_service.Path.home", return_value=Path(home_dir)):
+             patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(Path(home_dir) / ".claude"),
+                              "VCT_STATE_DIR": str(Path(home_dir) / ".vct")}):
             # Ollama up but lacking qwen3 + jina; CodeEmbed down.
             # Text backend still works (Ollama responds to /api/tags),
             # so for_project() succeeds — but code_backend_ready==False
@@ -1077,11 +1087,13 @@ class CodeFallbackChainTests(unittest.TestCase):
 
 class FailureCaptureTests(unittest.TestCase):
     def test_for_project_raises_when_no_backends(self):
-        # Patch Path.home() so the failure-capture JSONL goes to a temp
-        # dir, NOT the user's real ~/.claude/metrics/.
+        # Steer both state roots so the failure-capture JSONL goes to a
+        # temp dir, NOT the user's real telemetry (v0.2.92 W7 moved the
+        # stream to <VCT_STATE_DIR>/metrics — see the sibling test above).
         import tempfile
         with _EnvIsolation(), tempfile.TemporaryDirectory() as home_dir, \
-             patch("vco_lib.embedding_service.Path.home", return_value=Path(home_dir)):
+             patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(Path(home_dir) / ".claude"),
+                              "VCT_STATE_DIR": str(Path(home_dir) / ".vct")}):
             ollama_m = MagicMock(spec=OllamaAdapter)
             ollama_m.is_reachable.return_value = False
             ollama_m.list_embedding_models.return_value = []
@@ -1104,16 +1116,18 @@ class FailureCaptureTests(unittest.TestCase):
             import tempfile
             with tempfile.TemporaryDirectory() as home_dir:
                 fake_home = Path(home_dir)
-                with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                     # Build the error WITH capture (the default). The capture
-                    # logic writes to ~/.claude/metrics/embedding_failures.jsonl
+                    # logic writes <VCT_STATE_DIR>/metrics/embedding_failures.jsonl
+                    # (v0.2.92 W7 — it was ~/.claude/metrics before the move).
                     NoEmbeddingBackendError(
                         "test failure",
                         attempted_backends=["ollama"],
                         error_per_backend={"ollama": "not reachable"},
                         install_root=None,
                     )
-                    log = fake_home / ".claude" / "metrics" / "embedding_failures.jsonl"
+                    log = fake_home / ".vct" / "metrics" / "embedding_failures.jsonl"
                     self.assertTrue(log.exists(), f"missing: {log}")
                     content = log.read_text()
                     record = json.loads(content.strip().splitlines()[-1])
@@ -1129,7 +1143,8 @@ class FailureCaptureTests(unittest.TestCase):
                 proj_root = Path(proj_dir)
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
-                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                    with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                         NoEmbeddingBackendError(
                             "test failure",
                             attempted_backends=["ollama", "openai"],
@@ -1154,14 +1169,15 @@ class FailureCaptureTests(unittest.TestCase):
             import tempfile
             with tempfile.TemporaryDirectory() as home_dir:
                 fake_home = Path(home_dir)
-                with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                     NoEmbeddingBackendError(
                         "test",
                         attempted_backends=["ollama"],
                         error_per_backend={"ollama": "down"},
                         install_root=None,
                     )
-                    log = fake_home / ".claude" / "metrics" / "embedding_failures.jsonl"
+                    log = fake_home / ".vct" / "metrics" / "embedding_failures.jsonl"
                     record = json.loads(log.read_text().strip().splitlines()[-1])
                     snap = record["env_snapshot"]
                     self.assertNotIn("sk-livekey-1234567890abcdef", json.dumps(snap))
@@ -1174,13 +1190,14 @@ class FailureCaptureTests(unittest.TestCase):
             import tempfile
             with tempfile.TemporaryDirectory() as home_dir:
                 fake_home = Path(home_dir)
-                with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                     NoEmbeddingBackendError(
                         "no capture",
                         attempted_backends=["ollama"],
                         capture=False,
                     )
-                    log = fake_home / ".claude" / "metrics" / "embedding_failures.jsonl"
+                    log = fake_home / ".vct" / "metrics" / "embedding_failures.jsonl"
                     self.assertFalse(log.exists())
 
     def test_success_clears_failure_markdown(self):
@@ -1227,7 +1244,8 @@ class FailureCaptureTests(unittest.TestCase):
                 proj_root = Path(proj_dir)
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
-                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                    with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                         NoEmbeddingBackendError(
                             "no backends",
                             attempted_backends=["ollama", "codeembed"],
@@ -1254,7 +1272,8 @@ class FailureCaptureTests(unittest.TestCase):
             import tempfile
             with tempfile.TemporaryDirectory() as home_dir:
                 fake_home = Path(home_dir)
-                with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                     # Should not raise even without install_root.
                     exc = NoEmbeddingBackendError(
                         "discovery failure",
@@ -1274,7 +1293,8 @@ class FailureCaptureTests(unittest.TestCase):
                 proj_root = Path(proj_dir)
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
-                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                    with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
                         # Plant a stale deferral via the failure-capture path.
                         NoEmbeddingBackendError(
                             "test failure",
@@ -1321,7 +1341,8 @@ class FailureCaptureTests(unittest.TestCase):
                 proj_root = Path(proj_dir)
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
-                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home), \
+                    with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                     "VCT_STATE_DIR": str(fake_home / ".vct")}), \
                          patch(
                              "vco_lib.embedding_service._write_failure_deferral",
                              side_effect=RuntimeError("simulated deferral failure"),
@@ -1342,7 +1363,7 @@ class FailureCaptureTests(unittest.TestCase):
                             # We assert JSONL + MD were written before the
                             # deferral attempt.
                             pass
-                        jsonl = fake_home / ".claude" / "metrics" / "embedding_failures.jsonl"
+                        jsonl = fake_home / ".vct" / "metrics" / "embedding_failures.jsonl"
                         md = proj_root / ".claude" / "context" / "EMBEDDING_FAILURES.md"
                         self.assertTrue(jsonl.exists(), "JSONL must be written first")
                         self.assertTrue(md.exists(), "MD hint must be written second")
@@ -2797,9 +2818,13 @@ class ArcticSecondaryFanoutTests(unittest.TestCase):
         """WP-O rework: `_bounded_for_secondary` returns a bounded leading window +
         truncated=True when the text exceeds the model's num_ctx char budget, and
         (text, False) when it fits or the model is unregistered."""
-        from vco_lib.embedding_service import _bounded_for_secondary, _CHARS_PER_TOKEN
-        # arctic num_ctx = 4096 → char budget 4096*4.
-        budget = 4096 * _CHARS_PER_TOKEN
+        from vco_lib.embedding_service import (
+            _bounded_for_secondary,
+            _char_budget_for_model,
+        )
+        # PRIMARY-role budget (the default): 12 800 for arctic. Read from the
+        # helper rather than restated, so a retune moves the test with it.
+        budget = _char_budget_for_model(ARCTIC_SECONDARY_MODEL)
         big = "x" * (budget + 5000)
         sub, trunc = _bounded_for_secondary(big, ARCTIC_SECONDARY_MODEL)
         self.assertTrue(trunc, "oversized text must be flagged truncated")

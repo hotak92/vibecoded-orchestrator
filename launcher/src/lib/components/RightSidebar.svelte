@@ -19,8 +19,12 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
-  import { modules } from '$lib/stores/modules';
-  import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
+  import { modules, installedIds } from '$lib/stores/modules';
+  import {
+    detectModuleErrorAfterAction,
+    installProgressLabel,
+    resolveProjectScopedAction,
+  } from '$lib/module-status-display';
   import { getColorRgb, type BrandColor } from '$lib/color-rgb';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
@@ -94,6 +98,74 @@
   } = $props();
 
   const orchState = $derived($orchestrator);
+
+  // v0.2.92: does this component's OWN speculative load (below) confirm
+  // the store's `installed` rows currently reflect the SELECTED project?
+  // Mirrors `+page.svelte`'s `installedKnownForSelectedProject` — kept as
+  // a distinct derivation here (not imported) because it reads THIS
+  // component's `current`/`$modules` closures; the underlying rule
+  // (installedProjectId must match by id, from a load that succeeded) is
+  // identical, see that file's comment for the full rationale.
+  const installedKnownForSelectedProject = $derived(
+    $selectedProject !== null && $modules.installedProjectId === $selectedProject.id,
+  );
+
+  // v0.2.92: TRI-STATE — does the CURRENTLY SELECTED project have its own
+  // `module_installs` row for this module? `null` means "we don't know
+  // yet" (see `installedKnownForSelectedProject` above); only `true`/
+  // `false` when a load for THIS exact project has actually landed.
+  // Sourced from `installedIds` (per-project, loaded via
+  // `list_installed_modules(project_id)`) — the same query
+  // `update_module_for_project` consults. Needed to correct
+  // `catalogKind` below when it disagrees with what THIS project can
+  // actually act on (see `resolveProjectScopedAction`'s docstring).
+  const hasInstallRowForProject = $derived<boolean | null>(
+    selectedApp === null
+      ? null
+      : installedKnownForSelectedProject
+        ? $installedIds.has(selectedApp.id)
+        : null,
+  );
+
+  // v0.2.92: project-scoped action + kind-override resolution — shared
+  // with the Home Library grid via `resolveProjectScopedAction` so the
+  // two surfaces never disagree about what a click on this module does.
+  const moduleActionState = $derived(
+    selectedApp
+      ? resolveProjectScopedAction(selectedApp.catalogKind, hasInstallRowForProject)
+      : { kindOverride: null, action: null, pending: false },
+  );
+
+  // v0.2.92: the kind every downstream derivation (effectiveStage,
+  // statusLabel, statusClass) should read instead of the raw
+  // `selectedApp.catalogKind` — corrected when the catalog says "update
+  // available" but this project has no row (see `moduleActionState`
+  // above). `undefined` (not present) when there's no override, so the
+  // `if (selectedApp.catalogKind)` / switch fallbacks below stay intact.
+  const effectiveCatalogKind = $derived(moduleActionState.kindOverride ?? selectedApp?.catalogKind);
+
+  // v0.2.92: ensure the per-project install rows are actually loaded for
+  // whichever project is selected, INDEPENDENTLY of whatever host route
+  // embeds this component. `+page.svelte` also proactively loads them
+  // for its own card grid (same store, so this is often a fast no-op
+  // re-fetch there), but `routes/store/+page.svelte` — the other host of
+  // this component — does not, so without this the right-rail's action
+  // would sit at `pending: true` (unknown) forever on that route.
+  // `loadInstalledSpeculative` (not `loadInstalled`) — this call isn't
+  // part of a user action narrating its own outcome, so a failure gets
+  // its own one-shot toast (see the store's docstring).
+  onMount(() => {
+    if ($selectedProject) {
+      void modules.loadInstalledSpeculative($selectedProject.id);
+    }
+  });
+  $effect(() => {
+    const project = $selectedProject;
+    if (project) {
+      void modules.loadInstalledSpeculative(project.id);
+    }
+  });
+
   // v0.2.33 (Agent E, L11): COMING_SOON_IDS is retained as a fallback
   // for callers that don't pass a catalogKind (e.g. legacy code paths
   // that still construct an `App` from scratch). New callers should
@@ -113,8 +185,8 @@
     // v0.2.33 (Agent E, L11): if the caller passed the catalog
     // entry's kind, that's the authoritative signal — same source
     // as the home tile.
-    if (selectedApp.catalogKind) {
-      switch (selectedApp.catalogKind) {
+    if (effectiveCatalogKind) {
+      switch (effectiveCatalogKind) {
         case 'bundled':
         case 'installed':
         case 'update_available':
@@ -158,8 +230,8 @@
    */
   const statusLabel = $derived.by(() => {
     if (!selectedApp) return 'Installed';
-    if (selectedApp.catalogKind) {
-      switch (selectedApp.catalogKind) {
+    if (effectiveCatalogKind) {
+      switch (effectiveCatalogKind) {
         case 'available':
           return 'Not installed';
         case 'installed':
@@ -184,8 +256,8 @@
   const statusClass = $derived.by(() => {
     if (effectiveStage === 'coming_soon') return 'sidebar-info-status-soon';
     if (effectiveStage === 'not_installed') return 'sidebar-info-status-pending';
-    if (selectedApp?.catalogKind === 'broken') return 'sidebar-info-status-warn';
-    if (selectedApp?.catalogKind === 'update_available')
+    if (effectiveCatalogKind === 'broken') return 'sidebar-info-status-warn';
+    if (effectiveCatalogKind === 'update_available')
       return 'sidebar-info-status-warn';
     return '';
   });
@@ -197,21 +269,30 @@
     selectedApp !== null && effectiveStage === 'not_installed' && selectedApp.id === 'orchestrator'
   );
 
-  // Module repair/update action (Reinstall / Retry / Update) for an
-  // actionable catalog kind. Distinct from showLaunchActions/showInstallAction
-  // (which stay orchestrator-only): this surfaces the SAME action the
-  // /modules tile and the Home card now expose, so the right-rail status
-  // chip stops being a dead label for broken/update_available modules. The
-  // mapping is centralised in `moduleActionForKind`. NOT Pro-gated — an
+  // Module repair/update action (Reinstall / Retry / Update / Install) for
+  // an actionable catalog kind. Distinct from showLaunchActions/
+  // showInstallAction (which stay orchestrator-only): this surfaces the
+  // SAME action the /modules tile and the Home card now expose, so the
+  // right-rail status chip stops being a dead label for broken/
+  // update_available modules. The mapping is centralised in
+  // `resolveProjectScopedAction` (`moduleActionState` above), which also
+  // corrects the update_available-but-not-installed-here mismatch (field
+  // report 2026-08-31 — see that helper's docstring). NOT Pro-gated — an
   // actionable kind is already-installed; only a selected project is
   // required (install/update are per-project).
-  const moduleRepairAction = $derived(
-    selectedApp ? moduleActionForKind(selectedApp.catalogKind) : null
-  );
+  const moduleRepairAction = $derived(moduleActionState.action);
+  // v0.2.92: true while we don't yet know whether the selected project
+  // has an install row for this module — see `resolveProjectScopedAction`.
+  // The template disables the button while this is true instead of
+  // guessing which operation (Update vs Install) is correct.
+  const moduleRepairPending = $derived(moduleActionState.pending);
   let moduleRepairBusy = $state(false);
 
   async function runModuleRepair() {
     if (!selectedApp || !moduleRepairAction) return;
+    // v0.2.92: backstop — see the identical guard in +page.svelte's
+    // `handleCardModuleAction` for the rationale.
+    if (moduleRepairPending) return;
     const project = $selectedProject;
     if (!project) {
       toast.error('Select a project first to install or update modules.');
@@ -252,8 +333,18 @@
       if (errMsg) {
         toast.error(`${selectedApp.name}: ${errMsg}`, { key: toastKey });
       } else {
+        // v0.2.92: word off `label`, not just `method` — the fresh-install
+        // fallback and the broken/error Reinstall/Retry paths all share
+        // method:'install', but only the latter two are actually
+        // "re"-installs from this project's point of view.
+        const successVerb =
+          moduleRepairAction.method === 'update'
+            ? 'updated'
+            : moduleRepairAction.label === 'Install'
+              ? 'installed'
+              : 'reinstalled';
         toast.success(
-          `${selectedApp.name} ${moduleRepairAction.method === 'install' ? 'reinstalled' : 'updated'}`,
+          `${selectedApp.name} ${successVerb}`,
           { key: toastKey },
         );
       }
@@ -451,26 +542,49 @@
 
       <div class="sidebar-divider"></div>
     {:else if moduleRepairAction}
-      <!-- Actionable module (broken/error/update_available): expose the
-           Reinstall/Retry/Update action here too, so the right-rail status
-           chip is no longer a dead label. Same command path as the /modules
-           tile and the Home card (moduleActionForKind). Disabled + tooltip
-           when no project is selected (install/update are per-project). -->
+      <!-- Actionable module (broken/error/update_available, or the
+           project-scoped Install fallback resolved by
+           `resolveProjectScopedAction`): expose the Reinstall/Retry/
+           Update/Install action here too, so the right-rail status chip
+           is no longer a dead label. Same command path as the /modules
+           tile and the Home card. Disabled + tooltip when no project is
+           selected (install/update are per-project). -->
       <div class="sidebar-section">
         <h4 class="sidebar-label">Quick Actions</h4>
         <div class="sidebar-actions">
-          <button
-            class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
-            disabled={moduleRepairBusy || !current}
-            title={!current ? 'Select a project first' : ''}
-            onclick={runModuleRepair}
-          >
-            {moduleRepairBusy ? 'Working…' : moduleRepairAction.label}
-          </button>
+          {#if moduleRepairBusy}
+            <!-- v0.2.92: live phase text (real backend stages from
+                 `module://install-progress` — see +page.svelte's
+                 identical block for the full rationale), not a static
+                 "Working…" placeholder. -->
+            <span class="sidebar-action-busy">
+              <span class="spinner-sm" aria-hidden="true"></span>
+              {installProgressLabel(
+                selectedApp ? ($modules.installProgress[selectedApp.id] ?? null) : null,
+              ) ?? (moduleRepairAction.method === 'update' ? 'Updating…' : 'Installing…')}
+            </span>
+          {:else}
+            <button
+              class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
+              disabled={!current || moduleRepairPending}
+              title={!current
+                ? 'Select a project first'
+                : moduleRepairPending
+                  ? "Checking this project's install status…"
+                  : ''}
+              onclick={runModuleRepair}
+            >
+              {moduleRepairAction.label}
+            </button>
+          {/if}
           <p class="sidebar-info-key" style:font-size="11px" style:line-height="1.5">
-            {moduleRepairAction.method === 'update'
+            {moduleRepairPending
+              ? "Checking whether this module is installed for the selected project…"
+              : moduleRepairAction.method === 'update'
               ? 'A newer version is available for this module.'
-              : 'This module needs to be reinstalled to work.'}
+              : moduleRepairAction.label === 'Install'
+                ? 'This module is not installed for the selected project.'
+                : 'This module needs to be reinstalled to work.'}
           </p>
         </div>
       </div>
@@ -675,6 +789,43 @@
   .sidebar-action-btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+  }
+
+  /* v0.2.92: in-flight install/update badge for the Quick Actions panel.
+     Same purple "working" vocabulary as ModuleCatalog.svelte's
+     `.status-badge-bundled` / the Home card's `.app-card-status-busy` so
+     an in-flight module reads identically everywhere the launcher shows
+     it. */
+  .sidebar-action-busy {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 14px;
+    border-radius: 999px;
+    color: var(--color-purple, #b29bff);
+    background: rgba(123, 95, 255, 0.12);
+    border: 1px solid rgba(123, 95, 255, 0.3);
+  }
+
+  .spinner-sm {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    border: 2px solid rgba(123, 95, 255, 0.25);
+    border-top-color: var(--color-purple, #b29bff);
+    border-radius: 50%;
+    animation: sidebar-spin 0.6s linear infinite;
+  }
+
+  @keyframes sidebar-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .launch-picker {

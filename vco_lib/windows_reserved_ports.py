@@ -292,8 +292,8 @@ def check_ports(
                     f"Windows reserved range {start}-{end}; reserved it for "
                     f"application use (netsh excludedportrange, persistent). "
                     f"You may need to restart the WinNAT service "
-                    f"(`net stop winnat && net start winnat`) for it to take "
-                    f"effect."
+                    f"(`net stop winnat` then `net start winnat`) for it to "
+                    f"take effect."
                 )
                 continue
             # Reservation attempted but failed — fall through to the warning.
@@ -312,7 +312,14 @@ def check_ports(
         # Non-admin (or failed auto-reserve): print the actionable fix.
         emit("  [reserved-port] To fix, run this in an ELEVATED (Administrator) terminal:")
         emit(f"      {reserve_command(port)}")
-        emit("      net stop winnat && net start winnat")
+        # v0.2.92 (R42 sweep): two lines, never `net stop winnat && net
+        # start winnat`. This block is introduced as "run this in an ELEVATED
+        # terminal", and the elevated terminal Windows 10/11 opens by default
+        # is PowerShell 5.1 — which rejects `&&` as a syntax error. A remedy
+        # printed for Windows that only cmd.exe can run is the same
+        # narrowing R42 bans, one shell over.
+        emit("      net stop winnat")
+        emit("      net start winnat")
         unresolved.append((label, port, hit))
 
     return unresolved

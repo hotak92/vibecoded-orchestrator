@@ -118,29 +118,52 @@ if [ -n "$ORCH_ROOT" ] && [ -f "$ORCH_ROOT/scripts/launch-claude-mcp-stack.sh" ]
     WRAPPER_SCRIPT="$ORCH_ROOT/scripts/launch-claude-mcp-stack.sh"
 fi
 
-# Container runtime: prefer docker if podman isn't around (some users only have one).
-RUNTIME="${VCT_CONTAINER_RUNTIME:-}"
-if [ -z "$RUNTIME" ]; then
-    if command -v podman >/dev/null 2>&1; then RUNTIME=podman
-    elif command -v docker >/dev/null 2>&1; then RUNTIME=docker
-    else echo "ensure-containers: neither podman nor docker found, skipping" >&2; exit 0
-    fi
+# Container runtime + compose: ONE home — `python -m vco_lib.containers resolve`
+# (v0.2.92 PLAN-EXTENSION §3.5 / R13). This hook used to mirror the
+# podman/docker + compose-form detection inline (as did two sibling hooks,
+# install.py and the launcher), and the four copies had drifted in their
+# compose preference order. Class A of the A>B>C rule: one Python
+# implementation, called via a ~50 ms subprocess on this session-start path.
+# Loud-fail: if the resolver cannot run at all (no interpreter, broken
+# install), say so on stderr and skip — never fall back to an inline copy.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+    resolve_vco_venv_python "$SCRIPT_DIR"
 fi
-
-# Compose binary: detect both v2 plugin and v1 standalone, for either runtime.
-# User can override via VCT_COMPOSE_CMD.
-COMPOSE_CMD="${VCT_COMPOSE_CMD:-}"
-if [ -z "$COMPOSE_CMD" ]; then
-    if [ "$RUNTIME" = "podman" ]; then
-        if podman compose version >/dev/null 2>&1; then COMPOSE_CMD="podman compose"
-        elif command -v podman-compose >/dev/null 2>&1; then COMPOSE_CMD="podman-compose"
-        fi
-    elif [ "$RUNTIME" = "docker" ]; then
-        if docker compose version >/dev/null 2>&1; then COMPOSE_CMD="docker compose"
-        elif command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="docker-compose"
-        fi
-    fi
+RUN_PY="${VCO_VENV_PYTHON:-${PY:-}}"
+if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
+    echo "ensure-containers: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
+    exit 0
 fi
+__vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
+__vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" ; __vco_rt_rc=$?
+case "$__vco_rt_rc" in
+    0|3|4) eval "$__vco_rt_out" ;;
+    *)
+        echo "ensure-containers: vco_lib.containers resolve failed (rc=$__vco_rt_rc): $(tail -n 3 "$__vco_rt_err" 2>/dev/null | tr '\n' ' ')"
+        rm -f "$__vco_rt_err"
+        exit 0
+        ;;
+esac
+rm -f "$__vco_rt_err"
+# v0.2.92 BLOCKER-4 + MAJOR-6: the resolver REFUSES a pinned-but-unusable
+# runtime (podman and docker have per-runtime named volumes, so driving the
+# one the user did not pin brings the stack up EMPTY) and hands back the
+# refusal as its reason. Report it on STDOUT, not stderr: a SessionStart
+# hook's stderr is not surfaced to the user when the hook exits 0 -- only
+# stdout is injected as session context, and an unread report is not a report.
+if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
+    # `absent` is a true fact (nothing installed / daemon down / a refused
+    # pin); `unknown` means a probe could not run. Both are skips, both said.
+    echo "ensure-containers: $VCO_RUNTIME_REASON; skipping"
+    exit 0
+fi
+RUNTIME="$VCO_RUNTIME"
+# User can override the compose invocation via VCT_COMPOSE_CMD.
+COMPOSE_CMD="${VCT_COMPOSE_CMD:-$VCO_COMPOSE_CMD}"
 
 # ---------------------------------------------------------------------------
 # pid_alive :: 0 if PID is a live process, 1 otherwise.
@@ -307,6 +330,15 @@ started=0
 recovered=0
 needs_compose=false
 needs_gpu_wrapper=false
+# v0.2.92 BLOCKER-1: code_embed is the ONE compose service BUILT from the
+# checkout, and `up -d` builds an image only when it is MISSING — so a stale
+# image survives every update and keeps silently truncating over-window code
+# at HTTP 200. When THIS container is among the missing ones we are creating
+# it anyway, so `--build` costs a cache hit when the image is current and
+# rebuilds it when it is not. Deliberately NOT set when only weaviate/ollama
+# are missing: an unconditional `--build` on a session-start hook would
+# rebuild (CUDA: 6 GB base) every time any container went away.
+needs_code_embed_build=false
 # v0.2.50 audit F6 (2026-06-08): zombie detection (running status with
 # dead PID per /proc) is Podman-specific. On Docker the State.Pid value
 # carries different host-side semantics (containerd PID, VM PID on
@@ -359,6 +391,9 @@ for container in "${VCO_REQUIRED_CONTAINERS[@]}"; do
         if is_gpu_container "$container"; then
             needs_gpu_wrapper=true
         fi
+        case "$container" in
+            *code_embed*) needs_code_embed_build=true ;;
+        esac
     else
         # Container exists but stopped — try starting it
         $RUNTIME start "$container" 2>/dev/null && started=$((started + 1))
@@ -383,8 +418,19 @@ if [ "$needs_compose" = true ]; then
             echo "ensure-containers: wrapper invocation failed" >&2
     elif [ -n "$COMPOSE_CMD" ] && [ -n "$COMPOSE_DIR" ] && [ -d "$COMPOSE_DIR" ]; then
         # Don't redirect stderr — surface failures so users can see what went wrong.
-        (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d)
-        echo "Ran '$COMPOSE_CMD up -d' in $COMPOSE_DIR (missing containers detected)"
+        if [ "$needs_code_embed_build" = true ]; then
+            # Report which invocation ACTUALLY ran: claiming "--build" after
+            # falling back to a plain up would be a promise the run did not keep.
+            if (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d --build); then
+                echo "Ran '$COMPOSE_CMD up -d --build' in $COMPOSE_DIR (missing containers incl. the code-embedding service, whose image is built from source)"
+            else
+                (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d)
+                echo "Ran '$COMPOSE_CMD up -d' in $COMPOSE_DIR ('--build' was rejected, so the code-embedding image was NOT refreshed — run 'python install.py --update' from the orchestrator root)"
+            fi
+        else
+            (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d)
+            echo "Ran '$COMPOSE_CMD up -d' in $COMPOSE_DIR (missing containers detected)"
+        fi
     elif [ -z "$COMPOSE_CMD" ]; then
         echo "ensure-containers: $RUNTIME has no compose available (tried '$RUNTIME compose' and standalone) — install $RUNTIME-compose or the compose plugin" >&2
     elif [ -z "$COMPOSE_DIR" ]; then

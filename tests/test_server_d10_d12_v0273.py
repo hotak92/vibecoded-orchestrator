@@ -21,6 +21,8 @@ for _p in (str(REPO_ROOT), str(MCP)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from tests.common.child_env import child_env  # noqa: E402
+
 os.environ.setdefault("VCT_DISABLE_HUB_RESOLVER", "1")
 
 
@@ -40,7 +42,7 @@ def _import_server_with_env(env_overrides: dict[str, str]):
     ) % str(MCP)
     return subprocess.run(
         [sys.executable, "-c", code],
-        capture_output=True, text=True, env=env, timeout=60,
+        capture_output=True, text=True, env=child_env(env), timeout=60,
     )
 
 

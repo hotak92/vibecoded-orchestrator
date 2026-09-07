@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
@@ -141,6 +142,37 @@ class InstallBundleFreshTests(unittest.TestCase):
     def tearDown(self):
         import shutil
         shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def test_machine_local_compose_override_is_not_replicated(self):
+        """v0.2.92 delivery audit m7: `docker-compose.override.yml` is the
+        launcher's MACHINE-LOCAL volume-location config (gitignored, with
+        per-machine paths) written into the orchestrator clone. The compose
+        filter must not replicate it into project trees — observed doing so
+        in the audit's scratch install; harmless there only because the
+        override happened to say `services: {}`."""
+        # The launcher writes this file into the clone after install.
+        (self.orch / "infrastructure" / "docker-compose.override.yml").write_text(
+            "services:\n  weaviate:\n    volumes:\n"
+            "      - /this-machine/storage/weaviate_data:/var/lib/weaviate\n",
+            encoding="utf-8",
+        )
+        result = project_init.install_project_bundle(
+            self.proj,
+            orchestrator_root=self.orch,
+            update_mode=False,
+        )
+        self.assertEqual(result["errors"], [])
+        shipped = str(Path("infrastructure") / "docker-compose.override.yml")
+        self.assertFalse(
+            (self.proj / "infrastructure" / "docker-compose.override.yml").exists(),
+            "machine-local compose override was replicated into the project",
+        )
+        self.assertNotIn(shipped, result["actions"]["create"])
+        # The tracked compose files still ship.
+        self.assertTrue(
+            (self.proj / "infrastructure" / "docker-compose.yml").exists(),
+            "regular compose files must keep shipping",
+        )
 
     def test_fresh_install_creates_all_categories(self):
         result = project_init.install_project_bundle(
@@ -2194,6 +2226,7 @@ class BundleCliTests(unittest.TestCase):
             capture_output=True, text=True,
             cwd=str(REPO_ROOT),
             timeout=30,
+            env=child_env(),
         )
         self.assertEqual(result.returncode, 0,
                          msg=f"stderr={result.stderr}\nstdout={result.stdout}")
@@ -2212,6 +2245,7 @@ class BundleCliTests(unittest.TestCase):
             capture_output=True, text=True,
             cwd=str(REPO_ROOT),
             timeout=30,
+            env=child_env(),
         )
         self.assertEqual(result.returncode, 0)
         payload = json.loads(result.stdout)
@@ -2231,6 +2265,7 @@ class BundleCliTests(unittest.TestCase):
             capture_output=True, text=True,
             cwd=str(REPO_ROOT),
             timeout=10,
+            env=child_env(),
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("must refer to the same path", result.stderr)
@@ -2260,6 +2295,7 @@ class BootstrapCliTests(unittest.TestCase):
             capture_output=True, text=True,
             cwd=str(REPO_ROOT),
             timeout=10,
+            env=child_env(),
         )
         # Dry-run is exit 0 even when unreachable.
         self.assertEqual(result.returncode, 0,

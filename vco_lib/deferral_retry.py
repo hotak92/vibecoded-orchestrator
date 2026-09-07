@@ -113,6 +113,34 @@ FAILED = "failed"         # handler ran and did not succeed
 INCONCLUSIVE = "inconclusive"
 SKIPPED = "skipped"       # precondition absent (backend down, cap reached…)
 
+#: TRAIL-ONLY row status: a pass that reached this condition, found its
+#: handler and its remaining attempts, and then declined to run because the
+#: backend that handler needs was not reachable.
+#:
+#: v0.2.92 (WFT C7, register item 7). It is NOT a :class:`RetryResult` status
+#: callers can receive — the backend gate still RETURNS :data:`SKIPPED`, whose
+#: meaning callers and tests already depend on. It exists because the ledger
+#: renders ``auto_retryable`` as "VCO retries this itself", a promise that is
+#: true only while the backend eventually comes back, and NOTHING recorded the
+#: fact that it had not. Verified before writing this: after five dispatch
+#: passes with the backend down, ``attempts_path`` did not exist and
+#: ``attempt_count`` returned 0 — every blocked pass wrote its verdict to a
+#: per-run detached log and nowhere durable. So "VCO has retried N times and
+#: the service was down each time" was not a sentence the code could form. Now
+#: it is: :func:`retry_history` counts these rows and
+#: :func:`retry_disposition_note` renders them.
+#:
+#: Deliberately a DIFFERENT status from :data:`STARTED`, so the attempt cap is
+#: untouched — a machine whose backend is down for a week must still retry on
+#: the day it comes back (``test_skips_do_not_burn_the_cap``).
+BLOCKED = "blocked"
+
+#: Consecutive blocked passes after which the generic "VCO retries this
+#: itself" stops being the most useful thing to say. Below it the condition is
+#: plausibly transient and the generic disposition is fair; at it, the reader
+#: is owed the specific history instead.
+BLOCKED_NOTE_THRESHOLD = 3
+
 #: Which backend a handler's owed work actually needs. The gate asks THIS
 #: question — "is any backend up" was the wrong one: on a machine whose text
 #: backend answers and whose code backend does not, the either-backend probe
@@ -521,6 +549,130 @@ def record_attempt(folder: Path, result: RetryResult) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class RetryHistory:
+    """What has actually happened to one condition's retries in one folder.
+
+    Read from the same append-only trail :func:`record_attempt` writes, so the
+    history and the cap can never disagree about what a row means.
+    """
+
+    condition_id: str
+    #: :data:`STARTED` rows — one per handler invocation. THE cap input.
+    attempts: int = 0
+    #: :data:`BLOCKED` rows in total (the backend was down when a pass looked).
+    blocked: int = 0
+    #: Trailing CONSECUTIVE blocked rows. The number a disposition may quote:
+    #: "down each time" is only true of an unbroken run.
+    blocked_streak: int = 0
+    #: ISO timestamps bounding that streak (``""`` when there is none).
+    streak_first_ts: str = ""
+    streak_last_ts: str = ""
+    #: Status of the newest row of any kind (``""`` when the trail is empty).
+    last_status: str = ""
+
+    @property
+    def cap_reached(self) -> bool:
+        return self.attempts >= MAX_ATTEMPTS
+
+
+def retry_history(folder: Path, condition_id: str) -> RetryHistory:
+    """Summarise ``condition_id``'s trail in ``folder``. Never raises.
+
+    An absent or unreadable trail yields an all-zero history — the same
+    posture :func:`attempt_count` takes, and for the same reason: a missing
+    log is not evidence that anything happened, and everything downstream of
+    this treats zero as "nothing to say beyond the generic disposition".
+    """
+    path = attempts_path(folder)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return RetryHistory(condition_id=condition_id)
+    attempts = blocked = streak = 0
+    streak_first = streak_last = ""
+    last_status = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("condition_id") != condition_id:
+            continue
+        status = str(row.get("status") or "")
+        ts = str(row.get("ts") or "")
+        last_status = status or last_status
+        if status == STARTED:
+            attempts += 1
+        if status == BLOCKED:
+            blocked += 1
+            streak = streak + 1 if streak else 1
+            streak_first = streak_first or ts
+            streak_last = ts
+        elif status:
+            # Any non-blocked row ENDS the streak: something did run, so
+            # "down each time" would no longer be true of what follows.
+            streak = 0
+            streak_first = streak_last = ""
+    return RetryHistory(
+        condition_id=condition_id,
+        attempts=attempts,
+        blocked=blocked,
+        blocked_streak=streak,
+        streak_first_ts=streak_first,
+        streak_last_ts=streak_last,
+        last_status=last_status,
+    )
+
+
+def retry_disposition_note(folder: Path, condition_id: str) -> str:
+    """One honest sentence about THIS condition's retries, or ``""``.
+
+    WFT C7, register item 7. The ledger classes ``codegraph_embed_resync_pending``
+    ``auto_retryable`` and every surface renders that as "VCO retries this
+    itself" — which is true only if the backend the retry needs comes back.
+    A user whose code-embed service has been down since the entry appeared
+    reads a promise that is being kept in form and not in substance, with
+    nothing on any surface saying so.
+
+    ``""`` means the generic disposition is still the most accurate thing
+    available (nothing has been tried, or the run was recent enough to be
+    plausibly transient) — an empty note is a real answer, not a failure.
+
+    Deliberately a PURE READER. It does not touch the ledger: the entry
+    belongs to ``vco_lib.codegraph_resync``, which re-emits it on every
+    deferred run, so an explicit ``disposition`` written here would be
+    overwritten by the next update and revert in silence. Forking another
+    component's lifecycle to correct its text is not a fix; the callers of
+    THIS function render the correction where they render the condition. The
+    ledger's own leg needs
+    ``deferral_probes.clear_mechanism_sentence`` to consult this reader — that
+    file belongs to another lane and the recipe is in this package's report.
+    """
+    history = retry_history(folder, condition_id)
+    if history.cap_reached:
+        return (
+            f"VCO ran this retry {history.attempts} time(s) and has STOPPED "
+            f"(cap {MAX_ATTEMPTS}) — it is ordinary manual work now, not "
+            "something VCO will pick up again on its own."
+        )
+    if history.blocked_streak >= BLOCKED_NOTE_THRESHOLD:
+        window = (
+            f" since {history.streak_first_ts}" if history.streak_first_ts else ""
+        )
+        return (
+            f"VCO has been unable to retry this on the last "
+            f"{history.blocked_streak} pass(es){window}: the backend it needs "
+            "was unreachable every time. It will retry by itself the moment "
+            "that backend answers, and not before — so nothing changes here "
+            "until the service is back."
+        )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Registry glue
 # ---------------------------------------------------------------------------
@@ -797,14 +949,20 @@ def _dispatch_locked(
             + {True: "reachable", False: "provably down", None: "unknown"}[backend]
         )
         if backend is not True:
-            results.append(
-                RetryResult(
-                    cid, SKIPPED,
-                    f"no {handler.backend} embedding backend reachable"
-                    if backend is False
-                    else f"{handler.backend} backend reachability unknown",
-                )
+            skipped = RetryResult(
+                cid, SKIPPED,
+                f"no {handler.backend} embedding backend reachable"
+                if backend is False
+                else f"{handler.backend} backend reachability unknown",
             )
+            # v0.2.92 (WFT C7): record the BLOCK durably. Until now this arm
+            # returned and left nothing behind but a per-run detached log, so
+            # the ledger could keep promising "VCO retries this itself" while
+            # nothing recorded that it had been unable to, twelve passes
+            # running. A distinct status keeps the cap untouched — being
+            # blocked is not an attempt (`test_skips_do_not_burn_the_cap`).
+            record_attempt(folder, RetryResult(cid, BLOCKED, skipped.detail))
+            results.append(skipped)
             continue
         # Recorded BEFORE the handler runs: a crash must still consume its
         # attempt, or the cap can never engage on a handler that always dies.
@@ -1030,6 +1188,8 @@ def _dispatch_quiet(folder: Path) -> list[RetryResult]:
 
 __all__ = [
     "ATTEMPTS_FILENAME",
+    "BLOCKED",
+    "BLOCKED_NOTE_THRESHOLD",
     "CODE_BACKEND",
     "FAILED",
     "HANDLERS",
@@ -1043,6 +1203,7 @@ __all__ = [
     "TEXT_BACKEND",
     "Handler",
     "RetryContext",
+    "RetryHistory",
     "RetryResult",
     "attempt_count",
     "attempts_path",
@@ -1055,6 +1216,8 @@ __all__ = [
     "owed_condition_ids",
     "pidfile_path",
     "record_attempt",
+    "retry_disposition_note",
+    "retry_history",
     "retry_code_graph_walk",
     "retry_codegraph_resync",
     "retry_kg_seed",

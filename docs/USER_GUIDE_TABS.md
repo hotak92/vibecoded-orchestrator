@@ -80,15 +80,29 @@ The audit log (`db.audit("secret_set", …)`) records `{key, scope, sensitive}` 
 | `Resolution`  | `resolution`                        | Where the launcher looks for the value (see resolution table above).    |
 | (sub-tag)     | `file_path` / `env_name`            | Concrete file path or env var name when `resolution` is `file` / `env`. |
 | `Required for`| `required_for: Vec<String>`         | Agent/module names that need this secret to function.                   |
-| `Set?`        | `is_set: bool`                      | Whether the value resolves successfully right now.                      |
+| `Set?`        | live `get_secret_status_v2` probe   | Where the value actually is, right now, across BOTH stores (see below). |
+
+The `Set?` badge is measured on load, not read from the ref row. It reports one of five states:
+
+| Badge              | Meaning                                                                 |
+|--------------------|-------------------------------------------------------------------------|
+| `set`              | In the OS keychain and active for this project.                          |
+| `paused`           | The keychain holds a value, but it is paused for this project.           |
+| `set — file store` | Not in the keychain, but present in `~/.vct-secrets/` — every sanctioned resolver finds it. |
+| `unknown`          | A store could not be read (locked keychain, unreadable secrets dir, probe not returned). **Not** the same as absent. |
+| `not set`          | Both stores answered, and neither has it.                                |
+
+`unknown` is deliberately distinct from `not set`: "we could not look" and "it is not there" call for opposite actions — unlock the keychain versus type the value in. If you re-enter a secret on the strength of an `unknown`, you can end up with a copy in each store holding different values.
+
+The ref row still carries an `is_set` column in the DB. It is a snapshot the ref's WRITER left behind and nothing revises it, so it is not what this tab renders.
 
 #### Gotchas / failure modes
 
-- **`is_set: missing` after you just set it.** The flag is recomputed lazily when the launcher rescans. Click another tab and back, or restart the launcher.
+- **The badge is stale after you set a value elsewhere.** The probe runs when the tab loads. Switch tabs and back (or reload) to re-probe. (Before v0.3.0 this column rendered the ref row's stored `is_set` flag, which was written once at registration and NEVER recomputed — no amount of rescanning refreshed it. If you remember this tab claiming "set" for a key you had deleted, that was why.)
 - **"keyring entry for vct.… : platform error"** on Linux usually means there is no running Secret Service. Ensure `gnome-keyring-daemon` (or KWallet) is running and the login keyring is unlocked.
 - **Headless / SSH sessions on Linux**: libsecret requires a D-Bus session and an unlocked keyring. Either run the launcher inside a desktop session, or use `resolution: file` with `~/.vct-secrets/<name>` (chmod 600) instead.
 - **"value does not match validation pattern"** comes from `set_secret_v2` validating against the module manifest's `validation_regex`. Check the module's secrets manifest (e.g. for `GITHUB_TOKEN` the regex usually requires `ghp_…` / `github_pat_…`).
-- **Sensitive vs non-sensitive**: only non-sensitive secrets get a masked preview in the UI. For sensitive ones you'll only ever see `set` / `missing` and a `••••••••` placeholder — by design. Don't try to "fix" this; `get_secret_preview` will hard-error if you ask for a sensitive value.
+- **Sensitive vs non-sensitive**: only non-sensitive secrets get a masked preview in the UI. For sensitive ones you'll only ever see the presence badge and a `••••••••` placeholder — by design. Don't try to "fix" this; `get_secret_preview` will hard-error if you ask for a sensitive value.
 - **Secret refs do not auto-populate**. They are written by the modules during install (via `set_project_secret_ref`). If you uninstall a module, its refs are deleted by the install logic, not by anything in this tab.
 - **Deleting a project deletes all its refs but NOT the keychain entries.** The DB cascades on `projects.id`; the OS keychain does not. Clear stale entries manually if you care about that.
 

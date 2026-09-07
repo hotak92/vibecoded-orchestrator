@@ -48,6 +48,8 @@ import logging
 import os
 import sys
 from pathlib import Path
+
+from vco_lib.atomic import atomic_write_json
 from typing import Literal, Optional
 
 from vco_lib.paths import vct_root_dir
@@ -146,11 +148,9 @@ def write_lockfile(
         ),
     }
 
-    # Atomic write: temp file + rename. Avoids the race where another
-    # process reads a half-written JSON file mid-write.
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    # Atomic write through the ONE home (v0.2.92): avoids the race where
+    # another process reads a half-written JSON file mid-write.
+    atomic_write_json(p, payload)
     logger.info(
         "update_gate: wrote %s (phase=%s, expected_completion=%s)",
         p,

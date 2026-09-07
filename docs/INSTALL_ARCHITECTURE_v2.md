@@ -363,9 +363,16 @@ writes a resync deferral to `UPDATE_DEFERRED.md` naming both revisions plus the
 commands the user runs to re-chunk and re-embed:
 
 ```
-.claude/scripts/kg-sync --all
-.claude/scripts/code-graph-analyze . --force-recreate
+<folder>/.claude/scripts/kg-sync --all
+<folder>/.claude/scripts/code-graph-analyze <folder> --from-resolver --force-recreate
 ```
+
+`--from-resolver` is not optional decoration: `--force-recreate` DROPS the five
+`<prefix>_Code*` classes, and without an identity flag the analyzer's last
+resolution rung is the folder BASENAME (`.claude/env` is sourced for hooks, not
+for the terminal a user pastes this into). `vco_lib.codegraph_drop_guard`
+refuses the drop at run time if the resolved family is not this project's bound
+one.
 
 It fires **once per revision** (the marker advances after the write; first boot
 seeds the marker without a deferral) and is independent of the file-hash bundle

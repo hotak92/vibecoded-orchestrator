@@ -25,6 +25,12 @@
 pub mod api;
 pub mod auth;
 pub mod boot;
+// v0.2.92 WP-11 — read-only `GET /api/v1/chat-model-context`, so a CLI or an
+// agent can read the version-keyed chat-model context table without opening
+// launcher.db (the launcher stays the single writer). The MODEL GATEWAY does
+// not use this route: it reads the exported file, deliberately, so it keeps
+// working when neither the launcher nor the hub is running.
+pub mod chat_model_context_api;
 pub mod cli;
 pub mod cli_api;
 pub mod config_api;

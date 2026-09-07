@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
 """vco_lib — single source of truth for VibeCoded Tools project init/update.
 
 Modules:

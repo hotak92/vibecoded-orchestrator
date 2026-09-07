@@ -23,9 +23,24 @@ Discipline rule (user-locked 2026-06-09): "from now on consistent".
   ``module_settings`` user toggles, secrets) — upgrade in place via a
   forward-only migration helper. Drop+recreate is NOT acceptable for these.
 
-A parity test (``tests/test_schema_versions_parity.py``) asserts that the
-Rust constants in ``schema_versions_rust.json`` (generated from this module)
-match Python. CI fails if they drift.
+Parity is asserted from BOTH sides against the generated
+``vco_lib/schema_versions.json``:
+
+- ``tests/test_v52_ag_schema_versions.py`` (Python) — the JSON matches what
+  ``scripts/regen_schema_versions_json.py`` would produce, and
+  ``LAUNCHER_DB_TABLE_SET_VERSION`` equals the highest version registered in
+  ``migrations.rs``.
+- ``launcher/src-tauri/tests/schema_versions_rust_parity.rs`` (Rust) — the
+  same JSON, ``include_str!``d at compile time, checked against
+  ``migrations::MIGRATIONS``. Two languages, one committed snapshot, so
+  neither side can bump alone.
+
+CI fails if they drift.
+
+v0.2.92 (R16/R23): this paragraph used to name a parity test
+(``tests/test_schema_versions_parity.py``) and a generated file
+(``schema_versions_rust.json``) that have never existed in this repo. Both
+names are corrected above, and the Rust half they described is now real.
 """
 
 from __future__ import annotations
@@ -197,6 +212,21 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 44 = migration 044_project_moves.sql (v0.2.92, WP-17/W3 — the project-move
+#: ledger). Its partial UNIQUE index on ``project_id WHERE status IN
+#: ('running','flipped')`` is the single-flight gate: a second concurrent move
+#: of the same project fails in SQLite rather than in application logic, so
+#: there is no check-then-act window between a GUI click and a CLI run. The
+#: status machine is the move's failure-semantics contract ('running' = nothing
+#: in ``projects`` has changed yet; 'flipped' = the commit transaction landed
+#: and post-commit reconciliation may still be owed). Bumped ATOMICALLY with
+#: mig 044's Rust registration.
+#: 43 = migration 043_chat_model_context.sql (v0.2.92, WP-11 — the
+#: version-keyed CHAT-model context table, keyed by FULL model id because a
+#: family wildcard would overstate the smaller member's window by 5x). Read by
+#: the model gateway through the exported JSON at
+#: ``<vct_root>/model-gateway/chat_model_context.json``. Bumped ATOMICALLY
+#: with mig 043's Rust registration.
 #: 42 = migration 042_project_hooks_disabled_entry.sql (v0.2.91, decision #27
 #: — nullable project_hooks.disabled_entry_json). The Hooks tab was a full
 #: placebo (its rows were read by nothing while Claude Code reads
@@ -227,7 +257,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 42
+LAUNCHER_DB_TABLE_SET_VERSION = 44
 
 
 # ===========================================================================
@@ -235,8 +265,11 @@ LAUNCHER_DB_TABLE_SET_VERSION = 42
 # ===========================================================================
 
 #: Canonical version constants by artifact_type → expected schema_version.
-#: Used by ``tests/test_schema_versions_parity.py`` to assert Rust matches
-#: Python, and by ``vco_lib/project_init.py`` install/update flows to drive
+#: Exported to ``vco_lib/schema_versions.json`` by
+#: ``scripts/regen_schema_versions_json.py``; that snapshot is what
+#: ``tests/test_v52_ag_schema_versions.py`` (Python) and
+#: ``launcher/src-tauri/tests/schema_versions_rust_parity.rs`` (Rust) check.
+#: Also read by ``vco_lib/project_init.py``'s install/update flows to drive
 #: the recreate/upgrade decision.
 CANONICAL_VERSIONS: dict[str, int] = {
     # Layer 1 — Weaviate collections (DERIVED)

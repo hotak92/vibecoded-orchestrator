@@ -79,6 +79,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from vco_lib.atomic import rotate_tail_lines
 from typing import NamedTuple, Optional
 
 logger = logging.getLogger("vco.access_resolver")
@@ -361,28 +363,13 @@ def _maybe_rotate_jsonl(path: Path, max_bytes: int = 1_048_576, keep_lines: int 
     (the fail-open contract above doesn't get to fail because of log
     bookkeeping).
     """
-    try:
-        if not path.is_file():
-            return
-        if path.stat().st_size <= max_bytes:
-            return
-        # Read tail. For a 1 MiB file with ~150-byte rows that's ~7000
-        # lines; reading the full file once is fine. The bash sibling
-        # uses a more sophisticated tail-N approach for its awk scan
-        # rate-limit hot path.
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-        tail = lines[-keep_lines:]
-        tmp = path.with_suffix(path.suffix + ".rot.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.writelines(tail)
-        # Atomic replace — works on Linux + macOS + Windows.
-        os.replace(str(tmp), str(path))
-    except Exception:
-        # Rotation failure must not break the metric emit's fail-open
-        # contract. Worst case the file keeps growing — next call's
-        # rotation attempt will retry.
-        pass
+    # v0.2.92 (duplication-merge): the read-tail / write-tmp / os.replace
+    # routine lives ONCE in `vco_lib.atomic.rotate_tail_lines` (shared with
+    # `resolver_warn`). Soft-fail is the helper's contract: a rotation
+    # failure must not break the metric emit's fail-open path — worst case
+    # the file keeps growing and the next call retries. The bash sibling
+    # uses a tail-N approach for its awk scan rate-limit hot path.
+    rotate_tail_lines(path, max_bytes=max_bytes, keep_lines=keep_lines)
 
 
 def _emit_metric(project_id: str, collection: str, reason: str) -> None:

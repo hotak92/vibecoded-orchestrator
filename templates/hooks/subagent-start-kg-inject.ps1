@@ -111,6 +111,13 @@ if ($AgentId)   { $Env:VCT_AGENT_ID   = $AgentId }
 if ($AgentType) { $Env:VCT_AGENT_TYPE = $AgentType }
 
 # Cap prompt to 400 chars for the query — see .sh sibling.
+#
+# WP-E (v0.2.92) query enrichment: deliberately NOT applied here — a decision,
+# not an omission. The 400-char prompt is far above the short-trigger
+# threshold enrichment requires, the SubagentStart payload carries no
+# transcript_path to forward, and the only transcript in reach is the
+# PARENT's, which a subagent is deliberately isolated from. Full rationale in
+# the .sh sibling; MUST MATCH it.
 $Query = if ($Prompt.Length -gt 400) { $Prompt.Substring(0, 400) } else { $Prompt }
 
 # Resolve VCO venv via the shared helper.

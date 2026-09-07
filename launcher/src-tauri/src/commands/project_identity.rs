@@ -2427,6 +2427,88 @@ mod tests {
         assert_eq!(normalise_prefix_for_match("123abc"), "123abc");
     }
 
+    // ─── F-10 (v0.2.92, WP-6): Python<->Rust parity for
+    // `normalise_prefix_for_match` ─────────────────────────────────────
+    //
+    // The Python SSOT (`vco_lib/project_identity.py::normalise_for_match`)
+    // and this file's mirror both carried a "must match the other" comment
+    // and neither carried a test (PLAN-v0292-REMAINING F-10 / O3 --
+    // CLAUDE.md ranks an un-pinned cross-language mirror as class C, the
+    // last resort, and REQUIRES a parity test locking it). The Python side
+    // is pinned against the shared corpus by
+    // `tests/test_v0292_data_safety_guards.py::NormaliseForMatchParityTests`;
+    // this is the missing Rust-side reader that closes the other half of
+    // the gap, so a one-sided edit to either implementation now fails on
+    // BOTH sides instead of only one.
+    //
+    // Fixture path resolution copies `env_secrets_migrate.rs`'s
+    // `load_secrets_fixture` shape: `CARGO_MANIFEST_DIR`
+    // (= `launcher/src-tauri/`) walked up two parents to the repo root,
+    // same as `tests/project_naming_parity.rs`. The bare
+    // `env!("CARGO_MANIFEST_DIR")` below is compile-time-only path
+    // resolution inside `#[cfg(test)]` code -- it never ships in the
+    // release binary, unlike the production-code sites
+    // `module_gui.rs::production_code_does_not_use_cargo_manifest_dir_for_path_resolution`
+    // guards against.
+    //
+    // An unreadable/unparsable fixture is a hard test failure (`panic!`),
+    // never a skip -- a skip would reintroduce the exact silence F-10
+    // closes (WP-6 trap, PLAN-v0292-REMAINING-2026-09-02.md).
+
+    #[derive(serde::Deserialize)]
+    struct NormaliseForMatchFixture {
+        vectors: Vec<(String, String)>,
+    }
+
+    fn load_normalise_for_match_fixture() -> NormaliseForMatchFixture {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR must have two parents (repo layout)");
+        let fixture_path = repo_root
+            .join("tests")
+            .join("fixtures")
+            .join("normalise_for_match_parity.json");
+        let raw = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "read {}: {} -- shared with tests/test_v0292_data_safety_guards.py\
+                 ::NormaliseForMatchParityTests",
+                fixture_path.display(),
+                e
+            )
+        });
+        let fix: NormaliseForMatchFixture = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse {}: {}", fixture_path.display(), e));
+        assert!(
+            !fix.vectors.is_empty(),
+            "Fixture {} has no vectors",
+            fixture_path.display()
+        );
+        fix
+    }
+
+    #[test]
+    fn normalise_prefix_for_match_matches_shared_fixture() {
+        let fix = load_normalise_for_match_fixture();
+        let mut failures: Vec<String> = Vec::new();
+        for (input, expected) in &fix.vectors {
+            let got = normalise_prefix_for_match(input);
+            if &got != expected {
+                failures.push(format!(
+                    "normalise_prefix_for_match({:?}) = {:?}, fixture expects {:?}",
+                    input, got, expected
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Rust mirror diverged from the shared parity corpus \
+             (tests/fixtures/normalise_for_match_parity.json):\n{}",
+            failures.join("\n")
+        );
+    }
+
     // ─── W3 / v0.2.16 (2026-05-18): wizard UX hardening ──────────────────
     //
     // Two surfaces:

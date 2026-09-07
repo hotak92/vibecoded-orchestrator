@@ -53,7 +53,7 @@ All bundled agents are free and installed by default. They cover the base orches
 | `postmortem-author` | Blameless post-mortem drafting |
 | `sre-incident-responder` | Live production incident triage |
 
-### Skills — `skills/` (53 skills)
+### Skills — `skills/` (54 skills)
 
 All shipped in free tier. Short-form guidance documents invoked via `/skill-name`. Organized alphabetically: `accessibility-checker`, `ai-image-prompting`, `ai-model-selector`, `ai-prompting`, `ai-rag-advisor`, `api-designer`, `architect`, `architecture-consultant`, `batch-image-pipeline`, `build-vs-buy-decision`, `code-review-expert`, `codegraph-diagram`, `consulting-due-diligence`, `consulting-incident-coordinator`, `consulting-portfolio-status`, `content-calendar-planner`, `context`, `context-compress`, `database-advisor`, `debug-expert`, `deployment-advisor`, `design-system-auditor`, `doc-template`, `equation-check`, `explore-codebase`, `extract-docs`, `fix-issue`, `gui-test`, `gui-ux-expert`, `hardware-calculator`, `hpc-submit`, `idempotency-keys`, `interview`, `k8s-manifest-reviewer`, `kg-research`, `performance-optimizer`, `photoshop-scripting`, `react-patterns`, `repro-audit`, `saas-metrics-health-check`, `saas-pricing-strategist`, `sales-call-prep`, `security-reviewer`, `seo-content-brief`, `slo-designer`, `stats-consult`, `structured-output-extraction`, `task-breakdown`, `tdd`, `terraform-plan-reviewer`, `webhook-receiver`, `workflow-cost-estimator`, `workflow-maintain`.
 

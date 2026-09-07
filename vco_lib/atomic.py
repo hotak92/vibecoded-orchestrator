@@ -30,7 +30,10 @@ Design constraints:
 Public surface:
 
 * :func:`atomic_write_text` — write str to file, atomically.
-* :func:`atomic_write_bytes` — write bytes to file, atomically.
+* :func:`atomic_write_bytes` — write bytes to file, atomically; the ONE
+  byte-level writer (``mode=`` and ``symlink_safe=`` options, v0.2.92).
+* :func:`rotate_tail_lines` — truncate an append-only log to its tail
+  atomically (v0.2.92; was inline in two resolver modules).
 * :func:`atomic_write_json` — write JSON object, atomically.
 * :func:`atomic_copy_file` — copy a file to a destination atomically,
   metadata-preserving (``copy2`` semantic), with an optional V47-B
@@ -74,6 +77,7 @@ def atomic_write_text(
     *,
     encoding: str = "utf-8",
     fsync: bool = True,
+    mode: Optional[int] = None,
 ) -> None:
     """Write ``body`` to ``path`` atomically with the given encoding.
 
@@ -85,37 +89,19 @@ def atomic_write_text(
         fsync: Whether to fsync before rename (default True). Set
             False for pseudo-filesystems where fsync may raise
             spuriously.
+        mode: Optional unix permission bits applied to the FINAL path
+            after the rename (``os.chmod``). ``mkstemp`` creates the
+            tempfile 0600, so the file is never briefly MORE permissive
+            than ``mode`` — only less. A chmod ``OSError`` is swallowed
+            (chmod is a documented no-op on Windows).
 
     Crash-safety: tempfile is fsync'd to disk before ``os.replace``.
     On any exception the tempfile is unlinked and the exception
     re-raised. No ``.tmp`` leftovers on any code path.
     """
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(parent),
+    atomic_write_bytes(
+        path, body.encode(encoding), fsync=fsync, mode=mode,
     )
-    tmp_path = Path(tmp_path_str)
-    try:
-        with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
-            f.write(body)
-            f.flush()
-            if fsync:
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    # fsync can fail on pseudo-filesystems; don't
-                    # fail the write over it.
-                    pass
-        os.replace(str(tmp_path), str(path))
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
 
 
 def atomic_write_bytes(
@@ -123,12 +109,48 @@ def atomic_write_bytes(
     data: bytes,
     *,
     fsync: bool = True,
-) -> None:
-    """Write ``data`` to ``path`` atomically (binary mode)."""
-    parent = path.parent
+    mode: Optional[int] = None,
+    symlink_safe: bool = False,
+) -> Optional[Path]:
+    """Write ``data`` to ``path`` atomically (binary mode).
+
+    v0.2.92 (duplication-merge, PLAN-EXTENSION §3.13): this is now the ONE
+    byte-level atomic writer — :func:`atomic_write_text` encodes and
+    delegates here, and ``vco_lib.project_init._write_file_atomic`` (the
+    per-project bundle writer, formerly a 100-line sibling implementation)
+    is a thin wrapper over this function with ``symlink_safe=True``.
+
+    Args:
+        path: Destination file path.
+        data: Bytes to write.
+        fsync: Whether to fsync the tempfile before rename (default
+            True). Bulk writers (hundreds of small bundle files) may pass
+            False to keep the historical no-fsync behaviour.
+        mode: Optional unix permission bits applied to the final path
+            after the rename; see :func:`atomic_write_text`.
+        symlink_safe: When True, if ``path`` (or any ancestor directory)
+            is a symlink the bytes are NOT written through it: they land
+            at the NEW-8 / V47-B ``.vco-new`` redirect target computed by
+            :func:`_symlink_safe_redirect_target` (same convention as
+            :func:`atomic_copy_file`), and that target is returned. The
+            symlink and its destination are untouched.
+
+    Returns:
+        ``None`` on a normal write; the redirect ``Path`` when
+        ``symlink_safe`` redirected around a symlink. Existing callers
+        that ignore the return value are unaffected.
+    """
+    target = Path(path)
+    redirect: Optional[Path] = None
+    if symlink_safe:
+        redirect = _symlink_safe_redirect_target(target)
+        if redirect is not None:
+            target = redirect
+
+    parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
-        prefix=path.name + ".",
+        prefix=target.name + ".",
         suffix=".tmp",
         dir=str(parent),
     )
@@ -141,14 +163,51 @@ def atomic_write_bytes(
                 try:
                     os.fsync(f.fileno())
                 except OSError:
+                    # fsync can fail on pseudo-filesystems; don't
+                    # fail the write over it.
                     pass
-        os.replace(str(tmp_path), str(path))
+        os.replace(str(tmp_path), str(target))
+        if mode is not None:
+            try:
+                os.chmod(str(target), mode)
+            except OSError:
+                # chmod is a no-op on Windows; don't fail.
+                pass
     except Exception:
         try:
             tmp_path.unlink()
         except OSError:
             pass
         raise
+    return redirect
+
+
+def rotate_tail_lines(path: Path, *, max_bytes: int, keep_lines: int) -> bool:
+    """Truncate an append-only text log to its last ``keep_lines`` lines
+    once it exceeds ``max_bytes`` — atomically, via :func:`atomic_write_text`.
+
+    v0.2.92 (duplication-merge): ``vco_lib.access_resolver`` and
+    ``vco_lib.resolver_warn`` each carried this rotation inline (read all
+    lines, keep the tail, write a ``.rot.tmp`` sibling, ``os.replace``).
+    Two copies of a routine that decides what data to DISCARD is the wrong
+    thing to let drift, so it lives here once.
+
+    Soft-fail by contract: rotation must never break the emit path it
+    serves. Any ``OSError`` (unreadable, unwritable, vanished mid-way)
+    returns ``False`` and leaves the file as it was — the next call
+    retries. Returns ``True`` only when the file was actually rewritten.
+    """
+    path = Path(path)
+    try:
+        if not path.is_file() or path.stat().st_size <= max_bytes:
+            return False
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        tail = lines[-keep_lines:] if len(lines) > keep_lines else lines
+        atomic_write_text(path, "".join(tail), fsync=False)
+        return True
+    except OSError:
+        return False
 
 
 def atomic_copy_file(
@@ -232,9 +291,9 @@ def atomic_copy_file(
         if symlink_safe:
             # V47-B: never write through a symlink at the destination or
             # any ancestor under it. Redirect at the SAME LEVEL the
-            # symlink lives — mirroring the established NEW-8 convention at
-            # project_init.py:4540-4590 so the tempfile+os.replace never
-            # touch the symlink's target directory:
+            # symlink lives — the NEW-8 convention, held once in
+            # `_symlink_safe_redirect_target` — so the tempfile+os.replace
+            # never touch the symlink's target directory:
             #   * dst itself is a symlink  → `.vco-new` sibling of dst.
             #   * an ANCESTOR is a symlink → `.vco-new` sibling of THAT
             #     ancestor, with the path tail below it replicated
@@ -276,10 +335,12 @@ def _symlink_safe_redirect_target(dst: Path) -> Optional[Path]:
     """Compute the V47-B ``.vco-new`` redirect target for ``dst`` when a
     symlink blocks the write, or ``None`` when no symlink is in the way.
 
-    Mirrors the established NEW-8 convention at
-    :func:`vco_lib.project_init._write_file_atomic` (project_init.py:4540-4590)
-    so the redirect happens at the SAME LEVEL the symlink lives, never at
-    the leaf when the symlink is an ancestor:
+    The NEW-8 convention (v0.2.53, originally inline in
+    ``vco_lib.project_init._write_file_atomic``; since v0.2.92 that writer
+    is a thin wrapper over :func:`atomic_write_bytes` with
+    ``symlink_safe=True`` and THIS is the only copy of the walk) — the
+    redirect happens at the SAME LEVEL the symlink lives, never at the leaf
+    when the symlink is an ancestor:
 
       * ``dst`` itself is a symlink  → ``compute_vco_new_path(dst)``
         (leaf sibling — correct, the symlink is the leaf).
@@ -336,16 +397,22 @@ def atomic_write_json(
     path: Path,
     obj: Any,
     *,
-    indent: int = 2,
+    indent: Optional[int] = 2,
     sort_keys: bool = False,
     fsync: bool = True,
+    mode: Optional[int] = None,
 ) -> None:
-    """Serialize ``obj`` as JSON and write to ``path`` atomically."""
+    """Serialize ``obj`` as JSON and write to ``path`` atomically.
+
+    ``mode`` is applied to the final path after the rename (see
+    :func:`atomic_write_text`); the sentinel / lock writers in
+    ``vco_lib.collection_rename`` use it to keep claim files owner-only.
+    """
     body = json.dumps(obj, indent=indent, sort_keys=sort_keys, ensure_ascii=False)
     # Append a trailing newline for POSIX-friendly diffs.
     if not body.endswith("\n"):
         body = body + "\n"
-    atomic_write_text(path, body, fsync=fsync)
+    atomic_write_text(path, body, fsync=fsync, mode=mode)
 
 
 @contextlib.contextmanager

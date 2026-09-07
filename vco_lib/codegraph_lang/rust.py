@@ -8,8 +8,10 @@ FileExtraction`` reads source and RETURNS what to write — it mutates NO analyz
 state. The thin ``analyze_rust_file(ctx, file_path, repo_root)`` shim keeps the
 unchanged-skip gate analyzer-side (short-circuit preserved), then drives
 ``extract`` -> ``ctx.write_file_extraction`` -> stats dict. The dispatch table
-and ``EXTRACTORS`` entry are unchanged; behaviour is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+and ``EXTRACTORS`` entry are unchanged. Behaviour has since been CORRECTED
+here (v0.2.92 and WP-5b), so it is no longer byte-identical to the
+analyzer's original; ``tests/test_codegraph_golden.py`` pins what it does
+TODAY.
 
 ``_rust_methods_for_struct`` (V52-O.11.F per-impl method attribution) and
 ``_is_rust_test_fn`` (V52-O.11.J ``#[cfg(test)]`` gate) are unchanged.
@@ -20,7 +22,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
@@ -33,7 +35,9 @@ from vco_lib.codegraph_entities import (
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
+    blank_block_comments_preserving_lines,
     run_pure_extractor,
+    scan_to_declaration_terminator,
 )
 
 
@@ -262,12 +266,13 @@ def extract_rust_file(
     """
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('//')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-    content_clean = re.sub(r'/\*.*?\*/', ' ', content_clean, flags=re.DOTALL)
+    content_clean = blank_block_comments_preserving_lines(content_clean)
 
     # use statements
     imports = re.findall(r'use\s+([\w::{}, ]+);', content)
@@ -276,11 +281,22 @@ def extract_rust_file(
     type_pattern = re.compile(
         r'(?:pub\s+)?(?:struct|enum|trait)\s+([\w]+)', re.MULTILINE
     )
-    struct_info: Dict[str, int] = {}
+    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
+    # see the same change in `ruby.py`, where the fixture proves the loss.
+    # Two same-named types in ONE file are legal inside different
+    # `mod` blocks (`mod tests { struct Cfg; }` beside a top-level
+    # `struct Cfg;`), and this extractor ignores `mod` when building
+    # `full_name`, so the dict silently kept only the last.
+    # The writer's occurrence disambiguator keys on `(kind, identity_key)` and
+    # already covers KIND_CLASS, so the second declaration lands as `<name>#2`.
+    struct_decls: List[Tuple[str, int]] = []
     for m in type_pattern.finditer(content_clean):
         name = m.group(1)
         start_line = content_clean[:m.start()].count('\n') + 1
-        struct_info[name] = start_line
+        struct_decls.append((name, start_line))
+
+    #: Unique type names in source order — what the module summary lists.
+    struct_names: List[str] = list(dict.fromkeys(n for n, _ in struct_decls))
 
     # Functions: fn name(...)
     # V52-O.11.G (v0.2.52, 2026-06-09): expand prefix regex to capture the
@@ -311,8 +327,8 @@ def extract_rust_file(
     summary_parts = [f"Rust module: {relative_path}"]
     if crate_comment:
         summary_parts.append(crate_comment)
-    if struct_info:
-        summary_parts.append(f"Types: {', '.join(list(struct_info.keys())[:8])}")
+    if struct_names:
+        summary_parts.append(f"Types: {', '.join(struct_names[:8])}")
     module_summary = '\n'.join(summary_parts)
 
     complexity = float(1 + sum(content_clean.count(kw)
@@ -327,7 +343,13 @@ def extract_rust_file(
     entities: List[CodeEntity] = []
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
-    for sname, start_line in struct_info.items():
+    # v0.2.92 — the `end_line` convention. `_extract_balanced_block` returns
+    # the 1-indexed CLOSING line, and its docstring states that IS the
+    # `end_line` at every caller site. This loop used to store
+    # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
+    # FUNCTION loop below already used the returned value directly. One
+    # convention now; the golden corpus had ratified the +1 across 7 languages.
+    for sname, start_line in struct_decls:
         _class_end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
@@ -348,7 +370,7 @@ def extract_rust_file(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=sname, full_name=f"{file_path.stem}.{sname}",
             body=class_body, signature=signature, doc="",
-            start_line=start_line, end_line=start_line + len(class_lines),
+            start_line=start_line, end_line=_class_end_line,
             project=helpers.project_name,
             extras={"methods": methods[:20]},
             deferred_embed=(
@@ -369,7 +391,23 @@ def extract_rust_file(
             continue
         is_async = bool(re.search(rf'async\s+fn\s+{re.escape(fname)}', content_clean))
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
+        # v0.2.92: branch on whether the declaration OPENS A BLOCK. A trait
+        # method (`fn reset(&mut self);`) and an `extern` declaration have no
+        # body; running a brace scan from them finds no opener on their own
+        # line and latches onto the NEXT item's braces. Measured on the golden
+        # corpus: `engine.rs`'s trait `fn reset` (line 26) was stored as lines
+        # 26-32 — the trait's `}`, the `impl Resettable for Counter` header and
+        # the impl's own `reset` body — so the two `reset` rows that the
+        # duplicate-identity fix had just separated carried nearly the same
+        # text. `func_pattern` ends at the argument `)`, so the terminator is
+        # found by scanning past any `-> T` / `where` clause at depth 0.
+        _term, _term_pos = scan_to_declaration_terminator(content_clean, m.end())
+        if _term == '{':
+            end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
+        elif _term == ';':
+            end_line = content_clean[:_term_pos + 1].count('\n') + 1
+        else:  # no terminator inside the scan bound — keep the legacy scan
+            end_line = _extract_balanced_block(source_lines, start_line, language="rust")
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"fn {fname}({args_str})"

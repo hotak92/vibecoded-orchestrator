@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
 """V52-D.3: manifest sanitizer for 3rd-party `vct-module.json` files.
 
 This module validates extracted module manifests against a set of

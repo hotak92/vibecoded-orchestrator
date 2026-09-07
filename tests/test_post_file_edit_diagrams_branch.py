@@ -107,6 +107,8 @@ def test_non_diagram_edit_does_not_touch_throttle(tmp_path: Path):
     env["PATH"] = (
         os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     )
+    # §3.16: deliberately unpinned — the hook must resolve its own interpreter
+    # (resolve-vco-venv.sh / PATH), which is exactly what this test exercises.
     result = subprocess.run(
         [bash, str(project / ".claude" / "hooks" / "post-file-edit.sh")],
         input=json.dumps(payload),
@@ -187,6 +189,8 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
         os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     )
 
+    # §3.16: deliberately unpinned — the hook must resolve the per-test STUB
+    # venv python itself; a pinned PYTHONPATH would not be under test here.
     result = subprocess.run(
         [bash, str(project / ".claude" / "hooks" / "post-file-edit.sh")],
         input=json.dumps(payload),
@@ -309,6 +313,8 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     )
 
     def run_hook():
+        # §3.16: deliberately unpinned — the hook must resolve the per-test STUB
+        # venv python itself; a pinned PYTHONPATH would not be under test here.
         return subprocess.run(
             [bash, str(project / ".claude" / "hooks" / "post-file-edit.sh")],
             input=json.dumps(payload),

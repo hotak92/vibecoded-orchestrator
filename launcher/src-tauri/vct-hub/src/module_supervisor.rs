@@ -2298,36 +2298,24 @@ mod tests {
     /// v0.2.49 Phase 3 helper: `VCT_STATE_DIR`-scoped guard used by the
     /// manifest-resolver tests below.
     struct VctStateDirGuard {
-        _td: tempfile::TempDir,
-        previous: Option<String>,
+        _state: vct_launcher_core::test_env::StateDirGuard,
     }
 
     impl VctStateDirGuard {
         fn new() -> Self {
-            use std::sync::{Mutex, OnceLock};
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let _g = LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let td = tempfile::tempdir().expect("tempdir");
-            let previous = std::env::var("VCT_STATE_DIR").ok();
-            std::env::set_var("VCT_STATE_DIR", td.path());
-            drop(_g);
-            Self { _td: td, previous }
+            // v0.2.92: the redirect is the shared `state_dir_guard()`, which
+            // HOLDS `GLOBAL_ENV_MUTEX` for the whole life of this guard. The
+            // previous code took a local lock, set the var, then immediately
+            // `drop(_g)`-ed the lock — so the test body ran with the process-
+            // wide var unprotected — and restored by UNSETTING when there was
+            // no prior value, which destroyed any outer redirect.
+            Self {
+                _state: vct_launcher_core::test_env::state_dir_guard(),
+            }
         }
 
         fn vct_root(&self) -> std::path::PathBuf {
-            self._td.path().to_path_buf()
-        }
-    }
-
-    impl Drop for VctStateDirGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-                None => std::env::remove_var("VCT_STATE_DIR"),
-            }
+            self._state.path().to_path_buf()
         }
     }
 

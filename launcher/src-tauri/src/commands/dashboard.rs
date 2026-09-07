@@ -770,27 +770,17 @@ mod tests {
     /// Returns a guard that restores prior env on drop and the temp path.
     /// Run the closure under the SERIALIZE mutex.
     struct EnvGuard {
-        prev_state: Option<std::ffi::OsString>,
-        prev_home: Option<std::ffi::OsString>,
+        // v0.2.92: `VCT_STATE_DIR` + `HOME` are restored by the shared
+        // `test_env::EnvGuard` (which also holds `GLOBAL_ENV_MUTEX`), so
+        // this struct only carries the keychain lock now. The old fields
+        // restored by UNSETTING when there was no prior value.
+        _env: vct_launcher_core::test_env::EnvGuard,
         // v0.2.14 (2026-05-17): `_lock` is now a `KeychainGuard` (was
         // `MutexGuard<'static, ()>`) — the new guard bundles the
         // in-process mutex with a cross-process file lock so concurrent
         // `cargo test --lib` invocations from different terminals
         // serialise on the OS-shared keychain slot.
         _lock: crate::secrets::test_serialize::KeychainGuard,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.prev_state.take() {
-                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-                None => std::env::remove_var("VCT_STATE_DIR"),
-            }
-            match self.prev_home.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 
     fn setup_temp_env() -> (std::path::PathBuf, EnvGuard) {
@@ -807,10 +797,13 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev_state = std::env::var_os("VCT_STATE_DIR");
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("VCT_STATE_DIR", &tmp);
-        std::env::set_var("HOME", &tmp);
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        // The keychain lock is taken BEFORE `env_guard`'s GLOBAL_ENV_MUTEX
+        // here and nowhere the other way round — a consistent order.
+        let env = vct_launcher_core::test_env::env_guard(&[
+            ("VCT_STATE_DIR", Some(tmp_str.as_str())),
+            ("HOME", Some(tmp_str.as_str())),
+        ]);
         // Note: previous Fix #3 also isolated `VCT_SECRETS_DIR` here so
         // the keychain → ~/.vct-secrets/ bridge stayed in the temp dir.
         // The bridge has been removed in 0.1.7 (the launcher hub's
@@ -818,8 +811,7 @@ mod tests {
         // are pure-keychain again, so no per-test secrets-root isolation
         // is needed here.
         let guard = EnvGuard {
-            prev_state,
-            prev_home,
+            _env: env,
             _lock: lock,
         };
         (tmp, guard)

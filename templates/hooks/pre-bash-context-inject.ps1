@@ -21,12 +21,21 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
 $ToolArgs = $null
 $SessionId = ""
+# WP-E (v0.2.92): also extract transcript_path + prompt_id. transcript_path is
+# a PATH ONLY -- threaded to the producer's -Transcript flag below; the file's
+# CONTENTS are read in-process by the shared vco_lib/transcript_context.py
+# reader there, never in this script (R31 privacy discipline). prompt_id
+# scopes the query-cache key (query-cache.ps1). MUST MATCH the .sh sibling.
+$TranscriptPath = ""
+$PromptId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
-        if ($payload.tool_name)   { $ToolName = [string]$payload.tool_name }
-        if ($payload.tool_input)  { $ToolArgs = $payload.tool_input }
-        if ($payload.session_id)  { $SessionId = [string]$payload.session_id }
+        if ($payload.tool_name)       { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input)      { $ToolArgs = $payload.tool_input }
+        if ($payload.session_id)      { $SessionId = [string]$payload.session_id }
+        if ($payload.transcript_path) { $TranscriptPath = [string]$payload.transcript_path }
+        if ($payload.prompt_id)       { $PromptId = [string]$payload.prompt_id }
     }
 } catch { }
 
@@ -99,7 +108,7 @@ if ((Get-Command Test-VcoCodegraphBashGate -ErrorAction SilentlyContinue) -and (
     # v0.2.72 P2: the extracted symbol doubles as -Anchor so the CLI's shared
     # pipeline biases the rerank toward code call-linked to it.
     if ($cgSym -and (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) {
-        $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath "" -Anchor $cgSym
+        $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath "" -Anchor $cgSym -PromptId $PromptId -TranscriptPath $TranscriptPath
     }
     if ($cgRaw) {
         $cgInj = ""
@@ -142,7 +151,7 @@ $StateFile = Join-Path $StateDir "bash_task_${SessionId}_${CmdHash}.json"
 # Generate task_id; same hex8 shape as rl_kg_search.py's pre_edit_* keys.
 $TaskHex = ([guid]::NewGuid().ToString("N")).Substring(0, 8)
 $TaskId = "pre_bash_$TaskHex"
-$StartTsMs = [int64]((Get-Date) - (Get-Date "1970-01-01Z").ToUniversalTime()).TotalMilliseconds
+$StartTsMs = [long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
 $state = @{
     task_id = $TaskId
@@ -234,10 +243,15 @@ if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
         # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
         # wrapper. Falls back to the direct call when the helper is absent.
         if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
-            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1
+            # WP-E (v0.2.92): prompt_id scopes the cache key; transcript_path
+            # threads to the producer's -Transcript flag (path only). MUST
+            # MATCH the .sh sibling.
+            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1 -PromptId $PromptId -TranscriptPath $TranscriptPath
             if ($kgOut) { Set-Content -Path $KgTmp.FullName -Value $kgOut }
         } else {
-            & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+            $fallbackArgs = @($Query, '--limit', 1, '--hook-format')
+            if ($TranscriptPath) { $fallbackArgs += @('--transcript', $TranscriptPath) }
+            & $VenvPy $RlScript @fallbackArgs 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
         }
     } catch { }
 }

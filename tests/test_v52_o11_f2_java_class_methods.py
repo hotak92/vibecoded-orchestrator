@@ -397,8 +397,11 @@ public interface MyService {
     assert "logHelper" in methods
     assert "formatHelper" in methods
     assert "utilityMethod" in methods
-    # Abstract (no body) is intentionally excluded.
-    assert "mustImplement" not in methods
+    # v0.2.92 WP-5b: abstract / interface methods ARE captured now. This
+    # previously asserted their ABSENCE, which encoded the defect as an
+    # invariant: an interface whose methods list is empty makes the class row
+    # disagree with the graph's own function rows for the same methods.
+    assert "mustImplement" in methods
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +524,7 @@ def test_no_unconditional_method_finditer_in_java_class_loop() -> None:
     java_func_body = src[java_func_anchor_pos:java_func_end_pos]
 
     # Sanity: the body must contain the per-class loop header.
-    assert "for cname, start_line in class_info.items():" in java_func_body, (
+    assert "for cname, start_line, _class_end_line in class_decls:" in java_func_body, (
         "Java per-class loop header not found in `_analyze_java_file` body — "
         "file shape has changed unexpectedly."
     )

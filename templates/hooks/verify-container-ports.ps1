@@ -19,32 +19,69 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Verbose: $env:VCT_PORT_WATCHDOG_VERBOSE = "1"
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+. "$PSScriptRoot/_lib/compose-invocation.ps1"
 
 if ($env:VCT_SKIP_PORT_WATCHDOG -eq "1") { return }
 
-# Engine selection.
-$runtime = $env:VCT_CONTAINER_RUNTIME
-if (-not $runtime) {
-    if (Get-Command podman -ErrorAction SilentlyContinue) {
-        $runtime = "podman"
-    } elseif (Get-Command docker -ErrorAction SilentlyContinue) {
-        $runtime = "docker"
-    } else {
-        return
-    }
+# Container runtime + compose: ONE home — `python -m vco_lib.containers resolve`
+# (v0.2.92 PLAN-EXTENSION §3.5 / R13). This hook used to mirror the
+# podman/docker + compose-form detection inline (as did two sibling hooks,
+# install.py and the launcher), and the four copies had drifted in their
+# compose preference order. Class A of the A>B>C rule: one Python
+# implementation, called via a ~50 ms subprocess on this session-start path.
+# Loud-fail: if the resolver cannot run at all (no interpreter, broken
+# install), say so on stderr and skip — never fall back to an inline copy.
+$LibDir = Join-Path $PSScriptRoot "_lib"
+$FindPy = Join-Path $LibDir "find-python.ps1"
+if (Test-Path $FindPy) { . $FindPy }
+$RunPy = $PY
+$VenvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+if (Test-Path $VenvLib) {
+    . $VenvLib
+    try {
+        $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+        if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) { $RunPy = $VcoVenvPython }
+    } catch { }
 }
-if (-not (Get-Command $runtime -ErrorAction SilentlyContinue)) { return }
-
-# Compose driver (`podman-compose` / `podman compose` / `docker compose`).
-if ($runtime -eq "podman") {
-    if (Get-Command podman-compose -ErrorAction SilentlyContinue) {
-        $composeArgs = @("podman-compose")
-    } else {
-        $composeArgs = @("podman", "compose")
-    }
-} else {
-    $composeArgs = @("docker", "compose")
+if (-not $RunPy) {
+    Write-Output "verify-container-ports: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
+    return
 }
+$VcoRt = $null
+$VcoRtRc = $null
+# Capture the resolver's stderr instead of discarding it (v0.2.92 MAJOR-6):
+# `2>$null` used to throw the reason away, so a crash on Windows printed
+# "resolve failed (rc=N)" with nothing to act on while the .sh sibling
+# printed the stderr tail.
+$VcoRtErr = Join-Path ([System.IO.Path]::GetTempPath()) "vco-containers-resolve.$PID.err"
+try {
+    $VcoRtJson = & $RunPy -m vco_lib.containers resolve --json 2>$VcoRtErr
+    $VcoRtRc = $LASTEXITCODE
+    if ($VcoRtRc -in 0, 3, 4) { $VcoRt = ($VcoRtJson | Out-String) | ConvertFrom-Json }
+} catch { $VcoRt = $null }
+if (-not $VcoRt) {
+    $VcoRtWhy = ""
+    if (Test-Path $VcoRtErr) { $VcoRtWhy = ((Get-Content $VcoRtErr -Tail 3) -join " ").Trim() }
+    Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
+    Write-Output "verify-container-ports: vco_lib.containers resolve failed (rc=$VcoRtRc): $VcoRtWhy; skipping"
+    return
+}
+Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
+# v0.2.92 BLOCKER-4 + MAJOR-6: the resolver REFUSES a pinned-but-unusable
+# runtime (podman and docker have per-runtime named volumes, so driving the
+# one the user did not pin brings the stack up EMPTY) and hands back the
+# refusal as its reason. Report it on STDOUT, not stderr: a SessionStart
+# hook's stderr is not surfaced to the user when the hook exits 0 - only
+# stdout is injected as session context, and an unread report is not a report.
+if ($VcoRt.state -ne "resolved") {
+    # Probe-only watchdog: quiet on a plain "no runtime" host (ensure-containers
+    # already said it), but a REFUSED PIN is a user action, so it is reported.
+    if ($VcoRt.requested) { Write-Output "verify-container-ports: $($VcoRt.reason); skipping" }
+    return
+}
+$runtime = $VcoRt.runtime
+# Compose driver as an argv array.
+$composeArgs = if ($VcoRt.compose) { @($VcoRt.compose) } else { @($runtime, "compose") }
 
 # Container | host_port | probe_kind | probe_endpoint
 #
@@ -199,7 +236,14 @@ foreach ($z in $zombies) {
             if ($composeDir) {
                 Push-Location $composeDir
                 try {
-                    & $composeArgs[0] $composeArgs[1..($composeArgs.Length - 1)] up -d $service *>$null
+                    # v0.2.92: `$composeArgs[1..($composeArgs.Length - 1)]` is
+                    # the range `1..0` for a ONE-token compose command
+                    # (standalone `podman-compose`), which PowerShell evaluates
+                    # DESCENDING as @(1, 0) — invoking `podman-compose
+                    # podman-compose up -d <svc>`. Routed through the shared
+                    # splitter so all four hook sites share one correct rule.
+                    $composeInvocation = Split-VcoComposeCommand -ComposeCmd ($composeArgs -join ' ')
+                    & $composeInvocation.Head @($composeInvocation.Rest) up -d $service *>$null
                     if ($LASTEXITCODE -ne 0) {
                         Write-Output "     ! $($composeArgs -join ' ') up -d $service failed; manual: cd $composeDir; $($composeArgs -join ' ') up -d $service"
                     }

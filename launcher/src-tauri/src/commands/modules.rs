@@ -4016,13 +4016,20 @@ mod tests {
     }
 
     /// Acquire the catalog-test mutex AND redirect `VCT_STATE_DIR` to a
-    /// fresh tempdir. Returns the lock guard + tempdir; the caller drops
-    /// both at end-of-test to clean up.
+    /// fresh tempdir, with `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` unset for
+    /// the duration.
+    ///
+    /// v0.2.92: this used to return the two PRIOR env values for the body to
+    /// hand back to a `restore_env(...)` call on its LAST LINE — so any test
+    /// that failed an assertion left both vars pointing at its own tempdir
+    /// (and, for `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH`, unset) for every
+    /// test that ran after it. `StateDirGuard` restores from `Drop`, which
+    /// an assertion failure cannot skip. `restore_env` is gone, along with
+    /// all 26 of its call sites; the guard must simply be BOUND
+    /// (`let (_lock, tmp) = ...`) for the redirect to last the body.
     fn isolate_state() -> (
         std::sync::MutexGuard<'static, ()>,
-        tempfile::TempDir,
-        Option<String>,
-        Option<String>,
+        vct_launcher_core::test_env::StateDirGuard,
     ) {
         // Poison-tolerant lock acquisition: if a prior test panicked
         // mid-test, the lock is poisoned but the data inside (unit
@@ -4030,23 +4037,12 @@ mod tests {
         let lock = CATALOG_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev_state = std::env::var("VCT_STATE_DIR").ok();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
-        let prev_dev = std::env::var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH").ok();
-        std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
-        (lock, tmp, prev_state, prev_dev)
-    }
-
-    fn restore_env(prev_state: Option<String>, prev_dev: Option<String>) {
-        match prev_state {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
-        match prev_dev {
-            Some(v) => std::env::set_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH", v),
-            None => std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH"),
-        }
+        // CATALOG_TEST_LOCK is always taken BEFORE the workspace
+        // GLOBAL_ENV_MUTEX (inside the guard) and never the other way round.
+        let state = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH", None),
+        ]);
+        (lock, state)
     }
 
     /// Seed a project + an installed module_install row so the catalog's
@@ -4079,7 +4075,7 @@ mod tests {
     /// 4 builtin entries. No paid modules surface.
     #[test]
     fn list_module_catalog_returns_only_builtins_when_l0_empty() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let response = list_module_catalog_impl_with_l0(&db, ok_envelope(Vec::new()));
 
@@ -4101,14 +4097,13 @@ mod tests {
             other => panic!("expected Ok status, got {:?}", other),
         }
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 2: L0 returns RL with version=0.2.7, no install row →
     /// kind=available, version=0.2.7.
     #[test]
     fn list_module_catalog_renders_l0_module_as_available_when_uninstalled() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let response = list_module_catalog_impl_with_l0(
             &db,
@@ -4132,13 +4127,12 @@ mod tests {
             rl.manifest_source,
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 3: admin tier + L0 paid module → is_licensed=true (L10 regression).
     #[test]
     fn list_module_catalog_admin_tier_paid_module_is_licensed() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         db.set_tier_cache("admin", &serde_json::json!({}), None)
             .expect("set admin tier");
@@ -4161,14 +4155,13 @@ mod tests {
              access to (L2/L10 regression guard)"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 4: free tier + L0 paid module → is_licensed=false → button
     /// reads "Activate license" on the renderer side.
     #[test]
     fn list_module_catalog_free_tier_paid_module_is_not_licensed() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         db.set_tier_cache("free", &serde_json::json!({}), None)
             .expect("set free tier");
@@ -4191,13 +4184,12 @@ mod tests {
         );
         assert!(rl.license_required, "L0 says license_required=true");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 5: installed v0.2.7, L0 v0.2.8 → kind=update_available.
     #[test]
     fn list_module_catalog_renders_update_available_when_l0_newer_than_installed() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
 
@@ -4218,13 +4210,12 @@ mod tests {
              reads it from the install row and compares to L0's latest"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 6: installed v0.2.7, L0 v0.2.7 → kind=installed.
     #[test]
     fn list_module_catalog_renders_installed_when_versions_match() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
 
@@ -4241,14 +4232,13 @@ mod tests {
         assert_eq!(rl.kind, "installed", "versions match → installed");
         assert_eq!(rl.version, "0.2.7");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 7: install row with status='broken' → kind=broken (reconciler
     /// already flipped the row; catalog must reflect it).
     #[test]
     fn list_module_catalog_renders_broken_when_status_is_broken() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Broken);
 
@@ -4269,14 +4259,13 @@ mod tests {
              CTA"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 8: L0 unreachable with no cache → l0_status=Unavailable, only
     /// builtins in the modules list, no panic.
     #[test]
     fn list_module_catalog_handles_l0_unavailable_with_no_cache() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let response = list_module_catalog_impl_with_l0(
             &db,
@@ -4296,7 +4285,6 @@ mod tests {
         // No paid modules.
         assert!(!ids.contains(&"vct-rl-reranker"));
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 9: L0 unreachable with stale cache present → the client
@@ -4313,7 +4301,7 @@ mod tests {
     /// module_catalog_client.rs's own tests.
     #[test]
     fn list_module_catalog_handles_l0_unavailable_with_stale_cache() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         // Simulate `cached_module_catalog` returning Ok with a stale
         // envelope (the client layer would have already classified the
@@ -4337,14 +4325,13 @@ mod tests {
             .expect("stale cache contents must still render");
         assert_eq!(rl.version, "0.2.6");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 10: installed row for a module NOT in L0 → render as
     /// kind=installed + catalog_warning explaining "no longer available".
     #[test]
     fn list_module_catalog_includes_uninstalled_legacy_module_with_warning() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         // Install a hypothetical legacy module that L0 no longer lists.
         let _ = seed_install(&db, "vct-legacy", "0.1.0", ModuleStatus::Installed);
@@ -4372,14 +4359,13 @@ mod tests {
             legacy.catalog_warning
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 11: `resolve_install_metadata` reads from the L0 cache and
     /// returns the install slice.
     #[test]
     fn resolve_install_metadata_returns_l0_slice() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         // Seed the catalog cache the way `cached_module_catalog` would.
         let envelope = L0CatalogResponse {
@@ -4403,13 +4389,12 @@ mod tests {
         let missing = resolve_install_metadata(&db, "vct-not-in-l0");
         assert!(missing.is_err(), "unknown module must Err");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 12: `find_installed_manifest` reads `~/.vct/modules/<id>/`.
     #[test]
     fn find_installed_manifest_reads_on_disk_path() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
         // Place a minimal valid manifest at the expected path.
         let module_dir = tmp.path().join("modules").join("vct-test-installed");
@@ -4438,14 +4423,13 @@ mod tests {
         assert_eq!(manifest.version, "0.3.0");
         assert!(path.ends_with("vct-module.json"));
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 13: `find_installed_manifest` returns Err when the on-disk
     /// file is missing.
     #[test]
     fn find_installed_manifest_returns_err_when_missing() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
         let res = find_installed_manifest(&db, "vct-never-installed");
         assert!(
@@ -4460,7 +4444,6 @@ mod tests {
             msg
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Plant a synthetic install-root under `<tmp>/install_root/` that
@@ -4485,7 +4468,7 @@ mod tests {
     /// the env var isn't set.
     #[test]
     fn dev_affordance_hint_emitted_when_paid_modules_exists_without_env_var() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
         // Create the dev paid-modules dir under a synthetic install_root.
         let _install_root = plant_install_root(tmp.path(), &db);
@@ -4501,13 +4484,12 @@ mod tests {
         assert_eq!(hint.env_var_name, "VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
         assert!(hint.paid_modules_path.ends_with("paid-modules"));
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 15: dev affordance hint is suppressed after dismissal.
     #[test]
     fn dev_affordance_hint_suppressed_after_dismissal() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
         let _install_root = plant_install_root(tmp.path(), &db);
 
@@ -4521,14 +4503,13 @@ mod tests {
             "after dismissal the hint must NOT re-fire on subsequent catalog reads"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 16: dev paid-modules scan only runs when env var is set, and
     /// merges with L0 results (dev WINS for same module_id).
     #[test]
     fn dev_paid_modules_scan_only_runs_with_env_var_set() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // Plant a synthetic install-root with a dev manifest.
@@ -4589,7 +4570,6 @@ mod tests {
              record for the same module_id — explicit opt-in semantics"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     // ─── v0.2.33 B2: cold-start install resolver integration ────────────
@@ -4612,7 +4592,7 @@ mod tests {
     /// hand.
     #[test]
     fn cold_start_install_flow_uses_l0_synth_when_no_installed_or_dev_manifest() {
-        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, _tmp) = isolate_state();
         let db = open_db();
 
         // Seed the catalog cache the way `cached_module_catalog` would
@@ -4676,7 +4656,6 @@ mod tests {
         // post-incident triage can identify L0-synth installs.
         assert_eq!(source.as_audit_str(), "l0-synth");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 6 (re-install preference, v0.2.45 V45-C amended):
@@ -4695,7 +4674,7 @@ mod tests {
     /// by `test_v0245_l0_wins_when_strictly_newer` below.
     #[test]
     fn cold_start_install_prefers_installed_manifest_when_l0_not_newer() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // Seed L0 cache with v0.2.7 (SAME as what's on disk → on-disk wins).
@@ -4772,7 +4751,6 @@ mod tests {
              must not synthesize when nothing has changed"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Test 7 (dev preference): when the on-disk manifest is absent BUT
@@ -4783,7 +4761,7 @@ mod tests {
     /// specifically.
     #[test]
     fn cold_start_install_prefers_dev_paid_modules_when_env_var_set() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // Seed L0 cache (would be phase 3 if dev didn't win).
@@ -4879,7 +4857,6 @@ mod tests {
             "dev manifest version must win over L0 when the env var is set"
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     // ─── L9 manifest-parse-error JSONL logger (v0.2.33, Agent E) ──────
@@ -5008,7 +4985,7 @@ mod tests {
     /// l0_is_newer = false → phase 1 wins.
     #[test]
     fn test_v0245_on_disk_wins_when_l0_unavailable() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // Plant ONLY the on-disk manifest — leave catalog cache empty.
@@ -5031,14 +5008,13 @@ mod tests {
         }
         assert_eq!(manifest.version, "0.2.7");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Case 2: on-disk v0.2.7, L0 v0.2.7 (identical) → l0_is_newer = false →
     /// phase 1 wins. Re-install of the same version must not synthesize.
     #[test]
     fn test_v0245_on_disk_wins_when_versions_equal() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // Both versions match.
@@ -5066,7 +5042,6 @@ mod tests {
         }
         assert_eq!(manifest.version, "0.2.7");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Case 3 (THE bug fix): on-disk v0.2.7, L0 v0.2.8 → l0_is_newer =
@@ -5076,7 +5051,7 @@ mod tests {
     /// Retry, install should pull 0.2.8 not 0.2.7.
     #[test]
     fn test_v0245_l0_wins_when_strictly_newer() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         plant_installed_manifest(tmp.path(), "0.2.7");
@@ -5108,7 +5083,6 @@ mod tests {
         );
         assert_eq!(source.as_audit_str(), "l0-synth");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Plant an on-disk extracted manifest with an explicit
@@ -5172,7 +5146,7 @@ mod tests {
     /// that wedges at status='installing'. With the fix it is GLOBAL.
     #[test]
     fn update_to_newer_version_preserves_global_scope_from_on_disk() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // On-disk extract: GLOBAL-scope module at 0.2.10.
@@ -5223,7 +5197,6 @@ mod tests {
              global row, not a schema-incoherent per-project row",
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Inverse guard for the backstop: an already-installed PER-PROJECT
@@ -5233,7 +5206,7 @@ mod tests {
     /// must not let L0 promote a per-project module to global either.
     #[test]
     fn update_to_newer_version_preserves_per_project_scope_from_on_disk() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // On-disk extract: PER-PROJECT module at 0.2.10.
@@ -5264,7 +5237,6 @@ mod tests {
              global must NOT promote an already-per-project module",
         );
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Case 4: on-disk v0.2.8, L0 v0.2.7 (catalog stale relative to disk)
@@ -5273,7 +5245,7 @@ mod tests {
     /// L0 hasn't been refreshed yet. On-disk reflects truth.
     #[test]
     fn test_v0245_on_disk_wins_when_l0_older() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         plant_installed_manifest(tmp.path(), "0.2.8");
@@ -5301,7 +5273,6 @@ mod tests {
         }
         assert_eq!(manifest.version, "0.2.8");
 
-        restore_env(prev_state, prev_dev);
     }
 
     /// Case 5 (safety net): on-disk version unparseable ("abc"), L0 v0.2.8
@@ -5310,7 +5281,7 @@ mod tests {
     /// compare versions; honour the user's last-installed manifest.
     #[test]
     fn test_v0245_on_disk_wins_when_parse_fails() {
-        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let (_lock, tmp) = isolate_state();
         let db = open_db();
 
         // Plant an on-disk manifest with an unparseable version string.
@@ -5343,7 +5314,6 @@ mod tests {
         }
         assert_eq!(manifest.version, "abc");
 
-        restore_env(prev_state, prev_dev);
     }
 
     // ─── parse_semver unit tests ─────────────────────────────────────────
@@ -5493,11 +5463,9 @@ mod tests {
     /// tile renderer's expectations).
     #[test]
     fn test_v0249_builtin_catalog_entries_are_per_project_scope() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let _tmp = vct_launcher_core::test_env::state_dir_guard();
         let db = Db::open().expect("open db");
         let entries = builtin_catalog_entries(&db);
-        std::env::remove_var("VCT_STATE_DIR");
         assert!(!entries.is_empty(), "builtin catalog must be non-empty");
         for entry in &entries {
             assert_eq!(

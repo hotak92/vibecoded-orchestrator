@@ -114,10 +114,12 @@ def stage_pending(
             "ctx": ctx,
         }
         path = _pending_path(session_id, task_id, project_root)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w") as fh:
-            json.dump(payload, fh)
-        os.replace(tmp, path)  # atomic
+        # v0.2.92: one home for tmp+os.replace. `vco_lib` is a hard
+        # dependency of every MCP process (server.py imports it at
+        # startup), so this import is loud, not a soft degrade.
+        from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
+
+        atomic_write_json(path, payload, indent=None, fsync=False)
         return path
     except Exception as exc:  # noqa: BLE001
         logger.debug("stage_pending: write failed for %s (%s)", task_id[:8], exc)

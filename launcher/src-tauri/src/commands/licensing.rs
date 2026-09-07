@@ -969,7 +969,14 @@ pub async fn module_license_deactivate(
         .as_object()
         .cloned()
         .unwrap_or_default();
-    let removed = map.remove(&module_id).is_some();
+    // `shift_remove`, never `remove`: under `preserve_order` (v0.2.92)
+    // `Map::remove` is `swap_remove`. `module_licenses` is machine data in
+    // `launcher.db` rather than a user-authored file, so no order contract is
+    // at stake — but `shift_remove` is exactly the pre-v0.2.92 `BTreeMap`
+    // behaviour, so using it here means the feature flip changed the bytes of
+    // this blob in no way at all. Uniformity is also what keeps the rule
+    // ("never bare `remove` on a `serde_json::Map`") simple enough to hold.
+    let removed = map.shift_remove(&module_id).is_some();
     let new_value = serde_json::Value::Object(map);
     db.set_tier_cache(&row.orchestrator_tier, &new_value, row.last_error.as_deref())?;
     db.audit(
@@ -1551,7 +1558,7 @@ pub async fn clear_module_license_key(
             row.module_licenses
                 .as_object_mut()
                 .expect("module_licenses is always a JSON object")
-                .remove(&mid);
+                .shift_remove(&mid);
         })?;
     }
     // If we cleared the orchestrator slot, downgrade the cache to 'free'
@@ -1807,7 +1814,7 @@ pub async fn validate_module_license(
                             );
                             map.insert(mid.clone(), serde_json::Value::Object(entry));
                         } else {
-                            map.remove(&mid);
+                            map.shift_remove(&mid);
                         }
                     })?;
                 }
@@ -1841,7 +1848,7 @@ pub async fn validate_module_license(
                         row.module_licenses
                             .as_object_mut()
                             .expect("module_licenses is always a JSON object")
-                            .remove(&mid);
+                            .shift_remove(&mid);
                     })?;
                 }
                 Ok(ModuleLicenseValidationResult {
@@ -2606,7 +2613,7 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap_or_default();
-        let removed = map.remove("vct-rl-reranker").is_some();
+        let removed = map.shift_remove("vct-rl-reranker").is_some();
         assert!(removed, "precondition: entry was present");
         let new_value = serde_json::Value::Object(map);
         db.set_tier_cache(&row.orchestrator_tier, &new_value, row.last_error.as_deref())
@@ -2704,7 +2711,7 @@ mod tests {
         // Reproduce the overlay-removal step of clear_module_license_key.
         let row = db.get_tier_cache().unwrap();
         let mut map = row.module_licenses.as_object().cloned().unwrap_or_default();
-        let removed = map.remove("vct-rl-reranker").is_some();
+        let removed = map.shift_remove("vct-rl-reranker").is_some();
         assert!(removed);
         db.set_tier_cache(
             &row.orchestrator_tier,
@@ -3332,16 +3339,21 @@ mod tests {
     static BACKFILL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Execute `f` with `VCT_STATE_DIR=path` set, restoring the previous
-    /// value (or unsetting) on exit. Holds `BACKFILL_ENV_LOCK` throughout.
+    /// value on exit. Holds `BACKFILL_ENV_LOCK` throughout, and — via the
+    /// shared `env_guard` — the workspace-wide `GLOBAL_ENV_MUTEX` too.
+    /// `BACKFILL_ENV_LOCK` is always taken first and never the other way
+    /// round, so the order is consistent.
+    ///
+    /// v0.2.92: the set/restore pair is `env_guard`, which restores from
+    /// `Drop` — an assertion failure inside `f` can no longer leave the var
+    /// pointing at this test's directory.
     fn with_vct_state_dir<F: FnOnce()>(path: &std::path::Path, f: F) {
         let _guard = BACKFILL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("VCT_STATE_DIR").ok();
-        std::env::set_var("VCT_STATE_DIR", path);
+        let _env = vct_launcher_core::test_env::env_guard(&[(
+            "VCT_STATE_DIR",
+            Some(&*path.to_string_lossy()),
+        )]);
         f();
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
     }
 
     /// V0243-3 contract T1: when license_keys is empty AND ~/.vct/license.key

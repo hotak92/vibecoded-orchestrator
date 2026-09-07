@@ -29,9 +29,12 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    add_project,
+    create_empty_launcher_db,
+)
 from vco_lib import schema_versions as sv  # noqa: E402
 from vco_lib.artifact_version_registry import (  # noqa: E402
-    ArtifactVersionRow,
     ArtifactVersionStatus,
     check_artifact_version,
     list_artifacts_for_project,
@@ -48,29 +51,20 @@ from vco_lib.artifact_version_registry import (  # noqa: E402
 
 @pytest.fixture
 def db_with_v033(tmp_path):
-    """Apply migrations 1..33 against a fresh sqlite DB."""
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE _schema_migrations ("
-        "  version INTEGER PRIMARY KEY,"
-        "  description TEXT NOT NULL,"
-        "  applied_at INTEGER NOT NULL"
-        ")"
-    )
-    migrations_dir = (
-        _REPO / "launcher" / "src-tauri" / "vct-launcher-core" / "src" / "db" / "migrations"
-    )
-    files = sorted(migrations_dir.glob("[0-9][0-9][0-9]_*.sql"))
-    for f in files:
-        conn.executescript(f.read_text(encoding="utf-8"))
+    """Apply migrations 1..33 against a fresh sqlite DB.
+
+    v0.2.92 duplication-merge (§3.4): this used to be a private copy of the
+    migration applier — and one that applied EVERY migration despite its
+    name and docstring saying 1..33. Now the shared fixture's ``up_to=33``
+    makes the name true (033 is ``artifact_schema_versions``, the table
+    under test; nothing after it is needed).
+    """
+    db_path = create_empty_launcher_db(tmp_path / "launcher.db", up_to=33)
     # Register a project so FK references work.
-    conn.execute(
-        "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at, rl_port) "
-        "VALUES ('p1', 'test', '/tmp/p1', 'base', 'p1', 1, 1, NULL)"
+    add_project(
+        db_path, project_id="p1", name="test", folder_path="/tmp/p1", slug="p1",
+        created_at=1, updated_at=1,
     )
-    conn.commit()
-    conn.close()
     return db_path
 
 

@@ -207,13 +207,15 @@ Three scopes with distinct keychain service namespaces: `PerProject { project_id
 `project_secret_refs` table records which secrets a project requires and how to resolve them (`keychain-per-project`, `keychain-shared`, `keychain-global`, `file`, `env`) — never the values. The `is_set` flag is updated by a presence check at runtime.
 
 ### Secrets Tab in Project State
-`project-state/SecretsTab.svelte` shows the secret refs for the active project, with resolution source and `is_set` status per key. Backed by `list_project_secret_refs` command.
+`project-state/SecretsTab.svelte` shows the secret refs for the active project, with resolution source per key. Backed by the `list_project_secret_refs` command.
+
+The "Set?" column is a **live two-store probe**, not the row's stored `is_set` column. That column is a snapshot the ref's writer left behind (the hub's `.env` migration registers rows with `is_set = true` and nothing revises it), so rendering it reported "set" for keys the user had since deleted and "missing" for keys that resolve from the tier-2 file store. The tab now asks `get_secret_status_v2` per ref — the same command the Preferences → Secrets panel uses — and renders the shared `badgeOf` verdict: `set` / `paused` / `set — file store` / `unknown` / `not set`. `unknown` is a distinct state on purpose: a store that could not be read is never reported as an absence. Derivation + tests: `launcher/src/lib/project-state/secret-ref-status.ts`.
 
 ### Secrets / settings Tauri commands (`commands/secrets_cmd.rs`)
 Seven commands cover the GUI keychain + module settings surface:
 - `set_secret_v2(scope, module_id, key, value)` — write a secret to the OS keychain. The plaintext value never reaches SQLite.
 - `clear_secret_v2(scope, module_id, key)` — delete a keychain entry.
-- `is_secret_set(scope, module_id, key)` — boolean presence check (no read).
+- `is_secret_set(scope, module_id, key)` — boolean presence check (no read). Answers the launcher's **permission** question — true ⇔ the OS keychain holds a value AND the per-`(secret, requester)` active flag is set — so it deliberately ignores the tier-2 file store, which that matrix does not govern. It has no in-tree caller: every launcher surface uses `get_secret_status_v2`, which returns the same `is_set` boolean *plus* the two-store `StoreReport` the GUI badges need. Kept as a stable IPC surface for module authors who want the gate alone. **Do not widen it to consult the file store** — that would silently extend a permission decision over a store the matrix has no authority over; render presence from `StoreReport` instead.
 - `get_secret_preview(scope, module_id, key)` — first 4 + last 4 chars (never the full value); used for "currently set" display.
 - `get_setting_v2(project_id, module_id, setting_key)` — read a non-secret per-(project, module) setting from `module_settings`.
 - `set_setting_v2(project_id, module_id, setting_key, value_json)` — write a non-secret setting (JSON value).

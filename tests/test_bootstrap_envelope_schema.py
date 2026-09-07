@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PY = REPO_ROOT / "install.py"
 SCHEMA_PATH = (
@@ -44,7 +46,7 @@ def _build_envelope() -> dict:
     env["VCT_BOOTSTRAP_TEST_MODE"] = "1"
     cp = subprocess.run(
         [sys.executable, str(INSTALL_PY), "--bootstrap", "--json"],
-        capture_output=True, text=True, timeout=60, env=env,
+        capture_output=True, text=True, timeout=60, env=child_env(env),
     )
     assert cp.returncode == 0, f"bootstrap exited {cp.returncode}: {cp.stderr}"
     return json.loads(cp.stdout)

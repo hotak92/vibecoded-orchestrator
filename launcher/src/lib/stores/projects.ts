@@ -18,6 +18,7 @@ import type {
   UnregisterReport,
 } from '$lib/types/launcher';
 import { toast } from '$lib/stores/toast';
+import { decideBundleToast } from '$lib/stores/bundle-summary-logic';
 import { isErrorWarning } from '$lib/warning-severity';
 
 const SELECTED_KEY = 'vct.selected_project_id';
@@ -187,25 +188,18 @@ function createProjectsStore() {
         projectId: id,
       });
 
-      // One-line summary toast: choose info/success based on whether
-      // anything actually changed (created + overwritten + always_overwritten > 0).
-      const s = result.summary;
-      const shipped = s.created + s.overwritten + s.always_overwritten;
-      if (shipped === 0 && s.preserved === 0 && s.errors_count === 0) {
+      // Decision logic lives in `bundle-summary-logic.ts` so it is unit-tested
+      // without a Tauri runtime. It must stay there: the two honesty defects it
+      // fixes (an adoption-only run reporting "already up to date", and the
+      // summary line never mentioning adoptions) both came from this being
+      // inline and therefore untested.
+      const decision = decideBundleToast(result.summary);
+      if (decision.kind === 'up-to-date') {
         toast.success('Project bundle already up to date.');
+      } else if (decision.kind === 'error') {
+        toast.error(`Bundle update finished: ${decision.line}.`);
       } else {
-        const parts: string[] = [];
-        if (s.created > 0) parts.push(`${s.created} created`);
-        if (s.overwritten > 0) parts.push(`${s.overwritten} updated`);
-        if (s.always_overwritten > 0) parts.push(`${s.always_overwritten} always-updated`);
-        if (s.preserved > 0) parts.push(`${s.preserved} user-modifications preserved`);
-        if (s.errors_count > 0) parts.push(`${s.errors_count} errors`);
-        const line = parts.length > 0 ? parts.join(', ') : 'no changes';
-        if (s.errors_count > 0) {
-          toast.error(`Bundle update finished: ${line}.`);
-        } else {
-          toast.success(`Bundle update finished: ${line}.`);
-        }
+        toast.success(`Bundle update finished: ${decision.line}.`);
       }
 
       // Stream every warning as its own toast so the user sees the

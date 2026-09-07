@@ -18,7 +18,7 @@ paths:
     project create/rename/refresh).
   * Rust ``ensure_project_env_template`` (the ``.env`` template — sibling
     surface, NOT in scope for this contract; see Out of scope below).
-  * Python ``install.py`` backfill helpers (``_backfill_kg_collection_env_in_project``
+  * Python ``install.py`` backfill helpers (removed v0.2.92 — superseded by the config-projection single writer) (``_backfill_kg_collection_env_in_project``
     and friends) that scribble missing canonical keys when ``install-bundle
     --update`` runs against an older project.
   * Per-grant-change Tauri commands that called ``write_project_env_files``
@@ -222,7 +222,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -230,6 +229,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, NotRequired, Optional, TypedDict
 
 from vco_lib.atomic import atomic_write_text
+# v0.2.92 W18 — the tri-state probe result. Imported from `weaviate_helpers`
+# because that module is `vco_lib`'s dependency-free leaf (stdlib only), which
+# is what makes it a safe home for a type every other module needs; the type
+# itself is transport-agnostic and is used HERE for a pure sqlite read.
+from vco_lib.weaviate_helpers import ProbeResult
 from vco_lib.launcher_db_reader import (
     ACTIVE_EMBEDDING_SETTING_KEY,
     ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
@@ -1167,10 +1171,56 @@ def _fetch_kg_bindings(
     return {str(r["role"]): str(r["collection_name"]) for r in cur.fetchall()}
 
 
-def _fetch_codegraph_binding_prefix(
+def _is_missing_table_error(exc: sqlite3.Error) -> bool:
+    """True when ``exc`` says a table this DB was queried for does not exist.
+
+    ONE home for the ``"no such table" in str(exc).lower()`` test that three
+    resolvers in this module used to inline (``_fetch_diagram_access_list``,
+    ``_fetch_user_secret_known_keys``, and now
+    :func:`probe_codegraph_binding_prefix`). Extracted rather than copied a
+    third time.
+
+    Why the distinction is load-bearing: a pre-migration launcher.db that has
+    never had the table is a TRUE, structural "there are no rows" — soft-fail
+    to the empty answer. Every OTHER ``sqlite3.Error`` (corrupt image, locked
+    DB, disk I/O error) means we could not read a table that may well hold
+    rows, which is a different fact and must never be reported as emptiness.
+
+    (``vco_lib/kg_binding_heal.py`` inlines the same test at 10 further sites;
+    that module is outside this package's file set — reported to the merge
+    lane rather than edited here.)
+    """
+    return "no such table" in str(exc).lower()
+
+
+#: The question :func:`probe_codegraph_binding_prefix` answers.
+_WHAT_CODEGRAPH_BINDING = (
+    "the project's project_codegraph_bindings.collection_prefix"
+)
+
+
+def probe_codegraph_binding_prefix(
     conn: sqlite3.Connection, project_id: str
-) -> Optional[str]:
-    """Return the project's ``project_codegraph_bindings.collection_prefix``.
+) -> "ProbeResult[Optional[str]]":
+    """Tri-state read of ``project_codegraph_bindings.collection_prefix``.
+
+    v0.2.92 W18 — the ONE home for this question. Returns:
+
+        * ``present(prefix)`` — a binding row names a non-empty prefix.
+        * ``absent(None)``    — the read SUCCEEDED and no binding names a
+          prefix: the table does not exist yet (pre-migration DB), there is no
+          row for this project, the column is not a string, or the prefix is
+          empty/whitespace. All four are true statements about a readable DB.
+        * ``unknown(reason)`` — the DB could NOT be read (corrupt image,
+          locked, I/O error). **Not** absence.
+
+    The distinction matters because the ABSENT answer legitimately routes the
+    caller to a NAME-DERIVED placeholder prefix (correct: no analysis has run,
+    so any placeholder is fine and it matches what the hub derives). Applying
+    that same fallback to a read we could not perform is how a projection
+    silently overwrites a good, binding-derived ``CODE_GRAPH_PROJECT`` with a
+    guess — and a wrong code-graph prefix makes every CLI and hook query a
+    collection that does not exist, silently returning nothing.
 
     v0.2.72 R2 (F5 residual): the CODE_GRAPH_PROJECT env value must derive
     from the SAME source the hub resolver uses, or the CLI/hooks (env
@@ -1190,9 +1240,7 @@ def _fetch_codegraph_binding_prefix(
     ``enabled`` filter — a disabled binding still names the prefix the
     analyzer last wrote to.
 
-    Soft-fail: missing table (fresh/partial launcher.db), no row, empty /
-    whitespace prefix, or any SQLite error → ``None`` (caller falls back
-    to the name-derived prefix). Never raises.
+    Never raises.
     """
     try:
         cur = conn.cursor()
@@ -1202,15 +1250,47 @@ def _fetch_codegraph_binding_prefix(
             (project_id,),
         )
         row = cur.fetchone()
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        if _is_missing_table_error(exc):
+            # Pre-migration / partial launcher.db: the table has never
+            # existed, so no binding can name a prefix. A true absence.
+            return ProbeResult.absent(what=_WHAT_CODEGRAPH_BINDING)
+        return ProbeResult.unknown(
+            f"{type(exc).__name__}: {exc}", what=_WHAT_CODEGRAPH_BINDING,
+        )
     if row is None:
-        return None
+        return ProbeResult.absent(what=_WHAT_CODEGRAPH_BINDING)
     raw = row["collection_prefix"]
     if not isinstance(raw, str):
-        return None
+        return ProbeResult.absent(what=_WHAT_CODEGRAPH_BINDING)
     stripped = raw.strip()
-    return stripped if stripped else None
+    if not stripped:
+        return ProbeResult.absent(what=_WHAT_CODEGRAPH_BINDING)
+    return ProbeResult.present(stripped, what=_WHAT_CODEGRAPH_BINDING)
+
+
+def _fetch_codegraph_binding_prefix(
+    conn: sqlite3.Connection, project_id: str
+) -> Optional[str]:
+    """Scalar view of :func:`probe_codegraph_binding_prefix`.
+
+    ``str`` when a binding names a prefix, ``None`` when the read SUCCEEDED
+    and none does.
+
+    Raises:
+        vco_lib.weaviate_helpers.ProbeUnavailable: the read did not succeed.
+            v0.2.92 W18 — this used to return ``None`` on any ``sqlite3.Error``
+            too, so "no binding" and "could not read the DB" arrived at the
+            caller as the same value and both fell through to a name-derived
+            guess.
+
+    Kept as a separate function for ``vco_lib.project_identity.resolve_snapshot``
+    (outside this package's file set), which imports it by this name. NOTE for
+    whoever owns that module: it wraps this call in ``except Exception:
+    code_prefix = None``, so the raise is swallowed there and the conflation
+    survives at THAT site — the migration recipe is in the WP-2 report.
+    """
+    return probe_codegraph_binding_prefix(conn, project_id).require()
 
 
 # ─── Shared-KG default resolver (v0.2.40 W40-C) ──────────────────────────
@@ -1451,7 +1531,9 @@ def _fetch_diagram_access_list(
             (project_id,),
         )
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
+        # v0.2.92 W18: routed through the ONE home. Behaviour unchanged —
+        # missing table is a true "no grants"; every other error still raises.
+        if _is_missing_table_error(exc):
             return []
         raise
     # Use a set for dedup, sort for deterministic output (matches the
@@ -1529,7 +1611,8 @@ def _fetch_user_secret_known_keys(
             ),
         )
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower():
+        # v0.2.92 W18: routed through the ONE home. Behaviour unchanged.
+        if _is_missing_table_error(exc):
             return []
         raise
     rows = cur.fetchall()
@@ -2022,7 +2105,27 @@ def project_env_from_db(
         # (leading-digit / all-symbol), where any placeholder prefix is fine
         # (no binding exists yet). Matches the Rust `resolve_code_graph_project`
         # + the standalone `_apply_standalone_env` writer.
-        _cg_binding_prefix = _fetch_codegraph_binding_prefix(conn, project_id)
+        #
+        # v0.2.92 W18 — the three-way branch. The name-derived fallback below
+        # is CORRECT for a project whose binding row does not exist yet, and
+        # WRONG for a project whose binding row we simply failed to read: this
+        # function's output is written to `.claude/settings.json` env and
+        # `.claude/env`, so guessing here persists a CODE_GRAPH_PROJECT that
+        # can name a collection nothing ever wrote to. Refuse instead — the
+        # module's declared vocabulary for "the launcher DB could not be read"
+        # is `DbUnreachable`, and its callers already surface it
+        # (`env_template` exits 3 with `db_unreachable`; install.py records
+        # the action and leaves the existing env surfaces untouched).
+        _cg_binding = probe_codegraph_binding_prefix(conn, project_id)
+        if _cg_binding.is_unknown():
+            raise DbUnreachable(
+                "could not read "
+                "project_codegraph_bindings.collection_prefix for project "
+                f"{project_id}: {_cg_binding.reason}. Refusing to project a "
+                "name-derived CODE_GRAPH_PROJECT over a binding that may "
+                "exist — re-run once the launcher DB is readable."
+            )
+        _cg_binding_prefix = _cg_binding.require()
         if _cg_binding_prefix:
             code_graph_project = _cg_binding_prefix
         else:

@@ -19,7 +19,7 @@ Qwen3 Embedding is Alibaba's text-embedding family built on the dense Qwen3 foun
 | `qwen3-embedding:4b` | 4B | up to 2560 | 2.5 GB | 40K |
 | `qwen3-embedding:8b` (latest alias) | 8B | up to 4096 | 4.7 GB | 40K |
 
-Qwen3 Embedding supports user-defined output dimensions per request (Matryoshka-style truncation) — the orchestrator pins to 1024 dims to match the legacy Snowflake schema. The 0.6b variant requires `num_ctx=8192` to surface its full embedding quality; the orchestrator's wrapper sets this explicitly because Ollama's default is too small.
+Qwen3 Embedding supports user-defined output dimensions per request (Matryoshka-style truncation) — the orchestrator pins to 1024 dims to match the legacy Snowflake schema. The 0.6b variant needs an explicitly-set `num_ctx` to surface its full embedding quality; the orchestrator resolves it per model (10 240 here) from the same table that sizes chunks, so the requested window and the produced chunks cannot drift apart. Ollama's default is far smaller, and leaving it unset silently truncates.
 
 ## Where the orchestrator uses it
 

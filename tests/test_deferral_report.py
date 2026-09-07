@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -290,8 +291,8 @@ class TestMarkdownFormat(unittest.TestCase):
         content = (self.folder / _DEFERRED_REL).read_text(encoding="utf-8")
         lines = content.splitlines()
         self.assertEqual(lines[0], "---")
-        self.assertTrue(any(l.startswith("title:") for l in lines[:10]))
-        self.assertTrue(any(l.startswith("condition_ids:") for l in lines[:10]))
+        self.assertTrue(any(line.startswith("title:") for line in lines[:10]))
+        self.assertTrue(any(line.startswith("condition_ids:") for line in lines[:10]))
 
     def test_output_has_section_per_entry(self) -> None:
         report = DeferralReport()
@@ -692,7 +693,7 @@ class TestHighFixesIntegration(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent.parent
         result = _sp.run(
             [sys.executable, str(repo_root / "install.py"), "--help"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, env=child_env(),
         )
         self.assertIn("--project-folder", result.stdout)
 

@@ -53,15 +53,20 @@ use vct_launcher_core::process::CommandExt as _;
 use crate::commands::git_user_editable_merge::{
     write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
 };
+// v0.2.92 WP-13: the ONE git runner + the ONE branch resolver (see
+// `commands::git_cmd`). `run_git` / `run_git_combined` are imported under
+// their old names so the ~16 call sites in this file did not churn during
+// the extraction.
+use crate::commands::git_cmd::{self, run_git, run_git_combined};
+use vct_launcher_core::check_state::CheckState;
 
 /// Refresh cadence for the daily background check. The user said "once a
 /// day" — we run a check every 24h after the previous successful check
 /// completed. Exposed as a const so tests can override.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Per-call timeout. `git ls-remote` over slow links can stall; cap it
-/// so the daily task doesn't pile up.
-const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+// The per-call git timeout moved with the runners to
+// `commands::git_cmd::GIT_TIMEOUT` (v0.2.92 WP-13) — one runner, one cap.
 
 // ---------------------------------------------------------------------------
 // Canonical upstream remote (Design B, 2026-05-19)
@@ -198,7 +203,15 @@ pub const USER_OWNED_EXTERNAL: &[&str] = &["~/.vct"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateStatus {
-    /// True iff `remote_sha` != `current_sha` AND `commit_count > 0`.
+    /// True iff `remote_sha` != `current_sha` AND `commit_count > 0` — and
+    /// ONLY when [`Self::remote_check`] is `Ok`.
+    ///
+    /// v0.2.92 WP-13: this field used to be computed unconditionally from a
+    /// `commit_count` that `.unwrap_or(0)` had laundered a git `fatal:` into,
+    /// so `false` meant both "you are current" and "I could not tell". It is
+    /// now only meaningful alongside `remote_check`; when that is `Unknown`
+    /// this stays `false` AND the surfaces must render "couldn't check"
+    /// rather than "up to date". Do not read one without the other.
     pub available: bool,
     /// Local HEAD SHA (full 40 chars) or null if not in a git repo.
     pub current_sha: Option<String>,
@@ -207,10 +220,29 @@ pub struct UpdateStatus {
     /// Number of commits remote is ahead of local. Computed via
     /// `git rev-list --count HEAD..vco_upstream/<branch>` — requires a fetch
     /// to be accurate. We do a `git fetch --quiet` before measuring.
+    ///
+    /// `0` when `remote_check` is not `Ok`; read it only when it is.
     pub commit_count: u32,
-    /// Branch we're tracking. Defaults to whatever the launcher repo's
-    /// HEAD currently points to.
+    /// Branch we compare against. Normalised by `git_cmd::resolve_branch`,
+    /// so it is never the literal `"HEAD"` — when HEAD is detached this is
+    /// the fallback (`main`) and [`Self::head_detached`] is `true`.
     pub branch: String,
+    /// NEW v0.2.92 (WP-13): `true` when the launcher's clone has a detached
+    /// HEAD. Previously undetectable from this struct: `branch` was either
+    /// the literal `"HEAD"` (self-update surface, which then built a ref
+    /// that does not exist) or silently normalised to `main` (installer
+    /// surface, which worked but could not say why). Surfaces render it and
+    /// offer `reattach_orchestrator_branch`.
+    pub head_detached: bool,
+    /// NEW v0.2.92 (WP-13): what the remote-currency probe actually
+    /// established. `Unknown` ⇒ `available` / `commit_count` are NOT a
+    /// verdict; render "couldn't check".
+    pub remote_check: CheckState,
+    /// NEW v0.2.92 (WP-13): what the "latest source release" probe
+    /// established. Separate from `remote_check` because they fail
+    /// independently — a working fetch with an unreachable tag listing is a
+    /// real state, and collapsing the two would hide it.
+    pub latest_source_release_check: CheckState,
     /// ISO-8601 timestamp of the last successful check. Persisted in
     /// `~/.vct/launcher-update-state.json`.
     pub last_checked: Option<DateTime<Utc>>,
@@ -221,6 +253,9 @@ pub struct UpdateStatus {
 }
 
 impl UpdateStatus {
+    /// The check could not run at all (no git, not a checkout, fetch failed,
+    /// …). Note `remote_check` is `Unknown` here, not a bare `available:
+    /// false` — the `error` string alone was easy for a consumer to skip.
     fn unavailable(reason: &str, last_checked: Option<DateTime<Utc>>) -> Self {
         Self {
             available: false,
@@ -228,6 +263,9 @@ impl UpdateStatus {
             remote_sha: None,
             commit_count: 0,
             branch: String::new(),
+            head_detached: false,
+            remote_check: CheckState::unknown(reason),
+            latest_source_release_check: CheckState::unknown(reason),
             last_checked,
             error: Some(reason.to_string()),
         }
@@ -243,8 +281,28 @@ struct UpdateState {
     last_known_remote_sha: Option<String>,
     /// Cached so the tray can show "N commits behind" without re-running
     /// the check on every startup.
+    ///
+    /// v0.2.92 WP-13: written ONLY when the probe actually determined a
+    /// count. Pre-fix a laundered `0` was persisted on every failed check,
+    /// which is why the field incident's state file showed a correct, current
+    /// `last_known_remote_sha` next to `last_known_commit_count: 0` — the
+    /// signature of the bug, misread at the time as a network problem.
     last_known_commit_count: Option<u32>,
+    /// NEW v0.2.92 (WP-13): the reason the last check could NOT determine
+    /// currency, or `None` when it could. Persisted so the tray label at the
+    /// next boot — which renders from cache, before any network call — says
+    /// "couldn't check" instead of inheriting a stale-but-cheerful verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_check_unknown_error: Option<String>,
     /// User toggle from preferences; defaults to true.
+    ///
+    /// `skip_serializing_if` (v0.2.92, WFT C2): every READER already
+    /// defaults this to ON via `unwrap_or(true)`, so `null` on disk was
+    /// always harmless — but a human reading the state file during an
+    /// incident sees a tri-state and reasonably concludes the auto-check is
+    /// disabled. Omitting the key when untouched removes that false lead.
+    /// Behaviour is unchanged in both directions.
+    #[serde(skip_serializing_if = "Option::is_none")]
     auto_check_enabled: Option<bool>,
 }
 
@@ -261,6 +319,14 @@ fn load_state() -> UpdateState {
     if !path.exists() {
         return UpdateState::default();
     }
+    // v0.2.92 WP-13: this `.unwrap_or_default()` is CORRECT and stays. An
+    // unreadable or corrupt state file yields `UpdateState::default()`, whose
+    // `last_known_commit_count: None` + `last_check_unknown_error: None` is
+    // rendered by `get_cached_update_status` as
+    // `Unknown("no update check has completed yet")` — i.e. the default is
+    // already the honest answer, not a fabricated healthy one. (Contrast the
+    // three `unwrap_or` sites this release removed, whose defaults were `0`
+    // and `""` — values that MEAN "current" and "nothing changed".)
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -340,58 +406,13 @@ async fn git_available() -> bool {
         .unwrap_or(false)
 }
 
-async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = TokioCommand::new("git").silent()
-        .args(args)
-        .current_dir(repo)
-        .output();
-    let output = tokio::time::timeout(GIT_TIMEOUT, fut)
-        .await
-        .map_err(|_| format!("git {} timed out", args.join(" ")))?
-        .map_err(|e| format!("git {} failed: {}", args.join(" "), e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {}: {}", args.join(" "), stderr.trim()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Like `run_git` but on FAILURE returns the COMBINED stdout+stderr (and forces
-/// `LC_ALL=C` so git emits C-locale English wording). v0.2.71 (BLOCKER-1 fix):
-/// git writes `CONFLICT (...)` lines to STDOUT, not stderr, so the plain
-/// `run_git` (stderr-only error) made `is_merge_conflict` silently miss a real
-/// merge conflict on this surface — the pull error looked like a generic
-/// failure and dead-ended at a raw toast while leaving `.git/MERGE_HEAD` on
-/// disk. This helper feeds the shared `is_pull_conflict` classifier BOTH
-/// streams so a RealMerge conflict is correctly recognized and routed to the
-/// resync modal. The `LC_ALL=C` pin matches the classifier's English-substring
-/// assumption (LOW-4). Success return is unchanged (trimmed stdout).
-async fn run_git_combined(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = TokioCommand::new("git").silent()
-        .args(args)
-        .env("LC_ALL", "C")
-        .current_dir(repo)
-        .output();
-    let output = tokio::time::timeout(GIT_TIMEOUT, fut)
-        .await
-        .map_err(|_| format!("git {} timed out", args.join(" ")))?
-        .map_err(|e| format!("git {} failed: {}", args.join(" "), e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // COMBINE both streams so the conflict classifier sees stdout's
-        // `CONFLICT` lines (not just stderr).
-        return Err(format!(
-            "git {}: {}\n{}",
-            args.join(" "),
-            stderr.trim(),
-            stdout.trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
+// v0.2.92 WP-13: `run_git` / `run_git_combined` MOVED to
+// `commands::git_cmd` — the one home for every git invocation the launcher
+// makes. They are `use`d at the top of this file, so the call sites below are
+// unchanged. See `git_cmd`'s module docs for why the extraction was not
+// optional: this file's private branch resolver disagreed with
+// `installer.rs`'s five inline ones, and the disagreement is what made the
+// self-update check structurally blind in a detached HEAD.
 
 /// Abort an in-progress merge/rebase left by a failed RealMerge pull, so the
 /// working tree is clean for the next attempt. v0.2.71 (BLOCKER-1 fix): without
@@ -407,9 +428,11 @@ async fn abort_merge_or_rebase_in_progress(repo: &Path) {
     let _ = run_git(repo, &["rebase", "--abort"]).await;
 }
 
-async fn current_branch(repo: &Path) -> Result<String, String> {
-    run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await
-}
+// v0.2.92 WP-13: `current_branch` DELETED. It returned
+// `git rev-parse --abbrev-ref HEAD` verbatim — which is the literal string
+// `"HEAD"` in a detached HEAD, a value `unwrap_or_else(|_| "main")` never
+// caught because it arrives as `Ok`, not `Err`. Its three callers now use
+// `git_cmd::resolve_branch`, which normalises AND reports `detached`.
 
 async fn current_sha(repo: &Path) -> Result<String, String> {
     run_git(repo, &["rev-parse", "HEAD"]).await
@@ -744,29 +767,13 @@ where
     Err(last_err.unwrap_or_else(|| "git fetch failed (no stderr)".to_string()))
 }
 
-/// Count how many commits local HEAD is BEHIND `vco_upstream/<branch>` — i.e.
-/// `git rev-list --count HEAD..vco_upstream/<branch>`, the commits the upstream
-/// has that HEAD does not. Requires a prior `git fetch`. `0` means HEAD is at
-/// (or ahead of) the upstream tip — nothing left to pull.
-///
-/// (Renamed v0.2.63 from the misleading `count_commits_ahead`: `HEAD..X`
-/// counts commits reachable from X but not HEAD = how far HEAD is BEHIND X. The
-/// `check_for_*_update` callers already use it as "N commits behind / update
-/// available"; v0.2.63's `assert_head_reached_upstream` reuses it to refuse
-/// running install.py on a tree the pull failed to advance.)
-pub async fn count_commits_behind_upstream(repo: &Path, branch: &str) -> Result<u32, String> {
-    let raw = run_git(
-        repo,
-        &[
-            "rev-list",
-            "--count",
-            &format!("HEAD..{}/{}", VCO_UPSTREAM_REMOTE, branch),
-        ],
-    )
-    .await?;
-    raw.parse::<u32>()
-        .map_err(|e| format!("count parse failed: {}", e))
-}
+// v0.2.92 WP-13: `count_commits_behind_upstream` MOVED to
+// `commands::git_cmd::commits_behind(repo, remote, branch)`. It was a
+// `self_update`-private helper that `installer.rs` reached across into, i.e.
+// the shared question already lived in the wrong crate module — and the
+// remote name was baked in, which hid the fact that the BRANCH argument was
+// the thing every caller was getting wrong. Both callers now name the remote
+// explicitly.
 
 // ---------------------------------------------------------------------------
 // Tauri commands
@@ -795,40 +802,18 @@ pub async fn check_for_launcher_update<R: Runtime>(
         Err(e) => return Ok(UpdateStatus::unavailable(&e, last_checked)),
     };
 
-    let branch = current_branch(&repo)
-        .await
-        .unwrap_or_else(|_| "main".to_string());
-
-    let local_sha = match current_sha(&repo).await {
-        Ok(s) => s,
-        Err(e) => return Ok(UpdateStatus::unavailable(&e, last_checked)),
-    };
-
-    // Pin the canonical public AGPL upstream before any network ops. This
-    // is the crux of the Design B fix (2026-05-19): private forks have
-    // `origin` pointing at the fork, so we maintain a dedicated remote
-    // named `vco_upstream` that always points at the public repo.
-    if let Err(e) = ensure_upstream_remote(&repo).await {
-        return Ok(UpdateStatus::unavailable(&e, last_checked));
+    // The decision core lives in `evaluate_launcher_update` so it is
+    // reachable from tests against a fixture repo (v0.2.92 WP-13). Everything
+    // below is the parts that genuinely need the AppHandle / process state.
+    let (status, detached) = evaluate_launcher_update(&repo, last_checked).await;
+    let available = status.available;
+    if detached {
+        tracing::warn!(
+            "[vct] check_for_launcher_update: {} is on a DETACHED HEAD — Preferences → \
+             Launcher updates offers a one-click reattach",
+            repo.display()
+        );
     }
-
-    // Fetch + ls-remote both bring back the remote SHA. Fetch is required
-    // so `rev-list --count` works without doing a second network round-trip.
-    if let Err(e) = fetch_upstream(&repo).await {
-        // Network unreachable / auth failure / etc. Surface as a soft
-        // error — the UI still shows current SHA and last-known status.
-        return Ok(UpdateStatus::unavailable(&e, last_checked));
-    }
-
-    let remote_sha = match ls_remote_sha(&repo, &branch).await {
-        Ok(s) => s,
-        Err(e) => return Ok(UpdateStatus::unavailable(&e, last_checked)),
-    };
-
-    let commit_count = count_commits_behind_upstream(&repo, &branch)
-        .await
-        .unwrap_or(0);
-    let available = remote_sha != local_sha && commit_count > 0;
 
     // v0.2.91 WI-1: reconcile the dist binaries at UPDATE-CHECK time too.
     //
@@ -858,33 +843,213 @@ pub async fn check_for_launcher_update<R: Runtime>(
         );
     }
 
-    let now = Utc::now();
-
     // Persist regardless of available/not — that's how we honor the daily
     // cadence on next startup.
-    let mut state = load_state();
-    state.last_checked_at = Some(now);
-    state.last_known_remote_sha = Some(remote_sha.clone());
-    state.last_known_commit_count = Some(commit_count);
-    let _ = save_state(&state);
+    persist_check_result(&status);
 
-    let status = UpdateStatus {
-        available,
-        current_sha: Some(local_sha),
-        remote_sha: Some(remote_sha),
-        commit_count,
-        branch,
-        last_checked: Some(now),
-        error: None,
-    };
-
-    if available {
+    if status.available {
         // Tray + window listeners both subscribe to this. Payload is the
         // full status so consumers don't have to re-invoke the command.
         let _ = app.emit("vct-launcher-update-available", &status);
     }
 
     Ok(status)
+}
+
+/// The decision core of [`check_for_launcher_update`], against an explicit
+/// repo path: pin the upstream remote, fetch, then judge.
+///
+/// Extracted in v0.2.92 (WP-13) so the branch-resolution + verdict logic is
+/// TESTABLE. The Tauri command resolves its repo through
+/// `find_launcher_repo_root`, which walks up from `current_exe()` — i.e. the
+/// test binary's own directory — so as long as the logic lived inside the
+/// command there was no way to drive it against a fixture repo, and the
+/// detached-HEAD blindness could not be caught by any test. That is not a
+/// coincidence: the bug survived nine releases in code no test could reach.
+///
+/// Returns the status plus the raw `detached` bit (also mirrored on the
+/// status) so the caller can log without re-resolving.
+async fn evaluate_launcher_update(
+    repo: &Path,
+    last_checked: Option<DateTime<Utc>>,
+) -> (UpdateStatus, bool) {
+    // Pin the canonical public AGPL upstream before any network ops. This
+    // is the crux of the Design B fix (2026-05-19): private forks have
+    // `origin` pointing at the fork, so we maintain a dedicated remote
+    // named `vco_upstream` that always points at the public repo.
+    if let Err(e) = ensure_upstream_remote(repo).await {
+        return (UpdateStatus::unavailable(&e, last_checked), false);
+    }
+
+    // Fetch so `rev-list --count` works below without a second network
+    // round-trip.
+    if let Err(e) = fetch_upstream(repo).await {
+        // Network unreachable / auth failure / etc. Surface as a soft
+        // error — the UI still shows current SHA and last-known status.
+        return (UpdateStatus::unavailable(&e, last_checked), false);
+    }
+
+    evaluate_against_fetched_refs(repo, last_checked).await
+}
+
+/// Judge currency from refs that are ALREADY current — no remote pinning, no
+/// fetch.
+///
+/// This is where every one of the WP-13 defects lived, and separating it from
+/// the two network steps above is what makes them testable offline. The
+/// alternative was an `ensure_upstream_remote` that repoints a fixture's
+/// remote at the real github.com URL (its shape check rejects a filesystem
+/// path, by design) and then a `git fetch` that hangs on a network the test
+/// environment does not have — i.e. the test would have exercised the
+/// network, not the decision.
+///
+/// The remaining git calls here (`ls-remote`, `rev-list`) work against
+/// whatever `vco_upstream` points at, so a fixture pointing it at a local
+/// bare repo exercises the real code paths with no network at all.
+///
+/// ORDERING NOTE: branch/SHA resolution used to happen BEFORE the pin+fetch.
+/// It now happens after. Behaviourally equivalent — neither depends on the
+/// other — but on a repo where BOTH would fail, the reported error is now the
+/// remote one rather than the branch one. Both render identically
+/// (`unavailable(<git error>)`).
+async fn evaluate_against_fetched_refs(
+    repo: &Path,
+    last_checked: Option<DateTime<Utc>>,
+) -> (UpdateStatus, bool) {
+    // v0.2.92 WP-13: the ONE resolver. Pre-fix this was
+    // `current_branch(..).unwrap_or_else(|_| "main")`, which returned the
+    // literal `"HEAD"` in a detached HEAD because git reports that as a
+    // SUCCESS — the `unwrap_or_else` only ever fires on `Err`.
+    let branch_state = match git_cmd::resolve_branch(repo).await {
+        Ok(b) => b,
+        Err(e) => return (UpdateStatus::unavailable(&e, last_checked), false),
+    };
+    let branch = branch_state.name.clone();
+
+    let local_sha = match current_sha(repo).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                UpdateStatus::unavailable(&e, last_checked),
+                branch_state.detached,
+            )
+        }
+    };
+
+    let remote_sha = match ls_remote_sha(repo, &branch).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                UpdateStatus::unavailable(&e, last_checked),
+                branch_state.detached,
+            )
+        }
+    };
+
+    // v0.2.92 WP-13 — THE fix for the five-week silent outage.
+    //
+    // Pre-fix:
+    //     let commit_count = count_commits_behind_upstream(..).unwrap_or(0);
+    //     let available = remote_sha != local_sha && commit_count > 0;
+    //
+    // A git `fatal:` became the number 0, and `> 0` then read that as "not
+    // behind". Combined with the un-normalised branch above, `available` was
+    // STRUCTURALLY false in a detached HEAD at any distance from upstream.
+    //
+    // Now the failure keeps its own identity all the way to the GUI: the
+    // verdict is computed ONLY on the `Ok` arm, and the `Unknown` arm carries
+    // the git error so every surface can say what it could not do.
+    let (commit_count, remote_check) =
+        match git_cmd::commits_behind(repo, VCO_UPSTREAM_REMOTE, &branch).await {
+            Ok(n) => (n, CheckState::Ok),
+            Err(e) => {
+                tracing::warn!(
+                    "[vct] check_for_launcher_update: behind-count failed at {} ({}) — remote \
+                     currency is UNKNOWN, not 'up to date'",
+                    repo.display(),
+                    e
+                );
+                (0, CheckState::unknown(e))
+            }
+        };
+    let available =
+        remote_check.is_known() && remote_sha != local_sha && commit_count > 0;
+
+    // The "latest source release" probe is separate and fails separately.
+    // It is ALSO a WP-13 fix: it used to run `git describe --tags
+    // --abbrev=0`, i.e. "the closest tag reachable FROM HEAD", so an install
+    // detached on its own release tag was told the latest release was its own
+    // tag. Now it asks the remote.
+    let latest_source_release_check =
+        match git_cmd::latest_remote_tag(repo, VCO_UPSTREAM_REMOTE).await {
+            Ok(_) => CheckState::Ok,
+            Err(e) => {
+                tracing::warn!(
+                    "[vct] check_for_launcher_update: remote tag listing failed at {} ({})",
+                    repo.display(),
+                    e
+                );
+                CheckState::unknown(e)
+            }
+        };
+
+    if branch_state.detached {
+        tracing::warn!(
+            "[vct] check_for_launcher_update: {} has a DETACHED HEAD — comparing against \
+             {}/{} (the reattach affordance is on Preferences → Launcher updates)",
+            repo.display(),
+            VCO_UPSTREAM_REMOTE,
+            branch,
+        );
+    }
+
+    let now = Utc::now();
+    let status = UpdateStatus {
+        available,
+        current_sha: Some(local_sha),
+        remote_sha: Some(remote_sha),
+        commit_count,
+        branch,
+        head_detached: branch_state.detached,
+        remote_check,
+        latest_source_release_check,
+        last_checked: Some(now),
+        error: None,
+    };
+
+    (status, branch_state.detached)
+}
+
+/// Persist what the check established, for the cached (offline) surfaces.
+///
+/// v0.2.92 WP-13: the count is written ONLY when it is a real count, and the
+/// reason is written when it is not. Pre-fix a laundered `0` was persisted on
+/// every failed check, which is why the field install's state file paired a
+/// correct, current `last_known_remote_sha` with `last_known_commit_count: 0`
+/// — a combination that reads as "checked successfully, you are current" and
+/// was in fact "the check crashed". The tray then repeated that verdict at
+/// every subsequent boot, from cache, without ever touching the network.
+fn persist_check_result(status: &UpdateStatus) {
+    let mut state = load_state();
+    state.last_checked_at = status.last_checked;
+    if let Some(sha) = &status.remote_sha {
+        state.last_known_remote_sha = Some(sha.clone());
+    }
+    match &status.remote_check {
+        CheckState::Ok => {
+            state.last_known_commit_count = Some(status.commit_count);
+            state.last_check_unknown_error = None;
+        }
+        CheckState::NotApplicable => {
+            state.last_known_commit_count = None;
+            state.last_check_unknown_error = None;
+        }
+        CheckState::Unknown { error } => {
+            state.last_known_commit_count = None;
+            state.last_check_unknown_error = Some(error.clone());
+        }
+    }
+    let _ = save_state(&state);
 }
 
 /// User-triggered apply. Refuses if:
@@ -928,16 +1093,40 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
 
     // Step 2: detect what changed BEFORE pulling so we can decide what
     // to rebuild. We diff the current HEAD against vco_upstream/<branch>.
-    let branch = current_branch(&repo)
-        .await
-        .unwrap_or_else(|_| "main".to_string());
+    // v0.2.92 WP-13: through the ONE resolver — pre-fix this was the
+    // un-normalised `current_branch`, so a detached HEAD diffed against
+    // `vco_upstream/HEAD` (a ref that does not exist).
+    let branch_state = git_cmd::resolve_branch(&repo).await?;
+    let branch = branch_state.name.clone();
+    if branch_state.detached {
+        tracing::warn!(
+            "[vct] apply_launcher_update: {} has a DETACHED HEAD — pulling {}/{}. The pull \
+             fast-forwards fine, but HEAD stays detached afterwards; use the Reattach action \
+             on Preferences → Launcher updates to return to a branch.",
+            repo.display(),
+            VCO_UPSTREAM_REMOTE,
+            branch,
+        );
+    }
 
     // Fetch upstream so the local refs (vco_upstream/<branch>) are current
     // for the diff and the subsequent pull. Without this, a fresh `vco_upstream`
     // remote has no tracking refs yet and the diff returns empty.
     fetch_upstream(&repo).await?;
 
-    let pre_diff = run_git(
+    // v0.2.92 WP-13: `.unwrap_or_default()` here was the THIRD laundering of
+    // the same missing ref. An empty diff because `vco_upstream/HEAD` does not
+    // exist is indistinguishable from an empty diff because nothing changed —
+    // so `needs_cargo` and `needs_npm` both came out `false` and the launcher
+    // PULLED NEW SOURCE AND SILENTLY SKIPPED THE REBUILD, leaving the user on
+    // the old binary with new source on disk.
+    //
+    // Unknown now means REBUILD EVERYTHING. That is the conservative
+    // direction: the cost of an unnecessary `cargo` + `npm` build is minutes
+    // of the user's time on a button they explicitly pressed; the cost of a
+    // skipped necessary build is a launcher that reports a version it is not
+    // running.
+    let (needs_cargo, needs_npm) = match run_git(
         &repo,
         &[
             "diff",
@@ -946,9 +1135,22 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         ],
     )
     .await
-    .unwrap_or_default();
-    let needs_cargo = changed_paths_need_cargo(&pre_diff);
-    let needs_npm = changed_paths_need_npm(&pre_diff);
+    {
+        Ok(pre_diff) => (
+            changed_paths_need_cargo(&pre_diff),
+            changed_paths_need_npm(&pre_diff),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "[vct] apply_launcher_update: pre-pull diff against {}/{} failed ({}) — \
+                 rebuilding BOTH cargo and npm rather than assuming nothing changed",
+                VCO_UPSTREAM_REMOTE,
+                branch,
+                e
+            );
+            (true, true)
+        }
+    };
 
     // Step 3: pull from the canonical upstream using the SHARED divergence
     // decision (v0.2.71 Piece 4). PRE-v0.2.71 this was a blind `--ff-only`:
@@ -1150,9 +1352,36 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // fetch). Detect a conflicted tree on the success path and route to the
     // resync modal instead of rebuilding + restarting on a broken tree. (The
     // FfOnly arm can't reach this — it never merges.)
-    let unmerged = run_git(&repo, &["diff", "--name-only", "--diff-filter=U"])
-        .await
-        .unwrap_or_default();
+    //
+    // v0.2.92 WP-13: the LAST `.unwrap_or_default()` in this file, and the
+    // same shape as the three the field incident was made of — an errored
+    // `git diff` produced an empty string, an empty string means "no
+    // conflicts", and the launcher would go on to rebuild and restart on a
+    // tree it had not actually inspected. Nothing had ever reported it
+    // because it only bites when git is already misbehaving.
+    //
+    // "I could not check for conflicts" is now its own outcome and it STOPS,
+    // in the safe direction: the pull has already landed, so the user loses
+    // nothing by retrying, whereas restarting into a half-merged tree is the
+    // failure this check exists to prevent. Deliberately NOT routed to the
+    // resync modal — that path is destructive (`reset --hard`) and must never
+    // be reached on a guess.
+    let unmerged = match run_git(&repo, &["diff", "--name-only", "--diff-filter=U"]).await {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::error!(
+                "[vct] apply_launcher_update: could not check for unmerged files after the \
+                 pull ({e}) — refusing to rebuild/restart on an uninspected tree"
+            );
+            revert_rename(pre_pull_renamed.as_deref());
+            return Err(format!(
+                "The pull completed, but the launcher could not verify the working tree is \
+                 free of merge conflicts (`git diff --diff-filter=U` failed: {e}). Nothing \
+                 was rebuilt or restarted. Check `git -C {} status` and click Update again.",
+                repo.display()
+            ));
+        }
+    };
     if !unmerged.trim().is_empty() {
         // Abort here too: an autostash-pop conflict leaves the tree dirty +
         // a dangling stash; clean it so the next attempt isn't blocked.
@@ -1232,9 +1461,12 @@ pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         return Err("git not found on PATH — cannot resync".into());
     }
     let repo = find_launcher_repo_root()?;
-    let branch = current_branch(&repo)
-        .await
-        .unwrap_or_else(|_| "main".to_string());
+    // v0.2.92 WP-13: through the ONE resolver. Pre-fix a detached HEAD made
+    // this the literal `"HEAD"`, so the `git reset --hard vco_upstream/HEAD`
+    // below hard-errored on a ref that does not exist — i.e. "Resync now"
+    // could not work AT ALL in the very state the user needed it for.
+    let branch_state = git_cmd::resolve_branch(&repo).await?;
+    let branch = branch_state.name.clone();
 
     // Pin the canonical public upstream (Design B). Must precede the fetch.
     ensure_upstream_remote(&repo).await?;
@@ -1244,7 +1476,10 @@ pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), 
 
     // Diff BEFORE reset so we know which builds to run. After the reset
     // HEAD == vco_upstream/<branch> and the diff would be empty.
-    let pre_diff = run_git(
+    // Unknown ⇒ rebuild everything (same reasoning as
+    // `apply_launcher_update`: a skipped necessary build is invisible, an
+    // unnecessary one is merely slow).
+    let (needs_cargo, needs_npm) = match run_git(
         &repo,
         &[
             "diff",
@@ -1253,9 +1488,22 @@ pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         ],
     )
     .await
-    .unwrap_or_default();
-    let needs_cargo = changed_paths_need_cargo(&pre_diff);
-    let needs_npm = changed_paths_need_npm(&pre_diff);
+    {
+        Ok(pre_diff) => (
+            changed_paths_need_cargo(&pre_diff),
+            changed_paths_need_npm(&pre_diff),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "[vct] force_resync_launcher: pre-reset diff against {}/{} failed ({}) — \
+                 rebuilding BOTH cargo and npm",
+                VCO_UPSTREAM_REMOTE,
+                branch,
+                e
+            );
+            (true, true)
+        }
+    };
 
     // Destructive step. After this point local divergent commits are gone.
     run_git(
@@ -1727,14 +1975,46 @@ pub fn spawn_daily_check<R: Runtime>(app: AppHandle<R>) {
 #[command]
 pub fn get_cached_update_status() -> UpdateStatus {
     let state = load_state();
-    let count = state.last_known_commit_count.unwrap_or(0);
     let remote = state.last_known_remote_sha.clone();
+
+    // v0.2.92 WP-13: three cases, not two.
+    //
+    //   * a real cached count      ⇒ Ok, and `available` is a verdict;
+    //   * a recorded failure       ⇒ Unknown, carrying the recorded reason;
+    //   * nothing cached at all    ⇒ Unknown ("no check has completed yet"),
+    //                                NOT `available: false`.
+    //
+    // The third case is the one that used to lie the loudest: on a fresh
+    // launcher process, before the first daily tick, `count.unwrap_or(0)`
+    // rendered a confident "up to date" in the tray built from no data.
+    let (available, commit_count, remote_check) = match (
+        state.last_known_commit_count,
+        state.last_check_unknown_error.as_deref(),
+    ) {
+        (_, Some(err)) => (false, 0, CheckState::unknown(err)),
+        (Some(n), None) => (n > 0, n, CheckState::Ok),
+        (None, None) => (
+            false,
+            0,
+            CheckState::unknown("no update check has completed yet"),
+        ),
+    };
+
     UpdateStatus {
-        available: count > 0,
+        available,
         current_sha: None,
         remote_sha: remote,
-        commit_count: count,
+        commit_count,
         branch: String::new(),
+        // The cache does not record attachment (it is a property of the repo
+        // right now, not of the last check) and this command deliberately
+        // does no I/O. `false` here means "not asserted", and the surfaces
+        // that care call `check_for_launcher_update`.
+        head_detached: false,
+        remote_check,
+        // Never cached — the tag probe is a network question with no cheap
+        // offline answer, so from cache it is always undetermined.
+        latest_source_release_check: CheckState::unknown("not cached"),
         last_checked: state.last_checked_at,
         error: None,
     }
@@ -1802,28 +2082,37 @@ pub fn get_launcher_running_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Return the most recent release tag visible to the launcher's enclosing
-/// git checkout. Uses `git describe --tags --abbrev=0` against the
-/// canonical upstream remote (so the answer reflects the PUBLIC release
-/// stream, not whatever a private fork's `origin` happens to hold).
+/// Return the newest release tag ON THE UPSTREAM REMOTE.
 ///
-/// Returns `Ok(Some(tag))` when a tag is found, `Ok(None)` when the repo
-/// has no tags yet (e.g. brand-new dev checkout), and `Err` when git
-/// itself isn't available or the launcher isn't running from a git
-/// checkout. The frontend treats `None` and `Err` the same way: hide the
-/// "Latest source release" line entirely rather than render confusing
-/// fallback text.
+/// Returns `Ok(Some(tag))` when the remote advertises tags, `Ok(None)` when
+/// it advertises none (a brand-new or self-hosted mirror), and `Err` when
+/// the question could not be answered at all — git missing, not a checkout,
+/// or the remote unreachable. The three are DISTINCT and the caller must
+/// keep them distinct: `Err` means "unknown", and the page renders
+/// "couldn't check" rather than falling back to anything.
 ///
-/// We DELIBERATELY do not hit the GitHub API here. Reasons:
-///   - The local checkout already has the tag info via `vco_upstream`'s
-///     refs (populated by every fetch the daily check runs). One extra
-///     network round-trip would just retrace ground we already covered.
-///   - GitHub API requires either rate-limit-tolerance or an auth token;
-///     the launcher already operates fine without either.
-///   - Privacy: a self-hosted enterprise mirror (`VCO_UPSTREAM_URL` env
-///     override) might not even speak the GitHub API.
+/// ## v0.2.92 WP-13 — what changed and why it mattered
 ///
-/// v0.2.35 Agent K.
+/// This used to run `git describe --tags --abbrev=0`, i.e. *the closest tag
+/// reachable FROM HEAD*. That is a formally correct answer to a different
+/// question. An install detached on `v0.2.88` was told the latest source
+/// release was `v0.2.88`; the Updates page then rendered
+/// `Running: v0.2.88 | Latest source release: v0.2.88` and the lag banner
+/// (a string inequality on those two values) stayed hidden. Of everything
+/// that went wrong during the five-week outage, this single line is the one
+/// that most directly produced "everything reported healthy" — it was the
+/// only place the user could have SEEN the gap, and it showed parity.
+///
+/// `git_cmd::latest_remote_tag` asks the remote (`ls-remote --tags --refs
+/// --sort=-v:refname`), so HEAD's position cannot influence the answer.
+///
+/// We still DELIBERATELY do not hit the GitHub API:
+///   - `ls-remote` uses the same transport + auth the fetch already uses;
+///   - the GitHub API needs rate-limit tolerance or a token, and the
+///     launcher operates fine without either;
+///   - a self-hosted mirror (`VCO_UPSTREAM_URL`) may not speak it at all.
+///
+/// v0.2.35 Agent K; remote-sourced in v0.2.92 WP-13.
 #[command]
 pub async fn get_latest_source_release_tag() -> Result<Option<String>, String> {
     if !git_available().await {
@@ -1831,41 +2120,119 @@ pub async fn get_latest_source_release_tag() -> Result<Option<String>, String> {
     }
     let repo = find_launcher_repo_root()?;
 
-    // Make sure vco_upstream exists + fetch tags so we see the latest
-    // release even when a private-fork `origin` lags. Soft-fail: if the
-    // network is dead we still try to read whatever tags the local
-    // .git/refs/tags/ directory already has.
-    let _ = ensure_upstream_remote(&repo).await;
-    // v0.2.83 (D5): route the tags fetch through the single serialized home
-    // (Tags policy = Persistent ladder + `--tags`). Still soft-fail — if the
-    // network is dead we read whatever tags `.git/refs/tags/` already has.
+    // Make sure vco_upstream exists + points at the canonical public repo
+    // before we ask it anything. Hard-fail here: an unusable remote means we
+    // genuinely cannot answer, and saying so is the whole point.
+    ensure_upstream_remote(&repo).await?;
+
+    // Keep the local tag refs warm too. Soft-fail and NOT load-bearing: the
+    // answer comes from the remote, so a failed fetch no longer silently
+    // changes what we report — it just means `.git/refs/tags/` stays stale
+    // for other consumers.
     let _ = serialized_fetch_upstream(&repo, FetchPolicy::Tags, None).await;
 
-    // `git describe --tags --abbrev=0` returns the closest reachable tag.
-    // On a clean release-tag head it's the tag itself; on a branch ahead
-    // of the last tag it's still the most recent tag in history, which
-    // is exactly what we want ("latest source release").
-    match run_git(&repo, &["describe", "--tags", "--abbrev=0"]).await {
-        Ok(tag) => {
-            let trimmed = tag.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
-        Err(e) => {
-            // The most common failure mode is "no tags yet" — git emits
-            // "fatal: No names found, cannot describe anything." Treat
-            // that as Ok(None) rather than a hard error so the UI just
-            // hides the line.
-            if e.to_lowercase().contains("no names found") {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
+    git_cmd::latest_remote_tag(&repo, VCO_UPSTREAM_REMOTE).await
+}
+
+/// Return HEAD to a branch after a detached checkout — the ONLY path-less
+/// `git checkout <branch>` in the entire launcher.
+///
+/// ## Why this command exists
+///
+/// Every other `git checkout` in this codebase is path-scoped
+/// (`checkout -- <file>` / `checkout HEAD -- <file>`), which cannot move
+/// HEAD. So before v0.2.92 a user whose clone was in a detached HEAD had NO
+/// in-GUI way out: the launcher could (after WP-13) tell them the state, and
+/// `update_orchestrator` could even fast-forward them, but returning to a
+/// branch required a terminal. For a GUI-first user that is a dead end, and
+/// the state is one an ordinary `git checkout v0.2.NN` puts them in.
+///
+/// ## Guards — all three must pass, and each refuses with its own reason
+///
+/// 1. **HEAD is actually detached.** Refusing on an attached HEAD keeps this
+///    from becoming a general-purpose branch switcher.
+/// 2. **The working tree is clean** (`git status --porcelain` empty,
+///    untracked included). `git checkout <branch>` would carry modified
+///    files across or abort part-way; neither belongs behind a one-click
+///    button.
+/// 3. **The detached commit is an ANCESTOR of `vco_upstream/<branch>`**
+///    (`git merge-base --is-ancestor`). This is the one that matters: if the
+///    user has commits that upstream does not have, checking out the branch
+///    silently strands them on an unreferenced commit — recoverable only via
+///    reflog, which a GUI-first user will not reach for. When it fails we
+///    refuse and NAME the commit so they can get back to it.
+///
+/// An `Err` from any guard leaves the repo byte-identical: nothing runs
+/// before all three pass.
+#[command]
+pub async fn reattach_orchestrator_branch() -> Result<String, String> {
+    if !git_available().await {
+        return Err("git not found on PATH — cannot reattach".into());
     }
+    let repo = find_launcher_repo_root()?;
+
+    let state = git_cmd::resolve_branch(&repo).await?;
+    if !state.detached {
+        return Err(format!(
+            "HEAD is already attached to `{}` — nothing to reattach.",
+            state.name
+        ));
+    }
+    let target = state.name.clone();
+
+    if !git_cmd::tree_is_clean(&repo).await? {
+        return Err(format!(
+            "The working tree at {} has uncommitted or untracked changes. Commit, stash or \
+             discard them first — reattaching to `{}` would carry them across or abort \
+             part-way.",
+            repo.display(),
+            target
+        ));
+    }
+
+    ensure_upstream_remote(&repo).await?;
+    // Fetch so the ancestry question is asked against the CURRENT upstream
+    // tip. Hard-fail: a stale ref could make an unmerged commit look like an
+    // ancestor, and this guard is the one protecting the user's commits.
+    fetch_upstream(&repo).await?;
+
+    let upstream_ref = format!("{}/{}", VCO_UPSTREAM_REMOTE, target);
+    let head_sha = current_sha(&repo).await?;
+    if !git_cmd::is_ancestor(&repo, "HEAD", &upstream_ref).await? {
+        return Err(format!(
+            "Refusing to reattach: the commit you are on ({}) is NOT contained in `{}`, so \
+             checking out `{}` would leave it unreferenced. If those commits are yours, keep \
+             them first (e.g. `git -C {} branch my-work {}`), then reattach.",
+            &head_sha[..head_sha.len().min(12)],
+            upstream_ref,
+            target,
+            repo.display(),
+            &head_sha[..head_sha.len().min(12)],
+        ));
+    }
+
+    run_git(&repo, &["checkout", &target]).await?;
+
+    // Confirm rather than assume. A checkout that reports success but leaves
+    // HEAD detached (it should not, but this is the one destructive-adjacent
+    // path here) must not be reported as done.
+    let after = git_cmd::resolve_branch(&repo).await?;
+    if after.detached {
+        return Err(format!(
+            "`git checkout {}` reported success but HEAD is still detached at {}. Nothing was \
+             lost; inspect the repo at {} manually.",
+            target,
+            &head_sha[..head_sha.len().min(12)],
+            repo.display()
+        ));
+    }
+    tracing::info!(
+        "[vct] reattach_orchestrator_branch: {} reattached to `{}` (was detached at {})",
+        repo.display(),
+        after.name,
+        &head_sha[..head_sha.len().min(12)],
+    );
+    Ok(after.name)
 }
 
 /// Compare a running launcher version (from `CARGO_PKG_VERSION`) with
@@ -2818,5 +3185,549 @@ mod tests {
         // The recovery instructions a terminal Claude needs.
         assert!(body.contains("**For your Claude assistant**"));
         assert!(body.contains("python install.py --update"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // v0.2.92 WP-13 — the detached-HEAD blindness regression suite
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    // Every test below is red against the pre-fix source and green after,
+    // on ANY operating system. That mattered: the defect was REPORTED from
+    // Windows, and "we'll confirm it on the tester's machine" would have
+    // made the fix unverifiable in CI. Nothing here is OS-specific — it is
+    // git behaviour and Rust decision logic.
+    //
+    // The fixture (`detached_upstream_fixture`) reproduces the FIELD shape
+    // exactly:
+    //   * the local repo is built with `init` + `remote add` + `fetch`,
+    //     NEVER `clone`. `clone` creates `refs/remotes/<remote>/HEAD`;
+    //     production's `ensure_upstream_remote` (which only ever runs
+    //     `remote add` / `set-url`) does not. A clone-based fixture makes
+    //     `HEAD..vco_upstream/HEAD` RESOLVE, and would pass against the very
+    //     code that shipped the outage;
+    //   * `VCO_UPSTREAM_URL` points at a local bare repo, so
+    //     `ensure_upstream_remote` + `fetch_upstream` run for real, offline;
+    //   * HEAD is detached on an old tag with upstream two commits ahead.
+
+    mod detached_head_v0292 {
+        use super::*;
+        use std::process::{Command as StdCommand, Stdio};
+
+        macro_rules! skip_if_no_git {
+            () => {
+                if StdCommand::new("git")
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| !s.success())
+                    .unwrap_or(true)
+                {
+                    eprintln!("skipping: git not on PATH");
+                    return;
+                }
+            };
+        }
+
+        fn git(cwd: &Path, args: &[&str]) {
+            let st = StdCommand::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(st.success(), "git {args:?} failed in {}", cwd.display());
+        }
+
+        /// (tempdir, local repo, bare remote path). HEAD detached on
+        /// `v0.0.1`; upstream is 2 commits ahead and carries `v0.0.2`.
+        fn detached_upstream_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().to_path_buf();
+            let remote = root.join("remote.git");
+            let seed = root.join("seed");
+            let local = root.join("local");
+            std::fs::create_dir_all(&seed).unwrap();
+            std::fs::create_dir_all(&local).unwrap();
+
+            git(
+                &root,
+                &["init", "--bare", "--initial-branch=main", "-q", "remote.git"],
+            );
+
+            git(&seed, &["init", "--initial-branch=main", "-q"]);
+            std::fs::write(seed.join("README.md"), "seed\n").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "-qm", "c1"]);
+            git(&seed, &["tag", "v0.0.1"]);
+            git(
+                &seed,
+                &["remote", "add", "vco_upstream", remote.to_str().unwrap()],
+            );
+            git(&seed, &["push", "-q", "vco_upstream", "main", "--tags"]);
+
+            git(&local, &["init", "--initial-branch=main", "-q"]);
+            git(
+                &local,
+                &["remote", "add", "vco_upstream", remote.to_str().unwrap()],
+            );
+            git(&local, &["fetch", "-q", "vco_upstream"]);
+            git(&local, &["checkout", "-q", "-B", "main", "vco_upstream/main"]);
+
+            std::fs::create_dir_all(seed.join("launcher/src-tauri/src")).unwrap();
+            std::fs::write(seed.join("launcher/src-tauri/src/x.rs"), "// x\n").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "-qm", "c2"]);
+            std::fs::write(seed.join("README.md"), "seed v2\n").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "-qm", "c3"]);
+            git(&seed, &["tag", "v0.0.2"]);
+            git(&seed, &["push", "-q", "vco_upstream", "main", "--tags"]);
+
+            git(&local, &["fetch", "-q", "vco_upstream", "--tags"]);
+            git(&local, &["checkout", "-q", "--detach", "v0.0.1"]);
+
+            (tmp, local, remote)
+        }
+
+        // NOTE ON THE SEAM: these tests drive
+        // `evaluate_against_fetched_refs`, not `evaluate_launcher_update`.
+        // The difference is the two NETWORK steps the latter runs first —
+        // `ensure_upstream_remote` (which repoints the remote at the real
+        // github.com URL, since its shape check deliberately rejects a
+        // filesystem path) and `fetch_upstream`. Driving those would make
+        // every assertion below depend on the test host having network
+        // access to github.com, which is neither true in CI nor what these
+        // tests are about. The fixture pre-fetches, so the remaining git
+        // calls (`ls-remote`, `rev-list`, `describe`) hit the local bare repo
+        // and every defect WP-13 fixes is exercised for real, offline, on any
+        // OS. The two network steps have their own tests
+        // (`ensure_upstream_remote_*`, `never_resolving_attempt_times_out_*`).
+
+        /// **THE test for the field incident.** Detached HEAD, upstream two
+        /// commits ahead. Pre-fix this produced `available=false,
+        /// commit_count=0` — a confident "up to date" — at any distance.
+        #[tokio::test]
+        async fn check_reports_available_when_detached_and_behind() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+
+            // Precondition: really detached, and really behind.
+            let raw = git_cmd::run_git(&local, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .await
+                .expect("rev-parse");
+            assert_eq!(raw, "HEAD", "fixture is not in a detached HEAD");
+
+            let status = evaluate_against_fetched_refs(&local, None).await.0;
+
+            assert_eq!(
+                status.remote_check,
+                CheckState::Ok,
+                "the check DID complete — the branch just needed normalising: {:?}",
+                status.remote_check
+            );
+            assert_eq!(
+                status.commit_count, 2,
+                "two upstream commits must be counted, not laundered to 0"
+            );
+            assert!(
+                status.available,
+                "an install two commits behind must report an update as AVAILABLE, detached \
+                 or not — this is the assertion the shipped code failed for five weeks"
+            );
+            assert!(
+                status.head_detached,
+                "the detached state must be reported, not silently normalised away"
+            );
+            assert_eq!(
+                status.branch, "main",
+                "the compared branch is the normalised fallback, never the literal HEAD"
+            );
+        }
+
+        /// Attached HEAD, same distance: identical verdict. Proves the fix
+        /// did not simply hard-code "detached ⇒ available".
+        #[tokio::test]
+        async fn check_reports_available_when_attached_and_behind() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            git(&local, &["checkout", "-q", "main"]);
+
+            let status = evaluate_against_fetched_refs(&local, None).await.0;
+            assert!(status.available);
+            assert_eq!(status.commit_count, 2);
+            assert!(!status.head_detached);
+        }
+
+        /// Leave-alone half: a repo AT the upstream tip reports no update
+        /// and a successful check — "up to date" must still be reachable.
+        #[tokio::test]
+        async fn check_reports_up_to_date_when_current() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            git(&local, &["checkout", "-q", "main"]);
+            git(&local, &["merge", "--no-edit", "-q", "vco_upstream/main"]);
+
+            let status = evaluate_against_fetched_refs(&local, None).await.0;
+            assert_eq!(status.remote_check, CheckState::Ok);
+            assert_eq!(status.commit_count, 0);
+            assert!(!status.available, "at the tip there is nothing to offer");
+        }
+
+        /// The tri-state itself, reproducing the FIELD SHAPE precisely:
+        /// `ls-remote` SUCCEEDS (so a real, current remote SHA is obtained
+        /// and persisted) while `rev-list` FAILS (so the distance is
+        /// unknowable). That exact combination is what the reported
+        /// `launcher-update-state.json` contained — a correct
+        /// `last_known_remote_sha` beside `last_known_commit_count: 0` — and
+        /// it is why the incident was first misread as a network problem.
+        ///
+        /// Achieved by deleting the local tracking refs while leaving the
+        /// remote reachable: `ls-remote` goes to the remote, `rev-list` reads
+        /// local refs.
+        #[tokio::test]
+        async fn check_reports_unknown_not_up_to_date_when_rev_list_fails() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            let _ = std::fs::remove_dir_all(local.join(".git/refs/remotes/vco_upstream"));
+            let _ = std::fs::remove_file(local.join(".git/packed-refs"));
+
+            // Precondition: exactly one of the two questions is answerable.
+            assert!(
+                ls_remote_sha(&local, "main").await.is_ok(),
+                "fixture precondition: the remote must still answer"
+            );
+            assert!(
+                git_cmd::commits_behind(&local, VCO_UPSTREAM_REMOTE, "main")
+                    .await
+                    .is_err(),
+                "fixture precondition: the behind-count must be unanswerable"
+            );
+
+            let status = evaluate_against_fetched_refs(&local, None).await.0;
+
+            assert!(
+                status.remote_check.is_unknown(),
+                "an unanswerable behind-count must leave remote_check Unknown, got {:?}",
+                status.remote_check
+            );
+            assert!(
+                status
+                    .remote_check
+                    .error()
+                    .unwrap_or("")
+                    .contains("rev-list"),
+                "Unknown must carry the reason the GUI shows the user, got {:?}",
+                status.remote_check.error()
+            );
+            assert!(
+                status.remote_sha.is_some(),
+                "the remote SHA WAS obtained — that half succeeded, and pretending \
+                 otherwise would hide which half broke"
+            );
+            assert!(
+                !status.available,
+                "we still do not CLAIM an update — but the surfaces read remote_check, not \
+                 this bool, to decide what to render"
+            );
+
+            // And the persisted form keeps the two halves separate, so the
+            // next boot's cached label cannot resurrect a verdict.
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                persist_check_result(&status);
+                let cached = get_cached_update_status();
+                assert!(cached.remote_check.is_unknown());
+                assert!(
+                    cached.remote_sha.is_some(),
+                    "the SHA is still cached; only the VERDICT is withheld"
+                );
+            });
+        }
+
+        /// A broken remote (nothing resolves at all) is ALSO Unknown, not a
+        /// quiet "up to date". Distinct from the test above: there the remote
+        /// answered, here it does not.
+        #[tokio::test]
+        async fn check_reports_unknown_when_the_remote_is_unreachable() {
+            skip_if_no_git!();
+            let (tmp, local, _remote) = detached_upstream_fixture();
+            let nowhere = tmp.path().join("no-such-remote.git");
+            git(
+                &local,
+                &["remote", "set-url", "vco_upstream", nowhere.to_str().unwrap()],
+            );
+
+            let status = evaluate_against_fetched_refs(&local, None).await.0;
+            assert!(
+                status.remote_check.is_unknown(),
+                "got {:?}",
+                status.remote_check
+            );
+            assert!(!status.available);
+        }
+
+        /// Cached-status honesty: the tri-state survives the round-trip
+        /// through `~/.vct/launcher-update-state.json`, so the tray at the
+        /// next boot does not resurrect a verdict that was never made.
+        #[test]
+        fn cached_status_reports_unknown_after_a_failed_check() {
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                let failed = UpdateStatus {
+                    available: false,
+                    current_sha: None,
+                    remote_sha: Some("f".repeat(40)),
+                    commit_count: 0,
+                    branch: "main".into(),
+                    head_detached: true,
+                    remote_check: CheckState::unknown("rev-list: fatal: ambiguous argument"),
+                    latest_source_release_check: CheckState::unknown("no network"),
+                    last_checked: Some(Utc::now()),
+                    error: None,
+                };
+                persist_check_result(&failed);
+
+                let cached = get_cached_update_status();
+                assert!(
+                    cached.remote_check.is_unknown(),
+                    "a failed check must not be cached as a healthy one: {:?}",
+                    cached.remote_check
+                );
+                assert!(cached
+                    .remote_check
+                    .error()
+                    .unwrap_or("")
+                    .contains("ambiguous argument"));
+                assert!(!cached.available);
+            });
+        }
+
+        /// And the success direction: a real count IS cached and IS a
+        /// verdict, so the tray can still say "3 commits behind" offline.
+        #[test]
+        fn cached_status_reports_ok_after_a_successful_check() {
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                let good = UpdateStatus {
+                    available: true,
+                    current_sha: None,
+                    remote_sha: Some("a".repeat(40)),
+                    commit_count: 3,
+                    branch: "main".into(),
+                    head_detached: false,
+                    remote_check: CheckState::Ok,
+                    latest_source_release_check: CheckState::Ok,
+                    last_checked: Some(Utc::now()),
+                    error: None,
+                };
+                persist_check_result(&good);
+
+                let cached = get_cached_update_status();
+                assert_eq!(cached.remote_check, CheckState::Ok);
+                assert_eq!(cached.commit_count, 3);
+                assert!(cached.available);
+            });
+        }
+
+        /// Before ANY check has run, the cache must say "unknown", not "up
+        /// to date". Pre-fix `count.unwrap_or(0)` rendered a confident
+        /// green from no data at all, on every fresh launcher process.
+        #[test]
+        fn cached_status_is_unknown_before_the_first_check() {
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                let cached = get_cached_update_status();
+                assert!(
+                    cached.remote_check.is_unknown(),
+                    "no completed check ⇒ Unknown, not a green verdict built from nothing"
+                );
+                assert!(!cached.available);
+            });
+        }
+
+        /// `auto_check_enabled` must not appear in the persisted JSON until
+        /// the user actually sets it (WFT C2 — cosmetic, but it sent a real
+        /// incident investigation down a wrong path). Behaviour unchanged:
+        /// readers still default it ON.
+        #[test]
+        fn untouched_auto_check_is_omitted_from_the_state_file_and_still_defaults_on() {
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                let s = UpdateState {
+                    last_checked_at: Some(Utc::now()),
+                    last_known_remote_sha: Some("a".repeat(40)),
+                    last_known_commit_count: Some(0),
+                    last_check_unknown_error: None,
+                    auto_check_enabled: None,
+                };
+                save_state(&s).expect("save");
+                let raw = std::fs::read_to_string(state_file_path()).expect("read");
+                assert!(
+                    !raw.contains("auto_check_enabled"),
+                    "an untouched toggle must not render as a tri-state a human misreads:\n{raw}"
+                );
+                assert!(
+                    get_auto_check_enabled(),
+                    "and the DEFAULT must still be ON — the omission is cosmetic only"
+                );
+
+                set_auto_check_enabled(false).expect("set");
+                let raw = std::fs::read_to_string(state_file_path()).expect("read");
+                assert!(
+                    raw.contains("\"auto_check_enabled\": false"),
+                    "an explicit choice IS persisted:\n{raw}"
+                );
+                assert!(!get_auto_check_enabled());
+            });
+        }
+
+        /// `apply_launcher_update`'s rebuild gating: when the pre-pull diff
+        /// cannot be computed, BOTH builds must run.
+        ///
+        /// Asserted at the decision boundary rather than by driving the
+        /// whole command (which pulls, rebuilds and restarts the process).
+        /// The production code path is three lines below this logic and
+        /// shares the same `Err ⇒ (true, true)` shape.
+        #[tokio::test]
+        async fn apply_rebuilds_everything_when_diff_unknown() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+
+            // The exact call the pre-pull gating makes, against the ref that
+            // does not exist in a `remote add` clone — i.e. what the shipped
+            // code passed while detached.
+            let broken = git_cmd::run_git(
+                &local,
+                &["diff", "--name-only", "HEAD..vco_upstream/HEAD"],
+            ).await;
+            assert!(
+                broken.is_err(),
+                "precondition: the missing-ref diff must ERROR, not return empty"
+            );
+
+            let (needs_cargo, needs_npm) = match broken {
+                Ok(d) => (changed_paths_need_cargo(&d), changed_paths_need_npm(&d)),
+                Err(_) => (true, true),
+            };
+            assert!(
+                needs_cargo && needs_npm,
+                "an undetermined diff must rebuild EVERYTHING — the pre-fix \
+                 `.unwrap_or_default()` produced an empty string here, and an empty diff \
+                 means 'nothing changed', so the launcher pulled new source and skipped \
+                 both builds"
+            );
+
+            // Leave-alone half: a diff that really is empty still skips.
+            let empty = git_cmd::run_git(&local, &["diff", "--name-only", "HEAD..HEAD"]).await
+                .expect("HEAD..HEAD resolves");
+            assert!(!changed_paths_need_cargo(&empty));
+            assert!(!changed_paths_need_npm(&empty));
+
+            // …and a real diff against the RESOLVED branch gates correctly.
+            let real = git_cmd::run_git(
+                &local,
+                &["diff", "--name-only", "HEAD..vco_upstream/main"],
+            ).await
+            .expect("resolved ref works even while detached");
+            assert!(
+                changed_paths_need_cargo(&real),
+                "the fixture's upstream touches launcher/src-tauri/**; got: {real:?}"
+            );
+        }
+
+        /// `get_latest_source_release_tag` must ask the REMOTE. Detached on
+        /// `v0.0.1` with `v0.0.2` upstream, `git describe` says `v0.0.1` —
+        /// which the Updates page rendered as "Latest source release", next
+        /// to an identical "Running:" value, and the lag banner (a string
+        /// inequality) therefore stayed hidden.
+        #[tokio::test]
+        async fn latest_source_release_tag_comes_from_remote_not_head() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+
+            let describe =
+                git_cmd::run_git(&local, &["describe", "--tags", "--abbrev=0"]).await
+                    .expect("describe");
+            assert_eq!(describe, "v0.0.1", "what the OLD implementation returned");
+
+            let tag = git_cmd::latest_remote_tag(&local, VCO_UPSTREAM_REMOTE).await
+                .expect("ls-remote")
+                .expect("remote has tags");
+            assert_eq!(
+                tag, "v0.0.2",
+                "the newest REMOTE tag — the question the user was actually asking"
+            );
+            assert_ne!(tag, describe, "the two answers genuinely differ here");
+        }
+
+        // ── reattach_orchestrator_branch: one act, two leave-alones ──
+        //
+        // The command itself resolves its repo via `find_launcher_repo_root`
+        // (walks up from `current_exe()`), so these drive the guard chain
+        // against the fixture directly. Each asserts the REPO STATE after,
+        // not just the return value — a refusal that still moved HEAD would
+        // pass a return-value-only test.
+
+        #[tokio::test]
+        async fn reattach_acts_when_clean_and_ancestor() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            assert!(git_cmd::resolve_branch(&local).await.unwrap().detached);
+
+            assert!(git_cmd::tree_is_clean(&local).await.unwrap());
+            assert!(git_cmd::is_ancestor(&local, "HEAD", "vco_upstream/main").await.unwrap());
+            git_cmd::run_git(&local, &["checkout", "main"]).await.expect("checkout");
+
+            let after = git_cmd::resolve_branch(&local).await.unwrap();
+            assert!(!after.detached, "HEAD must be attached afterwards");
+            assert_eq!(after.name, "main");
+        }
+
+        #[tokio::test]
+        async fn reattach_refuses_dirty_tree() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            std::fs::write(local.join("README.md"), "user edit\n").unwrap();
+
+            assert!(
+                !git_cmd::tree_is_clean(&local).await.unwrap(),
+                "the clean-tree guard must REFUSE here"
+            );
+            // Leave-alone: nothing ran, so HEAD is untouched and the edit
+            // survives.
+            assert!(git_cmd::resolve_branch(&local).await.unwrap().detached);
+            assert_eq!(
+                std::fs::read_to_string(local.join("README.md")).unwrap(),
+                "user edit\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn reattach_refuses_when_not_ancestor() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            // A commit upstream does not have: checking out `main` would
+            // strand it on an unreferenced commit (reflog-only recovery).
+            git(&local, &["checkout", "-q", "--orphan", "sidework"]);
+            std::fs::write(local.join("mine.txt"), "my work\n").unwrap();
+            git(&local, &["add", "-A"]);
+            git(&local, &["commit", "-qm", "my work"]);
+            let sha = git_cmd::run_git(&local, &["rev-parse", "HEAD"]).await.unwrap();
+            git(&local, &["checkout", "-q", "--detach", &sha]);
+
+            assert!(
+                !git_cmd::is_ancestor(&local, "HEAD", "vco_upstream/main").await.unwrap(),
+                "the ancestry guard must REFUSE here"
+            );
+            // Leave-alone: the commit is still reachable from HEAD.
+            assert_eq!(
+                git_cmd::run_git(&local, &["rev-parse", "HEAD"]).await.unwrap(),
+                sha
+            );
+            assert!(local.join("mine.txt").exists());
+        }
     }
 }

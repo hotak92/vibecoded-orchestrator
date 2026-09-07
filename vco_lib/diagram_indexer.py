@@ -45,10 +45,11 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+
+from vco_lib.atomic import atomic_write_json
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -421,27 +422,11 @@ def _validate_scoped_path(file_path: Path) -> tuple[str, str, str]:
 def _write_sidecar_atomic(sidecar_path: Path, payload: dict[str, Any]) -> None:
     """Write JSON payload to sidecar_path atomically.
 
-    Uses tempfile + os.replace so a reader of the sidecar never observes
-    a half-written file. Tempfile is created in the SAME directory as
-    the target so os.replace is atomic (cross-device renames are not).
+    Through :func:`vco_lib.atomic.atomic_write_json` (v0.2.92 duplication-
+    merge — was an inline tempfile + ``os.replace`` copy) so a reader of the
+    sidecar never observes a half-written file.
     """
-    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".meta.",
-        suffix=".json.tmp",
-        dir=str(sidecar_path.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        os.replace(tmp_path, sidecar_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(sidecar_path, payload, indent=2, sort_keys=True)
 
 
 def _read_sidecar(sidecar_path: Path) -> Optional[dict[str, Any]]:

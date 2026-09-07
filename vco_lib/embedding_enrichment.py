@@ -110,6 +110,13 @@ if str(_VCO_LIB_PARENT) not in sys.path:
 from vco_lib.embedding_service import (  # noqa: E402
     EmbeddingService,
     NoEmbeddingBackendError,
+    _bounded_for_model,
+)
+# W3 (v0.2.92 wiring audit): the truncation-tag merge for single-slot
+# patches — ONE shared merger (vco_lib home), so enrichment and the
+# dual-log backfill cannot drift on the merge rule.
+from vco_lib.kg_truncation_tags import (  # noqa: E402
+    merge_slot_truncation,
 )
 from vco_lib.weaviate_schema import (  # noqa: E402
     CODE_NAMED_VECTORS,
@@ -433,7 +440,14 @@ def enrich_collection_vectors(
       ``svc.embed_code_batch``.
     * Write the resulting vector to the new slot ONLY (single-slot
       update — Weaviate's ``coll.data.update(uuid=..., vector={new_slot:
-      v})`` preserves every other slot's data).
+      v})`` preserves every other slot's data), and — when the item's
+      vector positively came from a bounded leading window AND the row
+      already carries a complete ``truncated_slots`` record — merge that
+      verdict into the record via the shared
+      ``vco_lib.kg_truncation_tags.merge_slot_truncation`` (W3). Rows
+      predating the record, and items whose verdict is not provable, get
+      NO property patch: the slot stays out of the row's measured set and
+      reads as UNKNOWN, never a guessed False.
     * Soft-fail per object: an exception during embed OR write
       increments ``failed`` and appends a redacted detail row to
       ``failures`` (up to :data:`MAX_FAILURE_DETAILS`). The remaining
@@ -641,6 +655,13 @@ def _run_enrichment_loop(
 
     pending_uuids: list[Any] = []
     pending_texts: list[str] = []
+    # W3: per-pending-item context for the truncation-tag merge — the FULL
+    # content length (``pending_texts`` holds the EMBED_INPUT_CHAR_CAP-capped
+    # slice, so the cap itself is invisible downstream) and the row's EXISTING
+    # complete ``truncated_slots`` record (None when the row predates it —
+    # those rows legitimately get NO merge; see merge_slot_truncation).
+    pending_full_lens: list[int] = []
+    pending_existing_props: list["Optional[dict]"] = []
 
     # We need a total estimate for the progress %. v4's iterator doesn't
     # expose a length without consuming. Use Weaviate's aggregate count
@@ -648,14 +669,54 @@ def _run_enrichment_loop(
     # as just "Enriched X..." with no percentage).
     estimated_total = _estimate_object_count(collection_name)
 
+    def _clear_pending() -> None:
+        pending_uuids.clear()
+        pending_texts.clear()
+        pending_full_lens.clear()
+        pending_existing_props.clear()
+
+    def _item_truncation_verdict(idx: int, model_id: str) -> "Optional[bool]":
+        """W3: was THIS batch item's vector embedded from a leading window?
+
+        TRI-STATE. ``True`` only when positively provable, from one of two
+        causes:
+          1. the content exceeded ``EMBED_INPUT_CHAR_CAP`` before the embed
+             (``pending_texts`` holds the capped slice); or
+          2. the shared ``_bounded_for_model`` bound — the SAME function the
+             batch legs apply internally to the SAME capped input (text via
+             ``_embed_ollama_batch_bounded``, code via
+             ``_embed_codeembed_batch_bounded``), so the pre-bound verdict is
+             EXACT for what the batch call sent.
+
+        Everything else is ``None`` (UNKNOWN), never ``False``. The residual
+        gap is the PER-ITEM shrink that runs after a whole-batch refusal
+        (``_embed_codeembed_one_bounded`` / ``_embed_ollama_one_bounded``):
+        the batch API returns vectors only, so a shrink applied there is
+        invisible from here. That happens routinely — the CodeEmbed batch
+        pre-bounds to ~3 684 chars, which still exceeds the measured 1 024-
+        token codesage window on much real code, so a batch carrying one
+        maximal entity degrades to per-item calls and says so in its
+        "isolating to per-item embed" warning. Returning ``False`` here
+        would turn that invisible shrink into a stored full-fidelity claim;
+        returning ``None`` leaves the slot UNMEASURED on the row, so the
+        shared reader answers UNKNOWN. This path UNDER-reports truncation by
+        construction and never over-claims fidelity.
+        """
+        if pending_full_lens[idx] > EMBED_INPUT_CHAR_CAP:
+            return True
+        try:
+            _bounded, trunc = _bounded_for_model(pending_texts[idx], model_id)
+        except Exception:  # noqa: BLE001 — bound must never break the write
+            return None
+        return True if trunc else None
+
     def _flush_batch() -> None:
         nonlocal enriched, failed, dry_run_pending
         if not pending_uuids:
             return
         if dry_run:
             dry_run_pending += len(pending_uuids)
-            pending_uuids.clear()
-            pending_texts.clear()
+            _clear_pending()
             return
 
         # Embed the whole batch in one call.
@@ -677,8 +738,7 @@ def _run_enrichment_loop(
             for uid in pending_uuids:
                 failed += 1
                 _append_failure(failures, str(uid), msg)
-            pending_uuids.clear()
-            pending_texts.clear()
+            _clear_pending()
             return
 
         # Defensive: vector count should match input count exactly.
@@ -688,6 +748,22 @@ def _run_enrichment_loop(
                 "shortage as failed and writing what we have.",
                 len(vectors), len(pending_uuids),
             )
+
+        # W3: the active model the batch embed bounds against — the SAME id
+        # ``embed_text_batch`` / ``embed_code_batch`` resolve internally, so
+        # the pre-bound verdict below matches what the batch actually sent.
+        try:
+            _model_id = (
+                embedding_service.code_model_id
+                if kind == "code"
+                else embedding_service.text_model_id
+            )
+        except Exception:  # noqa: BLE001 — never break the write
+            _model_id = ""
+        try:
+            _active_text_slot = str(embedding_service.text_vector_slot) or ""
+        except Exception:  # noqa: BLE001 — no slot name → no merge (honest)
+            _active_text_slot = ""
 
         for idx, uid in enumerate(pending_uuids):
             if idx >= len(vectors):
@@ -702,8 +778,23 @@ def _run_enrichment_loop(
                 failed += 1
                 _append_failure(failures, str(uid), "embed returned empty vector")
                 continue
+            # W3: merge this item's truncation verdict into the row's stored
+            # record (shared merger). ``None`` = no honest merge (row has no
+            # complete record, or the active slot name is unavailable) →
+            # write the vector ONLY, leaving the row's state UNKNOWN.
+            _trunc_patch = merge_slot_truncation(
+                pending_existing_props[idx],
+                new_slot,
+                _item_truncation_verdict(idx, _model_id),
+                _active_text_slot,
+            )
             try:
-                col.data.update(uuid=uid, vector={new_slot: vec})
+                if _trunc_patch is not None:
+                    col.data.update(
+                        uuid=uid, vector={new_slot: vec}, properties=_trunc_patch
+                    )
+                else:
+                    col.data.update(uuid=uid, vector={new_slot: vec})
                 enriched += 1
             except Exception as e:
                 msg = f"update failed: {type(e).__name__}: {e}"
@@ -714,8 +805,7 @@ def _run_enrichment_loop(
                 failed += 1
                 _append_failure(failures, str(uid), msg)
 
-        pending_uuids.clear()
-        pending_texts.clear()
+        _clear_pending()
 
     # ── Iterate ─────────────────────────────────────────────────────
     try:
@@ -757,6 +847,11 @@ def _run_enrichment_loop(
             else:
                 pending_uuids.append(obj.uuid)
                 pending_texts.append(content[:EMBED_INPUT_CHAR_CAP])
+                # W3: remember the uncapped length + the row's existing
+                # truncation record for the merge at flush time.
+                pending_full_lens.append(len(content))
+                _props = obj.properties if isinstance(obj.properties, dict) else None
+                pending_existing_props.append(_props)
 
         if len(pending_uuids) >= BATCH_SIZE:
             _flush_batch()

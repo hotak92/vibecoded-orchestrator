@@ -669,6 +669,84 @@ set -e
 assert_eq "$rc" "1" "test_no_on_disk_token_keeps_the_401_path"
 rm -f "$scratch/responses/_require_token"
 
+# ── Test 20 (v0.3.0): the `.no-shared-fallback` per-project opt-out ─────
+#
+# docs/VCT_SECRETS_PRIMITIVE.md §"Design choices" promises a project can opt
+# out of the SHARED file-store tier by placing
+# `projects/<NAME>/.no-shared-fallback`, and the launcher's "Disable shared
+# secrets for this project" toggle WRITES that marker
+# (secrets_cmd.rs::set_shared_secrets_read_disabled). Until v0.3.0 no
+# resolver READ it, so the toggle gated tier 1 while tier 2 kept serving the
+# very values the user opted out of.
+#
+# Exercised through the RESOLVER's own CLI entry point (not by sourcing
+# `shared_fallback_disabled`): a test that called the predicate directly
+# would still pass if `file_store_get` stopped consulting it.
+#
+# Tier 1 is made to miss by pointing VCT_STATE_DIR at an empty dir with no
+# hub token, so the chain falls to tier 2 deterministically.
+optout_store="$scratch/optout-store"
+mkdir -p "$optout_store/shared" \
+         "$optout_store/projects/optdemo" \
+         "$optout_store/projects/optother" \
+         "$optout_store/projects/shared"
+printf 'shared-only-value' >"$optout_store/shared/OPTOUT_KEY"
+printf 'own-value'         >"$optout_store/projects/optdemo/OWN_KEY"
+
+run_tier2() {
+    # $1 = project arg, $2 = key. Echoes stdout; sets `rc`.
+    set +e
+    out=$(VCT_STATE_DIR="$scratch/empty-state-dir" \
+          VCT_SECRETS_DIR="$optout_store" \
+          env -u VCT_HUB_TOKEN -u VCT_HUB_PORT \
+          "$RESOLVER" "$1" "$2" 2>/dev/null)
+    rc=$?
+    set -e
+}
+
+# LEAVE-ALONE half: no marker → the shared copy still resolves.
+run_tier2 optdemo OPTOUT_KEY
+assert_eq "$rc" "0" "test_no_marker_shared_still_resolves/exit_code"
+assert_eq "$out" "shared-only-value" "test_no_marker_shared_still_resolves/value"
+
+# ACT half: marker present → the shared copy must NOT resolve.
+: >"$optout_store/projects/optdemo/.no-shared-fallback"
+run_tier2 optdemo OPTOUT_KEY
+assert_eq "$out" "" "test_marker_blocks_the_shared_tier/no_value"
+case "$rc" in
+    0) assert_eq "1" "0" "test_marker_blocks_the_shared_tier/exit_nonzero (got 0)" ;;
+    *) assert_eq "0" "0" "test_marker_blocks_the_shared_tier/exit_nonzero" ;;
+esac
+
+# The project's OWN keys are untouched by the opt-out.
+run_tier2 optdemo OWN_KEY
+assert_eq "$rc" "0" "test_marker_leaves_own_keys_alone/exit_code"
+assert_eq "$out" "own-value" "test_marker_leaves_own_keys_alone/value"
+
+# The marker is scoped to the project that placed it.
+run_tier2 optother OPTOUT_KEY
+assert_eq "$rc" "0" "test_marker_is_scoped_to_its_project/exit_code"
+assert_eq "$out" "shared-only-value" "test_marker_is_scoped_to_its_project/value"
+
+# A stray projects/shared/ orphan must not disable every shared read.
+: >"$optout_store/projects/shared/.no-shared-fallback"
+run_tier2 shared OPTOUT_KEY
+assert_eq "$rc" "0" "test_shared_pseudo_name_never_opts_itself_out/exit_code"
+assert_eq "$out" "shared-only-value" \
+    "test_shared_pseudo_name_never_opts_itself_out/value"
+
+# The refusal must not print the value it refused to serve.
+set +e
+optout_err=$(VCT_STATE_DIR="$scratch/empty-state-dir" \
+             VCT_SECRETS_DIR="$optout_store" \
+             env -u VCT_HUB_TOKEN -u VCT_HUB_PORT \
+             "$RESOLVER" optdemo OPTOUT_KEY 2>&1)
+set -e
+case "$optout_err" in
+    *shared-only-value*) assert_eq "1" "0" "test_optout_refusal_never_prints_value" ;;
+    *) assert_eq "0" "0" "test_optout_refusal_never_prints_value" ;;
+esac
+
 # ── Summary ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "── Summary: $PASS passed, $FAIL failed"
 exit $((FAIL > 0 ? 1 : 0))

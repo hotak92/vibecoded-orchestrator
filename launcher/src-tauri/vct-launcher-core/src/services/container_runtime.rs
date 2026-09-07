@@ -122,22 +122,33 @@ pub const DEDUP_SENTINEL: &str = "vct-launcher-core::services::container_runtime
 //
 // This promoted detector applies the canonical v0.2.14 contract
 // (install.py `_runtime_preference_from_env` + `_detect_container_runtime`
-// + `_container_runtime_reachable`):
+// + `_container_runtime_reachable`), with the v0.2.92 pin discipline
+// (delivery-audit M1 / R35 — the same ruling BLOCKER-4 already applied to
+// the other two surfaces, `vco_lib.containers.resolve` and
+// `services/runtime.rs::candidate_order`):
 //
-//   1. `VCT_CONTAINER_RUNTIME=podman|docker` — explicit user choice.
-//      Honored when that runtime's daemon responds; otherwise falls
-//      through to auto-detect with a stderr note (lenient — a
-//      misconfigured env var must not strand the user; mirrors
-//      install.py:8087-8103).
+//   1. `VCT_CONTAINER_RUNTIME=podman|docker` — a PIN. When it names a
+//      runtime, that runtime is the ONLY candidate; a pinned runtime
+//      whose daemon does not respond is REFUSED with an error naming
+//      the pin, why it is unusable, and whether the other runtime is
+//      usable — never substituted. Pre-v0.2.92 this surface fell
+//      through to the other runtime with only a warn: a pinned-podman
+//      user whose machine was stopped got the module image pulled into
+//      docker and started against docker's EMPTY copy of every named
+//      volume, while the supervisor's next pass re-selected podman —
+//      split brain over user data (podman and docker keep separate
+//      named volumes).
 //   2. `<install_root>/state/install/runtime.txt` — the runtime
 //      install.py detected and recorded (`_persist_runtime_txt`).
-//      Treated as a preference re-ordering, not a hard pin — a
-//      daemon-dead recorded runtime falls through to the other
-//      candidate with a stderr note.
-//   3. Daemon-aware probe of `["podman", "docker"]` (podman-first,
-//      matching install.py + services/runtime.rs policy) via
-//      `<cmd> info` — the round-trip that exercises the same code
-//      path `run`/`pull` need. `--version` is NOT used as a
+//      Same pin semantics: the recorded runtime is where the install
+//      put the data, so it is probed ALONE; unusable → refusal that
+//      names the file and the env override that can supersede it.
+//      (Only consulted when the env override is absent — the explicit
+//      env choice wins.)
+//   3. No pin: daemon-aware probe of `["podman", "docker"]`
+//      (podman-first, matching install.py + services/runtime.rs
+//      policy) via `<cmd> info` — the round-trip that exercises the
+//      same code path `run`/`pull` need. `--version` is NOT used as a
 //      selection signal anymore (only to distinguish
 //      "binary present, daemon dead" from "not installed" in the
 //      error message).
@@ -231,29 +242,188 @@ async fn runtime_binary_present(cmd: &str) -> bool {
 /// Split out so the env→runtime.txt→default precedence is unit-testable
 /// without spawning processes.
 ///
-/// * `env_pref` — the validated `VCT_CONTAINER_RUNTIME` value (probed
-///   FIRST; on daemon failure the detector falls through to the rest).
-/// * `runtime_txt` — the validated runtime.txt token (preference
-///   re-ordering: moved to the front of the auto-detect order).
+/// A PIN IS THE WHOLE ORDER (v0.2.92 delivery-audit M1 / R35, the same
+/// ruling BLOCKER-4 already applied to `vco_lib.containers.resolve` and
+/// `runtime.rs::candidate_order` — this was the third and last surface
+/// that still fell through). Pre-v0.2.92 a pinned-but-down runtime was
+/// put first and BOTH runtimes followed, so a pinned-podman user whose
+/// machine was stopped got their module image pulled into DOCKER and the
+/// container started there — against docker's EMPTY copy of every named
+/// volume — while the supervisor's next pass re-selected podman. Split
+/// brain over user data. A pinned runtime that is unusable is now
+/// REFUSED by [`decide_module_runtime`] with a message naming the pin,
+/// why it is unusable, and whether the other runtime is usable.
+///
+/// * `env_pref` — the validated `VCT_CONTAINER_RUNTIME` value. When
+///   `Some`, the returned order is exactly `[env_pref]`.
+/// * `runtime_txt` — the validated runtime.txt token. Same pin semantics
+///   (the recorded runtime is where the install put the data); only
+///   consulted when `env_pref` is `None`.
+///
+/// The unpinned arm is byte-identical to `runtime.rs::candidate_order`
+/// and `vco_lib.containers.runtime_candidate_order`; the fixture
+/// `tests/fixtures/container_runtime_parity.json` (read by this module's
+/// `parity_fixture_module_plane_matches_every_scenario` test) pins all
+/// three surfaces to the same answers so they cannot drift again.
 pub fn runtime_candidate_order(
     env_pref: Option<&str>,
     runtime_txt: Option<&str>,
 ) -> Vec<String> {
-    let mut order: Vec<String> = Vec::with_capacity(3);
     if let Some(p) = env_pref {
-        order.push(p.to_string());
+        return vec![p.to_string()];
     }
     if let Some(t) = runtime_txt {
-        if !order.iter().any(|c| c == t) {
-            order.push(t.to_string());
+        return vec![t.to_string()];
+    }
+    vec!["podman".to_string(), "docker".to_string()]
+}
+
+/// Where a pin came from — names the knob the refusal message tells the
+/// user to turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePinSource {
+    /// The explicit `VCT_CONTAINER_RUNTIME` env override.
+    EnvOverride,
+    /// The install-time record `<install_root>/state/install/runtime.txt`.
+    RuntimeTxt,
+}
+
+impl RuntimePinSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            RuntimePinSource::EnvOverride => "VCT_CONTAINER_RUNTIME",
+            RuntimePinSource::RuntimeTxt => "state/install/runtime.txt",
         }
     }
-    for c in ["podman", "docker"] {
-        if !order.iter().any(|x| x == c) {
-            order.push(c.to_string());
+}
+
+/// The pin, when there is one: the validated env override, else the
+/// validated runtime.txt token, else `None` (auto-detect). `Some(_)`
+/// iff [`runtime_candidate_order`] returns a one-element order.
+pub fn pinned_runtime<'a>(
+    env_pref: Option<&'a str>,
+    runtime_txt: Option<&'a str>,
+) -> Option<(&'a str, RuntimePinSource)> {
+    if let Some(p) = env_pref {
+        return Some((p, RuntimePinSource::EnvOverride));
+    }
+    runtime_txt.map(|t| (t, RuntimePinSource::RuntimeTxt))
+}
+
+/// What one candidate's probes established on the module container
+/// plane: the daemon answered (`<cmd> info`), only the client binary
+/// exists (`<cmd> --version` works but the daemon/machine didn't
+/// answer), or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleRuntimeProbe {
+    Responsive,
+    BinaryOnly,
+    Missing,
+}
+
+/// The refusal message for a pinned-but-unusable runtime. Pure, and
+/// deliberately shaped like `vco_lib.containers._pin_refusal_reason`
+/// (the infra-plane Python refusal): it names what was pinned and via
+/// which channel, why it is unusable ("start it" vs "install it"),
+/// whether the OTHER runtime is usable, and the two things the user can
+/// do about it. Every arm contains the literal "container runtime" so
+/// generic `Err` matchers (the live-probe test) keep working.
+pub fn module_runtime_pin_refusal(
+    pin: &str,
+    source: RuntimePinSource,
+    installed: bool,
+    other_usable: bool,
+) -> String {
+    let other = if pin == "podman" { "docker" } else { "podman" };
+    let state = if installed {
+        format!(
+            "{pin} is installed but its daemon/machine is not responding \
+             to `{pin} info`"
+        )
+    } else {
+        format!("{pin} is not installed (binary not on PATH)")
+    };
+    let head = match source {
+        RuntimePinSource::EnvOverride => {
+            format!("VCT_CONTAINER_RUNTIME={pin} is set but {state}")
+        }
+        RuntimePinSource::RuntimeTxt => {
+            format!(
+                "the recorded container runtime (state/install/runtime.txt) is \
+                 {pin} but {state}"
+            )
+        }
+    };
+    if other_usable {
+        let remedy = match source {
+            RuntimePinSource::EnvOverride => format!(
+                "start {pin}, or unset VCT_CONTAINER_RUNTIME / set it to {other}"
+            ),
+            RuntimePinSource::RuntimeTxt => format!(
+                "start {pin}, or set VCT_CONTAINER_RUNTIME={other} to override \
+                 the recorded runtime"
+            ),
+        };
+        format!(
+            "{head}; {other} is a usable container runtime but VCO will NOT \
+             drive it for you (podman and docker have SEPARATE named volumes, \
+             so the module container would come up against an EMPTY volume) — \
+             {remedy}"
+        )
+    } else {
+        format!(
+            "{head}; {other} is not a usable container runtime either — start \
+             {pin} (or install it), then retry"
+        )
+    }
+}
+
+/// The pure decision half of [`detect_container_runtime`] — the module
+/// container plane's counterpart of `runtime.rs::select_runtime`. Given
+/// the candidate order and what the probes established, pick the
+/// runtime; a PINNED order that cannot be satisfied is REFUSED (never
+/// substituted), and the refusal knows whether the other runtime is
+/// usable. Kept separate from the async probing so the shared parity
+/// fixture (`tests/fixtures/container_runtime_parity.json`, key
+/// `expect_module_plane`) can drive it in this module's tests without
+/// podman or docker — the same shape `runtime.rs` uses for
+/// `candidate_order` + `select_runtime`.
+pub fn decide_module_runtime(
+    order: &[String],
+    probes: &HashMap<String, ModuleRuntimeProbe>,
+    pinned: Option<(&str, RuntimePinSource)>,
+) -> Result<String, String> {
+    for candidate in order {
+        if probes.get(candidate) == Some(&ModuleRuntimeProbe::Responsive) {
+            return Ok(candidate.clone());
         }
     }
-    order
+    if let Some((pin, source)) = pinned {
+        let installed = probes
+            .get(pin)
+            .map(|p| *p != ModuleRuntimeProbe::Missing)
+            .unwrap_or(false);
+        let other = if pin == "podman" { "docker" } else { "podman" };
+        let other_usable =
+            probes.get(other) == Some(&ModuleRuntimeProbe::Responsive);
+        return Err(module_runtime_pin_refusal(pin, source, installed, other_usable));
+    }
+    let binary_only: Vec<&str> = order
+        .iter()
+        .filter(|c| probes.get(*c) == Some(&ModuleRuntimeProbe::BinaryOnly))
+        .map(|c| c.as_str())
+        .collect();
+    if binary_only.is_empty() {
+        Err("no container runtime found (tried podman, docker)".into())
+    } else {
+        Err(format!(
+            "no responsive container runtime: {} installed but daemon/machine \
+             not responding to `info` (start it: Linux `systemctl --user start \
+             podman.socket` / `sudo systemctl start docker`; macOS+Windows \
+             `podman machine start` / open Docker Desktop)",
+            binary_only.join(", "),
+        ))
+    }
 }
 
 /// v0.2.54: the ONE daemon-aware container-runtime detector shared by
@@ -261,6 +431,16 @@ pub fn runtime_candidate_order(
 /// `installer_engine.rs`) and the hub's supervisor
 /// (`module_supervisor.rs`). See the section comment above for the
 /// precedence contract.
+///
+/// v0.2.92 delivery-audit M1: this surface now implements the same pin
+/// discipline as the other two (`vco_lib.containers.resolve`,
+/// `runtime.rs`) — see [`runtime_candidate_order`]. The probe-then-decide
+/// split mirrors `runtime.rs`: this async half only gathers what the
+/// probes established (daemon responsive / binary-only / missing, plus
+/// the OTHER runtime's daemon state on the refusal path so the message
+/// can name the repin target) and hands it to the pure
+/// [`decide_module_runtime`], which the shared parity fixture also
+/// drives.
 ///
 /// `install_root`: the orchestrator clone root, used to locate
 /// `state/install/runtime.txt`. The launcher passes
@@ -280,46 +460,44 @@ pub async fn detect_container_runtime(
     let runtime_txt = install_root.and_then(read_runtime_txt);
 
     let order = runtime_candidate_order(env_pref.as_deref(), runtime_txt.as_deref());
+    let pinned = pinned_runtime(env_pref.as_deref(), runtime_txt.as_deref());
 
-    let mut binary_only: Vec<String> = Vec::new();
+    let mut probes: HashMap<String, ModuleRuntimeProbe> = HashMap::new();
+    let mut resolved = false;
     for candidate in &order {
-        if runtime_daemon_responsive(candidate).await {
-            return Ok(candidate.clone());
-        }
-        // Daemon dead. Was this an explicit preference? Tell the user
-        // we're falling through rather than silently switching engines.
-        let was_pref = env_pref.as_deref() == Some(candidate.as_str())
-            || runtime_txt.as_deref() == Some(candidate.as_str());
-        if runtime_binary_present(candidate).await {
-            if was_pref {
-                tracing::warn!(
-                    "[container_runtime] preferred runtime '{}' (from {}) is \
-                     installed but its daemon/machine isn't responding to \
-                     `{} info`; trying the next candidate.",
-                    candidate,
-                    if env_pref.as_deref() == Some(candidate.as_str()) {
-                        "VCT_CONTAINER_RUNTIME"
-                    } else {
-                        "state/install/runtime.txt"
-                    },
-                    candidate,
-                );
+        let outcome = if runtime_daemon_responsive(candidate).await {
+            ModuleRuntimeProbe::Responsive
+        } else if runtime_binary_present(candidate).await {
+            ModuleRuntimeProbe::BinaryOnly
+        } else {
+            ModuleRuntimeProbe::Missing
+        };
+        resolved |= outcome == ModuleRuntimeProbe::Responsive;
+        probes.insert(candidate.clone(), outcome);
+    }
+
+    // Refusal path only: the message must be able to say whether the
+    // OTHER runtime is usable — that is the user's repin target, and the
+    // difference between "start podman" and "install a runtime". With a
+    // pin the order never contained it, so probe it here, once. It is
+    // never probed on the happy path and never becomes the result.
+    if !resolved {
+        if let Some((pin, _source)) = pinned {
+            let other = if pin == "podman" { "docker" } else { "podman" };
+            if !probes.contains_key(other) {
+                let outcome = if runtime_daemon_responsive(other).await {
+                    ModuleRuntimeProbe::Responsive
+                } else if runtime_binary_present(other).await {
+                    ModuleRuntimeProbe::BinaryOnly
+                } else {
+                    ModuleRuntimeProbe::Missing
+                };
+                probes.insert(other.to_string(), outcome);
             }
-            binary_only.push(candidate.clone());
         }
     }
 
-    if binary_only.is_empty() {
-        Err("no container runtime found (tried podman, docker)".into())
-    } else {
-        Err(format!(
-            "no responsive container runtime: {} installed but daemon/machine \
-             not responding to `info` (start it: Linux `systemctl --user start \
-             podman.socket` / `sudo systemctl start docker`; macOS+Windows \
-             `podman machine start` / open Docker Desktop)",
-            binary_only.join(", "),
-        ))
-    }
+    decide_module_runtime(&order, &probes, pinned)
 }
 
 // ─── GPU passthrough flags (v0.2.54 P0-4) ──────────────────────────────
@@ -3084,30 +3262,268 @@ mod tests {
 
     // ─── v0.2.54 C-RT-1 / C-RT-2: promoted runtime detection ─────────
 
-    /// Candidate ordering: env preference first, runtime.txt second,
-    /// podman-first default tail, no duplicates.
+    /// Candidate ordering (v0.2.92 pin discipline, delivery-audit M1):
+    /// a pin — env override OR runtime.txt — IS the whole order; no pin
+    /// means the canonical podman-first pair. The env override wins when
+    /// both name a runtime. Byte-identical to `runtime.rs::candidate_order`
+    /// and `vco_lib.containers.runtime_candidate_order` on the arms they
+    /// share; the fixture test below pins all three surfaces together.
     #[test]
     fn v0254_runtime_candidate_order_precedence() {
         assert_eq!(
             runtime_candidate_order(None, None),
             vec!["podman".to_string(), "docker".to_string()],
         );
+        // A pin is the WHOLE order — no tail, no second candidate to
+        // fall through to.
         assert_eq!(
             runtime_candidate_order(Some("docker"), None),
-            vec!["docker".to_string(), "podman".to_string()],
+            vec!["docker".to_string()],
+        );
+        assert_eq!(
+            runtime_candidate_order(Some("podman"), None),
+            vec!["podman".to_string()],
         );
         assert_eq!(
             runtime_candidate_order(None, Some("docker")),
-            vec!["docker".to_string(), "podman".to_string()],
+            vec!["docker".to_string()],
         );
-        // env wins over runtime.txt; no dup when they agree.
+        assert_eq!(
+            runtime_candidate_order(None, Some("podman")),
+            vec!["podman".to_string()],
+        );
+        // env wins over runtime.txt when they disagree.
         assert_eq!(
             runtime_candidate_order(Some("podman"), Some("docker")),
-            vec!["podman".to_string(), "docker".to_string()],
+            vec!["podman".to_string()],
         );
         assert_eq!(
             runtime_candidate_order(Some("docker"), Some("docker")),
-            vec!["docker".to_string(), "podman".to_string()],
+            vec!["docker".to_string()],
+        );
+        assert_eq!(
+            pinned_runtime(Some("podman").as_deref(), Some("docker")),
+            Some(("podman", RuntimePinSource::EnvOverride)),
+        );
+        assert_eq!(
+            pinned_runtime(None, Some("docker").as_deref()),
+            Some(("docker", RuntimePinSource::RuntimeTxt)),
+        );
+        assert_eq!(pinned_runtime(None, None), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Parity fixture (v0.2.92 delivery-audit M1) — the SAME JSON drives
+    // tests/test_container_runtime_ssot.py (Python resolve) and
+    // runtime.rs's tests (candidate_order + select_runtime). The
+    // `expect_module_plane` key is THIS surface's answer: what
+    // detect_container_runtime's decision half picks for the MODULE
+    // CONTAINER plane (no compose gating — module containers don't need
+    // compose; a runtime the infra plane rejects for lacking compose is
+    // still fine here).
+    // -----------------------------------------------------------------
+
+    fn parity_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/container_runtime_parity.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        serde_json::from_str(&text).expect("fixture parses")
+    }
+
+    fn fixture_names(v: &serde_json::Value, key: &str) -> Vec<String> {
+        v[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture scenario lacks `{}`", key))
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Fixture scenario → the validated pin pair this surface derives
+    /// from `env` (+ `runtime_txt` when the scenario declares one).
+    /// Unrecognised / `auto` / unset env is no pin, mirroring
+    /// `runtime_preference_from_env`.
+    fn fixture_pin(sc: &serde_json::Value) -> Option<(&str, RuntimePinSource)> {
+        let env = sc["env"].as_str().filter(|e| *e == "podman" || *e == "docker");
+        let txt = sc
+            .get("runtime_txt")
+            .and_then(|v| v.as_str())
+            .filter(|t| *t == "podman" || *t == "docker");
+        pinned_runtime(env, txt)
+    }
+
+    /// Build the probe ledger a scenario describes: `daemon_ok` →
+    /// Responsive; else `version_ok` → BinaryOnly; else Missing.
+    /// (`probe_unknown` rows collapse to Missing here: this surface is
+    /// two-state over its Err — the Python resolver's UNKNOWN tri-state
+    /// has no module-plane counterpart, which the fixture comment
+    /// records.)
+    fn fixture_probes(sc: &serde_json::Value) -> HashMap<String, ModuleRuntimeProbe> {
+        let daemon_ok = fixture_names(sc, "daemon_ok");
+        let version_ok = fixture_names(sc, "version_ok");
+        let mut probes = HashMap::new();
+        for rt in ["podman", "docker"] {
+            let outcome = if daemon_ok.iter().any(|c| c == rt) {
+                ModuleRuntimeProbe::Responsive
+            } else if version_ok.iter().any(|c| c == rt) {
+                ModuleRuntimeProbe::BinaryOnly
+            } else {
+                ModuleRuntimeProbe::Missing
+            };
+            probes.insert(rt.to_string(), outcome);
+        }
+        probes
+    }
+
+    #[test]
+    fn parity_fixture_every_scenario_names_a_module_plane_expectation() {
+        let fx = parity_fixture();
+        let scenarios = fx["scenarios"].as_array().expect("scenarios array");
+        assert!(scenarios.len() >= 10, "fixture shrank: {}", scenarios.len());
+        for sc in scenarios {
+            assert!(
+                sc.get("expect_module_plane").is_some(),
+                "scenario {} lacks expect_module_plane — the module-plane \
+                 (container_runtime.rs) leg of this fixture silently skips it",
+                sc["name"]
+            );
+        }
+    }
+
+    /// The three runtime-selection surfaces read ONE fixture, so they
+    /// cannot drift: Python `vco_lib.containers.resolve`,
+    /// `runtime.rs::candidate_order` + `select_runtime`, and this
+    /// module's `runtime_candidate_order` + `decide_module_runtime`.
+    /// The load-bearing rows are the refusals — reverting this surface
+    /// to a fall-through (pin first, then both) turns them into
+    /// `Ok(other)` and fails here.
+    #[test]
+    fn parity_fixture_module_plane_matches_every_scenario() {
+        let fx = parity_fixture();
+        for sc in fx["scenarios"].as_array().unwrap() {
+            let name = sc["name"].as_str().unwrap();
+            let pin = fixture_pin(sc);
+            // Derive the order exactly the way `detect_container_runtime`
+            // does, so both pin arms of `runtime_candidate_order` are
+            // exercised by the fixture (env pin and runtime_txt pin).
+            let (env_arg, txt_arg) = match pin {
+                Some((p, RuntimePinSource::EnvOverride)) => (Some(p), None),
+                Some((p, RuntimePinSource::RuntimeTxt)) => (None, Some(p)),
+                None => (None, None),
+            };
+            let order = runtime_candidate_order(env_arg, txt_arg);
+            let probes = fixture_probes(sc);
+            let got = decide_module_runtime(&order, &probes, pin);
+            let want = &sc["expect_module_plane"];
+            match want["ok"].as_str() {
+                Some(rt) => assert_eq!(
+                    got.as_deref(),
+                    Ok(rt),
+                    "scenario {}: module plane must resolve {}",
+                    name,
+                    rt
+                ),
+                None => {
+                    let err = got.expect_err(&format!(
+                        "scenario {}: fixture expects a refusal, module plane \
+                         resolved instead",
+                        name
+                    ));
+                    if let Some(pin_name) = want["refused"]["pinned"].as_str() {
+                        assert_eq!(pin.unwrap().0, pin_name, "scenario {}", name);
+                        assert!(
+                            err.contains(pin_name),
+                            "scenario {}: refusal must name the pin {:?}: {}",
+                            name,
+                            pin_name,
+                            err
+                        );
+                        assert!(
+                            err.contains("container runtime"),
+                            "scenario {}: refusal must say 'container runtime': {}",
+                            name, err
+                        );
+                        assert!(
+                            err.contains("SEPARATE named volumes"),
+                            "scenario {}: refusal must say why it will not \
+                             substitute: {}",
+                            name, err
+                        );
+                        let alt_usable =
+                            want["refused"]["alternative_usable"].as_bool().unwrap();
+                        assert_eq!(
+                            err.contains("is a usable container runtime but VCO will NOT drive it"),
+                            alt_usable,
+                            "scenario {}: alternative_usable={} but message: {}",
+                            name, alt_usable, err
+                        );
+                        if let Some(via) = want["refused"]["via"].as_str() {
+                            assert!(
+                                err.contains(via),
+                                "scenario {}: refusal must name the source \
+                                 {:?}: {}",
+                                name, via, err
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The refusal message splits the two remedies the way the Python
+    /// surface does (`_pin_refusal_reason`): an installed-but-down pin
+    /// says "start it"; a pin whose binary is absent says "install it".
+    #[test]
+    fn module_plane_pin_refusal_names_state_and_remedy() {
+        let m = module_runtime_pin_refusal(
+            "podman",
+            RuntimePinSource::EnvOverride,
+            true,
+            true,
+        );
+        assert!(m.contains("VCT_CONTAINER_RUNTIME=podman is set but"));
+        assert!(m.contains("not responding to `podman info`"));
+        assert!(m.contains("docker is a usable container runtime but VCO will NOT drive it"));
+        assert!(m.contains("start podman, or unset VCT_CONTAINER_RUNTIME"));
+        assert!(m.contains("container runtime"));
+
+        let not_installed = module_runtime_pin_refusal(
+            "docker",
+            RuntimePinSource::EnvOverride,
+            false,
+            true,
+        );
+        assert!(not_installed.contains("docker is not installed"));
+        assert!(not_installed.contains("set it to podman"));
+
+        let no_alt = module_runtime_pin_refusal(
+            "podman",
+            RuntimePinSource::RuntimeTxt,
+            true,
+            false,
+        );
+        assert!(no_alt.contains("state/install/runtime.txt"));
+        assert!(no_alt.contains("docker is not a usable container runtime either"));
+        assert!(no_alt.contains("start podman (or install it), then retry"));
+        // The runtime.txt remedy must NOT tell the user to unset the env
+        // var — the pin does not come from there.
+        assert!(!no_alt.contains("unset VCT_CONTAINER_RUNTIME"));
+    }
+
+    /// The auto arm still falls through — podman down + docker up with
+    /// NO pin resolves docker. R35 refuses PINS, not auto-detection;
+    /// this pins the distinction so the fix cannot overreach.
+    #[test]
+    fn module_plane_auto_arm_still_falls_through() {
+        let order = runtime_candidate_order(None, None);
+        let mut probes = HashMap::new();
+        probes.insert("podman".into(), ModuleRuntimeProbe::BinaryOnly);
+        probes.insert("docker".into(), ModuleRuntimeProbe::Responsive);
+        assert_eq!(
+            decide_module_runtime(&order, &probes, None),
+            Ok("docker".to_string())
         );
     }
 

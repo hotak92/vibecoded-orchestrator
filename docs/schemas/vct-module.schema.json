@@ -81,11 +81,11 @@
     },
     "license": {
       "default": {
-        "min_orchestrator_tier": "",
         "required": false,
-        "trial_days": 0,
         "type": null,
-        "variant_ids": []
+        "variant_ids": [],
+        "min_orchestrator_tier": "",
+        "trial_days": 0
       },
       "allOf": [
         {
@@ -95,14 +95,14 @@
     },
     "requirements": {
       "default": {
-        "depends_on": [],
-        "disk_mb": 0,
-        "gpu": false,
-        "memory_mb": 0,
-        "network": [],
-        "node": null,
         "os": [],
-        "python": null
+        "python": null,
+        "node": null,
+        "memory_mb": 0,
+        "disk_mb": 0,
+        "network": [],
+        "gpu": false,
+        "depends_on": []
       },
       "allOf": [
         {

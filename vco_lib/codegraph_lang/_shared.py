@@ -2,10 +2,13 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Shared helpers for the per-language code-graph extractors (P2f stage 2).
 
-Moved VERBATIM out of ``templates/scripts/analyze_code_graph.py`` (v0.2.76)
-— behavior is pinned byte-identically by the golden snapshot suite
-(``tests/test_codegraph_golden.py``); treat any output drift as a regression,
-not a refactor opportunity.
+Moved VERBATIM out of ``templates/scripts/analyze_code_graph.py`` (v0.2.76).
+The MOVE was byte-identical; the module has since GROWN corrections and new
+shared helpers (v0.2.92 and WP-5b), so it is no longer output-identical to
+the analyzer's original. The golden snapshot suite
+(``tests/test_codegraph_golden.py``) pins what it does TODAY, and unexplained
+drift is still a regression — but a snapshot records behaviour, not
+correctness (see ``tests/fixtures/codegraph_golden/README.md``).
 
 Contents (all previously module-level in the analyzer, used ONLY by the
 extractors / the per-language method helpers):
@@ -14,8 +17,18 @@ extractors / the per-language method helpers):
   skip heuristic for machine-minified files.
 * ``_extract_balanced_block`` + ``_scrub_for_brace_balance`` — V52-O.11.E
   brace-balanced body extraction (every brace-language extractor).
+* ``extract_end_keyword_block`` (v0.2.92 WP-5b) — its sibling for the two
+  languages that close a block with the WORD ``end`` (Ruby, Lua), where a
+  brace count finds no opener at all and runs the body to end-of-file. Shares
+  the lexer and the 1-indexed closing-line return convention with the brace
+  scanner, and nothing else: an ``end`` count additionally has to decide, per
+  occurrence, whether the keyword opens anything (Ruby's statement modifiers
+  spell ``if`` exactly like its block form).
 * ``_extract_external_calls`` (+ the ``_HTTP/GRPC/MQ/WS_LIBS`` gates and
   ``_strip_triple_quoted``) — cross-language interaction extraction.
+* ``build_api_entity`` (v0.2.92) — the ONE constructor for a ``KIND_API``
+  ``CodeEntity``, extracted from the three byte-identical copies that had
+  accumulated in ``javascript`` / ``csharp`` / ``proto``.
 
 Helpers the extractors share WITH non-extractor analyzer code — the
 ``embed_function`` / ``embed_class`` / ``generate_embedding`` /
@@ -28,7 +41,19 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
+
+from vco_lib.codegraph_entities import CodeEntity, KIND_API
 
 
 # ── P2f stage 3 (v0.2.77 Part 6): the NARROW helpers protocol ───────────────
@@ -145,6 +170,240 @@ def run_pure_extractor(
     return ctx.write_file_extraction(fx)
 
 
+# ── v0.2.92: the ONE CodeAPI entity constructor ─────────────────────────────
+def build_api_entity(
+    *,
+    file_path_rel: str,
+    endpoint: str,
+    method: str,
+    description: str,
+    project: Any,
+    embed: Callable[[str], Any],
+    parameters: Optional[List[str]] = None,
+    returns: str = "",
+    proxy_target: str = "",
+    handler_full_name: Optional[str] = None,
+) -> CodeEntity:
+    """Build the ``KIND_API`` :class:`CodeEntity` for one route/endpoint.
+
+    Single-homes what were three byte-identical hand-rolled copies (javascript
+    Fastify routes, csharp ASP.NET attributes, proto RPC entries) before the
+    python producer would have made a fourth. The copies each had to re-state
+    the same four easy-to-get-wrong details:
+
+      * the EXACT extras key set the CodeAPI schema + content-hash contract
+        expects (``endpoint`` / ``method`` / ``api_description`` /
+        ``parameters`` / ``returns`` / ``project`` / ``proxy_target``) — the
+        first five feed ``CONTENT_HASH_FIELDS['CodeAPI']``, so a missing or
+        renamed key silently re-hashes every stored row;
+      * ``project`` travels in ``extras``, NOT in the ``CodeEntity.project``
+        named field (CodeAPI's property set is wholly extras-driven);
+      * ``handler`` is a REFERENCE a pure producer cannot mint (it needs the
+        target function's UUID). It is requested via the private
+        ``extras['_handler_full_name']`` control key, which
+        ``write_file_extraction`` resolves against the entities it has ALREADY
+        written for this file — so the handler's ``CodeEntity`` must be emitted
+        BEFORE this one, and an unresolvable name drops the edge rather than
+        fabricating it;
+      * the embed must be DEFERRED (v0.2.82 G1 task 2) as a ZERO-arg closure
+        with the description captured by DEFAULT ARGUMENT — a late-binding
+        closure over a loop variable would embed the wrong text.
+
+    ``endpoint`` + ``method`` are also the dedup identity
+    (``CodeEntity.identity_key()`` → ``"<endpoint>:<method>"``, seeded into the
+    deterministic UUID together with the project + ``file_path_rel``), so two
+    routes that differ only by method are two rows, and the same route declared
+    in two files does not collide.
+
+    Behaviour is pinned byte-identically for all three pre-existing call-sites
+    by ``tests/test_codegraph_golden.py`` (the fixture repo exercises a C#
+    ``[HttpGet]``/``[HttpPost]``, two proto RPCs and two Fastify routes).
+    """
+    extras: Dict[str, Any] = {
+        "endpoint": endpoint,
+        "method": method,
+        "api_description": description,
+        "parameters": list(parameters) if parameters else [],
+        "returns": returns,
+        "project": project,
+        "proxy_target": proxy_target,
+    }
+    if handler_full_name:
+        extras["_handler_full_name"] = handler_full_name
+    return CodeEntity(
+        kind=KIND_API,
+        file_path_rel=file_path_rel,
+        extras=extras,
+        deferred_embed=(lambda d=description: embed(d)),
+    )
+
+
+# ── v0.2.92: the ONE mount-prefix + route-path join ────────────────────────
+def join_route(prefix: str, path: str) -> str:
+    """Join a mount prefix (router / blueprint / controller ``[Route]``) with a
+    route path, producing the leading-slash endpoint every producer stores.
+
+    Extracted from the two byte-equivalent copies that had accumulated —
+    ``python._py_join_route`` and ``csharp._csharp_join_route``. They became
+    equivalent in v0.2.92 when the C# side stopped emitting a slash-less
+    endpoint for the no-controller-route case; before that the C# copy could
+    not be shared. Their ONLY remaining divergence was that C# also stripped
+    whitespace off the method template, which is a C#-input concern (the route
+    regex captures verbatim between the quotes of ``[HttpGet(" all ")]``), not
+    part of the join — so the C# producer normalises its own argument at the
+    call site and this function stays a pure refactor of both.
+
+    Normalizes the SEAM only. A trailing slash on ``path`` is semantically
+    meaningful in Flask (``/users/`` and ``/users`` are different rules) and is
+    preserved verbatim. An EMPTY path yields the bare prefix, matching
+    FastAPI's ``self.prefix + path`` concatenation: ``APIRouter(prefix="/v1")``
+    with ``@router.get("")`` serves ``/v1``, NOT ``/v1/``; a prefix that is
+    itself empty yields ``"/"`` rather than ``""``.
+
+    Output is pinned byte-identically by ``tests/test_codegraph_golden.py`` and
+    by the old-vs-new parity matrix in
+    ``tests/test_v0292_shared_join_route.py``; treat drift as a regression.
+    """
+    p = (prefix or "").strip().rstrip("/")
+    if p and not p.startswith("/"):
+        p = "/" + p
+    if not path:
+        return p or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return p + path
+
+
+# ── v0.2.92: the ONE "where does the declaration actually start" walk ──────
+def skip_leading_whitespace(text: str, match_start: int, match_end: int) -> int:
+    """First non-whitespace offset in ``text[match_start:match_end]``.
+
+    Every regex-based producer in this package opens its class/method pattern
+    with a modifier alternation that INCLUDES ``\\s`` — ``(?:public|private|
+    …|\\s)+`` (java, csharp), ``(?:^|\\n)\\s*`` (cpp). That group starts
+    matching at the whitespace which follows the PREVIOUS token, so
+    ``match.start()`` routinely sits on the previous LINE and
+    ``text[:match.start()].count('\\n') + 1`` is one or more lines too high.
+    Measured on the golden corpus before v0.2.92: the Java class ``Account``
+    was stored starting on ``package golden;``, ``Account.deposit`` on the
+    constructor's closing ``}`` (with a ``body`` that began with that brace),
+    and the C++ class ``Point`` on the previous class's ``};``.
+
+    Bounded by ``match_end`` so an all-whitespace match cannot walk past its
+    own span. Returns ``match_start`` when the first character is already
+    non-whitespace, which is the no-op every already-correct caller sees.
+    """
+    pos = match_start
+    while pos < match_end and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+# ── v0.2.92: the ONE declaration-terminator scan ───────────────────────────
+def scan_to_declaration_terminator(
+    text: str,
+    from_pos: int,
+    stops: str = ";{",
+    limit: int = 4000,
+) -> Tuple[Optional[str], int]:
+    """First character from ``stops`` at bracket depth 0 at/after ``from_pos``.
+
+    Answers "does this declaration OPEN A BLOCK, or does it just end?" — the
+    question every brace-scanning producer in this package assumed away.
+    ``_extract_balanced_block`` is only meaningful for a declaration that opens
+    a ``{``; run it on a BODILESS declaration (a Rust trait method, a C#
+    interface / abstract method, a C++ pure-virtual) and it finds no opener on
+    that line, keeps scanning, and latches onto the NEXT construct's braces.
+    Measured on the golden corpus before v0.2.92: ``engine.rs``'s trait
+    ``fn reset(&mut self);`` (line 26) was stored with ``end_line`` 32 and a
+    ``body`` containing the trait's ``}``, the ``impl Resettable for Counter``
+    header AND the impl's own ``reset`` body — so the two ``reset`` rows the
+    duplicate-identity fix had just separated carried nearly the same text.
+
+    Depth counts ``()``, ``[]`` and ``{}``. The stop test runs BEFORE the depth
+    update, so a ``{`` in ``stops`` is reported rather than counted. Depth is
+    what keeps a nested terminator from ending the declaration early: a Rust
+    ``-> [u8; 4] {`` return type, and a C# statement-lambda expression body
+    (``=> Items.Select(x => { var y = x; return y; }).Count();``), both contain
+    a ``;`` that is not the terminator.
+
+    Returns ``(None, from_pos)`` when nothing is found inside ``limit`` — the
+    conservative outcome; callers fall back to the declaration line rather
+    than scanning away.
+    """
+    depth = 0
+    for k in range(from_pos, min(len(text), from_pos + limit)):
+        ch = text[k]
+        if depth <= 0 and ch in stops:
+            return ch, k
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+    return None, from_pos
+
+
+# ── v0.2.92: the ONE block-comment scrub ───────────────────────────────────
+def blank_block_comments_preserving_lines(
+    text: str,
+    open_tok: str = "/*",
+    close_tok: str = "*/",
+    *,
+    line_anchored: bool = False,
+) -> str:
+    """Remove block comments from ``text`` WITHOUT changing its line count.
+
+    THE DEFECT THIS CLOSES (v0.2.92). Nine extractors each carried their own
+    ``re.sub(<open>.*?<close>, " ", text, flags=re.DOTALL)``. Substituting a
+    single space for a comment that spans N newlines DELETES N lines from the
+    scrubbed copy — and eight of those nine extractors then derive entity line
+    numbers from that copy (``content_clean[:m.start()].count('\\n') + 1``)
+    while slicing bodies out of ``source_lines``, which is split from the
+    ORIGINAL text. Every entity below a multi-line block comment was therefore
+    stored with a ``start_line``/``end_line``/``body`` shifted UP by the number
+    of lines the comments above it occupied, and the error accumulates down the
+    file. Measured on a four-line ``/* … */`` above a controller: the class row
+    started on the comment's second line and a method's ``body`` began with a
+    comment fragment.
+
+    THE RULE. Newline count in == newline count out, always:
+
+      * a comment containing N >= 1 newlines becomes exactly ``"\\n" * N`` —
+        the newlines both hold the line numbering steady AND keep the tokens on
+        either side apart (a newline is whitespace, so nothing is glued);
+      * a single-line comment (N == 0) becomes ``" "`` — byte-for-byte what
+        every call site did before, so ``int/*x*/y`` stays ``int y`` and never
+        becomes ``inty``.
+
+    ``open_tok`` / ``close_tok`` are literal delimiters (escaped here, so no
+    caller hand-rolls a pattern). ``line_anchored=True`` additionally requires
+    both delimiters to start a line — the Ruby ``=begin`` / ``=end`` form,
+    whose pre-existing pattern was ``^=begin.*?^=end`` and whose anchoring is
+    load-bearing (an ``=end`` inside an expression must not close a comment).
+
+    Non-greedy by construction, so ``/* a */ x /* b */`` is two comments rather
+    than one span swallowing ``x``. An UNTERMINATED comment matches nothing and
+    is left verbatim — the conservative outcome (a scrub that ran away to EOF
+    would delete the rest of the file from the parser's view).
+
+    Pinned by ``tests/test_v0292_wp5_block_comment_scrub.py`` (the newline-count
+    invariant, per delimiter family) and by
+    ``tests/test_codegraph_golden.py`` (the stored line numbers themselves).
+    """
+    o = re.escape(open_tok)
+    c = re.escape(close_tok)
+    if line_anchored:
+        pattern = re.compile(rf"^{o}.*?^{c}", re.MULTILINE | re.DOTALL)
+    else:
+        pattern = re.compile(rf"{o}.*?{c}", re.DOTALL)
+
+    def _blank(m: "re.Match[str]") -> str:
+        newlines = m.group(0).count("\n")
+        return "\n" * newlines if newlines else " "
+
+    return pattern.sub(_blank, text)
+
+
 # CG-5 (v0.2.75 P3d): minified-CONTENT heuristic. The name-suffix denylist
 # (``CODEGRAPH_SKIP_SUFFIXES``) only catches conventionally-named build output
 # (``*.min.js`` …). Vendored / generated files that DON'T carry the suffix
@@ -243,14 +502,28 @@ def _extract_balanced_block(
     Rust raw strings, C# verbatim strings, Lua long brackets). Omitting
     ``language`` selects the C-family profile, which will mis-lex those.
     Every in-package call site threads its key; the registry↔table parity
-    test keeps that true. ``end``-keyword
-    languages (Lua) do NOT use this helper — their extractors
-    (``vco_lib/codegraph_lang/lua.py``) key on the ``end`` token
-    directly. Indent-significant languages don't use it either (Python
-    uses AST so it bypasses this helper entirely; Ruby uses ``end``
-    keywords — callers there may still use this helper since Ruby's
-    bodies are short enough that brace-balance over a 400-line window
-    won't over-extend, but it's a less precise fit).
+    test keeps that true.
+
+    ``end``-KEYWORD LANGUAGES DO NOT USE THIS HELPER (v0.2.92 WP-5b). Ruby and
+    Lua close their blocks with the WORD ``end``; ``ruby.py`` and ``lua.py``
+    call :func:`extract_end_keyword_block` instead, and nothing in this package
+    passes ``language="ruby"`` or ``language="lua"`` here any more
+    (``tests/test_v0292_wp5b_end_block_scanner.py`` pins which scanner each
+    extractor module uses).
+
+    The two releases of history, because it explains the shape of the fix:
+    until WP-5b both of them DID call this helper, and idiomatic Ruby has no
+    braces around a class or a method at all — so the scan found no opener,
+    fell through to the ``min(start_line + 40, len(source_lines))`` runaway
+    branch, and every entity's stored ``body`` ran from its declaration to
+    end-of-file. Measured on the golden corpus at the time: all three
+    ``ledger.rb`` classes AND all six of its methods ended at line 40 of a
+    40-line file. Over-extension there was never a window-size effect; it was
+    the no-opener fallback, which is why widening ``max_lookahead`` would not
+    have helped and a different scanner was needed.
+
+    Indent-significant languages do not use this helper either — Python goes
+    through the AST and bypasses it entirely.
 
     Performance: ~O(end_line - start_line) lines scanned per call. With
     ``max_lookahead=400`` and typical function bodies of 10-50 lines,
@@ -298,6 +571,248 @@ def _extract_balanced_block(
     # No balanced close within lookahead — fall back to the legacy
     # behavior so callers don't crash. This is the runaway-function
     # branch; in practice almost never hit.
+    return min(start_line + 40, len(source_lines))
+
+
+# ---------------------------------------------------------------------------
+# v0.2.92 WP-5b — the ONE ``end``-keyword block scanner
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES. ``_extract_balanced_block`` counts BRACES. Ruby and
+# Lua terminate their blocks with the WORD ``end``, and idiomatic Ruby has no
+# braces around a class or a method at all — so every Ruby class and every Ruby
+# method took the no-opener runaway branch above and stored a ``body`` running
+# from its declaration to the end of the file. Measured on the shipped golden
+# corpus at v0.2.92: all three ``ledger.rb`` classes AND all six of its methods
+# ended at line 40 of a 40-line file, and ``vector.lua``'s ``clamp`` ended at
+# 39 for a function that closes on 38. That is not an off-by-one: an entity's
+# stored text (and therefore its embedding) was every line after it.
+#
+# WHY A SEPARATE FUNCTION rather than a mode of ``_extract_balanced_block``:
+# brace balance is a CHARACTER count over a scrubbed line, ``end`` balance is a
+# WORD count that additionally has to decide, per occurrence, whether the word
+# opens anything at all. Ruby's statement modifiers (``value = 1 if flag``) use
+# the same keyword as the block form and take no ``end`` — counting one of
+# those as an opener runs the body on to the next unmatched ``end``, which is
+# strictly worse than the bug being fixed. The two scanners share the lexer
+# (``_scrub_line_stateful``) and the return convention, and nothing else.
+
+
+class _EndBlockProfile(NamedTuple):
+    """Which words open an ``end``-terminated block, for ONE language."""
+
+    #: keywords that open a block wherever they appear as a bare word.
+    always_open: FrozenSet[str]
+    #: keywords that open a block ONLY in expression-start position. Anywhere
+    #: else they are Ruby statement modifiers, which take no ``end``. Empty for
+    #: a language (Lua) that has no modifier form.
+    open_at_expression_start: FrozenSet[str] = frozenset()
+    #: keywords whose HEADER may be terminated by ``do`` on the same line
+    #: (``while x do``, ``for i = 1, n do``). That ``do`` belongs to the header
+    #: that already incremented the depth and must not count a second time.
+    header_do: FrozenSet[str] = frozenset()
+    #: ``def foo = expr`` — Ruby 3.0's endless method — opens no block.
+    endless_def: bool = False
+
+
+#: language key -> profile. Keys are ``lang_dispatch`` keys, the same alphabet
+#: ``_LANG_SYNTAX`` and ``codegraph_lang.EXTRACTORS`` use. A language with no
+#: row here has no ``end``-keyword blocks, and
+#: :func:`extract_end_keyword_block` answers "this declaration opens nothing"
+#: for it rather than raising — the walk must never crash on a heuristic.
+#: ``tests/test_v0292_wp5b_end_block_scanner.py`` pins that every call site in
+#: this package passes a key that IS in this table.
+_END_BLOCK_PROFILES: Dict[str, _EndBlockProfile] = {
+    # ``case``/``for``/``begin`` have no modifier form in Ruby, so they are
+    # unconditional. ``if``/``unless``/``while``/``until`` do, so they are not.
+    "ruby": _EndBlockProfile(
+        always_open=frozenset({"class", "module", "def", "begin", "case", "for", "do"}),
+        open_at_expression_start=frozenset({"if", "unless", "while", "until"}),
+        header_do=frozenset({"while", "until", "for"}),
+        endless_def=True,
+    ),
+    # Lua has no statement modifiers: ``if``/``for``/``while`` always open.
+    # ``repeat``/``until`` is deliberately ABSENT — that pair is closed by
+    # ``until``, not by ``end``, so counting ``repeat`` would never balance
+    # while ignoring both is exactly right (any ``end`` inside a repeat body
+    # belongs to a nested block that opens inside it).
+    "lua": _EndBlockProfile(
+        always_open=frozenset({"function", "if", "for", "while", "do"}),
+        header_do=frozenset({"for", "while"}),
+    ),
+}
+
+_END_BLOCK_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+#: A word preceded by one of these is a member/symbol/variable name, not a
+#: keyword: ``range.end``, ``:end``, ``@if``, ``$do``.
+_END_BLOCK_NOT_KEYWORD_BEFORE: FrozenSet[str] = frozenset(".:@$")
+
+#: A prefix ending in one of these puts the next token at the start of an
+#: expression, where Ruby reads ``if`` as a block rather than as a modifier.
+#: Deliberately EXCLUDES ``?`` and ``!``: they are Ruby method-name suffixes,
+#: so ``valid? if flag`` / ``save! if flag`` are modifiers, not blocks.
+_EXPRESSION_START_CHARS: FrozenSet[str] = frozenset("=(,[{;|&")
+
+#: Same, for a prefix ending in a word. ``return``/``next``/``break``/``raise``
+#: are NOT here: ``return if done`` is the modifier form.
+_EXPRESSION_START_WORDS: FrozenSet[str] = frozenset(
+    {"and", "or", "not", "then", "do", "else", "elsif", "when", "in", "ensure", "rescue"}
+)
+
+_TRAILING_WORD_RE = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)$")
+
+
+def _at_expression_start(text: str, pos: int) -> bool:
+    """Is ``text[pos:]`` at the beginning of an expression?
+
+    The Ruby modifier test. ``pos`` is the offset of the keyword in a SCRUBBED
+    line, so strings are already a single placeholder token and cannot make an
+    operator the last visible character.
+    """
+    prefix = text[:pos].rstrip()
+    if not prefix:
+        return True
+    if prefix[-1] in _EXPRESSION_START_CHARS:
+        return True
+    m = _TRAILING_WORD_RE.search(prefix)
+    return m is not None and m.group(1) in _EXPRESSION_START_WORDS
+
+
+def _is_endless_def(text: str, pos: int) -> bool:
+    """Ruby 3.0 ``def name(args) = expr`` — a method with no ``end``.
+
+    ``pos`` is the offset just past the ``def`` keyword. Reads the method-name
+    token (which may itself be an operator: ``==``, ``[]=``, ``value=``), then
+    an optional balanced parameter list, then asks whether what follows is a
+    bare ``=``. ``def value=(v)`` and ``def ==(other)`` therefore stay ordinary
+    methods: their ``=`` is part of the NAME, consumed before the test.
+    """
+    n = len(text)
+    i = pos
+    while i < n and text[i].isspace():
+        i += 1
+    while i < n and not text[i].isspace() and text[i] != "(":
+        i += 1
+    while i < n and text[i].isspace():
+        i += 1
+    if i < n and text[i] == "(":
+        depth = 0
+        while i < n:
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        while i < n and text[i].isspace():
+            i += 1
+    if i >= n or text[i] != "=":
+        return False
+    return i + 1 >= n or text[i + 1] not in "=>~"
+
+
+def extract_end_keyword_block(
+    # ``Sequence`` rather than ``List``: this function only indexes and takes
+    # ``len``, and ``List`` is INVARIANT — a caller holding a
+    # ``list[LiteralString]`` (which is what ``"…".split("\n")`` on a literal
+    # infers to) cannot pass it to a ``List[str]`` parameter.
+    source_lines: Sequence[str],
+    start_line: int,
+    *,
+    language: str,
+    max_lookahead: int = 400,
+) -> int:
+    """End-line of an ``end``-terminated block, by the same contract as
+    :func:`_extract_balanced_block`: the **1-indexed line of the token that
+    closes the block**, consumed as
+    ``'\\n'.join(source_lines[start_line - 1:end_line])``.
+
+    ``start_line`` is the DECLARATION line (``class Foo``, ``def bar``,
+    ``function baz()``), not the line after it.
+
+    THREE OUTCOMES, all bounded:
+
+      * the matching ``end`` is found → its line number;
+      * the declaration line opens NOTHING (a Ruby endless method
+        ``def size = @n``, a one-line construct already closed on it, an
+        unknown language) → ``start_line``. That is the conservative answer:
+        a one-line body, never the rest of the file;
+      * no matching ``end`` inside ``max_lookahead`` → ``min(start_line + 40,
+        len(source_lines))``, byte-for-byte the graceful-degradation branch
+        ``_extract_balanced_block`` already uses, so the two scanners tell one
+        story about runaway input.
+
+    WHAT IT COUNTS. Comments and string literals are removed by the shared
+    per-language lexer with state carried across lines, so an ``end`` inside a
+    string or a ``=begin`` block is not a closer. A word preceded by ``.``,
+    ``:``, ``@`` or ``$`` is a member/symbol/ivar name, and a word followed by
+    ``:`` is a hash key (``end:``) — neither is a keyword.
+
+    KNOWN LIMITS, stated rather than implied:
+      * a Ruby heredoc body (``<<~SQL``) is not lexed as a string, so an
+        ``end`` inside one is counted. The shared lexer has never modelled
+        heredocs; this scanner inherits that gap and no more.
+      * a ``while``/``for`` header split across lines puts its ``do`` on a
+        later line, where the same-line ``header_do`` guard cannot see it, so
+        the block is counted twice. Both forms are rare; the failure direction
+        is a body that ends LATE, which is the pre-existing behaviour rather
+        than a new class of error.
+    """
+    if start_line < 1 or start_line > len(source_lines):
+        return min(start_line + 40, len(source_lines))  # legacy fallback
+
+    profile = _END_BLOCK_PROFILES.get((language or "").strip().lower())
+    if profile is None:
+        return start_line
+
+    syn = _syntax_for(language)
+    scrub_state: Optional[_ScrubState] = None
+    depth = 0
+    found_opener = False
+    lookahead_end = min(start_line - 1 + max_lookahead, len(source_lines))
+
+    for line_idx in range(start_line - 1, lookahead_end):
+        scrubbed, scrub_state = _scrub_line_stateful(
+            source_lines[line_idx], syn, scrub_state, placeholder="_"
+        )
+        pending_header_do = False
+        for m in _END_BLOCK_WORD_RE.finditer(scrubbed):
+            word = m.group(0)
+            if m.start() and scrubbed[m.start() - 1] in _END_BLOCK_NOT_KEYWORD_BEFORE:
+                continue
+            if m.end() < len(scrubbed) and scrubbed[m.end()] == ":":
+                continue  # a hash key / label, e.g. `end:` or `if:`
+            if word == "end":
+                depth -= 1
+                if found_opener and depth <= 0:
+                    return line_idx + 1
+                continue
+            if word in profile.always_open:
+                if word == "do" and pending_header_do:
+                    pending_header_do = False  # belongs to this line's header
+                    continue
+                if word == "def" and profile.endless_def and _is_endless_def(
+                    scrubbed, m.end()
+                ):
+                    continue
+            elif word in profile.open_at_expression_start:
+                if not _at_expression_start(scrubbed, m.start()):
+                    continue  # a statement modifier — no `end` to match
+            else:
+                continue
+            depth += 1
+            found_opener = True
+            if word in profile.header_do:
+                pending_header_do = True
+
+        if line_idx == start_line - 1 and not found_opener:
+            # The declaration itself opened no block. Nothing later in the file
+            # can belong to it, so a one-line body is the only honest answer.
+            return start_line
+
     return min(start_line + 40, len(source_lines))
 
 
@@ -389,6 +904,11 @@ class _ScrubState(NamedTuple):
     opener: str = ""      # non-empty only for a NESTABLE block comment (Rust)
     depth: int = 1
     continuation: bool = False  # a trailing backslash may extend this string
+    #: True only for a block comment. Distinguishes a comment construct from a
+    #: string/char construct that happens to reuse the same span-tracking
+    #: machinery, so ``keep_strings`` (v0.2.92 WP-G) knows which removed
+    #: regions to restore verbatim and which to keep dropping.
+    is_comment: bool = False
 
 
 # Characters a shell/PowerShell ``#`` must follow to begin a comment.
@@ -594,7 +1114,10 @@ def _open_construct_at(
     for opener, closer, nested in syn.block_comments:
         if line.startswith(opener, i):
             return i + len(opener), _ScrubState(
-                closer=closer, spans_lines=True, opener=opener if nested else ""
+                closer=closer,
+                spans_lines=True,
+                opener=opener if nested else "",
+                is_comment=True,
             )
     return None
 
@@ -610,30 +1133,78 @@ def _line_comment_at(line: str, i: int, syn: _LangSyntax) -> bool:
 
 
 def _scrub_line_stateful(
-    line: str, syn: _LangSyntax, state: Optional[_ScrubState] = None
+    line: str,
+    syn: _LangSyntax,
+    state: Optional[_ScrubState] = None,
+    *,
+    placeholder: str = "",
+    keep_strings: bool = False,
 ) -> Tuple[str, Optional[_ScrubState]]:
     """Remove comments + string literals from ONE line, carrying lexer state.
 
-    Returns ``(code-only text, state for the next line)``. The removed regions
-    are dropped entirely (delimiters included) — the only consumers are the
-    ``{``/``}`` counters in ``_extract_balanced_block``, and no delimiter this
-    lexer recognises is a brace.
+    Returns ``(code-only text, state for the next line)``. By default the
+    removed regions are dropped entirely (delimiters included) — the only
+    consumer that wanted that is the ``{``/``}`` counter in
+    ``_extract_balanced_block``, and no delimiter this lexer recognises is a
+    brace.
+
+    ``placeholder`` (v0.2.92 WP-5b) substitutes ONE occurrence of the given
+    text for each removed STRING (not for a comment — nothing follows a line
+    comment). Default ``""`` reproduces the drop-entirely behaviour byte for
+    byte, so every pre-existing caller is unaffected.
+
+    WHY THE OPTION EXISTS. ``extract_end_keyword_block`` has to decide whether
+    a Ruby ``if`` is a block opener or a statement MODIFIER, and it decides it
+    from the text preceding the keyword. Dropping a string leaves
+    ``x = "hi" if flag`` as ``x =  if flag`` — a prefix ending in ``=``, which
+    reads as expression-START position and would classify a modifier as an
+    opener, over-running the body by everything up to the next stray ``end``.
+    Substituting a single token (``x = _ if flag``) keeps the SHAPE of the line
+    while still hiding the string's contents from the keyword scanner.
+
+    ``keep_strings`` (v0.2.92 WP-G) answers a THIRD question, different from
+    both defaults above: "what does this line print/emit?" A scanner looking
+    for CLI commands baked into a Rust ``format!("…")`` call needs comments
+    gone (prose false-positives a regex) but string literals INTACT (the
+    command text lives inside them — dropping strings turns a false positive
+    into a silent false negative, the worse direction). When set, every
+    construct this lexer does NOT classify as ``is_comment`` (quote strings,
+    char literals, raw/triple-quote string forms) is reproduced verbatim
+    instead of dropped or replaced; comments are still stripped. Mutually
+    exclusive with ``placeholder`` in practice (the two answer different
+    questions) but not enforced — ``placeholder`` is simply ignored for any
+    region ``keep_strings`` already preserved.
     """
     out: List[str] = []
     i = 0
     n = len(line)
 
     if state is not None:
+        was_comment = state.is_comment
         i, state = _scan_construct(line, 0, state)
         if state is not None:
+            if keep_strings and not was_comment:
+                return line, _carry_state(state, line)
             return "", _carry_state(state, line)
+        if keep_strings and not was_comment:
+            out.append(line[0:i])
+        elif placeholder:
+            out.append(placeholder)
 
     while i < n:
         opened = _open_construct_at(line, i, syn)
         if opened is not None:
+            start = i
+            is_comment = opened[1].is_comment
             i, state = _scan_construct(line, opened[0], opened[1])
             if state is not None:
+                if keep_strings and not is_comment:
+                    return "".join(out) + line[start:], _carry_state(state, line)
                 return "".join(out), _carry_state(state, line)
+            if keep_strings and not is_comment:
+                out.append(line[start:i])
+            elif placeholder:
+                out.append(placeholder)
             continue
 
         if _line_comment_at(line, i, syn):
@@ -641,6 +1212,7 @@ def _scrub_line_stateful(
 
         ch = line[i]
         if ch == '"':
+            start = i
             i, state = _scan_construct(
                 line,
                 i + 1,
@@ -649,13 +1221,23 @@ def _scrub_line_stateful(
                 ),
             )
             if state is not None:
+                if keep_strings:
+                    return "".join(out) + line[start:], _carry_state(state, line)
                 return "".join(out), _carry_state(state, line)
+            if keep_strings:
+                out.append(line[start:i])
+            elif placeholder:
+                out.append(placeholder)
             continue
 
         if ch == "'":
             if syn.char_quote:
                 m = _CHAR_LITERAL_RE.match(line, i)
                 if m is not None:
+                    if keep_strings:
+                        out.append(line[i : m.end()])
+                    elif placeholder:
+                        out.append(placeholder)
                     i = m.end()
                     continue
                 # A Rust lifetime ('a) or a C++ digit separator — ordinary text.
@@ -663,11 +1245,18 @@ def _scrub_line_stateful(
                 i += 1
                 continue
             if syn.single_quote_string:
+                start = i
                 i, state = _scan_construct(
                     line, i + 1, _ScrubState(closer="'", escapes=True)
                 )
                 if state is not None:
+                    if keep_strings:
+                        return "".join(out) + line[start:], _carry_state(state, line)
                     return "".join(out), _carry_state(state, line)
+                if keep_strings:
+                    out.append(line[start:i])
+                elif placeholder:
+                    out.append(placeholder)
                 continue
 
         out.append(ch)

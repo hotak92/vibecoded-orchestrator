@@ -466,8 +466,18 @@ def _check_migration_022() -> _CheckResult:
 
 
 def _claude_json_path() -> Path:
-    """Path to the user's ``~/.claude.json``. Monkey-patched in tests."""
-    return Path.home() / ".claude.json"
+    """Path to the user's ``~/.claude.json``.
+
+    Resolved via ``vco_lib.paths.user_home`` (v0.2.92 W-CLAUDE) so the
+    ``$VCT_USER_HOME_OVERRIDE`` pin steers it like every other reader of this
+    file. Tests may still monkey-patch this function, but no longer HAVE to:
+    a per-symbol patch only protects the call sites someone remembered, which
+    is exactly how the sibling reader in ``vco_lib.doctor`` kept reaching the
+    developer's real config.
+    """
+    from vco_lib.paths import user_home
+
+    return user_home() / ".claude.json"
 
 
 def _check_mcp_wrappers() -> _CheckResult:
@@ -1219,11 +1229,13 @@ def _check_hook_scripts_on_disk(project_folder: Path) -> _CheckResult:
 
 def _check_indexer_importable() -> _CheckResult:
     try:
+        # The import IS the check (each name must resolve); the names are
+        # deliberately unused afterwards.
         from vco_lib.diagram_indexer import (  # noqa: F401
-            index_diagram,
-            drop_diagram_by_path,
-            parse_mermaid,
-            parse_excalidraw,
+            index_diagram,  # pyright: ignore[reportUnusedImport] — importability probe
+            drop_diagram_by_path,  # pyright: ignore[reportUnusedImport] — importability probe
+            parse_mermaid,  # pyright: ignore[reportUnusedImport] — importability probe
+            parse_excalidraw,  # pyright: ignore[reportUnusedImport] — importability probe
         )
     except ImportError as exc:
         return _CheckResult(
@@ -1241,7 +1253,7 @@ def _check_indexer_importable() -> _CheckResult:
     # absence so older snapshots don't FAIL here.
     has_async = False
     try:
-        from vco_lib.diagram_indexer import index_diagram_async  # noqa: F401
+        from vco_lib.diagram_indexer import index_diagram_async  # noqa: F401  # pyright: ignore[reportUnusedImport] — optional-presence probe
         has_async = True
     except ImportError:
         pass

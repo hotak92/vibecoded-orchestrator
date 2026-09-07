@@ -125,33 +125,67 @@ vco_query_cache_put() {
     return 0
 }
 
-# vco_kg_search_cached <venv> <rl_script> <query> <limit> — run the RL-aware KG
-# search (rl_kg_search.py --hook-format) through the shared TTL cache. Echoes
-# the raw "KG:"-prefixed block(s), served from cache on a repeat query.
+# vco_kg_search_cached <venv> <rl_script> <query> <limit> [prompt_id] [transcript_path]
+# — run the RL-aware KG search (rl_kg_search.py --hook-format) through the
+# shared TTL cache. Echoes the raw "KG:"-prefixed block(s), served from cache
+# on a repeat query.
 #
 # Same one-home rationale as codegraph_query_block: pre-edit and pre-bash each
 # invoked rl_kg_search.py inline with identical shape; this wraps that call so
 # a symbol/query re-searched within the TTL is served from disk (~ms) instead
 # of paying the ~1.3 s interpreter+import+embed+query round-trip again.
 #
-# NOTE: the KG cache is keyed on the "kg" surface + query + limit so it does
-# NOT collide with the "cg" code-graph entries. The result is RAW (pre-dedup);
-# the caller dedups per-session via the seen-store, so cached replays stay
-# dedup-accurate. Empty results ARE cached (an empty symbol isn't re-queried).
-# Best-effort: missing cache helper OR missing venv/script -> falls back to a
-# direct call (pre-edit/pre-bash already guard the venv/script existence).
+# NOTE: the KG cache is keyed on the "kg" surface + query + limit + prompt_id
+# so it does NOT collide with the "cg" code-graph entries. The result is RAW
+# (pre-dedup); the caller dedups per-session via the seen-store, so cached
+# replays stay dedup-accurate. Empty results ARE cached (an empty symbol
+# isn't re-queried). Best-effort: missing cache helper OR missing
+# venv/script -> falls back to a direct call (pre-edit/pre-bash already
+# guard the venv/script existence).
+#
+# WP-E (v0.2.92) query enrichment: [prompt_id] and [transcript_path] are OPTIONAL
+# trailing args, default "" (an omitting caller reproduces pre-WP-E behaviour
+# byte-for-byte). ``prompt_id`` joins the cache key ONLY — the query text
+# passed on this bash boundary is always the raw, unenriched trigger (a short
+# symbol/query string); enrichment happens INSIDE rl_kg_search.py from
+# ``--transcript``, so two different turns issuing the identical short trigger
+# would otherwise collide on the same cache key despite having different
+# enriched embeddings. Keying on prompt_id makes a same-turn re-ask a hit and
+# a cross-turn re-ask a miss — WHEN a prompt_id is actually delivered.
+#
+# KNOWN DEGRADATION when prompt_id is EMPTY (a harness that does not send one,
+# e.g. pre-2.1.196 Claude Code, or any caller omitting the arg): every turn
+# contributes the same empty component, so all turns collapse onto ONE key and
+# a cross-turn re-ask of the identical trigger is a HIT, replaying a result
+# embedded from a DIFFERENT enrichment window for up to the TTL
+# (_VCO_QUERY_CACHE_TTL_DEFAULT, 900 s). That is the pre-WP-E behaviour
+# exactly — no worse than before enrichment existed, and it fails toward a
+# stale-but-valid KG block rather than an error — but it is NOT the
+# "correctly a miss" guarantee the paragraph above describes, and this comment
+# says so rather than letting the guarantee read as unconditional. Narrowing
+# it (per-turn salt, TTL clamp on empty prompt_id) is a BEHAVIOUR change, out
+# of scope here; the honest statement is the deliverable.
+#
+# ``transcript_path`` is a
+# PATH, never text — it is passed through to the producer as ``--transcript
+# <path>`` so the enrichment composition happens in the process that embeds
+# it; the path itself is not secret and is safe in argv, but the transcript
+# CONTENTS it points to must never be read into this shell (see PLAN R31 /
+# vco_lib/transcript_context.py's privacy discipline).
 vco_kg_search_cached() {
     local venv="$1"
     local rl_script="$2"
     local query="$3"
     local limit="${4:-1}"
+    local prompt_id="${5:-}"
+    local transcript_path="${6:-}"
     [ -n "$query" ] || return 0
     [ -n "$venv" ] || return 0
     [ -f "$rl_script" ] || return 0
 
     local _key=""
     if command -v vco_query_cache_key >/dev/null 2>&1; then
-        _key="$(vco_query_cache_key "kg" "$query" "$limit")"
+        _key="$(vco_query_cache_key "kg" "$query" "$limit" "$prompt_id")"
     fi
     if [ -n "$_key" ] && command -v vco_query_cache_get >/dev/null 2>&1; then
         local _hit
@@ -164,7 +198,11 @@ vco_kg_search_cached() {
     # Cache miss — run the live search. The producers cap themselves; the
     # caller historically `head -40`'d, so we do the same here for parity.
     local _out
-    _out="$("$venv" "$rl_script" "$query" --limit "$limit" --hook-format 2>/dev/null | head -40 || true)"
+    if [ -n "$transcript_path" ]; then
+        _out="$("$venv" "$rl_script" "$query" --limit "$limit" --hook-format --transcript "$transcript_path" 2>/dev/null | head -40 || true)"
+    else
+        _out="$("$venv" "$rl_script" "$query" --limit "$limit" --hook-format 2>/dev/null | head -40 || true)"
+    fi
     if [ -n "$_key" ] && command -v vco_query_cache_put >/dev/null 2>&1; then
         vco_query_cache_put "$_key" "$_out"
     fi
@@ -205,6 +243,16 @@ vco_kg_search_cached() {
 #   $8 cg_limit      — CG --limit (ignored when cg_out_file is "")
 #   $9 cg_exclude    — CG --exclude-file
 #   $10 cg_anchor    — CG --anchor
+#   $11 prompt_id    — WP-E (v0.2.92): cache-key scoping ONLY, "" when absent
+#                      (older Claude Code builds; see vco_kg_search_cached's
+#                      docstring for the collision this prevents — same
+#                      rationale, applied to both the kg_key and cg_key here).
+#   $12 transcript_path — WP-E (v0.2.92): a PATH, never text; threaded to the
+#                      driver as a single ``--transcript <path>`` flag so
+#                      BOTH legs receive the SAME enrichment context. Empty
+#                      when the caller has no transcript_path (degrades to
+#                      today's exact argv — the zero-functionality-change
+#                      contract this function already documents above).
 #
 # Returns 0 always. Returns 1 ONLY as an internal signal that the caller should
 # fall back to the legacy two-call path (driver missing / no venv / no markers in
@@ -226,6 +274,7 @@ vco_dual_search_cached() {
     local kg_out="$1" cg_out="$2" venv="$3" rl_script="$4" query="$5"
     local kg_limit="${6:-1}" cg_project_arg="$7" cg_limit="${8:-2}"
     local cg_exclude="$9" cg_anchor="${10:-}"
+    local prompt_id="${11:-}" transcript_path="${12:-}"
 
     [ -n "$query" ] || return 0
     local want_kg=0 want_cg=0
@@ -234,10 +283,14 @@ vco_dual_search_cached() {
     [ "$want_kg" = "1" ] || [ "$want_cg" = "1" ] || return 0
 
     # --- 1. per-leg cache probe (same keys as the single-leg wrappers) ------
+    # prompt_id joins BOTH keys (WP-E, v0.2.92) — see the $11 doc above for
+    # why: the query text on this boundary is the raw trigger, not the
+    # enriched text, so two different turns issuing the same short trigger
+    # must not collide on one cache entry.
     local kg_key="" cg_key=""
     if command -v vco_query_cache_key >/dev/null 2>&1; then
-        [ "$want_kg" = "1" ] && kg_key="$(vco_query_cache_key "kg" "$query" "$kg_limit")"
-        [ "$want_cg" = "1" ] && cg_key="$(vco_query_cache_key "cg" "$query" "$cg_project_arg" "$cg_limit" "$cg_exclude" "$cg_anchor")"
+        [ "$want_kg" = "1" ] && kg_key="$(vco_query_cache_key "kg" "$query" "$kg_limit" "$prompt_id")"
+        [ "$want_cg" = "1" ] && cg_key="$(vco_query_cache_key "cg" "$query" "$cg_project_arg" "$cg_limit" "$cg_exclude" "$cg_anchor" "$prompt_id")"
     fi
     local need_kg="$want_kg" need_cg="$want_cg"
     local _hit
@@ -301,6 +354,11 @@ vco_dual_search_cached() {
         [ -n "$cg_exclude" ] && set -- "$@" --cg-exclude-file "$cg_exclude"
         [ -n "$cg_anchor" ] && set -- "$@" --cg-anchor "$cg_anchor"
     fi
+    # WP-E (v0.2.92): one --transcript flag threads to BOTH legs inside
+    # hook_dual_search.py (it forwards the same path to the KG argv and the
+    # CG argv) — appended once here, not per-leg. Omitted entirely when
+    # empty so a caller without a transcript_path reproduces today's argv.
+    [ -n "$transcript_path" ] && set -- "$@" --transcript "$transcript_path"
 
     local _tmp
     _tmp="$(mktemp 2>/dev/null || printf '%s' "/tmp/vco_dual_$$_$RANDOM")"

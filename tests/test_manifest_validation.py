@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
 from vco_lib.manifest_validation import (
     ValidationResult,
     validate_install_scope_coherence,
@@ -369,6 +370,7 @@ def test_v52d3_cli_valid_manifest_exits_0(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=child_env(),
     )
     assert proc.returncode == 0, (
         f"expected exit 0, got {proc.returncode}; "
@@ -387,6 +389,7 @@ def test_v52d3_cli_invalid_manifest_exits_1(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=child_env(),
     )
     assert proc.returncode == 1, (
         f"expected exit 1, got {proc.returncode}; "
@@ -405,6 +408,7 @@ def test_v52d3_cli_no_arg_exits_2() -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=child_env(),
     )
     assert proc.returncode == 2
 
@@ -422,6 +426,7 @@ def test_v52d3_cli_missing_file_exits_1(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=child_env(),
     )
     assert proc.returncode == 1
     out = json.loads(proc.stdout)

@@ -28,6 +28,8 @@ from typing import Any, List
 
 import pytest
 
+from tests.common.child_env import child_env
+
 
 # ---------------------------------------------------------------------------
 # Import the analyzer module from templates/scripts/ without it landing on
@@ -434,7 +436,12 @@ def test_main_exits_4_on_insert_errors(analyzer_mod, tmp_path: Path, monkeypatch
                     return None
             config = _config()
 
-        def _fake_create_collections(self, force=False):
+        # v0.2.92 (BLOCKER-2): mirror the real signature — main() now passes
+        # `repo_path` so the drop guard can check the family being dropped
+        # against that folder's bindings. A fake that does not accept it turns
+        # a wiring change into a TypeError instead of exercising the path
+        # under test.
+        def _fake_create_collections(self, force=False, *, repo_path=None):
             self.modules_collection = _Coll("Fake_CodeModule")
             self.classes_collection = _Coll("Fake_CodeClass")
             self.functions_collection = _Coll("Fake_CodeFunction")
@@ -499,7 +506,7 @@ def test_main_exits_4_on_insert_errors(analyzer_mod, tmp_path: Path, monkeypatch
     proc = subprocess.run(
         [sys.executable, str(runner)],
         capture_output=True, text=True, timeout=30,
-        env={**os.environ, "VCT_JOERN_AVAILABLE": "0"},
+        env=child_env(VCT_JOERN_AVAILABLE="0"),
     )
 
     assert proc.returncode == 4, (

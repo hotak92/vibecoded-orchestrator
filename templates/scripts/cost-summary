@@ -8,6 +8,10 @@
 # the .py with the same args. The old heredoc version also had a broken
 # argument path (read $1/$2 but consumed a never-exported DAYS env var) —
 # delegating to argparse fixes `--days N` / `--session ID` for free.
+#
+# v0.2.92 W7: no path knowledge lives here. The .py resolves the metrics
+# directories (new home + frozen archive) itself, so this shim did not need to
+# change when the home moved — which is the point of it being a shim.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

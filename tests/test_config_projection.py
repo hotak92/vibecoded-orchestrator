@@ -24,7 +24,6 @@ Run: pytest tests/test_config_projection.py -v
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
@@ -32,6 +31,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+from tests.common.launcher_db_fixture import (
+    add_codegraph_binding,
+    add_kg_binding,
+    make_launcher_db,
+)
 from vco_lib.config_projection import (
     CLAUDE_ENV_MANAGED_BEGIN,
     CLAUDE_ENV_MANAGED_END,
@@ -66,17 +71,22 @@ def _make_launcher_db(
     app_state: dict[str, str] | None = None,
     codegraph_binding_prefix: str | None = None,
 ) -> None:
-    """Build a minimal launcher.db with the schema this module reads.
+    """Build a launcher.db with the REAL launcher schema, seeded for the
+    resolver tests below.
 
-    Tables created: projects, project_kg_bindings, kg_collection_access,
-    codegraph_access, module_settings, project_codegraph_bindings.
-    Schema mirrors the migrations in
-    ``launcher/src-tauri/vct-launcher-core/src/db/migrations/`` (just
-    enough columns for the resolver — not the full schema).
+    v0.2.92 duplication-merge (§3.4): the schema now comes from
+    ``tests.common.launcher_db_fixture``, which APPLIES the shipped
+    ``launcher/src-tauri/vct-launcher-core/src/db/migrations/*.sql`` — so it
+    cannot drift from the DB the launcher actually writes. This helper used to
+    hand-roll seven ``CREATE TABLE`` statements ("just enough columns for the
+    resolver"), which is how it silently missed e.g. ``projects.host``,
+    ``app_state.updated_at``, and the ``project_kg_bindings.role`` CHECK.
+    The keyword shape is unchanged, so every call site below is untouched.
 
     Args:
         kg_bindings: ``{role: collection_name}`` rows to insert for
-            ``project_id``.
+            ``project_id``. ``role`` is constrained by the real schema to
+            ``primary`` | ``shared`` | ``archive``.
         kg_access: list of (collection_name, access_level) rows for
             ``project_id``.
         codegraph_access: list of (grantor_project_id, access_level)
@@ -88,129 +98,48 @@ def _make_launcher_db(
         module_settings: list of (project_id, module_id, key, value)
             with ``value`` being a JSON string.
         extra_projects: additional (id, name, folder_path, slug) rows
-            for cross-project tests (e.g. codegraph_access joins).
+            for cross-project tests (e.g. codegraph_access joins). The real
+            schema makes ``folder_path`` UNIQUE and indexes ``slug``
+            uniquely, so these must differ from each other and from the
+            primary project.
         codegraph_binding_prefix: when set, insert a
             ``project_codegraph_bindings`` row for ``project_id`` with
             this ``collection_prefix`` (v0.2.72 R2 — CODE_GRAPH_PROJECT
             derives binding-prefix-first).
     """
-    conn = sqlite3.connect(str(db_path))
-    cur = conn.cursor()
-    cur.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT NOT NULL
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            embedding_model TEXT,
-            PRIMARY KEY (project_id, role)
-        );
-        CREATE TABLE kg_collection_access (
-            project_id TEXT NOT NULL,
-            collection_name TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            -- v0.2.49 Step F SF6 (L3-SF1): align test-only DDL with the
-            -- production schema. Migration 029 added these audit columns;
-            -- this fixture hand-rolls its own DDL and omitted them.
-            -- DEFAULT 0 matches migration 029's backfill of legacy rows.
-            created_at INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (project_id, collection_name)
-        );
-        CREATE TABLE codegraph_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE diagram_access (
-            grantor_project_id TEXT NOT NULL,
-            grantee_project_id TEXT NOT NULL,
-            access_level TEXT NOT NULL,
-            granted_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (grantor_project_id, grantee_project_id)
-        );
-        CREATE TABLE module_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT NOT NULL,
-            module_id TEXT NOT NULL,
-            setting_key TEXT NOT NULL,
-            setting_value TEXT NOT NULL,
-            UNIQUE(project_id, module_id, setting_key)
-        );
-        CREATE TABLE app_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE project_codegraph_bindings (
-            project_id TEXT PRIMARY KEY,
-            collection_prefix TEXT NOT NULL,
-            embedding_model TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1
-        );
-        """
+    projects: list[dict[str, object]] = [{
+        "project_id": project_id,
+        "name": project_name,
+        "folder_path": project_folder,
+        "slug": project_slug,
+    }]
+    projects.extend(
+        {"project_id": pid, "name": name, "folder_path": folder, "slug": slug}
+        for pid, name, folder, slug in (extra_projects or [])
     )
-    # app_state stores values verbatim (NOT JSON) — matches the Rust
-    # `app_state_set` write semantics.
-    for state_key, state_value in (app_state or {}).items():
-        cur.execute(
-            "INSERT INTO app_state (key, value) VALUES (?, ?)",
-            (state_key, state_value),
-        )
-    cur.execute(
-        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-        (project_id, project_name, project_folder, project_slug),
+    make_launcher_db(
+        db_path,
+        projects=projects,
+        # app_state stores values verbatim (NOT JSON) — matches the Rust
+        # `app_state_set` write semantics.
+        app_state=app_state or {},
+        module_settings=module_settings or [],
+        kg_access=[
+            (project_id, coll, level) for coll, level in (kg_access or [])
+        ],
+        codegraph_access=[
+            (grantor, project_id, level)
+            for grantor, level in (codegraph_access or [])
+        ],
+        diagram_access=[
+            (grantor, project_id, level)
+            for grantor, level in (diagram_access or [])
+        ],
     )
-    for row in extra_projects or []:
-        cur.execute(
-            "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
-            row,
-        )
     for role, coll in (kg_bindings or {}).items():
-        cur.execute(
-            "INSERT INTO project_kg_bindings (project_id, role, collection_name) "
-            "VALUES (?, ?, ?)",
-            (project_id, role, coll),
-        )
-    for coll, level in kg_access or []:
-        cur.execute(
-            "INSERT INTO kg_collection_access (project_id, collection_name, access_level) "
-            "VALUES (?, ?, ?)",
-            (project_id, coll, level),
-        )
-    for grantor, level in codegraph_access or []:
-        cur.execute(
-            "INSERT INTO codegraph_access (grantor_project_id, grantee_project_id, "
-            "access_level, granted_at) VALUES (?, ?, ?, ?)",
-            (grantor, project_id, level, 0),
-        )
-    for grantor, level in diagram_access or []:
-        cur.execute(
-            "INSERT INTO diagram_access (grantor_project_id, grantee_project_id, "
-            "access_level, granted_at) VALUES (?, ?, ?, ?)",
-            (grantor, project_id, level, 0),
-        )
-    for pid, mid, key, value in module_settings or []:
-        cur.execute(
-            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value) "
-            "VALUES (?, ?, ?, ?)",
-            (pid, mid, key, value),
-        )
+        add_kg_binding(db_path, project_id, role, coll)
     if codegraph_binding_prefix is not None:
-        cur.execute(
-            "INSERT INTO project_codegraph_bindings "
-            "(project_id, collection_prefix) VALUES (?, ?)",
-            (project_id, codegraph_binding_prefix),
-        )
-    conn.commit()
-    conn.close()
+        add_codegraph_binding(db_path, project_id, codegraph_binding_prefix)
 
 
 # ─── project_env_from_db tests ──────────────────────────────────────────
@@ -1417,12 +1346,9 @@ def test_apply_escapes_double_quotes_in_shell_env(tmp_path: Path) -> None:
 def _run_cli(*args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Run ``python -m vco_lib.config_projection`` and capture output."""
     cmd = [sys.executable, "-m", "vco_lib.config_projection", *args]
-    env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
-    # Ensure the repo's vco_lib is importable.
-    repo_root = Path(__file__).resolve().parent.parent
-    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    # child_env() puts the repo root FIRST on PYTHONPATH so the child imports
+    # the CHECKOUT's vco_lib, never a stale site-packages copy (§3.16).
+    env = child_env(**(env_extra or {}))
     return subprocess.run(cmd, capture_output=True, text=True, env=env)
 
 

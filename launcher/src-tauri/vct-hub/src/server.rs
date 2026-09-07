@@ -18,9 +18,9 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::{
-    api, auth, cli_api, config_api, db, infra_watchdog, lifecycle_api, mcp_tool_grants_api,
-    module_db_api, module_supervisor, modules_api, project_state_api, project_tokens,
-    rl_events_api, secrets_api, weaviate_probe,
+    api, auth, chat_model_context_api, cli_api, config_api, db, infra_watchdog, lifecycle_api,
+    mcp_tool_grants_api, module_db_api, module_supervisor, modules_api, project_state_api,
+    project_tokens, rl_events_api, secrets_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -196,6 +196,16 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest(
             "/api/v1",
             rl_events_api::router().with_state(launcher_state.clone()),
+        )
+        // v0.2.92 WP-11: read-only chat-model context table. Ordinary
+        // global-hub.token route (it is not per-project — a model's context
+        // window is a property of the model), mounted INSIDE the hub-wide
+        // auth layer like its siblings above. No write path here by design:
+        // the launcher is the single writer for launcher.db and owns the
+        // export-on-every-mutation invariant the gateway depends on.
+        .nest(
+            "/api/v1",
+            chat_model_context_api::router().with_state(launcher_state.clone()),
         )
         // v0.2.31: module-owned DB rows. Uses its OWN bearer-scope
         // middleware (require_module_scope) — token is the per-(module,

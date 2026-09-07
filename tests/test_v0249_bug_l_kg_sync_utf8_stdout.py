@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 
 def _project_root() -> Path:
     here = Path(__file__).resolve().parent
@@ -65,6 +67,7 @@ def test_sync_knowledge_graph_reconfigures_stdout_for_utf8():
         capture_output=True,
         text=True,
         timeout=30,
+        env=child_env(),
     )
     assert result.returncode == 0, f"subprocess failed: {result.stderr}"
     out_lines = result.stdout.strip().split("\n")
@@ -109,6 +112,7 @@ def test_emoji_print_does_not_crash_when_stdout_is_cp1252():
         capture_output=True,
         text=True,
         timeout=30,
+        env=child_env(),
     )
     assert result.returncode == 0, (
         f"subprocess crashed (expected reconfigure to neutralize cp1252):\n"

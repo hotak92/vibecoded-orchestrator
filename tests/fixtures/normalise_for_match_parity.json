@@ -1,0 +1,106 @@
+{
+  "_comment": [
+    "SPDX-License-Identifier: AGPL-3.0-or-later",
+    "Shared Python<->Rust parity corpus for the prefix-normalisation rule.",
+    "",
+    "Python home:  vco_lib/project_identity.py::normalise_for_match",
+    "Rust  mirror: launcher/src-tauri/src/commands/project_identity.rs",
+    "              ::normalise_prefix_for_match",
+    "",
+    "CLAUDE.md's cross-language rule ranks a MIRROR as class C (last resort) and",
+    "REQUIRES a parity test locking it. Both sides carried a 'must match the",
+    "other' comment and neither carried a test (v0.2.92 F-10). This file is the",
+    "data half of the fix. BOTH sides now assert against it, so a one-sided",
+    "edit fails on BOTH: Python via `tests/test_v0292_data_safety_guards.py",
+    "::NormaliseForMatchParityTests`, Rust via `project_identity.rs",
+    "::normalise_prefix_for_match_matches_shared_fixture` (added v0.2.92 WP-6 —",
+    "before that the Rust reader was a TODO here, i.e. the mirror asserted a",
+    "guarantee no test enforced).",
+    "",
+    "Rule: keep [0-9A-Za-z] only (ASCII alphanumeric), lowercase, drop the rest.",
+    "It normalises the WHOLE string -- it does NOT reduce a class name to its",
+    "prefix ('Foo_KnowledgeGraph' -> 'fooknowledgegraph', not 'foo')."
+  ],
+  "vectors": [
+    [
+      "VibeCodedOrchestrator",
+      "vibecodedorchestrator"
+    ],
+    [
+      "VibeCoded Orchestrator",
+      "vibecodedorchestrator"
+    ],
+    [
+      "vibecoded_orchestrator",
+      "vibecodedorchestrator"
+    ],
+    [
+      "VibeCoded_Orchestrator",
+      "vibecodedorchestrator"
+    ],
+    [
+      "Vibecodedorchestrator",
+      "vibecodedorchestrator"
+    ],
+    [
+      "vibecoded-orchestrator",
+      "vibecodedorchestrator"
+    ],
+    [
+      "Camel_Case",
+      "camelcase"
+    ],
+    [
+      "CamelCase",
+      "camelcase"
+    ],
+    [
+      "MyProject",
+      "myproject"
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "___",
+      ""
+    ],
+    [
+      "123abc",
+      "123abc"
+    ],
+    [
+      "étude",
+      "tude"
+    ],
+    [
+      "ACME_widget",
+      "acmewidget"
+    ],
+    [
+      "ACMEWidget_KnowledgeGraph",
+      "acmewidgetknowledgegraph"
+    ],
+    [
+      "  spaced  out  ",
+      "spacedout"
+    ],
+    [
+      "Tab\tSep",
+      "tabsep"
+    ],
+    [
+      "emoji🙂here",
+      "emojihere"
+    ],
+    [
+      "Ünïcödé_Prôject",
+      "ncdprject"
+    ],
+    [
+      "MiXeD123_CaSe",
+      "mixed123case"
+    ]
+  ]
+}

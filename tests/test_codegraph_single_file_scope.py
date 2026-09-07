@@ -1120,8 +1120,13 @@ def test_live_unchanged_file_writes_zero_objects_on_rerun(
         svc.close()
         pytest.skip("could not connect to Weaviate — skipping live e2e")
     try:
-        # Fresh collections so the run is deterministic.
-        analyzer.create_collections(force=True)
+        # Fresh collections so the run is deterministic. `repo_path` is
+        # REQUIRED with force=True (v0.2.92 BLOCKER-2): the identity guard
+        # checks the family being dropped against that folder's registered
+        # bindings, and a force call that names no folder cannot be checked,
+        # so it is refused. This throwaway repo is unregistered, so the guard
+        # allows the drop.
+        analyzer.create_collections(force=True, repo_path=repo)
 
         first = analyzer.analyze_repository(
             repo, only_file=(repo / "only.py"),

@@ -25,6 +25,39 @@
   // starts) still see the install affordance front-and-centre.
   import RuntimeMissingBanner from '$lib/components/RuntimeMissingBanner.svelte';
   import { orchestrator } from '$lib/stores/orchestrator';
+  // v0.2.92 WP-12 — the model gateway. It is NOT a container, so it gets a
+  // card of its own rather than a row in the table above: it has no image,
+  // no adoption mode, nothing to "re-detect", and the container watchdog
+  // deliberately does not supervise it. Every decision the card makes lives
+  // in `$lib/api/model_gateway` so a vitest can reach it; what is left here
+  // is markup and event wiring.
+  import {
+    DEFAULT_GATEWAY_MODEL,
+    canStop,
+    checkModelGateway,
+    describeStatus,
+    describeWriteResult,
+    gatewayIsConfigured,
+    getModelGatewayStatus,
+    inspectVSCodeTarget,
+    listVSCodeTargets,
+    pointPanelAtGateway,
+    pointPanelWarnings,
+    projectHasRoutingGuidance,
+    resetPanelToNative,
+    setModelGatewayBoot,
+    setProjectRoutingGuidance,
+    startModelGateway,
+    stopDisabledReason,
+    stopModelGateway,
+  } from '$lib/api/model_gateway';
+  import type {
+    ModelGatewayStatus,
+    VSCodeInspection,
+    VSCodeTarget,
+    VSCodeWriteResult,
+  } from '$lib/types/model-gateway';
+  import { projects } from '$lib/stores/projects';
 
   interface ServiceRuntimeState {
     name: string;
@@ -53,6 +86,22 @@
   // Discriminated union mirroring `ContainerFullness` in
   // launcher/src-tauri/src/services/picker.rs. Serde emits `kind` as the
   // discriminator (snake_case).
+  //
+  // v0.2.92 (review MAJOR-8): the `kind` arms are the hand-listed SERVICE
+  // UNION for this page, and until now nothing pinned them to anything. They
+  // are now diffed against the hub's canonical service table
+  // (`vct-hub/src/lifecycle_api.rs::canonical_service_skeletons`) by
+  // `services-union.test.ts`, which fails if a service joins that table and no
+  // arm follows — or if an arm names something the hub does not serve.
+  //
+  // The pin has ONE declared exclusion, and it is structural rather than
+  // drift: `model_gateway` is a PROCESS, not a `vco_*` container. It has no
+  // image, no adoption mode, nothing to "re-detect", so a fullness probe for
+  // it would have no candidates to describe — the page gives it a card of its
+  // own instead (see the `$lib/api/model_gateway` import above). The test
+  // states that exclusion explicitly, mirroring
+  // `infra_watchdog::watchdog_never_supervises_the_model_gateway_process` on
+  // the Rust side, so "sync the two lists" cannot quietly undo it.
   type ContainerFullness =
     | {
         kind: 'weaviate';
@@ -104,6 +153,118 @@
   let progress = $state<LifecycleProgress | null>(null);
   let pollerHandle: ReturnType<typeof setInterval> | null = null;
   let unlistenProgress: (() => void) | null = null;
+
+  // ─── Model gateway card ────────────────────────────────────────────────
+  let gw = $state<ModelGatewayStatus | null>(null);
+  let gwError = $state<string | null>(null);
+  let gwBusy = $state(false);
+  let gwCheck = $state<string | null>(null);
+
+  let vsTargets = $state<VSCodeTarget[]>([]);
+  let vsSelected = $state<string | null>(null);
+  let vsInspection = $state<VSCodeInspection | null>(null);
+  let vsResult = $state<VSCodeWriteResult | null>(null);
+  // Default model: OFF. VCO adds the gateway's catalogue to the picker; the
+  // model is the user's choice, made visibly, in the picker or here.
+  let setDefaultModel = $state(false);
+  let modelChoice = $state(DEFAULT_GATEWAY_MODEL);
+  let removeSlots = $state(false);
+
+  // Per-project CLAUDE.md routing-guidance flags, keyed by project id.
+  let guidance = $state<Record<string, boolean>>({});
+
+  const gwLine = $derived(describeStatus(gw));
+  const gwWarnings = $derived(pointPanelWarnings(vsInspection));
+  const gwConfigured = $derived(gatewayIsConfigured(gw));
+
+  async function refreshGateway() {
+    try {
+      gw = await getModelGatewayStatus();
+      gwError = null;
+    } catch (e) {
+      gwError = String(e);
+    }
+  }
+
+  async function refreshVSCodeTargets() {
+    try {
+      vsTargets = await listVSCodeTargets();
+      if (!vsSelected && vsTargets.length > 0) {
+        vsSelected = vsTargets[0].path;
+      }
+      await refreshInspection();
+    } catch (e) {
+      gwError = String(e);
+    }
+  }
+
+  async function refreshInspection() {
+    if (!vsSelected) {
+      vsInspection = null;
+      return;
+    }
+    try {
+      vsInspection = await inspectVSCodeTarget(vsSelected);
+    } catch (e) {
+      vsInspection = null;
+      gwError = String(e);
+    }
+  }
+
+  async function gwAction(fn: () => Promise<unknown>) {
+    gwBusy = true;
+    gwError = null;
+    try {
+      await fn();
+    } catch (e) {
+      gwError = String(e);
+    } finally {
+      gwBusy = false;
+      await refreshGateway();
+    }
+  }
+
+  async function doPointPanel() {
+    if (!vsSelected) return;
+    await gwAction(async () => {
+      vsResult = await pointPanelAtGateway({
+        path: vsSelected!,
+        model: setDefaultModel ? modelChoice : null,
+        removeSlotOverrides: removeSlots,
+      });
+      await refreshInspection();
+    });
+  }
+
+  async function doResetNative() {
+    if (!vsSelected) return;
+    await gwAction(async () => {
+      vsResult = await resetPanelToNative(vsSelected!);
+      await refreshInspection();
+    });
+  }
+
+  async function loadGuidanceFlags() {
+    const next: Record<string, boolean> = {};
+    for (const p of $projects.projects) {
+      try {
+        next[p.id] = await projectHasRoutingGuidance(p.id);
+      } catch {
+        // A project whose row cannot be read is shown as off rather than
+        // guessed as on — the section it gates is advice about models, and
+        // showing it where it may not apply is the failure mode to avoid.
+        next[p.id] = false;
+      }
+    }
+    guidance = next;
+  }
+
+  async function toggleGuidance(projectId: string, enabled: boolean) {
+    await gwAction(async () => {
+      await setProjectRoutingGuidance(projectId, enabled);
+      guidance = { ...guidance, [projectId]: enabled };
+    });
+  }
 
   // Picker-modal state. Open when `pickerService != null`.
   let pickerService = $state<string | null>(null);
@@ -335,7 +496,17 @@
       // Soft-fail: log to console only; this is a diagnostics fetch.
       console.warn('services_get_adoption failed:', e);
     }
-    pollerHandle = setInterval(refresh, 5000);
+    // Model gateway: its own probes, on the same 5 s cadence as the table.
+    await refreshGateway();
+    await refreshVSCodeTargets();
+    // The per-project guidance list needs the project rows; load them if
+    // this page was the entry point.
+    await projects.load();
+    await loadGuidanceFlags();
+    pollerHandle = setInterval(() => {
+      refresh();
+      refreshGateway();
+    }, 5000);
     unlistenProgress = await listen<LifecycleProgress>(
       'vct-services-lifecycle',
       (e) => {
@@ -514,6 +685,308 @@
     <ServicesSchemaSection />
   {/if}
 
+  <!-- v0.2.92 WP-12 — model gateway. Rendered OUTSIDE the snapshot guard
+       above: it is a process, not a container, so it must still be
+       manageable on a machine with no container runtime at all. -->
+  <section class="gateway-card">
+    <header class="gw-head">
+      <h2>Model gateway</h2>
+      <span class="status {gwLine.tone}">{gwLine.label}</span>
+    </header>
+    <p class="muted">
+      A local, loopback-only endpoint that serves your Claude subscription and
+      any configured vendor subscription in ONE Claude Code model picker. Each
+      entry names the model that answers: vendor models appear under a
+      <code>claude-gw/</code> prefix and are forwarded under their real id.
+    </p>
+    <p class="gw-detail">{gwLine.detail}</p>
+
+    {#if gwError}
+      <div class="banner error">{gwError}</div>
+    {/if}
+
+    <div class="bulk-actions">
+      <button
+        onclick={() => gwAction(() => startModelGateway())}
+        disabled={gwBusy || gw?.reachable === true}
+      >
+        Start
+      </button>
+      <button
+        onclick={() => gwAction(async () => {
+          const out = await stopModelGateway();
+          if (!out.stopped) gwError = out.message;
+        })}
+        disabled={gwBusy || !canStop(gw)}
+        title={stopDisabledReason(gw)}
+      >
+        Stop
+      </button>
+      <label class="gw-toggle">
+        <input
+          type="checkbox"
+          checked={gw?.boot === 'enabled'}
+          disabled={gwBusy || gw?.boot === 'unsupported'}
+          onchange={(e) =>
+            gwAction(() => setModelGatewayBoot(e.currentTarget.checked))}
+        />
+        Start at login
+      </label>
+      <button
+        class="secondary"
+        onclick={() =>
+          gwAction(async () => {
+            try {
+              gwCheck = await checkModelGateway();
+            } catch (e) {
+              gwCheck = String(e);
+            }
+          })}
+        disabled={gwBusy}
+        title="Run the gateway's configuration self-test"
+      >
+        Diagnose
+      </button>
+    </div>
+
+    {#if gw?.boot === 'unsupported'}
+      <p class="muted small">
+        This machine's init system could not be inspected, so login autostart
+        is unavailable here — not off. Nothing was changed.
+      </p>
+    {:else}
+      <p class="muted small">
+        Turning login autostart off also stops a running gateway on Linux and
+        macOS. On Windows it removes the scheduled task but leaves an
+        already-running gateway running.
+      </p>
+    {/if}
+
+    {#if !canStop(gw) && gw?.process === 'running'}
+      <div class="banner warn">{stopDisabledReason(gw)}</div>
+    {/if}
+
+    {#if gw && !gw.python}
+      <div class="banner error">
+        No Python interpreter could be resolved for the gateway. Re-run
+        <code>install.py</code> to rebuild the orchestrator venv — Start,
+        Diagnose and the panel actions all need one.
+      </div>
+    {:else if gw?.python && gwCheck}
+      <p class="muted small">
+        Interpreter: <code>{gw.python}</code>
+      </p>
+    {/if}
+
+    {#if gwCheck}
+      <pre class="gw-check">{gwCheck}</pre>
+    {/if}
+
+    {#if gw?.health}
+      <dl class="gw-meta">
+        <dt>port</dt>
+        <dd>{gw.port} <span class="muted">(loopback only)</span></dd>
+        <dt>catalog</dt>
+        <dd>
+          {#each Object.entries(gw.health.catalog_source) as [family, source]}
+            <code class="src {source}">{family}: {source}</code>
+          {/each}
+          {#if Object.values(gw.health.catalog_source).includes('static')}
+            <span class="muted"
+              >— a family reading <code>static</code> is being served from the
+              shipped fallback list, so newly released models are missing from
+              the picker until the live fetch succeeds.</span
+            >
+          {/if}
+        </dd>
+        <dt>context table</dt>
+        <dd>
+          {gw.health.context_table_source}
+          {#if gw.health.context_table_path}
+            <code>{gw.health.context_table_path}</code>
+          {/if}
+        </dd>
+        <dt>Claude login</dt>
+        <dd>
+          {gw.health.oauth_state}
+          {#if gw.health.oauth_state !== 'present'}
+            <span class="muted"
+              >— run <code>claude</code> once in a terminal and log in;
+              the gateway reads (never writes) the CLI's credentials file, and
+              Claude-family models will 401 until it is valid.</span
+            >
+          {/if}
+        </dd>
+        <dt>token file</dt>
+        <dd>
+          {gw.health.token_file_permissions}
+          {#if gw.health.token_file_permissions !== 'owner_only'}
+            <span class="muted"
+              >— the gateway's token authorises proxying under your Claude
+              login; anything but <code>owner_only</code> means another local
+              account may be able to read it.</span
+            >
+          {/if}
+        </dd>
+      </dl>
+    {/if}
+
+    <!-- ── VS Code panel ─────────────────────────────────────────────── -->
+    <h3>VS Code panel</h3>
+    <p class="muted small">
+      The Claude Code extension does not read <code>.claude/settings.json</code>
+      for routing — it reads VS Code's own global
+      <code>settings.json</code>. These buttons write exactly two keys there
+      (<code>claudeCode.environmentVariables</code> and
+      <code>claudeCode.disableLoginPrompt</code>), back the file up first, and
+      restrict it to your account afterwards.
+      <strong>VS Code must be fully quit and reopened</strong> for a change to
+      take effect.
+    </p>
+
+    {#if vsTargets.length === 0}
+      <p class="muted">
+        No VS Code-family <code>settings.json</code> found for this user
+        account. VCO only offers files that already exist — it will not create
+        a configuration for an editor you do not have. Set
+        <code>VCT_VSCODE_SETTINGS_FILES</code> to point at a portable or
+        custom-profile install.
+      </p>
+    {:else}
+      <label class="gw-field">
+        Settings file
+        <select
+          bind:value={vsSelected}
+          onchange={refreshInspection}
+          disabled={gwBusy}
+        >
+          {#each vsTargets as t}
+            <option value={t.path}>{t.display_name} — {t.path}</option>
+          {/each}
+        </select>
+      </label>
+
+      {#if vsInspection}
+        <p class="gw-detail">
+          {#if vsInspection.points_at_vco_gateway}
+            Pointed at this gateway ({vsInspection.base_url}){#if vsInspection.model}, default model
+              <code>{vsInspection.model}</code>{/if}.
+          {:else if vsInspection.base_url}
+            Pointed at <code>{vsInspection.base_url}</code>, which is not a
+            gateway on this machine. Uninstalling VCO will leave it alone;
+            "Reset to stock Claude Code" below still clears it, because that
+            is you asking.
+          {:else if vsInspection.parseable === false}
+            Cannot be edited automatically (see the warning below).
+          {:else}
+            Stock Claude Code — no routing keys set.
+          {/if}
+        </p>
+      {/if}
+
+      {#each gwWarnings as w}
+        <div class="banner warn">{w}</div>
+      {/each}
+
+      <div class="gw-options">
+        <label class="gw-toggle">
+          <input type="checkbox" bind:checked={setDefaultModel} disabled={gwBusy} />
+          Also set the picker's Default entry
+        </label>
+        {#if setDefaultModel}
+          <input
+            class="gw-model"
+            type="text"
+            bind:value={modelChoice}
+            disabled={gwBusy}
+            aria-label="Default model id"
+          />
+        {/if}
+        {#if vsInspection && vsInspection.slot_overrides.length > 0}
+          <label class="gw-toggle">
+            <input type="checkbox" bind:checked={removeSlots} disabled={gwBusy} />
+            Also remove the tier/subagent overrides already in this file
+          </label>
+        {/if}
+      </div>
+      <p class="muted small">
+        Leaving the Default entry unset keeps whatever you already chose. VCO
+        never sets the Opus / Sonnet / Haiku / Fable tier slots or the subagent
+        slot: the name you pick in the picker has to be the model that answers.
+        That is safe here precisely because this gateway forwards real Claude
+        ids to Anthropic — pointed straight at a third-party endpoint instead,
+        those same names come back answered by the vendor's own small model
+        with HTTP 200 and no error
+        (<a
+          href="https://docs.z.ai/scenario-example/develop-tools/claude"
+          target="_blank"
+          rel="noreferrer">documented vendor behaviour</a
+        >).
+      </p>
+
+      <div class="bulk-actions">
+        <button
+          onclick={doPointPanel}
+          disabled={gwBusy || !vsSelected || !gwConfigured}
+          title={gwConfigured
+            ? 'Write the routing keys into this settings file'
+            : 'Start the gateway once first — it creates the host token this action writes.'}
+        >
+          Point panel at gateway
+        </button>
+        <button onclick={doResetNative} disabled={gwBusy || !vsSelected}>
+          Reset to stock Claude Code
+        </button>
+      </div>
+
+      {#if vsResult}
+        <div class="banner {vsResult.ok ? 'info' : 'error'}">
+          {describeWriteResult(vsResult)}
+          {#if vsResult.backup_path}
+            <br /><span class="muted">Backup: <code>{vsResult.backup_path}</code></span>
+          {/if}
+          {#if vsResult.paste_block}
+            <p class="muted small">
+              VCO did not touch the file. Paste these keys into it by hand
+              (the token value is in the gateway's token file — VCO does not
+              print credentials):
+            </p>
+            <pre class="gw-check">{vsResult.paste_block}</pre>
+          {/if}
+        </div>
+      {/if}
+    {/if}
+
+    <!-- ── CLAUDE.md routing guidance ────────────────────────────────── -->
+    {#if gwConfigured && $projects.projects.length > 0}
+      <h3>Model-routing guidance in project CLAUDE.md</h3>
+      <p class="muted small">
+        Adds a model-routing section to a project's <code>CLAUDE.md</code> —
+        which task classes to route to which model, and the rule that a model
+        name must never be silently re-pointed. Off by default and offered only
+        here, because a project on a machine with no gateway must not read
+        advice about models it cannot reach. Toggling re-renders only the
+        VCO-managed region of that file; anything you wrote around it is
+        untouched.
+      </p>
+      <ul class="gw-projects">
+        {#each $projects.projects as p}
+          <li>
+            <label class="gw-toggle">
+              <input
+                type="checkbox"
+                checked={guidance[p.id] ?? false}
+                disabled={gwBusy}
+                onchange={(e) => toggleGuidance(p.id, e.currentTarget.checked)}
+              />
+              {p.name}
+            </label>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
+
   {#if pickerService}
     <div
       class="modal-backdrop"
@@ -683,6 +1156,112 @@
   .status.down {
     background: rgba(107, 114, 128, 0.2);
     color: #9ca3af;
+  }
+  /* v0.2.92 WP-12: the model gateway's status has FOUR tones, not two.
+     `warn` is "alive but not answering" / "stale pid file"; `unknown` is
+     "could not determine", which must not look like either up or down. */
+  .status.warn {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fbbf24;
+  }
+  .status.unknown {
+    background: rgba(123, 95, 255, 0.18);
+    color: #b7a6ff;
+  }
+  .gateway-card {
+    margin-top: 2rem;
+    padding: 1rem 1.1rem 1.2rem;
+    border: 1px solid var(--border, #333);
+    border-radius: 6px;
+  }
+  .gw-head {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .gw-head h2 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .gateway-card h3 {
+    margin: 1.2rem 0 0.3rem;
+    font-size: 0.95rem;
+  }
+  .gw-detail {
+    margin: 0 0 0.6rem;
+    font-size: 0.9rem;
+  }
+  .muted.small,
+  .gateway-card p.small {
+    font-size: 0.82rem;
+  }
+  .gw-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.88rem;
+  }
+  .gw-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+  }
+  .gw-field select,
+  .gw-model {
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--border, #333);
+    border-radius: 4px;
+    background: var(--button-bg, #2a2a2a);
+    color: inherit;
+    font-size: 0.85rem;
+  }
+  .gw-options {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0.5rem 0;
+  }
+  .gw-meta {
+    display: grid;
+    grid-template-columns: 9rem 1fr;
+    gap: 0.25rem 0.75rem;
+    font-size: 0.85rem;
+    margin: 0.6rem 0;
+  }
+  .gw-meta dt {
+    color: var(--text-muted, #aaa);
+  }
+  .gw-meta dd {
+    margin: 0;
+  }
+  .src {
+    margin-right: 0.4rem;
+  }
+  .src.static {
+    color: #fbbf24;
+  }
+  .src.unavailable {
+    color: #f87171;
+  }
+  .gw-check {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border, #333);
+    border-radius: 4px;
+    padding: 0.6rem;
+    font-size: 0.78rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+  .gw-projects {
+    list-style: none;
+    padding: 0;
+    margin: 0.3rem 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
   }
   .tag {
     margin-left: 0.4rem;

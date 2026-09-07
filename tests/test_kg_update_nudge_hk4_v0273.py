@@ -17,7 +17,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,6 +34,14 @@ pytestmark = pytest.mark.skipif(
 def _env(home: Path) -> dict:
     env = os.environ.copy()
     env["HOME"] = str(home)
+    # v0.2.92 W7: the nudge counter moved out of `~/.claude/metrics` into the
+    # VCT state root. Pin BOTH roots to this test's fake home so the hook's
+    # `_lib/metrics-dir.sh` resolves inside `tmp_path` — previously the
+    # `$HOME` pin alone was enough, and the suite-wide `VCT_STATE_DIR`
+    # redirect (conftest W-STATE) would otherwise send every test in this file
+    # to one SHARED directory and make them see each other's rows.
+    env["VCT_STATE_DIR"] = str(home / ".vct")
+    env["VCT_CLAUDE_DIR"] = str(home / ".claude")
     env.pop("VCT_VENV", None)
     env.pop("VCT_DISABLE_HOOKS", None)
     env.pop("KG_NUDGE_OFF", None)
@@ -57,6 +64,17 @@ def _run(home: Path, payload: dict, extra: dict | None = None):
 
 
 def _metrics_path(home: Path) -> Path:
+    """The counter's home since v0.2.92 W7 — `<VCT_STATE_DIR>/metrics`.
+
+    `_env` pins `VCT_STATE_DIR` to `<home>/.vct`, so this mirrors
+    `vco_lib.paths.vct_metrics_dir()` for these fixtures. The pre-W7 location
+    (`<home>/.claude/metrics`) is now a frozen archive the hook only READS.
+    """
+    return home / ".vct" / "metrics" / "kg_update_tokens.jsonl"
+
+
+def _legacy_metrics_path(home: Path) -> Path:
+    """The pre-W7 archive path, for the seed-from-archive continuity test."""
     return home / ".claude" / "metrics" / "kg_update_tokens.jsonl"
 
 

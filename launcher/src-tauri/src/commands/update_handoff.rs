@@ -567,12 +567,16 @@ pub async fn get_update_recovery_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    fn isolated_state_dir() -> (TempDir, std::path::PathBuf) {
-        let td = tempfile::tempdir().expect("tempdir");
-        // Override VCT_STATE_DIR so vct_root_dir() returns td.path().
-        std::env::set_var("VCT_STATE_DIR", td.path());
+    /// v0.2.92: this SET `VCT_STATE_DIR` and never restored it, and took no
+    /// lock at all — so nine tests each left the process-wide var pointing at
+    /// their own (already-deleted) tempdir for whatever ran next. The guard
+    /// restores on drop; callers must keep binding it (`let (_td, dir) = …`).
+    fn isolated_state_dir() -> (
+        vct_launcher_core::test_env::StateDirGuard,
+        std::path::PathBuf,
+    ) {
+        let td = vct_launcher_core::test_env::state_dir_guard();
         let p = td.path().to_path_buf();
         (td, p)
     }

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  {{INSTALLED_AT_PATH}}
+
+  macOS LaunchAgent for the VCO model gateway (`vct-model-gateway`).
+
+  DEFAULT OFF. This plist exists only because the user asked for it, via the
+  `register-boot` flag of `vct-model-gateway` or the launcher's gateway
+  toggle. The gateway proxies under the user's Claude login and any
+  configured vendor subscription, so making it a login-time daemon widens
+  the machine's security surface — the user's decision, not the
+  installer's. `install.py` run with the `update` flag re-renders an
+  EXISTING plist; it never creates a first one.
+
+  (Long flags are named without their leading double hyphen throughout this
+  comment: XML 1.0 forbids the two-hyphen sequence inside a comment, and the
+  container-stack template carries the same note for the same reason.)
+
+  Written by vco_lib/boot_service.py, the same home that registers the
+  container stack's LaunchAgent and unregisters both. `launchctl bootstrap
+  gui/<uid>` is the modern load path with `launchctl load -w` as the legacy
+  fallback; re-registration is idempotent because an already-loaded agent's
+  "Bootstrap failed: 17: File exists" is tolerated.
+
+  Log paths: launchd refuses to start a job whose StandardOutPath directory
+  does not exist, so boot_service.py creates it before bootstrapping.
+
+  Template substitutions:
+    {{INSTALLED_AT_PATH}} — absolute path where this plist landed
+    {{LABEL}}             — launchd label (reverse-DNS, must match filename)
+    {{EXEC_ARGV_PLIST}}   — the ProgramArguments array body, pre-rendered as
+                            <string> elements: the gateway entry point
+                            resolved at registration time plus the `serve`
+                            verb
+    {{WORKING_DIR}}       — directory the daemon runs in
+    {{STATE_DIR}}         — VCT state root pinned at registration time
+    {{BOOT_LOG_FILE}}     — where launchd captures the PROCESS's own output
+                            (startup refusals, tracebacks). Deliberately NOT
+                            the daemon's own log file: the daemon logs to
+                            stderr as well as to that file, so pointing
+                            launchd at the same path would write every
+                            record twice.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+{{EXEC_ARGV_PLIST}}
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on abnormal exit only. A bare KeepAlive=true would also
+         restart after a clean shutdown, making "stop the gateway"
+         impossible from the launcher. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle restarts so a gateway that cannot bind its port does not
+         spin. macOS's own default is 10s; stated here so it is visible. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>WorkingDirectory</key>
+    <string>{{WORKING_DIR}}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Pin the state dir chosen at registration time; a dev install
+             with VCT_STATE_DIR set must not contaminate production state at
+             the next login. -->
+        <key>VCT_STATE_DIR</key>
+        <string>{{STATE_DIR}}</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{BOOT_LOG_FILE}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{BOOT_LOG_FILE}}</string>
+
+    <!-- Background, not Interactive: the gateway serves HTTP on loopback
+         and has no UI, so it should not compete with foreground apps for
+         scheduling priority. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

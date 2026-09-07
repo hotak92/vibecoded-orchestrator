@@ -32,6 +32,7 @@ from __future__ import annotations
 import sys
 from collections import namedtuple
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -395,3 +396,34 @@ def test_the_dismiss_key_can_actually_be_populated(install, monkeypatch):
         why_deferred="w", command_to_apply="c",
     )
     assert fields_for(install, "disk_space_low", bare)["mount_paths"]
+
+
+# ─── v0.2.92 R42 follow-up: the remediation must be paste-able on Windows ────
+
+def test_disk_remediation_windows_branch_is_powershell():
+    """The inspection lines must be runnable in the shell a Windows user
+    actually has. `df` / `du` do not exist there — the same Windows-narrowing
+    R42 bans one layer up in the file. The Windows branch prints Get-Volume /
+    Get-ChildItem equivalents instead, and keeps the shared podman line
+    (the podman CLI is identical on Windows)."""
+    low = [{"label": "install", "path": "C:\\VCO", "free_bytes": 1}]
+    with mock.patch("vco_lib.doctor.sys.platform", "win32"):
+        block = doctor._disk_remediation(low, 20.0)
+    assert "df -h" not in block and "du -sh" not in block
+    assert "Get-Volume" in block
+    assert "Get-ChildItem" in block
+    assert "Measure-Object Length -Sum" in block
+    assert "podman system prune" in block  # shared, cross-OS CLI
+    assert "rl_archive" in block           # the warning survives the branch
+    assert "CLEARS ITSELF" in block
+
+
+def test_disk_remediation_posix_branch_unchanged():
+    """The POSIX branch keeps the exact pre-fix commands (verified text: these
+    are reads the operator was already told to run)."""
+    low = [{"label": "install", "path": "/", "free_bytes": 1}]
+    with mock.patch("vco_lib.doctor.sys.platform", "linux"):
+        block = doctor._disk_remediation(low, 20.0)
+    assert "df -h /" in block
+    assert 'du -sh "$VCT_STATE_DIR"/logs "$VCT_STATE_DIR"/rl_archive' in block
+    assert "du -sh ~/.ollama/models/*" in block

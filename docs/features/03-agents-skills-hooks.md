@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 44 bundled agents, 53 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 invoked by sibling hooks rather than registered). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 44 bundled agents, 54 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 invoked by sibling hooks rather than registered). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -136,7 +136,7 @@ Seven agents reference `orchestrator-tools` in their frontmatter as of v0.1.0: `
 
 ## Bundled Skills (`templates/skills/`)
 
-Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`, or list them in an agent's `skills:` frontmatter. Install to `~/.claude/skills/` via `install.py --with-skills` (default-on). 53 skills, organized across multiple model tiers (Opus for deep reasoning, Sonnet for implementation guidance, Haiku for quick checks).
+Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`, or list them in an agent's `skills:` frontmatter. Install to `~/.claude/skills/` via `install.py --with-skills` (default-on). 54 skills, organized across multiple model tiers (Opus for deep reasoning, Sonnet for implementation guidance, Haiku for quick checks).
 
 ### Opus-tier skills (deep reasoning)
 
@@ -219,7 +219,7 @@ Non-blocking (background). Container names configurable via `VCT_REQUIRED_CONTAI
 </details>
 
 ### `ensure-code-embed-service.sh` — SessionStart (startup, background)
-Auto-start the code embedding service container if it exists and is stopped. Silent no-op when the container doesn't exist (CPU-only users who haven't enabled `code_embed` in `compose.yaml`).
+Auto-start the code embedding service container if it exists and is stopped. Silent no-op when the container doesn't exist (CPU-only users who haven't enabled `code_embed` in `compose.yaml`). The container it inspects/starts is named `code_embed` by default — override with `VCT_CODE_EMBED_CONTAINER` if yours is named differently; the port probe follows `CODE_EMBED_PORT` (default `11440`).
 
 ### `session-start-kg-loader.sh` — SessionStart (startup, blocking)
 Display KG resource paths at session start. Optionally launches the RL server if installed (Pro tier; silent no-op when absent).

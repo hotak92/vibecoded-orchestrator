@@ -5,8 +5,10 @@
 Moved VERBATIM from ``templates/scripts/analyze_code_graph.py``:
 ``CodeGraphAnalyzer._analyze_proto_file`` — only body edits are the mechanical ``self.`` -> ``ctx.`` rename
 (``ctx`` IS the analyzer instance) and the analyzer-resident embedding
-seams reached via ``ctx.``. Behavior is pinned byte-identically by
-``tests/test_codegraph_golden.py``.
+seams reached via ``ctx.``. The MOVE was verbatim; behaviour has since
+been corrected here (v0.2.92 block-comment scrub), so it is no longer
+byte-identical to the analyzer's original.
+``tests/test_codegraph_golden.py`` pins what it does TODAY.
 """
 from __future__ import annotations
 
@@ -19,12 +21,13 @@ from typing import Any, Dict, List
 from vco_lib.codegraph_entities import (
     CodeEntity,
     FileExtraction,
-    KIND_API,
     KIND_CLASS,
     ModuleDescriptor,
 )
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
+    blank_block_comments_preserving_lines,
+    build_api_entity,
     run_pure_extractor,
 )
 
@@ -39,13 +42,14 @@ def extract_proto_file(
     """
     content = source_text
     source_lines = content.split('\n')
-    loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('//')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
 
     # Strip comments
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-    content_clean = re.sub(r'/\*.*?\*/', ' ', content_clean, flags=re.DOTALL)
+    content_clean = blank_block_comments_preserving_lines(content_clean)
 
     # package name
     pkg_match = re.search(r'^package\s+([\w.]+)\s*;', content, re.MULTILINE)
@@ -142,19 +146,19 @@ def extract_proto_file(
             f"gRPC {entry['service']}.{entry['method']} "
             f"({entry['input']}) → ({entry['output']}) [{pkg}]"
         )
-        # v0.2.82 (G1 task 2): defer the API embed (SKIP/STAMP on a
-        # metadata-only revision bump). Default-arg capture pins api_desc.
-        entities.append(CodeEntity(
-            kind=KIND_API, file_path_rel=relative_path,
-            extras={
-                "endpoint": endpoint, "method": "gRPC",
-                "api_description": api_desc,
-                "parameters": [entry['input']], "returns": entry['output'],
-                "project": helpers.project_name, "proxy_target": "",
-            },
-            deferred_embed=(
-                lambda d=api_desc: helpers.generate_embedding(d)
-            ),
+        # v0.2.82 (G1 task 2): the API embed is DEFERRED (SKIP/STAMP on a
+        # metadata-only revision bump); the shared builder owns the default-arg
+        # capture that pins api_desc.
+        # v0.2.92: constructed by the ONE shared builder (see _shared).
+        entities.append(build_api_entity(
+            file_path_rel=relative_path,
+            endpoint=endpoint,
+            method="gRPC",
+            description=api_desc,
+            project=helpers.project_name,
+            parameters=[entry['input']],
+            returns=entry['output'],
+            embed=helpers.generate_embedding,
         ))
         stats['apis'] += 1
 

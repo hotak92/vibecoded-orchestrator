@@ -56,6 +56,9 @@ _TESTS_DIR = Path(__file__).resolve().parents[2]
 if str(_TESTS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR.parent))
 
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    apply_migrations as _apply_migrations,
+)
 from tests.common.sandbox import (  # noqa: E402
     SandboxLayout,
     make_sandbox,
@@ -64,15 +67,6 @@ from tests.common.sandbox import (  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MIGRATIONS_DIR = (
-    REPO_ROOT
-    / "launcher"
-    / "src-tauri"
-    / "vct-launcher-core"
-    / "src"
-    / "db"
-    / "migrations"
-)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -122,67 +116,9 @@ CANONICAL_PROJECTS: tuple[ProjectSpec, ...] = (
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _apply_migrations(db_path: Path) -> None:
-    """Apply every shipped launcher.db migration in version order.
-
-    Mirrors what ``vct_launcher_core::db::migrations::apply`` does at
-    runtime, but in pure Python — no need for a cargo build in the
-    fixture setup path.
-
-    Migration 013 toggles ``PRAGMA foreign_keys`` outside its
-    transaction. ``sqlite3.executescript`` handles this correctly
-    because it issues each `;`-separated statement individually and
-    is implicitly outside a transaction when foreign_keys pragmas
-    fire. We open the connection with ``isolation_level=None`` so we
-    have manual control.
-    """
-    if not MIGRATIONS_DIR.is_dir():
-        raise FileNotFoundError(
-            f"migrations directory not found: {MIGRATIONS_DIR}"
-        )
-    sql_files = sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"))
-    if not sql_files:
-        raise FileNotFoundError(
-            f"no migrations found in {MIGRATIONS_DIR}"
-        )
-
-    # Use isolation_level=None so PRAGMA foreign_keys writes outside
-    # a transaction (sqlite3's default mode wraps DML in implicit
-    # transactions, which would render the off→on toggle in 013 a no-op).
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
-    try:
-        # Build the migrations tracking table the Rust runner uses.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS _schema_migrations (
-                version     INTEGER PRIMARY KEY,
-                description TEXT NOT NULL,
-                applied_at  INTEGER NOT NULL
-            )
-            """
-        )
-        already_applied: set[int] = {
-            int(row[0])
-            for row in conn.execute("SELECT version FROM _schema_migrations")
-        }
-        for sql_path in sql_files:
-            # Parse the leading XXX_ as the version number.
-            try:
-                version = int(sql_path.name.split("_", 1)[0])
-            except ValueError:
-                continue
-            if version in already_applied:
-                continue
-            sql = sql_path.read_text(encoding="utf-8")
-            conn.executescript(sql)
-            now_ms = int(time.time() * 1000)
-            conn.execute(
-                "INSERT INTO _schema_migrations (version, description, applied_at) "
-                "VALUES (?, ?, ?)",
-                (version, sql_path.stem, now_ms),
-            )
-    finally:
-        conn.close()
+# v0.2.92 duplication-merge (PLAN-EXTENSION §3.4): the migration applier that
+# used to live here — the 20th hand-rolled copy in tests/ — moved to
+# `tests/common/launcher_db_fixture.apply_migrations` and is imported above.
 
 
 def _now_ms() -> int:

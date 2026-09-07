@@ -15,8 +15,9 @@ Covers:
       - JSON encoding round-trips through `Db::module_global_enabled`
         semantics (Python writes 'false'; Rust decodes Value::Bool(false))
 
-The tests use `sqlite3` directly + `tempfile.TemporaryDirectory` so the
-path-discovery + on-disk-existence checks are exercised realistically.
+The tests build real on-disk launcher.db files (shared fixture, shipped
+migrations) inside `tempfile.TemporaryDirectory` so the path-discovery +
+on-disk-existence checks are exercised realistically.
 """
 from __future__ import annotations
 
@@ -30,6 +31,12 @@ from unittest import mock
 # install.py lives at the repo root; tests/ is a sibling.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import install  # type: ignore  # noqa: E402
+from tests.common import launcher_db_fixture  # noqa: E402
+from tests.common.launcher_db_fixture import (  # noqa: E402
+    add_module_setting,
+    create_empty_launcher_db,
+    insert_rows,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,58 +44,43 @@ import install  # type: ignore  # noqa: E402
 # + the migration-025 schema for rl_events.
 # ---------------------------------------------------------------------------
 
-_MODULE_SETTINGS_POST_034 = """
-CREATE TABLE module_settings (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id      TEXT,
-    module_id       TEXT NOT NULL,
-    setting_key     TEXT NOT NULL,
-    setting_value   TEXT NOT NULL
-);
-CREATE UNIQUE INDEX idx_ms_unique_global
-    ON module_settings(module_id, setting_key)
-    WHERE project_id IS NULL;
-"""
-
-_MODULE_SETTINGS_PRE_034 = """
-CREATE TABLE module_settings (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id      TEXT NOT NULL,
-    module_id       TEXT NOT NULL,
-    setting_key     TEXT NOT NULL,
-    setting_value   TEXT NOT NULL,
-    UNIQUE(project_id, module_id, setting_key)
-);
-"""
-
-_RL_EVENTS_SCHEMA = """
-CREATE TABLE rl_events (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type      TEXT NOT NULL,
-    ts              INTEGER NOT NULL,
-    project_id      TEXT,
-    task_id         TEXT NOT NULL,
-    payload_json    TEXT NOT NULL
-);
-"""
-
-
 def _create_full_db(db_path: Path, num_rl_events: int = 0) -> None:
-    """Create launcher.db with post-034 schema for both tables, plus
-    `num_rl_events` filler rows in rl_events."""
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_MODULE_SETTINGS_POST_034)
-        conn.executescript(_RL_EVENTS_SCHEMA)
-        for i in range(num_rl_events):
-            conn.execute(
-                "INSERT INTO rl_events (event_type, ts, task_id, payload_json) "
-                "VALUES (?, ?, ?, ?)",
-                ("retrieval", 1700000000000 + i, f"t-{i}", "{}"),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    """Create launcher.db on the REAL launcher schema (every shipped
+    migration applied, so module_settings is the post-034 nullable-project
+    shape and rl_events is the post-039 shape), plus ``num_rl_events``
+    filler rows in rl_events.
+
+    v0.2.92 §3.4: this file used to carry three hand-written schema strings
+    for module_settings (post-034), module_settings (pre-034) and rl_events.
+    Two of them are now the real thing; the pre-034 one is expressed as a
+    genuinely half-migrated DB (see :func:`_create_pre_034_db`).
+    """
+    create_empty_launcher_db(db_path)
+    if num_rl_events:
+        insert_rows(db_path, "rl_events", [
+            {
+                "event_type": "retrieval",
+                "ts": 1700000000000 + i,
+                "task_id": f"t-{i}",
+                "payload_json": "{}",
+            }
+            for i in range(num_rl_events)
+        ])
+
+
+def _create_pre_034_db(db_path: Path) -> None:
+    """A GENUINE pre-migration-034 launcher.db: migrations 001..033 applied
+    verbatim, nothing after.
+
+    ``module_settings.project_id`` is therefore ``NOT NULL`` — not because
+    this test declares it so, but because that is the column migration 001
+    created and migration 034 (the nullable rebuild) has not run. Expressing
+    the degraded state by STOPPING the real migration chain keeps the rest of
+    the DB honest and leaves no hand-rolled DDL behind.
+    """
+    # `up_to=33` stops the real chain after 033 and RAISES if 033 were the
+    # latest migration (then this could not be a pre-034 DB).
+    launcher_db_fixture.apply_migrations(db_path, up_to=33)
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +130,12 @@ class TestSeedRlRerankerDefaultDisabled(unittest.TestCase):
 
     def test_skip_when_rl_events_table_missing(self) -> None:
         """Pre-migration-025 launcher.db: no rl_events table. Soft-fail."""
+        # Real schema, then DROP rl_events: that table arrived in migration
+        # 025, so a launcher.db older than it genuinely lacks it.
+        create_empty_launcher_db(self._db_path)
         conn = sqlite3.connect(str(self._db_path))
         try:
-            conn.executescript(_MODULE_SETTINGS_POST_034)
+            conn.execute("DROP TABLE rl_events")
             conn.commit()
         finally:
             conn.close()
@@ -156,13 +151,7 @@ class TestSeedRlRerankerDefaultDisabled(unittest.TestCase):
         The helper detects the pre-034 schema by the failed insert path
         OR by an OperationalError on the probe — either way, soft-fail.
         """
-        conn = sqlite3.connect(str(self._db_path))
-        try:
-            conn.executescript(_MODULE_SETTINGS_PRE_034)
-            conn.executescript(_RL_EVENTS_SCHEMA)
-            conn.commit()
-        finally:
-            conn.close()
+        _create_pre_034_db(self._db_path)
         # The probe SELECT WHERE project_id IS NULL works on either
         # schema (NULL semantics in SQL are universal). But the insert
         # of project_id=NULL fails on pre-034 with a NOT NULL
@@ -183,23 +172,16 @@ class TestSeedRlRerankerDefaultDisabled(unittest.TestCase):
     def test_skip_when_global_row_already_exists(self) -> None:
         """Pre-existing global row → preserve user choice."""
         _create_full_db(self._db_path, num_rl_events=0)
-        conn = sqlite3.connect(str(self._db_path))
-        try:
-            # Seed an existing global row set to TRUE (= user has
-            # explicitly enabled). The seeder must not flip it to false.
-            conn.execute(
-                "INSERT INTO module_settings "
-                "  (project_id, module_id, setting_key, setting_value) "
-                "VALUES (NULL, ?, ?, ?)",
-                (
-                    install._RL_RERANKER_MODULE_ID,
-                    install._MODULE_ENABLED_FOR_PROJECT_KEY,
-                    "true",
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        # Seed an existing global row set to TRUE (= user has explicitly
+        # enabled). The seeder must not flip it to false. project_id=None is
+        # the host-wide row shape migration 034 made legal.
+        add_module_setting(
+            self._db_path,
+            None,
+            install._RL_RERANKER_MODULE_ID,
+            install._MODULE_ENABLED_FOR_PROJECT_KEY,
+            "true",
+        )
 
         install._seed_rl_reranker_default_disabled()
         # User's "true" choice preserved.

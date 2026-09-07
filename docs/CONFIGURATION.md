@@ -153,7 +153,11 @@ The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry 
 | `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | URL | Code-embedding FastAPI service URL. |
 | `CODE_EMBED_BACKEND` | `gpu` (default) | `ollama` | `gpu` → CodeSage-Large-v2 via the FastAPI service (sentence-transformers); `ollama` → routes embeds through Ollama. The Ollama-path default model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim); install.py overrides `CODE_EMBED_MODEL` to `qwen3-embedding:0.6b` (1024-dim) on 6-12 GB GPU hosts. |
 | `CODE_EMBED_MODEL` | `codesage-large-v2` (default) | model id | Explicit code model override. |
+| `VCT_CODE_EMBED_BUILD_CONTEXT` | `<orchestrator>/claude_mcp_servers/code_embedding_service` | path | Build context for the `code_embed` image, which is the ONE VCO service BUILT from source rather than pulled. Set it when the compose file runs outside the orchestrator clone (a per-project layout does not bundle the service source). It is also where `vco doctor` and `python -m vco_lib.code_embed_image` look for the source they compare against the running service's `/health.source_sha`; point it at the same directory compose builds from, or the staleness check reports `unknown`. |
 | `DUAL_EMBEDDING_ENABLED` | `false` (default) | `true` | When true, both `qwen3_embed` and `openai_embed` slots are populated on every write so the active slot can be switched without re-indexing. |
+| `VCT_EMBED_REQUEST_TIMEOUT_SECS` | `180` (default) | seconds | Per-embed-REQUEST timeout inside every backend adapter (Ollama / CodeEmbed / OpenAI). Bounds a single chunk request — a wedged embedder (hung socket, dead container) fails at chunk granularity instead of hanging forever, while a slow-but-progressing run is never killed. Unset, empty, non-numeric or non-positive → the 180 s default (the guard is never disabled). Raise it on hardware where chunks legitimately take minutes (e.g. arctic on CPU); `install.py` threads an export into its KG-seed subprocess, so install-time seeding honours it too. |
+| `VCO_EMBED_503_RETRY_DELAY` | (unset) | seconds | Scales the embed 503-retry backoff schedule (base 2 s / 5 s / 10 s, each +jitter). The value becomes the FIRST delay and the rest scale proportionally — `0` makes every retry sleep 0 s, `1` compresses the whole schedule. A malformed value is ignored and the base schedule runs unscaled (a knob must not be a kill switch). |
+| `VCO_OLLAMA_KEEP_ALIVE` | `24h` (default) | Ollama duration | `keep_alive` pinned on every Ollama embed request so the model stays resident (Ollama's own ~5 min idle default otherwise costs a ~1.9 s model reload on the next embed). Any value Ollama accepts works: `30m`, `2h`, `-1` (never evict), `0` (opt back into immediate unload). An explicitly EMPTY value sends no `keep_alive` field at all, deferring to Ollama's server-side `OLLAMA_KEEP_ALIVE`. |
 
 **Multi-slot fallback chain**: when `EmbeddingService.for_project()` resolves to a slot whose backend is unreachable (e.g. `codesage_embed` selected but the FastAPI service is down), it walks a fallback chain in order: codesage → qwen3 (via Ollama) → openai (when key set). The chain only fires for the code slot; the text slot resolution is strict. Diagnostic logging lands at `WARNING` level — check the MCP stderr if you suspect a fallback fired silently.
 
@@ -299,7 +303,7 @@ Since v0.2.91 the prune is **archive-then-delete**: victim rows are written to a
 
 `vco_lib/containers.py` resolves the runtime via:
 
-1. `VCT_CONTAINER_RUNTIME` env var — explicit `podman` or `docker`. Wins over everything when set.
+1. `VCT_CONTAINER_RUNTIME` env var — explicit `podman` or `docker`. It is a **pin**, not a preference: when set, it is the *only* candidate. If the pinned runtime is unusable (not installed, client binary refuses, daemon/machine/socket down), VCO **refuses** with an actionable message naming what you pinned, why it is unusable, and whether the other runtime is usable — it does **not** fall back to the other one. See [Why a refused pin is not a fallback](#why-a-refused-pin-is-not-a-fallback) below.
 2. Caller-passed `runtime` arg.
 3. `auto` (or unset) → probe `podman` first, then `docker`. Podman-first is intentional: podman's rootless mode is the orchestrator's default deployment.
 
@@ -307,7 +311,7 @@ The chosen executable is returned as a string (`podman` or `docker`) and used un
 
 ### Forcing Docker when both runtimes are installed
 
-Hosts with both Podman AND Docker installed default to Podman (step 3 above; see `_detect_container_runtime` at `install.py:6799`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
+Hosts with both Podman AND Docker installed default to Podman (step 3 above; see `_detect_container_runtime` at `install.py:8920`, a thin call into `vco_lib/containers.py::resolve`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
 
 ```bash
 export VCT_CONTAINER_RUNTIME=docker
@@ -315,7 +319,23 @@ python install.py --update          # install / update flows
 .claude/hooks/ensure-containers.sh  # session-start hook
 ```
 
-Persist the override by adding the export to a shell rc (`~/.bashrc` / `~/.zshrc`) or to the per-project `.claude/env` so every Claude Code session inherits it. The value wins over auto-probe and over any caller-passed `runtime` argument. Symmetric override: `VCT_CONTAINER_RUNTIME=podman` forces Podman when auto-probe would have picked Docker (unusual but possible if `podman` is installed but not first in `PATH`). Unrecognised values are logged and ignored — falling through to auto-probe.
+Persist the override by adding the export to a shell rc (`~/.bashrc` / `~/.zshrc`) or to the per-project `.claude/env` so every Claude Code session inherits it. The value wins over auto-probe and over any caller-passed `runtime` argument. Symmetric override: `VCT_CONTAINER_RUNTIME=podman` forces Podman when auto-probe would have picked Docker (unusual but possible if `podman` is installed but not first in `PATH`). Unrecognised values are logged and ignored — falling through to auto-probe (an unrecognised value is not a pin).
+
+### Why a refused pin is not a fallback
+
+Podman and Docker keep **separate named volumes** (`infrastructure/docker-compose.yml` maps `weaviate_data` → `vco_weaviate_data` and friends *inside whichever runtime drives compose*). So the two runtimes are two different data planes holding two different knowledge graphs.
+
+That is why a pinned-but-unusable runtime is refused rather than swapped. Consider the common case: you pinned `podman`, rebooted, and the podman machine did not come back up while Docker Desktop did. A fallback would run `docker compose up -d` and stand up an **empty Weaviate on :8081** — which every downstream heal, sync and search then reads as *your* knowledge graph, while the launcher (strict about the pin since PR-43) reports no runtime at all. Both halves look plausible in isolation; together they are a split brain over your data.
+
+Instead every surface says the same thing. The session-start hooks print the resolver's reason **on stdout** (so it lands in the session context — a hook's stderr is discarded when it exits 0):
+
+```
+ensure-containers: VCT_CONTAINER_RUNTIME=podman is set but `podman info` failed (daemon / machine / socket not running); docker is usable but VCO will NOT drive it for you (podman and docker have SEPARATE named volumes, so the stack would come up EMPTY on the other one) — start podman, or unset VCT_CONTAINER_RUNTIME / set it to docker; skipping
+```
+
+`install.py` writes the same text to the install log, and the launcher's install preflight returns `pinned` / `pinned_installed` / `alternative_usable` alongside `available: false` so the modal can say "podman is pinned but unusable" instead of "no container runtime is installed".
+
+Your three ways out, in the order the message lists them: **start the pinned runtime** (usual fix — `podman machine start`, `systemctl --user start podman.socket`, launch Docker Desktop); **unset `VCT_CONTAINER_RUNTIME`** to return to auto-probe; or **repin** to the runtime the message named as usable — knowing that its volumes are a different data plane, so an existing KG on the other runtime will not be there.
 
 ## MCP Servers
 
@@ -370,12 +390,13 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_NO_AUTO_LAUNCH=1` | Skip auto-spawning the launcher GUI at end of `first-install.sh` / `first-install.command`. Equivalent to passing `--no-auto-launch`. Useful for CI, agent-driven installs, or when the GUI will be controlled out-of-band (Xvfb, Playwright). |
 | `VCT_NO_DESKTOP_ICON=1` | Skip creating the desktop shortcut after a successful install. Equivalent to passing `--no-desktop-icon`. Linux: `~/.local/share/applications/vct-launcher.desktop` + `~/Desktop/vct-launcher.desktop` skipped. macOS: `~/Applications/VCT Launcher` symlink skipped. Windows: `%USERPROFILE%\Desktop\VCT Launcher.lnk` + Start Menu entry skipped. Useful for CI / unattended installs, or when running multiple VCO installs on the same user account. |
 | `VCT_NON_INTERACTIVE=1` | Treat the run as non-interactive. The Python auto-installer wrappers (`install.sh` / `install.ps1`) will fail loudly on missing Python rather than prompting — fix it in your CI image. Implied by `--quiet`. |
-| `VCT_CONTAINER_RUNTIME=podman|docker` | Pin the container runtime instead of auto-probing. Useful in CI where both runtimes might be present but only one is configured. |
+| `VCT_CONTAINER_RUNTIME=podman|docker` | Pin the container runtime instead of auto-probing. Useful in CI where both runtimes might be present but only one is configured. A **pin**: if the named runtime is unusable the install refuses with an actionable message rather than silently using the other one (they have separate volumes — see [Container runtime](#container-runtime)). |
 | `VCT_STATE_DIR=/path` | Override `~/.vct/` as the launcher state-root. Lets dev launchers run alongside production without contaminating state. Hub binaries pick this up automatically; resolver clients honour it too. |
 | `VCT_DISABLE_HOOKS=1` | See section below. |
-| `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` | **Test-only sentinel** consumed by `launcher/src-tauri/src/hub_launcher.rs:84`. When set, the launcher's hub-binary discovery skips steps 4 and 5 (in-tree dist resolution via `current_exe()` walking) and returns `None` if no other candidate matched. Production code never sets this — it exists so `cargo test` runs against `target/debug/` (where sibling cargo invocations may leave a real `vct-hub` binary) can deterministically assert "no hub anywhere". Do NOT use this as a user workaround for hub-start failures; the correct path for that is `vct-hub --start-if-not-running` (see TROUBLESHOOTING.md). |
+| `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` | **Test-only sentinel** consumed by `hub_launcher::find_hub_dist_sibling`. When set, the launcher's hub-binary discovery skips the in-tree dist resolution (the `current_exe()` sibling + arch-less-grandparent walk) and returns `None` if no other candidate matched. **Since v0.2.92 this is a manual override, not the protection**: discovery now refuses BY DEFAULT whenever `current_exe()`'s parent directory is `deps` — i.e. under any cargo test binary — because opt-in safety failed (only this module's own tests ever set the var, so every other test in the workspace resolved `target/debug/vct-hub` and `ensure_hub_running` spawned it against the developer's real `~/.vct`). A shipped launcher never lives in a `deps` dir, and a dev `cargo run` build lives in `target/<profile>/`, not `deps/`, so both keep finding their sibling hub. Production code never sets the var. Do NOT use it as a user workaround for hub-start failures; the correct path for that is `vct-hub --start-if-not-running` (see TROUBLESHOOTING.md). |
 | `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` | Runtime override for the RL module's paid-module pull-token gateway URL. Short-circuits the L0 catalog / L1 manifest / hardcoded-default resolution chain inside `installer_engine::request_pull_token` and POSTs the license-key request to `<url>` verbatim. Use when the on-disk endpoint is wrong (manifest still carries a `placeholder.<tld>` URL, tenant has migrated, gateway is being staged behind a custom domain). Empty / whitespace-only values are ignored. |
 | `VCT_MODULE_PULL_TIMEOUT_SECS=<n>` | Upper bound, in seconds, on a single module-image `podman`/`docker pull` during a module install or update. Default `1800` (30 min). The bound exists to catch a genuinely *stalled* registry (network black hole, half-open connection, a registry that accepts the connection but never streams layers) — without it, a stalled pull leaves the install row wedged at `status='installing'` forever (the pull future never resolves). On timeout the pull is killed and the install transitions to `status='error'` with an actionable message, then becomes retry-eligible. Raise it for unusually large GPU-variant images on a slow link. A zero, negative, or non-numeric value is **ignored** and the default is used — the bound is never disabled (a stalled pull must always be able to fail). |
+| `VCT_INSTALL_DOCKER_TIMEOUT=<seconds>` | Cap on the `compose up -d` step of `install.py` / `install.py --update` (first-run image pulls included). Default `900` (15 min), clamped to a 60 s minimum; a non-numeric value falls back to the default. A hung container daemon fails the step with a message naming this variable instead of blocking forever — raise it (e.g. `1800`) on slow links with a cold image cache where healthy pulls legitimately exceed 15 min. |
 
 ## Runtime env knobs
 
@@ -385,6 +406,57 @@ Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.
 |---|---|---|
 | `VCT_RESYNC_SPAWN_DISABLED` | unset (spawn allowed) | Truthy (`true`/`1`/`yes`/`on`, case-insensitive) → `vco_lib/codegraph_resync.py` never spawns a background analyzer child. The gate is checked **before** the per-spawn log file is created and before any `Popen`, so a disabled run also stops writing `~/.vct/logs/resync-*.log` records. For CI runners, air-gapped installs, and anyone who wants code-graph walks strictly on demand. `tests/conftest.py` sets it for the whole suite (with an explicit opt-out list for the tests that assert spawn behaviour), the same convention as `RL_HUB_POST_DISABLED`. |
 | `VCT_DISK_SPACE_MIN_FREE_GB` | `2` | Free-space floor, in GiB, for `vco doctor`'s disk-space probe (install root + vct state dir, deduplicated by filesystem). Strictly below the floor the finding is a warning; below 256 MiB it is critical; exactly at the floor is `ok`. Fractional values (`0.5`) are legal; a malformed or non-positive value falls back to the 2 GiB default and does **not** disable the check. Below the floor also emits the `disk_space_low` deferral condition — see [`features/05-install-and-secrets.md`](features/05-install-and-secrets.md#disk-space-probe). |
+| `VCO_QUERY_ENRICH` | unset (enrichment on) | Set to exactly `off` to disable hook query enrichment — the retrieval query is then the bare trigger, as before v0.2.92. Note this knob takes the literal string `off` only; unlike the breaker's kill switch it does not also accept `0` / `false` / `no`. |
+| `VCO_QUERY_ENRICH_SHORT_TOKENS` | `24` | A trigger shorter than this many tokens is considered too thin to retrieve on, and gets enriched with the previous turn's context. Raise it to enrich more aggressively, lower it to enrich almost never. Unparseable values fall back to the default. |
+| `VCO_QUERY_ENRICH_SHARE` | `0.5` | Fraction of the embedding model's chunking-preset budget the added context may occupy, clamped to `[0.0, 1.0]` (the clamp applies to the resolved value, so an out-of-range kwarg is clamped too). The trigger always comes first and is never truncated to make room. Unparseable values fall back to the default. |
+| `VCT_VSCODE_SETTINGS_FILES` | unset | `os.pathsep`-separated list of absolute `settings.json` paths that replaces the launcher's VS Code-variant discovery when flipping the editor panel to the model gateway (`vco_lib/vscode_settings.py`). Set it for portable installs, `--user-data-dir` setups, or any VS Code-family editor the variant table does not know by name. The launcher's Services page names this variable when discovery finds no target. |
+| `VCT_CODEGRAPH_FORCE_REWALK` | unset | Env form of `analyze_code_graph.py --force-rewalk`: bypasses ONLY the per-FILE staleness gate, so the next walk re-parses every file. The per-ENTITY content-hash gate still runs — a converged project re-walks but re-embeds nothing. VCO's own background extractor-generation resync sets it (env survives the two process hops to the analyzer, where a CLI flag would not); set it by hand to force a full re-walk, e.g. after an extractor bug shipped stale rows. |
+| `VCT_LAUNCHER_DB_PATH` | `<VCT_STATE_DIR or ~/.vct>/launcher.db` | Overrides the launcher-database location for every VCO-side reader (`vco_lib.paths.launcher_db_path`: install.py's config projection, `project_init`, the read-only `launcher_db_reader`). One canonical resolver since v0.2.54 — before that only the reader honoured it, so the reader and the writers could disagree about which DB they were looking at. Set it when the DB genuinely lives outside the state root; symlink `~/.vct` instead for whole-state relocation. |
+| `VCT_BASH_KG_THRESHOLD_CHARS` | `500` | Minimum length, in characters, of a proposed Bash command before `pre-bash-context-inject` runs a KG search on it and injects matches as additional context. Raise it to quiet the hook on medium-sized routine commands; lower it to enrich more often. |
+| `VCO_QUERY_CACHE_TTL` | `900` (15 min) | Seconds a warm query-cache entry under `.claude/state/` is replayed by `pre-edit-context-inject` instead of re-querying the KG / code graph. Empty results are cached too (sentinel file), so a symbol that returns nothing isn't re-queried within the TTL. Entries are GC'd at twice this age; any cache error falls back to a live query (best-effort, never breaks injection). |
+| `VCO_KG_SYNC_DEBOUNCE_SECONDS` | `5` | Quiet window, in seconds, that the kg-sync debounce waits after a `knowledge/**` edit before syncing. `0` disables debouncing — every edit syncs immediately (the pre-2026-06-18 behaviour). A non-numeric value falls back to 5. |
+| `VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS` | `120` | Per-project rate limit, in seconds, between end-of-turn code-graph drains (`stop-codegraph-drain`). A second Stop inside the window skips the drain. A non-numeric value falls back to 120. |
+| `VCT_SUBAGENT_MAX_DIFF` | `500` | Cap on the changed-file list `subagent-stop-reconcile` computes from a subagent's snapshot, protecting the reconcile consumers (KG-sync, code-graph drain, credential scan) from a runaway tree-wide diff (e.g. a subagent that ran a formatter pass). |
+| `VCT_SNAPSHOT_DIRS` | `knowledge docs src lib launcher claude_mcp_servers .claude/scripts vco_lib templates tests` | Space-separated directories (relative to the project root) the subagent snapshot library walks. Missing directories are skipped. The same list drives the snapshot AND the diff, so override it in both places' env (any process that runs either). |
+| `VCT_SNAPSHOT_CODE_EXTS` | `py\|rs\|ts\|tsx\|js\|jsx\|go\|java\|cs\|c\|cpp\|h\|hpp\|rb\|php\|swift\|kt\|scala\|sh\|ps1\|sql` | Pipe-separated code-file extensions the snapshot walk tracks (`.md` files under the snapshot dirs are always tracked). Extend it when your language is missing from the default. |
+| `VCT_SNAPSHOT_PRUNE_DIRS` | `target node_modules .git .wt __pycache__ .venv dist build .next .svelte-kit .pytest_cache .mypy_cache .ruff_cache` | Space-separated directory basenames pruned from the snapshot walk (build / VCS / cache trees). Applied identically at snapshot and diff time so the two stay comparable; add a differently-named build tree here. |
+| `VCT_SNAPSHOT_GC_DAYS` | `3` | Age, in days, at which orphaned subagent snapshots under `.claude/state/` are garbage-collected (a killed agent whose Stop hook never fired would otherwise leak its snapshot forever). Live agents' snapshots are always fresh enough to be untouched. |
+| `VCT_WORKTREE_GUARD_ENFORCE` | unset | `=1` hard-blocks (exit non-zero) only the belt-and-suspenders branch of `worktree-guard` — a payload that supplies an explicit worktree path equal to the parent checkout. Ordinary spawns create an isolated worktree unconditionally; this flag does not gate that. |
+
+### Model gateway (`claude-gw`)
+
+The local model-gateway daemon (`claude_mcp_servers/model_router/`, default port `11436`) is started, stopped and boot-registered by the launcher (Services page). Every knob below is optional and read at daemon startup by `model_router/config.py`; a healthy install needs none of them.
+
+| Var | Default | Effect |
+|---|---|---|
+| `VCT_MODEL_GATEWAY_PORT` | `11436` | TCP port. Falls back to the port file `<vct-state-dir>/model-gateway.port` (written by the running daemon, same convention as `hub.port`), then to the default. A non-numeric or out-of-range value falls through the same chain rather than being used literally. |
+| `VCT_MODEL_GATEWAY_HOST` | `127.0.0.1` | Bind address. REFUSED at startup unless it resolves to a loopback address: the gateway proxies under your Claude login and is authorised by a local file token, so binding a routable interface is an error, not a configuration. |
+| `VCT_MODEL_GATEWAY_CREDENTIALS` | `~/.claude/.credentials.json` | Path to the Claude CLI's OAuth credentials file (honours `VCT_CLAUDE_DIR`, see next section). Harness-owned: the gateway only ever reads it, never writes or copies it. |
+| `VCT_MODEL_GATEWAY_CONTEXT_TABLE` | `<vct-state-dir>/model-gateway/chat_model_context.json` | Where the daemon looks for an exported chat-model context table (schema: `model_router.context_table`). No writer of this file exists yet; absence is the normal state. |
+| `VCT_MODEL_GATEWAY_SECRET_PROJECT` | unset | Project scope handed to the vct-secrets resolver when the vendor key was stored against a specific project. Unset means the shared scope in the file store and a by-path lookup in the hub. The launcher passes this through when it starts the daemon. |
+| `VCT_MODEL_GATEWAY_CATALOG_TTL` | `21600` (6 h) | Seconds before the live model catalog is re-fetched. |
+| `VCT_MODEL_GATEWAY_STATIC_RETRY_TTL` | `300` | When a live catalog fetch fails and the static fallback is serving, retry the live fetch after this many seconds instead of waiting out the full catalog TTL (a one-minute vendor outage must not cost six hours of a stale picker). |
+| `VCT_MODEL_GATEWAY_KEY_TTL` | `300` | Seconds before the vendor key is re-resolved, so a rotation is picked up — and a hub that was down at boot is retried — without restarting the daemon. |
+| `VCT_GW_TMP_TOKEN` | unset | Passes the gateway's host token to `vco` CLI subcommands without putting it in argv (shell history, `ps` listings). Unset is the normal case: the token is then read from the gateway's own token file and never crosses a process boundary. |
+
+The three TTL knobs exist primarily so the smoke tests can drive the caches without sleeping; they are documented because a knob nobody can find is a knob that gets re-invented.
+
+### Metrics location and the `~/.claude` migration (v0.2.92)
+
+VCO's JSONL telemetry streams (`costs.jsonl`, `failures.jsonl`, `compactions.jsonl`, `kg_update_tokens.jsonl`, `embedding_failures.jsonl`, `bundled_versions.jsonl`) live under `<`[`VCT_STATE_DIR`](#install-time-env-knobs)`>/metrics` (default `~/.vct/metrics`). Before v0.2.92 they were written to `~/.claude/metrics`; `~/.claude` is Claude Code's own directory and VCO now writes nothing under it the harness did not ask for. The old location is a frozen archive: still read, never deleted, never written by the migration.
+
+**`VCT_CLAUDE_DIR`** — the one user-settable knob in this story. It overrides `~/.claude` as the Claude Code user directory for every VCO read of it: the MCP workflow config (`workflow/config/mcp-config.json`) and the legacy metrics archive above. All consumers resolve through a single resolver (`vco_lib/paths.py::claude_user_dir`), so one pin steers all of them; the test suite uses the same pin to stay out of real state. Not to be confused with `~/.claude.json` — that is a FILE beside this directory and follows the user-home override, not this one.
+
+The four `VCO_METRICS_*` variables below are **internal — do not set them**. They are exported by `templates/hooks/_lib/metrics-dir.sh` (and its `.ps1` sibling) so VCO's own hooks share one answer to "where do metrics live?"; they are documented here so their names are not a mystery in a process listing:
+
+| Var | Meaning |
+|---|---|
+| `VCO_METRICS_HOME` | The new home, `<VCT_STATE_DIR>/metrics` — unconditionally. |
+| `VCO_LEGACY_METRICS_DIR` | The frozen archive, `$VCT_CLAUDE_DIR/metrics` (default `~/.claude/metrics`) — unconditionally. |
+| `VCO_METRICS_MIGRATED` | `1` when the one-time copy is done or not needed (no archive / no `*.jsonl` in it), else `0`. |
+| `VCO_METRICS_DIR` | The write target: the new home once migration is verified, the archive while a copy is still owed. |
+
+Writers switch to the new home only after `vco_lib.metrics_migration` has copied AND verified every archived file (record: `<home>/.migrated-from-claude.json`). Until then they keep appending to the archive — nothing is stranded and nothing is double-counted; the next migration run finishes the job and the writers move on their own.
 
 For the RL event-retention knobs (`RL_EVENTS_*`) see [Paid-module license framework → RL event retention and archives](#rl-event-retention-and-archives); they apply on free installs too.
 
@@ -431,10 +503,27 @@ Auto-generated 2-3 sentence summaries for every KG node, written to `knowledge/.
 
 1. `claude` CLI on PATH — optional, used only for KG-node summarization when present.
 2. Ollama at `http://localhost:11435` — automatic fallback; works for any VCO user since Ollama is already required for embeddings. Default model `qwen3.5:9b` (16+ GB VRAM) or `gemma4:e4b` for low-VRAM hosts.
-3. `ANTHROPIC_API_KEY` direct — opt-in fallback; costs $$ per generation.
-4. Silent skip — friendly log line, exits 0.
+3. OpenAI — opt-in, and gated twice: it needs `OPENAI_API_KEY` **and** consent (`kg_summary_openai_consent` in launcher Preferences → KG Summaries, or the operator flag `--force-api`). Costs $$ per generation.
+4. `ANTHROPIC_API_KEY` direct — opt-in fallback; costs $$ per generation.
+5. Silent skip — friendly log line, exits 0.
 
-Force a specific backend with `KG_SUMMARY_BACKEND=cli|ollama|api|skip`. Override Ollama generation params with `KG_SUMMARY_OLLAMA_OPTIONS='{"temperature": 0.5, "num_ctx": 32768}'` (JSON object passed through to the Ollama API).
+Force a specific backend with `KG_SUMMARY_BACKEND=cli|ollama|openai|api|skip` (`api` = Anthropic direct, `openai` = OpenAI). Override Ollama generation params with `KG_SUMMARY_OLLAMA_OPTIONS='{"temperature": 0.5, "num_ctx": 32768}'` (JSON object passed through to the Ollama API).
+
+### Circuit breaker (usage limits and outages)
+
+A tier that stops serving mid-run is **demoted** rather than retried: without this, an account that hits its cap partway through a backfill keeps spawning a doomed request for every remaining node (a field report measured 426 of them in one run). The latch lives in `<vct-state-dir>/summary_backend_breaker.json` because the generator runs one process per node, and it **expires** rather than persisting — a recovered endpoint works again with no file to delete. The reason is classified, and the four classes are treated differently on purpose: `rate_limit` and `auth` demote on the first occurrence (retrying cannot succeed), `capacity` (529/503/timeout) needs several consecutive strikes because it recovers on its own, and anything unclassified never trips.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `VCO_SUMMARY_BREAKER` | enabled | Kill switch. Set to `off`, `0`, `false` or `no` to disable the breaker entirely — every tier is then tried on every node, as before v0.2.92. |
+| `VCO_SUMMARY_BREAKER_COOLDOWN` | `900` | Seconds a tier stays demoted after a **usage-limit** failure. Long, because that clock is not yours to move. |
+| `VCO_SUMMARY_BREAKER_AUTH_COOLDOWN` | `120` | Seconds a tier stays demoted after an **auth** failure. Short, because *you* are the fix: you re-authenticate and expect the next node to use the tier again. |
+| `VCO_SUMMARY_BREAKER_CAPACITY_COOLDOWN` | `60` | Seconds a tier stays demoted after a sustained **capacity** failure (529 / 503 / timeout). |
+| `VCO_SUMMARY_BREAKER_CAPACITY_STRIKES` | `3` | Consecutive capacity failures before that tier is demoted at all. A permanent latch on one transient 529 would be its own bug. |
+
+Values below the documented floor are ignored (a cooldown must be ≥ 0, a strike count ≥ 1), so a typo falls back to the default rather than disabling the guard. When every tier is cooling down the generator logs `no backend available — … cooling down after a usage-limit / capacity failure. Nothing to install; retry after the cooldown.` — the launcher surfaces that line verbatim instead of telling you to install a CLI you already have.
+
+A backend named explicitly through `KG_SUMMARY_BACKEND` is **never** auto-demoted or substituted: you asked for that tier, so the failure is raised rather than quietly answered by a different model.
 
 A separate `PreToolUse` hook validates frontmatter on every write to `knowledge/**/*.md` and blocks writes missing required fields (`title`, `type`, `tags`, `created`, `updated`, `status`). The summary generator depends on these.
 

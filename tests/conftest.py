@@ -44,9 +44,11 @@ from __future__ import annotations
 
 import functools
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -78,6 +80,708 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # hook early enough.
 _VCO_TEST_STATE = Path(tempfile.mkdtemp(prefix="vco-test-state-"))
 os.environ.setdefault("VCT_QUERY_LOG_DIR", str(_VCO_TEST_STATE / "query_logs"))
+
+
+# ─── W-STATE (v0.2.92): no test may reach the user's REAL ~/.vct ────────────
+#
+# 2026-09-01 incident. Four tests in `test_v0244_adversarial_fixes.py` drove
+# `install._seed_weaviate_shared_kg_only` with `_is_orchestrator_root_install`
+# faked True. They stubbed the two write paths that existed when they were
+# written (`_write_app_state_key`, `_rebind_orchestrator_root_to_canonical`) —
+# and then v0.2.76's R8 shim added a THIRD one underneath them
+# (`_converge_orchestrator_root_kg_pointer`), which resolves the real
+# `~/.vct/launcher.db` and UPSERTs `app_state.orchestrator_root_kg_collection`.
+# Every local `pytest tests/` since has rewritten that row to the last fixture
+# literal in file order: the maintainer's live pointer read `'NewKG'` for four
+# days (2026-08-28T18:37 -> repaired 2026-09-01T22:37), and `NewKG` exists
+# nowhere in shipped source — only in that test file.
+#
+# The lesson is NOT "those four tests were sloppy". They were correct when
+# written. **A test's isolation is a claim about production code, and a
+# production change can silently expire it.** So the guard cannot be another
+# per-symbol stub (the next new write path expires that too) — it redirects
+# the PATH RESOLUTION at its root, which every present and future consumer
+# goes through:
+#
+#   `VCT_STATE_DIR` is the first tier of `vco_lib.paths.vct_root_dir`, and
+#   `tests/test_vct_root_dir_consolidation.py` already forbids reconstructing
+#   `~/.vct` inline outside that module. So redirecting it moves launcher.db,
+#   hub.db, `~/.vct/logs/`, the hub token/port files and the update lockfile in
+#   ONE place — including for the subprocess-spawning tests, which inherit it.
+#
+# This INVERTS the previous convention: the state-dir redirect used to be
+# opt-IN (only `_RESYNC_SPAWN_OPT_OUT_FILES` got it), so ~63 test files reached
+# the real `~/.vct` by default. It is now the DEFAULT, and standing aside from
+# it is the thing you opt into (`_SELF_ISOLATED_STATE_DIR_FILES`, below).
+#
+# Safety of the inversion: CI already runs `pytest tests/ -q` on a runner with
+# NO `~/.vct` at all, so every test must already tolerate an absent launcher.db
+# — the redirect just makes a developer's local run match CI instead of
+# silently reading (and, per above, writing) their live install.
+#
+# Set at conftest IMPORT time, not only in the fixture, because module-scope
+# code resolves state paths during COLLECTION, before any function fixture can
+# run: `tests/test_agent_secrets.py` decides its module-level skip by reading
+# `~/.vct/hub.port` + `hub.token` at import. The autouse fixture below then
+# RE-ESTABLISHES the redirect per test, which matters for the opposite reason:
+# several suites set `VCT_STATE_DIR` themselves and `os.environ.pop` it in
+# tearDown, which would otherwise delete the import-time redirect for every
+# test that follows.
+_VCO_STATE_REDIRECT = _VCO_TEST_STATE / "vct_root"
+_VCO_SECRETS_REDIRECT = _VCO_TEST_STATE / "vct_secrets"
+_VCO_STATE_REDIRECT.mkdir(parents=True, exist_ok=True)
+_VCO_SECRETS_REDIRECT.mkdir(parents=True, exist_ok=True)
+
+_REAL_VCT_ROOT = Path.home() / ".vct"
+
+# Escape hatch for a deliberate run against the real state dir (debugging a
+# live install). Never set in CI or in a normal local run. Covers BOTH the
+# `~/.vct` redirect above and the `~/.claude` one below — one hatch for "run
+# against my real user state", not one per resource.
+_ALLOW_REAL_STATE = os.environ.get("VCO_TEST_ALLOW_REAL_STATE", "") not in (
+    "", "0", "false",
+)
+
+if not _ALLOW_REAL_STATE:
+    os.environ["VCT_STATE_DIR"] = str(_VCO_STATE_REDIRECT)
+    os.environ["VCT_SECRETS_DIR"] = str(_VCO_SECRETS_REDIRECT)
+    # `VCT_LAUNCHER_DB_PATH` OUTRANKS `VCT_STATE_DIR` in
+    # `vco_lib.paths.launcher_db_path`, so an ambient one would defeat the
+    # redirect. Drop it; tests that set it themselves still win (they set it
+    # after this fixture, inside their own setUp).
+    os.environ.pop("VCT_LAUNCHER_DB_PATH", None)
+
+
+# ─── W-CLAUDE (v0.2.92): the same discipline for the user's real ~/.claude ───
+#
+# W-STATE (above) closed `~/.vct`. It did NOT cover `~/.claude`, and that one
+# was leaking at the same time: `vco_lib.embedding_service._failure_jsonl_path`
+# returned `Path.home()/".claude"/"metrics"/"embedding_failures.jsonl"` with no
+# override anywhere in the chain, so two tests in
+# `tests/test_maintain_kg_guards.py` appended fixture-shaped rows
+# (`"attempted_backends": []`, `"message": "none"`, `"install_root": null`) to
+# the maintainer's REAL telemetry stream on every `pytest tests/` — measured
+# 1257 -> 1265 rows across one lane's runs, and +2 more in the run that
+# produced this fix. Same shape as the W-STATE incident: a per-call-site
+# `Path.home()` with no root anyone could steer.
+#
+# Two levers, because there are two resources:
+#
+#   * `VCT_CLAUDE_DIR` -> `vco_lib.paths.claude_user_dir()`, the new root of
+#     every `~/.claude/**` consumer (the metrics writers in
+#     `embedding_service` / `install.py` / `vco_lib.cli.verify`, the
+#     `workflow/config/mcp-config.json` read in
+#     `templates/scripts/query_code_graph.py`, the legacy
+#     `workflow/scripts` sys.path entry in
+#     `templates/scripts/detect_duplicates.py`).
+#   * `VCT_USER_HOME_OVERRIDE` -> `install._user_home_for_install()`, which
+#     already existed (v0.2.11 PR-16) and already resolves `~/.claude.json`
+#     for `_check_ollama_mcp_remnants` / `_check_search_mcp_env_obsolete`.
+#     The lever was simply never pulled suite-wide, so four tests read the
+#     developer's real global Claude config and branched on its contents —
+#     de-hermeticising, since CI has no such file.
+#
+# `~/.claude.json` is a FILE beside `~/.claude/`, not inside it, which is why
+# one env var cannot cover both. Do not add a third: teach a new consumer one
+# of these two.
+#
+# Set at IMPORT time for the same reason as the others — module-scope code
+# resolves these during COLLECTION (`query_code_graph.py` reads
+# `mcp-config.json` at module import, and it is imported by 6 test files).
+_VCO_CLAUDE_REDIRECT = _VCO_TEST_STATE / "claude_home"
+_VCO_USER_HOME_REDIRECT = _VCO_TEST_STATE / "user_home"
+_VCO_CLAUDE_REDIRECT.mkdir(parents=True, exist_ok=True)
+_VCO_USER_HOME_REDIRECT.mkdir(parents=True, exist_ok=True)
+
+_REAL_CLAUDE_DIR = Path.home() / ".claude"
+_REAL_CLAUDE_JSON = Path.home() / ".claude.json"
+
+if not _ALLOW_REAL_STATE:
+    os.environ["VCT_CLAUDE_DIR"] = str(_VCO_CLAUDE_REDIRECT)
+    os.environ["VCT_USER_HOME_OVERRIDE"] = str(_VCO_USER_HOME_REDIRECT)
+
+
+# Files that isolate the state dir THEMSELVES and must not have `VCT_STATE_DIR`
+# pinned over the top of their own mechanism. The redirect is POPPED for these,
+# so whatever they set up governs.
+#
+# Add a file here only with a written rationale, and only when it demonstrably
+# cannot reach the real `~/.vct` — a file whose isolation covers SOME of its
+# tests does not qualify. Preferred alternative: pin a fixture DB via
+# `VCT_LAUNCHER_DB_PATH` (`tests/common/launcher_db_fixture.py`), which
+# outranks `VCT_STATE_DIR` and needs no entry here.
+#
+#   * `test_launcher_db_reader.py` — its `isolated_env` fixture tests the
+#     resolver's ``Path.home()`` FALLBACK, which it exercises by faking `$HOME`
+#     to `tmp_path` and seeding `$HOME/.vct/launcher.db`. `VCT_STATE_DIR` is
+#     an EARLIER tier of the same resolver, so pinning it hides the tier under
+#     test. Verified safe: all 22 tests in the file take `isolated_env`, so
+#     none can resolve the developer's real home. The sqlite tripwire (which
+#     is session-scoped and unaffected by this list) still refuses a write.
+_SELF_ISOLATED_STATE_DIR_FILES: frozenset = frozenset({
+    "test_launcher_db_reader.py",
+})
+
+
+@pytest.fixture
+def child_env() -> dict:
+    """Environment for a child Python process with the repo root FIRST on
+    ``PYTHONPATH`` (v0.2.92 §3.16). See ``tests/common/child_env.py`` — the
+    function form is for unittest-style tests; this fixture is the same dict
+    for pytest-style ones. A fresh copy per test: mutate freely."""
+    from tests.common.child_env import child_env as _child_env
+
+    return _child_env()
+
+
+@pytest.fixture(autouse=True)
+def _redirect_user_state_dir(request):
+    """Re-establish the `~/.vct` redirect for EVERY test (see the block above).
+
+    Re-establishing per test is the load-bearing part: a tearDown doing
+    ``os.environ.pop("VCT_STATE_DIR", None)`` would otherwise strip the
+    import-time redirect and silently un-protect the rest of the session.
+    """
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+
+    # NOTE `VCT_LAUNCHER_DB_PATH` is dropped ONCE at import (above) and NOT
+    # re-dropped here. Per-test popping would defeat a MODULE-scoped pin —
+    # `tests/test_detect_legacy_kg_collections.py::setUpModule` sets it via
+    # `mock.patch.dict`, and pytest runs module-scoped setup BEFORE
+    # function-scoped fixtures, so this fixture would clobber it. Safety does
+    # not depend on it: `VCT_STATE_DIR` (re-established below) already moves
+    # the default, and a leaked value from another test can only point at
+    # another tmp path — never at the real DB, which the tripwire refuses.
+    keys = {
+        "VCT_STATE_DIR": str(_VCO_STATE_REDIRECT),
+        "VCT_SECRETS_DIR": str(_VCO_SECRETS_REDIRECT),
+    }
+    # W-CLAUDE: the `~/.claude` levers are re-established UNCONDITIONALLY, and
+    # are deliberately NOT part of the stand-aside set above. The one recorded
+    # stand-aside (`test_launcher_db_reader.py`) exists because `VCT_STATE_DIR`
+    # is an earlier TIER of the very `Path.home()` resolver that file tests —
+    # a reason that is specific to the launcher-db resolver and says nothing
+    # about `~/.claude`. Popping these two for it would open a hole in the new
+    # guard to buy nothing.
+    claude_keys = {
+        "VCT_CLAUDE_DIR": str(_VCO_CLAUDE_REDIRECT),
+        "VCT_USER_HOME_OVERRIDE": str(_VCO_USER_HOME_REDIRECT),
+    }
+    self_isolated = (
+        request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES
+    )
+    prev = {k: os.environ.get(k) for k in (*keys, *claude_keys)}
+    if self_isolated:
+        # Stand aside DETERMINISTICALLY (pop, don't restore the ambient value)
+        # so the file's own isolation is what governs on every machine —
+        # including a developer's shell that exports VCT_STATE_DIR.
+        for key in keys:
+            os.environ.pop(key, None)
+    else:
+        os.environ.update(keys)
+    os.environ.update(claude_keys)
+    try:
+        yield
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _is_inside(root: Path, candidate: Path) -> bool:
+    """True when ``candidate`` IS ``root`` or lives under it. Never raises.
+
+    ONE home for the containment test both tripwires make (the `~/.vct` sqlite
+    guard and the `~/.claude` audit-hook guard). Both run inside code paths
+    where an exception would surface as something other than a guard verdict,
+    so a filesystem error answers "not inside" rather than propagating.
+    """
+    try:
+        return candidate == root or root in candidate.parents
+    except (OSError, ValueError):
+        return False
+
+
+def _drain_and_report(attempts: list, describe) -> None:
+    """Drain ``attempts``; raise ``AssertionError`` if it was non-empty.
+
+    The reporting half shared by the two guard fixtures below. Kept as one
+    function because the property is identical and load-bearing in both: a
+    refusal that production code SWALLOWED (these callers soft-fail on
+    ``Exception`` / ``OSError``) must still red the test, or the near-miss
+    looks green. Only the message differs, so only the message is a parameter.
+    """
+    recorded = list(attempts)
+    del attempts[:]
+    if recorded:
+        raise AssertionError(describe(recorded))
+
+
+class RealUserStateWriteBlocked(RuntimeError):
+    """A test tried to open the user's real `~/.vct` DB read-WRITE."""
+
+
+_real_sqlite3_connect = sqlite3.connect
+_state_write_attempts: list = []
+
+
+def consume_state_write_attempts() -> list:
+    """Drain + return the recorded tripwire refusals.
+
+    ONLY for the guard's own tests, which trip it on purpose and must not then
+    be failed by ``_fail_test_that_tried_to_write_real_state``.
+    """
+    attempts = list(_state_write_attempts)
+    del _state_write_attempts[:]
+    return attempts
+
+
+def _tripwire_sqlite_connect(database, *args, **kwargs):
+    """`sqlite3.connect` wrapper that REFUSES a writable handle on real state.
+
+    Second layer, deliberately independent of the env redirect above: it fires
+    even for a path the env cannot steer — a future hardcoded
+    ``Path.home() / ".vct" / "launcher.db"`` (that shape already exists, e.g.
+    ``templates/scripts/summary_backends.py``), or any caller that bypasses
+    ``vco_lib.paths``. Read-only URI handles (``file:...?mode=ro``) pass: they
+    cannot corrupt anything, and forbidding them is not this guard's job.
+
+    The refusal is recorded as well as raised, because most production callers
+    soft-fail on ``Exception``; the autouse fixture below turns a swallowed
+    refusal into a RED test rather than a silent near-miss.
+    """
+    target = database
+    readonly = False
+    if isinstance(target, (str, bytes, os.PathLike)):
+        text = os.fspath(target)
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        if text.startswith("file:"):
+            body, _, query = text[5:].partition("?")
+            readonly = "mode=ro" in query or "immutable=1" in query
+            text = body
+        try:
+            resolved = Path(text).expanduser()
+        except (OSError, ValueError):
+            resolved = None
+        if resolved is not None and not readonly:
+            if _is_inside(_REAL_VCT_ROOT, resolved):
+                _state_write_attempts.append(str(resolved))
+                raise RealUserStateWriteBlocked(
+                    f"test opened {resolved} read-WRITE; the suite must never "
+                    f"write the user's real launcher state (see tests/conftest.py "
+                    f"W-STATE)"
+                )
+    return _real_sqlite3_connect(database, *args, **kwargs)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _install_real_state_sqlite_tripwire():
+    """Install the `sqlite3.connect` tripwire for the whole session."""
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    sqlite3.connect = _tripwire_sqlite_connect
+    try:
+        yield
+    finally:
+        sqlite3.connect = _real_sqlite3_connect
+
+
+@pytest.fixture(autouse=True)
+def _fail_test_that_tried_to_write_real_state():
+    """Turn a SWALLOWED tripwire refusal into a red test.
+
+    Without this, a production soft-fail (``except Exception: return False``)
+    would absorb the block and the test would pass green while having tried to
+    write the developer's live install — exactly the invisibility that let the
+    2026-09-01 incident run for four days.
+    """
+    del _state_write_attempts[:]
+    yield
+    _drain_and_report(
+        _state_write_attempts,
+        lambda attempts: (
+            "test attempted a read-WRITE connection to real user state: "
+            + ", ".join(sorted(set(attempts)))
+        ),
+    )
+
+
+class RealClaudeHomeWriteBlocked(RuntimeError):
+    """A test tried to WRITE inside the user's real `~/.claude` (or
+    `~/.claude.json`)."""
+
+
+#: Recorded accesses to the real `~/.claude`, as ``(kind, path)`` where kind is
+#: ``"write"`` or ``"read"``. Drained per test by the reporter fixture below.
+_claude_access_attempts: list = []
+
+_O_WRITE_MASK = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+#: Audit events that MUTATE. ``open`` is classified per-call (read vs write).
+_MUTATION_EVENTS = frozenset({
+    "os.mkdir", "os.rmdir", "os.remove", "os.rename", "os.link", "os.symlink",
+    "os.truncate", "os.chmod",
+})
+_WATCHED_EVENTS = frozenset({"open"}) | _MUTATION_EVENTS
+
+
+def consume_claude_access_attempts() -> list:
+    """Drain + return the recorded `~/.claude` accesses.
+
+    ONLY for the guard's own tests, which trip it on purpose and must not then
+    be failed by ``_fail_test_that_touched_real_claude_home``. Sibling of
+    :func:`consume_state_write_attempts`.
+    """
+    attempts = list(_claude_access_attempts)
+    del _claude_access_attempts[:]
+    return attempts
+
+
+def _under_real_claude(raw) -> "Path | None":
+    """Resolved path if ``raw`` names the real `~/.claude` tree or
+    `~/.claude.json`, else None. Never raises (it runs inside an audit hook)."""
+    try:
+        text = os.fspath(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or ".claude" not in text:
+        return None  # fast path: the overwhelming majority of opens
+    try:
+        resolved = Path(text)
+        if not resolved.is_absolute():
+            resolved = Path(os.path.abspath(text))
+    except (OSError, ValueError):
+        return None
+    if resolved == _REAL_CLAUDE_JSON or _is_inside(_REAL_CLAUDE_DIR, resolved):
+        return resolved
+    return None
+
+
+def _under_real_vct(raw) -> "Path | None":
+    """Resolved path if ``raw`` names something inside the real `~/.vct`,
+    else None. Never raises (it runs inside an audit hook).
+
+    Sibling of :func:`_under_real_claude`, same shape and same fast path.
+    """
+    try:
+        text = os.fspath(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or ".vct" not in text:
+        return None  # fast path: the overwhelming majority of opens
+    try:
+        resolved = Path(text)
+        if not resolved.is_absolute():
+            resolved = Path(os.path.abspath(text))
+    except (OSError, ValueError):
+        return None
+    return resolved if _is_inside(_REAL_VCT_ROOT, resolved) else None
+
+
+def _open_is_write(mode, flags) -> bool:
+    """Classify an ``open`` audit event as a write.
+
+    ``io.open`` supplies the string mode; ``os.open`` supplies ``mode=None``
+    plus the real flags. Directory handles are excluded: opening a directory
+    carries O_RDWR-ish flags on some paths and can never append a row.
+    """
+    if isinstance(flags, int) and flags > 0 and (flags & _O_DIRECTORY):
+        return False
+    if isinstance(mode, str):
+        return any(ch in mode for ch in "wax+")
+    if isinstance(flags, int) and flags > 0:
+        return bool(flags & _O_WRITE_MASK)
+    return False
+
+
+def _user_state_audit_hook(event: str, args) -> None:
+    """Refuse WRITES into the real `~/.claude` or `~/.vct`; record reads of
+    the former.
+
+    ONE hook for two roots, because the resource is the same one — a file
+    open — and an audit hook runs on EVERY open in the process, so a second
+    hook would double that cost to answer a question this one already has
+    the path for.
+
+    Second layer for both, deliberately independent of the env redirects
+    above — exactly as the `sqlite3.connect` tripwire is for `~/.vct`
+    databases. It fires for a path the env cannot steer: a future hardcoded
+    ``Path.home() / ".claude" / ...`` (that shape still exists in
+    `vco_lib/doctor.py`, `vco_lib/cli/verify_diagrams.py`,
+    `claude_mcp_servers/rl_client/rl_logger.py`) or ``Path.home() / ".vct"``
+    (that shape exists in `templates/scripts/summary_backends.py`), or any
+    caller that bypasses `vco_lib.paths`.
+
+    **Why an audit hook and not monkeypatched symbols.** The thing to hook is
+    the RESOURCE, and the file-open resource has several doors:
+    ``builtins.open``, ``io.open``, ``pathlib.Path.open`` (which is what
+    ``write_text`` / ``write_bytes`` go through and which does NOT see a
+    patched ``builtins.open``), ``os.open``, ``os.mkdir``. Patching that set
+    by name is the per-symbol bet whose expiry caused the W-STATE incident —
+    and it would be re-placed every time CPython or a library adds a door.
+    ``sys.addaudithook`` sits under all of them at the C level.
+
+    **Why the `sqlite3.connect` tripwire below still exists.** `~/.vct` now
+    has TWO guards, and they cover different doors rather than overlapping:
+    launcher state is a SQLite handle that never passes through Python's
+    ``open`` at all (sqlite opens the file in C), so only the
+    ``sqlite3.connect`` wrapper can see it; everything ELSE under `~/.vct`
+    — `hub.token`, `hub.port`, `hub.pid`, `logs/**.jsonl`, the update
+    lockfile, `summary_backend_breaker.json` — is an ordinary file that
+    only this hook can see. Before v0.2.92 WP-Q2 the second set had no
+    guard at all: a hardcoded ``Path.home() / ".vct" / ...`` write would
+    have landed in the developer's live install with the DB guard sitting
+    right beside it, blind.
+
+    The two SHARE what can be shared — the containment test
+    (``_is_inside``), the redirect fixture, the escape hatch, the recorded-
+    attempt list (``_state_write_attempts``, so ONE reporter fixture reds a
+    swallowed refusal from either door) and the exception type.
+
+    They COULD converge further: CPython also raises a ``sqlite3.connect``
+    audit event, so this hook could absorb the DB door too. That means
+    rewriting the shipped `~/.vct` tripwire (its own tests assert on the
+    monkeypatched ``sqlite3.connect`` identity and on read-only URI
+    handling), which is a restructure of a guard landed one lane earlier in
+    this same cycle — recorded here as the recommendation, deliberately not
+    taken mid-cycle.
+
+    **Reads are recorded, not refused** — a deliberate asymmetry. A read
+    cannot damage the user's install, and raising mid-read would send
+    production code down a fallback branch, changing what the test proves
+    while looking like a guard success. But a read of the real home still
+    de-hermeticises (the same test then means something different on the
+    maintainer's box and on CI), so it reds the test in teardown with the path
+    named. Writes get both: refused AND recorded.
+
+    The recording matters as much as the raising, for the reason W-STATE
+    found: most production callers here soft-fail on ``Exception``
+    (``_write_failure_jsonl`` catches ``OSError``, ``doctor`` catches
+    ``Exception``), so a refusal that was only raised would be swallowed and
+    the near-miss would look green.
+    """
+    if _ALLOW_REAL_STATE or event not in _WATCHED_EVENTS:
+        return
+    if not args:
+        return
+    mode = args[1] if event == "open" and len(args) > 1 else None
+    flags = args[2] if event == "open" and len(args) > 2 else None
+    is_write = event != "open" or _open_is_write(mode, flags)
+
+    resolved = _under_real_claude(args[0])
+    if resolved is not None:
+        if not is_write:
+            _claude_access_attempts.append(("read", str(resolved)))
+            return
+        _claude_access_attempts.append(("write", str(resolved)))
+        raise RealClaudeHomeWriteBlocked(
+            f"test tried to write {resolved}; the suite must never write the "
+            f"user's real Claude Code state (see tests/conftest.py W-CLAUDE — "
+            f"route the path through vco_lib.paths.claude_user_dir())"
+        )
+
+    # W-STATE-FILES (v0.2.92 WP-Q2): the same refusal for PLAIN FILES under
+    # the real `~/.vct`. The sqlite tripwire below covers `launcher.db` and
+    # `hub.db` — a handle sqlite opens in C, which never passes through
+    # Python's `open` — but `~/.vct` is not only databases: `hub.token`,
+    # `hub.port`, `hub.pid`, `logs/**.jsonl`, the update lockfile and
+    # `summary_backend_breaker.json` are ordinary files, and a caller that
+    # resolved one of those with a hardcoded `Path.home() / ".vct"` would
+    # have written the developer's live install with nothing to stop it.
+    # The env redirect (`VCT_STATE_DIR`) is the first layer and steers every
+    # caller that goes through `vco_lib.paths`; this is the second layer,
+    # for the ones that do not — exactly the two-layer shape W-STATE and
+    # W-CLAUDE already use.
+    #
+    # WRITES ONLY, deliberately — the asymmetry is the OPPOSITE of the
+    # `~/.claude` leg above and is not an oversight. `~/.claude` records
+    # reads because a test that branches on the maintainer's real global
+    # config means something different on CI. `~/.vct` reads are routine
+    # and harmless by construction: conftest itself reads `hub.port` /
+    # `hub.token` at import to decide a module-level skip, and the sqlite
+    # guard already lets read-only DB handles through for the same reason.
+    # Recording them would red dozens of tests for no incident.
+    resolved = _under_real_vct(args[0])
+    if resolved is None or not is_write:
+        return
+    _state_write_attempts.append(str(resolved))
+    raise RealUserStateWriteBlocked(
+        f"test tried to write {resolved}; the suite must never write the "
+        f"user's real launcher state (see tests/conftest.py W-STATE-FILES — "
+        f"route the path through vco_lib.paths.vct_root_dir())"
+    )
+
+
+# Installed at IMPORT, not from a fixture, for two reasons: collection-time
+# module-scope code already resolves these paths (six test files import
+# `query_code_graph.py`, which reads `mcp-config.json` at module import), and
+# `sys.addaudithook` is one-way by design — CPython has no removal API,
+# because an audit hook a caller could pop would not be a guard. The
+# `_ALLOW_REAL_STATE` check therefore lives INSIDE the hook rather than around
+# its installation.
+sys.addaudithook(_user_state_audit_hook)
+
+
+#: Test files whose READ of the real `~/.claude` is owned by an in-flight work
+#: package in this same cycle, keyed to the reason and the exact fix. Same
+#: idiom (and same rule) as ``PENDING_MIGRATION`` in
+#: ``tests/test_v0291_no_bare_prints_in_rust_crates.py``: **MUST be empty at
+#: release-tag time** — the no-deferred-fixes rule applies to this list like
+#: any other backlog.
+#:
+#: WRITES are NEVER exempt: an entry here only downgrades a de-hermeticising
+#: READ from red to reported. The audit hook still refuses every write.
+_CLAUDE_READ_PENDING_OWNER: dict = {
+    # EMPTY, and must stay empty at release-tag time.
+    #
+    # The one historical entry (test_v0291_dogfood_deferral_selfclear.py) was
+    # owed by vco_lib/doctor.py, which read `Path.home() / ".claude.json"`
+    # inline so the VCT_USER_HOME_OVERRIDE redirect could not steer it. That
+    # fix has LANDED (doctor.py resolves via vco_lib.paths.user_home()), so the
+    # entry was deleted exactly as its own text instructed.
+    #
+    # An entry here downgrades the REAL-`~/.claude` READ guard to a warning for
+    # one test file. The WRITE leg is never downgraded. Add one only with the
+    # exact fix and its owner named in the reason string, and delete it in the
+    # same change that lands the fix.
+}
+
+
+@pytest.fixture(autouse=True)
+def _fail_test_that_touched_real_claude_home(request):
+    """Turn a swallowed refusal — or any read of the real `~/.claude` — red.
+
+    Sibling of ``_fail_test_that_tried_to_write_real_state``; kept separate
+    rather than generalised because the two report different resources with
+    different remediations, and that fixture is driven by hand by its own test.
+    They share the drain-and-raise half (``_drain_and_report``).
+    """
+    del _claude_access_attempts[:]
+    yield
+    pending = request.node.fspath.basename in _CLAUDE_READ_PENDING_OWNER
+    if pending:
+        # Reported, not raised: the write leg is untouched, so the leak this
+        # guard exists for is still hard-blocked for these files too.
+        leftover = [a for a in _claude_access_attempts if a[0] != "read"]
+        reads = [a for a in _claude_access_attempts if a[0] == "read"]
+        del _claude_access_attempts[:]
+        if reads:
+            warnings.warn(
+                f"{request.node.nodeid} read the real ~/.claude "
+                f"({', '.join(sorted({p for _k, p in reads}))}) — known "
+                f"pending item, see _CLAUDE_READ_PENDING_OWNER in "
+                f"tests/conftest.py",
+                UserWarning, stacklevel=1,
+            )
+        _claude_access_attempts.extend(leftover)
+    _drain_and_report(_claude_access_attempts, _describe_claude_accesses)
+
+
+def _describe_claude_accesses(attempts: list) -> str:
+    writes = sorted({p for kind, p in attempts if kind == "write"})
+    reads = sorted({p for kind, p in attempts if kind == "read"})
+    detail = []
+    if writes:
+        detail.append("wrote: " + ", ".join(writes))
+    if reads:
+        detail.append("read: " + ", ".join(reads))
+    return (
+        "test touched the user's real ~/.claude (" + "; ".join(detail)
+        + ") — route the path through vco_lib.paths.claude_user_dir() "
+        "(or vco_lib.paths.user_home() for ~/.claude.json) so the conftest "
+        "redirect can steer it"
+    )
+
+
+# ─── W-RL (v0.2.92, register item 28): the RL corpus home is STEERABLE ───
+#
+# The two guards above are RUNTIME tripwires: they fire when a test opens a
+# file. This one is STRUCTURAL, and it exists because the leak it closes could
+# never have tripped them.
+#
+# `RLDataLogger.DEFAULT_DIR` was `Path.home() / ".claude" / "retrieval_rl_data"`
+# evaluated in the CLASS BODY, i.e. once at import. Two consequences, both
+# measured before the fix:
+#
+#   * no override steered it — with `VCT_CLAUDE_DIR` *and* `VCT_STATE_DIR` both
+#     pointing at temp dirs, it still resolved to the maintainer's real
+#     `~/.claude/retrieval_rl_data`; and
+#   * constructing `RLDataLogger()` with no arguments `mkdir(parents=True)`s
+#     that directory, so the first test (or MCP subprocess, or paid-module
+#     caller) to take the default would have created it under the real home.
+#
+# The audit hook would have caught the mkdir, but only if something took the
+# default — nothing in the tree does today, so the loaded gun sat there
+# silently. A guard that only fires on use is not enough for a default; this
+# one asserts the RESOLVED VALUE itself, once per session, whether or not any
+# test constructs a logger.
+#
+# It must also survive the thing that made the original bug invisible: the
+# value being frozen at import. Asserting containment is exactly what proves
+# it is not — the conftest redirect is established at conftest import, which
+# happens AFTER `rl_logger` may already have been imported by a test module,
+# so a frozen value cannot be inside the redirect. That is why this assertion
+# bites rather than being a tautology.
+
+
+class RealRlDataHomeNotRedirected(AssertionError):
+    """`RLDataLogger`'s default corpus dir escaped the suite's redirect."""
+
+
+def assert_rl_data_home_is_redirected(resolved: Path) -> None:
+    """Raise unless ``resolved`` is inside the suite's ``~/.vct`` redirect.
+
+    Split out from the fixture as a pure decision so its own test can drive it
+    with the pre-v0.2.92 value and prove it FAILS — a guard nobody has watched
+    fail is a guard nobody can trust (the W-STATE lesson: an isolation claim
+    that expired silently).
+
+    Cross-OS: pure ``Path`` containment via ``_is_inside``; no separator
+    literal, no ``~`` expansion, no ``os.sep``. It compares against the
+    redirect the conftest itself created, so it is correct on Windows, macOS
+    and Linux without a per-OS branch.
+    """
+    if _is_inside(_VCO_STATE_REDIRECT, resolved):
+        return
+    raise RealRlDataHomeNotRedirected(
+        f"RLDataLogger's default RL-data directory resolved to {resolved}, "
+        f"which is outside the suite redirect {_VCO_STATE_REDIRECT}. It must "
+        f"resolve LAZILY through vco_lib.paths.vct_root_dir() (see "
+        f"claude_mcp_servers/rl_client/rl_logger.py::default_rl_data_dir). A "
+        f"value computed in the class body freezes at import and no redirect "
+        f"can steer it — that was register item 28, and it created "
+        f"~/.claude/retrieval_rl_data on the real home."
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_rl_data_home_is_redirected():
+    """Assert the RL corpus default is steerable, once per session.
+
+    Session-scoped and lazily importing, rather than run at conftest import:
+    `claude_mcp_servers.rl_client` pulls in `pydantic` via its package
+    `__init__`, and a missing optional dependency should fail the tests that
+    need it, not collection of the entire suite.
+    """
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    from claude_mcp_servers.rl_client.rl_logger import RLDataLogger
+
+    assert_rl_data_home_is_redirected(RLDataLogger.DEFAULT_DIR)
+    assert_rl_data_home_is_redirected(RLDataLogger.DEFAULT_PATH.parent)
+    yield
 
 
 def _weaviate_importable(python_exe: str) -> bool:
@@ -374,6 +1078,12 @@ def _disable_resync_spawn_in_tests(request):
     gate CLEARED plus `VCT_STATE_DIR` pointed at a per-session temp dir, so their
     log headers land in tmp instead of `~/.vct/logs/`. Restores prior env in
     ``finally`` so a test that sets the vars itself isn't clobbered.
+
+    NOTE (v0.2.92 W-STATE): `VCT_STATE_DIR` is now redirected for the WHOLE
+    suite by `_redirect_user_state_dir`, so this fixture's own redirect is
+    belt-and-braces rather than the only thing keeping these seven files out of
+    `~/.vct/logs/`. Kept because it pins the spawn axis explicitly (and because
+    a file removed from the list below must not silently lose the redirect).
     """
     key = "VCT_RESYNC_SPAWN_DISABLED"
     test_file = request.node.fspath.basename

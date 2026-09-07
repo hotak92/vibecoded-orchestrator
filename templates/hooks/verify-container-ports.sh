@@ -39,29 +39,59 @@ set -uo pipefail
 
 [ "${VCT_SKIP_PORT_WATCHDOG:-0}" = "1" ] && exit 0
 
-# Engine selection: explicit env override wins; otherwise prefer podman
-# (project convention), fall back to docker. Bail if neither is on PATH.
-RUNTIME="${VCT_CONTAINER_RUNTIME:-}"
-if [ -z "$RUNTIME" ]; then
-    if command -v podman >/dev/null 2>&1; then
-        RUNTIME="podman"
-    elif command -v docker >/dev/null 2>&1; then
-        RUNTIME="docker"
-    else
-        exit 0
-    fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Container runtime + compose: ONE home — `python -m vco_lib.containers resolve`
+# (v0.2.92 PLAN-EXTENSION §3.5 / R13). This hook used to mirror the
+# podman/docker + compose-form detection inline (as did two sibling hooks,
+# install.py and the launcher), and the four copies had drifted in their
+# compose preference order. Class A of the A>B>C rule: one Python
+# implementation, called via a ~50 ms subprocess on this session-start path.
+# Loud-fail: if the resolver cannot run at all (no interpreter, broken
+# install), say so on stderr and skip — never fall back to an inline copy.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+    resolve_vco_venv_python "$SCRIPT_DIR"
 fi
-command -v "$RUNTIME" >/dev/null 2>&1 || exit 0
-
-# Compose driver matches engine (podman-compose for podman, docker compose
-# for docker). Both honour the same compose.yaml format.
-case "$RUNTIME" in
-    podman)
-        COMPOSE_CMD=("podman-compose")
-        command -v podman-compose >/dev/null 2>&1 || COMPOSE_CMD=("podman" "compose")
+RUN_PY="${VCO_VENV_PYTHON:-${PY:-}}"
+if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
+    echo "verify-container-ports: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
+    exit 0
+fi
+__vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
+__vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" ; __vco_rt_rc=$?
+case "$__vco_rt_rc" in
+    0|3|4) eval "$__vco_rt_out" ;;
+    *)
+        echo "verify-container-ports: vco_lib.containers resolve failed (rc=$__vco_rt_rc): $(tail -n 3 "$__vco_rt_err" 2>/dev/null | tr '\n' ' ')"
+        rm -f "$__vco_rt_err"
+        exit 0
         ;;
-    docker)
-        COMPOSE_CMD=("docker" "compose")
+esac
+rm -f "$__vco_rt_err"
+# v0.2.92 BLOCKER-4 + MAJOR-6: the resolver REFUSES a pinned-but-unusable
+# runtime (podman and docker have per-runtime named volumes, so driving the
+# one the user did not pin brings the stack up EMPTY) and hands back the
+# refusal as its reason. Report it on STDOUT, not stderr: a SessionStart
+# hook's stderr is not surfaced to the user when the hook exits 0 -- only
+# stdout is injected as session context, and an unread report is not a report.
+if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
+    # A probe-only watchdog: nothing to verify without a usable runtime, so it
+    # stays quiet on a plain "no runtime" host -- ensure-containers already
+    # said that. A REFUSED PIN is different: it is a user action
+    # (start the pinned runtime, or repin), so it is reported.
+    if [ -n "${VCO_RUNTIME_REQUESTED:-}" ]; then
+        echo "verify-container-ports: $VCO_RUNTIME_REASON; skipping"
+    fi
+    exit 0
+fi
+RUNTIME="$VCO_RUNTIME"
+# Compose driver as an argv array (the resolver quotes each token).
+if [ "${#VCO_COMPOSE_ARGV[@]}" -gt 0 ]; then COMPOSE_CMD=("${VCO_COMPOSE_ARGV[@]}"); else COMPOSE_CMD=("$RUNTIME" "compose"); fi
+case "$RUNTIME" in
+    podman|docker)
         ;;
     *)
         exit 0

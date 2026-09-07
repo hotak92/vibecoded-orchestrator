@@ -734,6 +734,32 @@ pub fn hub_exe_basename_match(exe_basename: &str) -> bool {
 /// own pid (the launcher). Returns the number of hubs signalled
 /// (informational).
 pub fn pre_update_hub_kill_sweep() -> usize {
+    // v0.2.92 — REAPING HALF of the test-contamination defect.
+    //
+    // This sweep identifies its targets by PROCESS IDENTITY (exe basename),
+    // so `VCT_STATE_DIR` isolation cannot contain it: a test with a perfectly
+    // redirected state dir still SIGTERMs the developer's real running hub.
+    // Six tests in `installer.rs::hub_stop_tests` call
+    // `ensure_hub_stopped_for_update`, which calls this unconditionally —
+    // which is why `cargo test -p vct-launcher-temp --lib` was observed
+    // stopping the live hub and removing `~/.vct/hub.pid` (the pid file is
+    // deleted by the dying hub itself, during its own graceful shutdown).
+    //
+    // Measured: with a decoy process named `vct-hub` running inside the same
+    // PID namespace as the suite, `cargo test --workspace` reaped it. With
+    // this guard, it survives.
+    //
+    // Returning 0 is honest: under a test harness we sweep nothing, and no
+    // caller reads the count for anything but a log line.
+    if crate::hub_launcher::running_under_test_harness() {
+        tracing::warn!(
+            "[update_gate] hub-sweep: refusing to enumerate/terminate \
+             vct-hub processes — this process is a cargo test binary, and \
+             the sweep matches on exe basename, so it would reap the \
+             developer's REAL hub regardless of VCT_STATE_DIR isolation"
+        );
+        return 0;
+    }
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);

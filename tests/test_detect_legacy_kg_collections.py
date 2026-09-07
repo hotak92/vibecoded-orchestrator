@@ -16,7 +16,9 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -27,6 +29,31 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import project_init  # noqa: E402
+
+
+# v0.2.92 W8 — HERMETICITY. Both detectors consult a launcher.db-derived
+# keep-set (the KG one always did; the code-graph one does since W8). Every
+# case in this module is written against the "keep-set UNRESOLVABLE" posture —
+# detection keeps its historic substring/Levenshtein behaviour and the emitted
+# DROP command is the conservative gate. Pin an absent DB so the module asserts
+# that posture deterministically instead of inheriting whatever projects the
+# developer's real ~/.vct/launcher.db happens to hold.
+_DB_PIN = None
+
+
+def setUpModule():
+    global _DB_PIN
+    _DB_PIN = mock.patch.dict(
+        os.environ,
+        {"VCT_LAUNCHER_DB_PATH": str(
+            Path(tempfile.gettempdir()) / "vct-w8-absent-launcher.db")},
+    )
+    _DB_PIN.start()
+
+
+def tearDownModule():
+    if _DB_PIN is not None:
+        _DB_PIN.stop()
 
 
 # ---------------------------------------------------------------------------

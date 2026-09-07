@@ -160,11 +160,14 @@ def _install_pinned_npm(package_key: str) -> Any:
     import os
 
     from vco_lib.install_npm import install_pinned_npm as _real
+    from vco_lib.paths import claude_metrics_dir
 
     npm_path = _which("npm")
-    audit_log_path = (
-        Path.home() / ".claude" / "metrics" / "bundled_versions.jsonl"
-    )
+    # ONE home for the metrics dir (v0.2.92 W-CLAUDE): `install.py`'s
+    # `_BUNDLED_VERSIONS_AUDIT_LOG` names the same file, and an inline
+    # `Path.home()` here was both a second copy and unsteerable by the
+    # `$VCT_CLAUDE_DIR` pin the test suite uses to stay out of real telemetry.
+    audit_log_path = claude_metrics_dir() / "bundled_versions.jsonl"
     # Repo root anchor for ``file:`` pin resolution: prefer the canonical
     # env var the launcher/install set, else the in-tree layout
     # (verify.py lives at ``vco_lib/cli/verify.py`` → repo root is 3 up).

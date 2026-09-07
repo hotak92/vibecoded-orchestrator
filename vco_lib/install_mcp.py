@@ -146,6 +146,17 @@ WEAVIATE_MCP_REQUIRED_SUBMODULES: tuple[str, ...] = (
     "weaviate_mcp.rl_state",
     "weaviate_mcp.embeddings",
     "weaviate_mcp.rl_enrichment",
+    # v0.2.92 (wave-3 register #21): `model_router` is the second package
+    # `claude_mcp_servers/pyproject.toml` installs into the venv, and the
+    # `vct-model-gateway` console script resolves through it. An install
+    # whose editable install silently missed it would only surface as a
+    # gateway that will not start — verify it at install time like the rest.
+    "model_router.config",
+    "model_router.routing",
+    "model_router.auth",
+    "model_router.catalog",
+    "model_router.context_table",
+    "model_router.fileperms",
 )
 
 

@@ -59,6 +59,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 KG_SYNC_SH = REPO_ROOT / "templates" / "scripts" / "kg-sync"
@@ -89,7 +91,7 @@ def _deps_available() -> bool:
     try:
         r = subprocess.run(
             [sys.executable, "-c", probe],
-            capture_output=True, timeout=60,
+            capture_output=True, timeout=60, env=child_env(),
         )
         return r.returncode == 0
     except Exception:
@@ -119,7 +121,7 @@ def _run_script(args: list[str], env: dict, script: Path = SCRIPT_PATH,
                 timeout: int = 90) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(script)] + args,
-        env=env, capture_output=True, text=True, timeout=timeout,
+        env=child_env(env), capture_output=True, text=True, timeout=timeout,
     )
 
 
@@ -330,7 +332,7 @@ class WrapperRootPinningTests(unittest.TestCase):
         env = _base_env(VCT_INSTALL_ROOT=str(self.install_root), **extra_env)
         return subprocess.run(
             ["bash", str(self.wrapper), "--all"],
-            env=env, capture_output=True, text=True, timeout=90,
+            env=child_env(env), capture_output=True, text=True, timeout=90,
         )
 
     def test_fabio_repro_wrapper_tree_wins_over_leaked_kg_base_dir(self) -> None:

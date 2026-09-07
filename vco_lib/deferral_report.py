@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
 """Deferral report writer for non-auto-resolvable update conditions.
 
 When ``install.py --update`` encounters a condition it cannot safely fix
@@ -118,6 +120,31 @@ SEVERITY_ORDER = ("critical", "warning", "info")
 _CLAUDE_MD_REL = Path("CLAUDE.md")
 _REMINDER_BEGIN = "<!-- vco-deferral-reminder-begin -->"
 _REMINDER_END = "<!-- vco-deferral-reminder-end -->"
+
+# ---------------------------------------------------------------------------
+# v0.2.92 WP-15: the REST of the VCO-owned Markdown-region vocabulary.
+#
+# This module is the ONE home for "which HTML-comment markers does VCO inject
+# into a project's CLAUDE.md?" — it already owned the deferral-reminder pair,
+# and `strip_vco_owned_regions` below needs all three families in one place.
+# `vco_lib.project_init` re-exports the managed-region pair under its
+# historical names so existing importers are unaffected.
+#
+#   1. reminder pair   — spliced in by this module when a ledger exists.
+#   2. AUTO pair       — install.py's `_materialize_orchestrator_self_claude_md`
+#                        wraps the ORCHESTRATOR render so a re-render replaces
+#                        only the block.  The BEGIN marker carries a
+#                        parenthesised provenance note, so it is matched by
+#                        PREFIX, not by equality.
+#   3. managed pair    — project_init's `merge_managed_region` wraps the
+#                        PROJECT render so a re-render replaces only the body.
+#                        These two are single MARKER LINES around content that
+#                        is itself meaningful, so only the lines are stripped.
+# ---------------------------------------------------------------------------
+MANAGED_REGION_OPEN = "<!-- >>>VCO_MANAGED>>> -->"
+MANAGED_REGION_CLOSE = "<!-- <<<VCO_MANAGED<<< -->"
+_AUTO_REGION_BEGIN_PREFIX = "<!-- BEGIN: AUTO"
+_AUTO_REGION_END = "<!-- END: AUTO -->"
 
 # Leading frontmatter detector: ``^---\n<body>\n---\n``. The trailing
 # newline after the closing fence is captured so we can splice the
@@ -261,6 +288,170 @@ def _reminder_block(entries: Optional[List["DeferralEntry"]] = None) -> str:
     )
 
 
+def _find_marker_spans(
+    existing: str,
+    is_begin: Callable[[str], bool],
+    is_end: Optional[Callable[[str], bool]] = None,
+):
+    """Fence-aware line-start span scanner. THE one scanner in this module.
+
+    v0.2.92 WP-15 extracted the predicates out of
+    :func:`_find_all_reminder_marker_spans` so the VCO-owned-region stripper
+    could locate the AUTO and managed-region markers with the SAME A-4 rules
+    instead of growing a second scanner (a second scanner is how the fenced-
+    marker bug would come back for the new families). The reminder wrapper
+    below is now the only caller that hard-codes the reminder pair.
+
+    ``is_begin`` / ``is_end`` receive the line ALREADY stripped of surrounding
+    whitespace and answer "is this line the marker?" — so a marker embedded in
+    a longer line, or quoted mid-sentence, never counts.
+
+    ``is_end=None`` selects SINGLE-LINE mode: every ``is_begin`` hit is its own
+    one-line span and ``dangling`` is always False. That is what the
+    managed-region pair needs — those markers are standalone lines, not the
+    fences of a block — and it keeps them on the same fence-aware rules
+    instead of a bare ``str.find``.
+
+    Returns ``(spans, dangling)`` — see the wrapper's docstring for the
+    contract, which is unchanged.
+    """
+    lines = existing.splitlines(keepends=True)
+    in_fence = False
+    fence_marker: Optional[str] = None  # track ``` vs ~~~ style
+    begin_at: Optional[int] = None  # char offset of pending begin marker line
+    spans: List[tuple] = []  # (start, end) char offsets, document order
+    offset = 0
+    for line in lines:
+        stripped = line.strip()
+        # Fenced code-block toggle: a line whose FIRST non-space content is
+        # ``` or ~~~ (info string allowed after). Track the fence char so a
+        # nested ``` inside a ~~~ block doesn't mis-toggle.
+        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+            in_fence = True
+            fence_marker = stripped[:3]
+            offset += len(line)
+            continue
+        if in_fence:
+            if stripped.startswith(fence_marker or "```"):
+                in_fence = False
+                fence_marker = None
+            offset += len(line)
+            continue
+        # Outside a fence: match markers only when they ARE the line (after
+        # stripping surrounding whitespace) — a marker quoted mid-sentence
+        # or inside a longer line does not count.
+        if is_begin(stripped):
+            if is_end is None:
+                # Single-line mode: the marker line IS the span.
+                spans.append((offset, offset + len(line.rstrip("\n"))))
+            else:
+                begin_at = offset
+        elif is_end is not None and is_end(stripped) and begin_at is not None:
+            # end marker line ends at offset + len(line); we want the offset
+            # just past the marker text (exclude the trailing newline so the
+            # caller controls newline trimming).
+            spans.append((begin_at, offset + len(line.rstrip("\n"))))
+            begin_at = None
+        offset += len(line)
+
+    return spans, begin_at is not None
+
+
+def _find_all_reminder_marker_spans(existing: str):
+    """Locate EVERY real reminder block in ``existing``, in document order.
+
+    v0.2.92: the scanning half of the single-owner fix. Returns
+    ``(spans, dangling)``:
+
+        spans    — list of ``(start, end)`` char-offset pairs, one per
+                   COMPLETE begin/end pair found at a real (unfenced,
+                   line-start) position, in document order.  ``start`` =
+                   index of the begin marker line; ``end`` = index just past
+                   the end marker text (its trailing newline excluded, so the
+                   caller owns newline trimming).
+        dangling — True when a real begin marker was still unmatched at EOF.
+
+    Matching rules are the A-4 (v0.2.73) rules, unchanged: a marker counts
+    only when it IS the line (after stripping surrounding whitespace) AND it
+    sits outside a fenced code block.  A marker QUOTED inside a fence (this
+    repo's shareable CLAUDE.md documents them) is invisible here, which is
+    what stops a quoted begin from being paired with a later real end and
+    deleting every line between them.
+
+    A second begin before the pending one closes REPLACES the pending begin
+    (the pre-v0.2.92 single-span locator did the same via plain assignment);
+    the abandoned begin is left alone rather than paired across user content.
+
+    WHY a multi-span locator exists at all: two emitters used to own this
+    block — this module and ``templates/ORCHESTRATOR-CLAUDE.md.template`` —
+    and neither could see the other, so a CLAUDE.md that reached "no block"
+    (a resolved ledger strips it) and was then spliced BEFORE the next
+    template render ended up with a splice-owned copy above the AUTO region
+    and a template-owned copy inside it.  A first-pair-only locator refreshes
+    one and renders the other forever.  The template no longer carries a
+    copy; this locator is how installs already in the doubled state get
+    collapsed back to one.
+
+    v0.2.92 WP-15: the loop moved to :func:`_find_marker_spans`; this is now
+    the reminder-pair binding of that ONE scanner. Rules and return contract
+    are byte-for-byte the same (pinned by
+    ``tests/test_v0292_deferral_reminder_single_owner.py``).
+    """
+    return _find_marker_spans(
+        existing,
+        lambda stripped: stripped == _REMINDER_BEGIN,
+        lambda stripped: stripped == _REMINDER_END,
+    )
+
+
+def _remove_reminder_span(existing: str, start: int, end: int) -> str:
+    """Excise ONE located block plus the separator whitespace the splicer added.
+
+    Extracted from ``_strip_reminder_from_claude_md`` (v0.2.92) so the strip
+    path and the splice's collapse path share ONE removal rule — a second
+    inline copy would have been the third generation of this same block of
+    slicing.  Offsets must come from :func:`_find_all_reminder_marker_spans`.
+
+    Separator arithmetic: removal takes back the block's own newline plus
+    exactly ONE blank line, preferring the leading side.
+
+    That is one fewer than the pre-v0.2.92 rule, which took a blank line from
+    BOTH sides.  The splicer only ever ADDS one per side while CONSUMING the
+    blanks that were already adjacent, so the two-sided rule removed a
+    separator nobody inserted: it ate the blank line after a file's YAML
+    frontmatter on every strip, and — now that the collapse path also removes
+    blocks this module did not insert — it would have merged a user's own
+    paragraphs on either side of one.
+
+    Perfect fidelity is NOT achievable here and the choice is a deliberate
+    trade.  A frontmatter file WITH a blank line after its closing fence and
+    one WITHOUT splice to the SAME bytes — case 2 strips the tail's leading
+    newlines — so no removal rule can restore both.  This one restores the
+    blank-line shape (standard Markdown, and what the KG node format uses)
+    and leaves the other with one extra blank line, which renders
+    identically.  The pre-v0.2.92 rule made the opposite choice AND lost the
+    paragraph break in the collapse case.  ``TestSeparatorArithmetic`` in
+    tests/test_v0292_deferral_reminder_single_owner.py pins both halves so
+    the trade cannot flip silently.
+    """
+    before = existing[:start]
+    after = existing[end:]
+
+    # The block's own terminating newline (``end`` stops at the marker text).
+    if after.startswith("\n"):
+        after = after[1:]
+
+    # Then exactly ONE blank-line separator. Prefer the leading side, where
+    # only the SECOND-to-last newline goes (the blank line itself), leaving
+    # the newline that ends the preceding logical line intact.
+    if before.endswith("\n\n"):
+        before = before[:-1]
+    elif after.startswith("\n"):
+        after = after[1:]
+
+    return before + after
+
+
 def _find_reminder_marker_span(existing: str):
     """A-4 (v0.2.73): locate the reminder block by LINE-START markers that
     live OUTSIDE fenced code blocks.
@@ -282,41 +473,13 @@ def _find_reminder_marker_span(existing: str):
     user content between them. Matching only line-start markers outside
     fences removes that class of silent destruction.
     """
-    lines = existing.splitlines(keepends=True)
-    in_fence = False
-    fence_marker: Optional[str] = None  # track ``` vs ~~~ style
-    begin_at: Optional[int] = None  # char offset of begin marker line
-    offset = 0
-    for line in lines:
-        stripped = line.strip()
-        # Fenced code-block toggle: a line whose FIRST non-space content is
-        # ``` or ~~~ (info string allowed after). Track the fence char so a
-        # nested ``` inside a ~~~ block doesn't mis-toggle.
-        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
-            in_fence = True
-            fence_marker = stripped[:3]
-            offset += len(line)
-            continue
-        if in_fence:
-            if stripped.startswith(fence_marker or "```"):
-                in_fence = False
-                fence_marker = None
-            offset += len(line)
-            continue
-        # Outside a fence: match markers only when they ARE the line (after
-        # stripping surrounding whitespace) — a marker quoted mid-sentence
-        # or inside a longer line does not count.
-        if stripped == _REMINDER_BEGIN:
-            begin_at = offset
-        elif stripped == _REMINDER_END and begin_at is not None:
-            # end marker line ends at offset + len(line); we want the offset
-            # just past the marker text (exclude the trailing newline so the
-            # caller controls newline trimming).
-            end = offset + len(line.rstrip("\n"))
-            return (begin_at, end)
-        offset += len(line)
-
-    if begin_at is not None:
+    spans, dangling = _find_all_reminder_marker_spans(existing)
+    if spans:
+        # Historical contract: the FIRST complete pair wins, and a stray
+        # begin AFTER it is invisible (the pre-v0.2.92 locator returned on
+        # the first pair and never scanned further).
+        return spans[0]
+    if dangling:
         # Real begin found but no matching real end → ambiguous. Do nothing.
         return ("ambiguous",)
     return None
@@ -329,9 +492,10 @@ def _splice_reminder_into_claude_md(
 
     Three insertion points (in priority order):
 
-    1. If a previous reminder block exists (real, line-start markers outside
-       fences): replace it in place — preserves position chosen on the
-       original insertion, prevents block migration on every install.
+    1. If one or more previous reminder blocks exist (real, line-start
+       markers outside fences): replace the FIRST in place — preserves the
+       position chosen on the original insertion, prevents block migration on
+       every install — and REMOVE every later one (v0.2.92 collapse).
     2. Else if ``existing`` opens with YAML frontmatter (``---\n...\n---\n``):
        prepend the block immediately AFTER the closing fence, separated by a
        blank line.
@@ -342,22 +506,64 @@ def _splice_reminder_into_claude_md(
     (real begin, no real end) we DO NOT splice — we return the file
     unchanged so no user content is destroyed (the orphan marker stays; the
     user can clean it). This prefers a missing refresh over data loss.
+
+    v0.2.92 — WHY the collapse, and WHY the FIRST copy is the survivor.
+
+    Installs exist in the wild whose CLAUDE.md carries TWO blocks: one
+    splice-owned (live counts) and one that the orchestrator CLAUDE.md
+    template used to render unconditionally.  Neither emitter could see the
+    other, so every install refreshed one and re-rendered the other and the
+    duplication was self-sustaining.  The template no longer carries a copy;
+    without this collapse those users would keep the doubled block forever,
+    because nothing else in the system would ever remove it.
+
+    The survivor is the FIRST block, for three reasons:
+
+    * It is the position-preserving choice this function already promises —
+      the same rule that keeps the block from migrating on every install.
+    * It is marker-agnostic.  Picking "the copy outside the AUTO region"
+      would require this module to know install.py's
+      ``<!-- BEGIN: AUTO -->`` fences AND project_init's
+      ``<!-- >>>VCO_MANAGED>>> -->`` fences — two conventions from two
+      layers, neither of which this generic splicer has any business
+      knowing.
+    * In the real damaged shape the first copy IS the render-stable one: a
+      splice that found no block prepends at the very top (case 2/3), i.e.
+      ABOVE the AUTO region, while the template's copy sat INSIDE it.
+      Should the survivor nonetheless land inside a managed region on some
+      hand-edited file, the state is self-correcting: the next render
+      replaces that region wholesale with template text that carries no
+      block, and the next splice re-inserts at case 2/3 — outside it.
+
+    Extra copies are NOT removed when a dangling begin marker is also
+    present: that file is already ambiguous, and this function's older
+    contract in that situation was to refresh the first pair and touch
+    nothing else.  Healing an ambiguous file is worth less than the
+    guarantee that we never cut across content we cannot parse.
     """
     block = _reminder_block(entries)
 
-    span = _find_reminder_marker_span(existing)
-    if span == ("ambiguous",):
-        # Conservative: leave the file exactly as-is rather than risk
-        # splicing across user content.
-        return existing
-    if isinstance(span, tuple) and len(span) == 2 and isinstance(span[0], int):
-        start, end = span
-        after = existing[end:]
+    spans, dangling = _find_all_reminder_marker_spans(existing)
+
+    if spans:
+        keep_start, keep_end = spans[0]
+        # Collapse: drop every later block, highest offset first so the
+        # surviving block's offsets stay valid. Skipped while ambiguous.
+        extras = [] if dangling else spans[1:]
+        out = existing
+        for start, end in reversed(extras):
+            out = _remove_reminder_span(out, start, end)
+        after = out[keep_end:]
         # Strip a single leading newline so re-injections don't accumulate
         # blank lines.
         if after.startswith("\n"):
             after = after[1:]
-        return existing[:start] + block + after
+        return out[:keep_start] + block + after
+
+    if dangling:
+        # Conservative: leave the file exactly as-is rather than risk
+        # splicing across user content.
+        return existing
 
     # Case 2: frontmatter — splice after closing fence.
     fm_match = _LEADING_FRONTMATTER_RE.match(existing)
@@ -377,7 +583,7 @@ def _splice_reminder_into_claude_md(
 
 
 def _strip_reminder_from_claude_md(existing: str) -> str:
-    """Return ``existing`` with the wrapped reminder block removed.
+    """Return ``existing`` with EVERY wrapped reminder block removed.
 
     No-op (returns the original string) when no real block is found or when
     the begin marker is ambiguous (real begin, no real end). Cleans up the
@@ -386,36 +592,114 @@ def _strip_reminder_from_claude_md(existing: str) -> str:
 
     A-4: uses the same fence-aware line-start locator as the splicer, so a
     marker quoted inside a code fence never triggers a delete.
+
+    v0.2.92: removes ALL real blocks, not just the first. This is the repair
+    path for an install already carrying the doubled block whose ledger is
+    now EMPTY — ``write()`` calls here, and a first-block-only strip would
+    leave the second copy asserting "Pending VCO action" on a project with
+    no ledger at all, permanently.  Same dangling-begin conservatism as the
+    splicer: while a stray begin is present, only the first block goes.
     """
-    span = _find_reminder_marker_span(existing)
-    if span is None or span == ("ambiguous",):
-        # No real block, or an orphan begin — preserve the file. The user
-        # can clean an orphan manually.
+    spans, dangling = _find_all_reminder_marker_spans(existing)
+    if not spans:
+        # No real block, or an orphan begin only — preserve the file. The
+        # user can clean an orphan manually.
         return existing
-    # Past the guard, span is the concrete (start, end) int pair — the
-    # ("ambiguous",) 1-tuple and None variants are already returned above.
-    # Bind as int so the slices below type cleanly (the union's ambiguous
-    # arm can't reach here).
-    start: int = span[0]  # type: ignore[assignment]
-    end: int = span[1]  # type: ignore[index]
+    if dangling:
+        spans = spans[:1]
 
-    before = existing[:start]
+    # Highest offset first: removing a later block cannot shift the offsets
+    # of an earlier one.
+    out = existing
+    for start, end in reversed(spans):
+        out = _remove_reminder_span(out, start, end)
+    return out
+
+
+def _remove_marker_line(existing: str, start: int, end: int) -> str:
+    """Excise ONE single marker LINE (and only its own newline).
+
+    Companion to :func:`_remove_reminder_span`, which is written for a BLOCK
+    the splicer surrounded with blank-line separators. The managed-region pair
+    is not a block: the two markers sit flush against content that must
+    survive, so taking a blank-line separator here would silently merge the
+    user's paragraph with the template body. Offsets come from
+    :func:`_find_marker_spans`.
+    """
     after = existing[end:]
-
-    # Trim the trailing newline the splicer added immediately after the
-    # block AND the blank-line separator (if any).
     if after.startswith("\n"):
         after = after[1:]
-    if after.startswith("\n"):
-        after = after[1:]
+    return existing[:start] + after
 
-    # Trim the blank-line separator the splicer inserted before the block —
-    # only the SECOND-to-last newline (the blank line itself), leaving the
-    # newline that ends the preceding logical line intact.
-    if before.endswith("\n\n"):
-        before = before[:-1]
 
-    return before + after
+def strip_vco_owned_regions(text: str) -> str:
+    """Return ``text`` with every VCO-INJECTED region removed.
+
+    **Compare-only. NEVER write the result back to a user file.** The AUTO
+    region IS the orchestrator root's whole CLAUDE.md body and the managed
+    region wraps a project's whole rendered body — persisting this output
+    would destroy both. The mutating strippers are
+    :func:`_strip_reminder_from_claude_md` (reminder pair only) and
+    :func:`_strip_claude_md_reminder`; this one exists so a DIFF can compare
+    like against like.
+
+    v0.2.92 WP-15 (why this exists): ``project_init``'s
+    ``_install_project_level_templates`` flags a project's CLAUDE.md as
+    "meaningfully differs from the shipping reference" and emits
+    ``template_review_pending``. Three of the differences it was counting are
+    VCO's OWN injected content, not user divergence:
+
+      1. the deferral-reminder block this module splices in whenever a ledger
+         exists — so *every project carrying any deferral at all* was reported
+         as diverged, permanently (the code's own comment conceded it fires
+         "for essentially every established project, forever" and v0.2.83
+         answered the NOISE with dismissal memory rather than the CAUSE);
+      2. the ``<!-- >>>VCO_MANAGED>>> -->`` marker LINES that
+         ``merge_managed_region`` wraps around the render at create time,
+         while the reference sidecar is written UNwrapped — so a project VCO
+         itself created, never touched by a human, diverged on its second
+         bundle run by construction;
+      3. an AUTO region, which is install.py's orchestrator-root render.
+
+    Each family is removed with the rule that matches its shape: the reminder
+    and AUTO pairs are BLOCKS (removed whole, via the shared span remover that
+    also takes back the separator whitespace their inserters added); the
+    managed pair is two MARKER LINES around content that stays.
+
+    All three use the ONE fence-aware scanner (:func:`_find_marker_spans`), so
+    a marker QUOTED inside a fenced code block — this repo's own shareable
+    CLAUDE.md documents all three families — is invisible here and cannot
+    swallow the user's prose between it and a later real marker.
+
+    Idempotent: applying this to its own output returns the same string.
+    """
+    out = _strip_reminder_from_claude_md(text)
+
+    # AUTO region: a BLOCK. The BEGIN marker carries a provenance note
+    # (`<!-- BEGIN: AUTO (rendered by install.py from ...) -->`), so it is
+    # matched by prefix + the comment terminator rather than by equality.
+    spans, dangling = _find_marker_spans(
+        out,
+        lambda s: s.startswith(_AUTO_REGION_BEGIN_PREFIX) and s.endswith("-->"),
+        lambda s: s == _AUTO_REGION_END,
+    )
+    if dangling:
+        # Same conservatism as the reminder stripper: while a stray BEGIN is
+        # present, only the first complete pair goes.
+        spans = spans[:1]
+    for start, end in reversed(spans):
+        out = _remove_reminder_span(out, start, end)
+
+    # Managed-region pair: two MARKER LINES; the body between them is the
+    # rendered template and IS the thing being compared, so it stays.
+    lines, _ = _find_marker_spans(
+        out,
+        lambda s: s in (MANAGED_REGION_OPEN, MANAGED_REGION_CLOSE),
+    )
+    # Highest offset first — removing a later line cannot shift an earlier one.
+    for start, end in reversed(lines):
+        out = _remove_marker_line(out, start, end)
+    return out
 
 
 def _ensure_claude_md_reminder(

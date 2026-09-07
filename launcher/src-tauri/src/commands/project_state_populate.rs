@@ -39,7 +39,20 @@ use std::path::Path;
 
 use serde_json::Value as JsonValue;
 
-use crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
+/// v0.2.92 W12 — the `role='shared'` binding row's own home: DB-backed
+/// resolution (never the bundled constant), the `manual_override`-aware
+/// repair gates, and the sweep that heals rows an earlier guess poisoned.
+/// Kept as a child module rather than inlined here because it is a distinct
+/// concern with its own invariants — this file seeds per-project state, that
+/// one owns the shared-KG pointer.
+pub mod shared_kg_binding;
+
+// `LAST_RESORT_SHARED_KG_COLLECTION` is deliberately NOT imported here any
+// more (v0.2.92 W12 / Fix 1): this module is a WRITER, and a writer that
+// materialises a read-time fallback into a binding row promotes a guess to
+// permanent authority. Resolution goes through
+// `shared_kg_binding::resolve_shared_kg_collection`, which answers `None`
+// instead of guessing.
 // v0.2.91 WP-E item 3: `is_default_disabled_mcp` is no longer consulted here —
 // the fresh-insert default-disabled rule lives in the shared
 // `Db::register_project_mcp_server_honoring_defaults` helper.
@@ -736,20 +749,37 @@ fn populate_kg_bindings(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    // Single source of truth — see project_env_settings.rs. Renamed from
-    // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
-    let shared_collection = LAST_RESORT_SHARED_KG_COLLECTION;
     let weaviate_url = "http://localhost:8081";
     let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;
 
     // X-1 / v0.2.76: route the derive-name-then-write through the single
     // binding-writer home. The primary role derives the collection from the
-    // project name (writer owns the sanitizer call); the shared role passes a
-    // fixed collection name. Idempotence: set_project_kg_binding upserts ON
-    // CONFLICT(project_id, role). User edits WILL be overwritten by a re-run —
-    // the intended contract for these orchestrator-managed defaults; the
-    // launcher GUI edits them via the writer directly.
+    // project name (writer owns the sanitizer call); the shared role passes an
+    // already-resolved collection name.
+    //
+    // Idempotence — what this function actually does with an EXISTING row
+    // (v0.2.92 W12, Fix 4): NOTHING. Both writes are gated on
+    // `!kg_binding_already_exists(...)`, so a re-run never reaches the
+    // underlying upsert for a role that already has a row. The prior comment
+    // here said "User edits WILL be overwritten by a re-run — the intended
+    // contract for these orchestrator-managed defaults", which described
+    // `set_project_kg_binding`'s ON CONFLICT semantics IF REACHED and was
+    // therefore materially scarier than the behaviour. It mattered: a comment
+    // that misstates the safety of a write path is how a future maintainer
+    // "simplifies" the gate away.
+    //
+    // The gate is load-bearing, in both directions:
+    //   * It preserves every later authority over these rows — the launcher
+    //     GUI's Identity tab, the Python `kg_binding_heal` self-heal, and a
+    //     hand correction carrying a `manual_override` sentinel. Re-onboarding
+    //     a project must not silently revert any of them.
+    //   * It is also what made the pre-W12 shared-role bug PERMANENT: the row
+    //     was only ever written when none existed, and once a wrong name was
+    //     in there nothing in this path would ever correct it (readers are
+    //     binding-first, so the row outranked the correct resolver forever).
+    //     The fix is upstream of the gate — resolve the name instead of
+    //     guessing it — not a weakening of the gate.
     if !kg_binding_already_exists(db, project_id, "primary") {
         if let Err(e) = crate::db::bindings_writer::write_kg_binding_primary_from_name(
             db,
@@ -767,23 +797,61 @@ fn populate_kg_bindings(
             report.kg_bindings_inserted += 1;
         }
     }
+    // v0.2.92 W12 (Fix 1) — the shared role is RESOLVED from launcher.db, and
+    // when it cannot be resolved we write NO row.
+    //
+    // It used to be seeded from `LAST_RESORT_SHARED_KG_COLLECTION`. A last
+    // resort is a READ-TIME fallback owned by each reader; persisting it as a
+    // row promotes a guess to permanent authority, because every reader is
+    // binding-first (`config_projection.py` resolves
+    // `kg_bindings.get("shared", resolved_default)`, so the row outranks the
+    // correct resolver forever, and the hub reads the row directly). On an
+    // install whose orchestrator KG was re-pointed away from the bundled
+    // default, that constant names a class that does not exist — so every
+    // project born after the re-point inherited a shared-KG pointer into the
+    // void, and retrieval returned nothing while every component reported
+    // success.
+    //
+    // Writing NOTHING is deliberate on the unresolvable path, and it is the
+    // safer of the two failure modes: a MISSING row falls through to the
+    // read-time resolvers (which do end in the constant, correctly, at the
+    // point of use), whereas a WRONG row silently outranks them forever. The
+    // skip is reported rather than silent — an install that cannot name its
+    // own shared KG is worth a line in the populate report.
     if !kg_binding_already_exists(db, project_id, "shared") {
-        if let Err(e) = crate::db::bindings_writer::write_kg_binding(
-            db,
-            project_id,
-            "shared",
-            shared_collection,
-            Some(embedding_model),
-            Some(embedding_dim),
-            None,
-            Some(weaviate_url),
-            &JsonValue::Null,
-        ) {
-            report
-                .warnings
-                .push(format!("write_kg_binding(shared): {}", e));
-        } else {
-            report.kg_bindings_inserted += 1;
+        match shared_kg_binding::resolve_shared_kg_collection(db) {
+            Some(shared_collection) => {
+                if let Err(e) = crate::db::bindings_writer::write_kg_binding(
+                    db,
+                    project_id,
+                    "shared",
+                    &shared_collection,
+                    Some(embedding_model),
+                    Some(embedding_dim),
+                    None,
+                    Some(weaviate_url),
+                    &JsonValue::Null,
+                ) {
+                    report
+                        .warnings
+                        .push(format!("write_kg_binding(shared): {}", e));
+                } else {
+                    report.kg_bindings_inserted += 1;
+                }
+            }
+            None => {
+                let msg = format!(
+                    "write_kg_binding(shared): skipped for project {} — the \
+                     shared-KG collection could not be resolved from \
+                     launcher.db (no app_state override, no orchestrator-root \
+                     primary binding). Leaving the row ABSENT on purpose so \
+                     the read-time resolvers own the fallback; a guessed row \
+                     would outrank them permanently.",
+                    project_id
+                );
+                tracing::warn!("[vct] populate_kg_bindings: {}", msg);
+                report.warnings.push(msg);
+            }
         }
     }
 }
@@ -938,7 +1006,10 @@ mod tests {
     use super::*;
     use crate::db::models::ProjectHost;
 
-    fn make_db_with_project(project_id: &str, name: &str) -> Db {
+    /// A DB holding just the project under test — no orchestrator-root row,
+    /// so the shared-KG name cannot be resolved. Models a standalone-binary
+    /// install (or the moment before the launcher's first boot sweep).
+    fn make_db_with_project_only(project_id: &str, name: &str) -> Db {
         let db = Db::open_in_memory().expect("in-memory db");
         let slug = db.generate_unique_slug(name).unwrap();
         // Platform-aware placeholder folder path. Stored only as a string
@@ -947,6 +1018,151 @@ mod tests {
         db.insert_project(project_id, name, folder, ProjectHost::Base, &slug)
             .unwrap();
         db
+    }
+
+    /// The default fixture: the project under test PLUS the orchestrator-root
+    /// row and its primary KG binding.
+    ///
+    /// v0.2.92 W12 — the root row is now part of the baseline fixture because
+    /// it is part of every real machine: `ensure_orchestrator_root_kg_binding`
+    /// seeds it on every launcher boot, pointer-derived. Since v0.2.92 the
+    /// shared binding is RESOLVED from it rather than guessed from a
+    /// constant, so a fixture without it models an install that cannot name
+    /// its own shared KG — which is a real state, but not the default one.
+    /// The seeded name is the canonical pointer's value, whose default on a
+    /// fresh DB is the bundled shared name, so every pre-v0.2.92 expectation
+    /// in these tests is unchanged (and now holds for the right reason).
+    fn make_db_with_project(project_id: &str, name: &str) -> Db {
+        let db = make_db_with_project_only(project_id, name);
+        let collection = db.get_orchestrator_root_kg_collection().unwrap();
+        seed_orchestrator_root(&db, &collection);
+        db
+    }
+
+    /// Seed the orchestrator-root project + its PRIMARY KG binding — the
+    /// machine's source of truth for the shared-KG name.
+    fn seed_orchestrator_root(db: &Db, collection: &str) {
+        let folder = if cfg!(windows) {
+            r"C:\tmp\orchroot"
+        } else {
+            "/tmp/orchroot"
+        };
+        db.insert_project(
+            "root-id",
+            "VibeCoded Orchestrator",
+            folder,
+            ProjectHost::OrchestratorRoot,
+            "orchestrator-root",
+        )
+        .unwrap();
+        crate::db::bindings_writer::write_kg_binding(
+            db,
+            "root-id",
+            "primary",
+            collection,
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+    }
+
+    fn shared_binding_of(db: &Db, project_id: &str) -> Option<String> {
+        db.list_project_kg_bindings(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.role == "shared")
+            .map(|b| b.collection_name)
+    }
+
+    // ─── v0.2.92 W12 (Fix 1) — the shared-KG binding row ─────────────
+
+    /// ACT: the shared row is written from the DB-resolved name, not from
+    /// the bundled last-resort constant. On a re-pointed install the two
+    /// differ, and persisting the constant is what minted the phantom.
+    #[test]
+    fn shared_binding_is_resolved_from_launcher_db_not_a_constant() {
+        // A re-pointed install: the machine's shared KG is NOT the bundled
+        // constant. That divergence is what the old code could not express.
+        let db = make_db_with_project_only("p1", "Proj");
+        seed_orchestrator_root(&db, "VCODev_KnowledgeGraph");
+
+        let mut report = PopulateReport::default();
+        populate_kg_bindings("p1", "Proj", &db, &mut report);
+
+        assert_eq!(
+            shared_binding_of(&db, "p1").as_deref(),
+            Some("VCODev_KnowledgeGraph"),
+            "the shared row must name the machine's real shared KG"
+        );
+    }
+
+    /// ACT (the honest-failure half): nothing resolves ⇒ NO row. A missing
+    /// row falls through to the read-time resolvers, which are correct; a
+    /// guessed row outranks them forever, because every reader is
+    /// binding-first.
+    #[test]
+    fn shared_binding_is_absent_when_nothing_resolves() {
+        // No orchestrator-root project, no app_state override.
+        let db = make_db_with_project_only("p1", "Proj");
+
+        let mut report = PopulateReport::default();
+        populate_kg_bindings("p1", "Proj", &db, &mut report);
+
+        assert_eq!(
+            shared_binding_of(&db, "p1"),
+            None,
+            "an unresolvable shared-KG name must leave NO row behind"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("shared") && w.contains("could not be resolved")),
+            "the skip must be reported, not silent: {:?}",
+            report.warnings
+        );
+        // The primary row is unaffected — one leg failing must not take the
+        // other down.
+        assert!(
+            db.list_project_kg_bindings("p1")
+                .unwrap()
+                .iter()
+                .any(|b| b.role == "primary"),
+            "primary binding must still be seeded"
+        );
+    }
+
+    /// LEAVE-ALONE: an existing shared row is never rewritten here, even
+    /// when the resolver would produce a different name. The existence gate
+    /// is what protects a user's / a heal's choice.
+    #[test]
+    fn existing_shared_binding_is_left_alone() {
+        let db = make_db_with_project_only("p1", "Proj");
+        seed_orchestrator_root(&db, "VCODev_KnowledgeGraph");
+        crate::db::bindings_writer::write_kg_binding(
+            &db,
+            "p1",
+            "shared",
+            "UserPicked_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        let mut report = PopulateReport::default();
+        populate_kg_bindings("p1", "Proj", &db, &mut report);
+
+        assert_eq!(
+            shared_binding_of(&db, "p1").as_deref(),
+            Some("UserPicked_KnowledgeGraph"),
+            "re-running populate must not overwrite an existing shared row"
+        );
     }
 
     fn write_agent_file(dir: &Path, file_name: &str, frontmatter: &str, body: &str) {
@@ -2593,7 +2809,10 @@ mod tests {
     #[test]
     fn global_module_with_kg_collections_populates_access_for_all_projects() {
         let _folder = scratch_dir("global-kg-populate");
-        let db = make_db_with_project("p1", "P1");
+        // Project-only fixture: this test's arithmetic is about the
+        // global-module fan-out across REGISTERED projects, so it counts
+        // exactly the projects it seeds (no orchestrator-root row).
+        let db = make_db_with_project_only("p1", "P1");
         // Add a second project so we can verify access lands on BOTH.
         let folder2 = if cfg!(windows) { r"C:\tmp\y" } else { "/tmp/y" };
         let slug2 = db.generate_unique_slug("P2").unwrap();
@@ -2675,7 +2894,10 @@ mod tests {
         //      returns 0 (preserved), no clobber. Row stays at "none" +
         //      still flagged user_configured.
         let _folder = scratch_dir("global-kg-idempotent");
-        let db = make_db_with_project("p1", "P1");
+        // Project-only fixture: this test's arithmetic is about the
+        // global-module fan-out across REGISTERED projects, so it counts
+        // exactly the projects it seeds (no orchestrator-root row).
+        let db = make_db_with_project_only("p1", "P1");
 
         // First install via the seed path.
         let mut report1 = PopulateReport::default();
@@ -2752,7 +2974,10 @@ mod tests {
     #[test]
     fn global_module_multiple_kg_collections_populates_all() {
         let _folder = scratch_dir("global-kg-multi");
-        let db = make_db_with_project("p1", "P1");
+        // Project-only fixture: this test's arithmetic is about the
+        // global-module fan-out across REGISTERED projects, so it counts
+        // exactly the projects it seeds (no orchestrator-root row).
+        let db = make_db_with_project_only("p1", "P1");
 
         let mut report = PopulateReport::default();
         populate_kg_collection_access_for_global_module(

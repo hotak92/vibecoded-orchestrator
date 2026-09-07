@@ -44,6 +44,7 @@ __all__ = [
     "codegraph_results_per_chunk",
     "combine_kg_results",
     "combine_codegraph_results",
+    "model_max_tokens",
 ]
 
 
@@ -57,6 +58,19 @@ def _model_max_tokens(model_name: str) -> Optional[int]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("query_chunking: preset lookup failed (%s)", exc)
     return None
+
+
+def model_max_tokens(model_name: str) -> Optional[int]:
+    """Public alias for :func:`_model_max_tokens` (v0.2.92, WP-E).
+
+    The private name stays exactly as-is (an existing test monkeypatches
+    ``query_chunking._model_max_tokens`` directly), so this is an ADDITIVE
+    wrapper, not a rename — the single query-budget SSOT (``chunking.py``'s
+    ``chunking_preset_for_model``) now has a name other modules
+    (``search_knowledge.py``, ``query_code_graph.py``) can import without
+    reaching into a private attribute.
+    """
+    return _model_max_tokens(model_name)
 
 
 def is_oversized(query: str, model_name: str) -> bool:

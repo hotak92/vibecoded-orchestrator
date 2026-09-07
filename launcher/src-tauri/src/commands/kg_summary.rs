@@ -581,14 +581,8 @@ async fn run_subprocess_loop(
                 counts.nodes_skipped = counts.nodes_skipped.saturating_add(1);
                 let remaining = nodes_total.saturating_sub((idx as u32) + 1);
                 counts.nodes_skipped = counts.nodes_skipped.saturating_add(remaining);
+                early_skip_reason = Some(no_backend_reason(&log));
                 append_log(&mut combined_log, &log);
-                early_skip_reason = Some(
-                    "no backend available — install the `claude` CLI \
-                     (preferred), start Ollama at the configured URL, or set \
-                     ANTHROPIC_API_KEY. Summaries will also generate \
-                     incrementally as you edit nodes in Claude Code sessions."
-                        .to_string(),
-                );
                 if backend_seen.is_none() {
                     backend_seen = Some("skip".to_string());
                 }
@@ -842,7 +836,20 @@ async fn invoke_summariser_once(
 /// `generate-kg-summary.py::select_backend`). Don't `?` on
 /// `strip_prefix` inside the loop — that short-circuits the WHOLE
 /// function on the first non-matching line.
+///
+/// **The LAST match wins, not the first** (v0.2.92 WP-Q2). WP-Q's circuit
+/// breaker made one node emit the line more than once: `call_llm` demotes a
+/// tier that stops serving, drops the cached choice, and re-enters
+/// `select_backend`, which logs the replacement tier. So a rate-limited run
+/// prints `backend: cli`, then `backend 'cli' demoted`, then
+/// `backend: ollama` — and first-match reported the tier that FAILED as the
+/// tier that produced the summary. The sidecar was already honest here (it
+/// records `_BACKEND_CACHE["choice"]`, i.e. the tier that answered); only
+/// this row lagged, so the launcher pill disagreed with the file on disk.
+/// Later lines in one node's stdout are strictly later selections, so the
+/// last one is the tier that served.
 fn parse_backend_from_stdout(stdout: &str) -> Option<String> {
+    let mut last: Option<String> = None;
     for line in stdout.lines() {
         let t = line.trim_start();
         let Some(after) = t.strip_prefix("KG-summary backend:") else {
@@ -854,10 +861,43 @@ fn parse_backend_from_stdout(stdout: &str) -> Option<String> {
             .take_while(|c| c.is_ascii_alphabetic())
             .collect();
         if !word.is_empty() {
-            return Some(word);
+            last = Some(word);
         }
     }
-    None
+    last
+}
+
+/// The install hint — correct only when nothing is installed.
+const NO_BACKEND_INSTALL_HINT: &str =
+    "no backend available — install the `claude` CLI (preferred), start \
+     Ollama at the configured URL, or set ANTHROPIC_API_KEY. Summaries will \
+     also generate incrementally as you edit nodes in Claude Code sessions.";
+
+/// Substring that distinguishes "every tier is cooling down" from "nothing
+/// is installed". Must match `summary_backends.select_backend()`'s
+/// cooling-down branch (pinned by `cooling_down_marker_matches_script_log_line`).
+const COOLING_DOWN_MARKER: &str = "cooling down after a usage-limit";
+
+/// Pick the skip reason to store for a `NoBackend` outcome.
+///
+/// v0.2.92 WP-Q2: "install the `claude` CLI" is the WRONG advice for a user
+/// whose CLI is installed and merely rate-limited — WP-Q's breaker demotes
+/// that tier, and once every tier is demoted `select_backend` reports
+/// `no backend available — … cooling down …, retry after the cooldown`.
+/// Telling that user to install what they already have sends them to fix
+/// the one thing that is not broken. When the script said "cooling down",
+/// we surface ITS line verbatim (it names which tiers and why); otherwise
+/// the install hint stands.
+///
+/// Both branches keep the `no backend available` substring, so anything
+/// grepping the stored reason for it keeps working.
+fn no_backend_reason(log: &str) -> String {
+    for line in log.lines() {
+        if line.contains(NO_BACKEND_MARKER) && line.contains(COOLING_DOWN_MARKER) {
+            return line.trim().to_string();
+        }
+    }
+    NO_BACKEND_INSTALL_HINT.to_string()
 }
 
 // ─── Helpers (DB / event / log) ──────────────────────────────────────────
@@ -1061,7 +1101,14 @@ pub(crate) fn enumerate_markdown_files(root: &std::path::Path) -> Vec<std::path:
 pub(crate) fn resolve_summary_script(
     project_folder: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    vct_launcher_core::paths::resolve_installed_script(
+    // v0.2.92: route through the guarded resolver (same ladder + the
+    // stale-wrapper marker check). `generate-kg-summary.py` carries no
+    // `$VCT_INSTALL_ROOT` marker in its shipped form, so the guard derives
+    // "not marker-bearing" and the project-local copy is trusted exactly as
+    // before — the point is that it no longer DEPENDS on that: the day the
+    // shipped script grows the ladder, this call site inherits the check
+    // instead of silently staying the one unguarded spawn site.
+    crate::commands::codegraph::resolve_bundled_script(
         project_folder,
         "generate-kg-summary.py",
     )
@@ -1331,6 +1378,74 @@ mod tests {
 
         let s = "  KG-summary backend: skip (forced via env)\n";
         assert_eq!(parse_backend_from_stdout(s).as_deref(), Some("skip"));
+    }
+
+    #[test]
+    fn parse_backend_reports_the_tier_that_answered_not_the_one_that_failed() {
+        // v0.2.92 WP-Q2. WP-Q's breaker made one node print the line twice:
+        // `call_llm` demotes a tier that stops serving, drops the cached
+        // choice, and re-enters `select_backend`, which logs the replacement.
+        // First-match reported `cli` — the tier that FAILED — as the producer
+        // of a summary Ollama actually wrote, so the launcher pill disagreed
+        // with the sidecar (which was already honest).
+        let demoted = "Generating summaries for: Foo\n\
+                       \x20 KG-summary backend: cli (claude on PATH, smoke-test OK)\n\
+                       \x20 KG-summary: backend 'cli' demoted — rate_limit/429; cooling down 900s\n\
+                       \x20 KG-summary: falling through to the next backend tier\n\
+                       \x20 KG-summary backend: ollama (qwen3.5:9b)\n";
+        assert_eq!(parse_backend_from_stdout(demoted).as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn parse_backend_is_unchanged_when_there_was_no_demotion() {
+        // The overwhelmingly common case must not move: one line, one answer.
+        let s = "  KG-summary backend: cli (claude on PATH, smoke-test OK)\n\
+                 \x20 Foo Title: generated in 3.2s\n";
+        assert_eq!(parse_backend_from_stdout(s).as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn cooling_down_marker_string_matches_script_log_line() {
+        // Same defensive pin as `no_backend_marker_string_matches_script_log_line`:
+        // a literal snippet of what `summary_backends.select_backend()` prints,
+        // so renaming the script's message fails here instead of silently
+        // reverting the launcher to the wrong advice.
+        let canonical = "  KG-summary: no backend available — cli, ollama cooling \
+                         down after a usage-limit / capacity failure. Nothing to \
+                         install; retry after the cooldown. Skipping.";
+        assert!(canonical.contains(COOLING_DOWN_MARKER));
+        assert!(canonical.contains(NO_BACKEND_MARKER));
+    }
+
+    #[test]
+    fn no_backend_reason_surfaces_the_cooling_down_line_not_the_install_hint() {
+        // "install the `claude` CLI" is the WRONG advice for a user whose CLI
+        // is installed and merely rate-limited — it sends them to fix the one
+        // thing that is not broken.
+        let log = "--- knowledge/a.md ---\n\
+                   \x20 KG-summary: no backend available — cli, ollama cooling down \
+                   after a usage-limit / capacity failure. Nothing to install; retry \
+                   after the cooldown. Skipping.\n";
+        let reason = no_backend_reason(log);
+        assert!(reason.contains("retry after the cooldown"), "{reason}");
+        assert!(!reason.contains("install the `claude` CLI"), "{reason}");
+        // The substring anything greps for survives in BOTH branches.
+        assert!(reason.contains(NO_BACKEND_MARKER), "{reason}");
+    }
+
+    #[test]
+    fn no_backend_reason_keeps_the_install_hint_when_nothing_is_installed() {
+        // The LEAVE-ALONE case: a genuinely empty machine still gets told what
+        // to install.
+        let log = "--- knowledge/a.md ---\n\
+                   \x20 KG-summary: no backend available (no claude CLI, no Ollama at \
+                   http://localhost:11435, no OPENAI_API_KEY, no ANTHROPIC_API_KEY). \
+                   Skipping.\n";
+        let reason = no_backend_reason(log);
+        assert!(reason.contains("install the `claude` CLI"), "{reason}");
+        assert!(reason.contains(NO_BACKEND_MARKER), "{reason}");
+        // And a log with no marker at all falls back to the same hint.
+        assert_eq!(no_backend_reason("nothing relevant here"), NO_BACKEND_INSTALL_HINT);
     }
 
     #[test]

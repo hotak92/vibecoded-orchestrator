@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "_comment": "Last-resort catalog, used ONLY when a live fetch fails (no credentials yet, no network, vendor outage). It is a SNAPSHOT taken on 2026-09-02, not a maintained list: vendors add and retire models on the same endpoint, which is why the live fetch exists and why the gateway re-tries it far sooner than the live TTL when the static list is in use. Whenever a family is served from here the gateway says so — '_vct_catalog_source' in the /v1/models response and 'catalog_source' in /health both read 'static'. Selecting a model that has since been retired produces the upstream's own 4xx, relayed verbatim.",
+  "families": {
+    "anthropic": {
+      "_comment": "First-party Claude ids observed in a live /v1/models response under an OAuth login. Display names are the ids themselves: inventing marketing names here would put a string in the picker that no upstream ever returned.",
+      "models": [
+        { "id": "claude-fable-5-1" },
+        { "id": "claude-opus-5" },
+        { "id": "claude-sonnet-5" },
+        { "id": "claude-fable-5" },
+        { "id": "claude-opus-4-8" },
+        { "id": "claude-sonnet-4-6" },
+        { "id": "claude-haiku-4-5-20251001" }
+      ]
+    },
+    "zai": {
+      "_comment": "GLM ids observed in a live /v1/models response under a Coding Plan key. The same ten ids the shipped chat-model context seed cites.",
+      "models": [
+        { "id": "glm-5.3" },
+        { "id": "glm-5.3-flash" },
+        { "id": "glm-5.2" },
+        { "id": "glm-5.1" },
+        { "id": "glm-5" },
+        { "id": "glm-5-turbo" },
+        { "id": "glm-4.7" },
+        { "id": "glm-4.6" },
+        { "id": "glm-4.5" },
+        { "id": "glm-4.5-air" }
+      ]
+    }
+  }
+}

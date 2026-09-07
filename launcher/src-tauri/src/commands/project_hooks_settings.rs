@@ -24,8 +24,9 @@
 //! `_merge_hooks_for_bundle` helper) create and update the file on every
 //! install and bundle update, and the canonical on-disk form is their output.
 //! A Rust JSON writer would be a second home for that knowledge; the drift
-//! that produces is already documented in `vco_lib/settings_merge.py` for the
-//! install.py / project_init.py pair. Hook toggling is a user-action-triggered
+//! that produces is already documented on
+//! `vco_lib/project_init.py::_merge_settings_template_for_bundle`, the live
+//! merge for the install.py / project_init.py pair. Hook toggling is a user-action-triggered
 //! path where a ~100 ms subprocess is invisible, so the A-leg applies with no
 //! caveat.
 //!
@@ -458,12 +459,24 @@ pub async fn disable_hook(
     .await?;
 
     // Store the writer's OWN serialisation, verbatim. Do NOT read `parked`
-    // (the object) and re-serialise it: `serde_json::Value` is backed by a
-    // BTreeMap unless the `preserve_order` feature is enabled, so a round trip
-    // through it SORTS the inner hook item's keys — `{type, command, timeout}`
-    // becomes `{command, timeout, type}`, and the file restored on re-enable
-    // no longer matches the original byte-for-byte. A JSON *string* value has
-    // no such hazard, which is why the writer hands us one.
+    // (the object) and re-serialise it.
+    //
+    // The original reason was that `serde_json::Value` was backed by a
+    // BTreeMap, so a round trip SORTED the inner hook item's keys —
+    // `{type, command, timeout}` came back as `{command, timeout, type}` and
+    // the entry restored on re-enable no longer matched byte-for-byte. That
+    // specific hazard is gone: v0.2.92 enables `preserve_order` for every
+    // launcher crate, so a round trip now keeps insertion order.
+    //
+    // The design STAYS, because it never depended on that: order is only one
+    // of the ways a re-serialisation can differ from the writer's bytes.
+    // Indentation, key escaping, number formatting (`1.0` vs `1`) and
+    // whitespace are all re-derived by `to_string`, and none of them is
+    // pinned by any contract we control — the hooks editor is a separate
+    // program. Round-tripping a *string* through the DB is the only form that
+    // guarantees what comes back is what the writer produced, whatever
+    // serialiser either side happens to be built with. A JSON string value
+    // has no such hazard, which is why the writer hands us one.
     let parked_json = result
         .get("parked_json")
         .and_then(JsonValue::as_str)

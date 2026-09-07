@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 def _discover_db_path() -> Optional[Path]:
@@ -99,6 +100,67 @@ def _open_db_readonly(
         return conn
     except Exception:
         return None
+
+
+@dataclass(frozen=True)
+class ProjectRef:
+    """One registered project row, as a census consumer needs it.
+
+    ``folder`` is the row's ``folder_path`` VERBATIM (absolute path string
+    the launcher wrote); canonicalisation is the caller's job because
+    different consumers compare against differently-derived paths.
+    """
+
+    id: str
+    name: str
+    folder: str
+    host: str
+
+
+def list_registered_projects() -> Optional[List[ProjectRef]]:
+    """Every row in ``projects``, or ``None`` when the registry is unavailable.
+
+    v0.2.92 WP-D: the registry feed for the bundle-staleness census. The
+    three-way distinction the census is built on:
+
+    * ``None`` — launcher.db does not exist / cannot be opened / has no
+      ``projects`` table (a fresh root install before the first launcher
+      boot is the NORMAL case, not an error). The census reports
+      ``registry="unavailable"`` and no verdict is invented.
+    * ``[]`` — the DB is readable and truly no projects are registered
+      (a legitimate, reportable state: everything current, nothing stale).
+    * rows — the census population.
+
+    Read-only (``mode=ro`` URI, same discipline as every helper here): the
+    launcher is the only writer of its own DB, and a census that blocks or
+    corrupts a live launcher would be a diagnostic causing the disease.
+    """
+    conn = _open_db_readonly()
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT id, name, folder_path, host FROM projects"
+        ).fetchall()
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    out: List[ProjectRef] = []
+    for row in rows:
+        try:
+            out.append(ProjectRef(
+                id=str(row["id"]),
+                name=str(row["name"]),
+                folder=str(row["folder_path"]),
+                host=str(row["host"]),
+            ))
+        except (KeyError, TypeError):  # noqa: PERF203 — one bad row ≠ no registry
+            continue
+    return out
 
 
 def get_orchestrator_root_project_id() -> Optional[str]:
@@ -187,17 +249,30 @@ def get_orchestrator_root_bindings() -> Tuple[Optional[str], Optional[str]]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _codegraph_binding_prefixes_on_conn(conn: sqlite3.Connection) -> list[str]:
+def _codegraph_binding_prefixes_on_conn(
+    conn: sqlite3.Connection,
+) -> Optional[list[str]]:
     """Read every ``collection_prefix`` in ``project_codegraph_bindings`` on an
-    ALREADY-OPEN connection. Returns ``[]`` on SQLite error (missing table on a
-    free-tier DB, etc.). Does NOT open or close the connection — the caller owns
-    its lifecycle (SEV-3 #3 TOCTOU fix: all reads share one open)."""
+    ALREADY-OPEN connection.
+
+    Returns ``None`` when the QUERY FAILED (the file is not a database, the
+    table is absent, the page is corrupt, the read was interrupted) and ``[]``
+    when the table is genuinely EMPTY. v0.2.92 F-1: these two are DIFFERENT
+    answers and must not share a representation — this function used to map
+    both to ``[]``, and :func:`codegraph_binding_keep_set` then reported
+    ``resolvable=True`` for a keep-set it had never actually read, which made
+    ``project_init._legacy_codegraph_drop_revalidated`` ALLOW the drop of a
+    live bound class on a corrupt / foreign-schema ``launcher.db``.
+
+    Does NOT open or close the connection — the caller owns its lifecycle
+    (SEV-3 #3 TOCTOU fix: all reads share one open).
+    """
     try:
         rows = conn.execute(
             "SELECT collection_prefix FROM project_codegraph_bindings"
         ).fetchall()
     except Exception:
-        return []
+        return None
     out: list[str] = []
     for r in rows:
         val = (r["collection_prefix"] or "").strip()
@@ -211,7 +286,17 @@ def _codegraph_extra_path_owner_prefixes_on_conn(
 ) -> list[str]:
     """Read the code-graph prefixes of every project that OWNS a row in
     ``project_codegraph_extra_paths`` on an ALREADY-OPEN connection. Returns
-    ``[]`` on SQLite error. Does NOT manage the connection lifecycle."""
+    ``[]`` on SQLite error. Does NOT manage the connection lifecycle.
+
+    Deliberately does NOT get the ``None``-on-failure treatment its two
+    siblings received in v0.2.92 F-1: this is an INNER JOIN onto
+    ``project_codegraph_bindings``, so every prefix it can return is already in
+    :func:`_codegraph_binding_prefixes_on_conn`'s result. Its failure therefore
+    cannot shrink the keep-set, and gating ``resolvable`` on it would refuse
+    drops on pre-migration-026 databases (the table was added there) for no
+    protection gain. The rule: only a query whose failure LOSES protection may
+    turn the keep-set unresolvable.
+    """
     try:
         rows = conn.execute(
             "SELECT DISTINCT b.collection_prefix "
@@ -241,12 +326,19 @@ def get_codegraph_binding_prefixes() -> list[str]:
     an empty keep-set makes the detector CONSERVATIVE upstream (callers
     MUST treat "no bindings resolvable" as "cannot safely attribute →
     do not flag anything", never as "everything is an orphan").
+
+    NOTE: this LIST-ONLY surface deliberately keeps its ``list[str]`` contract
+    and still collapses "unreadable" into ``[]`` — it has no ``resolvable``
+    channel to carry the distinction, and no destructive decision is taken on
+    it. Anything gating a DROP must use :func:`codegraph_binding_keep_set`,
+    which since v0.2.92 F-1 reports ``resolvable=False`` for the unreadable
+    case instead of an empty-and-confirmed keep-set.
     """
     conn = _open_db_readonly()
     if conn is None:
         return []
     try:
-        return _codegraph_binding_prefixes_on_conn(conn)
+        return _codegraph_binding_prefixes_on_conn(conn) or []
     finally:
         try:
             conn.close()
@@ -372,12 +464,14 @@ def codegraph_binding_keep_set() -> tuple[list[str], bool]:
     the ``project_codegraph_extra_paths`` owner prefixes (deduped, order-stable).
 
     ``resolvable`` is ``False`` when launcher.db could not be opened at all
-    (no DB / locked / discovery failed) — the CRITICAL distinction the
-    detector needs: an empty keep-set because the DB is UNREACHABLE must NOT
-    be read as "every prefix is an orphan". When ``resolvable`` is False the
-    detector MUST refuse to flag anything (conservative data-safety). When
-    ``resolvable`` is True but ``prefixes`` is empty, the DB is genuinely
-    empty (no registered projects) and the caller may proceed.
+    (no DB / locked / discovery failed) OR when the binding read itself failed
+    (v0.2.92 F-1: not-a-database, absent table, corrupt page) — the CRITICAL
+    distinction the detector needs: an empty keep-set because the DB is
+    UNREADABLE must NOT be read as "every prefix is an orphan". When
+    ``resolvable`` is False the detector MUST refuse to flag anything
+    (conservative data-safety). ``resolvable=True`` with an empty ``prefixes``
+    means the table was READ and is genuinely empty (no registered projects),
+    and the caller may proceed.
 
     SEV-3 #3 (v0.2.73): BOTH reads run on the SAME connection that established
     ``resolvable``. Previously ``resolvable`` was set by the outer open, then
@@ -390,9 +484,16 @@ def codegraph_binding_keep_set() -> tuple[list[str], bool]:
     if conn is None:
         return ([], False)
     try:
+        bound = _codegraph_binding_prefixes_on_conn(conn)
+        if bound is None:
+            # v0.2.92 F-1: the binding read FAILED (not-a-database, absent
+            # table, corrupt page, interrupted read). We have not confirmed
+            # anything — say so, rather than handing back an empty-and-
+            # "resolvable" keep-set that clears every live prefix for deletion.
+            return ([], False)
         seen: set[str] = set()
         ordered: list[str] = []
-        for p in list(_codegraph_binding_prefixes_on_conn(conn)) + list(
+        for p in list(bound) + list(
             _codegraph_extra_path_owner_prefixes_on_conn(conn)
         ):
             if p not in seen:
@@ -424,16 +525,27 @@ def codegraph_binding_keep_set() -> tuple[list[str], bool]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _kg_binding_collection_names_on_conn(conn: sqlite3.Connection) -> list[str]:
+def _kg_binding_collection_names_on_conn(
+    conn: sqlite3.Connection,
+) -> Optional[list[str]]:
     """Read every ``collection_name`` in ``project_kg_bindings`` (ALL projects,
-    ALL roles) on an ALREADY-OPEN connection. Returns ``[]`` on SQLite error
-    (missing table on a free-tier DB, etc.). Caller owns the connection."""
+    ALL roles) on an ALREADY-OPEN connection.
+
+    Returns ``None`` when the QUERY FAILED (not a database / absent table /
+    corrupt / interrupted) and ``[]`` when the table is genuinely EMPTY —
+    the v0.2.92 F-1 distinction. Collapsing both into ``[]`` made
+    :func:`kg_binding_keep_set` claim ``resolvable=True`` for a keep-set it had
+    never read, which is how ``project_init._legacy_kg_drop_revalidated``
+    came to ALLOW dropping a live KG class on a corrupt ``launcher.db``.
+
+    Caller owns the connection.
+    """
     try:
         rows = conn.execute(
             "SELECT collection_name FROM project_kg_bindings"
         ).fetchall()
     except Exception:
-        return []
+        return None
     out: list[str] = []
     for r in rows:
         val = (r["collection_name"] or "").strip()
@@ -451,11 +563,13 @@ def kg_binding_keep_set() -> tuple[list[str], bool]:
     ``Foobar_KnowledgeGraph``), not prefixes — the legacy-KG detector compares
     a candidate's full class name (normalised) against this set.
 
-    ``resolvable`` is ``False`` only when launcher.db could not be opened at all.
-    The legacy-KG detector MUST treat ``resolvable=False`` as "cannot confirm
-    which KG classes are live → do NOT emit any drop command" (conservative
-    data-safety — never widen the drop blast radius). ``resolvable=True`` with
-    an empty list means the DB is genuinely empty (no bound projects).
+    ``resolvable`` is ``False`` when launcher.db could not be opened at all OR
+    when the binding read itself failed (v0.2.92 F-1: not-a-database, absent
+    table, corrupt page, interrupted read). The legacy-KG detector MUST treat
+    ``resolvable=False`` as "cannot confirm which KG classes are live → do NOT
+    emit any drop command" (conservative data-safety — never widen the drop
+    blast radius). ``resolvable=True`` with an empty list means the table was
+    READ and is genuinely empty (no bound projects).
 
     Single-connection (SEV-3 #3 discipline): the read that populates the list
     runs on the SAME connection that established ``resolvable``.
@@ -464,9 +578,15 @@ def kg_binding_keep_set() -> tuple[list[str], bool]:
     if conn is None:
         return ([], False)
     try:
+        names = _kg_binding_collection_names_on_conn(conn)
+        if names is None:
+            # v0.2.92 F-1: read FAILED → nothing is confirmed. Never report an
+            # empty-but-"resolvable" keep-set, which reads downstream as "no
+            # project holds any live KG class" and clears every one for drop.
+            return ([], False)
         seen: set[str] = set()
         ordered: list[str] = []
-        for name in _kg_binding_collection_names_on_conn(conn):
+        for name in names:
             if name not in seen:
                 seen.add(name)
                 ordered.append(name)

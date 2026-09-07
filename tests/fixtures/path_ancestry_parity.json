@@ -1,0 +1,421 @@
+{
+  "_comment": [
+    "SPDX-License-Identifier: AGPL-3.0-or-later",
+    "Shared Python<->Rust parity corpus for PATH ANCESTRY.",
+    "",
+    "Python home:  vco_lib/project_move.py::path_compare_key / _parts / is_ancestor",
+    "Rust  mirror: launcher/src-tauri/vct-launcher-core/src/db/bindings_writer.rs",
+    "              ::path_parts / is_ancestor",
+    "",
+    "WHY THIS FILE EXISTS (v0.2.92 MAJOR-12). bindings_writer.rs carried a",
+    "'MUST MATCH vco_lib/project_move.py' tier-C mirror comment that named",
+    "tests/test_v0292_wp18_rename_delivery.py as the thing bounding the",
+    "divergence risk, 'driving the SAME fixture table through both",
+    "implementations'. No such table existed: that file asserted only that the",
+    "strings 'fn is_ancestor' and 'MUST MATCH' appeared in the Rust source --",
+    "both satisfiable by a comment -- and path_compare_key had zero test hits",
+    "repo-wide. Underneath the false claim the two implementations really did",
+    "disagree: is_ancestor('/a', '/a/b/../..') was False in Python and True in",
+    "Rust. This file is the table the comment always claimed.",
+    "",
+    "THE '..' DECISION. Both sides now COLLAPSE '.' and '..' lexically, i.e.",
+    "Python's os.path.normpath / ntpath.normpath behaviour won and the Rust",
+    "mirror adopted it. Three reasons, in order:",
+    "  1. The mirror follows its home. bindings_writer.rs itself names",
+    "     project_move.py as 'the tested Python home for this rule'.",
+    "  2. The consumer REWRITES user data. repoint_kg_dir_path re-points a",
+    "     user-owned kg_dir_path column for every row it judges to be under the",
+    "     old root. Collapsing '..' yields FEWER ancestor matches, so the",
+    "     not-collapsing behaviour was a false-POSITIVE write: it rewrote a row",
+    "     whose stored path lexically resolves to '/' and is not under the root",
+    "     at all. CLAUDE.md's conservative-defaults rule settles that direction.",
+    "  3. Adopting the Rust behaviour in Python would have opened a second",
+    "     hole: paths_equal('/a', '/a/b/..') would become False, so the move",
+    "     preflight's overlap guard would stop recognising a destination that",
+    "     is lexically the source.",
+    "Lexical collapsing can disagree with a symlinked reality ('/a/link/..' is",
+    "not necessarily '/a'). That is accepted and deliberate: path_compare_key",
+    "documents that it must NOT touch the filesystem, and callers that need a",
+    "resolved path resolve first (_resolve_for_compare).",
+    "",
+    "SHAPES. Rust has ONE function used on three OSes; Python has three shapes.",
+    "Each vector declares which:",
+    "  posix-sensitive   -> Python platform='linux',  Rust case_insensitive=false",
+    "  posix-insensitive -> Python platform='darwin', Rust case_insensitive=true",
+    "  windows           -> Python platform='win32',  Rust case_insensitive=true",
+    "",
+    "WHAT THIS CORPUS DOES NOT PIN, and why -- read before adding vectors:",
+    "  * Unicode case folding. Python casefolds (full folding: 'STRASSE' vs",
+    "    'strasse'), Rust str::to_lowercase does simple lowercasing. They",
+    "    disagree on inputs like 'ß'. Closing that needs a full-folding crate in",
+    "    the launcher, which is out of proportion to a path component; the",
+    "    corpus therefore stays ASCII on the case axis and the divergence is",
+    "    recorded here rather than hidden.",
+    "  * A literal backslash used as a FILENAME character on POSIX. Rust's",
+    "    path_parts always splits on both separators; Python's posix shapes",
+    "    treat '\\\\' as an ordinary character. So a directory genuinely named",
+    "    'a\\\\b' on Linux is one component to Python and two to Rust. Closing it",
+    "    needs a separator flag threaded through repoint_kg_dir_path_ci's public",
+    "    signature (case-insensitivity alone cannot express it: macOS is",
+    "    case-insensitive with POSIX separators). Posix-shape vectors below",
+    "    therefore use '/' only.",
+    "  * Windows drive-RELATIVE paths ('C:a', meaning 'a, relative to the CWD",
+    "    on drive C'). The launcher stores absolute paths; ntpath models the",
+    "    per-drive CWD and the Rust mirror does not.",
+    "",
+    "Both sides assert against this file, so a one-sided edit fails on BOTH:",
+    "Python via tests/test_v0292_wp18_rename_delivery.py::TestPathAncestryParity,",
+    "Rust via bindings_writer.rs::path_ancestry_matches_shared_fixture. An",
+    "unreadable or unparsable fixture is a hard failure on both sides, never a",
+    "skip -- a skip would reintroduce exactly the silence this file closes."
+  ],
+  "parts": [
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/b",
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/b/",
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/./b",
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a//b",
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "//a/b",
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/A/Proj",
+      "expected": [
+        "A",
+        "Proj"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/",
+      "expected": []
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": ".",
+      "expected": []
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/b/../c",
+      "expected": [
+        "a",
+        "c"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/b/../..",
+      "expected": []
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/..",
+      "expected": []
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/..",
+      "expected": []
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/../a",
+      "expected": [
+        "a"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "a/../../b",
+      "expected": [
+        "..",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "a/b/../..",
+      "expected": []
+    },
+    {
+      "shape": "posix-sensitive",
+      "path": "/a/../a/b",
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "shape": "posix-insensitive",
+      "path": "/A/Proj",
+      "expected": [
+        "a",
+        "proj"
+      ]
+    },
+    {
+      "shape": "posix-insensitive",
+      "path": "/A/Proj/../KG",
+      "expected": [
+        "a",
+        "kg"
+      ]
+    },
+    {
+      "shape": "posix-insensitive",
+      "path": "/a/b/../..",
+      "expected": []
+    },
+    {
+      "shape": "posix-insensitive",
+      "path": "/Users/X/Proj",
+      "expected": [
+        "users",
+        "x",
+        "proj"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:\\Proj",
+      "expected": [
+        "c:",
+        "proj"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:/Proj/kg",
+      "expected": [
+        "c:",
+        "proj",
+        "kg"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:\\Proj\\.\\kg",
+      "expected": [
+        "c:",
+        "proj",
+        "kg"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:\\",
+      "expected": [
+        "c:"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "\\\\server\\share\\p",
+      "expected": [
+        "server",
+        "share",
+        "p"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:\\a\\b\\..\\..",
+      "expected": [
+        "c:"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:\\..\\x",
+      "expected": [
+        "c:",
+        "x"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "C:\\Proj\\kg\\..",
+      "expected": [
+        "c:",
+        "proj"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "\\a\\..\\..\\b",
+      "expected": [
+        "b"
+      ]
+    },
+    {
+      "shape": "windows",
+      "path": "a\\..\\..\\b",
+      "expected": [
+        "..",
+        "b"
+      ]
+    }
+  ],
+  "ancestry": [
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a",
+      "descendant": "/a/b/../..",
+      "expected": false
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a",
+      "descendant": "/a/b/..",
+      "expected": false
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a",
+      "descendant": "/a/b/../c",
+      "expected": true
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a/proj",
+      "descendant": "/a/project",
+      "expected": false
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a/proj",
+      "descendant": "/a/proj/kg",
+      "expected": true
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a/proj",
+      "descendant": "/a/proj",
+      "expected": false
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/A/Proj",
+      "descendant": "/a/proj/kg",
+      "expected": false
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a",
+      "descendant": "/a/../a/b",
+      "expected": true
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a",
+      "descendant": "/b/../a/c",
+      "expected": true
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": "/a",
+      "descendant": "/a/../b",
+      "expected": false
+    },
+    {
+      "shape": "posix-sensitive",
+      "ancestor": ".",
+      "descendant": "./a",
+      "expected": true
+    },
+    {
+      "shape": "posix-insensitive",
+      "ancestor": "/A/Proj",
+      "descendant": "/a/proj/kg",
+      "expected": true
+    },
+    {
+      "shape": "posix-insensitive",
+      "ancestor": "/A/Proj",
+      "descendant": "/a/proj",
+      "expected": false
+    },
+    {
+      "shape": "posix-insensitive",
+      "ancestor": "/A",
+      "descendant": "/a/b/../..",
+      "expected": false
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\Proj",
+      "descendant": "C:\\Proj\\kg",
+      "expected": true
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\Proj",
+      "descendant": "C:\\Project\\kg",
+      "expected": false
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\Proj",
+      "descendant": "C:/proj/kg",
+      "expected": true
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\Proj",
+      "descendant": "C:\\Proj\\kg\\..\\..",
+      "expected": false
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\Proj",
+      "descendant": "C:\\Proj\\a\\..\\b",
+      "expected": true
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\Proj",
+      "descendant": "C:\\Proj\\..\\Other",
+      "expected": false
+    },
+    {
+      "shape": "windows",
+      "ancestor": "C:\\",
+      "descendant": "C:\\Proj",
+      "expected": true
+    }
+  ]
+}

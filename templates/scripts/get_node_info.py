@@ -18,6 +18,56 @@ WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 
+# VCO-SHARED-BEGIN: _resolve_orchestrator_root (verbatim across templates/scripts/*.py)
+def _resolve_orchestrator_root() -> "Path | None":
+    """Return the orchestrator clone root — the directory that CONTAINS
+    ``claude_mcp_servers/`` — or ``None`` when it cannot be located.
+
+    THE one shape for this question across ``templates/scripts/*.py``. It is
+    copied VERBATIM into every shipped script that asks it and pinned
+    byte-identical by
+    ``tests/test_v0292_cli_root_resolution_and_prefix.py::test_root_resolver_bodies_identical``
+    — a DOCUMENTED class-C mirror with an enforcing test rather than a silent
+    copy, because these scripts must answer "where is the orchestrator?"
+    BEFORE they can import anything from it (importing ``vco_lib`` to find
+    ``vco_lib`` is circular).
+
+    Candidate order — the first candidate that actually CONTAINS
+    ``claude_mcp_servers/`` wins; a candidate that does not is SKIPPED, never
+    returned:
+
+      1. ``$VCT_ORCHESTRATOR_ROOT`` — canonical; written into ``.claude/env``
+         and ``.claude/settings.json`` by the bundle installer
+         (``vco_lib/config_projection.py``).
+      2. ``$VCT_INSTALL_ROOT`` — legacy alias carrying the same value; some
+         launcher subprocess spawns set only this one.
+      3. ``<script>/../..`` — the in-tree layout, correct ONLY when the script
+         sits in the orchestrator clone's own ``.claude/scripts/`` (or in
+         ``templates/scripts/`` in the clone). On an INSTALLED project this
+         resolves to the USER project root, which has no
+         ``claude_mcp_servers/`` — which is exactly why every rung is
+         validated and why this rung is LAST.
+
+    Never raises. Path joins go through ``pathlib`` so no separator is
+    assumed (a Windows ``\\``-separator bug shipped once already, v0.2.81).
+    """
+    for _candidate in (
+        os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip(),
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+        str(Path(__file__).resolve().parent.parent.parent),
+    ):
+        if not _candidate:
+            continue
+        try:
+            _root = Path(_candidate)
+            if (_root / "claude_mcp_servers").is_dir():
+                return _root
+        except (OSError, ValueError):
+            continue
+    return None
+# VCO-SHARED-END: _resolve_orchestrator_root
+
+
 # v0.2.21 Step 18 (caller migration): resolve KG collection names via the
 # launcher's vct-hub. Falls back to env vars when the hub is unreachable.
 # Pre-v0.2.21 the hardcoded "ClaudeKnowledgeGraph" only worked on the
@@ -48,18 +98,48 @@ def _resolve_kg_collections() -> tuple[str, str]:
 
 KG_COLLECTION, SHARED_KG_COLLECTION = _resolve_kg_collections()
 
-# P1-D (2026-05-08): centralized access-matrix helper. Resolved via
-# $VCT_ORCHESTRATOR_ROOT (the orchestrator clone is where
-# claude_mcp_servers/scripts/kg_access.py lives) with an in-tree
-# fallback. Self-only fallback keeps the CLI functional even on a
-# hand-edited venv that doesn't ship the helper.
+# P1-D (2026-05-08): centralized access-matrix helper. `kg_access` lives at
+# <orchestrator>/claude_mcp_servers/scripts/kg_access.py. Self-only fallback
+# keeps the CLI functional even on a hand-edited venv that doesn't ship the
+# helper — what it loses is the ACCESS MATRIX, never correctness of the
+# self collection.
+#
+# v0.2.92: the root ladder is `_resolve_orchestrator_root()` above (the ONE
+# shape across templates/scripts/*.py) — it adds the `$VCT_INSTALL_ROOT`
+# rung this site was missing (some launcher spawns set only that alias) and
+# validates every rung instead of falling through to an unchecked
+# script-relative guess.
 try:
     # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-    _env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if _env_root and (Path(_env_root) / "claude_mcp_servers" / "scripts").is_dir():
-        sys.path.insert(0, str(Path(_env_root) / "claude_mcp_servers" / "scripts"))
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers" / "scripts"))
+    # v0.2.92 (R4/R21) — INSTALL-TIME BAKED ROOT. `vco_lib/rewire.py`
+    # substitutes the placeholder below when this file is installed into a
+    # project, so an installed copy still finds `kg_access` (and therefore the
+    # launcher's cross-project ACCESS MATRIX) with NOTHING in the environment.
+    # In the clone the placeholder stays literal, `Path("{{ORCHESTRATOR_ROOT}}")
+    # / "vco_lib"` is not a directory, and this block is inert — the validation
+    # IS the placeholder guard. It is used ONLY when NEITHER env pin
+    # ($VCT_ORCHESTRATOR_ROOT, $VCT_INSTALL_ROOT) names a real orchestrator
+    # root — a VALID pin always wins, a provably stale one is healed — and it
+    # runs BEFORE the `_resolve_orchestrator_root()` call below so the env
+    # rung can see it. The shared resolver block itself is byte-pinned across
+    # scripts and is deliberately NOT edited.
+    _VCO_BAKED_ORCHESTRATOR_ROOT = "{{ORCHESTRATOR_ROOT}}"
+    _vco_env_pins = [os.environ.get(_k, "").strip()
+                     for _k in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT")]
+    if (Path(_VCO_BAKED_ORCHESTRATOR_ROOT) / "vco_lib").is_dir() and not any(
+        _p and (Path(_p) / "vco_lib").is_dir() for _p in _vco_env_pins
+    ):
+        os.environ["VCT_ORCHESTRATOR_ROOT"] = _VCO_BAKED_ORCHESTRATOR_ROOT
+    _kg_access_dir = (
+        (_resolve_orchestrator_root() or Path(__file__).resolve().parent.parent.parent)
+        / "claude_mcp_servers" / "scripts"
+    )
+    # APPEND, not insert(0): nothing else on the path provides `kg_access`, and
+    # this directory holds a dozen loose script modules — putting it first
+    # would let any of them shadow a same-named import for the whole process.
+    # (Same reasoning, same words, as search_knowledge.py's P1-D block.)
+    if _kg_access_dir.is_dir() and str(_kg_access_dir) not in sys.path:
+        sys.path.append(str(_kg_access_dir))
     # VCO-REWIRE-END: orchestrator-root-resolution
     from kg_access import kg_collections_to_search as _kg_collections_to_search  # type: ignore[import-not-found]
 except Exception:

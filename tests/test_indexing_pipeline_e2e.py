@@ -31,13 +31,13 @@ Run: pytest tests/test_indexing_pipeline_e2e.py -v
 """
 from __future__ import annotations
 
-import json
-import sqlite3
 from pathlib import Path
 from typing import Any, List
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.common.launcher_db_fixture import make_launcher_db
 
 
 # ---------------------------------------------------------------------------
@@ -110,50 +110,19 @@ class _FakeWeaviateClient:
 # ---------------------------------------------------------------------------
 
 
-_PROJECT_DIAGRAMS_SCHEMA = """
-CREATE TABLE projects (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE project_diagrams (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id TEXT NOT NULL,
-    diagram_name TEXT NOT NULL,
-    diagram_type TEXT NOT NULL CHECK(diagram_type IN ('mermaid','excalidraw')),
-    file_path TEXT NOT NULL,
-    category_path TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    inferred_title TEXT,
-    diagram_kind TEXT,
-    content_text TEXT,
-    node_count INTEGER,
-    edge_count INTEGER,
-    chat_id TEXT,
-    linked_session_summary TEXT,
-    config_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(project_id, diagram_name)
-);
-"""
-
-
 @pytest.fixture
 def project_setup(tmp_path: Path, monkeypatch):
     """Build a fake project layout: launcher.db + .claude/diagrams + env."""
-    # SQLite DB with the project_diagrams schema.
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_PROJECT_DIAGRAMS_SCHEMA)
-        conn.execute(
-            "INSERT INTO projects (id, name) VALUES (?, ?)",
-            ("proj-e2e-uuid", "E2EProject"),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    # Real launcher schema (migrations applied), one registered project —
+    # ``project_diagrams`` is created by the migrations, not by the test.
+    db_path = make_launcher_db(
+        tmp_path,
+        projects=[{
+            "project_id": "proj-e2e-uuid",
+            "name": "E2EProject",
+            "folder_path": tmp_path,
+        }],
+    )
 
     # .claude/diagrams/ root.
     diagrams_root = tmp_path / ".claude" / "diagrams"
@@ -306,17 +275,14 @@ def test_pipeline_missing_env_skips_weaviate_gracefully(
     from vco_lib.diagram_indexer import index_diagram_async
 
     # Fresh setup without the env var set.
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_PROJECT_DIAGRAMS_SCHEMA)
-        conn.execute(
-            "INSERT INTO projects (id, name) VALUES (?, ?)",
-            ("proj-noenv-uuid", "NoEnvProj"),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    db_path = make_launcher_db(
+        tmp_path,
+        projects=[{
+            "project_id": "proj-noenv-uuid",
+            "name": "NoEnvProj",
+            "folder_path": tmp_path,
+        }],
+    )
     diagrams_root = tmp_path / ".claude" / "diagrams"
     diagrams_root.mkdir(parents=True)
     monkeypatch.delenv("DIAGRAMS_COLLECTION", raising=False)

@@ -453,8 +453,8 @@ def test_sh_hook_passes_hook_format_to_code_graph_query() -> None:
     # (`code-graph-query" search "$QUERY" ...`), not the various
     # mentions in comments.
     invocations = [
-        (i, l) for i, l in _producer_invocation_lines(body, "code-graph-query")
-        if "search " in l or " search" in l
+        (i, line) for i, line in _producer_invocation_lines(body, "code-graph-query")
+        if "search " in line or " search" in line
     ]
     assert invocations, (
         "code-graph-query search invocation missing entirely (no executable "
@@ -539,8 +539,8 @@ def test_ps1_hook_passes_hook_format_to_both_producers() -> None:
     # parity block mentions producer names too, so we strip comment lines
     # before pattern matching.
     non_comment_lines = [
-        l for l in ps1.splitlines()
-        if not l.lstrip().startswith("#")
+        line for line in ps1.splitlines()
+        if not line.lstrip().startswith("#")
     ]
     non_comment_body = "\n".join(non_comment_lines)
 
@@ -553,8 +553,8 @@ def test_ps1_hook_passes_hook_format_to_both_producers() -> None:
     # Find any non-comment line with both $RlScript and --hook-format
     # (or a fallback pair: `rl_kg_search` + `--hook-format`).
     kg_paired = any(
-        ("$RlScript" in l or "rl_kg_search" in l) and "--hook-format" in l
-        for l in non_comment_lines
+        ("$RlScript" in line or "rl_kg_search" in line) and "--hook-format" in line
+        for line in non_comment_lines
     )
     assert kg_paired, (
         "pre-edit-context-inject.ps1 RL/KG producer invocation missing "
@@ -564,8 +564,8 @@ def test_ps1_hook_passes_hook_format_to_both_producers() -> None:
 
     # Code-graph: PowerShell invokes via `$cgQueryPs1` / `$cgQuerySh`.
     cg_paired = any(
-        ("code-graph-query" in l or "cgQuery" in l) and "--hook-format" in l
-        for l in non_comment_lines
+        ("code-graph-query" in line or "cgQuery" in line) and "--hook-format" in line
+        for line in non_comment_lines
     )
     assert cg_paired, (
         "pre-edit-context-inject.ps1 code-graph-query invocation missing "

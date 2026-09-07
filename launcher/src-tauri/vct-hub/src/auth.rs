@@ -698,30 +698,16 @@ mod tests {
         routing::get,
         Router,
     };
-    use std::sync::Mutex;
 
     // Note: `Method` and `Request` come into scope via the parent
     // module's imports. `Body` is no longer used here (we use the
     // spawn-server pattern, not tower::oneshot), so we don't pull it.
 
-    // The token-file tests mutate VCT_STATE_DIR at process scope.
-    // Serialise them so parallel cargo-test runs don't observe each
-    // other. Mirrors the pattern in `paths.rs`.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn with_state_dir<F: FnOnce(&std::path::Path)>(f: F) {
-        let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Safety: tests are serialized by SERIALIZE; no thread
-        // concurrently observes/mutates VCT_STATE_DIR.
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
-        f(tmp.path());
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
-    }
+    // v0.2.92: `with_state_dir` and its file-local SERIALIZE mutex are
+    // now the shared workspace helpers — the local copy unset
+    // `VCT_STATE_DIR` on exit instead of restoring it, and its mutex
+    // only excluded other tests in THIS file.
+    use vct_launcher_core::test_env::{state_dir_guard, with_state_dir};
 
     // ─── Token generation ────────────────────────────────────────────
 
@@ -1609,12 +1595,10 @@ mod tests {
         // serialises against the other flag tests; the state-dir set is
         // safe under that same held lock.
         let _g = LegacyFlagGuard::set("0");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Safety: LegacyFlagGuard holds LEGACY_FLAG_SERIALIZE + tests run
-        // single-threaded (RUST_TEST_THREADS=1 for env-mutating tests).
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
+        // `state_dir_guard()` is taken AFTER `LegacyFlagGuard` in all three
+        // of these tests, and no test in this file takes them the other way
+        // round, so the two locks have a consistent order.
+        let tmp = state_dir_guard();
 
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         seed_project_row(&db, "mid-pid", "MidSession", "/tmp/mid");
@@ -1657,10 +1641,6 @@ mod tests {
             .await
             .expect("hub reachable");
         assert_eq!(resp2.status(), StatusCode::OK);
-
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
     }
 
     /// Flag OFF + global token + an UNKNOWN id (no DB row) → NO lazy-mint;
@@ -1669,10 +1649,10 @@ mod tests {
     #[tokio::test]
     async fn lazy_mint_does_not_rescue_unknown_id_when_flag_off() {
         let _g = LegacyFlagGuard::set("0");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
+        // `state_dir_guard()` is taken AFTER `LegacyFlagGuard` in all three
+        // of these tests, and no test in this file takes them the other way
+        // round, so the two locks have a consistent order.
+        let tmp = state_dir_guard();
 
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         // No projects seeded.
@@ -1694,10 +1674,6 @@ mod tests {
         );
         assert_eq!(registry.token_for("ghost-pid"), None);
         assert!(!tmp.path().join("hub.token.ghost-pid").exists());
-
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
     }
 
     // ── v0.2.77 Part 8 Task 4d: slug canonicalization in auth ──────────
@@ -1843,11 +1819,10 @@ mod tests {
     #[tokio::test]
     async fn f1_lazy_mint_reachable_through_production_layer_stack() {
         let _g = LegacyFlagGuard::set("0");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Safety: LegacyFlagGuard serialises the flag/env-mutating tests.
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", tmp.path());
-        }
+        // `state_dir_guard()` is taken AFTER `LegacyFlagGuard` in all three
+        // of these tests, and no test in this file takes them the other way
+        // round, so the two locks have a consistent order.
+        let _tmp = state_dir_guard();
 
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         seed_project_row(&db, "f1-pid", "F1Session", "/tmp/f1");
@@ -1878,9 +1853,5 @@ mod tests {
             registry.token_for("f1-pid").is_some(),
             "F1: lazy-mint must register the scoped token"
         );
-
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
     }
 }

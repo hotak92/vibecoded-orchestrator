@@ -18,7 +18,29 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 # propagated from this same logical version by `scripts/bump-version.sh`
 # and verified by `scripts/pre-ship-check.sh`.
 [workspace.package]
-version = "0.2.91"
+version = "0.2.92"
+
+# v0.2.92 (WP-19): SINGLE source of truth for the `serde_json` feature set.
+#
+# `preserve_order` swaps `Value::Object`'s backing store from `BTreeMap`
+# (alphabetical) to `IndexMap` (insertion order). Every JSON file the
+# launcher rewrites — `~/.claude/settings.json` (Artifact panel),
+# `~/.claude.json` (MCP registration), per-project `.claude/settings.json`
+# and `.vscode/settings.json` — is a read-modify-write, so without this
+# feature a write alphabetises keys in a file the USER owns and edits.
+#
+# It lives here, not on each member, because the feature MUST be uniform.
+# Cargo unifies features across the packages in a given build graph, so a
+# member that declared plain `serde_json = "1"` would still get the feature
+# during `cargo build --workspace` but NOT during `cargo build -p <member>`
+# — the same source compiled two ways, with a silently different on-disk
+# byte order. A workspace entry makes that drift unrepresentable.
+#
+# `launcher/tools/vct-cli` is a SEPARATE workspace (own Cargo.lock) and
+# cannot inherit; it declares the identical feature set on its own and is
+# held in lockstep by `tests/serde_json_preserve_order.rs`.
+[workspace.dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [package]
 name = "vct-launcher-temp"
@@ -90,7 +112,9 @@ tauri-plugin-single-instance = "2"
 # whatever shape the user left it in.
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Inherited from [workspace.dependencies] above so the `preserve_order`
+# feature cannot drift between members. See the comment there.
+serde_json.workspace = true
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }

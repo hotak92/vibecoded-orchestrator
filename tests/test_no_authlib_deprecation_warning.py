@@ -44,6 +44,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -60,6 +62,7 @@ def _run_subprocess(code: str) -> subprocess.CompletedProcess:
         text=True,
         timeout=30,
         cwd=str(REPO_ROOT),
+        env=child_env(),
     )
 
 

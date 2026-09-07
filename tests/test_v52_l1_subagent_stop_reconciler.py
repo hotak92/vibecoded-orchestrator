@@ -37,6 +37,7 @@ tests handle PowerShell sibling coverage via conditional pwsh detection.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -107,6 +108,13 @@ def _run_hook(
     env.pop("VCT_DISABLE_HOOKS", None)
     if home_override is not None:
         env["HOME"] = str(home_override)
+        # v0.2.92 W7: the nudge counter moved out of `~/.claude/metrics` into
+        # the VCT state root, so pinning `$HOME` alone no longer isolates it.
+        # Pin BOTH roots to the fake home; without the state-dir pin the hook
+        # would land in the suite-wide conftest redirect, shared with every
+        # other test.
+        env["VCT_STATE_DIR"] = str(home_override / ".vct")
+        env["VCT_CLAUDE_DIR"] = str(home_override / ".claude")
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -640,13 +648,21 @@ def test_credential_scan_emits_alert_on_aws_key(tmp_path):
 
 
 def test_nudge_counter_incremented_for_session(tmp_path, monkeypatch):
-    """Pre-seed `$HOME/.claude/metrics/kg_update_tokens.jsonl` with a
-    row for our session_id. After reconcile, that row's
-    `subagent_work_units` must have increased."""
+    """Pre-seed the counter with a row for our session_id. After reconcile,
+    that row's `subagent_work_units` must have increased.
+
+    v0.2.92 W7 turned this into a two-part test. The seed goes into the
+    PRE-W7 archive (`$HOME/.claude/metrics`), and the bump must appear in the
+    NEW home (`$VCT_STATE_DIR/metrics`) — so this also exercises the
+    continuity path: a session whose counter predates the move must keep its
+    baseline instead of restarting at zero. The archive is asserted
+    byte-identical afterwards, because the hook only ever READS it.
+    """
     project = _setup_project(tmp_path)
     fake_home = tmp_path / "fake-home"
     (fake_home / ".claude" / "metrics").mkdir(parents=True, exist_ok=True)
-    nudge_file = fake_home / ".claude" / "metrics" / "kg_update_tokens.jsonl"
+    legacy_nudge_file = fake_home / ".claude" / "metrics" / "kg_update_tokens.jsonl"
+    nudge_file = fake_home / ".vct" / "metrics" / "kg_update_tokens.jsonl"
 
     session = "T06-session-uuid"
     agent_id = "T06-agent"
@@ -661,7 +677,22 @@ def test_nudge_counter_incremented_for_session(tmp_path, monkeypatch):
         "fired_once": False,
         "subagent_work_units": 50,
     }
-    nudge_file.write_text(json.dumps(seed) + "\n", encoding="utf-8")
+    legacy_nudge_file.write_text(json.dumps(seed) + "\n", encoding="utf-8")
+    legacy_digest_before = hashlib.sha256(
+        legacy_nudge_file.read_bytes()
+    ).hexdigest()
+
+    # Run the real W7 migration, which is what moves this machine's writers to
+    # the new home: it COPIES the archive across and records the verification.
+    # Until it has run, the hook deliberately keeps writing to the archive
+    # (writers switch only after a verified copy), so this is the update-axis
+    # sequence a real machine goes through, in order.
+    from vco_lib.metrics_migration import migrate_metrics
+
+    migration = migrate_metrics(
+        fake_home / ".claude" / "metrics", fake_home / ".vct" / "metrics"
+    )
+    assert migration.ok and migration.status == "migrated", migration.to_dict()
 
     # 1. Snapshot.
     start_result = _run_hook(
@@ -696,8 +727,12 @@ def test_nudge_counter_incremented_for_session(tmp_path, monkeypatch):
         f"reconcile exited {stop_result.returncode}; "
         f"stderr={stop_result.stderr!r}")
 
-    # Read the post-reconcile file. The reconciler rewrites atomically
-    # so last-row-wins for our session.
+    # Read the post-reconcile file in the NEW home. The reconciler rewrites
+    # atomically so last-row-wins for our session.
+    assert nudge_file.is_file(), (
+        f"the counter must be written to the W7 home {nudge_file}, seeded "
+        f"from the archive; found nothing there"
+    )
     lines = [
         ln for ln in nudge_file.read_text(encoding="utf-8").splitlines()
         if ln.strip()
@@ -712,6 +747,14 @@ def test_nudge_counter_incremented_for_session(tmp_path, monkeypatch):
     assert bumped.get("subagent_count", 0) >= 1
     assert bumped.get("subagent_last_at"), (
         "subagent_last_at must be set to an ISO timestamp")
+    # Continuity: the seeded baseline came ACROSS, it was not reset.
+    assert bumped.get("baseline") == 1000, (
+        f"the pre-W7 baseline must survive the move: {bumped!r}")
+    # LEAVE-ALONE: the archive is read-only to this hook.
+    assert (
+        hashlib.sha256(legacy_nudge_file.read_bytes()).hexdigest()
+        == legacy_digest_before
+    ), "the hook must never write the frozen ~/.claude/metrics archive"
 
 
 # --------------------------------------------------------------------------- #

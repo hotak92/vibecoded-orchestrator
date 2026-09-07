@@ -144,10 +144,19 @@ if [ -n "$SESSION_ID" ]; then
     [ -f "$CTX_SNAPSHOT_SESSION" ] && rm -f "$CTX_SNAPSHOT_SESSION"
 fi
 
-# Log the compaction event
-LOG_DIR="$HOME/.claude/metrics"
-mkdir -p "$LOG_DIR"
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"trigger\":\"$TRIGGER\"}" >> "$LOG_DIR/compactions.jsonl"
+# Log the compaction event. v0.2.92 W7: the metrics home moved out of
+# ~/.claude; `_lib/metrics-dir.sh` is the ONE shell-side resolver (sibling:
+# `_lib/metrics-dir.ps1`). A missing helper skips the log line rather than
+# guessing a path — the notification below still fires.
+_PC_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/metrics-dir.sh"
+if [ -f "$_PC_LIB" ]; then
+    # shellcheck source=_lib/metrics-dir.sh disable=SC1091
+    . "$_PC_LIB"
+    LOG_DIR="$(vco_metrics_dir 2>/dev/null || printf '')"
+    if [ -n "$LOG_DIR" ]; then
+        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"trigger\":\"$TRIGGER\"}" >> "$LOG_DIR/compactions.jsonl"
+    fi
+fi
 
 # Cross-platform desktop notification (Linux/macOS/Windows). See audit F2.
 if [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then

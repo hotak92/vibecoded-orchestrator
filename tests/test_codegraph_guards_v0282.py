@@ -393,11 +393,17 @@ def test_T1_multichunk_function_stamps_zero_perchunk_embeds(analyzer_mod):
     embed_revision=2 and the PER-CHUNK mass re-embed (module-level
     ``generate_embedding``, one call per chunk on the base) is AVOIDED entirely.
 
-    NOTE on the one full-body precheck embed: for a chunkable entity
-    ``_resolve_deferred_embed`` computes a SINGLE-chunk hash (total=1) that can
-    never match a stored multi-chunk row (total=3), so it fires the deferred
-    embedder once on the full body — a PRE-EXISTING cost that happens on every
-    over-budget visit at ANY revision, independent of G1. What T1 pins is the
+    NOTE on the one full-body precheck embed — **REMOVED in v0.2.92 (Defect
+    A); this paragraph described the pre-fix world.** For a chunkable entity
+    ``_resolve_deferred_embed`` computed a SINGLE-chunk hash (total=1) that can
+    never match a stored multi-chunk row (total=3), so it fired the deferred
+    embedder once on the full body and the fan-out then discarded that vector —
+    one wasted MAX-SIZE embed per multi-chunk entity per walk, converged or not
+    (3,147 such entities on this machine). ``_dedup_insert`` now plans the chunk
+    texts FIRST and pops the deferred callable when the entity is multi-chunk,
+    so that embed no longer happens at all. This test still passes because it
+    never asserted the full-body count — it pins the OTHER property. What T1
+    pins is the
     N-per-chunk mass re-embed via ``generate_embedding``: ZERO on the stamp
     path. FAIL-ON-BASE: base re-embeds every chunk in ``_maybe_chunk_and_write``
     (no stamp path existed) → 3 generate_embedding calls; here → 0, and 3

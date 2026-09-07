@@ -32,6 +32,17 @@ async def main():
         action="store_true",
         help="Prefix each result header with 'KG: ' so the pre-edit hook can dedup by title",
     )
+    # WP-E (v0.2.92): a PATH, never text — the shared query_enrichment module
+    # reads the transcript tail in-process and composes the enriched query
+    # here. Passing text through argv would put conversation content (incl.
+    # thinking) into `ps`/hook command logs, which the WP-E privacy rule
+    # forbids. Absent/unreadable/empty transcript degrades to "no enrichment
+    # available", never an error.
+    parser.add_argument(
+        "--transcript",
+        default=None,
+        help="Path to the live Claude Code JSONL transcript (for query enrichment)",
+    )
     args = parser.parse_args()
     header_prefix = "KG: " if args.hook_format else ""
 
@@ -80,6 +91,23 @@ async def main():
 
         fetch_limit = args.limit * _RL_OVERFETCH
 
+        # WP-E (v0.2.92): when the trigger is SHORT relative to the embedding
+        # model's capacity, enrich it with recent conversation text (walking
+        # backwards through the transcript) before it becomes the retrieval
+        # query. When the trigger is already long/oversized, build_query
+        # leaves it unchanged and the existing is_oversized/chunk_query flow
+        # below takes over — "over -> chunk; do not enrich" per the user's
+        # spec (DECISIONS-2026-09-03 R30). `args.query` (the raw trigger) is
+        # kept for the --hook-format identifier lines and the RL telemetry
+        # query field (§6 Q2 default: raw trigger, never enriched text).
+        from vco_lib.query_enrichment import build_query as _build_query
+        _enriched = _build_query(
+            args.query,
+            transcript_path=args.transcript,
+            embedding_models=[EMBEDDING_MODEL],
+        )
+        effective_query = _enriched.text
+
         # Run the search across each collection and merge candidates by
         # title-keyed best score. The MCP server's hybrid_search /
         # semantic_graph_search already do this — we replicate the
@@ -89,7 +117,7 @@ async def main():
             vector = None
             target_name = None
         else:
-            vector, target_name = await _get_search_vector(args.query)
+            vector, target_name = await _get_search_vector(effective_query)
         # F-G (v0.2.70): the active named-vector slot (e.g. "qwen3_embed"). The
         # hook path historically attached NO node vector at all, so EVERY
         # hook-driven retrieval (≈72% of all events) carried no n_emb → cosine
@@ -157,8 +185,8 @@ async def main():
         # rl_client.query_chunking (one home, reuses chunking.py + _cosine).
         from claude_mcp_servers.rl_client import query_chunking as _qc
 
-        if EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(args.query, EMBEDDING_MODEL):
-            query_chunks = _qc.chunk_query(args.query, EMBEDDING_MODEL)
+        if EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(effective_query, EMBEDDING_MODEL):
+            query_chunks = _qc.chunk_query(effective_query, EMBEDDING_MODEL)
             per_chunk_limit = _qc.kg_results_per_chunk(args.limit) * _RL_OVERFETCH
             pooled_per_chunk: list[list[dict]] = []
             query_chunk_embs: list[list[float]] = []
@@ -175,7 +203,7 @@ async def main():
                 pooled_per_chunk, query_chunk_embs, args.limit * _RL_OVERFETCH
             )
         else:
-            all_formatted = await _retrieve_for_vector(args.query, vector, fetch_limit)
+            all_formatted = await _retrieve_for_vector(effective_query, vector, fetch_limit)
 
         if not all_formatted:
             # v0.2.21 audit fix: under --hook-format, emit a single short

@@ -284,7 +284,7 @@
     // single file-existence probe + manifest read.
     //
     // v0.2.83 (WP-A2 / D3): this hourly poll is the SLOW backstop. When a
-    // `checkStatus()` lands `remote_check_ok === false` (the remote probe
+    // `checkStatus()` lands `remote_check.state === 'unknown'` (the remote probe
     // couldn't determine whether an update exists — the historical
     // first-start-after-release miss), the orchestrator store now schedules
     // its OWN short-burst retries (30s / 90s / 300s, capped) instead of

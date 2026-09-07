@@ -15,6 +15,19 @@ Trio:
   * dismiss ⇒ hashes stored.
   * unchanged references ⇒ suppressed on next run.
   * ONE reference changed ⇒ re-emitted.
+
+v0.2.92 WP-15 note (accuracy, no behaviour change here): the first paragraph
+above used to be read as "…which is essentially every established project".
+That was true, but three of the differences being counted were VCO's OWN
+injected content — the deferral-reminder block, the `>>>VCO_MANAGED>>>`
+marker lines, and (on an orchestrator root) a comparison against the wrong
+document. `vco_lib.template_divergence.meaningfully_differs` removed that
+CAUSE; what reaches this producer now is genuine USER divergence.
+
+The dismissal MEMORY is deliberately untouched by that change and every
+assertion below still holds: a user who already silenced the nudge stays
+silenced while VCO ships no new reference. See
+`tests/test_v0292_n35_vco_owned_regions.py` for the divergence half.
 """
 from __future__ import annotations
 

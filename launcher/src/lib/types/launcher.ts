@@ -102,11 +102,71 @@ export interface RenameProjectResult {
 }
 
 /**
+ * Mirror of Rust `RenameClassMove` (commands/projects_v2.rs, v0.2.92 W14).
+ *
+ * ONE class the collection rename would carry. `action` is the whole story
+ * for the reader:
+ *
+ * - `copy`          — `src_count` objects move, WITH their vectors.
+ * - `create-empty`  — the source exists but is empty.
+ * - `source-absent` — the project is BOUND to a class that does not exist in
+ *                     Weaviate. No data is carried; the destination is made so
+ *                     the new binding names something real. (Measured on this
+ *                     machine: 3 of 5 prefix records name a dead prefix, so
+ *                     this row is a normal sight, not an error.)
+ * - `resume`        — an interrupted run created this destination already; the
+ *                     copy is UUID-preserving, so repeating it re-writes.
+ * - `noop`          — this member's name does not change.
+ */
+export interface RenameClassMove {
+  src: string;
+  dst: string;
+  action: 'copy' | 'create-empty' | 'source-absent' | 'resume' | 'noop';
+  src_count: number | null;
+  note: string;
+}
+
+/** Mirror of Rust `RenameCollectionsPreview` (commands/projects_v2.rs). */
+export interface RenameCollectionsPreview {
+  project_id: string;
+  project_name: string;
+  new_name: string;
+  old_code_prefix: string;
+  new_code_prefix: string;
+  moves: RenameClassMove[];
+  carried_objects: number;
+  /**
+   * The previous class names. This operation NEVER drops them — the ledger
+   * records the one guarded command that retires them later. UI copy must not
+   * imply they were removed.
+   */
+  retired_classes: string[];
+  warnings: string[];
+}
+
+/**
+ * Mirror of Rust `RenameCollectionsResult` (commands/projects_v2.rs).
+ *
+ * `refused` carries the engine's machine key (`destination_exists`,
+ * `prefix_collision`, `weaviate_unreachable`, …) so the UI can explain the
+ * specific precondition instead of a generic failure. A refusal means NOTHING
+ * was changed anywhere.
+ */
+export interface RenameCollectionsResult {
+  ok: boolean;
+  refused: string | null;
+  error: string | null;
+  preview: RenameCollectionsPreview | null;
+  /** Present only on a performed (non-dry-run) rename. */
+  summary: unknown | null;
+}
+
+/**
  * Mirror of Rust `UpdateSummary` (commands/projects_v2.rs).
  *
  * PR 5 (2026-05-01): per-action counts produced by the bundle install
  * during an `update_project_v2` run. Drives the toast summary line
- * ("5 files updated, 2 user-modifications preserved") plus optional
+ * ("5 files updated, 2 replaced (backup kept)") plus optional
  * detail breakdowns. Field naming mirrors the Rust struct (snake_case).
  */
 export interface UpdateSummary {
@@ -115,8 +175,15 @@ export interface UpdateSummary {
   /** Files whose installed content matched the prior-shipped manifest hash;
    *  now overwritten with the new shipped version. */
   overwritten: number;
-  /** Files where installed content diverged from the prior-shipped hash
-   *  (= user-modified). Preserved on disk; surfaced via the
+  /** User-modified files whose bytes were BACKED UP to
+   *  `.claude/backups/bundle-adoptions/<ts>/` before the shipped version was
+   *  written (the v0.2.84 adoption policy). This is the common outcome for a
+   *  divergent file; `preserved` is the rare fallback. The Rust struct has
+   *  always sent this — the toast simply never read it, so an adoption-only
+   *  update reported "no changes". */
+  adopted: number;
+  /** Files where installed content diverged and the backup could NOT be
+   *  written, so the user's copy was left in place. Rare. Surfaced via the
    *  `bundle_user_modified_preserved` deferral entry. */
   preserved: number;
   /** Files whose installed content already matches what we'd write. */
@@ -129,6 +196,17 @@ export interface UpdateSummary {
   /** Number of `errors[]` entries in the JSON envelope (per-file write
    *  failures). Each is also surfaced as a string in `warnings`. */
   errors_count: number;
+  /** True iff this run actually WROTE at least one file under `knowledge/**`
+   *  or `docs/**` — the Rust side's kg-sync spawn gate (v0.2.71 Piece 5b).
+   *  Only the change-CAUSING buckets set it; `noop`/`preserve` do not.
+   *
+   *  v0.2.92 (review MAJOR-10): the field has always been serialised
+   *  (`projects_v2.rs`, `#[serde(default)]`) and was the SECOND field this
+   *  interface dropped at the type boundary — the `adopted` fix closed one
+   *  instance of the class and left the neighbour open. `types/launcher.parity.test.ts`
+   *  now diffs the two declarations so a third instance fails a test instead
+   *  of shipping. */
+  kg_or_docs_content_changed: boolean;
 }
 
 /**
@@ -569,14 +647,22 @@ export interface KgSyncView {
   kg_total: number;
   kg_succeeded: number;
   kg_failed: number;
+  /** Intentional non-synces (archived / frontmarker / excluded /
+   *  embed-skipped) — v0.2.92 WP-B1 / D12. Live-event only: stored rows
+   *  report 0 (the DB has no such column). Treat as optional at use sites
+   *  so payloads from an older launcher binary still typecheck. */
+  kg_skipped?: number;
   /** Total `.md` files in docs/ (per the script's "📚 Found N" header). */
   docs_total: number;
   docs_succeeded: number;
   docs_failed: number;
+  /** Docs-side skip count — see `kg_skipped`. */
+  docs_skipped?: number;
   error_message: string | null;
   /** Last ~4 KiB of subprocess stdout/stderr — debugging aid. */
   log_tail: string | null;
-  /** Live phase indicator on `running` events ("scan" | "knowledge" | "docs" | "embed"). */
+  /** Live phase indicator on `running` events
+   *  ("scan" | "queued" | "embed" | "knowledge" | "docs" | "finalize"). */
   current_phase: string | null;
 }
 
@@ -697,4 +783,68 @@ export interface InstallHealth {
   mcp_servers_ok: boolean;
   /** True when every signal passes OR when in developer mode. */
   all_ok: boolean;
+}
+
+/* ─── Bundle-staleness census (v0.2.92 WP-D GUI half) ──────────────────────
+ *
+ * Mirrors `commands/bundle_staleness.rs` — the Tauri wrapper around the
+ * READ-ONLY `python -m vco_lib.bundle_staleness --json` census.
+ *
+ * The three-state verdict is load-bearing and must never be collapsed:
+ * `unknown` means "VCO could not prove this project's bundle state", which
+ * is NOT the same as `current` and NOT the same as `stale`. Likewise a
+ * census that could not RUN is reported with `determined: false` and a
+ * `summary` of `null` — never a zeroed summary, because "0 stale" and
+ * "I have no idea" must be distinguishable by every caller.
+ */
+
+/** Per-project verdict. Faithful mirror of the Python census verdicts. */
+export type BundleVerdict = 'current' | 'stale' | 'unknown';
+
+/** One project row of the census (Python §5.1 row shape, minus the
+ *  display-only `recorded` / `counts` blocks the chip does not use). */
+export interface BundleStalenessProject {
+  /** Launcher project id (`projects.id`). */
+  id: string;
+  name: string;
+  /** Resolved project folder, as the census saw it. */
+  folder: string;
+  verdict: BundleVerdict;
+  /** Machine reason: `noop` / `files_changed` / `folder_missing` /
+   *  `manifest_missing` / `manifest_unparseable` / `engine_error` /
+   *  `self_check_failed`. Renders as the chip's tooltip cause. */
+  reason: string;
+  /** Files a bundle update would change. Non-empty only when `stale`. */
+  changed_files: string[];
+  /** Count of user-modified files the update would preserve. */
+  user_modified: number;
+}
+
+/** Population counts. Present ONLY on a determined census. */
+export interface BundleStalenessSummary {
+  current: number;
+  stale: number;
+  unknown: number;
+}
+
+/** `bundle_staleness_census` command result. */
+export interface BundleStalenessCensus {
+  /** False when the census could not run at all (no interpreter, no
+   *  orchestrator root, non-zero exit, unparseable output, or a registry
+   *  the census could not read). When false, `summary` is null and
+   *  `projects` is empty — an explicit "could not determine", never
+   *  "everything is fine". */
+  determined: boolean;
+  /** Why the census could not be determined. Null when `determined`. */
+  error: string | null;
+  /** `launcher.db` on a determined census; the raw Python value (e.g.
+   *  `unavailable`) or null otherwise. */
+  registry: string | null;
+  /** Running orchestrator semver, for display next to the count. */
+  running_version: string | null;
+  projects: BundleStalenessProject[];
+  summary: BundleStalenessSummary | null;
+  /** Remedy strings echoed from the census (GUI path / CLI command). */
+  remedy_gui: string | null;
+  remedy_cli: string | null;
 }

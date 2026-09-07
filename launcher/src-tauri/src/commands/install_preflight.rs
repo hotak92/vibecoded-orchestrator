@@ -35,7 +35,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::services::runtime::{detect_runtime, invalidate_cache as invalidate_runtime_cache};
+use crate::services::runtime::{
+    detect_runtime, invalidate_cache as invalidate_runtime_cache, pinned_runtime, probe_runtime,
+    runtime_on_path,
+};
 
 /// Result of the install-pipeline preflight check.
 ///
@@ -62,6 +65,24 @@ pub struct RuntimeAvailability {
     /// unknown platforms or when a runtime IS already available (no link
     /// needed in the success case).
     pub install_url: Option<String>,
+    /// `VCT_CONTAINER_RUNTIME`, when it names a runtime (`auto` / empty /
+    /// unrecognised → `None`). v0.2.92 BLOCKER-4: a pin is honoured or
+    /// REFUSED, never swapped for the other runtime — podman and docker have
+    /// per-runtime named volumes, so driving the other one would bring the
+    /// stack up on an empty data plane.
+    pub pinned: Option<String>,
+    /// True when a pin is set and nothing resolved — i.e. the runtime the
+    /// user pinned is the one that is unusable. Lets the modal say "podman is
+    /// pinned but unusable" instead of the false "no container runtime is
+    /// installed" it used to show a user whose podman was merely stopped.
+    pub pinned_unusable: bool,
+    /// Whether the pinned runtime's binary is on PATH at all. Splits the two
+    /// remedies: `true` → start it; `false` → install it, or repin.
+    pub pinned_installed: bool,
+    /// The OTHER runtime, named only when it is usable and the pinned one is
+    /// not — the user's repin target. The launcher does NOT switch to it on
+    /// its own, for the same volume reason.
+    pub alternative_usable: Option<String>,
 }
 
 /// Resolve the canonical install URL for the current OS. Mirrors the
@@ -140,11 +161,31 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
         None
     };
 
+    // v0.2.92 BLOCKER-4: `detect_runtime` is strict about a pin, so `None`
+    // under a pin means "the runtime you pinned is unusable" — NOT "no
+    // container runtime is installed". Those are different sentences and
+    // different user actions, and the modal could not tell them apart.
+    let pinned = if info.is_none() { pinned_runtime() } else { None };
+    let pinned_installed = pinned.map(runtime_on_path).unwrap_or(false);
+    let alternative_usable = match pinned {
+        // Probe the runtime the user did NOT pin, so the modal can name the
+        // repin target. Only reached on the failure path, so no cost to the
+        // happy one.
+        Some(p) => probe_runtime(p.other())
+            .await
+            .map(|i| i.runtime.binary().to_string()),
+        None => None,
+    };
+
     Ok(RuntimeAvailability {
         available: info.is_some(),
         detected: info.map(|i| i.runtime.binary().to_string()),
         platform,
         install_url,
+        pinned: pinned.map(|p| p.binary().to_string()),
+        pinned_unusable: pinned.is_some(),
+        pinned_installed,
+        alternative_usable,
     })
 }
 
@@ -251,5 +292,21 @@ mod tests {
             "platform must be a known value, got: {}",
             r.platform
         );
+
+        // v0.2.92 BLOCKER-4 invariants, whichever branch the host is in.
+        if r.available {
+            // A resolved runtime is never reported as a refused pin.
+            assert!(r.pinned.is_none() && !r.pinned_unusable);
+            assert!(r.alternative_usable.is_none());
+        }
+        assert_eq!(r.pinned.is_some(), r.pinned_unusable);
+        if let Some(p) = r.pinned.as_deref() {
+            assert!(matches!(p, "podman" | "docker"));
+            // The alternative is never the pinned runtime itself — that is
+            // the swap the whole refusal exists to prevent.
+            assert_ne!(r.alternative_usable.as_deref(), Some(p));
+        } else {
+            assert!(!r.pinned_installed && r.alternative_usable.is_none());
+        }
     }
 }

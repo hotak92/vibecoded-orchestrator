@@ -77,10 +77,12 @@ DOCUMENTED_EXCLUSIONS: frozenset[str] = frozenset(
         # set; the primaries (EMBEDDING_MODEL / ACTIVE_EMBEDDING /
         # CODE_EMBED_MODEL) ARE listed and gate the reload. These legacy /
         # provider-specific spellings ride along and don't independently
-        # need to trip a reload.
+        # need to trip a reload. (TOKENIZER_MODEL was here until v0.2.92:
+        # D16 removed the chunker's chat-model tokenizer read — nothing in
+        # weaviate_mcp consumes that key anymore, so the exclusion entry
+        # went with it.)
         "LEGACY_TEXT_EMBEDDING_MODEL",
         "OPENAI_EMBEDDING_MODEL",
-        "TOKENIZER_MODEL",
         # Sidecar-format toggle: not search-routing config;
         # SHARED_KG_NODE_FORMATS controls sidecar summary loading (re-read
         # per query, no reload needed). (VCO_CODE_GRAPH_TEST_PENALTY and the

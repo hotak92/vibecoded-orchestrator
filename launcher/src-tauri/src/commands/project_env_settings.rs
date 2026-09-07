@@ -434,7 +434,7 @@ pub async fn get_project_active_embedding(
 /// every higher-priority source is empty):
 ///
 ///   1. `app_state[shared_kg.collection_name]` — explicit GUI override.
-///   2. `resolve_shared_kg_from_orchestrator_root(db)` — reads
+///   2. The orchestrator-root project's PRIMARY KG binding — reads
 ///      `project_kg_bindings(slug='orchestrator-root', role='primary').
 ///      collection_name`. This is the SOURCE OF TRUTH for the shared-KG
 ///      name on every machine where the orchestrator-root project is
@@ -444,6 +444,16 @@ pub async fn get_project_active_embedding(
 ///      a totally-fresh-fresh first boot before any project is created,
 ///      OR in tests with an empty in-memory DB. In production, callers
 ///      should essentially never see this value.
+///
+/// Legs 1+2 are NOT implemented here: they live in
+/// [`crate::commands::project_state_populate::shared_kg_binding::
+/// resolve_shared_kg_collection`], which is the single home for the
+/// DB-backed chain (v0.2.92 W12 wiring). This module owns only leg 3 —
+/// the reader-side last resort that turns that function's `None` into a
+/// name. That split is the whole point of the const: a WRITER must never
+/// materialise leg 3 into a binding row (see the W12 header in
+/// `shared_kg_binding.rs`), so the DB-backed resolver deliberately has no
+/// access to it.
 ///
 /// Must stay in lockstep with:
 ///   * `vco_lib/project_init.py::_SHARED_KG_NAME`
@@ -1022,13 +1032,18 @@ pub fn populate(
     // SHARED_KG_COLLECTION to be empty would break the read path too,
     // which the asymmetric-access model since 2026-05-01 explicitly
     // says must never be empty.
-    let shared_kg_collection = db
-        .app_state_get(APP_STATE_KEY_SHARED_KG_NAME)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .or_else(|| resolve_shared_kg_from_orchestrator_root(db))
-        .unwrap_or_else(|| LAST_RESORT_SHARED_KG_COLLECTION.to_string());
+    //
+    // v0.2.92 W12 (Task 3) — legs 1+2 are NOT re-implemented here. They live
+    // in `shared_kg_binding::resolve_shared_kg_collection`, the single home
+    // for the DB-backed chain; this call site adds ONLY leg 3, the
+    // reader-side last resort. Before the unification the same two legs were
+    // spelled out here and again in `shared_kg_binding` — two copies of a
+    // priority order that MUST agree, which is precisely the drift CLAUDE.md's
+    // "one concern, one home" rule exists to prevent.
+    let shared_kg_collection =
+        crate::commands::project_state_populate::shared_kg_binding::
+            resolve_shared_kg_collection(db)
+            .unwrap_or_else(|| LAST_RESORT_SHARED_KG_COLLECTION.to_string());
 
     let shared_kg_write_disabled = match project_id {
         Some(pid) => get_shared_kg_write_disabled(db, pid).unwrap_or(false),
@@ -1565,37 +1580,22 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
     (pairs, known_keys)
 }
 
-/// PR-9 (v0.2.11): resolve the shared KG collection name from the
-/// Orchestrator Project's primary `project_kg_bindings` entry.
-///
-/// Returns `Some(collection_name)` when:
-///   - the orchestrator-root project row exists in `projects` (migration
-///     013 has run AND `ensure_orchestrator_root` succeeded), AND
-///   - that row has a `project_kg_bindings` entry with `role='primary'`
-///     and a non-empty `collection_name`.
-///
-/// Returns `None` (so the caller falls through to
-/// `LAST_RESORT_SHARED_KG_COLLECTION`) when:
-///   - the row doesn't exist (standalone-binary install — no clone),
-///   - the binding isn't seeded yet (rare — happens between
-///     migration-013 run and the first `ensure_orchestrator_root` call),
-///   - any DB error (we treat as "not derivable" and let the caller use
-///     the safe fallback rather than crashing env resolution).
-///
-/// Soft-fail throughout. Never panics. The call site is on the hot path
-/// of every project env render, so we use the cheapest possible
-/// lookups (1 SELECT by slug + 1 SELECT bindings list).
-fn resolve_shared_kg_from_orchestrator_root(db: &Db) -> Option<String> {
-    use crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
-
-    let root_row = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG).ok().flatten()?;
-    let bindings = db.list_project_kg_bindings(&root_row.id).ok()?;
-    bindings
-        .into_iter()
-        .find(|b| b.role == "primary")
-        .map(|b| b.collection_name)
-        .filter(|s| !s.is_empty())
-}
+// v0.2.92 W12 (Task 3) — `resolve_shared_kg_from_orchestrator_root` USED TO
+// LIVE HERE (PR-9, v0.2.11). It was a private copy of legs 1+2 of the
+// shared-KG resolution chain; `shared_kg_binding::resolve_shared_kg_collection`
+// (v0.2.92 W12) was a second copy, written because this one was private and
+// unreachable from the new module. Two implementations of one priority order
+// is the duplication CLAUDE.md forbids, so the copies were collapsed onto the
+// `shared_kg_binding` one and this function deleted; `populate` now calls it
+// and appends `LAST_RESORT_SHARED_KG_COLLECTION` for its reader-side answer.
+//
+// A THIRD implementation survives on purpose in
+// `launcher/src-tauri/vct-hub/src/config_api.rs`: `vct-hub` is a separate
+// crate that depends only on `vct-launcher-core`, NOT on this binary crate,
+// so it cannot call this code at all. That boundary is real, not laziness —
+// it is pinned behaviourally instead, by the shared truth table in
+// `shared_kg_binding::tests::shared_resolution_truth_table` and its hub-side
+// twin `config_api::tests::shared_resolution_truth_table_matches_launcher`.
 
 /// W40-B (v0.2.40): decide whether a project's env files need
 /// regeneration based on binding-row freshness vs env-file mtime.

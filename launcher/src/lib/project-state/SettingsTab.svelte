@@ -19,7 +19,11 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { projects } from '$lib/stores/projects';
-  import type { ProjectView } from '$lib/types/launcher';
+  import type {
+    ProjectView,
+    RenameCollectionsPreview,
+    RenameCollectionsResult,
+  } from '$lib/types/launcher';
   import RegenerateOrDeferModal, {
     type StaleDerivedArtifact,
   } from '$lib/components/RegenerateOrDeferModal.svelte';
@@ -41,6 +45,64 @@
   // entries land in UPDATE_DEFERRED.md; this panel is where they read and
   // clear them without leaving the launcher.
   import DeferralLedgerPanel from '$lib/components/DeferralLedgerPanel.svelte';
+  // v0.2.92 WP-17 (W3) — change the project's folder. The picker helper is
+  // the shared one (browse-cancel is a silent no-op there, which is the
+  // behaviour this flow wants too).
+  import { pickDirectory } from '$lib/dialog';
+
+  // Move types are declared HERE rather than in `$lib/types/launcher.ts`
+  // because this is their only consumer today. The plan itself is produced by
+  // `MovePlan.to_json` in `vco_lib/project_move.py` and carried through Rust
+  // as an opaque JSON value on purpose — a mirrored Rust struct would be a
+  // third copy of a shape with one owner.
+  //
+  // W3 wrote "when W14's rename flow becomes a second consumer, these move to
+  // `$lib/types/launcher.ts` unchanged". W14 ARRIVED and did NOT become one:
+  // a collection rename carries CLASSES, not files, so it needs its own shape
+  // (`RenameCollectionsPreview`, imported above) rather than this one. Those
+  // types live in `$lib/types/launcher.ts` because they sit beside the
+  // existing `RenameProjectResult` there. These two stay local: still one
+  // consumer, so the trigger has not fired. Recorded rather than left as an
+  // open expectation, so the next reader does not go looking for a move that
+  // was correctly not made.
+  interface MovePlanConflict {
+    rel: string;
+    /** `identical` — the destination already has these exact bytes.
+     *  `divergent` — it has different bytes; the source's version lands as a
+     *  `.vco-moved` sibling and NOTHING is overwritten. */
+    kind: 'identical' | 'divergent';
+  }
+  interface MovePlanPreview {
+    src: string;
+    dst: string;
+    counts: {
+      bundle_clean: number;
+      user_modified: number;
+      user_adjacent: number;
+      to_copy: number;
+      conflicts_identical: number;
+      conflicts_divergent: number;
+    };
+    conflicts: MovePlanConflict[];
+    stays_in_old_folder: string[];
+    warnings: string[];
+  }
+  interface ChangeProjectPathResult {
+    ok: boolean;
+    /** Distinct machine key for a pre-commit refusal (`dst_not_empty`,
+     *  `dst_inside_registered_project`, …) so the UI can offer the right
+     *  next action rather than a generic error. */
+    refused: string | null;
+    error: string | null;
+    plan: MovePlanPreview | null;
+    pre_flip: unknown | null;
+    post_flip: unknown | null;
+    commit: unknown | null;
+    /** TRUE once the flip transaction landed. After this the UI must NOT say
+     *  "nothing changed" — the project HAS moved. */
+    committed: boolean;
+    warnings: string[];
+  }
 
   let { projectId }: { projectId: string } = $props();
 
@@ -300,6 +362,194 @@
     }
   }
 
+
+  // ── v0.2.92 WP-17 (W3): change the project's folder ────────────────────
+  //
+  // Two steps, never one. `preview_project_path_change` is read-only and
+  // ALWAYS runs first, because the one thing a move cannot do is ask
+  // afterwards: once files have landed at the destination and the row has
+  // flipped, "did you mean this?" is too late. The preview is where the user
+  // sees the conflict list, the copy counts, and the fact that the old folder
+  // is kept.
+  let moveTarget = $state('');
+
+  // ── Rename collections (v0.2.92 W14) ────────────────────────────────────
+  //
+  // The OTHER rename. `rename_project_v2` (the name field above) is
+  // identity-preserving by design: it changes the display name and the slug
+  // and every collection keeps its creation-time name. This panel is the
+  // explicitly consented operation that carries the DATA too.
+  //
+  // Preview → confirm, the same shape as the move panel, because the same
+  // property makes it safe: the user sees exactly which classes move and how
+  // many objects each holds BEFORE anything is written.
+  let renameTarget = $state('');
+  let renameBusy = $state(false);
+  let renamePreview = $state<RenameCollectionsPreview | null>(null);
+  let renameRefusal = $state<{ reason: string; error: string } | null>(null);
+  let renameResult = $state<RenameCollectionsResult | null>(null);
+
+  async function previewRenameCollections() {
+    if (!project || !renameTarget.trim()) return;
+    renameBusy = true;
+    renameRefusal = null;
+    renamePreview = null;
+    renameResult = null;
+    try {
+      const res = await invoke<RenameCollectionsResult>(
+        'rename_collections_v2',
+        {
+          id: project.id,
+          newName: renameTarget.trim(),
+          dryRun: true,
+        },
+      );
+      if (!res.ok) {
+        renameRefusal = {
+          reason: res.refused ?? 'unknown',
+          error: res.error ?? '',
+        };
+        return;
+      }
+      renamePreview = res.preview ?? null;
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      renameBusy = false;
+    }
+  }
+
+  async function confirmRenameCollections() {
+    if (!project || !renamePreview) return;
+    renameBusy = true;
+    try {
+      const res = await invoke<RenameCollectionsResult>(
+        'rename_collections_v2',
+        {
+          id: project.id,
+          newName: renameTarget.trim(),
+          dryRun: false,
+        },
+      );
+      renameResult = res;
+      if (res.ok) {
+        toast.success('Collections renamed — the previous classes were kept');
+        renamePreview = null;
+        await load();
+      } else {
+        // A refusal here means NOTHING was changed: every precondition is
+        // checked before the first object is copied, and the copy is verified
+        // before a single binding moves.
+        renameRefusal = {
+          reason: res.refused ?? 'unknown',
+          error: res.error ?? '',
+        };
+      }
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      renameBusy = false;
+    }
+  }
+
+  let movePreview = $state<MovePlanPreview | null>(null);
+  let moveRefusal = $state<{ reason: string; error: string } | null>(null);
+  let moveIntoExisting = $state(false);
+  let moveFromMissing = $state(false);
+  let moveBusy = $state(false);
+  let moveResult = $state<ChangeProjectPathResult | null>(null);
+
+  async function browseMoveTarget() {
+    const picked = await pickDirectory({
+      title: 'Choose the project’s new folder',
+      defaultPath: project?.folder_path,
+    });
+    // Browse-cancel is a silent no-op — clearing a path the user typed
+    // because they changed their mind about browsing would be hostile.
+    if (picked) {
+      moveTarget = picked;
+      movePreview = null;
+      moveRefusal = null;
+      moveResult = null;
+    }
+  }
+
+  async function previewMove() {
+    if (!project || !moveTarget.trim()) return;
+    moveBusy = true;
+    moveRefusal = null;
+    movePreview = null;
+    moveResult = null;
+    try {
+      const res = await invoke<ChangeProjectPathResult>(
+        'preview_project_path_change',
+        {
+          projectId: project.id,
+          newPath: moveTarget.trim(),
+          intoExisting: moveIntoExisting,
+          fromMissing: moveFromMissing,
+        },
+      );
+      if (!res.ok) {
+        moveRefusal = {
+          reason: res.refused ?? 'unknown',
+          error: res.error ?? '',
+        };
+        // `dst_not_empty` and `src_registered_path_missing` are the two
+        // refusals with a legitimate opt-in. Surfacing the checkbox only
+        // when its refusal actually fired keeps the default path free of
+        // switches whose consequences the user has no reason to think about.
+        return;
+      }
+      movePreview = res.plan ?? null;
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      moveBusy = false;
+    }
+  }
+
+  async function confirmMove() {
+    if (!project || !movePreview) return;
+    moveBusy = true;
+    try {
+      const res = await invoke<ChangeProjectPathResult>(
+        'change_project_path_v2',
+        {
+          projectId: project.id,
+          newPath: moveTarget.trim(),
+          intoExisting: moveIntoExisting,
+          fromMissing: moveFromMissing,
+          safeAdd: false,
+        },
+      );
+      moveResult = res;
+      if (res.ok) {
+        toast.success('Project folder changed');
+        movePreview = null;
+        await load();
+      } else if (res.committed) {
+        // The distinction the user needs most: the move DID happen and the
+        // follow-up did not. Saying "nothing changed" here would be the most
+        // expensive kind of wrong.
+        toast.error(
+          'The project moved, but the follow-up reconciliation did not ' +
+            'finish. Run: vco project move --verify --folder ' +
+            moveTarget.trim(),
+        );
+      } else {
+        toast.error(
+          (res.error ?? 'The move was refused.') +
+            ' Nothing changed — the project is still at its current folder.',
+        );
+      }
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      moveBusy = false;
+    }
+  }
+
   onMount(load);
   // Re-load when the embedding page swaps projectId (rare — the project
   // page already remounts the tab, but keep the effect for safety).
@@ -338,13 +588,231 @@
     </section>
 
     <section class="ps-section">
+      <h2>Project folder</h2>
+      <p class="ps-hint">
+        Move this project's registration to a different folder. VCO copies what
+        it manages plus your VCO-adjacent files (<code>knowledge/</code>,
+        <code>.claude/context/</code>, disabled agents and skills, files you
+        edited) and re-creates the rest there.
+        <strong>Nothing at the destination is ever overwritten</strong> — a file
+        that differs lands beside it as a <code>.vco-moved</code> sibling with a
+        ledger entry — and
+        <strong>the old folder is never deleted</strong>. Your project's own
+        source, <code>.git</code> and <code>.env</code> stay where they are;
+        move those yourself.
+      </p>
+      <p class="ps-hint">
+        The project keeps its identity: collection names, the code-graph prefix
+        and the slug do not change. Only where it lives does.
+      </p>
+      <div class="ps-move-row">
+        <input
+          bind:value={moveTarget}
+          placeholder="Absolute path of the new folder"
+          aria-label="New project folder"
+          onchange={() => {
+            movePreview = null;
+            moveRefusal = null;
+          }}
+        />
+        <button class="ps-btn" onclick={browseMoveTarget} disabled={moveBusy}>
+          Browse…
+        </button>
+        <button
+          class="ps-btn"
+          onclick={previewMove}
+          disabled={moveBusy || !moveTarget.trim()}
+        >
+          {moveBusy ? 'Checking…' : 'Preview move'}
+        </button>
+      </div>
+
+      {#if moveRefusal}
+        <div class="ps-move-refusal">
+          <p><strong>Cannot move there:</strong> {moveRefusal.error}</p>
+          {#if moveRefusal.reason === 'dst_not_empty'}
+            <label class="ps-move-opt">
+              <input type="checkbox" bind:checked={moveIntoExisting} />
+              That folder already has my project in it — move into it anyway
+              (existing files are still never overwritten)
+            </label>
+          {/if}
+          {#if moveRefusal.reason === 'src_registered_path_missing'}
+            <label class="ps-move-opt">
+              <input type="checkbox" bind:checked={moveFromMissing} />
+              The current folder is gone — just re-point the registration
+              (nothing can be copied)
+            </label>
+          {/if}
+        </div>
+      {/if}
+
+      {#if movePreview}
+        <div class="ps-move-preview">
+          <p>
+            <code>{movePreview.src}</code> → <code>{movePreview.dst}</code>
+          </p>
+          <ul>
+            <li>{movePreview.counts.to_copy} file(s) copied</li>
+            <li>
+              {movePreview.counts.bundle_clean} unmodified bundle file(s) re-created
+              at the destination instead of copied
+            </li>
+            <li>
+              {movePreview.counts.conflicts_identical} already identical there
+            </li>
+            <li>
+              <strong
+                >{movePreview.counts.conflicts_divergent} differ there</strong
+              >
+              — those land beside the existing file as
+              <code>.vco-moved</code> siblings, one ledger entry each
+            </li>
+          </ul>
+          {#if movePreview.conflicts.some((c) => c.kind === 'divergent')}
+            <details>
+              <summary>Show the files that differ</summary>
+              <ul class="ps-move-conflicts">
+                {#each movePreview.conflicts.filter((c) => c.kind === 'divergent') as c (c.rel)}
+                  <li><code>{c.rel}</code></li>
+                {/each}
+              </ul>
+            </details>
+          {/if}
+          {#each movePreview.warnings as w (w)}
+            <p class="ps-move-warn">{w}</p>
+          {/each}
+          <p class="ps-hint">
+            Claude Code keeps its per-project memory and transcripts keyed to
+            the OLD path. They do not follow a move; the summary afterwards
+            gives you the copy command.
+          </p>
+          <button
+            class="ps-btn-primary"
+            onclick={confirmMove}
+            disabled={moveBusy}
+          >
+            {moveBusy ? 'Moving…' : 'Move project'}
+          </button>
+        </div>
+      {/if}
+
+      {#if moveResult && moveResult.warnings.length > 0}
+        <ul class="ps-move-conflicts">
+          {#each moveResult.warnings as w (w)}
+            <li>{w}</li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+    <section class="ps-card">
+      <h3>Rename collections</h3>
+      <p class="ps-hint">
+        Renaming a project above changes only its display name — its Weaviate
+        collections keep the names they were created with, on purpose. This
+        does the other half: it gives the project a new name
+        <em>and carries every object</em>, with its vectors, to the class names
+        that name derives. Nothing is re-embedded.
+      </p>
+      <p class="ps-hint">
+        <strong>The previous classes are never dropped.</strong> They keep every
+        object; afterwards the project's ledger records the one guarded command
+        that retires them, which re-checks at that moment that nothing is still
+        bound to them and that the replacement still holds the data.
+      </p>
+      <div class="ps-move-row">
+        <input
+          bind:value={renameTarget}
+          placeholder="New project name"
+          aria-label="New project name"
+          onchange={() => {
+            renamePreview = null;
+            renameRefusal = null;
+          }}
+        />
+        <button
+          class="ps-btn"
+          onclick={previewRenameCollections}
+          disabled={renameBusy || !renameTarget.trim()}
+        >
+          {renameBusy ? 'Checking…' : 'Preview rename'}
+        </button>
+      </div>
+
+      {#if renameRefusal}
+        <div class="ps-move-refusal">
+          <p><strong>Cannot rename:</strong> {renameRefusal.error}</p>
+          <p class="ps-hint">
+            Nothing was changed. Every precondition is checked before the first
+            object is copied, and the copy is verified before a single binding
+            moves.
+          </p>
+        </div>
+      {/if}
+
+      {#if renamePreview}
+        <div class="ps-move-preview">
+          <p>
+            <code>{renamePreview.project_name}</code> →
+            <code>{renamePreview.new_name}</code>
+          </p>
+          <ul class="ps-move-conflicts">
+            {#each renamePreview.moves.filter((m) => m.action !== 'noop') as m (m.src)}
+              <li>
+                <code>{m.src}</code> → <code>{m.dst}</code>
+                {#if m.action === 'copy'}
+                  — {m.src_count} object(s), copied with their vectors
+                {:else if m.action === 'source-absent'}
+                  — <strong>this class does not exist</strong>; no data is
+                  carried and the destination is created so the new binding
+                  names something real
+                {:else if m.action === 'resume'}
+                  — resuming an interrupted rename
+                {:else}
+                  — empty
+                {/if}
+              </li>
+            {/each}
+          </ul>
+          <p>
+            <strong>{renamePreview.carried_objects} object(s)</strong> carried in
+            total. Kept, not dropped:
+            <code>{renamePreview.retired_classes.join(', ')}</code>
+          </p>
+          {#each renamePreview.warnings as w (w)}
+            <p class="ps-move-warn">{w}</p>
+          {/each}
+          <button
+            class="ps-btn-primary"
+            onclick={confirmRenameCollections}
+            disabled={renameBusy}
+          >
+            {renameBusy ? 'Carrying collections…' : 'Rename and carry the data'}
+          </button>
+        </div>
+      {/if}
+
+      {#if renameResult?.ok}
+        <p class="ps-hint">
+          Done. The previous classes are still there — see this project's
+          ledger below for the guarded command that retires them.
+        </p>
+      {/if}
+    </section>
+
+
+    <section class="ps-section">
       <h2>Bundle</h2>
       <p class="ps-hint">
         Re-run the per-project bundle install to pick up newly-shipped orchestrator files
-        (hooks, scripts, agents, skills, infrastructure) WITHOUT overwriting your
-        customizations. Files you've edited are preserved and listed in
-        <code>.claude/context/UPDATE_DEFERRED.md</code> with a
-        <code>bundle_user_modified_preserved</code> entry. If your
+        (hooks, scripts, agents, skills, infrastructure). Your knowledge notes
+        under <code>knowledge/</code> are never overwritten. For other files you
+        have edited, your version is <strong>backed up</strong> to
+        <code>.claude/backups/bundle-adoptions/&lt;timestamp&gt;/</code> and the
+        shipped version is then written, so your edit stays recoverable but is
+        not what runs. If a backup cannot be written, your file is left in place
+        instead and listed in <code>.claude/context/UPDATE_DEFERRED.md</code>
+        with a <code>bundle_user_modified_preserved</code> entry. If your
         <code>.claude</code> (or <code>.claude/agents</code>) is a symlink, new
         content is parked at <code>.vco-new</code> siblings and listed under a
         <code>symlink_preserved_under_install_path</code> entry instead. The
@@ -510,6 +978,47 @@
   }
   .ps-btn-link { background: none; border: none; color: #f99; cursor: pointer; font-size: 11px; padding: 0; }
   .ps-btn-link:hover { text-decoration: underline; }
+
+  /* v0.2.92 WP-17 — the move flow. Preview-then-confirm, so the preview
+     block is visually distinct from the input row that produced it. */
+  .ps-move-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .ps-move-row input {
+    flex: 1 1 24rem;
+    min-width: 16rem;
+  }
+  .ps-move-refusal {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    border: 1px solid var(--danger, #b23);
+    border-radius: 6px;
+  }
+  .ps-move-opt {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+    margin-top: 0.5rem;
+    font-size: 0.9em;
+  }
+  .ps-move-preview {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    border: 1px solid var(--border, #444);
+    border-radius: 6px;
+  }
+  .ps-move-warn {
+    font-size: 0.9em;
+    opacity: 0.85;
+  }
+  .ps-move-conflicts {
+    max-height: 12rem;
+    overflow-y: auto;
+    font-size: 0.85em;
+  }
 
   /* Danger zone — distinct red border + dark accent so it doesn't look
      like just another section. Mirrors the GitHub "Danger zone" pattern. */

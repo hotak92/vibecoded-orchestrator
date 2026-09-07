@@ -190,6 +190,68 @@ class OrphanDetectionTests(unittest.TestCase):
             f"expected a retire auto-resolution row; got {parsed}",
         )
 
+    def test_orphan_whole_skill_dir_is_pruned_not_left_empty(self):
+        """v0.2.92 delivery audit m1: when upstream deletes an ENTIRE skill
+        (`templates/skills/architect/`), the update must not leave the empty
+        `.claude/skills/architect/` directory behind. Observed live in the
+        audit's scratch install (rc-native). The prune walks up while dirs
+        are empty and stops at the first non-empty ancestor."""
+        skill_dir = self.proj / ".claude" / "skills" / "architect"
+        self.assertTrue((skill_dir / "SKILL.md").exists(),
+                        "first install should have written the skill")
+
+        # Upstream drops the whole skill directory.
+        import shutil
+        shutil.rmtree(str(self.orch / "templates" / "skills" / "architect"))
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        self.assertEqual(result["errors"], [])
+        for rel in (
+            str(Path(".claude") / "skills" / "architect" / "SKILL.md"),
+            str(Path(".claude") / "skills" / "architect" / "extra.txt"),
+        ):
+            self.assertIn(rel, result["actions"]["orphan-deleted"], rel)
+        self.assertFalse(
+            skill_dir.exists(),
+            "empty skill directory must be pruned with its orphaned files",
+        )
+
+    def test_orphan_prune_stops_at_non_empty_ancestors(self):
+        """The prune never removes a directory that still has content —
+        deleting ONE file from a multi-file directory must leave the
+        directory (and every fuller ancestor) in place. rmdir-only-empty
+        is the safety property; this pins it against a future
+        `shutil.rmtree`-style regression."""
+        # Delete only extra.txt upstream; SKILL.md keeps shipping.
+        (self.orch / "templates" / "skills" / "architect" / "extra.txt").unlink()
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        rel = str(Path(".claude") / "skills" / "architect" / "extra.txt")
+        self.assertIn(rel, result["actions"]["orphan-deleted"])
+        skill_dir = self.proj / ".claude" / "skills" / "architect"
+        self.assertTrue(
+            (skill_dir / "SKILL.md").exists(),
+            "still-shipped file must survive",
+        )
+        self.assertTrue(skill_dir.is_dir(), "non-empty directory must stay")
+        # And a user file in the directory blocks the prune of that dir.
+        (self.orch / "templates" / "skills" / "architect" / "SKILL.md").unlink()
+        keep = self.proj / ".claude" / "skills" / "architect" / "user-notes.md"
+        keep.write_text("# user content\n", encoding="utf-8")
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        rel2 = str(Path(".claude") / "skills" / "architect" / "SKILL.md")
+        self.assertIn(rel2, result["actions"]["orphan-deleted"])
+        self.assertTrue(
+            keep.exists() and skill_dir.is_dir(),
+            "a directory holding a user file must never be pruned",
+        )
+
     def test_orphan_missing_on_disk_is_silently_dropped(self):
         """If the prior manifest mentions a file the user already
         deleted from disk (e.g. via a manual `rm` between installs),

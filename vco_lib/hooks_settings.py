@@ -22,7 +22,7 @@ module is that edit, and it is deliberately the ONLY implementation:
   the canonical on-disk form (``json.dumps(..., indent=2)`` + trailing
   newline) is *their* output. A Rust writer would be a second home for
   that shape knowledge, and the drift that produces is already documented
-  in :mod:`vco_lib.settings_merge`'s docstring for the install.py /
+  in :func:`vco_lib.project_init._merge_settings_template_for_bundle` for the install.py /
   project_init.py pair. The launcher calls this module as
   ``python -m vco_lib.hooks_settings`` over the RT-4 interpreter ladder
   (``python_resolve::resolve_python_for_vco_lib``) — the same shape

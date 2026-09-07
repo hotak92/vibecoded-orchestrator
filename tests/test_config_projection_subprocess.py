@@ -40,12 +40,14 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests.common.child_env import child_env
+from tests.common.launcher_db_fixture import make_launcher_db
 
 
 # ─── Fixtures ───────────────────────────────────────────────────────────
@@ -61,65 +63,27 @@ def launcher_db_with_project(tmp_path: Path) -> tuple[Path, str, Path]:
     project_folder = tmp_path / "MyProject"
     project_folder.mkdir()
 
-    db_path = tmp_path / "launcher.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            slug TEXT
-        );
-        CREATE TABLE project_kg_bindings (
-            project_id TEXT,
-            role TEXT,
-            collection_name TEXT
-        );
-        CREATE TABLE kg_collection_access (
-            project_id TEXT,
-            collection_name TEXT,
-            access_level TEXT
-        );
-        CREATE TABLE codegraph_access (
-            grantee_project_id TEXT,
-            grantor_project_id TEXT,
-            access_level TEXT
-        );
-        CREATE TABLE module_settings (
-            project_id TEXT,
-            module_id TEXT,
-            setting_key TEXT,
-            setting_value TEXT
-        );
-        """
-    )
+    # Real launcher schema (shipped migrations applied verbatim) — v0.2.92
+    # §3.4. The hand-rolled DDL this replaces declared five tables with
+    # nullable everything, so it could not have caught a NOT NULL / CHECK
+    # violation the launcher's own writer would hit.
     project_id = "proj-subproc-1"
-    conn.execute(
-        "INSERT INTO projects VALUES (?, ?, ?, ?)",
-        (project_id, "MyProject", str(project_folder), "myproject"),
+    db_path = make_launcher_db(
+        tmp_path / "launcher.db",
+        projects=[{
+            "project_id": project_id,
+            "name": "MyProject",
+            "folder_path": str(project_folder),
+            "slug": "myproject",
+            "kg_primary": "MyProject_KnowledgeGraph",
+            "kg_shared": "VibeCodedOrchestrator_KnowledgeGraph",
+            "kg_extra_roles": {"archive": "MyProject_Development"},
+        }],
     )
-    conn.execute(
-        "INSERT INTO project_kg_bindings VALUES (?, ?, ?)",
-        (project_id, "primary", "MyProject_KnowledgeGraph"),
-    )
-    conn.execute(
-        "INSERT INTO project_kg_bindings VALUES (?, ?, ?)",
-        (project_id, "archive", "MyProject_Development"),
-    )
-    conn.execute(
-        "INSERT INTO project_kg_bindings VALUES (?, ?, ?)",
-        (project_id, "shared", "VibeCodedOrchestrator_KnowledgeGraph"),
-    )
-    conn.commit()
-    conn.close()
     return db_path, project_id, project_folder
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
-
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run_apply_cli(
@@ -139,21 +103,18 @@ def _run_apply_cli(
       * cwd = project_folder when supplied
       * 30 s timeout
     """
-    env = {
+    # Deliberately MINIMAL base env (that is the Rust caller's shape), then
+    # child_env() pins the repo root first on PYTHONPATH so the child imports
+    # the checkout's vco_lib rather than a stale site-packages copy (§3.16).
+    base = {
         "PATH": os.environ.get("PATH", ""),
         "VCT_STATE_DIR": str(db_path.parent),
-        # PYTHONPATH so the test environment can find vco_lib without
-        # needing it pip-installed. The Rust path relies on the
-        # interpreter's venv having vco_lib reachable via the
-        # orchestrator clone's directory structure.
-        "PYTHONPATH": str(REPO_ROOT),
     }
     # Pass HOME so the launcher DB fallback (~/.vct/launcher.db) doesn't
     # resolve to a system path the test can't write to.
     if sys.platform != "win32" and "HOME" in os.environ:
-        env["HOME"] = os.environ["HOME"]
-    if extra_env:
-        env.update(extra_env)
+        base["HOME"] = os.environ["HOME"]
+    env = child_env(base, **(extra_env or {}))
 
     return subprocess.run(
         [
@@ -239,13 +200,13 @@ def test_subprocess_apply_exit_code_db_unreachable(tmp_path: Path) -> None:
     folder = tmp_path / "MyProject"
     folder.mkdir()
 
-    env = {
+    base = {
         "PATH": os.environ.get("PATH", ""),
         "VCT_STATE_DIR": str(empty_dir),
-        "PYTHONPATH": str(REPO_ROOT),
     }
     if sys.platform != "win32" and "HOME" in os.environ:
-        env["HOME"] = os.environ["HOME"]
+        base["HOME"] = os.environ["HOME"]
+    env = child_env(base)
     result = subprocess.run(
         [sys.executable, "-m", "vco_lib.config_projection", "apply",
          "--project-id", "any-id"],
@@ -277,11 +238,10 @@ def test_subprocess_apply_respects_vct_state_dir(
     # Second: WITHOUT VCT_STATE_DIR, also point HOME away from any real
     # ~/.vct/launcher.db so the fallback can't find a DB. The CLI must
     # fail with db_unreachable.
-    env = {
+    env = child_env({
         "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": str(REPO_ROOT),
         "HOME": str(folder),  # not a real HOME; ~/.vct/launcher.db won't exist
-    }
+    })
     result = subprocess.run(
         [sys.executable, "-m", "vco_lib.config_projection", "apply",
          "--project-id", project_id],

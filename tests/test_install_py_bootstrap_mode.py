@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PY = REPO_ROOT / "install.py"
 
@@ -40,7 +42,7 @@ def _run_install(args: list[str], *, timeout: int = 60) -> subprocess.CompletedP
     env.pop("ANTHROPIC_API_KEY", None)
     return subprocess.run(
         [sys.executable, str(INSTALL_PY), *args],
-        capture_output=True, text=True, timeout=timeout, env=env,
+        capture_output=True, text=True, timeout=timeout, env=child_env(env),
     )
 
 
