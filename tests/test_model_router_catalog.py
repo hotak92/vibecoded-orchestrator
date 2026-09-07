@@ -100,7 +100,10 @@ class StaticSnapshotTests(unittest.TestCase):
         """A snapshot id with no seed row would be advertised with the client's
         conservative default; a seed row with no snapshot id would be a
         citation for a model the fallback never offers."""
-        seed_ids = set(load_seed().rows)
+        # Only the vendor's rows: the seed also carries first-party Claude
+        # rows for the settings writer's [1m] decoration, and those are not
+        # part of any vendor's fallback catalog.
+        seed_ids = {mid for mid, row in load_seed().rows.items() if row.vendor == "zai"}
         snapshot_ids = {
             row["id"] for row in self.payload["families"]["zai"]["models"]
         }

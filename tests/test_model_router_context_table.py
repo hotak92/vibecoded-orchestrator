@@ -31,14 +31,34 @@ from pathlib import Path
 
 from model_router import context_table as ct
 
-#: The ten rows the shipped seed must carry, and nothing else.
-EXPECTED_SEED_IDS = {
+#: The ten vendor rows the shipped seed must carry.
+EXPECTED_VENDOR_SEED_IDS = {
     "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5",
     "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
 }
 
+#: The first-party rows. They exist for ONE reader —
+#: ``vco_lib.vscode_settings.decorate_1m`` — so a slot/default naming a 1M
+#: Claude model carries the client's own ``[1m]`` hint (a plain id is
+#: assumed 200K; field symptom: "0% context remaining" right after
+#: compaction). The gateway's ``/v1/models`` never reads them: first-party
+#: ids are published verbatim (pinned below).
+EXPECTED_CLAUDE_SEED_IDS = {
+    "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+}
+
+#: The seed, and nothing else.
+EXPECTED_SEED_IDS = EXPECTED_VENDOR_SEED_IDS | EXPECTED_CLAUDE_SEED_IDS
+
 #: Exactly the models whose official page states a 1M window.
-EXPECTED_1M_IDS = {"glm-5.3", "glm-5.3-flash", "glm-5.2"}
+EXPECTED_1M_IDS = {"glm-5.3", "glm-5.3-flash", "glm-5.2"} | EXPECTED_CLAUDE_SEED_IDS
+
+#: Official documentation host per vendor id. A citation anywhere else is
+#: not a vendor page.
+OFFICIAL_DOC_PREFIX = {
+    "zai": "https://docs.z.ai/",
+    "anthropic": "https://docs.anthropic.com",
+}
 
 
 class SeedTests(unittest.TestCase):
@@ -50,17 +70,19 @@ class SeedTests(unittest.TestCase):
         self.assertTrue(ct.SEED_PATH.is_file(), ct.SEED_PATH)
         self.assertEqual(ct.SEED_PATH.parent.name, "model_router")
 
-    def test_seed_has_exactly_the_ten_documented_rows(self) -> None:
+    def test_seed_has_exactly_the_documented_rows(self) -> None:
         self.assertEqual(set(self.seed.rows), EXPECTED_SEED_IDS)
 
     def test_every_seed_row_cites_an_official_vendor_page(self) -> None:
         """A row without a citation is a test failure, not a data choice."""
         for model_id, row in self.seed.rows.items():
             with self.subTest(model=model_id):
+                prefix = OFFICIAL_DOC_PREFIX.get(row.vendor)
+                self.assertIsNotNone(prefix, f"{model_id}: unknown vendor {row.vendor!r}")
                 self.assertTrue(
-                    row.source.startswith("https://docs.z.ai/"),
+                    row.source.startswith(prefix or "\0"),
                     f"{model_id} cites {row.source!r}, which is not an official "
-                    "vendor documentation URL",
+                    f"{row.vendor} documentation URL",
                 )
 
     def test_no_seed_row_was_dropped_for_lack_of_a_citation(self) -> None:
@@ -91,18 +113,70 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(self.seed.rows["glm-5.2"].context_window, 1_000_000)
         self.assertEqual(self.seed.rows["glm-5.1"].context_window, 200_000)
 
-    def test_no_claude_family_row(self) -> None:
-        """The client knows first-party windows natively; a row here could
-        only disagree with it."""
-        for model_id in self.seed.rows:
-            self.assertNotIn("claude", model_id.lower())
+    def test_claude_rows_are_first_party_and_1m(self) -> None:
+        """The Claude 5 rows exist so ``vco_lib.vscode_settings.decorate_1m``
+        can append the client's own ``[1m]`` hint to a slot/default naming
+        one of them. Every such row is vendor ``anthropic`` and 1M; every
+        other ``claude``-named id is deliberately absent (the client knows
+        the older families' windows natively, and a row could only disagree
+        with it)."""
+        from model_router.vendors import ANTHROPIC_FAMILY
+
+        claude_rows = {mid for mid in self.seed.rows if "claude" in mid.lower()}
+        self.assertEqual(claude_rows, EXPECTED_CLAUDE_SEED_IDS)
+        for model_id in claude_rows:
+            row = self.seed.rows[model_id]
+            with self.subTest(model=model_id):
+                self.assertEqual(row.vendor, ANTHROPIC_FAMILY.family_id)
+                self.assertTrue(row.window_1m)
+                self.assertEqual(row.context_window, 1_000_000)
+
+    def test_claude_rows_never_reach_the_gateway_catalog(self) -> None:
+        """The gateway publishes first-party ids VERBATIM; the ``[1m]``
+        decision is applied to VENDOR entries only. A Claude row in the seed
+        must therefore not change what ``/v1/models`` advertises. Driven
+        through the real ``CatalogService.union`` with the real seed's
+        ``advertise_1m``, so a refactor that routes first-party entries
+        through the table reds here rather than in the field."""
+        import asyncio
+
+        from model_router import catalog as cat
+        from model_router.vendors import ANTHROPIC_FAMILY, VENDORS
+
+        seed = self.seed
+        assert seed.advertise_1m("claude-opus-5"), "precondition: the seed row is 1M"
+
+        async def fetch(url, _headers):
+            if ANTHROPIC_FAMILY.upstream in url:
+                return {"data": [{"id": "claude-opus-5", "display_name": "Opus 5"}]}
+            return {"data": [{"id": "glm-5.3", "display_name": "GLM-5.3"}]}
+
+        async def vendor_key(_vendor):
+            return "key"
+
+        service = cat.CatalogService(
+            vendors=dict(VENDORS),
+            anthropic=ANTHROPIC_FAMILY,
+            fetch_json=fetch,
+            oauth_token=lambda: "tok",
+            vendor_key=vendor_key,
+            live_ttl_s=3600,
+            static_ttl_s=60,
+            clock=lambda: 100.0,
+        )
+        entries, _ = asyncio.run(service.union(advertise_1m=seed.advertise_1m))
+        ids = {e.id for e in entries}
+        self.assertIn("claude-opus-5", ids, "first-party id published verbatim")
+        self.assertNotIn("claude-opus-5[1m]", ids, "the seed row must not decorate it")
+        self.assertIn("claude-gw/glm-5.3[1m]", ids, "the vendor row still does")
 
     def test_every_row_names_a_vendor_that_exists(self) -> None:
-        from model_router.vendors import VENDORS
+        from model_router.vendors import ANTHROPIC_FAMILY, VENDORS
 
+        known = set(VENDORS) | {ANTHROPIC_FAMILY.family_id}
         for model_id, row in self.seed.rows.items():
             with self.subTest(model=model_id):
-                self.assertIn(row.vendor, VENDORS)
+                self.assertIn(row.vendor, known)
 
 
 class ExactLookupTests(unittest.TestCase):

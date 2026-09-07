@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-09-02T00:00:00Z",
+  "generated_at": "2026-09-07T00:00:00Z",
   "source": "shipped-seed",
-  "_comment": "Seed for the chat-model context table. Keys are FULL model ids, never family wildcards: glm-5.2 has a 1M window while glm-5.1 has 200K, so a 'glm-5*' pattern would misreport by 5x. Every row cites the official vendor page it was read from; a row without a citation is a test failure, not a data choice (tests/test_model_router_context_table.py). Claude-family ids are deliberately absent — Claude Code knows their windows natively. Window/output figures are the vendor's own decimal-K figures, not powers of two. This file is the FALLBACK: the launcher exports a user-editable table to <vct_root>/model-gateway/chat_model_context.json, and that export wins when present.",
+  "_comment": "Seed for the chat-model context table. Keys are FULL model ids, never family wildcards: glm-5.2 has a 1M window while glm-5.1 has 200K, so a 'glm-5*' pattern would misreport by 5x. Every row cites the official vendor page it was read from; a row without a citation is a test failure, not a data choice (tests/test_model_router_context_table.py). Claude-family rows (vendor 'anthropic') are here for ONE consumer: vco_lib.vscode_settings.decorate_1m, which appends Claude Code's own '[1m]' context hint to a slot/default value naming a 1M model — the client assumes 200K for a plain id like claude-fable-5-1 (field symptom: '0% context remaining' right after compaction). The gateway's /v1/models does NOT read these rows: first-party ids are published verbatim (model_router.catalog.CatalogService.union). Window/output figures are the vendor's own decimal-K figures, not powers of two. This file is the FALLBACK: the launcher exports a user-editable table to <vct_root>/model-gateway/chat_model_context.json, and that export wins when present.",
   "models": {
     "glm-5.3": {
       "vendor": "zai",
@@ -75,6 +75,38 @@
       "window_1m": false,
       "source": "https://docs.z.ai/guides/llm/glm-4.5",
       "source_note": "This model has no page of its own (https://docs.z.ai/guides/llm/glm-4.5-air returns 404); its specification sits on the GLM-4.5 card, which is what the cited URL is. Third-party listings of a 1M variant of this model are NOT official and are deliberately not reflected here."
+    },
+    "claude-fable-5-1": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.anthropic.com",
+      "source_note": "First-party row; read only by vco_lib.vscode_settings.decorate_1m so a slot/default naming this model carries the client's own [1m] hint. Not advertised by the gateway (first-party ids are published verbatim)."
+    },
+    "claude-fable-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.anthropic.com",
+      "source_note": "First-party row; see claude-fable-5-1."
+    },
+    "claude-opus-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.anthropic.com",
+      "source_note": "First-party row; see claude-fable-5-1."
+    },
+    "claude-sonnet-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.anthropic.com",
+      "source_note": "First-party row; see claude-fable-5-1."
     }
   }
 }

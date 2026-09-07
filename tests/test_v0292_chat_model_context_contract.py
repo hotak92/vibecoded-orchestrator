@@ -249,7 +249,9 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
             )
             self.assertEqual(table.path, path)
             self.assertEqual(table.uncited, ())
-            self.assertEqual(len(table.rows), 10)
+            # Ten cited vendor rows + the four first-party Claude 5 rows
+            # (pinned in tests/test_model_router_context_table.py).
+            self.assertEqual(len(table.rows), 14)
 
     def test_the_one_m_decisions_survive_the_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

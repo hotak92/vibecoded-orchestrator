@@ -78,6 +78,40 @@ exactly one operation, and the boundary is hard:
 table is unavailable or unreadable — this module runs at session startup
 and must never be the reason a session fails to start.
 
+The two-state mode switch — ``multimodel`` <-> ``remote-control``
+------------------------------------------------------------------
+Claude Code's Remote Control (phone / claude.ai control of this machine) is
+ENDPOINT-GATED: from 2.1.196 the client refuses to start it whenever
+``ANTHROPIC_BASE_URL`` is anything but api.anthropic.com, claude.ai login or
+not. And because ``claudeCode.environmentVariables`` is machine-scoped there
+is no per-workspace split. So the user gets exactly one of the two at a
+time, and :func:`set_mode` is the switch:
+
+* ``remote-control`` — remove the four routing keys and the login-prompt
+  key (what :func:`reset_native` does) but KEEP the rest of the env block:
+  the user's other keys, and every ``ANTHROPIC_MODEL`` / tier / subagent
+  value that names a model the stock client can resolve (a real Claude id).
+  Only values that CANNOT resolve natively — ``claude-gw/<id>`` names, or
+  ids the context table attributes to a third-party vendor — are dropped,
+  and they are STASHED (with the routing key NAMES; never the token or the
+  api-key value, which are re-derived from the gateway's token file on the
+  way back) in ``<vct_root>/model-gateway/vscode-mode-stash.json`` (0600).
+* ``multimodel`` — :func:`point_at_gateway` with the stashed model and slot
+  values put back, then the stash is cleared. A missing stash is a plain
+  point.
+
+Restoring a stashed slot value is the ONE case in which this module writes
+a tier/subagent key, and it is not an exception to the NEVER-write rule so
+much as its corollary: the value is the user's own, made in their file and
+taken out of it by the other leg of the same switch. It is put back
+verbatim (plus the ``[1m]`` decoration below), only into the file it was
+taken from, and only for the ``ANTHROPIC_MODEL`` / slot keys — a stash
+cannot inject a routing key or any other name into the env block.
+
+Both legs are idempotent: re-applying the current mode changes nothing and
+leaves the stash exactly as it was, so a second click cannot destroy the
+choices the first one saved.
+
 Merge, never replace
 --------------------
 :func:`point_at_gateway` carries forward every key it does not itself write
@@ -236,6 +270,34 @@ ENV_TOKEN = "VCT_GW_TMP_TOKEN"
 #: absolute ``settings.json`` paths. For portable installs, ``--user-data-dir``
 #: setups and any VS Code variant this module does not know by name.
 ENV_TARGET_OVERRIDE = "VCT_VSCODE_SETTINGS_FILES"
+
+#: The two states of the switch, plus the two a probe can report but the
+#: switch never writes.
+MODE_MULTIMODEL = "multimodel"
+MODE_REMOTE_CONTROL = "remote-control"
+MODE_UNMANAGED = "unmanaged"
+MODE_UNPARSEABLE = "unparseable"
+MODES = (MODE_MULTIMODEL, MODE_REMOTE_CONTROL)
+
+#: ``vendor`` value of a first-party (Claude) row in the chat-model context
+#: table. Duplicated from ``model_router.vendors.ANTHROPIC_FAMILY.family_id``
+#: for the same reason as the port and the namespace above; pinned by
+#: ``tests/test_vscode_settings.py``. A row whose vendor is anything else
+#: names a model only the gateway can serve.
+FIRST_PARTY_VENDOR = "anthropic"
+
+#: Where the mode switch keeps the choices it takes out of the file.
+#: ``<vct_root>/model-gateway/`` is the gateway's own state subdirectory
+#: (``model_router.config._STATE_SUBDIR``), so everything about the gateway
+#: lives in one place and an uninstall sweep finds it.
+STASH_SUBDIR = "model-gateway"
+STASH_BASENAME = "vscode-mode-stash.json"
+_STASH_SCHEMA_VERSION = 1
+
+#: Routing keys whose VALUE is a credential (or its deliberate blank). Their
+#: names are stashed; their values never are — the token is re-read from the
+#: gateway's token file when the panel is pointed again.
+_STASH_SECRET_KEYS = frozenset({"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"})
 
 _BACKUP_STEM = ".bak-"
 
@@ -985,6 +1047,7 @@ def point_at_gateway(
     token: str,
     model: Optional[str] = None,
     remove_slot_overrides: bool = False,
+    restore_env: Optional[Mapping[str, str]] = None,
 ) -> dict:
     """Point the panel at the gateway, MERGING into the existing env block.
 
@@ -999,6 +1062,13 @@ def point_at_gateway(
             in the file. Default False: they are the user's keys. The GUI
             offers this as an explicit choice and names the keys it would
             remove.
+        restore_env: the user's OWN ``ANTHROPIC_MODEL`` / slot values, as
+            taken out of this file by the ``remote-control`` leg of the mode
+            switch, to put back verbatim. Any other key is ignored — a stash
+            cannot inject a routing key or an unknown name. An explicit
+            ``model`` still wins over a restored ``ANTHROPIC_MODEL``. See the
+            module docstring for why this is the corollary of the
+            never-write rule, not an exception to it.
 
     Returns a result dict; ``status`` is ``written``, ``unchanged`` or
     ``refused``. On ``refused`` the file is byte-for-byte untouched.
@@ -1015,6 +1085,7 @@ def point_at_gateway(
         "keys_written": [],
         "keys_preserved": [],
         "keys_removed": [],
+        "keys_restored": [],
         "slot_overrides_preserved": [],
         "values_healed": [],
         "permissions": "unknown",
@@ -1037,6 +1108,22 @@ def point_at_gateway(
                     removed.append(key)
             preserved = [k for k in preserved if k not in removed]
 
+        # The mode switch's stash, put back. Only the model key and the slot
+        # keys can come through here; the stash is user state and this is
+        # the guard that keeps it from ever writing a routing key. A value
+        # the user has since set by hand on the same key is overwritten:
+        # the stash IS their choice for this mode, made when they left it.
+        restored: list[str] = []
+        for key, value in (restore_env or {}).items():
+            if key != MODEL_KEY and key not in SLOT_OVERRIDE_KEYS:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                continue
+            block[key] = value
+            restored.append(key)
+        restored.sort()
+        preserved = [k for k in preserved if k not in restored]
+
         block["ANTHROPIC_BASE_URL"] = base_url
         block["ANTHROPIC_AUTH_TOKEN"] = token
         block["ANTHROPIC_API_KEY"] = ""
@@ -1045,7 +1132,8 @@ def point_at_gateway(
         if model:
             block[MODEL_KEY] = model
             written.append(MODEL_KEY)
-        elif MODEL_KEY in block:
+            restored = [k for k in restored if k != MODEL_KEY]
+        elif MODEL_KEY in block and MODEL_KEY not in restored:
             preserved.append(MODEL_KEY)
             preserved.sort()
 
@@ -1074,6 +1162,7 @@ def point_at_gateway(
         result["keys_written"] = written
         result["keys_preserved"] = preserved
         result["keys_removed"] = removed
+        result["keys_restored"] = restored
         result["values_healed"] = healed
         result["slot_overrides_preserved"] = sorted(
             k for k in SLOT_OVERRIDE_KEYS if k in block
@@ -1254,6 +1343,436 @@ def reset_native_if_vco_gateway(
 
 
 # ---------------------------------------------------------------------------
+# The mode switch — see "The two-state mode switch" in the module docstring.
+# ---------------------------------------------------------------------------
+
+
+def stash_path() -> Path:
+    """Where the ``remote-control`` leg keeps the choices it takes out."""
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / STASH_SUBDIR / STASH_BASENAME
+
+
+def is_gateway_only_model(value: Any, table: Optional[Any]) -> bool:
+    """Pure: does ``value`` name a model only the gateway can resolve?
+
+    True for a ``claude-gw/<id>`` name, and for a bare id the context table
+    attributes to a vendor other than :data:`FIRST_PARTY_VENDOR`. Everything
+    else — a real Claude id, an id the table does not know, a non-string —
+    is False, because the stock client MAY resolve it and dropping it would
+    be a guess. The ``[1m]`` suffix is ignored for the lookup, exactly as
+    :func:`decorate_1m` ignores it. ``table`` may be any object with
+    ``lookup(model_id) -> row-with-.vendor-or-None`` (the real
+    ``ContextTable`` does; tests pass a stub) or ``None``.
+    """
+    if not isinstance(value, str):
+        return False
+    base = value.strip()
+    if not base:
+        return False
+    if base.endswith(CONTEXT_1M_SUFFIX):
+        base = base[: -len(CONTEXT_1M_SUFFIX)]
+    if base.startswith(GATEWAY_ID_PREFIX):
+        return True
+    lookup = getattr(table, "lookup", None)
+    if lookup is None:
+        return False
+    try:
+        row = lookup(base)
+    except Exception:  # noqa: BLE001 — a broken table classifies nothing
+        return False
+    vendor = getattr(row, "vendor", "") if row is not None else ""
+    return bool(vendor) and vendor != FIRST_PARTY_VENDOR
+
+
+def _read_stash(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """``(document, problem)``. A missing stash is ``(None, None)``.
+
+    A stash that exists but cannot be used is reported, not raised: the
+    ``multimodel`` leg still points the panel (that is what the click asked
+    for) and says the restore was skipped and why.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, f"stash {path} could not be read: {exc}"
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        return None, f"stash {path} is not valid JSON: {exc}"
+    if not isinstance(doc, dict):
+        return None, f"stash {path} is not a JSON object"
+    if doc.get("schema_version") != _STASH_SCHEMA_VERSION:
+        return None, (
+            f"stash {path} has schema_version {doc.get('schema_version')!r}; "
+            f"this VCO reads {_STASH_SCHEMA_VERSION}"
+        )
+    values = doc.get("values")
+    if not isinstance(values, dict):
+        return None, f"stash {path} has no 'values' object"
+    return doc, None
+
+
+def _write_stash(path: Path, doc: Mapping[str, Any]) -> None:
+    """Write the stash owner-only. Loud when it cannot be locked down.
+
+    The stash never holds the token, so a permission failure here is not a
+    credential exposure — but it IS a file that names the user's model
+    choices, and the module's contract is "restricted to the owner" for
+    everything it writes.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(doc, indent=2) + "\n", mode=0o600)
+    try:
+        restrict_to_owner(path)
+    except PermissionHardeningError as exc:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise SettingsRefused(
+            "stash_not_lockable",
+            f"the mode stash {path} could not be restricted to your user "
+            f"account ({exc}). Nothing was changed.",
+        ) from exc
+
+
+def _clear_stash(path: Path) -> bool:
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Path equality that survives symlinks and ``~`` spellings; never raises."""
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return str(a) == str(b)
+
+
+def panel_mode(
+    path: Path,
+    *,
+    ports: Optional[Sequence[int]] = None,
+    stash: Optional[Path] = None,
+) -> dict:
+    """Which state of the switch a settings file is in. Reads only.
+
+    * ``multimodel`` — ``ANTHROPIC_BASE_URL`` is a VCO gateway on this
+      machine.
+    * ``remote-control`` — no ``ANTHROPIC_BASE_URL`` at all (stock client;
+      a missing file counts, it IS stock).
+    * ``unmanaged`` — a base URL that is not ours. The switch never touches
+      this state; the user set it, and only the user unsets it.
+    * ``unparseable`` — JSONC or otherwise unreadable; nothing is guessed.
+    """
+    path = Path(path)
+    stash = Path(stash) if stash is not None else stash_path()
+    probe = inspect_target(path, ports=ports)
+    out: dict[str, Any] = {
+        "mode": MODE_REMOTE_CONTROL,
+        "path": str(path),
+        "detail": "",
+        "base_url": probe["base_url"],
+        "model": probe["model"],
+        "slot_overrides": list(probe["slot_overrides"]),
+        "stash_present": stash.is_file(),
+        "stash_path": str(stash),
+    }
+    if not probe["exists"]:
+        out["detail"] = "No settings file; the panel is on stock Claude Code."
+        return out
+    if probe["parseable"] is False:
+        out["mode"] = MODE_UNPARSEABLE
+        out["detail"] = probe["message"] or "settings.json could not be parsed."
+        return out
+    if probe["points_at_vco_gateway"]:
+        out["mode"] = MODE_MULTIMODEL
+        out["detail"] = (
+            f"Panel points at the model gateway ({probe['base_url']}); "
+            "GLM and Claude share one picker. Remote Control is unavailable."
+        )
+        return out
+    if probe["base_url"] is None:
+        out["detail"] = (
+            "Stock Claude Code; Remote Control works. Gateway models are "
+            "not in the panel."
+        )
+        if out["stash_present"]:
+            out["detail"] += " Model choices from Multimodel mode are stashed."
+        return out
+    out["mode"] = MODE_UNMANAGED
+    out["detail"] = (
+        f"Panel points at a custom endpoint ({probe['base_url']}); VCO "
+        "leaves it alone."
+    )
+    return out
+
+
+def _mode_result(action_mode: str, path: Path, stash: Path) -> dict[str, Any]:
+    return {
+        "action": "set_mode",
+        "mode": action_mode,
+        "path": str(path),
+        "ok": False,
+        "status": "refused",
+        "reason": None,
+        "message": "",
+        "backup_path": None,
+        "keys_written": [],
+        "keys_preserved": [],
+        "keys_removed": [],
+        "keys_restored": [],
+        "values_stashed": [],
+        "slot_overrides_preserved": [],
+        "values_healed": [],
+        "stash_path": str(stash),
+        "stash_present": stash.is_file(),
+        "permissions": "unknown",
+        "paste_block": None,
+        "restart_required": True,
+    }
+
+
+def set_mode_remote_control(path: Path, *, stash: Optional[Path] = None) -> dict:
+    """The ``remote-control`` leg. See the module docstring for the rules.
+
+    Order of operations is the safety argument: the stash is written FIRST,
+    then the settings file. If the settings write is refused (and rolled
+    back by :func:`_write_settings`), the previous stash bytes are put back
+    — or the new file removed — so the stash and the settings file never
+    disagree about what has been taken out.
+    """
+    path = Path(path)
+    stash = Path(stash) if stash is not None else stash_path()
+    result = _mode_result(MODE_REMOTE_CONTROL, path, stash)
+    if not path.is_file():
+        result.update(
+            ok=True,
+            status="unchanged",
+            message=f"{path} does not exist; the panel is already on stock Claude Code.",
+        )
+        return result
+    try:
+        settings, original_text = _load_settings(path)
+        block = _existing_env_block(settings, path)
+        table = _context_table()
+
+        removed_routing = [k for k in ROUTING_KEYS if k in block]
+        routing_values = {
+            k: block[k]
+            for k in removed_routing
+            if k not in _STASH_SECRET_KEYS and isinstance(block[k], str)
+        }
+        stashed_values: dict[str, str] = {}
+        for key in (MODEL_KEY, *SLOT_OVERRIDE_KEYS):
+            if key in block and is_gateway_only_model(block[key], table):
+                stashed_values[key] = block[key]
+
+        new_block = {
+            k: v
+            for k, v in block.items()
+            if k not in removed_routing and k not in stashed_values
+        }
+        # R41 on the values that stay: a plain 1M Claude id in a slot reads
+        # as 200K to the stock client too, and the fix is the client's own
+        # suffix. Same model, right window — nothing else is touched.
+        healed: list[str] = []
+        for key in (MODEL_KEY, *SLOT_OVERRIDE_KEYS):
+            if key in new_block:
+                decorated = decorate_1m(new_block[key], table)
+                if decorated != new_block[key]:
+                    new_block[key] = decorated
+                    healed.append(key)
+
+        login_removed = LOGIN_PROMPT_KEY in settings
+        new_settings = {k: v for k, v in settings.items() if k != LOGIN_PROMPT_KEY}
+        if ENV_BLOCK_KEY in settings:
+            if new_block or not block:
+                # Either keys remain, or the block was empty before we got
+                # here — keep the shape the user had.
+                new_settings[ENV_BLOCK_KEY] = new_block
+            else:
+                # We emptied it; an empty husk is not a setting.
+                del new_settings[ENV_BLOCK_KEY]
+
+        keys_removed = removed_routing + ([LOGIN_PROMPT_KEY] if login_removed else [])
+        result["keys_removed"] = keys_removed
+        result["values_stashed"] = sorted(stashed_values)
+        result["values_healed"] = healed
+        result["slot_overrides_preserved"] = sorted(
+            k for k in SLOT_OVERRIDE_KEYS if k in new_block
+        )
+        result["keys_preserved"] = sorted(new_block)
+
+        if new_settings == settings:
+            result.update(
+                ok=True,
+                status="unchanged",
+                permissions=_probe_permissions(path),
+                message=(
+                    "Already on stock Claude Code; nothing to change. "
+                    "Restart VS Code if the panel has not picked it up."
+                ),
+            )
+            return result
+
+        # Stash first (see docstring). Only when something is actually
+        # being taken out: a run whose only change is the [1m] decoration
+        # must not overwrite a stash an earlier run made.
+        previous_stash: Optional[bytes] = None
+        wrote_stash = False
+        if removed_routing or stashed_values or login_removed:
+            try:
+                previous_stash = stash.read_bytes()
+            except OSError:
+                previous_stash = None
+            _write_stash(
+                stash,
+                {
+                    "schema_version": _STASH_SCHEMA_VERSION,
+                    "stashed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "settings_path": str(path),
+                    "routing_keys": removed_routing,
+                    "routing_values": routing_values,
+                    "login_prompt_removed": login_removed,
+                    "values": stashed_values,
+                },
+            )
+            wrote_stash = True
+        try:
+            backup, perms = _write_settings(
+                path, new_settings, original_text=original_text, existed=True,
+            )
+        except SettingsRefused:
+            if wrote_stash:
+                if previous_stash is None:
+                    _clear_stash(stash)
+                else:
+                    atomic_write_text(
+                        stash, previous_stash.decode("utf-8", "replace"), mode=0o600,
+                    )
+            raise
+        result["stash_present"] = stash.is_file()
+        stashed_note = (
+            " Gateway-only model choices stashed for Multimodel mode: "
+            + ", ".join(sorted(stashed_values))
+            + "."
+            if stashed_values
+            else ""
+        )
+        healed_note = (
+            " Same models, right context window: [1m] hint added to "
+            + ", ".join(healed)
+            + "."
+            if healed
+            else ""
+        )
+        result.update(
+            ok=True,
+            status="written",
+            backup_path=backup,
+            permissions=perms,
+            message=(
+                "Panel set to stock Claude Code; Remote Control can start. "
+                "Restart VS Code (fully quit and reopen); you may be asked to "
+                "log in again." + stashed_note + healed_note
+            ),
+        )
+        return result
+    except SettingsRefused as exc:
+        result["reason"] = exc.reason
+        result["message"] = (
+            f"{exc.message} To switch by hand, delete these two keys: "
+            f"`{ENV_BLOCK_KEY}` and `{LOGIN_PROMPT_KEY}`."
+        )
+        return result
+
+
+def set_mode_multimodel(
+    path: Path,
+    *,
+    base_url: str,
+    token: str,
+    stash: Optional[Path] = None,
+) -> dict:
+    """The ``multimodel`` leg: point, with the stash put back, then clear it.
+
+    The stash is honoured only when it was made for THIS settings file. Two
+    editors (VS Code and Cursor, say) share one stash path, and restoring
+    one editor's choices into the other's file would be a substitution the
+    user never made; in that case this is a plain point and the stash is
+    left for the file it belongs to.
+    """
+    path = Path(path)
+    stash = Path(stash) if stash is not None else stash_path()
+    doc, problem = _read_stash(stash)
+    restore: dict[str, str] = {}
+    skipped_reason: Optional[str] = problem
+    if doc is not None:
+        origin = Path(str(doc.get("settings_path") or ""))
+        if origin.name and _same_file(origin, path):
+            restore = {
+                k: v for k, v in doc["values"].items() if isinstance(v, str)
+            }
+        else:
+            skipped_reason = (
+                f"stash was made for {origin} and this is {path}; left alone"
+            )
+
+    result = point_at_gateway(
+        path, base_url=base_url, token=token, restore_env=restore,
+    )
+    result["action"] = "set_mode"
+    result["mode"] = MODE_MULTIMODEL
+    result["stash_path"] = str(stash)
+    result["values_stashed"] = []
+    result["stash_skipped_reason"] = skipped_reason
+    if result["ok"] and doc is not None and not skipped_reason:
+        _clear_stash(stash)
+        if result["keys_restored"]:
+            result["message"] += (
+                " Restored from your last Multimodel session: "
+                + ", ".join(result["keys_restored"])
+                + "."
+            )
+    result["stash_present"] = stash.is_file()
+    return result
+
+
+def set_mode(
+    path: Path,
+    mode: str,
+    *,
+    base_url: Optional[str] = None,
+    token: Optional[str] = None,
+    stash: Optional[Path] = None,
+) -> dict:
+    """Dispatch on ``mode``; the CLI's and the launcher's single entry point.
+
+    ``base_url`` and ``token`` are required for ``multimodel`` and ignored
+    for ``remote-control``. An unknown mode is a caller bug and raises.
+    """
+    if mode == MODE_REMOTE_CONTROL:
+        return set_mode_remote_control(path, stash=stash)
+    if mode == MODE_MULTIMODEL:
+        if not base_url or not token:
+            raise ValueError("multimodel needs base_url and token")
+        return set_mode_multimodel(
+            path, base_url=base_url, token=token, stash=stash,
+        )
+    raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
+
+
+# ---------------------------------------------------------------------------
 # CLI — the Rust launcher's entry point. stdout is a machine contract.
 # ---------------------------------------------------------------------------
 
@@ -1312,6 +1831,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="reset only when the panel points at a VCO gateway",
     )
     p_reset_if.add_argument("--path", required=True)
+
+    p_mode = sub.add_parser(
+        "mode",
+        help="the Multimodel <-> Remote Control switch: --get or --set",
+    )
+    p_mode.add_argument("--path", required=True)
+    which = p_mode.add_mutually_exclusive_group(required=True)
+    which.add_argument("--get", action="store_true", help="report the current mode")
+    which.add_argument(
+        "--set",
+        choices=MODES,
+        default=None,
+        help="apply a mode (idempotent; VS Code must be restarted afterwards)",
+    )
+    p_mode.add_argument(
+        "--base-url",
+        default=None,
+        help="multimodel only; default: http://127.0.0.1:<resolved gateway port>",
+    )
     return parser
 
 
@@ -1330,6 +1868,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "reset-if-gateway":
         result = reset_native_if_vco_gateway(
             Path(args.path), ports=resolve_gateway_ports(),
+        )
+        _emit(result)
+        return 0 if result["ok"] else 1
+    if args.command == "mode":
+        if args.get:
+            _emit(panel_mode(Path(args.path), ports=resolve_gateway_ports()))
+            return 0
+        if args.set == MODE_REMOTE_CONTROL:
+            result = set_mode(Path(args.path), MODE_REMOTE_CONTROL)
+            _emit(result)
+            return 0 if result["ok"] else 1
+        ports = resolve_gateway_ports()
+        base_url = args.base_url or f"http://127.0.0.1:{ports[0]}"
+        try:
+            token = resolve_host_token()
+        except SettingsRefused as exc:
+            _emit(
+                {
+                    "action": "set_mode",
+                    "mode": MODE_MULTIMODEL,
+                    "path": args.path,
+                    "ok": False,
+                    "status": "refused",
+                    "reason": exc.reason,
+                    "message": exc.message,
+                }
+            )
+            return 1
+        result = set_mode(
+            Path(args.path), MODE_MULTIMODEL, base_url=base_url, token=token,
         )
         _emit(result)
         return 0 if result["ok"] else 1
@@ -1372,12 +1940,20 @@ __all__ = [
     "ENV_BLOCK_KEY",
     "ENV_TARGET_OVERRIDE",
     "ENV_TOKEN",
+    "FIRST_PARTY_VENDOR",
     "GATEWAY_ID_PREFIX",
     "LOGIN_PROMPT_KEY",
     "MANAGED_SETTINGS_KEYS",
     "MODEL_KEY",
+    "MODES",
+    "MODE_MULTIMODEL",
+    "MODE_REMOTE_CONTROL",
+    "MODE_UNMANAGED",
+    "MODE_UNPARSEABLE",
     "ROUTING_KEYS",
     "SLOT_OVERRIDE_KEYS",
+    "STASH_BASENAME",
+    "STASH_SUBDIR",
     "SettingsRefused",
     "Target",
     "VARIANTS",
@@ -1386,15 +1962,21 @@ __all__ = [
     "describe_json_failure",
     "detect_targets",
     "inspect_target",
+    "is_gateway_only_model",
     "is_loopback_host",
     "is_vco_gateway_base_url",
     "main",
+    "panel_mode",
     "paste_block",
     "point_at_gateway",
     "reset_native",
     "reset_native_if_vco_gateway",
     "resolve_gateway_ports",
     "resolve_host_token",
+    "set_mode",
+    "set_mode_multimodel",
+    "set_mode_remote_control",
     "sniff_indent",
     "sniff_newline",
+    "stash_path",
 ]

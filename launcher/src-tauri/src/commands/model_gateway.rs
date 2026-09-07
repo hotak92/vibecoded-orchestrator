@@ -710,6 +710,95 @@ pub async fn model_gateway_reset_native(path: String) -> Result<serde_json::Valu
     .map_err(|e| format!("reset task failed: {}", e))?
 }
 
+// ─── The Multimodel <-> Remote Control switch ─────────────────────────────
+//
+// Remote Control is endpoint-gated in Claude Code (>= 2.1.196: refused
+// whenever `ANTHROPIC_BASE_URL` is not api.anthropic.com), and the
+// extension's env block is VS Code machine-scope, so the user has exactly
+// one of {gateway picker, Remote Control} at a time. The StatusBar's
+// segmented control drives these two commands; the Python CLI's `mode`
+// subcommand owns every byte of the decision (what to strip, what to stash,
+// what to restore). This side validates the mode word and builds argv —
+// nothing else, for the same A>B>C reason as the rest of this file.
+
+/// The two words the switch accepts. MUST MATCH
+/// `vco_lib/vscode_settings.py::MODES`; the CLI's argparse `choices`
+/// rejects anything else, so a drift here is a refusal, not a silent write.
+pub const PANEL_MODES: [&str; 2] = ["multimodel", "remote-control"];
+
+/// `python -m vco_lib.vscode_settings mode --get --path <p>`
+pub(crate) fn mode_get_argv(path: &str) -> Vec<String> {
+    vec![
+        "mode".to_string(),
+        "--get".to_string(),
+        "--path".to_string(),
+        path.to_string(),
+    ]
+}
+
+/// `python -m vco_lib.vscode_settings mode --set <mode> --path <p>
+/// [--base-url <url>]`.
+///
+/// `--base-url` rides along ONLY for `multimodel` — it is the same value
+/// `model_gateway_point_panel` sends, resolved from this process's view of
+/// the port (env, then the port file), so the two ways of pointing the
+/// panel cannot disagree. The `remote-control` leg has no use for it and
+/// the argv says so by omitting it.
+pub(crate) fn mode_set_argv(path: &str, mode: &str, base_url: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "mode".to_string(),
+        "--set".to_string(),
+        mode.to_string(),
+        "--path".to_string(),
+        path.to_string(),
+    ];
+    if let Some(url) = base_url {
+        args.push("--base-url".to_string());
+        args.push(url.to_string());
+    }
+    args
+}
+
+fn validate_mode(mode: &str) -> Result<&str, String> {
+    if PANEL_MODES.contains(&mode) {
+        Ok(mode)
+    } else {
+        Err(format!(
+            "unknown panel mode {:?}; expected one of {:?}",
+            mode, PANEL_MODES
+        ))
+    }
+}
+
+/// `{"mode": "multimodel"|"remote-control"|"unmanaged"|"unparseable", "path",
+/// "detail", ...}` — read-only.
+#[command]
+pub async fn model_gateway_mode_get(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || run_vscode_settings(&mode_get_argv(&path)))
+        .await
+        .map_err(|e| format!("mode get task failed: {}", e))?
+}
+
+/// Apply a mode. The write happens immediately; VS Code must be restarted
+/// by the user to load it (the GUI says so and never automates that).
+#[command]
+pub async fn model_gateway_mode_set(
+    path: String,
+    mode: String,
+) -> Result<serde_json::Value, String> {
+    let mode = validate_mode(&mode)?.to_string();
+    let base_url = if mode == "multimodel" {
+        Some(base_url(resolve_port()))
+    } else {
+        None
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        run_vscode_settings(&mode_set_argv(&path, &mode, base_url.as_deref()))
+    })
+    .await
+    .map_err(|e| format!("mode set task failed: {}", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,5 +984,80 @@ mod tests {
             "a fresh launcher supervises nothing; stop must refuse rather \
              than signal a pid it cannot identify"
         );
+    }
+
+    // ── the mode switch: argv is the whole contract with the Python CLI ──
+
+    #[test]
+    fn mode_get_argv_shape_is_fixed() {
+        assert_eq!(
+            mode_get_argv("/home/u/.config/Code/User/settings.json"),
+            vec!["mode", "--get", "--path", "/home/u/.config/Code/User/settings.json"]
+        );
+    }
+
+    #[test]
+    fn mode_set_multimodel_argv_carries_the_base_url() {
+        assert_eq!(
+            mode_set_argv("/p/settings.json", "multimodel", Some("http://127.0.0.1:11436")),
+            vec![
+                "mode",
+                "--set",
+                "multimodel",
+                "--path",
+                "/p/settings.json",
+                "--base-url",
+                "http://127.0.0.1:11436"
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_set_remote_control_argv_has_no_base_url() {
+        // LEAVE-ALONE half: the remote-control leg strips the base URL; a
+        // `--base-url` here would be an argument nothing reads.
+        let v = mode_set_argv("/p/settings.json", "remote-control", None);
+        assert_eq!(v, vec!["mode", "--set", "remote-control", "--path", "/p/settings.json"]);
+        assert!(!v.iter().any(|a| a == "--base-url"));
+    }
+
+    #[test]
+    fn mode_argv_never_carries_a_token() {
+        // The host token must not cross this process: neither argv builder
+        // has a parameter for it, and no argument looks like one.
+        for v in [
+            mode_get_argv("/p/settings.json"),
+            mode_set_argv("/p/settings.json", "multimodel", Some("http://127.0.0.1:11436")),
+        ] {
+            assert!(!v.iter().any(|a| a.contains("token") || a.contains("TOKEN")), "{:?}", v);
+        }
+    }
+
+    #[test]
+    fn mode_words_are_validated_before_any_spawn() {
+        assert_eq!(validate_mode("multimodel"), Ok("multimodel"));
+        assert_eq!(validate_mode("remote-control"), Ok("remote-control"));
+        for bad in ["", "Multimodel", "remote_control", "unmanaged", "native"] {
+            let err = validate_mode(bad).expect_err(bad);
+            assert!(err.contains("unknown panel mode"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn mode_words_match_the_python_writer() {
+        // (C)-tier mirror of `vco_lib/vscode_settings.py::MODES`; the CLI
+        // rejects anything else via argparse `choices`, so drift here is a
+        // refusal rather than a silent write — but it is still drift.
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let py = std::fs::read_to_string(repo_root.join("vco_lib").join("vscode_settings.py"))
+            .expect("vco_lib/vscode_settings.py readable");
+        for word in PANEL_MODES {
+            assert!(
+                py.contains(&format!("\"{}\"", word)),
+                "mode word {:?} not found in the Python writer",
+                word
+            );
+        }
+        assert!(py.contains("MODES = (MODE_MULTIMODEL, MODE_REMOTE_CONTROL)"));
     }
 }

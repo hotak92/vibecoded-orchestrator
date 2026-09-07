@@ -878,7 +878,9 @@ mod tests {
     // ── the shipped seed, parsed by the code that will parse it ──────────
 
     /// The REAL shipped seed loads under the launcher's parser, with the ten
-    /// cited GLM rows and the version-key evidence intact.
+    /// cited GLM rows, the four first-party Claude 5 rows (read only by
+    /// `vco_lib.vscode_settings.decorate_1m`; the gateway publishes
+    /// first-party ids verbatim) and the version-key evidence intact.
     ///
     /// This reads the repo file directly via `CARGO_MANIFEST_DIR`, which is
     /// compile-time-only path resolution INSIDE `#[cfg(test)]` (the same
@@ -899,7 +901,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).expect("seed is valid JSON");
         let rows = parse_document(&value).expect("seed parses under the writer's rules");
 
-        assert_eq!(rows.len(), 10, "the ten cited GLM rows of handoff §7");
+        assert_eq!(
+            rows.len(),
+            14,
+            "the ten cited GLM rows of handoff §7 plus the four Claude 5 rows"
+        );
         assert!(
             rows.iter().all(|r| !r.source.trim().is_empty()),
             "R10: no row without a cited source"
@@ -908,6 +914,14 @@ mod tests {
         let by_id = |id: &str| rows.iter().find(|r| r.model_id == id).unwrap_or_else(|| {
             panic!("seed is missing {}", id)
         });
+        // The first-party rows: vendor `anthropic`, 1M, cited to Anthropic's
+        // docs. They exist for the settings writer's [1m] decoration only.
+        for id in ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5"] {
+            let row = by_id(id);
+            assert_eq!(row.vendor, "anthropic", "{}", id);
+            assert!(row.window_1m && row.context_window == 1_000_000, "{}", id);
+            assert!(row.source.starts_with("https://docs.anthropic.com"), "{}", id);
+        }
         // The version-key evidence: same family, 5x apart. If a future edit
         // ever collapses these into a `glm-5*` rule, this reds.
         assert!(by_id("glm-5.2").window_1m && by_id("glm-5.2").context_window == 1_000_000);

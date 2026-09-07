@@ -2902,6 +2902,8 @@ pub fn run() {
             commands::model_gateway::model_gateway_vscode_inspect,
             commands::model_gateway::model_gateway_point_panel,
             commands::model_gateway::model_gateway_reset_native,
+            commands::model_gateway::model_gateway_mode_get,
+            commands::model_gateway::model_gateway_mode_set,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.

@@ -121,6 +121,175 @@ export async function resetPanelToNative(
   return invoke<VSCodeWriteResult>('model_gateway_reset_native', { path });
 }
 
+// ─── The Multimodel <-> Remote Control switch ─────────────────────────────
+//
+// Remote Control is endpoint-gated in Claude Code (>= 2.1.196: refused
+// whenever ANTHROPIC_BASE_URL is not api.anthropic.com, claude.ai login or
+// not), and `claudeCode.environmentVariables` is VS Code machine-scope, so
+// the user has exactly one of {gateway picker, Remote Control} at a time.
+// The StatusBar's segmented control flips between them; the Python writer
+// (`python -m vco_lib.vscode_settings mode`) owns every byte of the
+// decision. What lives here is the wire shape and the copy.
+
+/** The two states the switch writes, plus the two it only reports. */
+export type PanelMode =
+  | 'multimodel'
+  | 'remote-control'
+  | 'unmanaged'
+  | 'unparseable';
+
+/** The two states the switch can be asked to apply. */
+export type SettablePanelMode = 'multimodel' | 'remote-control';
+
+/**
+ * MUST MATCH `vco_lib/vscode_settings.py::MODES` and
+ * `model_gateway.rs::PANEL_MODES`. The Rust side refuses anything else
+ * before spawning, and the CLI's argparse `choices` refuses it again.
+ */
+export const PANEL_MODES: readonly SettablePanelMode[] = [
+  'multimodel',
+  'remote-control',
+] as const;
+
+/** `mode --get`: read-only description of one settings file's state. */
+export interface PanelModeReport {
+  mode: PanelMode;
+  path: string;
+  /** One sentence for the tooltip / status line. */
+  detail: string;
+  base_url: string | null;
+  model: string | null;
+  slot_overrides: string[];
+  /** A stash from a previous Remote Control switch is waiting. */
+  stash_present: boolean;
+  stash_path: string;
+}
+
+/** `mode --set`: a write result plus what the switch stashed / restored. */
+export interface PanelModeResult extends VSCodeWriteResult {
+  mode: SettablePanelMode;
+  /** Model/slot keys taken out of the file (remote-control leg). */
+  values_stashed?: string[];
+  /** Model/slot keys put back from the stash (multimodel leg). */
+  keys_restored?: string[];
+  stash_path?: string;
+  stash_present?: boolean;
+  /** Why a stash was NOT restored (made for another file, unreadable). */
+  stash_skipped_reason?: string | null;
+}
+
+export async function getPanelMode(path: string): Promise<PanelModeReport> {
+  return invoke<PanelModeReport>('model_gateway_mode_get', { path });
+}
+
+/**
+ * Apply a mode. The write is immediate; VS Code must be restarted by the
+ * user to load it — the caller shows the persistent notice and never
+ * automates the restart.
+ */
+export async function setPanelMode(
+  path: string,
+  mode: SettablePanelMode,
+): Promise<PanelModeResult> {
+  return invoke<PanelModeResult>('model_gateway_mode_set', { path, mode });
+}
+
+export interface ModeDescription {
+  /** Pill label. */
+  label: string;
+  /** One-sentence trade-off for the tooltip. */
+  tooltip: string;
+  /** Which pill (if any) renders filled. `null` = neither. */
+  active: SettablePanelMode | null;
+}
+
+/**
+ * Copy for each state. `unmanaged` and `unparseable` light no pill: the
+ * first is the user's own endpoint (VCO leaves it alone), the second is a
+ * file nothing should guess about.
+ */
+export function describeMode(mode: PanelMode | null): ModeDescription {
+  switch (mode) {
+    case 'multimodel':
+      return {
+        label: 'Multimodel',
+        tooltip: 'GLM + Claude in one picker; Remote Control unavailable.',
+        active: 'multimodel',
+      };
+    case 'remote-control':
+      return {
+        label: 'Remote Control',
+        tooltip:
+          'Stock Claude Code; phone Remote Control works; GLM models unavailable in the panel.',
+        active: 'remote-control',
+      };
+    case 'unmanaged':
+      return {
+        label: 'Custom endpoint',
+        tooltip: 'Panel points at a custom endpoint; VCO leaves it alone.',
+        active: null,
+      };
+    case 'unparseable':
+      return {
+        label: 'Unreadable settings',
+        tooltip:
+          'settings.json is not strict JSON (comments or trailing commas); VCO will not rewrite it.',
+        active: null,
+      };
+    default:
+      return { label: 'Panel mode', tooltip: 'Panel mode not loaded yet.', active: null };
+  }
+}
+
+/** Tooltip copy for each pill — the trade-off, one sentence each. */
+export const MODE_PILL_TOOLTIP: Record<SettablePanelMode, string> = {
+  multimodel: describeMode('multimodel').tooltip,
+  'remote-control': describeMode('remote-control').tooltip,
+};
+
+/**
+ * Why a pill is disabled, in the user's terms. Empty when clickable.
+ *
+ * Multimodel needs a configured gateway (a token on disk, or running, or
+ * registered at login) — pointing the panel at a gateway that has never run
+ * strands it. Both need a settings file to write. An unparseable file is
+ * refused by the writer anyway; saying so here saves the click.
+ */
+export function modeSwitchDisabledReason(
+  target: SettablePanelMode,
+  status: ModelGatewayStatus | null,
+  targets: VSCodeTarget[],
+  current: PanelModeReport | null,
+): string {
+  if (targets.length === 0) {
+    return 'No VS Code-family settings.json was found on this machine.';
+  }
+  if (current?.mode === 'unparseable') {
+    return describeMode('unparseable').tooltip;
+  }
+  if (target === 'multimodel' && !gatewayIsConfigured(status)) {
+    return 'Start the model gateway once (Services page) before pointing the panel at it.';
+  }
+  return '';
+}
+
+/** The persistent notice after a successful switch. Never automated. */
+export const RESTART_NOTICE = 'Applied — restart VS Code to load it';
+
+/**
+ * One line for the notice area after a switch: the restart reminder on a
+ * write, the writer's own message on a refusal or a no-op.
+ */
+export function describeModeResult(r: PanelModeResult): string {
+  if (!r.ok) return r.message;
+  if (r.status === 'unchanged') return r.message;
+  const bits: string[] = [];
+  if (r.values_stashed?.length) bits.push(`stashed ${r.values_stashed.join(', ')}`);
+  if (r.keys_restored?.length) bits.push(`restored ${r.keys_restored.join(', ')}`);
+  if (r.values_healed?.length) bits.push(`[1m] added to ${r.values_healed.join(', ')}`);
+  return bits.length ? `${RESTART_NOTICE} (${bits.join('; ')})` : RESTART_NOTICE;
+}
+
 /**
  * Turn the CLAUDE.md model-routing section on/off for one project.
  *
