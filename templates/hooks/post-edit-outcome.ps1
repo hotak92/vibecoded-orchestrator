@@ -1,4 +1,5 @@
-﻿# V52-M (v0.2.52) — post-edit outcome event recorder
+﻿# OS-EXEMPT-PARITY: v0.2.92 fixed a PowerShell-only epoch bug (mixed-DateTimeKind subtraction shifts by the UTC offset) — the .sh sibling's stamps were always correct; both siblings are pinned by tests/test_v0292_ps1_unix_epoch_parity.py.
+# V52-M (v0.2.52) — post-edit outcome event recorder
 # OS-PARITY: ports the .sh sibling. Fires AFTER Edit OR Write tool
 # executes. Emits an edit_outcome event with diff size + whether the
 # file existed before. Pairing strategy: trainer joins on (session_id,

@@ -91,9 +91,26 @@ class _Fixture:
             "VCT_CODE_EMBED_CONTAINER": "vco_code_embed_test",
             "CODE_EMBED_PORT": str(port),
             "TMPDIR": str(self.tmp),
+            # Hermeticity pin (2026-09-07 CI red): the hooks resolve their
+            # runtime via `python -m vco_lib.containers resolve`, probing
+            # podman-then-docker INCLUDING compose availability. The fake
+            # podman above answers `version`/`info` but refuses `compose`,
+            # so on a machine with no podman-compose but a usable docker
+            # (GitHub runners) the resolver hands the hook REAL docker —
+            # `container inspect` then never sees this fixture's marker and
+            # the compose-invocation accounting goes machine-dependent (CI:
+            # `2 != 1 : ['up -d --build code_embed', 'up -d code_embed']`,
+            # and `--build` firing for a weaviate-only outage). Pinning the
+            # runtime onto the fake podman makes RUNTIME — and therefore
+            # which binary answers every inspect — determined by the test.
+            "VCT_CONTAINER_RUNTIME": "podman",
         })
         env.pop("VCT_DISABLE_HOOKS", None)
         env.pop("VCO_VENV_PYTHON", None)
+        # The venv-resolution INPUTS the sourced helper reads; scrub so an
+        # ambient launcher shell cannot steer RUN_PY at a different tree.
+        env.pop("VCT_VENV", None)
+        env.pop("VCT_INSTALL_ROOT", None)
         return env
 
     def compose_invocations(self) -> list:
@@ -186,8 +203,14 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
                 "VCT_COMPOSE_DIR": str(compose_dir),
                 "VCT_REQUIRED_CONTAINERS": "vco_weaviate vco_ollama vco_code_embed",
                 "TMPDIR": str(tmp),
+                # Hermeticity pin — same reason as _Fixture.env: keep
+                # vco_lib.containers resolve on THIS fixture's fake podman
+                # regardless of what runtimes the host machine offers.
+                "VCT_CONTAINER_RUNTIME": "podman",
             })
             env.pop("VCT_DISABLE_HOOKS", None)
+            env.pop("VCT_VENV", None)
+            env.pop("VCT_INSTALL_ROOT", None)
             proc = subprocess.run(
                 ["bash", str(HOOKS / "ensure-containers.sh")],
                 env=env, capture_output=True, text=True, timeout=180,
@@ -260,8 +283,13 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
                 "VCT_REQUIRED_CONTAINERS": "vco_weaviate vco_ollama vco_code_embed",
                 "TMPDIR": str(tmp),
                 "TEMP": str(tmp),
+                # Hermeticity pin — same reason as _Fixture.env (keep the
+                # resolver on this fixture's fake podman; see that comment).
+                "VCT_CONTAINER_RUNTIME": "podman",
             })
             env.pop("VCT_DISABLE_HOOKS", None)
+            env.pop("VCT_VENV", None)
+            env.pop("VCT_INSTALL_ROOT", None)
             proc = subprocess.run(
                 [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-containers.ps1")],

@@ -54,6 +54,21 @@
 //! clone, subprocess non-zero) must NEVER mask the original operation's
 //! outcome. Callers keep their existing log-and-swallow behaviour.
 //!
+//! Best-effort is NOT the same as quiet. Every caller logs the `Err`, so the
+//! `Err` has to be worth logging: through v0.2.92 it read
+//! `deferral helper exited exit status: 1` — an exit code and nothing else —
+//! while the interpreter's own diagnosis was written straight to the
+//! LAUNCHER's stderr, because `.status()` inherits the child's streams. Two
+//! bad halves: a log line that cannot explain the failure, and an explanation
+//! that appears somewhere no caller controls, attached to no context. It
+//! surfaced as bare `ModuleNotFoundError: No module named 'vco_lib.deferral_emit'`
+//! tracebacks interleaved into CI's Rust test log (run 34118502499), reading
+//! like a crash in a suite that was in fact passing.
+//!
+//! So [`run_deferral_payload`] CAPTURES the child's output and folds the tail
+//! of it into the `Err`. The launcher's `tracing::warn!` then carries the
+//! interpreter path AND the reason; nothing writes to an inherited stream.
+//!
 //! ## Interpreter resolution
 //!
 //! Uses the shared RT-4 ladder
@@ -63,9 +78,16 @@
 //! to a bare PATH `python3`. This is the same upgrade Part 7c task 1 applied
 //! to the per-site `pick_python` copies.
 //!
+//! The last rung of that ladder is a bare `python3`, which on a machine with
+//! no VCO install cannot import `vco_lib` at all. That is a legitimate
+//! outcome, not a bug to paper over: the deferral goes unwritten and the
+//! caller logs why. What must NOT happen is the failure arriving as an
+//! unexplained exit code — see the best-effort note above.
+//!
 //! ## `.silent()` note
 //!
-//! The single `Command::new` here carries `.silent()`; the
+//! The single `Command::new` here — in [`run_deferral_payload`], which both
+//! public writers route through — carries `.silent()`; the
 //! `command_silent_gate` integration test scans this file by path.
 
 use std::path::Path;
@@ -115,15 +137,89 @@ pub fn emit_deferral_entry(
 
     let script = build_deferral_emit_script(sys_path_root, report_folder, fields);
 
-    let status = std::process::Command::new(&python)
+    run_deferral_payload(&python, &script, "deferral emit")
+}
+
+/// Run one `python -c` deferral payload, mapping failure to an `Err` that
+/// SAYS WHY.
+///
+/// The ONE spawn in this module — both public writers route through it, so
+/// the interpreter handling, the stream policy and the error shape cannot
+/// drift between "emit an entry" and "settle an entry".
+///
+/// Captures the child's streams (`output()`, not `status()`) for two reasons:
+///
+/// * the caller's log line becomes diagnostic. `deferral helper exited exit
+///   status: 1` names nothing; `… ModuleNotFoundError: No module named
+///   'vco_lib.deferral_emit'` names the whole problem;
+/// * an inherited stderr writes the child's traceback to whatever stream the
+///   launcher (or a test harness) happens to own, out of band and out of
+///   context. In CI run 34118502499 that put raw Python tracebacks in the
+///   middle of a passing Rust test log.
+///
+/// `what` names the operation for the message ("deferral emit" / "deferral
+/// resolve"). Success discards the captured output — a payload that succeeds
+/// has nothing to say.
+fn run_deferral_payload(python: &Path, script: &str, what: &str) -> Result<(), String> {
+    let out = std::process::Command::new(python)
         .silent()
         .arg("-c")
-        .arg(&script)
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("deferral helper exited {}", s)),
-        Err(e) => Err(format!("deferral helper spawn failed: {}", e)),
+        .arg(script)
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "{what} helper ({}) exited {}: {}",
+            python.display(),
+            o.status,
+            summarise_child_output(&o.stderr, &o.stdout)
+        )),
+        Err(e) => Err(format!(
+            "{what} helper spawn failed ({}): {e}",
+            python.display()
+        )),
+    }
+}
+
+/// Condense a failed child's output into ONE log-line-sized explanation.
+///
+/// Prefers stderr (where Python writes tracebacks) and falls back to stdout.
+/// Keeps the LAST few non-empty lines, because the line that says what went
+/// wrong (`ModuleNotFoundError: …`) is the last one — a traceback's leading
+/// frames are the least informative part of it. Bounded so a pathological
+/// child cannot flood the log.
+fn summarise_child_output(stderr: &[u8], stdout: &[u8]) -> String {
+    /// Lines kept from the tail. Three covers "File …, line N" + the
+    /// exception, with one spare.
+    const KEEP_LINES: usize = 3;
+    /// Hard ceiling on the rendered summary.
+    const MAX_CHARS: usize = 500;
+
+    let pick = |raw: &[u8]| -> Option<String> {
+        let text = String::from_utf8_lossy(raw);
+        let kept: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        Some(kept[kept.len().saturating_sub(KEEP_LINES)..].join(" | "))
+    };
+
+    let summary = match pick(stderr).or_else(|| pick(stdout)) {
+        Some(s) => s,
+        None => return "(no output)".to_string(),
+    };
+
+    // Truncate from the FRONT: the tail is the informative end.
+    if summary.chars().count() > MAX_CHARS {
+        let skip = summary.chars().count() - MAX_CHARS;
+        format!("…{}", summary.chars().skip(skip).collect::<String>())
+    } else {
+        summary
     }
 }
 
@@ -152,16 +248,7 @@ pub fn resolve_deferral_conditions(
 
     let script = build_deferral_resolve_script(sys_path_root, report_folder, condition_ids);
 
-    let status = std::process::Command::new(&python)
-        .silent()
-        .arg("-c")
-        .arg(&script)
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("deferral resolve helper exited {}", s)),
-        Err(e) => Err(format!("deferral resolve helper spawn failed: {}", e)),
-    }
+    run_deferral_payload(&python, &script, "deferral resolve")
 }
 
 /// Build the injection-safe `python -c` payload that marks condition IDs
@@ -287,6 +374,166 @@ pub fn py_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.92 CI-divergence fix: a payload whose `import vco_lib…` fails
+    /// must come back as an `Err` that NAMES the import failure.
+    ///
+    /// This is the machine-with-no-VCO-install case, and it is not
+    /// hypothetical: GitHub's `ubuntu-latest` is exactly that machine. The
+    /// RT-4 ladder finds no venv there, falls to a bare PATH `python3`, and
+    /// the payload's `sys.path.insert(0, <clone root>)` then resolves
+    /// `vco_lib` as an implicit NAMESPACE package over whatever `vco_lib/`
+    /// directory the caller's clone happens to contain — so `import
+    /// vco_lib.deferral_emit` raises. Pre-fix the caller was handed
+    /// `deferral helper exited exit status: 1` while the traceback went to an
+    /// inherited stderr; the failure was simultaneously unexplained and
+    /// unmissable, in the wrong place.
+    ///
+    /// Hermetic by construction: the module name cannot exist on any machine,
+    /// so the assertion does not depend on whether THIS host has `vco_lib`
+    /// importable (the maintainer's does — via `$VCT_INSTALL_ROOT`'s venv —
+    /// and CI's does not; that gap is what made this defect CI-only).
+    #[test]
+    fn a_payload_that_cannot_import_reports_the_import_error_not_a_bare_exit_code() {
+        let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        else {
+            eprintln!("skipping: no python interpreter resolved");
+            return;
+        };
+        // Spawnability probe — the PATH-fallback rung may name a python that
+        // isn't there, and "spawn failed" is a different assertion.
+        if std::process::Command::new(&python)
+            .arg("-c")
+            .arg("pass")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: {} is not spawnable", python.display());
+            return;
+        }
+
+        let err = run_deferral_payload(
+            &python,
+            "import vco_lib_absent_on_every_machine_8f21c3\n",
+            "deferral emit",
+        )
+        .expect_err("an unimportable payload must be an Err");
+
+        assert!(
+            err.contains("vco_lib_absent_on_every_machine_8f21c3"),
+            "the Err must carry the interpreter's own diagnosis — the module \
+             it could not import — not just an exit code; got: {err}"
+        );
+        assert!(
+            err.contains("deferral emit helper"),
+            "the Err must say which operation failed; got: {err}"
+        );
+        assert!(
+            err.contains(&python.display().to_string()),
+            "the Err must name the interpreter that failed — on a machine with \
+             several pythons that IS the diagnosis; got: {err}"
+        );
+    }
+
+    /// The success half, end to end, through a REAL python.
+    ///
+    /// Everything else in this module tests the payload as a string. Nothing
+    /// tested that the payload, handed to an interpreter, actually writes a
+    /// deferral — so a broken payload would have surfaced only as the same
+    /// swallowed best-effort `Err` that a missing `vco_lib` produces, i.e. as
+    /// nothing at all. (That gap is how the CI divergence stayed invisible: on
+    /// the maintainer's machine `$VCT_INSTALL_ROOT`'s venv makes every emit
+    /// succeed; on CI every emit fails; no test could tell the two apart.)
+    ///
+    /// Hermetic on both: `sys_path_root` is THIS repo's root, so `vco_lib`
+    /// resolves as a regular package at `sys.path[0]` regardless of what the
+    /// host has installed, and the whole import chain
+    /// (`deferral_emit` → `deferral_report` → `atomic`) is pure stdlib.
+    #[test]
+    fn a_real_python_writes_the_deferral_through_the_bridge() {
+        let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        else {
+            eprintln!("skipping: no python interpreter resolved");
+            return;
+        };
+        if std::process::Command::new(&python)
+            .arg("-c")
+            .arg("pass")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: {} is not spawnable", python.display());
+            return;
+        }
+
+        // <repo>/launcher/src-tauri → <repo>
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        assert!(
+            repo_root.join("vco_lib").join("deferral_emit.py").is_file(),
+            "fixture precondition: vco_lib/deferral_emit.py must exist at {}",
+            repo_root.display()
+        );
+
+        let folder = tempfile::tempdir().expect("tempdir");
+        let fields = DeferralEntryFields {
+            condition_id: "bridge_end_to_end_probe",
+            title: "Bridge probe",
+            detected: "written by a_real_python_writes_the_deferral_through_the_bridge",
+            why_deferred: "test",
+            command_to_apply: "```bash\necho probe\n```",
+            severity: "info",
+        };
+
+        emit_deferral_entry(&repo_root, folder.path(), &fields)
+            .expect("the bridge must WRITE, not merely not-crash");
+
+        let report = folder.path().join(".claude/context/UPDATE_DEFERRED.md");
+        let body = std::fs::read_to_string(&report)
+            .unwrap_or_else(|e| panic!("no report at {}: {e}", report.display()));
+        assert!(
+            body.contains("bridge_end_to_end_probe") && body.contains("Bridge probe"),
+            "the entry's own fields must reach the file; got:\n{body}"
+        );
+
+        // …and the settle half retires it, deleting the now-empty report.
+        resolve_deferral_conditions(&repo_root, folder.path(), &["bridge_end_to_end_probe"])
+            .expect("resolve must succeed through the same bridge");
+        assert!(
+            !report.is_file(),
+            "resolving the only entry must delete the report, not leave a husk"
+        );
+    }
+
+    /// The summariser keeps the END of a traceback (the exception line), not
+    /// the beginning (the least informative frames), and stays log-sized.
+    #[test]
+    fn child_output_summary_keeps_the_exception_and_stays_bounded() {
+        let traceback = b"Traceback (most recent call last):\n  \
+            File \"<string>\", line 4, in <module>\n\
+            ModuleNotFoundError: No module named 'vco_lib.deferral_emit'\n";
+        let s = summarise_child_output(traceback, b"");
+        assert!(
+            s.ends_with("ModuleNotFoundError: No module named 'vco_lib.deferral_emit'"),
+            "the exception line must survive to the end of the summary; got: {s}"
+        );
+
+        // stdout is the fallback, never the preference.
+        assert_eq!(summarise_child_output(b"", b"on stdout\n"), "on stdout");
+        assert_eq!(summarise_child_output(b"on stderr\n", b"on stdout\n"), "on stderr");
+        // Blank-but-present output is treated as no output.
+        assert_eq!(summarise_child_output(b"\n  \n", b""), "(no output)");
+
+        // A pathological child cannot flood the log, and truncation eats the
+        // FRONT so the tail (the reason) survives.
+        let flood = format!("{}THE_REASON", "x".repeat(4000));
+        let s = summarise_child_output(flood.as_bytes(), b"");
+        assert!(s.chars().count() <= 501, "summary must stay bounded; got {}", s.chars().count());
+        assert!(s.ends_with("THE_REASON"), "truncation must keep the tail; got: {s}");
+    }
 
     /// WP-B6 (v0.2.83): the chokepoint payload MUST route through the LOCKED
     /// emitter `vco_lib.deferral_emit` (`emit`), NOT the raw

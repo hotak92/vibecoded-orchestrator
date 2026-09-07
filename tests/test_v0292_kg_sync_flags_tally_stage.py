@@ -60,6 +60,11 @@ from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.common.child_env import child_env  # noqa: E402
+
 SCRIPT_PATH = Path(os.environ.get(
     "KG_SYNC_SCRIPT_UNDER_TEST",
     str(REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"),
@@ -695,8 +700,15 @@ class CanonicalFilePathTests(_SyncTestBase):
 def _write_forwarding_shim(path: Path) -> None:
     """An executable that forwards every invocation to the test run's
     real interpreter — so the wrapper tests exercise the REAL wrapper +
-    REAL script while the ``import weaviate, weaviate_mcp`` probe
-    succeeds exactly when the test environment can run the script."""
+    REAL script, unmodified, including the ``import weaviate, weaviate_mcp``
+    qualification probe.
+
+    That probe's INPUTS come from :func:`_wrapper_env`, which names both
+    halves of this checkout on ``PYTHONPATH``. Read its comment before
+    changing either: the probe used to be answered by whatever the host
+    happened to have installed, which made these tests pass here and fail
+    on CI with exit 3 — the wrapper's "did not run" — while asserting the
+    exit 2 that only reaches the caller once the script actually runs."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "#!/usr/bin/env bash\n"
@@ -707,14 +719,7 @@ def _write_forwarding_shim(path: Path) -> None:
 
 
 def _wrapper_env(venv_root: Path) -> dict:
-    env = os.environ.copy()
-    env.pop("VCT_INSTALL_ROOT", None)
-    env.pop("KG_SYNC_PROJECT_ROOT", None)
-    env.pop("KG_BASE_DIR", None)
-    env.pop("VIRTUAL_ENV", None)
-    env["VCT_VENV"] = str(venv_root)
-    env["PYTHONPATH"] = str(REPO_ROOT)
-    # PIN THE ORCHESTRATOR ROOT TO THIS CHECKOUT.
+    # PIN THE ORCHESTRATOR ROOT TO THIS CHECKOUT — `child_env()`'s whole job.
     #
     # `sync_knowledge_graph.py` resolves its `vco_lib` parent from
     # $VCT_ORCHESTRATOR_ROOT and inserts it at `sys.path[0]` — ahead of
@@ -728,7 +733,33 @@ def _wrapper_env(venv_root: Path) -> dict:
     # nothing raises and the test simply measures the wrong tree: an audit
     # earlier in this cycle read a stale 13 500-token chunk budget from exactly
     # this leak and nearly filed it as a defect in code that was already fixed.
-    env["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+    env = child_env()
+    env.pop("VCT_INSTALL_ROOT", None)
+    env.pop("KG_SYNC_PROJECT_ROOT", None)
+    env.pop("KG_BASE_DIR", None)
+    env.pop("VIRTUAL_ENV", None)
+    env["VCT_VENV"] = str(venv_root)
+
+    # `claude_mcp_servers` BELONGS ON THE PATH, and its absence is what turned
+    # CI run 34118502499 red with `3 != 2`.
+    #
+    # The wrapper qualifies a candidate venv only when BOTH `weaviate` and
+    # `weaviate_mcp` import from it, and `weaviate_mcp` is not a third-party
+    # package — it lives at `claude_mcp_servers/weaviate_mcp` and is normally
+    # reached through the editable install `install.py` performs. A fresh CI
+    # checkout has no such install, so with only REPO_ROOT on the path the
+    # probe failed, the wrapper refused with exit 3 ("did not run"), and the
+    # flag-forwarding these tests exist to measure never got to run at all.
+    #
+    # On a dev box the pre-fix path was green for a worse reason: the editable
+    # install resolved `weaviate_mcp` to the DOGFOOD FORK's checkout, so the
+    # qualification probe was answered by a tree that is not this one — the
+    # exact leak the paragraph above describes, one module over. Naming the
+    # public checkout's `claude_mcp_servers` explicitly fixes both: CI gains
+    # the module, and here PYTHONPATH precedes site-packages so this tree wins.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT), str(REPO_ROOT / "claude_mcp_servers")]
+    )
     return env
 
 

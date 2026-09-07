@@ -232,7 +232,10 @@ removed.
 **What it DID break, before v0.2.92**: the launcher's *self-update check*
 (Preferences → Launcher updates) asked git for the current branch, got the
 literal string `HEAD` back, and then compared against a ref
-(`vco_upstream/HEAD`) that does not exist in a VCO clone. git returned an
+(`vco_upstream/HEAD`) that does not exist in a VCO clone on git < 2.48
+(git ≥ 2.48 creates `<remote>/HEAD` on fetch by default —
+`remote.<name>.followRemoteHEAD` — so on newer git the ref existed and the
+bug wore a different mask). git returned an
 error; the code turned that error into the number `0`; and `0 commits behind`
 rendered as **"✓ Up to date"**. At the same time the "Latest source release"
 line asked `git describe` — *the closest tag reachable from HEAD* — so an

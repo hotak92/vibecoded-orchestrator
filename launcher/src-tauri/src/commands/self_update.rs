@@ -3199,12 +3199,17 @@ mod tests {
     //
     // The fixture (`detached_upstream_fixture`) reproduces the FIELD shape
     // exactly:
-    //   * the local repo is built with `init` + `remote add` + `fetch`,
-    //     NEVER `clone`. `clone` creates `refs/remotes/<remote>/HEAD`;
-    //     production's `ensure_upstream_remote` (which only ever runs
-    //     `remote add` / `set-url`) does not. A clone-based fixture makes
-    //     `HEAD..vco_upstream/HEAD` RESOLVE, and would pass against the very
-    //     code that shipped the outage;
+    //   * `refs/remotes/vco_upstream/HEAD` does NOT exist, so
+    //     `HEAD..vco_upstream/HEAD` is a `fatal:`. The local repo is built
+    //     with `init` + `remote add` + `fetch`, NEVER `clone` (clone creates
+    //     that ref; production's `ensure_upstream_remote`, which only ever
+    //     runs `remote add` / `set-url`, does not) — and the absence is then
+    //     PINNED via `git_cmd::pin_absent_remote_head`, because `fetch`
+    //     stopped guaranteeing it in git 2.48
+    //     (`remote.<name>.followRemoteHEAD` defaults to `create`). A fixture
+    //     in which that ref RESOLVES would pass against the very code that
+    //     shipped the outage — and, on 2026-09-07, an unpinned one turned a
+    //     git-2.55 CI runner red while git 2.43 stayed green locally;
     //   * `VCO_UPSTREAM_URL` points at a local bare repo, so
     //     `ensure_upstream_remote` + `fetch_upstream` run for real, offline;
     //   * HEAD is detached on an old tag with upstream two commits ahead.
@@ -3293,6 +3298,13 @@ mod tests {
 
             git(&local, &["fetch", "-q", "vco_upstream", "--tags"]);
             git(&local, &["checkout", "-q", "--detach", "v0.0.1"]);
+
+            // "`<remote>/HEAD` does not exist" is a PROPERTY of this fixture,
+            // not something `fetch` still guarantees — git 2.48's
+            // `remote.<name>.followRemoteHEAD=create` default creates it. One
+            // shared pin (git_cmd, so the two detached-HEAD fixtures cannot
+            // drift apart) states it explicitly; must follow the last fetch.
+            git_cmd::pin_absent_remote_head(&local, VCO_UPSTREAM_REMOTE);
 
             (tmp, local, remote)
         }
@@ -3598,7 +3610,11 @@ mod tests {
 
             // The exact call the pre-pull gating makes, against the ref that
             // does not exist in a `remote add` clone — i.e. what the shipped
-            // code passed while detached.
+            // code passed while detached. The absence is a PINNED property of
+            // the fixture (`git_cmd::pin_absent_remote_head`); a git >= 2.48
+            // creates that ref on fetch, and without the pin this `diff`
+            // succeeds, `broken.is_err()` fails, and the red is the test's
+            // fault rather than the code's.
             let broken = git_cmd::run_git(
                 &local,
                 &["diff", "--name-only", "HEAD..vco_upstream/HEAD"],

@@ -1,3 +1,4 @@
+﻿# OS-EXEMPT-PARITY: v0.2.92 hardened the PowerShell detached-spawn path (-WindowStyle guard) — windowed-process concerns have no POSIX analog in the .sh sibling.
 # Stop-hook deferred-citation drain (F-QUEUE, v0.2.70)
 # OS-PARITY: ports the .sh sibling. Fires at turn-end (Stop). Reads
 # session_id + transcript_path from stdin JSON and runs the python drain,

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -78,21 +78,98 @@ def test_every_pyright_include_path_exists():
         assert (_REPO_ROOT / entry).exists(), f"include path missing: {entry}"
 
 
+def _gitignore_literals() -> "set[str]":
+    """The literal (non-pattern, non-negated) paths the repo keeps out of a checkout.
+
+    Pattern lines are skipped deliberately: re-implementing gitignore matching
+    here would be a second, worse copy of git's own rules, and none of the
+    excludes this file has to classify are pattern-shaped.
+    """
+    raw = (_REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    out: set[str] = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "!")) or "*" in line:
+            continue
+        out.add(line.strip("/"))
+    return out
+
+
+def _is_ignored_by_repo(entry: str, ignored: "set[str]") -> bool:
+    """True when `entry` — or any ancestor of it — is literally gitignored."""
+    parts = PurePosixPath(entry.strip("/")).parts
+    return any("/".join(parts[:i]) in ignored for i in range(1, len(parts) + 1))
+
+
+def _exclude_verdict(entry: str, *, exists: bool, ignored: bool) -> str:
+    """Classify one concrete `exclude` entry. Pure, so the verdict is testable.
+
+    * ``present``   — the path is here; the exclusion is doing work.
+    * ``ephemeral`` — absent, but the repo's own .gitignore says a checkout
+      never contains it (`.claude/worktrees` is created on demand by the
+      Agent tool's ``isolation: worktree``). Absence carries no signal.
+    * ``stale``     — absent and TRACKABLE: somebody closed the backlog item
+      the exclusion existed for, without reopening the gate. This is the one
+      the test convicts on.
+    """
+    if exists:
+        return "present"
+    return "ephemeral" if ignored else "stale"
+
+
 def test_every_pyright_exclude_path_still_exists():
     """Same reasoning for excludes, minus the glob patterns.
 
     A `**/…` pattern names no single path; the concrete ones do, and a
     concrete exclude that no longer exists is a backlog item somebody already
     closed without reopening the gate.
+
+    CI run 34118502499 showed the check had one blind spot, though: it read
+    "absent" as "stale" for `.claude/worktrees`, which is gitignored and
+    therefore absent in EVERY fresh checkout — green on a dev box that had run
+    a worktree-isolated agent, red on CI, for a config entry that is correct.
+    Deleting the exclusion would have been the wrong repair (pyright would
+    then walk whole duplicate copies of the repo). So absence is now excused
+    only when the repo itself declares the path uncheckoutable; a tracked path
+    that vanished still convicts, with the original message.
     """
     cfg = _load_pyrightconfig()
+    ignored = _gitignore_literals()
     for entry in cfg.get("exclude", []):
         if "*" in entry:
             continue
-        assert (_REPO_ROOT / entry).exists(), (
+        verdict = _exclude_verdict(
+            entry,
+            exists=(_REPO_ROOT / entry).exists(),
+            ignored=_is_ignored_by_repo(entry, ignored),
+        )
+        assert verdict != "stale", (
             f"exclude path {entry} no longer exists — delete the entry so the "
             f"gate covers what it now can"
         )
+
+
+def test_the_ephemeral_excuse_cannot_swallow_a_stale_exclude():
+    """The excuse added above must stay narrow, or it replaces the gate.
+
+    Drives the pure verdict over all three inputs, then checks the classifier
+    against the two real entries that sit on opposite sides of the line — so
+    "absent is sometimes fine" can never quietly become "absent is fine".
+    """
+    assert _exclude_verdict("x", exists=True, ignored=False) == "present"
+    assert _exclude_verdict("x", exists=True, ignored=True) == "present"
+    assert _exclude_verdict("x", exists=False, ignored=True) == "ephemeral"
+    assert _exclude_verdict("x", exists=False, ignored=False) == "stale"
+
+    ignored = _gitignore_literals()
+    assert _is_ignored_by_repo(".claude/worktrees", ignored), (
+        "the entry the excuse exists for is no longer gitignored — either the "
+        "ignore rule moved (fix the classifier) or the directory is now "
+        "tracked (drop the excuse)"
+    )
+    assert not _is_ignored_by_repo(
+        "claude_mcp_servers/weaviate_mcp/server.py", ignored
+    ), "the backlog exclusion must still be held to the existence check"
 
 
 # --------------------------------------------------------------------------- #

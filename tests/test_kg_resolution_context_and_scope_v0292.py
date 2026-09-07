@@ -438,7 +438,7 @@ class TestKgAccessHelperIsActuallyImportable:
             "collection name and the access-matrix fan-out stays dead."
         )
         # The KG rule DROPS underscores (it is NOT the code-graph rule).
-        assert sk._sanitize_kg_prefix("SimRacing_AI") == "SimRacingAI"
+        assert sk._sanitize_kg_prefix("SimRaceTest_AI") == "SimRaceTestAI"
 
 
 class TestResolveKgScope:
@@ -493,8 +493,8 @@ class TestResolveKgScope:
         """KG names DROP underscores; code-graph class names PRESERVE them.
         Using the wrong one here would query a collection nobody created."""
         assert sk.resolve_kg_scope(
-            projects=["SimRacing_AI"], no_shared=True, self_kg="X", shared_kg="Y"
-        ) == ["SimRacingAI_KnowledgeGraph"]
+            projects=["SimRaceTest_AI"], no_shared=True, self_kg="X", shared_kg="Y"
+        ) == ["SimRaceTestAI_KnowledgeGraph"]
 
     def test_project_accepts_a_full_collection_name(self, sk):
         assert sk.resolve_kg_scope(

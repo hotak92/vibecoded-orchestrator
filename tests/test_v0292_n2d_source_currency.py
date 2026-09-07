@@ -928,6 +928,40 @@ class ShadowRemediationIsolatedVerifyTests(unittest.TestCase):
         self.assertNotIn("cd ", line)
         self.assertIn(" -I -c ", line)
 
+    @staticmethod
+    def _interpreter_that_installs_this_checkout(root: Path) -> Path:
+        """Build a throwaway interpreter whose ONLY ``vco_lib`` is this tree's.
+
+        The interpreter running pytest is the wrong instrument here. Whether
+        ``vco_lib`` is importable under ``-I`` is a property of how the machine
+        was set up, not of the printed line: a dev box that ran ``pip install
+        -e .`` has it in ``site-packages`` (so ``-I`` finds it), while CI puts
+        the checkout on ``PYTHONPATH`` only — which ``-I`` ignores BY DESIGN.
+        That is why CI run 34118502499 saw ``ModuleNotFoundError: No module
+        named 'vco_lib'`` from a command the maintainer's box ran fine.
+
+        So the test brings its own installation: an empty venv (no pip, so it
+        is offline and costs ~0 s) plus a ``.pth`` naming the repo root.
+        ``-I`` implies ``-E -s``, NOT ``-S`` — ``site`` still runs and ``.pth``
+        files are still processed — so this checkout is reachable exactly the
+        way a real install would be, and nothing else is.
+        """
+        import venv
+
+        venv.EnvBuilder(with_pip=False, symlinks=(os.name != "nt")).create(root)
+
+        site_packages = ([*root.glob("lib/python*/site-packages")]
+                         + [*root.glob("Lib/site-packages")])
+        assert len(site_packages) == 1, f"one site-packages expected: {site_packages}"
+        (site_packages[0] / "_repo_root.pth").write_text(
+            f"{REPO_ROOT}\n", encoding="utf-8",
+        )
+
+        for candidate in (root / "bin" / "python", root / "Scripts" / "python.exe"):
+            if candidate.exists():
+                return candidate
+        raise AssertionError(f"no interpreter under {root}")
+
     def test_the_printed_command_actually_runs_isolated(self):
         """Execute the printed tokens from inside a decoy vco_lib checkout:
         with ``-I`` the decoy must NOT win; without it (control) it must."""
@@ -936,34 +970,47 @@ class ShadowRemediationIsolatedVerifyTests(unittest.TestCase):
         line = self._printed_verify_line()
         tokens = shlex.split(line)
         # tokens[0] is the interpreter ("python" in the no-venv fallback);
-        # run the SAME flags/args under the real interpreter so the test is
-        # about the printed flags, not about which `python` is on PATH.
-        argv = [sys.executable] + tokens[1:]
-        self.assertIn("-I", argv)
+        # run the SAME flags/args under a purpose-built interpreter so the
+        # test is about the printed flags — not about which `python` is on
+        # PATH, and (since the CI failure) not about whether the pytest
+        # interpreter happens to have vco_lib installed.
+        self.assertIn("-I", tokens)
 
         with TemporaryDirectory() as td:
             decoy = Path(td) / "vco_lib"
             decoy.mkdir()
             (decoy / "__init__.py").write_text(self.DECOY_INIT, encoding="utf-8")
+
+            python = self._interpreter_that_installs_this_checkout(
+                Path(td) / "venv",
+            )
+            # DELIBERATELY UNPINNED — `child_env()` must NOT be used here.
+            # It exists to force the checkout onto a child's path; this test
+            # asks what the printed line resolves WITHOUT that help, and the
+            # control leg below has to be free to fall into the decoy.
             env = {k: v for k, v in os.environ.items()
                    if k.upper() != "PYTHONPATH"}
 
             isolated = subprocess.run(
-                argv, cwd=td, env=env, capture_output=True, text=True,
-                timeout=60,
+                [str(python)] + tokens[1:], cwd=td, env=env,
+                capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(0, isolated.returncode, isolated.stderr)
             self.assertNotIn("DECOY", (isolated.stdout + isolated.stderr))
             self.assertIn("vco_lib", isolated.stdout)
+            # ...and specifically THIS checkout's, not something else the
+            # interpreter could have reached.
+            self.assertIn(str(REPO_ROOT), isolated.stdout)
 
             control = subprocess.run(
-                [sys.executable] + [t for t in tokens[1:] if t != "-I"],
+                [str(python)] + [t for t in tokens[1:] if t != "-I"],
                 cwd=td, env=env, capture_output=True, text=True, timeout=60,
             )
             self.assertNotEqual(0, control.returncode, (
                 "without -I the decoy cwd must shadow the install — if this "
                 "control stops failing, the -I flag is no longer load-bearing"
             ))
+            self.assertIn("DECOY", control.stdout + control.stderr)
 
     def test_windows_venv_shape_gets_the_same_isolated_line(self):
         """The R23 fixture shape (Windows venv under .venv/Scripts) must carry

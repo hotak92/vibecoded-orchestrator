@@ -454,7 +454,7 @@ PROJECT_NAMES = [
     "VibeCoded Orchestrator",
     "My Cool App",
     "my cool app",
-    "SimRacing AI",
+    "SimRaceTest AI",
     "ACME Corp",
     "Proj v2",
     "Foo-Bar",
@@ -577,9 +577,9 @@ class TestPrefixRuleIsTheWritersRule:
         the KG rule DROPS underscores, the code rule PRESERVES them."""
         from vco_lib.codegraph_naming import sanitize_for_weaviate_class
 
-        assert sanitize_for_weaviate_class("SimRacing_AI") == "SimRacingAI"
-        assert cli_mod._collection_name("CodeFunction", "SimRacing_AI") == (
-            "SimRacing_AI_CodeFunction"
+        assert sanitize_for_weaviate_class("SimRaceTest_AI") == "SimRaceTestAI"
+        assert cli_mod._collection_name("CodeFunction", "SimRaceTest_AI") == (
+            "SimRaceTest_AI_CodeFunction"
         )
 
     def test_coll_and_the_fanout_agree(self, cli_mod):
@@ -678,7 +678,8 @@ class TestDelivery:
 
     def test_no_machine_specific_path_leaked_in(self):
         """R17 check 4 — nothing may assume this machine's layout."""
-        needles = ("/home/martino", "PROGETTI", "VCO_dev", "C:\\Users\\martino")
+        needles = ("/home/testauthor", "PROGETTI", "VCO_dev",
+                   "C:\\Users\\testauthor")
         for name in WP1_SHIPPED_FILES:
             src = (SCRIPTS / name).read_text(encoding="utf-8", errors="replace")
             for needle in needles:

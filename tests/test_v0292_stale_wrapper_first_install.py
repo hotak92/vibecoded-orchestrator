@@ -26,7 +26,7 @@ machine and ran ANOTHER project's sync script. Recorded outcome in
     kg_total = 329, kg_succeeded = 0, kg_failed = 329
     error_message = ... ModuleNotFoundError: No module named 'weaviate'
 
-`MultiagentOrchestrator_KnowledgeGraph`: 0 objects against 329 markdown files.
+`OrchestratorFixtureProj_KnowledgeGraph`: 0 objects against 329 markdown files.
 
 WHAT THESE TESTS PIN
 --------------------

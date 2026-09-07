@@ -3,7 +3,7 @@
 """Unclaimed populated KG classes — the inverse half of the D18 evidence scan.
 
 v0.2.92 (reported-not-fixed item 3). The field find: a live machine carried
-``Agape_KnowledgeGraph`` with 84 objects, NO binding row anywhere naming it,
+``AgapeTest_KnowledgeGraph`` with 84 objects, NO binding row anywhere naming it,
 and no source files in any registered project's folder — hours of embedded
 data with no reader, invisible to every surface: the D18 verdicts are keyed
 by REGISTERED project, the legacy-name detectors are hardcoded to specific
@@ -83,7 +83,7 @@ class FakeMachine:
         )
 
 
-def _agape_machine(tmp: Path):
+def _agape_test_machine(tmp: Path):
     """The field find, reproduced: one registered healthy project + one
     populated class from a project that is no longer registered."""
     m = FakeMachine(tmp)
@@ -92,9 +92,9 @@ def _agape_machine(tmp: Path):
                   files=files)
     m.add_class("LiveName_KnowledgeGraph", paths=files, count=3)
     # The removed project's class: populated, its paths resolve under NO
-    # registered folder (the Agape folder is gone with the project row).
+    # registered folder (the AgapeTest folder is gone with the project row).
     m.add_class(
-        "Agape_KnowledgeGraph",
+        "AgapeTest_KnowledgeGraph",
         paths=[f"knowledge/concepts/g{i}.md" for i in range(4)],
         count=84,
     )
@@ -110,15 +110,15 @@ class ScanUnclaimedTests(unittest.TestCase):
     def test_removed_project_leftover_is_unclaimed(self):
         """MUT target: drop the unclaimed computation from the scan (return
         BindingEvidenceScan(verdicts=...) without the field) and this goes
-        red — the Agape class becomes invisible again."""
+        red — the AgapeTest class becomes invisible again."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
-            scan = _agape_machine(Path(td)).scan()
+            scan = _agape_test_machine(Path(td)).scan()
             self.assertEqual(scan.mismatches, ())  # the live project is fine
             self.assertEqual(
                 [(u.name, u.count) for u in scan.unclaimed],
-                [("Agape_KnowledgeGraph", 84)],
+                [("AgapeTest_KnowledgeGraph", 84)],
             )
 
     def test_bound_class_is_not_unclaimed(self):
@@ -196,7 +196,7 @@ class ScanUnclaimedTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             m = FakeMachine(Path(td))
-            m.add_class("Agape_KnowledgeGraph",
+            m.add_class("AgapeTest_KnowledgeGraph",
                         paths=["knowledge/concepts/g1.md"], count=84)
             scan = kbd.scan_kg_binding_evidence(
                 db_path=m.db,
@@ -210,7 +210,7 @@ class ScanUnclaimedTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             m = FakeMachine(Path(td))
-            m.add_class("Agape_KnowledgeGraph",
+            m.add_class("AgapeTest_KnowledgeGraph",
                         paths=["knowledge/concepts/g1.md",
                                "knowledge/concepts/g2.md"], count=84)
             scan = kbd.scan_kg_binding_evidence(
@@ -256,7 +256,7 @@ class DoctorUnclaimedTests(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
-            scan = _agape_machine(Path(td)).scan()
+            scan = _agape_test_machine(Path(td)).scan()
             report = doctor.run_doctor(
                 Path(td), scope=doctor.SCOPE_FULL, resolvers=_resolvers(scan))
             findings = [f for f in report.findings
@@ -282,11 +282,11 @@ class DoctorUnclaimedTests(unittest.TestCase):
                              [doctor.CID_KG_UNCLAIMED])
             e = entries[0]
             combined = f"{e.detected} {e.command_to_apply} {e.why_deferred}"
-            self.assertIn("Agape_KnowledgeGraph", combined)
+            self.assertIn("AgapeTest_KnowledgeGraph", combined)
             self.assertIn("84", combined)
             self.assertEqual(e.severity, "info")
             self.assertEqual(e.dismiss_fields.get("classes"),
-                             ["Agape_KnowledgeGraph"])
+                             ["AgapeTest_KnowledgeGraph"])
             # The absolute constraint: no deletion path, printed or implied.
             for forbidden in ("DELETE /v1/schema", "drop the orphan",
                               "curl -X DELETE"):
@@ -300,7 +300,7 @@ class DoctorUnclaimedTests(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as td:
-            scan = _agape_machine(Path(td)).scan()
+            scan = _agape_test_machine(Path(td)).scan()
             folder = Path(td) / "proj"
             (folder / ".claude" / "context").mkdir(parents=True)
             report = doctor.run_doctor(folder, resolvers=_resolvers(scan))
@@ -312,7 +312,7 @@ class DoctorUnclaimedTests(unittest.TestCase):
                   / "UPDATE_DEFERRED.md").read_text(encoding="utf-8")
             for needle in (
                 "kg_unclaimed_populated_classes",
-                "Agape_KnowledgeGraph",
+                "AgapeTest_KnowledgeGraph",
                 "Identity tab",
             ):
                 self.assertIn(needle, md)
@@ -374,7 +374,7 @@ class DoctorUnclaimedTests(unittest.TestCase):
             m.add_project("p1", "RealName", kg_primary="Ghost_KnowledgeGraph",
                           files=files)
             m.add_class("RealName_KnowledgeGraph", paths=files, count=3)
-            m.add_class("Agape_KnowledgeGraph",
+            m.add_class("AgapeTest_KnowledgeGraph",
                         paths=[f"knowledge/concepts/g{i}.md" for i in range(4)],
                         count=84)
             scan = m.scan()
@@ -384,7 +384,7 @@ class DoctorUnclaimedTests(unittest.TestCase):
             self.assertEqual(finding.condition_id,
                              doctor.CID_KG_BINDING_EVIDENCE_MISMATCH)
             self.assertEqual(finding.detail.get("unclaimed"),
-                             ["Agape_KnowledgeGraph"])
+                             ["AgapeTest_KnowledgeGraph"])
             # The mismatch entry's dismissal identity is NOT keyed on the
             # unclaimed set (that pass owes the D18 entry only).
             entries = doctor.deferral_entries_for(report)
@@ -411,7 +411,7 @@ class ClearProbeTests(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
-            scan = _agape_machine(Path(td)).scan()
+            scan = _agape_test_machine(Path(td)).scan()
             ctx = deferral_probes.ProbeContext(folder=Path(td))
             with mock.patch.object(kbd, "scan_kg_binding_evidence",
                                    return_value=scan):

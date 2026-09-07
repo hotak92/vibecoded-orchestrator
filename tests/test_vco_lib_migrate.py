@@ -514,6 +514,34 @@ class CliMigrateCommandTests(unittest.TestCase):
             )
         }
 
+        # Hermeticity pin (added after CI run 34118502499 went red on five of
+        # these six tests with `1 != 0`). The tests below mock
+        # `project_init.migrate_collections` and say "so we don't hit the
+        # network" — but that mock only covers the KG/Dev dispatcher. The SAME
+        # handler then always runs the v0.2.18 additive helper, whose
+        # `enumerate_kg_collections` / `enumerate_code_collections` DO read
+        # /v1/schema; since v0.2.92 W18 an unreachable server raises
+        # ProbeUnavailable instead of returning [], the handler records it in
+        # `errors[]`, and `main()` returns 1. So the class silently required a
+        # live Weaviate: green on a dev box, red on a fresh CI checkout.
+        #
+        # `_list_all_classes` is the seam weaviate_schema.py documents for
+        # exactly this ("the seam tests patch to drive the enumerators against
+        # a fixed class list"), so pinning it here keeps the REAL enumerator
+        # filtering in the path and only removes the socket. An empty listing
+        # is the honest fixture: none of Foo's collections exist anywhere.
+        #
+        # This erases no coverage — the raise-don't-return-[] contract is owned
+        # by tests/test_v0292_wp2_class_probe_ssot.py, and the "a probe failure
+        # surfaces as exit 1" behaviour is pinned below by
+        # test_probe_failure_is_an_error_not_a_silent_success.
+        from vco_lib import weaviate_schema as _ws
+        _probe_patch = mock.patch.object(
+            _ws, "_list_all_classes", return_value=[],
+        )
+        _probe_patch.start()
+        self.addCleanup(_probe_patch.stop)
+
     def tearDown(self):
         for k, v in self._env_backup.items():
             if v is None:
@@ -563,6 +591,47 @@ class CliMigrateCommandTests(unittest.TestCase):
             with mock.patch.object(sys, "stdout", buf):
                 rc = project_init.main(argv)
             self.assertEqual(rc, 1)
+
+    def test_probe_failure_is_an_error_not_a_silent_success(self):
+        """An unreachable Weaviate must reach `errors[]` and exit 1.
+
+        This is the behaviour the rest of the class used to depend on by
+        ACCIDENT — before setUp pinned `_list_all_classes`, every test here
+        inherited whatever the ambient server said, which is why five of them
+        passed on a dev box and failed on CI. Now the dependency is stated in
+        one place and asserted: the handler must not turn "could not look" into
+        a clean plan. Drive the seam to raise and prove the conviction.
+        """
+        from vco_lib import weaviate_schema as _ws
+        from vco_lib.weaviate_helpers import ProbeUnavailable
+
+        fake_result = {
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy",
+                      "objects_copied": 0, "elapsed_ms": 0}],
+            "dry_run": True,
+            "errors": [],
+        }
+        with mock.patch.object(project_init, "migrate_collections",
+                               return_value=fake_result), \
+             mock.patch.object(
+                 _ws, "_list_all_classes",
+                 side_effect=ProbeUnavailable(
+                     "which classes exist in Weaviate", "connection refused",
+                 ),
+             ):
+            argv = ["migrate-collections", "--name", "Foo",
+                    "--dry-run", "--json"]
+            from io import StringIO
+            buf = StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                rc = project_init.main(argv)
+            self.assertEqual(rc, 1)
+            payload = json.loads(buf.getvalue().strip())
+            self.assertTrue(
+                any(e.get("action") == "v0218_schema"
+                    for e in payload["errors"]),
+                f"probe failure must be reported, got {payload['errors']}",
+            )
 
     def test_v0255_clean_dry_run_clears_stale_migration_deferral(self):
         """v0.2.55 (stale-migration-deferral fix): when a dry-run finds NO

@@ -1,3 +1,4 @@
+﻿# OS-EXEMPT-PARITY: v0.2.92 hardened the PowerShell detached-spawn path (-WindowStyle guard / Start-Job teardown) — windowed-process concerns have no POSIX analog in the .sh sibling.
 # stop-codegraph-drain.ps1 -- Stop hook (v0.2.73 FIX-B)
 # OS-PARITY: ports templates/hooks/stop-codegraph-drain.sh. END-OF-TURN BATCHED
 # code-graph sync. Replaces the per-EDIT code-graph-incremental scheduling that

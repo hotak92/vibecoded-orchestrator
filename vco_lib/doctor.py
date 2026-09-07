@@ -169,7 +169,7 @@ CID_KG_BINDING_EVIDENCE_MISMATCH = "kg_binding_evidence_mismatch"
 #: folder anchors its sampled paths) — the removed-project leftover the D18
 #: scan's verdicts cannot see because verdicts are keyed by REGISTERED
 #: project (v0.2.92 reported-not-fixed item 3; field find:
-#: ``Agape_KnowledgeGraph``, 84 objects). Registered ``action_required``:
+#: ``AgapeTest_KnowledgeGraph``, 84 objects). Registered ``action_required``:
 #: deciding what unclaimed data is (re-add the project / re-bind / expected
 #: leftover → dismiss) is a human decision that does not resolve on its own.
 #: Read-only detection; the entry NEVER prints a drop command.

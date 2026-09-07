@@ -18,10 +18,22 @@
 //! In a detached HEAD, `--abbrev-ref` returns the literal string `"HEAD"`.
 //! The installer surface normalised it to `main` and worked. The self-update
 //! surface passed `"HEAD"` through into `HEAD..vco_upstream/HEAD` — a ref
-//! that DOES NOT EXIST, because `ensure_upstream_remote` only ever runs
-//! `remote add` / `set-url` and git's fetch never creates a remote HEAD
-//! symref. git returned `fatal:`, and `.unwrap_or(0)` turned that into the
-//! number zero, and zero meant "up to date".
+//! that DID NOT EXIST on the field install, because `ensure_upstream_remote`
+//! only ever runs `remote add` / `set-url`, and the git that install ran
+//! never created a remote HEAD symref on `fetch`. git returned `fatal:`, and
+//! `.unwrap_or(0)` turned that into the number zero, and zero meant "up to
+//! date".
+//!
+//! **That last premise is git-VERSION dependent, and saying it unqualified
+//! cost a red CI run.** Since git 2.48, `fetch` honours
+//! `remote.<name>.followRemoteHEAD`, whose default `create` makes a plain
+//! `remote add` + `fetch` DO create `refs/remotes/<remote>/HEAD`. So on a
+//! modern git `HEAD..<remote>/HEAD` resolves and returns a count; on the
+//! field install's older git it was `fatal:`. Neither behaviour changes what
+//! this module must do — the normaliser answers with the RESOLVED branch and
+//! never constructs `<remote>/HEAD` at all — but the regression fixtures
+//! below have to pin the shape explicitly instead of inheriting whatever the
+//! host's git happens to do (see [`pin_absent_remote_head`]).
 //!
 //! So: two subsystems, one question, opposite answers on the same repo. That
 //! is a duplicated SYSTEM even though the two shared no lines of code — and
@@ -44,9 +56,16 @@
 //!
 //! ## What does NOT live here, deliberately
 //!
-//! `git remote set-head` is NOT called anywhere, and must not be added as a
-//! "second fix" for the missing `vco_upstream/HEAD` ref. The normaliser IS
-//! the fix; a second mechanism is a second thing to drift.
+//! `git remote set-head` is NOT called by any PRODUCTION path here or
+//! anywhere else in the launcher, and must not be added as a "second fix"
+//! for the missing `vco_upstream/HEAD` ref. The normaliser IS the fix; a
+//! second mechanism is a second thing to drift.
+//!
+//! The one `set-head` in this file is [`pin_absent_remote_head`], which is
+//! `#[cfg(test)]` and only ever `--delete`s. It does not fix anything for a
+//! user: it pins a FIXTURE's environment so the regression tests reproduce
+//! the field shape on every git version. Test-fixture setup and a production
+//! repair are different things; keep it that way.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -392,6 +411,115 @@ pub(crate) async fn is_ancestor(
     }
 }
 
+/// TEST-ONLY fixture pin: guarantee `refs/remotes/<remote>/HEAD` does NOT
+/// exist in `repo`, on every git version.
+///
+/// ## The divergence this exists to kill
+///
+/// Two regression suites — this module's `detached_fixture` and
+/// `self_update`'s `detached_upstream_fixture` — build their local repo with
+/// `init` + `remote add` + `fetch` (never `clone`) specifically so that
+/// `<remote>/HEAD` is ABSENT, which is what made the field install's
+/// `HEAD..vco_upstream/HEAD` a `fatal:` rather than a number. Two tests assert
+/// exactly that failure reaches the caller:
+///
+/// * `commits_behind_errors_on_a_ref_that_does_not_exist`
+/// * `self_update::…::apply_rebuilds_everything_when_diff_unknown`
+///
+/// "`fetch` does not create a remote HEAD" stopped being true in git 2.48,
+/// which added `remote.<name>.followRemoteHEAD` with the default `create`.
+/// On git 2.43 (the maintainer's machine) both tests passed; on git 2.55
+/// (GitHub's `ubuntu-latest`, 2026-09) the fetch created the ref, the
+/// "missing" ref resolved, `rev-list` answered `2`, and both tests failed —
+/// green locally, red in CI, with nothing wrong in the production code.
+///
+/// So the fixture states the shape instead of inheriting it. Belt AND
+/// braces, because either half alone is a bet on a git version:
+///
+/// 1. `remote.<remote>.followRemoteHEAD=never` — stops a git ≥2.48 from
+///    (re)creating the ref on any LATER fetch a test body runs. Unknown
+///    config keys are inert on older gits, so this is a no-op there.
+/// 2. `remote set-head <remote> --delete` — removes a ref that an earlier
+///    fetch already created. Idempotent: exit 0 whether or not it exists,
+///    and it removes only the HEAD symref (`<remote>/main` survives —
+///    verified on 2.43 and pinned by
+///    `pin_absent_remote_head_defeats_a_modern_git_remote_head`).
+///
+/// Then it ASSERTS the postcondition. If a future git defeats both halves,
+/// the fixture fails loudly here rather than turning the two tests into
+/// silent tautologies (or another baffling CI-only red).
+///
+/// Call AFTER the fixture's last fetch.
+#[cfg(test)]
+pub(crate) fn pin_absent_remote_head(repo: &Path, remote: &str) {
+    let run = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .silent()
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} in {}: {e}", repo.display()))
+    };
+
+    let key = format!("remote.{remote}.followRemoteHEAD");
+    let set = run(&["config", &key, "never"]);
+    assert!(
+        set.status.success(),
+        "git config {key} never failed in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&set.stderr).trim()
+    );
+
+    let head_ref = format!("refs/remotes/{remote}/HEAD");
+    let ref_names = |out: std::process::Output| -> Vec<String> {
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        v.sort();
+        v
+    };
+    let list = |run: &dyn Fn(&[&str]) -> std::process::Output| {
+        ref_names(run(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{remote}"),
+        ]))
+    };
+    let before = list(&run);
+
+    // Not asserted on: `--delete` is a no-op when the ref is absent, which is
+    // the common case on git <2.48. The postconditions below are the
+    // assertions that matter.
+    let _ = run(&["remote", "set-head", remote, "--delete"]);
+
+    let after = list(&run);
+    assert!(
+        !after.contains(&head_ref),
+        "fixture pin failed: {head_ref} still exists in {}. This git ({}) \
+         resists both followRemoteHEAD=never and `remote set-head --delete`; \
+         the detached-HEAD regression tests assume that ref is ABSENT and are \
+         meaningless until the pin is taught the new behaviour.",
+        repo.display(),
+        String::from_utf8_lossy(&run(&["--version"]).stdout).trim()
+    );
+
+    // …and the pin must have taken NOTHING ELSE with it. `set-head --delete`
+    // removes the HEAD symref, not what it points at; a git that ever
+    // dereferenced instead would silently gut the fixture's branch refs and
+    // every test using it would fail somewhere far away from the cause.
+    let expected: Vec<String> = before.into_iter().filter(|r| *r != head_ref).collect();
+    assert_eq!(
+        after,
+        expected,
+        "fixture pin removed more than {head_ref} in {}",
+        repo.display()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,13 +564,17 @@ mod tests {
     /// Build the fixture that reproduces the FIELD shape, not a convenient
     /// one. Two properties are load-bearing and easy to get wrong:
     ///
-    /// 1. the local repo is created with `init` + `remote add` + `fetch`,
-    ///    NEVER `clone` — because `clone` creates
-    ///    `refs/remotes/<remote>/HEAD` and the production
-    ///    `ensure_upstream_remote` (which only ever runs `remote add` /
-    ///    `set-url`) does not. A `clone`-based fixture makes
-    ///    `HEAD..vco_upstream/HEAD` resolve, and would have passed against
-    ///    the very code that shipped the outage;
+    /// 1. `refs/remotes/vco_upstream/HEAD` does NOT exist, so
+    ///    `HEAD..vco_upstream/HEAD` is a `fatal:` — the shape that turned
+    ///    into `.unwrap_or(0)`'s "up to date". The repo is therefore built
+    ///    with `init` + `remote add` + `fetch`, NEVER `clone` (clone always
+    ///    creates that ref; the production `ensure_upstream_remote`, which
+    ///    only ever runs `remote add` / `set-url`, does not) — AND the
+    ///    absence is then PINNED by [`pin_absent_remote_head`], because
+    ///    `fetch` alone stopped guaranteeing it in git 2.48
+    ///    (`remote.<name>.followRemoteHEAD` defaults to `create`). Without
+    ///    the pin this fixture is green on an old git and red on a new one,
+    ///    which is exactly what it did in CI on 2026-09-07;
     /// 2. HEAD is left DETACHED on the first tag with the remote two commits
     ///    ahead — the exact state the field install sat in.
     ///
@@ -488,6 +620,11 @@ mod tests {
 
         git(&local, &["fetch", "-q", "vco_upstream", "--tags"]);
         git(&local, &["checkout", "-q", "--detach", "v0.0.1"]);
+
+        // Property 1, stated rather than inherited. MUST come after the last
+        // fetch: on git >= 2.48 that fetch creates the very ref this pin
+        // removes.
+        pin_absent_remote_head(&local, "vco_upstream");
 
         (tmp, local, "vco_upstream")
     }
@@ -545,9 +682,20 @@ mod tests {
         skip_if_no_git!();
         let (_tmp, repo, remote) = detached_fixture();
 
-        // `<remote>/HEAD` does NOT exist under `remote add` + `fetch` — this
-        // is the production shape, and asking for it is what self_update.rs
-        // did in a detached HEAD.
+        // Precondition: `<remote>/HEAD` really is absent. The fixture PINS
+        // that (see `pin_absent_remote_head`); a git >= 2.48 would otherwise
+        // have created it on fetch, `rev-list` would answer `2`, and this
+        // test would fail while nothing was wrong with the code — which is
+        // precisely what CI did on 2026-09-07.
+        let probe = run_git(&repo, &["show-ref", "--verify", &format!("refs/remotes/{remote}/HEAD")])
+            .await;
+        assert!(
+            probe.is_err(),
+            "fixture precondition: refs/remotes/{remote}/HEAD must be ABSENT, \
+             else the call below is not asking for a missing ref at all"
+        );
+
+        // Asking for it is what self_update.rs did in a detached HEAD.
         let err = commits_behind(&repo, remote, "HEAD")
             .await
             .expect_err("HEAD..<remote>/HEAD must be an error, not a count");
@@ -555,6 +703,44 @@ mod tests {
             err.contains("rev-list"),
             "the error must name the failing git command, got: {err}"
         );
+    }
+
+    /// Red-proof for [`pin_absent_remote_head`], and the ONE place the CI
+    /// divergence is reproducible on ANY git version.
+    ///
+    /// `remote set-head <remote> -a` creates `refs/remotes/<remote>/HEAD`
+    /// by hand — byte-for-byte the state a git >= 2.48 `fetch` leaves behind
+    /// under its `followRemoteHEAD=create` default. The first half asserts
+    /// the CI failure verbatim (a COUNT, not an error); the second asserts
+    /// the pin restores the field shape and leaves the branch ref intact.
+    /// Delete the `pin_absent_remote_head` call from either fixture and this
+    /// still passes — but delete the pin's `--delete` leg and this goes red
+    /// on every machine, which is the point.
+    #[tokio::test]
+    async fn pin_absent_remote_head_defeats_a_modern_git_remote_head() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+
+        git(&repo, &["remote", "set-head", remote, "-a"]);
+
+        // THE CI FAILURE, reproduced: the "missing" ref resolves and the
+        // count comes back as if everything were fine.
+        let n = commits_behind(&repo, remote, "HEAD")
+            .await
+            .expect("with <remote>/HEAD present this resolves — that IS the divergence");
+        assert_eq!(n, 2, "and it answers with a plausible-looking count");
+
+        pin_absent_remote_head(&repo, remote);
+
+        commits_behind(&repo, remote, "HEAD")
+            .await
+            .expect_err("after the pin the field shape is back: a missing ref, an Err");
+
+        // The pin must remove the HEAD symref ONLY.
+        let n = commits_behind(&repo, remote, "main")
+            .await
+            .expect("the branch ref must survive the pin");
+        assert_eq!(n, 2);
     }
 
     #[tokio::test]

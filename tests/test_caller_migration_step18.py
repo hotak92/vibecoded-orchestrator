@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -134,8 +136,29 @@ class WeaviateMcpServerResolverTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._env_snapshot = _clear_relevant_env()
+        # Hermeticity pin (2026-09-07 CI red): server.py's v0.2.92 authority
+        # gate (`_hub_value_wins`) only lets hub values beat env when
+        # `_resolution_context()` actually identified the project — an
+        # existing `$CLAUDE_PROJECT_DIR`, or a CWD ancestor carrying
+        # `.claude/settings.json` / `.claude/env`. A CI checkout has neither
+        # (both markers are install-rendered and gitignored), so the context
+        # degrades to the module-path GUESS and env wins — these tests then
+        # assert the wrong arm ('EnvKG' != 'HubKG'; the legacy env CSV peers
+        # instead of the hub access list). They only passed on dev machines
+        # because the CWD walk happened to reach a home dir with a `.claude/`.
+        # Pinning CLAUDE_PROJECT_DIR at a fresh existing dir is exactly how
+        # Claude Code spawns the real MCP, so the hub-first arm is exercised
+        # deterministically on every machine.
+        self._hub_ctx_dir = tempfile.mkdtemp(prefix="step18-hub-ctx-")
+        self._prior_claude_project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = self._hub_ctx_dir
 
     def tearDown(self) -> None:
+        if self._prior_claude_project_dir is None:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        else:
+            os.environ["CLAUDE_PROJECT_DIR"] = self._prior_claude_project_dir
+        shutil.rmtree(self._hub_ctx_dir, ignore_errors=True)
         _restore_relevant_env(self._env_snapshot)
         _purge_modules(("weaviate_mcp", "vco_lib.project_config"))
 

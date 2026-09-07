@@ -28,10 +28,45 @@ HOOK_SH = REPO_ROOT / "templates" / "hooks" / "embedding-failures-surface.sh"
 HOOK_PS1 = REPO_ROOT / "templates" / "hooks" / "embedding-failures-surface.ps1"
 
 
+def _venv_stub(project_root: Path) -> Path:
+    """A silent exit-0 interpreter to pin via ``$VCT_VENV``.
+
+    Hermeticity pin (2026-09-07 CI red): the hook's fidelity leg spawns
+    ``$VCO_VENV_PYTHON -m vco_lib.embedding_fidelity notice`` whenever the
+    session's metrics redirect holds an ``embedding_failures.jsonl`` that has
+    grown past this project's marker — which is the NORMAL state mid-suite,
+    because earlier test files write fixture rows into the same conftest
+    redirect (``tests/test_maintain_kg_guards.py`` et al.). Whether that spawn
+    then produces output depends on machine state: on a dev box the clone
+    venv resolves and a healthy ``vco_lib.embedding_fidelity`` prints
+    nothing for foreign rows; on CI no venv resolves at all and the hook
+    legitimately prints its no-venv notice to STDOUT.
+
+    That notice BELONGS on stdout — it is the hook's contract channel
+    (Claude Code injects a SessionStart hook's stdout as a system-reminder
+    and DISCARDS its stderr on exit 0; see the hook's v0.2.92 MAJOR-3
+    note), so redirecting it to stderr would make it unreadable. The fix is
+    on the test side: pin ``$VCT_VENV`` at a stub interpreter so
+    ``resolve_vco_venv_python`` tier 1 always resolves and the spawn is a
+    deterministic silent success — the fidelity leg then never emits, and
+    these tests assert exactly their subject (the outage-hint leg).
+    """
+    stub = project_root / ".vct-test-venv-stub"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "# Test stub (see _venv_stub docstring): exit 0, print nothing.\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
 def _run_hook(project_root: Path, *, extra_env: dict[str, str] | None = None):
     """Invoke the shell hook with CLAUDE_PROJECT_DIR pointing at *project_root*."""
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(project_root)
+    env["VCT_VENV"] = str(_venv_stub(project_root))
     # Make sure we don't accidentally inherit a disable flag from the
     # test runner's environment.
     env.pop("VCT_DISABLE_HOOKS", None)

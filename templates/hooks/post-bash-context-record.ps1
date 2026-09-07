@@ -1,4 +1,5 @@
-﻿# V52-M (v0.2.52) — post-bash outcome event recorder
+﻿# OS-EXEMPT-PARITY: v0.2.92 fixed a PowerShell-only epoch bug (mixed-DateTimeKind subtraction shifts by the UTC offset) — the .sh sibling's stamps were always correct; both siblings are pinned by tests/test_v0292_ps1_unix_epoch_parity.py.
+# V52-M (v0.2.52) — post-bash outcome event recorder
 # OS-PARITY: ports the .sh sibling. Fires AFTER Bash tool executes.
 # Re-derives cmd_hash from stdin, reads the state file written by
 # pre-bash-context-inject.ps1, emits a bash_outcome event with the

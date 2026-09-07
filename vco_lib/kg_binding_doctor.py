@@ -57,7 +57,7 @@ The unclaimed dimension (v0.2.92, reported-not-fixed item 3)
 The same pass also reports the INVERSE gap: a populated ``*_KnowledgeGraph``
 class that no binding row names AND whose sampled paths anchor to no
 registered project's folder — data with no reader, e.g. a removed project's
-leftover class (the field find: ``Agape_KnowledgeGraph``, 84 objects, no
+leftover class (the field find: ``AgapeTest_KnowledgeGraph``, 84 objects, no
 binding row anywhere, source files gone). That class appears in NO verdict
 (the verdicts are keyed by registered project), so without this dimension
 it is invisible to every surface. The inputs are the ones the scan already
