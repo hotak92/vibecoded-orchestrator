@@ -43,7 +43,7 @@ SERVICE_DIR = REPO_ROOT / "claude_mcp_servers" / "code_embedding_service"
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from vco_lib import code_embed_image  # noqa: E402
+from vco_lib import code_embed_image, containers  # noqa: E402
 from vco_lib import deferral_probes, doctor  # noqa: E402
 
 
@@ -411,7 +411,14 @@ class ComposeArgvTests(unittest.TestCase):
              mock.patch.object(install, "_log_install_event"), \
              mock.patch.object(install, "_should_check_weaviate_reclaim_drift", return_value=False), \
              mock.patch.object(code_embed_image, "image_state", return_value=state), \
+             mock.patch.object(install._containers, "find_existing_container",
+                               side_effect=lambda svc, runtime="podman": f"vco_{svc}"), \
+             mock.patch.object(install._containers, "compose_identity_of",
+                               return_value=containers.ComposeIdentity("infrastructure")), \
              mock.patch.object(subprocess, "run", side_effect=fake_run):
+            # v0.2.93: the identity guard (test_v0293_compose_identity_guard)
+            # would otherwise probe the HOST's containers here — stub it as
+            # "ours" so this suite stays hermetic and keeps pinning the argv.
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 install._start_services(

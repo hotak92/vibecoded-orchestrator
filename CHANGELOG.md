@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — install step 5 on machines whose containers another compose project created (v0.2.93)
+
+Field 2026-09-07, dogfood update to v0.2.92: every service was healthy and
+adopted, yet `install.py --update` died at step 5/10 — after the manifest and
+bundle steps, before hooks, hub, MCP registration, KG seed and schema
+migrations — leaving a half-updated tree and no ledger row.
+
+- **Step 5 reads who owns a running container before recreating it.** v0.2.92's
+  adopt-recreate (and the code_embed image rebuild that feeds one) drove
+  `compose up --force-recreate` under `infrastructure/` against containers the
+  legacy `claude_mcp_servers/compose.yaml` had created (compose project
+  `vibecoded`). Compose refused with a stale-network-label error; with a clean
+  network it would have collided on the container name. `vco_lib.containers`
+  now reads the compose identity labels (`compose_identity_of`,
+  `compose_project_name`, `foreign_compose_identity`); a container another
+  project created — or one compose never created — is left exactly as it is,
+  printed as `[skip-recreate]`, and recorded as
+  `services_foreign_compose_identity` with the two honest options (apply the
+  change through the owning compose, or hand the services to install.py's
+  compose after checking the volume layout). Conservative on every probe
+  failure: anything not positively ours is not ours.
+- **A failed `compose up` no longer kills an `--update` nothing depends on.**
+  When every required service already answers, the failure is recorded as
+  `services_compose_up_failed` (stderr tail + the manual command) and the run
+  continues; a fresh install, or any required service down, keeps the hard
+  stop. New targeted hint for docker-compose's "network … has incorrect label"
+  refusal.
+- **The code_embed staleness probe never read the digest.** install.py's
+  detector hands over the exact URL it probed (`…/health`); the probe appended
+  `/health` again, GET `/health/health` 404'd, and the verdict read "service is
+  not answering /health" for a service that answered — the rebuild fired for
+  the wrong reason. `service_base_url` now treats a `/health` URL as the base
+  it is. (Instance #24 of a credited mechanism that never fired: the test
+  harness passed a bare base URL, the field passed the detector's.)
+
 ## [0.2.92] - 2026-09-07
 
 ### Fixed

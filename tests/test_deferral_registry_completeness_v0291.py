@@ -203,6 +203,15 @@ _V0292_OWNED_ADDITIONS = frozenset({
     "kg_binding_ambiguous_evidence",
 })
 
+# v0.2.93: step-5 guard rows. Both are emitted INSIDE an install.py run
+# (`_start_services`) and re-detected on every run, so owned-drop-when-absent
+# is the right clear probe: the moment the recreate goes through (or the
+# compose failure stops recurring) the row disappears on the next update.
+_V0293_OWNED_ADDITIONS = frozenset({
+    "services_foreign_compose_identity",
+    "services_compose_up_failed",
+})
+
 
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
@@ -505,7 +514,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
     def test_additions_are_exactly_the_deliberate_ones(self):
         added = self.owned - _V0290_OWNED_IDS
         self.assertEqual(
-            added, _V0291_OWNED_ADDITIONS | _V0292_OWNED_ADDITIONS,
+            added,
+            _V0291_OWNED_ADDITIONS | _V0292_OWNED_ADDITIONS | _V0293_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

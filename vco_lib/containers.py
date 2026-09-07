@@ -68,6 +68,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -83,6 +84,10 @@ __all__ = [
     "all_known_names",
     "find_existing_container",
     "UnknownServiceError",
+    "ComposeIdentity",
+    "compose_project_name",
+    "compose_identity_of",
+    "foreign_compose_identity",
     # v0.2.92 (§3.5 / R13): runtime + compose resolution, the ONE Python home.
     "RuntimeState",
     "RuntimeResolution",
@@ -269,6 +274,134 @@ def find_existing_container(
         if res.returncode == 0:
             return name
     return None
+
+# ===========================================================================
+# Compose identity — which compose project created a running container
+# (v0.2.93)
+# ===========================================================================
+#
+# v0.2.92 taught `install.py` step 5 to `--force-recreate` the vct-managed
+# services it adopts, so a changed compose config or a rebuilt image reaches
+# the running container on `--update`. That is only sound when the container
+# was CREATED by the compose identity install.py drives
+# (`<root>/infrastructure/docker-compose.yml`, project `infrastructure`).
+# Field 2026-09-07 (dogfood update to v0.2.92): every service was healthy and
+# adopted, but the containers had been created in July from the legacy
+# `claude_mcp_servers/compose.yaml` (project `vibecoded`). Compose under
+# project `infrastructure` refused with a stale-network-label error — and had
+# the network been clean it would have hit a container-name conflict instead —
+# so the whole update died at step 5 for services that needed nothing.
+#
+# Compose stamps the creating project on every container it makes. Reading
+# that label is the cheap, positive way to know BEFORE acting; a container
+# without it was not made by compose at all, so `--force-recreate` is not a
+# tool that applies to it either. Conservative default on this best-effort
+# path: anything that cannot be positively read as OURS is treated as NOT ours.
+
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_WORKING_DIR_LABEL = "com.docker.compose.project.working_dir"
+COMPOSE_CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
+
+_COMPOSE_NAME_KEY_RE = re.compile(r"^name:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class ComposeIdentity:
+    """The compose project a container was created under, from its labels."""
+
+    project: str
+    working_dir: str = ""
+    config_files: str = ""
+
+    def describe(self) -> str:
+        parts = [f"project '{self.project}'"]
+        if self.working_dir:
+            parts.append(f"in {self.working_dir}")
+        if self.config_files:
+            parts.append(f"({self.config_files})")
+        return " ".join(parts)
+
+
+def compose_project_name(compose_dir: Path, compose_text: str = "") -> str:
+    """Pure: the project name compose derives for ``compose_dir``.
+
+    A top-level ``name:`` key in the compose file wins; otherwise compose uses
+    the directory basename normalised the way docker compose does it —
+    lower-cased, every character outside ``[a-z0-9_-]`` dropped, leading
+    ``-``/``_`` trimmed. A ``COMPOSE_PROJECT_NAME`` / ``-p`` override is the
+    caller's business (install.py sets neither).
+    """
+    m = _COMPOSE_NAME_KEY_RE.search(compose_text or "")
+    if m:
+        return m.group(1)
+    raw = Path(compose_dir).name.lower()
+    return re.sub(r"[^a-z0-9_-]", "", raw).lstrip("-_")
+
+
+def compose_identity_of(
+    container: str,
+    runtime: str = "podman",
+    *,
+    run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
+) -> Optional[ComposeIdentity]:
+    """Read the compose identity labels of ``container``.
+
+    Returns ``None`` when the container cannot be inspected OR carries no
+    compose project label (it was not created by compose). Read-only and
+    soft-failing on every error — the caller must treat ``None`` as "not
+    known to be ours", never as "ours".
+    """
+    bin_name = _resolve_runtime(runtime)
+    if bin_name is None:
+        return None
+    fmt = "\t".join(
+        f'{{{{index .Config.Labels "{label}"}}}}'
+        for label in (
+            COMPOSE_PROJECT_LABEL,
+            COMPOSE_WORKING_DIR_LABEL,
+            COMPOSE_CONFIG_FILES_LABEL,
+        )
+    )
+    argv = [bin_name, "inspect", "--type", "container", "--format", fmt, container]
+    try:
+        res = (run or subprocess.run)(
+            argv, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    fields = (res.stdout or "").strip("\n").split("\t")
+    project = fields[0].strip() if fields else ""
+    if not project:
+        return None
+    return ComposeIdentity(
+        project=project,
+        working_dir=fields[1].strip() if len(fields) > 1 else "",
+        config_files=fields[2].strip() if len(fields) > 2 else "",
+    )
+
+
+def foreign_compose_identity(
+    found: Optional[ComposeIdentity], own_project: str,
+) -> Optional[str]:
+    """Pure: why ``found`` is NOT an identity ``own_project`` may recreate.
+
+    ``None`` means the container is ours to ``--force-recreate``. Any string
+    is the reason it is not: no compose labels (not compose-created), or
+    created under a different project. Only the project is judged — the
+    working directory and file list are reported, not compared, because a
+    moved checkout keeps its project name while its paths change.
+    """
+    if found is None:
+        return "carries no compose project label — it was not created by compose"
+    if found.project != own_project:
+        return (
+            f"was created by compose {found.describe()}, "
+            f"not by project '{own_project}'"
+        )
+    return None
+
 
 # ===========================================================================
 # Runtime + compose resolution — the ONE Python home (v0.2.92, R13 / §3.5)

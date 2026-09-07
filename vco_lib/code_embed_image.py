@@ -163,12 +163,30 @@ def service_base_url(explicit: Optional[str] = None) -> str:
     kind of divergence a second copy produces within one release.
     """
     if explicit:
-        return explicit.rstrip("/")
+        return _strip_health_suffix(explicit.rstrip("/"))
     from_env = os.environ.get("CODE_EMBED_SERVICE_URL", "").strip()
     if from_env:
-        return from_env.rstrip("/")
+        return _strip_health_suffix(from_env.rstrip("/"))
     port = os.environ.get("CODE_EMBED_PORT", "").strip() or str(DEFAULT_PORT)
     return f"http://localhost:{port}"
+
+
+_HEALTH_SUFFIX = "/health"
+
+
+def _strip_health_suffix(base: str) -> str:
+    """A URL that already names ``/health`` is still a base URL here.
+
+    install.py's service detector hands over the exact URL it probed
+    (``http://localhost:11440/health``); before v0.2.93 ``probe_health``
+    appended the path again, GET ``/health/health`` 404'd, and the verdict
+    read "service is not answering /health" for a service that was answering
+    fine (field 2026-09-07). The rebuild happened to fire anyway, for the
+    wrong reason — the digest comparison this module exists for never ran.
+    """
+    if base.endswith(_HEALTH_SUFFIX):
+        return base[: -len(_HEALTH_SUFFIX)]
+    return base
 
 
 def probe_health(url: Optional[str] = None, timeout: float = 3.0) -> Optional[dict]:

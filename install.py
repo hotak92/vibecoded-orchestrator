@@ -151,6 +151,7 @@ from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
+from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -13156,6 +13157,13 @@ def _start_services(
     # nothing to do. (v0.2.61: a vct-managed adopt with a changed compose
     # config lands in services_to_recreate, so we must NOT early-return when
     # that list is non-empty — the recreate below applies the new config.)
+    # v0.2.93: a container another compose identity created is never recreated.
+    _guard = _svc_guard.apply_recreate_guard(
+        services_to_recreate=services_to_recreate, recreate_for_rebuild=recreate_for_rebuild,
+        build_services=build_services, runtime=sysinfo.container_cmd, infra_dir=infra_dir,
+        compose_file=compose_file, deferral_report=deferral_report, log_event=_log_install_event,
+    )
+    services_to_recreate, recreate_for_rebuild, build_services, _foreign = _guard
     if not force_separate and not services_to_start and not services_to_recreate:
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
@@ -13478,24 +13486,7 @@ def _start_services(
         print("\n  Try starting manually:")
         print(f"    cd {infra_dir}")
         print(f"    {' '.join(compose_cmd)} up -d")
-        # Common cause: daemon not running. Surface it.
-        stderr_lower = (result.stderr or "").lower()
-        if "cannot connect" in stderr_lower or "daemon" in stderr_lower:
-            print("\n  Hint: container daemon not running.")
-            if sysinfo.container_cmd == "docker":
-                print("    Linux:  sudo systemctl start docker")
-                print("    macOS:  open Docker Desktop")
-                print("    Windows: start Docker Desktop")
-            else:
-                print("    Linux:  systemctl --user start podman.socket")
-        # Common cause: bind: address already in use → user already has a
-        # service on this port that we somehow didn't probe (different
-        # protocol, late startup, …). Tell them about the escape hatch.
-        if "address already in use" in stderr_lower or "bind" in stderr_lower:
-            print("\n  Hint: a host port is already in use.")
-            print("    Either stop the conflicting process, or set")
-            print("    VCT_FORCE_SEPARATE_CONTAINERS=1 + override WEAVIATE_PORT /")
-            print("    OLLAMA_PORT / CODE_EMBED_PORT to use distinct ports.")
+        _svc_guard.print_compose_failure_hints(result.stderr or "", sysinfo.container_cmd)
         _log_install_event(
             "5/10", "error",
             f"compose up failed (exit {result.returncode})",
@@ -13503,6 +13494,15 @@ def _start_services(
                   "exit_code": result.returncode,
                   "stderr_tail": (result.stderr or "").strip()[-400:]},
         )
+        # v0.2.93: --update with every required service answering → record + go on.
+        if _svc_guard.compose_failure_followup(
+            args=args, detected=detected, has_gpu=sysinfo.has_gpu,
+            deferral_report=deferral_report, exit_code=result.returncode,
+            stderr=result.stderr or "",
+            manual_cmd=f"cd {infra_dir} && {' '.join(compose_cmd)} up -d",
+            log_event=_log_install_event,
+        ):
+            return
         sys.exit(1)
     print("  OK")
     _log_install_event("5/10", "ok", "compose up completed")

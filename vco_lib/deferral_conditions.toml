@@ -201,6 +201,20 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "Re-probe pass reports it; resolution needs a human GPU-vendor choice."
 
+[conditions.services_foreign_compose_identity]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.93: step 5 skipped --force-recreate/--build for running service(s) whose container another compose project created (labels). Human decides: apply there, or hand ownership to install.py's compose."
+
+[conditions.services_compose_up_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.93: `compose up` failed on --update while every required service already answered; the update continued, the compose change did not apply."
+
 [conditions.dual_ollama_detected]
 class = "environmental"
 owner = "install.py"
