@@ -301,3 +301,58 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HardStopPersistsForeignRowTests(unittest.TestCase):
+    """Review R1 finding 4: the run report is only written by finalize() at
+    the end of a COMPLETED run, so on the hard stop the foreign-identity row
+    must go through the locked on-disk writer."""
+
+    def test_followup_persists_rows_through_the_locked_writer_on_hard_stop(self):
+        import argparse
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="_tmp_v0293_hardstop_"))
+        try:
+            entry = install_services_guard.build_foreign_compose_identity_entry(
+                {"code_embed": "container 'vco_code_embed' was created by compose project 'vibecoded'"},
+                "podman", root / "infrastructure",
+            )
+            cont = install_services_guard.compose_failure_followup(
+                args=argparse.Namespace(update=False), detected={}, has_gpu=True,
+                deferral_report=None, exit_code=1, stderr="boom",
+                manual_cmd="cd x && podman compose up -d", log_event=lambda *a, **k: None,
+                install_root=root, persist_on_hard_stop=(entry,),
+            )
+            self.assertFalse(cont)
+            ledger = root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+            self.assertTrue(ledger.is_file(), "hard stop must persist the owed row")
+            self.assertIn("services_foreign_compose_identity", ledger.read_text(encoding="utf-8"))
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_start_services_hands_the_guard_rows_to_the_followup(self):
+        """Wiring: on a foreign+FAIL run, _start_services passes the guard's
+        rows and the install root to the follow-up (spy, no disk write)."""
+        install = _install_module()
+        seen = {}
+
+        def spy(**kw):
+            seen.update(kw)
+            return False
+
+        foreign = containers.ComposeIdentity("vibecoded", "/home/u/claude_mcp_servers")
+        harness = StartServicesIdentityGuardTests()
+        harness.install = install
+        # Only weaviate is foreign (others start fresh) so compose still runs and fails.
+        decisions = {
+            "code_embed": {"action": install.ACTION_START, "probe": install.PROBE_NOT_RUNNING},
+            "weaviate": {"action": install.ACTION_ADOPT, "probe": install.PROBE_VCT_MANAGED},
+            "ollama": {"action": install.ACTION_START, "probe": install.PROBE_NOT_RUNNING},
+        }
+        with mock.patch.object(install._svc_guard, "compose_failure_followup", side_effect=spy):
+            with self.assertRaises(SystemExit):
+                harness._drive(foreign, rc=1, stderr="boom", update=False, decisions=decisions)
+        self.assertEqual(seen["install_root"], install.PROJECT_ROOT)
+        self.assertEqual([e.condition_id for e in seen["persist_on_hard_stop"]],
+                         ["services_foreign_compose_identity"])

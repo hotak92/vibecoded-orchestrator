@@ -46,14 +46,13 @@
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
-
-  export type OrchestratorConflictPayload = {
-    event: 'orchestrator_update_conflict';
-    operation: 'merge' | 'rebase';
-    branch: string;
-    conflicted_files: string[];
-    git_stderr: string;
-  };
+  // v0.2.93 (field incident 2026-09-07): every handler here brackets its
+  // invoke with `updater.beginOp` / `endOp` so the ONE progress overlay
+  // (+layout) animates for keep-local / accept-upstream / continue / abort
+  // too — these ran with no live indicator before. The payload type is the
+  // shared declaration in `$lib/tauri-error-payload`.
+  import { updater } from '$lib/stores/updater';
+  import { errorText, type OrchestratorConflictPayload } from '$lib/tauri-error-payload';
 
   let {
     payload,
@@ -197,14 +196,21 @@
     aborting = true;
     confirmingDismiss = false;
     error = null;
+    updater.beginOp('abort');
     try {
       await invoke<void>('abort_orchestrator_merge_or_rebase', { path: installPath });
       aborted = true;
+      // `conflict` is still set at this falling edge, so the overlay hands
+      // over (closes) rather than celebrating; the toast + this modal's
+      // own close carry the outcome.
+      updater.endOp();
       toast.success(`${operationLabel} aborted — working tree restored.`);
       // Give the user a beat to see the toast before dismissing.
       setTimeout(onClose, 600);
     } catch (e) {
-      error = `Abort failed: ${e}`;
+      const detail = errorText(e);
+      error = `Abort failed: ${detail}`;
+      updater.endOp(detail);
     } finally {
       aborting = false;
     }
@@ -268,18 +274,24 @@
     confirmingDismiss = false;
     resolutionMode = 'keep-local';
     error = null;
+    updater.beginOp('keep_local');
     try {
       await invoke<unknown>('keep_local_and_continue_update', {
         path: installPath,
       });
       resolved = true;
+      updater.endOp();
       toast.success(
-        `Resolved ${payload.conflicted_files.length} conflict(s) (kept local) — install.py is running.`
+        payload.conflicted_files.length === 0
+          ? 'Committed the staged resolution — install.py is running.'
+          : `Resolved ${payload.conflicted_files.length} conflict(s) (kept local) — install.py is running.`
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      error = `Keep local failed: ${e}`;
+      const detail = errorText(e);
+      error = `Keep local failed: ${detail}`;
       resolutionMode = null;
+      updater.endOp(detail);
     } finally {
       resolving = false;
     }
@@ -291,18 +303,24 @@
     confirmingDismiss = false;
     resolutionMode = 'accept-upstream';
     error = null;
+    updater.beginOp('accept_upstream');
     try {
       await invoke<unknown>('accept_upstream_and_continue_update', {
         path: installPath,
       });
       resolved = true;
+      updater.endOp();
       toast.success(
-        `Resolved ${payload.conflicted_files.length} conflict(s) (accepted upstream) — install.py is running.`
+        payload.conflicted_files.length === 0
+          ? 'Committed the staged resolution — install.py is running.'
+          : `Resolved ${payload.conflicted_files.length} conflict(s) (accepted upstream) — install.py is running.`
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      error = `Accept upstream failed: ${e}`;
+      const detail = errorText(e);
+      error = `Accept upstream failed: ${detail}`;
       resolutionMode = null;
+      updater.endOp(detail);
     } finally {
       resolving = false;
     }
@@ -313,6 +331,7 @@
     if (!resumeReady) return;
     resuming = true;
     error = null;
+    updater.beginOp('resume');
     try {
       // resume_orchestrator_update audit-logs, refuses on stale/dirty
       // state, then re-enters install.py --update + binary refresh +
@@ -321,13 +340,16 @@
       // there for crash-recovery paths where the restart hop fails.
       await invoke<unknown>('resume_orchestrator_update', { path: installPath });
       resumed = true;
+      updater.endOp();
       toast.success('Update resumed — install.py is running.');
       setTimeout(onClose, 600);
     } catch (e) {
       // The Rust command returns human-readable errors for the bad-state
       // cases (still mid-merge, leftover markers, no sentinel). Surface
       // verbatim — they're written FOR the user.
-      error = `Continue Update failed: ${e}`;
+      const detail = errorText(e);
+      error = `Continue Update failed: ${detail}`;
+      updater.endOp(detail);
     } finally {
       resuming = false;
     }

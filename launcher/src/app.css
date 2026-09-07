@@ -281,3 +281,23 @@ body {
     0 0 30px rgba(0, 191, 166, 0.06),
     inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
+
+/* ─── PENDING-OP SPIN GLYPH ─── */
+/* v0.2.93 (G): the ONE global home for the "this button's invoke is
+   pending" glyph. Same 1.4s linear rotation as the banners' scoped
+   `.bg-glyph.spin` status glyph (KgSyncBanner / CodeGraphBuildBanner), so
+   an in-flight button and an in-flight background job read identically.
+   Inherits the button's colour — no new colours. */
+.bg-glyph-spin {
+  display: inline-block;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  line-height: 1;
+  animation: bg-spin 1.4s linear infinite;
+}
+@keyframes bg-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .bg-glyph-spin { animation: none; }
+}

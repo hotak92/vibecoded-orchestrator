@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { parseTaggedErrorPayload } from '$lib/tauri-error-payload';
   import { projects } from '$lib/stores/projects';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime } from '$lib/tauri';
@@ -514,25 +515,10 @@
    * detect the leading `{"kind":"install_conflict"...}` shape.
    */
   function tryParseConflictError(s: string): InstallConflictError | null {
-    if (!s.includes('"kind":"install_conflict"')) return null;
-    try {
-      const parsed = JSON.parse(s);
-      if (parsed && parsed.kind === 'install_conflict') {
-        return parsed as InstallConflictError;
-      }
-    } catch {
-      // Some Tauri runtimes prepend a label like `Error: `. Strip and retry.
-      const stripped = s.replace(/^[^{]+/, '');
-      try {
-        const parsed = JSON.parse(stripped);
-        if (parsed && parsed.kind === 'install_conflict') {
-          return parsed as InstallConflictError;
-        }
-      } catch {
-        return null;
-      }
-    }
-    return null;
+    // v0.2.93: the ONE tolerant parser (leading whitespace / `Error:` label
+    // / Error instance), shared with the orchestrator-update modals and the
+    // updater store. This function's own strip-and-retry was its seed.
+    return parseTaggedErrorPayload<InstallConflictError>(s, 'kind', 'install_conflict');
   }
 
   async function loadStep2() {

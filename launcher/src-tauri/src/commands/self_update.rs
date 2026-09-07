@@ -1972,8 +1972,62 @@ pub fn spawn_daily_check<R: Runtime>(app: AppHandle<R>) {
 /// Read the cached "last known" status without doing a network call.
 /// Used by the tray to decide whether to render the "Update available"
 /// label on startup before the first daily check runs.
+///
+/// Stays a PURE file read (v0.2.93 review round 1, MINOR-5): this is a sync
+/// command and the tray builder calls it on the main thread, so it must not
+/// spawn git. The repo-aware view lives on
+/// [`get_cached_update_status_refreshed`] for the Updates page.
 #[command]
 pub fn get_cached_update_status() -> UpdateStatus {
+    cached_update_status_for(None)
+}
+
+/// v0.2.93 (stale status cache): the Updates page's variant. Consults the
+/// install root's git HEAD (three local `git rev-parse`/`merge-base` calls,
+/// no network) so `current_sha` / `branch` are real and a cached "N commits
+/// behind" is retracted once HEAD already contains the cached remote SHA —
+/// the field card that said "4 commits behind / Last checked 7:17 PM" long
+/// after the merge completed from a shell. Async, and the git spawns run on
+/// the blocking pool, so neither the IPC thread nor the tray is blocked. Not
+/// from a checkout ⇒ the pure cache view. See [`cached_update_status_for`].
+#[command]
+pub async fn get_cached_update_status_refreshed() -> UpdateStatus {
+    let repo = find_launcher_repo_root().ok();
+    match tokio::task::spawn_blocking(move || cached_update_status_for(repo.as_deref())).await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] get_cached_update_status_refreshed: blocking probe panicked ({}) — \
+                 returning the pure cache view",
+                e
+            );
+            cached_update_status_for(None)
+        }
+    }
+}
+
+/// Path-injectable body of [`get_cached_update_status`] /
+/// [`get_cached_update_status_refreshed`].
+///
+/// `repo = None` (the sync command, the tray, a launcher not running from a
+/// checkout, or a test that wants the pure cache view) keeps the pre-v0.2.93
+/// shape: `current_sha: None`, `branch: ""`, count as cached. Synchronous
+/// git by design — callers that must not block wrap it in `spawn_blocking`.
+///
+/// With a repo, cheaply from local git (soft-fail to the cache view on any
+/// error — never a guess):
+///   * `current_sha`   = `git rev-parse --short HEAD`
+///   * `branch`/`head_detached` = `git rev-parse --abbrev-ref HEAD` through
+///     the ONE normaliser (`git_cmd::branch_state_from_abbrev_ref`)
+///   * when `last_known_remote_sha` is cached AND `git merge-base
+///     --is-ancestor <remote_sha> HEAD` succeeds, HEAD already contains
+///     everything the last check saw upstream → `commit_count: 0`,
+///     `available: false`, `remote_check: Ok`. This is what retracts the
+///     "4 commits behind / Last checked 7:17 PM" card after a merge that
+///     completed from a shell (the field incident) without waiting a day
+///     for the next scheduled check. A non-ancestor (or an unknown SHA)
+///     leaves the cached verdict exactly as it was.
+pub(crate) fn cached_update_status_for(repo: Option<&Path>) -> UpdateStatus {
     let state = load_state();
     let remote = state.last_known_remote_sha.clone();
 
@@ -1987,7 +2041,7 @@ pub fn get_cached_update_status() -> UpdateStatus {
     // The third case is the one that used to lie the loudest: on a fresh
     // launcher process, before the first daily tick, `count.unwrap_or(0)`
     // rendered a confident "up to date" in the tray built from no data.
-    let (available, commit_count, remote_check) = match (
+    let (mut available, mut commit_count, mut remote_check) = match (
         state.last_known_commit_count,
         state.last_check_unknown_error.as_deref(),
     ) {
@@ -2000,23 +2054,136 @@ pub fn get_cached_update_status() -> UpdateStatus {
         ),
     };
 
+    let mut current_sha = None;
+    let mut branch = String::new();
+    let mut head_detached = false;
+    if let Some(repo) = repo {
+        current_sha = git_stdout_sync(repo, &["rev-parse", "--short", "HEAD"]);
+        if let Some(raw) = git_stdout_sync(repo, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            let st = git_cmd::branch_state_from_abbrev_ref(&raw);
+            branch = st.name;
+            head_detached = st.detached;
+        }
+        if let Some(sha) = remote.as_deref() {
+            if head_contains_sync(repo, sha) {
+                available = false;
+                commit_count = 0;
+                remote_check = CheckState::Ok;
+            }
+        }
+    }
+
     UpdateStatus {
         available,
-        current_sha: None,
+        current_sha,
         remote_sha: remote,
         commit_count,
-        branch: String::new(),
-        // The cache does not record attachment (it is a property of the repo
-        // right now, not of the last check) and this command deliberately
-        // does no I/O. `false` here means "not asserted", and the surfaces
-        // that care call `check_for_launcher_update`.
-        head_detached: false,
+        branch,
+        head_detached,
         remote_check,
         // Never cached — the tag probe is a network question with no cheap
         // offline answer, so from cache it is always undetermined.
         latest_source_release_check: CheckState::unknown("not cached"),
         last_checked: state.last_checked_at,
         error: None,
+    }
+}
+
+/// Synchronous, local-only git read for the cached-status surface, which
+/// is a sync Tauri command called from the tray builder (no async context
+/// to await [`run_git`] in). `None` on spawn failure or non-zero exit —
+/// the callers treat that as "not asserted", never as a value.
+fn git_stdout_sync(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .silent()
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// `git merge-base --is-ancestor <sha> HEAD` — `true` ONLY on exit 0. Exit 1
+/// (not an ancestor) and exit 128 (unknown object, e.g. a remote SHA that was
+/// never fetched) are both "cannot confirm" and return `false`, so the
+/// caller keeps whatever it already believed.
+fn head_contains_sync(repo: &Path, sha: &str) -> bool {
+    std::process::Command::new("git")
+        .silent()
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// v0.2.93 (stale status cache): after a pull-based update has landed
+/// (install.py succeeded; the restart hop is next), re-derive the cached
+/// currency from the freshly-fetched `<upstream>/<branch>` ref and persist
+/// it, so the Settings → Updates card and the tray do not keep quoting the
+/// PRE-update check ("N commits behind / Last checked <hours ago>") until
+/// the next scheduled tick. Called from `installer::update_orchestrator`'s
+/// inline tail and from `run_post_pull_install_and_restart` (merge / rebase
+/// / resume).
+///
+/// Local git only — the pull itself just fetched. Soft-fail: any git error
+/// leaves the state file untouched (a stale-but-honest cache beats a guessed
+/// one) and logs why.
+pub(crate) async fn refresh_cached_state_after_pull(repo: &Path, branch: &str) {
+    let upstream_ref = format!("{VCO_UPSTREAM_REMOTE}/{branch}");
+    let remote_sha = match run_git(repo, &["rev-parse", &upstream_ref]).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] refresh_cached_state_after_pull: could not resolve {} at {} ({}) — \
+                 leaving launcher-update-state.json as is",
+                upstream_ref,
+                repo.display(),
+                e
+            );
+            return;
+        }
+    };
+    let behind = match git_cmd::commits_behind(repo, VCO_UPSTREAM_REMOTE, branch).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] refresh_cached_state_after_pull: behind-count failed at {} ({}) — \
+                 leaving launcher-update-state.json as is",
+                repo.display(),
+                e
+            );
+            return;
+        }
+    };
+    let mut state = load_state();
+    state.last_checked_at = Some(Utc::now());
+    state.last_known_remote_sha = Some(remote_sha);
+    state.last_known_commit_count = Some(behind);
+    state.last_check_unknown_error = None;
+    match save_state(&state) {
+        Ok(()) => tracing::info!(
+            "[vct] refresh_cached_state_after_pull: cached currency refreshed — {} commit(s) \
+             behind {}",
+            behind,
+            upstream_ref
+        ),
+        Err(e) => tracing::warn!(
+            "[vct] refresh_cached_state_after_pull: save_state failed: {}",
+            e
+        ),
     }
 }
 
@@ -3391,6 +3558,148 @@ mod tests {
             assert_eq!(status.remote_check, CheckState::Ok);
             assert_eq!(status.commit_count, 0);
             assert!(!status.available, "at the tip there is nothing to offer");
+        }
+
+        // ---- v0.2.93 (stale status cache) -------------------------------
+
+        /// Trimmed stdout of a git command in `cwd` (test-only reader).
+        fn git_out(cwd: &Path, args: &[&str]) -> String {
+            let out = StdCommand::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(out.status.success(), "git {args:?} failed in {}", cwd.display());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Seed the cache the way a completed check would, then read it back
+        /// through the repo-aware path.
+        fn seed_cache(remote_sha: &str, count: u32) {
+            persist_check_result(&UpdateStatus {
+                available: count > 0,
+                current_sha: None,
+                remote_sha: Some(remote_sha.to_string()),
+                commit_count: count,
+                branch: "main".into(),
+                head_detached: false,
+                remote_check: CheckState::Ok,
+                latest_source_release_check: CheckState::Ok,
+                last_checked: Some(Utc::now()),
+                error: None,
+            });
+        }
+
+        /// THE field-incident card: "4 commits behind / Last checked 7:17 PM"
+        /// long after the merge was completed from a shell. When HEAD already
+        /// CONTAINS the cached remote SHA the cache must retract the count,
+        /// and `current_sha` / `branch` must be real, not `None` / `""`.
+        /// Red-proof: revert the ancestor check → `commit_count` stays 5.
+        #[test]
+        fn cached_status_reports_zero_behind_when_head_contains_cached_remote_sha() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            git(&local, &["checkout", "-q", "main"]);
+            git(&local, &["merge", "--no-edit", "-q", "vco_upstream/main"]);
+            let upstream_tip = git_out(&local, &["rev-parse", "vco_upstream/main"]);
+            let head_short = git_out(&local, &["rev-parse", "--short", "HEAD"]);
+
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                seed_cache(&upstream_tip, 5); // stale: recorded BEFORE the merge
+
+                let cached = cached_update_status_for(Some(&local));
+                assert_eq!(cached.commit_count, 0, "HEAD contains the cached remote tip");
+                assert!(!cached.available);
+                assert_eq!(cached.remote_check, CheckState::Ok);
+                assert_eq!(cached.current_sha.as_deref(), Some(head_short.as_str()));
+                assert_eq!(cached.branch, "main");
+                assert!(!cached.head_detached);
+                assert_eq!(cached.remote_sha.as_deref(), Some(upstream_tip.as_str()));
+
+                // The pure cache view (no repo) is unchanged from v0.2.92.
+                let pure = cached_update_status_for(None);
+                assert_eq!(pure.commit_count, 5);
+                assert!(pure.available);
+                assert!(pure.current_sha.is_none());
+                assert_eq!(pure.branch, "");
+            });
+        }
+
+        /// Leave-alone half: the cached remote SHA is NOT in HEAD's history
+        /// (upstream really is ahead) → the cached verdict is preserved
+        /// verbatim, while HEAD facts are still filled in. A detached HEAD
+        /// is reported through the ONE normaliser (`main` + flag).
+        #[test]
+        fn cached_status_preserves_count_when_remote_sha_is_not_an_ancestor() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            // Fixture: HEAD detached on v0.0.1, upstream 2 ahead.
+            let upstream_tip = git_out(&local, &["rev-parse", "vco_upstream/main"]);
+            let head_short = git_out(&local, &["rev-parse", "--short", "HEAD"]);
+
+            vct_launcher_core::test_env::with_state_dir(|_root| {
+                seed_cache(&upstream_tip, 2);
+
+                let cached = cached_update_status_for(Some(&local));
+                assert_eq!(cached.commit_count, 2, "not an ancestor → count preserved");
+                assert!(cached.available);
+                assert_eq!(cached.current_sha.as_deref(), Some(head_short.as_str()));
+                assert_eq!(cached.branch, "main", "detached normalises to the fallback");
+                assert!(cached.head_detached);
+
+                // An UNKNOWN sha (never fetched) can't be confirmed either →
+                // preserved too, never laundered into "up to date".
+                seed_cache(&"f".repeat(40), 3);
+                let cached = cached_update_status_for(Some(&local));
+                assert_eq!(cached.commit_count, 3);
+                assert!(cached.available);
+            });
+        }
+
+        /// The post-pull persist: a completed pull rewrites the cache from the
+        /// fetched upstream ref (0 behind at the tip), clearing a prior
+        /// failure reason. Red-proof: revert the call in the post-pull tails
+        /// → the file keeps "5 behind" until the next daily tick.
+        #[tokio::test]
+        async fn refresh_cached_state_after_pull_persists_current_verdict() {
+            skip_if_no_git!();
+            let (_tmp, local, _remote) = detached_upstream_fixture();
+            git(&local, &["checkout", "-q", "main"]);
+            git(&local, &["merge", "--no-edit", "-q", "vco_upstream/main"]);
+            let upstream_tip = git_out(&local, &["rev-parse", "vco_upstream/main"]);
+
+            let _state = vct_launcher_core::test_env::state_dir_guard();
+            // Stale AND failed: the shape the incident's state file had.
+            persist_check_result(&UpdateStatus {
+                available: false,
+                current_sha: None,
+                remote_sha: Some("0".repeat(40)),
+                commit_count: 0,
+                branch: "main".into(),
+                head_detached: false,
+                remote_check: CheckState::unknown("rev-list: boom"),
+                latest_source_release_check: CheckState::unknown("x"),
+                last_checked: None,
+                error: None,
+            });
+            assert!(cached_update_status_for(None).remote_check.is_unknown());
+
+            refresh_cached_state_after_pull(&local, "main").await;
+
+            let after = load_state();
+            assert_eq!(after.last_known_remote_sha.as_deref(), Some(upstream_tip.as_str()));
+            assert_eq!(after.last_known_commit_count, Some(0));
+            assert!(after.last_check_unknown_error.is_none());
+            assert!(after.last_checked_at.is_some(), "the card's 'Last checked' moves");
+            let cached = cached_update_status_for(None);
+            assert_eq!(cached.remote_check, CheckState::Ok);
+            assert!(!cached.available);
+
+            // Soft-fail leg: an unknown branch leaves the file untouched.
+            refresh_cached_state_after_pull(&local, "no-such-branch").await;
+            assert_eq!(load_state().last_known_commit_count, Some(0));
         }
 
         /// The tri-state itself, reproducing the FIELD SHAPE precisely:

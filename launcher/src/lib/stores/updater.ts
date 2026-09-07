@@ -17,6 +17,16 @@
 import { writable, get } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
 import { orchestrator, cancelScheduledRetry, renderCheck, checkError } from './orchestrator';
+// v0.2.93 (field incident 2026-09-07): the progress overlay is opened/closed
+// from HERE (beginOp / endOp) so every update-class operation — not only the
+// badge's four — drives the one live indicator.
+import { ui } from './ui';
+import {
+  parseTaggedErrorPayload,
+  parseOrchestratorConflictError,
+  errorText,
+  type OrchestratorConflictPayload,
+} from '$lib/tauri-error-payload';
 // M-P1-5: scope the seen-version flag by install_root so two clones
 // on the same machine maintain independent dismissal state. The
 // helper transparently migrates the legacy unscoped key on first
@@ -54,20 +64,44 @@ async function resolveInstallRoot(): Promise<string | null> {
   return cachedInstallRoot;
 }
 
-/** v0.2.16 (W4 / 0.5): which of the four update signals to render.
- *  Priority order (v0.2.51):
- *    'merge_resolved_incomplete' > 'binary_stale' > 'install_stale' > 'remote_ahead'.
- *  `merge_resolved_incomplete` is HIGHEST priority because every other
- *  flag is meaningless until install.py finishes against the freshly-
- *  merged source: a binary refresh against a non-installed source would
- *  ship a launcher that doesn't match its own manifest.
+/** v0.2.16 (W4 / 0.5): which of the update signals to render.
+ *  Priority order (v0.2.93):
+ *    'merge_in_progress' > 'merge_resolved_incomplete' > 'binary_stale'
+ *    > 'install_stale' > 'remote_ahead'.
+ *  `merge_in_progress` (v0.2.93, field incident 2026-09-07) is HIGHEST:
+ *  the clone is literally mid-merge (`.git/MERGE_HEAD` present) — nothing
+ *  else can proceed until the conflict is resolved or aborted.
+ *  `merge_resolved_incomplete` is next because every other flag is
+ *  meaningless until install.py finishes against the freshly-merged
+ *  source: a binary refresh against a non-installed source would ship a
+ *  launcher that doesn't match its own manifest.
  *  `null` when no signal is true. */
 export type UpdateKind =
+  | 'merge_in_progress'
   | 'merge_resolved_incomplete'
   | 'binary_stale'
   | 'install_stale'
   | 'remote_ahead'
   | null;
+
+/**
+ * v0.2.93: every update-class operation the progress overlay can be
+ * driving. `beginOp(kind)` / `endOp(err?)` bracket each one. The badge's
+ * four (update / install / restart / resume) plus the divergence modal's
+ * merge / rebase and the conflict modal's keep_local / accept_upstream /
+ * abort — the ops that, before v0.2.93, ran with NO live indicator at all
+ * (the field incident: a merge that hit a conflict looked like a hang).
+ */
+export type UpdateOpKind =
+  | 'update'
+  | 'install'
+  | 'restart'
+  | 'resume'
+  | 'merge'
+  | 'rebase'
+  | 'keep_local'
+  | 'accept_upstream'
+  | 'abort';
 
 /**
  * v0.2.23 (B4 / D19): structured payload returned by `update_orchestrator`
@@ -96,6 +130,14 @@ export type OrchestratorNonFfPayload = {
    *  required). Optional — pre-v0.2.27 Rust returns undefined; the modal
    *  treats the whole `diverged_files` list as diverging in that case. */
   local_only_files?: string[];
+  /** v0.2.93: paths changed ONLY upstream (will merge cleanly). With this
+   *  split `diverged_files` becomes the true both-sides intersection.
+   *  Optional — pre-v0.2.93 Rust omits both; the modal then shows the
+   *  intersection badge only. */
+  upstream_only_files?: string[];
+  /** v0.2.93: `upstream_only_files.length` as reported by Rust (the list
+   *  itself may be truncated for very large diffs). */
+  upstream_only_count?: number;
 };
 
 /**
@@ -144,12 +186,28 @@ interface UpdaterState {
    * expose the new version yet, only a boolean). When the boolean
    * transitions false→true we re-show. */
   lastSeenVersion: string | null;
+  /** An update-class operation is in flight (bracketed by `beginOp` /
+   *  `endOp`). Drives the progress overlay's running animation. */
   updating: boolean;
+  /** v0.2.93: which operation `updating` refers to — the CURRENT op while
+   *  `updating` is true, and the MOST RECENT one afterwards (deliberately
+   *  not cleared by `endOp`, so the overlay's title stays stable through
+   *  its completed / failed phases). `beginOp` overwrites it. */
+  op: UpdateOpKind | null;
   error: string | null;
   dismissed: boolean;
   /** v0.2.23 (B4 / D19): when non-null, render the divergence modal
-   *  instead of the popover error. Cleared by the modal's onClose. */
+   *  instead of the popover error. Cleared by the modal's onClose.
+   *  v0.2.93: the modal is mounted in `+layout.svelte` (root stacking
+   *  context), keyed on this field — no longer inside UpdateBadge. */
   nonFf: OrchestratorNonFfPayload | null;
+  /** v0.2.93 (field incident 2026-09-07): when non-null, render the
+   *  merge/rebase conflict modal (hoisted to `+layout.svelte`). Set by the
+   *  divergence modal when merge/rebase returns the
+   *  `orchestrator_update_conflict` payload, by `runUpdate` when the inline
+   *  pull does, and by `openPendingConflict` (the badge's "stalled merge"
+   *  action). Cleared by the modal's onClose. */
+  conflict: OrchestratorConflictPayload | null;
   /** v0.2.88 (DEFECT 1): when non-null, render the untracked-collision modal
    *  (Resolve & retry) instead of a raw error toast. Cleared by onClose. */
   untrackedCollision: OrchestratorUntrackedCollisionResolvablePayload | null;
@@ -194,18 +252,29 @@ async function saveSeen(v: string | null) {
   }
 }
 
-function pickKind(status: {
+/**
+ * Which badge kind a `check_for_updates` result renders. Exported (v0.2.93)
+ * so the priority order is pinned by a test instead of only by prose.
+ */
+export function pickKind(status: {
   remote_ahead: boolean;
   install_stale: boolean;
   binary_stale: boolean;
   merge_resolved_incomplete?: boolean;
+  merge_in_progress?: boolean;
 } | null): UpdateKind {
   if (!status) return null;
-  // v0.2.51 Bug A: merge_resolved_incomplete is HIGHEST priority. When
-  // a prior conflict-resolution path was abandoned, every downstream
-  // signal is misleading until install.py finishes against the freshly-
-  // merged source. Re-entering via resume_orchestrator_update is the
-  // ONLY correct next step.
+  // v0.2.93 (field incident 2026-09-07): merge_in_progress beats EVERYTHING.
+  // The clone is mid-merge (`.git/MERGE_HEAD` present) — a stalled conflict
+  // the launcher lost track of (restart while the modal was up, or the modal
+  // never rendered). Resolving or aborting it is the only possible next step;
+  // resume / restart / install against a conflicted tree are all wrong.
+  if (status.merge_in_progress) return 'merge_in_progress';
+  // v0.2.51 Bug A: merge_resolved_incomplete is next. When a prior
+  // conflict-resolution path was abandoned, every downstream signal is
+  // misleading until install.py finishes against the freshly-merged
+  // source. Re-entering via resume_orchestrator_update is the ONLY
+  // correct next step.
   //
   // Then: binary > install > remote (unchanged from v0.2.16).
   // - binary_stale wins because restart is fastest + a newer binary can
@@ -251,6 +320,8 @@ export function isAutostashPopResume(resumeOperation?: string | null): boolean {
  */
 export function titleForUpdateKind(kind: UpdateKind, resumeOperation?: string | null): string {
   switch (kind) {
+    case 'merge_in_progress':
+      return 'Resolving merge conflict';
     case 'merge_resolved_incomplete':
       return isAutostashPopResume(resumeOperation) ? 'Finishing update' : 'Resuming update';
     case 'binary_stale':
@@ -265,21 +336,87 @@ export function titleForUpdateKind(kind: UpdateKind, resumeOperation?: string | 
 }
 
 /**
+ * v0.2.93: overlay title for the operation actually in flight. The badge
+ * kind alone can't title a merge / rebase / keep-local / accept-upstream /
+ * abort (those start from a modal, not from a badge kind), so the op wins
+ * and the kind-based title is the fallback for the badge's own actions.
+ */
+export function titleForUpdateOp(
+  op: UpdateOpKind | null,
+  kind: UpdateKind,
+  resumeOperation?: string | null,
+): string {
+  switch (op) {
+    case 'update':
+      return 'Updating orchestrator';
+    case 'install':
+      return 'Installing update';
+    case 'restart':
+      return 'Restarting launcher';
+    case 'resume':
+      return titleForUpdateKind('merge_resolved_incomplete', resumeOperation);
+    case 'merge':
+      return 'Merging upstream changes';
+    case 'rebase':
+      return 'Rebasing onto upstream';
+    case 'keep_local':
+      return 'Keeping local versions';
+    case 'accept_upstream':
+      return 'Accepting upstream versions';
+    case 'abort':
+      return 'Aborting merge';
+    default:
+      return titleForUpdateKind(kind, resumeOperation);
+  }
+}
+
+/**
+ * v0.2.93: what the overlay says while an op runs and NO `install_progress`
+ * event has arrived yet. The git-phase ops (merge / rebase / abort) emit no
+ * progress at all, so without this the overlay would sit on a bare
+ * "Working…" — still better than the pre-v0.2.93 nothing, but the user
+ * should be told what is actually happening.
+ */
+export function runningMessageForUpdateOp(op: UpdateOpKind | null): string {
+  switch (op) {
+    case 'merge':
+      return 'Running git merge with upstream…';
+    case 'rebase':
+      return 'Running git rebase onto upstream…';
+    case 'keep_local':
+      return 'Checking out your versions and continuing the update…';
+    case 'accept_upstream':
+      return 'Checking out upstream versions and continuing the update…';
+    case 'abort':
+      return 'Restoring the working tree…';
+    case 'restart':
+      return 'Re-launching…';
+    default:
+      return 'Working…';
+  }
+}
+
+/**
+ * v0.2.93: whether the op ends in a launcher restart on success (so the
+ * overlay's hint can say so) — `abort` is the one op that doesn't.
+ */
+export function updateOpRestartsOnSuccess(op: UpdateOpKind | null): boolean {
+  return op !== 'abort';
+}
+
+/**
  * v0.2.23 (B4 / D19): try to parse a Tauri error as a non-FF divergence
  * payload from `update_orchestrator`. Returns null on any other shape.
  */
 function parseNonFfError(raw: unknown): OrchestratorNonFfPayload | null {
-  if (typeof raw !== 'string') return null;
-  if (!raw.startsWith('{')) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && parsed.event === 'orchestrator_update_non_ff') {
-      return parsed as OrchestratorNonFfPayload;
-    }
-  } catch {
-    // not JSON
-  }
-  return null;
+  // v0.2.93: tolerant shared parser (leading whitespace / `Error: ` label
+  // / Error instance). The old `startsWith('{')` check is the exact shape
+  // that hid the 2026-09-07 conflict payload.
+  return parseTaggedErrorPayload<OrchestratorNonFfPayload>(
+    raw,
+    'event',
+    'orchestrator_update_non_ff',
+  );
 }
 
 /**
@@ -289,17 +426,11 @@ function parseNonFfError(raw: unknown): OrchestratorNonFfPayload | null {
 function parseUntrackedCollisionError(
   raw: unknown
 ): OrchestratorUntrackedCollisionResolvablePayload | null {
-  if (typeof raw !== 'string') return null;
-  if (!raw.startsWith('{')) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && parsed.event === 'orchestrator_untracked_collision') {
-      return parsed as OrchestratorUntrackedCollisionResolvablePayload;
-    }
-  } catch {
-    // not JSON
-  }
-  return null;
+  return parseTaggedErrorPayload<OrchestratorUntrackedCollisionResolvablePayload>(
+    raw,
+    'event',
+    'orchestrator_untracked_collision',
+  );
 }
 
 /**
@@ -309,17 +440,11 @@ function parseUntrackedCollisionError(
 function parseAutostashPopError(
   raw: unknown
 ): OrchestratorAutostashPopConflictPayload | null {
-  if (typeof raw !== 'string') return null;
-  if (!raw.startsWith('{')) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && parsed.event === 'orchestrator_autostash_pop_conflict') {
-      return parsed as OrchestratorAutostashPopConflictPayload;
-    }
-  } catch {
-    // not JSON
-  }
-  return null;
+  return parseTaggedErrorPayload<OrchestratorAutostashPopConflictPayload>(
+    raw,
+    'event',
+    'orchestrator_autostash_pop_conflict',
+  );
 }
 
 function createUpdaterStore() {
@@ -328,9 +453,11 @@ function createUpdaterStore() {
     kind: null,
     lastSeenVersion: loadSeen(),
     updating: false,
+    op: null,
     error: null,
     dismissed: false,
     nonFf: null,
+    conflict: null,
     untrackedCollision: null,
     autostashPop: null,
     checking: false,
@@ -407,8 +534,53 @@ function createUpdaterStore() {
     }
   }
 
+  /**
+   * v0.2.93 (field incident 2026-09-07): ONE entry point for "an
+   * update-class operation is starting". Sets `updating` + `op`, clears
+   * any stale error, resets the orchestrator's last `install_progress`
+   * snapshot (so the overlay starts at 0%, not at the previous op's
+   * "done 100%"), and opens the blocking progress overlay. Callers:
+   * runUpdate / applyPendingInstall / resumeUpdate / runRestart here, the
+   * divergence modal's runMerge / runRebase, and the conflict modal's
+   * keep-local / accept-upstream / continue / abort handlers.
+   *
+   * Deliberately does NOT touch the decision-modal payload fields
+   * (`nonFf` / `conflict` / …): a merge started FROM the divergence modal
+   * must keep `nonFf` set, or the modal that launched it unmounts
+   * mid-flight (the second half of the incident).
+   */
+  function beginOp(kind: UpdateOpKind) {
+    orchestrator.resetProgress();
+    update((s) => ({ ...s, updating: true, op: kind, error: null }));
+    ui.openOrchestratorUpdateProgress();
+  }
+
+  /**
+   * v0.2.93: the matching "operation ended" call. `err` undefined/null ⇒
+   * success (or a hand-over to a decision modal — set the payload field
+   * BEFORE calling endOp so the overlay's falling edge sees it and closes
+   * instead of celebrating "Update complete"). Any other value ⇒ the
+   * overlay renders its FAILED state with the error text + Dismiss.
+   * `op` is left as-is so the overlay's title stays stable in its
+   * completed / failed phases.
+   */
+  function endOp(err?: unknown) {
+    const error = err === undefined || err === null ? null : errorText(err);
+    update((s) => ({ ...s, updating: false, error }));
+  }
+
   return {
     subscribe,
+
+    /** v0.2.93: see the inner `beginOp` — public surface for the modals. */
+    beginOp(kind: UpdateOpKind) {
+      beginOp(kind);
+    },
+
+    /** v0.2.93: see the inner `endOp` — public surface for the modals. */
+    endOp(err?: unknown) {
+      endOp(err);
+    },
 
     /** Pull update status from the orchestrator store. Re-shows the toast
      * if the underlying version changed since the last dismissal. */
@@ -511,72 +683,57 @@ function createUpdaterStore() {
       if (!tauriAvailable()) return;
       update((s) => ({
         ...s,
-        updating: true,
-        error: null,
         nonFf: null,
+        conflict: null,
         untrackedCollision: null,
         autostashPop: null,
       }));
+      beginOp('update');
       try {
         await orchestrator.update_orchestrator();
         update((s) => ({
           ...s,
-          updating: false,
           available: false,
           kind: null,
           dismissed: false,
-          nonFf: null,
-          untrackedCollision: null,
-          autostashPop: null,
         }));
+        endOp();
         // Re-check to refresh the new install/binary state.
         await orchestrator.checkStatus();
       } catch (e) {
         // v0.2.23 (B4 / D19): detect divergence. The error string is
         // the raw Tauri Err payload; the orchestrator store wraps it as
         // an Error so we unwrap before parsing.
-        const raw = e instanceof Error ? e.message : String(e);
+        const raw = errorText(e);
         const nff = parseNonFfError(raw);
         // v0.2.88 (DEFECT 1 + DEFECT 2): the inline update pull can now surface
         // TWO more structured, actionable events. Route each to its own modal
         // instead of a dead-end toast.
         const collision = parseUntrackedCollisionError(raw);
         const pop = parseAutostashPopError(raw);
+        // v0.2.93: the inline pull's auto-merge can also stop at a real
+        // conflict — route it to the (hoisted) conflict modal.
+        const conf = parseOrchestratorConflictError(raw);
+        // ORDER MATTERS: set the decision-modal payload FIRST, then endOp,
+        // so the overlay's falling edge sees the hand-over and closes
+        // instead of holding at "Update complete 100%".
         if (collision) {
-          update((s) => ({
-            ...s,
-            updating: false,
-            error: null,
-            nonFf: null,
-            untrackedCollision: collision,
-            autostashPop: null,
-          }));
+          update((s) => ({ ...s, untrackedCollision: collision }));
+          endOp();
         } else if (pop) {
-          update((s) => ({
-            ...s,
-            updating: false,
-            error: null,
-            nonFf: null,
-            untrackedCollision: null,
-            autostashPop: pop,
-          }));
+          update((s) => ({ ...s, autostashPop: pop }));
+          endOp();
+        } else if (conf) {
+          update((s) => ({ ...s, conflict: conf }));
+          endOp();
         } else if (nff) {
           // Surface the modal instead of a toast — the user has a real
           // choice to make (merge vs rebase vs cancel) and the raw
           // git stderr is unactionable.
-          update((s) => ({
-            ...s,
-            updating: false,
-            error: null,
-            nonFf: nff,
-          }));
+          update((s) => ({ ...s, nonFf: nff }));
+          endOp();
         } else {
-          update((s) => ({
-            ...s,
-            updating: false,
-            error: raw,
-            nonFf: null,
-          }));
+          endOp(raw);
         }
       }
     },
@@ -588,6 +745,52 @@ function createUpdaterStore() {
      */
     dismissNonFf() {
       update((s) => ({ ...s, nonFf: null }));
+    },
+
+    /**
+     * v0.2.93 (field incident 2026-09-07): a merge/rebase (started from the
+     * divergence modal, or the inline pull) stopped at a real conflict.
+     * Hands over to the conflict modal mounted in `+layout.svelte`. Clears
+     * `nonFf` — the divergence modal's job is done — so the two modals are
+     * never up at once.
+     */
+    setConflict(payload: OrchestratorConflictPayload) {
+      update((s) => ({ ...s, conflict: payload, nonFf: null, error: null }));
+    },
+
+    /** v0.2.93: dismiss the conflict modal (its onClose). */
+    dismissConflict() {
+      update((s) => ({ ...s, conflict: null }));
+    },
+
+    /**
+     * v0.2.93 (D): the badge's `merge_in_progress` action. The backend
+     * reports the clone is mid-merge but the launcher has no payload in
+     * memory (restart, or the modal never rendered). Ask Rust for the
+     * pending conflict payload (`get_pending_conflict_payload` — same JSON
+     * shape as the `orchestrator_update_conflict` Err) and open the
+     * hoisted conflict modal with it. Not an update-class op (a read), so
+     * no overlay; a failure is surfaced as the badge's popover error.
+     */
+    async openPendingConflict(): Promise<void> {
+      if (!tauriAvailable()) return;
+      const o = get(orchestrator);
+      try {
+        const raw = await invoke<string>('get_pending_conflict_payload', {
+          path: o.installPath,
+        });
+        const conf = parseOrchestratorConflictError(raw);
+        if (!conf) {
+          update((s) => ({
+            ...s,
+            error: `Could not read the pending merge conflict: ${String(raw)}`,
+          }));
+          return;
+        }
+        update((s) => ({ ...s, conflict: conf, nonFf: null, error: null }));
+      } catch (e) {
+        update((s) => ({ ...s, error: errorText(e) }));
+      }
     },
 
     /** v0.2.88 (DEFECT 1): dismiss the untracked-collision modal. */
@@ -607,24 +810,20 @@ function createUpdaterStore() {
      */
     async applyPendingInstall(): Promise<void> {
       if (!tauriAvailable()) return;
-      update((s) => ({ ...s, updating: true, error: null }));
+      beginOp('install');
       try {
         await orchestrator.apply_pending_install();
         update((s) => ({
           ...s,
-          updating: false,
           available: false,
           kind: null,
           dismissed: false,
         }));
+        endOp();
         // Re-check so install_stale clears + any new flags surface.
         await orchestrator.checkStatus();
       } catch (e) {
-        update((s) => ({
-          ...s,
-          updating: false,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+        endOp(e);
       }
     },
 
@@ -644,29 +843,24 @@ function createUpdaterStore() {
      */
     async resumeUpdate(): Promise<void> {
       if (!tauriAvailable()) return;
-      update((s) => ({ ...s, updating: true, error: null, nonFf: null }));
+      update((s) => ({ ...s, nonFf: null }));
+      beginOp('resume');
       try {
         const o = get(orchestrator);
         await invoke('resume_orchestrator_update', { path: o.installPath });
         update((s) => ({
           ...s,
-          updating: false,
           available: false,
           kind: null,
           dismissed: false,
           nonFf: null,
         }));
+        endOp();
         // Re-check so merge_resolved_incomplete clears + any newer flags
         // (binary_stale typically — the swap just landed) surface.
         await orchestrator.checkStatus();
       } catch (e) {
-        const raw = e instanceof Error ? e.message : String(e);
-        update((s) => ({
-          ...s,
-          updating: false,
-          error: raw,
-          nonFf: null,
-        }));
+        endOp(e);
         // v0.2.88 (DEFECT 3): the resume can honestly report "nothing to resume
         // but a real update is still pending" (the fake-100% field bug's fix).
         // Re-check status so the UpdateBadge re-shows the genuine pending update
@@ -689,7 +883,7 @@ function createUpdaterStore() {
      */
     async runRestart(): Promise<void> {
       if (!tauriAvailable()) return;
-      update((s) => ({ ...s, updating: true, error: null }));
+      beginOp('restart');
       try {
         const o = get(orchestrator);
         await invoke('restart_launcher', { installRoot: o.installPath });
@@ -698,17 +892,13 @@ function createUpdaterStore() {
         // (e.g. binary missing) so the spinner clears.
         update((s) => ({
           ...s,
-          updating: false,
           available: false,
           kind: null,
           dismissed: false,
         }));
+        endOp();
       } catch (e) {
-        update((s) => ({
-          ...s,
-          updating: false,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+        endOp(e);
       }
     },
 

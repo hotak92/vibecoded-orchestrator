@@ -104,6 +104,20 @@ export interface UpdateStatus {
    *  Rendered explicitly rather than shown as `Branch: main`, which is what
    *  the normalisation used to leave behind. */
   head_detached?: boolean;
+  /** v0.2.93 (field incident 2026-09-07): the install clone is MID-MERGE —
+   *  `.git/MERGE_HEAD` (or a rebase directory) exists because an
+   *  orchestrator merge/rebase stopped at a conflict and nothing has
+   *  resolved or aborted it since (e.g. the launcher was restarted while
+   *  the conflict modal was up). HIGHEST-priority badge kind: every other
+   *  signal is meaningless while the tree is mid-merge. The badge action
+   *  fetches the conflict payload via `get_pending_conflict_payload` and
+   *  reopens the conflict modal. Optional: pre-v0.2.93 Rust omits it. */
+  merge_in_progress?: boolean;
+  /** v0.2.93: the RUNNING launcher binary is newer than the last completed
+   *  install (a binary refresh landed but `install.py --update` never
+   *  finished). Rendered as a warning line in the badge popover.
+   *  Optional: pre-v0.2.93 Rust omits it. */
+  binary_ahead_of_install?: boolean;
 }
 
 /** What a probe actually established. Mirror of Rust
@@ -338,7 +352,8 @@ function createOrchestratorStore() {
             ? (updateStatus.remote_ahead
                 || updateStatus.install_stale
                 || updateStatus.binary_stale
-                || !!updateStatus.merge_resolved_incomplete)
+                || !!updateStatus.merge_resolved_incomplete
+                || !!updateStatus.merge_in_progress)
             : false;
 
           // v0.2.83 (WP-A2 / D3 + N-4) → v0.2.92 (WP-13): remote-check retry
@@ -405,6 +420,17 @@ function createOrchestratorStore() {
     /** Set install path */
     setInstallPath(path: string) {
       update((s) => ({ ...s, installPath: path }));
+    },
+
+    /**
+     * v0.2.93: drop the last `install_progress` snapshot. Called by
+     * `updater.beginOp()` so the progress overlay starts every update-class
+     * operation (merge / rebase / keep-local / accept-upstream / abort /
+     * resume / update / install / restart) at a clean 0% instead of
+     * replaying the previous op's final "done 100%" tick.
+     */
+    resetProgress() {
+      update((s) => ({ ...s, progress: null }));
     },
 
     /** Install orchestrator */

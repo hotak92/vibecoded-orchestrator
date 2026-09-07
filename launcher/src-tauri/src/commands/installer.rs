@@ -950,6 +950,37 @@ pub struct UpdateStatus {
     /// this fact, so the GUI could only ever say `Branch: main` about a repo
     /// whose HEAD points at no branch at all.
     pub head_detached: bool,
+    /// NEW v0.2.93 (field incident 2026-09-07): a merge or rebase started by
+    /// the launcher is STALLED in the clone — the resume sentinel is present
+    /// AND `.git/MERGE_HEAD` / `.git/rebase-{merge,apply}` still exist. This
+    /// is the exact complement of `merge_resolved_incomplete` (sentinel
+    /// present, git state CLEARED): the two are never true together.
+    ///
+    /// Pre-v0.2.93 this state rendered NOTHING — `merge_resolved_incomplete`
+    /// deliberately stayed false ("the modal is the right surface"), but the
+    /// modal does not survive a launcher restart, so a stalled merge became
+    /// invisible to every surface. The frontend reopens the conflict modal via
+    /// `get_pending_conflict_payload`.
+    ///
+    /// Decided from the git state ALONE (`.git/MERGE_HEAD` / `.git/rebase-*`
+    /// present) — the sentinel is NOT required, so a stalled merge whose
+    /// sentinel write failed, or one started from a shell, still badges.
+    /// Still the exact complement of `merge_resolved_incomplete` (sentinel
+    /// present AND git state cleared): never both true. See
+    /// `merge_state_flags`.
+    #[serde(default)]
+    pub merge_in_progress: bool,
+    /// NEW v0.2.93 (D-D): the RUNNING binary is ahead of the INSTALL. A merge
+    /// pull writes upstream's `launcher/dist/**` binaries into the tree
+    /// BEFORE the post-pull tail (install.py + manifest) runs; if that tail
+    /// never ran (stalled merge / sentinel pending) and the user relaunched,
+    /// the NEW binary is now booting against the OLD install
+    /// (`state/install-manifest.json::version` != this process's version).
+    /// Computed only while `merge_in_progress` or a sentinel is pending — a
+    /// plain version mismatch at rest is `install_stale`'s job. No auto-heal:
+    /// finishing (or aborting) the merge is the remedy.
+    #[serde(default)]
+    pub binary_ahead_of_install: bool,
 }
 
 /// Check for updates across all three signals (git, manifest, binary).
@@ -1174,21 +1205,27 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     // they're working on it; the modal is the right surface) from "merge
     // committed but launcher never re-entered" (DO badge — that's the
     // bug we're fixing).
-    let (merge_resolved_incomplete, resume_operation, resume_branch) =
-        match read_update_resume_sentinel(&p) {
-            Some(sentinel) => {
-                let merge_in_progress = p.join(".git").join("MERGE_HEAD").exists()
-                    || p.join(".git").join("rebase-merge").exists()
-                    || p.join(".git").join("rebase-apply").exists();
-                if merge_in_progress {
-                    // Modal is the right surface; don't double-render.
-                    (false, String::new(), String::new())
-                } else {
-                    (true, sentinel.operation, sentinel.branch)
-                }
-            }
-            None => (false, String::new(), String::new()),
-        };
+    //
+    // v0.2.93: the three-path probe is now the ONE shared
+    // `git_user_editable_merge::merge_or_rebase_in_progress`, and the
+    // "still mid-conflict" arm is no longer silent — it sets
+    // `merge_in_progress` so the badge can bring the user back to the
+    // conflict modal after a launcher restart (the field incident).
+    let live_op = crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&p);
+    let sentinel = read_update_resume_sentinel(&p);
+    let MergeStateFlags {
+        merge_resolved_incomplete,
+        resume_operation,
+        resume_branch,
+        merge_in_progress,
+    } = merge_state_flags(live_op, sentinel.as_ref());
+
+    // v0.2.93 (D-D): the running binary may be AHEAD of the install while
+    // a merge is stalled / a resume is pending. Same rule as the boot probe
+    // (`detect_binary_ahead_of_install`); NO log line here — this command
+    // is polled every 2 s by the conflict modal, and the one warn belongs
+    // to the boot probe in lib.rs (`warn_if_binary_ahead_of_install`).
+    let binary_ahead_of_install = detect_binary_ahead_of_install(&p).is_some();
 
     Ok(UpdateStatus {
         remote_ahead,
@@ -1203,7 +1240,127 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         on_disk_binary_version,
         remote_check,
         head_detached,
+        merge_in_progress,
+        binary_ahead_of_install,
     })
+}
+
+/// The four merge-state fields of `UpdateStatus`, decided in one place.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MergeStateFlags {
+    pub merge_resolved_incomplete: bool,
+    pub resume_operation: String,
+    pub resume_branch: String,
+    pub merge_in_progress: bool,
+}
+
+/// Pure decision core for the merge-state badge flags (v0.2.93).
+///
+/// * `merge_in_progress`         = a merge/rebase is live in `.git` — from
+///   the git state ALONE. Review round 1 (MAJOR-2): gating this on the
+///   sentinel too left a stalled merge whose sentinel write failed (the
+///   `sentinel_written=false` case the log line exists to report), or one
+///   started from a shell, badge-blank after a restart.
+/// * `merge_resolved_incomplete` = sentinel present AND git state cleared —
+///   unchanged v0.2.51 semantics; `resume_operation` / `resume_branch` are
+///   read from the sentinel only in that case.
+///
+/// The two are mutually exclusive by construction (`live_op` decides both).
+pub(crate) fn merge_state_flags(
+    live_op: Option<&'static str>,
+    sentinel: Option<&UpdateResumeSentinel>,
+) -> MergeStateFlags {
+    let merge_in_progress = live_op.is_some();
+    match sentinel {
+        Some(s) if live_op.is_none() => MergeStateFlags {
+            merge_resolved_incomplete: true,
+            resume_operation: s.operation.clone(),
+            resume_branch: s.branch.clone(),
+            merge_in_progress,
+        },
+        _ => MergeStateFlags {
+            merge_in_progress,
+            ..MergeStateFlags::default()
+        },
+    }
+}
+
+/// v0.2.93 (D-D): the facts behind `UpdateStatus::binary_ahead_of_install`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryAheadOfInstall {
+    /// `state/install-manifest.json::version` — what install.py last completed.
+    pub installed_version: String,
+    /// `CARGO_PKG_VERSION` of the RUNNING process.
+    pub running_version: String,
+    /// Why the install is considered mid-update: `"merge"` / `"rebase"` (live
+    /// git state) or `"sentinel"` (resume sentinel only, git state cleared).
+    pub cause: &'static str,
+}
+
+/// Pure decision core for [`BinaryAheadOfInstall`] (unit-tested; no I/O).
+///
+/// `Some` only when ALL of: an update is mid-flight (`cause` is `Some`), the
+/// install manifest exists (a never-installed tree has nothing to be ahead
+/// of), and the manifest version differs from the running binary. Strict
+/// string inequality, matching every other version comparison on
+/// `UpdateStatus` (install.py and the build script write one canonical
+/// string; mismatch == not the same install).
+pub(crate) fn binary_ahead_of_install_core(
+    cause: Option<&'static str>,
+    installed_version: Option<String>,
+    running_version: &str,
+) -> Option<BinaryAheadOfInstall> {
+    let cause = cause?;
+    let installed_version = installed_version?;
+    if installed_version.is_empty() || installed_version == running_version {
+        return None;
+    }
+    Some(BinaryAheadOfInstall {
+        installed_version,
+        running_version: running_version.to_string(),
+        cause,
+    })
+}
+
+/// v0.2.93 (D-D): read the on-disk facts and decide whether the running
+/// binary is ahead of the install (see [`binary_ahead_of_install_core`]).
+pub(crate) fn detect_binary_ahead_of_install(install_root: &Path) -> Option<BinaryAheadOfInstall> {
+    let cause = crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(install_root)
+        .or_else(|| read_update_resume_sentinel(install_root).map(|_| "sentinel"));
+    binary_ahead_of_install_core(
+        cause,
+        read_manifest_version(install_root),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// v0.2.93 (D-D): [`detect_binary_ahead_of_install`] + the ONE warn line.
+/// Called ONLY from the launcher boot probe (lib.rs). `check_for_updates`
+/// (the UpdateStatus producer, polled every 2 s while a conflict modal is
+/// open) calls the silent detector directly — review R1 #5. Returns
+/// the boolean the status struct carries. No auto-heal, no restart machinery
+/// — the standing rule is that a post-update restart is EXPECTED and the
+/// remedy for a stalled merge is to finish or abort it.
+pub(crate) fn warn_if_binary_ahead_of_install(install_root: &Path) -> bool {
+    match detect_binary_ahead_of_install(install_root) {
+        Some(facts) => {
+            tracing::warn!(
+                "[vct] binary ahead of install: running launcher v{} but the install manifest \
+                 at {} records v{} while a {} is pending — the merge pull landed upstream's \
+                 dist binaries before install.py ran. Finish (or abort) the merge from the \
+                 launcher's update badge; nothing is auto-healed.",
+                facts.running_version,
+                install_root.display(),
+                facts.installed_version,
+                match facts.cause {
+                    "sentinel" => "resume".to_string(),
+                    op => format!("stalled {}", op),
+                },
+            );
+            true
+        }
+        None => false,
+    }
 }
 
 // Version parsing, on-disk install-path status readers, and the launcher
@@ -3791,6 +3948,230 @@ fn emit_hub_restart_failed_after_abort_deferral(install_path: &Path) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.2.93 (field incident 2026-09-07, follow-up) — install.py phase failure.
+//
+// FIELD EVIDENCE: the user clicked Continue Update. `resume_orchestrator_update`
+// cleared the resume sentinel BEFORE install.py (by design — a crash inside
+// install.py must not loop the resume forever), install.py exited 1 at step
+// 5/10, and the outcome was: sentinel gone, badge clear, launcher log silent,
+// UPDATE_DEFERRED.md regenerated by install.py's own writer with NO row saying
+// the update did not complete. The user believed the install had finished.
+//
+// FIX: every launcher-driven `install.py --update` (the update_orchestrator
+// inline tail, the shared post-pull tail used by merge / rebase / resume, and
+// the install_stale retry `apply_pending_install`) now routes its exit through
+// `handle_install_phase_exit`: a non-zero exit logs at ERROR (exit code +
+// stderr tail) and appends an `update_install_phase_failed` action_required
+// row through the ONE Rust deferral bridge (`services::deferral`); a zero exit
+// settles that row (the next SUCCESSFUL install.py run clears it — from Rust
+// here, and from install.py's owned-set self-clear once the id is registered
+// in `vco_lib/deferral_conditions.toml` with owner = "install.py",
+// clear_probe = "owned-drop-when-absent").
+// ---------------------------------------------------------------------------
+
+/// Condition id of the "install.py phase failed" ledger row. Registered on
+/// the Python side in `vco_lib/deferral_conditions.toml` (class
+/// action_required, owner install.py, clear_probe owned-drop-when-absent).
+pub(crate) const UPDATE_INSTALL_PHASE_FAILED_CID: &str = "update_install_phase_failed";
+
+/// What a failed `install.py --update` run left behind, as plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstallPhaseFailure {
+    /// `ExitStatus::code()` — `None` when terminated by a signal.
+    pub exit_code: Option<i32>,
+    /// The last `[N/M]` step banner install.py printed (e.g. `[5/10]`), when
+    /// one was found in its output. Best-effort; `None` when absent.
+    pub last_step: Option<String>,
+    /// ≤ 300 chars from the END of stderr (stdout when stderr is empty —
+    /// some Python tracebacks land there), whitespace-trimmed.
+    pub stderr_tail: String,
+}
+
+/// Pure decision core: `None` on success (nothing to record), `Some` with
+/// the facts on failure. No I/O — unit-tested for both legs.
+pub(crate) fn classify_install_phase_exit(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Option<InstallPhaseFailure> {
+    if success {
+        return None;
+    }
+    let tail_source = if stderr.trim().is_empty() { stdout } else { stderr };
+    Some(InstallPhaseFailure {
+        exit_code,
+        last_step: last_install_step_marker(stdout, stderr),
+        stderr_tail: stderr_tail(tail_source, 300),
+    })
+}
+
+/// The LAST `[N/M]` token in install.py's output (it prints one banner per
+/// step, `[5/10] Starting services …`). Scans stdout then stderr so the
+/// later stream wins on a tie only when stdout had none.
+fn last_install_step_marker(stdout: &str, stderr: &str) -> Option<String> {
+    let scan = |text: &str| -> Option<String> {
+        let mut found = None;
+        for (i, _) in text.match_indices('[') {
+            let rest = &text[i + 1..];
+            let Some(end) = rest.find(']') else { continue };
+            let inner = &rest[..end];
+            let Some((a, b)) = inner.split_once('/') else { continue };
+            if !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+            {
+                found = Some(format!("[{}]", inner));
+            }
+        }
+        found
+    };
+    scan(stderr).or_else(|| scan(stdout))
+}
+
+/// ONE entry point for every launcher-driven `install.py --update` exit.
+/// Returns `true` when a failure row was actually WRITTEN to the ledger (the
+/// caller's user-facing `Err` still carries the raw stderr as before); `false`
+/// on success, and on a failure whose row could not be written (logged at
+/// ERROR either way). `vco_lib_root` is where `vco_lib/` lives (the install
+/// root in production; the repo root in tests); `install_path` is where the
+/// ledger is written.
+pub(crate) fn handle_install_phase_exit(
+    vco_lib_root: &Path,
+    install_path: &Path,
+    surface: &str,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    match classify_install_phase_exit(success, exit_code, stdout, stderr) {
+        None => {
+            settle_update_install_phase_failed_row(vco_lib_root, install_path, surface);
+            false
+        }
+        Some(failure) => {
+            record_update_install_phase_failure(vco_lib_root, install_path, surface, &failure)
+        }
+    }
+}
+
+/// The ERROR line + the `update_install_phase_failed` ledger row. Returns
+/// whether the row reached the ledger.
+fn record_update_install_phase_failure(
+    vco_lib_root: &Path,
+    install_path: &Path,
+    surface: &str,
+    failure: &InstallPhaseFailure,
+) -> bool {
+    let exit_label = failure
+        .exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let step_label = failure.last_step.as_deref().unwrap_or("unknown step");
+    tracing::error!(
+        "[vct] {}: install.py --update exited {} at {} — the orchestrator is only PARTLY \
+         updated (source merged; hooks / hub / MCP registration / KG seed / schema steps may \
+         not have run). Recording update_install_phase_failed. stderr tail: {:?}",
+        surface,
+        exit_label,
+        step_label,
+        failure.stderr_tail,
+    );
+
+    let detected = format!(
+        "`install.py --update` (run by the launcher's {surface}) exited {exit} at {step}. \
+         stderr tail: {tail}",
+        surface = surface,
+        exit = exit_label,
+        step = step_label,
+        tail = if failure.stderr_tail.is_empty() {
+            "(no output)".to_string()
+        } else {
+            failure.stderr_tail.clone()
+        },
+    );
+    let why_deferred = "The launcher does not retry; the source is merged but hooks, hub, MCP \
+                        registration, KG seed and schema steps may not have run. The \
+                        conflict-resume checkpoint was already cleared before install.py \
+                        started (by design, so a crashing install cannot loop the resume), so \
+                        nothing else records that this update did not complete.";
+    let root_display = install_path.display().to_string();
+    let command_to_apply = format!(
+        "```bash\n\
+         # Re-run the install phase from the install root (the source is already merged):\n\
+         cd \"{root}\"\n\
+         python install.py --update\n\
+         # Then fully quit and relaunch the launcher so the refreshed binary loads.\n\
+         #\n\
+         # This note clears itself on the next successful install.py run. To dismiss it\n\
+         # without re-running (not recommended — the install is incomplete):\n\
+         python -m vco_lib.project_init dismiss-deferral --folder \"{root}\" \
+         --condition-id {cid}\n\
+         ```",
+        root = root_display,
+        cid = UPDATE_INSTALL_PHASE_FAILED_CID,
+    );
+    // `severity` must be one of the ledger's `SEVERITY_ORDER`
+    // ("critical" | "warning" | "info" — `vco_lib/deferral_report.py`); an
+    // incomplete install is the worst tier and drives the ledger's
+    // `severity_max` banner.
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: UPDATE_INSTALL_PHASE_FAILED_CID,
+        title: "The update's install.py phase failed — the orchestrator is only partly updated",
+        detected: &detected,
+        why_deferred,
+        command_to_apply: &command_to_apply,
+        severity: "critical",
+    };
+    match crate::services::deferral::emit_deferral_entry(vco_lib_root, install_path, &fields) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                "[vct] {}: could not write the update_install_phase_failed deferral ({}) — the \
+                 partial-update state is NOT recorded in UPDATE_DEFERRED.md; run `python \
+                 install.py --update` from {}",
+                surface,
+                e,
+                root_display,
+            );
+            false
+        }
+    }
+}
+
+/// install.py could not even be SPAWNED (python missing / not executable /
+/// spawn error). Same partly-updated state as a non-zero exit — same ERROR
+/// line + ledger row, with the spawn error as the "stderr" tail and no exit
+/// code. Returns whether the row reached the ledger.
+pub(crate) fn record_install_spawn_failure(
+    vco_lib_root: &Path,
+    install_path: &Path,
+    surface: &str,
+    spawn_error: &str,
+) -> bool {
+    handle_install_phase_exit(vco_lib_root, install_path, surface, false, None, "", spawn_error)
+}
+
+/// A successful install.py run settles any prior failure row (no-op when
+/// absent). Best-effort — a settle failure must never mask the success.
+fn settle_update_install_phase_failed_row(vco_lib_root: &Path, install_path: &Path, surface: &str) {
+    if let Err(e) = crate::services::deferral::resolve_deferral_conditions(
+        vco_lib_root,
+        install_path,
+        &[UPDATE_INSTALL_PHASE_FAILED_CID],
+    ) {
+        tracing::warn!(
+            "[vct] {}: could not settle a prior update_install_phase_failed deferral \
+             (non-fatal): {}",
+            surface,
+            e
+        );
+    }
+}
+
 /// Best-effort blocking `GET http://127.0.0.1:<port>/health` probe.
 /// Returns true on HTTP 200. Used only by
 /// `ensure_hub_started_after_update`.
@@ -4276,6 +4657,29 @@ pub async fn update_orchestrator<R: Runtime>(
         }),
     );
 
+    // v0.2.93 (field incident 2026-09-07): a merge/rebase is ALREADY in
+    // progress in the clone → do NOT start a fresh pull (it would only be
+    // refused with "You have not concluded your merge (MERGE_HEAD exists)",
+    // pre-fix classified as a generic failure: no modal, no sentinel, and
+    // the `clear_update_resume_sentinel` below would have ERASED the first
+    // click's sentinel). Short-circuit to the SAME conflict payload the
+    // first click produced so the conflict modal opens on the stalled
+    // state. Must run BEFORE the sentinel clear, the kill-sweep, the hub
+    // stop and the binary renames — none of them are appropriate for a
+    // tree we are not going to touch.
+    if let Some(payload) =
+        refuse_if_merge_or_rebase_in_progress(&install_path, "update_orchestrator").await
+    {
+        write_audit(
+            "update_orchestrator_refused_merge_in_progress",
+            serde_json::json!({
+                "install_path": path,
+                "branch": start_branch,
+            }),
+        );
+        return Err(payload);
+    }
+
     // v0.2.51 Bug A: clear any leftover resume sentinel + deferral from a
     // prior half-finished update. A fresh `update_orchestrator` run
     // supersedes it — either we'll succeed (no resume needed), or we'll
@@ -4641,6 +5045,30 @@ pub async fn update_orchestrator<R: Runtime>(
         // this is for the user-facing message only, but accuracy matters.)
         let combined = format!("{}\n{}", stderr, stdout);
 
+        // v0.2.93 (field incident 2026-09-07): git REFUSED to pull because a
+        // merge/rebase is already in progress (a TOCTOU sibling of the
+        // pre-pull short-circuit above — e.g. a terminal `git merge` started
+        // between the probe and the pull). Tested FIRST: the unmerged-files
+        // variant ends in "unresolved conflict", which the conflict
+        // classifier below would otherwise claim as a FRESH conflict.
+        // Routes to the SAME conflict payload (sentinel written only if
+        // absent) so the modal opens on the stalled state.
+        if crate::commands::git_user_editable_merge::is_merge_in_progress_refusal(&combined) {
+            let fallback_op = if auto_merge_committed_divergence {
+                "merge"
+            } else {
+                "rebase"
+            };
+            return Err(handle_merge_in_progress_refusal(
+                &install_path,
+                "update_orchestrator",
+                &pull_branch,
+                fallback_op,
+                &combined,
+            )
+            .await);
+        }
+
         // v0.2.88 (F2-followup / FIELD DEFECT): the untracked-overwrite abort
         // MUST be caught BEFORE `is_merge_or_rebase_conflict`. Both match the
         // "would be overwritten by" substring, but this abort happens BEFORE any
@@ -4692,8 +5120,16 @@ pub async fn update_orchestrator<R: Runtime>(
             // v0.2.53 DEDUP-14: paired sentinel + deferral via the
             // single helper so future writers can't accidentally write
             // one without the other (v0.2.51 Bug A class).
-            write_resume_sentinel_and_deferral(&install_path, conflict_op, &pull_branch).await;
+            let sentinel_written =
+                write_resume_sentinel_and_deferral(&install_path, conflict_op, &pull_branch)
+                    .await;
             let conflicted = collect_conflicted_files(&install_path).await;
+            log_conflict_payload_return(
+                "update_orchestrator",
+                conflict_op,
+                &conflicted,
+                sentinel_written,
+            );
             return Err(serialize_orchestrator_conflict_error(
                 conflict_op,
                 &pull_branch,
@@ -4715,8 +5151,13 @@ pub async fn update_orchestrator<R: Runtime>(
         if crate::commands::self_update::is_non_fast_forward(&stderr) {
             let local_sha = read_head_sha(&install_path).await;
             let remote_sha = read_remote_sha(&install_path, &pull_branch).await;
-            let (upstream_changed, local_only) =
-                collect_diverged_files(&install_path, &pull_branch).await;
+            // v0.2.93: three sets, not two — `diverged` is now the real
+            // intersection (both sides touched), `upstream_only` the rest.
+            let DivergedFiles {
+                diverged,
+                upstream_only,
+                local_only,
+            } = collect_diverged_files(&install_path, &pull_branch).await;
             // v0.2.55 (durable-logging fix): the non-FF case previously
             // surfaced ONLY as the GUI Merge/Rebase/Cancel modal below. If
             // the user dismisses/cancels it, the update silently didn't
@@ -4738,7 +5179,8 @@ pub async fn update_orchestrator<R: Runtime>(
                 &pull_branch,
                 local_sha.as_deref(),
                 remote_sha.as_deref(),
-                &upstream_changed,
+                &diverged,
+                &upstream_only,
                 &local_only,
                 stderr.trim(),
             ));
@@ -4768,6 +5210,7 @@ pub async fn update_orchestrator<R: Runtime>(
                 detail: stderr.trim().to_string(),
             },
         );
+        log_generic_pull_failure("update_orchestrator", "git pull", &stderr);
         return Err(format!("git pull failed: {}", stderr));
     }
 
@@ -4886,14 +5329,21 @@ pub async fn update_orchestrator<R: Runtime>(
                 // pre-merge HEAD) is guaranteed DIFFERENT from the now-advanced
                 // HEAD, so resume's HEAD-advance guard passes. Labeled
                 // "autostash-pop" to keep the operation semantics honest.
-                if let Some(old) = old_sha.as_deref() {
-                    write_update_resume_sentinel(
+                let sentinel_written = match old_sha.as_deref() {
+                    Some(old) => write_update_resume_sentinel(
                         &install_path,
                         "autostash-pop",
                         &pull_branch,
                         old,
-                    );
-                }
+                    ),
+                    None => false,
+                };
+                log_conflict_payload_return(
+                    "update_orchestrator",
+                    "autostash-pop",
+                    &unmerged,
+                    sentinel_written,
+                );
                 return Err(serialize_autostash_pop_conflict_error(
                     &pull_branch,
                     &unmerged,
@@ -4906,7 +5356,15 @@ pub async fn update_orchestrator<R: Runtime>(
             } else {
                 "rebase"
             };
-            write_resume_sentinel_and_deferral(&install_path, conflict_op, &pull_branch).await;
+            let sentinel_written =
+                write_resume_sentinel_and_deferral(&install_path, conflict_op, &pull_branch)
+                    .await;
+            log_conflict_payload_return(
+                "update_orchestrator",
+                conflict_op,
+                &unmerged,
+                sentinel_written,
+            );
             return Err(serialize_orchestrator_conflict_error(
                 conflict_op,
                 &pull_branch,
@@ -5114,9 +5572,16 @@ pub async fn update_orchestrator<R: Runtime>(
     // exit code anyway, so this is forward-compatible.
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let mut install_child = cmd
-        .spawn()
-        .map_err(|e| format!("install.py --update failed to spawn: {}", e))?;
+    // v0.2.93 (review round 1, MINOR-3): a spawn failure after a successful
+    // pull is the same partly-updated state as a non-zero exit — record it.
+    let mut install_child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let msg = format!("install.py --update failed to spawn: {}", e);
+            record_install_spawn_failure(&install_path, &install_path, "update_orchestrator", &msg);
+            return Err(msg);
+        }
+    };
 
     let mut install_stdout_buf = Vec::<u8>::new();
     if let Some(stdout) = install_child.stdout.take() {
@@ -5191,6 +5656,19 @@ pub async fn update_orchestrator<R: Runtime>(
         stderr: install_stderr_buf,
     };
 
+    // v0.2.93: record a failed install phase (ERROR log + action_required
+    // ledger row) or settle a prior one on success — ONE entry point shared
+    // with the post-pull tail and apply_pending_install.
+    handle_install_phase_exit(
+        &install_path,
+        &install_path,
+        "update_orchestrator",
+        install_output.status.success(),
+        install_output.status.code(),
+        &String::from_utf8_lossy(&install_output.stdout),
+        &String::from_utf8_lossy(&install_output.stderr),
+    );
+
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
         // v0.2.17: install.py failed — don't restart. Revert the pre-pull
@@ -5214,6 +5692,14 @@ pub async fn update_orchestrator<R: Runtime>(
     // connection now (explicitly, before the binary-refresh/finalize tail
     // which may read/write the DB). On reopen failure this force-restarts.
     db_close_guard.reopen();
+
+    // v0.2.93 (stale status cache): the pull + install landed — refresh
+    // `~/.vct/launcher-update-state.json` NOW, before the restart hop kills
+    // this process, so the Settings → Updates card does not keep saying
+    // "N commits behind / Last checked <hours ago>" from the pre-update
+    // check. Soft-fail; the next daily check would repair it anyway.
+    crate::commands::self_update::refresh_cached_state_after_pull(&install_path, &pull_branch)
+        .await;
 
     // V52-AI: advance lockfile phase. install.py has finished; we're
     // now in the binary-refresh + hub-restart window. MCPs that try to
@@ -5412,13 +5898,24 @@ async fn read_remote_sha(repo: &Path, branch: &str) -> Option<String> {
 /// conflict (upstream has no version of them at all). The rewrite
 /// separates the two categories by anchoring on the merge-base.
 ///
-/// Returns `(upstream_changed_files, local_only_files)`. Empty vectors
-/// on any git failure — the modal renders without a file list, still
-/// usable.
-async fn collect_diverged_files(
-    repo: &Path,
-    branch: &str,
-) -> (Vec<String>, Vec<String>) {
+/// v0.2.93 (field incident 2026-09-07): three sets, not two. The modal said
+/// "764 files where both sides have diverging history" for an install whose
+/// local side had touched 8 — because `diverged_files` was the WHOLE
+/// upstream-touched set A, not the intersection. The user-facing claim
+/// ("both sides") is now literally what the field holds:
+///
+///   - `diverged`      = A ∩ B — touched on BOTH sides since the merge-base;
+///                       the only paths a merge can actually conflict on.
+///   - `upstream_only` = A ∖ B — coming in from upstream, untouched locally;
+///                       these auto-merge.
+///   - `local_only`    = B ∖ A — touched locally, untouched upstream; the
+///                       merge leaves them alone.
+///
+/// Empty sets on any git failure — the modal renders without a file list,
+/// still usable. When even `merge-base` fails the pre-v0.2.27 single-list
+/// fallback lands in `diverged` (unchanged fallback behaviour, documented on
+/// `legacy_collect_diverged_files`).
+async fn collect_diverged_files(repo: &Path, branch: &str) -> DivergedFiles {
     let upstream_ref = format!(
         "{}/{}",
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
@@ -5437,7 +5934,10 @@ async fn collect_diverged_files(
             // Fall through to the legacy single-list behaviour. Less
             // accurate but still informative.
             let legacy = legacy_collect_diverged_files(repo, branch).await;
-            return (legacy, Vec::new());
+            return DivergedFiles {
+                diverged: legacy,
+                ..DivergedFiles::default()
+            };
         }
     };
 
@@ -5461,21 +5961,44 @@ async fn collect_diverged_files(
     // Set B: files local touched since the fork point.
     let local_touched = run_diff(format!("{}..HEAD", merge_base)).await;
 
-    // upstream_changed_files = A (every upstream-touched file is
-    // relevant to the merge; A ∩ B are the real conflict candidates,
-    // A \ B will auto-merge — but both belong in the same "what's
-    // coming from upstream" bucket from the user's UI perspective).
-    let upstream_changed: Vec<String> = upstream_touched.iter().cloned().collect();
-
-    // local_only_files = B \ A (touched locally, untouched upstream —
-    // safe to leave alone, no merge attention needed).
-    let local_only: Vec<String> = local_touched
-        .iter()
-        .filter(|p| !upstream_touched.contains(*p))
+    // v0.2.93: `diverged` = A ∩ B. Pre-fix this was the whole of A, which
+    // put every upstream-only change (hundreds per release) under a modal
+    // heading that says "both sides" — the 764-vs-8 field figure.
+    let diverged: Vec<String> = upstream_touched
+        .intersection(&local_touched)
         .cloned()
         .collect();
 
-    (upstream_changed, local_only)
+    // upstream_only = A \ B (coming in from upstream, auto-merges).
+    let upstream_only: Vec<String> = upstream_touched
+        .difference(&local_touched)
+        .cloned()
+        .collect();
+
+    // local_only = B \ A (touched locally, untouched upstream —
+    // safe to leave alone, no merge attention needed).
+    let local_only: Vec<String> = local_touched
+        .difference(&upstream_touched)
+        .cloned()
+        .collect();
+
+    DivergedFiles {
+        diverged,
+        upstream_only,
+        local_only,
+    }
+}
+
+/// The three divergence sets `collect_diverged_files` computes (v0.2.93).
+/// Field docs on that function; every vector is sorted (BTreeSet-derived).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DivergedFiles {
+    /// A ∩ B — touched on both sides since the merge-base.
+    pub diverged: Vec<String>,
+    /// A ∖ B — upstream-only changes.
+    pub upstream_only: Vec<String>,
+    /// B ∖ A — local-only changes.
+    pub local_only: Vec<String>,
 }
 
 /// Pre-v0.2.27 fallback: single list of files diff between HEAD and the
@@ -5528,14 +6051,21 @@ async fn collect_conflicted_files(repo: &Path) -> Vec<String> {
 ///     "branch": "main",
 ///     "local_sha":  "abc..." | null,
 ///     "remote_sha": "def..." | null,
-///     "diverged_files": ["path/a", "path/b", ...],
+///     "diverged_files": ["path/a", "path/b", ...],   // A ∩ B (v0.2.93: was all of A)
+///     "local_only_files": ["path/c", ...],           // B ∖ A (v0.2.27)
+///     "upstream_only_files": ["path/d", ...],        // A ∖ B (v0.2.93)
+///     "upstream_only_count": 4,                      // len(upstream_only_files)
 ///     "git_stderr": "<raw error>"
 ///   }
+///
+/// Every pre-v0.2.93 key keeps its name and position so an older frontend
+/// keeps parsing; the two new keys are additive.
 fn serialize_orchestrator_non_ff_error(
     branch: &str,
     local: Option<&str>,
     remote: Option<&str>,
     diverged_files: &[String],
+    upstream_only_files: &[String],
     local_only_files: &[String],
     git_stderr: &str,
 ) -> String {
@@ -5557,15 +6087,26 @@ fn serialize_orchestrator_non_ff_error(
     };
     let files_field = to_json_array(diverged_files);
     let local_only_field = to_json_array(local_only_files);
+    let upstream_only_field = to_json_array(upstream_only_files);
     // v0.2.27: added `local_only_files` so the modal can render
     // "files only on your clone" as a separate (collapsible) section
     // instead of mixing them into the merge-conflict-candidate list.
     // Forks that track paths the public repo doesn't (e.g. a private
     // fork's `other_projects_knowledge/`) no longer see those paths flagged
     // as "diverged" in the modal.
+    // v0.2.93: added `upstream_only_files` + `upstream_only_count` so the
+    // modal can say "8 diverged, 756 coming in from upstream" instead of
+    // "764 diverged".
     format!(
-        "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"local_only_files\":{},\"git_stderr\":\"{}\"}}",
-        branch, local_field, remote_field, files_field, local_only_field, stderr_esc
+        "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"local_only_files\":{},\"upstream_only_files\":{},\"upstream_only_count\":{},\"git_stderr\":\"{}\"}}",
+        branch,
+        local_field,
+        remote_field,
+        files_field,
+        local_only_field,
+        upstream_only_field,
+        upstream_only_files.len(),
+        stderr_esc
     )
 }
 
@@ -5640,6 +6181,273 @@ fn serialize_autostash_pop_conflict_error(
         "{{\"event\":\"orchestrator_autostash_pop_conflict\",\"branch\":\"{}\",\"conflicted_files\":{},\"git_stderr\":\"{}\"}}",
         branch, files_field, stderr_esc
     )
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.93 (field incident 2026-09-07) — stalled merge/rebase handling.
+//
+// INCIDENT: "Merge upstream" conflicted on ONE file (CLAUDE.md), the sentinel
+// was written, the conflict Err was returned — and the GUI showed nothing.
+// After a launcher restart a second click ran a fresh `git pull`, which git
+// refused with "You have not concluded your merge (MERGE_HEAD exists)". That
+// text was classified as a GENERIC failure: no sentinel, no modal, a bare
+// toast. Meanwhile the UpdateBadge stayed blank (sentinel + MERGE_HEAD is the
+// one combination `check_for_updates` deliberately did not badge), and the
+// launcher's file log held no merge line at all.
+//
+// The helpers below give that state ONE home:
+//   * `refuse_if_merge_or_rebase_in_progress` — pre-pull short-circuit for the
+//     three update commands: reopen the conflict modal on the stalled state,
+//     touch nothing (no hub stop, no binary rename, no fetch, no pull).
+//   * `handle_merge_in_progress_refusal` — post-pull sibling for the TOCTOU
+//     window (git refused a pull we did start).
+//   * `build_pending_conflict_payload` — the `get_pending_conflict_payload`
+//     command body, so the frontend can reopen the modal after a restart.
+//   * `log_conflict_payload_return` / `log_generic_pull_failure` — the
+//     one-line summaries every conflict / generic-failure return now emits.
+// ---------------------------------------------------------------------------
+
+/// Write the resume sentinel + deferral ONLY when no sentinel is present.
+/// A stalled merge already carries the first click's sentinel (with the
+/// correct pre-merge `sha_at_conflict`); rewriting it would also reset
+/// `written_at`, which is the user-visible "since when" on the modal.
+/// Returns whether a sentinel was written by THIS call.
+async fn ensure_resume_sentinel_present(
+    install_path: &Path,
+    operation: &str,
+    pull_branch: &str,
+) -> bool {
+    if read_update_resume_sentinel(install_path).is_some() {
+        return false;
+    }
+    write_resume_sentinel_and_deferral(install_path, operation, pull_branch).await
+}
+
+/// Pre-pull short-circuit shared by `update_orchestrator`,
+/// `merge_orchestrator_with_upstream` and `rebase_orchestrator_onto_upstream`.
+///
+/// `Some(payload)` when a merge or rebase is already in progress in the
+/// clone: the SAME `orchestrator_update_conflict` payload shape the original
+/// conflict produced (`operation` from the live git state, `conflicted_files`
+/// from the unmerged index, `git_stderr` = a short explanation — there is no
+/// live git output because no pull ran), with the sentinel (re)written only
+/// if absent. `None` = nothing in progress; the caller proceeds normally.
+///
+/// Deliberately does NOT stop the hub, rename binaries, fetch, or pull: a
+/// tree mid-merge is not one we are going to modify, and git would refuse
+/// the pull anyway (see `is_merge_in_progress_refusal`).
+async fn refuse_if_merge_or_rebase_in_progress(
+    install_path: &Path,
+    surface: &str,
+) -> Option<String> {
+    let op = crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(install_path)?;
+    let branch = match read_update_resume_sentinel(install_path) {
+        Some(s) if !s.branch.is_empty() => s.branch,
+        _ => resolve_pull_branch(install_path).await,
+    };
+    let sentinel_written = ensure_resume_sentinel_present(install_path, op, &branch).await;
+    let conflicted = collect_conflicted_files(install_path).await;
+    log_conflict_payload_return(surface, op, &conflicted, sentinel_written);
+    let explanation = format!(
+        "A {op} is already in progress in this clone (.git/{marker} present) — no new pull \
+         was started. {next}",
+        op = op,
+        marker = if op == "merge" { "MERGE_HEAD" } else { "rebase-merge" },
+        next = stalled_next_step(&conflicted),
+    );
+    Some(serialize_orchestrator_conflict_error(
+        op,
+        &branch,
+        &conflicted,
+        &explanation,
+    ))
+}
+
+/// The "what now" sentence for a stalled merge/rebase explanation. A stalled
+/// operation with NO unmerged entries left (every conflicted file already
+/// staged — the pre-merge step stages merged user-editable files, which is
+/// the state the field install was in) is resolved-but-uncommitted, and the
+/// modal must not imply there is still something to edit.
+fn stalled_next_step(conflicted: &[String]) -> &'static str {
+    if conflicted.is_empty() {
+        "No unmerged files remain — the resolution is staged but not committed. Keep local \
+         / Accept upstream commits it and continues the update; Abort restores the tree."
+    } else {
+        "Resolve the listed files and continue, or abort to restore the tree."
+    }
+}
+
+/// Post-pull sibling of `refuse_if_merge_or_rebase_in_progress`: git REFUSED
+/// a pull we did start because a merge/rebase is in progress (TOCTOU with the
+/// pre-pull probe, or a terminal-started merge). `fallback_op` labels the
+/// payload when the on-disk state cannot be read; `combined` (stdout+stderr)
+/// is carried as `git_stderr` verbatim. Callers restore binaries/hub BEFORE
+/// calling this where their surface renamed them.
+async fn handle_merge_in_progress_refusal(
+    install_path: &Path,
+    surface: &str,
+    pull_branch: &str,
+    fallback_op: &'static str,
+    combined: &str,
+) -> String {
+    let op = crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(install_path)
+        .unwrap_or(fallback_op);
+    let sentinel_written = ensure_resume_sentinel_present(install_path, op, pull_branch).await;
+    let conflicted = collect_conflicted_files(install_path).await;
+    log_conflict_payload_return(surface, op, &conflicted, sentinel_written);
+    serialize_orchestrator_conflict_error(op, pull_branch, &conflicted, combined.trim())
+}
+
+/// Body of the `get_pending_conflict_payload` command (path-injectable so it
+/// is unit-testable against a fixture repo in a real stalled merge).
+///
+/// Builds the SAME payload the original conflict return produced, from
+/// on-disk state alone:
+///   * `operation` / `branch` from the resume sentinel when present (schema:
+///     operation, branch, sha_at_conflict, written_at), else from the live
+///     git state (`.git/MERGE_HEAD` → merge, `.git/rebase-*` → rebase);
+///   * `conflicted_files` from the unmerged index (`collect_conflicted_files`);
+///   * `git_stderr` = a short explanation (there is no live git output).
+///
+/// A sentinel labelled `autostash-pop` yields the `orchestrator_autostash_pop_
+/// conflict` shape instead — that modal's buttons are the right resolvers for
+/// a stash-pop conflict (the merge itself already committed).
+///
+/// `Err` when there is nothing to reopen: no `.git`, nothing in progress AND
+/// no sentinel, or a sentinel whose git state has been cleared (that is the
+/// `merge_resolved_incomplete` badge's case — "Continue Update", not a modal).
+/// Never writes anything.
+pub(crate) async fn build_pending_conflict_payload(install_path: &Path) -> Result<String, String> {
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — no pending conflict to show".to_string());
+    }
+    let live_op = crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(install_path);
+    let sentinel = read_update_resume_sentinel(install_path);
+    let conflicted = collect_conflicted_files(install_path).await;
+
+    // autostash-pop: the merge committed; only the WIP restore clashed. No
+    // MERGE_HEAD, but the index holds UU entries — the pop modal's case.
+    if let Some(s) = sentinel.as_ref().filter(|s| s.operation == "autostash-pop") {
+        if conflicted.is_empty() {
+            return Err(
+                "The recorded local-change restore conflict has no unmerged files left — \
+                 use Continue Update to finish the update."
+                    .to_string(),
+            );
+        }
+        let explanation = format!(
+            "Recovered from the clone's on-disk state (no live git output): the update's \
+             local-change restore conflicted on {} file(s) at {}.",
+            conflicted.len(),
+            s.written_at,
+        );
+        return Ok(serialize_autostash_pop_conflict_error(
+            &s.branch,
+            &conflicted,
+            &explanation,
+        ));
+    }
+
+    let Some(op) = live_op else {
+        return Err(match sentinel {
+            Some(_) => "No merge or rebase is in progress any more — the conflict was \
+                        resolved or aborted outside the launcher. Use Continue Update to \
+                        finish the update, or Abort to clear the record."
+                .to_string(),
+            None => "No pending conflict: nothing is in progress in this clone.".to_string(),
+        });
+    };
+
+    let (operation, branch, since) = match sentinel {
+        Some(s) if !s.operation.is_empty() => {
+            let branch = if s.branch.is_empty() {
+                resolve_pull_branch(install_path).await
+            } else {
+                s.branch
+            };
+            (s.operation, branch, format!(" since {}", s.written_at))
+        }
+        _ => (
+            op.to_string(),
+            resolve_pull_branch(install_path).await,
+            String::new(),
+        ),
+    };
+    let explanation = format!(
+        "Recovered from the clone's on-disk state (no live git output): a {} has been in \
+         progress{} with {} unmerged file(s). {}",
+        operation,
+        since,
+        conflicted.len(),
+        stalled_next_step(&conflicted),
+    );
+    Ok(serialize_orchestrator_conflict_error(
+        &operation,
+        &branch,
+        &conflicted,
+        &explanation,
+    ))
+}
+
+/// v0.2.93: return the pending conflict payload for a stalled merge/rebase so
+/// the frontend can reopen `OrchestratorUpdateConflictModal` after a launcher
+/// restart (the modal itself does not survive one). Pairs with
+/// `UpdateStatus::merge_in_progress`. Read-only. See
+/// `build_pending_conflict_payload` for the payload contract and the `Err`
+/// cases.
+#[command]
+pub async fn get_pending_conflict_payload(path: String) -> Result<String, String> {
+    build_pending_conflict_payload(&PathBuf::from(&path)).await
+}
+
+/// One-line summary emitted immediately before EVERY conflict-payload
+/// `return Err(...)` (merge / rebase / autostash-pop, pre-pull refusal and
+/// post-pull alike). The field incident's launcher log had no merge line at
+/// all; this is the line that would have located it. No secrets are involved
+/// (operation label, counts, relative paths, a bool).
+fn log_conflict_payload_return(
+    surface: &str,
+    operation: &str,
+    conflicted: &[String],
+    sentinel_written: bool,
+) {
+    let first: Vec<&str> = conflicted.iter().take(3).map(String::as_str).collect();
+    tracing::warn!(
+        "[vct] {}: returning {} conflict payload — {} conflicted file(s), first: {:?}{}; \
+         sentinel_written={}",
+        surface,
+        operation,
+        conflicted.len(),
+        first,
+        if conflicted.len() > first.len() { ", …" } else { "" },
+        sentinel_written,
+    );
+}
+
+/// The `tracing::error!` line before a GENERIC (not conflict, not non-FF, not
+/// merge-in-progress) pull / rebase failure return, carrying the stderr tail
+/// (≤ 300 chars) so the log locates the cause without the GUI toast.
+fn log_generic_pull_failure(surface: &str, what: &str, stderr: &str) {
+    tracing::error!(
+        "[vct] {}: {} failed (not a conflict, not a non-fast-forward, not a \
+         merge-in-progress refusal) — stderr tail: {:?}",
+        surface,
+        what,
+        stderr_tail(stderr, 300),
+    );
+}
+
+/// The last `max_chars` characters of `s` (char-boundary safe, whitespace
+/// trimmed), prefixed with `…` when truncated.
+pub(crate) fn stderr_tail(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    let total = trimmed.chars().count();
+    if total <= max_chars {
+        return trimmed.to_string();
+    }
+    let skip = total - max_chars;
+    let tail: String = trimmed.chars().skip(skip).collect();
+    format!("…{}", tail)
 }
 
 /// v0.2.78 ITEM #0 (F2) — serialize the UNTRACKED-collision payload the
@@ -6841,10 +7649,43 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let install_output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("install.py --update failed: {}", e))?;
+    // v0.2.93 (review round 1, MINOR-3): a SPAWN failure (python missing /
+    // not executable) is the same "partly updated" state as a non-zero exit
+    // and must leave the same ledger row + ERROR line.
+    let install_output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!("install.py --update failed: {}", e);
+            record_install_spawn_failure(
+                install_path,
+                install_path,
+                "run_post_pull_install_and_restart",
+                &msg,
+            );
+            // Review R2 #4: same recovery as the non-zero-exit leg — put the
+            // pre-pull binaries and the hub back before reporting.
+            abort_update_restore_binaries_and_hub(
+                install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
+            return Err(msg);
+        }
+    };
+
+    // v0.2.93 (field incident follow-up): THIS is the tail `resume_orchestrator_
+    // update` reaches AFTER clearing the resume sentinel, so a non-zero exit
+    // here used to leave no trace anywhere (sentinel gone, badge clear, log
+    // silent, install.py's own ledger rewrite saying nothing). Record it.
+    handle_install_phase_exit(
+        install_path,
+        install_path,
+        "run_post_pull_install_and_restart",
+        install_output.status.success(),
+        install_output.status.code(),
+        &String::from_utf8_lossy(&install_output.stdout),
+        &String::from_utf8_lossy(&install_output.stderr),
+    );
 
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
@@ -6868,6 +7709,13 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     // `rebase_orchestrator_onto_upstream`).
     // v0.2.92 WP-13: through the ONE resolver (was the fifth inline copy).
     let v45b_branch = resolve_pull_branch(install_path).await;
+
+    // v0.2.93 (stale status cache): same refresh as `update_orchestrator`'s
+    // inline tail — this helper is the post-pull tail for merge / rebase /
+    // RESUME, so a merge completed from a shell + "Continue Update" also
+    // stops reporting the pre-merge "N commits behind". Soft-fail.
+    crate::commands::self_update::refresh_cached_state_after_pull(install_path, &v45b_branch)
+        .await;
 
     // v0.2.54 Track C (P0-7): shared finalize tail — V45-B binary wait,
     // V52-AI disarm, V52-AH staging + handoff, hub restart (no-handoff
@@ -6927,6 +7775,20 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
 
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot merge".to_string());
+    }
+
+    // v0.2.93 (field incident 2026-09-07): a merge/rebase is ALREADY in
+    // progress → reopen the conflict modal on it instead of running a
+    // second pull that git would only refuse. Before the kill-sweep, hub
+    // stop, binary renames and fetch — none of them apply to a tree we are
+    // not going to touch. See `refuse_if_merge_or_rebase_in_progress`.
+    if let Some(payload) = refuse_if_merge_or_rebase_in_progress(
+        &install_path,
+        "merge_orchestrator_with_upstream",
+    )
+    .await
+    {
+        return Err(payload);
     }
 
     // V52-AI (v0.2.54 P0-7): the merge path runs install.py + binary
@@ -7110,6 +7972,30 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
         // (content): ..." lines). Check both streams.
         let combined = format!("{}\n{}", stderr, stdout);
 
+        // v0.2.93 (field incident 2026-09-07): THE incident's second click.
+        // git refused the pull because the first click's merge is still in
+        // progress ("You have not concluded your merge (MERGE_HEAD
+        // exists)") — pre-fix this fell to the generic branch below: no
+        // sentinel, no modal, a bare toast. Tested BEFORE the conflict
+        // classifier (see `is_merge_in_progress_refusal`). Same payload
+        // shape as the conflict branch so the modal opens on the stalled
+        // merge; the sentinel is (re)written only if absent.
+        if crate::commands::git_user_editable_merge::is_merge_in_progress_refusal(&combined) {
+            abort_update_restore_binaries_and_hub(
+                &install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
+            return Err(handle_merge_in_progress_refusal(
+                &install_path,
+                "merge_orchestrator_with_upstream",
+                &pull_branch,
+                "merge",
+                &combined,
+            )
+            .await);
+        }
+
         if is_merge_or_rebase_conflict(&combined) {
             // Conflict: leave the working tree in the conflicted state
             // so the user can edit files manually. Revert the pre-pull
@@ -7130,9 +8016,16 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             // them back via the launcher GUI, while UPDATE_DEFERRED.md
             // surfaces the same state to terminal Claude sessions.
             // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
-            write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
+            let sentinel_written =
+                write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
 
             let conflicted = collect_conflicted_files(&install_path).await;
+            log_conflict_payload_return(
+                "merge_orchestrator_with_upstream",
+                "merge",
+                &conflicted,
+                sentinel_written,
+            );
             return Err(serialize_orchestrator_conflict_error(
                 "merge",
                 &pull_branch,
@@ -7148,6 +8041,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             pre_pull_renamed.as_deref(),
             pre_pull_renamed_hub.as_deref(),
         );
+        log_generic_pull_failure("merge_orchestrator_with_upstream", "git pull (merge)", &stderr);
         return Err(format!("git pull (merge) failed: {}", stderr));
     }
 
@@ -7194,7 +8088,14 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
                 pre_pull_renamed.as_deref(),
                 pre_pull_renamed_hub.as_deref(),
             );
-            write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
+            let sentinel_written =
+                write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
+            log_conflict_payload_return(
+                "merge_orchestrator_with_upstream",
+                "merge",
+                &unmerged,
+                sentinel_written,
+            );
             return Err(serialize_orchestrator_conflict_error(
                 "merge",
                 &pull_branch,
@@ -7283,6 +8184,18 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
 
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot rebase".to_string());
+    }
+
+    // v0.2.93: same pre-flight as the merge sibling — a stalled merge or
+    // rebase reopens the conflict modal instead of starting a second
+    // operation git would refuse. Before any sweep / hub stop / rename.
+    if let Some(payload) = refuse_if_merge_or_rebase_in_progress(
+        &install_path,
+        "rebase_orchestrator_onto_upstream",
+    )
+    .await
+    {
+        return Err(payload);
     }
 
     // V52-AI (v0.2.54 P0-7): same fork-bomb gate as the merge path —
@@ -7415,9 +8328,16 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             // mirrors the state into UPDATE_DEFERRED.md for terminal
             // Claude sessions.
             // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
-            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
+            let sentinel_written =
+                write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
 
             let conflicted = collect_conflicted_files(&install_path).await;
+            log_conflict_payload_return(
+                "rebase_orchestrator_onto_upstream",
+                "rebase",
+                &conflicted,
+                sentinel_written,
+            );
             return Err(serialize_orchestrator_conflict_error(
                 "rebase",
                 &pull_branch,
@@ -7431,6 +8351,7 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             pre_pull_renamed.as_deref(),
             pre_pull_renamed_hub.as_deref(),
         );
+        log_generic_pull_failure("rebase_orchestrator_onto_upstream", "git rebase", &stderr);
         return Err(format!("git rebase failed: {}", stderr));
     }
 
@@ -7475,7 +8396,14 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
                 pre_pull_renamed.as_deref(),
                 pre_pull_renamed_hub.as_deref(),
             );
-            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
+            let sentinel_written =
+                write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
+            log_conflict_payload_return(
+                "rebase_orchestrator_onto_upstream",
+                "rebase",
+                &unmerged,
+                sentinel_written,
+            );
             return Err(serialize_orchestrator_conflict_error(
                 "rebase",
                 &pull_branch,
@@ -7646,12 +8574,17 @@ fn read_update_resume_sentinel(install_path: &Path) -> Option<UpdateResumeSentin
 /// logged + swallowed because the conflict path that calls us MUST still
 /// surface the conflict error to the GUI (sentinel is a recovery aid,
 /// not a hard requirement).
+///
+/// v0.2.93: returns whether the sentinel actually landed on disk, so the
+/// conflict-return log line (`log_conflict_payload_return`) can say
+/// `sentinel_written=true|false` truthfully instead of "the writer was
+/// called". Callers that do not care ignore the bool.
 fn write_update_resume_sentinel(
     install_path: &Path,
     operation: &str,
     branch: &str,
     sha_at_conflict: &str,
-) {
+) -> bool {
     let sentinel = UpdateResumeSentinel {
         schema: 1,
         operation: operation.to_string(),
@@ -7667,7 +8600,7 @@ fn write_update_resume_sentinel(
                  skipping sentinel write",
                 e
             );
-            return;
+            return false;
         }
     };
     let target = install_path.join(UPDATE_RESUME_SENTINEL_REL);
@@ -7677,7 +8610,7 @@ fn write_update_resume_sentinel(
              skipping",
             target.display()
         );
-        return;
+        return false;
     };
     if let Err(e) = std::fs::create_dir_all(parent) {
         tracing::warn!(
@@ -7686,7 +8619,7 @@ fn write_update_resume_sentinel(
             parent.display(),
             e
         );
-        return;
+        return false;
     }
     // Write to a tempfile then rename — protects against partial writes
     // confusing a concurrent `check_for_updates` poll.
@@ -7701,7 +8634,7 @@ fn write_update_resume_sentinel(
             e
         );
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return false;
     }
     if let Err(e) = std::fs::rename(&tmp, &target) {
         tracing::error!(
@@ -7711,7 +8644,9 @@ fn write_update_resume_sentinel(
             e
         );
         let _ = std::fs::remove_file(&tmp);
+        return false;
     }
+    true
 }
 
 /// Best-effort: delete the resume sentinel. No-op when the file is
@@ -7941,14 +8876,19 @@ next successful install.py run, so the resolution is one command.\n\
 ///     (formerly L5945-L5947).
 ///
 /// Helper expects `install_path` already-validated by the caller.
+///
+/// v0.2.93: returns whether the SENTINEL landed (the deferral is written
+/// regardless; its own writer logs its failures) — see
+/// `write_update_resume_sentinel`.
 async fn write_resume_sentinel_and_deferral(
     install_path: &Path,
     operation: &str,
     pull_branch: &str,
-) {
+) -> bool {
     let sha = read_head_sha(install_path).await.unwrap_or_default();
-    write_update_resume_sentinel(install_path, operation, pull_branch, &sha);
+    let written = write_update_resume_sentinel(install_path, operation, pull_branch, &sha);
     write_update_resume_deferral(install_path, operation, pull_branch);
+    written
 }
 
 /// install.py runs successfully) and `abort_orchestrator_merge_or_rebase`.
@@ -8210,11 +9150,10 @@ pub async fn resume_orchestrator_update<R: Runtime>(
 
     // Probe in-flight merge/rebase state. If still mid-merge we refuse —
     // the user should finish the merge (or abort it) first.
-    let merge_head = install_path.join(".git").join("MERGE_HEAD");
-    let rebase_merge = install_path.join(".git").join("rebase-merge");
-    let rebase_apply = install_path.join(".git").join("rebase-apply");
+    // v0.2.93: through the ONE shared probe.
     let still_mid_merge =
-        merge_head.exists() || rebase_merge.exists() || rebase_apply.exists();
+        crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&install_path)
+            .is_some();
     if still_mid_merge {
         write_audit(
             "update_orchestrator_resume_rejected",
@@ -8553,6 +9492,84 @@ fn resolve_checkout_flag(side: ConflictResolutionSide, operation: &str) -> &'sta
     }
 }
 
+/// What the one-click resolver should do with a working tree that is
+/// mid-merge / mid-rebase (v0.2.93, review round 1 MAJOR-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OneClickState {
+    /// Unmerged entries remain: `git checkout --ours|--theirs` them, `git
+    /// add`, then finish.
+    CheckoutAndFinish { conflicted: Vec<String> },
+    /// Nothing unmerged, but the index holds STAGED content (every conflict
+    /// already `git add`-ed — the field state): just finish (commit /
+    /// `rebase --continue`).
+    CommitStagedResolution,
+    /// Nothing unmerged AND nothing staged: refuse (probable corruption).
+    NothingToResolve,
+}
+
+/// Decide [`OneClickState`] from the live index. Path-injectable so a
+/// fixture repo can drive it; the caller has already established that a
+/// merge/rebase is in progress.
+pub(crate) async fn classify_one_click_state(install_path: &Path) -> OneClickState {
+    let conflicted = collect_conflicted_files(install_path).await;
+    if !conflicted.is_empty() {
+        return OneClickState::CheckoutAndFinish { conflicted };
+    }
+    // `git diff --cached --quiet` exits 1 when the index differs from HEAD
+    // (staged content present), 0 when identical, 128+ on error. Only a
+    // POSITIVE "differs" answer commits anything — an error keeps the
+    // refusal (conservative default on a best-effort probe).
+    // Review R2 #1: in a MERGE (MERGE_HEAD present) an index identical to
+    // HEAD is still a legitimate resolution — the user took HEAD's side for
+    // every hunk — and `git commit --no-edit` records the 2-parent merge
+    // commit with no tree change. Only a rebase needs a differing index
+    // (an empty replayed commit wants `rebase --skip`, which is not offered).
+    let in_merge = crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(
+        install_path,
+    ) == Some("merge");
+    match run_git_raw(install_path, &["diff", "--cached", "--quiet"]).await {
+        Ok(out) if out.status.code() == Some(1) => OneClickState::CommitStagedResolution,
+        Ok(out) if in_merge && out.status.code() == Some(0) => {
+            OneClickState::CommitStagedResolution
+        }
+        _ => OneClickState::NothingToResolve,
+    }
+}
+
+/// Finish an in-progress merge (`git commit --no-edit`) or rebase (`git
+/// rebase --continue`). `GIT_EDITOR=true` is the cross-OS way to short-circuit
+/// the interactive editor: `true` exits 0 immediately, which git treats as
+/// "user accepted the existing message". For a rebase, `--continue` pauses
+/// again if a LATER replayed commit conflicts — the modal then reopens on the
+/// fresh conflict. Returns the user-facing error text on failure.
+pub(crate) async fn finish_merge_or_rebase(install_path: &Path, in_merge: bool) -> Result<(), String> {
+    let (args, what): (&[&str], &str) = if in_merge {
+        (&["commit", "--no-edit"], "git commit")
+    } else {
+        (&["rebase", "--continue"], "git rebase --continue")
+    };
+    let out = run_git_raw_env(install_path, args, &[("GIT_EDITOR", "true")])
+        .await
+        .map_err(|e| format!("{} failed to spawn: {}", what, e))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(if in_merge {
+        format!(
+            "git commit failed after staging the resolution: {}. Inspect the working tree \
+             manually.",
+            stderr.trim(),
+        )
+    } else {
+        format!(
+            "git rebase --continue failed after staging the resolution: {}. The rebase may \
+             have more conflicts on a later commit; inspect with `git status`.",
+            stderr.trim(),
+        )
+    })
+}
+
 /// Shared implementation for both `keep_local_and_continue_update` and
 /// `accept_upstream_and_continue_update`. Performs the conflict resolution
 /// (checkout + add + commit/continue) then delegates to
@@ -8655,28 +9672,78 @@ async fn resolve_conflict_and_resume<R: Runtime>(
     // Collect conflicted files BEFORE any checkout — once we run
     // `git checkout --ours/--theirs`, git clears the conflict state
     // for that path and it no longer appears in `--diff-filter=U`.
-    let conflicted = collect_conflicted_files(&install_path).await;
-    if conflicted.is_empty() {
-        // No files to resolve — but we ARE in mid-merge per the earlier
-        // probe. This shouldn't happen in normal flow; treat as a
-        // probable git-state corruption and refuse with a useful message
-        // rather than silently committing an empty resolution.
-        write_audit(
-            "update_orchestrator_one_click_rejected",
-            serde_json::json!({
-                "reason": "no_conflicted_files",
-                "live_operation": live_operation,
-                "side": format!("{:?}", side),
-                "install_path": path,
-            }),
-        );
-        return Err(
-            "Merge or rebase is in progress but git reports no conflicted \
-             files. Run `git status` in the install directory and either \
-             finish or abort the merge manually."
-                .to_string(),
-        );
-    }
+    //
+    // v0.2.93 (review round 1, MAJOR-1): the field on-disk state is
+    // MERGE_HEAD present with EVERY conflict already `git add`-ed (the
+    // pre-merge step stages merged user-editable files), so `--diff-filter=U`
+    // is EMPTY. Pre-fix both one-click buttons refused here ("no conflicted
+    // files") while the resume command refused too ("still in progress") —
+    // every button except Abort failed with a contradicting message. Now:
+    // staged content + nothing unmerged ⇒ commit the staged resolution and
+    // fall through to the same post-pull tail. Truly empty (nothing staged,
+    // nothing unmerged) keeps the refusal.
+    let conflicted = match classify_one_click_state(&install_path).await {
+        OneClickState::CheckoutAndFinish { conflicted } => conflicted,
+        OneClickState::CommitStagedResolution => {
+            write_audit(
+                "update_orchestrator_one_click_committing_staged_resolution",
+                serde_json::json!({
+                    "operation": live_operation,
+                    "side": format!("{:?}", side),
+                    "install_path": path,
+                }),
+            );
+            emit_progress(
+                &window,
+                "update",
+                "Conflicts already resolved — committing the staged resolution...",
+                10.0,
+            );
+            if let Err(e) = finish_merge_or_rebase(&install_path, in_merge).await {
+                write_audit(
+                    "update_orchestrator_one_click_failed",
+                    serde_json::json!({
+                        "stage": if in_merge { "commit" } else { "rebase_continue" },
+                        "stderr": e,
+                        "install_path": path,
+                    }),
+                );
+                return Err(e);
+            }
+            write_audit(
+                "update_orchestrator_one_click_resolved",
+                serde_json::json!({
+                    "side": format!("{:?}", side),
+                    "operation": live_operation,
+                    "flag": "none (staged resolution committed)",
+                    "resolved_count": 0,
+                    "install_path": path,
+                }),
+            );
+            return resume_orchestrator_update(app, path, window).await;
+        }
+        OneClickState::NothingToResolve => {
+            // MERGE_HEAD/rebase-* present but git reports neither unmerged
+            // entries nor staged content. Treat as probable git-state
+            // corruption and refuse with a useful message rather than
+            // silently committing an empty resolution.
+            write_audit(
+                "update_orchestrator_one_click_rejected",
+                serde_json::json!({
+                    "reason": "no_conflicted_files",
+                    "live_operation": live_operation,
+                    "side": format!("{:?}", side),
+                    "install_path": path,
+                }),
+            );
+            return Err(
+                "Merge or rebase is in progress but git reports no conflicted \
+                 files. Run `git status` in the install directory and either \
+                 finish or abort the merge manually."
+                    .to_string(),
+            );
+        }
+    };
 
     let flag = resolve_checkout_flag(side, live_operation);
     emit_progress(
@@ -8787,58 +9854,18 @@ async fn resolve_conflict_and_resume<R: Runtime>(
         20.0,
     );
 
-    if in_merge {
-        let out = run_git_raw_env(
-            &install_path,
-            &["commit", "--no-edit"],
-            &[("GIT_EDITOR", "true")],
-        )
-        .await
-        .map_err(|e| format!("git commit failed to spawn: {}", e))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            write_audit(
-                "update_orchestrator_one_click_failed",
-                serde_json::json!({
-                    "stage": "commit",
-                    "stderr": stderr.to_string(),
-                    "install_path": path,
-                }),
-            );
-            return Err(format!(
-                "git commit failed after staging the resolution: {}. \
-                 Inspect the working tree manually.",
-                stderr.trim(),
-            ));
-        }
-    } else {
-        // Rebase. `--continue` will pause if there are MORE conflicted
-        // commits to replay — in that case the caller (the modal) will
-        // see a fresh conflict modal pop and can resolve again.
-        let out = run_git_raw_env(
-            &install_path,
-            &["rebase", "--continue"],
-            &[("GIT_EDITOR", "true")],
-        )
-        .await
-        .map_err(|e| format!("git rebase --continue failed to spawn: {}", e))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            write_audit(
-                "update_orchestrator_one_click_failed",
-                serde_json::json!({
-                    "stage": "rebase_continue",
-                    "stderr": stderr.to_string(),
-                    "install_path": path,
-                }),
-            );
-            return Err(format!(
-                "git rebase --continue failed after staging the \
-                 resolution: {}. The rebase may have more conflicts on a \
-                 later commit; inspect with `git status`.",
-                stderr.trim(),
-            ));
-        }
+    // v0.2.93: ONE home for the commit / --continue step, shared with the
+    // staged-resolution branch above.
+    if let Err(e) = finish_merge_or_rebase(&install_path, in_merge).await {
+        write_audit(
+            "update_orchestrator_one_click_failed",
+            serde_json::json!({
+                "stage": if in_merge { "commit" } else { "rebase_continue" },
+                "stderr": e,
+                "install_path": path,
+            }),
+        );
+        return Err(e);
     }
 
     write_audit(
@@ -9599,10 +10626,28 @@ pub async fn apply_pending_install(
 
     emit_progress(&window, "install", "Running install.py --update...", 30.0);
 
-    let install_output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("install.py --update failed: {}", e))?;
+    // v0.2.93 (review round 1, MINOR-3): spawn failure ⇒ same row + ERROR line.
+    let install_output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!("install.py --update failed: {}", e);
+            record_install_spawn_failure(&install_path, &install_path, "apply_pending_install", &msg);
+            return Err(msg);
+        }
+    };
+
+    // v0.2.93: this is the install_stale RETRY surface — a successful run here
+    // is "the next successful install.py run" that settles a prior
+    // update_install_phase_failed row; a failed one keeps it current.
+    handle_install_phase_exit(
+        &install_path,
+        &install_path,
+        "apply_pending_install",
+        install_output.status.success(),
+        install_output.status.code(),
+        &String::from_utf8_lossy(&install_output.stdout),
+        &String::from_utf8_lossy(&install_output.stderr),
+    );
 
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
@@ -16043,6 +17088,7 @@ MemAvailable:   23456789 kB
                 Some("abc1234"),
                 Some("def5678"),
                 &["CLAUDE.md".to_string(), "knowledge/foo.md".to_string()],
+                &["launcher/dist/x".to_string(), "install.py".to_string(), "README.md".to_string()],
                 &["other_projects_knowledge/local-only.md".to_string()],
                 "fatal: Not possible to fast-forward, aborting.",
             );
@@ -16063,6 +17109,12 @@ MemAvailable:   23456789 kB
             let local_only = v["local_only_files"].as_array().expect("array");
             assert_eq!(local_only.len(), 1);
             assert_eq!(local_only[0], "other_projects_knowledge/local-only.md");
+            // v0.2.93: upstream_only_files + its count are a third category —
+            // the modal can now say "2 diverged, 3 coming in from upstream".
+            let upstream_only = v["upstream_only_files"].as_array().expect("array");
+            assert_eq!(upstream_only.len(), 3);
+            assert_eq!(upstream_only[0], "launcher/dist/x");
+            assert_eq!(v["upstream_only_count"], 3);
         }
 
         #[test]
@@ -16073,11 +17125,14 @@ MemAvailable:   23456789 kB
                 None,
                 &[],
                 &[],
+                &[],
                 "boom",
             );
             let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
             assert_eq!(v["diverged_files"].as_array().unwrap().len(), 0);
             assert_eq!(v["local_only_files"].as_array().unwrap().len(), 0);
+            assert_eq!(v["upstream_only_files"].as_array().unwrap().len(), 0);
+            assert_eq!(v["upstream_only_count"], 0);
             assert!(v["local_sha"].is_null());
             assert!(v["remote_sha"].is_null());
         }
@@ -16092,12 +17147,14 @@ MemAvailable:   23456789 kB
                 None,
                 None,
                 &["weird\"name.md".to_string()],
+                &["up\\stream.md".to_string()],
                 &[],
                 "boom",
             );
             let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
             let files = v["diverged_files"].as_array().unwrap();
             assert_eq!(files[0], "weird\"name.md");
+            assert_eq!(v["upstream_only_files"][0], "up\\stream.md");
         }
 
         #[test]
@@ -16381,6 +17438,84 @@ MemAvailable:   23456789 kB
                 .status()
                 .unwrap()
                 .success());
+        }
+
+        /// v0.2.93 — ONE home for the "stalled merge" fixture (previously
+        /// inlined twice, in the conflict-list test and the abort test). Edits
+        /// `README.md` differently on both sides (the base commit's file, so
+        /// it exists on both), pushes the upstream side through a second
+        /// clone, fetches, then runs the SAME `git pull --no-rebase --no-edit
+        /// vco_upstream main` the merge command runs. Returns the pull's
+        /// `Output`; asserts the merge is left in progress (`MERGE_HEAD`).
+        fn stall_merge_on_readme(local: &Path) -> std::process::Output {
+            std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
+            for args in [
+                vec!["add", "README.md"],
+                vec!["commit", "-m", "local README change"],
+            ] {
+                assert!(StdCommand::new("git")
+                    .silent()
+                    .args(&args)
+                    .current_dir(local)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+
+            // Reach through the bare-remote URL by cloning it again into a
+            // sibling workdir, modifying, pushing.
+            let pusher = local.parent().unwrap().join("pusher");
+            let remote_url = StdCommand::new("git")
+                .silent()
+                .args(["remote", "get-url", "vco_upstream"])
+                .current_dir(local)
+                .output()
+                .expect("get-url")
+                .stdout;
+            let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["clone", &remote_url])
+                .arg(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
+            for args in [
+                vec!["config", "user.email", "test@example.com"],
+                vec!["config", "user.name", "Test"],
+                vec!["add", "README.md"],
+                vec!["commit", "-m", "upstream README change"],
+                vec!["push", "origin", "main"],
+            ] {
+                assert!(StdCommand::new("git")
+                    .silent()
+                    .args(&args)
+                    .current_dir(&pusher)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["fetch", "vco_upstream"])
+                .current_dir(local)
+                .status()
+                .unwrap()
+                .success());
+
+            let pull = StdCommand::new("git")
+                .silent()
+                .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
+                .current_dir(local)
+                .output()
+                .expect("git pull merge");
+            assert!(!pull.status.success(), "merge should fail on overlap");
+            assert!(
+                local.join(".git").join("MERGE_HEAD").exists(),
+                "MERGE_HEAD must exist after conflicted merge"
+            );
+            pull
         }
 
         // ─── v0.2.78 ITEM #0 (F2 keystone) — untracked-collision handling ───
@@ -16745,15 +17880,23 @@ MemAvailable:   23456789 kB
                 stderr
             );
 
-            // The diverged-files helper must return at least UPSTREAM.md
-            // (added on upstream but absent locally).
-            let (diverged, local_only) =
-                collect_diverged_files(&local, "main").await;
+            // v0.2.93: UPSTREAM.md was added on upstream only and LOCAL.md
+            // locally only — NOTHING was touched on both sides, so `diverged`
+            // (the intersection) is EMPTY and each file lands in its own set.
+            // Pre-fix UPSTREAM.md sat in `diverged` ("both sides") — the
+            // 764-vs-8 field figure in miniature.
+            let DivergedFiles {
+                diverged,
+                upstream_only,
+                local_only,
+            } = collect_diverged_files(&local, "main").await;
             assert!(
-                diverged.iter().any(|p| p == "UPSTREAM.md"),
-                "expected UPSTREAM.md in diverged list, got {:?}",
+                diverged.is_empty(),
+                "no file was touched on both sides, got {:?}",
                 diverged
             );
+            assert_eq!(upstream_only, vec!["UPSTREAM.md".to_string()]);
+            assert_eq!(local_only, vec!["LOCAL.md".to_string()]);
 
             // The SHAs should both be readable.
             let local_sha = read_head_sha(&local).await;
@@ -16769,6 +17912,7 @@ MemAvailable:   23456789 kB
                 local_sha.as_deref(),
                 remote_sha.as_deref(),
                 &diverged,
+                &upstream_only,
                 &local_only,
                 stderr.trim(),
             );
@@ -16776,10 +17920,62 @@ MemAvailable:   23456789 kB
                 serde_json::from_str(&payload).expect("payload valid JSON");
             assert_eq!(v["event"], "orchestrator_update_non_ff");
             assert_eq!(v["branch"], "main");
-            assert!(!v["diverged_files"].as_array().unwrap().is_empty());
-            // local_only_files should be present (may be empty in this fixture,
-            // but the key must exist for the v0.2.27 shape contract).
-            assert!(v.get("local_only_files").is_some());
+            assert!(v["diverged_files"].as_array().unwrap().is_empty());
+            assert_eq!(v["upstream_only_files"][0], "UPSTREAM.md");
+            assert_eq!(v["upstream_only_count"], 1);
+            // local_only_files must be present for the v0.2.27 shape contract.
+            assert_eq!(v["local_only_files"][0], "LOCAL.md");
+        }
+
+        /// v0.2.93 — THE divergence-count test. Base commit; local touches 2
+        /// files, upstream touches 5, exactly 1 overlapping → diverged = 1,
+        /// upstream_only = 4, local_only = 1. Red-proof: with the intersection
+        /// reverted to "all of A", `diverged.len()` is 5 here.
+        #[tokio::test]
+        async fn collect_diverged_files_splits_intersection_upstream_only_local_only() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+
+            // Local touches 2: README.md (shared with upstream below) + LOCAL.md.
+            add_local_divergent_commit(&local, "README.md", "base\nlocal line\n");
+            add_local_divergent_commit(&local, "LOCAL.md", "local-only\n");
+
+            // Upstream touches 5: README.md (the overlap) + 4 new files.
+            // (`init_remote_and_clone` already pushed UPSTREAM.md — that is the
+            // 1st of the 4; add 3 more + the README edit through the seed.)
+            push_upstream_added_file(&seed, &local, "README.md", "base\nupstream line\n");
+            push_upstream_added_file(&seed, &local, "up/a.md", "a\n");
+            push_upstream_added_file(&seed, &local, "up/b.md", "b\n");
+            push_upstream_added_file(&seed, &local, "up/c.md", "c\n");
+
+            let sets = collect_diverged_files(&local, "main").await;
+            assert_eq!(sets.diverged, vec!["README.md".to_string()], "A ∩ B");
+            assert_eq!(
+                sets.upstream_only,
+                vec![
+                    "UPSTREAM.md".to_string(),
+                    "up/a.md".to_string(),
+                    "up/b.md".to_string(),
+                    "up/c.md".to_string(),
+                ],
+                "A ∖ B"
+            );
+            assert_eq!(sets.local_only, vec!["LOCAL.md".to_string()], "B ∖ A");
+
+            let payload = serialize_orchestrator_non_ff_error(
+                "main",
+                None,
+                None,
+                &sets.diverged,
+                &sets.upstream_only,
+                &sets.local_only,
+                "",
+            );
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v["diverged_files"].as_array().unwrap().len(), 1);
+            assert_eq!(v["upstream_only_count"], 4);
+            assert_eq!(v["local_only_files"].as_array().unwrap().len(), 1);
         }
 
         #[tokio::test]
@@ -16841,95 +18037,10 @@ MemAvailable:   23456789 kB
             skip_if_no_git!();
 
             let (_tmp, _remote, local) = init_remote_and_clone();
-            // Make a local commit that modifies a file we also modify on
-            // upstream — but UPSTREAM.md was only added on upstream, so we
-            // need to use a file that exists on both sides. Use README.md
-            // (the base commit's file, present locally and remotely) and
-            // modify it differently on both sides.
-            //
-            // Step 1: modify locally + commit.
-            std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
-            assert!(StdCommand::new("git").silent()
-                .args(["add", "README.md"])
-                .current_dir(&local)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["commit", "-m", "local README change"])
-                .current_dir(&local)
-                .status()
-                .unwrap()
-                .success());
-
-            // Step 2: simulate an upstream change to README.md too. Reach
-            // through the bare-remote URL by cloning it again into a temp
-            // workdir, modifying, pushing.
-            let pusher = local.parent().unwrap().join("pusher");
-            std::fs::create_dir_all(&pusher).unwrap();
-            // Clone from the bare remote — same URL used in vco_upstream.
-            let remote_url = StdCommand::new("git").silent()
-                .args(["remote", "get-url", "vco_upstream"])
-                .current_dir(&local)
-                .output()
-                .expect("get-url")
-                .stdout;
-            let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
-            assert!(StdCommand::new("git").silent()
-                .args(["clone", &remote_url])
-                .arg(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["config", "user.email", "test@example.com"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["config", "user.name", "Test"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
-            assert!(StdCommand::new("git").silent()
-                .args(["add", "README.md"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["commit", "-m", "upstream README change"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["push", "origin", "main"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-
-            // Step 3: fetch vco_upstream in the local clone so it sees the
-            // upstream README change.
-            assert!(StdCommand::new("git").silent()
-                .args(["fetch", "vco_upstream"])
-                .current_dir(&local)
-                .status()
-                .unwrap()
-                .success());
-
-            // Step 4: attempt the merge — should fail with conflict.
-            let pull = tokio::process::Command::new("git").silent()
-                .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
-                .current_dir(&local)
-                .output()
-                .await
-                .expect("git pull merge");
-            assert!(!pull.status.success(), "merge should fail on overlap");
+            // README.md (the base commit's file, present on both sides) is
+            // modified differently locally and upstream, then the merge
+            // command's exact pull is run — one fixture home (v0.2.93).
+            let pull = stall_merge_on_readme(&local);
 
             let combined = format!(
                 "{}\n{}",
@@ -16988,87 +18099,10 @@ MemAvailable:   23456789 kB
         async fn abort_merge_or_rebase_aborts_in_progress_merge() {
             skip_if_no_git!();
 
-            // Reproduce a conflict-state, then abort it.
+            // Reproduce a conflict-state (one fixture home, v0.2.93), then
+            // abort it.
             let (_tmp, _remote, local) = init_remote_and_clone();
-            // Set up overlapping changes (same scaffolding as the conflict
-            // test).
-            std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
-            assert!(StdCommand::new("git").silent()
-                .args(["add", "README.md"])
-                .current_dir(&local)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["commit", "-m", "local README"])
-                .current_dir(&local)
-                .status()
-                .unwrap()
-                .success());
-
-            let pusher = local.parent().unwrap().join("pusher2");
-            let remote_url = StdCommand::new("git").silent()
-                .args(["remote", "get-url", "vco_upstream"])
-                .current_dir(&local)
-                .output()
-                .expect("get-url")
-                .stdout;
-            let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
-            assert!(StdCommand::new("git").silent()
-                .args(["clone", &remote_url])
-                .arg(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["config", "user.email", "test@example.com"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["config", "user.name", "Test"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
-            assert!(StdCommand::new("git").silent()
-                .args(["add", "README.md"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["commit", "-m", "upstream README"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["push", "origin", "main"])
-                .current_dir(&pusher)
-                .status()
-                .unwrap()
-                .success());
-            assert!(StdCommand::new("git").silent()
-                .args(["fetch", "vco_upstream"])
-                .current_dir(&local)
-                .status()
-                .unwrap()
-                .success());
-
-            // Trigger the merge — expected to leave MERGE_HEAD.
-            let pull = StdCommand::new("git").silent()
-                .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
-                .current_dir(&local)
-                .output()
-                .expect("pull");
-            assert!(!pull.status.success(), "merge should leave conflict state");
-            assert!(
-                local.join(".git").join("MERGE_HEAD").exists(),
-                "MERGE_HEAD must exist after conflicted merge"
-            );
+            let _pull = stall_merge_on_readme(&local);
 
             // Abort.
             let result = abort_orchestrator_merge_or_rebase(
@@ -17080,6 +18114,647 @@ MemAvailable:   23456789 kB
                 !local.join(".git").join("MERGE_HEAD").exists(),
                 "MERGE_HEAD must be cleared after abort"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // v0.2.93 (field incident 2026-09-07) — stalled merge handling.
+        // -------------------------------------------------------------------
+
+        /// THE incident, reproduced with the real git on the host: a stalled
+        /// merge, then the SAME pull again. git 2.43 has TWO refusal shapes
+        /// depending on whether the conflicted entries are still unmerged:
+        ///
+        ///   1. index still `UU`: "Pulling is not possible because you have
+        ///      unmerged files … fatal: Exiting because of an unresolved
+        ///      conflict." — the OLD classifier claims this as a fresh
+        ///      conflict (the word "conflict"), which is why the callers test
+        ///      the refusal classifier FIRST.
+        ///   2. entries staged (the pre-merge step `git add`s merged
+        ///      user-editable files, which is what the field install had):
+        ///      "You have not concluded your merge (MERGE_HEAD exists)." —
+        ///      NOTHING to the old classifier → generic toast. The incident.
+        ///
+        /// Red-proof: revert `is_merge_in_progress_refusal` → both legs fail.
+        #[tokio::test]
+        async fn second_pull_on_stalled_merge_is_a_merge_in_progress_refusal() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let _first = stall_merge_on_readme(&local);
+
+            let second_pull = |local: &Path| {
+                let out = StdCommand::new("git")
+                    .silent()
+                    .args([
+                        "pull",
+                        "--no-rebase",
+                        "--no-edit",
+                        "--autostash",
+                        "vco_upstream",
+                        "main",
+                    ])
+                    .current_dir(local)
+                    .env("LC_ALL", "C")
+                    .output()
+                    .expect("second pull");
+                assert!(!out.status.success(), "a second pull must be refused");
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stderr),
+                    String::from_utf8_lossy(&out.stdout)
+                )
+            };
+
+            // Shape 1: unresolved index.
+            let combined = second_pull(&local);
+            assert!(
+                crate::commands::git_user_editable_merge::is_merge_in_progress_refusal(&combined),
+                "unmerged-index refusal must classify as merge-in-progress: {combined}"
+            );
+            assert!(
+                is_merge_or_rebase_conflict(&combined),
+                "documents WHY the refusal classifier runs first — the old one matches too: \
+                 {combined}"
+            );
+
+            // Shape 2: resolved-but-uncommitted (the field install's state).
+            std::fs::write(local.join("README.md"), "RESOLVED\n").unwrap();
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["add", "README.md"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            let combined = second_pull(&local);
+            assert!(
+                combined.contains("not concluded your merge"),
+                "fixture must reproduce the field text: {combined}"
+            );
+            assert!(
+                crate::commands::git_user_editable_merge::is_merge_in_progress_refusal(&combined),
+                "the field text must classify as merge-in-progress: {combined}"
+            );
+            assert!(
+                !is_merge_or_rebase_conflict(&combined),
+                "and it is NOT a conflict to the old classifier (the generic-toast path): \
+                 {combined}"
+            );
+            // The tree is still stalled — nothing was changed by the refusals.
+            assert_eq!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local),
+                Some("merge")
+            );
+            // And the post-pull handler on THIS state: no unmerged entries
+            // remain, so the payload says so instead of listing nothing.
+            let payload =
+                handle_merge_in_progress_refusal(&local, "test", "main", "merge", &combined)
+                    .await;
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v["operation"], "merge");
+            assert!(v["conflicted_files"].as_array().unwrap().is_empty());
+            assert!(v["git_stderr"].as_str().unwrap().contains("not concluded your merge"));
+
+            let _ = StdCommand::new("git")
+                .silent()
+                .args(["merge", "--abort"])
+                .current_dir(&local)
+                .status();
+            clear_update_resume_sentinel(&local);
+        }
+
+        /// The pre-pull short-circuit: on a stalled merge the three update
+        /// commands return the conflict payload WITHOUT touching the tree, and
+        /// the sentinel is written exactly once (a second call keeps the
+        /// first call's `written_at`). Red-proof: revert the helper's
+        /// `merge_or_rebase_in_progress` gate → `None`, first assert fails.
+        #[tokio::test]
+        async fn pre_pull_refusal_returns_conflict_payload_and_writes_sentinel_once() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let _pull = stall_merge_on_readme(&local);
+            assert!(
+                read_update_resume_sentinel(&local).is_none(),
+                "fixture precondition: no sentinel yet (the modal never opened)"
+            );
+
+            let payload = refuse_if_merge_or_rebase_in_progress(&local, "test")
+                .await
+                .expect("a stalled merge must short-circuit");
+            let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+            assert_eq!(v["event"], "orchestrator_update_conflict");
+            assert_eq!(v["operation"], "merge");
+            assert_eq!(v["branch"], "main");
+            let files = v["conflicted_files"].as_array().unwrap();
+            assert!(files.iter().any(|f| f == "README.md"), "got {files:?}");
+            assert!(
+                v["git_stderr"].as_str().unwrap().contains("already in progress"),
+                "the explanation replaces live git output"
+            );
+
+            let first = read_update_resume_sentinel(&local).expect("sentinel written");
+            assert_eq!(first.operation, "merge");
+            assert_eq!(first.branch, "main");
+            assert!(!first.sha_at_conflict.is_empty());
+            assert!(
+                local.join(".claude/context/UPDATE_DEFERRED.md").exists(),
+                "the paired deferral must land too"
+            );
+
+            // Second click: same payload, sentinel NOT rewritten.
+            let again = refuse_if_merge_or_rebase_in_progress(&local, "test")
+                .await
+                .expect("still stalled");
+            let v2: serde_json::Value = serde_json::from_str(&again).unwrap();
+            assert_eq!(v2["operation"], "merge");
+            let second = read_update_resume_sentinel(&local).expect("sentinel still there");
+            assert_eq!(
+                second.written_at, first.written_at,
+                "an existing sentinel is kept, not rewritten"
+            );
+
+            // Leave-alone leg: a clean tree short-circuits nothing.
+            let _ = StdCommand::new("git")
+                .silent()
+                .args(["merge", "--abort"])
+                .current_dir(&local)
+                .status();
+            assert!(refuse_if_merge_or_rebase_in_progress(&local, "test").await.is_none());
+        }
+
+        /// The post-pull sibling: the refusal text + on-disk state produce the
+        /// conflict payload with the live git text carried as `git_stderr`.
+        #[tokio::test]
+        async fn post_pull_refusal_handler_labels_from_disk_and_carries_git_text() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let _pull = stall_merge_on_readme(&local);
+            let text = "fatal: You have not concluded your merge (MERGE_HEAD exists).\n\
+                        hint: Please, commit your changes before you merge.";
+            // `fallback_op` = "rebase" is deliberately WRONG so the test proves
+            // the label comes from the on-disk state, not the caller's guess.
+            let payload =
+                handle_merge_in_progress_refusal(&local, "test", "main", "rebase", text).await;
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v["event"], "orchestrator_update_conflict");
+            assert_eq!(v["operation"], "merge", "label from .git/MERGE_HEAD, not the fallback");
+            assert!(v["git_stderr"].as_str().unwrap().contains("not concluded your merge"));
+            assert!(read_update_resume_sentinel(&local).is_some());
+            let _ = StdCommand::new("git")
+                .silent()
+                .args(["merge", "--abort"])
+                .current_dir(&local)
+                .status();
+        }
+
+        /// `get_pending_conflict_payload`'s body on a real stalled merge, with
+        /// and without the sentinel, plus both `Err` legs. Red-proof: revert
+        /// the command → nothing reopens the modal after a restart.
+        #[tokio::test]
+        async fn pending_conflict_payload_rebuilds_the_modal_from_disk() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+
+            // Nothing pending on a clean clone.
+            let err = build_pending_conflict_payload(&local).await.unwrap_err();
+            assert!(err.contains("No pending conflict"), "{err}");
+
+            let _pull = stall_merge_on_readme(&local);
+
+            // Stalled merge, NO sentinel (modal never opened): operation from
+            // the live git state, branch resolved, files from the index.
+            let payload = build_pending_conflict_payload(&local).await.expect("payload");
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v["event"], "orchestrator_update_conflict");
+            assert_eq!(v["operation"], "merge");
+            assert_eq!(v["branch"], "main");
+            assert_eq!(v["conflicted_files"][0], "README.md");
+            assert!(v["git_stderr"].as_str().unwrap().contains("Recovered"));
+
+            // With the sentinel the first click wrote: operation/branch/since
+            // come from it (schema: operation, branch, sha_at_conflict,
+            // written_at) — the field incident's exact on-disk state.
+            write_update_resume_sentinel(&local, "merge", "main", "deadbeef");
+            let written_at = read_update_resume_sentinel(&local).unwrap().written_at;
+            let payload = build_pending_conflict_payload(&local).await.expect("payload");
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v["operation"], "merge");
+            assert_eq!(v["branch"], "main");
+            assert!(
+                v["git_stderr"].as_str().unwrap().contains(&written_at),
+                "the explanation names the sentinel's written_at"
+            );
+            // And this is exactly the state the badge must now show.
+            assert_eq!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local),
+                Some("merge")
+            );
+
+            // Sentinel present but git state cleared → that is the
+            // `merge_resolved_incomplete` badge's case, not a modal.
+            let _ = StdCommand::new("git")
+                .silent()
+                .args(["merge", "--abort"])
+                .current_dir(&local)
+                .status();
+            let err = build_pending_conflict_payload(&local).await.unwrap_err();
+            assert!(err.contains("Continue Update"), "{err}");
+            clear_update_resume_sentinel(&local);
+        }
+
+        /// `UpdateStatus` serde: the two v0.2.93 flags default to `false` when
+        /// absent, so a payload from an older backend still deserializes.
+        #[test]
+        fn update_status_new_flags_default_false_when_absent() {
+            let full = UpdateStatus {
+                remote_ahead: false,
+                install_stale: false,
+                binary_stale: false,
+                merge_resolved_incomplete: false,
+                resume_operation: String::new(),
+                resume_branch: String::new(),
+                source_version: String::new(),
+                installed_version: String::new(),
+                running_version: String::new(),
+                on_disk_binary_version: String::new(),
+                remote_check: CheckState::NotApplicable,
+                head_detached: false,
+                merge_in_progress: true,
+                binary_ahead_of_install: true,
+            };
+            // An older backend's payload = today's minus the two new keys.
+            let mut v = serde_json::to_value(&full).unwrap();
+            let obj = v.as_object_mut().unwrap();
+            assert!(obj.remove("merge_in_progress").is_some());
+            assert!(obj.remove("binary_ahead_of_install").is_some());
+            let st: UpdateStatus = serde_json::from_value(v).expect("older payload parses");
+            assert!(!st.merge_in_progress);
+            assert!(!st.binary_ahead_of_install);
+            // And the round trip keeps them when present.
+            let back: UpdateStatus =
+                serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+            assert!(back.merge_in_progress && back.binary_ahead_of_install);
+        }
+
+        /// D-D decision core: all four gates, both legs.
+        #[test]
+        fn binary_ahead_of_install_core_requires_pending_update_and_version_mismatch() {
+            // Act: stalled merge + manifest behind the running binary.
+            let hit = binary_ahead_of_install_core(Some("merge"), Some("0.2.91".into()), "0.2.92")
+                .expect("ahead");
+            assert_eq!(hit.installed_version, "0.2.91");
+            assert_eq!(hit.running_version, "0.2.92");
+            assert_eq!(hit.cause, "merge");
+            assert!(binary_ahead_of_install_core(Some("sentinel"), Some("0.2.91".into()), "0.2.92").is_some());
+            // Leave alone: nothing pending (install_stale's job, not ours).
+            assert!(binary_ahead_of_install_core(None, Some("0.2.91".into()), "0.2.92").is_none());
+            // Leave alone: versions agree.
+            assert!(binary_ahead_of_install_core(Some("merge"), Some("0.2.92".into()), "0.2.92").is_none());
+            // Leave alone: never installed (no manifest) / empty manifest version.
+            assert!(binary_ahead_of_install_core(Some("merge"), None, "0.2.92").is_none());
+            assert!(binary_ahead_of_install_core(Some("merge"), Some(String::new()), "0.2.92").is_none());
+        }
+
+        /// The on-disk reader behind the boot warn + `UpdateStatus` field.
+        #[test]
+        fn detect_binary_ahead_of_install_reads_manifest_and_git_state() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            std::fs::create_dir_all(root.join("state")).unwrap();
+            let running = env!("CARGO_PKG_VERSION");
+            std::fs::write(
+                root.join("state/install-manifest.json"),
+                format!("{{\"version\":\"{running}-older\"}}"),
+            )
+            .unwrap();
+
+            assert!(detect_binary_ahead_of_install(root).is_none(), "nothing pending");
+            assert!(!warn_if_binary_ahead_of_install(root));
+
+            std::fs::write(root.join(".git/MERGE_HEAD"), "abc\n").unwrap();
+            let hit = detect_binary_ahead_of_install(root).expect("stalled merge + mismatch");
+            assert_eq!(hit.cause, "merge");
+            assert_eq!(hit.running_version, running);
+            assert!(warn_if_binary_ahead_of_install(root));
+
+            // Manifest matches the running binary → not ahead, even mid-merge.
+            std::fs::write(
+                root.join("state/install-manifest.json"),
+                format!("{{\"version\":\"{running}\"}}"),
+            )
+            .unwrap();
+            assert!(detect_binary_ahead_of_install(root).is_none());
+        }
+
+        // ---- v0.2.93 follow-up: install.py phase failure row ---------------
+
+        /// Pure decision core, both legs.
+        #[test]
+        fn classify_install_phase_exit_records_failure_facts_and_ignores_success() {
+            assert_eq!(classify_install_phase_exit(true, Some(0), "[10/10] done\n", ""), None);
+            let f = classify_install_phase_exit(
+                false,
+                Some(1),
+                "[4/10] ok\n[5/10] Starting services via podman ...\n",
+                "Traceback (most recent call last):\n  ...\nRuntimeError: podman daemon down\n",
+            )
+            .expect("a non-zero exit is a failure");
+            assert_eq!(f.exit_code, Some(1));
+            assert_eq!(f.last_step.as_deref(), Some("[5/10]"));
+            assert!(f.stderr_tail.ends_with("RuntimeError: podman daemon down"));
+            // Signal-killed + empty stderr: falls back to stdout for the tail.
+            let g = classify_install_phase_exit(false, None, "[2/10] boom\n", "  \n").unwrap();
+            assert_eq!(g.exit_code, None);
+            assert_eq!(g.last_step.as_deref(), Some("[2/10]"));
+            assert_eq!(g.stderr_tail, "[2/10] boom");
+            // No banner at all → None, never a guess.
+            assert_eq!(
+                classify_install_phase_exit(false, Some(2), "no banners [x/y] here", "")
+                    .unwrap()
+                    .last_step,
+                None
+            );
+        }
+
+        /// THE field-incident regression, through the REAL Python deferral
+        /// bridge: a non-zero install.py exit writes the
+        /// `update_install_phase_failed` row; a zero exit writes nothing and a
+        /// later zero exit settles the row. Red-proof: revert the emit in
+        /// `record_update_install_phase_failure` → the second assert block
+        /// fails; revert the settle → the last one fails.
+        #[test]
+        fn install_phase_failure_row_written_on_nonzero_exit_and_not_on_zero() {
+            let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+            else {
+                eprintln!("skipping: no python interpreter resolved");
+                return;
+            };
+            if StdCommand::new(&python)
+                .arg("-c")
+                .arg("pass")
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
+            {
+                eprintln!("skipping: {} is not spawnable", python.display());
+                return;
+            }
+            // <repo>/launcher/src-tauri → <repo> (where vco_lib/ lives).
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+            assert!(
+                repo_root.join("vco_lib").join("deferral_emit.py").is_file(),
+                "fixture precondition: vco_lib/deferral_emit.py at {}",
+                repo_root.display()
+            );
+            let install = tempfile::tempdir().expect("tempdir");
+            let report = install.path().join(".claude/context/UPDATE_DEFERRED.md");
+
+            // Leave-alone leg: exit 0 records nothing.
+            assert!(!handle_install_phase_exit(
+                &repo_root,
+                install.path(),
+                "test",
+                true,
+                Some(0),
+                "[10/10] done\n",
+                "",
+            ));
+            assert!(!report.exists(), "a successful install must not write a row");
+
+            // Act leg: exit 1 at step 5/10 records the action_required row.
+            assert!(handle_install_phase_exit(
+                &repo_root,
+                install.path(),
+                "test",
+                false,
+                Some(1),
+                "[5/10] Starting services via podman ...\n",
+                "RuntimeError: podman daemon down\n",
+            ));
+            let body = std::fs::read_to_string(&report)
+                .unwrap_or_else(|e| panic!("no ledger at {}: {e}", report.display()));
+            assert!(body.contains(UPDATE_INSTALL_PHASE_FAILED_CID), "{body}");
+            assert!(
+                body.contains("The update's install.py phase failed — the orchestrator is only partly updated"),
+                "{body}"
+            );
+            assert!(body.contains("exited 1 at [5/10]"), "{body}");
+            assert!(body.contains("podman daemon down"), "{body}");
+            assert!(body.contains("python install.py --update"), "{body}");
+            assert!(body.contains("dismiss-deferral"), "{body}");
+            assert!(body.contains("does not retry"), "{body}");
+
+            // The next SUCCESSFUL run settles it (Rust side; install.py's
+            // owned-set self-clear is the other half once the id is registered).
+            assert!(!handle_install_phase_exit(
+                &repo_root,
+                install.path(),
+                "test",
+                true,
+                Some(0),
+                "",
+                "",
+            ));
+            let settled = std::fs::read_to_string(&report).unwrap_or_default();
+            assert!(
+                !settled.contains(UPDATE_INSTALL_PHASE_FAILED_CID),
+                "a successful install must settle the row:\n{settled}"
+            );
+        }
+
+        // ---- v0.2.93 review round 1 fixes ---------------------------------
+
+        /// MAJOR-1: the field on-disk state — MERGE_HEAD present, every
+        /// conflict already `git add`-ed, `--diff-filter=U` EMPTY — must have
+        /// a working one-click button. The classifier picks
+        /// `CommitStagedResolution`, and `finish_merge_or_rebase` commits it
+        /// (MERGE_HEAD gone, a 2-parent merge commit at HEAD). Red-proof:
+        /// revert the classifier's staged probe → `NothingToResolve` here.
+        #[tokio::test]
+        async fn one_click_commits_a_fully_staged_resolution_and_refuses_a_truly_empty_one() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let _pull = stall_merge_on_readme(&local);
+
+            // Still unmerged: the classic checkout leg.
+            assert_eq!(
+                classify_one_click_state(&local).await,
+                OneClickState::CheckoutAndFinish {
+                    conflicted: vec!["README.md".to_string()]
+                }
+            );
+
+            // Field state: resolved + staged, nothing unmerged, MERGE_HEAD kept.
+            std::fs::write(local.join("README.md"), "RESOLVED\n").unwrap();
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["add", "README.md"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            assert!(collect_conflicted_files(&local).await.is_empty());
+            assert_eq!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local),
+                Some("merge")
+            );
+            assert_eq!(
+                classify_one_click_state(&local).await,
+                OneClickState::CommitStagedResolution
+            );
+            finish_merge_or_rebase(&local, true)
+                .await
+                .expect("committing the staged resolution must succeed");
+            assert!(
+                !local.join(".git").join("MERGE_HEAD").exists(),
+                "the merge must be concluded"
+            );
+            let parents = StdCommand::new("git")
+                .silent()
+                .args(["rev-list", "--parents", "-n", "1", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            let line = String::from_utf8_lossy(&parents.stdout);
+            assert_eq!(
+                line.split_whitespace().count(),
+                3,
+                "HEAD must be a merge commit (2 parents): {line}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(local.join("README.md")).unwrap(),
+                "RESOLVED\n"
+            );
+            // Post-condition the resume tail relies on: nothing in progress.
+            assert_eq!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local),
+                None
+            );
+
+            // Review R2 #1: a MERGE whose resolution equals HEAD (index ==
+            // HEAD, nothing unmerged) is still a legitimate merge commit —
+            // the commit leg, not a refusal.
+            std::fs::write(local.join(".git/MERGE_HEAD"), "0000000000000000000000000000000000000000\n")
+                .unwrap();
+            assert_eq!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local),
+                Some("merge")
+            );
+            assert_eq!(
+                classify_one_click_state(&local).await,
+                OneClickState::CommitStagedResolution
+            );
+            std::fs::remove_file(local.join(".git/MERGE_HEAD")).unwrap();
+            // Negative leg: a REBASE with NOTHING staged and nothing unmerged
+            // (index == HEAD) → the refusal is unchanged (an empty replayed
+            // commit wants `rebase --skip`, which the one-click does not offer).
+            std::fs::create_dir_all(local.join(".git/rebase-merge")).unwrap();
+            assert_eq!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local),
+                Some("rebase")
+            );
+            assert_eq!(
+                classify_one_click_state(&local).await,
+                OneClickState::NothingToResolve
+            );
+            std::fs::remove_dir_all(local.join(".git/rebase-merge")).unwrap();
+        }
+
+        /// MAJOR-2: the badge flags come from the git state alone; the
+        /// sentinel only labels the resolved-but-not-finished case. Both
+        /// legs + the exclusivity pin. Red-proof: reinstate the
+        /// `sentinel.is_some() &&` gate → the first assert fails.
+        #[test]
+        fn merge_state_flags_badge_live_git_state_without_sentinel_and_stay_exclusive() {
+            let sentinel = UpdateResumeSentinel {
+                schema: 1,
+                operation: "merge".into(),
+                branch: "main".into(),
+                sha_at_conflict: "abc".into(),
+                written_at: "2026-09-07T00:00:00Z".into(),
+            };
+            // Stalled merge, sentinel write failed (or shell-started merge).
+            let f = merge_state_flags(Some("merge"), None);
+            assert!(f.merge_in_progress, "MERGE_HEAD alone must badge");
+            assert!(!f.merge_resolved_incomplete);
+            // Stalled merge WITH sentinel: still in-progress, not "resolved".
+            let f = merge_state_flags(Some("rebase"), Some(&sentinel));
+            assert!(f.merge_in_progress);
+            assert!(!f.merge_resolved_incomplete);
+            assert_eq!(f.resume_operation, "");
+            // Git state cleared + sentinel: resolved-incomplete, from the sentinel.
+            let f = merge_state_flags(None, Some(&sentinel));
+            assert!(!f.merge_in_progress);
+            assert!(f.merge_resolved_incomplete);
+            assert_eq!(f.resume_operation, "merge");
+            assert_eq!(f.resume_branch, "main");
+            // Nothing at all.
+            assert_eq!(merge_state_flags(None, None), MergeStateFlags::default());
+            // Exclusivity pin over every combination.
+            for live in [None, Some("merge"), Some("rebase")] {
+                for s in [None, Some(&sentinel)] {
+                    let f = merge_state_flags(live, s);
+                    assert!(
+                        !(f.merge_in_progress && f.merge_resolved_incomplete),
+                        "never both: live={live:?} sentinel={}",
+                        s.is_some()
+                    );
+                }
+            }
+        }
+
+        /// MINOR-3: install.py failing to SPAWN (a non-existent python path)
+        /// leaves the same ledger row as a non-zero exit. Real spawn attempt,
+        /// real bridge. Red-proof: revert `record_install_spawn_failure` at
+        /// the spawn sites → no row (the `?` returned before any record).
+        #[tokio::test]
+        async fn install_spawn_failure_writes_the_partial_update_row() {
+            let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+            else {
+                eprintln!("skipping: no python interpreter resolved");
+                return;
+            };
+            if StdCommand::new(&python)
+                .arg("-c")
+                .arg("pass")
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
+            {
+                eprintln!("skipping: {} is not spawnable", python.display());
+                return;
+            }
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+            let install = tempfile::tempdir().expect("tempdir");
+            let report = install.path().join(".claude/context/UPDATE_DEFERRED.md");
+
+            // The exact shape the tails use: a python path that does not exist.
+            let bogus = install.path().join("no-such-dir").join("python");
+            let spawn_err = tokio::process::Command::new(&bogus)
+                .silent()
+                .args(["install.py", "--update"])
+                .current_dir(install.path())
+                .output()
+                .await
+                .expect_err("a non-existent interpreter must fail to spawn");
+            let msg = format!("install.py --update failed: {}", spawn_err);
+            assert!(record_install_spawn_failure(&repo_root, install.path(), "test", &msg));
+
+            let body = std::fs::read_to_string(&report)
+                .unwrap_or_else(|e| panic!("no ledger at {}: {e}", report.display()));
+            assert!(body.contains(UPDATE_INSTALL_PHASE_FAILED_CID), "{body}");
+            assert!(body.contains("exited signal at unknown step"), "{body}");
+            assert!(body.contains("install.py --update failed:"), "{body}");
+        }
+
+        #[test]
+        fn stderr_tail_is_char_safe_and_marks_truncation() {
+            assert_eq!(stderr_tail("  short  ", 300), "short");
+            let long = format!("{}END", "é".repeat(400));
+            let tail = stderr_tail(&long, 10);
+            assert!(tail.starts_with('…'));
+            assert!(tail.ends_with("END"));
+            assert_eq!(tail.chars().count(), 11);
         }
 
         // -------------------------------------------------------------------

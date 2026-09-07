@@ -87,6 +87,9 @@ vi.mock('./orchestrator', () => ({
     subscribe: orchStore.subscribe,
     checkStatus: checkStatusMock,
     update_orchestrator: updateOrchestratorMock,
+    // v0.2.93: runUpdate() now brackets itself with beginOp(), which resets
+    // the orchestrator's progress snapshot before opening the overlay.
+    resetProgress: vi.fn(),
   },
   cancelScheduledRetry: () => {},
 }));

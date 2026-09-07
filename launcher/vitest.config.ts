@@ -23,6 +23,12 @@ export default defineConfig({
     alias: {
       // Mirror sveltekit's `$lib` → `src/lib` alias.
       $lib: resolve(here, 'src/lib'),
+      // v0.2.93: `stores/ui.ts` (now imported by `stores/updater.ts` for
+      // the progress-overlay open/close) imports `goto` from
+      // `$app/navigation`, a SvelteKit virtual module that doesn't exist
+      // outside the kit pipeline. Point it at an inert stub so store tests
+      // can load the REAL ui store and assert on its flags.
+      '$app/navigation': resolve(here, 'src/lib/test-stubs/app-navigation.ts'),
     },
   },
   test: {

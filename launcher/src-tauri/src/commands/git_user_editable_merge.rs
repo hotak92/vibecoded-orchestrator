@@ -1944,6 +1944,83 @@ pub(crate) fn is_pull_conflict(err: &str) -> bool {
         || lower.contains("autostash")
 }
 
+/// v0.2.93 (field incident 2026-09-07) — did git REFUSE the pull / merge /
+/// rebase because a merge or rebase is ALREADY in progress in the clone?
+///
+/// This is a third shape, distinct from both [`is_pull_conflict`] (a conflict
+/// that just happened) and `is_untracked_overwrite_abort` (a pre-merge abort):
+/// nothing new happened at all — git looked at `.git/MERGE_HEAD` /
+/// `.git/rebase-merge/` and declined to start. The field incident: a first
+/// "Merge upstream" click conflicted on one file and left `MERGE_HEAD`; after a
+/// launcher restart the second click ran a fresh `git pull`, which printed
+/// exactly
+///
+/// ```text
+/// fatal: You have not concluded your merge (MERGE_HEAD exists).
+/// hint: Please, commit your changes before you merge.
+/// ```
+///
+/// No phrase in that text is in [`is_pull_conflict`]'s list — note the comma in
+/// `Please, commit your changes before you merge` versus the dirty-tree
+/// refusal's `Please commit your changes or stash them` — so it fell through to
+/// the generic "git pull failed" toast with no sentinel and no modal, and the
+/// stalled merge became invisible to every launcher surface.
+///
+/// Callers must test THIS classifier BEFORE [`is_pull_conflict`]: the
+/// unmerged-files variant ends in `fatal: Exiting because of an unresolved
+/// conflict.`, which the older classifier would claim as a fresh conflict.
+///
+/// Phrases (git 2.34–2.4x, C locale — same LOW-4 caveat as `is_pull_conflict`):
+///   - merge in progress:  "You have not concluded your merge (MERGE_HEAD exists)."
+///   - unmerged index:     "Pulling is not possible because you have unmerged files."
+///                         "you need to resolve your current index first"
+///   - rebase in progress: "It seems that there is already a rebase-merge directory"
+///                         "I wonder if you are in the middle of another rebase."
+///                         "It looks like 'git am' is in progress. Cannot rebase."
+///
+/// Deliberately NOT matched: "There is no merge in progress (MERGE_HEAD
+/// missing)." — that is git saying the opposite — and the `git status`
+/// wording "rebase in progress; onto …" (review round 1, NIT-6): a hook
+/// echoing `git status` into the pull's output would otherwise trip this
+/// classifier; only git's own refusal phrases above count.
+pub(crate) fn is_merge_in_progress_refusal(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("not concluded your merge")
+        || lower.contains("merge_head exists")
+        || lower.contains("you have unmerged files")
+        || lower.contains("resolve your current index first")
+        || lower.contains("there is already a rebase")
+        || lower.contains("in the middle of another rebase")
+        || lower.contains("is in progress. cannot rebase")
+}
+
+/// v0.2.93 — the ONE filesystem probe for "is a merge or rebase in progress
+/// in this clone right now?". Returns `Some("merge")` when `.git/MERGE_HEAD`
+/// exists, `Some("rebase")` when `.git/rebase-merge/` or `.git/rebase-apply/`
+/// exists, `None` otherwise. Merge wins when both are present (cannot happen
+/// through git itself; the order only matters for a hand-corrupted `.git`).
+///
+/// Extracted from the inline three-path probe `check_for_updates` carried
+/// (installer.rs, the `merge_resolved_incomplete` computation) so the update
+/// commands' pre-pull short-circuit, the stalled-merge badge, the pending-
+/// conflict payload builder and the resume guard all read the SAME
+/// definition. Pure filesystem — no git spawn — so it is cheap enough for
+/// every poll of `check_for_updates`.
+///
+/// Reads `<root>/.git/...` directly (a normal clone, which every orchestrator
+/// install is); a linked worktree whose `.git` is a gitdir pointer file reports
+/// `None`, exactly as the inline probe it replaces did.
+pub(crate) fn merge_or_rebase_in_progress(install_root: &Path) -> Option<&'static str> {
+    let git_dir = install_root.join(".git");
+    if git_dir.join("MERGE_HEAD").exists() {
+        return Some("merge");
+    }
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        return Some("rebase");
+    }
+    None
+}
+
 /// v0.2.88 (F2-followup) — is this git stderr the UNTRACKED-overwrite abort
 /// shape? i.e. git refused the operation BEFORE it started because a local
 /// UNTRACKED working-tree file would be clobbered by an incoming tracked file.
@@ -5283,6 +5360,113 @@ mod tests {
         // autostash"); a SUCCESS message "Applied autostash." would match too,
         // which is harmless because is_pull_conflict is only consulted after a
         // non-zero git exit. (Verified: clean autostash pulls exit 0.)
+    }
+
+    // ----- v0.2.93: merge-in-progress refusal classifier + fs probe -----
+
+    /// The EXACT git 2.43 stderr from the field incident (2026-09-07): the
+    /// second "Merge upstream" click after a launcher restart. Red-proof: with
+    /// the classifier reverted this text is nothing to `is_pull_conflict`
+    /// either, i.e. it falls through to the generic toast — the incident.
+    #[test]
+    fn merge_in_progress_refusal_classifies_the_field_incident_text_verbatim() {
+        let field = "fatal: You have not concluded your merge (MERGE_HEAD exists).\n\
+                     hint: Please, commit your changes before you merge.";
+        assert!(is_merge_in_progress_refusal(field));
+        // Documents WHY a separate classifier was needed: the older one does
+        // not see this text as a conflict (no "conflict", and the hint's
+        // wording is "Please, commit … before you merge", not "or stash").
+        assert!(
+            !is_pull_conflict(field),
+            "if this ever starts matching, the pre-classifier ordering in the \
+             callers still holds but the rationale comment is stale — update it"
+        );
+    }
+
+    #[test]
+    fn merge_in_progress_refusal_classifies_unmerged_index_and_rebase_shapes() {
+        assert!(is_merge_in_progress_refusal(
+            "error: Pulling is not possible because you have unmerged files.\n\
+             hint: Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             hint: as appropriate to mark resolution and make a commit.\n\
+             fatal: Exiting because of an unresolved conflict."
+        ));
+        assert!(is_merge_in_progress_refusal(
+            "error: you need to resolve your current index first"
+        ));
+        assert!(is_merge_in_progress_refusal(
+            "fatal: It seems that there is already a rebase-merge directory, and\n\
+             I wonder if you are in the middle of another rebase.  If that is the\n\
+             case, please try\n\tgit rebase (--continue | --abort | --skip)"
+        ));
+        assert!(is_merge_in_progress_refusal(
+            "fatal: It looks like 'git am' is in progress. Cannot rebase."
+        ));
+        // NIT-6: `git status` wording is NOT a refusal — a hook echoing status
+        // into the pull output must not trip the classifier.
+        assert!(!is_merge_in_progress_refusal("rebase in progress; onto 1234abc"));
+        assert!(!is_merge_in_progress_refusal(
+            "interactive rebase in progress; onto 1234abc\nLast command done (1 command done):"
+        ));
+        // Case-insensitive like its siblings.
+        assert!(is_merge_in_progress_refusal(
+            "FATAL: YOU HAVE NOT CONCLUDED YOUR MERGE (MERGE_HEAD EXISTS)."
+        ));
+    }
+
+    /// The dangerous direction. The dirty-tree refusal ("please commit your
+    /// changes OR STASH them") is the one `is_pull_conflict` owns and it must
+    /// NOT be mistaken for a stalled merge: routing it here would write a
+    /// resume sentinel for a merge that never started.
+    #[test]
+    fn merge_in_progress_refusal_ignores_dirty_tree_conflict_and_network_errors() {
+        assert!(!is_merge_in_progress_refusal(
+            "error: Your local changes to the following files would be overwritten by merge:\n\
+             \t.gitignore\nPlease commit your changes or stash them before you merge."
+        ));
+        assert!(!is_merge_in_progress_refusal(
+            "please commit your changes or stash them"
+        ));
+        assert!(!is_merge_in_progress_refusal(
+            "CONFLICT (content): Merge conflict in CLAUDE.md\n\
+             Automatic merge failed; fix conflicts and then commit the result."
+        ));
+        // git saying the OPPOSITE — a `merge --abort` with nothing to abort.
+        assert!(!is_merge_in_progress_refusal(
+            "fatal: There is no merge in progress (MERGE_HEAD missing)."
+        ));
+        assert!(!is_merge_in_progress_refusal("fatal: not a git repository"));
+        assert!(!is_merge_in_progress_refusal("Could not resolve host: github.com"));
+        assert!(!is_merge_in_progress_refusal("Already up to date."));
+        assert!(!is_merge_in_progress_refusal(""));
+    }
+
+    /// The filesystem probe: one home for the three-path `.git` check. Both
+    /// legs (act = Some, leave-alone = None) per the project rule.
+    #[test]
+    fn merge_or_rebase_in_progress_reads_the_git_state_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        assert_eq!(merge_or_rebase_in_progress(root), None, "clean clone");
+
+        std::fs::write(git_dir.join("MERGE_HEAD"), "abc\n").unwrap();
+        assert_eq!(merge_or_rebase_in_progress(root), Some("merge"));
+        std::fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
+
+        std::fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
+        assert_eq!(merge_or_rebase_in_progress(root), Some("rebase"));
+        std::fs::remove_dir_all(git_dir.join("rebase-merge")).unwrap();
+
+        std::fs::create_dir_all(git_dir.join("rebase-apply")).unwrap();
+        assert_eq!(merge_or_rebase_in_progress(root), Some("rebase"));
+        std::fs::remove_dir_all(git_dir.join("rebase-apply")).unwrap();
+
+        assert_eq!(merge_or_rebase_in_progress(root), None, "state cleared");
+        // No `.git` at all (not a clone) is also "nothing in progress".
+        assert_eq!(merge_or_rebase_in_progress(&root.join("nope")), None);
     }
 
     // ----- v0.2.88 (F2-followup): untracked-overwrite abort parser -----

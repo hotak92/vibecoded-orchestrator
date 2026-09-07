@@ -42,6 +42,88 @@ migrations — leaving a half-updated tree and no ledger row.
   it is. (Instance #24 of a credited mechanism that never fired: the test
   harness passed a bare base URL, the field passed the detector's.)
 
+### Fixed — the orchestrator update flow after a merge conflict (v0.2.93)
+
+Same dogfood day: the "Merge upstream changes" click hit one conflict, the
+backend returned the conflict payload, and the launcher showed nothing — a
+static "Merging…" label, no modal, no progress, no log line. After a restart
+the second click was refused by git ("You have not concluded your merge") and
+classified as a generic failure; the badge had nothing to say about a stalled
+merge; the Settings → Updates card kept "4 commits behind / Current —" long
+after the merge was done; the modal's "764 files where both sides diverged"
+was the upstream-changed count.
+
+- **A stalled merge is recognised, not re-attempted.** Both update commands
+  short-circuit BEFORE touching the hub, the binaries or the fetch when
+  `.git/MERGE_HEAD` / a rebase directory exists, and both of git's refusal
+  texts ("not concluded your merge", "unresolved conflict") route to the SAME
+  conflict payload the modal already understands. New `UpdateStatus` flags
+  `merge_in_progress` (badge arm "Update stopped at a merge conflict —
+  resolve it", highest priority) and `binary_ahead_of_install` (a relaunch
+  during a stalled merge boots the new binary against the old install; the
+  badge says so, nothing auto-heals). New command
+  `get_pending_conflict_payload` rebuilds the conflict modal from disk after
+  a restart.
+- **One live indicator for every update operation.** Merge, rebase, keep
+  local, accept upstream, abort and resume all run under the shared
+  progress overlay (brand loader, live `install_progress` message, an
+  explicit FAILED state with the error). The overlay hands over to the
+  decision modal instead of flashing "Update complete 100%" right before it.
+  The four decision modals (divergence, conflict, untracked collision,
+  autostash pop) now mount at the layout root — they were nested inside the
+  MenuBar, where a store change could unmount them mid-flight and the bar's
+  stacking context could size them to 52 px.
+- **Tolerant conflict-payload parsing** shared by the divergence modal, the
+  onboarding wizard and the store (leading whitespace and `Error:` prefixes
+  no longer degrade a conflict to a bare error; the footer shows the NEW
+  error, not the original non-FF summary).
+- **Honest divergence count.** `diverged_files` is the true both-sides
+  intersection; `upstream_only_files` / `upstream_only_count` are reported
+  separately ("changed only upstream, will merge cleanly").
+- **The Settings → Updates card stops lying.** The cached status now fills
+  the current SHA and branch, reports 0 behind when HEAD already contains
+  the cached remote SHA, is refreshed by every post-pull tail, and the page
+  re-checks when an update finishes or the window regains focus.
+- **A failed install phase is never silent.** When a launcher-driven
+  `install.py --update` exits non-zero after the source was merged (the
+  resume path clears the sentinel BEFORE that phase, so the badge went blank
+  while steps 6–10 had never run), the launcher logs the exit code + last
+  `[N/10]` step and writes a `critical` ledger row `update_install_phase_failed`
+  with the one command that finishes the update; the next successful run
+  drops it.
+- **The update flow leaves a trail.** Every conflict-payload return logs a
+  warn line (operation, conflicted-file count, sentinel written); every
+  generic pull failure logs an error with the stderr tail.
+- **Spinners on the other post-modal operations**: per-project Update
+  bundle, KG re-sync and code-graph rebuild buttons animate while the call
+  is pending, not only while the background poll reports "running".
+
+### Added — Multimodel ↔ Remote Control switch in the launcher frame (v0.2.93)
+
+Claude Code refuses Remote Control whenever `ANTHROPIC_BASE_URL` is not
+api.anthropic.com (≥ 2.1.196, claude.ai login does not change it), and the
+VS Code env block is machine-scoped, so a gateway-pointed panel and phone
+control cannot coexist per workspace. They CAN alternate:
+
+- A two-state control in the bottom-right of every page ("Multimodel" =
+  panel on the model gateway, GLM + Claude in one picker; "Remote Control" =
+  stock Claude Code, phone control works). Clicking applies the settings
+  change immediately and shows a persistent "restart VS Code to apply"
+  notice — the restart is the user's.
+- `python -m vco_lib.vscode_settings mode --get|--set` is the byte-layout
+  authority (Rust shells to it, never serialises the file). The Remote
+  Control leg strips only the routing keys and the values that cannot
+  resolve natively (`claude-gw/…`); every Claude slot the user chose stays.
+  Removed values are stashed (never the token) so the Multimodel leg
+  restores the exact model and slot choices, `[1m]`-decorated from the
+  context table. Idempotent both ways; `unmanaged` (foreign endpoint) is
+  left alone.
+- The version-keyed context table gains the Claude 5 family
+  (`claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
+  1M) so a slot or default naming a 1M Claude model carries the `[1m]` hint
+  the client needs — a plain id is budgeted at 200K and reads "0% context
+  left" right after a compaction.
+
 ## [0.2.92] - 2026-09-07
 
 ### Fixed

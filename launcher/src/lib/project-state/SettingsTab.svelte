@@ -824,7 +824,13 @@
         disabled={updating}
         title="Re-run install-bundle --update for this project"
       >
-        {updating ? 'Updating bundle…' : 'Update bundle'}
+        <!-- v0.2.93 (G): spinning glyph while the invoke is pending — the
+             brand `bg-spin` keyframe (global `.bg-glyph-spin`, app.css). -->
+        {#if updating}
+          <span class="bg-glyph-spin" aria-hidden="true">⟳</span> Updating…
+        {:else}
+          Update bundle
+        {/if}
       </button>
       <p class="ps-hint">
         Preserved files and every other deferred condition for THIS project are

@@ -20,7 +20,19 @@
   // protected paths). Per-project entries deliberately do NOT appear here;
   // each project's ledger renders on its own Settings tab.
   import DeferralLedgerPanel from '$lib/components/DeferralLedgerPanel.svelte';
-  import { renderCheck, checkError, type CheckState } from '$lib/stores/orchestrator';
+  import {
+    renderCheck,
+    checkError,
+    type CheckState,
+    type InstallProgress,
+  } from '$lib/stores/orchestrator';
+  // v0.2.93 (F): the card re-checks itself when an orchestrator update op
+  // finishes (falling edge of `$updater.updating`), when an
+  // `install_progress` "done" stage arrives, and when the window regains
+  // focus after one of those — the cached status is stale the moment an
+  // update lands, and the old page kept showing "Update available".
+  import { updater } from '$lib/stores/updater';
+  import { parseTaggedErrorPayload } from '$lib/tauri-error-payload';
 
   /** Mirror of Rust `self_update::UpdateStatus`. */
   type UpdateStatus = {
@@ -85,6 +97,15 @@
   let reattaching = $state(false);
 
   let unlisten: (() => void) | null = null;
+  let unlistenProgress: (() => void) | null = null;
+  // v0.2.93 (F): true once the cached-status load has resolved. Before
+  // that the "Current" cell shows a loading placeholder, so "—" is
+  // reserved for the case where the backend TRULY returned null.
+  let loaded = $state(false);
+  // v0.2.93 (F): an update-class op ended while this page was open but the
+  // window was unfocused; consumed by the next window focus.
+  let recheckPending = false;
+  let prevUpdating = false;
 
   /**
    * v0.2.35 Agent K — true iff the running binary's version differs
@@ -123,17 +144,8 @@
    * plain error string.
    */
   function parseUpdateError(raw: unknown): NonFastForwardError | null {
-    if (typeof raw !== 'string') return null;
-    if (!raw.startsWith('{')) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.kind === 'non_fast_forward') {
-        return parsed as NonFastForwardError;
-      }
-    } catch {
-      // not JSON — fall through to legacy string handling
-    }
-    return null;
+    // v0.2.93: the shared tolerant parser — no `startsWith('{')` brittleness.
+    return parseTaggedErrorPayload<NonFastForwardError>(raw, 'kind', 'non_fast_forward');
   }
 
   async function loadCached() {
@@ -146,7 +158,11 @@
     // other Tauri-missing surfaces (e.g. preferences/+page.svelte's
     // get_default_embedding_models handler).
     try {
-      const cached = await invoke<UpdateStatus>('get_cached_update_status');
+      // v0.2.93 (review R1 #7): the repo-aware variant fills current_sha /
+      // branch and retracts "N behind" when HEAD already contains the cached
+      // remote SHA; it runs its git reads off-thread. The tray keeps the
+      // pure-cache `get_cached_update_status`.
+      const cached = await invoke<UpdateStatus>('get_cached_update_status_refreshed');
       if (cached) status = cached;
       const paths = await invoke<string[]>('get_user_owned_paths');
       if (paths) userOwnedPaths = paths;
@@ -217,12 +233,17 @@
     }
   }
 
-  async function checkNow() {
+  async function checkNow(opts: { silent?: boolean } = {}) {
+    if (checking) return;
     checking = true;
     try {
       const result = await invoke<UpdateStatus>('check_for_launcher_update');
       if (result) {
         status = result;
+        loaded = true;
+        // v0.2.93 (F): automatic re-checks (after an update op / on focus)
+        // refresh the card silently — toasts are for the user's own click.
+        if (opts.silent) return;
         // v0.2.92 (WP-13): the toast follows the tri-state, in this order.
         // "Launcher is up to date" is now reachable ONLY from a check that
         // actually completed. Pre-fix it was the else-branch of
@@ -340,14 +361,44 @@
 
   onMount(async () => {
     await loadCached();
+    loaded = true;
     unlisten = await listen<UpdateStatus>('vct-launcher-update-available', (e) => {
       status = e.payload;
+    });
+    // v0.2.93 (F): an `install_progress` "done" stage means an orchestrator
+    // update / install just landed — the cached status is stale; re-check.
+    unlistenProgress = await listen<InstallProgress>('install_progress', (e) => {
+      if (e.payload?.stage === 'done') void recheckAfterUpdate();
     });
   });
 
   onDestroy(() => {
     if (unlisten) unlisten();
+    if (unlistenProgress) unlistenProgress();
   });
+
+  // v0.2.93 (F): falling edge of an update-class op (`$updater.updating`
+  // true → false) — the card is stale. Re-check now if the window has
+  // focus; otherwise remember, and re-check on the next focus.
+  $effect(() => {
+    const isUpdating = $updater.updating;
+    if (prevUpdating && !isUpdating) {
+      recheckPending = true;
+      if (typeof document === 'undefined' || document.hasFocus()) {
+        void recheckAfterUpdate();
+      }
+    }
+    prevUpdating = isUpdating;
+  });
+
+  async function recheckAfterUpdate() {
+    recheckPending = false;
+    await checkNow({ silent: true });
+  }
+
+  function handleWindowFocus() {
+    if (recheckPending) void recheckAfterUpdate();
+  }
 
   function shortSha(sha: string | null): string {
     return sha ? sha.slice(0, 7) : '—';
@@ -395,6 +446,10 @@
     });
   }
 </script>
+
+<!-- v0.2.93 (F): re-check when the window regains focus after an update op
+     ended while it was unfocused (see `handleWindowFocus`). -->
+<svelte:window onfocus={handleWindowFocus} />
 
 <svelte:head>
   <title>Launcher updates — VCT Launcher</title>
@@ -511,7 +566,10 @@
             compare against.
           </span>
         </div>
-      {:else if status?.available}
+      {:else if status?.available && status.commit_count > 0}
+        <!-- v0.2.93 (F): a cached `available: true` with `commit_count: 0`
+             is a stale/contradictory record (the count is the verdict) —
+             it falls through to "Up to date" below, never to this banner. -->
         <div class="upd-banner upd-banner-warn">
           <strong>⚠ Update available</strong>
           <span>
@@ -558,7 +616,9 @@
 
       <dl class="upd-meta">
         <dt>Current</dt>
-        <dd><code>{shortSha(status?.current_sha ?? null)}</code></dd>
+        <!-- v0.2.93 (F): "—" ONLY when the backend truly returned null;
+             before the cached load resolves, a loading placeholder. -->
+        <dd><code>{loaded ? shortSha(status?.current_sha ?? null) : '…'}</code></dd>
         <dt>Remote</dt>
         <dd><code>{shortSha(status?.remote_sha ?? null)}</code></dd>
         <dt>Branch</dt>
@@ -587,7 +647,7 @@
       </dl>
 
       <div class="upd-actions">
-        <button class="upd-btn" disabled={checking || applying} onclick={checkNow}>
+        <button class="upd-btn" disabled={checking || applying} onclick={() => checkNow()}>
           {checking ? 'Checking…' : 'Check now'}
         </button>
         <button

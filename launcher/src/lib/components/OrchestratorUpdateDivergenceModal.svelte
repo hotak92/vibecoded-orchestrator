@@ -39,18 +39,17 @@
 
   import { invoke } from '$lib/tauri';
   import { orchestrator } from '$lib/stores/orchestrator';
-  import type { OrchestratorNonFfPayload } from '$lib/stores/updater';
-  import OrchestratorUpdateConflictModal from './OrchestratorUpdateConflictModal.svelte';
-
-  // Conflict payload (re-declared here for self-containment; the
-  // conflict modal also declares its own copy).
-  type OrchestratorConflictPayload = {
-    event: 'orchestrator_update_conflict';
-    operation: 'merge' | 'rebase';
-    branch: string;
-    conflicted_files: string[];
-    git_stderr: string;
-  };
+  import { updater, type OrchestratorNonFfPayload } from '$lib/stores/updater';
+  // v0.2.93 (field incident 2026-09-07): ONE tolerant parser for every
+  // structured Err payload (leading whitespace / `Error:` label / Error
+  // instance). The local `startsWith('{')` parser this replaces is the
+  // exact reason the conflict payload rendered NOTHING on 2026-09-07.
+  // The conflict payload type lives there too — no more per-file copies.
+  import {
+    parseTaggedErrorPayload,
+    parseOrchestratorConflictError,
+    errorText,
+  } from '$lib/tauri-error-payload';
 
   // v0.2.78 ITEM #0 (F2): payload for an UNTRACKED-file collision where the
   // local file's content DIFFERS from the incoming upstream-added blob. The
@@ -83,8 +82,13 @@
   // AND seen fail in this modal session. Drives button priority.
   let mergeFailed = $state(false);
   let rebaseFailed = $state(false);
-  let lastError = $state<string | null>(null);
-  let conflict = $state<OrchestratorConflictPayload | null>(null);
+  // v0.2.93 (C): the LAST attempt's OWN error — a title plus the text of
+  // THAT failure. The pre-fix footer paired a fresh merge error with the
+  // ORIGINAL non-FF payload's stderr summary (an older, different failure).
+  let lastError = $state<{ title: string; detail: string | null } | null>(null);
+  // v0.2.93: a merge/rebase that stops at a conflict hands over to the
+  // conflict modal mounted in `+layout.svelte` via `updater.setConflict()`
+  // (which also clears `nonFf`, unmounting this modal). No local copy.
   // v0.2.78 ITEM #0 (F2): set when a merge/rebase surfaces a DIVERGENT
   // untracked-collision payload. Rendered as an informational chooser +
   // agent-deferral pointer (no auto-resolve — data-safety).
@@ -103,7 +107,14 @@
   const divergingPreview = $derived(divergingFiles.slice(0, 5));
   const divergingRest = $derived(divergingFiles.slice(5));
   const stderrTrimmed = $derived((payload.git_stderr ?? '').trim());
-  const stderrSummary = $derived(extractStderrSummary(stderrTrimmed));
+  // v0.2.93 (E): paths changed ONLY upstream — they merge cleanly and are
+  // not blockers. With this split `diverged_files` is the true both-sides
+  // intersection. Count from the explicit field when present (the list may
+  // be truncated for very large diffs), else from the list; 0 on an older
+  // backend that sends neither, in which case the line is simply hidden.
+  const upstreamOnlyCount = $derived(
+    payload.upstream_only_count ?? payload.upstream_only_files?.length ?? 0
+  );
 
   // Which action is "primary" right now? Defaults to merge; if merge
   // has failed once, rebase becomes primary; if both have failed, both
@@ -117,77 +128,54 @@
   }
 
   /**
-   * Extract the most informative single-line summary from a git stderr
-   * blob. We prefer lines starting with `error:`, `fatal:`, or
-   * `CONFLICT`; fallback is the last non-empty line.
-   */
-  function extractStderrSummary(raw: string): string | null {
-    if (!raw) return null;
-    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    if (lines.length === 0) return null;
-    const priority = lines.find((l) => /^(error:|fatal:|CONFLICT)/i.test(l));
-    return priority ?? lines[lines.length - 1];
-  }
-
-  /**
-   * Try to parse a Tauri error as a conflict payload. The merge/rebase
-   * commands return JSON-encoded errors when they hit conflicts. Any
-   * other shape stays a raw error string.
-   */
-  function parseConflictError(raw: unknown): OrchestratorConflictPayload | null {
-    if (typeof raw !== 'string') return null;
-    if (!raw.startsWith('{')) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.event === 'orchestrator_update_conflict') {
-        return parsed as OrchestratorConflictPayload;
-      }
-    } catch {
-      // not JSON
-    }
-    return null;
-  }
-
-  /**
    * v0.2.78 ITEM #0 (F2): parse a Tauri error as a DIVERGENT untracked-collision
-   * payload. Returns null for any other shape.
+   * payload. Returns null for any other shape. v0.2.93: via the shared
+   * tolerant parser (the conflict payload uses `parseOrchestratorConflictError`).
    */
   function parseUntrackedCollision(
     raw: unknown,
   ): OrchestratorUntrackedCollisionPayload | null {
-    if (typeof raw !== 'string') return null;
-    if (!raw.startsWith('{')) return null;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.event === 'orchestrator_untracked_collision') {
-        return parsed as OrchestratorUntrackedCollisionPayload;
-      }
-    } catch {
-      // not JSON
-    }
-    return null;
+    return parseTaggedErrorPayload<OrchestratorUntrackedCollisionPayload>(
+      raw,
+      'event',
+      'orchestrator_untracked_collision',
+    );
   }
 
   async function runMerge() {
     busy = true;
     busyOp = 'merge';
     lastError = null;
+    // v0.2.93 (field incident 2026-09-07): drive the ONE live progress
+    // overlay. Before this, the merge ran behind a static disabled
+    // "Merging…" label — indistinguishable from a hang.
+    updater.beginOp('merge');
     try {
       // The Rust command auto-restarts on success — we typically don't
       // return here. If we DO, refresh the store state.
       await invoke<void>('merge_orchestrator_with_upstream', { path: installPath });
       await orchestrator.checkStatus();
       onClose();
+      updater.endOp();
     } catch (e) {
-      const conf = parseConflictError(e);
+      const conf = parseOrchestratorConflictError(e);
       const untracked = parseUntrackedCollision(e);
       if (conf) {
-        conflict = conf;
+        // Hand over to the hoisted conflict modal. Payload FIRST, then
+        // endOp: the overlay's falling edge must see the hand-over and
+        // close, never hold at "Update complete".
+        updater.setConflict(conf);
+        updater.endOp();
       } else if (untracked) {
         untrackedCollision = untracked;
+        updater.endOp();
       } else {
-        lastError = `Merge failed: ${e}`;
+        const detail = errorText(e);
+        lastError = { title: 'Merge failed', detail };
         mergeFailed = true;
+        // The overlay renders FAILED + the error text + Dismiss; this
+        // modal keeps its own copy for after the dismiss.
+        updater.endOp(detail);
       }
     } finally {
       busy = false;
@@ -199,20 +187,26 @@
     busy = true;
     busyOp = 'rebase';
     lastError = null;
+    updater.beginOp('rebase');
     try {
       await invoke<void>('rebase_orchestrator_onto_upstream', { path: installPath });
       await orchestrator.checkStatus();
       onClose();
+      updater.endOp();
     } catch (e) {
-      const conf = parseConflictError(e);
+      const conf = parseOrchestratorConflictError(e);
       const untracked = parseUntrackedCollision(e);
       if (conf) {
-        conflict = conf;
+        updater.setConflict(conf);
+        updater.endOp();
       } else if (untracked) {
         untrackedCollision = untracked;
+        updater.endOp();
       } else {
-        lastError = `Rebase failed: ${e}`;
+        const detail = errorText(e);
+        lastError = { title: 'Rebase failed', detail };
         rebaseFailed = true;
+        updater.endOp(detail);
       }
     } finally {
       busy = false;
@@ -253,14 +247,6 @@
     onClose();
   }
 
-  function dismissConflict() {
-    conflict = null;
-    // Conflict modal handled its own abort/manual flow; closing the
-    // parent divergence modal too keeps the user out of an
-    // indeterminate state.
-    onClose();
-  }
-
   function onBackdropKey(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       cancel();
@@ -287,13 +273,10 @@
   });
 </script>
 
-{#if conflict}
-  <OrchestratorUpdateConflictModal
-    payload={conflict}
-    installPath={installPath}
-    onClose={dismissConflict}
-  />
-{:else if untrackedCollision}
+<!-- v0.2.93: the conflict modal is no longer nested here — a conflict hands
+     over to the instance mounted in `+layout.svelte` via updater.setConflict()
+     (which clears `nonFf`, unmounting this modal). -->
+{#if untrackedCollision}
   <!-- v0.2.78 ITEM #0 (F2): DIVERGENT untracked-file collision. The
        byte-identical case is auto-resolved in Rust; this UI only appears for
        genuine divergence, which we never auto-remove (data-safety). We show
@@ -406,9 +389,13 @@
         <section class="dvg-section" aria-labelledby="dvg-diverging-title">
           <div class="dvg-section-head">
             <span id="dvg-diverging-title" class="dvg-section-title">
-              Files where both sides have diverging history
+              Files changed on both sides
             </span>
-            <span class="dvg-badge dvg-badge-warn">{divergingFiles.length}</span>
+            <!-- v0.2.93 (E): the warn badge counts the TRUE intersection —
+                 `diverged_files` no longer includes upstream-only paths. -->
+            <span class="dvg-badge dvg-badge-warn">
+              {divergingFiles.length} file{divergingFiles.length === 1 ? '' : 's'} changed on both sides
+            </span>
           </div>
           <p class="dvg-section-help">
             These are the merge-blocker candidates — both your clone and upstream
@@ -432,6 +419,14 @@
             </details>
           {/if}
         </section>
+      {/if}
+
+      <!-- v0.2.93 (E): neutral, not a blocker — hidden on an older backend
+           that sends neither `upstream_only_count` nor `upstream_only_files`. -->
+      {#if upstreamOnlyCount > 0}
+        <p class="dvg-upstream-only" role="status">
+          {upstreamOnlyCount} file{upstreamOnlyCount === 1 ? '' : 's'} changed only upstream (will merge cleanly)
+        </p>
       {/if}
 
       {#if localOnlyFiles.length > 0}
@@ -474,12 +469,13 @@
 
     <footer class="dvg-footer">
       {#if lastError}
+        <!-- v0.2.93 (C): the NEW error's own text. Pre-fix this paired a
+             fresh merge/rebase error with the ORIGINAL non-FF payload's
+             stderr summary — a different, older failure. -->
         <div class="dvg-error" role="alert">
-          {#if stderrSummary}
-            <strong>{lastError}</strong>
-            <span class="dvg-error-detail">{stderrSummary}</span>
-          {:else}
-            {lastError}
+          <strong>{lastError.title}</strong>
+          {#if lastError.detail}
+            <span class="dvg-error-detail">{lastError.detail}</span>
           {/if}
         </div>
       {/if}
@@ -710,6 +706,15 @@
     background: rgba(255, 79, 160, 0.14); /* --color-pink at 14% */
     color: var(--color-pink);
     border-color: rgba(255, 79, 160, 0.35);
+  }
+  /* v0.2.93 (E): neutral upstream-only count — same muted tone as the
+     section help text, deliberately NOT a badge so it doesn't compete
+     with the pink both-sides warning. */
+  .dvg-upstream-only {
+    margin: 0 0 12px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--color-mid);
   }
 
   .dvg-files-preview {

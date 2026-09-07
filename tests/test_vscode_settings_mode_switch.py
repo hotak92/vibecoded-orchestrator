@@ -668,3 +668,31 @@ def test_cli_mode_needs_get_or_set(tmp_path: Path):
         vs.main(["mode", "--path", str(tmp_path / "s.json")])
     with pytest.raises(SystemExit):
         vs.main(["mode", "--set", "turbo", "--path", str(tmp_path / "s.json")])
+
+
+def test_second_remote_control_pass_merges_into_the_first_stash(
+    tmp_path: Path, stash: Path,
+):
+    """Review R1 finding 6: already on stock, the user hand-types a gateway-only
+    id into a slot, and remote-control runs again (CLI has no "already there"
+    guard). The stash must GAIN that slot, not lose the first pass's model."""
+    path = _pointed(tmp_path)
+    first = vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
+    assert first["status"] == "written"
+    first_doc = json.loads(stash.read_text(encoding="utf-8"))
+    assert vs.MODEL_KEY in first_doc["values"]
+    # Hand-typed gateway id while on stock.
+    doc = _doc(path)
+    doc.setdefault(vs.ENV_BLOCK_KEY, {})["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = FLASH_1M
+    path.write_text(json.dumps(doc, indent=4) + "\n", encoding="utf-8")
+    second = vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
+    assert second["status"] == "written"
+    merged = json.loads(stash.read_text(encoding="utf-8"))
+    assert merged["values"][vs.MODEL_KEY] == first_doc["values"][vs.MODEL_KEY]
+    assert merged["values"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == FLASH_1M
+    assert set(merged["routing_keys"]) >= set(first_doc["routing_keys"])
+    assert merged["login_prompt_removed"] is True
+    # A stash for ANOTHER settings file is never merged into.
+    other = _pointed(tmp_path / "other")
+    vs.set_mode(other, vs.MODE_REMOTE_CONTROL, stash=stash)
+    assert json.loads(stash.read_text(encoding="utf-8"))["settings_path"] == str(other)

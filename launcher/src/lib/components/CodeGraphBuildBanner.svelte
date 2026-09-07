@@ -228,7 +228,9 @@
     aria-live="polite"
   >
     <div class="bg-row">
-      <span class="bg-glyph" class:spin={view.status === 'running'} aria-hidden="true">
+      <!-- v0.2.93 (G): also spin while OUR rebuild invoke is pending, not only
+           once the background poll reports `running`. -->
+      <span class="bg-glyph" class:spin={view.status === 'running' || rerunning} aria-hidden="true">
         {statusGlyph(view.status)}
       </span>
       <div class="bg-text">
@@ -253,7 +255,11 @@
             onclick={rerun}
             disabled={rerunning}
           >
-            {rerunning ? 'Retrying…' : 'Retry build'}
+            {#if rerunning}
+              <span class="bg-glyph-spin" aria-hidden="true">⟳</span> Rebuilding…
+            {:else}
+              Retry build
+            {/if}
           </button>
         {/if}
         {#if view.status === 'partial'}
@@ -263,7 +269,11 @@
             onclick={rerun}
             disabled={rerunning}
           >
-            {rerunning ? 'Rebuilding…' : 'Rebuild'}
+            {#if rerunning}
+              <span class="bg-glyph-spin" aria-hidden="true">⟳</span> Rebuilding…
+            {:else}
+              Rebuild
+            {/if}
           </button>
           {#if isPruneFailurePartial}
             <!-- C-11b (v0.2.75 P2d): a plain Rebuild retries the SAME failing

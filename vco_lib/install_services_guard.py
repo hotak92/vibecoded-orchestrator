@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional, Sequence
 
 from vco_lib import containers as _containers
+from vco_lib import deferral_emit as _deferral_emit
 from vco_lib.deferral_report import DeferralEntry
 
 __all__ = [
+    "GuardOutcome",
     "foreign_owned_services",
     "emit_foreign_compose_identity_deferral",
     "apply_recreate_guard",
@@ -80,16 +82,13 @@ def foreign_owned_services(
     return out
 
 
-def emit_foreign_compose_identity_deferral(
-    deferral_report, foreign: dict[str, str], runtime: str, infra_dir: Path,
-) -> None:
-    """Ledger row for the services step 5 refused to recreate."""
-    if deferral_report is None or not foreign:
-        return
+def build_foreign_compose_identity_entry(
+    foreign: dict[str, str], runtime: str, infra_dir: Path,
+) -> DeferralEntry:
+    """The ledger row for the services step 5 refused to recreate."""
     names = " ".join(sorted(foreign))
     detail = "\n".join(f"  - {svc}: {why}" for svc, why in sorted(foreign.items()))
-    deferral_report.add_entry(
-        DeferralEntry(
+    return DeferralEntry(
             condition_id=CID_FOREIGN_IDENTITY,
             title=(
                 f"{len(foreign)} running service(s) belong to another compose "
@@ -128,7 +127,30 @@ def emit_foreign_compose_identity_deferral(
             severity="warning",
             kg_node_refs=[],
         )
-    )
+
+
+def emit_foreign_compose_identity_deferral(
+    deferral_report, foreign: dict[str, str], runtime: str, infra_dir: Path,
+) -> Optional[DeferralEntry]:
+    """Add the row to the RUN-scoped report; returns it so a hard stop can
+    still persist it (the run report is only written by ``finalize()`` at the
+    end of a COMPLETED run — review R1 finding 4)."""
+    if deferral_report is None or not foreign:
+        return None
+    entry = build_foreign_compose_identity_entry(foreign, runtime, infra_dir)
+    deferral_report.add_entry(entry)
+    return entry
+
+
+class GuardOutcome(NamedTuple):
+    services_to_recreate: list[str]
+    recreate_for_rebuild: list[str]
+    build_services: list[str]
+    foreign: dict[str, str]
+    #: rows added to the run report by this guard — persisted through the
+    #: locked on-disk writer if step 5 later hard-stops (see
+    #: :func:`compose_failure_followup`).
+    entries: tuple[DeferralEntry, ...]
 
 
 def apply_recreate_guard(
@@ -141,7 +163,7 @@ def apply_recreate_guard(
     compose_file: Path,
     deferral_report,
     log_event: LogEvent,
-) -> tuple[list[str], list[str], list[str], dict[str, str]]:
+) -> GuardOutcome:
     """Drop foreign-owned services from the three compose lists.
 
     Prints one ``[skip-recreate]`` line per service, writes the ledger row and
@@ -152,24 +174,29 @@ def apply_recreate_guard(
         services_to_recreate, runtime, infra_dir, compose_file,
     )
     if not foreign:
-        return services_to_recreate, recreate_for_rebuild, build_services, {}
+        return GuardOutcome(
+            services_to_recreate, recreate_for_rebuild, build_services, {}, (),
+        )
     for svc, why in sorted(foreign.items()):
         print(f"  [skip-recreate] {svc}: {why}")
     print(
         "      Left running as-is; the compose tuning / image rebuild did not "
         f"reach it. See UPDATE_DEFERRED.md ({CID_FOREIGN_IDENTITY})."
     )
-    emit_foreign_compose_identity_deferral(deferral_report, foreign, runtime, infra_dir)
+    entry = emit_foreign_compose_identity_deferral(
+        deferral_report, foreign, runtime, infra_dir,
+    )
     log_event(
         "5/10", "skip-recreate",
         "running container(s) owned by another compose identity — not recreated",
         data={"services": dict(foreign)},
     )
-    return (
+    return GuardOutcome(
         [s for s in services_to_recreate if s not in foreign],
         [s for s in recreate_for_rebuild if s not in foreign],
         [s for s in build_services if s not in foreign],
         foreign,
+        (entry,) if entry is not None else (),
     )
 
 
@@ -260,10 +287,24 @@ def compose_failure_followup(
     stderr: str,
     manual_cmd: str,
     log_event: LogEvent,
+    install_root: Optional[Path] = None,
+    persist_on_hard_stop: Sequence[DeferralEntry] = (),
 ) -> bool:
     """After a FAIL: ``True`` → the caller continues the update (row written);
-    ``False`` → the caller keeps its hard stop."""
+    ``False`` → the caller keeps its hard stop.
+
+    On the hard stop the run report is never written (``finalize()`` runs
+    only at the end of a completed run), so any row this step already owes
+    the user — the foreign-identity row above — is persisted here through
+    the locked on-disk writer (review R1 finding 4). Soft-fail: a ledger
+    write error must not mask the compose error the user is about to see.
+    """
     if not compose_failure_is_survivable(args, detected, has_gpu):
+        if install_root is not None and persist_on_hard_stop:
+            try:
+                _deferral_emit.emit_entries(install_root, tuple(persist_on_hard_stop))
+            except Exception as exc:  # noqa: BLE001 — never mask the compose error
+                print(f"  (could not persist the ledger row(s) before stopping: {exc})")
         return False
     emit_compose_up_failed_deferral(
         deferral_report, exit_code, (stderr or "").strip()[-600:], manual_cmd,

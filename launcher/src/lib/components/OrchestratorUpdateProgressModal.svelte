@@ -66,7 +66,12 @@
   // bleed up here.
 
   import { orchestrator } from '$lib/stores/orchestrator';
-  import { updater, titleForUpdateKind } from '$lib/stores/updater';
+  import {
+    updater,
+    titleForUpdateOp,
+    runningMessageForUpdateOp,
+    updateOpRestartsOnSuccess,
+  } from '$lib/stores/updater';
   import { ui } from '$lib/stores/ui';
 
   const COMPLETED_HOLD_MS = 1800;
@@ -122,10 +127,24 @@
       return;
     }
 
-    // Falling edge: updating just became false. Enter completed →
-    // hold COMPLETED_HOLD_MS → fade for FADE_OUT_MS → close.
+    // Falling edge: updating just became false.
     if (prevUpdating && !isUpdating) {
       clearTimers();
+      // v0.2.93 (field incident 2026-09-07): HAND-OVER, not completion.
+      // If the op ended by surfacing a decision modal (non-FF divergence,
+      // merge conflict, untracked collision, autostash-pop), the update is
+      // PAUSED — action needed. Never hold at "Update complete 100%" over
+      // a modal the user has to act on: close immediately and hand over.
+      // The modals live in +layout.svelte (same root stacking context as
+      // this overlay), so the hand-over is a plain visibility swap.
+      if (upd.nonFf || upd.conflict || upd.untrackedCollision || upd.autostashPop) {
+        phase = 'running';
+        fadingOut = false;
+        prevUpdating = false;
+        ui.closeOrchestratorUpdateProgress();
+        return;
+      }
+      // Genuine completion: hold COMPLETED_HOLD_MS → fade FADE_OUT_MS → close.
       phase = 'completed';
       fadingOut = false;
       holdTimer = setTimeout(() => { fadingOut = true; }, COMPLETED_HOLD_MS);
@@ -164,8 +183,11 @@
   // the resume-after-hand-resolved-conflict path. `resume_operation`
   // comes from the same `updateStatus` UpdateBadge reads for its
   // identical Finish/Continue distinction.
+  // v0.2.93: the op in flight wins over the badge kind — a merge / rebase /
+  // keep-local / accept-upstream / abort starts from a modal, not from a
+  // badge kind, and must be titled as what it is.
   const title = $derived(
-    titleForUpdateKind(upd.kind, orchState.updateStatus?.resume_operation)
+    titleForUpdateOp(upd.op, upd.kind, orchState.updateStatus?.resume_operation)
   );
 
   // Stage + message come straight from the install_progress events. We
@@ -174,11 +196,21 @@
   // AND the human-readable message ("Pulling latest changes…", "Applying
   // updates…").
   const stage = $derived(orchState.progress?.stage ?? '');
+  // v0.2.93: no `install_progress` event has arrived for THIS op yet
+  // (`beginOp` resets the snapshot to null). The git-phase ops (merge /
+  // rebase / abort) never emit one, so the bar shows a shimmer sweep and
+  // the percentage is withheld rather than lying with "0%".
+  const indeterminate = $derived(phase === 'running' && orchState.progress === null);
   const message = $derived.by(() => {
     if (phase === 'completed') return 'Update complete';
     if (phase === 'failed')    return upd.error ?? 'Update failed';
-    return orchState.progress?.message ?? 'Working…';
+    return orchState.progress?.message ?? runningMessageForUpdateOp(upd.op);
   });
+  const hint = $derived(
+    updateOpRestartsOnSuccess(upd.op)
+      ? "Please don't close the launcher — it will restart automatically when the update finishes."
+      : "Please don't close the launcher — this only takes a moment."
+  );
 
   // Dismiss the error state. Closes the overlay flag + clears the updater
   // error so subsequent updater interactions don't immediately re-show the
@@ -256,13 +288,19 @@
          pattern from CodeGraphReanalysisModal.svelte:178-185. 4px track,
          teal fill, 0.2s ease width transition; `.complete` class bumps
          the fill from 0.8 to 1.0 opacity. -->
-    <div class="oup-progress-track" aria-hidden="true">
+    <div class="oup-progress-track" class:indeterminate aria-hidden="true">
       <div
         class="oup-progress-fill"
         class:complete={phase === 'completed'}
         class:failed={phase === 'failed'}
         style:width="{phase === 'failed' ? 100 : fillPct}%"
       ></div>
+      {#if indeterminate}
+        <!-- v0.2.93: brand shimmer sweep (VCO_BRAND_REFERENCE §4) while no
+             real percentage exists yet — the bar is visibly ALIVE, never a
+             static 0% that reads as a hang. -->
+        <div class="oup-progress-shimmer"></div>
+      {/if}
     </div>
 
     <!-- Percentage + status message line. -->
@@ -271,7 +309,9 @@
         <span class="oup-pct-failed">FAILED</span>
         <span class="oup-message-failed">{message}</span>
       {:else}
-        <span class="oup-pct">{Math.round(fillPct)}%</span>
+        {#if !indeterminate}
+          <span class="oup-pct">{Math.round(fillPct)}%</span>
+        {/if}
         <span class="oup-message">{message}</span>
       {/if}
     </p>
@@ -288,9 +328,7 @@
     <!-- Hint to keep hands off during the update. Hidden once we're in
          the completed/failed phase so it doesn't fight the action affordances. -->
     {#if phase === 'running'}
-      <p class="oup-hint">
-        Please don't close the launcher — it will restart automatically when the update finishes.
-      </p>
+      <p class="oup-hint">{hint}</p>
     {/if}
   </div>
 </div>
@@ -458,12 +496,30 @@
   /* -------- Progress bar (mirrors cgr-progress-fill) -------- */
 
   .oup-progress-track {
+    position: relative;
     width: 100%;
     height: 4px;
     background: rgba(255, 255, 255, 0.06);
     border-radius: 4px;
     overflow: hidden;
     margin-top: 6px;
+  }
+  /* v0.2.93: indeterminate shimmer sweep — the brand-reference "premium
+     touch" (linear-gradient white 0.35, 1.6s left→right). Shown only while
+     an op runs with no real percentage yet, so the bar never sits static. */
+  .oup-progress-shimmer {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+    animation: oup-shimmer 1.6s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes oup-shimmer {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(100%); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .oup-progress-shimmer { animation: none; opacity: 0.5; }
   }
   .oup-progress-fill {
     height: 100%;

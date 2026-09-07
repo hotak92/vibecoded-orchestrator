@@ -215,6 +215,13 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.93: `compose up` failed on --update while every required service already answered; the update continued, the compose change did not apply."
 
+[conditions.update_install_phase_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_badge"]
+notes = "v0.2.93: emitted by the LAUNCHER (installer.rs) when a launcher-driven `install.py --update` exits non-zero after the source was merged; the next successful install.py run drops it."
+
 [conditions.dual_ollama_detected]
 class = "environmental"
 owner = "install.py"

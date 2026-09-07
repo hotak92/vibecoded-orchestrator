@@ -22,10 +22,11 @@
   import { onMount } from 'svelte';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { updater, isAutostashPopResume } from '$lib/stores/updater';
-  import { ui } from '$lib/stores/ui';
-  import OrchestratorUpdateDivergenceModal from './OrchestratorUpdateDivergenceModal.svelte';
-  import OrchestratorUntrackedCollisionModal from './OrchestratorUntrackedCollisionModal.svelte';
-  import OrchestratorAutostashPopModal from './OrchestratorAutostashPopModal.svelte';
+  // v0.2.93 (field incident 2026-09-07): the decision modals (divergence /
+  // conflict / untracked-collision / autostash-pop) are no longer rendered
+  // here — they live in `+layout.svelte`, keyed on the updater store. This
+  // badge is the TRIGGER only. The progress overlay is opened by
+  // `updater.beginOp()` inside each store action, not by this component.
 
   let popoverOpen = $state(false);
   let wrapperEl = $state<HTMLDivElement | null>(null);
@@ -49,6 +50,12 @@
   // extra line inside whichever popover is already showing.
   const headDetached = $derived(orchState.updateStatus?.head_detached === true);
 
+  // v0.2.93 (D): the RUNNING launcher binary is newer than the last
+  // completed install — a binary refresh landed but `install.py --update`
+  // never finished. Like `headDetached`, an extra warning line inside
+  // whichever popover is showing; it never replaces the real kind.
+  const binaryAhead = $derived(orchState.updateStatus?.binary_ahead_of_install === true);
+
   // v0.2.16 (W4 / 0.5): copy + action per kind. Drives both popover
   // header text and primary button label/handler.
   // v0.2.51 (Bug A): added 'merge_resolved_incomplete' kind — highest
@@ -57,6 +64,26 @@
   const kindCopy = $derived.by(() => {
     const us = orchState.updateStatus;
     switch (upd.kind) {
+      case 'merge_in_progress': {
+        // v0.2.93 (field incident 2026-09-07): the clone is mid-merge
+        // (`.git/MERGE_HEAD` present) and the launcher has no conflict
+        // payload in memory — the modal never rendered, or the launcher
+        // was restarted while it was up. Highest priority: nothing else
+        // can run against a conflicted tree. The action re-fetches the
+        // payload (`get_pending_conflict_payload`) and reopens the
+        // hoisted conflict modal.
+        return {
+          title: 'Update stopped at a merge conflict — resolve it',
+          desc:
+            `An orchestrator ${us?.resume_operation || 'merge'} on ` +
+            `\`${us?.resume_branch || 'main'}\` stopped at a conflict and the ` +
+            `clone is still mid-merge. Nothing else can update until you ` +
+            `resolve it (keep local / accept upstream) or abort it. Click ` +
+            `Resolve conflict to reopen the resolution dialog.`,
+          buttonLabel: 'Resolve conflict',
+          actionKey: 'resolve_conflict' as const,
+        };
+      }
       case 'merge_resolved_incomplete': {
         const op = us?.resume_operation || 'update';
         const branch = us?.resume_branch || 'main';
@@ -145,7 +172,13 @@
           title: 'Up to date',
           desc: 'No pending updates detected.',
           buttonLabel: '',
-          actionKey: null as null | 'restart' | 'install' | 'fetch_install' | 'resume',
+          actionKey: null as
+            | null
+            | 'restart'
+            | 'install'
+            | 'fetch_install'
+            | 'resume'
+            | 'resolve_conflict',
         };
     }
   });
@@ -182,21 +215,20 @@
   async function handleAction() {
     popoverOpen = false;
     if (kindCopy.actionKey === null) return;
-    // v0.2.40 (contributor): open the full-screen blocking progress overlay
-    // BEFORE invoking the updater action. The overlay subscribes to
-    // `$orchestrator.progress` (already populated by the install_progress
-    // Tauri listener) and stays up across the entire flow:
-    //   - `runUpdate`           — git pull + install.py --update + restart
-    //   - `applyPendingInstall` — install.py --update only
-    //   - `runRestart`          — re-exec the dist binary; the launcher
-    //                             dies mid-call so the overlay blinks
-    //                             once at restart, which is correct UX.
+    // v0.2.40 (contributor) → v0.2.93: the full-screen blocking progress
+    // overlay is opened by `updater.beginOp()` INSIDE each store action
+    // (runUpdate / applyPendingInstall / runRestart / resumeUpdate), so the
+    // same overlay also covers the modal-launched ops (merge / rebase /
+    // keep-local / accept-upstream / abort) that this badge never sees.
     // The overlay owns its own completion lifecycle (1.8 s hold at 100 %
-    // + 400 ms fade-out), then calls ui.closeOrchestratorUpdateProgress()
-    // itself — UpdateBadge no longer needs the rising/falling-edge
-    // bookkeeping that lived here in the first draft of this branch.
-    ui.openOrchestratorUpdateProgress();
+    // + 400 ms fade-out, or an immediate hand-over to a decision modal) and
+    // closes itself via ui.closeOrchestratorUpdateProgress().
     switch (kindCopy.actionKey) {
+      case 'resolve_conflict':
+        // v0.2.93 (D): fetch the pending conflict payload from the backend
+        // and reopen the hoisted conflict modal. A plain read — no overlay.
+        await updater.openPendingConflict();
+        break;
       case 'restart':
         await updater.runRestart();
         break;
@@ -246,45 +278,19 @@
 
 <svelte:window onclick={handleClickOutside} />
 
-<!-- v0.2.23 (B4 / D19): when update_orchestrator fails with a non-FF
-     divergence error, surface the merge/rebase/cancel modal. This runs
-     OUTSIDE the {#if visible} block so the modal stays usable even when
-     the user has dismissed the badge. -->
-{#if upd.nonFf}
-  <OrchestratorUpdateDivergenceModal
-    payload={upd.nonFf}
-    installPath={orchState.installPath}
-    onClose={() => updater.dismissNonFf()}
-  />
-{/if}
-
-<!-- v0.2.88 (DEFECT 1 / FIELD DEFECT): untracked-file collision with a new-in-
-     release path. The parsed collision set + a "Resolve & retry" button (the
-     pre-fix dead-end empty conflict modal is what this replaces). -->
-{#if upd.untrackedCollision}
-  <OrchestratorUntrackedCollisionModal
-    payload={upd.untrackedCollision}
-    installPath={orchState.installPath}
-    onClose={() => updater.dismissUntrackedCollision()}
-  />
-{/if}
-
-<!-- v0.2.88 (DEFECT 2 / FIELD DEFECT): merge succeeded but the --autostash pop
-     of local WIP conflicted. Distinct from a merge failure; keep-updated /
-     keep-local per file. -->
-{#if upd.autostashPop}
-  <OrchestratorAutostashPopModal
-    payload={upd.autostashPop}
-    installPath={orchState.installPath}
-    onClose={() => updater.dismissAutostashPop()}
-  />
-{/if}
+<!-- v0.2.23 (B4 / D19) → v0.2.93: the divergence / conflict / untracked-
+     collision / autostash-pop modals used to be rendered HERE, inside
+     MenuBar's `.menu-bar` (backdrop-filter + z-index 100 = a containing
+     block for position:fixed children) and under `{#if upd.nonFf}` (any
+     store change clearing the flag unmounted an in-flight modal). They now
+     live in `+layout.svelte`, keyed on the updater store. -->
 
 {#if visible}
   <div class="update-wrapper" bind:this={wrapperEl}>
     <button
       class="update-trigger"
       class:updating={upd.updating}
+      class:kind-conflict={upd.kind === 'merge_in_progress'}
       class:kind-resume={upd.kind === 'merge_resolved_incomplete'}
       class:kind-binary={upd.kind === 'binary_stale'}
       class:kind-install={upd.kind === 'install_stale'}
@@ -312,6 +318,11 @@
             branch. Updates still apply, but the clone stays detached
             afterwards. Preferences → Launcher updates has a one-click
             reattach.
+          </p>
+        {/if}
+        {#if binaryAhead}
+          <p class="popover-note popover-note-warn">
+            The running launcher is newer than the installed orchestrator — finish the update
           </p>
         {/if}
         {#if upd.error}
@@ -377,6 +388,11 @@
             This clone is on a <strong>detached HEAD</strong>. That alone does
             not break the check, but it is worth fixing — Preferences →
             Launcher updates has a one-click reattach.
+          </p>
+        {/if}
+        {#if binaryAhead}
+          <p class="popover-note popover-note-warn">
+            The running launcher is newer than the installed orchestrator — finish the update
           </p>
         {/if}
         <div class="popover-actions">
@@ -473,6 +489,34 @@
     50% {
       box-shadow: 0 0 0 6px rgba(123, 95, 255, 0);
     }
+  }
+  /* v0.2.93: merge_in_progress — a STALLED merge. Pink (the brand's
+     error/urgent accent, same as binary_stale) plus the resume pulse so it
+     is unmissable: the tree is mid-merge and nothing else can proceed. */
+  .update-trigger.kind-conflict {
+    border-color: rgba(255, 79, 160, 0.6);
+    color: var(--color-pink, #ff4fa0);
+    animation: conflict-pulse 2.4s ease-in-out infinite;
+  }
+  .update-trigger.kind-conflict:hover {
+    background: rgba(255, 79, 160, 0.1);
+    border-color: rgba(255, 79, 160, 0.8);
+  }
+  @keyframes conflict-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 0 rgba(255, 79, 160, 0.4);
+    }
+    50% {
+      box-shadow: 0 0 0 6px rgba(255, 79, 160, 0);
+    }
+  }
+
+  /* v0.2.93 (D): binary-ahead-of-install warning line — pink-bordered
+     variant of the detached-HEAD note: a state that needs finishing, not
+     a failure. */
+  .popover-note.popover-note-warn {
+    border-left-color: rgba(255, 79, 160, 0.7);
+    color: rgba(255, 255, 255, 0.85);
   }
 
   /* v0.2.83 (WP-A2 / D3): amber "couldn't check for updates" state. A

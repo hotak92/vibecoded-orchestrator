@@ -258,20 +258,31 @@ pub(crate) async fn resolve_branch(repo: &Path) -> Result<BranchState, String> {
             });
         }
     };
+    Ok(branch_state_from_abbrev_ref(&raw))
+}
+
+/// The pure normaliser behind [`resolve_branch`]: `git rev-parse --abbrev-ref
+/// HEAD` output → [`BranchState`].
+///
+/// `--abbrev-ref` prints the literal `HEAD` for a detached HEAD. That is
+/// git's documented behaviour, not an error, which is exactly why an
+/// `unwrap_or_else(|_| "main")` on the Result never fired for it.
+///
+/// v0.2.93: split out so the SYNCHRONOUS cached-status surface
+/// (`self_update::cached_update_status_for`, which cannot await) applies the
+/// same rule instead of carrying a second copy of it.
+pub(crate) fn branch_state_from_abbrev_ref(raw: &str) -> BranchState {
     let b = raw.trim();
-    // `--abbrev-ref` prints the literal `HEAD` for a detached HEAD. That is
-    // git's documented behaviour, not an error, which is exactly why an
-    // `unwrap_or_else(|_| "main")` on the Result never fired for it.
     if b.is_empty() || b == "HEAD" {
-        return Ok(BranchState {
+        return BranchState {
             name: FALLBACK_BRANCH.to_string(),
             detached: true,
-        });
+        };
     }
-    Ok(BranchState {
+    BranchState {
         name: b.to_string(),
         detached: false,
-    })
+    }
 }
 
 /// Count how many commits `HEAD` is BEHIND `<remote>/<branch>` —
@@ -648,6 +659,20 @@ mod tests {
         let st = resolve_branch(&repo).await.expect("resolve_branch");
         assert_eq!(st.name, "main", "detached HEAD must normalise to main");
         assert!(st.detached, "detached HEAD must be FLAGGED, not just normalised");
+    }
+
+    /// The pure rule the sync cached-status surface shares (v0.2.93).
+    #[test]
+    fn branch_state_from_abbrev_ref_applies_the_one_normalisation_rule() {
+        let d = branch_state_from_abbrev_ref("HEAD\n");
+        assert_eq!(d.name, FALLBACK_BRANCH);
+        assert!(d.detached);
+        let e = branch_state_from_abbrev_ref("   ");
+        assert_eq!(e.name, FALLBACK_BRANCH);
+        assert!(e.detached);
+        let a = branch_state_from_abbrev_ref("feature/x\n");
+        assert_eq!(a.name, "feature/x");
+        assert!(!a.detached);
     }
 
     #[tokio::test]

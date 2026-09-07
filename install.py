@@ -13163,7 +13163,7 @@ def _start_services(
         build_services=build_services, runtime=sysinfo.container_cmd, infra_dir=infra_dir,
         compose_file=compose_file, deferral_report=deferral_report, log_event=_log_install_event,
     )
-    services_to_recreate, recreate_for_rebuild, build_services, _foreign = _guard
+    services_to_recreate, recreate_for_rebuild, build_services, _foreign, _guard_rows = _guard
     if not force_separate and not services_to_start and not services_to_recreate:
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
@@ -13500,7 +13500,7 @@ def _start_services(
             deferral_report=deferral_report, exit_code=result.returncode,
             stderr=result.stderr or "",
             manual_cmd=f"cd {infra_dir} && {' '.join(compose_cmd)} up -d",
-            log_event=_log_install_event,
+            log_event=_log_install_event, install_root=PROJECT_ROOT, persist_on_hard_stop=_guard_rows,
         ):
             return
         sys.exit(1)

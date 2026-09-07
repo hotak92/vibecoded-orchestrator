@@ -76,6 +76,9 @@
   }
 
   async function refresh() {
+    // Review R2 #7: a focus/visibility probe landing during apply() must not
+    // race apply's own re-probe and leave the pill on the old mode.
+    if (busy) return;
     try {
       gw = await getModelGatewayStatus();
     } catch (e) {
@@ -133,9 +136,20 @@
     if (!tauriAvailable()) return;
     void refresh();
     // The gateway can be started/stopped from the Services page while this
-    // frame stays mounted; a slow poll keeps the disabled-reason honest.
-    const timer = setInterval(() => void refresh(), 20_000);
-    return () => clearInterval(timer);
+    // frame stays mounted. Re-probe when the window regains focus or becomes
+    // visible (and after every apply, see setMode) instead of polling: each
+    // probe spawns a python process, and a 20 s timer in a frame that is
+    // always mounted is a python spawn every 20 s for the app's lifetime.
+    const onFocus = () => void refresh();
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   });
 </script>
 

@@ -210,6 +210,10 @@ _V0292_OWNED_ADDITIONS = frozenset({
 _V0293_OWNED_ADDITIONS = frozenset({
     "services_foreign_compose_identity",
     "services_compose_up_failed",
+    # Emitted by the launcher (installer.rs) after a launcher-driven
+    # `install.py --update` exits non-zero; owned by install.py so the next
+    # SUCCESSFUL run drops it — that is the lifecycle, not a hazard.
+    "update_install_phase_failed",
 })
 
 

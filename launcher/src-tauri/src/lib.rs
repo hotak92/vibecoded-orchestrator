@@ -943,6 +943,12 @@ pub fn run() {
                         outcome.staged, outcome.armed,
                     );
                 }
+                // v0.2.93 (D-D): the inverse hazard — the RUNNING binary is
+                // AHEAD of the install because a merge pull landed upstream's
+                // dist binaries before install.py ran and the merge is still
+                // stalled (or a resume is pending). Warn-only; the same rule
+                // feeds `UpdateStatus::binary_ahead_of_install`. No auto-heal.
+                let _ = commands::installer::warn_if_binary_ahead_of_install(&root);
             });
 
             // v0.2.91 WP-D + WP-H, wired by WP-I: the cheap boot doctor pass,
@@ -3194,6 +3200,10 @@ pub fn run() {
             commands::installer::merge_orchestrator_with_upstream,
             commands::installer::rebase_orchestrator_onto_upstream,
             commands::installer::abort_orchestrator_merge_or_rebase,
+            // v0.2.93 (field incident 2026-09-07): reopen the conflict modal
+            // on a STALLED merge/rebase after a launcher restart. Pairs with
+            // `UpdateStatus::merge_in_progress`; read-only.
+            commands::installer::get_pending_conflict_payload,
             // v0.2.51 Bug A: resume an orchestrator-update flow that
             // halted at a merge/rebase conflict. The user resolved the
             // conflict in their editor (or via CLI) and the launcher
@@ -3431,6 +3441,10 @@ pub fn run() {
             commands::self_update::reattach_orchestrator_branch,
             commands::self_update::get_user_owned_paths,
             commands::self_update::get_cached_update_status,
+            // v0.2.93: repo-aware cached status for the Updates page only
+            // (async; the sync `get_cached_update_status` stays a pure file
+            // read for the tray).
+            commands::self_update::get_cached_update_status_refreshed,
             commands::self_update::set_auto_check_enabled,
             commands::self_update::get_auto_check_enabled,
             // v0.2.35 (Agent K): running-version display + post-update

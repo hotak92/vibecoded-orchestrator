@@ -406,7 +406,9 @@ class FreshVenvInstallTests(unittest.TestCase):
             env={**os.environ, "PYTHONPATH": str(self.purelib)},
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "10")
+        # 10 GLM rows + the 4 Claude 5 family rows added in v0.2.93 (the
+        # installed copy must carry the SAME seed the checkout ships).
+        self.assertEqual(completed.stdout.strip(), "14")
 
     def test_the_console_script_is_installed_and_executable(self) -> None:
         """A declared entry point that produces no runnable file is a promise."""

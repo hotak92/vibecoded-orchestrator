@@ -206,7 +206,9 @@
     aria-live="polite"
   >
     <div class="bg-row">
-      <span class="bg-glyph" class:spin={view.status === 'running'} aria-hidden="true">
+      <!-- v0.2.93 (G): also spin while OUR retry invoke is pending, not only
+           once the background poll reports `running`. -->
+      <span class="bg-glyph" class:spin={view.status === 'running' || retrying} aria-hidden="true">
         {statusGlyph(view.status)}
       </span>
       <div class="bg-text">
@@ -231,7 +233,11 @@
             onclick={retry}
             disabled={retrying}
           >
-            {retrying ? 'Retrying…' : 'Retry sync'}
+            {#if retrying}
+              <span class="bg-glyph-spin" aria-hidden="true">⟳</span> Re-syncing…
+            {:else}
+              Retry sync
+            {/if}
           </button>
         {/if}
         {#if view.status === 'success' || view.status === 'skipped'}

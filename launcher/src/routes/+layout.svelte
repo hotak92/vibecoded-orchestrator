@@ -36,6 +36,20 @@
   // hold+fade completion lifecycle (1.8 s + 400 ms) or on user-dismiss in
   // the error path. Namespacing reserved by A3 collision audit.
   import OrchestratorUpdateProgressModal from '$lib/components/OrchestratorUpdateProgressModal.svelte';
+  // v0.2.93 (field incident 2026-09-07): the orchestrator-update DECISION
+  // modals are mounted HERE, in the root stacking context, keyed on the
+  // updater store — not inside MenuBar → UpdateBadge. Two reasons:
+  //   1. `.menu-bar` has `backdrop-filter` + z-index 100, which makes it a
+  //      containing block for `position:fixed` descendants (the modals were
+  //      sized to the 52px bar and could vanish behind other chrome).
+  //   2. UpdateBadge's `{#if upd.nonFf}` unmounted an in-flight modal the
+  //      moment any store change cleared the flag mid-operation.
+  // UpdateBadge stays the TRIGGER only.
+  import OrchestratorUpdateDivergenceModal from '$lib/components/OrchestratorUpdateDivergenceModal.svelte';
+  import OrchestratorUpdateConflictModal from '$lib/components/OrchestratorUpdateConflictModal.svelte';
+  import OrchestratorUntrackedCollisionModal from '$lib/components/OrchestratorUntrackedCollisionModal.svelte';
+  import OrchestratorAutostashPopModal from '$lib/components/OrchestratorAutostashPopModal.svelte';
+  import { updater } from '$lib/stores/updater';
   import InstallWizard from '$lib/components/InstallWizard.svelte';
   import McpDashboard from '$lib/components/McpDashboard.svelte';
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
@@ -398,6 +412,39 @@
        closes after the completion hold+fade timer expires. -->
   {#if uiState.showOrchestratorUpdateProgress}
     <OrchestratorUpdateProgressModal />
+  {/if}
+  <!-- v0.2.93 (field incident 2026-09-07): orchestrator-update decision
+       modals, hoisted out of MenuBar → UpdateBadge (see the import note).
+       Keyed on the updater store so they survive badge state changes.
+       `conflict` wins over `nonFf` (setConflict clears nonFf anyway) so the
+       two are never stacked. The progress overlay above closes itself on
+       the falling edge of `updating` when any of these is set. -->
+  {#if $updater.conflict}
+    <OrchestratorUpdateConflictModal
+      payload={$updater.conflict}
+      installPath={$orchestrator.installPath}
+      onClose={() => updater.dismissConflict()}
+    />
+  {:else if $updater.nonFf}
+    <OrchestratorUpdateDivergenceModal
+      payload={$updater.nonFf}
+      installPath={$orchestrator.installPath}
+      onClose={() => updater.dismissNonFf()}
+    />
+  {/if}
+  {#if $updater.untrackedCollision}
+    <OrchestratorUntrackedCollisionModal
+      payload={$updater.untrackedCollision}
+      installPath={$orchestrator.installPath}
+      onClose={() => updater.dismissUntrackedCollision()}
+    />
+  {/if}
+  {#if $updater.autostashPop}
+    <OrchestratorAutostashPopModal
+      payload={$updater.autostashPop}
+      installPath={$orchestrator.installPath}
+      onClose={() => updater.dismissAutostashPop()}
+    />
   {/if}
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />

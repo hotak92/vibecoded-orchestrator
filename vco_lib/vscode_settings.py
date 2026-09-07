@@ -1635,16 +1635,38 @@ def set_mode_remote_control(path: Path, *, stash: Optional[Path] = None) -> dict
                 previous_stash = stash.read_bytes()
             except OSError:
                 previous_stash = None
+            # Review R1 finding 6: a second remote-control pass (already on
+            # stock, but a slot names a gateway-only id typed by hand) must
+            # ADD to the stash the first pass made for this same settings
+            # file, never replace it — otherwise the first pass's model/slot
+            # choices are gone before the multimodel leg can restore them.
+            # Newer values win per key (the user's latest expressed choice).
+            merged_values = dict(stashed_values)
+            merged_routing = list(removed_routing)
+            merged_login = login_removed
+            prior_doc, _prior_err = _read_stash(stash)
+            prior_path = prior_doc.get("settings_path") if prior_doc else None
+            if isinstance(prior_path, str) and _same_file(Path(prior_path), path):
+                prior_values = prior_doc.get("values")
+                if isinstance(prior_values, dict):
+                    merged_values = {**prior_values, **stashed_values}
+                for k in prior_doc.get("routing_keys") or ():
+                    if isinstance(k, str) and k not in merged_routing:
+                        merged_routing.append(k)
+                merged_login = merged_login or bool(prior_doc.get("login_prompt_removed"))
             _write_stash(
                 stash,
                 {
                     "schema_version": _STASH_SCHEMA_VERSION,
                     "stashed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "settings_path": str(path),
-                    "routing_keys": removed_routing,
+                    "routing_keys": merged_routing,
+                    # Informational only (`mode --get` / support bundles): the
+                    # multimodel leg takes its base URL from the caller, and
+                    # the token is NEVER here (see _STASH_SECRET_KEYS).
                     "routing_values": routing_values,
-                    "login_prompt_removed": login_removed,
-                    "values": stashed_values,
+                    "login_prompt_removed": merged_login,
+                    "values": merged_values,
                 },
             )
             wrote_stash = True
