@@ -63,6 +63,7 @@ import shutil
 import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -266,9 +267,13 @@ class Machine:
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = (Path(__file__).resolve().parent
-                    / f"_tmp_d18heal_{os.getpid()}_{id(self)}")
-        self.tmp.mkdir(parents=True, exist_ok=True)
+        # System tmp, NOT the repo tree: tearDown rmtree's this, but an
+        # INTERRUPTED run (killed lane, Ctrl-C'd suite) never reaches
+        # tearDown — a repo-adjacent scratch dir then leaks into the
+        # deliverable tree (v0.2.92 release day: four leaked _tmp_d18heal_*
+        # dirs; agent `rm` was permission-denied). tempfile.mkdtemp is
+        # unique per call, so no pid/id() bookkeeping either.
+        self.tmp = Path(tempfile.mkdtemp(prefix="v0292_d18heal_"))
         self.m = Machine(self.tmp)
         self.env = mock.patch.dict(os.environ, {
             "VCT_STATE_DIR": str(self.tmp),

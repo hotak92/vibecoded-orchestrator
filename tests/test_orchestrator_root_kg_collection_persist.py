@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -92,11 +93,12 @@ class OrchestratorRootCollectionPersistTests(unittest.TestCase):
     `_persist_orchestrator_root_kg_collection`."""
 
     def setUp(self):
-        self._tmp = (
-            Path(__file__).resolve().parent
-            / f"_tmp_orchroot_{os.getpid()}_{id(self)}"
-        )
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        # System tmp, NOT the repo tree — tearDown rmtree's this, but an
+        # interrupted run (killed lane, Ctrl-C'd suite) never reaches
+        # tearDown and a repo-adjacent scratch dir leaks into the
+        # deliverable tree (see the v0.2.92 release-day _tmp_orchroot_*
+        # leak). tempfile.mkdtemp is unique per call, no pid/id() needed.
+        self._tmp = Path(tempfile.mkdtemp(prefix="orchroot_persist_"))
         self._db_path = self._tmp / "launcher.db"
         # VCT_STATE_DIR points at the temp dir so
         # `_discover_app_state_db_path` resolves to our test DB.
