@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import socket
 import subprocess
 import threading
 import time
@@ -43,6 +42,8 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
+
+from tests.common.ports import free_port
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASH_RESOLVER = REPO_ROOT / "templates" / "scripts" / "vct_access_check.sh"
@@ -144,22 +145,13 @@ class _MockHandler(BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
 
-def _pick_free_port() -> int:
-    """Bind to :0 to get a free port, then close. Race-resistant enough
-    for sequential test runs (pytest doesn't parallelize this file by
-    default)."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture
 def mock_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Start a per-test mock hub, write hub.port + hub.token to a tmp
     VCT_STATE_DIR, yield the handler so tests can inject responses."""
-    port = _pick_free_port()
+    port = free_port()
     state_dir = tmp_path / "vct"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "hub.port").write_text(str(port), encoding="utf-8")
@@ -360,7 +352,7 @@ class TestBashResolver:
         (state_dir / "hub.token").write_text("test_token", encoding="utf-8")
         # Use a port nobody's listening on.
         monkeypatch.setenv("VCT_STATE_DIR", str(state_dir))
-        monkeypatch.setenv("VCT_HUB_PORT", str(_pick_free_port()))
+        monkeypatch.setenv("VCT_HUB_PORT", str(free_port()))
         monkeypatch.setenv("VCT_HUB_TOKEN", "test_token")
         result = _run_bash_resolver("p1", "Foo")
         assert result.returncode == 0
@@ -512,7 +504,7 @@ _DEFINITIVE_LINE = "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token"
 def stale_token_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Mock hub that accepts ONLY the on-disk token, with a STALE
     `VCT_HUB_TOKEN` exported — the field shape after a hub restart."""
-    port = _pick_free_port()
+    port = free_port()
     state_dir = tmp_path / "vct"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "hub.port").write_text(str(port), encoding="utf-8")
@@ -736,7 +728,7 @@ def test_ps1_retry_transport_failure_does_not_exit_url_error(tmp_path: Path):
     idx = src.find(marker)
     lib.write_text("﻿" + (src[:idx] if idx != -1 else src), encoding="utf-8")
 
-    dead_port = _pick_free_port()  # bound then released → nothing listening
+    dead_port = free_port()  # bound then released → nothing listening
     snippet = (
         f". '{lib}'; "
         f"$r = Invoke-AccessRequest -Token 't' "

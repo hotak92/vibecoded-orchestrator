@@ -22,23 +22,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import subprocess
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from tests.common.ports import free_port
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_SH = REPO_ROOT / "scripts" / "migrate-development-temporal-props.sh"
 SCRIPT_PS1 = REPO_ROOT / "scripts" / "migrate-development-temporal-props.ps1"
 
 
-def _free_port() -> int:
-    """Bind to port 0 to claim a free port, then release."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class _MockWeaviateHandler(BaseHTTPRequestHandler):
@@ -110,7 +106,7 @@ def _start_mock_weaviate(initial_classes: list):
     """Spin up the mock Weaviate on an ephemeral port, return (port, server)."""
     _MockWeaviateHandler.schema = {"classes": initial_classes}
     _MockWeaviateHandler.post_log = []
-    port = _free_port()
+    port = free_port()
     server = HTTPServer(("127.0.0.1", port), _MockWeaviateHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -140,7 +136,7 @@ class BashScriptTests(unittest.TestCase):
 
     def test_unreachable_weaviate_soft_fails(self):
         # Point at an unreachable URL — script must exit 0 (soft-fail).
-        port = _free_port()  # nothing bound to it
+        port = free_port()  # nothing bound to it
         env = os.environ.copy()
         env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
         result = subprocess.run(

@@ -241,12 +241,25 @@ class RouteTests(unittest.TestCase):
         assert isinstance(decision, Route)
         self.assertEqual(decision.forward_model, "glm-5.3")
 
-    def test_one_m_suffix_is_kept_for_the_first_party_route(self) -> None:
-        """On the Claude route ``[1m]`` names a real upstream variant."""
+    def test_one_m_suffix_is_stripped_for_the_first_party_route_too(self) -> None:
+        """``[1m]`` is a CLIENT spelling on every route, not an upstream name.
+
+        v0.2.93 forwarded it verbatim here on the theory that it named a real
+        upstream variant; a live probe returned ``404 not_found_error`` for
+        the suffixed id and 200 for the same id without it. The request for
+        the large window survives in ``one_m_requested``, which the server
+        turns into the beta header that actually buys it.
+        """
         decision = routing.route("claude-sonnet-5[1m]")
         assert isinstance(decision, Route)
-        self.assertEqual(decision.forward_model, "claude-sonnet-5[1m]")
+        self.assertEqual(decision.forward_model, "claude-sonnet-5")
         self.assertTrue(decision.is_anthropic)
+        self.assertTrue(decision.one_m_requested)
+
+    def test_a_plain_first_party_id_does_not_claim_the_1m_variant(self) -> None:
+        decision = routing.route("claude-sonnet-5")
+        assert isinstance(decision, Route)
+        self.assertFalse(decision.one_m_requested)
 
     def test_bare_vendor_id_routes_to_the_vendor(self) -> None:
         decision = routing.route("glm-4.6")

@@ -26,6 +26,8 @@ import time
 import unittest
 from pathlib import Path
 
+from tests.common.env import EnvIsolationMixin
+
 from model_router import auth, config, fileperms
 
 POSIX_ONLY = "POSIX mode bits do not exist on Windows; the Windows arm of this rule is test_host_token_acl_is_owner_only, which runs on the Windows CI leg"
@@ -34,35 +36,11 @@ WINDOWS_ONLY = "Windows ACLs cannot be inspected on POSIX; the POSIX arm of this
 FAKE_OAUTH = "wp9-oauth-synthetic-not-a-real-token"
 
 
-class _TmpCase(unittest.TestCase):
+class _TmpCase(EnvIsolationMixin, unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="wp9-auth-")
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
-
-    def set_env(self, key: str, value: str | None) -> None:
-        """Set (or clear) ``key`` and restore its EXACT prior state.
-
-        "Restore only if it was set" is not restoration: a key this test
-        introduced would survive into every later test in the process. That
-        is how a test named for isolation stops isolating — and it did
-        exactly that here before this helper existed, leaking
-        ``VCT_MODEL_GATEWAY_CONTEXT_TABLE`` into the CLI tests, which then
-        failed in a full-suite run while passing on their own.
-        """
-        original = os.environ.get(key)
-
-        def restore() -> None:
-            if original is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = original
-
-        self.addCleanup(restore)
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
 
 
 class HostTokenTests(_TmpCase):

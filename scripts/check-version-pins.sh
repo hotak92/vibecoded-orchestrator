@@ -60,6 +60,13 @@ WORKSPACE_INHERITED_CRATES=(
     "launcher/src-tauri/vct-updater/Cargo.toml"
     "launcher/src-tauri/vct-launcher-core/Cargo.toml"
 )
+# PYTHON-DUNDER pins — files carrying `__version__ = "X"`. Not in
+# VERSION_PIN_FILES because that loop greps for TOML/JSON spellings only, and
+# a pin nobody checks is how the model gateway served 0.2.92 from a 0.2.93
+# install: /health reported a version that had not existed for a release.
+DUNDER_PIN_FILES=(
+    "claude_mcp_servers/model_router/__init__.py"
+)
 
 # vcheck_run_pins <expected> : populate the global `VCHECK_FAILURES` array
 # with any pin/inherit mismatch. Returns 0 if all good, 1 otherwise. This
@@ -120,6 +127,23 @@ PY
         # the JSON-aware packages[""] check is best-effort on top of it.)
     fi
 
+    # Python `__version__` pins. The version goes into an ERE, so its dots
+    # must be escaped: unescaped, `0.2.93` also matches `0X2Y93` — a gate
+    # that accepts a version it should reject is worse than no gate.
+    local dunder expected_re got
+    expected_re="${expected//./\\.}"
+    for dunder in "${DUNDER_PIN_FILES[@]}"; do
+        if [ ! -f "$dunder" ]; then
+            VCHECK_FAILURES+=("$dunder (missing)")
+            continue
+        fi
+        if ! grep -qE "^__version__ *= *\"$expected_re\"" "$dunder"; then
+            got="$(grep -m1 -E '^__version__ *= *"' "$dunder" \
+                | sed -E 's/.*"([^"]+)".*/\1/' | head -c 80)"
+            VCHECK_FAILURES+=("$dunder (got: ${got:-<none>})")
+        fi
+    done
+
     # Workspace ROOT Cargo.toml: the literal must live under
     # [workspace.package] (not a stray top-level pin), so dropping
     # workspace inheritance is caught.
@@ -154,7 +178,7 @@ PY
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo "Version-pin check — expected v$_EXPECTED"
     if vcheck_run_pins "$_EXPECTED"; then
-        echo "OK — all ${#VERSION_PIN_FILES[@]} literal pins + workspace-package literal agree, and ${#WORKSPACE_INHERITED_CRATES[@]} crates inherit (version.workspace = true)."
+        echo "OK — all ${#VERSION_PIN_FILES[@]} literal pins + ${#DUNDER_PIN_FILES[@]} __version__ pin(s) + workspace-package literal agree, and ${#WORKSPACE_INHERITED_CRATES[@]} crates inherit (version.workspace = true)."
         exit 0
     else
         echo "FAIL — version drift detected:" >&2

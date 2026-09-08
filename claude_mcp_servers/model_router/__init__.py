@@ -59,6 +59,11 @@ needs both; the smoke check is about packaging, not capability.)
 
 from __future__ import annotations
 
-__version__ = "0.2.92"
+#: Reported by ``/health`` and ``vct-model-gateway --version``. Kept in step
+#: with the distribution version by ``scripts/bump-version.sh`` and GATED by
+#: ``scripts/check-version-pins.sh`` — it was neither until v0.2.94, which is
+#: how a 0.2.93 install served ``"version": "0.2.92"`` from /health and made
+#: "which gateway am I talking to?" unanswerable during an incident.
+__version__ = "0.2.93"
 
 __all__ = ["__version__"]

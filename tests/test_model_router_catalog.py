@@ -228,7 +228,12 @@ class AssemblyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1M ctx", match[0].display_name)
 
     async def test_the_one_m_decision_comes_from_the_caller_not_a_pattern(self) -> None:
-        """The table decides, by exact id; the catalog never guesses."""
+        """The table decides, by exact id; the catalog never guesses.
+
+        Since v0.2.94 the question is asked for FIRST-PARTY ids as well —
+        that is what puts a ``claude-…[1m]`` row in the picker — so the
+        assertion is on the exact ids asked, not merely on their count.
+        """
         asked: list[str] = []
 
         def advertise(model_id: str) -> bool:
@@ -236,11 +241,14 @@ class AssemblyTests(unittest.IsolatedAsyncioTestCase):
             return False
 
         service = _service(
-            responses={"acme.example": {"data": [{"id": "acme-1"}, {"id": "acme-2"}]}},
+            responses={
+                "first.example": {"data": [{"id": "claude-x"}]},
+                "acme.example": {"data": [{"id": "acme-1"}, {"id": "acme-2"}]},
+            },
             clock=_Clock(),
         )
         await service.union(advertise_1m=advertise)
-        self.assertEqual(asked, ["acme-1", "acme-2"])
+        self.assertEqual(asked, ["claude-x", "acme-1", "acme-2"])
 
     async def test_first_party_entries_are_sorted_and_vendor_order_is_stable(self) -> None:
         service = _service(

@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import io
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -263,6 +264,87 @@ def test_the_boot_log_and_the_daemon_log_are_different_files(sandbox):
     assert f"append:{daemon_log}" not in body
 
 
+def test_the_systemd_unit_bounds_a_restart_loop(sandbox):
+    """A restart policy without a REACHABLE limit is an unbounded loop.
+
+    systemd's defaults are 5 starts within 10 SECONDS; with `RestartSec=10s`
+    a loop can never reach 5 starts inside that window, so the default limit
+    never fires. On 2026-09-08 this unit restarted 1442 times over four hours
+    against a gateway that was already running. Both settings must be stated
+    explicitly, and the interval must be wide enough for the burst to be
+    reachable at this RestartSec.
+    """
+    home, _ = sandbox
+    spec = bs.model_gateway_spec(os_key="Linux", exec_argv=["/gw"])
+    bs.register(spec, templates_root=REPO_ROOT, system="Linux", home=home)
+    body = bs.systemd_unit_path(spec, home).read_text(encoding="utf-8")
+
+    interval = re.search(r"^StartLimitIntervalSec=(\d+)$", body, re.M)
+    burst = re.search(r"^StartLimitBurst=(\d+)$", body, re.M)
+    restart_sec = re.search(r"^RestartSec=(\d+)s$", body, re.M)
+    assert interval and burst and restart_sec, body
+
+    # Both under [Unit]: systemd reads them there, and a StartLimit* under
+    # [Service] is ignored on current versions. Compared by OFFSET against
+    # the section header, not by substring on a slice — a comment mentioning
+    # the setting satisfies a substring check, which would let the directive
+    # itself sit in the wrong section (or vanish) with the gate still green.
+    service_header = re.search(r"^\[Service\]$", body, re.M)
+    assert service_header is not None, body
+    for directive in (interval, burst):
+        assert directive.start() < service_header.start(), (
+            f"{directive.group(0)} must be under [Unit]; it is at "
+            f"offset {directive.start()}, after [Service] at "
+            f"{service_header.start()}"
+        )
+
+    seconds, starts, pace = (
+        int(interval.group(1)), int(burst.group(1)), int(restart_sec.group(1)),
+    )
+    assert starts * pace < seconds, (
+        f"{starts} starts paced {pace}s apart span {starts * pace}s, which "
+        f"must fit inside the {seconds}s window or the limit never fires"
+    )
+
+
+def test_the_launchagent_does_not_restart_a_clean_exit(sandbox):
+    """macOS twin of the same rule: exit 0 (stopped, or already running) is
+    a final state. A bare `KeepAlive` boolean would respin it."""
+    home, _ = sandbox
+    spec = bs.model_gateway_spec(os_key="Darwin", exec_argv=["/gw"])
+    bs.register(spec, templates_root=REPO_ROOT, system="Darwin", home=home)
+    body = bs.launchd_plist_path(spec, home).read_text(encoding="utf-8")
+    root = ET.fromstring(body)
+    top = root.find("dict")
+    assert top is not None
+    keys = [child.text for child in top if child.tag == "key"]
+    values = [child for child in top if child.tag != "key"]
+    keep_alive = values[keys.index("KeepAlive")]
+    assert keep_alive.tag == "dict", "a bare KeepAlive restarts a clean exit"
+    inner = [child.text for child in keep_alive if child.tag == "key"]
+    assert inner == ["SuccessfulExit"]
+    assert [c.tag for c in keep_alive if c.tag != "key"] == ["false"]
+    assert values[keys.index("ThrottleInterval")].text == "10"
+
+
+def test_the_windows_task_bounds_its_restarts(sandbox, monkeypatch):
+    """Windows twin. Task Scheduler restarts only a FAILED task, and the
+    count is bounded — both are what the other two OSes now state."""
+    home, _ = sandbox
+    monkeypatch.setenv("USERDOMAIN", "WORKGROUP")
+    monkeypatch.setenv("USERNAME", "tester")
+    spec = bs.model_gateway_spec(os_key="Windows", exec_argv=["gw.exe"])
+    bs.register(spec, templates_root=REPO_ROOT, system="Windows", home=home)
+    body = spec.windows_task_xml_path.read_text(encoding="utf-8")
+    root = ET.fromstring(body)
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    restart = root.find(".//t:RestartOnFailure", ns)
+    assert restart is not None
+    count = restart.find("t:Count", ns)
+    assert count is not None and 0 < int(count.text or "0") <= 10
+    assert restart.find("t:Interval", ns).text == "PT1M"
+
+
 def test_registration_is_refused_when_the_kill_switch_is_set(sandbox, monkeypatch):
     home, _ = sandbox
     monkeypatch.setenv("VCT_DISABLE_BOOT_SERVICE", "1")
@@ -294,6 +376,11 @@ def test_update_rerenders_an_existing_registration(sandbox):
     body = unit.read_text(encoding="utf-8")
     assert "/new/clone/bin/gw" in body
     assert "/old/clone/bin/gw" not in body
+    # ...and the re-render is how a POLICY change reaches a machine that
+    # registered before it existed: the restart limits added in v0.2.94 are
+    # in the unit after `--update`, not only in a fresh registration.
+    assert "StartLimitIntervalSec=" in body
+    assert "StartLimitBurst=" in body
 
 
 def test_update_creates_nothing_when_the_user_never_opted_in(sandbox):

@@ -94,6 +94,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from vco_lib.intfile import read_int_line
 from vco_lib.paths import vct_root_dir
 
 __all__ = [
@@ -208,18 +209,10 @@ def hub_pid() -> Optional[int]:
     unparseable lockfile is a regular ``None`` (the hub's own ``acquire()``
     overwrites it on next start) — never an exception.
     """
-    try:
-        raw = hub_pid_file().read_text(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        return None
-    first = raw.splitlines()[0].strip() if raw.splitlines() else ""
-    try:
-        pid = int(first)
-    except ValueError:
-        return None
     # `hub_status.rs` parses into u32, and the shell hooks' `pid_alive`
-    # rejects 0 explicitly. Both mean: not a startable owner.
-    return pid if pid > 0 else None
+    # rejects 0 explicitly. Both mean: not a startable owner — which is what
+    # `minimum=1` says to the shared reader.
+    return read_int_line(hub_pid_file(), minimum=1)
 
 
 def is_running() -> bool:

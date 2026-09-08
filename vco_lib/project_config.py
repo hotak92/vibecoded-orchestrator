@@ -95,6 +95,7 @@ from typing import Any, Callable, Optional
 import requests
 import requests.adapters
 
+from vco_lib.intfile import parse_int_line
 from vco_lib.paths import vct_root_dir
 
 
@@ -601,15 +602,20 @@ def _discover_hub() -> tuple[int, str]:
                 )
                 port = DEFAULT_HUB_PORT
             else:
-                try:
-                    port = int(raw) if raw else DEFAULT_HUB_PORT
-                except ValueError:
+                # The PARSE is shared (:func:`vco_lib.intfile.parse_int_line`);
+                # the classification above is not, and must not be — an
+                # unreadable file and a file of nonsense emit DIFFERENT
+                # warnings here, and that difference is the cross-language
+                # contract with the .sh/.ps1 siblings. Sharing the reader
+                # instead of the parser would have collapsed both into one.
+                parsed = parse_int_line(raw, minimum=1, maximum=65535)
+                if raw and parsed is None:
                     _warn_discovery(
                         "hub_port_invalid",
                         "hub.port contains non-integer content; "
                         "using default 7700",
                     )
-                    port = DEFAULT_HUB_PORT
+                port = parsed if parsed is not None else DEFAULT_HUB_PORT
 
         # Token: env > file > fail.
         #

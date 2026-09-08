@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional, Sequence
 
-from .routing import advertised_id
+from .routing import advertised_id, with_1m
 from .vendors import (
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
@@ -64,6 +64,12 @@ SOURCE_LIVE = "live"
 SOURCE_STATIC = "static"
 SOURCE_UNFETCHED = "unfetched"
 SOURCE_EMPTY = "unavailable"
+
+#: Appended to the display name of a ``[1m]`` companion entry so the picker
+#: shows two distinguishable rows for one model rather than the same name
+#: twice. The vendor path has its own ``· 1M ctx`` marker; this one is
+#: spelled out because a first-party row has no vendor suffix beside it.
+ONE_M_DISPLAY_SUFFIX = " (1M context)"
 
 
 @dataclass(frozen=True)
@@ -310,17 +316,37 @@ class CatalogService:
     ) -> tuple[list[CatalogEntry], dict[str, str]]:
         """Build the picker list.
 
-        First-party ids are published verbatim — the client knows them and
-        their windows natively. Vendor ids are published under the vendor's
-        namespace, with the ``[1m]`` suffix added only when the chat-model
-        context table says so for that EXACT id.
+        Vendor ids are published under the vendor's namespace, with the
+        ``[1m]`` suffix added only when the chat-model context table says so
+        for that EXACT id.
+
+        First-party ids are published verbatim AND, when the table says the
+        model has a 1M window, a second time with the ``[1m]`` suffix. Both,
+        not one: the plain id is the model, the suffixed one is the client's
+        request for the large window on that same model, and a user who wants
+        the 200K behaviour must still be able to ask for it. The claim that
+        "the client knows first-party windows natively" — which is why this
+        used to publish the plain id alone — is false in the one place it
+        mattered: with a custom base URL the client budgets 200K for a 1M
+        model unless the id carries the suffix, so a long session compacted
+        at a fifth of the context the user was paying for.
         """
         sources: dict[str, str] = {}
         entries: list[CatalogEntry] = []
 
         first = await self._anthropic_entries()
         sources[self._anthropic.family_id] = first.source
-        entries.extend(sorted(first.entries, key=lambda e: e.id))
+        published: list[CatalogEntry] = []
+        for entry in first.entries:
+            published.append(entry)
+            if advertise_1m(entry.id):
+                published.append(
+                    CatalogEntry(
+                        id=with_1m(entry.id),
+                        display_name=f"{entry.display_name}{ONE_M_DISPLAY_SUFFIX}",
+                    )
+                )
+        entries.extend(sorted(published, key=lambda e: e.id))
 
         for vendor in self._vendors.values():
             family = await self._vendor_entries(vendor)
@@ -364,6 +390,7 @@ def to_models_response(
 
 
 __all__ = [
+    "ONE_M_DISPLAY_SUFFIX",
     "SOURCE_EMPTY",
     "SOURCE_LIVE",
     "SOURCE_STATIC",

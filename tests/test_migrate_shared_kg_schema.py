@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import subprocess
 import tempfile
 import threading
@@ -30,15 +29,13 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from tests.common.ports import free_port
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_SH = REPO_ROOT / "scripts" / "migrate-shared-kg-schema.sh"
 SCRIPT_PS1 = REPO_ROOT / "scripts" / "migrate-shared-kg-schema.ps1"
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class _MockHandler(BaseHTTPRequestHandler):
@@ -127,7 +124,7 @@ def _start_mock(classes: list, objects: list = None, graphql_fail: bool = False)
     _MockHandler.delete_log = []
     _MockHandler.objects = list(objects or [])
     _MockHandler.graphql_fail = graphql_fail
-    port = _free_port()
+    port = free_port()
     server = HTTPServer(("127.0.0.1", port), _MockHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -154,7 +151,7 @@ class BashScriptTests(unittest.TestCase):
                         "Migration script must be executable (chmod +x)")
 
     def test_unreachable_weaviate_soft_fails(self):
-        port = _free_port()  # nothing bound
+        port = free_port()  # nothing bound
         env = os.environ.copy()
         env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
         env["SHARED_KG_COLLECTION"] = "FooBar_Shared"
