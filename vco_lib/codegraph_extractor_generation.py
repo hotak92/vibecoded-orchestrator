@@ -100,7 +100,12 @@ logger = logging.getLogger(__name__)
 #:
 #: 0.2.92 — Python ``CodeAPI`` emission added (was structurally absent);
 #:          C# route-attribute binding corrected + leading-slash normalisation.
-EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92",)
+#: 0.2.93 — no extractor changes. Appended so the ladder keeps COVERING the
+#:          release (the pinned delivery guard in test_v0292_wp5*_delivery
+#:          requires the newest bump >= the package version); the cost is one
+#:          incremental background re-walk per project on its next bundle
+#:          update (unchanged entities are not re-embedded).
+EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93")
 
 #: The newest generation a freshly-built graph satisfies.
 CURRENT_EXTRACTOR_GENERATION: str = EXTRACTOR_GENERATION_BUMPS[-1]

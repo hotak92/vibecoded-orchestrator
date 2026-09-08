@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.93] - 2026-09-08
+
+The dogfood-release. v0.2.92's own update to the maintainer's install died
+at install step 5 (containers owned by a legacy compose project) with the
+launcher showing nothing; this release is the fix wave that came out of it,
+plus the Multimodel ↔ Remote Control switch. v0.2.92 is retired as defective.
 
 ### Fixed — install step 5 on machines whose containers another compose project created (v0.2.93)
 

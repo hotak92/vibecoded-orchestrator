@@ -120,9 +120,15 @@ def test_an_unprovable_graph_still_owes_the_rewalk() -> None:
 
 def test_a_stamped_project_is_left_alone() -> None:
     """LEAVE-ALONE: the stamp is written only after a clean force walk."""
+    # v0.2.93 release-time pin move: the scenario versions are DERIVED from
+    # the ladder so this stays the same test at every future append (the
+    # shape — version crossing the newest bump, stamp AT the newest
+    # generation — is what "leave alone" means).
+    newest = EXTRACTOR_GENERATION_BUMPS[-1]
+    below_newest = EXTRACTOR_GENERATION_BUMPS[-2] if len(EXTRACTOR_GENERATION_BUMPS) > 1 else "0.2.91"
     v = decide(
-        prev_version="0.2.91", running_version="0.2.92",
-        stamp_generation="0.2.92", graph_exists=True,
+        prev_version=below_newest, running_version=newest,
+        stamp_generation=newest, graph_exists=True,
     )
     assert v.needs_reindex is False
     assert v.reason == REASON_STAMP_CURRENT

@@ -257,8 +257,11 @@ def test_plan_does_not_probe_weaviate_when_the_stamp_is_current(tmp_path: Path):
         calls.append(names)
         return {n: True for n in names}
 
-    ceg.write_stamp(tmp_path, "0.2.92")
-    v = ceg.plan(tmp_path, prev_version="0.2.50", running_version="0.2.92",
+    # v0.2.93 release-time pin move: "current stamp" means AT the newest
+    # ladder bump — derive it so this stays true at every future append.
+    ceg.write_stamp(tmp_path, ceg.EXTRACTOR_GENERATION_BUMPS[-1])
+    v = ceg.plan(tmp_path, prev_version="0.2.50",
+                 running_version=ceg.EXTRACTOR_GENERATION_BUMPS[-1],
                  project_name="DemoProj", probe=probe)
     assert v.needs_reindex is False
     assert calls == [], "a current stamp must answer without touching Weaviate"
