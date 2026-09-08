@@ -688,10 +688,14 @@ where
 /// `claude_mcp_servers/model_router/__main__.py::_bind_socket` (v0.2.94):
 /// both sides answer "is this port usable" for the SAME start, so a launcher
 /// that calls a port free where the daemon's bind refuses it reports a
-/// gateway that is not there. MUST MATCH that function's rule; the platform
-/// scoping of `SO_REUSEADDR` differs between the two languages (Rust std
-/// applies it on all non-Windows targets, the daemon on Linux only), which
-/// is exactly why question 1 is asked FIRST rather than left to the bind.
+/// gateway that is not there. MUST MATCH that function's rule, and the two
+/// sides now hold the SAME socket options: `SO_REUSEADDR` on every
+/// non-Windows target (Rust std sets it in `TcpListener::bind`; the daemon in
+/// `_apply_reuse_flags`) and no reuse option on Windows, where the flag means
+/// "steal a port another process is listening on". On EVERY OS the
+/// `connect()` of question 1 is the liveness half — the half a reuse flag
+/// cannot weaken, because it is not a bind — so the two "is it free?" answers
+/// agree wherever the gateway runs.
 pub(crate) fn port_is_free(port: u16) -> bool {
     port_is_free_with(port, port_answers, port_binds)
 }
