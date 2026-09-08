@@ -63,6 +63,10 @@ def _assert_no_downgrade_advice(text: str) -> None:
 def test_skill_ships_with_valid_frontmatter():
     text = _text(SKILL)
     assert text.startswith("---\n"), "SKILL.md must open with frontmatter"
+    # v0.2.93: the launcher's populate validates this key; a bundled skill
+    # without it warns in every project (field 2026-09-08).
+    assert re.search(r'^model: \\S+', text.split('---', 2)[1], re.MULTILINE), \
+        'rc-native must declare a model:'
     fm = text.split("---\n", 2)[1]
     meta = {}
     for line in fm.splitlines():
@@ -73,6 +77,22 @@ def test_skill_ships_with_valid_frontmatter():
     assert meta.get("description"), "no description = never auto-invoked"
 
 
+
+
+def test_every_bundled_skill_declares_a_model():
+    """v0.2.93 (field 2026-09-08): the rc-native skill shipped in v0.2.92
+    without a ``model:`` key — the launcher's populate warns per project and
+    the GUI renders Model as "—". Every bundled skill must declare one so the
+    Agents/Skills tabs stay honest about what answers.
+    """
+    import re as _re
+    skills_dir = Path(__file__).resolve().parent.parent / "templates" / "skills"
+    missing = []
+    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        fm = skill_md.read_text(encoding="utf-8").split("---", 2)
+        if len(fm) < 3 or not _re.search(r"^model:\s*\S+", fm[1], _re.MULTILINE):
+            missing.append(skill_md.parent.name)
+    assert not missing, f"bundled skills without model: frontmatter: {missing}"
 def test_skill_auto_starts_the_backend_on_every_invocation():
     text = _text(SKILL).lower()
     assert "every invocation" in text or "auto-start" in text

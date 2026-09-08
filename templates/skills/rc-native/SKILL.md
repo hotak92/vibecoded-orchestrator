@@ -4,6 +4,7 @@ description: Start/manage Claude Code Remote Control (claude.ai/code + mobile ap
 short_desc: "rc-native: detached native-auth Remote Control server alongside the gateway panel"
 keywords: [remote-control, "remote control", rc-native, claude.ai, "phone access", "mobile app", "/remote-control", "Remote Control initialization failed", endpoint gate, native auth]
 argument-hint: "[start|status|url|stop|logs]"
+model: haiku
 ---
 
 # rc-native — Remote Control alongside the gateway panel
