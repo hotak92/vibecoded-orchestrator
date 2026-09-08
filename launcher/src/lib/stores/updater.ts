@@ -276,15 +276,22 @@ export function pickKind(status: {
   // source. Re-entering via resume_orchestrator_update is the ONLY
   // correct next step.
   //
-  // Then: binary > install > remote (unchanged from v0.2.16).
+  // Then: binary > remote > install (v0.2.93 — see below).
   // - binary_stale wins because restart is fastest + a newer binary can
   //   change every other code path.
-  // - install_stale next: without an install.py pass, `.claude/` drifts.
-  // - remote_ahead last: "fully behind" but lowest urgency.
+  // - remote_ahead ABOVE install_stale (v0.2.93, field incident 2026-09-08):
+  //   a half-finished install previously masked the only action that PULLS
+  //   (`apply_pending_install` runs install.py from the tree as it stands),
+  //   so a user whose update died mid-install could never reach a newer
+  //   release through the badge — Resume re-ran the old installer forever.
+  //   The update flow INCLUDES the install (its post-pull tail), so when the
+  //   remote is ahead it is strictly the better offer; install_stale alone
+  //   (source ahead with no remote update, e.g. a shell pull) keeps the
+  //   install action.
   if (status.merge_resolved_incomplete) return 'merge_resolved_incomplete';
   if (status.binary_stale) return 'binary_stale';
-  if (status.install_stale) return 'install_stale';
   if (status.remote_ahead) return 'remote_ahead';
+  if (status.install_stale) return 'install_stale';
   return null;
 }
 

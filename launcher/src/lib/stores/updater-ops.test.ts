@@ -339,7 +339,12 @@ describe('pickKind priority (v0.2.93)', () => {
     expect(
       mod.pickKind({ remote_ahead: true, install_stale: true, binary_stale: true }),
     ).toBe('binary_stale');
+    // v0.2.93 (field 2026-09-08): a half-finished install must NOT mask the
+    // only action that pulls — the update flow includes the install.
     expect(mod.pickKind({ remote_ahead: true, install_stale: true, binary_stale: false })).toBe(
+      'remote_ahead',
+    );
+    expect(mod.pickKind({ remote_ahead: false, install_stale: true, binary_stale: false })).toBe(
       'install_stale',
     );
     expect(mod.pickKind({ remote_ahead: true, install_stale: false, binary_stale: false })).toBe(
