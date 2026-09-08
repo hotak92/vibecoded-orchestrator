@@ -63,10 +63,6 @@ def _assert_no_downgrade_advice(text: str) -> None:
 def test_skill_ships_with_valid_frontmatter():
     text = _text(SKILL)
     assert text.startswith("---\n"), "SKILL.md must open with frontmatter"
-    # v0.2.93: the launcher's populate validates this key; a bundled skill
-    # without it warns in every project (field 2026-09-08).
-    assert re.search(r'^model: \\S+', text.split('---', 2)[1], re.MULTILINE), \
-        'rc-native must declare a model:'
     fm = text.split("---\n", 2)[1]
     meta = {}
     for line in fm.splitlines():
@@ -75,6 +71,9 @@ def test_skill_ships_with_valid_frontmatter():
             meta[key.strip()] = value.strip()
     assert meta.get("name") == "rc-native"
     assert meta.get("description"), "no description = never auto-invoked"
+    # v0.2.93: the launcher's populate validates this key; a bundled skill
+    # without it warns in every project (field 2026-09-08).
+    assert meta.get("model"), "rc-native must declare a model:"
 
 
 
