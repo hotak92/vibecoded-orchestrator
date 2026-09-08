@@ -955,6 +955,56 @@ mod tests {
     }
 
     #[test]
+    fn systemd_unit_bounds_the_restart_loop_under_unit() {
+        // `Restart=on-failure` + `RestartSec=10s` with no start limit is an
+        // UNBOUNDED loop: systemd's default is 5 starts in 10 SECONDS, which
+        // a 10s RestartSec can never reach, so the default limit never fires.
+        let body = render_systemd_unit(
+            &PathBuf::from("/opt/vct/vct-hub"),
+            &PathBuf::from("/home/me/.vct"),
+        );
+        // Line-anchored: a mention inside the comment above them must not
+        // satisfy this.
+        assert!(
+            body.lines().any(|l| l.trim_end() == "StartLimitIntervalSec=600"),
+            "no StartLimitIntervalSec — the restart loop is unbounded:\n{}",
+            body
+        );
+        assert!(
+            body.lines().any(|l| l.trim_end() == "StartLimitBurst=5"),
+            "no StartLimitBurst — the restart loop is unbounded:\n{}",
+            body
+        );
+
+        // Both under [Unit]. systemd reads them there; the same keys under
+        // [Service] are REJECTED, which would leave the loop unbounded while
+        // the file looked correct.
+        // Split on the section HEADER LINE, not on the substring: the
+        // comment above these keys names `[Service]` too, and splitting on
+        // that cut the section short (this test failed that way first).
+        let unit_section: Vec<&str> = body
+            .lines()
+            .take_while(|l| l.trim_end() != "[Service]")
+            .collect();
+        assert!(
+            body.lines().any(|l| l.trim_end() == "[Service]"),
+            "the unit has no [Service] section header:\n{}",
+            body
+        );
+        let unit_section = unit_section.join("\n");
+        assert!(
+            unit_section.contains("StartLimitIntervalSec="),
+            "StartLimitIntervalSec is not in the [Unit] section:\n{}",
+            body
+        );
+        assert!(
+            unit_section.contains("StartLimitBurst="),
+            "StartLimitBurst is not in the [Unit] section:\n{}",
+            body
+        );
+    }
+
+    #[test]
     fn systemd_unit_has_no_placeholder_leakage() {
         let body = render_systemd_unit(
             &PathBuf::from("/opt/vct/vct-hub"),

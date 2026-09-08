@@ -35,7 +35,9 @@
     DEFAULT_GATEWAY_MODEL,
     canStop,
     checkModelGateway,
+    defaultModelError,
     describeStatus,
+    pointPanelPort,
     describeWriteResult,
     gatewayIsConfigured,
     getModelGatewayStatus,
@@ -166,9 +168,16 @@
   let vsResult = $state<VSCodeWriteResult | null>(null);
   // Default model: OFF. VCO adds the gateway's catalogue to the picker; the
   // model is the user's choice, made visibly, in the picker or here.
+  //
+  // v0.2.94: the entry is validated first-party-only. ANTHROPIC_MODEL is
+  // what a RESTARTED Claude Code panel resumes on, and this control's
+  // pre-selected GLM id is how one reached a real settings.json on
+  // 2026-09-08. The Python writer refuses a vendor id independently; this is
+  // the inline error that stops the user finding out after the write.
   let setDefaultModel = $state(false);
   let modelChoice = $state(DEFAULT_GATEWAY_MODEL);
   let removeSlots = $state(false);
+  const modelError = $derived(setDefaultModel ? defaultModelError(modelChoice) : '');
 
   // Per-project CLAUDE.md routing-guidance flags, keyed by project id.
   let guidance = $state<Record<string, boolean>>({});
@@ -226,11 +235,17 @@
 
   async function doPointPanel() {
     if (!vsSelected) return;
+    if (modelError) return;
     await gwAction(async () => {
       vsResult = await pointPanelAtGateway({
         path: vsSelected!,
         model: setDefaultModel ? modelChoice : null,
         removeSlotOverrides: removeSlots,
+        // The port THIS card is describing, when it has proof one is live.
+        // Without it the Rust side re-resolves and can write a base URL
+        // naming a different process (R1-1, same class); null when nothing
+        // is running keeps the pre-v0.2.94 resolution.
+        port: pointPanelPort(gw),
       });
       await refreshInspection();
     });
@@ -896,11 +911,17 @@
         {#if setDefaultModel}
           <input
             class="gw-model"
+            class:invalid={!!modelError}
             type="text"
             bind:value={modelChoice}
             disabled={gwBusy}
             aria-label="Default model id"
+            aria-invalid={!!modelError}
+            aria-describedby={modelError ? 'gw-model-error' : undefined}
           />
+          {#if modelError}
+            <span class="gw-model-error" id="gw-model-error" role="alert">{modelError}</span>
+          {/if}
         {/if}
         {#if vsInspection && vsInspection.slot_overrides.length > 0}
           <label class="gw-toggle">
@@ -910,9 +931,13 @@
         {/if}
       </div>
       <p class="muted small">
-        Leaving the Default entry unset keeps whatever you already chose. VCO
+        Leaving the Default entry unset keeps whatever you already chose. The
+        Default must be a Claude id: it is what a RESTARTED panel falls back
+        to, so a vendor model there answers sessions you believe are on
+        Claude — pick vendor models in the /model picker, which is what the
+        gateway's catalogue is for. VCO
         never sets the Opus / Sonnet / Haiku / Fable tier slots or the subagent
-        slot: the name you pick in the picker has to be the model that answers.
+        slot either: the name you pick in the picker has to be the model that answers.
         That is safe here precisely because this gateway forwards real Claude
         ids to Anthropic — pointed straight at a third-party endpoint instead,
         those same names come back answered by the vendor's own small model
@@ -927,7 +952,7 @@
       <div class="bulk-actions">
         <button
           onclick={doPointPanel}
-          disabled={gwBusy || !vsSelected || !gwConfigured}
+          disabled={gwBusy || !vsSelected || !gwConfigured || !!modelError}
           title={gwConfigured
             ? 'Write the routing keys into this settings file'
             : 'Start the gateway once first — it creates the host token this action writes.'}
@@ -1216,6 +1241,14 @@
     background: var(--button-bg, #2a2a2a);
     color: inherit;
     font-size: 0.85rem;
+  }
+  .gw-model.invalid {
+    border-color: var(--color-pink, #ff4fa0);
+  }
+  .gw-model-error {
+    flex-basis: 100%;
+    color: var(--color-pink, #ff4fa0);
+    font-size: 0.8rem;
   }
   .gw-options {
     display: flex;

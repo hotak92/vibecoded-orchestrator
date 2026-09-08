@@ -238,6 +238,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_moves (v0.2.92, WP-17/W3 — the project-move ledger). A move rewrites a project's path across launcher.db, its .claude/ state and its collection bindings; the risk is not the write but the INTERRUPTION, so the move gets a durable state machine instead of hope. Two things a sentinel FILE cannot do, which is why this is a table: (1) SINGLE-FLIGHT — the partial UNIQUE index on project_id WHERE status IN ('running','flipped') makes a second concurrent move of the same project fail in SQLite, not in application logic, so there is no check-then-act window between a GUI click and a CLI run; (2) SURVIVING THE FOLDER — a move whose destination was never created leaves no readable sentinel anywhere, while this row is what the launcher's boot sweep reads. The status machine IS the failure-semantics contract: 'running' = files may be copying INTO the destination but NOTHING in `projects` changed (the project still lives at src and works; the destination holds only ADDED files because the engine never overwrites); 'flipped' = the commit transaction succeeded — folder_path flipped, project_agents/project_skills/project_kg_bindings path columns re-pointed, code-graph rebuild queued, all atomically — so the project lives at dst and works while post-commit reconciliation may still be owed; 'completed' = reconciliation ran too; 'failed' = aborted before the flip, project never moved. There is deliberately no 'rolling_back' state: nothing is rolled back because nothing was overwritten or deleted, so undoing a refused move is a REPORT, not a state. Rows are never deleted — a completed move's row is the only durable record that this project used to live elsewhere, long after the dismissible ledger entry is gone; they die with their project via the FK cascade. Plain CREATE TABLE/INDEX IF NOT EXISTS — idempotent by construction AND by the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 43->44 atomically with this migration (B-2).",
         sql: include_str!("migrations/044_project_moves.sql"),
     },
+    Migration {
+        version: 45,
+        description: "chat_model_context_tombstone (v0.2.94 — the other half of the per-row boot seed). The seed used to write only into an EMPTY table, and that emptiness gate doubled as the \"do not reinstate what the user deleted\" guarantee; it also meant an UPGRADED install never saw a newly shipped model (v0.2.93 added four Claude 5 rows and every table that already held the ten GLM rows stayed at ten, so the gateway kept advertising Claude ids with the client's conservative default window). The seed is now per-row — insert what is absent, never touch what is there — which fixes upgrades and would otherwise resurrect a row the user deleted, because an absent row is absent whether it was deleted or is new. This table is that distinction. A TABLE and not a flag column because the row it remembers no longer exists; no FK to chat_model_context for the same reason (an FK would delete the memory with the thing remembered). Two readers, and the asymmetry is the design: the BOOT SEED skips any tombstoned id (an automatic path must never undo an explicit human delete), while \"Reseed from shipped defaults\" CLEARS the tombstones it re-inserts (a deliberate click, and that button already documents itself as restoring a deleted shipped row). Plain CREATE TABLE IF NOT EXISTS — idempotent by construction AND by the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 44->45 atomically with this migration (B-2).",
+        sql: include_str!("migrations/045_chat_model_context_tombstone.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2826,6 +2831,92 @@ mod tests {
             rusqlite::params![id, folder],
         )
         .expect("seed project");
+    }
+
+    // ─── Migration 045 — chat_model_context_tombstone (v0.2.94) ──────────
+
+    /// FRESH BRANCH: the table exists with exactly the two documented
+    /// columns, keyed by model_id.
+    #[test]
+    fn migration_045_creates_the_tombstone_table_on_a_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let v: u32 = conn
+            .query_row("SELECT MAX(version) FROM _schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(v >= 45, "expected at least version 45, got {}", v);
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(chat_model_context_tombstone)")
+            .unwrap();
+        let cols: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(names, vec!["model_id", "deleted_at"]);
+        assert_eq!(
+            cols.iter().filter(|c| c.1 > 0).map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            vec!["model_id"],
+            "model_id is the primary key — one tombstone per model"
+        );
+    }
+
+    /// UPGRADE BRANCH: applying over a v44 database leaves the existing
+    /// chat_model_context rows alone. The tombstone table is additive; a user
+    /// who upgrades must not lose the context rows they already have.
+    #[test]
+    fn migration_045_applies_on_upgrade_from_v44_preserving_context_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 44).expect("apply up to v44");
+        conn.execute(
+            "INSERT INTO chat_model_context
+                (model_id, vendor, context_window, max_output, window_1m,
+                 source, source_note, user_edited, updated_at)
+             VALUES ('glm-5.1', 'zai', 200000, 128000, 0,
+                     'https://docs.z.ai/x', '', 1, '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply the rest");
+
+        let kept: i64 = conn
+            .query_row(
+                "SELECT user_edited FROM chat_model_context WHERE model_id = 'glm-5.1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "an existing user-edited row survives the upgrade");
+        let tombstones: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_model_context_tombstone", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(tombstones, 0, "an upgrade invents no deletions");
+    }
+
+    /// The two CHECKs: neither column may hold a blank or whitespace-only
+    /// value. Same character set as migration 043 — SQLite's one-argument
+    /// `trim()` strips spaces ONLY, so a tab would otherwise pass.
+    #[test]
+    fn migration_045_refuses_a_blank_or_whitespace_only_tombstone() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).expect("apply migrations");
+        for (id, at) in [("", "2026-09-08T00:00:00Z"), ("\t", "2026-09-08T00:00:00Z"), ("glm-5.1", " ")] {
+            let err = conn.execute(
+                "INSERT INTO chat_model_context_tombstone (model_id, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![id, at],
+            );
+            assert!(err.is_err(), "accepted a blank tombstone: ({:?}, {:?})", id, at);
+        }
     }
 
     /// FRESH BRANCH: a brand-new database gets the table with the documented

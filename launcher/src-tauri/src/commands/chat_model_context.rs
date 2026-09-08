@@ -184,8 +184,17 @@ pub fn export_now(db: &Db) -> ExportReport {
             }
         }
     };
+    // The tombstones ride along so the gateway's own seed fallback cannot
+    // advertise a row this machine deleted (cross-lane contract, v0.2.94). A
+    // read failure here degrades to "no tombstones" rather than failing the
+    // export: the models are the load-bearing half, and an export that never
+    // lands leaves the gateway on a stale file.
+    let tombstones = db.list_chat_model_context_tombstones().unwrap_or_else(|e| {
+        tracing::warn!("[vct] chat-model context: could not read tombstones: {}", e);
+        Vec::new()
+    });
     let generated_at = now_iso8601_utc();
-    let doc = export_document(&rows, &generated_at);
+    let doc = export_document(&rows, &tombstones, &generated_at);
 
     match atomic_write_json(&path, &doc, BackupPolicy::Once { ext: "pre-vco" }) {
         Ok(()) => ExportReport {
@@ -214,7 +223,13 @@ pub fn export_now(db: &Db) -> ExportReport {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
 
-/// First-boot seed + export, called once from `lib.rs::run`.
+/// Boot seed + export, called once from `lib.rs::run`.
+///
+/// The seed inserts shipped rows the table does not have yet — including on
+/// an UPGRADED install, which the first-boot-only gate this replaced could
+/// not do (0.2.93 shipped four Claude rows that reached no existing table).
+/// The export then runs unconditionally, so a table that gained rows reaches
+/// the gateway in the same boot rather than waiting for the next mutation.
 ///
 /// Soft-fail end to end: nothing here may block the launcher from starting.
 /// Every failure path logs a line a user can act on, and none of them leave
@@ -222,10 +237,10 @@ pub fn export_now(db: &Db) -> ExportReport {
 /// transaction).
 pub fn seed_and_export_on_boot(db: &Db) {
     match load_seed_rows(db) {
-        Ok(Some((path, rows))) => match db.seed_chat_model_context_if_empty(&rows) {
+        Ok(Some((path, rows))) => match db.seed_chat_model_context_upsert_missing(&rows) {
             Ok(0) => {}
             Ok(n) => tracing::info!(
-                "[vct] chat-model context: seeded {} row(s) from {}",
+                "[vct] chat-model context: seeded {} new row(s) from {}",
                 n,
                 path.display()
             ),

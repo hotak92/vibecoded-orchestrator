@@ -199,10 +199,24 @@ class SchemaParityTests(unittest.TestCase):
     def test_the_top_level_document_keys_are_the_contracts(self) -> None:
         self.assertEqual(
             _rust_export_doc_keys(),
-            ["schema_version", "generated_at", "source", "models"],
+            ["schema_version", "generated_at", "source", "models", "tombstones"],
             "top-level shape (and, under serde_json's preserve_order, the "
             "on-disk key ORDER) drifted from the documented contract",
         )
+
+    def test_tombstones_is_a_top_level_list_the_gateway_can_read(self) -> None:
+        """CROSS-LANE CONTRACT (v0.2.94): model ids this machine DELETED.
+
+        The gateway ships the same seed inside its own wheel, so without this
+        list a row deleted in the launcher keeps its `[1m]` companion in the
+        gateway's fallback. Always present, possibly empty — an absent key and
+        an empty list must not mean different things to the reader.
+        """
+        self.assertIn("tombstones", _rust_export_doc_keys())
+        builder = _RUST_CORE.read_text(encoding="utf-8")
+        self.assertIn("serde_json::Value::Array(", builder)
+        self.assertIn("deleted.sort();", builder, "sorted, so a re-export is stable")
+        self.assertIn("deleted.dedup();", builder)
 
 
 class RoundTripThroughTheRealReaderTests(unittest.TestCase):
@@ -231,6 +245,9 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
                 "generated_at": "2026-09-02T18:04:11Z",
                 "source": _rust_str_const(_RUST_CORE, "EXPORT_SOURCE_LAUNCHER_DB"),
                 "models": models,
+                # v0.2.94 cross-lane contract. Empty here: this fixture is the
+                # shipped seed, and the reader must accept the key either way.
+                "tombstones": [],
             }[key]
         return doc
 

@@ -40,6 +40,8 @@ GLM = "claude-gw/glm-5.3"
 GLM_1M = "claude-gw/glm-5.3[1m]"
 FLASH_1M = "claude-gw/glm-5.3-flash[1m]"
 CLAUDE_45 = "claude-opus-4-5"
+OPUS = "claude-opus-5"
+OPUS_1M = "claude-opus-5[1m]"
 
 POSIX_ONLY = "POSIX mode bits do not exist on Windows"
 
@@ -90,6 +92,22 @@ def _block(path: Path) -> dict:
 @pytest.fixture()
 def stash(tmp_path: Path) -> Path:
     return tmp_path / "state" / "model-gateway" / "vscode-mode-stash.json"
+
+
+@pytest.fixture(autouse=True)
+def _offline_gateway_probe(monkeypatch):
+    """`panel_mode` probes the gateway's /health; these tests must not.
+
+    Without this, every `--get` in this file makes a real request to
+    127.0.0.1:<gateway port> — which on a developer machine may be answered
+    by whatever else owns that port (the 2026-09-08 machine had a legacy
+    container on 11436). The probe itself is tested in
+    tests/test_vscode_settings.py against a faked
+    ``http.client.HTTPConnection`` (NOT ``urlopen``: the probe deliberately
+    bypasses urllib so a loopback health check cannot be answered by an
+    ``http_proxy``).
+    """
+    monkeypatch.setattr(vs, "probe_gateway", lambda **_kw: vs.GATEWAY_STOPPED)
 
 
 @pytest.fixture(autouse=True)
@@ -368,6 +386,8 @@ def test_refused_settings_write_removes_a_stash_it_created(
 
 
 def test_round_trip_restores_the_exact_gateway_choices(tmp_path: Path, stash: Path):
+    """A first-party Default never leaves the file at all: it resolves in
+    both modes, so the remote-control leg has no reason to take it out."""
     path = _pointed(
         tmp_path,
         {
@@ -375,17 +395,20 @@ def test_round_trip_restores_the_exact_gateway_choices(tmp_path: Path, stash: Pa
             "CLAUDE_CODE_SUBAGENT_MODEL": CLAUDE_45,
             "MY_OWN_KEY": "kept",
         },
+        model=OPUS_1M,
     )
     original = _block(path)
     vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in _block(path)
+    assert _block(path)[vs.MODEL_KEY] == OPUS_1M, "a Claude Default resolves natively"
 
     out = vs.set_mode(
         path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash,
     )
     assert out["ok"] and out["status"] == "written", out
     assert out["mode"] == vs.MODE_MULTIMODEL
-    assert out["keys_restored"] == ["ANTHROPIC_DEFAULT_HAIKU_MODEL", vs.MODEL_KEY]
+    assert out["keys_restored"] == ["ANTHROPIC_DEFAULT_HAIKU_MODEL"]
+    assert out["refusal_reason"] is None
     assert "Restored" in out["message"]
     assert _block(path) == original, "the round trip is exact"
     assert _doc(path)[vs.LOGIN_PROMPT_KEY] is True
@@ -393,9 +416,43 @@ def test_round_trip_restores_the_exact_gateway_choices(tmp_path: Path, stash: Pa
     assert out["stash_present"] is False
 
 
+def test_multimodel_refuses_to_restore_a_vendor_default(tmp_path: Path, stash: Path):
+    """USER RULING 2026-09-08, on the leg that would have re-created it.
+
+    The stash is the user's own state, and the slot values below come back
+    verbatim — but ANTHROPIC_MODEL is the value a RESTARTED panel resumes on,
+    and a vendor id there is the incident. So this ONE key does not come
+    back, and the result says which id it declined and why.
+    """
+    path = _pointed(
+        tmp_path,
+        {"ANTHROPIC_DEFAULT_HAIKU_MODEL": FLASH_1M, "CLAUDE_CODE_SUBAGENT_MODEL": CLAUDE_45},
+        model=GLM_1M,
+    )
+    stashed = vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
+    assert vs.MODEL_KEY in stashed["values_stashed"]
+
+    out = vs.set_mode(
+        path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash,
+    )
+    assert out["ok"] and out["status"] == "written"
+    block = _block(path)
+    assert vs.MODEL_KEY not in block, "the vendor Default does not come back"
+    assert block["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == FLASH_1M, (
+        "a per-tier slot is the user's explicit choice and is restored"
+    )
+    assert block["CLAUDE_CODE_SUBAGENT_MODEL"] == CLAUDE_45
+    assert out["keys_restored"] == ["ANTHROPIC_DEFAULT_HAIKU_MODEL"]
+    reason = out["refusal_reason"]
+    assert reason and GLM_1M in reason and vs.MODEL_KEY in reason
+    assert reason in out["message"]
+
+
 def test_restored_plain_values_are_decorated(tmp_path: Path, stash: Path):
-    """A stash made by a pre-seed VCO could hold a plain ``claude-gw/glm-5.3``;
-    the restore passes through the same [1m] loop as every other value."""
+    """A stash made by a pre-seed VCO could hold a plain
+    ``claude-gw/glm-5.3-flash``; the restore passes through the same [1m]
+    loop as every other value. The vendor Default in the same stash is
+    refused — one leg, two rules, neither swallowing the other."""
     path = _pointed(tmp_path, {"ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-gw/glm-5.3-flash"}, model=GLM)
     vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
     assert json.loads(stash.read_text())["values"][vs.MODEL_KEY] == GLM
@@ -403,9 +460,10 @@ def test_restored_plain_values_are_decorated(tmp_path: Path, stash: Path):
     out = vs.set_mode(path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash)
     assert out["status"] == "written"
     block = _block(path)
-    assert block[vs.MODEL_KEY] == GLM_1M
+    assert vs.MODEL_KEY not in block
+    assert out["refusal_reason"] and GLM in out["refusal_reason"]
     assert block["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == FLASH_1M
-    assert set(out["values_healed"]) == {vs.MODEL_KEY, "ANTHROPIC_DEFAULT_HAIKU_MODEL"}
+    assert out["values_healed"] == ["ANTHROPIC_DEFAULT_HAIKU_MODEL"]
 
 
 def test_multimodel_without_a_stash_is_a_plain_point(tmp_path: Path, stash: Path):
@@ -436,6 +494,7 @@ def test_full_round_trip_twice_ends_where_it_started(tmp_path: Path, stash: Path
     path = _pointed(
         tmp_path,
         {"ANTHROPIC_DEFAULT_HAIKU_MODEL": FLASH_1M, "CLAUDE_CODE_SUBAGENT_MODEL": CLAUDE_45},
+        model=OPUS_1M,
     )
     start = _doc(path)
     for _ in range(2):
@@ -443,6 +502,21 @@ def test_full_round_trip_twice_ends_where_it_started(tmp_path: Path, stash: Path
         vs.set_mode(path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash)
     assert _doc(path) == start
     assert not stash.exists()
+
+
+def test_a_vendor_default_is_dropped_by_the_first_round_trip_and_stays_dropped(
+    tmp_path: Path, stash: Path,
+):
+    """The incident's own file, run through the switch: the GLM Default goes
+    and does not come back, while everything else round-trips."""
+    path = _pointed(tmp_path, {"CLAUDE_CODE_SUBAGENT_MODEL": CLAUDE_45}, model=GLM_1M)
+    for _ in range(2):
+        vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
+        vs.set_mode(path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash)
+    block = _block(path)
+    assert vs.MODEL_KEY not in block
+    assert block["CLAUDE_CODE_SUBAGENT_MODEL"] == CLAUDE_45
+    assert set(vs.ROUTING_KEYS) <= set(block)
 
 
 def test_stash_for_another_editor_is_left_alone(tmp_path: Path, stash: Path):
@@ -517,10 +591,10 @@ def test_explicit_model_beats_a_restored_one(tmp_path: Path, stash: Path):
     """``point_at_gateway`` contract: the caller's explicit choice wins."""
     path = _settings(tmp_path, {"editor.fontSize": 13})
     out = vs.point_at_gateway(
-        path, base_url=BASE_URL, token=TOKEN, model=GLM_1M,
-        restore_env={vs.MODEL_KEY: FLASH_1M},
+        path, base_url=BASE_URL, token=TOKEN, model=OPUS_1M,
+        restore_env={vs.MODEL_KEY: "claude-fable-5-1[1m]"},
     )
-    assert _block(path)[vs.MODEL_KEY] == GLM_1M
+    assert _block(path)[vs.MODEL_KEY] == OPUS_1M
     assert vs.MODEL_KEY in out["keys_written"]
     assert vs.MODEL_KEY not in out["keys_restored"]
     assert vs.MODEL_KEY not in out["keys_preserved"]
@@ -584,6 +658,224 @@ def test_panel_mode_unmanaged_for_a_different_local_port(tmp_path: Path, stash: 
     assert vs.panel_mode(path, ports=(11436,), stash=stash)["mode"] == vs.MODE_UNMANAGED
 
 
+def test_panel_mode_names_a_prototype_gateway_as_the_migration_it_is(
+    tmp_path: Path, stash: Path,
+):
+    """The 2026-09-08 panel pointed at 127.0.0.1:8787 — the prototype
+    gateway, reported as `unmanaged` with no hint that clicking Multimodel
+    is exactly the fix."""
+    path = _settings(
+        tmp_path, {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}},
+    )
+    out = vs.panel_mode(path, ports=(11436,), stash=stash)
+    assert out["mode"] == vs.MODE_UNMANAGED
+    assert out["prototype_endpoint"] is True
+    assert "Multimodel moves it" in out["detail"]
+
+
+def test_panel_mode_does_not_call_a_remote_endpoint_a_prototype(
+    tmp_path: Path, stash: Path,
+):
+    """LEAVE-ALONE half: a vendor endpoint is the user's own decision and
+    gets no migration copy — only a loopback port can be a local prototype."""
+    path = _settings(
+        tmp_path,
+        {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
+    )
+    out = vs.panel_mode(path, ports=(11436,), stash=stash)
+    assert out["prototype_endpoint"] is False
+    assert "leaves it alone" in out["detail"]
+    # And the gateway's own URL is never "a prototype".
+    pointed = _pointed(tmp_path / "ours")
+    assert vs.panel_mode(pointed, ports=(11436,), stash=stash)["prototype_endpoint"] is False
+
+
+def test_panel_mode_flags_a_vendor_default_without_touching_it(
+    tmp_path: Path, stash: Path,
+):
+    path = _pointed(tmp_path, model=GLM_1M)
+    before = _sha(path)
+    out = vs.panel_mode(path, ports=(11436,), stash=stash)
+    assert out["default_model_is_vendor"] is True
+    assert out["model"] == GLM_1M
+    assert _sha(path) == before, "--get reads; it never writes"
+
+    first_party = _pointed(tmp_path / "claude", model=OPUS_1M)
+    assert (
+        vs.panel_mode(first_party, ports=(11436,), stash=stash)["default_model_is_vendor"]
+        is False
+    )
+    no_default = _pointed(tmp_path / "none", model=None)
+    assert (
+        vs.panel_mode(no_default, ports=(11436,), stash=stash)["default_model_is_vendor"]
+        is False
+    )
+
+
+def test_panel_mode_reports_all_four_gateway_endpoint_combinations(
+    tmp_path: Path, stash: Path, monkeypatch,
+):
+    """Review R2-3: two independent questions, four answers."""
+    path = _settings(
+        tmp_path, {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}},
+    )
+    for gw_state in (vs.GATEWAY_RUNNING, vs.GATEWAY_STOPPED):
+        for ep_state in (vs.GATEWAY_RUNNING, vs.GATEWAY_STOPPED):
+            _probe_by_port(monkeypatch, {11437: gw_state, 8787: ep_state})
+            out = vs.panel_mode(path, ports=(11437,), stash=stash)
+            assert (out["gateway"], out["endpoint"]) == (gw_state, ep_state)
+
+
+def test_panel_mode_reports_the_gateways_tri_state(tmp_path: Path, stash: Path, monkeypatch):
+    """The field the StatusBar's Start action keys on. Reported for EVERY
+    mode, including a missing file — "no settings file" and "the gateway is
+    down" are different problems and the frame shows both."""
+    path = _pointed(tmp_path)
+    for state in vs.GATEWAY_STATES:
+        monkeypatch.setattr(vs, "probe_gateway", lambda state=state, **_kw: state)
+        assert vs.panel_mode(path, ports=(11436,), stash=stash)["gateway"] == state
+        assert vs.panel_mode(tmp_path / "nope.json", stash=stash)["gateway"] == state
+
+
+def _probe_by_port(monkeypatch, states: dict[int, str]):
+    """Stub :func:`probe_gateway` per port, recording what was asked."""
+    asked: list[int] = []
+
+    def capture(*, ports=None, timeout=None):
+        port = (tuple(ports or ()) or (0,))[0]
+        asked.append(port)
+        return states.get(port, vs.GATEWAY_STOPPED)
+
+    monkeypatch.setattr(vs, "probe_gateway", capture)
+    return asked
+
+
+def test_a_panel_on_the_default_port_is_not_ours_when_another_port_resolved(
+    tmp_path: Path, stash: Path, monkeypatch,
+):
+    """Review R1-2 + R2-3, the reporter's machine in one test.
+
+    Panel at 11436 (a legacy container answers there), gateway resolved on
+    11437 and running. The panel must NOT read as a healthy Multimodel
+    setup, the ENDPOINT field must describe 11436 — the port the panel talks
+    to — and the GATEWAY field must describe 11437, so the frame does not
+    offer to start something that is already running.
+    """
+    asked = _probe_by_port(
+        monkeypatch, {11436: vs.GATEWAY_UNREACHABLE, 11437: vs.GATEWAY_RUNNING},
+    )
+    path = _settings(
+        tmp_path, {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11436"}},
+    )
+    out = vs.panel_mode(path, ports=(11437,), stash=stash)
+    assert sorted(asked) == [11436, 11437]
+    assert out["endpoint"] == vs.GATEWAY_UNREACHABLE, "the panel's own port"
+    assert out["gateway"] == vs.GATEWAY_RUNNING, "the VCO gateway's port"
+    assert out["mode"] != vs.MODE_MULTIMODEL, (
+        "a stale default port answered by a foreign service is not a healthy "
+        "Multimodel panel"
+    )
+    assert out["prototype_endpoint"] is True
+
+
+def test_the_two_probes_collapse_to_one_when_the_panel_is_on_the_gateway(
+    tmp_path: Path, stash: Path, monkeypatch,
+):
+    asked = _probe_by_port(monkeypatch, {11437: vs.GATEWAY_RUNNING})
+    path = _settings(
+        tmp_path,
+        {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11437"}},
+    )
+    out = vs.panel_mode(path, ports=(11437,), stash=stash)
+    assert out["mode"] == vs.MODE_MULTIMODEL
+    assert asked == [11437], "one port, one probe — this runs on every refresh"
+    assert out["gateway"] == vs.GATEWAY_RUNNING
+    assert out["endpoint"] == vs.GATEWAY_RUNNING
+
+
+def test_endpoint_is_none_when_there_is_no_local_endpoint_to_probe(
+    tmp_path: Path, stash: Path, monkeypatch,
+):
+    """A stock panel and a remote endpoint have no loopback port; saying
+    'unreachable' about either would be an invented alarm."""
+    _probe_by_port(monkeypatch, {11437: vs.GATEWAY_RUNNING})
+    stock = _settings(tmp_path / "stock", {"editor.fontSize": 13})
+    assert vs.panel_mode(stock, ports=(11437,), stash=stash)["endpoint"] is None
+
+    remote = _settings(
+        tmp_path / "remote",
+        {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
+    )
+    out = vs.panel_mode(remote, ports=(11437,), stash=stash)
+    assert out["endpoint"] is None
+    assert out["gateway"] == vs.GATEWAY_RUNNING
+
+
+def test_a_dead_prototype_endpoint_does_not_report_the_gateway_as_stopped(
+    tmp_path: Path, stash: Path, monkeypatch,
+):
+    """Review R2-3, the defect in one assertion: the frame used to read the
+    panel's port as the gateway's state, label the pill "gateway stopped"
+    and offer a Start that then errored "already running"."""
+    _probe_by_port(
+        monkeypatch, {8787: vs.GATEWAY_STOPPED, 11437: vs.GATEWAY_RUNNING},
+    )
+    path = _settings(
+        tmp_path, {vs.ENV_BLOCK_KEY: {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}},
+    )
+    out = vs.panel_mode(path, ports=(11437,), stash=stash)
+    assert out["gateway"] == vs.GATEWAY_RUNNING
+    assert out["endpoint"] == vs.GATEWAY_STOPPED
+    assert out["prototype_endpoint"] is True
+
+
+def test_migrating_a_prototype_panel_reports_the_vendor_default_it_kept(
+    tmp_path: Path, stash: Path,
+):
+    """Review R1-3: the incident's own file, migrated.
+
+    The panel points at the prototype gateway and its Default is
+    `claude-gw/glm-5.3[1m]`. Clicking Multimodel keeps that value (it is the
+    user's key — the ruling forbids WRITING one, not keeping one) and must
+    say so, or the migration hands back a panel that still resumes on GLM
+    with a notice that reads "Applied".
+    """
+    path = _settings(
+        tmp_path,
+        {
+            vs.ENV_BLOCK_KEY: {
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+                vs.MODEL_KEY: GLM_1M,
+            }
+        },
+    )
+    out = vs.set_mode(path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash)
+    assert out["ok"] and out["status"] == "written"
+    assert _block(path)[vs.MODEL_KEY] == GLM_1M, "kept, not deleted"
+    assert out["vendor_default_preserved"] == GLM_1M
+    assert GLM_1M in out["message"] and "Clear default" in out["message"]
+
+
+def test_a_first_party_default_carried_forward_is_not_reported_as_vendor(
+    tmp_path: Path, stash: Path,
+):
+    path = _pointed(tmp_path, model=OPUS_1M)
+    out = vs.point_at_gateway(path, base_url=BASE_URL, token=TOKEN)
+    assert vs.MODEL_KEY in out["keys_preserved"]
+    assert out["vendor_default_preserved"] is None
+    assert "Clear default" not in out["message"]
+
+
+def test_clear_default_leaves_the_switch_state_alone(tmp_path: Path, stash: Path):
+    """Clearing the Default must not knock the panel out of Multimodel."""
+    path = _pointed(tmp_path, {"ANTHROPIC_DEFAULT_HAIKU_MODEL": FLASH_1M}, model=GLM_1M)
+    out = vs.clear_default_model(path)
+    assert out["ok"] and out["status"] == "written"
+    assert vs.panel_mode(path, ports=(11436,), stash=stash)["mode"] == vs.MODE_MULTIMODEL
+    assert vs.panel_mode(path, ports=(11436,), stash=stash)["default_model_is_vendor"] is False
+    assert _block(path)["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == FLASH_1M
+
+
 def test_panel_mode_unparseable_guesses_nothing(tmp_path: Path, stash: Path):
     path = tmp_path / "Code" / "User" / "settings.json"
     path.parent.mkdir(parents=True)
@@ -633,7 +925,9 @@ def test_cli_mode_set_multimodel_takes_the_token_from_env_never_argv(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] and payload["mode"] == vs.MODE_MULTIMODEL
-    assert payload["keys_restored"] == ["ANTHROPIC_DEFAULT_HAIKU_MODEL", vs.MODEL_KEY]
+    # The haiku slot comes back; the GLM Default the fixture wrote does not.
+    assert payload["keys_restored"] == ["ANTHROPIC_DEFAULT_HAIKU_MODEL"]
+    assert payload["refusal_reason"] and GLM_1M in payload["refusal_reason"]
     assert _block(path)["ANTHROPIC_AUTH_TOKEN"] == TOKEN
     assert not (tmp_path / "state" / vs.STASH_SUBDIR / vs.STASH_BASENAME).exists()
 

@@ -4,13 +4,21 @@
   import { tauriAvailable } from '$lib/tauri';
   import {
     MODE_PILL_TOOLTIP,
-    describeMode,
+    clearPanelDefaultModel,
+    describeModeReport,
     describeModeResult,
+    describeSwitchOutcome,
+    endpointWarning,
+    gatewayIsLive,
     getModelGatewayStatus,
     getPanelMode,
     listVSCodeTargets,
     modeSwitchDisabledReason,
+    multimodelPillLabel,
     setPanelMode,
+    startModelGateway,
+    switchToMultimodel,
+    vendorDefaultWarning,
   } from '$lib/api/model_gateway';
   import type { PanelModeReport, SettablePanelMode } from '$lib/api/model_gateway';
   import type { ModelGatewayStatus, VSCodeTarget } from '$lib/types/model-gateway';
@@ -40,6 +48,18 @@
   //
   // The write is immediate. The user restarts VS Code themselves — the
   // notice says so and stays until dismissed; nothing here automates it.
+  //
+  // v0.2.94, from the 2026-09-08 incident, three changes here:
+  //   * The Multimodel pill no longer sits disabled behind "start the
+  //     gateway once (Services page)". It STARTS the gateway and then
+  //     points — including from a prototype endpoint, which is the whole
+  //     migration path off the pre-product gateway.
+  //   * A stopped gateway is named in the pill's own label, with a Start
+  //     action beside it, instead of surfacing as a token-file error after
+  //     the click.
+  //   * A vendor ANTHROPIC_MODEL already in the file is shown as a warning
+  //     with a one-click Clear, because THAT value — not the picker — is
+  //     what a panel restart resumes on.
 
   let gw = $state<ModelGatewayStatus | null>(null);
   let targets = $state<VSCodeTarget[]>([]);
@@ -49,7 +69,7 @@
   let busy = $state(false);
   let notice = $state<{ tone: 'ok' | 'err'; text: string } | null>(null);
 
-  const mode = $derived(describeMode(report?.mode ?? null));
+  const mode = $derived(describeModeReport(report));
   const disabledMulti = $derived(
     modeSwitchDisabledReason('multimodel', gw, targets, report),
   );
@@ -59,11 +79,22 @@
   const neutralTooltip = $derived(
     loadError ? `Panel mode unavailable: ${loadError}` : mode.tooltip,
   );
+  // Two independent readings (review R2-3): `gateway` is the VCO gateway on
+  // this machine — it drives the pill label and the Start action — while
+  // `endpoint` is whatever THIS panel currently talks to, which starting a
+  // gateway does not fix and which therefore only ever produces a warning.
+  const multiLabel = $derived(multimodelPillLabel(report));
+  const gatewayStopped = $derived(report?.gateway === 'stopped');
+  const vendorDefault = $derived(vendorDefaultWarning(report));
+  const endpointDown = $derived(endpointWarning(report));
 
   function pillTitle(target: SettablePanelMode, disabledReason: string): string {
     if (busy) return 'Applying…';
     if (disabledReason) return disabledReason;
     const base = MODE_PILL_TOOLTIP[target];
+    if (target === 'multimodel' && gatewayStopped) {
+      return `${base} The gateway is not running; clicking this starts it first.`;
+    }
     return mode.active === target ? `${base} (current)` : base;
   }
 
@@ -105,11 +136,65 @@
     if (mode.active === target) return;
     busy = true;
     try {
-      const result = await setPanelMode(selected, target);
-      notice = {
-        tone: result.ok ? 'ok' : 'err',
-        text: describeModeResult(result),
-      };
+      if (target === 'multimodel') {
+        // Starts the gateway when it is not running, points, and retries
+        // once on the token-file race a fresh start can lose. Every one of
+        // those decisions lives in `$lib/api/model_gateway` so the vitest
+        // can reach it; this file only awaits it.
+        notice = describeSwitchOutcome(await switchToMultimodel(selected, report));
+      } else {
+        const result = await setPanelMode(selected, target);
+        notice = { tone: result.ok ? 'ok' : 'err', text: describeModeResult(result) };
+      }
+    } catch (e) {
+      notice = { tone: 'err', text: String(e) };
+    } finally {
+      busy = false;
+    }
+    try {
+      await refresh();
+    } catch (e) {
+      loadError = String(e);
+    }
+  }
+
+  /** Start the gateway from the frame, then re-probe. */
+  async function startGateway() {
+    if (busy) return;
+    busy = true;
+    try {
+      const status = await startModelGateway();
+      gw = status;
+      // Only claim it started when it ANSWERED (review R1-7): the Rust side
+      // polls /health for up to 5 s and reports what it found, so a status
+      // that is still not reachable means the daemon did not come up.
+      notice = gatewayIsLive(status)
+        ? { tone: 'ok', text: `Model gateway started on port ${status.port}.` }
+        : {
+            tone: 'err',
+            text: `The model gateway was asked to start on port ${status.port} but is not answering: ${
+              status.health_error ?? 'no reason given'
+            }. Check the Services page.`,
+          };
+    } catch (e) {
+      notice = { tone: 'err', text: String(e) };
+    } finally {
+      busy = false;
+    }
+    try {
+      await refreshMode();
+    } catch (e) {
+      loadError = String(e);
+    }
+  }
+
+  /** Remove ANTHROPIC_MODEL — that key only, with a backup. */
+  async function clearDefault() {
+    if (busy || !selected) return;
+    busy = true;
+    try {
+      const result = await clearPanelDefaultModel(selected);
+      notice = { tone: result.ok ? 'ok' : 'err', text: result.message };
     } catch (e) {
       notice = { tone: 'err', text: String(e) };
     } finally {
@@ -179,7 +264,7 @@
           disabled={busy || !!disabledMulti}
           onclick={() => apply('multimodel')}
         >
-          Multimodel
+          {multiLabel}
         </button>
         <button
           type="button"
@@ -196,6 +281,36 @@
           <span class="mode-neutral" title={neutralTooltip}>{mode.label}</span>
         {/if}
       </div>
+      {#if gatewayStopped}
+        <button
+          type="button"
+          class="mode-action"
+          title="Start the local model gateway now, then re-check."
+          disabled={busy}
+          onclick={startGateway}
+        >
+          Start gateway
+        </button>
+      {/if}
+      {#if endpointDown}
+        <span class="mode-warning" role="status">
+          <span class="mode-notice-text" title={endpointDown}>{endpointDown}</span>
+        </span>
+      {/if}
+      {#if vendorDefault}
+        <span class="mode-warning" role="status">
+          <span class="mode-notice-text" title={vendorDefault}>{vendorDefault}</span>
+          <button
+            type="button"
+            class="mode-action"
+            title="Remove ANTHROPIC_MODEL from the settings file. Nothing else is touched."
+            disabled={busy}
+            onclick={clearDefault}
+          >
+            Clear default
+          </button>
+        </span>
+      {/if}
       {#if notice}
         <span class="mode-notice" class:err={notice.tone === 'err'} role="status">
           <span class="mode-notice-text" title={notice.text}>{notice.text}</span>
@@ -283,6 +398,49 @@
 
   .mode-pill.active:disabled {
     opacity: 1;
+  }
+
+  /* Inline action beside the switch (Start gateway / Clear default). */
+  .mode-action {
+    height: 18px;
+    padding: 0 9px;
+    border-radius: 999px;
+    border: 1px solid var(--color-teal);
+    background: transparent;
+    color: var(--color-teal);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background 0.2s ease,
+      color 0.2s ease;
+  }
+
+  .mode-action:hover:not(:disabled) {
+    background: var(--color-teal);
+    color: var(--color-bg);
+  }
+
+  .mode-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  /* Vendor-Default warning: pink tint, the brand's error/highlight accent. */
+  .mode-warning {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 42vw;
+    height: 22px;
+    padding: 0 4px 0 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(var(--color-pink-rgb), 0.4);
+    background: rgba(var(--color-pink-rgb), 0.1);
+    color: var(--color-text);
   }
 
   .mode-neutral {

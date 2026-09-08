@@ -105,20 +105,88 @@ def test_model_written_only_when_explicitly_picked(settings_file: Path):
     assert vs.MODEL_KEY not in env_block(settings_file)
 
     vs.point_at_gateway(
+        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-opus-5",
+    )
+    # claude-opus-5 is 1M-windowed in the shipped context table, so the
+    # written id carries the client's [1m] hint (R41 decoration; see
+    # tests/test_v0292_vscode_settings_1m_decoration.py).
+    assert env_block(settings_file)[vs.MODEL_KEY] == "claude-opus-5[1m]"
+
+
+def test_a_vendor_model_is_never_written_as_the_default(settings_file: Path):
+    """USER RULING 2026-09-08, the incident in one assertion.
+
+    ANTHROPIC_MODEL is the value a RESTARTED panel resumes on. With a vendor
+    id there, 204 turns of a release cycle ran on GLM while the picker still
+    said Fable. So the key is refused — and the rest of the write proceeds,
+    because the user asked to be pointed at the gateway and that part is
+    fine.
+    """
+    result = vs.point_at_gateway(
         settings_file, base_url=BASE_URL, token=TOKEN, model="claude-gw/glm-5.3",
     )
-    # glm-5.3 is 1M-windowed in the shipped context table, so the written
-    # id carries the client's [1m] hint (R41 decoration; see
-    # tests/test_v0292_vscode_settings_1m_decoration.py).
-    assert env_block(settings_file)[vs.MODEL_KEY] == "claude-gw/glm-5.3[1m]"
+    block = env_block(settings_file)
+    assert vs.MODEL_KEY not in block, "a vendor id must never become the Default"
+    assert block["ANTHROPIC_BASE_URL"] == BASE_URL, "the rest of the write proceeds"
+    assert result["ok"] and result["status"] == "written"
+    assert vs.MODEL_KEY not in result["keys_written"]
+    reason = result["refusal_reason"]
+    assert reason and "claude-gw/glm-5.3" in reason, "the refusal names the id"
+    assert vs.MODEL_KEY in reason and "Default" in reason, "and the rule"
+    assert reason in result["message"], "a silent refusal is the same defect again"
 
 
-def test_default_model_is_glm_5_3_not_flash():
-    assert vs.DEFAULT_GATEWAY_MODEL == "claude-gw/glm-5.3"
-    assert "flash" not in vs.DEFAULT_GATEWAY_MODEL
-    # Never a pre-5.3 version either.
-    for older in ("glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4"):
-        assert not vs.DEFAULT_GATEWAY_MODEL.endswith(older)
+def test_a_namespaced_claude_id_is_not_first_party_either(settings_file: Path):
+    """`claude-gw/claude-opus-5` resolves ONLY through the gateway.
+
+    The tail is a real Claude id, but the namespace is not: a panel that came
+    back stock would fall back to a name nothing answers. Rejecting on the
+    substring alone would have let this through.
+    """
+    result = vs.point_at_gateway(
+        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-gw/claude-opus-5",
+    )
+    assert vs.MODEL_KEY not in env_block(settings_file)
+    assert result["refusal_reason"]
+
+
+def test_first_party_rule_covers_the_1m_suffix_and_the_namespace():
+    for ok in ("claude-opus-5", "claude-opus-5[1m]", "Claude-Fable-5-1"):
+        assert vs.is_first_party_model_id(ok) is True, ok
+    for no in (
+        "claude-gw/glm-5.3",
+        "claude-gw/glm-5.3[1m]",
+        "claude-gw/claude-opus-5",
+        "glm-5.3",
+        "glm-5.3[1m]",
+        "gpt-x",
+        "",
+        "   ",
+        None,
+        42,
+    ):
+        assert vs.is_first_party_model_id(no) is False, no
+
+
+def test_first_party_rule_is_a_prefix_test_and_case_folds_first():
+    """Review R1-5. A substring test passed BOTH of these.
+
+    `glm-5.3-claude` is a vendor id that happens to contain the word, and
+    `Claude-GW/glm-5.3` is the gateway namespace in different case — the
+    exact value the namespace check exists to catch.
+    """
+    for vendor_id in ("glm-5.3-claude", "Claude-GW/glm-5.3", "CLAUDE-GW/glm-5.3[1m]",
+                      "my-claude-proxy", "anthropic-ish"):
+        assert vs.is_first_party_model_id(vendor_id) is False, vendor_id
+    assert vs.FIRST_PARTY_ID_PREFIX == "claude-"
+
+
+def test_default_model_offered_by_the_gui_is_first_party():
+    """The pre-selected Default was `claude-gw/glm-5.3` until 2026-09-08 and
+    is exactly what put the machine on GLM overnight."""
+    assert vs.is_first_party_model_id(vs.DEFAULT_GATEWAY_MODEL)
+    assert not vs.DEFAULT_GATEWAY_MODEL.startswith(vs.GATEWAY_ID_PREFIX)
+    assert "glm" not in vs.DEFAULT_GATEWAY_MODEL.lower()
 
 
 def test_default_model_exists_in_the_shipped_context_seed():
@@ -135,8 +203,11 @@ def test_default_model_exists_in_the_shipped_context_seed():
         / "chat_model_context.seed.json"
     )
     models = json.loads(seed.read_text(encoding="utf-8"))["models"]
-    bare = vs.DEFAULT_GATEWAY_MODEL.split("/", 1)[1]
+    bare = vs.DEFAULT_GATEWAY_MODEL.split("/", 1)[-1]
     assert bare in models, f"{bare} is not a row in {seed.name}"
+    assert models[bare]["vendor"] == vs.FIRST_PARTY_VENDOR, (
+        "the offered Default must be a row the seed itself calls first-party"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,13 +218,84 @@ def test_default_model_exists_in_the_shipped_context_seed():
 def test_rerun_preserves_the_users_model_choice(settings_file: Path):
     """The defect the field prototype had: re-sync reset ANTHROPIC_MODEL."""
     vs.point_at_gateway(
-        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-gw/glm-5.3",
+        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-opus-5",
     )
     result = vs.point_at_gateway(settings_file, base_url=BASE_URL, token=TOKEN)
     # Preserved AND window-correct: the re-run keeps the [1m] decoration
     # idempotently instead of letting the value drift back to plain.
+    assert env_block(settings_file)[vs.MODEL_KEY] == "claude-opus-5[1m]"
+    assert vs.MODEL_KEY in result["keys_preserved"]
+
+
+def test_the_result_names_the_base_url_it_wrote(settings_file: Path):
+    """The reporting half of R1-1: a caller's done message must be able to
+    name the endpoint actually written, not the one it assumed."""
+    other = "http://127.0.0.1:11437"
+    result = vs.point_at_gateway(settings_file, base_url=other, token=TOKEN)
+    assert result["base_url"] == other
+    assert env_block(settings_file)["ANTHROPIC_BASE_URL"] == other
+    # Present on a refusal too — that is when knowing the target matters most.
+    path = settings_file.parent / "broken.json"
+    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    refused = vs.point_at_gateway(path, base_url=other, token=TOKEN)
+    assert refused["ok"] is False and refused["base_url"] == other
+
+
+def test_a_vendor_default_already_in_the_file_is_preserved_not_deleted(
+    settings_file: Path,
+):
+    """LEAVE-ALONE half of the rule: VCO refuses to WRITE one; it does not
+    reach into the user's file and remove one they already have. It is
+    reported (`panel_mode`) and cleared on a click (`clear_default_model`)."""
+    settings = json.loads(settings_file.read_text(encoding="utf-8"))
+    settings[vs.ENV_BLOCK_KEY] = {vs.MODEL_KEY: "claude-gw/glm-5.3[1m]"}
+    settings_file.write_text(json.dumps(settings, indent=4) + "\n", encoding="utf-8")
+
+    result = vs.point_at_gateway(settings_file, base_url=BASE_URL, token=TOKEN)
     assert env_block(settings_file)[vs.MODEL_KEY] == "claude-gw/glm-5.3[1m]"
     assert vs.MODEL_KEY in result["keys_preserved"]
+    assert result["refusal_reason"] is None, "nothing was refused; nothing was asked"
+
+
+def test_clear_default_removes_only_the_model_key(settings_file: Path):
+    vs.point_at_gateway(
+        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-opus-5",
+    )
+    settings = json.loads(settings_file.read_text(encoding="utf-8"))
+    settings[vs.ENV_BLOCK_KEY]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "claude-gw/glm-5.3-flash"
+    settings_file.write_text(json.dumps(settings, indent=4) + "\n", encoding="utf-8")
+
+    result = vs.clear_default_model(settings_file)
+    assert result["ok"] and result["status"] == "written"
+    assert result["keys_removed"] == [vs.MODEL_KEY]
+    assert result["cleared_value"] == "claude-opus-5[1m]"
+    block = env_block(settings_file)
+    assert vs.MODEL_KEY not in block
+    assert set(vs.ROUTING_KEYS) <= set(block), "routing keys are not its business"
+    assert block["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-gw/glm-5.3-flash", (
+        "a slot override is the user's per-tier choice, not the restart fallback"
+    )
+    assert json.loads(settings_file.read_text(encoding="utf-8"))[vs.LOGIN_PROMPT_KEY] is True
+
+
+def test_clear_default_is_a_no_op_when_there_is_none(settings_file: Path):
+    vs.point_at_gateway(settings_file, base_url=BASE_URL, token=TOKEN)
+    before = settings_file.read_bytes()
+    result = vs.clear_default_model(settings_file)
+    assert result["ok"] and result["status"] == "unchanged"
+    assert result["keys_removed"] == []
+    assert settings_file.read_bytes() == before
+
+
+def test_clear_default_refuses_jsonc_byte_identical(tmp_path: Path):
+    path = tmp_path / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    before = path.read_bytes()
+    result = vs.clear_default_model(path)
+    assert result["ok"] is False and result["reason"] == "not_strict_json"
+    assert vs.MODEL_KEY in result["message"]
+    assert path.read_bytes() == before
 
 
 def test_unrelated_env_keys_are_carried_forward_and_reported(settings_file: Path):
@@ -563,9 +705,17 @@ def test_is_vco_gateway_base_url(url, expected):
     assert vs.is_vco_gateway_base_url(url, ports=(11436,)) is expected
 
 
-def test_resolve_gateway_ports_always_includes_the_documented_default():
-    ports = vs.resolve_gateway_ports()
-    assert vs.DEFAULT_GATEWAY_PORT in ports
+def test_resolve_gateway_ports_falls_back_to_the_default_only_without_evidence(
+    monkeypatch, tmp_path,
+):
+    """Review R2-5. The old form asserted the default was ALWAYS in the
+    answer, which contradicted R1-2 and passed only because conftest
+    redirects VCT_STATE_DIR to a scratch dir with no port files. Now it
+    pins the leave-alone half explicitly: no pin, no port file, no
+    last-port record -> the documented default, and nothing else."""
+    monkeypatch.delenv(vs.PORT_ENV, raising=False)
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "empty-state"))
+    assert vs.resolve_gateway_ports() == (vs.DEFAULT_GATEWAY_PORT,)
 
 
 # ---------------------------------------------------------------------------
@@ -796,13 +946,13 @@ def test_permissions_probe_is_a_tristate(settings_file: Path, monkeypatch):
 
 def test_inspect_reports_a_pointed_panel(settings_file: Path):
     vs.point_at_gateway(
-        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-gw/glm-5.3",
+        settings_file, base_url=BASE_URL, token=TOKEN, model="claude-opus-5",
     )
     info = vs.inspect_target(settings_file, ports=(11436,))
     assert info["exists"] and info["parseable"] is True
     assert info["points_at_vco_gateway"] is True
     assert info["base_url"] == BASE_URL
-    assert info["model"] == "claude-gw/glm-5.3[1m]"
+    assert info["model"] == "claude-opus-5[1m]"
     assert info["discovery_enabled"] is True
     assert info["disable_login_prompt"] is True
     assert info["slot_overrides"] == []
@@ -856,6 +1006,291 @@ def test_cli_point_exits_nonzero_on_refusal(tmp_path: Path, capsys, monkeypatch)
     rc = vs.main(["point", "--path", str(path), "--base-url", BASE_URL])
     assert rc == 1
     assert json.loads(capsys.readouterr().out)["reason"] == "not_strict_json"
+
+
+def test_cli_point_with_a_vendor_model_exits_nonzero_with_the_reason(
+    settings_file: Path, capsys, monkeypatch,
+):
+    """A script that asked for a Default and got none must not read exit 0.
+
+    The routing keys ARE written (that is what `point` was asked to do); the
+    non-zero exit and the payload's `refusal_reason` are how the caller
+    learns the Default was declined.
+    """
+    monkeypatch.setenv(vs.ENV_TOKEN, TOKEN)
+    rc = vs.main(
+        [
+            "point",
+            "--path",
+            str(settings_file),
+            "--base-url",
+            BASE_URL,
+            "--model",
+            "claude-gw/glm-5.3",
+        ],
+    )
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True and payload["status"] == "written"
+    assert "claude-gw/glm-5.3" in payload["refusal_reason"]
+    block = env_block(settings_file)
+    assert vs.MODEL_KEY not in block
+    assert block["ANTHROPIC_BASE_URL"] == BASE_URL
+
+
+def test_cli_point_with_a_first_party_model_exits_zero(
+    settings_file: Path, capsys, monkeypatch,
+):
+    monkeypatch.setenv(vs.ENV_TOKEN, TOKEN)
+    rc = vs.main(
+        [
+            "point",
+            "--path",
+            str(settings_file),
+            "--base-url",
+            BASE_URL,
+            "--model",
+            "claude-opus-5",
+        ],
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["refusal_reason"] is None
+    assert env_block(settings_file)[vs.MODEL_KEY] == "claude-opus-5[1m]"
+
+
+def test_cli_clear_default_emits_only_json(settings_file: Path, capsys, monkeypatch):
+    monkeypatch.setenv(vs.ENV_TOKEN, TOKEN)
+    vs.main(["point", "--path", str(settings_file), "--base-url", BASE_URL,
+             "--model", "claude-opus-5"])
+    capsys.readouterr()
+    rc = vs.main(["clear-default", "--path", str(settings_file)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action"] == "clear_default_model"
+    assert payload["keys_removed"] == [vs.MODEL_KEY]
+    assert vs.MODEL_KEY not in env_block(settings_file)
+
+
+# ---------------------------------------------------------------------------
+# probe_gateway — the tri-state the GUI's Start action keys on
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self._body = body
+        self.status = status
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class _FakeConnection:
+    """Stands in for ``http.client.HTTPConnection``. Records the target so
+    the probe cannot quietly start asking a different host."""
+
+    seen: list[tuple[str, int, str]] = []
+
+    def __init__(self, host, port, timeout=None, *, answer=None, raises=None):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._answer = answer
+        self._raises = raises
+
+    def request(self, method, path):
+        _FakeConnection.seen.append((self.host, self.port, path))
+        if self._raises is not None:
+            raise self._raises
+
+    def getresponse(self):
+        return self._answer
+
+    def close(self):
+        pass
+
+
+def _fake_conn(monkeypatch, *, answer=None, raises=None):
+    import functools
+    import http.client
+
+    _FakeConnection.seen = []
+    monkeypatch.setattr(
+        http.client,
+        "HTTPConnection",
+        functools.partial(_FakeConnection, answer=answer, raises=raises),
+    )
+
+
+def test_probe_gateway_running_only_for_our_service(monkeypatch):
+    _fake_conn(
+        monkeypatch,
+        answer=_FakeResponse(
+            b'{"ok": true, "service": "vct-model-gateway", "version": "0.2.94"}'
+        ),
+    )
+    assert vs.probe_gateway(ports=(11436,)) == vs.GATEWAY_RUNNING
+    assert _FakeConnection.seen == [("127.0.0.1", 11436, "/health")], (
+        "the probe asks loopback directly — never a proxy, never a hostname"
+    )
+
+
+def test_probe_gateway_foreign_answer_is_unreachable_not_running(monkeypatch):
+    """The 2026-09-08 machine: a legacy scorer container owned port 11436.
+
+    Calling that "running" would point the panel at somebody else's service
+    under our name — and would suppress the port-collision fallback that
+    picks a free port instead.
+    """
+    _fake_conn(monkeypatch, answer=_FakeResponse(b'{"service": "vco-model-router"}'))
+    assert vs.probe_gateway(ports=(11436,)) == vs.GATEWAY_UNREACHABLE
+
+
+def test_probe_gateway_refused_is_stopped(monkeypatch):
+    _fake_conn(monkeypatch, raises=ConnectionRefusedError(111, "Connection refused"))
+    assert vs.probe_gateway(ports=(11436,)) == vs.GATEWAY_STOPPED
+
+
+def test_probe_gateway_timeout_is_unreachable_never_stopped(monkeypatch):
+    import socket
+
+    _fake_conn(monkeypatch, raises=socket.timeout("timed out"))
+    assert vs.probe_gateway(ports=(11436,)) == vs.GATEWAY_UNREACHABLE
+
+
+def test_probe_gateway_http_error_is_unreachable(monkeypatch):
+    _fake_conn(monkeypatch, answer=_FakeResponse(b"nope", status=503))
+    assert vs.probe_gateway(ports=(11436,)) == vs.GATEWAY_UNREACHABLE
+
+
+def test_probe_gateway_unparseable_body_is_unreachable(monkeypatch):
+    _fake_conn(monkeypatch, answer=_FakeResponse(b"<html>hi"))
+    assert vs.probe_gateway(ports=(11436,)) == vs.GATEWAY_UNREACHABLE
+
+
+def _state(monkeypatch, tmp_path, **files):
+    """A scratch ``<vct_root>`` holding the named port files."""
+    root = tmp_path / "state"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("VCT_STATE_DIR", str(root))
+    monkeypatch.delenv(vs.PORT_ENV, raising=False)
+    for name, value in files.items():
+        basename = {
+            "port": vs.PORT_BASENAME,
+            "last": vs.LAST_PORT_BASENAME,
+        }[name]
+        (root / basename).write_text(f"{value}\n", encoding="utf-8")
+    return root
+
+
+def test_is_vco_gateway_base_url_defaults_to_the_resolved_port_not_the_shipped_one(
+    monkeypatch, tmp_path,
+):
+    """Review R3-6: the default argument must not restore the pre-R1-2 rule.
+
+    A caller that omits `ports` used to be told "11436 is ours" whatever the
+    machine actually resolved — including the uninstall-time reset, which
+    would then skip our own panel on 11437 and volunteer to reset somebody
+    else's on 11436.
+    """
+    _state(monkeypatch, tmp_path, last=11437)
+    assert vs.is_vco_gateway_base_url("http://127.0.0.1:11437") is True
+    assert vs.is_vco_gateway_base_url("http://127.0.0.1:11436") is False
+    # An explicit list still wins — a caller with a better answer keeps it.
+    assert vs.is_vco_gateway_base_url("http://127.0.0.1:11436", ports=(11436,)) is True
+    # ...including an EMPTY one, which says "no port here is ours".
+    assert vs.is_vco_gateway_base_url("http://127.0.0.1:11437", ports=()) is False
+
+
+def test_resolve_gateway_ports_answers_with_the_resolved_port_alone(
+    monkeypatch, tmp_path,
+):
+    """Review R1-2: the shipped default is not permanently 'ours'.
+
+    Returning both the resolved port AND 11436 is what let a panel pointed
+    at a legacy container on 11436 read as a healthy VCO gateway while the
+    real one ran on 11437.
+    """
+    _state(monkeypatch, tmp_path, port=11437)
+    assert vs.resolve_gateway_ports() == (11437,)
+    assert vs.DEFAULT_GATEWAY_PORT not in vs.resolve_gateway_ports()
+
+
+def test_the_last_started_port_survives_the_daemons_clean_exit(monkeypatch, tmp_path):
+    """Review R2-2, the whole point of the last-port record.
+
+    The daemon UNLINKS its port file when it exits cleanly. Without this
+    record, a gateway that had moved to 11437 (because something else held
+    11436) is forgotten the moment it stops: the panel it wrote reads as an
+    unmanaged prototype endpoint, the uninstall reset walks past it, and a
+    Services "point" writes our host token into a base URL naming whatever
+    owns the default port.
+    """
+    _state(monkeypatch, tmp_path, last=11437)
+    assert vs.resolve_gateway_ports() == (11437,)
+
+
+def test_the_live_port_file_beats_the_last_port_record(monkeypatch, tmp_path):
+    """Order matters: a RUNNING gateway's own file is better evidence than
+    the launcher's memory of the last one it started."""
+    _state(monkeypatch, tmp_path, port=11440, last=11437)
+    assert vs.resolve_gateway_ports() == (11440,)
+
+
+def test_the_env_pin_beats_every_file(monkeypatch, tmp_path):
+    _state(monkeypatch, tmp_path, port=11440, last=11437)
+    monkeypatch.setenv(vs.PORT_ENV, "11999")
+    assert vs.resolve_gateway_ports() == (11999,)
+
+
+def test_a_corrupt_or_out_of_range_port_file_is_ignored_not_trusted(
+    monkeypatch, tmp_path,
+):
+    root = _state(monkeypatch, tmp_path)
+    for bad in ("not-a-port", "", "0", "70000", "-1"):
+        (root / vs.PORT_BASENAME).write_text(bad, encoding="utf-8")
+        (root / vs.LAST_PORT_BASENAME).write_text(bad, encoding="utf-8")
+        assert vs.resolve_gateway_ports() == (vs.DEFAULT_GATEWAY_PORT,), bad
+
+
+def test_resolve_gateway_ports_falls_back_only_when_nothing_resolved(
+    monkeypatch, tmp_path,
+):
+    """LEAVE-ALONE half: an uninstalled gateway (no importable package) must
+    still recognise the documented port, or the uninstall-time reset would
+    walk past the panel it is meant to clean up."""
+    import builtins
+
+    _state(monkeypatch, tmp_path)
+    real_import = builtins.__import__
+
+    def no_model_router(name, *a, **k):
+        if name.startswith("model_router"):
+            raise ImportError("simulated: gateway package uninstalled")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_model_router)
+    assert vs.resolve_gateway_ports() == (vs.DEFAULT_GATEWAY_PORT,)
+
+
+def test_panel_endpoint_port_is_the_panels_own_loopback_port_or_nothing():
+    """Review R2-3: the panel's endpoint is a different question from the
+    gateway's port, and a remote endpoint has no local port at all."""
+    assert vs.panel_endpoint_port("http://127.0.0.1:11436") == 11436
+    assert vs.panel_endpoint_port("http://localhost:8787") == 8787
+    for no_port in (
+        None,
+        "",
+        "https://api.z.ai/api/anthropic",
+        "http://127.0.0.1/no-port",
+        "not a url",
+    ):
+        assert vs.panel_endpoint_port(no_port) is None, no_port
+
+
+def test_probe_gateway_states_are_the_three_the_gui_switches_on():
+    assert vs.GATEWAY_STATES == ("running", "stopped", "unreachable")
 
 
 def test_cli_reset_if_gateway_leaves_foreign_alone(tmp_path: Path, capsys):

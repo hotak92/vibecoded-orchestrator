@@ -212,6 +212,14 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 45 = migration 045_chat_model_context_tombstone.sql (v0.2.94 — the other
+#: half of the per-row chat-model-context boot seed). The seed used to write
+#: only into an EMPTY table, which doubled as the "never reinstate a row the
+#: user deleted" guarantee while leaving UPGRADED installs without any newly
+#: shipped model row. Per-row seeding fixes the upgrade and needs this table
+#: to keep the delete: the boot seed skips tombstoned ids, and only the
+#: explicit "Reseed from shipped defaults" clears them. Bumped ATOMICALLY
+#: with mig 045's Rust registration.
 #: 44 = migration 044_project_moves.sql (v0.2.92, WP-17/W3 — the project-move
 #: ledger). Its partial UNIQUE index on ``project_id WHERE status IN
 #: ('running','flipped')`` is the single-flight gate: a second concurrent move
@@ -257,7 +265,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 44
+LAUNCHER_DB_TABLE_SET_VERSION = 45
 
 
 # ===========================================================================

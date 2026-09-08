@@ -97,6 +97,225 @@ def test_frontend_default_model_matches_the_writer():
     assert m.group(1) == vs.DEFAULT_GATEWAY_MODEL
 
 
+def test_frontend_first_party_rule_mirrors_the_writer():
+    """(C)-tier parity pin for the GLM-never-default rule (USER RULING
+    2026-09-08).
+
+    The rule exists on both sides because the GUI validates the Default-model
+    field on every keystroke — spawning Python per character to answer a
+    three-substring question is not a trade worth making — and because the
+    writer must refuse independently of any GUI. Two implementations means a
+    parity test, and it pins the DATA the rule is made of: the namespace, the
+    context suffix, and the two substrings. Drift makes the GUI accept what
+    the writer then refuses (or worse, the reverse).
+    """
+    from vco_lib import vscode_settings as vs
+
+    ts = TS.read_text(encoding="utf-8")
+    for const, value in (
+        ("GATEWAY_ID_PREFIX", vs.GATEWAY_ID_PREFIX),
+        ("CONTEXT_1M_SUFFIX", vs.CONTEXT_1M_SUFFIX),
+        ("FIRST_PARTY_ID_PREFIX", vs.FIRST_PARTY_ID_PREFIX),
+        ("GATEWAY_SERVICE_NAME", vs.GATEWAY_SERVICE_NAME),
+    ):
+        m = re.search(rf"export const {const} = '([^']+)'", ts)
+        assert m, f"{const} not found in the frontend API module"
+        assert m.group(1) == value, f"{const} drifted from the writer"
+
+    rule = re.search(
+        r"export function isFirstPartyModelId\(.*?\n\}", ts, re.DOTALL
+    )
+    assert rule, "isFirstPartyModelId not found in the frontend API module"
+    body = rule.group(0)
+    for token in ("FIRST_PARTY_ID_PREFIX", "GATEWAY_ID_PREFIX", "CONTEXT_1M_SUFFIX"):
+        assert token in body, f"the TS rule no longer consults {token}"
+    # Review R1-5: a PREFIX test, case-folded BEFORE the namespace check.
+    assert "startsWith(FIRST_PARTY_ID_PREFIX)" in body, (
+        "the TS rule must test a prefix, not a substring — `glm-5.3-claude` "
+        "passes `includes('claude')`"
+    )
+    assert "includes(" not in body, "a substring test is what R1-5 removed"
+    assert body.index("toLowerCase()") < body.index("startsWith(GATEWAY_ID_PREFIX)"), (
+        "case-fold BEFORE the namespace check, or `Claude-GW/glm-5.3` slips "
+        "past it"
+    )
+
+    # And the two agree on the cases that matter, case by case.
+    for model_id, expected in (
+        ("claude-opus-5", True),
+        ("claude-opus-5[1m]", True),
+        ("Claude-Fable-5-1", True),
+        ("claude-gw/claude-opus-5", False),
+        ("claude-gw/glm-5.3", False),
+        ("Claude-GW/glm-5.3", False),
+        ("glm-5.3", False),
+        ("glm-5.3-claude", False),
+        ("", False),
+    ):
+        assert vs.is_first_party_model_id(model_id) is expected, model_id
+
+
+def test_the_writer_refuses_a_vendor_default_at_both_write_paths(tmp_path):
+    """The rule is enforced where a Default can be WRITTEN, not only where it
+    is typed: a GUI is not a guard."""
+    from vco_lib import vscode_settings as vs
+
+    path = tmp_path / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}\n", encoding="utf-8")
+
+    explicit = vs.point_at_gateway(
+        path, base_url="http://127.0.0.1:11436", token="synthetic", model="claude-gw/glm-5.3",
+    )
+    restored = vs.point_at_gateway(
+        path,
+        base_url="http://127.0.0.1:11436",
+        token="synthetic",
+        restore_env={vs.MODEL_KEY: "claude-gw/glm-5.3[1m]"},
+    )
+    for result in (explicit, restored):
+        assert result["ok"], result
+        assert result["refusal_reason"], "a refusal the user is never told about is the bug"
+    block = json.loads(path.read_text(encoding="utf-8"))[vs.ENV_BLOCK_KEY]
+    assert vs.MODEL_KEY not in block
+
+
+def test_the_health_service_name_is_the_same_word_in_all_three_languages():
+    """Review R1-7 leans on it: the GUI claims a start only when /health
+    answered with THIS name, and the Rust starter decides "is this port mine?"
+    the same way. Three copies of a literal, one gateway."""
+    from vco_lib import vscode_settings as vs
+
+    server = (
+        REPO / "claude_mcp_servers" / "model_router" / "server.py"
+    ).read_text(encoding="utf-8")
+    rust = (
+        REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
+    ).read_text(encoding="utf-8")
+    ts = TS.read_text(encoding="utf-8")
+
+    assert f'GATEWAY_SERVICE: &str = "{vs.GATEWAY_SERVICE_NAME}"' in rust
+    assert f"GATEWAY_SERVICE_NAME = '{vs.GATEWAY_SERVICE_NAME}'" in ts
+
+    # ── the gateway's own copy ────────────────────────────────────────────
+    # CROSS-LANE (v0.2.94): the gateway declares the word once, as
+    # `model_router.config.SERVICE_NAME`, and `server.py` emits
+    # `"service": SERVICE_NAME` — so the quoted literal is no longer in
+    # server.py. Both states are pinned so the test cannot go vacuous at the
+    # merge, and the match is LINE-ANCHORED on the declaration: server.py
+    # still spells the name in a help string
+    # (`vct-model-gateway --print-token-path`), so a bare substring test
+    # would stay green while /health answered with something else.
+    gw_config = GATEWAY_CONFIG.read_text(encoding="utf-8")
+    if re.search(r"^SERVICE_NAME\s*(?::[^=]+)?=", gw_config, re.MULTILINE):
+        assert py_const(GATEWAY_CONFIG, "SERVICE_NAME") == vs.GATEWAY_SERVICE_NAME, (
+            "model_router.config.SERVICE_NAME and the writer's "
+            "GATEWAY_SERVICE_NAME are different words; the GUI would never "
+            "recognise the gateway it just started"
+        )
+        assert '"service": SERVICE_NAME' in server, (
+            "config.py declares SERVICE_NAME but /health does not emit it — "
+            "the constant and the answered word have drifted apart"
+        )
+    else:
+        assert f'"service": "{vs.GATEWAY_SERVICE_NAME}"' in server, (
+            "the health payload no longer carries the word every reader "
+            "identifies this daemon by"
+        )
+
+
+def test_the_port_file_names_match_their_owners_on_both_sides():
+    """Review R2-2. Three processes resolve the gateway's port from the same
+    two files; a basename that drifts silently splits them."""
+    from vco_lib import vscode_settings as vs
+
+    assert vs.PORT_BASENAME == py_const(GATEWAY_CONFIG, "_PORT_BASENAME").strip('"')
+    # The gateway spells its env name inline rather than as a constant, so
+    # this pins the literal it actually reads.
+    assert (
+        f'os.environ.get("{vs.PORT_ENV}")'
+        in GATEWAY_CONFIG.read_text(encoding="utf-8")
+    ), "the writer would honour a pin the gateway does not read"
+
+    rust = (
+        REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
+    ).read_text(encoding="utf-8")
+    assert f'PORT_BASENAME: &str = "{vs.PORT_BASENAME}"' in rust
+    assert f'LAST_PORT_BASENAME: &str = "{vs.LAST_PORT_BASENAME}"' in rust, (
+        "the launcher writes the last-port record and the writer reads it; "
+        "two names means the record is never found"
+    )
+
+    # ── the collision fallback range, on both sides ───────────────────────
+    # CROSS-LANE CONTRACT (v0.2.94): the launcher moves a start off an
+    # occupied port through 11460..11468, and the gateway lane is teaching
+    # `model_router` to do the same on EADDRINUSE. Two ranges would mean the
+    # daemon binding a port the launcher never looks at.
+    #
+    # It sits at 11460 because a fallback must never hand the gateway a port
+    # another VCO service OWNS, and a bindable-right-now probe cannot see
+    # that hazard — the collision surfaces later, when the reserved service
+    # starts and cannot bind its own address. Claimed: 11435 ollama, 11436
+    # the gateway's own default, 11438 RL container-internal, 11439 legacy
+    # RL, 11440 code-embed, 11442 ORCHESTRATOR_ROOT_RL_PORT, 11443
+    # GLOBAL_RL_PORT, 11450 module-manifest example, 11500..11900 the
+    # per-project RL window.
+    assert "FALLBACK_PORT_RANGE: std::ops::RangeInclusive<u16> = 11460..=11468" in rust, (
+        "the launcher's fallback range moved; the gateway mirrors these digits"
+    )
+
+    gw_src = GATEWAY_CONFIG.read_text(encoding="utf-8")
+    if "FALLBACK_PORT_RANGE" in gw_src:
+        assert "range(11460, 11469)" in gw_src or "11460, 11469" in gw_src, (
+            "model_router.config.FALLBACK_PORT_RANGE must be 11460..11468 "
+            "inclusive — the same nine ports the launcher tries"
+        )
+    else:
+        # The gateway lane has not landed its half yet. This branch is a
+        # NARROW guard, not a proof: it catches the two shapes that would
+        # make the comparison above silently stop happening — a divergent
+        # range spelled without the constant, and a bind-retry loop landing
+        # in `__main__.py` (where lane A's fallback lives) with no constant
+        # in `config.py` to compare against.
+        assert "11460" not in gw_src, (
+            "model_router names port 11460 without a FALLBACK_PORT_RANGE "
+            "constant — the two sides' ranges can no longer be compared by "
+            "name; re-point this test at whatever it declares"
+        )
+        gw_main = (
+            REPO / "claude_mcp_servers" / "model_router" / "__main__.py"
+        ).read_text(encoding="utf-8")
+        assert "EADDRINUSE" not in gw_main, (
+            "the gateway grew a bind-retry path while config.py declares no "
+            "FALLBACK_PORT_RANGE — the launcher's 11460..=11468 is then "
+            "unpinned against whatever ports that loop actually tries"
+        )
+
+
+def test_the_export_carries_the_tombstones_key_the_gateway_reads():
+    """CROSS-LANE CONTRACT (v0.2.94): the gateway's seed fallback must not
+    advertise a `[1m]` companion for a row this machine deleted, and the only
+    way it learns about a deletion is this key. Named here so a rename on
+    either side is a red test rather than a silently ignored list."""
+    builder = (
+        REPO
+        / "launcher"
+        / "src-tauri"
+        / "vct-launcher-core"
+        / "src"
+        / "db"
+        / "chat_model_context.rs"
+    ).read_text(encoding="utf-8")
+    assert '"tombstones".into()' in builder, "the export builder no longer emits it"
+    assert "pub fn export_document(" in builder
+    exporter = (
+        REPO / "launcher" / "src-tauri" / "src" / "commands" / "chat_model_context.rs"
+    ).read_text(encoding="utf-8")
+    assert "list_chat_model_context_tombstones()" in exporter, (
+        "the file export must SOURCE the list, not emit an empty one"
+    )
+
+
 def test_frontend_slot_key_list_matches_the_writer():
     from vco_lib import vscode_settings as vs
 
@@ -187,12 +406,20 @@ def test_no_wp12_file_ever_assigns_a_tier_or_subagent_slot():
     )
 
 
-def test_default_model_is_glm_5_3_and_never_flash_or_older():
+def test_default_model_offered_by_the_gui_is_first_party():
+    """USER RULING 2026-09-08: a vendor model is never the Default.
+
+    It was `claude-gw/glm-5.3` here until the panel-restart incident, and
+    that pre-selection is how the value reached a real settings.json. The
+    Default is the restart fallback, so it names a model that answers under
+    its own name at api.anthropic.com — the picker is where vendor models
+    belong.
+    """
     from vco_lib import vscode_settings as vs
 
-    assert vs.DEFAULT_GATEWAY_MODEL == "claude-gw/glm-5.3"
-    for banned in ("flash", "glm-5.2", "glm-5.1", "glm-4"):
-        assert banned not in vs.DEFAULT_GATEWAY_MODEL
+    assert vs.is_first_party_model_id(vs.DEFAULT_GATEWAY_MODEL)
+    for banned in ("glm", "flash", vs.GATEWAY_ID_PREFIX):
+        assert banned not in vs.DEFAULT_GATEWAY_MODEL.lower()
 
 
 def test_template_never_makes_flash_a_default():
@@ -377,7 +604,9 @@ def test_seed_and_default_model_agree():
     )
     from vco_lib import vscode_settings as vs
 
-    assert vs.DEFAULT_GATEWAY_MODEL.split("/", 1)[1] in seed["models"]
+    row = seed["models"].get(vs.DEFAULT_GATEWAY_MODEL)
+    assert row, f"{vs.DEFAULT_GATEWAY_MODEL} is not a row in the shipped seed"
+    assert row["vendor"] == vs.FIRST_PARTY_VENDOR
 
 
 def test_the_two_vscode_keys_are_the_names_the_extension_reads():
