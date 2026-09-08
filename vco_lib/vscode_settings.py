@@ -37,7 +37,7 @@ What "point at gateway" writes — and what it must never write
 Written: ``ANTHROPIC_BASE_URL``, ``ANTHROPIC_AUTH_TOKEN`` (the gateway's
 loopback host token), ``ANTHROPIC_API_KEY=""``,
 ``CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1``; plus ``ANTHROPIC_MODEL``
-ONLY when the caller passes an explicit choice.
+ONLY when the caller passes an explicit FIRST-PARTY choice (next section).
 
 NEVER written: ``ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL``,
 ``ANTHROPIC_SMALL_FAST_MODEL``, ``CLAUDE_CODE_SUBAGENT_MODEL``. Pointing a
@@ -54,6 +54,36 @@ DIRECTLY at a third-party endpoint the same omission would be dangerous —
 those endpoints answer ``claude-*`` names with their own small model, HTTP
 200, no error (documented vendor behaviour, docs.z.ai). The gateway is what
 makes leaving the slots unset the honest choice.
+
+A vendor model is never the Default (USER RULING 2026-09-08)
+------------------------------------------------------------
+``ANTHROPIC_MODEL`` is not "the model I picked". It is the model the client
+falls back to, and a Claude Code panel PROCESS RESTART resumes the session on
+it — the picker choice does not survive. On 2026-09-08 the Default held
+``claude-gw/glm-5.3[1m]`` (written by the prototype
+``claude-or-vscode-sync``, and pre-selected by 0.2.93's own "Also set the
+picker's Default entry"), the panel restarted at 00:38Z, and 204 turns of a
+release cycle ran on GLM while every surface still said Fable.
+
+So: a vendor model may be PICKED — putting it in the picker is what the
+gateway is FOR — and may never be the Default. :func:`is_first_party_model_id`
+is the rule, and it is enforced at the two places a Default can be written:
+:func:`point_at_gateway`'s explicit ``model=``, and the ``multimodel`` leg's
+restore of a stashed ``ANTHROPIC_MODEL``. Both refuse the key, name the id
+and the rule in ``refusal_reason``, and write everything else.
+
+Two deliberate asymmetries:
+
+* SLOT overrides (haiku / small-fast / subagent) are NOT touched by this
+  rule. They are per-tier choices the user made explicitly, they do not
+  govern what a restart falls back to, and this module has never written
+  them anyway — a restored one goes back exactly as it was.
+* An ``ANTHROPIC_MODEL`` already in the file is PRESERVED, not deleted.
+  It is the user's key. :func:`panel_mode` reports it
+  (``default_model_is_vendor``) so the GUI can say so out loud, and
+  :func:`clear_default_model` removes it — that one key, on a click, with a
+  backup. Silently deleting a value the user may have chosen on purpose
+  would be the same class of surprise this rule exists to end.
 
 The ONE permitted touch on those values — the ``[1m]`` decoration (R41)
 -----------------------------------------------------------------------
@@ -235,13 +265,22 @@ SLOT_OVERRIDE_KEYS = (
     "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
-#: The GLM id the GUI pre-selects when the user chooses to set a default at
-#: all. GLM-5.3, never the flash variant and never a pre-5.3 version: flash
-#: breaks an already-passing baseline test in 6.9% of agent rollouts (vs 4.4%
-#: for 5.3) and longer runs help it only 46% of the time, so it is a
-#: verified-breadth model, not a default. Pinned against the shipped context
-#: seed by ``tests/test_vscode_settings.py``.
-DEFAULT_GATEWAY_MODEL = "claude-gw/glm-5.3"
+#: The id the GUI pre-selects when the user chooses to set a default at all.
+#: FIRST-PARTY, always — see :func:`is_first_party_model_id` for the rule and
+#: the incident behind it. Pinned against the shipped context seed by
+#: ``tests/test_vscode_settings.py``, and against the first-party rule by
+#: ``tests/test_v0292_model_gateway_gui_contract.py``.
+DEFAULT_GATEWAY_MODEL = "claude-opus-5"
+
+#: Basenames under ``<vct_root>`` for the gateway's port file (written by the
+#: daemon, DELETED on its clean exit) and for the launcher's record of the
+#: port it last started one on (written by ``model_gateway_start``, never
+#: deleted). Both duplicated from their owners on purpose, for the same
+#: reason as the port below: this module must still resolve a gateway whose
+#: package is uninstalled. Pinned against both owners by
+#: ``tests/test_v0292_model_gateway_gui_contract.py``.
+PORT_BASENAME = "model-gateway.port"
+LAST_PORT_BASENAME = "model-gateway.last-port"
 
 #: The gateway's documented port. Duplicated from ``model_router.config`` on
 #: purpose: :func:`is_vco_gateway_base_url` must still recognise a panel
@@ -254,10 +293,20 @@ DEFAULT_GATEWAY_PORT = 11436
 #: below must keep recognising gateway ids even when the package is gone.
 GATEWAY_ID_PREFIX = "claude-gw/"
 
+#: Prefix EVERY first-party (Anthropic-served) chat model id carries, and the
+#: prefix the gateway routes to api.anthropic.com. Compared case-folded; see
+#: :func:`is_first_party_model_id` for why this is a prefix and not a
+#: substring.
+FIRST_PARTY_ID_PREFIX = "claude-"
+
 #: The client-side context-window hint :func:`decorate_1m` may append. The
 #: gateway strips it before routing — it changes the window the client
 #: ASSUMES, never the model that answers.
 CONTEXT_1M_SUFFIX = "[1m]"
+
+#: The gateway's port-pin env var. Duplicated from ``model_router.config``
+#: for the same reason as the basenames above; pinned by the same test.
+PORT_ENV = "VCT_MODEL_GATEWAY_PORT"
 
 #: Env var carrying the host token to this process. Present so a caller that
 #: already holds the token can pass it without it ever appearing in argv (or
@@ -285,6 +334,21 @@ MODES = (MODE_MULTIMODEL, MODE_REMOTE_CONTROL)
 #: ``tests/test_vscode_settings.py``. A row whose vendor is anything else
 #: names a model only the gateway can serve.
 FIRST_PARTY_VENDOR = "anthropic"
+
+#: The gateway's ``/health`` ``service`` value. A loopback port that answers
+#: with anything else is NOT the gateway, however plausible it looks — the
+#: machine in the 2026-09-08 incident had a legacy scorer container on the
+#: gateway's default port and a prototype gateway on another.
+GATEWAY_SERVICE_NAME = "vct-model-gateway"
+
+#: :func:`probe_gateway`'s three answers, and its timeout. Tri-state on
+#: purpose: "I could not tell" is not "stopped", and the Start action the
+#: GUI offers on ``stopped`` would be wrong on ``unreachable``.
+GATEWAY_RUNNING = "running"
+GATEWAY_STOPPED = "stopped"
+GATEWAY_UNREACHABLE = "unreachable"
+GATEWAY_STATES = (GATEWAY_RUNNING, GATEWAY_STOPPED, GATEWAY_UNREACHABLE)
+GATEWAY_PROBE_TIMEOUT = 1.0
 
 #: Where the mode switch keeps the choices it takes out of the file.
 #: ``<vct_root>/model-gateway/`` is the gateway's own state subdirectory
@@ -689,10 +753,15 @@ def is_vco_gateway_base_url(
     our gateway, and leave any other value the user set completely alone" —
     so a false positive here would clobber someone else's configuration.
 
-    ``ports`` defaults to the gateway's documented port. A caller that can
-    reach ``model_router.config.resolve_port()`` should pass both it and the
-    default: after an uninstall the port FILE is gone, and the recorded URL
-    must still be recognised.
+    ``ports`` defaults to :func:`resolve_gateway_ports`, which is the one
+    place that decides which port is ours (env pin, then the daemon's port
+    file, then the launcher's last-port record, then the documented
+    default). Review R3-6: this used to default to the documented port
+    ALONE, which quietly restored the pre-R1-2 rule — "11436 is ours because
+    it is the number we ship" — for any caller that omitted the argument,
+    including the uninstall-time reset. A caller with a better answer still
+    passes it; a caller with none now gets the same answer as everyone else
+    instead of a weaker one.
     """
     if not url:
         return False
@@ -704,7 +773,10 @@ def is_vco_gateway_base_url(
         return False
     if not is_loopback_host(parts.hostname or ""):
         return False
-    allowed = tuple(ports) if ports else (DEFAULT_GATEWAY_PORT,)
+    # `is not None`, not truthiness: an explicit empty sequence is a caller
+    # saying "no port on this machine is ours", and falling through to the
+    # resolver would answer the opposite question.
+    allowed = tuple(ports) if ports is not None else resolve_gateway_ports()
     try:
         port = parts.port
     except ValueError:
@@ -714,26 +786,202 @@ def is_vco_gateway_base_url(
     return port in allowed
 
 
-def resolve_gateway_ports() -> tuple[int, ...]:
-    """The ports a VCO gateway may be reachable on, most specific first.
+def _state_dir() -> Optional[Path]:
+    """``<vct_root>``, or ``None`` when it cannot be resolved. Never raises."""
+    try:
+        from vco_lib.paths import vct_root_dir
 
-    Reads ``model_router.config.resolve_port()`` (env, then the port file)
-    and always includes the documented default, so the answer survives the
-    port file being deleted — which is precisely the state an uninstalled
-    gateway leaves behind.
-    """
-    ports: list[int] = []
+        return vct_root_dir()
+    except Exception:  # noqa: BLE001 — a probe answers, it never raises
+        return None
+
+
+def _read_port_file(path: Optional[Path]) -> Optional[int]:
+    """A usable port from a one-line file, or ``None``. Never raises."""
+    if path is None:
+        return None
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def port_file_path() -> Optional[Path]:
+    """The daemon's port file. Path from ``model_router.config`` when it can
+    be imported, else composed here (see :data:`PORT_BASENAME`)."""
     try:
         from model_router.config import (  # pyright: ignore[reportMissingImports]
-            resolve_port,
+            port_path,
         )
 
-        ports.append(resolve_port())
-    except Exception:  # noqa: BLE001 — a broken/absent gateway must not break the probe
-        pass
-    if DEFAULT_GATEWAY_PORT not in ports:
-        ports.append(DEFAULT_GATEWAY_PORT)
-    return tuple(ports)
+        return Path(port_path())
+    except Exception:  # noqa: BLE001 — an absent gateway package is not an error here
+        root = _state_dir()
+        return None if root is None else root / PORT_BASENAME
+
+
+def last_port_path() -> Optional[Path]:
+    """Where the LAUNCHER records the port it last started a gateway on.
+
+    Review R2-2: the daemon deletes its port file on a clean exit, so a
+    gateway that had moved off the default port (because something else held
+    it) left nothing behind — and the very next resolution answered with the
+    shipped default, which on the reporter's machine is a legacy container.
+    That mis-resolution is not cosmetic: the uninstall reset skips a panel it
+    no longer recognises, and a Services "point" writes our host token into a
+    base URL naming somebody else's service.
+
+    This file is written by ``model_gateway_start`` and never deleted, so it
+    is a memory of INTENT rather than of liveness — which is exactly what a
+    stopped gateway needs to still be recognisable.
+    """
+    root = _state_dir()
+    return None if root is None else root / LAST_PORT_BASENAME
+
+
+def resolve_gateway_ports() -> tuple[int, ...]:
+    """The port a VCO gateway is reachable on. ONE answer, not a set.
+
+    In order: the ``VCT_MODEL_GATEWAY_PORT`` pin, the daemon's live port
+    file, the launcher's last-chosen-port record, then the documented
+    default. Each step is EVIDENCE; the default is the answer only when
+    there is none.
+
+    Review R1-2: this used to return the resolved port AND the default, and
+    ``DEFAULT_GATEWAY_PORT`` being permanently "ours" is what let a panel
+    pointed at 11436 — held on the reporter's machine by a legacy container
+    — read as a healthy VCO gateway while the real one ran on 11437. A port
+    is ours because something resolved it, never because it is the number we
+    ship.
+
+    The chain is spelled out here rather than delegated to
+    ``model_router.config.resolve_port`` because the last-port step is the
+    LAUNCHER's record, which that resolver knows nothing about; the two file
+    LOCATIONS still come from the gateway package whenever it is importable
+    (:func:`port_file_path`), so only the "read an int from a line" part is
+    local.
+    """
+    pinned = _read_port_env()
+    if pinned:
+        return (pinned,)
+    live = _read_port_file(port_file_path())
+    if live:
+        return (live,)
+    last = _read_port_file(last_port_path())
+    if last:
+        return (last,)
+    return (DEFAULT_GATEWAY_PORT,)
+
+
+def _read_port_env(env: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """``VCT_MODEL_GATEWAY_PORT``, when it names a usable port."""
+    env = os.environ if env is None else env
+    raw = (env.get(PORT_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def panel_endpoint_port(base_url: Optional[str]) -> Optional[int]:
+    """The LOOPBACK port this panel talks to, or ``None``.
+
+    ``None`` covers both "no endpoint configured" and "a remote endpoint" —
+    neither is a port this machine can probe, and answering with the
+    resolved gateway port instead would describe a process the panel never
+    reaches (review R1-2). It is the input to the ``endpoint`` field, which
+    is a separate question from ``gateway`` (review R2-3): the panel's
+    endpoint being dead does not mean the VCO gateway is stopped, and the
+    GUI acts on those two differently — one is a warning, the other is a
+    Start button.
+    """
+    if not base_url:
+        return None
+    try:
+        parts = urlsplit(base_url.strip())
+    except ValueError:
+        return None
+    if not is_loopback_host(parts.hostname or ""):
+        return None
+    try:
+        return parts.port
+    except ValueError:
+        return None
+
+
+def probe_gateway(
+    *,
+    ports: Optional[Sequence[int]] = None,
+    timeout: Optional[float] = None,
+) -> str:
+    """Is a VCO gateway answering on the resolved port? Tri-state, never lies.
+
+    * ``running`` — ``/health`` answered 200 with OUR service name.
+    * ``stopped`` — the connection was refused: nothing is listening.
+    * ``unreachable`` — anything else: a timeout, an HTTP error, a body that
+      is not our health payload (something else owns the port — on the
+      machine this was written for, a legacy scorer container held 11436),
+      or a name/socket error.
+
+    The three are kept apart because the GUI acts differently on each: it
+    offers to START the gateway on ``stopped`` (that is the fix), and must
+    NOT on ``unreachable`` (starting a second daemon against an occupied
+    port is how the incident's port collision happened).
+
+    ``http.client`` rather than ``urllib.request`` on purpose: ``urlopen``
+    applies the environment's proxy settings, and a machine with
+    ``http_proxy`` set but no ``no_proxy`` entry for localhost would have its
+    LOOPBACK health probe answered by a proxy. This connects to
+    127.0.0.1 directly, which is the only thing this probe ever wants.
+
+    Never raises. This runs behind a status refresh; a probe that throws
+    would take the whole panel-mode read down with it.
+    """
+    import http.client
+
+    resolved = tuple(ports) if ports else resolve_gateway_ports()
+    if not resolved:
+        return GATEWAY_UNREACHABLE
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", resolved[0], timeout=timeout or GATEWAY_PROBE_TIMEOUT,
+        )
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return GATEWAY_UNREACHABLE
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except ConnectionRefusedError:
+        return GATEWAY_STOPPED
+    except OSError as exc:
+        # Some stacks wrap the refusal (e.g. socket.error chains). Anything
+        # else — a timeout, a reset, a DNS-free socket error — is honestly
+        # "could not tell", never "stopped".
+        if isinstance(getattr(exc, "__cause__", None), ConnectionRefusedError):
+            return GATEWAY_STOPPED
+        return GATEWAY_UNREACHABLE
+    except Exception:  # noqa: BLE001 — a probe answers, it never raises
+        return GATEWAY_UNREACHABLE
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    if isinstance(payload, dict) and payload.get("service") == GATEWAY_SERVICE_NAME:
+        return GATEWAY_RUNNING
+    # Something answered and it is not ours. Reporting that as "running"
+    # would send the panel at a foreign service under our name.
+    return GATEWAY_UNREACHABLE
 
 
 def resolve_host_token(env: Optional[Mapping[str, str]] = None) -> str:
@@ -1040,6 +1288,61 @@ def decorate_1m(value: Any, table: Optional[Any]) -> Any:
     return value
 
 
+# ---------------------------------------------------------------------------
+# GLM is never the Default (USER RULING 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+def is_first_party_model_id(model_id: Any) -> bool:
+    """Pure: does this id name a model ANTHROPIC serves, under its own name?
+
+    ``ANTHROPIC_MODEL`` is not "the model I picked" — it is the model the
+    client falls back to. A Claude Code panel process that RESTARTS resumes
+    the session on this value, silently discarding the picker choice; on
+    2026-09-08 that turned a Fable session into a GLM one at 00:42Z and 204
+    turns ran on a vendor model before anyone noticed. So a vendor model may
+    be PICKED (that is what the gateway's catalogue is for) and may never be
+    the Default. First-party is the whole rule:
+
+    * ``claude-opus-5`` / ``claude-fable-5-1`` -> True. Anthropic's own ids
+      all begin ``claude-``; the gateway routes exactly that prefix to
+      api.anthropic.com, and the stock client resolves it too, so the value
+      is safe in either mode.
+    * ``claude-gw/<anything>`` -> False even when the tail is a Claude id:
+      the namespace means "only the gateway resolves this", so a panel that
+      came back stock would fall back to a name nothing answers.
+    * ``glm-5.3``, ``gpt-x``, anything else -> False.
+
+    A PREFIX test, not a substring one, and case-folded BEFORE the namespace
+    check — review R1-5: ``glm-5.3-claude`` would pass a substring test and
+    is a vendor id, and ``Claude-GW/glm-5.3`` would slip past a
+    case-sensitive namespace check into the very state this rule exists to
+    prevent. The ``[1m]`` suffix is ignored for the decision, exactly as
+    :func:`decorate_1m` and :func:`is_gateway_only_model` ignore it.
+    """
+    if not isinstance(model_id, str):
+        return False
+    base = model_id.strip().lower()
+    if not base:
+        return False
+    if base.endswith(CONTEXT_1M_SUFFIX):
+        base = base[: -len(CONTEXT_1M_SUFFIX)].strip()
+    if base.startswith(GATEWAY_ID_PREFIX):
+        return False
+    return base.startswith(FIRST_PARTY_ID_PREFIX)
+
+
+def _vendor_default_refusal(model_id: str, origin: str) -> str:
+    """The sentence a refused Default write leaves behind. Names id + rule."""
+    return (
+        f"{model_id!r} was NOT written to {MODEL_KEY} ({origin}): a vendor "
+        "model is never the panel's Default. The Default is what a restarted "
+        "Claude Code panel falls back to, so a vendor id there answers "
+        "sessions you believe are on Claude. Pick it in the /model picker "
+        "instead — the gateway puts it there."
+    )
+
+
 def point_at_gateway(
     path: Path,
     *,
@@ -1055,9 +1358,12 @@ def point_at_gateway(
         path: the VS Code global ``settings.json`` to edit.
         base_url: the gateway's base URL (``http://127.0.0.1:<port>``).
         token: the gateway's loopback host token.
-        model: written to ``ANTHROPIC_MODEL`` only when non-empty. ``None``
-            leaves any existing value exactly as it was — re-running this
-            action must never reset the user's model choice.
+        model: written to ``ANTHROPIC_MODEL`` only when non-empty AND
+            first-party (:func:`is_first_party_model_id`); a vendor id is
+            refused, named in ``refusal_reason``, and the rest of the write
+            proceeds without the key. ``None`` leaves any existing value
+            exactly as it was — re-running this action must never reset the
+            user's model choice.
         remove_slot_overrides: drop tier/subagent overrides already present
             in the file. Default False: they are the user's keys. The GUI
             offers this as an explicit choice and names the keys it would
@@ -1068,15 +1374,27 @@ def point_at_gateway(
             cannot inject a routing key or an unknown name. An explicit
             ``model`` still wins over a restored ``ANTHROPIC_MODEL``. See the
             module docstring for why this is the corollary of the
-            never-write rule, not an exception to it.
+            never-write rule, not an exception to it. The SLOT values come
+            back whatever they name (they are the user's explicit per-tier
+            choices); a restored ``ANTHROPIC_MODEL`` naming a vendor model
+            does not — same rule, same ``refusal_reason``.
 
     Returns a result dict; ``status`` is ``written``, ``unchanged`` or
     ``refused``. On ``refused`` the file is byte-for-byte untouched.
+    ``refusal_reason`` is set (and the key omitted) when a Default write was
+    declined; it is orthogonal to ``status``, which still reports what the
+    rest of the write did.
     """
     path = Path(path)
     result: dict[str, Any] = {
         "action": "point_at_gateway",
         "path": str(path),
+        # What was actually WRITTEN into ANTHROPIC_BASE_URL. Reported so a
+        # caller's done message can name the port it really pointed at rather
+        # than the one it assumed — the reporting half of the same defect
+        # R1-1 fixed in the argv (a re-resolved port silently naming another
+        # process).
+        "base_url": base_url,
         "ok": False,
         "status": "refused",
         "reason": None,
@@ -1088,10 +1406,16 @@ def point_at_gateway(
         "keys_restored": [],
         "slot_overrides_preserved": [],
         "values_healed": [],
+        "refusal_reason": None,
+        "vendor_default_preserved": None,
         "permissions": "unknown",
         "paste_block": None,
         "restart_required": True,
     }
+    refusals: list[str] = []
+    if model and not is_first_party_model_id(model):
+        refusals.append(_vendor_default_refusal(model, "the choice passed in"))
+        model = None
     existed = path.is_file()
     try:
         settings, original_text = _load_settings(path)
@@ -1118,6 +1442,13 @@ def point_at_gateway(
             if key != MODEL_KEY and key not in SLOT_OVERRIDE_KEYS:
                 continue
             if not isinstance(value, str) or not value.strip():
+                continue
+            if key == MODEL_KEY and not is_first_party_model_id(value):
+                # The stash is the user's own choice, but this one key is the
+                # restart fallback, and a vendor id there is the 2026-09-08
+                # incident. The slot keys below are unaffected: they are
+                # per-tier picks, not the Default.
+                refusals.append(_vendor_default_refusal(value, "restored from the stash"))
                 continue
             block[key] = value
             restored.append(key)
@@ -1164,8 +1495,31 @@ def point_at_gateway(
         result["keys_removed"] = removed
         result["keys_restored"] = restored
         result["values_healed"] = healed
+        result["refusal_reason"] = " ".join(refusals) or None
+        # Review R1-3: the ruling forbids WRITING a vendor Default, not
+        # keeping the user's. But carrying one forward in silence is how the
+        # migration click (prototype endpoint -> VCO gateway) left the
+        # incident's own `claude-gw/glm-5.3[1m]` in place with a message that
+        # said nothing about it. Kept, and SAID.
+        kept_default = block.get(MODEL_KEY)
+        if (
+            MODEL_KEY in preserved
+            and isinstance(kept_default, str)
+            and not is_first_party_model_id(kept_default)
+        ):
+            result["vendor_default_preserved"] = kept_default
         result["slot_overrides_preserved"] = sorted(
             k for k in SLOT_OVERRIDE_KEYS if k in block
+        )
+
+        kept_note = (
+            ""
+            if not result["vendor_default_preserved"]
+            else (
+                f" Kept your Default {result['vendor_default_preserved']} — it is a "
+                "vendor model, so a Claude Code restart resumes on it. Use "
+                "\u201cClear default\u201d in the status bar to remove it."
+            )
         )
 
         if existed and new_settings == settings:
@@ -1176,6 +1530,8 @@ def point_at_gateway(
                 message=(
                     "Already pointed at this gateway; nothing to change. "
                     "Restart VS Code if the panel has not picked it up."
+                    + ("" if not refusals else " " + " ".join(refusals))
+                    + kept_note
                 ),
             )
             return result
@@ -1198,14 +1554,100 @@ def point_at_gateway(
                     if healed
                     else ""
                 )
+                + ("" if not refusals else " " + " ".join(refusals))
+                + kept_note
             ),
         )
         return result
     except SettingsRefused as exc:
         result["reason"] = exc.reason
         result["message"] = exc.message
+        result["refusal_reason"] = " ".join(refusals) or None
+        # `model` is already None when it was refused, so the block the user
+        # is told to paste by hand cannot carry the id VCO just declined.
         result["paste_block"] = paste_block(
             base_url=base_url, token=token, model=model,
+        )
+        return result
+
+
+def clear_default_model(path: Path) -> dict:
+    """Remove ``ANTHROPIC_MODEL`` and NOTHING else.
+
+    The counterpart to the refusal in :func:`point_at_gateway`: VCO will not
+    WRITE a vendor Default, and a file that already holds one (written by the
+    prototype ``claude-or-vscode-sync``, or by a hand edit) is the user's to
+    keep — so it is surfaced (``panel_mode``'s ``default_model_is_vendor``)
+    with this one-key action beside it, never deleted behind their back.
+
+    Routing keys, slot overrides, every other setting: untouched. An env
+    block this empties is dropped, on the same reasoning as the
+    ``remote-control`` leg — an empty husk is not a setting.
+    """
+    path = Path(path)
+    result: dict[str, Any] = {
+        "action": "clear_default_model",
+        "path": str(path),
+        "ok": False,
+        "status": "refused",
+        "reason": None,
+        "message": "",
+        "backup_path": None,
+        "keys_removed": [],
+        "cleared_value": None,
+        "permissions": "unknown",
+        "paste_block": None,
+        "restart_required": True,
+    }
+    if not path.is_file():
+        result.update(
+            ok=True,
+            status="unchanged",
+            message=f"{path} does not exist; there is no Default to clear.",
+        )
+        return result
+    try:
+        settings, original_text = _load_settings(path)
+        block = _existing_env_block(settings, path)
+        if MODEL_KEY not in block:
+            result.update(
+                ok=True,
+                status="unchanged",
+                permissions=_probe_permissions(path),
+                message=(
+                    f"No {MODEL_KEY} is set; the panel already falls back to "
+                    "whatever you pick in the /model picker."
+                ),
+            )
+            return result
+        cleared = block.pop(MODEL_KEY)
+        new_settings = dict(settings)
+        if block:
+            new_settings[ENV_BLOCK_KEY] = block
+        else:
+            new_settings.pop(ENV_BLOCK_KEY, None)
+        backup, perms = _write_settings(
+            path, new_settings, original_text=original_text, existed=True,
+        )
+        result.update(
+            ok=True,
+            status="written",
+            backup_path=backup,
+            keys_removed=[MODEL_KEY],
+            cleared_value=cleared if isinstance(cleared, str) else None,
+            permissions=perms,
+            message=(
+                f"Default model cleared ({cleared}). The panel now uses the "
+                "model you pick in /model, and a restart cannot silently put "
+                "you back on that one. Restart VS Code to load the change."
+            ),
+        )
+        return result
+    except SettingsRefused as exc:
+        result["reason"] = exc.reason
+        result["message"] = (
+            f"{exc.message} To clear it by hand, delete the `{MODEL_KEY}` "
+            f"entry from `{ENV_BLOCK_KEY}`."
         )
         return result
 
@@ -1458,6 +1900,31 @@ def _same_file(a: Path, b: Path) -> bool:
         return str(a) == str(b)
 
 
+def is_prototype_endpoint(
+    base_url: Optional[str],
+    *,
+    ports: Optional[Sequence[int]] = None,
+) -> bool:
+    """Pure: a loopback endpoint on this machine that is NOT a VCO gateway.
+
+    The 2026-09-08 shape exactly: the panel pointed at ``127.0.0.1:8787``, a
+    prototype gateway that predates the product one, while the VCO gateway
+    had never been started. That reads as ``unmanaged`` — correct, VCO does
+    not own it — but it is the ONE ``unmanaged`` case with an obvious
+    migration (click Multimodel), so it is named rather than lumped in with
+    "some endpoint the user chose".
+    """
+    if not base_url:
+        return False
+    if is_vco_gateway_base_url(base_url, ports=ports):
+        return False
+    try:
+        parts = urlsplit(base_url.strip())
+    except ValueError:
+        return False
+    return is_loopback_host(parts.hostname or "")
+
+
 def panel_mode(
     path: Path,
     *,
@@ -1473,10 +1940,38 @@ def panel_mode(
     * ``unmanaged`` — a base URL that is not ours. The switch never touches
       this state; the user set it, and only the user unsets it.
     * ``unparseable`` — JSONC or otherwise unreadable; nothing is guessed.
+
+    Three fields beyond the mode, each one a thing the GUI decided WRONGLY
+    before it existed (2026-09-08 incident report):
+
+    * ``gateway`` — :func:`probe_gateway` on the RESOLVED gateway port: is
+      there a VCO gateway on this machine? The switch used to refuse the
+      Multimodel leg with "start the gateway once" and leave the user to
+      work out how; the GUI now starts it, and needs to know which of the
+      three states it is in before offering that.
+    * ``endpoint`` — the same probe against the port THIS PANEL talks to,
+      or ``None`` when that is not a loopback port (no endpoint, or a
+      remote one). Review R2-3: these are different questions, and reading
+      one as the other produced a "gateway stopped" label with a Start
+      button that then errored "already running" — the dead thing was the
+      panel's prototype endpoint, not the gateway.
+    * ``prototype_endpoint`` — see :func:`is_prototype_endpoint`.
+    * ``default_model_is_vendor`` — the file's ``ANTHROPIC_MODEL`` names a
+      model VCO would refuse to write there. Reported, never auto-removed:
+      :func:`clear_default_model` is the user's one-click way out.
     """
     path = Path(path)
     stash = Path(stash) if stash is not None else stash_path()
     probe = inspect_target(path, ports=ports)
+    resolved = tuple(ports) if ports else resolve_gateway_ports()
+    gateway_port = resolved[0] if resolved else None
+    endpoint_port = panel_endpoint_port(probe["base_url"])
+    # One probe per distinct port: the two fields ask about the same process
+    # whenever the panel already points at the resolved gateway, and this
+    # runs on every status refresh.
+    gateway_state = (
+        probe_gateway(ports=(gateway_port,)) if gateway_port else GATEWAY_UNREACHABLE
+    )
     out: dict[str, Any] = {
         "mode": MODE_REMOTE_CONTROL,
         "path": str(path),
@@ -1486,6 +1981,20 @@ def panel_mode(
         "slot_overrides": list(probe["slot_overrides"]),
         "stash_present": stash.is_file(),
         "stash_path": str(stash),
+        "gateway": gateway_state,
+        "endpoint": (
+            None
+            if endpoint_port is None
+            else (
+                gateway_state
+                if endpoint_port == gateway_port
+                else probe_gateway(ports=(endpoint_port,))
+            )
+        ),
+        "prototype_endpoint": is_prototype_endpoint(probe["base_url"], ports=ports),
+        "default_model_is_vendor": bool(
+            probe["model"] and not is_first_party_model_id(probe["model"])
+        ),
     }
     if not probe["exists"]:
         out["detail"] = "No settings file; the panel is on stock Claude Code."
@@ -1510,10 +2019,17 @@ def panel_mode(
             out["detail"] += " Model choices from Multimodel mode are stashed."
         return out
     out["mode"] = MODE_UNMANAGED
-    out["detail"] = (
-        f"Panel points at a custom endpoint ({probe['base_url']}); VCO "
-        "leaves it alone."
-    )
+    if out["prototype_endpoint"]:
+        out["detail"] = (
+            f"Panel points at a custom LOCAL endpoint ({probe['base_url']}) "
+            "that is not the VCO gateway — a prototype gateway, most likely. "
+            "Multimodel moves it to the VCO gateway."
+        )
+    else:
+        out["detail"] = (
+            f"Panel points at a custom endpoint ({probe['base_url']}); VCO "
+            "leaves it alone."
+        )
     return out
 
 
@@ -1534,6 +2050,8 @@ def _mode_result(action_mode: str, path: Path, stash: Path) -> dict[str, Any]:
         "values_stashed": [],
         "slot_overrides_preserved": [],
         "values_healed": [],
+        "refusal_reason": None,
+        "vendor_default_preserved": None,
         "stash_path": str(stash),
         "stash_present": stash.is_file(),
         "permissions": "unknown",
@@ -1825,7 +2343,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect = sub.add_parser("inspect", help="describe one settings file")
     p_inspect.add_argument("--path", required=True)
 
-    p_point = sub.add_parser("point", help="point the panel at the gateway")
+    p_point = sub.add_parser(
+        "point",
+        help=(
+            "point the panel at the gateway. Exits NON-ZERO when a "
+            "--model was declined, even though the routing keys were "
+            "written — a caller that asked for a Default and got none must "
+            "not read exit 0 as success. (`mode --set multimodel` differs "
+            "deliberately: the switch itself succeeded, so it exits 0 and "
+            "reports the declined Default in `refusal_reason`.)"
+        ),
+    )
     p_point.add_argument("--path", required=True)
     p_point.add_argument(
         "--base-url",
@@ -1836,8 +2364,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=None,
         help=(
-            "value for ANTHROPIC_MODEL. Omit to leave the user's current "
-            "choice untouched (the default)."
+            "value for ANTHROPIC_MODEL. Must be a first-party (Claude) id — "
+            "a vendor id is refused, because the Default is what a restarted "
+            "panel falls back to. Omit to leave the user's current choice "
+            "untouched (the default)."
         ),
     )
     p_point.add_argument(
@@ -1848,6 +2378,12 @@ def build_parser() -> argparse.ArgumentParser:
             "never writes them; this only removes ones already there."
         ),
     )
+
+    p_clear = sub.add_parser(
+        "clear-default",
+        help="remove ANTHROPIC_MODEL (the restart fallback) and nothing else",
+    )
+    p_clear.add_argument("--path", required=True)
 
     p_reset = sub.add_parser("reset", help="remove both managed keys")
     p_reset.add_argument("--path", required=True)
@@ -1860,7 +2396,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mode = sub.add_parser(
         "mode",
-        help="the Multimodel <-> Remote Control switch: --get or --set",
+        help=(
+            "the Multimodel <-> Remote Control switch: --get or --set. "
+            "--set exits 0 whenever the switch was applied, INCLUDING when a "
+            "stashed vendor Default was declined (see `refusal_reason` in the "
+            "payload); only a refusal that changed nothing exits non-zero. "
+            "`point` is stricter — see its help."
+        ),
     )
     p_mode.add_argument("--path", required=True)
     which = p_mode.add_mutually_exclusive_group(required=True)
@@ -1887,6 +2429,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "inspect":
         _emit(inspect_target(Path(args.path), ports=resolve_gateway_ports()))
         return 0
+    if args.command == "clear-default":
+        result = clear_default_model(Path(args.path))
+        _emit(result)
+        return 0 if result["ok"] else 1
     if args.command == "reset":
         result = reset_native(Path(args.path))
         _emit(result)
@@ -1952,7 +2498,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         remove_slot_overrides=bool(args.remove_slot_overrides),
     )
     _emit(result)
-    return 0 if result["ok"] else 1
+    # A declined `--model` exits non-zero even though the routing keys were
+    # written: a script that asked for a Default and got none must not read
+    # exit 0 as "you have it". The reason travels in the payload.
+    return 0 if (result["ok"] and not result.get("refusal_reason")) else 1
 
 
 if __name__ == "__main__":  # pragma: no cover - process entry point
@@ -1963,11 +2512,19 @@ __all__ = [
     "CONTEXT_1M_SUFFIX",
     "DEFAULT_GATEWAY_MODEL",
     "DEFAULT_GATEWAY_PORT",
+    "GATEWAY_PROBE_TIMEOUT",
+    "GATEWAY_RUNNING",
+    "GATEWAY_SERVICE_NAME",
+    "GATEWAY_STATES",
+    "GATEWAY_STOPPED",
+    "GATEWAY_UNREACHABLE",
     "ENV_BLOCK_KEY",
     "ENV_TARGET_OVERRIDE",
     "ENV_TOKEN",
+    "FIRST_PARTY_ID_PREFIX",
     "FIRST_PARTY_VENDOR",
     "GATEWAY_ID_PREFIX",
+    "LAST_PORT_BASENAME",
     "LOGIN_PROMPT_KEY",
     "MANAGED_SETTINGS_KEYS",
     "MODEL_KEY",
@@ -1976,6 +2533,8 @@ __all__ = [
     "MODE_REMOTE_CONTROL",
     "MODE_UNMANAGED",
     "MODE_UNPARSEABLE",
+    "PORT_BASENAME",
+    "PORT_ENV",
     "ROUTING_KEYS",
     "SLOT_OVERRIDE_KEYS",
     "STASH_BASENAME",
@@ -1984,17 +2543,24 @@ __all__ = [
     "Target",
     "VARIANTS",
     "candidate_paths",
+    "clear_default_model",
     "decorate_1m",
     "describe_json_failure",
     "detect_targets",
     "inspect_target",
+    "is_first_party_model_id",
     "is_gateway_only_model",
     "is_loopback_host",
+    "is_prototype_endpoint",
     "is_vco_gateway_base_url",
+    "last_port_path",
     "main",
+    "panel_endpoint_port",
     "panel_mode",
+    "port_file_path",
     "paste_block",
     "point_at_gateway",
+    "probe_gateway",
     "reset_native",
     "reset_native_if_vco_gateway",
     "resolve_gateway_ports",

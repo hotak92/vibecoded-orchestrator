@@ -69,7 +69,16 @@ pub fn router() -> Router<LauncherDbHandle> {
 
 async fn get_chat_model_context(State(db): State<LauncherDbHandle>) -> impl IntoResponse {
     match db.0.list_chat_model_context() {
-        Ok(rows) => Json(export_document(&rows, &now_iso8601_utc())).into_response(),
+        // Same document as the file export, tombstones included: two shapes
+        // for one table is the drift this builder exists to prevent. A
+        // tombstone read failure degrades to an empty list rather than a 500
+        // — the models are what the caller came for.
+        Ok(rows) => Json(export_document(
+            &rows,
+            &db.0.list_chat_model_context_tombstones().unwrap_or_default(),
+            &now_iso8601_utc(),
+        ))
+        .into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "chat_model_context_read_failed",

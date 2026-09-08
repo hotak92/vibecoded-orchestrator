@@ -104,6 +104,19 @@ export interface VSCodeWriteResult {
    * so the toast reports them; the field keeps the wire contract complete.
    */
   values_healed?: string[];
+  /**
+   * A Default write the writer DECLINED (a vendor id), naming the id and the
+   * rule. Orthogonal to `ok`: the rest of the write still happened, which is
+   * why it is its own field and not `reason`.
+   */
+  refusal_reason?: string | null;
+  /** The ANTHROPIC_BASE_URL actually written, so a toast can name the port. */
+  base_url?: string | null;
+  /**
+   * A vendor `ANTHROPIC_MODEL` already in the file and carried forward. Kept
+   * (it is the user's key) and REPORTED, because a restart resumes on it.
+   */
+  vendor_default_preserved?: string | null;
   permissions: string;
   paste_block: string | null;
   restart_required: boolean;

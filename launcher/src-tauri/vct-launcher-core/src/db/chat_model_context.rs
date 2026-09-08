@@ -296,8 +296,21 @@ impl Db {
             updated_at: now,
         };
         {
-            let guard = self.lock();
-            guard
+            let mut guard = self.lock();
+            let tx = guard
+                .transaction()
+                .map_err(|e| format!("upsert_chat_model_context begin: {}", e))?;
+            // Review R2-9: a row the user deletes and then re-adds by hand
+            // must not keep its tombstone — the next boot's seed would read
+            // it as "the user does not want this id" while the pane shows the
+            // row they just typed. One transaction with the write, for the
+            // same reason as the delete above.
+            tx.execute(
+                "DELETE FROM chat_model_context_tombstone WHERE model_id = ?1",
+                params![row.model_id],
+            )
+            .map_err(|e| format!("upsert_chat_model_context tombstone: {}", e))?;
+            tx
                 .execute(
                     "INSERT INTO chat_model_context
                         (model_id, vendor, context_window, max_output, window_1m,
@@ -325,32 +338,90 @@ impl Db {
                     ],
                 )
                 .map_err(|e| format!("upsert_chat_model_context: {}", e))?;
+            tx.commit()
+                .map_err(|e| format!("upsert_chat_model_context commit: {}", e))?;
         }
         Ok(row)
     }
 
-    /// Delete one row. `Ok(false)` when nothing matched — an absent row is
-    /// not an error, and reporting it as one would make a double-click on the
-    /// pane's delete button look like a failure.
+    /// Delete one row AND remember that it was deleted (migration 045).
+    ///
+    /// `Ok(false)` when nothing matched — an absent row is not an error, and
+    /// reporting it as one would make a double-click on the pane's delete
+    /// button look like a failure.
+    ///
+    /// The tombstone is what keeps the boot seed from reinstating this row on
+    /// the next launch, now that the seed is per-row rather than
+    /// first-boot-only. It is written even when no row matched: a user who
+    /// deletes an id that is not there yet has still said "I do not want
+    /// this one", and the shipped seed may add it tomorrow.
     pub fn delete_chat_model_context(&self, model_id: &str) -> Result<bool, String> {
-        let guard = self.lock();
-        let affected = guard
+        let now = now_iso8601_utc();
+        let mut guard = self.lock();
+        // ONE transaction (review R2-4). Split, a failed tombstone INSERT
+        // leaves the row deleted with nothing remembering it — which is
+        // precisely the state the next boot's seed would silently undo, and
+        // the caller would have been told the delete failed.
+        let tx = guard
+            .transaction()
+            .map_err(|e| format!("delete_chat_model_context begin: {}", e))?;
+        let affected = tx
             .execute(
                 "DELETE FROM chat_model_context WHERE model_id = ?1",
                 params![model_id],
             )
             .map_err(|e| format!("delete_chat_model_context: {}", e))?;
+        tx.execute(
+            "INSERT INTO chat_model_context_tombstone (model_id, deleted_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(model_id) DO UPDATE SET deleted_at = excluded.deleted_at",
+            params![model_id, now],
+        )
+        .map_err(|e| format!("delete_chat_model_context tombstone: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("delete_chat_model_context commit: {}", e))?;
         Ok(affected > 0)
     }
 
-    /// First-boot seed: insert every shipped row IF AND ONLY IF the table is
-    /// empty. Returns the number inserted (0 when the table already had rows).
+    /// Every id the user has deleted, for tests and for the pane.
+    pub fn list_chat_model_context_tombstones(&self) -> Result<Vec<String>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT model_id FROM chat_model_context_tombstone ORDER BY model_id ASC",
+            )
+            .map_err(|e| format!("prepare list tombstones: {}", e))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query list tombstones: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list tombstones: {}", e))
+    }
+
+    /// Boot seed: insert every shipped row whose `model_id` is ABSENT.
+    /// Returns the number inserted (0 when the table already has them all).
     ///
-    /// Emptiness — not per-row absence — is the gate on purpose. A user who
-    /// deletes a row they do not want must not have it silently reinstated on
-    /// the next boot; restoring shipped rows is what the explicit "Reseed"
-    /// button is for.
-    pub fn seed_chat_model_context_if_empty(
+    /// Per-row absence, not emptiness. The emptiness gate this replaces
+    /// (`seed_chat_model_context_if_empty`, v0.2.92) meant an UPGRADED
+    /// install never saw a newly shipped model: 0.2.93 added four Claude 5
+    /// rows to the seed and every table that already held the ten GLM rows
+    /// stayed at ten, so the gateway kept advertising Claude ids with the
+    /// client's conservative default window. A first-boot-only seed is a
+    /// seed that only ever works on machines that did not need it.
+    ///
+    /// Never an UPDATE, and that is the whole safety argument: an existing
+    /// row may be a user edit, and this path cannot tell (it does not look —
+    /// see `reseed_chat_model_context`, which does look and preserves them
+    /// explicitly). Absent rows only.
+    ///
+    /// A row the user DELETED does NOT come back: `delete_chat_model_context`
+    /// leaves a tombstone (migration 045) and this path skips any id that has
+    /// one. That is the half the emptiness gate used to provide for free, and
+    /// losing it silently was the cost this seeder is not allowed to have.
+    /// Only the explicit "Reseed from shipped defaults" clears tombstones —
+    /// an automatic path must never undo a human's delete, and a deliberate
+    /// click may.
+    pub fn seed_chat_model_context_upsert_missing(
         &self,
         rows: &[ChatModelContextInput],
     ) -> Result<usize, String> {
@@ -367,36 +438,35 @@ impl Db {
         let mut guard = self.lock();
         let tx = guard
             .transaction()
-            .map_err(|e| format!("seed_chat_model_context_if_empty begin: {}", e))?;
-        let existing: i64 = tx
-            .query_row("SELECT COUNT(*) FROM chat_model_context", [], |r| r.get(0))
-            .map_err(|e| format!("seed_chat_model_context_if_empty count: {}", e))?;
-        if existing > 0 {
-            return Ok(0);
-        }
+            .map_err(|e| format!("seed_chat_model_context_upsert_missing begin: {}", e))?;
         let mut inserted = 0usize;
         for row in &validated {
-            tx.execute(
-                "INSERT INTO chat_model_context
-                    (model_id, vendor, context_window, max_output, window_1m,
-                     source, source_note, user_edited, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
-                params![
-                    row.model_id,
-                    row.vendor,
-                    row.context_window,
-                    row.max_output,
-                    i64::from(row.window_1m),
-                    row.source,
-                    row.source_note,
-                    now,
-                ],
-            )
-            .map_err(|e| format!("seed row {}: {}", row.model_id, e))?;
-            inserted += 1;
+            // `DO NOTHING`, never `DO UPDATE`: the row that is already there
+            // may be the user's, and this path has no business deciding.
+            let affected = tx
+                .execute(
+                    "INSERT INTO chat_model_context
+                        (model_id, vendor, context_window, max_output, window_1m,
+                         source, source_note, user_edited, updated_at)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8
+                     WHERE ?1 NOT IN (SELECT model_id FROM chat_model_context_tombstone)
+                     ON CONFLICT(model_id) DO NOTHING",
+                    params![
+                        row.model_id,
+                        row.vendor,
+                        row.context_window,
+                        row.max_output,
+                        i64::from(row.window_1m),
+                        row.source,
+                        row.source_note,
+                        now,
+                    ],
+                )
+                .map_err(|e| format!("seed row {}: {}", row.model_id, e))?;
+            inserted += affected;
         }
         tx.commit()
-            .map_err(|e| format!("seed_chat_model_context_if_empty commit: {}", e))?;
+            .map_err(|e| format!("seed_chat_model_context_upsert_missing commit: {}", e))?;
         Ok(inserted)
     }
 
@@ -410,6 +480,12 @@ impl Db {
     /// Rows in the table that the shipped seed does not mention are never
     /// removed: reseed adds and refreshes, it does not prune. A user's own
     /// Kimi/Qwen rows survive it.
+    ///
+    /// It also CLEARS the tombstone of every id it re-applies (migration
+    /// 045). This is the one path allowed to: "restore the shipped defaults"
+    /// is a deliberate click that means exactly that, and leaving a tombstone
+    /// behind would let the next boot's seed disagree with the row this click
+    /// just restored.
     pub fn reseed_chat_model_context(
         &self,
         rows: &[ChatModelContextInput],
@@ -473,6 +549,11 @@ impl Db {
                 }
                 None => {
                     tx.execute(
+                        "DELETE FROM chat_model_context_tombstone WHERE model_id = ?1",
+                        params![row.model_id],
+                    )
+                    .map_err(|e| format!("reseed clear tombstone {}: {}", row.model_id, e))?;
+                    tx.execute(
                         "INSERT INTO chat_model_context
                             (model_id, vendor, context_window, max_output, window_1m,
                              source, source_note, user_edited, updated_at)
@@ -526,7 +607,11 @@ impl Db {
 /// inserted in `model_id` order so a re-export with no data change produces
 /// byte-identical output — which is what lets the gateway's `(mtime_ns, size)`
 /// change-detector stay quiet and what makes a diff of this file readable.
-pub fn export_document(rows: &[ChatModelContextRow], generated_at: &str) -> serde_json::Value {
+pub fn export_document(
+    rows: &[ChatModelContextRow],
+    tombstones: &[String],
+    generated_at: &str,
+) -> serde_json::Value {
     let mut models = serde_json::Map::new();
     let mut ordered: Vec<&ChatModelContextRow> = rows.iter().collect();
     ordered.sort_by(|a, b| a.model_id.cmp(&b.model_id));
@@ -549,6 +634,17 @@ pub fn export_document(rows: &[ChatModelContextRow], generated_at: &str) -> serd
         models.insert(row.model_id.clone(), serde_json::Value::Object(entry));
     }
 
+    // CROSS-LANE CONTRACT (v0.2.94): `tombstones` is the sorted list of model
+    // ids the user has DELETED. The gateway reads it so its own shipped-seed
+    // fallback never advertises a `[1m]` companion for a row this machine
+    // removed — without it, "deleted" holds in launcher.db and in the export's
+    // `models` map while the seed inside the gateway's wheel still knows the
+    // id. Always present, possibly empty: an absent key and an empty list must
+    // not mean different things to the reader.
+    let mut deleted: Vec<&String> = tombstones.iter().collect();
+    deleted.sort();
+    deleted.dedup();
+
     let mut doc = serde_json::Map::new();
     doc.insert(
         "schema_version".into(),
@@ -563,6 +659,15 @@ pub fn export_document(rows: &[ChatModelContextRow], generated_at: &str) -> serd
         serde_json::Value::from(EXPORT_SOURCE_LAUNCHER_DB),
     );
     doc.insert("models".into(), serde_json::Value::Object(models));
+    doc.insert(
+        "tombstones".into(),
+        serde_json::Value::Array(
+            deleted
+                .into_iter()
+                .map(|id| serde_json::Value::from(id.clone()))
+                .collect(),
+        ),
+    );
     serde_json::Value::Object(doc)
 }
 
@@ -828,13 +933,13 @@ mod tests {
     // ── seed ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn seed_populates_an_empty_table_once_and_never_again() {
+    fn seed_populates_an_empty_table_once_and_is_a_no_op_after() {
         let db = make_db();
         let seed = vec![input("glm-5.1"), one_m("glm-5.2")];
 
-        assert_eq!(db.seed_chat_model_context_if_empty(&seed).unwrap(), 2);
-        // Second boot: the table is not empty, so the seeder does nothing.
-        assert_eq!(db.seed_chat_model_context_if_empty(&seed).unwrap(), 0);
+        assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 2);
+        // Second boot: every shipped row is present, so nothing is written.
+        assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 0);
         assert_eq!(db.list_chat_model_context().unwrap().len(), 2);
         assert!(
             db.list_chat_model_context()
@@ -846,25 +951,172 @@ mod tests {
     }
 
     #[test]
-    fn seed_does_not_reinstate_a_row_the_user_deleted() {
+    fn seed_inserts_newly_shipped_rows_into_an_upgraded_table() {
+        // The 0.2.93 shape exactly: ten GLM rows already in the table, four
+        // Claude rows added to the shipped seed. Under the old emptiness
+        // gate this inserted NOTHING and the export stayed at ten — the
+        // reason a whole release's context rows never reached any upgraded
+        // install.
+        let db = make_db();
+        let old_seed: Vec<ChatModelContextInput> =
+            (0..10).map(|i| input(&format!("glm-{}", i))).collect();
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&old_seed).unwrap(),
+            10
+        );
+
+        let mut new_seed = old_seed.clone();
+        for id in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-fable-5-1"] {
+            new_seed.push(one_m(id));
+        }
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&new_seed).unwrap(),
+            4,
+            "only the absent rows are inserted"
+        );
+        assert_eq!(db.list_chat_model_context().unwrap().len(), 14);
+        assert!(db.get_chat_model_context("claude-opus-5").unwrap().unwrap().window_1m);
+    }
+
+    #[test]
+    fn seed_never_overwrites_a_row_that_is_already_there() {
+        // The other half: an existing row may be a user edit, and the boot
+        // seed does not look. It inserts what is absent and touches nothing
+        // else — `reseed_chat_model_context` is the path that refreshes,
+        // and it is the one that checks `user_edited`.
+        let db = make_db();
+        let edited = db
+            .upsert_chat_model_context(
+                ChatModelContextInput {
+                    context_window: 111_111,
+                    source: "my own measurement".into(),
+                    ..input("glm-5.1")
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&[one_m("glm-5.1"), input("glm-5.2")])
+                .unwrap(),
+            1,
+            "the absent row only"
+        );
+        assert_eq!(
+            db.get_chat_model_context("glm-5.1").unwrap().unwrap(),
+            edited,
+            "every field of the existing row survives, updated_at included"
+        );
+    }
+
+    #[test]
+    fn a_deleted_shipped_row_stays_deleted_across_boots() {
+        // Review R1-6. Per-row seeding without a tombstone would resurrect
+        // this row on the next launch: an absent row is absent whether the
+        // user deleted it or the vendor is new, and only the tombstone tells
+        // those apart.
         let db = make_db();
         let seed = vec![input("glm-5.1"), one_m("glm-5.2")];
-        db.seed_chat_model_context_if_empty(&seed).unwrap();
+        db.seed_chat_model_context_upsert_missing(&seed).unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
+        assert_eq!(db.list_chat_model_context_tombstones().unwrap(), vec!["glm-5.1"]);
 
-        // Next boot.
-        assert_eq!(db.seed_chat_model_context_if_empty(&seed).unwrap(), 0);
+        for _boot in 0..3 {
+            assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 0);
+        }
         let ids: Vec<String> = db
             .list_chat_model_context()
             .unwrap()
             .into_iter()
             .map(|r| r.model_id)
             .collect();
-        assert_eq!(
-            ids,
-            vec!["glm-5.2"],
-            "an emptiness gate, not a per-row gate — the deleted row stays gone"
+        assert_eq!(ids, vec!["glm-5.2"], "deleted means deleted");
+    }
+
+    #[test]
+    fn an_explicit_reseed_restores_a_deleted_row_and_clears_its_tombstone() {
+        // The one path allowed to undo a delete, because the user asked for
+        // it by name — and it must leave no tombstone behind, or the next
+        // boot's seed would disagree with the row it just restored.
+        let db = make_db();
+        let seed = vec![input("glm-5.1")];
+        db.seed_chat_model_context_upsert_missing(&seed).unwrap();
+        db.delete_chat_model_context("glm-5.1").unwrap();
+
+        assert_eq!(db.reseed_chat_model_context(&seed).unwrap().inserted, 1);
+        assert!(db.list_chat_model_context_tombstones().unwrap().is_empty());
+        assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 0);
+        assert!(db.get_chat_model_context("glm-5.1").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_failed_tombstone_write_rolls_the_delete_back() {
+        // Review R2-4: split across two statements, a failing tombstone
+        // INSERT left the row deleted with nothing remembering it — the exact
+        // state the next boot's seed silently undoes, reported to the caller
+        // as a failure.
+        let db = make_db();
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")]).unwrap();
+        // Make the tombstone INSERT fail: the CHECK refuses a blank id, and a
+        // blank id is what an empty model_id delete would write.
+        assert!(db.delete_chat_model_context("").is_err());
+
+        // Now the real proof: a delete whose tombstone cannot be written must
+        // not leave the table row gone. Drop the tombstone table to force the
+        // INSERT to fail, then delete a real row.
+        {
+            let guard = db.lock();
+            guard
+                .execute("DROP TABLE chat_model_context_tombstone", [])
+                .unwrap();
+        }
+        assert!(
+            db.delete_chat_model_context("glm-5.1").is_err(),
+            "a delete that cannot be remembered must report failure"
         );
+        assert!(
+            db.get_chat_model_context("glm-5.1").unwrap().is_some(),
+            "and must leave the row in place — one transaction, both writes"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_deleted_row_by_hand_clears_its_tombstone() {
+        // Review R2-9: otherwise the pane shows the row the user just typed
+        // while the next boot's seed still reads "they do not want this id".
+        let db = make_db();
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")]).unwrap();
+        db.delete_chat_model_context("glm-5.1").unwrap();
+        assert_eq!(db.list_chat_model_context_tombstones().unwrap(), vec!["glm-5.1"]);
+
+        db.upsert_chat_model_context(input("glm-5.1"), true).unwrap();
+        assert!(
+            db.list_chat_model_context_tombstones().unwrap().is_empty(),
+            "the id is wanted again — the memory of the delete goes with it"
+        );
+        // And the boot seed leaves the re-added row exactly as typed.
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&[one_m("glm-5.1")]).unwrap(),
+            0
+        );
+        assert!(db.get_chat_model_context("glm-5.1").unwrap().unwrap().user_edited);
+    }
+
+    #[test]
+    fn a_tombstone_never_blocks_a_different_model() {
+        // LEAVE-ALONE half: deleting one row must not make the table
+        // un-seedable for the rest.
+        let db = make_db();
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")]).unwrap();
+        db.delete_chat_model_context("glm-5.1").unwrap();
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&[input("glm-5.1"), one_m("claude-opus-5")])
+                .unwrap(),
+            1,
+            "the new model arrives; the deleted one does not come back"
+        );
+        assert!(db.get_chat_model_context("claude-opus-5").unwrap().is_some());
+        assert!(db.get_chat_model_context("glm-5.1").unwrap().is_none());
     }
 
     #[test]
@@ -874,7 +1126,7 @@ mod tests {
             input("glm-5.1"),
             ChatModelContextInput { source: "".into(), ..input("glm-5.2") },
         ];
-        assert!(db.seed_chat_model_context_if_empty(&seed).is_err());
+        assert!(db.seed_chat_model_context_upsert_missing(&seed).is_err());
         assert!(
             db.list_chat_model_context().unwrap().is_empty(),
             "a half-seeded table would hide a broken build behind a populated look"
@@ -886,7 +1138,7 @@ mod tests {
     #[test]
     fn reseed_refreshes_an_untouched_row() {
         let db = make_db();
-        db.seed_chat_model_context_if_empty(&[input("glm-5.1")])
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
             .unwrap();
 
         // The vendor published a correction; the shipped seed now says 1M.
@@ -904,7 +1156,7 @@ mod tests {
     #[test]
     fn reseed_leaves_a_user_edited_row_byte_identical() {
         let db = make_db();
-        db.seed_chat_model_context_if_empty(&[input("glm-5.1")])
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
             .unwrap();
         let edited = db
             .upsert_chat_model_context(
@@ -934,7 +1186,7 @@ mod tests {
     #[test]
     fn reseed_inserts_a_newly_shipped_model_and_skips_an_identical_row() {
         let db = make_db();
-        db.seed_chat_model_context_if_empty(&[input("glm-5.1")])
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
             .unwrap();
 
         let outcome = db
@@ -971,7 +1223,7 @@ mod tests {
     #[test]
     fn reseed_restores_a_deleted_shipped_row() {
         let db = make_db();
-        db.seed_chat_model_context_if_empty(&[input("glm-5.1")])
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
             .unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
 
@@ -999,6 +1251,7 @@ mod tests {
     fn export_document_matches_the_gateway_readers_contract() {
         let doc = export_document(
             &[row("glm-5.2", true, ""), row("glm-4.5-air", false, "cited from the glm-4.5 card")],
+            &[],
             "2026-09-02T18:04:11Z",
         );
 
@@ -1023,11 +1276,57 @@ mod tests {
         // reader coerces with bool(), so an integer would work by accident
         // while making the file wrong for a human and for jq.
         assert!(air["window_1m"].is_boolean());
+
+        // CROSS-LANE CONTRACT: the key is always present, even when empty —
+        // the gateway reads exactly `tombstones`, and an absent key would
+        // have to be guessed at.
+        assert_eq!(doc["tombstones"], serde_json::json!([]));
+        assert!(doc.as_object().unwrap().contains_key("tombstones"));
+    }
+
+    #[test]
+    fn the_export_carries_the_tombstones_sorted_deduped_and_named_exactly() {
+        // The gateway's seed fallback still knows every shipped id, so a row
+        // deleted here has to travel to it as a deletion — otherwise it keeps
+        // advertising the `[1m]` companion for a model this machine removed.
+        let doc = export_document(
+            &[row("glm-5.2", true, "")],
+            &[
+                "glm-5.1".to_string(),
+                "claude-opus-5".to_string(),
+                "glm-5.1".to_string(),
+            ],
+            "t",
+        );
+        assert_eq!(
+            doc["tombstones"],
+            serde_json::json!(["claude-opus-5", "glm-5.1"]),
+            "sorted and de-duplicated, so a re-export is byte-identical"
+        );
+        // The models map is untouched by it.
+        assert!(doc["models"].as_object().unwrap().contains_key("glm-5.2"));
+    }
+
+    #[test]
+    fn a_tombstoned_id_is_not_also_a_model_row() {
+        // Belt and braces on the contract's meaning: the two lists cannot
+        // disagree, because a deleted row is gone from the table.
+        let db = make_db();
+        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1"), one_m("glm-5.2")])
+            .unwrap();
+        db.delete_chat_model_context("glm-5.1").unwrap();
+        let doc = export_document(
+            &db.list_chat_model_context().unwrap(),
+            &db.list_chat_model_context_tombstones().unwrap(),
+            "t",
+        );
+        assert_eq!(doc["tombstones"], serde_json::json!(["glm-5.1"]));
+        assert!(!doc["models"].as_object().unwrap().contains_key("glm-5.1"));
     }
 
     #[test]
     fn export_document_omits_an_empty_source_note() {
-        let doc = export_document(&[row("glm-5.2", true, "")], "t");
+        let doc = export_document(&[row("glm-5.2", true, "")], &[], "t");
         let entry = doc["models"]["glm-5.2"].as_object().unwrap();
         assert!(
             !entry.contains_key("source_note"),
@@ -1041,6 +1340,7 @@ mod tests {
         // this test is what makes that order deterministic.
         let doc = export_document(
             &[row("glm-5.2", true, ""), row("glm-4.5", false, ""), row("glm-5.1", false, "")],
+            &[],
             "t",
         );
         let keys: Vec<&String> = doc["models"].as_object().unwrap().keys().collect();
@@ -1049,12 +1349,17 @@ mod tests {
         // Top-level keys are in declaration order, not alphabetical (which
         // would put `generated_at` first).
         let top: Vec<&String> = doc.as_object().unwrap().keys().collect();
-        assert_eq!(top, vec!["schema_version", "generated_at", "source", "models"]);
+        assert_eq!(
+            top,
+            vec!["schema_version", "generated_at", "source", "models", "tombstones"],
+            "`tombstones` goes LAST — the gateway's reader keys off names, but \
+             a stable key order is what keeps a re-export byte-identical"
+        );
     }
 
     #[test]
     fn export_document_of_an_empty_table_is_a_valid_document_not_a_null() {
-        let doc = export_document(&[], "t");
+        let doc = export_document(&[], &[], "t");
         assert_eq!(doc["schema_version"], serde_json::json!(1));
         assert!(doc["models"].as_object().unwrap().is_empty());
     }
@@ -1062,8 +1367,8 @@ mod tests {
     #[test]
     fn re_exporting_unchanged_rows_is_byte_identical() {
         let rows = vec![row("glm-5.2", true, ""), row("glm-4.5", false, "n")];
-        let a = serde_json::to_string_pretty(&export_document(&rows, "t")).unwrap();
-        let b = serde_json::to_string_pretty(&export_document(&rows, "t")).unwrap();
+        let a = serde_json::to_string_pretty(&export_document(&rows, &[], "t")).unwrap();
+        let b = serde_json::to_string_pretty(&export_document(&rows, &[], "t")).unwrap();
         assert_eq!(a, b, "the gateway's (mtime_ns,size) detector depends on this");
     }
 
@@ -1075,7 +1380,7 @@ mod tests {
             row("glm-5.2", true, ""),
             row("glm-4.5-air", false, "cited from the glm-4.5 card"),
         ];
-        let parsed = parse_document(&export_document(&rows, "t")).unwrap();
+        let parsed = parse_document(&export_document(&rows, &[], "t")).unwrap();
         assert_eq!(parsed.len(), 2);
         // Sorted by id, and every carried field survives the round trip.
         assert_eq!(parsed[0].model_id, "glm-4.5-air");

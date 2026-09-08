@@ -79,8 +79,59 @@ use vct_launcher_core::python_resolve::resolve_python_for_vco_lib;
 
 /// The gateway's documented default port.
 pub const DEFAULT_GATEWAY_PORT: u16 = 11436;
+
+/// Ports the starter falls back to when the resolved one is taken by
+/// something that is not a gateway.
+///
+/// The 2026-09-08 machine is the case this exists for: a legacy scorer
+/// container owned 11436, so every start attempt died on a bind error the
+/// GUI could only report as "it did not come up". Nine ports is enough for
+/// any plausible number of local services and small enough to stay a
+/// documented, predictable range rather than a scan.
+///
+/// It sits at 11460, clear of every port a VCO service claims, because a
+/// fallback must never hand the gateway a port ANOTHER VCO SERVICE OWNS.
+/// `port_is_free` only asks whether a port is bindable right now, so taking
+/// a reserved-but-idle one does not fail here — it fails later, when that
+/// service starts and cannot bind its own address. The claimed ports
+/// (v0.2.94 survey of shipped code):
+///
+/// * 11435 — Ollama (`mcp_registration.rs::DEFAULT_OLLAMA_PORT`).
+/// * 11436 — this gateway's own default ([`DEFAULT_GATEWAY_PORT`]).
+/// * 11438 — RL container-internal `RL_SERVER_PORT`.
+/// * 11439 — legacy RL server (`weaviate_mcp/server.py`'s `RL_SERVER_URL`).
+/// * 11440 — code-embed service (`vco_lib/code_embed_image.py::DEFAULT_PORT`).
+/// * 11442 — `module_service.rs::ORCHESTRATOR_ROOT_RL_PORT`.
+/// * 11443 — `container_runtime.rs::GLOBAL_RL_PORT`.
+/// * 11450 — module-manifest container-port example.
+/// * 11500..=11900 — per-project RL allocation window
+///   (`module_service.rs::RL_PORT_RANGE_LO`/`_HI`).
+///
+/// CROSS-LANE (v0.2.94): the gateway daemon retries the SAME nine ports on
+/// EADDRINUSE, as `model_router.config.FALLBACK_PORT_RANGE`.
+/// `tests/test_v0292_model_gateway_gui_contract.py` compares the two the
+/// moment that constant exists, and guards the not-yet-landed state until
+/// then. Moving the range means moving BOTH sides in the same change.
+pub const FALLBACK_PORT_RANGE: std::ops::RangeInclusive<u16> = 11460..=11468;
+
+/// `/health`'s `service` value. MUST MATCH `model_router/server.py`. A port
+/// answering with anything else is NOT a gateway, however plausible.
+const GATEWAY_SERVICE: &str = "vct-model-gateway";
 const PID_BASENAME: &str = "model-gateway.pid";
 const PORT_BASENAME: &str = "model-gateway.port";
+/// The launcher's record of the port it last STARTED a gateway on.
+///
+/// Review R2-2: the daemon unlinks its own port file on a clean exit, so a
+/// gateway that had moved off the default (because something else held it)
+/// was forgotten the moment it stopped — and the next resolution answered
+/// with the shipped default, which on the reporter's machine is a legacy
+/// container. Not cosmetic: the uninstall reset then walks past the panel it
+/// should clean up, and a Services "point" writes our host token into a base
+/// URL naming somebody else's service. This file is written on every start
+/// and never deleted; it remembers INTENT, which is exactly what a stopped
+/// gateway needs to stay recognisable. MUST MATCH
+/// `vco_lib/vscode_settings.py::LAST_PORT_BASENAME`.
+const LAST_PORT_BASENAME: &str = "model-gateway.last-port";
 const TOKEN_BASENAME: &str = "model-gateway.token";
 const PORT_ENV: &str = "VCT_MODEL_GATEWAY_PORT";
 
@@ -137,16 +188,67 @@ fn port_path() -> PathBuf {
     vct_root_dir().join(PORT_BASENAME)
 }
 
+fn last_port_path() -> PathBuf {
+    vct_root_dir().join(LAST_PORT_BASENAME)
+}
+
+/// Read a one-line port file. `None` for absent, unreadable, unparseable or
+/// out-of-range — a corrupt file must degrade to the next source, never
+/// blank the card or resolve to something nonsensical.
+fn read_port_file(path: &Path) -> Option<u16> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let port = text.trim().parse::<u16>().ok()?;
+    (port > 0).then_some(port)
+}
+
+/// Record the port we just started a gateway on. Soft-fail by design: a
+/// gateway that started must not be reported as failed because a memo could
+/// not be written. Owner-only through `boot_token::write_token_file`, which
+/// is this workspace's ONE implementation of the O_CREAT|0o600 (plus Windows
+/// DACL) small-file write — a second copy of that sequence is exactly what
+/// the modularity rule forbids, even for a value that is not a secret.
+///
+/// WRITTEN BEFORE THE SPAWN, AND NOT CLEARED WHEN THE SPAWN FAILS. Both are
+/// deliberate. Before, because a daemon that starts and exits between here
+/// and the status read deletes its own port file and would otherwise leave
+/// nothing behind. Not cleared, because this file records INTENT, not
+/// liveness: every consumer re-probes `/health` before believing anything is
+/// there, and "ours" is decided by the RESOLVED port alone — so a stale
+/// record can at worst make a probe ask about a port nobody is listening on,
+/// which answers `stopped`. The alternative (clear it on failure) would
+/// reintroduce the very gap this file closes, since a start that fails
+/// AFTER binding is indistinguishable from one that never bound.
+fn remember_last_port(port: u16) {
+    let path = last_port_path();
+    if let Err(e) = vct_launcher_core::services::boot_token::write_token_file(
+        &path,
+        &format!("{}\n", port),
+    ) {
+        tracing::warn!(
+            "[vct] model gateway: could not record the chosen port in {}: {}",
+            path.display(),
+            e
+        );
+    }
+}
+
 fn token_path() -> PathBuf {
     vct_root_dir().join(TOKEN_BASENAME)
 }
 
-/// `$VCT_MODEL_GATEWAY_PORT` -> the port file -> the documented default.
+/// `$VCT_MODEL_GATEWAY_PORT` -> the daemon's port file -> the launcher's
+/// last-chosen-port record -> the documented default.
 ///
-/// Same order as `model_router.config.resolve_port`. An out-of-range or
-/// unparseable value falls through rather than erroring: the port file is
-/// written by the daemon and read here, so a corrupt one must degrade to the
-/// default instead of blanking the status card.
+/// The first two steps are `model_router.config.resolve_port`'s order; the
+/// third is this launcher's own memory (review R2-2), and it is what keeps a
+/// gateway that ran on a fallback port recognisable after the daemon has
+/// exited and deleted its port file. Each step is EVIDENCE; the default is
+/// the answer only when there is none. MUST MATCH the chain in
+/// `vco_lib/vscode_settings.py::resolve_gateway_ports`.
+///
+/// An out-of-range or unparseable value falls through rather than erroring:
+/// these files are read on every status poll, so a corrupt one must degrade
+/// to the next source instead of blanking the card.
 pub fn resolve_port() -> u16 {
     if let Ok(raw) = std::env::var(PORT_ENV) {
         if let Ok(v) = raw.trim().parse::<u16>() {
@@ -155,18 +257,26 @@ pub fn resolve_port() -> u16 {
             }
         }
     }
-    if let Ok(text) = std::fs::read_to_string(port_path()) {
-        if let Ok(v) = text.trim().parse::<u16>() {
-            if v > 0 {
-                return v;
-            }
-        }
-    }
-    DEFAULT_GATEWAY_PORT
+    read_port_file(&port_path())
+        .or_else(|| read_port_file(&last_port_path()))
+        .unwrap_or(DEFAULT_GATEWAY_PORT)
 }
 
 fn base_url(port: u16) -> String {
     format!("http://127.0.0.1:{}", port)
+}
+
+/// The base URL a panel write must carry: the caller's KNOWN port when it has
+/// one, the resolved port otherwise.
+///
+/// Review R1-1b — one home for the decision both panel-writing commands make.
+/// A caller that has just started a gateway knows which port it bound, and
+/// `resolve_port()` may not: the daemon writes its port file during start-up,
+/// and a launcher whose env pins a port reads the pin regardless. Deriving
+/// the URL from a stale resolution is how the panel was pointed at a legacy
+/// container on 11436 — with our token, under a notice that said "Applied".
+pub(crate) fn resolved_base_url(port: Option<u16>) -> String {
+    base_url(port.filter(|p| *p > 0).unwrap_or_else(resolve_port))
 }
 
 // ─── Process state ────────────────────────────────────────────────────────
@@ -329,21 +439,65 @@ async fn probe_health(port: u16) -> (Option<bool>, Option<GatewayHealth>, Option
 /// `pip install -e claude_mcp_servers/` did not run (or ran into a broken
 /// venv): `model_router` is importable from the clone directly. That is a
 /// hint, not a second resolver — the installed distribution still wins.
-fn gateway_command(python: &Path, orchestrator_root: Option<&Path>) -> Command {
+/// `PYTHONPATH` for a `-m` spawn out of the orchestrator clone: the clone
+/// root (so `vco_lib` resolves) and `claude_mcp_servers` (so `model_router`
+/// does), separated the OS's way.
+///
+/// One home for both spawns — review R1-4. `run_vscode_settings` did NOT set
+/// it while `gateway_command` did, and the consequence was not an import
+/// error: `vco_lib.vscode_settings.resolve_gateway_ports` SWALLOWS a failed
+/// `model_router` import and answers with the documented default port, so on
+/// an install whose `pip install -e claude_mcp_servers/` had not run, a
+/// gateway on 11437 read as an unmanaged prototype endpoint. A silent wrong
+/// answer from a missing env var is exactly the shape that must have one
+/// definition, not two.
+pub(crate) fn orchestrator_pythonpath(root: &Path) -> std::ffi::OsString {
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut value = std::ffi::OsString::from(root.as_os_str());
+    value.push(sep);
+    value.push(root.join("claude_mcp_servers").as_os_str());
+    value
+}
+
+/// `python -m <module>` with the launcher's env sandbox and the clone's
+/// `PYTHONPATH`.
+///
+/// `PYTHONPATH` entries precede site-packages in `sys.path`, so THE CLONE
+/// WINS over any installed distribution of the same name (review R2-7 — this
+/// comment previously claimed the opposite). That is the intended
+/// resolution: the launcher spawns the source it was built from, and it also
+/// keeps a not-yet-`pip install -e`d clone working instead of degrading.
+fn python_module_command(python: &Path, module: &str, orchestrator_root: Option<&Path>) -> Command {
     let mut cmd = Command::new(python).silent();
-    cmd.arg("-m").arg("model_router");
+    cmd.arg("-m").arg(module);
     crate::services::vco_lib_bridge::reinject_minimal_env(&mut cmd);
-    // Re-inject the daemon's own documented knobs, which the sandbox's
-    // allowlist (built for `vco_lib` spawns) does not carry.
+    // The gateway's documented knobs, which the sandbox's allowlist (built
+    // for `vco_lib` spawns) does not carry. BOTH spawns need them, not just
+    // the daemon's — review R2-6: the writer resolves the gateway's port,
+    // and `VCT_MODEL_GATEWAY_PORT` is exactly the pin that answer must
+    // honour. Without this it never saw the pin and answered from files
+    // alone, disagreeing with the launcher that spawned it.
     for (k, v) in std::env::vars() {
         if k.starts_with(GATEWAY_ENV_PREFIX) {
             cmd.env(k, v);
         }
     }
     if let Some(root) = orchestrator_root {
-        cmd.env("PYTHONPATH", root.join("claude_mcp_servers"));
+        cmd.env("PYTHONPATH", orchestrator_pythonpath(root));
     }
     cmd
+}
+
+fn gateway_command(python: &Path, orchestrator_root: Option<&Path>) -> Command {
+    python_module_command(python, "model_router", orchestrator_root)
+}
+
+/// The writer spawn. Same `PYTHONPATH` as the daemon spawn (review R1-4):
+/// the writer imports `model_router` to resolve the gateway's port and its
+/// context table, and answers with a DEFAULT rather than an error when it
+/// cannot.
+pub(crate) fn vscode_settings_command(python: &Path, orchestrator_root: Option<&Path>) -> Command {
+    python_module_command(python, "vco_lib.vscode_settings", orchestrator_root)
 }
 
 fn python_or_err() -> Result<PathBuf, String> {
@@ -424,12 +578,11 @@ fn run_to_completion(mut cmd: Command, label: &str) -> Result<(i32, String, Stri
 /// must render, not an exception to swallow.
 fn run_vscode_settings(args: &[String]) -> Result<serde_json::Value, String> {
     let python = python_or_err()?;
-    let mut cmd = Command::new(&python).silent();
-    cmd.arg("-m").arg("vco_lib.vscode_settings");
+    let root = crate::commands::installer::find_local_repo_root().ok();
+    let mut cmd = vscode_settings_command(&python, root.as_deref());
     for a in args {
         cmd.arg(a);
     }
-    crate::services::vco_lib_bridge::reinject_minimal_env(&mut cmd);
     let (code, stdout, stderr) = run_to_completion(cmd, "vco_lib.vscode_settings")?;
     match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         Ok(v) => Ok(v),
@@ -442,14 +595,141 @@ fn run_vscode_settings(args: &[String]) -> Result<serde_json::Value, String> {
     }
 }
 
+// ─── Port collision ───────────────────────────────────────────────────────
+
+/// Can a listener bind this loopback port right now?
+///
+/// A bind attempt, not a connect: "nothing answered" and "nothing can bind"
+/// are different questions, and only the second one predicts whether the
+/// daemon we are about to spawn will come up. The listener is dropped
+/// immediately, so this leaves nothing behind.
+pub(crate) fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// The first port the daemon can actually bind: the requested one, else the
+/// first free port in [`FALLBACK_PORT_RANGE`].
+///
+/// Pure, with the probe injected, so both halves are unit-testable without
+/// occupying a real port: the act (fall back) and the leave-alone (a free
+/// requested port is used unchanged, never "helpfully" moved).
+pub(crate) fn choose_start_port<F>(requested: u16, is_free: F) -> Option<u16>
+where
+    F: Fn(u16) -> bool,
+{
+    if is_free(requested) {
+        return Some(requested);
+    }
+    FALLBACK_PORT_RANGE
+        .filter(|p| *p != requested)
+        .find(|p| is_free(*p))
+}
+
+/// Is a VCO gateway already answering here? (As opposed to some other
+/// service owning the port, which is the case we route around.)
+async fn gateway_answers_on(port: u16) -> bool {
+    matches!(probe_health(port).await, (Some(true), Some(h), _) if h.service == GATEWAY_SERVICE)
+}
+
+/// How long `model_gateway_start` waits for the daemon to answer, and how
+/// often it asks. 5 s total: a cold aiohttp import on a slow disk takes a
+/// second or two, and anything past five is a start that failed.
+const START_POLL_ATTEMPTS: u32 = 50;
+const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Poll `probe` until it answers true, or the attempts run out.
+///
+/// Review R1-1a: the previous code slept a fixed 600 ms and then REPORTED,
+/// which is a guess wearing a status payload's clothes. It also raced the
+/// daemon's own start-up order — the token file is written before the port
+/// file (`model_router/__main__.py` :184 vs :201) — so a "started" report
+/// could precede the port file that every later port resolution reads.
+/// Waiting for `/health` waits for both.
+///
+/// `interval` is a parameter (not a constant) so the unit tests can drive
+/// the loop with no wall-clock cost.
+pub(crate) async fn poll_until<F, Fut>(attempts: u32, interval: Duration, mut probe: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for attempt in 0..attempts {
+        if probe().await {
+            return true;
+        }
+        if attempt + 1 < attempts && !interval.is_zero() {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    false
+}
+
+/// `VCT_MODEL_GATEWAY_PORT` as the LAUNCHER sees it, when it is a usable port.
+fn env_pinned_port() -> Option<u16> {
+    std::env::var(PORT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0)
+}
+
+/// Why a start must be refused rather than moved off an explicit pin.
+///
+/// Review R1-1: a pin is a statement about where this machine's gateway
+/// lives, and every later resolution — the status poll, the panel's
+/// `--base-url`, the MCP env — reads that pin, not our choice. Quietly
+/// starting somewhere else would leave every one of them pointing at
+/// whatever holds the pinned port. Pure so both halves are testable.
+/// `requested` is the port the CALLER asked for explicitly (`None` when the
+/// port was resolved rather than named), and it is what distinguishes the two
+/// ways a pin can be contradicted — review R2-8: claiming "that port is in
+/// use" when the user simply typed a different number is a false diagnosis,
+/// and it sends them looking for a process that does not exist.
+pub(crate) fn env_pin_conflict(
+    pinned: Option<u16>,
+    chosen: u16,
+    requested: Option<u16>,
+) -> Option<String> {
+    let p = pinned.filter(|p| *p != chosen)?;
+    Some(match requested {
+        Some(asked) if asked != p => format!(
+            "you asked for port {}, but {} pins port {}. Every later port \
+             resolution reads the pin, so the launcher would then look for \
+             the gateway on {} while it listened on {}. Change the pin, or \
+             start it on {}.",
+            asked, PORT_ENV, p, p, asked, p
+        ),
+        _ => format!(
+            "{} pins port {}, but that port is in use by another process and \
+             the gateway would have to start on {} instead. Every later port \
+             resolution reads the pin, so it would then look for the gateway \
+             on {}. Free port {}, or change the pin.",
+            PORT_ENV, p, chosen, p, p
+        ),
+    })
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────
 
 #[command]
 pub async fn model_gateway_status(
     supervisor: State<'_, GatewaySupervisor>,
 ) -> Result<ModelGatewayStatus, String> {
+    status_on_port(&supervisor, resolve_port()).await
+}
+
+/// The status payload for ONE known port.
+///
+/// Split out for `model_gateway_start`: the daemon writes its port file as
+/// it boots, so a status read microseconds later can still resolve the OLD
+/// port and report the just-started gateway as unreachable. The starter
+/// knows which port it chose and says so; every other caller resolves it the
+/// normal way ([`resolve_port`]: env pin, the port file the daemon wrote,
+/// the launcher's last-started-port record, then the default).
+async fn status_on_port(
+    supervisor: &GatewaySupervisor,
+    port: u16,
+) -> Result<ModelGatewayStatus, String> {
     let supervised_pid = supervisor.poll();
-    let port = resolve_port();
     let (state, pid) = probe_process();
     let (reachable, health, health_error) = probe_health(port).await;
     let boot = tauri::async_runtime::spawn_blocking(boot_status_word)
@@ -499,18 +779,75 @@ pub async fn model_gateway_start(
         ));
     }
 
+    if port == Some(0) {
+        return Err("port 0 is not a valid gateway port".to_string());
+    }
+    let requested = port.unwrap_or_else(resolve_port);
+    // Something already owns the port? Two very different cases, and
+    // conflating them is how a start silently does nothing: OUR gateway
+    // answering there means there is nothing to start, while any other
+    // occupant means we move rather than die on a bind error (the
+    // 2026-09-08 machine had a legacy container on 11436).
+    let chosen = if port_is_free(requested) {
+        requested
+    } else if gateway_answers_on(requested).await {
+        return Err(format!(
+            "a model gateway is already answering on {} — it was not started \
+             by this launcher, so there is nothing to start. Use it, or stop \
+             it where it was started.",
+            base_url(requested)
+        ));
+    } else {
+        match tauri::async_runtime::spawn_blocking(move || {
+            choose_start_port(requested, port_is_free)
+        })
+        .await
+        .unwrap_or(None)
+        {
+            Some(p) => p,
+            None => {
+                return Err(format!(
+                    "port {} is in use by another process, and every fallback \
+                     port ({}..={}) is taken too. Free one of them, or set \
+                     {} to a port you know is free.",
+                    requested,
+                    FALLBACK_PORT_RANGE.start(),
+                    FALLBACK_PORT_RANGE.end(),
+                    PORT_ENV
+                ))
+            }
+        }
+    };
+
+    if let Some(conflict) = env_pin_conflict(env_pinned_port(), chosen, port) {
+        return Err(conflict);
+    }
+
     let python = python_or_err()?;
     let root = crate::commands::installer::find_local_repo_root().ok();
     let mut cmd = gateway_command(&python, root.as_deref());
-    if let Some(p) = port {
-        if p == 0 {
-            return Err("port 0 is not a valid gateway port".to_string());
-        }
-        cmd.arg("--port").arg(p.to_string());
-        // The daemon writes the port file from its own resolution, and the
-        // status poll reads it back; pin the env too so a probe issued
-        // before the daemon has written the file still asks the right port.
-        cmd.env(PORT_ENV, p.to_string());
+    cmd.arg("--port").arg(chosen.to_string());
+    // The daemon writes the port file from its own resolution, and the
+    // status poll reads it back; pin the env too so a probe issued
+    // before the daemon has written the file still asks the right port.
+    cmd.env(PORT_ENV, chosen.to_string());
+    // Remembered BEFORE the spawn: a daemon that starts and exits between
+    // here and the status read would otherwise leave nothing behind (its own
+    // port file is deleted on a clean exit — review R2-2).
+    remember_last_port(chosen);
+    if chosen != requested {
+        // NOTE for the next reader: when `requested` came from a
+        // `VCT_MODEL_GATEWAY_PORT` pin in the LAUNCHER's own environment,
+        // later status polls keep resolving that pinned port and will report
+        // whatever owns it — not this gateway. That is the pin doing what a
+        // pin does; the honest answer then comes from the card's own
+        // "something is listening but did not return a gateway health
+        // payload". Starting is still better than dying on a bind error.
+        tracing::info!(
+            "[vct] model gateway: port {} is in use by another process; starting on {} instead",
+            requested,
+            chosen
+        );
     }
     // The daemon logs to its own file; a detached child must not inherit
     // the GUI's stdio.
@@ -531,13 +868,20 @@ pub async fn model_gateway_start(
         *guard = Some(child);
     }
 
-    // Give the daemon a moment to bind before the first status read, so the
-    // card does not flash "not running" immediately after a successful
-    // start. Bounded and short; the poller corrects either way.
-    tauri::async_runtime::spawn_blocking(|| std::thread::sleep(Duration::from_millis(600)))
-        .await
-        .ok();
-    model_gateway_status(supervisor).await
+    // Wait for the daemon to ANSWER, rather than sleeping and assuming
+    // (review R1-1a). `/health` answering with our service name is the only
+    // evidence that the process bound the port AND wrote its token and port
+    // files — which is what every later resolution reads.
+    poll_until(START_POLL_ATTEMPTS, START_POLL_INTERVAL, || {
+        gateway_answers_on(chosen)
+    })
+    .await;
+    // Reported on the port we CHOSE, not on whatever the port file says yet:
+    // the daemon may not have written it, and a status naming the old port
+    // would tell the user the start failed. When the poll timed out the
+    // status carries that honestly (`reachable`/`health` from a real probe),
+    // and the GUI gates its "started on port N" line on it.
+    status_on_port(&supervisor, chosen).await
 }
 
 #[derive(Debug, Serialize)]
@@ -680,14 +1024,15 @@ pub async fn model_gateway_point_panel(
     path: String,
     model: Option<String>,
     remove_slot_overrides: Option<bool>,
+    port: Option<u16>,
 ) -> Result<serde_json::Value, String> {
-    let port = resolve_port();
+    // Same `port` contract as `model_gateway_mode_set` — review R1-1b.
     let mut args = vec![
         "point".to_string(),
         "--path".to_string(),
         path,
         "--base-url".to_string(),
-        base_url(port),
+        resolved_base_url(port),
     ];
     if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
         args.push("--model".to_string());
@@ -699,6 +1044,22 @@ pub async fn model_gateway_point_panel(
     tauri::async_runtime::spawn_blocking(move || run_vscode_settings(&args))
         .await
         .map_err(|e| format!("point task failed: {}", e))?
+}
+
+/// Remove `ANTHROPIC_MODEL` from the panel's env block — that key only.
+///
+/// The counterpart to the writer's refusal to WRITE a vendor Default: a file
+/// that already holds one is the user's, so it is surfaced in the StatusBar
+/// with this one-click action rather than deleted behind their back.
+#[command]
+pub async fn model_gateway_clear_default_model(
+    path: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_vscode_settings(&["clear-default".to_string(), "--path".to_string(), path])
+    })
+    .await
+    .map_err(|e| format!("clear-default task failed: {}", e))?
 }
 
 #[command]
@@ -741,10 +1102,13 @@ pub(crate) fn mode_get_argv(path: &str) -> Vec<String> {
 ///
 /// `--base-url` rides along ONLY for `multimodel` — it is the same value
 /// `model_gateway_point_panel` sends, resolved from this process's view of
-/// the port (env, then the port file), so the two ways of pointing the
-/// panel cannot disagree. The `remote-control` leg has no use for it and
-/// the argv says so by omitting it.
+/// the port ([`resolve_port`]: env pin, the daemon's port file, the
+/// launcher's last-started-port record, then the default), so the two ways
+/// of pointing the panel cannot disagree. The `remote-control` leg has no
+/// use for it and the argv says so by omitting it.
 pub(crate) fn mode_set_argv(path: &str, mode: &str, base_url: Option<&str>) -> Vec<String> {
+    // (`base_url` is built by the caller from the port it KNOWS — see
+    // `model_gateway_mode_set`'s `port` parameter, review R1-1b.)
     let mut args = vec![
         "mode".to_string(),
         "--set".to_string(),
@@ -781,14 +1145,23 @@ pub async fn model_gateway_mode_get(path: String) -> Result<serde_json::Value, S
 
 /// Apply a mode. The write happens immediately; VS Code must be restarted
 /// by the user to load it (the GUI says so and never automates that).
+/// `port` is the port the CALLER knows the gateway is on — the one
+/// `model_gateway_start` just chose and proved live. It exists because
+/// `resolve_port()` cannot answer that question in time: the daemon writes
+/// its port file during start-up, and a launcher whose env pins a port reads
+/// the pin regardless. Writing `base_url` from a stale resolution is how the
+/// panel got pointed at a legacy container on 11436 — with our token, and a
+/// notice that said "Applied" (review R1-1b). `None` keeps the old
+/// resolution for callers that have no better answer.
 #[command]
 pub async fn model_gateway_mode_set(
     path: String,
     mode: String,
+    port: Option<u16>,
 ) -> Result<serde_json::Value, String> {
     let mode = validate_mode(&mode)?.to_string();
     let base_url = if mode == "multimodel" {
-        Some(base_url(resolve_port()))
+        Some(resolved_base_url(port))
     } else {
         None
     };
@@ -986,6 +1359,349 @@ mod tests {
         );
     }
 
+    // ── port collision (B3) ─────────────────────────────────────────────
+
+    #[test]
+    fn a_free_requested_port_is_used_unchanged() {
+        // LEAVE-ALONE half: the fallback range exists for a taken port and
+        // must never "helpfully" move a start that had no problem.
+        assert_eq!(choose_start_port(DEFAULT_GATEWAY_PORT, |_| true), Some(DEFAULT_GATEWAY_PORT));
+        assert_eq!(choose_start_port(12345, |_| true), Some(12345));
+    }
+
+    #[test]
+    fn a_taken_port_falls_back_to_the_first_free_one_in_the_range() {
+        // The 2026-09-08 machine: a legacy container owns 11436, so the
+        // gateway has to start on 11460 instead of dying on a bind error.
+        let taken = |p: u16| p != DEFAULT_GATEWAY_PORT;
+        assert_eq!(
+            choose_start_port(DEFAULT_GATEWAY_PORT, taken),
+            Some(*FALLBACK_PORT_RANGE.start())
+        );
+
+        // ...and skips further occupied ones rather than stopping at the first.
+        // 11463 is INSIDE the range on purpose: a probe naming a port outside
+        // it would answer `None` and this assertion would stop testing the
+        // skip at all.
+        assert!(FALLBACK_PORT_RANGE.contains(&11463), "the premise of this assertion");
+        let only_11463_free = |p: u16| p == 11463;
+        assert_eq!(choose_start_port(DEFAULT_GATEWAY_PORT, only_11463_free), Some(11463));
+    }
+
+    #[test]
+    fn everything_taken_reports_rather_than_guessing() {
+        assert_eq!(choose_start_port(DEFAULT_GATEWAY_PORT, |_| false), None);
+    }
+
+    #[test]
+    fn the_requested_port_is_not_retried_inside_the_fallback_range() {
+        // Asking for 11463 and finding it taken must not offer 11463 again.
+        // The requested port has to be INSIDE the range for this to assert
+        // anything: an outside one is skipped by the iteration regardless, so
+        // the "not retried" property would hold vacuously.
+        assert!(FALLBACK_PORT_RANGE.contains(&11463), "the premise of this test");
+        let seen = std::cell::RefCell::new(Vec::<u16>::new());
+        let chosen = choose_start_port(11463, |p| {
+            seen.borrow_mut().push(p);
+            p == 11464
+        });
+        assert_eq!(chosen, Some(11464));
+        assert_eq!(seen.borrow().iter().filter(|p| **p == 11463).count(), 1);
+    }
+
+    #[test]
+    fn port_is_free_is_a_bind_probe_not_a_guess() {
+        // Hold a real ephemeral port and prove the probe says so — the
+        // primitive the fallback is built on, tested against a real socket
+        // rather than mocked into always agreeing with itself.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let held = listener.local_addr().unwrap().port();
+        assert!(!port_is_free(held), "a bound port must not read as free");
+        drop(listener);
+        assert!(port_is_free(held), "and it is free again once released");
+    }
+
+    #[test]
+    fn the_fallback_range_is_the_documented_one() {
+        assert_eq!(*FALLBACK_PORT_RANGE.start(), 11460);
+        assert_eq!(*FALLBACK_PORT_RANGE.end(), 11468);
+        assert!(
+            !FALLBACK_PORT_RANGE.contains(&DEFAULT_GATEWAY_PORT),
+            "the default port is not its own fallback"
+        );
+        // The reason it sits at 11460 (v0.2.94): a fallback must not hand the
+        // gateway a port another VCO service owns. One entry per claimed
+        // port, so a future widening of the window is a red test rather than
+        // a service that cannot bind its own address.
+        for reserved in [
+            11439u16, // legacy RL server
+            11440,    // code-embed service
+            11442,    // ORCHESTRATOR_ROOT_RL_PORT
+            11443,    // GLOBAL_RL_PORT
+            11450,    // module-manifest container-port example
+            11500,    // RL_PORT_RANGE_LO (per-project allocation window)
+        ] {
+            assert!(
+                !FALLBACK_PORT_RANGE.contains(&reserved),
+                "port {} belongs to another VCO service",
+                reserved
+            );
+        }
+    }
+
+    #[test]
+    fn the_health_service_name_matches_the_gateway_server() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let py = std::fs::read_to_string(
+            repo_root
+                .join("claude_mcp_servers")
+                .join("model_router")
+                .join("server.py"),
+        )
+        .expect("model_router/server.py readable");
+        assert!(
+            py.contains(&format!("\"{}\"", GATEWAY_SERVICE)),
+            "the starter decides 'is this port MINE?' by a service name the \
+             gateway no longer emits"
+        );
+    }
+
+    // ── R1-1: the port a start CHOSE must reach the panel write ─────────
+
+    #[test]
+    fn mode_set_carries_the_chosen_port_not_a_re_resolution() {
+        // The BLOCKER: the gateway starts on 11437 (11436 taken) and the
+        // panel write derived its base URL from `resolve_port()` — which on
+        // that machine still answered 11436, the legacy container. The panel
+        // was handed our token pointing at a foreign service, and the notice
+        // said "Applied".
+        let argv = mode_set_argv("/p/settings.json", "multimodel", Some(&base_url(11437)));
+        let i = argv.iter().position(|a| a == "--base-url").expect("--base-url");
+        assert_eq!(argv[i + 1], "http://127.0.0.1:11437");
+        assert!(!argv[i + 1].contains("11436"));
+    }
+
+    #[test]
+    fn a_known_port_beats_the_resolver_for_the_panels_base_url() {
+        // The BLOCKER's second half: both panel-writing commands go through
+        // this, so a started gateway's port reaches the settings file rather
+        // than being re-derived from a resolution that can still be stale.
+        let g = scratch_root();
+        std::fs::write(g.path().join(PORT_BASENAME), "11436\n").unwrap();
+        assert_eq!(resolved_base_url(Some(11437)), "http://127.0.0.1:11437");
+        // LEAVE-ALONE half: no known port means the old resolution, unchanged.
+        assert_eq!(resolved_base_url(None), "http://127.0.0.1:11436");
+        assert_eq!(resolved_base_url(Some(0)), "http://127.0.0.1:11436");
+    }
+
+    #[test]
+    fn an_env_pin_that_differs_from_the_chosen_port_refuses_the_start() {
+        // A pin is a statement about where this machine's gateway lives, and
+        // every later resolution reads it. Moving off it silently would point
+        // the status poll, the panel and the MCP env at the wrong process.
+        let refusal = env_pin_conflict(Some(11436), 11437, None).expect("a conflict must refuse");
+        assert!(refusal.contains(PORT_ENV), "{}", refusal);
+        assert!(refusal.contains("11436") && refusal.contains("11437"), "{}", refusal);
+    }
+
+    #[test]
+    fn no_pin_or_a_matching_pin_lets_the_start_proceed() {
+        // LEAVE-ALONE half: the refusal is for a CONFLICT, not for pinning.
+        assert_eq!(env_pin_conflict(None, 11437, None), None);
+        assert_eq!(env_pin_conflict(Some(11437), 11437, None), None);
+        assert_eq!(env_pin_conflict(Some(11437), 11437, Some(11437)), None);
+    }
+
+    #[test]
+    fn neither_refusal_message_carries_a_flattened_line_continuation() {
+        // Review R3-3: a `\` continuation that was itself inside a generated
+        // string collapsed into the Rust literal, so the user read "Every
+        // later port              resolution reads the pin". These messages
+        // are shipped copy; a run of spaces in one is a defect in it.
+        for message in [
+            env_pin_conflict(Some(11436), 11437, None).expect("occupied-port refusal"),
+            env_pin_conflict(Some(11436), 11440, Some(11440)).expect("explicit-port refusal"),
+        ] {
+            assert!(
+                !message.contains("   "),
+                "a run of 3+ spaces in shipped copy: {:?}",
+                message
+            );
+            assert!(!message.contains('\n'), "one line, wrapped by the GUI: {:?}", message);
+        }
+    }
+
+    #[test]
+    fn an_explicit_port_request_is_not_reported_as_an_occupied_port() {
+        // Review R2-8: the pin was contradicted by the CALLER, not by a
+        // process. Saying "in use by another process" sends the user looking
+        // for something that is not there.
+        let asked = env_pin_conflict(Some(11436), 11440, Some(11440)).expect("refusal");
+        assert!(asked.contains("you asked for port 11440"), "{}", asked);
+        assert!(!asked.contains("in use by another process"), "{}", asked);
+
+        let occupied = env_pin_conflict(Some(11436), 11437, None).expect("refusal");
+        assert!(occupied.contains("in use by another process"), "{}", occupied);
+    }
+
+    // ── R2-2: the last-chosen-port record ───────────────────────────────
+
+    #[test]
+    fn the_last_started_port_is_used_once_the_daemon_deleted_its_port_file() {
+        // The daemon unlinks its port file on a clean exit; without this
+        // record the very next resolution answers with the shipped default,
+        // which on the reporter's machine is a legacy container.
+        let g = scratch_root();
+        std::fs::write(g.path().join(LAST_PORT_BASENAME), "11437\n").unwrap();
+        assert_eq!(resolve_port(), 11437);
+    }
+
+    #[test]
+    fn a_live_port_file_beats_the_last_port_record() {
+        let g = scratch_root();
+        std::fs::write(g.path().join(PORT_BASENAME), "11440\n").unwrap();
+        std::fs::write(g.path().join(LAST_PORT_BASENAME), "11437\n").unwrap();
+        assert_eq!(resolve_port(), 11440);
+    }
+
+    #[test]
+    fn a_corrupt_last_port_record_degrades_to_the_default() {
+        let g = scratch_root();
+        for bad in ["", "nonsense", "0", "999999"] {
+            std::fs::write(g.path().join(LAST_PORT_BASENAME), bad).unwrap();
+            assert_eq!(resolve_port(), DEFAULT_GATEWAY_PORT, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn remember_last_port_writes_the_file_the_python_side_reads() {
+        let g = scratch_root();
+        remember_last_port(11437);
+        let path = g.path().join(LAST_PORT_BASENAME);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "11437",
+            "the record is what makes a stopped gateway recognisable"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "state under ~/.vct is owner-only");
+        }
+    }
+
+    #[test]
+    fn the_last_port_basename_matches_the_python_reader() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let py = std::fs::read_to_string(repo_root.join("vco_lib").join("vscode_settings.py"))
+            .expect("vco_lib/vscode_settings.py readable");
+        assert!(
+            py.contains(&format!("LAST_PORT_BASENAME = \"{}\"", LAST_PORT_BASENAME)),
+            "the two sides would read and write different files"
+        );
+    }
+
+    #[test]
+    fn both_python_spawns_carry_the_gateway_knobs() {
+        // Review R2-6: the writer resolves the gateway's port, and the pin is
+        // the first step of that resolution — it must see it.
+        let _g = scratch_root();
+        let saved = std::env::var_os(PORT_ENV);
+        // SAFETY: `scratch_root()` holds the workspace-wide env mutex.
+        unsafe { std::env::set_var(PORT_ENV, "11437") };
+
+        let carried: Vec<bool> = [
+            gateway_command(Path::new("/usr/bin/python3"), None),
+            vscode_settings_command(Path::new("/usr/bin/python3"), None),
+        ]
+        .iter()
+        .map(|cmd| {
+            cmd.get_envs().any(|(k, v)| {
+                k.to_string_lossy() == PORT_ENV
+                    && v.map(|vv| vv.to_string_lossy() == "11437").unwrap_or(false)
+            })
+        })
+        .collect();
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(PORT_ENV, v),
+                None => std::env::remove_var(PORT_ENV),
+            }
+        }
+        assert_eq!(carried, vec![true, true], "both spawns must see the pin");
+    }
+
+    #[test]
+    fn the_start_waits_for_a_live_answer_instead_of_sleeping() {
+        // Review R1-1a: the daemon writes its TOKEN before its PORT file, so
+        // a fixed sleep could report "started" while both the port file and
+        // the token were still absent. The poll asks until it gets an answer.
+        let calls = std::cell::Cell::new(0u32);
+        let live_on_third = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move { n >= 3 }
+        };
+        let ok = tauri::async_runtime::block_on(poll_until(10, Duration::ZERO, live_on_third));
+        assert!(ok);
+        assert_eq!(calls.get(), 3, "it stops at the first live answer");
+    }
+
+    #[test]
+    fn the_start_poll_gives_up_rather_than_hanging() {
+        let calls = std::cell::Cell::new(0u32);
+        let never = || {
+            calls.set(calls.get() + 1);
+            async { false }
+        };
+        let ok = tauri::async_runtime::block_on(poll_until(4, Duration::ZERO, never));
+        assert!(!ok, "a gateway that never answers must not report as started");
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn the_start_poll_budget_is_bounded_and_documented() {
+        assert_eq!(START_POLL_ATTEMPTS, 50);
+        assert_eq!(START_POLL_INTERVAL, Duration::from_millis(100));
+        let total = START_POLL_INTERVAL * START_POLL_ATTEMPTS;
+        assert!(total <= Duration::from_secs(6), "a GUI click cannot wait longer");
+    }
+
+    // ── R1-4: PYTHONPATH parity between the two python spawns ───────────
+
+    #[test]
+    fn both_python_spawns_carry_the_clone_on_pythonpath() {
+        // The writer spawn had no PYTHONPATH while the daemon spawn did, and
+        // `resolve_gateway_ports` SWALLOWS the resulting ImportError and
+        // answers with the default port — so our own gateway on 11437 read as
+        // an unmanaged prototype endpoint.
+        let root = Path::new("/opt/vco");
+        for cmd in [
+            gateway_command(Path::new("/usr/bin/python3"), Some(root)),
+            vscode_settings_command(Path::new("/usr/bin/python3"), Some(root)),
+        ] {
+            let value = cmd
+                .get_envs()
+                .find(|(k, _)| k.to_string_lossy() == "PYTHONPATH")
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().to_string())
+                .expect("PYTHONPATH must be set for a -m spawn out of the clone");
+            assert!(value.contains("/opt/vco"), "{}", value);
+            assert!(value.contains("claude_mcp_servers"), "{}", value);
+        }
+    }
+
+    #[test]
+    fn the_pythonpath_separator_is_the_platforms_own() {
+        let value = orchestrator_pythonpath(Path::new("/opt/vco"))
+            .to_string_lossy()
+            .to_string();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(value.matches(sep).count(), 1, "{}", value);
+    }
+
     // ── the mode switch: argv is the whole contract with the Python CLI ──
 
     #[test]
@@ -1041,6 +1757,18 @@ mod tests {
             let err = validate_mode(bad).expect_err(bad);
             assert!(err.contains("unknown panel mode"), "{}", err);
         }
+    }
+
+    #[test]
+    fn the_clear_default_subcommand_exists_in_the_python_cli() {
+        // The command shells to `clear-default`; argparse rejects an unknown
+        // subcommand with a usage message on STDERR and no JSON, which the
+        // bridge would report as "did not return JSON" — a drift that reads
+        // like a broken interpreter.
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let py = std::fs::read_to_string(repo_root.join("vco_lib").join("vscode_settings.py"))
+            .expect("vco_lib/vscode_settings.py readable");
+        assert!(py.contains("\"clear-default\""));
     }
 
     #[test]

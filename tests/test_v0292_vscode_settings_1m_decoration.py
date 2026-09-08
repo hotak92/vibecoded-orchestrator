@@ -237,12 +237,14 @@ def test_healing_only_change_is_written_not_reported_unchanged(tmp_path):
 
 
 def test_explicit_plain_model_choice_is_decorated(tmp_path):
+    """First-party id: a vendor one is refused before it can be decorated
+    (USER RULING 2026-09-08 — see tests/test_vscode_settings.py)."""
     path = _settings_file(tmp_path)
     result = vs.point_at_gateway(
-        path, base_url=BASE_URL, token=TOKEN, model="claude-gw/glm-5.3",
+        path, base_url=BASE_URL, token=TOKEN, model="claude-opus-5",
     )
     assert result["values_healed"] == [vs.MODEL_KEY]
-    assert _block(path)[vs.MODEL_KEY] == "claude-gw/glm-5.3[1m]"
+    assert _block(path)[vs.MODEL_KEY] == "claude-opus-5[1m]"
 
 
 def test_non_1m_and_claude_slot_values_pass_through_untouched(tmp_path):

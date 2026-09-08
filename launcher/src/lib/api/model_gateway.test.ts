@@ -33,6 +33,7 @@ import {
   inspectVSCodeTarget,
   listVSCodeTargets,
   pointPanelAtGateway,
+  pointPanelPort,
   pointPanelWarnings,
   projectHasRoutingGuidance,
   resetPanelToNative,
@@ -189,6 +190,7 @@ describe('R15 — the model is the user’s choice', () => {
       path: '/p/settings.json',
       model: null,
       removeSlotOverrides: false,
+      port: null,
     });
   });
 
@@ -196,6 +198,82 @@ describe('R15 — the model is the user’s choice', () => {
     mockInvoke.mockResolvedValue({ ok: true });
     await pointPanelAtGateway({ path: '/p/settings.json', model: '   ' });
     expect(mockInvoke.mock.calls[0][1].model).toBeNull();
+  });
+
+  it('pointPanelPort hands over the live gateway port, and only a live one', () => {
+    // The Services card's half of R1-1: without this the panel write
+    // re-resolves (launcher env -> port file -> 11436) and can name a
+    // different process than the card is describing.
+    const base = makeStatus();
+    const live = makeStatus({
+      port: 11437,
+      reachable: true,
+      health: { ...base.health!, port: 11437 },
+    });
+    expect(pointPanelPort(live)).toBe(11437);
+    // LEAVE-ALONE half: no proof, no port — Rust resolves as it always did.
+    expect(pointPanelPort(makeStatus({ port: 11437, reachable: false }))).toBeNull();
+    expect(pointPanelPort(makeStatus({ port: 11437, reachable: null }))).toBeNull();
+    expect(
+      pointPanelPort(
+        makeStatus({
+          port: 11437,
+          reachable: true,
+          health: { ...base.health!, service: 'vco-model-router' },
+        }),
+      ),
+    ).toBeNull();
+    expect(pointPanelPort(null)).toBeNull();
+  });
+
+  it('does not repeat the writer’s own kept-Default sentence (R3-4)', () => {
+    // The Python writer already names a preserved vendor Default in
+    // `message`; appending a second sentence printed it twice in the toast.
+    const line = describeWriteResult({
+      action: 'point_at_gateway',
+      path: '/p/settings.json',
+      ok: true,
+      status: 'written',
+      reason: null,
+      message:
+        'Panel pointed at the model gateway. Kept your Default claude-gw/glm-5.3[1m] — it is a vendor model.',
+      backup_path: null,
+      keys_written: ['ANTHROPIC_BASE_URL'],
+      permissions: 'owner_only',
+      paste_block: null,
+      restart_required: true,
+      vendor_default_preserved: 'claude-gw/glm-5.3[1m]',
+    });
+    expect(line.match(/Kept your Default/g)?.length).toBe(1);
+    expect(line).toContain('claude-gw/glm-5.3[1m]');
+  });
+
+  it('the done message names the endpoint that was WRITTEN', () => {
+    const line = describeWriteResult({
+      action: 'point_at_gateway',
+      path: '/p/settings.json',
+      ok: true,
+      status: 'written',
+      reason: null,
+      message: 'Panel pointed at the model gateway.',
+      backup_path: null,
+      keys_written: ['ANTHROPIC_BASE_URL'],
+      permissions: 'owner_only',
+      paste_block: null,
+      restart_required: true,
+      base_url: 'http://127.0.0.1:11437',
+    });
+    expect(line).toContain('Pointed at http://127.0.0.1:11437.');
+  });
+
+  it('sends port: null by default and a known port when the caller has one', async () => {
+    // R1-1b: a caller that just started a gateway knows which port it bound;
+    // one that does not lets the Rust side resolve as before.
+    mockInvoke.mockResolvedValue({ ok: true });
+    await pointPanelAtGateway({ path: '/p/settings.json' });
+    expect(mockInvoke.mock.calls[0][1].port).toBeNull();
+    await pointPanelAtGateway({ path: '/p/settings.json', port: 11437 });
+    expect(mockInvoke.mock.calls[1][1].port).toBe(11437);
   });
 
   it('forwards an explicit choice, trimmed', async () => {
@@ -207,9 +285,13 @@ describe('R15 — the model is the user’s choice', () => {
     expect(mockInvoke.mock.calls[0][1].model).toBe('claude-gw/glm-5.3');
   });
 
-  it('the offered default is glm-5.3 — not flash, not pre-5.3', () => {
-    expect(DEFAULT_GATEWAY_MODEL).toBe('claude-gw/glm-5.3');
+  it('the offered default is first-party — never a vendor model (v0.2.94)', () => {
+    // It was 'claude-gw/glm-5.3' until 2026-09-08. ANTHROPIC_MODEL is what a
+    // RESTARTED panel resumes on, so this pre-selection is how a machine ran
+    // a release cycle on GLM while the picker still said Fable.
+    expect(DEFAULT_GATEWAY_MODEL).toBe('claude-opus-5');
     expect(DEFAULT_GATEWAY_MODEL).not.toContain('flash');
+    expect(DEFAULT_GATEWAY_MODEL).not.toContain('claude-gw/');
   });
 
   it('names all six slot keys it must never write', () => {
