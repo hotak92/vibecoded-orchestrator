@@ -194,9 +194,34 @@ def test_the_health_service_name_is_the_same_word_in_all_three_languages():
     ).read_text(encoding="utf-8")
     ts = TS.read_text(encoding="utf-8")
 
-    assert f'"{vs.GATEWAY_SERVICE_NAME}"' in server
     assert f'GATEWAY_SERVICE: &str = "{vs.GATEWAY_SERVICE_NAME}"' in rust
     assert f"GATEWAY_SERVICE_NAME = '{vs.GATEWAY_SERVICE_NAME}'" in ts
+
+    # ── the gateway's own copy ────────────────────────────────────────────
+    # CROSS-LANE (v0.2.94): the gateway declares the word once, as
+    # `model_router.config.SERVICE_NAME`, and `server.py` emits
+    # `"service": SERVICE_NAME` — so the quoted literal is no longer in
+    # server.py. Both states are pinned so the test cannot go vacuous at the
+    # merge, and the match is LINE-ANCHORED on the declaration: server.py
+    # still spells the name in a help string
+    # (`vct-model-gateway --print-token-path`), so a bare substring test
+    # would stay green while /health answered with something else.
+    gw_config = GATEWAY_CONFIG.read_text(encoding="utf-8")
+    if re.search(r"^SERVICE_NAME\s*(?::[^=]+)?=", gw_config, re.MULTILINE):
+        assert py_const(GATEWAY_CONFIG, "SERVICE_NAME") == vs.GATEWAY_SERVICE_NAME, (
+            "model_router.config.SERVICE_NAME and the writer's "
+            "GATEWAY_SERVICE_NAME are different words; the GUI would never "
+            "recognise the gateway it just started"
+        )
+        assert '"service": SERVICE_NAME' in server, (
+            "config.py declares SERVICE_NAME but /health does not emit it — "
+            "the constant and the answered word have drifted apart"
+        )
+    else:
+        assert f'"service": "{vs.GATEWAY_SERVICE_NAME}"' in server, (
+            "the health payload no longer carries the word every reader "
+            "identifies this daemon by"
+        )
 
 
 def test_the_port_file_names_match_their_owners_on_both_sides():

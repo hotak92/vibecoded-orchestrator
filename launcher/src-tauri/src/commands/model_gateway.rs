@@ -597,14 +597,103 @@ fn run_vscode_settings(args: &[String]) -> Result<serde_json::Value, String> {
 
 // ─── Port collision ───────────────────────────────────────────────────────
 
-/// Can a listener bind this loopback port right now?
+/// How long the connect half of the availability probe waits.
 ///
-/// A bind attempt, not a connect: "nothing answered" and "nothing can bind"
-/// are different questions, and only the second one predicts whether the
-/// daemon we are about to spawn will come up. The listener is dropped
-/// immediately, so this leaves nothing behind.
-pub(crate) fn port_is_free(port: u16) -> bool {
+/// Loopback answers or refuses in microseconds; this bounds the pathological
+/// case (a firewall blackholing 127.0.0.1) instead of stalling a click.
+const PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Test-only override for [`port_answers`]. `None` means "ask the network".
+///
+/// It exists because NO real socket can distinguish "[`port_is_free`]
+/// consults the connect probe" from "[`port_is_free`] is the bind probe" on
+/// Linux: a live listener there fails the bind too, whatever address it is
+/// bound to (verified empirically for specific, wildcard, dual-stack `[::]`
+/// and `SO_REUSEPORT` listeners). The platform where the difference is
+/// observable — macOS/BSD, where `SO_REUSEADDR` lets a specific bind succeed
+/// under a wildcard listener — is not the one this suite runs on. Without a
+/// seam the composition would be two lines of wiring no test can mutate, and
+/// the repo has been burned before by a mechanism credited with no evidence
+/// it fires. The seam is in the I/O primitive, not in the decision.
+#[cfg(test)]
+thread_local! {
+    static ANSWERS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Does a live listener ANSWER on this loopback port?
+///
+/// A successful `connect()` means something accepted, and it does so whether
+/// that listener is bound to `127.0.0.1` specifically or to the wildcard
+/// `0.0.0.0` — which is the occupant a bind probe can miss. A REFUSED
+/// connection is the answer "nothing is there", not an error.
+pub(crate) fn port_answers(port: u16) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ANSWERS_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpStream::connect_timeout(&addr, PORT_CONNECT_TIMEOUT) {
+        Ok(stream) => {
+            // Closed immediately; this probe leaves nothing behind and must
+            // never hold a connection open against the occupant.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Can a listener BIND this loopback port right now?
+///
+/// The question that predicts whether the daemon we are about to spawn comes
+/// up, and the only one that sees a port held by something that is listening
+/// but not accepting. The listener is dropped immediately, so this leaves
+/// nothing behind.
+pub(crate) fn port_binds(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Is this loopback port free for a gateway to bind? The composition, with
+/// both probes injected so the ORDER and the short-circuit are unit-testable
+/// without occupying a real port.
+pub(crate) fn port_is_free_with<A, B>(port: u16, answers: A, binds: B) -> bool
+where
+    A: Fn(u16) -> bool,
+    B: Fn(u16) -> bool,
+{
+    !answers(port) && binds(port)
+}
+
+/// Is this loopback port free for a gateway to bind?
+///
+/// TWO questions, in this order, and both must answer yes:
+///
+///   1. [`port_answers`] — does a live listener accept here? A bind probe
+///      alone can say "free" while one does. `std::net::TcpListener::bind`
+///      sets `SO_REUSEADDR` on every non-Windows platform, and on macOS/BSD
+///      that flag ALSO relaxes the wildcard-versus-specific check: a bind to
+///      `127.0.0.1:P` there SUCCEEDS while another process listens on
+///      `0.0.0.0:P`. The starter would then hand the daemon an address it
+///      cannot serve on, and report a start that never happened.
+///   2. [`port_binds`] — can a listener take it? Catches the occupant that
+///      holds a port without accepting, which no connect can see.
+///
+/// The connect probe can only ever turn "free" into "taken", never the other
+/// way round, so this is a strict tightening of the previous bind-only
+/// answer — the leave-alone half (a genuinely free port stays free) is
+/// unchanged.
+///
+/// SHARED DESIGN with the daemon's own availability rule in
+/// `claude_mcp_servers/model_router/__main__.py::_bind_socket` (v0.2.94):
+/// both sides answer "is this port usable" for the SAME start, so a launcher
+/// that calls a port free where the daemon's bind refuses it reports a
+/// gateway that is not there. MUST MATCH that function's rule; the platform
+/// scoping of `SO_REUSEADDR` differs between the two languages (Rust std
+/// applies it on all non-Windows targets, the daemon on Linux only), which
+/// is exactly why question 1 is asked FIRST rather than left to the bind.
+pub(crate) fn port_is_free(port: u16) -> bool {
+    port_is_free_with(port, port_answers, port_binds)
 }
 
 /// The first port the daemon can actually bind: the requested one, else the
@@ -1421,6 +1510,129 @@ mod tests {
         assert!(port_is_free(held), "and it is free again once released");
     }
 
+    /// A port nothing holds right now. Discovered by binding :0 and letting
+    /// the socket go, so the tests below can bind it themselves the way they
+    /// need to (specific address, or wildcard).
+    fn a_free_port() -> u16 {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    #[test]
+    fn a_live_listener_on_the_specific_address_is_not_free() {
+        let port = a_free_port();
+        let held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(port_answers(port), "a listener that accepts must answer");
+        assert!(!port_is_free(port), "a live listener means the port is taken");
+        drop(held);
+    }
+
+    #[test]
+    fn a_live_listener_on_the_wildcard_address_is_not_free() {
+        // The case the bind probe alone can miss: on macOS/BSD a bind to
+        // 127.0.0.1:P succeeds while another process listens on 0.0.0.0:P,
+        // because `TcpListener::bind` sets SO_REUSEADDR there. The connect
+        // probe sees the occupant on every platform, which is why it runs
+        // first.
+        let port = a_free_port();
+        let held = std::net::TcpListener::bind(("0.0.0.0", port)).unwrap();
+        assert!(
+            port_answers(port),
+            "a wildcard listener accepts loopback connections"
+        );
+        assert!(
+            !port_is_free(port),
+            "a wildcard listener owns this port; calling it free hands the \
+             daemon an address it cannot serve on"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn a_released_port_reads_as_free_again() {
+        // LEAVE-ALONE half: the connect probe tightens the answer for an
+        // OCCUPIED port and must not make a free one unusable.
+        let port = a_free_port();
+        let held = std::net::TcpListener::bind(("0.0.0.0", port)).unwrap();
+        assert!(!port_is_free(port));
+        drop(held);
+        assert!(!port_answers(port), "nothing accepts once the listener is gone");
+        assert!(port_is_free(port), "a released port is free again");
+    }
+
+    /// Sets [`ANSWERS_OVERRIDE`] and clears it on drop, so a panicking
+    /// assertion cannot leave the forced answer behind for the next test on
+    /// this thread.
+    struct ForcedAnswer;
+
+    impl ForcedAnswer {
+        fn yes() -> Self {
+            ANSWERS_OVERRIDE.with(|c| c.set(Some(true)));
+            Self
+        }
+    }
+
+    impl Drop for ForcedAnswer {
+        fn drop(&mut self) {
+            ANSWERS_OVERRIDE.with(|c| c.set(None));
+        }
+    }
+
+    #[test]
+    fn port_is_free_consults_the_connect_probe_not_only_the_bind() {
+        // The SHIPPED entry point, mutation-provable: reduce it to the bind
+        // probe alone and this goes red. The real-socket tests above cannot
+        // catch that on Linux (see `ANSWERS_OVERRIDE`), and the injected
+        // composition below tests `port_is_free_with`, not the function the
+        // starter actually calls.
+        let port = a_free_port();
+        assert!(
+            port_is_free(port),
+            "baseline: nothing holds this port, so both probes say free"
+        );
+
+        let _forced = ForcedAnswer::yes();
+        assert!(
+            !port_is_free(port),
+            "something answers on this port; a successful BIND must not \
+             overrule that — on macOS/BSD a bind under a wildcard listener \
+             succeeds and the daemon would be handed an address it cannot \
+             serve on"
+        );
+    }
+
+    #[test]
+    fn the_connect_probe_runs_first_and_short_circuits_the_bind() {
+        // The composition itself, with both halves injected — the ORDER is
+        // the whole point and a real socket cannot demonstrate it on Linux
+        // (there a live listener fails the bind too, so a bind-only
+        // implementation would pass the socket tests above).
+        let binds_attempted = std::cell::Cell::new(0u32);
+        let answered = port_is_free_with(
+            12345,
+            |_| true,
+            |_| {
+                binds_attempted.set(binds_attempted.get() + 1);
+                true
+            },
+        );
+        assert!(
+            !answered,
+            "something answers there; a successful bind must not overrule it"
+        );
+        assert_eq!(
+            binds_attempted.get(),
+            0,
+            "the bind probe must not run once the port is known to be taken"
+        );
+
+        // ...and the bind still decides when nothing answers.
+        assert!(port_is_free_with(12345, |_| false, |_| true));
+        assert!(!port_is_free_with(12345, |_| false, |_| false));
+    }
+
     #[test]
     fn the_fallback_range_is_the_documented_one() {
         assert_eq!(*FALLBACK_PORT_RANGE.start(), 11460);
@@ -1452,18 +1664,47 @@ mod tests {
     #[test]
     fn the_health_service_name_matches_the_gateway_server() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-        let py = std::fs::read_to_string(
-            repo_root
-                .join("claude_mcp_servers")
-                .join("model_router")
-                .join("server.py"),
-        )
-        .expect("model_router/server.py readable");
-        assert!(
-            py.contains(&format!("\"{}\"", GATEWAY_SERVICE)),
-            "the starter decides 'is this port MINE?' by a service name the \
-             gateway no longer emits"
-        );
+        let pkg = repo_root.join("claude_mcp_servers").join("model_router");
+        let config =
+            std::fs::read_to_string(pkg.join("config.py")).expect("model_router/config.py readable");
+        let server =
+            std::fs::read_to_string(pkg.join("server.py")).expect("model_router/server.py readable");
+
+        // Matched as a WHOLE LINE, never as a bare substring: `server.py`
+        // still spells the name inside a help string
+        // (`vct-model-gateway --print-token-path`), so a `contains` test
+        // would stay green while `/health` answered with something else
+        // entirely — the one failure this test exists to catch.
+        //
+        // CROSS-LANE (v0.2.94): the gateway declares the word once, as
+        // `model_router.config.SERVICE_NAME`, and `server.py` emits
+        // `"service": SERVICE_NAME`. Until that lands, the literal is still
+        // inline in the health payload; both states are pinned, so this test
+        // cannot quietly become vacuous at the moment of the merge.
+        let declares_constant = config
+            .lines()
+            .any(|l| l.starts_with("SERVICE_NAME") && l.contains('='));
+        if declares_constant {
+            let declaration = format!("SERVICE_NAME = \"{}\"", GATEWAY_SERVICE);
+            assert!(
+                config.lines().any(|l| l.trim_end() == declaration),
+                "model_router/config.py declares SERVICE_NAME as something \
+                 other than {:?}; the starter's 'is this port MINE?' test \
+                 reads a word the gateway no longer emits",
+                declaration
+            );
+            assert!(
+                server.contains("\"service\": SERVICE_NAME"),
+                "config.py declares SERVICE_NAME but /health does not emit \
+                 it — the constant and the answered word have drifted apart"
+            );
+        } else {
+            assert!(
+                server.contains(&format!("\"service\": \"{}\"", GATEWAY_SERVICE)),
+                "the starter decides 'is this port MINE?' by a service name \
+                 the gateway no longer emits"
+            );
+        }
     }
 
     // ── R1-1: the port a start CHOSE must reach the panel write ─────────

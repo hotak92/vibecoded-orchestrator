@@ -3,6 +3,13 @@ Description=VCT Hub (vibecoded-orchestrator) — supervisor + project-config res
 Documentation=https://github.com/vibecoded-tools/vibecoded-orchestrator
 # Don't try to start before the user session is ready; otherwise loopback bind can race.
 After=default.target
+# What restarts: a hub that EXITED NON-ZERO (Restart=on-failure below). What does
+# not: a clean `--stop` (exit 0), and a hub that is still running. These two END a
+# crash loop — systemd's default limit is 5 starts in 10 SECONDS, which RestartSec=10s
+# can never reach, so without them the loop is unbounded. Both keys belong under
+# [Unit]; systemd rejects them under [Service].
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
