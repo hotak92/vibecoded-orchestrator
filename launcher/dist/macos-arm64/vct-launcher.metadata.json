@@ -1,11 +1,11 @@
 {
-  "source_sha": "da26ac7b97910c336e97bf87ff2353ebd78ae16f",
-  "source_short_sha": "da26ac7",
-  "source_hash": "6c76f5d5c5011962ecbe23dc4af8f38039f3fd3e",
-  "built_at": "2026-09-07T14:57:08Z",
-  "launcher_version": "0.2.92",
+  "source_sha": "4e541e3b71800e95cdf2fd4d064c1d8799c88f03",
+  "source_short_sha": "4e541e3",
+  "source_hash": "708668c421a655bf868c36a0b104af5257feb1db",
+  "built_at": "2026-09-08T03:51:24Z",
+  "launcher_version": "0.2.93",
   "host_target": "macos-arm64",
   "binary_name": "vct-launcher",
-  "binary_size_bytes": 27261776,
+  "binary_size_bytes": 27394288,
   "tier": "experimental"
 }
