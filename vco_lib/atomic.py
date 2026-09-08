@@ -32,6 +32,11 @@ Public surface:
 * :func:`atomic_write_text` — write str to file, atomically.
 * :func:`atomic_write_bytes` — write bytes to file, atomically; the ONE
   byte-level writer (``mode=`` and ``symlink_safe=`` options, v0.2.92).
+* :func:`atomic_text_stream` — ``contextmanager`` yielding a text handle
+  for callers that cannot hold the whole body in memory (v0.2.94; optional
+  ``backup=`` performs the "keep the previous version" link here rather
+  than at the call site, and never overwrites an existing backup;
+  ``mode=`` as in :func:`atomic_write_bytes`).
 * :func:`rotate_tail_lines` — truncate an append-only log to its tail
   atomically (v0.2.92; was inline in two resolver modules).
 * :func:`atomic_write_json` — write JSON object, atomically.
@@ -63,6 +68,7 @@ modularity — so the deferral emitter (``vco_lib.deferral_emit``) and
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -182,7 +188,145 @@ def atomic_write_bytes(
     return redirect
 
 
-def rotate_tail_lines(path: Path, *, max_bytes: int, keep_lines: int) -> bool:
+#: Errnos that mean "this filesystem or path cannot hard-link", i.e. the ONLY
+#: reason :func:`atomic_text_stream` falls back from ``os.link`` to a rename.
+#: Everything else — ``EEXIST`` first among them — is a real error and is
+#: raised. ``EOPNOTSUPP`` and ``ENOTSUP`` are the same value on Linux and
+#: different ones elsewhere, so both names are resolved defensively.
+_LINK_UNSUPPORTED_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("EPERM", "EXDEV", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EMLINK", "EACCES")
+    if hasattr(errno, name)
+)
+
+
+@contextlib.contextmanager
+def atomic_text_stream(
+    path: Path,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+    newline: str = "",
+    fsync: bool = True,
+    backup: Optional[Path] = None,
+    mode: Optional[int] = None,
+) -> Iterator[Any]:
+    """The STREAMING member of this family: yields a text handle, replaces on exit.
+
+    :func:`atomic_write_text` and :func:`atomic_write_bytes` take the whole
+    body as a VALUE, which is the right shape for a config file and the wrong
+    one for a caller rewriting a multi-gigabyte file line by line — it would
+    have to hold the entire result in memory to use them. That gap is why
+    ``vco_lib.transcript_repair`` (Claude Code session ``.jsonl`` repair;
+    real files reach hundreds of megabytes) would otherwise have hand-rolled
+    the tmp+rename dance a fifth time. Same crash-safety contract as the rest
+    of the family: same-directory tempfile, fsync before the rename, tempfile
+    unlinked on any exception, no ``.tmp`` left behind on any path.
+
+    Args:
+        path: destination, replaced atomically when the block exits cleanly.
+        encoding / errors / newline: passed to ``open`` on the tempfile.
+            ``newline=""`` (the default here, unlike ``open``'s) keeps the
+            caller's line endings verbatim — a rewriter that silently
+            translated CRLF would corrupt the very lines it is preserving.
+            ``errors="surrogateescape"`` pairs with a reader opened the same
+            way to round-trip bytes that are not valid UTF-8.
+        fsync: fsync the tempfile before the rename.
+        backup: when given AND ``path`` exists, the previous version is kept
+            here. It is taken as a HARD LINK before the single replace, not as
+            a rename after it: two renames leave a window in which ``path``
+            does not exist at all, so a crash between them loses the file the
+            caller was trying to protect. A hard link makes the backup and the
+            original the same inode until the replace swings ``path`` to the
+            new one — there is no moment when either name is missing. Where
+            hard links are unavailable (FAT, some network mounts, a
+            cross-device path) it falls back to the rename, which is still
+            better than no backup. O(1) either way: no copy, so backing up a
+            gigabyte costs nothing.
+
+            **An existing backup is NEVER overwritten**: the link fails with
+            ``EEXIST`` and that error is raised. The fallback rename is
+            reserved for the errnos that mean "this filesystem cannot link"
+            (:data:`_LINK_UNSUPPORTED_ERRNOS`) — catching every ``OSError``
+            let ``EEXIST`` through to a ``replace`` that destroyed the
+            EARLIER backup, which is the one worth having when the second
+            repair is the one that went wrong. Naming the file so this
+            cannot happen is the caller's job; a same-second timestamp is not
+            a unique name.
+        mode: optional unix permission bits applied to the FINAL path after
+            the replace, exactly as in :func:`atomic_write_bytes`. Without
+            it the destination inherits the tempfile's ``mkstemp`` mode,
+            0600 — a NARROWING for a file that was more permissive, never a
+            widening. A caller rewriting a file whose mode must survive
+            passes the original's ``st_mode``; the BACKUP always keeps it,
+            because a hard link shares the inode that carries it.
+
+    Raises:
+        Whatever the body raises, after the tempfile is cleaned up. The
+        destination is untouched in that case: a failed repair leaves the
+        original exactly as it was. ``FileExistsError`` when ``backup``
+        already exists (see above), before the destination is touched.
+    """
+    target = Path(path)
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(
+        prefix=target.name + ".", suffix=".tmp", dir=str(parent),
+    )
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(
+            fd, "w", encoding=encoding, errors=errors, newline=newline,
+        ) as handle:
+            yield handle
+            handle.flush()
+            if fsync:
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    # fsync can fail on pseudo-filesystems; don't fail
+                    # the write over it (same tolerance as the family).
+                    pass
+        if backup is not None and target.exists():
+            try:
+                os.link(str(target), str(backup))
+            except (NotImplementedError, AttributeError):
+                # No os.link on this platform at all.
+                os.replace(str(target), str(backup))
+            except OSError as exc:
+                if exc.errno not in _LINK_UNSUPPORTED_ERRNOS:
+                    # EEXIST above all: the backup name is already taken, and
+                    # replacing it would destroy the earlier version. Anything
+                    # else unexpected is not a "this filesystem cannot link"
+                    # signal either, and guessing that it is turns a real
+                    # error into a silent rename.
+                    raise
+                # FAT, some network mounts, a cross-device path. Fall back to
+                # the rename: a one-instant window is worse than the link,
+                # better than no backup.
+                os.replace(str(target), str(backup))
+        os.replace(str(tmp_path), str(target))
+        if mode is not None:
+            try:
+                os.chmod(str(target), mode)
+            except OSError:
+                # chmod is a no-op on Windows; don't fail the write over it.
+                pass
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def rotate_tail_lines(
+    path: Path,
+    *,
+    max_bytes: int,
+    keep_lines: int,
+    in_place: bool = False,
+) -> bool:
     """Truncate an append-only text log to its last ``keep_lines`` lines
     once it exceeds ``max_bytes`` — atomically, via :func:`atomic_write_text`.
 
@@ -191,6 +335,24 @@ def rotate_tail_lines(path: Path, *, max_bytes: int, keep_lines: int) -> bool:
     lines, keep the tail, write a ``.rot.tmp`` sibling, ``os.replace``).
     Two copies of a routine that decides what data to DISCARD is the wrong
     thing to let drift, so it lives here once.
+
+    Args:
+        path: the log.
+        max_bytes: rotate only once the file is bigger than this.
+        keep_lines: how many trailing lines survive.
+        in_place: rewrite the SAME inode (truncate) instead of replacing the
+            path with a new one. Required — v0.2.94 — when a live process
+            holds the file open in append mode and the rotator is that same
+            process or a sibling: ``os.replace`` gives the path a new inode
+            while every open descriptor keeps pointing at the old, now
+            unlinked one, so the rotation looks done and every subsequent
+            write disappears into a file with no name. That is exactly the
+            shape of an init system's ``StandardError=append:`` redirect.
+            The cost is a window in which the file is short: the tail is
+            written from the start of the same inode and the remainder
+            truncated, so a crash mid-way leaves a partial log rather than
+            no log. For a diagnostic log that is the right trade; for
+            anything a reader parses as a whole, use the default.
 
     Soft-fail by contract: rotation must never break the emit path it
     serves. Any ``OSError`` (unreadable, unwritable, vanished mid-way)
@@ -203,8 +365,14 @@ def rotate_tail_lines(path: Path, *, max_bytes: int, keep_lines: int) -> bool:
             return False
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
-        tail = lines[-keep_lines:] if len(lines) > keep_lines else lines
-        atomic_write_text(path, "".join(tail), fsync=False)
+        tail = "".join(lines[-keep_lines:] if len(lines) > keep_lines else lines)
+        if in_place:
+            with path.open("r+", encoding="utf-8", errors="replace") as fh:
+                fh.seek(0)
+                fh.write(tail)
+                fh.truncate()
+            return True
+        atomic_write_text(path, tail, fsync=False)
         return True
     except OSError:
         return False

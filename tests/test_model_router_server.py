@@ -58,6 +58,12 @@ class _Upstream:
         self.messages_raw: bytes | None = None
         self.content_type = "application/json"
         self.stream_chunks: list[bytes] | None = None
+        #: A NON-stream body delivered in several writes, so the client's
+        #: reader sees several chunks. The gap between them is what makes the
+        #: difference between "one buffered chunk" and "the whole body"
+        #: observable rather than a race — see
+        #: ``tests/test_v0294_gateway_relay_buffer.py``.
+        self.json_chunks: list[bytes] | None = None
         self.stream_gap_s = 0.0
         self.server: TestServer | None = None
 
@@ -103,6 +109,19 @@ class _Upstream:
 
     async def _messages(self, request: web.Request) -> web.StreamResponse:
         await self._record(request)
+        if self.json_chunks is not None:
+            response = web.StreamResponse(
+                status=self.messages_status,
+                headers={"Content-Type": self.content_type},
+            )
+            response.enable_chunked_encoding()
+            await response.prepare(request)
+            for chunk in self.json_chunks:
+                await response.write(chunk)
+                if self.stream_gap_s:
+                    await asyncio.sleep(self.stream_gap_s)
+            await response.write_eof()
+            return response
         if self.stream_chunks is not None:
             response = web.StreamResponse(
                 status=self.messages_status,
@@ -144,6 +163,7 @@ class GatewayTestBase(unittest.IsolatedAsyncioTestCase):
         self.vendor = Vendor(
             vendor_id=base.vendor_id,
             display_suffix=base.display_suffix,
+            display_name=base.display_name,
             namespace=base.namespace,
             upstream=vendor_url,
             secret_keys=base.secret_keys,
@@ -501,14 +521,20 @@ class AuthAndRoutingTests(GatewayTestBase):
         self.assertEqual(self.vendor_up.requests, [])
 
     async def test_upstream_error_is_relayed_verbatim(self) -> None:
-        self.vendor_up.messages_status = 429
-        self.vendor_up.messages_raw = b'{"error":{"code":"1302","message":"rate"}}'
+        """Verbatim relay, on a status that is NOT quota exhaustion.
+
+        This used to assert it for 429, which is now the ONE substituted
+        status (``tests/test_v0294_gateway_quota.py``). 400 keeps the general
+        policy pinned: the vendor's own words still reach the user.
+        """
+        self.vendor_up.messages_status = 400
+        self.vendor_up.messages_raw = b'{"error":{"code":"1302","message":"bad"}}'
         resp = await self.client.post(
             "/v1/messages",
             headers=self.auth(),
             json={"model": "claude-gw/glm-5.3", "messages": []},
         )
-        self.assertEqual(resp.status, 429)
+        self.assertEqual(resp.status, 400)
         self.assertEqual(await resp.read(), self.vendor_up.messages_raw)
 
     async def test_unreachable_upstream_is_502(self) -> None:

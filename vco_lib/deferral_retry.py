@@ -86,6 +86,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
+from vco_lib.intfile import read_int_line
+
 #: Per (folder, condition) attempt ceiling. Beyond it the entry stays for the
 #: user — a retry that failed three times is not transient.
 MAX_ATTEMPTS = 3
@@ -764,14 +766,21 @@ def pidfile_path(folder: Path) -> Path:
 
 
 def _read_pidfile(path: Path) -> Optional[int]:
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        return int(raw.splitlines()[0])
-    except (ValueError, IndexError):
-        return None
+    """The pid in ``path``, or ``None``. Never raises.
+
+    One line of policy over :func:`vco_lib.intfile.read_int_line`, which is
+    the ONE reader for "first line of a small state file, as an int" — pid
+    files, port files and lock files all go through it. ``minimum=1`` because
+    a recorded 0 is not a process any more than a missing file is.
+
+    Two readings changed with the shared reader, both narrowing and neither
+    reachable from this module's own writer (``_acquire_lock`` writes exactly
+    ``f"{os.getpid()}"``): a LEADING blank line now reads as ``None`` where
+    strip-then-split tolerated it, and non-UTF-8 bytes read as ``None``
+    rather than raising through ``read_text``. A pidfile of either shape was
+    not written by us and is better treated as absent than as a lock.
+    """
+    return read_int_line(path, minimum=1)
 
 
 def _lock_is_held(path: Path) -> bool:

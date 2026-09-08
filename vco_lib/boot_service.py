@@ -351,11 +351,22 @@ def boot_log_file(log_file: Path) -> Path:
     file. A daemon that configures a file handler on ``log_file`` and also
     logs to stderr would have every record written twice if the unit
     redirected stderr into the same path; that duplication reads as a bug in
-    the daemon and is unfixable from the unit side. Keeping them apart means
-    ``<name>.log`` holds the daemon's structured records and
-    ``<name>.boot.log`` holds exactly what the daemon could NOT record — a
-    refusal to start, an import error, a crash — which is the material you
-    need when a login-time service silently does not come up.
+    the daemon and is unfixable from the unit side.
+
+    Two paths must BOTH hold for this file to stay small, and only one of
+    them lives here. Separate paths (this function) stop the exact-duplicate
+    case; what they do not stop is the daemon writing INFO to stderr, which
+    the init system appends HERE — so an access line landed in both files
+    and this one grew for the life of a healthy daemon. The other half of
+    the rule therefore lives in the daemon:
+    ``model_router.__main__._configure_logging`` raises stderr to WARNING
+    once its file handler opens.
+
+    With both in force the split is: ``<name>.log`` holds the daemon's
+    records in full, and ``<name>.boot.log`` holds what the daemon could not
+    record (a refusal to start, an import error, a crash) PLUS warnings and
+    errors, which appear in both by design — a warning is exactly what
+    someone reading a boot log is looking for.
     """
     return log_file.with_name(f"{log_file.stem}.boot{log_file.suffix}")
 

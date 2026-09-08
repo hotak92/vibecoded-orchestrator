@@ -20,12 +20,27 @@ successful-looking answer from a model the user did not choose — worse than an
 error, because nothing surfaces. So it is a local 400 whose message says what
 happened.
 
-**The ``[1m]`` suffix is client-side only.** Claude Code's convention for a
-1M-context variant is an ``[1m]`` suffix on the model id. Live beta-header
-logging shows the client adds no ``context-1m`` beta header for a custom id,
-so the suffix carries no upstream meaning: it is stripped before a vendor sees
-the name. It is NOT stripped on the first-party Claude route, where ``[1m]``
-identifies a real upstream variant.
+**The ``[1m]`` suffix is client-side only — on BOTH routes.** Claude Code's
+convention for a 1M-context variant is an ``[1m]`` suffix on the model id. It
+is a CLIENT convention and nothing more: no upstream has a model whose name
+ends in ``[1m]``, and a first-party id carrying it came back ``404
+not_found_error`` naming that exact spelling while the same id without it
+returned 200 — same endpoint, same credentials, same minute. The window
+itself is bought with the ``context-1m-2025-08-07`` BETA HEADER.
+
+So the suffix is stripped on every route, and :attr:`Route.one_m_requested`
+carries the fact across because the forwarded name no longer records it.
+
+**What the strip is actually for.** On ordinary traffic the client resolves
+the suffix ITSELF: the gateway's request log shows it sending the bare id
+plus the ``context-1m`` beta, so the strip never fires and the header is
+already there. It fires for the paths where the client does not — a
+hand-written ``curl``, ``ANTHROPIC_MODEL`` set to a suffixed id by a tool or
+a user, an SDK that passes the picker string through. Those produced the
+field 404 this replaces. It is a defensive normalisation of an id the client
+usually normalises first, not the mechanism by which 1M works day to day; the
+catalog half (advertising ``<id>[1m]``) is what the client reads to know the
+window exists at all.
 """
 
 from __future__ import annotations
@@ -60,6 +75,7 @@ class Route:
         family_id: ``vendor_id`` or the Anthropic family id; used as the
             per-family key in logs, catalog caches and ``/health``.
         is_anthropic: True for the first-party OAuth route.
+        one_m_requested: the requested id carried ``[1m]``.
     """
 
     upstream: str
@@ -67,6 +83,11 @@ class Route:
     vendor: Optional[Vendor]
     family_id: str
     is_anthropic: bool
+    #: The REQUESTED id carried Claude Code's ``[1m]`` suffix. Stripped from
+    #: ``forward_model`` on every route (no upstream knows the spelling), so
+    #: this flag is the only surviving record that the user asked for the
+    #: 1M-context variant. The server turns it into the beta header.
+    one_m_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +107,16 @@ def strip_1m(model_id: str) -> str:
     if model_id.endswith(ONE_M_SUFFIX):
         return model_id[: -len(ONE_M_SUFFIX)]
     return model_id
+
+
+def with_1m(model_id: str) -> str:
+    """Add :data:`ONE_M_SUFFIX` unless it is already there. Idempotent.
+
+    The inverse of :func:`strip_1m`, and the ONLY place the suffix is spelled
+    when building an id (``advertised_id`` and the first-party catalog both
+    route through here), so the two directions cannot drift apart.
+    """
+    return model_id if model_id.endswith(ONE_M_SUFFIX) else f"{model_id}{ONE_M_SUFFIX}"
 
 
 def has_claude_marker(model_id: str) -> bool:
@@ -156,6 +187,7 @@ def _vendor_route(vendor: Vendor, raw_remainder: str) -> Route | RouteError:
         vendor=vendor,
         family_id=vendor.vendor_id,
         is_anthropic=False,
+        one_m_requested=raw_remainder.endswith(ONE_M_SUFFIX),
     )
 
 
@@ -171,8 +203,8 @@ def route(
     1. an explicit vendor namespace (``<namespace><id>``);
     2. a vendor's bare-id prefix (so the CLI can use the vendor's real id);
     3. a Claude marker anywhere in the id -> the first-party OAuth route,
-       with the id passed through UNCHANGED (``[1m]`` included: on this route
-       the suffix names a real upstream variant);
+       with ``[1m]`` stripped (no upstream model is named that; the 1M window
+       travels as a beta header) and recorded in ``one_m_requested``;
     4. otherwise a local 400 that lists the namespaces that do exist.
     """
     if not isinstance(model_id, str) or not model_id.strip():
@@ -195,10 +227,11 @@ def route(
     if has_claude_marker(model_id):
         return Route(
             upstream=anthropic.upstream,
-            forward_model=model_id,
+            forward_model=strip_1m(model_id),
             vendor=None,
             family_id=anthropic.family_id,
             is_anthropic=True,
+            one_m_requested=model_id.endswith(ONE_M_SUFFIX),
         )
 
     known = ", ".join(
@@ -221,7 +254,8 @@ def advertised_id(vendor: Vendor, model_id: str, one_m: bool) -> str:
     one model version has a 1M window while the previous minor version has
     200K, so a ``<family>*`` wildcard would misreport the window by 5x.
     """
-    return f"{vendor.namespace}{model_id}{ONE_M_SUFFIX if one_m else ''}"
+    namespaced = f"{vendor.namespace}{model_id}"
+    return with_1m(namespaced) if one_m else namespaced
 
 
 __all__ = [
@@ -233,4 +267,5 @@ __all__ = [
     "route",
     "split_namespace",
     "strip_1m",
+    "with_1m",
 ]

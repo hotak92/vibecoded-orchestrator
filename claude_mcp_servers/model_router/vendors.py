@@ -74,6 +74,12 @@ class Vendor:
             key in ``/health``'s ``catalog_source``.
         display_suffix: appended to the ``display_name`` shown in the picker
             so a user can see WHICH subscription answers an entry.
+        display_name: short human name for the vendor, used in error text the
+            GATEWAY authors (today: the quota message, where "<name> quota
+            exhausted" has to name a subscription the user recognises).
+            Optional — :func:`vendor_display_name` falls back to the suffix
+            with its separator stripped, so a row that omits it still reads
+            correctly and adding a vendor stays a one-row change.
         namespace: prefix that makes the vendor's ids survive Claude Code's
             discovery filter. MUST contain a :data:`CLAUDE_ID_MARKERS` entry
             and MUST end with a separator, so ``split`` is unambiguous.
@@ -118,6 +124,7 @@ class Vendor:
     docs_url: str = ""
     alias_trap: bool = False
     static_ids: tuple[str, ...] = ()
+    display_name: str = ""
 
 
 ANTHROPIC_FAMILY = AnthropicFamily(
@@ -140,6 +147,7 @@ VENDORS: Mapping[str, Vendor] = {
         display_suffix=" · Z.ai subscription",
         namespace=GATEWAY_NAMESPACE,
         upstream="https://api.z.ai/api/anthropic",
+        display_name="Z.ai",
         secret_keys=("glm_api_key", "zai_api_key"),
         bare_id_prefixes=("glm",),
         catalog_path="/v1/models",
@@ -229,6 +237,20 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                 )
 
 
+def vendor_display_name(vendor: Vendor) -> str:
+    """The name to put in gateway-authored user-facing text.
+
+    Precedence: the explicit ``display_name``, else the ``display_suffix``
+    with its leading separator and padding removed, else the ``vendor_id``.
+    Never empty — an error message that names no vendor is the message this
+    whole exercise replaced.
+    """
+    if vendor.display_name.strip():
+        return vendor.display_name.strip()
+    trimmed = vendor.display_suffix.strip().lstrip("·-–—|/ ").strip()
+    return trimmed or vendor.vendor_id
+
+
 __all__ = [
     "ANTHROPIC_FAMILY",
     "AnthropicFamily",
@@ -240,4 +262,5 @@ __all__ = [
     "VENDORS",
     "Vendor",
     "validate_registry",
+    "vendor_display_name",
 ]

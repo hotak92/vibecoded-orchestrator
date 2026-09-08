@@ -46,6 +46,7 @@ future writer, not a description of an existing counterpart::
     {"schema_version": 1,
      "generated_at": "<ISO-8601 UTC>",
      "source": "launcher.db",
+     "tombstones": ["<full-model-id>", ...],
      "models": {"<full-model-id>": {"vendor": "<vendor_id>",
                                     "context_window": <int>,
                                     "max_output": <int>,
@@ -57,6 +58,28 @@ Absent file -> the shipped seed. Malformed file -> the shipped seed PLUS a
 warning naming the path; never a crash, and never an empty table served as if
 it were the truth. The file is re-read when its ``(mtime_ns, size)`` changes,
 which is checked once per ``/v1/models`` call.
+
+**A present export does not hide the seed.** Precedence is per ROW: the export
+wins for every id it names, and an id it does not name falls through to the
+shipped seed (:meth:`ContextTable.lookup`). v0.2.93 shipped whole-file
+precedence and it cost the feature it was written for — the launcher's
+exporter writes vendor rows only, so on every upgraded install the export
+existed, carried no Claude row, and every first-party 1M model was therefore
+advertised at the client's default window.
+
+**...which is why DELETION needs its own word.** With per-row fallback, an id
+the user removes in the GUI is simply an id the export no longer names — and
+"no longer names" is exactly the state that falls through to the seed, so the
+row would come back. ``tombstones`` is the export writer's way of saying
+DELETED rather than ABSENT: a listed id resolves to nothing, seed included.
+An absent ``tombstones`` key is an empty list, so an export written by an
+older launcher keeps working unchanged.
+
+**An id with no row anywhere gets no ``[1m]`` advert**, which is the honest
+outcome: Claude Code then applies its own conservative assumption (200K) for
+an id it does not recognise. The gateway does not invent a window for a model
+nobody has documented — that is the same rule as the citation requirement
+above, one layer out.
 """
 
 from __future__ import annotations
@@ -64,7 +87,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -109,18 +132,49 @@ class ContextTable:
     path: Optional[Path]
     #: Ids dropped for lacking a citation. Surfaced so the GUI can show them.
     uncited: tuple[str, ...] = ()
+    #: Seed rows consulted for an id the ACTIVE table has no row for. Set
+    #: only when the active table came from an export. See
+    #: :meth:`lookup` for why per-row rather than whole-file precedence.
+    fallback_rows: Mapping[str, ModelContext] = field(default_factory=dict)
+    #: Ids the export declares DELETED. Distinct from absent: absent falls
+    #: through to the seed, deleted resolves to nothing at all.
+    tombstones: frozenset[str] = frozenset()
 
     def lookup(self, model_id: str) -> Optional[ModelContext]:
-        """EXACT match only. ``glm-5.1-flash-x`` never resolves to ``glm-5.1``."""
-        return self.rows.get(model_id)
+        """EXACT match only. ``glm-5.1-flash-x`` never resolves to ``glm-5.1``.
+
+        Precedence is PER ROW, not per file: an export row wins for the id it
+        names, and an id the export does not name falls through to the shipped
+        seed. The alternative — whole-file precedence — is what shipped in
+        v0.2.93 and it silently lost data: the launcher's exporter writes the
+        ten vendor rows it knows about, so on every upgraded install the
+        export had no Claude rows at all and every first-party 1M model was
+        advertised as if it were 200K. An absent row means "this table has
+        nothing to say about that id", never "that id has no 1M window".
+        """
+        if model_id in self.tombstones:
+            # Checked BEFORE the fallback, which is the whole point: the user
+            # deleted this row in the GUI, and a per-row fallback that did not
+            # know the difference between "deleted" and "absent" would hand it
+            # straight back from the seed.
+            return None
+        row = self.rows.get(model_id)
+        if row is None:
+            return self.fallback_rows.get(model_id)
+        return row
 
     def advertise_1m(self, model_id: str) -> bool:
         row = self.lookup(model_id)
         return bool(row and row.window_1m)
 
 
-def _parse(payload: object, origin: Path) -> tuple[dict[str, ModelContext], tuple[str, ...]]:
-    """Parse a table document. Raises ``ValueError`` on a shape it cannot use."""
+def _parse(
+    payload: object, origin: Path,
+) -> tuple[dict[str, ModelContext], tuple[str, ...], tuple[str, ...]]:
+    """Parse a table document. Raises ``ValueError`` on a shape it cannot use.
+
+    Returns ``(rows, uncited, tombstones)``.
+    """
     if not isinstance(payload, dict):
         raise ValueError("top level is not an object")
     version = payload.get("schema_version")
@@ -132,6 +186,18 @@ def _parse(payload: object, origin: Path) -> tuple[dict[str, ModelContext], tupl
     models = payload.get("models")
     if not isinstance(models, dict):
         raise ValueError("'models' is missing or not an object")
+
+    raw_tombstones = payload.get("tombstones")
+    tombstones: tuple[str, ...] = ()
+    if isinstance(raw_tombstones, list):
+        tombstones = tuple(
+            entry for entry in raw_tombstones if isinstance(entry, str) and entry
+        )
+    elif raw_tombstones is not None:
+        logger.warning(
+            "model-gateway: 'tombstones' in %s is not a list; ignored",
+            origin,
+        )
 
     rows: dict[str, ModelContext] = {}
     uncited: list[str] = []
@@ -174,7 +240,7 @@ def _parse(payload: object, origin: Path) -> tuple[dict[str, ModelContext], tupl
             source=source,
             source_note=str(raw.get("source_note") or ""),
         )
-    return rows, tuple(uncited)
+    return rows, tuple(uncited), tombstones
 
 
 class _UnsupportedSchema(ValueError):
@@ -185,7 +251,7 @@ def load_seed() -> ContextTable:
     """The shipped table. A broken seed is a broken BUILD, so it is loud."""
     try:
         payload = json.loads(SEED_PATH.read_text(encoding="utf-8"))
-        rows, uncited = _parse(payload, SEED_PATH)
+        rows, uncited, _tombstones = _parse(payload, SEED_PATH)
     except (OSError, ValueError) as exc:
         # The seed ships inside the wheel and is pinned by a packaging test.
         # If it is unreadable the install is damaged; say so and serve an
@@ -246,7 +312,7 @@ class ContextTableLoader:
 
         try:
             payload = json.loads(self._export_path.read_text(encoding="utf-8"))
-            rows, uncited = _parse(payload, self._export_path)
+            rows, uncited, tombstones = _parse(payload, self._export_path)
         except _UnsupportedSchema as exc:
             logger.warning(
                 "model-gateway: chat-model context export %s declares an "
@@ -270,8 +336,21 @@ class ContextTableLoader:
             source=SOURCE_EXPORT,
             path=self._export_path,
             uncited=uncited,
+            fallback_rows=self._seed_rows(),
+            tombstones=frozenset(tombstones),
         )
         return self._table
+
+    def _seed_rows(self) -> Mapping[str, ModelContext]:
+        """The shipped rows, as the per-row fallback under an export.
+
+        One home: the seed is loaded once here and handed to every table the
+        loader builds, so nothing else in the package needs to know that a
+        fallback exists — ``ContextTable.lookup`` is the only reader.
+        """
+        if self._seed is None:
+            self._seed = load_seed()
+        return self._seed.rows
 
 
 __all__ = [

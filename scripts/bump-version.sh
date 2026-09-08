@@ -22,6 +22,10 @@
 #   * launcher/package-lock.json         top-level + packages[""] "version".
 #   * launcher/src-tauri/tauri.conf.json "version".
 #   * vct-module.json                    "version".
+#   * claude_mcp_servers/model_router/__init__.py  __version__ (the model
+#     gateway reports this from /health; it drifted to 0.2.92 on a 0.2.93
+#     install because this script did not touch it, and check-version-pins.sh
+#     did not look at it either — so nothing said the two disagreed).
 #
 # It does NOT touch CHANGELOG.md (that needs a human-written entry) and it
 # does NOT commit/tag (the release flow owns that). After running, verify
@@ -47,6 +51,7 @@ PKG_JSON="launcher/package.json"
 PKG_LOCK="launcher/package-lock.json"
 TAURI_CONF="launcher/src-tauri/tauri.conf.json"
 MODULE_JSON="vct-module.json"
+MR_INIT="claude_mcp_servers/model_router/__init__.py"
 
 # The 4 workspace crates that inherit the [workspace.package] version.
 WS_CRATES=(vct-launcher-temp vct-hub vct-updater vct-launcher-core)
@@ -79,6 +84,7 @@ print_pins() {
     printf "  %-44s %s\n" "$PKG_LOCK (root)" "$(grep -m1 '"version"' "$PKG_LOCK" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?')"
     printf "  %-44s %s\n" "$TAURI_CONF" "$(grep -m1 '"version"' "$TAURI_CONF" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?')"
     printf "  %-44s %s\n" "$MODULE_JSON" "$(grep -m1 '"version"' "$MODULE_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?')"
+    printf "  %-44s %s\n" "$MR_INIT" "$(grep -m1 '^__version__' "$MR_INIT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?')"
 }
 
 if [ $# -eq 0 ]; then usage 1; fi
@@ -155,6 +161,9 @@ sed_i "0,/\"version\": *\"[0-9][^\"]*\"/ s//\"version\": \"$NEW\"/" "$TAURI_CONF
 
 # 6) vct-module.json — "version".
 sed_i "0,/\"version\": *\"[0-9][^\"]*\"/ s//\"version\": \"$NEW\"/" "$MODULE_JSON"
+
+# 6b) model_router/__init__.py — __version__ (the gateway's /health value).
+sed_i "0,/^__version__ *= *\"[0-9][^\"]*\"/ s//__version__ = \"$NEW\"/" "$MR_INIT"
 
 # 7) Cargo.lock — regenerate via cargo so the 4 workspace crate entries
 #    pick up the new version. Fallback: rewrite the 4 entries by name if

@@ -131,13 +131,18 @@ class SeedTests(unittest.TestCase):
                 self.assertTrue(row.window_1m)
                 self.assertEqual(row.context_window, 1_000_000)
 
-    def test_claude_rows_never_reach_the_gateway_catalog(self) -> None:
-        """The gateway publishes first-party ids VERBATIM; the ``[1m]``
-        decision is applied to VENDOR entries only. A Claude row in the seed
-        must therefore not change what ``/v1/models`` advertises. Driven
+    def test_claude_rows_add_a_1m_companion_to_the_gateway_catalog(self) -> None:
+        """A first-party 1M row publishes the plain id AND an ``[1m]`` twin.
+
+        This assertion is inverted from the one v0.2.93 shipped, which pinned
+        "a Claude row must NOT change what /v1/models advertises" on the
+        theory that the client knows first-party windows natively. It does not
+        when it is pointed at a custom base URL: it budgeted 200K for a 1M
+        model, so a session compacted at a fifth of the window the user was
+        paying for. Both entries are published — the plain id is still the
+        200K behaviour, and nobody loses the ability to ask for it. Driven
         through the real ``CatalogService.union`` with the real seed's
-        ``advertise_1m``, so a refactor that routes first-party entries
-        through the table reds here rather than in the field."""
+        ``advertise_1m``, so the wiring is what is pinned, not a helper."""
         import asyncio
 
         from model_router import catalog as cat
@@ -166,9 +171,12 @@ class SeedTests(unittest.TestCase):
         )
         entries, _ = asyncio.run(service.union(advertise_1m=seed.advertise_1m))
         ids = {e.id for e in entries}
-        self.assertIn("claude-opus-5", ids, "first-party id published verbatim")
-        self.assertNotIn("claude-opus-5[1m]", ids, "the seed row must not decorate it")
+        self.assertIn("claude-opus-5", ids, "first-party id still published verbatim")
+        self.assertIn("claude-opus-5[1m]", ids, "the seed row decorates it too")
         self.assertIn("claude-gw/glm-5.3[1m]", ids, "the vendor row still does")
+        companion = next(e for e in entries if e.id == "claude-opus-5[1m]")
+        self.assertIn("1M context", companion.display_name)
+        self.assertTrue(companion.display_name.startswith("Opus 5"))
 
     def test_every_row_names_a_vendor_that_exists(self) -> None:
         from model_router.vendors import ANTHROPIC_FAMILY, VENDORS

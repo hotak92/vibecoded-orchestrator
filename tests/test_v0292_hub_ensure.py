@@ -42,6 +42,7 @@ current files, so neither an always-pass nor an always-fail helper survives).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -462,6 +463,48 @@ def test_resolve_needs_only_the_stdlib(tmp_path: Path) -> None:
     module_level = source.split("def hub_pid_file")[0]
     assert "from vco_lib.deferral_probes import" not in module_level
     assert "from vco_lib.paths import vct_root_dir" in module_level
+
+    # The claim above is about the whole import SURFACE, not one forbidden
+    # name, so scan it: nothing third-party at this module's top, and nothing
+    # third-party at the top of the vco_lib modules it pulls in — otherwise
+    # the property is inherited away one hop down. v0.2.94 added
+    # `vco_lib.intfile` (the shared small-state-file reader) here; this is
+    # what keeps that from being the hop that breaks the boot path.
+    assert not _third_party_imports(module_level), _third_party_imports(module_level)
+
+    imported = set(re.findall(r"^from (vco_lib\.\w+) import", module_level, re.M))
+    assert imported, "the scan found no vco_lib import — it has gone blind"
+    for name in sorted(imported):
+        rel = Path(name.replace(".", "/") + ".py")
+        dependency = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        head = dependency.split("\ndef ")[0]
+        assert not _third_party_imports(head), f"{name}: {_third_party_imports(head)}"
+
+
+#: Modules a bare system python has. Anything else in a boot-path dependency
+#: means the UPDATE flow can fail to import before it can repair itself.
+_STDLIB_ROOTS = {
+    "argparse", "collections", "contextlib", "dataclasses", "enum", "errno",
+    "functools", "hashlib", "io", "json", "logging", "os", "pathlib",
+    "platform", "re", "shutil", "socket", "subprocess", "sys", "tempfile",
+    "time", "typing", "urllib", "uuid",
+}
+
+
+def _third_party_imports(head: str) -> list[str]:
+    """Import lines in ``head`` that a bare system python could not satisfy."""
+    found = []
+    for line in head.splitlines():
+        if not line.startswith(("import ", "from ")):
+            continue
+        if line.startswith("from __future__"):
+            continue
+        root = line.split()[1].split(".")[0]
+        if root == "vco_lib":
+            continue  # followed transitively by the caller's own rule
+        if root not in _STDLIB_ROOTS:
+            found.append(line.strip())
+    return found
 
 
 def test_dist_arch_dir_matches_a_real_shipped_slot() -> None:

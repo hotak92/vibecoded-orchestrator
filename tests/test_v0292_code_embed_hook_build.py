@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -24,15 +23,13 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from tests.common.ports import free_port
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
 IS_WINDOWS = os.name == "nt"
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class _Fixture:
@@ -131,7 +128,7 @@ class BashHookTests(unittest.TestCase):
     def test_compose_leg_passes_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = _Fixture(Path(tmp))
-            proc = self._run(fx, _free_port())
+            proc = self._run(fx, free_port())
             calls = fx.compose_invocations()
             self.assertTrue(calls, f"compose was never invoked:\n{proc.stdout}\n{proc.stderr}")
             self.assertIn("up -d --build code_embed", calls[0])
@@ -142,7 +139,7 @@ class BashHookTests(unittest.TestCase):
     def test_a_compose_that_rejects_build_still_brings_the_service_up_and_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = _Fixture(Path(tmp), compose_fails_on_build=True)
-            proc = self._run(fx, _free_port())
+            proc = self._run(fx, free_port())
             calls = fx.compose_invocations()
             self.assertEqual(len(calls), 2, f"{calls}\n{proc.stdout}")
             self.assertIn("--build", calls[0])
@@ -390,7 +387,7 @@ class PowerShellHookTests(unittest.TestCase):
     def test_compose_leg_passes_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = _Fixture(Path(tmp))
-            env = fx.env(_free_port())
+            env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
                 [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -407,7 +404,7 @@ class PowerShellHookTests(unittest.TestCase):
         """Parity with the bash retry arm — proven by running, not by reading."""
         with tempfile.TemporaryDirectory() as tmp:
             fx = _Fixture(Path(tmp), compose_fails_on_build=True)
-            env = fx.env(_free_port())
+            env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
                 [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -441,7 +438,7 @@ class PowerShellHookTests(unittest.TestCase):
         """The splitter fix: `podman-compose` must not become its own argument."""
         with tempfile.TemporaryDirectory() as tmp:
             fx = _Fixture(Path(tmp))
-            env = fx.env(_free_port())
+            env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             subprocess.run(
                 [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",

@@ -22,6 +22,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.common.env import EnvIsolationMixin
+
 from model_router import __main__ as cli
 from model_router import __version__
 
@@ -29,25 +31,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MCP_ROOT = REPO_ROOT / "claude_mcp_servers"
 
 
-class _StateDirCase(unittest.TestCase):
+class _StateDirCase(EnvIsolationMixin, unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="wp9-cli-")
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
-        for key, value in (
-            ("VCT_STATE_DIR", str(self.dir)),
-            ("VCT_CLAUDE_DIR", str(self.dir / "claude")),
-        ):
-            original = os.environ.get(key)
-            os.environ[key] = value
-            self.addCleanup(
-                lambda k=key, v=original: os.environ.__setitem__(k, v)
-                if v is not None else os.environ.pop(k, None),
-            )
+        self.set_env("VCT_STATE_DIR", str(self.dir))
+        self.set_env("VCT_CLAUDE_DIR", str(self.dir / "claude"))
         for key in ("VCT_MODEL_GATEWAY_PORT", "VCT_MODEL_GATEWAY_HOST"):
-            original = os.environ.pop(key, None)
-            if original is not None:
-                self.addCleanup(os.environ.__setitem__, key, original)
+            self.set_env(key, None)
 
 
 class FlagTests(_StateDirCase):
@@ -134,7 +126,8 @@ class SelfTestTests(_StateDirCase):
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), before)
 
     def test_check_fails_on_a_non_loopback_bind_address(self) -> None:
-        os.environ["VCT_MODEL_GATEWAY_HOST"] = "0.0.0.0"
+        # THE leak: this line used to be a bare assignment. See set_env.
+        self.set_env("VCT_MODEL_GATEWAY_HOST", "0.0.0.0")
         buffer = io.StringIO()
         self.assertEqual(cli.run_check(stream=buffer), 1)
         self.assertIn("PROBLEM", buffer.getvalue())
@@ -155,40 +148,43 @@ class SingleInstanceTests(_StateDirCase):
         self.assertIsNone(cli._acquire_single_instance(pid_file))
         self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), str(os.getpid()))
 
-    def test_refuses_when_a_live_process_holds_it(self) -> None:
-        """ACT half: a running gateway must not be raced."""
-        pid_file = self.dir / "model-gateway.pid"
-        # The probe is imported inside the function, so its HOME module is
-        # what a test patches.
-        import vco_lib.deferral_probes as probes
+    def test_an_existing_file_is_reported_never_overwritten(self) -> None:
+        """ACT half, and the atomicity: the CREATE is the lock.
 
-        saved = probes.pid_is_alive
-        probes.pid_is_alive = lambda pid: True  # type: ignore[assignment]
-        self.addCleanup(setattr, probes, "pid_is_alive", saved)
+        Read-then-write let two starts both find no live holder, both write
+        their own pid and both bind — the pid file then named one instance
+        while the port file named the other. ``O_CREAT | O_EXCL`` makes
+        exactly one of them win, and the loser gets the winner's pid back to
+        reason about. Whether that pid means "already serving" or "a number
+        reused after a crash" is ``_serve``'s call, not this function's.
+        """
+        pid_file = self.dir / "model-gateway.pid"
         pid_file.write_text("424242\n", encoding="utf-8")
-        message = cli._acquire_single_instance(pid_file)
-        self.assertIsNotNone(message)
-        self.assertIn("424242", message or "")
-        self.assertIn(str(pid_file), message or "")
-        # ...and the holder's pid is left intact.
+        self.assertEqual(cli._acquire_single_instance(pid_file), 424242)
+        # ...and the holder's claim is left byte-intact.
         self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), "424242")
 
-    def test_claims_a_stale_file(self) -> None:
-        """LEAVE-ALONE half: a dead holder must not block a restart forever."""
-        import vco_lib.deferral_probes as probes
-
-        saved = probes.pid_is_alive
-        probes.pid_is_alive = lambda pid: False  # type: ignore[assignment]
-        self.addCleanup(setattr, probes, "pid_is_alive", saved)
+    def test_two_claimants_in_sequence_leave_the_first_in_place(self) -> None:
+        """The property the exclusive create exists for."""
         pid_file = self.dir / "model-gateway.pid"
-        pid_file.write_text("424242\n", encoding="utf-8")
         self.assertIsNone(cli._acquire_single_instance(pid_file))
-        self.assertEqual(pid_file.read_text(encoding="utf-8").strip(), str(os.getpid()))
+        self.assertEqual(
+            cli._acquire_single_instance(pid_file), os.getpid(),
+            "the second claim reports the first, and changes nothing",
+        )
+        self.assertEqual(
+            pid_file.read_text(encoding="utf-8").strip(), str(os.getpid()),
+        )
 
-    def test_a_garbage_pid_file_does_not_block_startup(self) -> None:
+    def test_a_garbage_pid_file_is_reported_as_unreadable(self) -> None:
+        """Not None: "the file exists and says nothing usable" is its own
+        answer, and the caller unlinks it rather than assuming it is free."""
         pid_file = self.dir / "model-gateway.pid"
         pid_file.write_text("not-a-pid\n", encoding="utf-8")
-        self.assertIsNone(cli._acquire_single_instance(pid_file))
+        self.assertEqual(
+            cli._acquire_single_instance(pid_file), cli.UNREADABLE_PID,
+        )
+        self.assertEqual(cli.UNREADABLE_PID, -1)
 
     def test_release_removes_only_our_own_pid_file(self) -> None:
         pid_file = self.dir / "model-gateway.pid"
@@ -239,13 +235,7 @@ class SubprocessEntryPointTests(_StateDirCase):
         self.assertIn("OK", completed.stdout)
 
     def test_check_exits_one_when_the_configuration_cannot_serve(self) -> None:
-        env_backup = os.environ.get("VCT_MODEL_GATEWAY_HOST")
-        os.environ["VCT_MODEL_GATEWAY_HOST"] = "0.0.0.0"
-        self.addCleanup(
-            lambda: os.environ.__setitem__("VCT_MODEL_GATEWAY_HOST", env_backup)
-            if env_backup is not None
-            else os.environ.pop("VCT_MODEL_GATEWAY_HOST", None),
-        )
+        self.set_env("VCT_MODEL_GATEWAY_HOST", "0.0.0.0")
         completed = self._run("--check")
         self.assertEqual(completed.returncode, 1)
         self.assertIn("PROBLEM", completed.stdout)

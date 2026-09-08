@@ -36,15 +36,27 @@ Documentation=https://github.com/hotak92/vibecoded-orchestrator
 # The gateway binds loopback and reads local files; it needs the user
 # session to exist, not the network.
 After=default.target
+# STOP a real crash loop. These two must be stated: systemd's defaults are 5
+# starts within 10 SECONDS, and `RestartSec=10s` below means a loop can never
+# reach 5 starts inside that window — so the default limit never fires and the
+# loop is unbounded. That is not theory: on 2026-09-08 this unit restarted
+# 1442 times over four hours (once every 10s) against a gateway that was
+# already running, appending 294 KB to the boot log.
+# 5 starts within 600s: a genuinely broken start gives up after ~50 seconds
+# and stays failed, where `systemctl --user status vct-model-gateway` shows
+# it, instead of hiding in a loop nobody looks at.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart={{EXEC_START}}
 WorkingDirectory={{WORKING_DIR}}
-# Restart on crash, not on a clean stop: exit 0 means the user (or the
-# launcher) asked it to stop, and restarting then would make `--stop`
-# impossible. RestartSec bounds a crash loop; systemd's default start-limit
-# then gives up rather than spinning.
+# Restart on crash, NOT on exit 0 — and exit 0 covers both "the user asked it
+# to stop" and "a gateway was already running, so this start had nothing to
+# do". Restarting either would make stopping the gateway impossible, and the
+# second one used to be an exit 1 that fed the loop described above.
+# RestartSec paces a restart; the StartLimit above is what ends one.
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=15s
