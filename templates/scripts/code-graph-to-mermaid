@@ -7,29 +7,58 @@
 #
 # Usage: code-graph-to-mermaid <seed_symbol> [--hops N] [--scope ...]
 #
+# Exit codes: whatever `vco codegraph-diagram` exits; 1 = REFUSAL - no Python
+# environment with the dependencies this wrapper needs (wrapper-only).
+#
 # See `docs/CODEGRAPH_DIAGRAM.md` for the full flag reference.
+#
+# Bug history:
+#   - v0.2.94: this wrapper probed two venv layouts relative to ITSELF, put
+#     `<project>/..` on PYTHONPATH and then ran a bare `python3` - which in
+#     any non-root project (no `vco_lib` beside `.claude/`) is PATH's
+#     interpreter with no `vco_lib` at all: `ModuleNotFoundError` dressed as
+#     a diagram failure. A shipped component does not get a silent fallback
+#     (standing rule). Ladder + refusal now come from the ONE home every
+#     KG/code-graph wrapper shares; the qualifying interpreter has `vco_lib`
+#     installed, so no PYTHONPATH crutch is needed or set.
+#
+# PARITY: this file and `code-graph-to-mermaid.ps1` must stay in lockstep
+# (same tiers, same gate, same refusal text, same forwarding).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Probe canonical .venv locations in priority order — see code-graph-query
-# for the rationale (OSS install root precedes the legacy
-# claude_mcp_servers/.venv layout).
-VENV_PATH=""
-for _c in "$SCRIPT_DIR/../../.venv" "$SCRIPT_DIR/../../claude_mcp_servers/.venv"; do
-    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
-        VENV_PATH="$_c"
-        break
-    fi
-done
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `vco_lib.cli` imports `vco_lib.*` at MODULE scope; `codegraph-diagram`
+# fetches its subgraph through the `weaviate` client (function-local import
+# in `vco_lib.codegraph_to_mermaid.fetch_subgraph`) - without it there is no
+# diagram, so its absence changes the ANSWER, not the speed.
+LADDER_IMPORT="import weaviate, vco_lib"
 
-if [ -n "$VENV_PATH" ]; then
-    # shellcheck disable=SC1090
-    source "$VENV_PATH/bin/activate"
+# The ladder lives in ONE home, shipped beside this wrapper. A missing lib is
+# a broken install, not a reason to fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "code-graph-to-mermaid: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "code-graph-to-mermaid: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  code-graph-to-mermaid did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
+fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
+
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+
+# NO BARE `python3` FALLBACK - see the header. PARITY: the .ps1 sibling
+# refuses identically.
+if [ -z "$LADDER_PYTHON" ]; then
+    vct_venv_ladder_refusal "code-graph-to-mermaid" "$LADDER_IMPORT" "$SCRIPT_DIR"
+    {
+        echo "code-graph-to-mermaid: Refusing to run with an unqualified interpreter -"
+        echo "code-graph-to-mermaid: a diagram that cannot reach the code graph is"
+        echo "code-graph-to-mermaid: not a diagram of it."
+        echo "code-graph-to-mermaid: (exit 1 = did not run)"
+    } >&2
+    vct_venv_ladder_refusal_summary "code-graph-to-mermaid" 1
+    exit 1
 fi
 
-# Resolve project-root so `python -m vco_lib.cli` can find the package
-# regardless of the user's cwd.
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-
-exec python3 -m vco_lib.cli codegraph-diagram "$@"
+exec "$LADDER_PYTHON" -m vco_lib.cli codegraph-diagram "$@"

@@ -97,7 +97,7 @@ def active_text_vector_slot(service: Any = None, *, default: str = "") -> str:
     # Imported lazily: `slot_for_service` callers (the hot write path) must
     # not pay for the embedding-service import, and this branch is the only
     # one that needs the model→slot table.
-    from vco_lib.embedding_service import (  # noqa: PLC0415
+    from vco_lib.embedding_service import (  # noqa: PLC0415 - lazy: see the comment above
         _resolve_text_slot,
         resolve_active_text_model_id,
     )
@@ -143,7 +143,7 @@ def collection_vector_slots(collection: Any) -> "tuple[str, ...] | None":
             if hasattr(vector_config, "keys")
             else list(vector_config)
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - any client/schema shape error means "unreadable"; the caller FAILS the scan on None
         return None
     return tuple(str(name) for name in names)
 
