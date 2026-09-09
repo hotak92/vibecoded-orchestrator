@@ -1,4 +1,4 @@
-# PowerShell wrapper for `vco codegraph-diagram` — Phase 3 of the
+﻿# PowerShell wrapper for `vco codegraph-diagram` — Phase 3 of the
 # diagrams-integration plan. Cross-OS sibling of code-graph-to-mermaid
 # (bash). Same flags, same exit codes, same JSON shape.
 #

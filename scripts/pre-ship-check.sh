@@ -521,7 +521,7 @@ if [ "$AUTO_MERGE" = "true" ]; then
 elif [ "$AUTO_MERGE" = "unknown" ]; then
     gate_warn "allow_auto_merge" "Could not check (gh api error)"
 else
-    gate_warn "allow_auto_merge = true (advisory)" \
+    gate_warn "allow_auto_merge = $AUTO_MERGE (advisory; Dependabot auto-merge workflow cannot merge)" \
         "Owner-discretion. Triage Dependabot PRs first, then: gh api -X PATCH /repos/$REPO -f allow_auto_merge=true"
 fi
 

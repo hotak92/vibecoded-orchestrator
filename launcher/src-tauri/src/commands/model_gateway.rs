@@ -320,6 +320,7 @@ fn boot_service_main_pid() -> Option<u32> {
         return None;
     }
     let out = Command::new("systemctl")
+        .silent()
         .args([
             "--user",
             "show",
