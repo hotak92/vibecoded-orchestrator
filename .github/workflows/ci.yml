@@ -225,6 +225,13 @@ jobs:
           pip install -r requirements.txt
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
           pip install pytest
+          # v0.2.94: the package itself, editable — what install.py does on
+          # every machine. The interpreter resolver preflights "can this
+          # interpreter import vco_lib + weaviate from a NEUTRAL cwd"; with
+          # the repo only on cwd that probe fails here while passing on any
+          # real install, and the spawn-guard tests went red for the runner,
+          # not the code.
+          pip install -e .
       - name: pytest
         run: pytest tests/ -q
 

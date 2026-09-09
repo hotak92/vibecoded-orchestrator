@@ -89,8 +89,20 @@ class SpawnGuardBase(unittest.TestCase):
         against the actual interpreter) while leaving the fake free to record
         the spawn argvs. Production warms the same memo the same way: once per
         process, which is what makes an 8-project "Update all" pay for one probe.
+
+        When the interpreter being warmed is THIS runner's own and it cannot
+        import the stack from a neutral cwd (a CI runner without the editable
+        install), the tests that assume "launched" have no honest verdict:
+        skip with the reason rather than fail on the runner or pass vacuously.
+        A deliberately broken interpreter (the refusal tests) is never skipped.
         """
-        return px.preflight(python_exe)
+        ok, why = px.preflight(python_exe)
+        if not ok and str(python_exe) == sys.executable:
+            self.skipTest(
+                f"runner interpreter cannot preflight the stack ({why}); "
+                "CI installs the package editable so this does not skip there"
+            )
+        return ok, why
 
     def spawned_argvs(self):
         """Patch Popen, returning the list of argvs it was handed."""
