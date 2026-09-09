@@ -278,6 +278,14 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
         "updated_at",
         note="Orchestrator-wide model metadata; no project scope at all.",
     ),
+    # ── chat_model_context_tombstone (migration 045, v0.2.94) ─────────────
+    *_plain(
+        "chat_model_context_tombstone",
+        "model_id",
+        "deleted_at",
+        note="A row the user deleted from the orchestrator-wide model table, "
+        "with the event time; no project scope, no path.",
+    ),
     # ── code_graph_builds ────────────────────────────────────────────────
     *_plain("code_graph_builds", "project_id", "status", "languages"),
     ColumnPolicy(

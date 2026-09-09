@@ -356,9 +356,21 @@ class TestDelivery(unittest.TestCase):
     def test_table_set_version_matches_the_highest_migration(self):
         from vco_lib.schema_versions import LAUNCHER_DB_TABLE_SET_VERSION
 
+        # v0.2.94: derived from the migrations directory rather than a
+        # literal — the literal 44 went red the moment migration 045 landed
+        # with its own (correct) bump; the property this test guards is
+        # "Python == highest registered migration", not "== 44".
+        migrations_dir = (
+            REPO_ROOT / "launcher/src-tauri/vct-launcher-core/src/db/migrations"
+        )
+        highest = max(
+            int(m.group(1))
+            for p in migrations_dir.glob("*.sql")
+            if (m := re.match(r"^(\d{3})_", p.name))
+        )
         self.assertEqual(
             LAUNCHER_DB_TABLE_SET_VERSION,
-            44,
+            highest,
             "a Python-ahead or Rust-ahead bump stamps a phantom schema version",
         )
 
