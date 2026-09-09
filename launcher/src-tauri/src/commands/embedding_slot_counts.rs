@@ -164,6 +164,14 @@ pub async fn project_embedding_slot_counts(
     // v0.2.94: the ONE ladder, not the bare bootstrap probe — `slot-counts`
     // imports `vco_lib.embedding_enrichment` AND queries Weaviate, so a PEP-668
     // system python returns "0 slots" for a reason that is not about slots.
+    //
+    // v0.2.94 review item 2c — this fallback is now REACHABLE (the ladder no
+    // longer ends in a PATH rung) and is KEPT DELIBERATELY: this call is a
+    // read-only COUNT whose failure mode is an empty panel, and the function
+    // already returns `SlotCounts::empty(...)` on every other unresolvable
+    // condition above. A refusal here would replace "0 slots" with an error
+    // dialog for a surface the user did not ask a question on. Contrast the
+    // bundle create/update path, which refuses: that one WRITES.
     let py_cmd: PathBuf =
         vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();

@@ -253,3 +253,40 @@ def test_the_stale_never_shipped_comment_is_gone(tmp_path):
         "post-file-edit.ps1 still claims kg-duplicates.ps1 has never shipped; "
         "the file exists at templates/scripts/kg-duplicates.ps1"
     )
+
+
+#: The one filter both hooks apply to the every-10-edits scan output. v0.2.94
+#: (review item 3) added `^<tool>: ERROR` so a wrapper REFUSAL reaches the
+#: report; the bash side is DRIVEN by
+#: `test_post_file_edit_hk1_v0273.test_every10_scan_surfaces_a_wrapper_refusal`,
+#: the PowerShell side cannot be driven on a POSIX runner, so its literal is
+#: pinned here against the bash one — line-anchored, so a drift names the file
+#: and line that caused it.
+_SCAN_FILTER = "✅|⚠️|📊|❌|^[A-Za-z0-9_-]+: ERROR"
+
+
+def _filter_lines(path, needle):
+    return [
+        n for n, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1)
+        if needle in line
+    ]
+
+
+def test_both_hooks_apply_the_same_scan_filter_including_the_refusal_shape():
+    """PARITY: the .ps1 hook's `Select-String` pattern == the bash `grep -E`.
+
+    Red-proof: drop `^[A-Za-z0-9_-]+: ERROR` from either file and this fails
+    naming that file; the driven bash test then also fails for its half.
+    """
+    hook_sh = REPO / "templates" / "hooks" / "post-file-edit.sh"
+    sh_hits = _filter_lines(hook_sh, f'grep -E "({_SCAN_FILTER})"')
+    ps1_hits = _filter_lines(HOOK_PS1, f"Select-String -Pattern '{_SCAN_FILTER}'")
+    assert len(sh_hits) == 1, (
+        f"post-file-edit.sh must apply the scan filter {_SCAN_FILTER!r} exactly "
+        f"once; found at lines {sh_hits}"
+    )
+    assert len(ps1_hits) == 1, (
+        f"post-file-edit.ps1 must apply the SAME scan filter {_SCAN_FILTER!r} "
+        f"exactly once (parity with post-file-edit.sh:{sh_hits[0]}); found at "
+        f"lines {ps1_hits}"
+    )

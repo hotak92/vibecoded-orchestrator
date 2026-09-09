@@ -57,10 +57,10 @@
 //!   (`modules_api.rs`'s `/projects/{id}/env` resolver) — not a new
 //!   resolution strategy invented for hooks.
 //! * Python interpreter: `vct_launcher_core::python_resolve::
-//!   resolve_python_for_vco_lib()` (the shared RT-4 ladder; its final tier
-//!   is a bare `python3`/`python.exe` PATH fallback, sufficient here since
-//!   `vco_lib.hooks_settings` only imports stdlib + `vco_lib.atomic` /
-//!   `vco_lib.symlink_handler`, no third-party deps).
+//!   resolve_python_for_vco_lib()` (the shared RT-4 ladder). Since v0.2.94
+//!   the ladder has NO bare `python3`/`python.exe` PATH rung: it returns
+//!   `None` when no install venv qualifies, and this module reports that as
+//!   a broken install rather than running an interpreter without `vco_lib`.
 //! * Parked-entry storage: `Db::{park_project_hook_entry,
 //!   get_parked_project_hook_entry, unpark_project_hook_entry,
 //!   list_project_hooks}` — all already in `vct-launcher-core`, unchanged.

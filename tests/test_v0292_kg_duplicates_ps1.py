@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.wrapper_staging import stage_scripts
+
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER_PS1 = REPO / "templates" / "scripts" / "kg-duplicates.ps1"
 
@@ -47,8 +49,9 @@ def _require_pwsh() -> str:
 
 def _stage_project(tmp_path: Path) -> Path:
     scripts = tmp_path / ".claude" / "scripts"
-    scripts.mkdir(parents=True)
-    shutil.copyfile(WRAPPER_PS1, scripts / "kg-duplicates.ps1")
+    # v0.2.94: the wrapper and the `vct_venv_ladder.ps1` it dot-sources are
+    # ONE shipped unit; staging only the wrapper stages a BROKEN install.
+    stage_scripts(scripts, "kg-duplicates.ps1")
     return tmp_path
 
 
@@ -83,21 +86,25 @@ def test_forwards_every_argument_to_detect_duplicates(tmp_path: Path) -> None:
     (scripts / "detect_duplicates.py").write_text(
         "import sys\nprint('ARGV=' + repr(sys.argv[1:]))\n", encoding="utf-8",
     )
-    # A qualifying interpreter: weaviate must import from it.
+    # A qualifying interpreter: BOTH modules must import from it.
     #
-    # DELIBERATELY UNPINNED (no `child_env()`): this probe asks the same
-    # question the shipped wrapper asks on a USER's machine — "can this
-    # interpreter import weaviate?" — and `child_env()` injects the repo onto
-    # PYTHONPATH, which would answer a different question and let the test
-    # pass on a host where the wrapper itself would refuse. Allow-listed in
-    # `tests/test_v0292_fixround_child_env_lint.py::_ALLOWLIST`.
+    # v0.2.94: the probe was `import weaviate` alone, which was WEAKER than
+    # what the wrapper (and `detect_duplicates.py`, which needs vco_lib to
+    # resolve the named-vector slot) actually requires. A test probe that is
+    # weaker than the gate it stands in for can pass on a host where the
+    # wrapper refuses — so it tracks the wrapper's real requirement.
+    #
+    # DELIBERATELY UNPINNED (no `child_env()`): this asks the same question
+    # the shipped wrapper asks on a USER's machine, and `child_env()` injects
+    # the repo onto PYTHONPATH, which would answer a different one.
+    # Allow-listed in `tests/test_v0292_fixround_child_env_lint.py::_ALLOWLIST`.
     probe = subprocess.run(
-        [sys.executable, "-c", "import weaviate"],
+        [sys.executable, "-c", "import weaviate, vco_lib"],
         capture_output=True, text=True,
     )
     if probe.returncode != 0:
         pytest.skip(
-            "no interpreter with the `weaviate` client available — the "
+            "no interpreter with `weaviate` + `vco_lib` available — the "
             "wrapper's qualification probe cannot pass on this host"
         )
     fake_venv = tmp_path / "fake-venv"

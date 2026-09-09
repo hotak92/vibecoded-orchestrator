@@ -538,11 +538,20 @@ def _get_target_vector_slot() -> str:
     behaviour where every slot was qwen3-shaped under ollama_embed.
     Callers that hit this fallback on a non-qwen3 install will get
     poor search results, but they won't crash.
+
+    v0.2.94: the slot READ itself is the shared
+    ``vco_lib.kg_vector_slot.slot_for_service`` — one home with kg-sync's
+    writer, the MCP write path and the duplicate scanner. The legacy default
+    above is unchanged and stays this caller's own decision; the import is
+    function-local and reached only when the service exists, so the
+    "vco_lib isn't importable" path still returns the hardcode.
     """
     svc = _get_or_create_embedding_service()
     if svc is None:
         return "ollama_embed"
-    return svc.text_vector_slot
+    from vco_lib.kg_vector_slot import slot_for_service
+
+    return slot_for_service(svc, "ollama_embed")
 
 
 def get_embedding(text: str) -> list:

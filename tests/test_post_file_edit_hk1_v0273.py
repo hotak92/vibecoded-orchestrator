@@ -287,6 +287,63 @@ def test_every10_scan_report_keeps_the_error_line(tmp_path):
     )
 
 
+def test_every10_scan_surfaces_a_wrapper_refusal(tmp_path):
+    """v0.2.94 item 3: a REFUSED scan must reach the report, not vanish.
+
+    The staged wrapper stands in for a `kg-duplicates` that found no
+    qualifying interpreter: it prints the real refusal shape — `<tool>: ERROR
+    - no Python environment …` lines plus the shared ⚠️ summary the ladder
+    appends — and exits non-zero. Pre-fix the hook filtered on `✅|⚠️|📊|❌`
+    only, so a refusal (which carried none of them) produced an EMPTY match,
+    no report was written, and the every-10-edits scan was a silent no-op on
+    exactly the installs that had something to say.
+
+    Mutation check: drop `^[A-Za-z0-9_-]+: ERROR` from the hook's grep AND the
+    ⚠️ line from the wrapper below, and the report never appears.
+    """
+    _skeleton(tmp_path)
+    (tmp_path / "knowledge").mkdir()
+    (tmp_path / ".claude" / "scripts").mkdir(parents=True, exist_ok=True)
+    wrapper = tmp_path / ".claude" / "scripts" / "kg-duplicates"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "printf 'kg-duplicates: ERROR - no Python environment with VCO'\"'\"'s KG dependencies.\\n' >&2\n"
+        "printf 'kg-duplicates:   - /nowhere/.venv\\n' >&2\n"
+        "printf 'STAGED-REFUSAL-MARKER\\n' >&2\n"
+        "printf '\\342\\232\\240\\357\\270\\217  kg-duplicates did NOT run (exit 1): no Python environment with its dependencies.\\n' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    os.chmod(wrapper, 0o755)
+    (tmp_path / ".claude" / "logs" / ".kg_edit_count").write_text(
+        "9", encoding="utf-8")
+    f = tmp_path / "knowledge" / "node.md"
+    f.write_text("# a node\n")
+    payload = {"tool_input": {"file_path": str(f)}, "session_id": "s"}
+    result = _run(tmp_path, payload)
+    assert result.returncode == 0, result.stderr
+
+    report = tmp_path / ".claude/state/kg_duplicates_report.txt"
+    deadline = time.monotonic() + 30.0
+    body = ""
+    while time.monotonic() < deadline:
+        if report.is_file():
+            body = report.read_text(encoding="utf-8", errors="replace")
+            if body.strip():
+                break
+        time.sleep(0.2)
+    assert body.strip(), (
+        "a refused scan wrote no report — the every-10-edits check is a "
+        "silent no-op again"
+    )
+    assert "kg-duplicates: ERROR - no Python environment" in body, (
+        f"the refusal's ERROR line must reach the report; got {body!r}"
+    )
+    assert "did NOT run" in body, (
+        f"the shared \u26a0 summary line must reach the report; got {body!r}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # D-16: CLAUDE_PROJECT_DIR is honored for PROJECT_ROOT.
 # --------------------------------------------------------------------------- #

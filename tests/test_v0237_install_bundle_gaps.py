@@ -48,6 +48,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from tests.common.wrapper_staging import effective_wrapper_text
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -490,7 +492,11 @@ class WrapperVenvFallbackTextTests(unittest.TestCase):
                 wrapper_path.exists(),
                 f"bash wrapper {name} missing — Gap 6b backport incomplete",
             )
-            text = wrapper_path.read_text(encoding="utf-8")
+            # v0.2.94: `effective_wrapper_text` follows the ladder to its
+            # ONE home (`vct_venv_ladder.sh`) for the wrappers that source it
+            # instead of demanding every wrapper keep an inlined copy — the
+            # duplication this gate would otherwise mandate.
+            text = effective_wrapper_text(wrapper_path)
             self.assertIn(
                 '"${VCT_INSTALL_ROOT:-}/.venv"', text,
                 f"{name} must probe $VCT_INSTALL_ROOT/.venv "
@@ -505,7 +511,7 @@ class WrapperVenvFallbackTextTests(unittest.TestCase):
         scripts_dir = REPO_ROOT / "templates" / "scripts"
         for name in self.WRAPPER_NAMES_BASH:
             wrapper_path = scripts_dir / name
-            text = wrapper_path.read_text(encoding="utf-8")
+            text = effective_wrapper_text(wrapper_path)
             self.assertIn(
                 'import weaviate', text,
                 f"{name} must validate `weaviate` is importable in the "
@@ -522,7 +528,7 @@ class WrapperVenvFallbackTextTests(unittest.TestCase):
                 wrapper_path.exists(),
                 f"PS1 wrapper {name} missing — Gap 6b backport incomplete",
             )
-            text = wrapper_path.read_text(encoding="utf-8")
+            text = effective_wrapper_text(wrapper_path, encoding="utf-8-sig")
             self.assertIn(
                 '$env:VCT_INSTALL_ROOT', text,
                 f"{name} must probe $env:VCT_INSTALL_ROOT "
@@ -534,7 +540,7 @@ class WrapperVenvFallbackTextTests(unittest.TestCase):
         scripts_dir = REPO_ROOT / "templates" / "scripts"
         for name in self.WRAPPER_NAMES_PS1:
             wrapper_path = scripts_dir / name
-            text = wrapper_path.read_text(encoding="utf-8")
+            text = effective_wrapper_text(wrapper_path, encoding="utf-8-sig")
             self.assertIn(
                 'import weaviate', text,
                 f"{name} must validate `weaviate` is importable in the "

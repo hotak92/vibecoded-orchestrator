@@ -1367,6 +1367,12 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
     // module named 'weaviate'`. Prefer the RT-4 ladder venv; fall back to
     // system.python_cmd only when no venv resolves (then the JSON errors[]
     // surface as soft warnings, as before).
+    //
+    // v0.2.94 review item 2c: the fallback is now REACHABLE (the ladder no
+    // longer ends in a PATH rung) and is kept here deliberately — this helper
+    // returns its failures as JSON `errors[]` that the caller already surfaces
+    // as soft warnings, so a bootstrap-python attempt that fails is reported
+    // either way. The bundle create/update path is the one that refuses.
     let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
@@ -1599,6 +1605,41 @@ impl BundleMode {
         }
     }
 
+    /// v0.2.94 review item 2c: the ladder found NO vco_lib-capable interpreter.
+    ///
+    /// This path must NOT fall back to `system.python_cmd`. That value is
+    /// BOOTSTRAP python — a bare PATH probe, correct only for the first-install
+    /// flow that runs before any venv exists — and using it here IS the
+    /// 2026-09-09 field defect: `project_init` survived on its cwd, every
+    /// detached grandchild inherited `/usr/bin/python3` and died on
+    /// `ModuleNotFoundError: No module named 'vco_lib'`, and the GUI reported
+    /// success for all 8 projects. Naming the tiers is what turns "it silently
+    /// did nothing" into a fixable message.
+    fn no_vco_lib_python_warning(self) -> String {
+        let tiers = "$VCT_VENV, $VCT_INSTALL_ROOT/.venv, \
+                     $VCT_INSTALL_ROOT/claude_mcp_servers/.venv, \
+                     $VCT_ORCHESTRATOR_ROOT (same two layouts), then a walk up \
+                     from the launcher binary";
+        match self {
+            BundleMode::Create { .. } => format!(
+                "install-bundle skipped: no Python environment with VCO's own \
+                 dependencies (vco_lib / weaviate). Probed, in order: {}. \
+                 Hooks/scripts/agents/skills not installed. Re-run the \
+                 orchestrator install, or set $VCT_VENV to its .venv.",
+                tiers
+            ),
+            BundleMode::Update => format!(
+                "install-bundle --update skipped: no Python environment with \
+                 VCO's own dependencies (vco_lib / weaviate). Probed, in order: \
+                 {}. Project files unchanged — running this under a bare PATH \
+                 python is what made the 2026-09-09 update report success while \
+                 every background child died on ModuleNotFoundError. Re-run the \
+                 orchestrator install, or set $VCT_VENV to its .venv.",
+                tiers
+            ),
+        }
+    }
+
     /// Orchestrator root (where vco_lib lives) could not be found.
     fn orch_root_not_found_warning(self, e: &dyn std::fmt::Display) -> String {
         match self {
@@ -1800,7 +1841,16 @@ async fn run_install_bundle_core(
     // it and died on `ModuleNotFoundError: No module named 'vco_lib'`. The GUI
     // said "code-graph re-index started in the background" for all 8 projects.
     // The bundle path now walks the SAME ladder as every other vco_lib spawn.
-    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
+    //
+    // v0.2.94 review item 2c — and it does NOT fall back. `system.python_cmd`
+    // is BOOTSTRAP python; using it here is the defect above, not a degraded
+    // result. `None` from the ladder means no interpreter on this machine can
+    // import our own package, so this refuses with a warning that NAMES the
+    // tiers it probed and leaves the project unchanged.
+    let Some(py_cmd) = resolve_python_for_vco_lib_local() else {
+        warnings.push(mode.no_vco_lib_python_warning());
+        return (warnings, summary);
+    };
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     // Base argv — byte-identical to both pre-refactor mirrors. The per-mode
     // flag (if any) is appended AFTER, so the create-default (`safe_add=false`)
@@ -3546,12 +3596,31 @@ fn resolve_python_for_vco_lib_local() -> Option<PathBuf> {
 /// anything that imports our own package. That distinction is the reason this
 /// helper exists rather than each call-site "remembering" it.
 ///
-/// The fallback tier is kept: when NO venv resolves anywhere on the ladder, a
-/// PATH python is still better than not spawning at all (the callers already
-/// surface the resulting failure as a soft warning) — and
-/// `resolve_python_for_vco_lib` itself already ends in that PATH tier with its
-/// documented warning, so this `unwrap_or_else` is reached only in the
-/// theoretically-impossible case.
+/// v0.2.94 review item 2c — the fallback is now REACHABLE and therefore a
+/// DELIBERATE choice each caller makes. `resolve_python_for_vco_lib` no longer
+/// ends in a PATH tier, so `unwrap_or_else` here fires whenever no venv
+/// qualifies. Use it only where a best-effort attempt under a bootstrap python
+/// is better than not running AND its failure is surfaced.
+///
+/// CALL-SITE AUDIT (v0.2.94 review item 2c), every user of this helper:
+///
+/// * `run_install_bundle_core` — **does NOT use it.** Refuses via
+///   `no_vco_lib_python_warning`: it WRITES the project, and a bundle spawn
+///   that cannot import vco_lib is the 2026-09-09 defect reporting success,
+///   not a degraded result.
+/// * `run_bootstrap_collections`, `build_migrate_command`,
+///   `run_node_formats_schema_check`, `run_schema_migration_check`,
+///   `drop_owned_collections`, `probe_stale_derived_collections`,
+///   `apply_stale_derived_choice`, `perform_hard_cut` — KEPT. Each parses the
+///   child's JSON and turns a non-zero exit / unparseable stdout into an
+///   `Err(..)` or a warning that carries the child's stderr, so a bootstrap
+///   python fails LOUDLY and destroys nothing. The destructive three
+///   (`drop_owned_collections`, `apply_stale_derived_choice`,
+///   `perform_hard_cut`) do their deleting INSIDE that child, so an
+///   interpreter that cannot import `vco_lib` deletes nothing at all.
+/// * `embedding_slot_counts` (via `resolve_python_for_vco_lib_or` directly) —
+///   KEPT, and documented at that call site: a read-only count whose every
+///   other unresolvable condition already returns `SlotCounts::empty`.
 ///
 /// Cross-language pin: the Python half of the same ladder is
 /// `vco_lib/python_exe.py` (see its module docstring).
@@ -9812,8 +9881,19 @@ mod tests {
             .expect("run_install_bundle_core's program setup moved — re-pin it");
         let window = &src[anchor..anchor + 1400];
         assert!(
-            window.contains("vco_lib_python_or(&system.python_cmd)"),
+            window.contains("resolve_python_for_vco_lib_local()"),
             "the bundle spawn must resolve its interpreter through the ladder"
+        );
+        // v0.2.94 review item 2c: and it must REFUSE, not fall back. This
+        // spawn writing under a bootstrap python IS the 2026-09-09 defect.
+        assert!(
+            !window.contains("vco_lib_python_or(&system.python_cmd)"),
+            "the bundle spawn must not fall back to bootstrap python"
+        );
+        assert!(
+            window.contains("no_vco_lib_python_warning()"),
+            "an unresolvable interpreter must surface as a GUI warning naming \
+             the tiers, not as a silent bootstrap-python spawn"
         );
         assert!(
             window.contains("Command::new(&py_cmd)"),

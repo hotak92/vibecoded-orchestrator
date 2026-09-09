@@ -175,19 +175,32 @@ class TestTheRefusalCodeLive(unittest.TestCase):
 
     def test_bash_wrapper_refuses_with_the_dedicated_code(self):
         import os
-        import shutil
+
+        from tests.common.wrapper_staging import stage_scripts
 
         with TemporaryDirectory() as td:
             scripts = Path(td) / ".claude" / "scripts"
-            scripts.mkdir(parents=True)
-            shutil.copy(KG_SYNC, scripts / "kg-sync")
+            # v0.2.94: the wrapper and the `vct_venv_ladder.sh` it sources are
+            # ONE shipped unit. Staging only the wrapper stages a BROKEN
+            # install, and the wrapper would (correctly) refuse for a
+            # different reason than the one under test.
+            stage_scripts(scripts, "kg-sync")
             (scripts / "sync_knowledge_graph.py").write_text(
                 "raise SystemExit('THE SYNC SCRIPT MUST NOT RUN')\n"
             )
             env = {
                 k: v
                 for k, v in os.environ.items()
-                if k not in ("VCT_INSTALL_ROOT", "VCT_VENV", "VIRTUAL_ENV")
+                # v0.2.94 item 2a: VCT_ORCHESTRATOR_ROOT is a resolution
+                # channel now — leaving it in lets a maintainer shell resolve a
+                # real venv, and this test stops exercising the refusal.
+                if k
+                not in (
+                    "VCT_INSTALL_ROOT",
+                    "VCT_VENV",
+                    "VCT_ORCHESTRATOR_ROOT",
+                    "VIRTUAL_ENV",
+                )
             }
             proc = subprocess.run(
                 ["bash", str(scripts / "kg-sync"), "--all"],

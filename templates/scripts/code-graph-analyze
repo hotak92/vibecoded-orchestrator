@@ -1,106 +1,70 @@
 #!/usr/bin/env bash
 # Code Graph Analyzer wrapper - AST-based code entity extraction
 # Usage: code-graph-analyze /path/to/repo [OPTIONS]
+#
+# Exit codes: whatever `analyze_code_graph.py` exits; 1 = REFUSAL - no Python
+# environment with the dependencies this wrapper needs (wrapper-only).
+#
+# Bug history (the ladder's, not the analyzer's):
+#   - 2026-04-28: example project codegraph build failed with
+#     "weaviate-client not installed" because example/Code had neither
+#     .venv nor claude_mcp_servers/.venv → added VCT_INSTALL_ROOT fallbacks.
+#   - 2026-05-07: a user project's codegraph build failed with
+#     `ModuleNotFoundError: weaviate` because the project HAS its own
+#     `.venv/` (used by its own runtime) which the script activated before
+#     getting to VCT_INSTALL_ROOT → reorder + validate-has-weaviate-client.
+#   - 2026-06-27 (RT-4): a project's INSTALLED shim hardcoded the removed
+#     legacy `.../Claude/claude_mcp_servers/.venv/bin/python` and exited 127
+#     → added the `$VCT_VENV` tier, which also accepts a DIRECT interpreter
+#     path so a stale default is always recoverable by one override.
+#   - v0.2.94: the tiers above were maintained HERE, a fourth copy of the
+#     same decision, and this wrapper still fell through to a bare `python3`
+#     when nothing qualified — running the analyzer against an interpreter
+#     that cannot import its deps, which fails one layer deeper with a
+#     message about the wrong thing. A shipped component does not get a
+#     silent fallback (standing rule). Ladder + refusal now come from the ONE
+#     home every KG/code-graph wrapper shares; the `$VCT_VENV`-as-interpreter
+#     tier moved there with them, so nothing is lost.
+#
+# PARITY: this file and `code-graph-analyze.ps1` must stay in lockstep (same
+# tiers, same gate, same refusal text, same forwarding).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Probe candidate venvs — RESILIENT INTERPRETER DISCOVERY (RT-4).
-#
-# This order MUST MATCH the canonical tiers in
-# templates/hooks/_lib/resolve-vco-venv.sh (and the .ps1 sibling of
-# THIS file). Do not fork the order — a divergence here is exactly the
-# class of bug RT-4 caught: an installed shim that hardcoded an absolute
-# legacy venv path (`.../Claude/claude_mcp_servers/.venv/bin/python`)
-# broke with exit 127 once that legacy venv was removed, because it had
-# no fallback discovery at all.
-#
-# Once the bundle install lands the script in a USER PROJECT's
-# `.claude/scripts/`, `$SCRIPT_DIR/../../.venv` resolves to the
-# project's OWN venv (e.g. /home/me/my-project/.venv) — which
-# typically has the project's own deps but NOT weaviate-client +
-# the analyzer deps. So we must:
-#
-# 1. Honour `$VCT_VENV` first — the explicit override a user / the
-#    launcher sets to point at a known-good VCO venv. This is the tier
-#    that makes a stale/removed default recoverable (RT-4's remedy).
-# 2. Prefer `$VCT_INSTALL_ROOT/.venv` (the launcher always sets this
-#    to the orchestrator clone, which has weaviate-client) over the
-#    script-relative candidates. This is the canonical case for any
-#    project registered via the launcher.
-# 3. Fall back to clone-relative candidates (only meaningful when this
-#    script sits inside a real VCO clone, not a user project).
-# 4. ALSO validate each candidate venv has weaviate-client installed
-#    before activating it. This protects against the script being
-#    run from an unrelated context where SCRIPT_DIR/../../.venv
-#    happens to exist but is the wrong env.
-#
-# Bug history:
-#   - 2026-04-28: example project codegraph build failed with
-#     "weaviate-client not installed" because example/Code had
-#     neither .venv nor claude_mcp_servers/.venv → added
-#     VCT_INSTALL_ROOT fallbacks.
-#   - 2026-05-07: a user project's codegraph build failed with
-#     `ModuleNotFoundError: weaviate` because the project HAS its
-#     own `.venv/` (used by its own runtime) which the script
-#     activated before getting to VCT_INSTALL_ROOT → reorder +
-#     validate-has-weaviate-client.
-#   - 2026-06-27 (RT-4): a project's INSTALLED shim hardcoded the
-#     removed legacy `.../Claude/claude_mcp_servers/.venv/bin/python`
-#     and exited 127. The template already has no hardcode, but this
-#     revision adds the missing $VCT_VENV tier so a stale default is
-#     always recoverable by the same override the hooks honour.
-CANDIDATES=(
-    "${VCT_VENV:-}"                                    # explicit override (canonical tier 1)
-    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
-    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
-    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
-    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
-)
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `analyze_code_graph.py` imports `vco_lib.embedding_service` at MODULE scope
+# (unguarded, v0.2.75+); `weaviate` and `weaviate_mcp.code_truncation` /
+# `.code_ranking` are module-scope inside `try:` blocks that CONTINUE - an
+# analysis that cannot reach them writes nothing and looks like a build that
+# produced nothing, which is the verdict the probe rule exists to protect.
+# Gating on `weaviate` alone - the pre-v0.2.94 gate - let all of that through.
+LADDER_IMPORT="import weaviate, weaviate_mcp, vco_lib"
 
-# Resolve the python interpreter inside a candidate. Accepts EITHER a
-# venv directory (probes bin/python, bin/python3, Scripts/python.exe) OR
-# a direct interpreter path ($VCT_VENV may point straight at the binary,
-# mirroring resolve-vco-venv.sh tier 1). Echoes the interpreter on
-# success, empty on failure.
-_interp_for_candidate() {
-    local c="$1"
-    if [ -x "$c/bin/python" ]; then echo "$c/bin/python"; return 0; fi
-    if [ -x "$c/bin/python3" ]; then echo "$c/bin/python3"; return 0; fi
-    if [ -x "$c/Scripts/python.exe" ]; then echo "$c/Scripts/python.exe"; return 0; fi
-    # $VCT_VENV given as the interpreter itself (not a venv dir).
-    if [ -x "$c" ] && [ ! -d "$c" ]; then echo "$c"; return 0; fi
-    return 1
-}
-
-# Validate a candidate resolves to a python that has the analyzer deps
-# installed. Without this gate, an unrelated venv (e.g. the project's own
-# venv at SCRIPT_DIR/../../.venv post bundle install) would be activated
-# and the analyzer would crash with ModuleNotFoundError downstream.
-venv_has_analyzer_deps() {
-    local py
-    py="$(_interp_for_candidate "$1")" || return 1
-    [ -n "$py" ] || return 1
-    "$py" -c "import weaviate" 2>/dev/null
-}
-
-VENV_PY=""
-for c in "${CANDIDATES[@]}"; do
-    [ -z "$c" ] && continue
-    [ "$c" = "/.venv" ] && continue                # empty VCT_INSTALL_ROOT → skip
-    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
-    if venv_has_analyzer_deps "$c"; then
-        VENV_PY="$(_interp_for_candidate "$c")"
-        break
-    fi
-done
-
-# Run the Python script with the resolved interpreter directly (no
-# `activate` needed — we hold the exact interpreter path). If nothing
-# resolved, fall through to system python3, which fails loudly with
-# "weaviate-client not installed" rather than silently using the wrong
-# environment.
-if [ -n "$VENV_PY" ]; then
-    "$VENV_PY" "$SCRIPT_DIR/analyze_code_graph.py" "$@"
-else
-    python3 "$SCRIPT_DIR/analyze_code_graph.py" "$@"
+# The ladder lives in ONE home, shipped beside this wrapper. A missing lib is
+# a broken install, not a reason to fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "code-graph-analyze: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "code-graph-analyze: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  code-graph-analyze did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
 fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
+
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+
+# NO BARE `python3` FALLBACK - see the header. PARITY: the .ps1 sibling
+# refuses identically.
+if [ -z "$LADDER_PYTHON" ]; then
+    vct_venv_ladder_refusal "code-graph-analyze" "$LADDER_IMPORT" "$SCRIPT_DIR"
+    {
+        echo "code-graph-analyze: Refusing to run with an unqualified interpreter -"
+        echo "code-graph-analyze: an analysis that cannot write the collection must"
+        echo "code-graph-analyze: never look like a build that produced nothing."
+        echo "code-graph-analyze: (exit 1 = did not run)"
+    } >&2
+    vct_venv_ladder_refusal_summary "code-graph-analyze" 1
+    exit 1
+fi
+
+exec "$LADDER_PYTHON" "$SCRIPT_DIR/analyze_code_graph.py" "$@"

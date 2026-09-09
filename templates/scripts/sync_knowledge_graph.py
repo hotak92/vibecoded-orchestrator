@@ -311,6 +311,12 @@ from vco_lib.embedding_service import (
 # ONE shared stamper (vco_lib home — importable from every writer layer), so
 # kg-sync, the MCP store, and the single-slot patch writers cannot drift.
 from vco_lib.kg_truncation_tags import truncation_tag_properties
+# v0.2.94: the named-vector slot has ONE home. The WRITER (this script) and
+# every READER (detect_duplicates.py, search_knowledge.py, the MCP write path)
+# resolve it through the same helper, so a scan cannot target a slot the sync
+# never populated — the divergence that left the duplicate scanner querying no
+# slot at all on multi-vector collections.
+from vco_lib.kg_vector_slot import active_text_vector_slot  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
 # v0.2.92 WP-B1 (D13): the canonical file_path shape helper. `to_posix_rel`
 # is pure + dependency-free (see its docstring); importing it loudly here
 # (never an inline copy) because every Weaviate write below must store ONE
@@ -690,8 +696,15 @@ class WeaviateWrapper:
 
     @property
     def text_vector_slot(self) -> str:
-        """Active named-vector slot for KG writes (e.g. 'qwen3_embed')."""
-        return self.embedding_service.text_vector_slot
+        """Active named-vector slot for KG writes (e.g. 'qwen3_embed').
+
+        v0.2.94: resolved through the ONE home (``vco_lib.kg_vector_slot``)
+        that every READER now shares — the duplicate scanner, the MCP write
+        path and the KG search CLI. The service stays authoritative here (it
+        is the object that produces the vectors); the shared helper only
+        guarantees the writer and the readers cannot name different slots.
+        """
+        return active_text_vector_slot(self.embedding_service)
 
     def close(self) -> None:
         """Close the Weaviate connection (and embedding HTTP session)

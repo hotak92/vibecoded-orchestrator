@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.wrapper_staging import effective_wrapper_text, stage_scripts
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SHIM = _REPO_ROOT / "templates" / "scripts" / "code-graph-analyze"
@@ -62,10 +63,16 @@ def _make_fake_venv(root: Path, marker: str, with_weaviate: bool = True) -> Path
 
 
 def _install_shim(dest_scripts: Path) -> Path:
-    """Copy the shim + a trivial analyze_code_graph.py into a scripts dir."""
+    """Copy the shim + a trivial analyze_code_graph.py into a scripts dir.
+
+    v0.2.94: the shim SOURCES `vct_venv_ladder.sh` (the tiers below live in
+    ONE home now), and the bundle installs the two together. Staging only the
+    shim stages a BROKEN install, which refuses for a different reason than
+    the one under test.
+    """
     dest_scripts.mkdir(parents=True, exist_ok=True)
+    stage_scripts(dest_scripts, "code-graph-analyze")
     shim = dest_scripts / "code-graph-analyze"
-    shutil.copy2(_SHIM, shim)
     shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
     # A placeholder analyzer so the shim has a target to invoke (only the
     # stub python ever "runs" it — content is irrelevant).
@@ -75,10 +82,15 @@ def _install_shim(dest_scripts: Path) -> Path:
 
 def _clean_env() -> dict:
     env = dict(os.environ)
-    # DISCIPLINE: any test spawning a venv-resolving path MUST clear the
-    # ambient VCT_VENV so a real machine value can't hijack the assertion.
+    # DISCIPLINE: any test spawning a venv-resolving path MUST clear EVERY
+    # ambient resolution channel, or a real machine value hijacks the
+    # assertion. `VCT_ORCHESTRATOR_ROOT` joined the ladder in v0.2.94 (review
+    # item 2a) and immediately proved the point: on a maintainer shell that
+    # exports it, the shim resolved the real orchestrator venv and the
+    # dep-gate test below silently stopped testing the dep gate.
     env.pop("VCT_VENV", None)
     env.pop("VCT_INSTALL_ROOT", None)
+    env.pop("VCT_ORCHESTRATOR_ROOT", None)
     return env
 
 
@@ -132,10 +144,14 @@ def test_shim_accepts_vct_venv_as_direct_interpreter(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_shim_skips_venv_without_analyzer_deps(tmp_path: Path) -> None:
-    """A venv lacking weaviate-client must NOT be selected — the dep gate
-    protects against activating the user's own project venv. With only a
-    deps-less VCT_VENV, the shim falls through to system python3 (which
-    also lacks it), NOT the wrong venv."""
+    """A venv lacking the analyzer deps must NOT be selected — the dep gate
+    protects against activating the user's own project venv.
+
+    v0.2.94: with only a deps-less VCT_VENV the shim now REFUSES (exit 1,
+    named candidates on stderr) instead of falling through to system python3.
+    The old fall-through ran the analyzer under an interpreter that could not
+    import its deps, so the failure surfaced one layer deeper with a message
+    about the wrong thing — the silent-fallback the standing rule forbids."""
     proj = tmp_path / "ProjA"
     scripts = proj / ".claude" / "scripts"
     shim = _install_shim(scripts)
@@ -150,8 +166,13 @@ def test_shim_skips_venv_without_analyzer_deps(tmp_path: Path) -> None:
     )
     # It must not have used the deps-less venv's stub marker.
     assert "WRONG_VENV" not in out.stdout, (
-        "shim selected a venv without weaviate-client — dep gate regressed"
+        "shim selected a venv without the analyzer deps — dep gate regressed"
     )
+    assert out.returncode == 1, (
+        f"an unqualified interpreter must be a REFUSAL, not a run: "
+        f"{out.stdout!r} {out.stderr!r}"
+    )
+    assert "code-graph-analyze: ERROR - no Python environment" in out.stderr
 
 
 def _shim_code_lines() -> list:
@@ -184,10 +205,16 @@ def test_shim_has_no_hardcoded_legacy_interpreter_path() -> None:
 def test_shim_candidate_order_matches_canonical_tiers() -> None:
     """Source guard: the .sh shim probes VCT_VENV first, then
     VCT_INSTALL_ROOT, then clone-relative — the canonical order."""
-    body = _SHIM.read_text(encoding="utf-8")
-    i_vct_venv = body.find('"${VCT_VENV:-}"')
+    # v0.2.94: the tiers live in the shared ladder the shim sources;
+    # `effective_wrapper_text` follows them there rather than demanding the
+    # shim keep an inlined fourth copy.
+    body = effective_wrapper_text(_SHIM)
+    i_vct_venv = body.find('"$VCT_VENV"')
     i_install = body.find('"${VCT_INSTALL_ROOT:-}/.venv"')
-    i_clone = body.find('"$SCRIPT_DIR/../../.venv"')
+    # The clone-relative tier is spelled through the ladder's resolved
+    # 2-up path (`$LADDER_CLONE_ROOT`), which is ALSO where the VCO-clone
+    # discriminator gates it — the tier the shim's own inline copy had.
+    i_clone = body.find('"$LADDER_CLONE_ROOT/.venv"')
     assert -1 < i_vct_venv < i_install < i_clone, (
         "candidate order must be VCT_VENV -> VCT_INSTALL_ROOT -> clone-relative"
     )

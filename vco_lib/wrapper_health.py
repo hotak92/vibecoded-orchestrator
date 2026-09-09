@@ -30,9 +30,24 @@ cross-language A>B>C rule): both the Python side and the Rust side read the
 same bytes and apply the same two-line test, so a wrapper added to
 ``templates/scripts/`` in a future release is covered the day it ships,
 without either side being edited. It also derives — rather than hardcodes —
-the exclusions the old lists spelled out by hand: ``kg-duplicates`` (POSIX)
-and ``generate-kg-summary.py`` carry no marker in their shipped form, so they
-are not marker-checked and a healthy copy is never flagged.
+the exclusions the old lists spelled out by hand: a shipped script that
+carries no marker (``generate-kg-summary.py``) is not marker-checked, so a
+healthy copy of it is never flagged.
+
+v0.2.94 — TWO shapes now satisfy the rule. The venv ladder moved to ONE home
+(``templates/scripts/vct_venv_ladder.{sh,ps1}``), so a wrapper honours it
+either by INLINING ``$VCT_INSTALL_ROOT`` or by SOURCING the ladder that owns
+it (:data:`LADDER_DELEGATION_MARKER`). Consequences worth stating, because the
+old prose named the opposite:
+
+* ``kg-duplicates`` IS marker-bearing now. It used to be the documented
+  exclusion — it had no ladder at all — and it has one today, so a stale copy
+  of it is as dangerous as a stale ``kg-sync``. ``kg-dedup`` and ``kg-migrate``
+  joined for the same reason.
+* :func:`marker_bearing_basenames` also returns the two ladder LIBS
+  themselves. That is correct rather than incidental: a stale
+  ``vct_venv_ladder.sh`` in a project breaks every wrapper that sources it, so
+  it is exactly the file whose staleness matters most.
 
 WHAT THE MARKER PROVES, AND WHAT IT DOES NOT
 --------------------------------------------
@@ -53,11 +68,12 @@ healthy one.
 
 MIRROR CONTRACT
 ---------------
-``RESILIENT_WRAPPER_MARKER`` is mirrored in
-``launcher/src-tauri/src/commands/codegraph.rs`` (``RESILIENT_WRAPPER_MARKER``)
-because the launcher must answer this at resolve time with no Python
-subprocess available. The literal is pinned by
-``tests/test_v0292_wrapper_health.py::MarkerParityTests``.
+``RESILIENT_WRAPPER_MARKER`` **and** ``LADDER_DELEGATION_MARKER`` are mirrored
+in ``launcher/src-tauri/src/commands/codegraph.rs`` (same names) because the
+launcher must answer this at resolve time with no Python subprocess available;
+the two-shape test itself is mirrored there as ``contents_are_resilient``. Both
+literals are pinned by
+``tests/test_v0292_stale_wrapper_first_install.py::WrapperHealthEnumeration::test_marker_literal_matches_the_rust_mirror``.
 """
 
 from __future__ import annotations
@@ -67,6 +83,7 @@ from typing import Iterable, Optional
 
 __all__ = [
     "RESILIENT_WRAPPER_MARKER",
+    "LADDER_DELEGATION_MARKER",
     "shipped_scripts_dir",
     "bytes_are_resilient",
     "path_is_resilient",
@@ -79,6 +96,21 @@ __all__ = [
 #: `RESILIENT_WRAPPER_MARKER` const in
 #: `launcher/src-tauri/src/commands/codegraph.rs`.
 RESILIENT_WRAPPER_MARKER = "VCT_INSTALL_ROOT"
+
+#: The SECOND way a wrapper can honour the ladder, since v0.2.94: by sourcing
+#: it instead of inlining it (`templates/scripts/vct_venv_ladder.{sh,ps1}`,
+#: which carries `$VCT_INSTALL_ROOT` itself).
+#:
+#: Without this, the extraction would have silently RETIRED the staleness
+#: check for every wrapper it touched: a migrated shipped template no longer
+#: contains the first marker, so `shipped_requires_marker` would return False
+#: and the pre-VCO copies a field project was found carrying (2026-09-05:
+#: kg-sync, kg-search, kg-info, code-graph-query, code-graph-analyze, all
+#: pointing at another checkout's venv) would stop being detected. The marker
+#: asks "does this file honour the resilient ladder?" — delegating to it is a
+#: yes. MUST MATCH the `LADDER_DELEGATION_MARKER` const in
+#: `launcher/src-tauri/src/commands/codegraph.rs`.
+LADDER_DELEGATION_MARKER = "vct_venv_ladder"
 
 
 def _default_orchestrator_root() -> Path:
@@ -99,8 +131,17 @@ def shipped_scripts_dir(orchestrator_root: Optional[Path] = None) -> Path:
 
 
 def bytes_are_resilient(data: bytes) -> bool:
-    """Do these bytes still honour the ``$VCT_INSTALL_ROOT`` ladder?"""
-    return RESILIENT_WRAPPER_MARKER.encode("utf-8") in data
+    """Do these bytes still honour the resilient ladder?
+
+    Two shapes count, and both are the same answer: the wrapper INLINES the
+    ``$VCT_INSTALL_ROOT`` tier (pre-v0.2.94), or it SOURCES the shared ladder
+    that owns it (v0.2.94+). A pre-VCO copy has neither, which is the whole
+    point of the check.
+    """
+    return (
+        RESILIENT_WRAPPER_MARKER.encode("utf-8") in data
+        or LADDER_DELEGATION_MARKER.encode("utf-8") in data
+    )
 
 
 def path_is_resilient(path: Path) -> bool:

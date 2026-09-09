@@ -1,42 +1,56 @@
 #!/bin/bash
-# Wrapper script for get_node_info.py with automatic venv activation.
+# Wrapper script for get_node_info.py.
 #
-# v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
-# from `code-graph-analyze`. See `kg-sync` for the full rationale.
+# Exit codes: whatever `get_node_info.py` exits; 1 = REFUSAL - no Python
+# environment with the dependency this wrapper needs (wrapper-only).
+#
+# v0.2.94: this wrapper resolved its interpreter through a WEAKER ladder than
+# `kg-sync`'s (no `$VCT_VENV` tier, no `.claude/env` tier, no VCO-clone
+# discriminator) and then fell through to a bare `python` when nothing
+# qualified - so on a user project it ran whatever interpreter was first on
+# PATH and died inside the script with a ModuleNotFoundError naming the wrong
+# problem. A shipped component does not get a silent fallback (standing rule).
+# Ladder + refusal now come from the ONE home every KG wrapper shares.
+#
+# PARITY: this file and `kg-info.ps1` must stay in lockstep (same tiers, same
+# gate, same refusal text, same forwarding).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Validate a venv has the KG-info deps installed.
-venv_has_kg_deps() {
-    local v="$1"
-    local py=""
-    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
-    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
-    else return 1
-    fi
-    "$py" -c "import weaviate" 2>/dev/null
-}
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# The rule (see `vct_venv_ladder.sh`): name what the script needs to reach a
+# CORRECT VERDICT. `weaviate` is a module-scope import; `vco_lib` is
+# function-local but verdict-critical - it resolves WHICH COLLECTION to read
+# (`vco_lib.project_config`), and the env fallback can name another project's,
+# turning "node not found" into an answer about the wrong graph.
+# `weaviate_mcp` is NOT named: telemetry only.
+LADDER_IMPORT="import weaviate, vco_lib"
 
-CANDIDATES=(
-    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
-    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
-    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
-    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
-)
+# The ladder lives in ONE home, shipped beside this wrapper. A missing lib is
+# a broken install, not a reason to fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "kg-info: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "kg-info: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  kg-info did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
+fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
 
-VENV_PATH=""
-for c in "${CANDIDATES[@]}"; do
-    [ -z "$c" ] && continue
-    [ "$c" = "/.venv" ] && continue
-    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
-    if venv_has_kg_deps "$c"; then
-        VENV_PATH="$c"
-        break
-    fi
-done
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
 
-if [ -n "$VENV_PATH" ]; then
-    source "$VENV_PATH/bin/activate"
+# NO BARE `python` FALLBACK - see the header. PARITY: the .ps1 sibling refuses
+# identically.
+if [ -z "$LADDER_PYTHON" ]; then
+    vct_venv_ladder_refusal "kg-info" "$LADDER_IMPORT" "$SCRIPT_DIR"
+    {
+        echo "kg-info: Refusing to run with an unqualified interpreter - a"
+        echo "kg-info: lookup that cannot reach the collection must never"
+        echo "kg-info: report 'node not found'."
+        echo "kg-info: (exit 1 = did not run)"
+    } >&2
+    vct_venv_ladder_refusal_summary "kg-info" 1
+    exit 1
 fi
 
-python "$SCRIPT_DIR/get_node_info.py" "$@"
+exec "$LADDER_PYTHON" "$SCRIPT_DIR/get_node_info.py" "$@"

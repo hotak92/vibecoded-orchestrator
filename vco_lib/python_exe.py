@@ -86,10 +86,11 @@ logger = logging.getLogger(__name__)
 #: Explicit override env var. May name a venv directory OR an interpreter.
 VENV_ENV_VAR = "VCT_VENV"
 
-#: Orchestrator-clone env vars, in probe order. The Rust mirror reads only the
-#: first; the second is honoured here because several Python entry points
-#: (hooks, `project_move`, `boot_service`) already publish it and a resolver
-#: that ignored it would answer differently from its own callers.
+#: Orchestrator-clone env vars, in probe order. All four ladders (this one,
+#: the Rust mirror, `vct_venv_ladder.sh` / `.ps1`) honour BOTH since v0.2.94:
+#: several entry points (hooks, `project_move`, `boot_service`) publish the
+#: second, and a resolver that ignored it would answer differently from its
+#: own callers. Pinned by `FourWayLadderParity`.
 INSTALL_ROOT_ENV_VARS = ("VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT")
 
 #: venv directory layouts probed under an install root, in order. The second is
