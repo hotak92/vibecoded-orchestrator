@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.94] - 2026-09-09
+
+The incident release. A Claude Code panel restart put a chat back on the
+vendor Default model for a whole night, the vendor's built-in tool poisoned
+three transcripts with ids Anthropic rejects, and the same day's "Update
+all bundles" reported code-graph re-indexes that had died at spawn in
+every non-root project while a project with zero knowledge nodes was told
+there was nothing to re-embed. Every one of those is fixed at its root here
+and pinned by tests, six Fable review rounds deep; the ruff gate that would
+have caught the one real `NameError` in shipped source is now part of CI.
+
 ### Fixed — the model gateway: vendor tool ids, vendor quota errors, `[1m]`, and one access-log line (v0.2.94)
 
 Incident 2026-09-08 (maintainer's machine): a chat that had been on Fable
@@ -122,6 +133,70 @@ first sync had failed months earlier and nothing ever retried it.
   root and non-root alike (it used to fall back to the per-edit generator with
   `--all`, which exited 2 silently); a failure now records
   `kg_node_formats_refresh_failed` in the ledger instead of one stderr line.
+
+### Fixed — the model gateway is never worse than native (v0.2.94)
+
+On its first real day the product gateway failed three healthy conversations
+that Anthropic served natively: aiohttp's default 1 MiB request limit (every
+large chat → 413, which Claude Code renders as "Request too large … compact"),
+a 600 s total upstream timeout (a Fable answer cut at 601 s), and a mid-stream
+failure relayed as a clean, complete-looking response. The rule is now explicit
+and tested: through the gateway, the outcome is never worse than native.
+
+- **Requests are never refused for their size.** The body is unbounded; the id
+  rewrite works on a 32 MiB buffer (`VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES`)
+  and a larger body is streamed through unrewritten, with only the gateway's
+  own model namespace spliced in the head. Re-encoded bodies no longer inflate
+  (compact, non-ASCII-preserving JSON). Unparseable bodies go to Anthropic for
+  its verdict instead of a gateway-worded 400. Long headers (16 KiB) pass.
+- **Streams are never cut by the proxy.** Upstream timeouts are idle-based
+  (30 s connect, 1800 s idle) with no total; an upstream failure mid-stream
+  reaches the client as the same premature close native produces, so the
+  client retries instead of accepting a truncated answer; 502s carry
+  `x-should-retry`, a vendor's `retry-after` is relayed.
+- **Cosmetic work fails open.** If any id rewrite raises, the original bytes
+  are forwarded or relayed and one access line says so.
+- **The daemon is supervised.** The boot unit restarts in 2 s within its start
+  limit and allows 60 s to drain a stream on stop; the launcher respawns a
+  child it started once with backoff, and the card says "unsupervised
+  (hand-started)" when the running pid is nobody's.
+- **Pointing the panel at the gateway now proves it first**: a multi-MiB
+  `count_tokens` through the gateway and natively must agree (status and token
+  count), the picker must list first-party models, and the daemon must not be
+  older than the package; any mismatch refuses to point (`vco … dogfood`).
+- OAuth visibility: `/health` reports seconds to token expiry, the card warns
+  30 minutes ahead, and an upstream 401 re-reads the credentials once. The
+  gateway does not refresh the token itself (native's refresh is a locked
+  protocol with no public endpoint); a gateway-only machine needs one native
+  Claude Code use per token lifetime.
+- A chaos suite (`tests/test_v0294_gateway_robustness.py`) pins each case as
+  "outcome equals native": huge bodies, deep and broken JSON, rewriters that
+  raise, upstream 5xx/abort/idle, 10 MB SSE, parallel streams, 16 KiB headers.
+
+### Fixed — the duplicate scanner produces a verdict again on named-vector collections (v0.2.94)
+
+- `kg-duplicates` (and the launcher's duplicate check) failed at its first
+  query on every collection with named vectors — "multiple vectors, but no
+  target vectors were provided" — and had printed "Scan did NOT complete"
+  every tenth edit since named vectors shipped. The active vector slot is
+  now resolved by one shared helper (`vco_lib/kg_vector_slot.py`) used by the
+  scanner, the sync writer, the search script and the MCP embeddings;
+  single-unnamed-vector collections keep the old query; an unresolvable
+  slot is a failed scan, never a silent zero.
+- **One venv ladder for every shipped script wrapper**
+  (`templates/scripts/vct_venv_ladder.{sh,ps1}`): the interpreter ladder had
+  been copied into four wrappers, `kg-duplicates` (bash) had none, and six
+  more fell back to a bare `python` that silently ran the wrong interpreter
+  (`code-graph-to-mermaid`, the last of them, was caught by the final
+  verification pass, not the implementation: nine pairs in all).
+  Every wrapper now resolves the orchestrator venv the same way, declares the
+  modules its script needs, and refuses loudly naming them (the post-edit
+  hooks surface the refusal); a parity test pins each bash/PowerShell pair to
+  the same declaration, and one four-way test pins the shell, Python and
+  Rust interpreter ladders to the same tiers. No ladder ends in a bare
+  `python` any more: the launcher's bundle path refuses, naming every tier,
+  instead of running whatever `python3` is on PATH. The stale-wrapper
+  detector now keys on the delegation marker in both its homes.
 
 ### Added — ruff is a CI gate for the shipped Python (v0.2.94)
 

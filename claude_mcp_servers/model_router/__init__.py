@@ -64,6 +64,6 @@ from __future__ import annotations
 #: ``scripts/check-version-pins.sh`` — it was neither until v0.2.94, which is
 #: how a 0.2.93 install served ``"version": "0.2.92"`` from /health and made
 #: "which gateway am I talking to?" unanswerable during an incident.
-__version__ = "0.2.93"
+__version__ = "0.2.94"
 
 __all__ = ["__version__"]
