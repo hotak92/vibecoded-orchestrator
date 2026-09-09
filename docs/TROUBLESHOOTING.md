@@ -950,3 +950,19 @@ For a deeper failure, also attach `state/logs/install.jsonl` (the structured per
 - GitHub Issues: <https://github.com/hotak92/vibecoded-orchestrator/issues>
 - Community channel: (TBD — linked from vibecodedtools.it at launch)
 - Commercial support: Pro tier includes email support.
+
+### "API Error: 400 messages.N.content.1.server_tool_use.id: String should match pattern '^srvtoolu_…'"
+
+A session that ran on a vendor model through the gateway used the vendor's
+built-in tool (Z.ai `analyze_image`, web search); the vendor's ids and tool
+names are not Anthropic's, and every later request that carries that history
+to Anthropic is rejected. From v0.2.94 the gateway repairs such a history in
+flight; for a session you run natively, repair the saved transcript once:
+
+```bash
+vco fix-transcript ~/.claude/projects/<project-dir>/<session-id>.jsonl --dry-run
+vco fix-transcript ~/.claude/projects/<project-dir>/<session-id>.jsonl   # backup written first
+```
+
+Compaction fails with the same error for the same reason and works again
+after the repair.

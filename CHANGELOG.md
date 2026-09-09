@@ -5,6 +5,164 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — the model gateway: vendor tool ids, vendor quota errors, `[1m]`, and one access-log line (v0.2.94)
+
+Incident 2026-09-08 (maintainer's machine): a chat that had been on Fable
+came back from a panel restart on the env Default `claude-gw/glm-5.3[1m]`,
+ran a whole night on GLM unnoticed, and GLM's built-in `analyze_image`
+wrote `server_tool_use` blocks with `call_…` ids into the transcript.
+Anthropic's validator requires `^srvtoolu_…` there, so every later
+Anthropic-bound request failed `400 messages.N.content.1.server_tool_use.id`
+— "the chat is dead" — in three projects at once; the raw Z.ai weekly-quota
+429 that arrived alongside read as an Anthropic limit. The gateway had no
+per-request log line, so the first hours went to blaming routing, which was
+never wrong: 1,322 Fable requests, none sent to the vendor.
+
+- **Vendor tool ids are normalised on the wire** (non-stream and SSE):
+  `server_tool_use.id` → `srvtoolu_<sanitised>`, `tool_use.id` →
+  `toolu_<sanitised>`, with a bounded per-vendor map that hands the vendor
+  its own ids back in the next request's `tool_result`. A vendor built-in
+  Anthropic cannot represent at any id (`analyze_image`) is stripped with its
+  result, and logged by message index. A transcript that already carries
+  the poison is repaired in flight on the Anthropic route — proven live on
+  the incident transcript. Anthropic's own server-tool names are the one
+  portable set (copied from the validator's message).
+- **`vco fix-transcript <session.jsonl> [--dry-run]`** repairs a saved
+  session the same deterministic way (backup first, streaming rewrite,
+  untouched lines byte-identical) for sessions that must run natively.
+- **A vendor 402/429 is surfaced as the vendor's**, classified before it is
+  worded: "<vendor> quota exhausted (HTTP 429)… pick a Claude model with
+  /model" only when the vendor's body, code or a long/absent reset says so;
+  a per-minute limit reads "rate-limited (HTTP 429)… retry shortly". Always
+  HTTP 429 to the client (a 402 from a local proxy invites the wrong
+  conclusion about the Claude account), JSON even for a streaming request
+  (the SDK parses a non-2xx body as JSON); the upstream body goes to the log
+  at DEBUG and the access line records the class. Anthropic's own errors are
+  relayed untouched.
+- **`[1m]` is a client-side hint**: stripped before forwarding to Anthropic
+  (the gateway used to 404 on the literal `claude-fable-5-1[1m]`), the
+  `context-1m` beta appended when the client's header lacks it, and the
+  catalog now advertises `<id>[1m]` companions for every 1M-capable Claude
+  row — read per row from the export OR the shipped seed, so an upgraded
+  install whose export predates the Claude rows still gets them.
+- **One access-log line per request** (`requested=… route=… forward=…
+  status=… ms=…`, never bodies or headers) and a `refused` line with the
+  reason. Marker-rule regression tests pin that every `claude-*` id routes
+  to Anthropic and every foreign id is a local 400 naming the id.
+- **A vendor JSON body is buffered whole before its ids are rewritten**: the
+  relay read one buffered chunk and called it the body, so a response larger
+  than the first chunk was truncated and relayed with a wrong length.
+- **SSE frames may end in CR, LF or CRLF** (the spec allows all three); each
+  line keeps its own terminator, so an untouched stream is byte-identical.
+- **`serve` at login no longer crash-loops when a gateway already runs**: a
+  live pid is verified over `/health` (our service name, on the daemon's port
+  chain); "already running on 127.0.0.1:N" is exit 0, not a failure, so
+  `Restart=on-failure` does not respin it — on the maintainer's machine the
+  user unit had restarted 1,442 times in four hours. A pid that answers
+  nothing is taken over with a warning. The systemd unit gains an explicit
+  start limit (`StartLimitIntervalSec=600`, `StartLimitBurst=5`; the old
+  comment credited systemd's default, which a 10 s `RestartSec` can never
+  trip), re-rendered by `install.py --update`; the boot log is rotated in
+  place at start. The launchd and Windows twins already had the right
+  policy and are now pinned by tests.
+- **"Is this port free?" means the same thing to the daemon and the
+  launcher**: a `connect()` probe first (a live listener, specific or
+  wildcard, means taken), then a bind with `SO_REUSEADDR` on every POSIX
+  system so a port in TIME_WAIT never blocks a restart (Windows: exclusive
+  use, never reuse). The daemon binds every address its host resolves to
+  (`localhost` on a dual-stack machine no longer lands on one family while
+  clients use the other) and, when the resolved port is taken and none was
+  pinned, falls back through the same 11460–11468 window the launcher tries,
+  recording the port it bound. The pid file is claimed atomically
+  (`O_EXCL`), so two starters inside the same second cannot both proceed.
+- `model_router.__version__` is now bumped by `scripts/bump-version.sh` and
+  checked by `scripts/check-version-pins.sh` (it had drifted to 0.2.92 on a
+  0.2.93 install).
+
+### Fixed — every install/update spawn runs under the orchestrator venv; the bundle update re-syncs what Weaviate is actually missing (v0.2.94)
+
+Field evidence 2026-09-08/09 (maintainer's machine): "Update all bundles" reported
+"code-graph re-index started in the background" for every project while every
+non-root re-index died at once with `ModuleNotFoundError: No module named
+'vco_lib'` — the launcher ran the bundle update under the bare PATH `python3`
+and the detached child inherited it. The same update logged "kg-sync skipped —
+nothing to re-embed" for a project whose collection held zero nodes because its
+first sync had failed months earlier and nothing ever retried it.
+
+- **One interpreter resolver** (`vco_lib/python_exe.py`; Rust mirror
+  `python_resolve.rs` pinned by a parity test): `VCT_VENV` → `<root>/.venv` →
+  legacy venv → the running interpreter only if it can import `vco_lib` and
+  `weaviate` → a typed failure naming every candidate. Every Python spawn of a
+  vco_lib helper (code-graph resync, kg-sync, summaries, collection rename,
+  hard cut, schema migration, project move) and every launcher bundle spawn use
+  it; the resync child is started as `-m vco_lib.codegraph_resync`, never by
+  file path. A first-install machine still probes the system Python to create
+  the venv — that is the one legitimate use and it is named as such.
+- **A doomed child is never reported as started**: the resync preflights the
+  interpreter before spawning and returns `failed` (naming the interpreter and
+  the missing module), which the bundle report shows as a warning. Resync and
+  kg-sync log headers record interpreter, cwd and argv.
+- **Recovery is "Update bundle" again**: the failed attempts had advanced each
+  project's manifest without walking, so the extractor-generation ladder gains
+  a `0.2.94` rung; projects that completed carry a stamp and are not re-walked.
+- **The bundle-update kg-sync gate consults reality**: it spawns when the bundle
+  touched knowledge/docs, OR the last recorded sync is absent or failed, OR a
+  read-only drift probe (`kg-sync --check-drift`, machine-readable sentinel
+  line) reports missing/stale nodes; "skipped" is only ever printed with the
+  probe's counts, and an unavailable probe is a warning, never "every node
+  present". The automatic path always runs the plain content-hash-gated
+  `kg-sync --all` — a node whose hash matches is never re-embedded, and the
+  spawn refuses force/rechunk flags by construction. Cost: one read-only
+  drift probe per project per update when nothing changed (a Python start,
+  a hub query and a knowledge walk, run sequentially).
+- **Post-sync summary refresh works outside the root**: the orchestrator's
+  `generate_node_formats.py` is invoked with the project's knowledge dir for
+  root and non-root alike (it used to fall back to the per-edit generator with
+  `--all`, which exited 2 silently); a failure now records
+  `kg_node_formats_refresh_failed` in the ledger instead of one stderr line.
+
+### Added — ruff is a CI gate for the shipped Python (v0.2.94)
+
+- `ruff check vco_lib claude_mcp_servers scripts install.py` runs in CI
+  (`Python (ruff)` job) and in `scripts/pre-ship-check.sh`; the version is
+  pinned in `requirements-dev.txt`. It had been a local convention only, so a
+  lint regression could reach main unnoticed. `tests/` (174 pre-existing
+  findings, mostly unused imports) is not gated yet.
+
+### Fixed — a vendor model is never the panel's Default; the switch starts the gateway it needs (v0.2.94)
+
+- **User ruling: GLM is never the Default.** `point --model`, the Multimodel
+  leg's stash restore and the Services card refuse to write a non-first-party
+  id into `ANTHROPIC_MODEL` (the write proceeds without it; the result and
+  the GUI name the id and the rule). `DEFAULT_GATEWAY_MODEL` is `claude-opus-5`.
+  An existing vendor Default is kept — never deleted behind the user — but
+  reported (`vendor_default_preserved`) with a one-click **Clear default** in
+  the status bar and a new `clear-default` CLI. Why: a panel restart reverts
+  the session to the env Default; the `/model` pick of a gateway-discovered
+  model does not survive it.
+- **The Multimodel ↔ Remote Control switch works on a machine where the
+  gateway has never run**: it starts the gateway first (polling `/health`
+  for OUR service name, not a fixed sleep), points the panel at the port it
+  actually started (never a re-resolved one; an env pin that disagrees
+  refuses the start with both ports named), retries once on the token-file
+  race, and says "started on port N" only when the gateway answered.
+  `mode --get` reports `gateway: running|stopped|unreachable` from the port
+  the PANEL points at, flags a prototype endpoint (a loopback URL that is
+  not our gateway) as the migration it is, and both Python spawns from the
+  launcher carry the same `PYTHONPATH`.
+- **Port collision**: when the default port is held by something that is
+  not a VCO gateway (a legacy router container, in the field), the start
+  picks the first free port in 11460–11468 and reports it. The window is
+  chosen clear of every VCO port (RL 11439/11442/11443, code-embed 11440,
+  per-project RL 11500–11900): a fallback that lands on a sibling service's
+  idle port only moves the collision to that service's next start.
+- **Context-table seed rows are upserted on every boot** (new shipped rows
+  land on upgraded installs — the Claude 5 family rows added in 0.2.93 had
+  never reached an upgraded table), with a tombstone so a row the user
+  deleted stays deleted until an explicit Reseed (migration 045).
+
 ## [0.2.93] - 2026-09-08
 
 The dogfood-release. v0.2.92's own update to the maintainer's install died
