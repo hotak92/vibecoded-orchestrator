@@ -422,6 +422,10 @@ def _stripped_env() -> dict:
         # to a bare `python` / `python3`.
         ("code-graph-analyze", "analyze_code_graph.py", 1),
         ("kg-search", "search_knowledge.py", 1),
+        # Found by the lane F verification, not the implementation: it ran
+        # `python3 -m vco_lib.cli` (no script file to tripwire — the module
+        # is the target, and a bare python has none of it).
+        ("code-graph-to-mermaid", None, 1),
     ],
 )
 def test_bash_wrapper_refuses_instead_of_running_a_bare_interpreter(
