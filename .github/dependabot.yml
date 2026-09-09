@@ -26,6 +26,15 @@
 # total (1 per ecosystem with non-major activity, plus one per major
 # bump that fires through the ungrouped path).
 #
+# Backlog cap (2026-09-10): open-pull-requests-limit lowered to 3 per package
+# ecosystem (2 for actions) — 30 open Dependabot PRs made the project look
+# unattended, and per the owner's ruling these PRs are suggestions, never
+# obligations. npm and Cargo MAJOR bumps now roll into one grouped PR per
+# ecosystem too (Cargo treats 0.x -> 0.y as major, which alone had produced
+# five individual launcher PRs); pip majors stay individual because they are
+# the load-bearing ones (mcp 2.x, sentence-transformers 6.x) and need
+# targeted runtime validation.
+#
 # Cadence change (2026-08-23): weekly -> monthly, and `day:` dropped
 # (it is only meaningful for `interval: weekly`).
 #
@@ -50,7 +59,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "python"
@@ -78,7 +87,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "python"
@@ -112,7 +121,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
     labels:
       - "dependencies"
       - "github-actions"
@@ -136,7 +145,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "npm"
@@ -152,6 +161,12 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      launcher-npm-major:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "major"
 
   # ─── Cargo (launcher Tauri Rust backend) ─────────────────────────────
   # Note on Rust 0.x crates: per Cargo semver, 0.X → 0.Y is technically
@@ -165,7 +180,7 @@ updates:
       interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "cargo"
@@ -181,3 +196,9 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      launcher-cargo-major:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "major"

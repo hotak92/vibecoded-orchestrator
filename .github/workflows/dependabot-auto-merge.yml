@@ -27,9 +27,24 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for patch & minor
+      # v0.2.94: this step used to FAIL on every Dependabot PR because the
+      # repository deliberately keeps `allow_auto_merge` OFF (owner ruling,
+      # 2026-09-10: Dependabot PRs are suggestions, never obligations, and
+      # nothing merges without a human). A workflow that is red by policy
+      # is noise that hides real reds. So: ask the repository first; when
+      # auto-merge is allowed, request it; when it is not, say so and
+      # succeed. The step never blocks anything either way.
+      - name: Request auto-merge for patch & minor (no-op when the repo disallows it)
         if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
-        run: gh pr merge --auto --squash "$PR_URL"
+        run: |
+          set -euo pipefail
+          allowed="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.allow_auto_merge')"
+          if [ "$allowed" = "true" ]; then
+            gh pr merge --auto --squash "$PR_URL"
+            echo "::notice::auto-merge requested for $PR_URL (merges when required checks pass)"
+          else
+            echo "::notice::allow_auto_merge is false on ${GITHUB_REPOSITORY} by owner policy — leaving $PR_URL for human review (this is not a failure)"
+          fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
