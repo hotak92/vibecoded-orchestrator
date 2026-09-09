@@ -25,4 +25,4 @@ transformers>=4.40.0,<4.50.0
 fastapi>=0.136.1
 uvicorn>=0.50.0
 pydantic>=2.13.3
-requests>=2.33.1
+requests>=2.34.2
