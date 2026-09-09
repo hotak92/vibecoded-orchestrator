@@ -203,11 +203,22 @@ if ($VenvPy -and (Test-Path $VenvPy)) {
     $env:VCT_PREBASH_CMD_LEN = [string]$CmdLen
     $env:VCT_PREBASH_TS_MS = [string]$StartTsMs
     $env:VCT_PREBASH_SESSION = $SessionId
+    $env:VCT_PROJECT_ROOT = $ProjectRoot
     $preBashPy = @"
 import os
+# v0.2.94: pin the project root the hook already resolved for THIS child.
+# A rootless embedding_service._detect_project_root() falls through to
+# Path.cwd() (rule 4) and reconciles THAT directory's deferral ledger,
+# rewriting its CLAUDE.md -- in a detached child, cwd is whatever the
+# harness gave us, not the project. KG_BASE_DIR is rule 2 of the same
+# ladder and already means the project folder path; setdefault, so an
+# explicit VS Code / launcher value still wins.
+_vco_project_root = r'''$ProjectRoot'''
+if _vco_project_root:
+    os.environ.setdefault('KG_BASE_DIR', _vco_project_root)
 try:
     from vco_lib.project_config import resolve_for_project
-    cfg = resolve_for_project(os.environ.get('CLAUDE_PROJECT_DIR', ''))
+    cfg = resolve_for_project(os.environ.get('CLAUDE_PROJECT_DIR', os.environ.get('VCT_PROJECT_ROOT', '')))
     project_id = cfg.get('project_id') if isinstance(cfg, dict) else None
 except Exception:
     project_id = None

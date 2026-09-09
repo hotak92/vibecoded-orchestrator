@@ -37,9 +37,15 @@ resolution never lands on this checkout.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -55,6 +61,14 @@ from vco_lib.embedding_providers.openai import (  # noqa: E402
 )
 
 REPO_CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
+
+#: The artefacts a deferral-ledger reconcile leaves in the root it resolved.
+#: Every one of them landing in THIS checkout is the field shape of the leak.
+LEDGER_ARTEFACTS = (
+    "EMBEDDING_FAILURES.md",
+    "UPDATE_DEFERRED.md",
+    "UPDATE_DEFERRED.json",
+)
 
 #: The UNPATCHED resolver. Captured at import — collection runs before any
 #: fixture, so this is the real function even though conftest's session-scoped
@@ -75,6 +89,18 @@ def _repo_claude_md_sha() -> str:
         return hashlib.sha256(REPO_CLAUDE_MD.read_bytes()).hexdigest()
     except OSError:
         return "MISSING"
+
+
+def _ledger_state(root: Path) -> dict[str, str]:
+    """Hash of each ledger artefact under ``root/.claude/context`` (or MISSING)."""
+    ctx = root / ".claude" / "context"
+    out: dict[str, str] = {}
+    for name in LEDGER_ARTEFACTS:
+        try:
+            out[name] = hashlib.sha256((ctx / name).read_bytes()).hexdigest()
+        except OSError:
+            out[name] = "MISSING"
+    return out
 
 
 def _seed_sentinel_root(tmp_path: Path) -> Path:
@@ -188,4 +214,126 @@ def test_successful_for_project_leaves_the_checkout_alone(tmp_path, monkeypatch)
         "conftest's session-end restore would hide this from a later `git "
         "status`, so this assertion is the only place the IN-PROCESS write is "
         "observable — keep preventing it here rather than leaning on repair."
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hook; the .ps1 sibling is Windows'")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="no bash on PATH")
+def test_real_post_edit_hook_reconciles_its_own_project_not_the_checkout(tmp_path):
+    """The FIELD half: run the shipped hook for real, from a hostile cwd.
+
+    Everything above contains the leak for the SUITE — an in-process patch
+    (conftest) and an env pin for children built through
+    ``tests/common/child_env.py``. Neither reaches a user's machine, and the
+    same mechanism runs there: ``templates/hooks/post-edit-outcome.sh`` spawns
+    a Python child that calls ``emit_outcome_event``, and downstream of it
+    ``EmbeddingService.for_project()`` is reached with no root, so
+    ``_detect_project_root`` falls to ``Path.cwd()`` — whatever directory the
+    harness handed the hook, which is not guaranteed to be the project. It
+    then writes THAT root's ledger (``EMBEDDING_FAILURES.md`` /
+    ``UPDATE_DEFERRED.*``) and rewrites its ``CLAUDE.md``.
+
+    So this runs the real hook from a fixture project under ``tmp_path``, with
+    cwd deliberately set to this checkout and a from-scratch environment
+    carrying neither ``KG_BASE_DIR`` nor ``$VCT_ORCHESTRATOR_ROOT`` — exactly
+    the conditions under which the child used to pick the checkout.
+
+    **Do not route this env through ``child_env()``.** That helper pins
+    ``KG_BASE_DIR`` itself, which is the very thing under test: the assertions
+    would then hold with the hook's pin deleted, and the test would prove
+    nothing. The scrubbing is the point.
+
+    Both halves are asserted, because either alone is satisfiable by an
+    accident: the fixture project MUST receive the ledger (otherwise the
+    emit chain soft-failed before reaching ``for_project()`` and "the checkout
+    is untouched" is vacuous), and the checkout's ``CLAUDE.md`` + ledger MUST
+    be byte-identical.
+
+    Red-proof (2026-09-09): with the ``KG_BASE_DIR`` pin removed from
+    ``post-edit-outcome.sh``, the fixture receives nothing and the checkout's
+    ``.claude/context/`` gains ``EMBEDDING_FAILURES.md`` + ``UPDATE_DEFERRED.*``.
+    Note which assertion caught it: the checkout's ``CLAUDE.md`` did NOT change
+    in that run, because its reminder block already matched what the reconcile
+    would have written. The ledger-artefact comparison is what makes the escape
+    observable; the CLAUDE.md hash alone would have passed.
+    """
+    hook_src = REPO_ROOT / "templates" / "hooks" / "post-edit-outcome.sh"
+
+    project = tmp_path / "fixture_project"
+    hooks = project / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    (project / ".claude" / "context").mkdir(parents=True)
+    # Installed layout: <project>/.claude/hooks/, so the hook's own
+    # `$SCRIPT_DIR/../..` fallback resolves the fixture project — the branch
+    # that matters, since CLAUDE_PROJECT_DIR is deliberately not set below.
+    shutil.copy2(hook_src, hooks / hook_src.name)
+    shutil.copytree(hook_src.parent / "_lib", hooks / "_lib")
+    (project / "CLAUDE.md").write_text("# fixture project\n", encoding="utf-8")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
+        # The child imports vco_lib + claude_mcp_servers from THIS tree.
+        "PYTHONPATH": f"{REPO_ROOT}{os.pathsep}{REPO_ROOT / 'claude_mcp_servers'}",
+        # Tier-1 of _lib/resolve-vco-venv.sh accepts an interpreter path.
+        "VCT_VENV": sys.executable,
+        "VCT_STATE_DIR": str(tmp_path / "state"),
+        # Dead ports: no embedding backend is reachable, so for_project()
+        # takes its FAILURE path — which reconciles the ledger just as the
+        # success path does, without depending on a live Ollama in CI.
+        "OLLAMA_URL": "http://127.0.0.1:9",
+        "CODE_EMBED_SERVICE_URL": "http://127.0.0.1:9",
+        "WEAVIATE_URL": "http://127.0.0.1:9",
+    }
+
+    before_claude_md = _repo_claude_md_sha()
+    before_ledger = _ledger_state(REPO_ROOT)
+
+    payload = {
+        "tool_name": "Edit",
+        "session_id": "v0294-containment",
+        "tool_input": {
+            "file_path": str(project / "edited.py"),
+            "old_string": "a",
+            "new_string": "ab",
+        },
+    }
+    proc = subprocess.run(
+        ["bash", str(hooks / hook_src.name)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(REPO_ROOT),  # the hostile cwd, on purpose
+        env=env,
+        timeout=600,
+    )
+    assert proc.returncode == 0, (
+        f"the hook must never fail the host tool call: rc={proc.returncode} "
+        f"stderr={proc.stderr[-2000:]}"
+    )
+
+    fixture_ledger = _ledger_state(project)
+    assert fixture_ledger["EMBEDDING_FAILURES.md"] != "MISSING", (
+        "the hook's child never reached EmbeddingService.for_project() with "
+        "the fixture project as its root, so the containment assertions below "
+        "prove nothing. Either the emit chain soft-failed earlier (check "
+        f"stderr: {proc.stderr[-2000:]}) or the KG_BASE_DIR pin in "
+        f"{hook_src} stopped taking effect."
+    )
+    assert fixture_ledger["UPDATE_DEFERRED.md"] != "MISSING", (
+        "the failure deferral was not written into the fixture project"
+    )
+
+    assert _repo_claude_md_sha() == before_claude_md, (
+        f"the shipped hook rewrote the tracked {REPO_CLAUDE_MD} — its child "
+        "resolved a project root of its own instead of the one the hook "
+        "already knew."
+    )
+    assert _ledger_state(REPO_ROOT) == before_ledger, (
+        f"the shipped hook wrote deferral-ledger artefacts into {REPO_ROOT}"
+        "/.claude/context/ instead of the project it was fired for. In the "
+        "field this is a user's UNRELATED project getting another project's "
+        "embedding-failure ledger."
     )

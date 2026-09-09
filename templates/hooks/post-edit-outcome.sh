@@ -113,6 +113,16 @@ VENV="${VCO_VENV_PYTHON:-}"
 if [ -n "$VENV" ] && [ -f "$VENV" ]; then
     "$VENV" -c "
 import os, json, sys, uuid
+# v0.2.94: pin the project root the hook already resolved for THIS child.
+# A rootless embedding_service._detect_project_root() falls through to
+# Path.cwd() (rule 4) and reconciles THAT directory's deferral ledger,
+# rewriting its CLAUDE.md -- in a detached child, cwd is whatever the
+# harness gave us, not the project. KG_BASE_DIR is rule 2 of the same
+# ladder and already means the project folder path; setdefault, so an
+# explicit VS Code / launcher value still wins.
+_vco_project_root = r'''$PROJECT_ROOT'''
+if _vco_project_root:
+    os.environ.setdefault('KG_BASE_DIR', _vco_project_root)
 # Mint our own task_id; offline trainer joins by (session_id, file_path, ts).
 task_id = f'edit_outcome_{uuid.uuid4().hex[:8]}'
 
