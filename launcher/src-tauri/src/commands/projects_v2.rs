@@ -1111,32 +1111,118 @@ pub(crate) async fn apply_post_bundle_steps(
     // embedding-MODEL or COLLECTION switch is handled by the dedicated
     // regenerate-embeddings / migration flow, NOT by a bundle update, so a
     // content-change gate is correct and sufficient here.
-    if !should_spawn_kg_sync_on_bundle(is_initial_create, kg_or_docs_content_changed) {
-        tracing::info!(
-            "[vct] kg-sync skipped for {} (bundle update touched no \
-             knowledge/** or docs/** content; on-disk KG/docs unchanged \
-             — nothing to re-embed)",
-            project_id
-        );
-    } else if let Err(e) = db.upsert_kg_sync(
-        project_id,
-        kg_sync_status::PENDING,
-        Some(now),
-        None,
-        None,
-        0, 0, 0,
-        0, 0, 0,
-        None,
-        None,
+    //
+    // v0.2.94: the content-change axis alone is not enough — see the v0.2.94
+    // block in `change_detect.rs` for the 8-project field evidence. The gate now
+    // also asks the STORE (a read-only `kg-sync --check-drift`) and the project's
+    // own `kg_syncs.status`, and distinguishes "confirmed nothing owed" from
+    // "could not check". The drift probe runs ONLY when the cheap legs left the
+    // decision open.
+    //
+    // The row is CLASSIFIED, never read raw: `running`/`pending` mean a live
+    // task owns this project (probing mid-sync would report the not-yet-written
+    // nodes as drift and queue a redundant second run), and a `running` row is
+    // only evidence of a live task while its liveness stamp is fresh — the same
+    // read-time guard `get_kg_sync_status` applies, via the same
+    // `heartbeat_is_stale` home, so an abandoned row does not block the repair
+    // for a sweeper interval.
+    let last_kg_sync = classify_last_kg_sync(
+        db.get_kg_sync(project_id).ok().flatten().as_ref(),
+        chrono::Utc::now().timestamp_millis(),
+        kg_sync::heartbeat_stale_secs(),
+    );
+    let drift = if kg_sync_needs_drift_probe(
+        is_initial_create,
+        kg_or_docs_content_changed,
+        &last_kg_sync,
     ) {
-        tracing::warn!("[vct] warning: could not queue kg-sync for {}: {}", project_id, e);
+        Some(
+            kg_sync::probe_kg_drift(&db, project_id, project_name, folder)
+                .await,
+        )
     } else {
-        kg_sync::spawn_initial_sync(
-            app.clone(),
-            project_id.to_string(),
-            project_name.to_string(),
-            folder_path_str.clone(),
+        None
+    };
+    let kg_decision = decide_kg_sync_on_bundle(
+        is_initial_create,
+        kg_or_docs_content_changed,
+        &last_kg_sync,
+        drift,
+    );
+    if let KgSyncDecision::SkipConfirmed { scanned } = &kg_decision {
+        tracing::info!(
+            "[vct] kg-sync skipped for {} — on-disk knowledge/docs unchanged \
+             AND Weaviate holds every node ({} checked, 0 missing, 0 stale)",
+            project_id,
+            scanned
         );
+    }
+    if let KgSyncDecision::SkipInFlight { status } = &kg_decision {
+        tracing::info!(
+            "[vct] kg-sync skipped for {} — a sync is already {} for this \
+             project; the drift probe was NOT run (a mid-sync probe reports \
+             not-yet-written nodes as missing) and no second run was queued",
+            project_id,
+            status
+        );
+    }
+    // NOT phrased as "nothing to re-embed" — we do not know that. And a log
+    // line alone would leave the user reading "update complete" with no hint
+    // that the one check which could have contradicted it never answered, so it
+    // goes in `warnings` (the toast surface) too. Which decisions owe a warning
+    // is decided in ONE place: `kg_sync_decision_warning`.
+    if let Some(msg) = kg_sync_decision_warning(&kg_decision) {
+        tracing::warn!("[vct] {} ({})", msg, project_id);
+        warnings.push(msg);
+    }
+    if let KgSyncDecision::Spawn(reason) = &kg_decision {
+        match reason {
+            KgSyncSpawnReason::DriftDetected { missing, stale, scanned } => tracing::info!(
+                "[vct] kg-sync spawned for {} — the bundle touched nothing on \
+                 disk, but Weaviate is missing/stale on {} of {} node(s) \
+                 ({} missing, {} stale). Content-hash gated: only those embed.",
+                project_id, missing + stale, scanned, missing, stale
+            ),
+            KgSyncSpawnReason::NeverSucceeded { last_status } => tracing::info!(
+                "[vct] kg-sync spawned for {} — its last recorded sync status \
+                 is '{}', so this project has never had a successful seed; \
+                 \"files unchanged\" is not a reason to skip it",
+                project_id, last_status
+            ),
+            KgSyncSpawnReason::ContentChanged => tracing::info!(
+                "[vct] kg-sync spawned for {} — the bundle update wrote \
+                 knowledge/** or docs/** content",
+                project_id
+            ),
+            KgSyncSpawnReason::InitialCreate => tracing::info!(
+                "[vct] kg-sync spawned for {} — first install", project_id
+            ),
+        }
+    }
+    if matches!(kg_decision, KgSyncDecision::Spawn(_)) {
+        // ONE spawn path for all four legs (create / content-changed /
+        // never-succeeded / drift) — a drift repair is the SAME hash-gated
+        // `kg-sync --all` a content change gets, never a forced re-embed.
+        if let Err(e) = db.upsert_kg_sync(
+            project_id,
+            kg_sync_status::PENDING,
+            Some(now),
+            None,
+            None,
+            0, 0, 0,
+            0, 0, 0,
+            None,
+            None,
+        ) {
+            tracing::warn!("[vct] warning: could not queue kg-sync for {}: {}", project_id, e);
+        } else {
+            kg_sync::spawn_initial_sync(
+                app.clone(),
+                project_id.to_string(),
+                project_name.to_string(),
+                folder_path_str.clone(),
+            );
+        }
     }
 
     // KG summary auto-backfill (v0.2.3 / 2026-05-12): kick off the
@@ -1281,8 +1367,7 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
     // module named 'weaviate'`. Prefer the RT-4 ladder venv; fall back to
     // system.python_cmd only when no venv resolves (then the JSON errors[]
     // surface as soft warnings, as before).
-    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
-        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
@@ -1706,7 +1791,17 @@ async fn run_install_bundle_core(
 
     let folder_str = folder.to_string_lossy().to_string();
     let templates_str = templates_root.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.94 — THE 2026-09-09 FIELD DEFECT. This spawn ran under
+    // `system.python_cmd`, a BARE PATH probe (`detect_python()` returns the
+    // string `"python3"`). `project_init` itself survived on `current_dir` =
+    // the orchestrator root, but `sys.executable` inside it was
+    // `/usr/bin/python3`, and every detached child the bundle update triggers
+    // (the code-graph resync driver, its prune/backfill/summary riders) inherited
+    // it and died on `ModuleNotFoundError: No module named 'vco_lib'`. The GUI
+    // said "code-graph re-index started in the background" for all 8 projects.
+    // The bundle path now walks the SAME ladder as every other vco_lib spawn.
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     // Base argv — byte-identical to both pre-refactor mirrors. The per-mode
     // flag (if any) is appended AFTER, so the create-default (`safe_add=false`)
     // argv is byte-identical to pre-v0.2.63 and the existing argv-shape parity
@@ -1852,7 +1947,10 @@ pub(crate) async fn run_install_bundle_update(
 // should_spawn_kg_sync_on_bundle) — the kg/docs re-embed gate — were
 // extracted verbatim to the `change_detect` submodule in v0.2.77 Part 7d.
 // The facade re-exports every symbol.
-mod change_detect;
+// v0.2.94: `pub(crate)` (was private) so `commands::kg_sync` can name
+// `DriftVerdict` — the drift PROBE lives with the other kg-sync subprocess
+// plumbing, while the DECISION it feeds stays here, pure and unit-tested.
+pub(crate) mod change_detect;
 pub(crate) use change_detect::*;
 
 /// Test-friendly seam: same as `run_install_bundle_update` but lets a
@@ -1994,8 +2092,7 @@ async fn build_migrate_command(
     // `ModuleNotFoundError: No module named 'weaviate'`. Same F3 pattern as
     // migrate-schema: fall back to system.python_cmd only when no venv
     // resolves (the caller then defers safely, never advances on failure).
-    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
-        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.arg("-m")
         .arg("vco_lib.project_init")
@@ -2443,7 +2540,11 @@ pub(crate) async fn run_node_formats_schema_check(
     };
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.94: the ONE ladder (`vco_lib_python_or`) — this probe imports
+    // `vco_lib` AND touches Weaviate, so a bare PATH python fails it for a
+    // reason that has nothing to do with the schema.
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -2584,8 +2685,7 @@ pub(crate) async fn run_schema_migration_check(
     // ($VCT_VENV → <root>/.venv → <root>/claude_mcp_servers/.venv → system);
     // falls back to system.python_cmd only when no venv resolves (the runner
     // then defers safely, as before — never advances on a failed edge).
-    let py_cmd: std::path::PathBuf = resolve_python_for_vco_lib_local()
-        .unwrap_or_else(|| std::path::PathBuf::from(&system.python_cmd));
+    let py_cmd: std::path::PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
@@ -3425,6 +3525,39 @@ fn apply_project_env_via_python(
 #[inline]
 fn resolve_python_for_vco_lib_local() -> Option<PathBuf> {
     vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+}
+
+/// v0.2.94: THE program for any `python -m vco_lib.*` spawn in this file.
+///
+/// `resolve_python_for_vco_lib_local().unwrap_or_else(|| PathBuf::from(&system
+/// .python_cmd))` had been written out SIX times here, and the three spawns
+/// that had NOT been converted to it were still running a bare
+/// `system.python_cmd`. One of those three was the bundle update — which is how
+/// the 2026-09-09 field defect happened: "Update all" ran
+/// `python -m vco_lib.project_init install-bundle --update` under
+/// `detect_python()`'s bare PATH probe (`python3`), `project_init` imported
+/// `vco_lib` only because its cwd is the orchestrator root, and every detached
+/// grandchild it spawned inherited `/usr/bin/python3` and died on
+/// `ModuleNotFoundError: No module named 'vco_lib'` in a log nobody reads.
+///
+/// **`system.python_cmd` is BOOTSTRAP python, not vco_lib python.** It is the
+/// right answer for the first-install flow, which must probe the machine BEFORE
+/// any venv exists (`installer.rs::detect_python`); it is the wrong answer for
+/// anything that imports our own package. That distinction is the reason this
+/// helper exists rather than each call-site "remembering" it.
+///
+/// The fallback tier is kept: when NO venv resolves anywhere on the ladder, a
+/// PATH python is still better than not spawning at all (the callers already
+/// surface the resulting failure as a soft warning) — and
+/// `resolve_python_for_vco_lib` itself already ends in that PATH tier with its
+/// documented warning, so this `unwrap_or_else` is reached only in the
+/// theoretically-impossible case.
+///
+/// Cross-language pin: the Python half of the same ladder is
+/// `vco_lib/python_exe.py` (see its module docstring).
+#[inline]
+pub(crate) fn vco_lib_python_or(fallback: &str) -> PathBuf {
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or(fallback)
 }
 
 /// Bug 23 + 30: write per-project env files for every Claude Code surface.
@@ -6042,8 +6175,7 @@ async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>
     // ladder venv over a PEP-668 system python that can't import weaviate;
     // fall back to system.python_cmd only when no venv resolves (then the
     // drop soft-fails with a warning, as before).
-    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
-        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
@@ -6498,8 +6630,7 @@ pub async fn probe_stale_derived_collections(
     let folder_str = folder.to_string_lossy().to_string();
     // v0.2.74 (Fable-review F3): venv python first — the edges/probes import
     // weaviate, which only lives in the venv (see run_schema_migration_check).
-    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
-        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
@@ -6637,8 +6768,7 @@ pub async fn apply_stale_derived_choice(
 
     // v0.2.74 (Fable-review F3): venv python first — migrate-schema imports
     // weaviate, which only lives in the venv (see run_schema_migration_check).
-    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
-        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
     let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     if choice == "regenerate" {
         cmd.args([
@@ -6795,7 +6925,10 @@ pub async fn perform_hard_cut(
          vct_root=Path(sys.argv[4]), project_id=(sys.argv[5] or None), stamp=sys.argv[6]); \
          print(json.dumps(r.to_dict()))"
     );
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.94: the ONE ladder — the snippet does `from vco_lib.hard_cut import
+    // hard_cut`, so it needs an interpreter that can actually import us.
+    let py_cmd: PathBuf = vco_lib_python_or(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-c",
         &snippet,
@@ -9602,6 +9735,93 @@ mod tests {
         assert!(
             envelope_kg_or_docs_content_changed(&envelope2),
             "overwrite under knowledge/ must trigger a content change"
+        );
+    }
+
+    // ── v0.2.94: the bundle spawn's PROGRAM (the 2026-09-09 field defect) ──
+    //
+    // `build_bundle_argv` pins the ARGUMENTS; nothing pinned the PROGRAM, and
+    // the program was the bug: `tokio::process::Command::new(&system.python_cmd)`
+    // with `system.python_cmd == "python3"` (a bare PATH probe from
+    // `installer::detect_python`, which exists to find a BOOTSTRAP python before
+    // any venv does). Everything the update then spawned inherited
+    // `/usr/bin/python3` and died on `import vco_lib`.
+
+    /// With `$VCT_INSTALL_ROOT` naming a clone that has a venv, the bundle
+    /// spawn's program is THAT venv's interpreter — never the bare `python3`
+    /// fallback, even though the fallback is what is passed in.
+    #[cfg(unix)]
+    #[test]
+    fn v0294_bundle_python_is_the_venv_not_a_bare_path_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "vct-bundlepy-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let bin = root.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Deliberately ONLY `python3` (no `bin/python`): a real `python -m venv`
+        // creates both, but the second rung of the per-layout probe is the one
+        // this exercises.
+        let py = bin.join("python3");
+        std::fs::write(&py, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&py).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&py, perms).unwrap();
+
+        let saved_venv = std::env::var_os("VCT_VENV");
+        let saved_root = std::env::var_os("VCT_INSTALL_ROOT");
+        unsafe {
+            std::env::remove_var("VCT_VENV");
+            std::env::set_var("VCT_INSTALL_ROOT", &root);
+        }
+        let got = vco_lib_python_or("python3");
+        unsafe {
+            if let Some(v) = saved_venv {
+                std::env::set_var("VCT_VENV", v);
+            }
+            match saved_root {
+                Some(v) => std::env::set_var("VCT_INSTALL_ROOT", v),
+                None => std::env::remove_var("VCT_INSTALL_ROOT"),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            got, py,
+            "the bundle spawn must use the orchestrator venv's interpreter; \
+             falling back to the bare PATH probe is the 2026-09-09 defect"
+        );
+        assert_ne!(
+            got,
+            std::path::PathBuf::from("python3"),
+            "a bare `python3` program is what killed all 8 detached children"
+        );
+    }
+
+    /// And the helper is what the bundle spawn actually calls — a resolver
+    /// nothing calls fixes nothing. Source-pinned because the spawn itself
+    /// needs a `SystemDetection` + a real subprocess to exercise.
+    #[test]
+    fn v0294_the_bundle_spawn_calls_the_resolver() {
+        let src = include_str!("projects_v2.rs");
+        let anchor = src
+            .find("let templates_str = templates_root.to_string_lossy().to_string();")
+            .expect("run_install_bundle_core's program setup moved — re-pin it");
+        let window = &src[anchor..anchor + 1400];
+        assert!(
+            window.contains("vco_lib_python_or(&system.python_cmd)"),
+            "the bundle spawn must resolve its interpreter through the ladder"
+        );
+        assert!(
+            window.contains("Command::new(&py_cmd)"),
+            "the resolved interpreter must be the program that is spawned"
+        );
+        assert!(
+            !window.contains("Command::new(&system.python_cmd)"),
+            "the bundle spawn must not run the bare bootstrap probe"
         );
     }
 

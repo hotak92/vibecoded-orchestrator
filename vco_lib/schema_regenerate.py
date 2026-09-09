@@ -382,8 +382,14 @@ def _regenerate_per_project_collection(
     .py:8488-8568). NO new drop path. We parse the JSON envelope to confirm the
     rebuild + re-ingest actually happened.
     """
+    # v0.2.94: the ONE resolver, not `sys.executable`. The regenerate flow is
+    # launcher-driven, and the launcher's bundle path spawns Python from a bare
+    # PATH probe; `migrate-collections` needs `weaviate` importable.
+    from vco_lib.python_exe import resolve_or_current
+
     cmd = [
-        sys.executable, "-m", "vco_lib.project_init", "migrate-collections",
+        resolve_or_current(install_root=orchestrator_root),
+        "-m", "vco_lib.project_init", "migrate-collections",
         "--name", project_name,
         "--force-rebuild",
         "--project-folder", str(folder),

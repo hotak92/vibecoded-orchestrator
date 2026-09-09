@@ -756,7 +756,7 @@ def test_spawn_launches_backfill_child(monkeypatch, tmp_path):
         lambda argv, **kw: (spawned.append(argv), _P())[1],
     )
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     backfill = [a for a in spawned if "--backfill-metadata" in a]

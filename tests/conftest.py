@@ -1057,7 +1057,50 @@ _RESYNC_SPAWN_OPT_OUT_FILES = frozenset({
     "test_v0272_pregate_audit_fixes.py",
     "test_v0283_embed_resync_selfclear_pin.py",
     "test_v0284_identity_sweep.py",
+    # v0.2.94: the spawn-seam guard. It asserts BOTH halves — that a healthy
+    # interpreter still reaches `launched` with a `-m` argv, and that a broken
+    # one is refused BEFORE any Popen — so the P5 kill-switch (which
+    # short-circuits to `skipped` ahead of both) must be off for it.
+    "test_v0294_python_exe_spawn_guard.py",
 })
+
+
+@pytest.fixture(autouse=True)
+def _seed_python_exe_preflight():
+    """v0.2.94: record, for the preflight memo, what THIS process already proved.
+
+    ``vco_lib.python_exe.preflight`` gates every real spawn on "can this
+    interpreter import ``vco_lib`` + ``weaviate``", and answers it by running a
+    fresh child. Two reasons that child must not run inside the suite:
+
+    * it is REDUNDANT for ``sys.executable`` — pytest already imported
+      ``vco_lib`` with this very interpreter, and ``weaviate-client`` is a
+      ``requirements.txt`` dependency of the same environment. The answer is
+      known before the probe starts;
+    * dozens of spawn tests monkeypatch ``subprocess.Popen`` module-wide, which
+      ``subprocess.run`` (and therefore the probe) would then walk into.
+
+    This is NOT a bypass of the guard. It seeds ONE fact about ONE interpreter;
+    any other interpreter — notably the deliberately-broken fakes in
+    ``tests/test_v0294_python_exe_spawn_guard.py`` — is probed for real, which is
+    what keeps the red-proof honest.
+
+    FUNCTION-scoped, not session-scoped: the two ``test_v0294_python_exe_*``
+    files clear the memo in their own ``setUp``/cleanup (they must, to measure
+    real verdicts), and a session-scoped seed would be wiped by the first of
+    them and absent for every later test in the run — green in isolation, red in
+    the full suite. Re-seeding per test costs one dict write.
+    """
+    from vco_lib import python_exe as _px
+
+    _px._PREFLIGHT_CACHE[
+        (
+            sys.executable,
+            _px.DEFAULT_REQUIRED_MODULES,
+            _px._preflight_env_fingerprint(),
+        )
+    ] = (True, "")
+    yield
 
 
 @pytest.fixture(autouse=True)

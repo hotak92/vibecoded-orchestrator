@@ -881,6 +881,29 @@ this row) — claiming a retry without a wired handler would tell the \
 reader "this resolves itself" when nothing does, which is worse than the \
 silent-drift gap this condition exists to close."""
 
+[conditions.kg_node_formats_refresh_failed]
+class = "auto_retryable"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.94 (field report 2026-09-09). The post-`--all` \
+`.node_formats.json` refresh looked for the generator under the SYNCED \
+project's own `claude_mcp_servers/scripts/` — a directory that exists only in \
+the orchestrator clone — so every USER project fell through to the per-edit \
+`.claude/scripts/generate-kg-summary.py --all`, whose argparse takes a FILE \
+and therefore exits 2. Result: no non-root project had ever had its summary \
+sidecar refreshed after a bulk sync, and the only trace was one stderr line \
+`(node-format refresh exited 2; summaries left as-is — non-fatal)`. The fix \
+runs the ROOT generator with `--knowledge-dir <project>/knowledge` — one \
+component, identical for root and non-root — and this condition is what stops \
+the remaining failure modes (no clone reachable, generator non-zero, 600 s \
+cap) from being invisible again. `retry_action` reuses the EXISTING \
+`retry:py:kg_seed` handler rather than declaring a new one: that handler \
+re-runs `sync_knowledge_graph.py --all`, which re-runs this refresh — the \
+retry is real and already wired, so no HANDLERS edit is claimed. Cleared by \
+the paired `_clear_node_formats_deferral` on a refresh that exits 0."""
+
 [conditions.kg_binding_missing]
 class = "action_required"
 owner = "vco_lib.kg_sync_drift"

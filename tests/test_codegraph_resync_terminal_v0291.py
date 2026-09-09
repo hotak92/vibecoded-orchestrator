@@ -526,7 +526,7 @@ def test_spawn_forwards_log_path_to_driver(monkeypatch, tmp_path):
         lambda argv, **kw: (spawned.append(argv), _FakeProc())[1],
     )
     result = cr.spawn_background_resync(
-        repo, "MyProj", python_exe="/usr/bin/python3"
+        repo, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     driver = [a for a in spawned if "--run-resync" in a][0]

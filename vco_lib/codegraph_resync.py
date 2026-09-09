@@ -64,6 +64,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+# v0.2.94: THE resolver for "which interpreter can run our own code". A hard
+# import, never a guarded one — `vco_lib` importing `vco_lib` is the definition
+# of a healthy install, and a fallback here would re-create the exact silent
+# degrade this module was fixed to stop doing.
+from vco_lib import python_exe as _python_exe
+
 if TYPE_CHECKING:  # real type for annotations; runtime import is the guarded one below
     from vco_lib.deferral_report import DeferralEntry as _DeferralEntryT
 
@@ -1876,6 +1882,12 @@ class ResyncTriggerResult:
                             for the caller to record. Nothing was spawned.
       * ``"skipped"``    — a precondition wasn't met (analyzer/python missing,
                             no project name). Soft no-op; ``message`` explains.
+      * ``"failed"``     — v0.2.94: the resolved interpreter cannot import what
+                            the detached child needs (``vco_lib`` / ``weaviate``),
+                            so NOTHING was spawned. Distinct from ``skipped``
+                            because it is a BROKEN install, not a precondition
+                            we chose not to meet — the caller surfaces it as a
+                            warning rather than folding it into "ok".
       * ``"not_owed"``   — R-6 (v0.2.73): the owed-probe POSITIVELY confirmed
                             zero stale rows — no work owed, nothing spawned.
                             The caller may resolve a pending
@@ -2191,12 +2203,35 @@ def _hub_post_codegraph_build(project_name: str, payload: dict,
 
     root = vct_root_dir()
     port_raw = os.environ.get("VCT_HUB_PORT") or ""
-    if not port_raw:
+    if port_raw:
         try:
-            port_raw = (root / "hub.port").read_text(encoding="utf-8").strip()
-        except Exception:  # noqa: BLE001
-            port_raw = ""
-    port = int(port_raw) if port_raw else 7700
+            port = int(port_raw.strip())
+        except ValueError:
+            port = 7700
+    else:
+        # ONE reader for "the integer in a small state file" — first line,
+        # trimmed, bounds-checked. This module previously parsed the WHOLE file
+        # as an int, so a `hub.port` with any trailing line raised where a
+        # sibling reader answered. `vco_lib.intfile` lands with the gateway lane
+        # (v0.2.94); until it merges, the import is local so this module still
+        # loads in a tree without it (the 7700 fallback is unchanged either way).
+        port = 7700
+        try:
+            # pyright: ignore[reportMissingImports] — `vco_lib.intfile` is
+            # authored by the v0.2.94 GATEWAY lane and does not exist in THIS
+            # worktree yet; the module (and this line) resolve at merge. DELETE
+            # this ignore then: an unresolved import that stays suppressed after
+            # its module lands is how a real missing import hides.
+            from vco_lib.intfile import read_int_line  # pyright: ignore[reportMissingImports]
+        except ImportError:  # pragma: no cover — pre-merge tree only
+            try:
+                port = int((root / "hub.port").read_text(encoding="utf-8").strip())
+            except Exception:  # noqa: BLE001
+                port = 7700
+        else:
+            port = read_int_line(
+                root / "hub.port", sentinel=7700, minimum=1, maximum=65535,
+            )
     token = os.environ.get("VCT_HUB_TOKEN") or ""
     if not token:
         token = (root / "hub.token").read_text(encoding="utf-8").strip()
@@ -2537,8 +2572,14 @@ def run_resync_and_verify(
         print(f"[resync-driver] pre-walk probe raised: {exc}", flush=True)
         pre_counts = None
 
+    # v0.2.94: the ONE resolver, not `sys.executable`. This process was itself
+    # spawned with a preflighted venv python by `spawn_background_resync`, so
+    # `sys.executable` is normally already right — but `--run-resync` is also a
+    # documented MANUAL entry point, and "normally already right" is what the
+    # 2026-09-09 defect was made of. `resolve_or_current` prefers the ladder and
+    # falls back to this interpreter, so it can only ever improve the answer.
     argv = [
-        sys.executable, str(analyzer_path), str(repo_root),
+        _python_exe.resolve_or_current(), str(analyzer_path), str(repo_root),
         "--project", project_name,
     ]
     if prune_stale:
@@ -2832,6 +2873,51 @@ def identity_sweep_if_stale(
     return moved_deduped
 
 
+def _write_spawn_header(
+    log_handle,
+    *,
+    project_name: Optional[str] = None,
+    python_exe: Optional[str] = None,
+    cwd: Optional[object] = None,
+    argv: Optional[list] = None,
+) -> None:
+    """Write the per-spawn log header — the ONE home for those lines (v0.2.94).
+
+    Called twice per spawn because the argv is not final until the `--log-path`
+    flag has been appended, and the file must be open before that: once with the
+    identity block (project / timestamp / interpreter / cwd), once with the
+    executed argv. Passing only the parts you have keeps that a single writer
+    rather than two inline copies drifting apart.
+
+    Why these lines exist: the 2026-09-09 incident was diagnosable only by
+    re-deriving the spawn chain from source, because the log recorded the
+    child's OUTPUT and nothing about how it was started. One line naming the
+    interpreter would have ended it immediately.
+
+    RAISES on a write failure — deliberately. The FIRST call is what proves the
+    freshly-opened handle is usable, and its caller's ``except`` is the existing
+    degrade-to-DEVNULL path (v0.2.73 R-5); swallowing here would keep a handle
+    the children then inherit and cannot write to. The second call, whose
+    failure is merely cosmetic, catches for itself.
+    """
+    parts: list[str] = []
+    if project_name is not None:
+        parts.append(
+            f"# codegraph resync for {project_name} — spawned "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+        )
+    if python_exe is not None:
+        parts.append(f"# interpreter: {python_exe}\n")
+    if cwd is not None:
+        parts.append(f"# cwd: {cwd}\n")
+    if argv is not None:
+        parts.append("# argv: " + " ".join(shlex.quote(a) for a in argv) + "\n")
+    if not parts:
+        return
+    log_handle.write("".join(parts).encode())
+    log_handle.flush()
+
+
 def spawn_background_resync(
     repo_root: Path,
     project_name: str,
@@ -2895,11 +2981,28 @@ def spawn_background_resync(
             message=f"analyze_code_graph.py not found under {repo_root}",
         )
 
-    py = python_exe or sys.executable
-    if not py:
-        return ResyncTriggerResult(
-            status="skipped", message="no python interpreter resolved"
-        )
+    # v0.2.94: the interpreter comes from the ONE resolver, never from
+    # `sys.executable`. THE FIELD DEFECT (2026-09-09): the launcher spawns the
+    # bundle update with a bare PATH `python3`, so `sys.executable` inside
+    # `project_init` was `/usr/bin/python3`; every detached child here inherited
+    # it and died with `ModuleNotFoundError: No module named 'vco_lib'` in a log
+    # nobody reads, while this function returned "launched".
+    if python_exe:
+        py: str = str(python_exe)
+    else:
+        resolved = _python_exe.resolve_vco_lib_python_or_none()
+        if resolved is None:
+            return ResyncTriggerResult(
+                status="failed",
+                message=(
+                    "no Python interpreter able to import vco_lib + weaviate "
+                    "was found — the orchestrator venv is missing or broken; "
+                    "re-run `python install.py --update` from the orchestrator "
+                    "root. NOT spawning a background walk that would only die "
+                    "in a log file."
+                ),
+            )
+        py = str(resolved)
 
     # R-5 rider (A-1): shlex-quote every part — the command lands verbatim in
     # UPDATE_DEFERRED.md and must survive paths containing spaces.
@@ -2996,8 +3099,37 @@ def spawn_background_resync(
     # Prune is only ever safe from a FULL walk that visits every current
     # file; CG-4 orphan cleanup is handled by the F9 ignore-prune child and
     # the GUI-triggered full rebuild, NOT by this selective re-embed resync.
+    # LOUD FAILURE AT THE SPAWN SEAM (v0.2.94). Everything above could still
+    # decline for a legitimate reason (nothing owed, service down) — this is
+    # the last gate before a REAL detached child, and the only place that
+    # proves the chosen interpreter can import what that child needs. The
+    # resolver accepts a venv on EXISTENCE (cheap, and matching the Rust
+    # mirror); a venv that exists but is broken only shows up here.
+    #
+    # "started in the background" must never be printed for a child that cannot
+    # import its own package — printing it anyway is precisely why the
+    # 2026-09-09 defect survived two releases. Cached per interpreter per
+    # process, so an 8-project "Update all" pays for one probe.
+    _pf_ok, _pf_detail = _python_exe.preflight(py)
+    if not _pf_ok:
+        return ResyncTriggerResult(
+            status="failed",
+            message=(
+                f"background code-graph resync NOT started for {project_name}: "
+                f"{_pf_detail}. The detached analyzer would have died on import "
+                f"(this is what the empty ~1 KB resync logs were). Fix the "
+                f"install — `python install.py --update` from the orchestrator "
+                f"root — then re-run the bundle update."
+            ),
+        )
+
+    # ``-m vco_lib.codegraph_resync``, NOT ``str(Path(__file__).resolve())``
+    # (v0.2.94). A FILE path makes the child's `import vco_lib` depend on its
+    # cwd, and the cwd here is the USER PROJECT — so the child could only ever
+    # import `vco_lib` by accident. `-m` resolves the package through the
+    # interpreter's own environment, which is the thing we just preflighted.
     argv = [
-        py, str(Path(__file__).resolve()), "--run-resync",
+        py, "-m", "vco_lib.codegraph_resync", "--run-resync",
         "--project", project_name,
         "--repo-root", str(repo_root),
         "--analyzer", str(analyzer),
@@ -3025,13 +3157,21 @@ def spawn_background_resync(
     if log_path is not None:
         try:
             log_handle = open(log_path, "ab")
-            log_handle.write(
-                f"# codegraph resync for {project_name} — spawned "
-                f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode()
+            _write_spawn_header(
+                log_handle, project_name=project_name, python_exe=py,
+                cwd=repo_root,
             )
-            log_handle.flush()
         except Exception as exc:  # noqa: BLE001
             logger.warning("codegraph resync: cannot open log file: %s", exc)
+            # v0.2.94: the header write can fail on an ALREADY-OPEN handle (the
+            # degrade this except exists for), and dropping the reference is not
+            # closing it — the fd would leak until GC, in a function whose whole
+            # discipline is that the parent owns nothing after the spawn.
+            if log_handle is not None:
+                try:
+                    log_handle.close()
+                except OSError:
+                    pass
             log_handle = None
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
     popen_kwargs = {
@@ -3051,14 +3191,22 @@ def spawn_background_resync(
     if log_handle is not None and log_path is not None:
         argv += ["--log-path", str(log_path)]
 
+    # v0.2.94: the FINAL driver argv, appended to the header AFTER the
+    # `--log-path` push so what is recorded is what is executed.
+    if log_handle is not None:
+        try:
+            _write_spawn_header(log_handle, argv=argv)
+        except Exception as exc:  # noqa: BLE001 — a header line never blocks a spawn
+            logger.debug("codegraph resync: argv header not written: %s", exc)
+
     # F9: spawn the ignore-set prune as a SECOND detached child (this module
-    # run as a script — see the __main__ handler). Background, soft-fail:
+    # run as `-m`; see the __main__ handler). Background, soft-fail:
     # a prune spawn failure never blocks the resync itself. Rows it deletes
     # are regenerable derived data; the concurrent analyzer never re-writes
     # them (its walkers skip the same ignore set).
     try:
         prune_argv = [
-            py, str(Path(__file__).resolve()),
+            py, "-m", "vco_lib.codegraph_resync",
             "--prune-ignored", "--project", project_name,
         ]
         if index_dot_claude:
@@ -3076,7 +3224,7 @@ def spawn_background_resync(
     # idempotent; a spawn failure never blocks the resync itself.
     try:
         backfill_argv = [
-            py, str(Path(__file__).resolve()),
+            py, "-m", "vco_lib.codegraph_resync",
             "--backfill-metadata", "--project", project_name,
         ]
         # Handle kept alive — see _DETACHED_CHILDREN.

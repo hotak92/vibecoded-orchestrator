@@ -1039,7 +1039,7 @@ def test_f9_prune_spawned_by_background_resync(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mod.subprocess, "Popen",
                         lambda argv, **kw: spawned.append(argv) or _P())
-    result = mod.spawn_background_resync(tmp_path, "TProj", python_exe="python3")
+    result = mod.spawn_background_resync(tmp_path, "TProj", python_exe=sys.executable)
     assert result.status == "launched"
     # v0.2.73: prune child + metadata-backfill child + resync driver child.
     assert len(spawned) == 3, "prune + backfill + driver children"

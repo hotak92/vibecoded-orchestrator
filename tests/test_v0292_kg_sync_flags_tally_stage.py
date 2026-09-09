@@ -48,6 +48,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import shutil
 import stat
@@ -482,6 +483,154 @@ class TallyAndDetailsTests(_SyncTestBase):
             "summary lines precede the details block",
         )
 
+    def test_a_clean_all_retires_the_drift_entry_check_drift_wrote(self):
+        """R6/2: the automatic repair must not leave the user an action item.
+
+        `--check-drift` is read-only against WEAVIATE but it WRITES the project
+        ledger — that is how a finding reaches the user. Now that the launcher's
+        bundle-update gate runs the scan automatically and spawns `--all` when
+        it reports drift, the finding and its repair land on the SAME update; if
+        only a later clean scan could clear it, every repaired project would
+        keep an `action_required` entry saying "run `kg-sync --all`" for the run
+        that had just happened.
+
+        A zero-failure `--all` is the paired proof: it wrote every node the scan
+        named.
+        """
+        from vco_lib.deferral_emit import DeferralEntry, emit
+        from vco_lib.kg_sync_drift import CID_DRIFT
+
+        self._fixture()
+        emit(
+            self.root,
+            DeferralEntry(
+                condition_id=CID_DRIFT,
+                title="KG nodes on disk are missing from Weaviate",
+                detected="67 missing, 5 stale out of 78 checked",
+                why_deferred="detected by a read-only scan",
+                command_to_apply="python .claude/scripts/kg-sync --all",
+                severity="warning",
+            ),
+        )
+        ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertIn(CID_DRIFT, ledger.read_text(encoding="utf-8"),
+                      "fixture sanity: the entry must exist before the sync")
+
+        mod = self.load()
+        self.install_working_backends(mod)
+        code, _out, err = self.run_main(mod, ["kg-sync", "--all"])
+        self.assertEqual(code, 0, f"stderr:\n{err}")
+        self.assertNotIn(
+            CID_DRIFT,
+            ledger.read_text(encoding="utf-8") if ledger.exists() else "",
+            "a fully successful --all must retire the drift entry it repaired",
+        )
+
+    def test_an_all_that_walked_no_knowledge_nodes_does_not_retire_drift(self):
+        """R7/2: zero FAILURES is not the same as "wrote every node there is".
+
+        `total_fail` sums KG **and** docs failures, so a project with a
+        populated `docs/` and an EMPTY `knowledge/` reaches zero failures having
+        considered zero knowledge nodes. Retiring the drift entry there would
+        claim proof about nodes the run never looked at.
+        """
+        from vco_lib.deferral_emit import DeferralEntry, emit
+        from vco_lib.kg_sync_drift import CID_DRIFT
+
+        # knowledge/ exists (created by setUp) but is EMPTY; docs/ has content.
+        docs = self.root / "docs"
+        docs.mkdir()
+        (docs / "guide.md").write_text("# Guide\n\nbody\n", encoding="utf-8")
+        emit(
+            self.root,
+            DeferralEntry(
+                condition_id=CID_DRIFT,
+                title="KG nodes on disk are missing from Weaviate",
+                detected="12 missing out of 12 checked",
+                why_deferred="detected by a read-only scan",
+                command_to_apply="python .claude/scripts/kg-sync --all",
+                severity="warning",
+            ),
+        )
+        mod = self.load(dev="TestDev")
+        self.install_working_backends(mod)
+        code, out, err = self.run_main(mod, ["kg-sync", "--all"])
+        self.assertEqual(code, 0, f"stderr:\n{err}")
+        self.assertIn("📊 KG:   0 succeeded, 0 failed, 0 skipped", out)
+        ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertIn(
+            CID_DRIFT, ledger.read_text(encoding="utf-8"),
+            "a run that walked no knowledge nodes must NOT retire a drift "
+            "entry about knowledge nodes",
+        )
+
+    def test_a_project_with_no_knowledge_tree_at_all_does_retire_drift(self):
+        """...but with NO `knowledge/` there is nothing a drift entry could
+        still be true about, so a stale one is safe to retire."""
+        from vco_lib.deferral_emit import DeferralEntry, emit
+        from vco_lib.kg_sync_drift import CID_DRIFT
+
+        (self.root / "knowledge").rmdir()  # created by setUp
+        docs = self.root / "docs"
+        docs.mkdir()
+        (docs / "guide.md").write_text("# Guide\n\nbody\n", encoding="utf-8")
+        emit(
+            self.root,
+            DeferralEntry(
+                condition_id=CID_DRIFT,
+                title="KG nodes on disk are missing from Weaviate",
+                detected="stale entry from a previous layout",
+                why_deferred="detected by a read-only scan",
+                command_to_apply="python .claude/scripts/kg-sync --all",
+                severity="warning",
+            ),
+        )
+        mod = self.load(dev="TestDev")
+        self.install_working_backends(mod)
+        code, _out, err = self.run_main(mod, ["kg-sync", "--all"])
+        self.assertEqual(code, 0, f"stderr:\n{err}")
+        ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertNotIn(
+            CID_DRIFT,
+            ledger.read_text(encoding="utf-8") if ledger.exists() else "",
+        )
+
+    def test_a_failing_all_does_not_retire_the_drift_entry(self):
+        """The narrow-clear rule (decision #12): a PARTIAL run proves nothing.
+
+        Only a run with zero per-node failures may claim the named nodes landed.
+        """
+        from vco_lib.deferral_emit import DeferralEntry, emit
+        from vco_lib.kg_sync_drift import CID_DRIFT
+
+        self._fixture()
+        emit(
+            self.root,
+            DeferralEntry(
+                condition_id=CID_DRIFT,
+                title="KG nodes on disk are missing from Weaviate",
+                detected="1 missing out of 1 checked",
+                why_deferred="detected by a read-only scan",
+                command_to_apply="python .claude/scripts/kg-sync --all",
+                severity="warning",
+            ),
+        )
+        mod = self.load()
+        harness = self.install_working_backends(mod)
+        # Make every node write fail → total_fail > 0.
+        mod.sync_node = lambda _srv, path: mod.SyncOutcome(
+            mod.OUTCOME_FAILED, mod.to_posix_rel(path), "forced failure",
+        )
+        code, _out, _err = self.run_main(mod, ["kg-sync", "--all"])
+        self.assertNotEqual(code, 0, "a failing tree sync must not exit 0")
+        self.assertIsNotNone(harness.last)
+        ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertIn(
+            CID_DRIFT, ledger.read_text(encoding="utf-8"),
+            "a partial run must NOT retire the drift entry — the nodes it "
+            "named are not proven to have landed",
+        )
+
     def test_details_log_written_under_vct_state_dir(self):
         self._fixture()
         mod = self.load()
@@ -536,30 +685,46 @@ class FinalizeStageMarkerTests(_SyncTestBase):
             "the marker must be printed before the regen subprocess starts",
         )
 
-    def _stub_generator(self, *, exit_code: int = 0) -> Path:
-        gen = self.root / ".claude" / "scripts" / "generate-kg-summary.py"
-        gen.parent.mkdir(parents=True, exist_ok=True)
-        sentinel = self.root / "regen-ran.sentinel"
-        if exit_code == 0:
-            gen.write_text(
-                "#!/usr/bin/env python3\n"
-                "from pathlib import Path\n"
-                f"Path({str(sentinel)!r}).write_text('ran')\n",
-                encoding="utf-8",
-            )
-        else:
-            gen.write_text(
-                "#!/usr/bin/env python3\n"
-                "import sys\n"
-                f"sys.exit({exit_code})\n",
-                encoding="utf-8",
-            )
-        return sentinel
+    def _stub_root_generator(self, *, exit_code: int = 0) -> tuple[Path, Path]:
+        """Plant a fake ORCHESTRATOR CLONE holding the real generator's path.
 
-    def test_marker_emitted_and_stub_generator_invoked(self):
-        # A stub summary generator exists → the REAL regen path prints the
-        # marker and runs the stub; the run still exits 0.
-        sentinel = self._stub_generator(exit_code=0)
+        v0.2.94: the refresh no longer looks inside the SYNCED project — that
+        was the bug (``claude_mcp_servers/scripts/`` exists only in the clone,
+        so every user project fell through to the per-edit generator, which
+        exits 2 on ``--all``). It resolves the clone through
+        ``vco_lib.python_exe.resolve_install_root`` and runs the clone's
+        ``generate_node_formats.py`` with ``--knowledge-dir``. The fake clone
+        here is a NON-ROOT layout: it is a different directory from the project
+        being synced, which is the case that never worked.
+
+        Returns ``(argv_record, install_root)``. The stub writes its own argv to
+        ``argv_record`` so the test can prove WHICH generator ran and with what.
+        """
+        install_root = self.root / "orchestrator-clone"
+        # `looks_like_orchestrator_root` wants vco_lib/ + .claude/.
+        (install_root / "vco_lib").mkdir(parents=True, exist_ok=True)
+        (install_root / ".claude").mkdir(parents=True, exist_ok=True)
+        gen = install_root / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
+        gen.parent.mkdir(parents=True, exist_ok=True)
+        argv_record = self.root / "regen-argv.json"
+        gen.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"Path({str(argv_record)!r}).write_text(json.dumps(sys.argv))\n"
+            f"sys.exit({exit_code})\n",
+            encoding="utf-8",
+        )
+        os.environ["VCT_INSTALL_ROOT"] = str(install_root)
+        self.addCleanup(os.environ.pop, "VCT_INSTALL_ROOT", None)
+        return argv_record, install_root
+
+    def test_marker_emitted_and_root_generator_invoked_for_a_non_root_project(self):
+        # A non-root project: the generator lives in the CLONE, the knowledge
+        # tree lives here. The marker prints and the CLONE's generator runs,
+        # pointed at THIS project's knowledge/ — the invocation that is
+        # identical for root and non-root.
+        argv_record, install_root = self._stub_root_generator(exit_code=0)
         _write_node(self.root / "knowledge" / "concepts" / "active.md", "Active")
         mod = self.load()
         self.install_working_backends(mod)
@@ -570,10 +735,28 @@ class FinalizeStageMarkerTests(_SyncTestBase):
             "📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...",
             out,
         )
-        self.assertTrue(sentinel.exists(), "the regen generator was invoked")
+        self.assertTrue(argv_record.exists(), "the ROOT generator was invoked")
+        argv = json.loads(argv_record.read_text(encoding="utf-8"))
+        self.assertTrue(
+            argv[0].endswith("generate_node_formats.py"),
+            f"the CLONE's generator must be the one that runs, got {argv[0]!r}",
+        )
+        self.assertIn(str(install_root), argv[0],
+                      "resolved from the orchestrator clone, not the project")
+        self.assertIn("--all", argv)
+        self.assertIn("--knowledge-dir", argv)
+        self.assertEqual(
+            argv[argv.index("--knowledge-dir") + 1],
+            str(self.root / "knowledge"),
+            "the SYNCED project's knowledge/ is the target",
+        )
+        # Standing rule: never regenerate content that is already current.
+        for forbidden in ("--force", "--rechunk", "--recreate"):
+            self.assertNotIn(forbidden, argv,
+                             f"the automatic path must never pass {forbidden}")
 
-    def test_regen_failure_is_non_fatal(self):
-        self._stub_generator(exit_code=3)
+    def test_regen_failure_is_non_fatal_and_lands_in_the_ledger(self):
+        self._stub_root_generator(exit_code=3)
         _write_node(self.root / "knowledge" / "concepts" / "active.md", "Active")
         mod = self.load()
         self.install_working_backends(mod)
@@ -581,6 +764,32 @@ class FinalizeStageMarkerTests(_SyncTestBase):
         code, _out, err = self.run_main(mod, ["kg-sync", "--all"])
         self.assertEqual(code, 0, "a failed summary regen never fails the sync")
         self.assertIn("node-format refresh exited 3", err)
+        # v0.2.94: a non-zero exit is no longer ONE stderr line nobody reads.
+        ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertTrue(ledger.is_file(),
+                        "a failed refresh must be recorded as owed work")
+        self.assertIn("kg_node_formats_refresh_failed",
+                      ledger.read_text(encoding="utf-8"))
+
+    def test_no_reachable_clone_is_recorded_rather_than_skipped_silently(self):
+        # No VCT_INSTALL_ROOT and no clone above the tmp project → the refresh
+        # cannot run. Pre-v0.2.94 this `return`ed silently.
+        os.environ["VCT_INSTALL_ROOT"] = str(self.root / "not-a-clone")
+        self.addCleanup(os.environ.pop, "VCT_INSTALL_ROOT", None)
+        _write_node(self.root / "knowledge" / "concepts" / "active.md", "Active")
+        mod = self.load()
+        self.install_working_backends(mod)
+        real = self.real_regen
+        # Pin the resolver to "nothing found" so the developer's own checkout
+        # (which IS a clone, two levels up) cannot answer for the test.
+        with mock.patch("vco_lib.python_exe.resolve_install_root", return_value=None):
+            mod._regen_node_formats_after_full_sync = real
+            code, _out, _err = self.run_main(mod, ["kg-sync", "--all"])
+        self.assertEqual(code, 0)
+        ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertTrue(ledger.is_file())
+        self.assertIn("kg_node_formats_refresh_failed",
+                      ledger.read_text(encoding="utf-8"))
 
 
 # ─── 4. Canonical POSIX file_path (D13) ─────────────────────────────────

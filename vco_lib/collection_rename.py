@@ -1048,11 +1048,13 @@ def _reproject_env(plan: RenamePlan, *,
     rather than composing a second one.
     """
     import subprocess
-    import sys as _sys
 
     from vco_lib.project_move import build_child_env
+    from vco_lib.python_exe import resolve_or_current
 
-    argv = [_sys.executable, "-m", "vco_lib.config_projection", "apply",
+    # v0.2.94: the ONE resolver, not `sys.executable` — a rename can be driven
+    # from the launcher, whose bundle path spawns Python via a bare PATH probe.
+    argv = [resolve_or_current(), "-m", "vco_lib.config_projection", "apply",
             "--project-id", plan.project_id, "--folder", plan.folder]
     env = build_child_env({"CLAUDE_PROJECT_DIR": plan.folder,
                            "KG_BASE_DIR": plan.folder})

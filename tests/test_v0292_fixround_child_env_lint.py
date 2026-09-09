@@ -57,6 +57,13 @@ _ALLOWLIST: dict[str, int] = {
     # importable. `child_env()` would pin the checkout onto the child's path
     # and the test would stop measuring the thing it exists to measure.
     "tests/test_v0292_code_embed_image_rebuild.py": 1,
+    # DELIBERATELY UNPINNED (v0.2.94): the child is `python -m venv
+    # --without-pip`, building the FIXTURE for the interpreter red-proof — an
+    # interpreter that genuinely cannot import `vco_lib` / `weaviate`, which is
+    # the whole property under test. `child_env()` pins the checkout onto the
+    # child's path, which is precisely the state the fixture must NOT be in.
+    # Reason recorded at the call site.
+    "tests/test_v0294_python_exe_resolver.py": 1,
     "tests/test_codegraph_cli_readpath_v0270.py": 2,
     "tests/test_codegraph_naming.py": 1,
     "tests/test_detached_children_no_resourcewarning.py": 1,

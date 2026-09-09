@@ -13629,6 +13629,15 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                 if sync_script.is_file():
                     import subprocess  # local import — module convention
 
+                    from vco_lib.python_exe import resolve_or_current
+
+                    # v0.2.94: the ONE resolver, not `sys.executable`. When the
+                    # LAUNCHER runs this CLI it spawns it with a bare PATH
+                    # `python3` (projects_v2's bundle path), so `sys.executable`
+                    # here is a system interpreter with no `weaviate` — and the
+                    # re-ingest this recovery contract promises would die on
+                    # import, leaving the KG empty after a rebuild.
+                    sync_py = resolve_or_current()
                     sync_env = dict(os.environ)
                     if args.weaviate_url:
                         sync_env["WEAVIATE_URL"] = args.weaviate_url
@@ -13639,7 +13648,7 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                     )
                     try:
                         proc = subprocess.run(
-                            [sys.executable, str(sync_script), "--all"],
+                            [sync_py, str(sync_script), "--all"],
                             cwd=str(folder),
                             env=sync_env,
                             timeout=900,
@@ -15182,7 +15191,13 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
         return (False, "no knowledge/**/*.md nodes to regenerate from")
     formats_path = knowledge_dir / ".node_formats.json"
     before_hash = _file_sha256(formats_path) if formats_path.exists() else ""
-    py = sys.executable or "python3"
+    # v0.2.94: the ONE resolver. Under the launcher's bundle path
+    # `sys.executable` is a bare-PATH system python (the 2026-09-09 defect), and
+    # `generate-kg-summary.py` imports `vco_lib` for its backend selection —
+    # every node would "fail" for a reason that has nothing to do with summaries.
+    from vco_lib.python_exe import resolve_or_current
+
+    py = resolve_or_current()
     failures = 0
     for node in nodes:
         try:

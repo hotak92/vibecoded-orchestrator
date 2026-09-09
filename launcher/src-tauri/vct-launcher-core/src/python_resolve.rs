@@ -37,6 +37,25 @@
 //! This module is pure `std` (no tauri, no tokio) so it lives in
 //! `vct-launcher-core` and is shared by both the launcher GUI binary and any
 //! other consumer without dragging heavy deps.
+//!
+//! ## Cross-language pin (v0.2.94)
+//!
+//! **MUST MATCH `vco_lib/python_exe.py`** — the Python half of this same
+//! ladder. It is a C-tier mirror and justified as one: this side has to find a
+//! Python interpreter BEFORE it can ask Python anything, which is the single
+//! shape A-tier (call the one implementation via a subprocess) cannot cover.
+//! Only the DATA is duplicated — the env-var names, the venv layouts, and the
+//! interpreter file names below — and
+//! `tests/test_v0294_python_exe_parity.py` extracts all three from THIS FILE
+//! and asserts them against the Python constants, so the two cannot drift.
+//!
+//! The 2026-09-09 field defect is why the pin exists: the launcher's bundle
+//! path was NOT using this ladder (it spawned `python -m vco_lib.project_init
+//! install-bundle --update` under `detect_system()`'s bare PATH probe), so
+//! every detached child of that update died on `ModuleNotFoundError: No module
+//! named 'vco_lib'`. `system.python_cmd` is BOOTSTRAP python — correct for the
+//! first-install flow, which runs before any venv exists — and is never the
+//! answer for a process that imports our own package.
 
 use std::path::{Path, PathBuf};
 
@@ -95,6 +114,19 @@ fn venv_in(root: &Path) -> Option<PathBuf> {
 /// callers that previously treated `None` as "no python" keep working.
 pub fn resolve_python_for_vco_lib_str() -> Option<String> {
     resolve_python_for_vco_lib().map(|p| p.to_string_lossy().to_string())
+}
+
+/// v0.2.94: THE program for a `python -m vco_lib.*` spawn, with the caller's
+/// own last-resort fallback (in the launcher: `system.python_cmd`).
+///
+/// One home for the `resolve_python_for_vco_lib().unwrap_or_else(|| PathBuf::
+/// from(&system.python_cmd))` idiom, which had been written out six times in
+/// `commands/projects_v2.rs` alone — while three OTHER spawns in the same file
+/// (the bundle update among them) still used the bare fallback directly. That
+/// asymmetry is the 2026-09-09 field defect: a convention that must be
+/// REMEMBERED at each call-site is a convention some call-site will forget.
+pub fn resolve_python_for_vco_lib_or(fallback: &str) -> PathBuf {
+    resolve_python_for_vco_lib().unwrap_or_else(|| PathBuf::from(fallback))
 }
 
 pub fn resolve_python_for_vco_lib() -> Option<PathBuf> {
