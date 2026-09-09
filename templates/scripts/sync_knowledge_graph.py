@@ -3895,7 +3895,7 @@ def _regen_node_formats_after_full_sync() -> None:
     # orchestrator clone. Every user project therefore fell through to
     # `.claude/scripts/generate-kg-summary.py --all`, which is the PER-EDIT
     # generator: its argparse takes a FILE, so `--all` is a usage error and it
-    # exits 2. Observed live after MultiagentOrchestrator's `kg-sync --all`:
+    # exits 2. Observed live after a user project's `kg-sync --all`:
     # `(node-format refresh exited 2; summaries left as-is — non-fatal)`. Net
     # effect: after ANY bulk sync, no non-root project has EVER had its
     # `.node_formats.json` refreshed, and the only trace was one stderr line.

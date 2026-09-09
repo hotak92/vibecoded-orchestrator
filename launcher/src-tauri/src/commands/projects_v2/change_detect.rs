@@ -109,7 +109,7 @@ pub(crate) fn should_spawn_kg_sync_on_bundle(
 //     docs/** content; on-disk KG/docs unchanged — nothing to re-embed)
 //
 // while `kg-sync --check-drift` reported, read-only, that Weaviate was missing
-// most of those nodes: ARTup 67 missing + 5 stale of 78; MultiagentOrchestrator
+// most of those nodes: one project 67 missing + 5 stale of 78; another
 // 310 missing of 327 — with ZERO objects in its collection, because its INITIAL
 // sync had failed on 2026-09-05 (`ModuleNotFoundError: No module named
 // 'weaviate'`, from a kg-sync wrapper rendered against a PREVIOUS orchestrator
@@ -402,7 +402,7 @@ mod v0294_gate_tests {
         assert!(!kg_sync_needs_drift_probe(false, true, &ok_status()));
     }
 
-    /// THE MultiagentOrchestrator LEG: `failed` since 2026-09-05, two bundle
+    /// THE never-succeeded LEG: `failed` since 2026-09-05, two bundle
     /// updates since, each skipped on "files unchanged".
     #[test]
     fn a_never_succeeded_project_spawns_even_with_nothing_touched() {
@@ -423,7 +423,7 @@ mod v0294_gate_tests {
         assert!(!kg_sync_needs_drift_probe(false, false, &LastKgSync::Absent));
     }
 
-    /// THE ARTup LEG: last sync succeeded, bundle touched nothing, but the
+    /// THE drift LEG: last sync succeeded, bundle touched nothing, but the
     /// store is missing 67 of 78 nodes.
     #[test]
     fn drift_spawns() {

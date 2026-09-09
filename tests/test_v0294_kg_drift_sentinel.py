@@ -4,8 +4,8 @@
 
 Field evidence (2026-09-09): after "Update all", the launcher logged for all 8
 projects *"kg-sync skipped … on-disk KG/docs unchanged — nothing to re-embed"*,
-while `kg-sync --check-drift` reported ARTup 67 missing + 5 stale of 78 and
-MultiagentOrchestrator 310 missing of 327 (its collection held ZERO objects).
+while `kg-sync --check-drift` reported one project 67 missing + 5 stale of 78 and
+another 310 missing of 327 (its collection held ZERO objects).
 The gate could not see Weaviate, so it inferred a fact about the STORE from a
 fact about DISK WRITES.
 

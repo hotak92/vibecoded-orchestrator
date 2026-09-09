@@ -1021,7 +1021,7 @@ async fn run_subprocess(
     use tokio::sync::mpsc;
 
     // v0.2.94 diagnosability: name the wrapper, its argv, and the interpreter
-    // the vco_lib ladder resolves. The 2026-09-05 MultiagentOrchestrator
+    // the vco_lib ladder resolves. The 2026-09-05 field
     // failure (`ModuleNotFoundError: No module named 'weaviate'`) was a wrapper
     // rendered against a PREVIOUS orchestrator location, and the only trace was
     // a `log_tail` column nobody reads.
@@ -1891,7 +1891,7 @@ pub(crate) async fn probe_kg_drift(
     args.push("--check-drift".to_string());
 
     // Diagnosability (v0.2.94): name the wrapper AND the interpreter tier the
-    // spawn will use. The 2026-09-05 MultiagentOrchestrator failure was a
+    // spawn will use. The 2026-09-05 field failure was a
     // wrapper rendered against a PREVIOUS orchestrator location — invisible
     // until someone read a log_tail by hand.
     tracing::info!(
