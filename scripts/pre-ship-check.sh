@@ -291,7 +291,23 @@ fi
 
 # Gate 2: cargo test --lib (unit tests).
 echo "  [running cargo test --lib (keychain-safe)...]"
-if bash scripts/test-keychain-safe.sh > /tmp/preship-cargo-test.log 2>&1; then
+# v0.2.94: the Rust interpreter ladder has no bare PATH rung any more, so a
+# cargo run resolves `python -m vco_lib.*` spawns ONLY through $VCT_VENV, an
+# install-root env var, or a venv above the test binary. CI provides exactly
+# one channel — `VCT_VENV` at a checkout venv (ci.yml, Rust job). This leg
+# MUST match CI: the maintainer's ambient VCT_INSTALL_ROOT / VCT_ORCHESTRATOR_ROOT
+# (a live install) made the hub's hook-enforcement tests pass locally while
+# the runner refused with `no_python` (f21e918b). So: unset the ambient
+# roots and point VCT_VENV at the interpreter this gate already pins for
+# pytest (the ladder accepts an interpreter path). No qualifying interpreter
+# → the leg fails here, as it would on CI, instead of passing by accident.
+_LADDER_ENV=(env -u VCT_INSTALL_ROOT -u VCT_ORCHESTRATOR_ROOT)
+if [ -n "$_PYTEST_PY" ] && [ -x "$_PYTEST_PY" ]; then
+    _LADDER_ENV+=("VCT_VENV=$(cd "$(dirname "$_PYTEST_PY")" && pwd)/$(basename "$_PYTEST_PY")")
+else
+    _LADDER_ENV+=(-u VCT_VENV)
+fi
+if "${_LADDER_ENV[@]}" bash scripts/test-keychain-safe.sh > /tmp/preship-cargo-test.log 2>&1; then
     gate_pass "cargo test --lib (keychain-safe)"
 else
     gate_fail "cargo test --lib (keychain-safe)" "See /tmp/preship-cargo-test.log"
