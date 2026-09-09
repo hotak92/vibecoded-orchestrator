@@ -192,7 +192,7 @@ class GatewayTestBase(unittest.IsolatedAsyncioTestCase):
             context_table_file=self.root / "chat_model_context.json",
             catalog_ttl_s=3600,
             static_retry_ttl_s=1,
-            upstream_timeout_s=10,
+            upstream_idle_timeout_s=10,
             catalog_timeout_s=5,
         )
         self.client = await self.make_client()
@@ -511,13 +511,30 @@ class AuthAndRoutingTests(GatewayTestBase):
         body = await resp.json()
         self.assertIn("OWN model", body["error"]["message"])
 
-    async def test_unreadable_body_is_a_local_400(self) -> None:
+    async def test_an_unreadable_body_gets_the_upstreams_verdict(self) -> None:
+        """It used to be a gateway 400 — which native cannot produce.
+
+        Native sends whatever the client wrote and the API judges it, so the
+        gateway forwards the bytes unread to the first-party upstream and
+        relays what comes back. A refusal invented here is a refusal the user
+        cannot appeal to anyone.
+        """
+        self.anthropic_up.messages_status = 400
+        self.anthropic_up.messages_body = {
+            "type": "error", "error": {"type": "invalid_request_error"},
+        }
         resp = await self.client.post(
             "/v1/messages",
             headers={**self.auth(), "Content-Type": "application/json"},
             data=b"{not json",
         )
         self.assertEqual(resp.status, 400)
+        self.assertEqual(await resp.json(), self.anthropic_up.messages_body)
+        # Forwarded byte for byte, and to the FIRST-PARTY upstream — no
+        # vendor key is spent on bytes nobody could read.
+        self.assertEqual(
+            self.anthropic_up.message_requests[0]["body"], b"{not json",
+        )
         self.assertEqual(self.vendor_up.requests, [])
 
     async def test_upstream_error_is_relayed_verbatim(self) -> None:
@@ -631,7 +648,7 @@ class HealthTests(GatewayTestBase):
     DOCUMENTED_FIELDS = {
         "ok", "service", "version", "port", "host", "catalog_source",
         "context_table_source", "context_table_path", "oauth_present",
-        "oauth_state", "vendors", "vendor_keys_cached",
+        "oauth_state", "oauth_expires_in_s", "vendors", "vendor_keys_cached",
         "token_file_permissions",
     }
 

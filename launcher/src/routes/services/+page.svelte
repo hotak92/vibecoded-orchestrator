@@ -39,6 +39,9 @@
     describeStatus,
     pointPanelPort,
     describeWriteResult,
+    describeDogfood,
+    describeOAuthExpiry,
+    describeSupervision,
     gatewayIsConfigured,
     getModelGatewayStatus,
     inspectVSCodeTarget,
@@ -183,6 +186,13 @@
   let guidance = $state<Record<string, boolean>>({});
 
   const gwLine = $derived(describeStatus(gw));
+  // Two facts the status line deliberately does not fold in: who (if anyone)
+  // supervises the process, and how long the Claude login it proxies has
+  // left. Both are `null` when there is nothing worth saying.
+  const gwSupervision = $derived(describeSupervision(gw));
+  const gwOAuth = $derived(describeOAuthExpiry(gw));
+  // Only ever set by a START, and only shown when the proof REFUSED.
+  const gwDogfood = $derived(describeDogfood(gw));
   const gwWarnings = $derived(pointPanelWarnings(vsInspection));
   const gwConfigured = $derived(gatewayIsConfigured(gw));
 
@@ -715,6 +725,25 @@
       <code>claude-gw/</code> prefix and are forwarded under their real id.
     </p>
     <p class="gw-detail">{gwLine.detail}</p>
+
+    {#if gwSupervision}
+      <p class="gw-detail {gwSupervision.tone}">
+        <strong>{gwSupervision.label}.</strong>
+        {gwSupervision.detail}
+      </p>
+    {/if}
+    {#if gwOAuth}
+      <p class="gw-detail {gwOAuth.tone}">
+        <strong>{gwOAuth.label}.</strong>
+        {gwOAuth.detail}
+      </p>
+    {/if}
+    {#if gwDogfood}
+      <div class="banner error">
+        <strong>{gwDogfood.label}.</strong>
+        {gwDogfood.detail}
+      </div>
+    {/if}
 
     {#if gwError}
       <div class="banner error">{gwError}</div>

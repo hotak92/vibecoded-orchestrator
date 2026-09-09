@@ -341,6 +341,17 @@ FIRST_PARTY_VENDOR = "anthropic"
 #: gateway's default port and a prototype gateway on another.
 GATEWAY_SERVICE_NAME = "vct-model-gateway"
 
+#: The host the native half of the dogfood proof talks to, and the API
+#: version both halves send. Literals here rather than imports from
+#: ``model_router``: this module runs on installs where the gateway package
+#: is not importable, and the proof must not need it.
+DOGFOOD_NATIVE_HOST = "api.anthropic.com"
+DOGFOOD_ANTHROPIC_VERSION = "2023-06-01"
+
+#: The model the proof names. ``count_tokens`` only measures a body, so the
+#: id matters solely for being first-party and current.
+DOGFOOD_MODEL = DEFAULT_GATEWAY_MODEL
+
 #: :func:`probe_gateway`'s three answers, and its timeout. Tri-state on
 #: purpose: "I could not tell" is not "stopped", and the Start action the
 #: GUI offers on ``stopped`` would be wrong on ``unreachable``.
@@ -915,6 +926,467 @@ def panel_endpoint_port(base_url: Optional[str]) -> Optional[int]:
         return parts.port
     except ValueError:
         return None
+
+
+#: Wall-clock budget for ONE dogfood HTTP call, and for the whole set. The
+#: set runs in front of a user action (pointing the panel, or a start
+#: reporting success), so it has to be over before that action would have
+#: felt slow — and a hung upstream must not be able to hold it.
+#:
+#: The budget is checked BEFORE every leg, so the worst case is one full
+#: call past the budget: ``DOGFOOD_TOTAL_BUDGET_S + DOGFOOD_CALL_TIMEOUT_S``.
+#: Any caller that puts a deadline on this process (the launcher's
+#: ``DOGFOOD_TIMEOUT`` in ``launcher/src-tauri/src/commands/model_gateway.rs``)
+#: must allow at least that plus interpreter startup, or it kills a proof
+#: that was about to answer.
+DOGFOOD_CALL_TIMEOUT_S = 8.0
+DOGFOOD_TOTAL_BUDGET_S = 20.0
+
+#: The beta a native panel presents with an OAuth access token. Sent on the
+#: native leg so the two calls differ ONLY in which endpoint answers them; a
+#: comparison against a request Anthropic would refuse for a different reason
+#: proves nothing.
+DOGFOOD_OAUTH_BETA = "oauth-2025-04-20"
+
+#: Bodies the proof sends, sized to the DEFECT rather than to a round
+#: number: the incident threshold was aiohttp's 1 MiB default, so 1.5 MiB of
+#: ASCII is already past every accidental limit the gateway had. The accented
+#: body is the one an ``ensure_ascii`` re-encode inflates threefold — and it
+#: is written with ``ensure_ascii=False`` (see :func:`_dogfood_body`), or it
+#: would be plain ASCII on the wire and prove nothing about non-ASCII at all.
+#: ``DOGFOOD_ACCENTED_BYTES`` counts CHARACTERS of ``è``; each is two UTF-8
+#: bytes, so the accented body is ~2 MiB on the wire (the uplink-budget test
+#: multiplies by two for exactly this reason).
+#:
+#: Kept SMALL on purpose. Every byte is uploaded four times (client ->
+#: gateway -> Anthropic, and again natively), and each leg has to finish
+#: inside :data:`DOGFOOD_CALL_TIMEOUT_S`; a 6 MiB body on a 10 Mbit uplink
+#: does not, which would make a slow connection look like a broken gateway.
+DOGFOOD_ASCII_BYTES = 1536 * 1024
+DOGFOOD_ACCENTED_BYTES = 1024 * 1024
+
+
+def _native_connection(timeout: float) -> Any:
+    """The connection the NATIVE half of the proof uses.
+
+    A function rather than an inline constructor so a test can serve the
+    native leg from a loopback stub: the proof compares two ENDPOINTS, and a
+    test that could only reach the real one would either not run or spend
+    money. Everything else about the call — headers, body, parsing — stays
+    shared, which is the part that must not diverge.
+    """
+    import http.client
+
+    return http.client.HTTPSConnection(DOGFOOD_NATIVE_HOST, timeout=timeout)
+
+
+def _dogfood_body(nbytes: int, char: str) -> bytes:
+    """A minimal, valid ``count_tokens`` request of about ``nbytes``.
+
+    ``ensure_ascii=False`` is the point of the accented variant: with
+    Python's default every ``è`` leaves as ``\u00e8``, so the "1 MiB
+    accented" body would be a 6 MB pure-ASCII one — six times the size it
+    claims, and no test of non-ASCII handling whatsoever.
+    """
+    return json.dumps(
+        {
+            "model": DOGFOOD_MODEL,
+            "messages": [{"role": "user", "content": char * nbytes}],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _post_json(
+    conn: Any, path: str, body: bytes, headers: Mapping[str, str],
+) -> "tuple[int, Optional[dict]]":
+    """POST and read one JSON answer. ``(status, payload-or-None)``."""
+    conn.request("POST", path, body=body, headers=dict(headers))
+    resp = conn.getresponse()
+    raw = resp.read()
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        payload = None
+    return resp.status, payload if isinstance(payload, dict) else None
+
+
+def dogfood_gateway(
+    port: int,
+    token: str,
+    *,
+    credentials_file: Optional[Path] = None,
+    cost_free_only: bool = True,
+    timeout: float = DOGFOOD_CALL_TIMEOUT_S,
+) -> dict:
+    """Prove the gateway answers like Anthropic BEFORE anything is pointed at it.
+
+    Every gateway defect this release fixed was found by a user, in a live
+    session, hours after the switch said "done" — a 413 on a long
+    conversation, a stream cut at 601 s, a 500 the SDK retried ten times.
+    None of them could have survived one real request compared against one
+    native request, and that is all this is: the same body to both endpoints,
+    and a refusal to point the panel at a gateway that answered differently.
+
+    The cases, in order, each bounded by ``timeout``:
+
+    1. ``/v1/messages/count_tokens`` with a 1.5 MiB ASCII body — and a 1 MiB
+       accented one, actually accented on the wire — through the gateway AND
+       natively. Equal status, equal ``input_tokens``. That is the whole
+       class of "the gateway mangles or refuses a big body" in one
+       comparison, at a size past the 1 MiB default that caused the incident
+       and small enough that a modest uplink still finishes inside the
+       budget. ``count_tokens`` costs nothing.
+    2. ``/v1/models`` lists at least one first-party model, so the picker the
+       user is about to open is not empty.
+    3. Non-free, opt-in (``cost_free_only=False``): a ``max_tokens: 1``
+       streamed completion both ways, which must both end in ``message_stop``
+       with the same ``stop_reason``. It is the only case that proves the
+       STREAMING path end to end, and it is the only one that spends money —
+       hence the flag, and hence the default.
+    4. ``/health`` reports a version not older than this package's, so a
+       stale daemon left running from a previous install is not what the
+       panel gets pointed at.
+
+    Returns a result dict: ``ok``, ``status`` (``ok`` / ``refused`` /
+    ``skipped``), ``reason`` (``dogfood:<case>`` on a refusal), ``cases`` and
+    ``elapsed_s``. ``skipped`` means the proof could not RUN — no Claude
+    login to compare against, or the native endpoint unreachable — which is
+    deliberately not a refusal: a machine with no first-party login still has
+    a working vendor gateway, and blocking it would be the gateway deciding
+    something it cannot know.
+    """
+    import http.client
+    import time as _time
+
+    started = _time.monotonic()
+    cases: list[dict] = []
+    result: dict[str, Any] = {
+        "action": "dogfood_gateway",
+        "ok": False,
+        "status": "refused",
+        "reason": None,
+        "port": port,
+        "cases": cases,
+        "elapsed_s": 0.0,
+    }
+
+    def finish(status: str, reason: Optional[str], message: str) -> dict:
+        result["status"] = status
+        result["reason"] = reason
+        result["ok"] = status == "ok"
+        result["message"] = message
+        result["elapsed_s"] = round(_time.monotonic() - started, 3)
+        return result
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        cases.append({"case": name, "ok": ok, "detail": detail})
+
+    access_token = _dogfood_access_token(credentials_file)
+    if not access_token:
+        record("native_login", False, "no Claude access token to compare against")
+        return finish(
+            "skipped",
+            None,
+            "no Claude login on this machine, so there is nothing to compare "
+            "the gateway against; pointing the panel is still allowed.",
+        )
+
+    gateway_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "anthropic-version": DOGFOOD_ANTHROPIC_VERSION,
+    }
+    native_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": DOGFOOD_ANTHROPIC_VERSION,
+        "anthropic-beta": DOGFOOD_OAUTH_BETA,
+    }
+
+    bodies = (
+        ("ascii_body", _dogfood_body(DOGFOOD_ASCII_BYTES, "x")),
+        ("accented_body", _dogfood_body(DOGFOOD_ACCENTED_BYTES, "\u00e8")),
+    )
+    for name, body in bodies:
+        if _time.monotonic() - started > DOGFOOD_TOTAL_BUDGET_S:
+            record(name, False, "budget spent before this case ran")
+            return finish("skipped", None, "the dogfood budget ran out")
+        gw_conn = nat_conn = None
+        gw_error: Optional[OSError] = None
+        gw_status, gw_payload = 0, None
+        try:
+            gw_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            gw_status, gw_payload = _post_json(
+                gw_conn, "/v1/messages/count_tokens", body, gateway_headers,
+            )
+        except OSError as exc:
+            # NOT a refusal yet. This leg carries the upload; on a slow
+            # uplink the socket timeout fires on the network, not on the
+            # gateway, and refusing here would make a slow connection read as
+            # a broken daemon. Whether it is evidence depends entirely on the
+            # native leg below: if THAT one succeeds within the same budget,
+            # the network was fine and the gateway was not.
+            gw_error = exc
+        finally:
+            if gw_conn is not None:
+                gw_conn.close()
+        try:
+            nat_conn = _native_connection(timeout)
+            nat_status, nat_payload = _post_json(
+                nat_conn, "/v1/messages/count_tokens", body, native_headers,
+            )
+        except OSError as exc:
+            # The COMPARISON is unavailable, not failed: an offline machine
+            # must still be able to point at its gateway.
+            record(name, False, f"native call failed: {exc}")
+            return finish(
+                "skipped", None, f"could not reach {DOGFOOD_NATIVE_HOST} ({exc})",
+            )
+        finally:
+            if nat_conn is not None:
+                nat_conn.close()
+
+        if gw_error is not None:
+            record(name, False, f"gateway call failed: {gw_error}")
+            return finish(
+                "refused",
+                f"dogfood:{name}",
+                f"the gateway did not answer a {len(body)}-byte count_tokens "
+                f"call ({gw_error}) while api.anthropic.com answered the same "
+                f"body with HTTP {nat_status}.",
+            )
+
+        gw_tokens = (gw_payload or {}).get("input_tokens")
+        nat_tokens = (nat_payload or {}).get("input_tokens")
+        if gw_status != nat_status or gw_tokens != nat_tokens:
+            record(
+                name,
+                False,
+                f"gateway {gw_status}/{gw_tokens} vs native {nat_status}/{nat_tokens}",
+            )
+            return finish(
+                "refused",
+                f"dogfood:{name}",
+                f"the same {len(body)}-byte request answered "
+                f"HTTP {gw_status} (input_tokens={gw_tokens}) through the "
+                f"gateway and HTTP {nat_status} (input_tokens={nat_tokens}) "
+                "natively. The panel was NOT pointed at it.",
+            )
+        record(name, True, f"HTTP {gw_status}, input_tokens={gw_tokens}")
+
+    if _time.monotonic() - started > DOGFOOD_TOTAL_BUDGET_S:
+        return finish("skipped", None, "the dogfood budget ran out")
+    models_ok, models_detail = _dogfood_models(port, token, timeout)
+    record("models", models_ok, models_detail)
+    if not models_ok:
+        return finish("refused", "dogfood:models", models_detail)
+
+    if _time.monotonic() - started > DOGFOOD_TOTAL_BUDGET_S:
+        return finish("skipped", None, "the dogfood budget ran out")
+    version_ok, version_detail = _dogfood_version(port, timeout)
+    record("version", version_ok, version_detail)
+    if not version_ok:
+        return finish("refused", "dogfood:version", version_detail)
+
+    if not cost_free_only and (
+        _time.monotonic() - started <= DOGFOOD_TOTAL_BUDGET_S
+    ):
+        stream_ok, stream_detail = _dogfood_stream(
+            port, token, native_headers, timeout,
+        )
+        record("stream", stream_ok, stream_detail)
+        if not stream_ok:
+            return finish("refused", "dogfood:stream", stream_detail)
+
+    return finish(
+        "ok", None, f"the gateway answered like Anthropic on {len(cases)} checks.",
+    )
+
+
+def _dogfood_access_token(credentials_file: Optional[Path]) -> Optional[str]:
+    """The Claude access token, read (never logged, never returned upward).
+
+    Read here rather than passed in, so no caller — and no log line, and no
+    argv — ever handles it.
+    """
+    path = Path(credentials_file) if credentials_file else _default_credentials_path()
+    try:
+        section = json.loads(path.read_text(encoding="utf-8")).get("claudeAiOauth")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(section, dict):
+        return None
+    token = section.get("accessToken")
+    expires = section.get("expiresAt") or 0
+    if not isinstance(token, str) or not token:
+        return None
+    try:
+        if expires and int(expires) / 1000 <= __import__("time").time():
+            return None
+    except (TypeError, ValueError):
+        return None
+    return token
+
+
+def _default_credentials_path() -> Path:
+    """Where the Claude CLI keeps its credentials. MUST MATCH
+    ``model_router.config.credentials_path`` — the gateway reads the same
+    file, and a proof that read a different one would compare two logins."""
+    from vco_lib.paths import claude_user_dir
+
+    override = (os.environ.get("VCT_MODEL_GATEWAY_CREDENTIALS") or "").strip()
+    return Path(override) if override else claude_user_dir() / ".credentials.json"
+
+
+def _dogfood_models(port: int, token: str, timeout: float) -> "tuple[bool, str]":
+    """At least one first-party entry, or the picker the user opens is empty."""
+    import http.client
+
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        conn.request(
+            "GET", "/v1/models", headers={"Authorization": f"Bearer {token}"},
+        )
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except (OSError, ValueError) as exc:
+        return False, f"/v1/models did not answer ({exc})"
+    finally:
+        if conn is not None:
+            conn.close()
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return False, "/v1/models did not return a data list"
+    first_party = [
+        e for e in entries
+        if isinstance(e, dict) and is_first_party_model_id(str(e.get("id", "")))
+    ]
+    if not first_party:
+        return False, f"/v1/models listed {len(entries)} models, none first-party"
+    return True, f"{len(first_party)} first-party of {len(entries)} models"
+
+
+def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
+    """The daemon answering must not be older than this package.
+
+    A gateway left running from a previous install answers happily and
+    without any of this release's fixes — the exact shape of the 2026-09-09
+    incident, where the fix existed in the repo and nowhere on the machine.
+    """
+    import http.client
+
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        conn.request("GET", "/health")
+        payload = json.loads(conn.getresponse().read().decode("utf-8", "replace"))
+    except (OSError, ValueError) as exc:
+        return False, f"/health did not answer ({exc})"
+    finally:
+        if conn is not None:
+            conn.close()
+    running = str(payload.get("version") or "")
+    mine = _this_package_version()
+    if not running or not mine:
+        return True, f"version comparison unavailable (running={running or '?'})"
+    if _version_tuple(running) < _version_tuple(mine):
+        return False, (
+            f"the daemon answering is v{running}, older than this install "
+            f"(v{mine}). Restart the gateway so the running code is the "
+            "installed code."
+        )
+    return True, f"v{running}"
+
+
+def _version_tuple(text: str) -> tuple:
+    parts = []
+    for chunk in text.split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _this_package_version() -> str:
+    """This install's version, from the same pyproject the release tags."""
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("vibecoded-orchestrator")
+    except Exception:  # noqa: BLE001 — a missing dist must not fail the proof
+        return ""
+
+
+def _dogfood_stream(
+    port: int, token: str, native_headers: Mapping[str, str], timeout: float,
+) -> "tuple[bool, str]":
+    """A one-token streamed completion, both ways. COSTS MONEY (opt-in)."""
+    import http.client
+
+    body = json.dumps(
+        {
+            "model": DOGFOOD_MODEL,
+            "max_tokens": 1,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).encode("utf-8")
+
+    def read_stream(conn: Any, headers: Mapping[str, str]) -> "tuple[int, bytes]":
+        conn.request("POST", "/v1/messages", body=body, headers=dict(headers))
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+
+    gw_conn = nat_conn = None
+    try:
+        gw_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        gw_status, gw_raw = read_stream(
+            gw_conn,
+            {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "anthropic-version": DOGFOOD_ANTHROPIC_VERSION,
+            },
+        )
+        nat_conn = _native_connection(timeout)
+        nat_status, nat_raw = read_stream(nat_conn, native_headers)
+    except OSError as exc:
+        return False, f"streamed comparison failed ({exc})"
+    finally:
+        for conn in (gw_conn, nat_conn):
+            if conn is not None:
+                conn.close()
+    for label, raw in (("gateway", gw_raw), ("native", nat_raw)):
+        if b"message_stop" not in raw:
+            return False, f"the {label} stream did not end with message_stop"
+    if gw_status != nat_status:
+        return False, f"gateway {gw_status} vs native {nat_status}"
+    if _stop_reason(gw_raw) != _stop_reason(nat_raw):
+        return False, (
+            f"stop_reason {_stop_reason(gw_raw)!r} through the gateway vs "
+            f"{_stop_reason(nat_raw)!r} natively"
+        )
+    return True, f"both streams ended with stop_reason={_stop_reason(gw_raw)!r}"
+
+
+def _stop_reason(raw: bytes) -> Optional[str]:
+    """The ``stop_reason`` an SSE answer carries, or ``None``."""
+    for line in raw.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        try:
+            event = json.loads(line[5:].strip() or b"{}")
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            reason = event.get("delta", {}).get("stop_reason") if isinstance(
+                event.get("delta"), dict
+            ) else None
+            reason = reason or event.get("stop_reason")
+            if reason:
+                return str(reason)
+    return None
 
 
 def probe_gateway(
@@ -2343,6 +2815,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect = sub.add_parser("inspect", help="describe one settings file")
     p_inspect.add_argument("--path", required=True)
 
+    p_dogfood = sub.add_parser(
+        "dogfood",
+        help=(
+            "send one real request through the gateway AND to "
+            "api.anthropic.com and compare the answers. Exits 0 when they "
+            "match (or when the comparison could not run), 1 when they do "
+            "not."
+        ),
+    )
+    p_dogfood.add_argument("--port", type=int, default=None)
+    p_dogfood.add_argument(
+        "--paid",
+        action="store_true",
+        help="also compare a 1-token streamed completion (costs money)",
+    )
+
     p_point = sub.add_parser(
         "point",
         help=(
@@ -2355,6 +2843,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_point.add_argument("--path", required=True)
+    p_point.add_argument(
+        "--skip-dogfood",
+        action="store_true",
+        help=(
+            "do not compare the running gateway against api.anthropic.com "
+            "before writing. The comparison is the only thing standing "
+            "between a broken gateway and a panel pointed at it, so this is "
+            "for offline machines and tests, not for speed."
+        ),
+    )
     p_point.add_argument(
         "--base-url",
         default=None,
@@ -2473,6 +2971,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         _emit(result)
         return 0 if result["ok"] else 1
+    if args.command == "dogfood":
+        ports = (args.port,) if args.port else resolve_gateway_ports()
+        try:
+            token = resolve_host_token()
+        except SettingsRefused as exc:
+            _emit(
+                {
+                    "action": "dogfood_gateway",
+                    "ok": False,
+                    "status": "refused",
+                    "reason": exc.reason,
+                    "message": exc.message,
+                    # The GUI reads `cases`; a refusal envelope without it
+                    # made the card's own renderer throw, inside a `$derived`.
+                    "cases": [],
+                }
+            )
+            return 1
+        verdict = dogfood_gateway(
+            ports[0], token, cost_free_only=not args.paid,
+        )
+        _emit(verdict)
+        # `skipped` exits 0: the proof could not RUN (no login, no network),
+        # which is not evidence against the gateway.
+        return 1 if verdict["status"] == "refused" else 0
+
     # point
     ports = resolve_gateway_ports()
     base_url = args.base_url or f"http://127.0.0.1:{ports[0]}"
@@ -2490,6 +3014,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
         )
         return 1
+    # Prove it before pointing at it. Only when something IS answering:
+    # pointing at a gateway that has not been started yet is a legitimate
+    # action, and there is nothing to compare then.
+    if not getattr(args, "skip_dogfood", False) and probe_gateway(
+        ports=(ports[0],),
+    ) == GATEWAY_RUNNING:
+        verdict = dogfood_gateway(ports[0], token)
+        if verdict["status"] == "refused":
+            _emit(
+                {
+                    "action": "point_at_gateway",
+                    "path": args.path,
+                    "ok": False,
+                    "status": "refused",
+                    "reason": verdict["reason"],
+                    "message": verdict["message"],
+                    "dogfood": verdict,
+                }
+            )
+            return 1
+
     result = point_at_gateway(
         Path(args.path),
         base_url=base_url,
@@ -2510,6 +3055,10 @@ if __name__ == "__main__":  # pragma: no cover - process entry point
 
 __all__ = [
     "CONTEXT_1M_SUFFIX",
+    "DOGFOOD_ANTHROPIC_VERSION",
+    "DOGFOOD_CALL_TIMEOUT_S",
+    "DOGFOOD_NATIVE_HOST",
+    "DOGFOOD_TOTAL_BUDGET_S",
     "DEFAULT_GATEWAY_MODEL",
     "DEFAULT_GATEWAY_PORT",
     "GATEWAY_PROBE_TIMEOUT",
@@ -2560,6 +3109,7 @@ __all__ = [
     "port_file_path",
     "paste_block",
     "point_at_gateway",
+    "dogfood_gateway",
     "probe_gateway",
     "reset_native",
     "reset_native_if_vco_gateway",

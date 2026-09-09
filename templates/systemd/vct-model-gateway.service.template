@@ -37,7 +37,7 @@ Documentation=https://github.com/hotak92/vibecoded-orchestrator
 # session to exist, not the network.
 After=default.target
 # STOP a real crash loop. These two must be stated: systemd's defaults are 5
-# starts within 10 SECONDS, and `RestartSec=10s` below means a loop can never
+# starts within 10 SECONDS, and the `RestartSec` below means a loop can never
 # reach 5 starts inside that window — so the default limit never fires and the
 # loop is unbounded. That is not theory: on 2026-09-08 this unit restarted
 # 1442 times over four hours (once every 10s) against a gateway that was
@@ -56,10 +56,18 @@ WorkingDirectory={{WORKING_DIR}}
 # to stop" and "a gateway was already running, so this start had nothing to
 # do". Restarting either would make stopping the gateway impossible, and the
 # second one used to be an exit 1 that fed the loop described above.
-# RestartSec paces a restart; the StartLimit above is what ends one.
+# RestartSec paces a restart; the StartLimit above is what ends one. 2s, not
+# 10s: with StartLimitIntervalSec/Burst above now actually bounding the loop,
+# pacing exists to let a transient cause clear (a port still in TIME_WAIT, a
+# state dir on a mount that has not appeared yet), not to hide a loop — and a
+# gateway the user is waiting on should come back in seconds.
 Restart=on-failure
-RestartSec=10s
-TimeoutStopSec=15s
+RestartSec=2s
+# 60s, matching ``shutdown_timeout=60`` in ``run_app`` (model_router/__main__).
+# A stop while a completion is streaming must be allowed to finish it: at the
+# old 15s systemd SIGKILLed the daemon mid-stream, which the client sees as a
+# truncated answer — and "restart the gateway" is a thing users do routinely.
+TimeoutStopSec=60s
 # Pin the state dir chosen at registration time so a dev install with
 # VCT_STATE_DIR set does not silently contaminate production state on the
 # next login.

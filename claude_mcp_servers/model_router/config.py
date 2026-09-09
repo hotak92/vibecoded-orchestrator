@@ -46,6 +46,14 @@ Environment knobs (all optional; every one is read by code in this package)
     Cache lifetimes in seconds. Present so the smoke tests can drive the
     cache without sleeping; documented because a knob nobody can find is a
     knob that gets re-invented.
+``VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES``
+    How much of a request body the daemon will HOLD in order to rewrite ids
+    in it, in bytes. Defaults to :data:`REWRITE_BUFFER_LIMIT_BYTES`. It is
+    not a request ceiling — a body past it is forwarded upstream as a stream,
+    unrewritten, never refused — so lowering it trades the rewrite for
+    memory, and raising it does the reverse. A non-numeric or non-positive
+    value falls back to the default (:func:`_env_int`): an unbounded buffer
+    is not a state a typo should be able to reach.
 """
 
 from __future__ import annotations
@@ -87,6 +95,53 @@ DEFAULT_STATIC_RETRY_TTL_S = 300
 #: Vendor keys are re-resolved at most this often, so a rotation is picked up
 #: without restarting and a hub that was down at boot is retried.
 DEFAULT_KEY_TTL_S = 300
+
+#: Default seconds of upstream SILENCE tolerated on a relayed response. See
+#: :attr:`GatewayConfig.upstream_idle_timeout_s` — this is an idle bound, and
+#: there is deliberately no total one.
+DEFAULT_UPSTREAM_IDLE_TIMEOUT_S = 1800.0
+
+#: Seconds to wait for the TCP connection to an upstream. Short and separate
+#: from the idle bound: failing to CONNECT is a different condition from a
+#: slow answer, and it is the one that should fail fast — a wrong or dead
+#: upstream must surface as a 502 the client can retry, not as a half-hour
+#: hang. Not a knob: no machine needs a different value, and the one thing
+#: that could go wrong (a network that takes 40 s to connect) is better
+#: reported than waited on.
+UPSTREAM_CONNECT_TIMEOUT_S = 30
+
+#: How much of a request body the gateway will HOLD in memory so it can
+#: rewrite ids inside it. **Not a request ceiling**: nothing is refused for
+#: being bigger — a body past this bound is forwarded upstream as a stream,
+#: unrewritten, and the upstream's own answer is relayed (see the body-size
+#: policy in :mod:`model_router.server`).
+#:
+#: A bound has to exist because the gateway is not a pass-through: it rewrites
+#: the model id, and a vendor's tool ids, inside the body, which means holding
+#: it. 32 MiB is chosen to sit just ABOVE Anthropic's documented 32 MB Messages
+#: API request ceiling — the limit behind the 413 ``request_too_large`` in
+#: https://docs.claude.com/en/api/errors, and the number Claude Code quotes
+#: back at the user ("Request too large (max 32MB)"). Rounding UP to MiB is the
+#: safe direction: every body the first-party upstream can accept is one the
+#: gateway rewrites, and only bodies that upstream would refuse anyway reach
+#: the streaming path.
+#:
+#: The 2026-09-09 field defect is why the distinction is spelled out. aiohttp's
+#: DEFAULT ``client_max_size`` is 1 MiB, and with the body buffered that
+#: default made the gateway answer 413 to every ``POST /v1/messages`` of a
+#: conversation past roughly 250K tokens of context — far less with images —
+#: while the same conversation worked natively against Anthropic. The client
+#: renders any 413 as an accumulated-attachments problem, so the gateway's own
+#: refusal read as the user's fault. A buffer bound must therefore never be
+#: reachable as a refusal.
+#:
+#: The same NUMBER as :data:`model_router.tool_ids.SSE_BUFFER_LIMIT_BYTES` and
+#: deliberately not shared with it: that one bounds an unframed RESPONSE
+#: stream and is ours to re-tune, this one is pinned to a PUBLISHED request
+#: limit and moves only when Anthropic's documentation does. Same value today,
+#: different reasons to change, so they are two constants rather than one with
+#: two meanings.
+REWRITE_BUFFER_LIMIT_BYTES = 32 * 1024 * 1024
 
 _TOKEN_BASENAME = "model-gateway.token"
 _PID_BASENAME = "model-gateway.pid"
@@ -332,14 +387,32 @@ class GatewayConfig:
     static_retry_ttl_s: int = DEFAULT_STATIC_RETRY_TTL_S
     key_ttl_s: int = DEFAULT_KEY_TTL_S
     secret_project: str | None = None
-    #: Seconds to wait for an upstream response. Long by design: a streaming
-    #: completion legitimately runs for minutes. Z.ai's own Claude Code sample
-    #: config sets a 3000 s client timeout for the same reason.
-    upstream_timeout_s: int = 600
+    #: Seconds of SILENCE from the upstream before the relay gives up — an
+    #: IDLE timeout, never a total one. The distinction is the 2026-09-09
+    #: 04:18 incident: a ``total`` of 600 s cut a stream that was still
+    #: delivering, at 601 s, and the client saw the gateway end a working
+    #: answer that native would have finished. A total budget cannot be
+    #: correct here — a long completion legitimately runs for as long as it
+    #: runs — so the only sound question is "has the upstream gone quiet?".
+    #:
+    #: 1800 s is deliberately above the client's own idle clamp, so when both
+    #: are waiting the CLIENT is the one that gives up first and reports it in
+    #: its own words. It is never a first-byte limit in practice either: the
+    #: client's own first-byte window for a 30 MB body is ~599 s.
+    #:
+    #: Float, not int: the chaos suite drives sub-second idleness, and a knob
+    #: that cannot express 0.2 s cannot be tested without sleeping for
+    #: minutes.
+    upstream_idle_timeout_s: float = DEFAULT_UPSTREAM_IDLE_TIMEOUT_S
     #: Seconds to wait for a catalog fetch. Short: ``/v1/models`` is the
     #: picker's blocking call, and a stalled vendor must fall back to the
     #: static catalog rather than hang the picker open.
     catalog_timeout_s: int = 10
+    #: How much of a request body is held for the id rewrite, in bytes. Read
+    #: by :func:`model_router.server.messages_handler`; a body past it is
+    #: streamed upstream unrewritten rather than refused. See
+    #: :data:`REWRITE_BUFFER_LIMIT_BYTES`.
+    rewrite_buffer_bytes: int = REWRITE_BUFFER_LIMIT_BYTES
 
     @classmethod
     def from_env(cls, *, token: str = "") -> "GatewayConfig":
@@ -356,6 +429,10 @@ class GatewayConfig:
                 "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", DEFAULT_STATIC_RETRY_TTL_S,
             ),
             key_ttl_s=_env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S),
+            rewrite_buffer_bytes=_env_int(
+                "VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES",
+                REWRITE_BUFFER_LIMIT_BYTES,
+            ),
             secret_project=(
                 (os.environ.get("VCT_MODEL_GATEWAY_SECRET_PROJECT") or "").strip()
                 or None
@@ -370,6 +447,9 @@ __all__ = [
     "DEFAULT_PORT",
     "DEFAULT_STATIC_RETRY_TTL_S",
     "FALLBACK_PORT_RANGE",
+    "DEFAULT_UPSTREAM_IDLE_TIMEOUT_S",
+    "REWRITE_BUFFER_LIMIT_BYTES",
+    "UPSTREAM_CONNECT_TIMEOUT_S",
     "SERVICE_NAME",
     "LAST_PORT_BASENAME",
     "GatewayConfig",

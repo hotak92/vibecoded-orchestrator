@@ -150,31 +150,193 @@ const GATEWAY_ENV_PREFIX: &str = "VCT_MODEL_GATEWAY_";
 /// deadlocking the caller.
 const PY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Deadline for the dogfood proof, DERIVED rather than picked.
+///
+/// `vco_lib.vscode_settings` checks its own budget before every leg, so the
+/// worst case there is `DOGFOOD_TOTAL_BUDGET_S` (20) plus one full call that
+/// started just inside it, `DOGFOOD_CALL_TIMEOUT_S` (8) = 28 s. Add
+/// interpreter startup and import (~3 s on a cold page cache) and round up:
+/// 45 s. MUST stay above those two constants — a deadline shorter than the
+/// proof's own budget kills a run that was about to answer, and the launcher
+/// would report "could not run" for a gateway that was being proved.
+/// `tests/test_v0294_gateway_dogfood.py::BudgetParityTests` pins the
+/// relationship from the Python side.
+const DOGFOOD_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// `/health` probe timeout. Short on purpose — this runs on a GUI poll.
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
 
 // ─── Supervised-child registry ────────────────────────────────────────────
 
+/// How long a supervised child that died must stay dead before it is
+/// restarted. Not a sleep: the wait is measured across status polls, so the
+/// GUI thread never blocks on it. It exists so a gateway that dies during
+/// startup (a port taken in the same instant, a state dir on a mount that is
+/// still appearing) is retried once the cause has had a moment to clear.
+const RESPAWN_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Respawns allowed per launcher session. ONE, deliberately: a single restart
+/// covers the transient death, and anything that dies twice is a real fault
+/// the user must see rather than a loop this process hides. Continuous
+/// supervision is the boot service's job — it has systemd/launchd behind it,
+/// including a start-limit — and duplicating that here would be a second
+/// supervisor with different rules.
+const MAX_RESPAWNS: u8 = 1;
+
+/// A gateway THIS launcher started, and what is needed to bring it back.
+struct Supervised {
+    /// `None` once the child has exited and been reaped.
+    child: Option<Child>,
+    /// The port it was started on. A respawn MUST land on the same one: the
+    /// port file, the VS Code settings and every resolver that already read
+    /// them name that port, so a restart somewhere else is a gateway nobody
+    /// can find.
+    port: u16,
+    /// When the child was found dead — the clock for [`RESPAWN_BACKOFF`].
+    dead_since: Option<Instant>,
+    respawns: u8,
+}
+
 /// Handles for gateways THIS launcher started. Registered as Tauri state in
 /// `lib.rs`; empty after a launcher restart, which is exactly why
 /// `supervised` is reported to the GUI rather than assumed.
 #[derive(Default)]
-pub struct GatewaySupervisor(Mutex<Option<Child>>);
+pub struct GatewaySupervisor(Mutex<Option<Supervised>>);
 
 impl GatewaySupervisor {
     /// Reap an exited child so a long-lived launcher does not accumulate a
     /// zombie, and report whether a live supervised child remains.
     fn poll(&self) -> Option<u32> {
         let mut guard = self.0.lock().ok()?;
-        let child = guard.as_mut()?;
+        let entry = guard.as_mut()?;
+        let child = entry.child.as_mut()?;
         match child.try_wait() {
             Ok(Some(_)) => {
-                *guard = None;
+                entry.child = None;
+                entry.dead_since = Some(Instant::now());
                 None
             }
             Ok(None) => Some(child.id()),
             Err(_) => Some(child.id()),
         }
+    }
+
+    /// [`poll`](Self::poll), plus ONE restart of a child that died.
+    ///
+    /// A gateway the launcher started has no other supervisor: the boot
+    /// service is opt-in and off by default, so without this a crash leaves
+    /// a card that says "not running" next to a client that has been pointed
+    /// at a dead port — the failure is silent until the next request.
+    ///
+    /// Deliberately driven from the status poll rather than a background
+    /// task: it is the moment the launcher already asks "is it alive?", it
+    /// carries no timer of its own, and it cannot outlive the window the
+    /// user is looking at. Called `supervise` and not `poll` so a caller
+    /// that only wants the fact — `model_gateway_stop` — cannot start a
+    /// process by asking a question.
+    fn supervise(&self) -> Option<u32> {
+        if let Some(pid) = self.poll() {
+            return Some(pid);
+        }
+        let mut guard = self.0.lock().ok()?;
+        let entry = guard.as_mut()?;
+        if entry.child.is_some() || entry.respawns >= MAX_RESPAWNS {
+            return None;
+        }
+        match entry.dead_since {
+            Some(at) if at.elapsed() >= RESPAWN_BACKOFF => {}
+            // Either it has not been dead long enough, or we never saw it
+            // die (an entry with no clock is one `poll` has not reaped yet).
+            _ => return None,
+        }
+        let port = entry.port;
+        match spawn_gateway_child(port) {
+            Ok(child) => {
+                let pid = child.id();
+                tracing::warn!(
+                    "[vct] model gateway: the child this launcher started \
+                     exited; restarted it on port {} (pid {}). A second death \
+                     will not be restarted — enable Start at login for real \
+                     supervision.",
+                    port,
+                    pid
+                );
+                entry.child = Some(child);
+                entry.dead_since = None;
+                entry.respawns += 1;
+                Some(pid)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[vct] model gateway: the child this launcher started \
+                     exited and could not be restarted on port {}: {}",
+                    port,
+                    e
+                );
+                entry.respawns = MAX_RESPAWNS;
+                None
+            }
+        }
+    }
+}
+
+/// Who, if anyone, will restart this gateway when it dies.
+///
+/// Reported rather than inferred by the GUI, and it distinguishes "nothing
+/// is watching this" from "we cannot tell" — a card that guesses
+/// "supervised" for a hand-started daemon is exactly how a dead gateway goes
+/// unnoticed.
+fn supervision_word(running: bool, supervised: bool, pid: Option<u32>, boot: &str) -> String {
+    if !running {
+        return "not_running".to_string();
+    }
+    if supervised {
+        return "launcher".to_string();
+    }
+    if boot != "enabled" {
+        // Positive knowledge, not a guess: autostart is off and the child is
+        // not ours, so no supervisor exists for it.
+        return "unsupervised".to_string();
+    }
+    match boot_service_main_pid() {
+        Some(main_pid) if Some(main_pid) == pid => "boot_service".to_string(),
+        Some(_) => "unsupervised".to_string(),
+        // Autostart is on but the unit's own pid could not be read (not
+        // systemd, or the tool is missing). Saying "boot_service" here would
+        // be the guess this function exists to avoid.
+        None => "unknown".to_string(),
+    }
+}
+
+/// The pid systemd has for the gateway unit, when that question can be asked.
+///
+/// Linux only, on purpose. `systemctl --user show` answers it exactly; on
+/// macOS and Windows the equivalent needs parsing output that is not a
+/// contract, so this returns `None` there and the caller reports `unknown`
+/// rather than inventing an answer. MUST MATCH `MODEL_GATEWAY_UNIT_NAME` in
+/// `vco_lib/boot_service.py` — the unit is written there.
+fn boot_service_main_pid() -> Option<u32> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "vct-model-gateway.service",
+            "--property=MainPID",
+            "--value",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&out.stdout).trim().parse::<u32>() {
+        // systemd reports 0 for "no main process", which is not a pid.
+        Ok(0) | Err(_) => None,
+        Ok(pid) => Some(pid),
     }
 }
 
@@ -375,6 +537,9 @@ pub struct ModelGatewayStatus {
     /// True when THIS launcher session started the gateway and still holds
     /// the child handle — the only case in which stopping it is safe.
     pub supervised: bool,
+    /// Who would restart it if it died: `launcher` / `boot_service` /
+    /// `unsupervised` / `unknown` / `not_running`. See [`supervision_word`].
+    pub supervision: String,
     pub port: u16,
     pub base_url: String,
     /// `Some(true)` reachable, `Some(false)` refused, `None` = could not
@@ -390,6 +555,12 @@ pub struct ModelGatewayStatus {
     pub token_present: bool,
     /// The launcher can resolve an interpreter to run the daemon with.
     pub python: Option<String>,
+    /// The dogfood verdict, when this payload came from a START. `None` on
+    /// an ordinary status poll: the proof sends two real requests and takes
+    /// seconds, so it belongs to the action a user waited for, not to a
+    /// five-second refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dogfood: Option<serde_json::Value>,
 }
 
 // ─── Health probe ─────────────────────────────────────────────────────────
@@ -500,6 +671,37 @@ pub(crate) fn vscode_settings_command(python: &Path, orchestrator_root: Option<&
     python_module_command(python, "vco_lib.vscode_settings", orchestrator_root)
 }
 
+/// Spawn the daemon on `port`, detached from the GUI's stdio.
+///
+/// ONE home for the two callers that must not drift: the user pressing Start
+/// ([`model_gateway_start`]) and the supervisor restarting a child that died
+/// ([`GatewaySupervisor::supervise`]). A respawn built from a second copy of
+/// this command is a respawn that silently loses the port pin or the
+/// PYTHONPATH the first one had.
+fn spawn_gateway_child(port: u16) -> Result<Child, String> {
+    let python = python_or_err()?;
+    let root = crate::commands::installer::find_local_repo_root().ok();
+    let mut cmd = gateway_command(&python, root.as_deref());
+    cmd.arg("--port").arg(port.to_string());
+    // The daemon writes the port file from its own resolution, and the
+    // status poll reads it back; pin the env too so a probe issued before
+    // the daemon has written the file still asks the right port.
+    cmd.env(PORT_ENV, port.to_string());
+    // The daemon logs to its own file; a detached child must not inherit the
+    // GUI's stdio.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "could not start the model gateway with {}: {}",
+                python.display(),
+                e
+            )
+        })
+}
+
 fn python_or_err() -> Result<PathBuf, String> {
     resolve_python_for_vco_lib().ok_or_else(|| {
         "no python interpreter found for the model gateway (checked \
@@ -527,7 +729,18 @@ fn run_gateway_cli(args: &[&str]) -> Result<(i32, String, String), String> {
 /// a pipe buffer never exits, so it is killed here rather than deadlocking
 /// the GUI thread. Every payload this module reads is a single small JSON
 /// object, far below any platform's pipe capacity.
-fn run_to_completion(mut cmd: Command, label: &str) -> Result<(i32, String, String), String> {
+fn run_to_completion(cmd: Command, label: &str) -> Result<(i32, String, String), String> {
+    run_to_completion_within(cmd, label, PY_TIMEOUT)
+}
+
+/// [`run_to_completion`] with an explicit deadline, for the one caller whose
+/// work legitimately outlasts the default: the dogfood proof sends real
+/// requests to a real API (see [`DOGFOOD_TIMEOUT`]).
+fn run_to_completion_within(
+    mut cmd: Command,
+    label: &str,
+    limit: Duration,
+) -> Result<(i32, String, String), String> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -535,7 +748,7 @@ fn run_to_completion(mut cmd: Command, label: &str) -> Result<(i32, String, Stri
         .spawn()
         .map_err(|e| format!("{}: spawn failed: {}", label, e))?;
 
-    let deadline = Instant::now() + PY_TIMEOUT;
+    let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
@@ -546,7 +759,7 @@ fn run_to_completion(mut cmd: Command, label: &str) -> Result<(i32, String, Stri
                     return Err(format!(
                         "{}: timed out after {} s",
                         label,
-                        PY_TIMEOUT.as_secs()
+                        limit.as_secs()
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -822,17 +1035,31 @@ async fn status_on_port(
     supervisor: &GatewaySupervisor,
     port: u16,
 ) -> Result<ModelGatewayStatus, String> {
-    let supervised_pid = supervisor.poll();
+    // `supervise`, not `poll`: a child of ours that died is restarted once
+    // here, because nothing else will (the boot service is opt-in and off by
+    // default). See `GatewaySupervisor::supervise`.
+    let supervised_pid = supervisor.supervise();
     let (state, pid) = probe_process();
     let (reachable, health, health_error) = probe_health(port).await;
     let boot = tauri::async_runtime::spawn_blocking(boot_status_word)
         .await
         .unwrap_or_else(|_| "unsupported".to_string());
+    let supervised = supervised_pid.is_some() && supervised_pid == pid;
+    let supervision = {
+        let running = state == ProcessState::Running;
+        let boot_word = boot.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            supervision_word(running, supervised, pid, &boot_word)
+        })
+        .await
+        .unwrap_or_else(|_| "unknown".to_string())
+    };
 
     Ok(ModelGatewayStatus {
         process: state.as_str().to_string(),
         pid: pid.or(supervised_pid),
-        supervised: supervised_pid.is_some() && supervised_pid == pid,
+        supervised,
+        supervision,
         port,
         base_url: base_url(port),
         reachable,
@@ -841,6 +1068,7 @@ async fn status_on_port(
         boot,
         token_present: token_path().is_file(),
         python: resolve_python_for_vco_lib().map(|p| p.to_string_lossy().to_string()),
+        dogfood: None,
     })
 }
 
@@ -942,23 +1170,15 @@ pub async fn model_gateway_start(
             chosen
         );
     }
-    // The daemon logs to its own file; a detached child must not inherit
-    // the GUI's stdio.
-    let child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "could not start the model gateway with {}: {}",
-                python.display(),
-                e
-            )
-        })?;
+    let child = spawn_gateway_child(chosen)?;
 
     if let Ok(mut guard) = supervisor.0.lock() {
-        *guard = Some(child);
+        *guard = Some(Supervised {
+            child: Some(child),
+            port: chosen,
+            dead_since: None,
+            respawns: 0,
+        });
     }
 
     // Wait for the daemon to ANSWER, rather than sleeping and assuming
@@ -969,12 +1189,88 @@ pub async fn model_gateway_start(
         gateway_answers_on(chosen)
     })
     .await;
+    // Prove it before reporting success. A gateway that ANSWERS is not a
+    // gateway that answers CORRECTLY, and every defect this release fixed
+    // reached a user through a start that said "started" on nothing more
+    // than a 200 from `/health`. Best-effort by design: a proof that cannot
+    // run (no Claude login, no network) must not turn a working start into a
+    // failure, so only an explicit `refused` is carried to the GUI, and even
+    // then as a WARNING beside a status the user can still act on.
+    let dogfood = tauri::async_runtime::spawn_blocking(move || run_dogfood(chosen))
+        .await
+        .unwrap_or(None);
+
     // Reported on the port we CHOSE, not on whatever the port file says yet:
     // the daemon may not have written it, and a status naming the old port
     // would tell the user the start failed. When the poll timed out the
     // status carries that honestly (`reachable`/`health` from a real probe),
     // and the GUI gates its "started on port N" line on it.
-    status_on_port(&supervisor, chosen).await
+    let mut status = status_on_port(&supervisor, chosen).await?;
+    status.dogfood = dogfood;
+    Ok(status)
+}
+
+/// Run the Python dogfood proof for `port`; `None` when it could not run.
+///
+/// Through the SAME spawn path as every other `vco_lib` call
+/// (`vscode_settings_command`), so the interpreter, the `PYTHONPATH` and the
+/// state dir are the ones the rest of this module uses — a second spawn
+/// recipe here would be a second set of things to keep in step.
+fn run_dogfood(port: u16) -> Option<serde_json::Value> {
+    // The `_or` resolver (lane D, `vct_launcher_core::python_resolve`): a
+    // machine whose venv resolution fails still gets a chance at the proof
+    // through whatever `python3` is on PATH, and a wrong interpreter simply
+    // fails the spawn — which is reported, not treated as evidence.
+    let python =
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3");
+    let root = crate::commands::installer::find_local_repo_root().ok();
+    let mut cmd = vscode_settings_command(&python, root.as_deref());
+    cmd.arg("dogfood").arg("--port").arg(port.to_string());
+    let (_code, stdout, stderr) =
+        match run_to_completion_within(cmd, "vct-dogfood", DOGFOOD_TIMEOUT) {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("[vct] model gateway: dogfood proof did not run: {}", e);
+            return None;
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(v) => {
+            if v.get("status").and_then(|s| s.as_str()) == Some("refused") {
+                tracing::warn!(
+                    "[vct] model gateway: dogfood REFUSED ({}): {}",
+                    v.get("reason").and_then(|r| r.as_str()).unwrap_or("-"),
+                    v.get("message").and_then(|m| m.as_str()).unwrap_or("-")
+                );
+            }
+            Some(v)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[vct] model gateway: dogfood output was not JSON ({}): {}",
+                e,
+                stderr.trim()
+            );
+            None
+        }
+    }
+}
+
+/// What Stop does to the supervisor: EMPTY it, and report the live pid it
+/// was holding (`None` when the child had already died).
+///
+/// A function rather than two lines inside the command, because the property
+/// that matters is a leave-alone one and has to be testable without Tauri
+/// state: `poll` alone reaps a dead child but leaves the ENTRY, so a Stop
+/// pressed after a crash answered "no gateway is running" and the next status
+/// poll cheerfully respawned what the user had just stopped. A stop is also a
+/// cancellation of any pending respawn, whatever else it reports.
+fn take_for_stop(supervisor: &GatewaySupervisor) -> (Option<Supervised>, Option<u32>) {
+    let taken = supervisor.0.lock().ok().and_then(|mut g| g.take());
+    let pid = taken
+        .as_ref()
+        .and_then(|entry| entry.child.as_ref().map(|child| child.id()));
+    (taken, pid)
 }
 
 #[derive(Debug, Serialize)]
@@ -987,7 +1283,7 @@ pub struct StopOutcome {
 pub async fn model_gateway_stop(
     supervisor: State<'_, GatewaySupervisor>,
 ) -> Result<StopOutcome, String> {
-    let supervised_pid = supervisor.poll();
+    let (taken, supervised_pid) = take_for_stop(&supervisor);
     let (state, pid) = probe_process();
 
     if supervised_pid.is_none() {
@@ -1022,9 +1318,7 @@ pub async fn model_gateway_stop(
     }
 
     let result = tauri::async_runtime::spawn_blocking({
-        // Take the child out of the state, so a failed kill cannot leave a
-        // half-owned handle behind.
-        let taken = supervisor.0.lock().ok().and_then(|mut g| g.take());
+        let taken = taken.and_then(|entry| entry.child);
         move || match taken {
             Some(mut child) => match child.kill() {
                 Ok(()) => {
@@ -2032,5 +2326,155 @@ mod tests {
             );
         }
         assert!(py.contains("MODES = (MODE_MULTIMODEL, MODE_REMOTE_CONTROL)"));
+    }
+
+    // ── v0.2.94: who is watching this process? ───────────────────────────
+    //
+    // The gateway that died at 04:18 was hand-started, and the card said
+    // "running" until someone looked. These pin the DECISION — including the
+    // two leave-alone answers, which are the ones a helpful-sounding default
+    // would get wrong.
+
+    #[test]
+    fn a_hand_started_gateway_is_named_unsupervised() {
+        assert_eq!(
+            supervision_word(true, false, Some(4242), "disabled"),
+            "unsupervised"
+        );
+    }
+
+    #[test]
+    fn our_own_child_is_supervised_by_the_launcher() {
+        assert_eq!(
+            supervision_word(true, true, Some(4242), "disabled"),
+            "launcher"
+        );
+    }
+
+    #[test]
+    fn autostart_on_but_unverifiable_is_unknown_not_supervised() {
+        // Only reachable where the unit's pid cannot be read — every
+        // non-Linux host, and a Linux one without systemd. The point is that
+        // it is NOT "boot_service": claiming a supervisor we could not
+        // confirm is the false comfort this word exists to refuse.
+        if boot_service_main_pid().is_none() {
+            assert_eq!(
+                supervision_word(true, false, Some(4242), "enabled"),
+                "unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stopped_gateway_is_not_described_as_unsupervised() {
+        assert_eq!(
+            supervision_word(false, false, None, "disabled"),
+            "not_running"
+        );
+    }
+
+    #[test]
+    fn the_respawn_budget_is_one_and_the_backoff_is_real() {
+        // A loop is the boot service's problem to bound, not ours: the
+        // launcher restarts a child ONCE and then reports. If this ever
+        // grows, it has become a second supervisor with its own rules.
+        assert_eq!(MAX_RESPAWNS, 1);
+        assert!(RESPAWN_BACKOFF >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_empty_supervisor_never_spawns_anything() {
+        // `supervise` may start a process, so the "nothing to do" case is
+        // worth pinning: no entry means no spawn, whatever the poll cadence.
+        let supervisor = GatewaySupervisor::default();
+        assert!(supervisor.supervise().is_none());
+        assert!(supervisor.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_death_we_have_not_waited_out_is_not_respawned_yet() {
+        // The backoff is measured across polls rather than slept through, so
+        // the first poll after a death must decline — otherwise a start
+        // failure becomes a tight restart loop driven by the GUI's timer.
+        let supervisor = GatewaySupervisor::default();
+        *supervisor.0.lock().unwrap() = Some(Supervised {
+            child: None,
+            port: 11436,
+            dead_since: Some(Instant::now()),
+            respawns: 0,
+        });
+        assert!(supervisor.supervise().is_none());
+        assert_eq!(supervisor.0.lock().unwrap().as_ref().unwrap().respawns, 0);
+    }
+
+    #[test]
+    fn a_stop_cancels_a_pending_respawn() {
+        // The leave-alone half of the respawn decision, and the one that
+        // bites. Driven through `take_for_stop` — the function
+        // `model_gateway_stop` itself calls — rather than through a hand
+        // rolled `take()`, which would pin the test's own copy of the
+        // behaviour and stay green if the command stopped doing it.
+        let supervisor = GatewaySupervisor::default();
+        *supervisor.0.lock().unwrap() = Some(Supervised {
+            child: None,
+            port: 11436,
+            // Long enough ago that `supervise` WOULD respawn it.
+            dead_since: Some(Instant::now() - Duration::from_secs(60)),
+            respawns: 0,
+        });
+
+        let (taken, pid) = take_for_stop(&supervisor);
+        assert!(taken.is_some(), "the entry was there to take");
+        assert!(pid.is_none(), "the child was already dead");
+        assert!(
+            supervisor.supervise().is_none(),
+            "a stopped gateway must not come back on the next poll"
+        );
+        assert!(supervisor.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn stopping_an_empty_supervisor_reports_nothing_and_breaks_nothing() {
+        let supervisor = GatewaySupervisor::default();
+        let (taken, pid) = take_for_stop(&supervisor);
+        assert!(taken.is_none());
+        assert!(pid.is_none());
+    }
+
+    #[test]
+    fn the_dogfood_deadline_exceeds_the_proofs_own_budget() {
+        // Read from the Python, not re-typed: a deadline shorter than the
+        // budget kills a proof that was about to answer, and the launcher
+        // then reports "could not run" for a gateway being proved.
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let py = std::fs::read_to_string(repo_root.join("vco_lib").join("vscode_settings.py"))
+            .expect("vco_lib/vscode_settings.py readable");
+        let value_of = |name: &str| -> f64 {
+            let line = py
+                .lines()
+                .find(|l| l.starts_with(&format!("{} = ", name)))
+                .unwrap_or_else(|| panic!("{} not found", name));
+            line.split('=').nth(1).unwrap().trim().parse().unwrap()
+        };
+        let worst_case =
+            value_of("DOGFOOD_TOTAL_BUDGET_S") + value_of("DOGFOOD_CALL_TIMEOUT_S");
+        assert!(
+            (DOGFOOD_TIMEOUT.as_secs() as f64) > worst_case,
+            "DOGFOOD_TIMEOUT ({}s) must exceed the proof's own worst case ({}s)",
+            DOGFOOD_TIMEOUT.as_secs(),
+            worst_case
+        );
+    }
+
+    #[test]
+    fn the_budget_is_respected_after_a_restart() {
+        let supervisor = GatewaySupervisor::default();
+        *supervisor.0.lock().unwrap() = Some(Supervised {
+            child: None,
+            port: 11436,
+            dead_since: Some(Instant::now() - Duration::from_secs(60)),
+            respawns: MAX_RESPAWNS,
+        });
+        assert!(supervisor.supervise().is_none());
     }
 }

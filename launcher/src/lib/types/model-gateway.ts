@@ -23,20 +23,73 @@ export interface GatewayHealth {
   oauth_present: boolean;
   /** `present` | `expired` | `absent` | `unreadable`. */
   oauth_state: string;
+  /**
+   * Seconds until the Claude login expires; negative once it has, `null`
+   * when the credentials file states no expiry.
+   *
+   * It matters because NOTHING in the gateway refreshes that login: a panel
+   * pointed at the gateway authenticates with the host token, so the native
+   * refresh that a directly-connected panel performs never happens. A
+   * gateway-only machine therefore goes dark when this reaches zero, and the
+   * card warns before it does.
+   */
+  oauth_expires_in_s: number | null;
   vendors: string[];
   vendor_keys_cached: string[];
   /** `owner_only` | `broader` | `unknown` for the gateway's token file. */
   token_file_permissions: string;
 }
 
+/** One check inside a dogfood run. */
+export interface DogfoodCase {
+  case: string;
+  ok: boolean;
+  detail: string;
+}
+
+/**
+ * `ok` — the gateway answered like Anthropic.
+ * `refused` — it did NOT; `reason` is `dogfood:<case>`.
+ * `skipped` — the comparison could not run (no Claude login, no network),
+ *   which is deliberately not evidence against the gateway.
+ */
+export interface DogfoodVerdict {
+  ok: boolean;
+  status: 'ok' | 'refused' | 'skipped';
+  reason: string | null;
+  message: string;
+  /** Absent on the CLI's own refusal envelopes (no proof ran). */
+  cases?: DogfoodCase[];
+  elapsed_s: number;
+}
+
 export type GatewayProcessState = 'running' | 'stale_pid_file' | 'not_running';
 export type BootAutostart = 'enabled' | 'disabled' | 'unsupported';
+
+/** Who would restart the gateway if it died. */
+export type GatewaySupervision =
+  | 'launcher'
+  | 'boot_service'
+  | 'unsupervised'
+  | 'unknown'
+  | 'not_running';
 
 export interface ModelGatewayStatus {
   process: GatewayProcessState;
   pid: number | null;
   /** True only when THIS launcher session started it (see the Rust docs). */
   supervised: boolean;
+  /** See `supervision_word` in the Rust command module. */
+  supervision: GatewaySupervision;
+  /**
+   * The dogfood verdict, present only on the payload a START returns.
+   *
+   * `vco_lib.vscode_settings.dogfood_gateway` sends one real request through
+   * the gateway and the same one to api.anthropic.com and compares them, so
+   * "started" means "answers like Anthropic" rather than "answered
+   * /health". Absent on ordinary status polls — the proof costs seconds.
+   */
+  dogfood?: DogfoodVerdict | null;
   port: number;
   base_url: string;
   /** `true` reachable, `false` refused, `null` could not determine. */
