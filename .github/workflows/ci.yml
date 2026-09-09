@@ -162,7 +162,27 @@ jobs:
       # vct-updater) — pre-Track-E this was `--lib` against the root
       # crate only, so 3 of 4 crates' tests never ran in CI. See the
       # script header for the retry-policy decision on adopt_populated.
+      # v0.2.94: the interpreter ladder (`python_resolve.rs`) no longer ends
+      # in a bare PATH `python3` — `None` is the answer when no install venv
+      # exists, and the hub's hook-enforcement tests (which spawn
+      # `python -m vco_lib.hooks_settings`) refuse with `no_python`. A real
+      # install always has `<root>/.venv` with `pip install -e .`; the hosted
+      # runner does not, so give it the same shape here (the Python job
+      # already does the editable install for the same reason, eb1a74a4).
+      # `--no-deps`: `vco_lib.hooks_settings` is stdlib + vco_lib only, and
+      # the bare `python3` these tests ran under before had no deps either.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install vco_lib into a checkout venv (what every real install has)
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet --no-deps -e .
+          .venv/bin/python -c 'import vco_lib, vco_lib.hooks_settings; print(vco_lib.__file__)'
       - name: cargo test --workspace --tests (keychain-safe wrapper)
+        env:
+          VCT_VENV: ${{ github.workspace }}/.venv
         run: bash scripts/test-keychain-safe.sh
 
       # v0.2.54 Track E (P0-1): vct-cli is a SEPARATE Cargo workspace
