@@ -240,6 +240,35 @@ def test_floor_values_documented_as_must_match() -> None:
 # --------------------------------------------------------------------------
 # G5 — analyzer worktree-pollution guard (folded into Stream C)
 # --------------------------------------------------------------------------
+def _analyzer_env(env: dict, tmp_path: Path) -> dict:
+    """``child_env`` for an analyzer spawn, with its ledger root contained.
+
+    CONTAINMENT (v0.2.94). ``child_env`` pins ``$VCT_ORCHESTRATOR_ROOT`` at the
+    checkout so the child imports THIS tree's ``vco_lib``. The analyzer reads
+    that SAME variable for a second, unrelated purpose — the root whose
+    deferral ledger it reconciles (``main()``: ``install_root`` →
+    ``EmbeddingService.for_project`` → ``_clear_failure_deferral``) — and
+    reconciling a ledger rewrites the ``vco-deferral-reminder`` block in
+    ``<root>/CLAUDE.md``. Left at the checkout, every spawn below that gets
+    past the G5 guard edited a TRACKED file (the stray ``M CLAUDE.md`` seen in
+    ``git status`` during a suite run).
+
+    ``child_env``'s own ``KG_BASE_DIR`` pin does NOT cover this case: the
+    analyzer passes the root EXPLICITLY to ``for_project()``, and an explicit
+    root outranks both env vars in ``_detect_project_root``.
+
+    ``child_env`` documents this opt-out, and the ``PYTHONPATH`` it also sets
+    still resolves ``vco_lib`` from the checkout, so the import pin the helper
+    exists for is preserved. Applied to EVERY spawn here, including the three
+    that refuse at the guard: which ones reach the reconcile is a property of
+    the guard under test, and a test should not depend on the thing it is
+    testing to stay out of the working tree.
+    """
+    sentinel = tmp_path / "orchestrator_root_sentinel"
+    sentinel.mkdir(parents=True, exist_ok=True)
+    return child_env(env, VCT_ORCHESTRATOR_ROOT=str(sentinel))
+
+
 def test_g5_guard_present_in_analyzer() -> None:
     src = (REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py").read_text(encoding="utf-8")
     assert "_WORKTREE_PATH_SEGMENTS" in src, "analyzer missing the G5 worktree guard"
@@ -260,7 +289,7 @@ def test_g5_guard_refuses_worktree_basename_without_project(tmp_path: Path) -> N
     r = subprocess.run(
         [_analyzer_python(), str(analyzer), "."],
         cwd=str(wt), capture_output=True, text=True, timeout=60,
-        env=child_env(env),
+        env=_analyzer_env(env, tmp_path),
     )
     assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
     assert "refusing to mint" in r.stderr, r.stderr[-400:]
@@ -280,7 +309,7 @@ def test_g5_guard_allows_explicit_project_from_worktree(tmp_path: Path) -> None:
         r = subprocess.run(
             [_analyzer_python(), str(analyzer), ".", "--project", "CanonicalProj"],
             cwd=str(wt), capture_output=True, text=True, timeout=60,
-            env=child_env(env),
+            env=_analyzer_env(env, tmp_path),
         )
         assert "refusing to mint" not in r.stderr, (
             f"guard wrongly fired with an explicit --project: {r.stderr[-400:]}"
@@ -312,7 +341,7 @@ def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -
     r = subprocess.run(
         [_analyzer_python(), str(analyzer), "."],
         cwd=str(legit), capture_output=True, text=True, timeout=60,
-        env=child_env(env),
+        env=_analyzer_env(env, tmp_path),
     )
     assert "refusing to mint" not in r.stderr, (
         f"guard FALSE-REFUSED a legitimately-named 'wt-foo' project: {r.stderr[-400:]}"
@@ -332,7 +361,7 @@ def test_g5_guard_refuses_explicit_worktree_relative_project(tmp_path: Path) -> 
     r = subprocess.run(
         [_analyzer_python(), str(analyzer), ".", "--project", "vco-wt/bug1"],
         cwd=str(plain), capture_output=True, text=True, timeout=60,
-        env=child_env(env),
+        env=_analyzer_env(env, tmp_path),
     )
     assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
     assert "refusing to mint" in r.stderr, r.stderr[-400:]
@@ -354,7 +383,7 @@ def test_g5_guard_allows_explicit_legit_wt_substring_project(tmp_path: Path) -> 
         r = subprocess.run(
             [_analyzer_python(), str(analyzer), ".", "--project", "SwiftlyTyped"],
             cwd=str(plain), capture_output=True, text=True, timeout=60,
-            env=child_env(env),
+            env=_analyzer_env(env, tmp_path),
         )
         assert "refusing to mint" not in r.stderr, (
             f"guard FALSE-REFUSED an explicit legit 'wt'-substring project: {r.stderr[-400:]}"

@@ -915,6 +915,67 @@ def _guard_repo_tracked_files_against_install_pollution():
             pass
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _rootless_embedding_root_never_resolves_the_checkout():
+    """PREVENT the pollution the fixture above only repairs.
+
+    ``EmbeddingService.for_project()`` ends by reconciling the deferral ledger
+    of the root it resolved — ``_clear_failure_deferral`` on success,
+    ``_write_failure_deferral`` on failure — and reconciling a ledger REWRITES
+    ``<root>/CLAUDE.md`` (entries ⇒ the ``vco-deferral-reminder`` block is
+    spliced in; none ⇒ it is stripped). ``_detect_project_root`` falls back to
+    ``Path.cwd()`` when that directory holds a ``.claude/``, and pytest's cwd
+    is this checkout — whose ``CLAUDE.md`` is TRACKED.
+
+    So every rootless ``for_project()`` anywhere in the suite edited a
+    versioned file mid-run. The guard above restores it at session END, which
+    is why a completed run looked clean and only an in-flight ``git status``
+    (or a killed run) showed ``M CLAUDE.md``. Repairing at the end is not the
+    same as not doing it: a suite that is interrupted, or read concurrently by
+    another agent's ``git status``, still sees the damage.
+
+    ONE home rather than N call sites, deliberately: the offenders are not a
+    fixed list. Because the strip is idempotent, only the FIRST of them is
+    observable in any given run — so "fix the file the watcher named" would
+    have to be repeated for an unknown number of rounds and could never be
+    proven complete. Routing the ROOTLESS answer is complete by construction.
+
+    An EXPLICIT ``project_root=`` is delegated to the real resolver untouched,
+    so every test that passes one still exercises real resolution. A test that
+    needs the genuine rootless behaviour captures the function at import time
+    (see ``tests/test_v0294_no_test_writes_repo_root_claude_md.py``), which
+    predates this patch.
+
+    An in-process patch cannot reach a CHILD; children are contained at the
+    seams that build their environment, not here. ``tests/common/child_env.py``
+    pins ``KG_BASE_DIR`` at a throwaway directory — the key
+    ``_detect_project_root`` consults FIRST, ahead of ``$VCT_ORCHESTRATOR_ROOT``,
+    so the import pin that helper exists for is untouched. Exporting the same
+    key from THIS fixture was tried and reverted: it is read by more than the
+    project-root resolver, and ``tests/test_v0289_kg_sync_project_root.py``
+    pins its precedence against a subprocess — a session-wide value makes those
+    assertions untestable.
+
+    Two cases the ``KG_BASE_DIR`` lever cannot reach, each handled at its call
+    site: a child handed an EXPLICIT root (``analyze_code_graph.py`` passes
+    ``$VCT_ORCHESTRATOR_ROOT`` straight into ``for_project()``, and an explicit
+    argument outranks both env vars), and a child spawned with a hand-built env
+    that never went through ``child_env``.
+    """
+    from unittest.mock import patch
+
+    import vco_lib.embedding_service as _es_mod
+
+    sentinel = Path(tempfile.mkdtemp(prefix="vco-rootless-project-root-"))
+    _real_detect = _es_mod._detect_project_root
+
+    def _detect_into_sentinel(explicit=None):
+        return _real_detect(explicit) if explicit is not None else sentinel
+
+    with patch.object(_es_mod, "_detect_project_root", _detect_into_sentinel):
+        yield
+
+
 # Test files that explicitly exercise the hub-resolver and MUST run with
 # the gate UNSET (so `vco_lib.project_config.resolve` reaches its HTTP
 # probe + their mock-patches actually fire). The autouse fixture below

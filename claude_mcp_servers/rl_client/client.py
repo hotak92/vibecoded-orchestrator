@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -35,12 +36,7 @@ except ImportError:  # pragma: no cover (httpx is a hard dep)
     httpx = None  # type: ignore[assignment]
 
 from .schemas import (
-    CacheNodesRequest,
-    CacheNodesResponse,
     HealthResponse,
-    NodeInput,
-    RankedNode,
-    RLUpdateRequest,
     RLUpdateResponse,
 )
 
@@ -124,8 +120,6 @@ class NegotiationResult:
 # underscore), rejects everything else. Length capped at 64 chars
 # (UUID = 36; slugs we see in practice are <= 32; 64 is a generous
 # headroom that still bounds filesystem path length).
-
-import re
 
 # Match UUID v4 case-insensitive OR alphanumeric/dash/underscore
 # (slugs the launcher generates from project names). Length 1..64.

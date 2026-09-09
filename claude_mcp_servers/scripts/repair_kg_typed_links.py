@@ -136,6 +136,34 @@ def _graphql_post(query: str) -> dict:
     return resp.json()
 
 
+def _build_page_query(collection_name: str, after_cursor: str | None = None) -> str:
+    """Build the GraphQL query for ONE page of a collection.
+
+    Split out of ``_fetch_all_objects`` so the query text can be asserted
+    without a live Weaviate (see
+    tests/test_v0294_repair_kg_typed_links_query.py). It has to be: until
+    v0.2.94 this interpolated ``{_graphql_fields}`` — a name that has never
+    existed — so every run of this repair script died with ``NameError`` before
+    it reached the network. The constant is ``_GRAPHQL_FIELDS``, and it must be
+    the ONE place the fetched property list is written, because
+    ``_repair_collection`` reads exactly those properties back off each row.
+    """
+    after_clause = f', after: "{after_cursor}"' if after_cursor else ""
+    return f"""
+        {{
+          Get {{
+            {collection_name}(
+              limit: {_PAGE_SIZE}
+              {after_clause}
+            ) {{
+              _additional {{ id }}
+              {_GRAPHQL_FIELDS}
+            }}
+          }}
+        }}
+        """
+
+
 def _fetch_all_objects(collection_name: str) -> list[dict]:
     """Fetch all objects from a collection using REST GraphQL pagination.
 
@@ -145,20 +173,7 @@ def _fetch_all_objects(collection_name: str) -> list[dict]:
     after_cursor: str | None = None
 
     while True:
-        after_clause = f', after: "{after_cursor}"' if after_cursor else ""
-        query = f"""
-        {{
-          Get {{
-            {collection_name}(
-              limit: {_PAGE_SIZE}
-              {after_clause}
-            ) {{
-              _additional {{ id }}
-              {_graphql_fields}
-            }}
-          }}
-        }}
-        """
+        query = _build_page_query(collection_name, after_cursor)
         try:
             result = _graphql_post(query)
         except requests.HTTPError as exc:

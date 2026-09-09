@@ -22,8 +22,6 @@ SAFE operation (base model), never in container-side path traversal.
 """
 from __future__ import annotations
 
-import pytest
-
 from claude_mcp_servers.rl_client.client import sanitize_project_id
 
 
