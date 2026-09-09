@@ -875,3 +875,108 @@ export function gatewayIsConfigured(s: ModelGatewayStatus | null): boolean {
   if (!s) return false;
   return s.reachable === true || s.token_present || s.boot === 'enabled';
 }
+
+/**
+ * Who would restart this gateway if it died — said plainly, including when
+ * the answer is "nobody".
+ *
+ * A running gateway nobody supervises is the state that produced a silent
+ * outage: the card said "running", the process died an hour later, and the
+ * next thing the user saw was their editor failing. "Hand-started" is the
+ * word for it because it is also the remedy's clue — Start at login is the
+ * toggle right beside this line.
+ *
+ * `unknown` is kept distinct from `unsupervised` on purpose: the Rust side
+ * only claims a supervisor it could verify, and a card that upgrades "I
+ * could not ask" to "supervised" would re-introduce the same false comfort.
+ */
+export function describeSupervision(s: ModelGatewayStatus | null): StatusLine | null {
+  if (!s || s.supervision === 'not_running') return null;
+  switch (s.supervision) {
+    case 'launcher':
+      return {
+        tone: 'up',
+        label: 'supervised by this launcher',
+        detail:
+          'This launcher started it and will restart it once if it dies. Closing the launcher leaves it running but unsupervised.',
+      };
+    case 'boot_service':
+      return {
+        tone: 'up',
+        label: 'supervised at login',
+        detail:
+          'The login service owns this process and restarts it on failure.',
+      };
+    case 'unsupervised':
+      return {
+        tone: 'warn',
+        label: 'unsupervised (hand-started)',
+        detail:
+          'Nothing will restart this gateway if it dies — your editor would simply start failing. Turn on Start at login for a supervised one.',
+      };
+    default:
+      return {
+        tone: 'unknown',
+        label: 'supervision unknown',
+        detail:
+          'Start at login is on, but this machine could not be asked whether the login service owns this exact process.',
+      };
+  }
+}
+
+/**
+ * The dogfood verdict, when it is worth showing.
+ *
+ * A refusal is the loudest thing this card can say: the gateway answered
+ * DIFFERENTLY from Anthropic on a real request, so pointing a panel at it
+ * would hand the user a session that fails in a way they cannot diagnose.
+ * `skipped` is silent — a machine with no Claude login or no network has a
+ * perfectly good gateway and nothing to compare it against.
+ */
+export function describeDogfood(s: ModelGatewayStatus | null): StatusLine | null {
+  const verdict = s?.dogfood;
+  if (!verdict || verdict.status !== 'refused') return null;
+  // `?? []`: the verdict may come from the CLI's own refusal envelope (a
+  // missing host token), which has no cases — and this runs inside a
+  // `$derived`, where a throw takes the whole card down.
+  const failed = (verdict.cases ?? []).find((c) => !c.ok);
+  return {
+    tone: 'down',
+    label: `gateway answered differently from Anthropic (${verdict.reason ?? 'unknown check'})`,
+    detail: `${verdict.message}${failed ? ` [${failed.case}: ${failed.detail}]` : ''}`,
+  };
+}
+
+/** Warn this long before the Claude login expires. */
+export const OAUTH_WARN_SECONDS = 30 * 60;
+
+/**
+ * The Claude login's remaining life, when it is short enough to act on.
+ *
+ * Nothing in the gateway refreshes that login: a panel pointed at the
+ * gateway presents the host token, so the refresh a directly-connected panel
+ * performs never happens, and a gateway-only machine goes dark when the
+ * token expires. `null` here means "nothing to say" — plenty of time left,
+ * no expiry stated, or no login at all (which the status line already
+ * covers).
+ */
+export function describeOAuthExpiry(s: ModelGatewayStatus | null): StatusLine | null {
+  const seconds = s?.health?.oauth_expires_in_s;
+  if (seconds === null || seconds === undefined) return null;
+  if (seconds <= 0) {
+    return {
+      tone: 'down',
+      label: 'Claude login expired',
+      detail:
+        'The gateway cannot serve first-party models until you run `claude` (or open a native panel) once to refresh the login.',
+    };
+  }
+  if (seconds > OAUTH_WARN_SECONDS) return null;
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return {
+    tone: 'warn',
+    label: `Claude login expires in ${minutes} min`,
+    detail:
+      'Run `claude` (or open a native panel) once before then: the gateway reads that login and never refreshes it itself.',
+  };
+}

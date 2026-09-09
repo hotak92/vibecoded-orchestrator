@@ -307,6 +307,64 @@ def test_the_systemd_unit_bounds_a_restart_loop(sandbox):
     )
 
 
+def test_a_stop_may_not_kill_a_stream_in_flight(sandbox):
+    """`TimeoutStopSec` must not be shorter than the daemon's own shutdown.
+
+    The daemon asks aiohttp for `shutdown_timeout=60` so a completion that is
+    mid-stream when the service stops is allowed to finish. A 15s stop
+    timeout — the value shipped before v0.2.94 — SIGKILLed it instead, and
+    the client saw a truncated answer for what the user experienced as an
+    ordinary "restart the gateway". The two numbers are one decision in two
+    files, so the test compares them rather than asserting a literal.
+    """
+    home, _ = sandbox
+    spec = bs.model_gateway_spec(os_key="Linux", exec_argv=["/gw"])
+    bs.register(spec, templates_root=REPO_ROOT, system="Linux", home=home)
+    body = bs.systemd_unit_path(spec, home).read_text(encoding="utf-8")
+
+    stop_timeout = re.search(r"^TimeoutStopSec=(\d+)s$", body, re.M)
+    assert stop_timeout is not None, body
+
+    daemon = (
+        REPO_ROOT / "claude_mcp_servers" / "model_router" / "__main__.py"
+    ).read_text(encoding="utf-8")
+    shutdown = re.search(r"shutdown_timeout=(\d+)(?:\.\d+)?", daemon)
+    assert shutdown is not None, "the daemon must state its shutdown timeout"
+    assert int(stop_timeout.group(1)) >= int(shutdown.group(1)), (
+        f"systemd would SIGKILL after {stop_timeout.group(1)}s while the "
+        f"daemon is still draining for {shutdown.group(1)}s"
+    )
+
+
+def test_register_boot_writes_the_CURRENT_template_not_the_installed_one(sandbox):
+    """`--register-boot` re-renders; a stale unit cannot survive it.
+
+    The unit installed on the 2026-09-09 machine predated the restart-loop
+    bound, so the fix existed in the repo and nowhere on disk. Two paths write
+    this file — `install.py --update` (via `rerender_if_registered`) and
+    `--register-boot` (via `register`) — and BOTH must render the template as
+    it is today. The update path has its own test; this one pins the
+    register path, because "the user re-enabled autostart" is the more
+    likely way a stale unit gets replaced.
+    """
+    home, _ = sandbox
+    spec = bs.model_gateway_spec(os_key="Linux", exec_argv=["/gw"])
+    unit = bs.systemd_unit_path(spec, home)
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(
+        "[Unit]\nDescription=stale\n[Service]\nExecStart=/gone\n",
+        encoding="utf-8",
+    )
+
+    bs.register(spec, templates_root=REPO_ROOT, system="Linux", home=home)
+
+    body = unit.read_text(encoding="utf-8")
+    assert "stale" not in body
+    for directive in ("StartLimitIntervalSec=", "StartLimitBurst=",
+                      "RestartSec=", "TimeoutStopSec="):
+        assert directive in body, f"{directive} missing from a fresh render"
+
+
 def test_the_launchagent_does_not_restart_a_clean_exit(sandbox):
     """macOS twin of the same rule: exit 0 (stopped, or already running) is
     a final state. A bare `KeepAlive` boolean would respin it."""

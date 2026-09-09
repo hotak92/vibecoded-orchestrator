@@ -281,7 +281,9 @@ class SseRewriterTests(unittest.TestCase):
                 "content_block": {"type": "server_tool_use", "id": "call_abc",
                                   "name": "web_search", "input": {}}})
         ) + rewriter.flush()
-        self.assertIn(b'"id": "srvtoolu_vct_call_abc"', out)
+        # Compact separators (``_COMPACT_JSON``): a rewritten event must
+        # never be longer than the one upstream sent.
+        self.assertIn(b'"id":"srvtoolu_vct_call_abc"', out)
         self.assertEqual(id_map["srvtoolu_vct_call_abc"], "call_abc")
 
     def test_a_split_chunk_boundary_is_handled(self) -> None:
@@ -454,7 +456,7 @@ class SseRewriterTests(unittest.TestCase):
         # because an assistant message may not carry a tool_result AT ALL,
         # which is a separate live 400 from the dropped-producer rule.
         self.assertNotIn("call_never_seen", out)
-        self.assertIn('"type": "text"', out)
+        self.assertIn('"type":"text"', out)
         indexes = [
             json.loads(line[len("data: "):])["index"]
             for line in out.splitlines()

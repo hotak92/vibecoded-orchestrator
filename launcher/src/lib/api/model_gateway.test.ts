@@ -27,6 +27,9 @@ import {
   canStop,
   checkModelGateway,
   describeStatus,
+  describeDogfood,
+  describeOAuthExpiry,
+  describeSupervision,
   describeWriteResult,
   gatewayIsConfigured,
   getModelGatewayStatus,
@@ -56,6 +59,7 @@ function makeStatus(over: Partial<ModelGatewayStatus> = {}): ModelGatewayStatus 
     process: 'running',
     pid: 4242,
     supervised: true,
+    supervision: 'launcher',
     port: 11436,
     base_url: 'http://127.0.0.1:11436',
     reachable: true,
@@ -70,6 +74,7 @@ function makeStatus(over: Partial<ModelGatewayStatus> = {}): ModelGatewayStatus 
       context_table_path: '/home/u/.vct/model-gateway/chat_model_context.json',
       oauth_present: true,
       oauth_state: 'present',
+      oauth_expires_in_s: 8 * 3600,
       vendors: ['zai'],
       vendor_keys_cached: ['zai'],
       token_file_permissions: 'owner_only',
@@ -565,5 +570,111 @@ describe('describeWriteResult', () => {
     expect(
       describeWriteResult({ ...base, status: 'unchanged', message: 'already set' }),
     ).toBe('already set');
+  });
+});
+
+// ─── v0.2.94: supervision and login expiry ────────────────────────────────
+//
+// Both exist because "running" was not the whole truth. A gateway nobody
+// supervises dies silently, and a login the gateway cannot refresh expires
+// silently; the card has to say so BEFORE the user's editor starts failing.
+
+describe('describeSupervision', () => {
+  it('names a hand-started gateway as unsupervised', () => {
+    const line = describeSupervision(
+      makeStatus({ supervised: false, supervision: 'unsupervised' }),
+    );
+    expect(line?.tone).toBe('warn');
+    expect(line?.label).toBe('unsupervised (hand-started)');
+    expect(line?.detail).toContain('Start at login');
+  });
+
+  it('does not upgrade "could not ask" to supervised', () => {
+    const line = describeSupervision(makeStatus({ supervision: 'unknown' }));
+    expect(line?.tone).toBe('unknown');
+    expect(line?.label).toContain('unknown');
+  });
+
+  it('says who owns it when that is known', () => {
+    expect(describeSupervision(makeStatus({ supervision: 'launcher' }))?.tone).toBe('up');
+    expect(
+      describeSupervision(makeStatus({ supervision: 'boot_service' }))?.label,
+    ).toBe('supervised at login');
+  });
+
+  it('says nothing about a gateway that is not running', () => {
+    expect(describeSupervision(makeStatus({ supervision: 'not_running' }))).toBeNull();
+    expect(describeSupervision(null)).toBeNull();
+  });
+});
+
+describe('describeOAuthExpiry', () => {
+  function withExpiry(seconds: number | null) {
+    const s = makeStatus();
+    return { ...s, health: { ...s.health!, oauth_expires_in_s: seconds } };
+  }
+
+  it('stays quiet while there is plenty of time', () => {
+    expect(describeOAuthExpiry(withExpiry(8 * 3600))).toBeNull();
+  });
+
+  it('warns inside the last half hour, in minutes', () => {
+    const line = describeOAuthExpiry(withExpiry(25 * 60));
+    expect(line?.tone).toBe('warn');
+    expect(line?.label).toContain('25 min');
+  });
+
+  it('reports an expired login as down, with the remedy', () => {
+    const line = describeOAuthExpiry(withExpiry(-60));
+    expect(line?.tone).toBe('down');
+    expect(line?.detail).toContain('claude');
+  });
+
+  it('says nothing when no expiry is stated', () => {
+    expect(describeOAuthExpiry(withExpiry(null))).toBeNull();
+  });
+});
+
+describe('describeDogfood', () => {
+  const refused = {
+    ok: false,
+    status: 'refused' as const,
+    reason: 'dogfood:ascii_6mib',
+    message: 'the same 6291456-byte request answered HTTP 413 through the gateway',
+    cases: [{ case: 'ascii_6mib', ok: false, detail: 'gateway 413/None vs native 200/1024' }],
+    elapsed_s: 2.4,
+  };
+
+  it('shouts when the gateway answered differently from Anthropic', () => {
+    const line = describeDogfood(makeStatus({ dogfood: refused }));
+    expect(line?.tone).toBe('down');
+    expect(line?.label).toContain('dogfood:ascii_6mib');
+    expect(line?.detail).toContain('413');
+  });
+
+  it('stays silent when the proof merely could not run', () => {
+    expect(
+      describeDogfood(
+        makeStatus({
+          dogfood: { ...refused, status: 'skipped', reason: null, ok: false },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('survives a refusal envelope that carries no cases', () => {
+    // The CLI's own refusal (a missing host token) has no `cases`; this runs
+    // inside a `$derived`, so a throw here takes the whole card down.
+    const { cases: _dropped, ...caseless } = refused;
+    const line = describeDogfood(makeStatus({ dogfood: caseless as never }));
+    expect(line?.tone).toBe('down');
+    expect(line?.detail).toContain('413');
+  });
+
+  it('stays silent on a pass, and on a status that never ran one', () => {
+    expect(
+      describeDogfood(makeStatus({ dogfood: { ...refused, status: 'ok', ok: true } })),
+    ).toBeNull();
+    expect(describeDogfood(makeStatus())).toBeNull();
   });
 });

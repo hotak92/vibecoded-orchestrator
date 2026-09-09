@@ -199,6 +199,19 @@ def _listener_accepts(family: int, sockaddr: object) -> bool:
     return True
 
 
+#: Header limits handed to aiohttp's request parser. A dict rather than three
+#: literals at the call site so a TEST can serve with exactly what the daemon
+#: serves with: re-typing the numbers in a test would pin the test's own copy,
+#: and the failure they exist to prevent (a 16 KiB ``anthropic-beta`` answered
+#: with a bare 400 ``text/plain``) could come back with the gate still green.
+#: See ``tests/test_v0294_gateway_robustness.py``.
+SERVER_LIMITS = {
+    "max_field_size": 32768,
+    "max_line_size": 32768,
+    "max_headers": 256,
+}
+
+
 def _bind_targets(host: str, port: int) -> "list[tuple[int, int, int, object]]":
     """Every distinct address ``host`` names for ``port``, deduplicated."""
     infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -714,7 +727,45 @@ def _serve(port_override: Optional[int]) -> int:
         # the gateway's access line is deliberately ONE line in ONE shape
         # (see the logging policy in ``model_router.server``). Two lines per
         # request is not extra detail, it is a log nobody can grep.
-        web.run_app(app, sock=socks, print=None, access_log=None)
+        #
+        # Every other argument here exists because aiohttp's SERVER default is
+        # tighter than what a real Claude Code client sends, and each tight
+        # default is a failure that happens through the gateway and not
+        # natively:
+        #
+        # ``max_field_size`` / ``max_line_size`` (8190 by default) — a session
+        # with several betas enabled sends an ``anthropic-beta`` header of ~16
+        # KiB. Over the default the connection is answered with a bare 400
+        # ``text/plain`` that no SDK can parse. 32 KiB is double the largest
+        # header observed and still bounded.
+        # ``max_headers`` (128) — raised with them, for the same reason: the
+        # limit that trips must not be ours.
+        # ``keepalive_timeout`` — ``run_app`` narrows aiohttp's own 3630 s
+        # default to 75 s. A client that thinks for two minutes between turns
+        # then writes to a socket the gateway has closed, which surfaces as a
+        # spurious disconnect; 3630 s restores the library's own value.
+        # ``shutdown_timeout=60`` (matched by ``TimeoutStopSec`` in the boot
+        # unit) — a stop during a long stream must be allowed to finish it.
+        # ``handler_cancellation=True`` — when the CLIENT goes away, cancel
+        # the handler so the upstream request is dropped immediately instead
+        # of running to completion on a connection nobody is reading. Without
+        # it an abandoned turn keeps burning the user's quota.
+        web.run_app(
+            app,
+            sock=socks,
+            print=None,
+            access_log=None,
+            shutdown_timeout=60.0,
+            keepalive_timeout=3630.0,
+            handler_cancellation=True,
+            # Spelled out rather than unpacked: `**dict` hides the keyword
+            # names from the type checker, and these three are exactly the
+            # kind of argument a rename upstream would silently drop. The
+            # VALUES still have one home, which is what the test reads.
+            max_field_size=SERVER_LIMITS["max_field_size"],
+            max_line_size=SERVER_LIMITS["max_line_size"],
+            max_headers=SERVER_LIMITS["max_headers"],
+        )
         return 0
     finally:
         # ``run_app`` takes ownership of the sockets and closes them on

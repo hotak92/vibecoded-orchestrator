@@ -49,6 +49,27 @@ on a vendor route the tool ids in the response are normalised
 and the transcript is append-only, so relaying it faithfully is relaying a
 booby trap.
 
+Body-size policy: **the gateway never refuses a request for its size.** A
+proxy that answers what the upstream would have served is a failure the user
+cannot route around, and this one was exactly that on 2026-09-09: aiohttp's
+DEFAULT ``client_max_size`` is 1 MiB and this handler buffers the body (it
+rewrites ids in it), so every ``POST /v1/messages`` of a conversation past
+roughly 250K tokens of context — far less with images — came back 413 from the
+gateway itself while the same conversation worked natively. Claude Code renders
+ANY 413 as "Request too large (max 32MB). Accumulated images and attachments…",
+so the daemon's own refusal read as the user's transcript being at fault.
+
+Hence two decisions that must be read together. The application is built with
+:data:`UNBOUNDED_CLIENT_MAX_SIZE`, so aiohttp imposes no ceiling at all; and
+the id rewrite — which needs the whole body in memory — is bounded instead by
+:data:`model_router.config.REWRITE_BUFFER_LIMIT_BYTES`. A body past that bound
+is NOT parsed and NOT held: the buffered head is forwarded followed by the rest
+of the client's stream, and whatever the upstream answers (200, or its own 413)
+reaches the client verbatim. The ONE edit on that path is the model id literal,
+spliced to the routed name because the ``claude-gw/`` namespace and the ``[1m]``
+suffix are the gateway's own invention and no upstream knows them. The tool-id
+repair is skipped; it is a repair, and the request is the point.
+
 Logging policy: never a body (DEBUG-only for a quota refusal), never a
 credential. ONE line per request in ONE shape —
 ``requested=… route=… forward=… status=… ms=… stream=…`` — where ``requested``
@@ -71,7 +92,7 @@ import ipaddress
 import json
 import logging
 import time
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Mapping, NamedTuple, Optional
 
 import aiohttp
 from aiohttp import web
@@ -79,7 +100,7 @@ from aiohttp import web
 from . import __version__
 from .auth import OAuthReader, token_matches
 from .catalog import CatalogService, to_models_response
-from .config import SERVICE_NAME, GatewayConfig
+from .config import SERVICE_NAME, UPSTREAM_CONNECT_TIMEOUT_S, GatewayConfig
 from .context_table import ContextTableLoader
 from .fileperms import OwnerOnlyState
 from .quota import (
@@ -92,6 +113,7 @@ from .quota import (
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
 from .tool_ids import (
+    COMPACT_JSON,
     JSON_BUFFER_LIMIT_BYTES,
     BoundedIdMap,
     RepairStats,
@@ -117,7 +139,11 @@ logger = logging.getLogger(__name__)
 #: are dropped because the client presents the LOCAL host token there, and
 #: forwarding it upstream would leak it to the vendor. ``accept-encoding`` is
 #: dropped so the client library's own negotiation governs, keeping the relayed
-#: bytes and the relayed headers consistent.
+#: bytes and the relayed headers consistent. ``content-encoding`` is dropped
+#: for the mirror-image reason on the REQUEST: aiohttp has already
+#: decompressed the body by the time it reaches the handler, so forwarding
+#: the header would tell the upstream to gunzip plain JSON — a 400 that only
+#: happens through the gateway.
 _HOP_BY_HOP_REQUEST = frozenset(
     {
         "host",
@@ -133,6 +159,7 @@ _HOP_BY_HOP_REQUEST = frozenset(
         "authorization",
         "x-api-key",
         "accept-encoding",
+        "content-encoding",
     }
 )
 
@@ -163,6 +190,39 @@ _STREAM_CHUNK_HINT = "event-stream"
 #: carried the suffix and the client did not send the header itself.
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
+#: Passed to aiohttp as the application's ``client_max_size``. Zero is
+#: aiohttp's "no limit" (``web_request.BaseRequest.read`` guards the size
+#: check with ``if self._client_max_size:``), and no limit is the correct
+#: value here: the gateway must never be the party that refuses a request for
+#: its size — see the body-size policy in this module's docstring. What the
+#: gateway BUFFERS is bounded separately, by
+#: :data:`model_router.config.REWRITE_BUFFER_LIMIT_BYTES`, and overrunning
+#: that bound streams the request instead of refusing it.
+#:
+#: ``tests/test_v0294_gateway_body_limit.py`` pins the BEHAVIOUR, not just the
+#: value: a body well past aiohttp's 1 MiB default is served end to end, so an
+#: aiohttp release that gave 0 some other meaning fails there.
+UNBOUNDED_CLIENT_MAX_SIZE = 0
+
+#: The access-line field that says a request was served WITHOUT the id
+#: rewrite because it outgrew the buffer. One spelling, in one place: it is
+#: what an operator greps for after "why did this call carry a namespaced
+#: model id upstream?".
+REWRITE_BUFFER_NOTE = "note=body_over_rewrite_buffer"
+
+#: What :func:`_guarded` returns when a rewrite raised, so the caller can
+#: tell "the pass produced nothing" from "the pass is broken". A unique
+#: object, not ``None``: empty ``bytes`` is an ordinary result from
+#: :meth:`SseIdRewriter.feed` (it holds a partial event back), and conflating
+#: the two would abandon the rewrite on every buffered chunk.
+_ABANDON = object()
+
+#: How much of an over-buffer body is walked for the routing fields. The
+#: top-level ``model`` sits in the flat head of every request a client
+#: actually sends, so this is generous; it is bounded at all because the walk
+#: is a Python-level scan and the buffer it runs on can be tens of MiB.
+HEAD_SCAN_BYTES = 64 * 1024
+
 #: How much of a vendor's quota-refusal body is read before it is replaced.
 #: Bounded because the body is never relayed — it exists here only to find a
 #: reset hint and to be logged at DEBUG, and an unbounded read of a body we
@@ -170,13 +230,58 @@ CONTEXT_1M_BETA = "context-1m-2025-08-07"
 _QUOTA_BODY_PEEK_BYTES = 64 * 1024
 
 
+#: What a GATEWAY-side 502 carries. Anthropic's SDKs read ``x-should-retry``
+#: to decide whether a status is worth another attempt, and every 502 this
+#: daemon writes is transient by construction — the upstream refused the
+#: connection, or went quiet. Native sees a connection error there and
+#: retries; without this header the same condition through the gateway is a
+#: hard failure, which is the invariant ("never worse than native") breaking
+#: on the most ordinary flake there is.
+RETRYABLE_HEADERS = {"x-should-retry": "true"}
+
+
 def _error_body(kind: str, message: str) -> dict:
     """Anthropic-shaped error envelope, so the client renders our text."""
     return {"type": "error", "error": {"type": kind, "message": message}}
 
 
-def _json_error(status: int, kind: str, message: str) -> web.Response:
-    return web.json_response(_error_body(kind, message), status=status)
+def _json_error(
+    status: int,
+    kind: str,
+    message: str,
+    headers: Optional[Mapping[str, str]] = None,
+) -> web.Response:
+    return web.json_response(
+        _error_body(kind, message),
+        status=status,
+        headers=dict(headers) if headers else None,
+    )
+
+
+def _guarded(fn: Callable[..., Any], *args: Any, what: str) -> Any:
+    """Run a REWRITE; on ANY exception log once and return :data:`_ABANDON`.
+
+    Every rewrite in this module is optional by nature — it repairs somebody
+    else's bytes so that a later request does not break. Unguarded, a bug in
+    one leaves the handler with an unhandled exception, which aiohttp turns
+    into a 500 ``text/plain``; Anthropic's SDK retries a 500 up to ten times,
+    so one defect becomes ten vendor-billed requests and the user is told
+    nothing useful. Native, against the same upstream, would simply have
+    received the upstream's own answer.
+
+    The caller therefore always has an answer to "what would I have had if
+    this pass had never existed?", and gives it to the request.
+    ``Exception`` deliberately, not a named list: the point is that NO defect
+    in a repair may take a request down, and a repair cannot know in advance
+    which bug it will have.
+    """
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001 — see the docstring: this is the point
+        logger.exception(
+            "model-gateway: %s failed; continuing without it", what,
+        )
+        return _ABANDON
 
 
 def _peer_host(request: web.Request) -> Optional[str]:
@@ -397,6 +502,19 @@ def _add_route(
     app.router.add_route(method, path + "/", handler, name=f"{name}_slash")
 
 
+def _expires_in_s(expires_at_ms: int) -> Optional[int]:
+    """Seconds until an epoch-millisecond expiry, or ``None`` when unstated.
+
+    Signed: a login that expired ten minutes ago reports ``-600``, which is
+    information, where a floor at zero would make "just expired" and "expired
+    yesterday" the same reading. ``None`` means the credentials file states no
+    expiry at all — not "expires now".
+    """
+    if not expires_at_ms:
+        return None
+    return int(expires_at_ms / 1000 - time.time())
+
+
 async def health_handler(request: web.Request) -> web.Response:
     """Liveness. Cached state plus one ``stat``; never blocks.
 
@@ -408,7 +526,9 @@ async def health_handler(request: web.Request) -> web.Response:
     ``unavailable``),
     ``context_table_source``, ``context_table_path``, ``oauth_present``
     (bool), ``oauth_state`` (``present``/``expired``/``absent``/
-    ``unreadable``), ``vendors``, ``vendor_keys_cached``,
+    ``unreadable``), ``oauth_expires_in_s`` (int seconds, negative once past,
+    ``null`` when the file states no expiry), ``vendors``,
+    ``vendor_keys_cached``,
     ``token_file_permissions`` (``owner_only``/``broader``/``unknown``,
     sampled at startup — probing it here would shell out on Windows).
     """
@@ -429,6 +549,14 @@ async def health_handler(request: web.Request) -> web.Response:
             "context_table_path": str(table.path) if table.path else None,
             "oauth_present": oauth.present,
             "oauth_state": oauth.state,
+            # The number the launcher card needs to warn BEFORE the gateway
+            # goes dark. A panel pointed here presents a host token, not the
+            # Claude login, so nothing in this process refreshes that login —
+            # only a native client does. Reporting "present" up to the second
+            # it expires is therefore true and useless; the countdown is what
+            # lets the GUI say "re-login within 25 minutes" while there is
+            # still time to act.
+            "oauth_expires_in_s": _expires_in_s(oauth.expires_at_ms),
             "vendors": sorted(gateway.vendors.keys()),
             "vendor_keys_cached": list(gateway.keys.cached_vendor_ids()),
             "token_file_permissions": gateway.token_permissions,
@@ -558,8 +686,256 @@ def _unauthorised() -> web.Response:
     )
 
 
+def _read_json_string(
+    buf: bytes, start: int, end: int,
+) -> "tuple[Optional[str], int]":
+    """The JSON string literal starting at ``buf[start]``, and where it ends.
+
+    ``start`` must be the opening quote. Escapes are honoured while looking
+    for the closing one — an escaped quote inside a value must not end it —
+    and the literal is decoded by :mod:`json` itself rather than by hand, so
+    an escaped id is read exactly as the upstream will read it. Returns
+    ``(None, …)`` when the literal is truncated or invalid, which is a normal
+    outcome here: the buffer is a PREFIX of the body.
+    """
+    i = start + 1
+    while i < end:
+        c = buf[i]
+        if c == 0x5C:  # backslash — the next byte is escaped, whatever it is
+            i += 2
+            continue
+        if c == 0x22:  # the closing quote
+            try:
+                text = json.loads(buf[start:i + 1])
+            except (ValueError, UnicodeDecodeError):
+                return None, i + 1
+            return (text if isinstance(text, str) else None), i + 1
+        i += 1
+    return None, end
+
+
+class HeadField(NamedTuple):
+    """A top-level field read out of a body the gateway did not parse.
+
+    ``value`` is the decoded text. ``start`` and ``end`` bound the RAW literal
+    inside the buffer — quotes included for a string — so a caller can splice
+    a replacement into the bytes without re-encoding, or even parsing, the
+    body around it. That is the whole reason the span is carried: on the
+    over-buffer path there is no parsed body to edit, and the one edit the
+    gateway still owes the request is a substitution of exactly this literal
+    (see :func:`_splice_literal`).
+    """
+
+    value: str
+    start: int
+    end: int
+
+
+def _splice_literal(buf: bytes, field: HeadField, replacement: str) -> bytes:
+    """``buf`` with ``field``'s literal replaced by ``replacement``, encoded.
+
+    The ONE edit made to a body that outgrew the rewrite buffer, and it is
+    made because the thing being replaced is the GATEWAY's own invention: the
+    ``claude-gw/`` namespace and Claude Code's ``[1m]`` suffix are client-side
+    spellings that no upstream has ever heard of (see
+    :mod:`model_router.routing`). Forwarding them verbatim would be forwarding
+    a request only the gateway could have broken — the opposite of the reason
+    this path exists. Everything else stays untouched: the tool-id repair is a
+    correction of a VENDOR's output and skipping it costs a cosmetic id, not
+    the request.
+
+    ``json.dumps`` writes the replacement, so an id needing escapes is encoded
+    the way the upstream's parser reads it rather than by string surgery.
+    """
+    return (
+        buf[:field.start]
+        + json.dumps(replacement).encode("utf-8")
+        + buf[field.end:]
+    )
+
+
+def _shallow_top_level_fields(head: bytes) -> "dict[str, HeadField]":
+    """The top-level scalar fields of a JSON object, read from its head.
+
+    Used on ONE path: a request body too big to hold, where the gateway still
+    has to know which upstream and which credential it is for. It reads only
+    what it can prove is at the top level — a ``"model"`` nested inside a
+    message, or one inside a string, is at a depth this walk tracks and is
+    never mistaken for the request's own. That exactness is the point: a
+    regex would send somebody's conversation to the wrong vendor, with the
+    wrong key, on a body it never parsed.
+
+    Duplicate top-level keys are read LAST-wins, which matches every JSON
+    parser an upstream will use — but only within the scanned window: a
+    second ``"model"`` sitting past :data:`HEAD_SCAN_BYTES` is invisible here
+    while the upstream would honour it. A body with two top-level ``model``
+    keys is malformed by convention rather than by grammar, and the outcome
+    (the first one routes, the upstream sees the second) is documented rather
+    than guarded, because guarding it would mean parsing the whole body —
+    which is the thing this path exists to avoid.
+
+    Values come back as :class:`HeadField` — the decoded text plus the span
+    of the raw literal, which is what makes a splice possible (a string's
+    contents, quotes excluded, but a span that INCLUDES them; a bare literal's
+    spelling, e.g. ``"true"``). Containers are skipped, so nothing nested is
+    returned. Missing is missing: a field sitting after a container longer
+    than :data:`HEAD_SCAN_BYTES` is simply not found, and the caller decides
+    what an absence means.
+    """
+    out: "dict[str, HeadField]" = {}
+    end = min(len(head), HEAD_SCAN_BYTES)
+    i = 0
+    while i < end and head[i] in b" \t\r\n":
+        i += 1
+    if i >= end or head[i] != 0x7B:  # not a JSON object
+        return out
+    i += 1
+    depth = 1
+    expect_key = True
+    key: Optional[str] = None
+    while i < end:
+        c = head[i]
+        if c in b" \t\r\n":
+            i += 1
+            continue
+        if c == 0x22:  # a string literal
+            literal_start = i
+            text, i = _read_json_string(head, i, end)
+            if depth != 1:
+                continue  # inside a container: read past it, keep nothing
+            if text is None:
+                return out  # truncated mid-literal; nothing after it is sound
+            if expect_key:
+                key = text
+            else:
+                if key is not None:
+                    out[key] = HeadField(text, literal_start, i)
+                key = None
+            continue
+        if depth == 1:
+            if c == 0x3A:  # ':'
+                expect_key = False
+                i += 1
+                continue
+            if c == 0x2C:  # ','
+                expect_key = True
+                key = None
+                i += 1
+                continue
+            if c == 0x7D:  # '}' — the whole object fit inside the head
+                return out
+            if c in b"{[":
+                depth += 1
+                i += 1
+                continue
+            start = i  # a bare literal: number, true, false, null
+            while i < end and head[i] not in b",}] \t\r\n":
+                i += 1
+            if i == start:
+                # NO PROGRESS. The byte here is one this scan has no branch
+                # for and the literal scan stops on immediately — a ``]`` at
+                # depth 1, i.e. a malformed body (``{"a":1]``, ``{"model":]``).
+                # Continuing would re-examine the same byte forever, on the
+                # EVENT LOOP: one such request froze the whole daemon, every
+                # other session included. A body this broken has no readable
+                # model, which is the caller's "cannot route" case, so
+                # stopping here is also the honest answer.
+                return out
+            if key is not None and not expect_key:
+                out[key] = HeadField(
+                    head[start:i].decode("ascii", "replace"), start, i,
+                )
+            key = None
+            continue
+        if c in b"{[":
+            depth += 1
+        elif c in b"}]":
+            depth -= 1
+            if depth == 1:
+                key = None  # the value that opened it is finished
+        i += 1
+    return out
+
+
+async def _drain(content: aiohttp.StreamReader) -> int:
+    """Read and discard whatever is left of a request body. Never raises.
+
+    Precautionary, and measured rather than assumed: answering while the
+    client is still uploading is the classic way a carefully-worded error is
+    replaced by a connection reset in the client's write path. Against
+    aiohttp's OWN client it is NOT reproducible — 8 MiB and 24 MiB bodies
+    answered early both arrive complete, with no ``Connection: close`` — so
+    this is not credited with fixing a symptom seen here. It is kept because
+    the clients that actually talk to this daemon are not aiohttp (Node's
+    undici, curl, the Python SDK), the cost is one pass over bytes already on
+    the wire, and "finish reading the request before answering it" is the
+    behaviour every HTTP client is written against.
+
+    Errors are swallowed on purpose: the client hanging up mid-drain is the
+    normal way this ends, and there is nothing left to report it to.
+    """
+    dropped = 0
+    try:
+        async for chunk in content.iter_any():
+            dropped += len(chunk)
+    except (
+        ConnectionResetError,
+        ConnectionAbortedError,
+        aiohttp.ClientError,
+        asyncio.TimeoutError,
+    ):
+        pass
+    return dropped
+
+
+async def _stream_after(
+    head: bytes, content: aiohttp.StreamReader,
+) -> AsyncIterator[bytes]:
+    """The bytes already buffered, then the rest of the client's body.
+
+    :func:`_buffer_bounded` stops holding at the chunk that crossed the bound
+    and leaves the remainder in the reader, so this replays the head and then
+    follows the stream: no byte is read twice and none is dropped.
+    """
+    if head:
+        yield head
+    async for chunk in content.iter_any():
+        yield chunk
+
+
 async def messages_handler(request: web.Request) -> web.StreamResponse:
-    """Proxy ``/v1/messages`` and ``/v1/messages/count_tokens``."""
+    """Proxy ``/v1/messages`` and ``/v1/messages/count_tokens``.
+
+    The body is BUFFERED, not streamed through: the routed model name has to
+    be in the forwarded bytes, and on a vendor route the tool ids have to be
+    restored, so on the ordinary path the gateway is not a pass-through. What
+    it will hold to do that is
+    :attr:`model_router.config.GatewayConfig.rewrite_buffer_bytes` (default
+    :data:`model_router.config.REWRITE_BUFFER_LIMIT_BYTES`, 32 MiB — above
+    Anthropic's own documented request ceiling, so every body the first-party
+    upstream can accept is rewritten).
+
+    Past that bound the request is still SERVED, because the gateway refuses
+    nothing for size (see the body-size policy in the module docstring). The
+    body is not parsed and not held: the buffered head is forwarded and the
+    rest of the client's stream follows it, with no rewrite, and the upstream's
+    own answer is relayed. Two consequences, both deliberate:
+
+    * only the routing fields are read out of the head
+      (:func:`_shallow_top_level_fields`) — enough to choose the upstream and
+      the credential, and nothing more. A body whose ``model`` is not readable
+      there cannot be routed at all and is the ONE size-related refusal left
+      (400, ``reason=model_unreadable_in_head``): it is unroutable, not too
+      big;
+    * the body is forwarded as it arrived apart from ONE substitution: the
+      model id literal is spliced to the routed name
+      (:func:`_splice_literal`), because the ``claude-gw/`` namespace and the
+      ``[1m]`` suffix are the gateway's OWN spellings and no upstream knows
+      them. The tool-id repair does not run — it needs the whole body, and it
+      corrects a vendor's output rather than the request. So an oversized
+      request is answered by the upstream, on its merits, which is the point
+      of this path.
+    """
     gateway: Gateway = request.app[APP_KEY]
     # Taken BEFORE the auth check, so every outcome below — including the
     # two that answer without reading the body — measures the same thing:
@@ -569,19 +945,99 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
 
-    raw = await request.read()
-    try:
-        payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            raise ValueError("body is not a JSON object")
-    except ValueError as exc:
-        return _json_error(
-            400, "invalid_request_error", f"unreadable request body ({exc})",
+    buffer_limit = gateway.config.rewrite_buffer_bytes
+    raw, over_buffer = await _buffer_bounded(request.content, buffer_limit)
+    payload: Optional[dict] = None
+    #: The body could not be parsed at all, so nothing about it is known and
+    #: nothing about it is changed — see the ``except`` below.
+    unparseable = False
+    #: Where the model id sits in ``raw``, on the over-buffer path only. The
+    #: span is what lets the routed name reach the upstream without the body
+    #: being parsed — see :func:`_splice_literal`.
+    model_field: Optional[HeadField] = None
+    if over_buffer:
+        # Deliberately NOT parsed and deliberately NOT refused: the body is
+        # past what this daemon will hold, so it goes upstream as a stream and
+        # only the fields that decide WHERE are read out of the head.
+        head = _shallow_top_level_fields(raw)
+        model_field = head.get("model")
+        requested_model = model_field.value if model_field is not None else ""
+        # Best effort, and only for the log: on a real oversized body the
+        # ``stream`` flag usually sits after the messages array, past the
+        # window this scan looks at.
+        stream_field = head.get("stream")
+        stream_requested = (
+            stream_field is not None and stream_field.value == "true"
         )
+        if not requested_model:
+            logger.info(
+                _access_line(
+                    requested="-",
+                    route="refused",
+                    forward="-",
+                    status=400,
+                    started=started,
+                    stream=stream_requested,
+                    extra=(
+                        f"reason=model_unreadable_in_head "
+                        f"bytes>={buffer_limit} scan={HEAD_SCAN_BYTES}"
+                    ),
+                )
+            )
+            # Finish reading before answering — see `_drain` for what that
+            # is and is not evidenced to prevent.
+            await _drain(request.content)
+            return _json_error(
+                400,
+                "invalid_request_error",
+                "this request body is larger than the model gateway will "
+                f"hold ({buffer_limit} bytes) and its `model` field is not in "
+                f"the first {HEAD_SCAN_BYTES} bytes, so there is no way to "
+                "tell which upstream it is for. Nothing here is refused for "
+                "its size — a body this large is forwarded unrewritten as "
+                "soon as the model can be read. Send `model` as an early "
+                "field.",
+            )
+    else:
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("body is not a JSON object")
+        except (ValueError, RecursionError) as exc:
+            # NOT a gateway 400. Native sends whatever the client produced and
+            # the API judges it, so a body this daemon cannot parse — a
+            # truncated write, a 2000-deep structure that blows the recursive
+            # decoder, an encoding the client and json disagree about — is
+            # forwarded to the first-party upstream exactly as it arrived,
+            # with the client's own headers, and ITS verdict is relayed. The
+            # gateway inventing a 400 here would be the one thing that cannot
+            # happen natively: a refusal the user cannot appeal to anyone.
+            logger.info(
+                "model-gateway: request body not parseable (%s); forwarding "
+                "it to the first-party upstream unread", exc,
+            )
+            unparseable = True
+            requested_model = ""
+            stream_requested = False
+        else:
+            payload = parsed
+            requested_model = payload.get("model") or ""
+            stream_requested = bool(payload.get("stream"))
 
-    requested_model = payload.get("model") or ""
-    stream_requested = bool(payload.get("stream"))
-    decision = route_model(requested_model, gateway.vendors, gateway.anthropic)
+    decision: "Route | RouteError"
+    if unparseable:
+        # There is no model to route on, so the route is the one that needs
+        # none: the user's own first-party account, which is where an
+        # unrouted Claude Code request goes natively.
+        decision = Route(
+            upstream=gateway.anthropic.upstream,
+            forward_model="",
+            vendor=None,
+            family_id=gateway.anthropic.family_id,
+            is_anthropic=True,
+        )
+    else:
+        decision = route_model(requested_model, gateway.vendors, gateway.anthropic)
     if isinstance(decision, RouteError):
         logger.info(
             _access_line(
@@ -617,8 +1073,15 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         )
 
     headers = gateway.forward_headers(request)
-    forward_payload: dict = payload
+    # ``None`` on the over-buffer path — there is no parsed body to rewrite,
+    # and every rewrite below is guarded by that rather than by re-testing the
+    # size.
+    forward_payload: Optional[dict] = payload
     mutated = False
+    #: A repair pass was abandoned (:func:`_guarded`). It rides to the access
+    #: line in ``note`` rather than being logged separately, so one request
+    #: still means one line.
+    rewrite_failed = False
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
         if oauth.token is None:
@@ -641,15 +1104,26 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         # with a message naming a message index the user cannot act on — and
         # since the transcript is append-only the session never recovers. So
         # they are repaired in flight rather than relayed into a dead end.
-        forward_payload, repair = sanitise_for_anthropic(forward_payload)
-        if repair.changed:
-            mutated = True
-            logger.info(
-                "model-gateway: repaired inherited tool blocks before the "
-                "first-party route (%s) at message index(es) %s",
-                repair.summary(),
-                ", ".join(str(i) for i in repair.touched_indexes) or "-",
+        if forward_payload is not None:
+            repaired = _guarded(
+                sanitise_for_anthropic,
+                forward_payload,
+                what="first-party tool-block repair",
             )
+            if repaired is _ABANDON:
+                # The client's own bytes go on unchanged and Anthropic's
+                # validator gets the last word — which is what native gets.
+                rewrite_failed = True
+            else:
+                forward_payload, repair = repaired
+                if repair.changed:
+                    mutated = True
+                    logger.info(
+                        "model-gateway: repaired inherited tool blocks before "
+                        "the first-party route (%s) at message index(es) %s",
+                        repair.summary(),
+                        ", ".join(str(i) for i in repair.touched_indexes) or "-",
+                    )
     else:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
@@ -661,21 +1135,64 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
         headers[vendor.auth_header] = f"{vendor.auth_scheme}{key_result.key}"
         # Hand the vendor back its OWN ids: we rewrote them on the way out.
-        forward_payload, restored = restore_vendor_ids(
-            forward_payload, gateway.id_map(vendor),
-        )
-        if restored:
-            mutated = True
+        if forward_payload is not None:
+            restored_pair = _guarded(
+                restore_vendor_ids,
+                forward_payload,
+                gateway.id_map(vendor),
+                what="vendor id restoration",
+            )
+            if restored_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, restored = restored_pair
+                if restored:
+                    mutated = True
 
     headers["Content-Type"] = "application/json"
     headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
 
-    # The routed name must be in the BYTES, not only in the router's copy.
-    if decision.forward_model != requested_model:
-        forward_payload = dict(forward_payload)
-        forward_payload["model"] = decision.forward_model
-        mutated = True
-    body = json.dumps(forward_payload).encode("utf-8") if mutated else raw
+    body: "bytes | AsyncIterator[bytes]"
+    note = "note=rewrite_failed" if rewrite_failed else ""
+    if unparseable:
+        # Byte for byte, headers and all. The upstream is the only party that
+        # can say whether these bytes are a request.
+        body = raw
+        note = f"{note} note=unparseable_body_forwarded".strip()
+    elif forward_payload is None:
+        # Streamed on, with ONE edit. The tool-id repair does not run (that is
+        # what ``forwarded_unrewritten`` says), because it needs the whole body
+        # and skipping it costs a cosmetic id. The model id IS fixed, because
+        # the namespace and the ``[1m]`` suffix are the gateway's own
+        # client-side spellings and no upstream knows them: leaving them in
+        # would make the gateway the author of the failure it is here to
+        # avoid. ``decision.forward_model`` is the same value the ordinary
+        # path writes into the body, so both paths send the upstream the same
+        # id — and on the first-party route the ``[1m]`` window travels as the
+        # ``anthropic-beta`` header set above, which this path already gets.
+        head_bytes = raw
+        model_note = "model_id=verbatim"
+        if model_field is not None and decision.forward_model != requested_model:
+            head_bytes = _splice_literal(
+                raw, model_field, decision.forward_model,
+            )
+            model_note = "model_id=spliced"
+        body = _stream_after(head_bytes, request.content)
+        note = (
+            f"{REWRITE_BUFFER_NOTE} bytes>={buffer_limit} "
+            f"forwarded_unrewritten {model_note}"
+        )
+    else:
+        # The routed name must be in the BYTES, not only in the router's copy.
+        if decision.forward_model != requested_model:
+            forward_payload = dict(forward_payload)
+            forward_payload["model"] = decision.forward_model
+            mutated = True
+        body = (
+            json.dumps(forward_payload, **COMPACT_JSON).encode("utf-8")
+            if mutated
+            else raw
+        )
 
     # Canonical path, i.e. the trailing slash a lenient client may have sent
     # is not passed upstream. Query string IS passed through untouched.
@@ -694,7 +1211,36 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         requested_model=str(requested_model),
         stream_requested=stream_requested,
         started=started,
+        note=note,
     )
+
+
+def _reread_oauth_headers(
+    gateway: "Gateway", headers: dict[str, str],
+) -> "Optional[dict[str, str]]":
+    """Headers carrying a NEWER Claude login, or ``None`` if nothing changed.
+
+    The gateway never refreshes the login itself — it only reads the file the
+    Claude CLI writes (see :mod:`model_router.auth`) — but a native client on
+    the same machine refreshes it roughly every eight hours, and it does so
+    behind a lock and a compare-and-swap that a second implementation must
+    not race. What this daemon CAN do is what the native client does after a
+    401 of its own: read the file again and adopt whatever is there now.
+
+    That closes the ordinary case — a long-lived gateway holding a token that
+    expired mid-session while a native window had already rotated it —
+    without owning any part of the refresh protocol. ``None`` means the file
+    still holds the token we just used, so a retry would only repeat the 401.
+    """
+    fresh = gateway.oauth.read()
+    if not fresh.token:
+        return None
+    presented = headers.get("Authorization", "")
+    if presented == f"Bearer {fresh.token}":
+        return None
+    updated = dict(headers)
+    updated["Authorization"] = f"Bearer {fresh.token}"
+    return updated
 
 
 async def _proxy(
@@ -703,13 +1249,28 @@ async def _proxy(
     decision: Route,
     url: str,
     headers: dict[str, str],
-    body: bytes,
+    body: "bytes | AsyncIterator[bytes]",
     *,
     requested_model: str = "",
     stream_requested: bool = False,
     started: Optional[float] = None,
+    note: str = "",
+    allow_oauth_retry: bool = True,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
+
+    ``body`` is bytes on the ordinary path and an async iterator when the
+    request outgrew the rewrite buffer — aiohttp sends the latter chunked,
+    which is one reason ``content-length`` is dropped from the forwarded
+    headers in every case. ``note`` rides along on every access line this call
+    writes, so a streamed-through request is identifiable from the log alone
+    rather than only from the absence of a rewrite.
+
+    Exactly one condition is retried, and only when the body is bytes: a
+    first-party 401 whose credentials file has since changed
+    (:func:`_reread_oauth_headers`). ``allow_oauth_retry`` is the recursion
+    bound — the retried call sets it False, so a genuinely dead login answers
+    401 rather than looping.
 
     On a stream, the SSE rewriter's held tail is flushed after the last
     upstream chunk — except on the client-disconnect path, where it is
@@ -719,8 +1280,19 @@ async def _proxy(
     """
     started = time.monotonic() if started is None else started
     route_label = _route_label(decision)
+    #: Set when a RESPONSE-side repair was abandoned (:func:`_guarded`). A
+    #: plain local read by the closure below, because the failure can happen
+    #: at any point of the relay while the line is written at the end — and
+    #: one request must still mean one line.
+    rewrite_failed = False
 
     def access(status: int, *, stream: bool, extra: str = "") -> None:
+        parts = [part for part in (extra, note) if part]
+        # Once, however many passes were abandoned: the handler may already
+        # have put it in `note` for a REQUEST-side failure, and one line
+        # saying the same thing twice reads as two events.
+        if rewrite_failed and "note=rewrite_failed" not in note:
+            parts.append("note=rewrite_failed")
         logger.info(
             _access_line(
                 requested=requested_model or decision.forward_model,
@@ -729,7 +1301,7 @@ async def _proxy(
                 status=status,
                 started=started,
                 stream=stream,
-                extra=extra,
+                extra=" ".join(parts),
             )
         )
 
@@ -738,15 +1310,51 @@ async def _proxy(
             url,
             data=body,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=gateway.config.upstream_timeout_s),
+            # NO total budget, on purpose: a completion runs as long as it
+            # runs, and a total one cut a healthy 601 s stream on 2026-09-09.
+            # What is bounded is CONNECTING and going quiet — the two
+            # conditions that actually mean the upstream is not coming back.
+            timeout=aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=UPSTREAM_CONNECT_TIMEOUT_S,
+                sock_read=gateway.config.upstream_idle_timeout_s,
+            ),
         )
     except RuntimeError as exc:  # session not started — a programming error
         logger.error("model-gateway: %s", exc)
         access(502, stream=stream_requested)
-        return _json_error(502, "api_error", str(exc))
+        return _json_error(502, "api_error", str(exc), headers=RETRYABLE_HEADERS)
 
     try:
         async with upstream_ctx as upstream:
+            if (
+                allow_oauth_retry
+                and decision.is_anthropic
+                and upstream.status == 401
+                and isinstance(body, (bytes, bytearray))
+            ):
+                # The login may have been refreshed by a native client while
+                # this request was in flight, and the credentials file is the
+                # shared truth: re-reading it costs one stat. Bytes only,
+                # because a streamed body is already consumed and cannot be
+                # sent twice — that request carries the 401 to the client,
+                # which is what native does when its own retry is impossible.
+                # `allow_oauth_retry=False` below is what bounds this at one.
+                refreshed = _reread_oauth_headers(gateway, headers)
+                if refreshed is not None:
+                    return await _proxy(
+                        request,
+                        gateway,
+                        decision,
+                        url,
+                        refreshed,
+                        body,
+                        requested_model=requested_model,
+                        stream_requested=stream_requested,
+                        started=started,
+                        note=f"{note} note=oauth_reread_retry".strip(),
+                        allow_oauth_retry=False,
+                    )
             vendor = decision.vendor
             if vendor is not None and upstream.status in QUOTA_STATUSES:
                 return await _quota_response(
@@ -786,43 +1394,129 @@ async def _proxy(
             # log instead — an SSE stream that ends early is what the client
             # sees, which is the truth.
             total = 0
+
+            async def send(data: bytes) -> bool:
+                """Write to the CLIENT. ``False`` once it has gone away."""
+                try:
+                    await response.write(data)
+                except (
+                    ConnectionResetError,
+                    ConnectionAbortedError,
+                    aiohttp.ClientConnectionError,
+                ):
+                    return False
+                return True
+
+            # Reading upstream and writing to the client are separated on
+            # purpose, because the SAME exception type means opposite things
+            # on the two sides and one `try` around both cannot tell them
+            # apart. `ServerTimeoutError` is an `asyncio.TimeoutError` AND an
+            # `aiohttp.ClientConnectionError`, so an upstream that went quiet
+            # was being logged as "the client left" and answered with a CLEAN
+            # end — the silent truncation this whole path exists to prevent.
+            # Which side raised is the only reliable discriminator, and it is
+            # structural.
+            chunks = upstream.content.iter_any().__aiter__()
             try:
-                async for chunk in upstream.content.iter_any():
-                    out = rewriter.feed(chunk) if rewriter is not None else chunk
+                while True:
+                    try:
+                        chunk = await chunks.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        # The UPSTREAM broke or went quiet mid-stream. Returning
+                        # the prepared response here would let aiohttp finish it
+                        # NORMALLY — the chunked terminator goes out and the
+                        # client reads a clean 200 that merely has no
+                        # ``message_stop``: a truncated answer it has no reason to
+                        # retry, which is strictly worse than native, where the
+                        # same failure arrives as a premature close and IS
+                        # retried. So the connection is aborted, which is that
+                        # premature close.
+                        logger.warning(
+                            "model-gateway: %s -> %s stream ended early after %dB: %s",
+                            decision.forward_model, decision.family_id, total, exc,
+                        )
+                        access(
+                            upstream.status,
+                            stream=is_stream,
+                            extra=f"bytes={total} note=upstream_ended_early",
+                        )
+                        _abort_connection(request)
+                        return response
+
+                    if rewriter is None:
+                        out = chunk
+                    else:
+                        out = _guarded(rewriter.feed, chunk, what="SSE id rewrite")
+                        if out is _ABANDON:
+                            # Abandon the REWRITE, not the stream: what the
+                            # rewriter was holding is upstream's, already off the
+                            # socket, so it goes out ahead of this chunk and
+                            # everything after is relayed verbatim.
+                            out = rewriter.take_pending() + chunk
+                            rewriter = None
+                            rewrite_failed = True
                     if out:
-                        await response.write(out)
+                        if not await send(out):
+                            # The CLIENT went away (closed a tab, hit Esc). Routine,
+                            # not an error, and NOT something to abort over: there
+                            # is no longer anyone to tell.
+                            access(
+                                upstream.status,
+                                stream=is_stream,
+                                extra=f"bytes={total} note=client_disconnected",
+                            )
+                            return response
                         total += len(out)
+
                 if rewriter is not None:
-                    tail = rewriter.flush()
+                    tail = _guarded(rewriter.flush, what="SSE id flush")
+                    if tail is _ABANDON:
+                        tail = rewriter.take_pending()
+                        rewrite_failed = True
                     if tail:
-                        await response.write(tail)
+                        if not await send(tail):
+                            access(
+                                upstream.status,
+                                stream=is_stream,
+                                extra=f"bytes={total} note=client_disconnected",
+                            )
+                            return response
                         total += len(tail)
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                aiohttp.ClientConnectionError,
-            ):
-                # The CLIENT went away mid-stream (closed a tab, hit Esc).
-                # That is routine, not an error: log it and stop writing.
+
+                try:
+                    await response.write_eof()
+                except (
+                    ConnectionResetError,
+                    ConnectionAbortedError,
+                    aiohttp.ClientConnectionError,
+                ):
+                  access(
+                      upstream.status,
+                      stream=is_stream,
+                      extra=f"bytes={total} note=client_disconnected",
+                  )
+                  return response
+            except asyncio.CancelledError:
+                # ``handler_cancellation=True`` (see ``run_app`` in
+                # ``model_router.__main__``) cancels this handler the moment
+                # the CLIENT goes away — which is the whole point, it drops
+                # the upstream request instead of burning quota on an answer
+                # nobody will read. But ``CancelledError`` is a
+                # BaseException: it passes straight through every
+                # ``except (ClientError, TimeoutError)`` below, so without
+                # this the most common real-world ending — the user hit Esc —
+                # was the ONE outcome that wrote no access line at all, and
+                # the `client_disconnected` branches only ever fired in
+                # tests. Logged, then re-raised: swallowing a cancellation
+                # would leave the task running against a dead connection.
                 access(
                     upstream.status,
                     stream=is_stream,
                     extra=f"bytes={total} note=client_disconnected",
                 )
-                return response
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                # The UPSTREAM broke mid-stream.
-                logger.warning(
-                    "model-gateway: %s -> %s stream ended early after %dB: %s",
-                    decision.forward_model, decision.family_id, total, exc,
-                )
-                access(
-                    upstream.status,
-                    stream=is_stream,
-                    extra=f"bytes={total} note=upstream_ended_early",
-                )
-                return response
-            await response.write_eof()
+                raise
             if rewriter is not None:
                 _log_repair(
                     decision.family_id, rewriter.stats, rewriter.blocks_suppressed,
@@ -831,16 +1525,17 @@ async def _proxy(
             return response
     except asyncio.TimeoutError:
         logger.warning(
-            "model-gateway: %s -> %s timed out after %ss",
+            "model-gateway: %s -> %s went quiet for %ss",
             decision.forward_model, decision.family_id,
-            gateway.config.upstream_timeout_s,
+            gateway.config.upstream_idle_timeout_s,
         )
         access(502, stream=stream_requested, extra="note=upstream_timeout")
         return _json_error(
             502,
             "api_error",
-            f"upstream {decision.upstream} did not answer within "
-            f"{gateway.config.upstream_timeout_s}s",
+            f"upstream {decision.upstream} sent nothing for "
+            f"{gateway.config.upstream_idle_timeout_s}s",
+            headers=RETRYABLE_HEADERS,
         )
     except aiohttp.ClientError as exc:
         logger.warning(
@@ -849,8 +1544,35 @@ async def _proxy(
         )
         access(502, stream=stream_requested, extra="note=upstream_unreachable")
         return _json_error(
-            502, "api_error", f"upstream {decision.upstream} unreachable: {exc}",
+            502,
+            "api_error",
+            f"upstream {decision.upstream} unreachable: {exc}",
+            headers=RETRYABLE_HEADERS,
         )
+
+
+def _abort_connection(request: web.Request) -> None:
+    """Kill the connection so a half-written response READS as half-written.
+
+    The only honest ending for a response whose body stopped arriving after
+    the status line went out. aiohttp would otherwise close the chunked body
+    cleanly, and a truncated SSE stream ending in a well-formed EOF is
+    indistinguishable, to the client, from a complete one — it stops, shows a
+    partial answer and never retries. An aborted transport surfaces as
+    ``ClientPayloadError`` / a premature close, which is what the same
+    upstream failure looks like natively and what every client already knows
+    how to handle.
+
+    Best-effort by design: no transport (a test double, a connection already
+    gone) means there is nothing left to abort.
+    """
+    transport = request.transport
+    if transport is None:
+        return
+    try:
+        transport.abort()
+    except Exception:  # noqa: BLE001 — a cleanup path may never raise
+        logger.debug("model-gateway: transport abort failed", exc_info=True)
 
 
 def _log_repair(family_id: str, stats: RepairStats, suppressed: int = 0) -> None:
@@ -923,7 +1645,18 @@ async def _quota_response(
             f"quota_class={classification}"
         ),
     )
-    return web.json_response(body, status=CLIENT_QUOTA_STATUS)
+    # The vendor's own wait, relayed: the BODY is replaced (that is this
+    # function's whole job), but "when may I try again?" is machine-readable
+    # advice the client acts on, and dropping it turns a 30 s rate limit into
+    # a guess. ``x-should-retry`` says the same thing to an SDK that reads it
+    # rather than the header.
+    quota_headers = dict(RETRYABLE_HEADERS)
+    retry_after = upstream.headers.get("Retry-After")
+    if retry_after:
+        quota_headers["Retry-After"] = retry_after
+    return web.json_response(
+        body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
+    )
 
 
 async def _buffer_bounded(
@@ -1001,13 +1734,43 @@ async def _relay_vendor_json(
         payload = json.loads(raw) if raw else None
     except ValueError:
         payload = None
-    if isinstance(payload, dict):
-        patched, stats = normalise_vendor_response(payload, gateway.id_map(vendor))
+    normalised = _guarded(
+        normalise_vendor_response,
+        payload,
+        gateway.id_map(vendor),
+        what="vendor response normalisation",
+    ) if isinstance(payload, dict) else None
+    failed = normalised is _ABANDON
+    if normalised is not None and not failed:
+        patched, stats = normalised
         if stats.changed:
             _log_repair(vendor.vendor_id, stats)
-            out = json.dumps(patched, ensure_ascii=False).encode("utf-8")
-    access(upstream.status, stream=False, extra=f"bytes={len(out)}")
+            out = json.dumps(patched, **COMPACT_JSON).encode("utf-8")
+    # Relaying the vendor's own bytes is the fallback: a cosmetic id costs
+    # the NEXT request a repair, a 500 costs this one entirely.
+    extra = f"bytes={len(out)}"
+    access(
+        upstream.status,
+        stream=False,
+        extra=f"{extra} note=rewrite_failed" if failed else extra,
+    )
     return web.Response(status=upstream.status, headers=relay, body=out)
+
+
+async def hello_handler(request: web.Request) -> web.Response:
+    """The client's preconnect probe: ``HEAD /api/hello``, answered 200 empty.
+
+    Claude Code opens the connection and warms DNS/TCP with this before the
+    first real call. Against ``api.anthropic.com`` it gets a 200; here it used
+    to land on the catch-all 404, which the client counts as a failed
+    endpoint check on every session start — a difference from native visible
+    in the client's own diagnostics for no reason at all.
+
+    No auth: it carries no information and reveals none. It is answered for
+    GET as well, because a probe that guesses the verb should not get a
+    different verdict.
+    """
+    return web.Response(status=200)
 
 
 async def not_found_handler(request: web.Request) -> web.Response:
@@ -1037,10 +1800,15 @@ def create_app(
         key_resolver=key_resolver,
         token_permissions=token_permissions,
     )
-    app = web.Application(middlewares=[loopback_only_middleware])
+    app = web.Application(
+        middlewares=[loopback_only_middleware],
+        client_max_size=UNBOUNDED_CLIENT_MAX_SIZE,
+    )
     app[APP_KEY] = gateway
 
     _add_route(app, "GET", "/health", health_handler, name="health")
+    _add_route(app, "HEAD", "/api/hello", hello_handler, name="hello_head")
+    _add_route(app, "GET", "/api/hello", hello_handler, name="hello_get")
     _add_route(app, "GET", "/v1/models", models_handler, name="models")
     _add_route(app, "POST", "/v1/messages", messages_handler, name="messages")
     _add_route(
@@ -1063,4 +1831,12 @@ def create_app(
     return app
 
 
-__all__ = ["APP_KEY", "Gateway", "create_app", "loopback_only_middleware"]
+__all__ = [
+    "APP_KEY",
+    "RETRYABLE_HEADERS",
+    "REWRITE_BUFFER_NOTE",
+    "UNBOUNDED_CLIENT_MAX_SIZE",
+    "Gateway",
+    "create_app",
+    "loopback_only_middleware",
+]

@@ -34,6 +34,7 @@ Two behaviours that differ from the field prototype, both deliberate:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -334,7 +335,21 @@ class CatalogService:
         sources: dict[str, str] = {}
         entries: list[CatalogEntry] = []
 
-        first = await self._anthropic_entries()
+        # Every family is fetched CONCURRENTLY. Sequentially, each stalling
+        # vendor added its own timeout to the picker's wait — two vendors down
+        # meant 20 s before the user saw a model list that was going to be the
+        # static fallback anyway. Concurrently the wait is the slowest single
+        # fetch, and each family still falls back on its own.
+        #
+        # ``gather`` without ``return_exceptions``: both helpers already
+        # answer with a fallback family instead of raising (that is what their
+        # ``source`` field records), so an exception here would be a defect
+        # worth surfacing rather than a vendor being down.
+        vendors = list(self._vendors.values())
+        first, *vendor_families = await asyncio.gather(
+            self._anthropic_entries(),
+            *(self._vendor_entries(vendor) for vendor in vendors),
+        )
         sources[self._anthropic.family_id] = first.source
         published: list[CatalogEntry] = []
         for entry in first.entries:
@@ -348,8 +363,7 @@ class CatalogService:
                 )
         entries.extend(sorted(published, key=lambda e: e.id))
 
-        for vendor in self._vendors.values():
-            family = await self._vendor_entries(vendor)
+        for vendor, family in zip(vendors, vendor_families):
             sources[vendor.vendor_id] = family.source
             for entry in family.entries:
                 one_m = advertise_1m(entry.id)

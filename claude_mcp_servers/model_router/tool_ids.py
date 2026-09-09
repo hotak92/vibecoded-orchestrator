@@ -61,6 +61,13 @@ DEFAULT_ID_MAP_SIZE = 4096
 #: single event boundary. A proxy must not be turned into a memory sink by a
 #: malformed upstream; past this point the bytes are relayed verbatim, which
 #: is the same thing the gateway did before this module existed.
+#:
+#: Equal today to :data:`model_router.config.REWRITE_BUFFER_LIMIT_BYTES` and
+#: deliberately a separate constant: that one bounds how much of a REQUEST is
+#: held for rewriting and is pinned to Anthropic's published request limit,
+#: this one is a defensive cap on a RESPONSE stream and is ours to re-tune. Do
+#: not fold them together — the next reason to move one is not a reason to
+#: move the other.
 SSE_BUFFER_LIMIT_BYTES = 32 * 1024 * 1024
 
 #: SSE frame separator: two line terminators, where a terminator is CRLF, LF
@@ -81,6 +88,20 @@ SSE_BUFFER_LIMIT_BYTES = 32 * 1024 * 1024
 #: be settled by any pattern and is resolved by waiting, in
 #: :meth:`SseIdRewriter.feed`.
 _EVENT_BOUNDARY = re.compile(rb"(?:\r\n|\r(?!\n)|\n){2}")
+
+#: How this package writes every JSON body it re-encodes, request or
+#: response. Python's defaults are not ``JSON.stringify``'s: ``ensure_ascii``
+#: escapes each non-ASCII character to ``\uXXXX`` (x3.0 on accented or CJK
+#: text) and the default separators add a space after every ``,`` and ``:``
+#: (x1.19 on ASCII). A rewrite that inflates a body can push a request the
+#: client sized correctly past the upstream's 32 MB limit — a 413 that
+#: happens through the gateway only.
+#:
+#: One home, used by :meth:`SseIdRewriter._reserialise` here and by
+#: :mod:`model_router.server` for the request body and the buffered vendor
+#: response: three call sites re-typing the same two options is three places
+#: for the next one to be forgotten.
+COMPACT_JSON: dict = {"ensure_ascii": False, "separators": (",", ":")}
 
 #: Largest JSON response body that is buffered for rewriting. Beyond it the
 #: body is relayed unchanged (with a warning): a rewrite is worth a copy of a
@@ -251,6 +272,17 @@ class SseIdRewriter:
     def blocks_suppressed(self) -> int:
         return len(self._dropped_indexes)
 
+    def take_pending(self) -> bytes:
+        """The bytes held back waiting for an event boundary, and forget them.
+
+        Public because a caller that must ABANDON the rewrite mid-stream (a
+        bug caught by :func:`model_router.server._guarded`) still has to
+        deliver them: they are the upstream's bytes, already consumed from
+        the socket, so dropping them truncates the turn over a cosmetic id.
+        """
+        held, self._buffer = bytes(self._buffer), b""
+        return held
+
     def _drain(self, *, final: bool) -> bytearray:
         """Split every COMPLETE event out of the buffer and rewrite it.
 
@@ -358,7 +390,9 @@ class SseIdRewriter:
     def _reserialise(
         lines: list[bytes], data_positions: list[int], payload: dict,
     ) -> bytes:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # A rewritten SSE event must not be LONGER than the one the
+        # upstream sent, or the relay inflates every stream it touches.
+        body = json.dumps(payload, **COMPACT_JSON).encode("utf-8")
         first = data_positions[0]
         # Keep THIS line's own ending, whatever it is: in a CRLF stream every
         # other line still carries its \r, and a single LF line in the middle
@@ -429,6 +463,7 @@ __all__ = [
     "DEFAULT_ID_MAP_SIZE",
     "RepairStats",
     "JSON_BUFFER_LIMIT_BYTES",
+    "COMPACT_JSON",
     "SSE_BUFFER_LIMIT_BYTES",
     "BoundedIdMap",
     "SseIdRewriter",
