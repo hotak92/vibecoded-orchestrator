@@ -91,7 +91,7 @@ torch>=2.11.0
 # ─── FastAPI (code embedding service HTTP server) ───
 # FastAPI (MIT) + uvicorn (BSD-3-Clause)
 fastapi>=0.136.1
-uvicorn>=0.46.0
+uvicorn>=0.47.0
 
 # ─── Telemetry (optional runtime) ───
 # psutil (BSD-3-Clause) — used by VCThelpers.telemetry for opt-in hardware
