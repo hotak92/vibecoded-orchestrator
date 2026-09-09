@@ -229,7 +229,14 @@ class RetryContext:
         return rc
 
     def interpreter(self) -> str:
-        return self.python or sys.executable or "python3"
+        if self.python:
+            return self.python
+        # v0.2.94: the orchestrator venv, never a bare sys.executable — the
+        # driver may itself have been started under the launcher's bootstrap
+        # python; its children (kg-sync, the analyzer) need vco_lib + weaviate.
+        from vco_lib.python_exe import resolve_or_current
+
+        return resolve_or_current()
 
 
 # ---------------------------------------------------------------------------
@@ -1052,7 +1059,9 @@ def spawn_detached(folder: Path, *, python: str = "") -> bool:
     driver that dies mid-run leaves a record (the R-5 lesson: DEVNULL is how a
     walk dies at 40% with no trace anywhere).
     """
-    argv = [python or sys.executable, "-m", "vco_lib.deferral_retry",
+    from vco_lib.python_exe import resolve_or_current
+
+    argv = [python or resolve_or_current(), "-m", "vco_lib.deferral_retry",
             "--folder", str(folder)]
     log_handle = None
     log_path = _log_path_for_stamp(time.strftime("%Y%m%d-%H%M%S"))

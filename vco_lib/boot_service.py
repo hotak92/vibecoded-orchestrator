@@ -64,7 +64,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
-from vco_lib.paths import looks_like_orchestrator_root, user_home, vct_root_dir
+from vco_lib.paths import user_home, vct_root_dir
 from vco_lib.timeutil import utc_iso_now
 
 # ---------------------------------------------------------------------------
@@ -276,10 +276,10 @@ def xml_escape_content(value: object) -> str:
 def default_templates_root() -> Path:
     """The orchestrator clone whose ``templates/`` this install should read.
 
-    Ladder: ``$VCT_ORCHESTRATOR_ROOT`` when it really names an orchestrator
-    clone (checked with :func:`vco_lib.paths.looks_like_orchestrator_root`,
-    the existing one home for that question — a stale exported value from a
-    moved clone must not win), then ``vco_lib/..``. The second rung is exact
+    Ladder (delegated to :func:`vco_lib.python_exe.resolve_install_root`):
+    ``$VCT_INSTALL_ROOT``, then ``$VCT_ORCHESTRATOR_ROOT``, each only when it
+    really names an orchestrator clone (a stale exported value from a moved
+    clone must not win), then ``vco_lib/..``. The second rung is exact
     rather than best-effort: ``install.py`` installs the root distribution
     with ``pip install -e .``, so an importable ``vco_lib`` lives INSIDE the
     clone. If it does not, the install is broken in the way
@@ -290,10 +290,17 @@ def default_templates_root() -> Path:
     gateway daemon. ``install.py`` passes its own ``PROJECT_ROOT``, which is
     more specific and stays authoritative there.
     """
-    env_root = (os.environ.get("VCT_ORCHESTRATOR_ROOT") or "").strip()
-    if env_root and looks_like_orchestrator_root(env_root):
-        return Path(env_root)
-    return Path(__file__).resolve().parent.parent
+    # v0.2.94: ONE home for "which clone am I in" — `vco_lib.python_exe.
+    # resolve_install_root` (explicit → $VCT_INSTALL_ROOT → $VCT_ORCHESTRATOR_ROOT,
+    # each only when it really names a clone → vco_lib/..). Precedence is a
+    # deliberate choice: VCT_INSTALL_ROOT is the variable every VCO-written
+    # environment carries; VCT_ORCHESTRATOR_ROOT is the older spelling, and
+    # both name the same clone on every install VCO produced. The final rung
+    # keeps the exactness argued above: vco_lib/.. IS the clone or the
+    # install is broken.
+    from vco_lib.python_exe import resolve_install_root
+
+    return resolve_install_root() or Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------

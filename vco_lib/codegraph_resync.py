@@ -2213,25 +2213,13 @@ def _hub_post_codegraph_build(project_name: str, payload: dict,
         # trimmed, bounds-checked. This module previously parsed the WHOLE file
         # as an int, so a `hub.port` with any trailing line raised where a
         # sibling reader answered. `vco_lib.intfile` lands with the gateway lane
-        # (v0.2.94); until it merges, the import is local so this module still
-        # loads in a tree without it (the 7700 fallback is unchanged either way).
-        port = 7700
-        try:
-            # pyright: ignore[reportMissingImports] — `vco_lib.intfile` is
-            # authored by the v0.2.94 GATEWAY lane and does not exist in THIS
-            # worktree yet; the module (and this line) resolve at merge. DELETE
-            # this ignore then: an unresolved import that stays suppressed after
-            # its module lands is how a real missing import hides.
-            from vco_lib.intfile import read_int_line  # pyright: ignore[reportMissingImports]
-        except ImportError:  # pragma: no cover — pre-merge tree only
-            try:
-                port = int((root / "hub.port").read_text(encoding="utf-8").strip())
-            except Exception:  # noqa: BLE001
-                port = 7700
-        else:
-            port = read_int_line(
-                root / "hub.port", sentinel=7700, minimum=1, maximum=65535,
-            )
+        # (v0.2.94) — the shared reader, imported locally like every other
+        # vco_lib import in this function.
+        from vco_lib.intfile import read_int_line
+
+        port = read_int_line(
+            root / "hub.port", sentinel=7700, minimum=1, maximum=65535,
+        )
     token = os.environ.get("VCT_HUB_TOKEN") or ""
     if not token:
         token = (root / "hub.token").read_text(encoding="utf-8").strip()

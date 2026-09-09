@@ -229,10 +229,8 @@ def resolve_install_root(explicit: "str | Path | None" = None) -> Optional[Path]
     Ladder: an explicit argument, then :data:`INSTALL_ROOT_ENV_VARS` (each only
     when it really names a clone), then ``vco_lib/..``.
 
-    ``vco_lib.boot_service.default_templates_root`` answers a near-identical
-    question for the gateway daemon and should delegate here once its lane
-    lands — it is held by another work package this wave, so the duplication is
-    NAMED rather than silently grown.
+    ``vco_lib.boot_service.default_templates_root`` (the gateway daemon's
+    templates root) delegates here since v0.2.94 — one home for the question.
     """
     if explicit:
         candidate = Path(explicit)
