@@ -61,6 +61,10 @@ use crate::commands::project_env_settings::{self, ProjectEnvSettings};
 // the shared `script_invocation` module (one home for all three bundled-
 // wrapper spawn sites — this file, orchestrator_core, codegraph).
 use crate::commands::script_invocation::invocation_for;
+// v0.2.94: the drift verdict type is owned by the DECISION module
+// (`projects_v2::change_detect`), which is pure and unit-tested; this file owns
+// only the probe that produces one.
+use crate::commands::projects_v2::change_detect::DriftVerdict;
 use crate::db::kg_syncs::{heartbeat_is_stale, status as sync_status, KgSyncRow};
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
@@ -1016,6 +1020,47 @@ async fn run_subprocess(
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::mpsc;
 
+    // v0.2.94 diagnosability: name the wrapper, its argv, and the interpreter
+    // the vco_lib ladder resolves. The 2026-09-05 MultiagentOrchestrator
+    // failure (`ModuleNotFoundError: No module named 'weaviate'`) was a wrapper
+    // rendered against a PREVIOUS orchestrator location, and the only trace was
+    // a `log_tail` column nobody reads.
+    //
+    // The argv is plain `--all`: content-hash gated, so an already-synced
+    // project reports N skipped / 0 embedded. No force/rechunk/recreate flag is
+    // ever added on this automatic path — `DRIFT_SPAWN_FORBIDDEN_FLAGS` and
+    // `the_automatic_spawn_never_forces_a_re_embed` pin that.
+    //
+    // The check below REFUSES rather than strips. Stripping the flag and
+    // running anyway would convert a programming error into a WARN nobody
+    // reads, and leave the run looking successful while doing something other
+    // than what its argv said — the same "silently degrade and report success"
+    // shape as the field defect this whole change exists to close. A forbidden
+    // flag here cannot be a user's doing: `base_args` comes from
+    // `invocation_for`, so its presence means someone edited this spawn path.
+    // Fail the row, name the flag, and let it be seen.
+    if let Some(msg) = forbidden_spawn_flag_message(&base_args) {
+        tracing::error!("[vct] {} ({})", msg, project_id);
+        assert_no_forbidden_spawn_flag(&base_args);
+        return SubprocessOutcome {
+            status: sync_status::FAILED.to_string(),
+            counts: ProgressCounts {
+                kg_total: kg_total_pre,
+                docs_total: docs_total_pre,
+                ..ProgressCounts::zero()
+            },
+            error_message: Some(msg),
+            log_tail: None,
+        };
+    }
+    tracing::info!(
+        "[vct] kg-sync spawn for {}: wrapper={} args={:?} --all vco_lib_python={}",
+        project_id,
+        program.display(),
+        base_args,
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
+            .unwrap_or_else(|| "<unresolved>".to_string()),
+    );
     let mut cmd = tokio::process::Command::new(&program).silent();
     cmd.args(&base_args)
         .arg("--all")
@@ -1704,6 +1749,376 @@ fn extract_number_before(s: &str, marker: &str) -> Option<u32> {
         .collect();
     let num: String = num.chars().rev().collect();
     num.parse().ok()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.2.94 — the READ-ONLY drift probe behind the bundle-update kg-sync gate
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// See `projects_v2::change_detect`'s v0.2.94 block for the field evidence. This
+// half runs the probe; that half owns the decision (and is pure, so all four
+// legs are unit-tested without a subprocess).
+//
+// It reuses the SAME wrapper the sync itself runs (`kg-sync`, resolved by
+// `resolve_kg_sync_script`, invoked via `invocation_for`) and the SAME env
+// block (`build_kg_sync_env`) — deliberately, so the probe cannot answer for a
+// different collection than the sync would write to.
+//
+// "Read-only" is precise, not absolute: `--check-drift` performs NO embedding
+// and NO Weaviate write, and always exits 0 — but it DOES write the project's
+// deferral ledger (`kg_sync_drift_detected` / `kg_binding_missing`), because
+// surfacing a finding is the whole point of the scan. That matters here: since
+// this gate started running the scan automatically, a drift finding is written
+// on the same update that repairs it, so the repairing `--all` retires the
+// entry itself (`_clear_drift_deferral`, paired-resolution). Without that pair
+// every automatic repair would leave the project carrying an action-required
+// entry telling the user to run the command that had just run.
+
+/// Prefix of the ONE machine-readable line `--check-drift` emits.
+/// MUST MATCH `templates/scripts/sync_knowledge_graph.py::DRIFT_SENTINEL_PREFIX`.
+pub(crate) const KG_DRIFT_SENTINEL: &str = "KG_DRIFT_JSON ";
+
+/// Flags the AUTOMATIC (gate-driven) kg-sync spawn must never carry.
+///
+/// Standing rule, four releases deep: never re-embed hash-unchanged rows. Plain
+/// `--all` is content-hash gated, so a drift of N nodes embeds exactly N; each
+/// flag below would defeat that gate and turn a drift repair into a full
+/// re-embed of an already-converged collection.
+pub(crate) const DRIFT_SPAWN_FORBIDDEN_FLAGS: [&str; 5] =
+    ["--rechunk", "--force", "--force-rebuild", "--recreate", "--drop"];
+
+/// `Some(message)` when `args` carries a flag the automatic path must never
+/// use; `None` when the argv is clean. Pure — no panic, no logging — so both
+/// outcomes are unit-testable.
+pub(crate) fn forbidden_spawn_flag_message(args: &[String]) -> Option<String> {
+    let bad = args
+        .iter()
+        .find(|a| DRIFT_SPAWN_FORBIDDEN_FLAGS.contains(&a.as_str()))?;
+    Some(format!(
+        "kg-sync refused: the automatic spawn carried {} — that would re-embed \
+         content whose content hash is unchanged. This is a bug in the \
+         launcher's spawn path, not a user setting; no sync was run.",
+        bad
+    ))
+}
+
+/// The debug-build trip, kept separate from the message so the message itself
+/// stays testable. A forbidden flag here cannot come from a user — `base_args`
+/// is built by `invocation_for` — so in a test/dev build it should be LOUD, and
+/// in release the caller's failed row carries it instead.
+pub(crate) fn assert_no_forbidden_spawn_flag(args: &[String]) {
+    debug_assert!(
+        forbidden_spawn_flag_message(args).is_none(),
+        "forbidden flag on the automatic kg-sync spawn: {:?}",
+        args
+    );
+}
+
+/// How long the read-only probe may take before we call it unavailable. It is
+/// a hash-diff GraphQL query plus a `knowledge/` walk — seconds, normally.
+/// A cap is safe HERE (unlike an embed) because timing out costs only the
+/// verdict, and a missing verdict is `SkipUnverified`, never a false "ok".
+const KG_DRIFT_PROBE_TIMEOUT_SECS: u64 = 120;
+
+/// Pure parser for the probe's stdout. Never panics; anything it cannot read
+/// as a verdict becomes `Unavailable`.
+pub(crate) fn parse_drift_output(stdout: &str) -> DriftVerdict {
+    let line = match stdout.lines().rev().find(|l| l.trim_start().starts_with(KG_DRIFT_SENTINEL)) {
+        Some(l) => l.trim_start().trim_start_matches(KG_DRIFT_SENTINEL),
+        None => {
+            return DriftVerdict::Unavailable {
+                detail: "the drift check printed no machine-readable verdict".to_string(),
+            }
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            return DriftVerdict::Unavailable {
+                detail: format!("drift verdict was unparseable: {}", e),
+            }
+        }
+    };
+    let field = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let status = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
+    let binding = v.get("binding").and_then(|x| x.as_str()).unwrap_or("");
+    let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+    if binding != "bound" {
+        // No collection to compare against. NOT "ok" — there is nothing that
+        // could have been checked (`kg_sync_drift.check_kg_binding`'s own
+        // distinction, preserved rather than flattened here).
+        return DriftVerdict::Unavailable {
+            detail: format!("no KG binding resolved ({})", if detail.is_empty() { binding } else { detail }),
+        };
+    }
+    match status {
+        "drift" => DriftVerdict::Drift {
+            missing: field("missing"),
+            stale: field("stale"),
+            scanned: field("scanned"),
+        },
+        "ok" => DriftVerdict::Ok { scanned: field("scanned") },
+        other => DriftVerdict::Unavailable {
+            detail: format!(
+                "drift check returned '{}'{}",
+                if other.is_empty() { "no status" } else { other },
+                if detail.is_empty() { String::new() } else { format!(" — {}", detail) }
+            ),
+        },
+    }
+}
+
+/// Run `kg-sync --check-drift` for `project_folder` and report what Weaviate
+/// actually holds. Never fails the caller: every error path is `Unavailable`.
+pub(crate) async fn probe_kg_drift(
+    db: &Db,
+    project_id: &str,
+    project_name: &str,
+    project_folder: &std::path::Path,
+) -> DriftVerdict {
+    let script = match resolve_kg_sync_script(project_folder) {
+        Some(p) => p,
+        None => {
+            return DriftVerdict::Unavailable {
+                detail: "kg-sync wrapper not found (looked in project, launcher install, $PATH)"
+                    .to_string(),
+            }
+        }
+    };
+    let env_settings = project_env_settings::populate(db, project_name, Some(project_id));
+    let orch_root = find_local_repo_root().ok();
+    let (program, mut args) = invocation_for(&script);
+    args.push("--check-drift".to_string());
+
+    // Diagnosability (v0.2.94): name the wrapper AND the interpreter tier the
+    // spawn will use. The 2026-09-05 MultiagentOrchestrator failure was a
+    // wrapper rendered against a PREVIOUS orchestrator location — invisible
+    // until someone read a log_tail by hand.
+    tracing::info!(
+        "[vct] kg-sync drift probe for {}: wrapper={} args={:?} vco_lib_python={}",
+        project_id,
+        script.display(),
+        args,
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
+            .unwrap_or_else(|| "<unresolved>".to_string()),
+    );
+
+    let mut cmd = tokio::process::Command::new(&program).silent();
+    cmd.args(&args)
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, val) in build_kg_sync_env(&env_settings, project_folder, orch_root.as_deref()) {
+        cmd.env(key, val);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(KG_DRIFT_PROBE_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return DriftVerdict::Unavailable {
+                detail: format!("drift check could not be spawned: {}", e),
+            }
+        }
+        Err(_) => {
+            return DriftVerdict::Unavailable {
+                detail: format!(
+                    "drift check did not finish within {} s",
+                    KG_DRIFT_PROBE_TIMEOUT_SECS
+                ),
+            }
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let verdict = parse_drift_output(&stdout);
+    if matches!(verdict, DriftVerdict::Unavailable { .. }) {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+        tracing::warn!(
+            "[vct] kg-sync drift probe for {} produced no verdict (exit {:?}); stderr tail: {:?}",
+            project_id,
+            out.status.code(),
+            tail,
+        );
+    }
+    verdict
+}
+
+#[cfg(test)]
+mod v0294_drift_probe_tests {
+    use super::*;
+
+    fn sentinel(body: &str) -> String {
+        format!("chatter before\n{}{}\nchatter after\n", KG_DRIFT_SENTINEL, body)
+    }
+
+    #[test]
+    fn parses_a_drift_verdict() {
+        let out = sentinel(
+            r#"{"binding":"bound","status":"drift","scanned":78,"missing":67,"stale":5}"#,
+        );
+        assert_eq!(
+            parse_drift_output(&out),
+            DriftVerdict::Drift { missing: 67, stale: 5, scanned: 78 }
+        );
+    }
+
+    #[test]
+    fn parses_a_clean_verdict() {
+        let out = sentinel(r#"{"binding":"bound","status":"ok","scanned":78}"#);
+        assert_eq!(parse_drift_output(&out), DriftVerdict::Ok { scanned: 78 });
+    }
+
+    /// The whole point: nothing that is not a POSITIVE "ok" may read as one.
+    #[test]
+    fn everything_else_is_unavailable_never_ok() {
+        for body in [
+            r#"{"binding":"unbound","status":"unknown","detail":"no KG binding"}"#,
+            r#"{"binding":"bound","status":"unknown","detail":"weaviate unreachable"}"#,
+            r#"{"binding":"bound"}"#,
+            "not json at all",
+        ] {
+            let got = parse_drift_output(&sentinel(body));
+            assert!(
+                matches!(got, DriftVerdict::Unavailable { .. }),
+                "{} must be Unavailable, got {:?}",
+                body,
+                got
+            );
+        }
+        assert!(matches!(
+            parse_drift_output("no sentinel anywhere\n"),
+            DriftVerdict::Unavailable { .. }
+        ));
+    }
+
+    /// The wrapper prints human chatter too; the LAST sentinel wins so a
+    /// re-invocation in one stream cannot resurrect a stale verdict.
+    #[test]
+    fn the_last_sentinel_wins() {
+        let out = format!(
+            "{p}{{\"binding\":\"bound\",\"status\":\"drift\",\"missing\":3,\"stale\":0,\"scanned\":3}}\n\
+             {p}{{\"binding\":\"bound\",\"status\":\"ok\",\"scanned\":3}}\n",
+            p = KG_DRIFT_SENTINEL
+        );
+        assert_eq!(parse_drift_output(&out), DriftVerdict::Ok { scanned: 3 });
+    }
+
+    /// THE COST PIN (standing rule, four releases deep: never re-embed
+    /// hash-unchanged rows). The automatic spawn — including the one a drift
+    /// verdict triggers — is plain `--all`, whose per-node content-hash gate
+    /// skips everything already current. A drift of N nodes embeds exactly N.
+    ///
+    /// This mirrors `run_subprocess`'s own argv construction
+    /// (`cmd.args(&base_args).arg("--all")`); if that line ever grows a flag,
+    /// this assertion is the thing that must be consciously updated.
+    #[test]
+    fn the_automatic_spawn_never_forces_a_re_embed() {
+        let (_program, base_args) = invocation_for(std::path::Path::new("/tmp/kg-sync"));
+        let mut argv = base_args;
+        argv.push("--all".to_string());
+        assert!(argv.iter().any(|a| a == "--all"));
+        for forbidden in DRIFT_SPAWN_FORBIDDEN_FLAGS {
+            assert!(
+                !argv.iter().any(|a| a == forbidden),
+                "the automatic kg-sync spawn must never carry {} — that would \
+                 re-embed content whose hash is unchanged",
+                forbidden
+            );
+        }
+        // And the source itself must not have grown one.
+        let src = include_str!("kg_sync.rs");
+        let spawn_line = src
+            .find("cmd.args(&base_args)\n        .arg(\"--all\")")
+            .expect("the automatic spawn's argv construction moved — re-pin it");
+        let window = &src[spawn_line..spawn_line + 200];
+        for forbidden in DRIFT_SPAWN_FORBIDDEN_FLAGS {
+            assert!(
+                !window.contains(forbidden),
+                "a {} flag appeared on the automatic kg-sync spawn",
+                forbidden
+            );
+        }
+    }
+
+    // ── R6/4: REFUSE a forbidden flag; never strip it and carry on ────────
+
+    #[test]
+    fn a_clean_argv_is_not_refused() {
+        let (_p, mut args) = invocation_for(std::path::Path::new("/tmp/kg-sync"));
+        args.push("--all".to_string());
+        assert_eq!(forbidden_spawn_flag_message(&args), None);
+        assert_no_forbidden_spawn_flag(&args); // must not trip
+    }
+
+    #[test]
+    fn a_forbidden_flag_is_refused_by_name() {
+        for bad in DRIFT_SPAWN_FORBIDDEN_FLAGS {
+            let args = vec!["--all".to_string(), bad.to_string()];
+            let msg = forbidden_spawn_flag_message(&args)
+                .unwrap_or_else(|| panic!("{} must be refused", bad));
+            assert!(msg.contains("refused"), "{}", msg);
+            assert!(msg.contains(bad), "the message must NAME the flag: {}", msg);
+            assert!(
+                msg.contains("no sync was run"),
+                "refusing means NOT running, and the message must say so: {}",
+                msg
+            );
+        }
+    }
+
+    /// ...and in a debug/test build it is LOUD, not a WARN nobody reads.
+    #[test]
+    #[should_panic(expected = "--rechunk")]
+    fn a_forbidden_flag_trips_the_debug_assert() {
+        assert_no_forbidden_spawn_flag(&["--all".to_string(), "--rechunk".to_string()]);
+    }
+
+    /// The refusal is WIRED: `run_subprocess` returns a FAILED row carrying the
+    /// message rather than stripping the flag and reporting success.
+    #[test]
+    fn the_refusal_fails_the_row_rather_than_stripping() {
+        let src = include_str!("kg_sync.rs");
+        let anchor = src
+            .find("if let Some(msg) = forbidden_spawn_flag_message(&base_args)")
+            .expect("the refusal moved out of run_subprocess — re-pin it");
+        let window = &src[anchor..anchor + 500];
+        assert!(window.contains("tracing::error!"), "it must be an ERROR, not a warn");
+        assert!(
+            window.contains("sync_status::FAILED"),
+            "the row must be marked failed so the refusal is visible in the GUI"
+        );
+        assert!(
+            !src.contains(".filter(|a| {\n            let forbidden"),
+            "the old silent-strip filter must be gone"
+        );
+    }
+
+    /// The probe must be read-only and the repair must be hash-gated: the
+    /// argv the probe builds carries `--check-drift` and nothing destructive.
+    #[test]
+    fn the_probe_argv_is_read_only() {
+        let (_program, mut args) = invocation_for(std::path::Path::new("/tmp/kg-sync"));
+        args.push("--check-drift".to_string());
+        assert!(args.iter().any(|a| a == "--check-drift"));
+        for forbidden in DRIFT_SPAWN_FORBIDDEN_FLAGS {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "the read-only probe must never carry {}",
+                forbidden
+            );
+        }
+    }
 }
 
 #[cfg(test)]

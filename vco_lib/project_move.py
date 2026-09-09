@@ -1475,8 +1475,12 @@ def _run_bundle_at(
     D-substituted transforms.
     """
     root = orchestrator_root or _orchestrator_root_guess()
+    # v0.2.94: the ONE resolver, not `sys.executable` — a move can be driven
+    # from the launcher, whose bundle path spawns Python via a bare PATH probe.
+    from vco_lib.python_exe import resolve_or_current
+
     argv = [
-        sys.executable,
+        resolve_or_current(install_root=root),
         "-m",
         "vco_lib.project_init",
         "install-bundle",
@@ -1620,8 +1624,10 @@ def _reproject_env(
     a sed list. That is why :data:`PATH_BEARING_ENV_KEYS` is a drift GATE
     rather than a rewrite driver.
     """
+    from vco_lib.python_exe import resolve_or_current  # v0.2.94: ONE resolver
+
     argv = [
-        sys.executable,
+        resolve_or_current(),
         "-m",
         "vco_lib.config_projection",
         "apply",

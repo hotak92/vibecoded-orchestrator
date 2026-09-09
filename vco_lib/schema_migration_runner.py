@@ -713,7 +713,13 @@ def _apply_subprocess_edge(
             cmd = ["bash", str(edge.path)]
     elif edge.ext == "py":
         # `.py` edges are run as scripts (a self-contained migration module).
-        cmd = [sys.executable, str(edge.path)]
+        # v0.2.94: the ONE resolver, not `sys.executable` — the migration runner
+        # is reachable from the launcher's bundle/update path, which spawns
+        # Python via a bare PATH probe; a `.py` edge that touches Weaviate would
+        # then die on `import weaviate` and be reported as a failed migration.
+        from vco_lib.python_exe import resolve_or_current
+
+        cmd = [resolve_or_current(), str(edge.path)]
     else:  # pragma: no cover - guarded by discover_edges
         logger.warning("_apply_subprocess_edge: unknown ext %s", edge.ext)
         return EdgeResult(ok=False)
@@ -784,7 +790,11 @@ def _retry_command(edge: MigrationEdge) -> str:
     if edge.ext == "sh":
         return f"bash {edge.path}"
     if edge.ext == "py":
-        return f"{sys.executable} {edge.path}"
+        # Same interpreter the runner would use — a retry command that names a
+        # DIFFERENT python than the failing run is a command that lies.
+        from vco_lib.python_exe import resolve_or_current
+
+        return f"{resolve_or_current()} {edge.path}"
     return (
         "python -m vco_lib.project_init migrate-schema "
         f"--folder . --project-id <id>   # re-runs {edge.path.name}"

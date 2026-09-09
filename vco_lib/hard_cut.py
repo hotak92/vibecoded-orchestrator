@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -367,9 +366,17 @@ def hard_cut(
         )
         res.steps.append("FAIL: install.py missing post-reset")
         return res
+    # v0.2.94: the ONE resolver, not `sys.executable`. `hard_cut` is driven from
+    # the launcher (`projects_v2.rs` runs it via a `-c` snippet under
+    # `system.python_cmd`), so `sys.executable` here is whatever bare PATH probe
+    # the launcher picked. `resolve_or_current` prefers the clone's own venv and
+    # falls back to this interpreter, so the recovery path can only improve —
+    # install.py itself remains bootstrap-capable under either.
+    from vco_lib.python_exe import resolve_or_current
+
     try:
         install = run(
-            [sys.executable, str(install_py), "--update"],
+            [resolve_or_current(install_root=clone_root), str(install_py), "--update"],
             cwd=str(clone_root), env=sub_env, timeout=_INSTALL_TIMEOUT,
             capture_output=True, text=True,
         )

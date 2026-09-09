@@ -288,6 +288,17 @@ def test_ladder_is_ordered_and_current_is_its_head():
     assert all(p is not None for p in parsed), ceg.EXTRACTOR_GENERATION_BUMPS
     assert parsed == sorted(parsed), "bumps must be oldest → newest"
     assert ceg.CURRENT_EXTRACTOR_GENERATION == ceg.EXTRACTOR_GENERATION_BUMPS[-1]
+    # v0.2.94: STRICTLY increasing, and therefore unique. The module's rule is
+    # "append, never edit", and appending a version that is already in the list
+    # (or below its head) is the accident that rule invites — a duplicate would
+    # be silently inert (`generation_is_current` reads only the head), so
+    # nothing else in the system would notice.
+    assert len(set(ceg.EXTRACTOR_GENERATION_BUMPS)) == len(
+        ceg.EXTRACTOR_GENERATION_BUMPS
+    ), f"duplicate entry in the ladder: {ceg.EXTRACTOR_GENERATION_BUMPS}"
+    assert all(
+        a < b for a, b in zip(parsed, parsed[1:])
+    ), f"ladder must be STRICTLY increasing: {ceg.EXTRACTOR_GENERATION_BUMPS}"
 
 
 def test_the_0292_bump_is_declared():

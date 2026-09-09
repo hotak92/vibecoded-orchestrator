@@ -105,7 +105,32 @@ logger = logging.getLogger(__name__)
 #:          requires the newest bump >= the package version); the cost is one
 #:          incremental background re-walk per project on its next bundle
 #:          update (unchanged entities are not re-embedded).
-EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93")
+#: 0.2.94 — no extractor changes either, but the RECOVERY entry for the
+#:          2026-09-09 field defect. The 0.2.92 and 0.2.93 re-walks were
+#:          TRIGGERED on eight projects and every one of them died on
+#:          `ModuleNotFoundError: No module named 'vco_lib'` (the detached child
+#:          got a bare-PATH `python3`; see `vco_lib.python_exe`). Those runs
+#:          wrote no completion stamp — correctly — but they DID advance each
+#:          project's recorded manifest version to 0.2.93, and rule 3 of
+#:          :func:`decide` ("prev_version at/past the newest bump ⇒ the graph
+#:          was produced by an analyzer that already had the fixes") would then
+#:          have stamped them as done WITHOUT ever walking. Appending 0.2.94 is
+#:          how the ladder re-owes work it never actually delivered.
+#:
+#:          THE COST, stated plainly rather than understated: appending to the
+#:          ladder moves the head, so a project stamped `0.2.93` is no longer
+#:          `generation_is_current` either — EVERY project that has a code graph
+#:          pays ONE forced re-extraction pass on its next bundle update, not
+#:          just the eight that were stranded. What that pass costs is a re-walk
+#:          of the tree with the analyzer's per-file skip gate bypassed; the
+#:          EMBEDS stay content-hash gated, so entities whose content is
+#:          unchanged are not re-embedded (no GPU-hours, no vector churn).
+#:          Projects with no graph still short-circuit at rule 2 and pay
+#:          nothing. That cost is accepted because the alternative is rule 3
+#:          declaring the stranded projects finished — permanently, silently,
+#:          and with no error anywhere. The asymmetry that decides it is the
+#:          same one :func:`decide` is built on.
+EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94")
 
 #: The newest generation a freshly-built graph satisfies.
 CURRENT_EXTRACTOR_GENERATION: str = EXTRACTOR_GENERATION_BUMPS[-1]
@@ -709,6 +734,21 @@ def ensure_extractor_generation(
                                         verdict.generation),
             message=message or "extractor re-index deferred",
         )
+    if status == "failed":
+        # v0.2.94: the spawner refused because the resolved interpreter cannot
+        # import what the detached child needs. This is a BROKEN install, not a
+        # decline — it must NOT be flattened into `skipped` (which the caller
+        # logs at phase "ok" and never surfaces to the user). Surfacing it is
+        # the whole point: the 2026-09-09 field defect was invisible for two
+        # releases because the GUI said "started in the background" while eight
+        # detached children died on `import vco_lib`. The stamp stays unwritten,
+        # so the next bundle update retries.
+        return ReindexResult(
+            status="failed", reason=verdict.reason,
+            generation=verdict.generation,
+            message=message or "extractor re-index could not be started",
+        )
+
     # not_owed / skipped from the spawner: it declined for a reason of its own
     # (spawn kill-switch, analyzer not found, empty project name). The stamp is
     # deliberately NOT written — the project stays owed and the next update

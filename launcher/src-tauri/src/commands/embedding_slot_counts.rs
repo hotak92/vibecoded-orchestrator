@@ -161,7 +161,12 @@ pub async fn project_embedding_slot_counts(
         Err(_) => return Ok(SlotCounts::empty(collection)),
     };
 
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.94: the ONE ladder, not the bare bootstrap probe — `slot-counts`
+    // imports `vco_lib.embedding_enrichment` AND queries Weaviate, so a PEP-668
+    // system python returns "0 slots" for a reason that is not about slots.
+    let py_cmd: PathBuf =
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.embedding_enrichment",

@@ -2138,6 +2138,18 @@ class SyncTally:
             + self.counts[OUTCOME_EXCLUDED_SKIPPED]
         )
 
+    @property
+    def total(self) -> int:
+        """Every outcome this tally saw — i.e. how many files the run CONSIDERED.
+
+        v0.2.94: distinct from ``succeeded``, and the distinction is what the
+        paired ledger clears need. Zero here means the tree was not walked at
+        all (no such directory, or nothing in it), which is not the same as
+        "walked and found nothing owed" — a clear predicated on the second must
+        not fire on the first.
+        """
+        return sum(self.counts.values())
+
     def summary_fragment(self) -> str:
         """`S succeeded, F failed, K skipped` — the exact fragment the
         launcher's ``parse_summary_line`` reads (which accepts both this
@@ -3876,14 +3888,57 @@ def _regen_node_formats_after_full_sync() -> None:
     """
     import subprocess
 
-    gen = PROJECT_ROOT / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
-    if not gen.is_file():
-        # Materialized-project layout: the per-edit generator lives under
-        # .claude/scripts/. If neither exists, silently skip (nothing to do).
-        alt = PROJECT_ROOT / ".claude" / "scripts" / "generate-kg-summary.py"
-        if not alt.is_file():
-            return
-        gen = alt
+    # v0.2.94 — ROOT-vs-NON-ROOT PARITY (field report 2026-09-09).
+    #
+    # This used to look for the generator under the SYNCED PROJECT's own
+    # `claude_mcp_servers/scripts/` — a directory that exists ONLY in the
+    # orchestrator clone. Every user project therefore fell through to
+    # `.claude/scripts/generate-kg-summary.py --all`, which is the PER-EDIT
+    # generator: its argparse takes a FILE, so `--all` is a usage error and it
+    # exits 2. Observed live after MultiagentOrchestrator's `kg-sync --all`:
+    # `(node-format refresh exited 2; summaries left as-is — non-fatal)`. Net
+    # effect: after ANY bulk sync, no non-root project has EVER had its
+    # `.node_formats.json` refreshed, and the only trace was one stderr line.
+    #
+    # The fix is the user's standing rule — ONE component for root and non-root.
+    # `generate_node_formats.py` already accepts `--knowledge-dir`, and sets
+    # `PROJECT_ROOT = KNOWLEDGE_DIR.parent` from it, so pointing the ROOT
+    # generator at this project's `knowledge/` is the identical invocation in
+    # both cases (for the root, install_root == PROJECT_ROOT and nothing
+    # changes). `sys.executable` is right here: the kg-sync wrapper already
+    # activated the orchestrator venv, which is why `vco_lib` imports below.
+    gen = None
+    install_root = None
+    try:
+        from vco_lib.python_exe import resolve_install_root
+
+        install_root = resolve_install_root()
+    except Exception as exc:  # noqa: BLE001 — a summary refresh never breaks a sync
+        print(f"   (node-format refresh: install root unresolved: {exc})",
+              file=sys.stderr)
+    if install_root is not None:
+        candidate = (
+            Path(install_root) / "claude_mcp_servers" / "scripts"
+            / "generate_node_formats.py"
+        )
+        if candidate.is_file():
+            gen = candidate
+    if gen is None:
+        # No orchestrator clone reachable from here. NOT a silent skip any more:
+        # the summaries genuinely stay stale, and the old fallback (the per-edit
+        # generator with `--all`) never worked. Record it as owed work.
+        _emit_node_formats_deferral(
+            PROJECT_ROOT,
+            reason=(
+                "the orchestrator clone's "
+                "`claude_mcp_servers/scripts/generate_node_formats.py` could "
+                "not be located from this project "
+                f"(install root: {install_root or 'unresolved'})"
+            ),
+        )
+        return
+    if not KNOWLEDGE_ROOT.is_dir():
+        return  # nothing to summarise; not a failure
     try:
         # Cap the whole regen so a slow/hung summary backend can't wedge the
         # sync exit. --all over a large KG can be slow but is bounded here.
@@ -3898,24 +3953,166 @@ def _regen_node_formats_after_full_sync() -> None:
         # including on direct-CLI runs without PYTHONUNBUFFERED.
         print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...",
               flush=True)
+        # NO `--force`: the generator skips nodes whose formats already exist,
+        # so a re-run over an already-summarised project regenerates nothing.
+        # (Standing rule: never re-embed / re-generate hash-unchanged content.)
         proc = subprocess.run(
-            [py, str(gen), "--all"],
+            [py, str(gen), "--all", "--knowledge-dir", str(KNOWLEDGE_ROOT)],
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
             timeout=600,
         )
         if proc.returncode != 0:
+            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1]
             print(
                 "   (node-format refresh exited "
                 f"{proc.returncode}; summaries left as-is — non-fatal)",
                 file=sys.stderr,
             )
+            _emit_node_formats_deferral(
+                PROJECT_ROOT,
+                reason=(
+                    f"`{gen.name} --all --knowledge-dir {KNOWLEDGE_ROOT}` exited "
+                    f"{proc.returncode}: {tail[:300] or '<no output>'}"
+                ),
+            )
+        else:
+            # Paired resolution (decision-#12 shape): a refresh that exited 0 is
+            # the proof the earlier failure no longer holds. Nothing else clears
+            # this entry.
+            _clear_node_formats_deferral(PROJECT_ROOT)
     except subprocess.TimeoutExpired:
         print("   (node-format refresh timed out; summaries left as-is — non-fatal)",
               file=sys.stderr)
+        _emit_node_formats_deferral(
+            PROJECT_ROOT,
+            reason="the generator did not finish within its 600 s cap",
+        )
     except Exception as e:  # noqa: BLE001 — soft-fail, never break the sync
         print(f"   (node-format refresh skipped: {e} — non-fatal)", file=sys.stderr)
+        _emit_node_formats_deferral(PROJECT_ROOT, reason=f"{type(e).__name__}: {e}")
+
+
+#: Condition id for a failed post-sync `.node_formats.json` refresh (v0.2.94).
+#: Declared in `vco_lib/deferral_conditions.toml` as `auto_retryable`.
+_NODE_FORMATS_CID = "kg_node_formats_refresh_failed"
+
+
+def _clear_drift_deferral(project_root: Path) -> None:
+    """Resolve ``kg_sync_drift_detected`` after a FULLY successful tree sync.
+
+    v0.2.94. ``--check-drift`` is read-only against WEAVIATE but it does write
+    the project ledger (that is how a finding reaches the user), and since the
+    launcher's bundle-update gate started running it automatically, an
+    ``action_required`` entry saying "run `kg-sync --all`" outlived the run that
+    had already done exactly that.
+
+    The clear is NARROW, like its two siblings: only an ``--all`` that finished
+    with zero per-node failures may retire it, because only that run proves the
+    missing/stale nodes the scan named actually landed.
+
+    Soft-fail: a sync's exit code never depends on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+        from vco_lib.kg_sync_drift import CID_DRIFT
+
+        resolve_conditions(project_root, (CID_DRIFT,))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _clear_node_formats_deferral(project_root: Path) -> None:
+    """Resolve :data:`_NODE_FORMATS_CID` after a refresh that exited 0.
+
+    The paired half of :func:`_emit_node_formats_deferral`. Soft-fail: the
+    sync's exit code never depends on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        resolve_conditions(project_root, (_NODE_FORMATS_CID,))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
+    """Record a failed summary refresh as owed work instead of one stderr line.
+
+    Pre-v0.2.94 this failure printed `(node-format refresh exited 2; ...)` and
+    vanished — which is how a refresh that had NEVER worked on a non-root
+    project survived unnoticed. Soft-fail: the bookkeeping never breaks a sync.
+    """
+    try:
+        from vco_lib.deferral_emit import DeferralEntry, emit
+
+        entry = DeferralEntry(
+            condition_id=_NODE_FORMATS_CID,
+            title="KG summaries (.node_formats.json) not refreshed after the sync",
+            detected=(
+                f"The post-sync `.node_formats.json` refresh did not complete: "
+                f"{reason}. The nodes ARE in Weaviate; what is stale is the "
+                f"description/summary sidecar `hybrid_search`'s `summary` and "
+                f"`titles` tiers read, so retrieval will show older summaries "
+                f"(or none) for nodes this sync changed."
+            ),
+            why_deferred=(
+                "The summary refresh is a soft-fail rider on the sync: it must "
+                "never fail a run that successfully embedded every node. The "
+                "condition is auto-retryable — the next successful `--all` "
+                "tree sync runs the refresh again and clears this entry. "
+                "Nothing is lost meanwhile except summary freshness."
+            ),
+            command_to_apply=(
+                "# Refresh the summary sidecar for this project "
+                "(existing summaries are skipped):\n"
+                "python <orchestrator-root>/claude_mcp_servers/scripts/"
+                "generate_node_formats.py --all --knowledge-dir "
+                f"{project_root / 'knowledge'}"
+            ),
+            severity="warning",
+        )
+        emit(project_root, entry)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+#: Prefix of the ONE machine-readable line ``--check-drift`` emits (v0.2.94).
+#: MUST MATCH ``kg_sync.rs::KG_DRIFT_SENTINEL`` — the launcher's bundle-update
+#: gate parses this line to decide whether an "on-disk unchanged" project still
+#: owes a sync. A PREFIXED JSON line rather than a ``--json`` mode because this
+#: script prints progress/setup chatter on stdout before ``main()`` even runs,
+#: so "stdout is JSON" would be a contract it cannot keep; and rather than the
+#: human summary line because a caller that regexes prose pins the prose.
+DRIFT_SENTINEL_PREFIX = "KG_DRIFT_JSON "
+
+
+def _print_drift_sentinel(binding, report) -> None:
+    """Emit the machine-readable drift verdict. Best-effort; never raises.
+
+    Always printed — including on the ``unbound`` early exit, where ``report``
+    is ``None`` — so a caller can distinguish "checked, nothing owed" from
+    "never got a verdict". Silence must never read as "every node is present".
+    """
+    import json  # local import — this script imports json per-function
+
+    try:
+        payload = {
+            "binding": getattr(binding, "status", "") or "",
+            "kg_collection": getattr(binding, "kg_collection", "") or "",
+            "status": getattr(report, "status", "") if report is not None else "unknown",
+            "scanned": int(getattr(report, "scanned", 0) or 0) if report is not None else 0,
+            "missing": len(getattr(report, "missing", ()) or ()) if report is not None else 0,
+            "stale": len(getattr(report, "stale", ()) or ()) if report is not None else 0,
+            "detail": (
+                getattr(report, "detail", "") if report is not None
+                else (getattr(binding, "detail", "") or "no KG binding")
+            ),
+        }
+        print(DRIFT_SENTINEL_PREFIX + json.dumps(payload), flush=True)
+    except Exception as exc:  # noqa: BLE001 — a report line never breaks a scan
+        print(f"   (drift sentinel not emitted: {exc})", file=sys.stderr)
 
 
 def _run_check_drift() -> None:
@@ -3964,6 +4161,7 @@ def _run_check_drift() -> None:
             "   → no drift scan possible without a binding. Register/"
             "bundle this project, then re-run --check-drift."
         )
+        _print_drift_sentinel(binding, None)
         sys.exit(0)
 
     report = scan_drift(
@@ -3994,6 +4192,7 @@ def _run_check_drift() -> None:
             "is deleted)."
         )
     surface_drift(PROJECT_ROOT, report)
+    _print_drift_sentinel(binding, report)
     sys.exit(0)
 
 
@@ -4230,6 +4429,32 @@ def main():
                 # only a FULLY successful --all proves the failed nodes
                 # from an earlier run actually landed.
                 _clear_sync_failures_deferral(PROJECT_ROOT)
+                # v0.2.94: and it retires the DRIFT entry `--check-drift` wrote.
+                #
+                # The launcher's bundle-update gate now runs `--check-drift`
+                # automatically and spawns THIS run when it reports drift. The
+                # scan surfaces `kg_sync_drift_detected` (action_required, "run
+                # kg-sync --all") — and pre-fix nothing here cleared it, because
+                # its only paired resolution was a LATER scan returning `ok`.
+                # So every automatic repair left the project carrying an
+                # action-required entry telling the user to do the thing that
+                # had just been done for them.
+                #
+                # A `--all` that finished with ZERO failures AND actually
+                # covered the knowledge tree IS the paired proof: it wrote every
+                # node the scan found missing or stale. Same narrow-clear rule
+                # as the two above — a partial run proves nothing.
+                #
+                # `kg_tally.total` is load-bearing, not belt-and-braces:
+                # `total_fail` sums KG **and** docs failures, so a project with
+                # a populated `docs/` and a missing or empty `knowledge/` would
+                # otherwise reach zero failures having considered ZERO knowledge
+                # nodes — and retire a drift entry about nodes it never looked
+                # at. `not KNOWLEDGE_ROOT.exists()` is the honest exception: with
+                # no tree at all there is nothing a drift entry could still be
+                # true about, so a stale one is safe to retire.
+                if kg_tally.total > 0 or not KNOWLEDGE_ROOT.exists():
+                    _clear_drift_deferral(PROJECT_ROOT)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted

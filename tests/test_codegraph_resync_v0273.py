@@ -51,7 +51,7 @@ def test_children_log_to_vct_root_logs_dir(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cr.subprocess, "Popen", _fake_popen)
     result = cr.spawn_background_resync(
-        repo, "MyProj", python_exe="/usr/bin/python3"
+        repo, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     logs = list((state_dir / "logs").glob("resync-MyProj-*.log"))
@@ -81,7 +81,7 @@ def test_log_prep_failure_degrades_to_devnull(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cr.subprocess, "Popen", _fake_popen)
     result = cr.spawn_background_resync(
-        repo, "MyProj", python_exe="/usr/bin/python3"
+        repo, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     assert all(k["stdout"] is subprocess.DEVNULL for k in spawned)
@@ -106,7 +106,7 @@ def test_resume_command_is_shlex_quoted(monkeypatch, tmp_path):
     _stub_analyzer_tree(repo)
 
     result = cr.spawn_background_resync(
-        repo, "MyProj", python_exe="/usr/bin/python3", check_owed=False
+        repo, "MyProj", python_exe=sys.executable, check_owed=False
     )
     assert result.status == "deferred"
     if result.deferral is not None:
@@ -311,7 +311,7 @@ def test_spawn_not_owed_when_probe_confirms_zero(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cr.subprocess, "Popen", _no_spawn)
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "not_owed"
     assert result.pid is None
@@ -325,7 +325,7 @@ def test_spawn_proceeds_when_probe_undeterminable(monkeypatch, tmp_path):
     _stub_analyzer_tree(tmp_path)
     monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
 
@@ -338,7 +338,7 @@ def test_spawn_proceeds_when_rows_owed(monkeypatch, tmp_path):
     _stub_analyzer_tree(tmp_path)
     monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
 
@@ -412,7 +412,7 @@ def test_spawn_proceeds_when_cleanup_owed_despite_zero_stale(monkeypatch, tmp_pa
     _stub_analyzer_tree(tmp_path)
     monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
 
@@ -430,7 +430,7 @@ def test_spawn_not_owed_when_zero_stale_and_zero_cleanup(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cr.subprocess, "Popen", _no_spawn)
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "not_owed"
 
@@ -453,7 +453,7 @@ def test_spawn_leaves_alone_when_cleanup_owed_undeterminable(monkeypatch, tmp_pa
 
     monkeypatch.setattr(cr.subprocess, "Popen", _no_spawn)
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "not_owed"
 
@@ -581,7 +581,7 @@ def test_spawn_launches_driver_not_bare_analyzer(monkeypatch, tmp_path):
         lambda argv, **kw: (spawned.append(argv), _FakeProc())[1],
     )
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     driver = [a for a in spawned if "--run-resync" in a]
@@ -607,7 +607,7 @@ def test_spawn_never_forwards_prune_stale(monkeypatch, tmp_path):
         lambda argv, **kw: (spawned.append(argv), _FakeProc())[1],
     )
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     driver = [a for a in spawned if "--run-resync" in a][0]
@@ -629,7 +629,7 @@ def test_spawn_registers_driver_pid_with_hub(monkeypatch, tmp_path):
     _stub_analyzer_tree(tmp_path)
     monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
     result = cr.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+        tmp_path, "MyProj", python_exe=sys.executable
     )
     assert result.status == "launched"
     # name, pid, AND the repo_root path (the C-3 primary resolver) are passed.

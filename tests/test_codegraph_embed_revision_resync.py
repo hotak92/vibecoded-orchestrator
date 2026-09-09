@@ -309,7 +309,7 @@ def test_resync_degrades_to_deferral_when_service_down(monkeypatch, tmp_path):
     (scripts / "analyze_code_graph.py").write_text("# stub\n")
 
     result = mod.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+        tmp_path, "MyProj", python_exe=sys.executable, check_owed=False,
     )
     assert result.status == "deferred", "service down → defer, never spawn"
     assert result.pid is None
@@ -337,7 +337,7 @@ def test_resync_launches_background_when_service_up(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mod.subprocess, "Popen", _fake_popen)
     result = mod.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+        tmp_path, "MyProj", python_exe=sys.executable, check_owed=False,
     )
     assert result.status == "launched"
     assert result.pid == 4321
@@ -352,7 +352,7 @@ def test_resync_skips_when_analyzer_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "code_embed_service_healthy", lambda *a, **k: True)
     # No analyzer script anywhere under tmp_path.
     result = mod.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+        tmp_path, "MyProj", python_exe=sys.executable, check_owed=False,
     )
     assert result.status == "skipped"
 
@@ -369,7 +369,7 @@ def test_resync_spawn_failure_degrades_to_deferral(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mod.subprocess, "Popen", _boom)
     result = mod.spawn_background_resync(
-        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+        tmp_path, "MyProj", python_exe=sys.executable, check_owed=False,
     )
     assert result.status == "deferred", "spawn failure must degrade, not crash"
 
