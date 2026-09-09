@@ -48,6 +48,36 @@ A test that deliberately wants the inherited value passes it explicitly:
 ``child_env(VCT_ORCHESTRATOR_ROOT=os.environ["VCT_ORCHESTRATOR_ROOT"])`` —
 overrides are applied last, so opting out is possible but must be written down.
 
+**``KG_BASE_DIR`` is pinned at a throwaway directory** (v0.2.94), for a
+DIFFERENT reason, and it is a containment fix rather than a correctness one.
+``$VCT_ORCHESTRATOR_ROOT`` above is read by shipped code for two unrelated
+purposes: locating ``vco_lib`` (why we pin it) and answering "which project
+root is this?" — and the second answer decides which project's deferral ledger
+gets reconciled. ``EmbeddingService.for_project()`` reconciles that ledger on
+BOTH its paths (``_clear_failure_deferral`` on success,
+``_write_failure_deferral`` on failure), and a reconcile REWRITES
+``<root>/CLAUDE.md``: the ``vco-deferral-reminder`` block is spliced in when
+entries exist and stripped when none do. So every child that touched an
+embedding backend was editing this checkout's TRACKED ``CLAUDE.md`` — measured
+at four such children per full-suite run, which is where the stray
+``M CLAUDE.md`` in a mid-run ``git status`` came from.
+
+``KG_BASE_DIR`` is the precise lever: ``embedding_service._detect_project_root``
+consults it BEFORE ``$VCT_ORCHESTRATOR_ROOT``, so pinning it reroutes the
+project-root answer while leaving the import pin — the whole point of this
+helper — untouched. The directory is per-process and empty; a child that
+resolves a KG file path relative to it writes into the throwaway dir instead of
+the working tree, which is the same containment by a second route.
+
+Unlike ``$VCT_ORCHESTRATOR_ROOT``, this key is pinned ONLY when ``base`` is
+omitted — i.e. only when we are handing the child THIS process's environment,
+which is the case that leaks. A caller that BUILT the mapping owns what is in
+it: ``tests/test_v0289_kg_sync_project_root.py`` passes ``_base_env(...)`` to
+assert the sync script's root-precedence ladder, and two of its cases depend on
+the child seeing a specific ``KG_BASE_DIR`` — or none at all, for the
+"script location fallback" rung. Pinning over that made both untestable. As
+always, ``overrides`` wins last.
+
 Tests that deliberately exercise the UNPINNED case (e.g. "does the shim find
 the venv on its own?") must say so at the call site with a comment; the
 §3.16 straggler grep lists every ``sys.executable`` spawn that bypasses this
@@ -56,10 +86,24 @@ helper, and each one needs that justification.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Mapping, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Lazily-created, one per test process. Module-level rather than per call:
+#: ``child_env`` is called thousands of times in a full run and a temp dir per
+#: call would be thousands of directories.
+_KG_BASE_SENTINEL: Optional[str] = None
+
+
+def _kg_base_sentinel() -> str:
+    """An empty throwaway directory to stand in as the child's project root."""
+    global _KG_BASE_SENTINEL
+    if _KG_BASE_SENTINEL is None:
+        _KG_BASE_SENTINEL = tempfile.mkdtemp(prefix="vco-child-kg-base-")
+    return _KG_BASE_SENTINEL
 
 
 def child_env(
@@ -75,5 +119,11 @@ def child_env(
     # Beats PYTHONPATH in the shipped scripts that read it — see the module
     # docstring. Set BEFORE `overrides` so a caller can still opt out.
     env["VCT_ORCHESTRATOR_ROOT"] = root
+    # Keeps the child's project-root answer (and so its deferral-ledger writes,
+    # and so this checkout's tracked CLAUDE.md) out of the working tree — see
+    # the module docstring. Only for the inherited-environment case: a caller
+    # that built `base` itself owns the root channels in it.
+    if base is None:
+        env["KG_BASE_DIR"] = _kg_base_sentinel()
     env.update(overrides)
     return env

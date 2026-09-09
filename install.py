@@ -105,6 +105,8 @@ if _sys.platform == "win32":
         pass
 
 import argparse
+import atexit
+import contextlib
 import datetime
 import json
 import os
@@ -118,7 +120,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -132,10 +134,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Single source of truth — see vco_lib/project_init.py docstring.
-# Moved to vco_lib.project_init in PR 2 — kept as shim for existing
-# callers; will be removed in PR 9 (cleanup).
-from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
+# The vco_lib modules install.py delegates to. Imported after the sys.path
+# insert above, hence the E402 waivers.
 from vco_lib.atomic import atomic_copy_file as _atomic_copy_file  # noqa: E402
 from vco_lib import launcher_db_writer as _launcher_db_writer  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
@@ -2993,8 +2993,8 @@ def _detect_third_party_project(install_path: Path) -> dict | None:
                         )
                     except Exception:  # noqa: BLE001
                         details["env"] = (
-                            f".env contains content matching secret-shape heuristic. "
-                            f"V47-C will offer to migrate to the OS keychain."
+                            ".env contains content matching secret-shape heuristic. "
+                            "V47-C will offer to migrate to the OS keychain."
                         )
                 else:
                     details["env"] = (
@@ -4307,7 +4307,6 @@ def _vct_state_dir() -> Path:
 # tests can scope the lock per-tmpdir). Soft-fails to WARNING when the
 # file can't be opened or locked — never blocks install.
 # ---------------------------------------------------------------------------
-import contextlib as _contextlib
 
 
 # ---------------------------------------------------------------------------
@@ -4384,8 +4383,7 @@ def _release_main_entry_lock_atexit() -> None:
     _MAIN_ENTRY_LOCK_HANDLE = None
 
 
-import atexit as _atexit
-_atexit.register(_release_main_entry_lock_atexit)
+atexit.register(_release_main_entry_lock_atexit)
 
 
 # A-6 (v0.2.73) deadline refresh + V52-AI initial lockfile write: extracted
@@ -4530,7 +4528,7 @@ def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
     return fp
 
 
-@_contextlib.contextmanager
+@contextlib.contextmanager
 def _install_advisory_lock(timeout_seconds: float = 60.0):
     """v0.2.44 V44-I: cross-OS advisory lock for the duration of the
     install-state mutation block.
@@ -12419,7 +12417,7 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             health_resp = urllib.request.urlopen(f"{base}/health", timeout=3)
             body = health_resp.read().decode("utf-8", errors="replace")
             if "codesage" in body.lower() or "code_embed" in body.lower():
-                return PROBE_VCT_MANAGED, f"code_embed responds with vct fingerprint"
+                return PROBE_VCT_MANAGED, "code_embed responds with vct fingerprint"
             return PROBE_FOREIGN, f"port {port} responds to /health but is not our code_embed"
         except Exception as e:
             return PROBE_INCOMPATIBLE, f"code_embed at {base} unrecognised: {e}"
@@ -12484,10 +12482,10 @@ def _decide_action(name: str, probe: str, evidence: str,
     print(f"  Detected a foreign {name} on port {_DEFAULT_PORTS[name]}.")
     print(f"  Evidence: {evidence}")
     print()
-    print(f"  Options:")
+    print("  Options:")
     print(f"    [1] alt-port  — pick a free port and run our own {name} alongside it (safe, default)")
     print(f"    [2] adopt     — reuse the existing {name}; WILL write our collections into it")
-    print(f"    [3] abort     — stop installation")
+    print("    [3] abort     — stop installation")
     try:
         ans = input(f"  Choice for {name} [1/2/3, default 1]: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -12613,7 +12611,7 @@ def _resolve_service_safety(args: argparse.Namespace) -> dict:
     point — we never start a container against an occupied port without
     explicit consent.
     """
-    print(f"\n[5b/10] Probing existing services (content-based detection) ...")
+    print("\n[5b/10] Probing existing services (content-based detection) ...")
 
     decisions: dict = {}
     state = _read_services_toml()
@@ -12983,7 +12981,7 @@ def _start_services(
     # headless install.py keeps things conservative.
     existing_volumes = _detect_existing_volume_paths()
     if existing_volumes:
-        print(f"  Existing orchestrator volumes detected — keeping in place:")
+        print("  Existing orchestrator volumes detected — keeping in place:")
         for name, info in existing_volumes.items():
             size = (
                 f" ({info['size_gb']:.1f} GB)" if info.get("size_gb") is not None else ""
@@ -13439,10 +13437,10 @@ def _start_services(
     except subprocess.TimeoutExpired:
         timeout_min = docker_timeout // 60
         print(f"  FAIL (timed out after {timeout_min} min)")
-        print(f"  Container daemon may be hung. Try manually:")
+        print("  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
         print(f"    {' '.join(compose_cmd)} up -d")
-        print(f"  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
+        print("  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
         _log_install_event(
             "5/10", "error",
             f"compose up timed out after {timeout_min} min",
@@ -14603,7 +14601,7 @@ def _warn_if_diagrams_empty(diagrams_name: str, weaviate_url: str) -> None:
     )
     _log_install_event(
         "7b/10", "warn",
-        f"Diagrams collection empty: no .mmd sources found",
+        "Diagrams collection empty: no .mmd sources found",
         data={"diagrams_collection": diagrams_name,
               "source_count": 0,
               "weaviate_count": 0},
@@ -16737,7 +16735,6 @@ def _emit_orchestrator_root_schema_deferrals(
         deferral_report.add_entry(_orphan_entry)
 
     # ── (b) linksTo property drift ─────────────────────────────────────────
-    shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
     _links_to_drift_classes: list[str] = []
     for class_name, class_def in class_map.items():
         # Only check KG-shaped collections (shared KG + per-project KG).
@@ -16780,7 +16777,7 @@ def _emit_orchestrator_root_schema_deferrals(
                     "# run migrate-shared-kg-schema.sh if it detects the gap\n"
                     "# Option 2 — full recreate + re-seed:\n"
                     "python -m vco_lib.project_init migrate-collections "
-                    f"--name <collection>  "
+                    "--name <collection>  "
                     "# opens a consent prompt, then re-syncs"
                 ),
                 severity="info",
@@ -16805,11 +16802,10 @@ def _emit_orchestrator_root_schema_deferrals(
 # migrate helpers into the extracted module.
 # ---------------------------------------------------------------------------
 from vco_lib.kg_binding_heal import (  # noqa: E402
-    _KG_ACCESS_RANK,
     _KG_BINDING_PREFIX_ADOPT_SUFFIXES,
     _count_weaviate_class_objects,
-    _prefix_adopt_kg_bindings_pass,
-    _rebind_collection_names_to_on_disk_casing,
+    _prefix_adopt_kg_bindings_pass as _prefix_adopt_kg_bindings_pass,
+    _rebind_collection_names_to_on_disk_casing as _rebind_collection_names_to_on_disk_casing,
     converge_root_pointer_write_side as _converge_root_pointer_write_side_impl,
     emit_ambiguous_evidence_entry as _emit_ambiguous_evidence_entry,
     pointer_drift_needs_rw as _pointer_drift_needs_rw,
@@ -16854,7 +16850,6 @@ def _w40_run_adoption_uplifts(
         deferral_report: active ``DeferralReport`` instance for the run.
         db_path: absolute path to ``launcher.db`` (for audit writes).
     """
-    import sqlite3
     import argparse as _argparse
 
     seen_collections: set[str] = set()
@@ -18682,16 +18677,13 @@ def _check_stale_mcp_json_shadow(
 # ---------------------------------------------------------------------------
 
 from vco_lib.install_mcp import (  # noqa: E402
-    _ALLOWED_GLOBAL_ENV_KEYS,
     _DEFAULT_MCP_ENTRY_NAMES,
-    _DEPRECATED_DEFAULT_MCPS,
-    _SECRET_SHAPED_SUBSTRINGS,
     _build_python_mcp_entries,
     _consent_for_stale_entries,
     _detect_deprecated_mcp_entries,
     _detect_stale_mcp_entries,
-    _filter_env_for_global_json,
-    _is_secret_shaped_env_key,
+    _filter_env_for_global_json as _filter_env_for_global_json,
+    _is_secret_shaped_env_key as _is_secret_shaped_env_key,
     _python_fallback_write_mcp_entries,
     _scan_deprecated_mcp_entries,
     _scan_stale_mcp_entries,
@@ -21006,8 +20998,8 @@ def _register_mcps(
                 f"launcher binary timed out after 30s: {exc}",
             )
             print(
-                f"  Launcher binary CLI timed out after 30s "
-                f"(binary may be stale and not recognise --register-default-mcps).",
+                "  Launcher binary CLI timed out after 30s "
+                "(binary may be stale and not recognise --register-default-mcps).",
                 file=sys.stderr,
             )
             return (False, True)
@@ -21141,7 +21133,7 @@ def _register_mcps(
                 ),
                 command_to_apply=(
                     "# Re-run install.py to recreate the venv, then:\n"
-                    f"python install.py --update"
+                    "python install.py --update"
                 ),
                 severity="warning",
                 kg_node_refs=[
@@ -22607,7 +22599,7 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
         # uses the multi-arch CPU default. The compose file reads this
         # via ${CODE_EMBED_DOCKERFILE:-Dockerfile}. Only emitted when
         # NVIDIA was detected — leaves CPU/AMD/Metal hosts on the default.
-        *([f"CODE_EMBED_DOCKERFILE=Dockerfile.cuda"]
+        *(["CODE_EMBED_DOCKERFILE=Dockerfile.cuda"]
           if embed_config.get("gpu_vendor") == "nvidia" else []),
         # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
         # reads/writes. Per-profile so low-resource/openai installs don't
@@ -23827,15 +23819,15 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
 
     print("Next steps:")
     print()
-    print(f"  1. Open this project in your editor (any of these works):")
+    print("  1. Open this project in your editor (any of these works):")
     print(f"       VS Code:           code {PROJECT_ROOT}")
     print(f"       Claude Code CLI:   cd {PROJECT_ROOT} && claude")
-    print(f"       Claude Desktop:    open the folder via the desktop app")
+    print("       Claude Desktop:    open the folder via the desktop app")
     print()
-    print(f"  2. Start a Claude Code session (the orchestrator activates automatically):")
-    print(f"     claude")
+    print("  2. Start a Claude Code session (the orchestrator activates automatically):")
+    print("     claude")
     print()
-    print(f"  3. Or activate the venv for manual scripts:")
+    print("  3. Or activate the venv for manual scripts:")
     print(f"     {activate}")
     print()
 
@@ -23951,17 +23943,17 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     will_stop_containers = compose_argv is not None and compose_dir.exists()
     if will_stop_containers:
         print(f"  [1] Stop containers via `{' '.join(compose_argv)} down`")
-        print(f"      (preserves volumes — separate step below)")
+        print("      (preserves volumes — separate step below)")
     elif compose_dir.exists():
         # Never silent: pre-v0.2.92 an unusable/absent runtime made step 1 a
         # no-op with no line in the plan at all.
         print(f"  [1] [skip] Containers not stopped — {_rt.reason}")
 
     if not args.keep_data:
-        print(f"  [2] Remove container volumes (Weaviate KG data + Ollama models + code embeddings)")
-        print(f"      Use --keep-data to preserve them.")
+        print("  [2] Remove container volumes (Weaviate KG data + Ollama models + code embeddings)")
+        print("      Use --keep-data to preserve them.")
     else:
-        print(f"  [2] [skip] Container volumes preserved (--keep-data)")
+        print("  [2] [skip] Container volumes preserved (--keep-data)")
 
     # Honour VCT_STATE_DIR / VCT_LAUNCHER_DB_PATH so a dev launcher's
     # state isolates cleanly (v0.2.54: canonical resolver).
@@ -23975,7 +23967,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     will_clean_claude_json = claude_json.exists()
     if will_clean_claude_json:
         print(f"  [4] Remove orchestrator MCP server entries from {claude_json}")
-        print(f"      (preserves your other MCP servers)")
+        print("      (preserves your other MCP servers)")
 
     # Boot-service removal (v0.2.54 Track G): plan lines name the exact
     # OS-specific artefact so --dry-run output is auditable.
@@ -23993,7 +23985,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     else:
         boot_artefact = f"(no boot service on {os_name})"
     print(f"  [5] Remove boot autostart: {boot_artefact}")
-    print(f"      + `vct-hub --unregister-boot` (no-op if never enabled)")
+    print("      + `vct-hub --unregister-boot` (no-op if never enabled)")
     print(f"      + model gateway autostart: {_gateway_boot_artefact(os_name)}")
 
     # v0.2.92 (WP-10): the model gateway's runtime state. Until now this
@@ -24013,13 +24005,13 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print(f"  [5b] [skip] No model-gateway state files under {_paths.vct_root_dir()}")
 
     if args.remove_projects:
-        print(f"  [6] Remove .claude/ folders in registered projects (--remove-projects)")
+        print("  [6] Remove .claude/ folders in registered projects (--remove-projects)")
     else:
-        print(f"  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
+        print("  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
 
     print()
-    print(f"  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
-    print(f"  WILL NOT TOUCH: any user source code outside orchestrator-managed paths")
+    print("  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
+    print("  WILL NOT TOUCH: any user source code outside orchestrator-managed paths")
     print()
 
     if dry:
@@ -24080,7 +24072,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             print("  To remove orchestrator container volumes manually, run:")
             print(f"    cd {compose_dir}")
             print(f"    {compose_str} {downop}")
-            print(f"  (alternatively, list and remove individually:)")
+            print("  (alternatively, list and remove individually:)")
             print(f"    {container_runtime} volume ls -q | grep -E 'weaviate|ollama|code_embed|codesage'")
             print(f"    {container_runtime} {removeop} <NAME>     # one at a time")
             print()
@@ -24188,8 +24180,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     else:
         print("  (nothing was removed)")
     print()
-    print(f"  Audit log: ~/.vibecoded/uninstall_audit.log")
-    print(f"  Note: ~/.vct-secrets/ left intact (user secrets).")
+    print("  Audit log: ~/.vibecoded/uninstall_audit.log")
+    print("  Note: ~/.vct-secrets/ left intact (user secrets).")
     return 0
 
 

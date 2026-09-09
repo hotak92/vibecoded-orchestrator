@@ -529,15 +529,12 @@ async def _get_all_code_embeddings(text: str) -> dict[str, list[float]]:
 def _scheme_for_collection(collection_name: str) -> str:
     """Return the vector scheme key ('kg' or 'code') for a collection.
 
-    Strips any project prefix (e.g. 'MyProject_CodeFunction' -> 'CodeFunction')
-    before checking CODE_SCHEME_COLLECTIONS.
+    Tolerates a project prefix (e.g. 'MyProject_CodeFunction') by matching the
+    CODE_SCHEME_COLLECTIONS base names as a SUFFIX.
     """
     from . import server
-    # Strip project prefix: everything after last '_' that matches a known base name
     base = collection_name
     if "_" in collection_name:
-        suffix = collection_name.rsplit("_", 1)[-1]
-        # Check if suffix matches a code collection base name
         for code_coll in server.CODE_SCHEME_COLLECTIONS:
             if collection_name.endswith(code_coll):
                 return "code"

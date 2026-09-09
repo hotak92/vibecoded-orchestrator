@@ -148,7 +148,7 @@ server = _LazyServerProxy()  # noqa: F811 — module-level attr source for serve
 # Answer-window matcher: single source of truth lives in
 # ``rl_client.answer_window`` (imported here the same way server.py did — one
 # concern, one home; the monitor + Stop-hook drain must agree byte-for-byte).
-from claude_mcp_servers.rl_client.answer_window import (
+from claude_mcp_servers.rl_client.answer_window import (  # noqa: E402 — kept beside the comment above, mirroring server.py's late import
     match_position_for_query as _match_position_for_query,
 )
 

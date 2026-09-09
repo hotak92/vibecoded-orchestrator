@@ -53,7 +53,7 @@ import asyncio
 import functools
 import uuid
 import warnings
-from typing import Any, Optional, List, Dict
+from typing import Optional
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -229,7 +229,7 @@ def _reraise_shipped_submodule_import(exc: "ImportError", submodule: str) -> Non
 
 # Import Chunker for splitting large node content before embedding.
 try:
-    from .chunking import Chunker  # noqa: E402 — after bootstrap
+    from .chunking import Chunker  # noqa: E402,F401 — after bootstrap; re-export (rl_client.citation_compute imports Chunker off this module)
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".chunking")
 
@@ -252,7 +252,7 @@ except ImportError as _exc:
 # editable-installed part of every healthy install (see the "vco_lib import
 # discipline" note further below), so a failed import here already fails
 # loudly (ImportError) with no fallback, matching that same discipline.
-from vco_lib.log_setup import configure_logging
+from vco_lib.log_setup import configure_logging  # noqa: E402 — after package-identity bootstrap
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -4376,16 +4376,16 @@ try:
         get_legacy_text_embedding,
         get_openai_embedding,
         get_embedding,
-        _get_both_embeddings,
-        _get_all_kg_embeddings,
+        _get_both_embeddings,  # noqa: F401 — re-export (block comment above): consumed off `server`
+        _get_all_kg_embeddings,  # noqa: F401 — re-export (block comment above): consumed off `server`
         _get_all_kg_embeddings_tagged,
-        _get_all_code_embeddings,
+        _get_all_code_embeddings,  # noqa: F401 — re-export (block comment above): consumed off `server`
         _scheme_for_collection,
         _primary_named_vector,
         _get_search_vector,
-        count_tokens_async,
+        count_tokens_async,  # noqa: F401 — re-export (block comment above): consumed off `server`
         get_code_embedding,
-        _inline_code_embed_http,
+        _inline_code_embed_http,  # noqa: F401 — re-export (block comment above): consumed off `server`
         get_code_query_embedding,
         _active_code_query_slot,
         get_legacy_code_embedding,
@@ -4757,13 +4757,72 @@ _RL_ENRICHMENT_EXPORTS = (
     "_rl_enrichment_gate_open", "_rl_enrichment_consumer_exists",
     "_rl_enrich_gate_reset_for_test",
 )
+#
+# The re-export itself is written out as ONE explicit ``from .rl_enrichment
+# import (...)`` per name (v0.2.94), NOT the ``globals()[n] = getattr(mod, n)``
+# loop it replaced. Same 44 objects, same binding moment, same names — but a
+# dynamic loop is invisible to static analysis: ruff read every call-site below
+# as an undefined name (44× F821) and a TYPO in the inventory above would have
+# surfaced only at runtime, on the first request that touched the mistyped
+# name. Spelled out, a typo is an ImportError at startup. The tuple above stays
+# the documented inventory and is pinned equal to this import list by
+# tests/test_v0294_lint_rl_enrichment_export_parity.py.
 try:
-    from . import rl_enrichment as _rl_enrichment  # noqa: E402 — after bootstrap
+    # ``X as X`` is the PEP 484 explicit-re-export form, honoured by ruff and
+    # pyright alike: 37 of these 44 are not called from THIS file — they exist
+    # so `server.<name>` stays the resolution point for rl_client's
+    # `from …weaviate_mcp.server import <fn>` and for the tests that patch
+    # `server.<fn>`. Written plainly they would read as 37 unused imports; the
+    # redundant alias states the intent in the language instead of suppressing
+    # the check, and keeps every line the same shape as a name is added.
+    from .rl_enrichment import (  # noqa: E402 — after bootstrap
+        _rl_load_messages as _rl_load_messages,
+        _rl_find_kg_positions as _rl_find_kg_positions,
+        _rl_extract_answer_window as _rl_extract_answer_window,
+        _resolve_claude_session_dir as _resolve_claude_session_dir,
+        _rl_find_all_transcripts_in_dir as _rl_find_all_transcripts_in_dir,
+        _rl_find_all_transcripts as _rl_find_all_transcripts,
+        _rl_is_literal_cited as _rl_is_literal_cited,
+        _rl_compute_and_write_citations as _rl_compute_and_write_citations,
+        _rl_force_flush_sentinel_path as _rl_force_flush_sentinel_path,
+        _rl_check_force_flush as _rl_check_force_flush,
+        _rl_clear_force_flush as _rl_clear_force_flush,
+        _rl_human_turn_after as _rl_human_turn_after,
+        _rl_delete_own_pending_file as _rl_delete_own_pending_file,
+        _rl_answer_monitor as _rl_answer_monitor,
+        _get_rl_client as _get_rl_client,
+        _embedding_dim_for as _embedding_dim_for,
+        _extract_obj_vector as _extract_obj_vector,
+        _cosine as _cosine,
+        _get_rl_telemetry_writer as _get_rl_telemetry_writer,
+        _resolve_code_embedding_triple as _resolve_code_embedding_triple,
+        _emit_code_structure_telemetry as _emit_code_structure_telemetry,
+        _emit_code_retrieval_telemetry as _emit_code_retrieval_telemetry,
+        _stage_code_citation_pending as _stage_code_citation_pending,
+        _get_rl_telemetry_writer_for as _get_rl_telemetry_writer_for,
+        _other_model_for_source as _other_model_for_source,
+        _embed_text_in_other_model as _embed_text_in_other_model,
+        _reset_rl_telemetry_writers as _reset_rl_telemetry_writers,
+        _rl_pack_linked_embs_for_node as _rl_pack_linked_embs_for_node,
+        _rl_regenerate_node_vector as _rl_regenerate_node_vector,
+        _rl_refetch_node_vector as _rl_refetch_node_vector,
+        _rl_find_representative_obj as _rl_find_representative_obj,
+        _rl_attach_other_slot_for_node as _rl_attach_other_slot_for_node,
+        _rl_attach_active_truncation_for_node as _rl_attach_active_truncation_for_node,
+        _stored_slot_truncation_state as _stored_slot_truncation_state,
+        TRUNCATED_SLOTS_PROP as TRUNCATED_SLOTS_PROP,
+        SECONDARY_TRUNCATED_SLOTS_PROP as SECONDARY_TRUNCATED_SLOTS_PROP,
+        _rl_enrich_nodes_with_linked_embs as _rl_enrich_nodes_with_linked_embs,
+        _resolve_dual_rl_log_enabled as _resolve_dual_rl_log_enabled,
+        _resolve_dual_rl_log_inputs as _resolve_dual_rl_log_inputs,
+        _slot_short_source as _slot_short_source,
+        _rl_cache_and_rerank as _rl_cache_and_rerank,
+        _rl_enrichment_gate_open as _rl_enrichment_gate_open,
+        _rl_enrichment_consumer_exists as _rl_enrichment_consumer_exists,
+        _rl_enrich_gate_reset_for_test as _rl_enrich_gate_reset_for_test,
+    )
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".rl_enrichment")
-for _name in _RL_ENRICHMENT_EXPORTS:  # re-export into server's namespace
-    globals()[_name] = getattr(_rl_enrichment, _name)
-del _name
 
 
 # ----------------------------------------------------------------------
@@ -8921,7 +8980,7 @@ async def migrate_embeddings(
         collection_name: Name of the Weaviate collection to migrate
         vector_scheme: "kg" or "code" (auto-detected if None)
     """
-    from weaviate.classes.config import Configure, Property, DataType
+    from weaviate.classes.config import Configure, Property
 
     # Resolve scheme
     scheme = vector_scheme or _scheme_for_collection(collection_name)
@@ -9195,7 +9254,7 @@ if __name__ == "__main__":
     except Exception as _reap_exc:  # noqa: BLE001 — never block startup
         logger.debug("weaviate-kg: stale-MCP reap raised (%s); continuing", _reap_exc)
 
-    logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
+    logger.info("Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")
     read_state = "DISABLED" if SHARED_KG_READ_DISABLED else "enabled"
     logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'} (read: {read_state})")

@@ -10,8 +10,6 @@ discovered by the per-package sweep + the project-level sweep.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from rl_client.client import _deprecation_warning

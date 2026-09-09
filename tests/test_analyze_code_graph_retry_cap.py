@@ -162,6 +162,7 @@ def _delete_class_safely(class_name: str) -> None:
 def test_analyze_fails_fast_on_case_insensitive_class_collision(
     unique_class_basename: str,
     temp_repo_with_python_file: Path,
+    tmp_path: Path,
 ) -> None:
     """End-to-end reproducer for the v0.2.15 codegraph wedge.
 
@@ -196,6 +197,22 @@ def test_analyze_fails_fast_on_case_insensitive_class_collision(
         # what the launcher uses in practice.)
         env = dict(os.environ)
         env["VCT_INSTALL_ROOT"] = str(Path(__file__).parent.parent.resolve())
+        # CONTAINMENT (v0.2.94): ``child_env`` pins $VCT_ORCHESTRATOR_ROOT at
+        # the checkout so the child imports THIS tree's vco_lib. The analyzer
+        # reads that SAME variable for a second, unrelated purpose — the root
+        # whose deferral ledger it reconciles (main(): install_root →
+        # EmbeddingService.for_project → _clear_failure_deferral) — and
+        # reconciling a ledger rewrites ``<root>/CLAUDE.md``'s reminder block.
+        # Left at the checkout this test edited a TRACKED file on every run.
+        # child_env documents this opt-out; PYTHONPATH (which it also sets)
+        # still resolves vco_lib from the checkout, so the import pin the
+        # helper exists for is preserved. NB ``--deferral-root`` does NOT cover
+        # this: it scopes the analyzer's own emits, not EmbeddingService's.
+        # Nor does child_env's KG_BASE_DIR pin: the analyzer passes the root
+        # EXPLICITLY to for_project(), and an explicit root outranks both env
+        # vars in _detect_project_root.
+        install_root_sentinel = tmp_path / "orchestrator_root_sentinel"
+        install_root_sentinel.mkdir(parents=True, exist_ok=True)
         # v0.2.73 (CG-3): Joern CFG/PDG removed — no VCT_JOERN_AVAILABLE / --no-cfg
         # to set; the analyzer no longer probes Joern.
 
@@ -217,7 +234,7 @@ def test_analyze_fails_fast_on_case_insensitive_class_collision(
             text=True,
             timeout=MAX_FAIL_FAST_SECONDS + 10,  # safety net: a real hang
                                                   # propagates as TimeoutExpired
-            env=child_env(env),
+            env=child_env(env, VCT_ORCHESTRATOR_ROOT=str(install_root_sentinel)),
         )
         elapsed = time.monotonic() - start
 
