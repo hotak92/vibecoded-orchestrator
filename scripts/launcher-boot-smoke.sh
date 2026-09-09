@@ -24,9 +24,16 @@
 # Environment handling:
 #   - HOME/XDG dirs are redirected to a throwaway temp dir so the smoke
 #     NEVER touches the operator's real ~/.vct state (fresh first-run boot).
-#   - Display: uses xvfb-run when available (CI), else the caller's real
-#     DISPLAY/WAYLAND_DISPLAY (dev machine — a window may appear briefly),
-#     else fails with exit 3.
+#   - Display: uses xvfb-run when available (CI). It NEVER falls back to the
+#     caller's real display on its own: on 2026-09-09 the fallback flashed the
+#     launcher window onto a live GNOME/X11 (mutter 46.2, NVIDIA) desktop TWICE
+#     and each time gnome-shell died on
+#     `meta_window_get_work_area_for_logical_monitor: assertion failed
+#     (logical_monitor)` — the operator came back to a dead session and every
+#     GUI app gone. Without xvfb-run the smoke exits 3 with the install hint;
+#     VCT_BOOT_SMOKE_REAL_DISPLAY=1 is the explicit, at-your-own-risk opt-in.
+#     VCT_BOOT_SMOKE_XVFB_RUN=<path> pins an xvfb-run outside the probed
+#     locations; the literal `none` disables probing (tests use it).
 #   - D-Bus: wraps in dbus-run-session when available so the
 #     single-instance plugin sees a private bus (a concurrently running
 #     real launcher can't make the smoke instance exit early).
@@ -83,7 +90,12 @@ fi
 # pattern as templates/hooks/lean-ctx-rewrite.sh's lean-ctx probe: try PATH,
 # then the known install locations, and SAY SO before falling back.
 XVFB_RUN=""
-if command -v xvfb-run >/dev/null 2>&1; then
+if [ -n "${VCT_BOOT_SMOKE_XVFB_RUN:-}" ]; then
+    # Explicit pin: a path (used as-is) or `none` (skip every probe).
+    if [ "$VCT_BOOT_SMOKE_XVFB_RUN" != "none" ]; then
+        XVFB_RUN="$VCT_BOOT_SMOKE_XVFB_RUN"
+    fi
+elif command -v xvfb-run >/dev/null 2>&1; then
     XVFB_RUN="xvfb-run"
 else
     for _cand in \
@@ -103,11 +115,20 @@ if [ -n "$XVFB_RUN" ]; then
 elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     echo "[boot-smoke] FAIL: no display and no xvfb-run — install xvfb" >&2
     exit 3
+elif [ "${VCT_BOOT_SMOKE_REAL_DISPLAY:-}" = "1" ]; then
+    echo "[boot-smoke] WARNING: VCT_BOOT_SMOKE_REAL_DISPLAY=1 — running against the REAL" \
+         "display (DISPLAY='${DISPLAY:-}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}')." \
+         "A launcher window WILL appear; on GNOME/X11 this has killed the whole" \
+         "desktop session (mutter logical_monitor assertion, 2026-09-09)." >&2
 else
-    echo "[boot-smoke] NOTE: xvfb-run not found on PATH or at any candidate" \
-         "path — running against the REAL display" \
-         "(DISPLAY='${DISPLAY:-}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}')." \
-         "A launcher window WILL appear briefly. Install xvfb to run headless." >&2
+    echo "[boot-smoke] FAIL: xvfb-run not found on PATH or at any candidate path, and a" \
+         "real display is present (DISPLAY='${DISPLAY:-}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}')." >&2
+    echo "[boot-smoke] REFUSING to open the launcher window on the operator's live desktop:" \
+         "on GNOME/X11 (mutter 46.2) that flash crashed gnome-shell and ended the session" \
+         "twice on 2026-09-09. Install xvfb ('sudo apt install xvfb'), or pin one with" \
+         "VCT_BOOT_SMOKE_XVFB_RUN=/path/to/xvfb-run, or opt in explicitly with" \
+         "VCT_BOOT_SMOKE_REAL_DISPLAY=1 (exit 3 = did not run)." >&2
+    exit 3
 fi
 
 echo "[boot-smoke] booting $BIN (isolated HOME=$SMOKE_HOME, waiting up to ${TIMEOUT_SECS}s for '$MARKER')"

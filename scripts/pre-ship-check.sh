@@ -330,7 +330,7 @@ if (cd launcher/src-tauri && cargo build -p vct-launcher-temp) > /tmp/preship-bo
         >> /tmp/preship-boot-smoke.log 2>&1; then
     gate_pass "launcher boot smoke (setup complete, no panics)"
 else
-    gate_fail "launcher boot smoke" "See /tmp/preship-boot-smoke.log"
+    gate_fail "launcher boot smoke" "See /tmp/preship-boot-smoke.log (exit 3 = no xvfb-run: install xvfb — the smoke never opens a window on the live desktop; CI runs it under Xvfb)"
 fi
 
 # Gate 3: pytest
