@@ -2843,6 +2843,27 @@ pub(crate) fn resolve_orchestrator_script(bin: &str) -> Option<std::path::PathBu
 /// is pinned by `tests/test_v0292_wrapper_health.py::MarkerParityTests`.
 pub(crate) const RESILIENT_WRAPPER_MARKER: &str = "VCT_INSTALL_ROOT";
 
+/// The SECOND way a wrapper can honour the ladder, since v0.2.94: by SOURCING
+/// it (`templates/scripts/vct_venv_ladder.{sh,ps1}`, which carries
+/// `$VCT_INSTALL_ROOT` itself) instead of inlining it.
+///
+/// Without this, the v0.2.94 extraction would have silently retired the
+/// staleness check for every wrapper it touched — a migrated shipped template
+/// no longer contains the first marker, so `wrapper_requires_resilience_marker`
+/// would return `false` and the pre-VCO copies the 2026-09-05 field project
+/// carried (kg-sync, kg-search, kg-info, code-graph-query, code-graph-analyze,
+/// all pointing at another checkout's venv) would stop being detected.
+///
+/// MUST MATCH `vco_lib/wrapper_health.py::LADDER_DELEGATION_MARKER`. The
+/// literal is pinned by `tests/test_v0292_stale_wrapper_first_install.py`.
+pub(crate) const LADDER_DELEGATION_MARKER: &str = "vct_venv_ladder";
+
+/// Do these wrapper bytes honour the resilient ladder, either shape?
+/// MUST MATCH `vco_lib/wrapper_health.py::bytes_are_resilient`.
+fn contents_are_resilient(contents: &str) -> bool {
+    contents.contains(RESILIENT_WRAPPER_MARKER) || contents.contains(LADDER_DELEGATION_MARKER)
+}
+
 /// Does `<bin>` ship the resilient (`$VCT_INSTALL_ROOT`) ladder, and therefore
 /// need its project-local copy stale-checked?
 ///
@@ -2869,7 +2890,7 @@ fn wrapper_requires_resilience_marker(bin: &str) -> bool {
     };
     let shipped = repo_root.join("templates").join("scripts").join(bin);
     match std::fs::read_to_string(&shipped) {
-        Ok(contents) => contents.contains(RESILIENT_WRAPPER_MARKER),
+        Ok(contents) => contents_are_resilient(&contents),
         Err(_) => false,
     }
 }
@@ -2893,7 +2914,7 @@ fn stale_project_wrappers(project_folder: &std::path::Path) -> Vec<String> {
         .filter(|e| e.path().is_file())
         .filter(|e| {
             std::fs::read_to_string(e.path())
-                .map(|c| c.contains(RESILIENT_WRAPPER_MARKER))
+                .map(|c| contents_are_resilient(&c))
                 .unwrap_or(false)
         })
         .map(|e| e.file_name().to_string_lossy().to_string())
@@ -2923,7 +2944,7 @@ fn stale_project_wrappers(project_folder: &std::path::Path) -> Vec<String> {
 /// candidate is healthy by definition of the ladder.
 fn analyzer_wrapper_is_resilient(path: &std::path::Path) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(contents) => contents.contains(RESILIENT_WRAPPER_MARKER),
+        Ok(contents) => contents_are_resilient(&contents),
         Err(_) => false,
     }
 }
@@ -3394,10 +3415,30 @@ mod build_tests {
         assert!(wrapper_requires_resilience_marker("code-graph-analyze"));
         assert!(wrapper_requires_resilience_marker("kg-sync"));
 
+        // v0.2.94: these joined the marker-bearing set by SOURCING the shared
+        // ladder (`LADDER_DELEGATION_MARKER`) instead of inlining it.
+        // `kg-duplicates` in particular had NO ladder at all before, which is
+        // why it used to be excluded here; a stale copy of it is now as
+        // dangerous as a stale kg-sync. The two ladder libs are included for
+        // the same reason: a stale copy of the lib breaks every wrapper that
+        // sources it.
+        for bin in [
+            "kg-duplicates",
+            "kg-dedup",
+            "kg-migrate",
+            "vct_venv_ladder.sh",
+            "vct_venv_ladder.ps1",
+        ] {
+            assert!(
+                wrapper_requires_resilience_marker(bin),
+                "{bin} honours the ladder (inlined or sourced), so its \
+                 project-local copy must be marker-checked"
+            );
+        }
+
         // NOT marker-bearing upstream — the exclusions the old list spelled
         // out by hand are now derived. Marker-checking these would flag every
         // healthy copy as stale.
-        assert!(!wrapper_requires_resilience_marker("kg-duplicates"));
         assert!(!wrapper_requires_resilience_marker("generate-kg-summary.py"));
         // A file VCO does not ship at all is never condemned.
         assert!(!wrapper_requires_resilience_marker("not-a-vco-script"));
@@ -3446,14 +3487,24 @@ mod build_tests {
         let d = tmpdir("marker");
         let healthy = d.join("healthy");
         let stale = d.join("stale");
-        // Healthy wrapper: carries the ladder marker.
+        // Healthy wrapper, shape 1 (pre-v0.2.94): the tier is INLINED.
         fs::write(&healthy, b"#!/bin/bash\nCANDIDATES=( \"${VCT_INSTALL_ROOT:-}/.venv\" )\n")
             .unwrap();
         // Stale pre-RT-4 wrapper: hardcoded absolute path, no ladder marker.
         fs::write(&stale, b"#!/bin/bash\nsource /home/user/.venv/bin/activate\n")
             .unwrap();
+        // Healthy wrapper, shape 2 (v0.2.94+): the tier is SOURCED from the
+        // shared ladder. Without `LADDER_DELEGATION_MARKER` this reads as
+        // stale, and every freshly-installed wrapper would be condemned.
+        let delegating = d.join("delegating");
+        fs::write(
+            &delegating,
+            b"#!/bin/bash\n. \"$SCRIPT_DIR/vct_venv_ladder.sh\"\n",
+        )
+        .unwrap();
 
         assert!(analyzer_wrapper_is_resilient(&healthy));
+        assert!(analyzer_wrapper_is_resilient(&delegating));
         assert!(!analyzer_wrapper_is_resilient(&stale));
         // Unreadable / missing path → conservative default: stale.
         assert!(!analyzer_wrapper_is_resilient(&d.join("does-not-exist")));

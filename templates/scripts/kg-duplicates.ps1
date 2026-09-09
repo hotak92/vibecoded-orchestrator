@@ -15,126 +15,60 @@
 # (The script's own argparse uses `--threshold`; PowerShell freely passes
 # single-dash tokens through `@args`, so both spellings reach it.)
 #
-# Exit codes: whatever `detect_duplicates.py` exits (0 = report written);
-# 1 = REFUSAL - no Python environment with the dependencies this wrapper
-# needs (wrapper-only; the script never emits it for its own results).
+# Exit codes: whatever `detect_duplicates.py` exits (0 = report written,
+# 1 = the scan could not complete); 1 = REFUSAL - no Python environment with
+# the dependencies this wrapper needs (wrapper-only).
 #
-# PARITY: this file follows the `kg-dedup` / `kg-sync` wrapper contract
-# (same venv tiers, same refusal shape, stderr refusal, no bare-python
-# fallback). The bash sibling `kg-duplicates` is the POSIX entry point.
+# v0.2.94: the parenthetical used to add "the script never emits it for its
+# own results", which stopped being true in v0.2.92 when a FAILED scan started
+# exiting 1 rather than reporting a clean graph. A wrapper's documented exit
+# ladder is part of its contract, so it is corrected rather than left standing.
+#
+# PARITY: this file follows the `kg-dedup` / `kg-sync` wrapper contract - the
+# same venv tiers from the SAME home (`vct_venv_ladder.ps1`, v0.2.94), the same
+# refusal shape on stderr, no bare-python fallback. The bash sibling
+# `kg-duplicates` is the POSIX entry point and gates on the same modules.
 
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..\..")
 
-# A candidate qualifies only when `weaviate` (the upstream client this
-# script imports at module level) imports from it. `detect_duplicates.py`
-# resolves its project root from its OWN file location (the wrapper
-# invokes it by path from $ScriptDir), so no project-root pin is needed
-# here - name what the script requires, nothing more.
-function Test-VenvHasDeps {
-    param([string]$PythonExe)
-    if (-not (Test-Path $PythonExe)) { return $false }
-    & $PythonExe -c "import weaviate" 2>$null
-    return ($LASTEXITCODE -eq 0)
-}
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `weaviate` is the upstream client `detect_duplicates.py` imports at module
+# level; `vco_lib` owns the named-vector slot resolution the scan needs to
+# query a multi-vector collection at all (v0.2.94). Pre-v0.2.94 this gate
+# named only `weaviate` - WEAKER than what the script requires, which is the
+# shape of gate that lets a run die inside the script instead of refusing here.
+$LadderImport = "import weaviate, vco_lib"
 
-# Read `VCT_ORCHESTRATOR_ROOT` out of the project's own `.claude\env` - the
-# DURABLE tier that needs no env inheritance (same line rule as
-# `vco_lib/envfile.py::parse_env_lines`). PARITY: kg-sync / kg-dedup.
-function Get-OrchestratorRootFromProjectEnv {
-    $envFile = Join-Path $ScriptDir "..\env"
-    if (-not (Test-Path $envFile)) { return $null }
-    foreach ($line in (Get-Content -LiteralPath $envFile -ErrorAction SilentlyContinue)) {
-        if ($line -match '^\s*(export\s+)?VCT_ORCHESTRATOR_ROOT\s*=\s*(.*)$') {
-            $val = $Matches[2].Trim()
-            if ($val.Length -ge 2 -and (
-                    ($val.StartsWith('"') -and $val.EndsWith('"')) -or
-                    ($val.StartsWith("'") -and $val.EndsWith("'")))) {
-                $val = $val.Substring(1, $val.Length - 2)
-            }
-            if ($val) { return $val }
-            return $null
-        }
-    }
-    return $null
+# The ladder lives in ONE home, shipped beside this wrapper (v0.2.94). A
+# missing lib is a broken install, not a reason to fall back to a bare
+# interpreter.
+$LadderLib = Join-Path $ScriptDir "vct_venv_ladder.ps1"
+if (-not (Test-Path $LadderLib)) {
+    [Console]::Error.WriteLine("kg-duplicates: ERROR - missing $LadderLib")
+    [Console]::Error.WriteLine("kg-duplicates: (broken install - re-run the orchestrator install)")
+    [Console]::Error.WriteLine("$([char]0x26A0)$([char]0xFE0F)  kg-duplicates did NOT run (exit 1): its shared venv ladder is missing. See the lines above.")
+    exit 1
 }
+. $LadderLib
 
-# Is this a real VCO orchestrator clone (not the user's project that merely
-# happens to own a `.venv`)? Same discriminator as kg-sync / kg-dedup.
-function Test-VcoOrchestratorClone {
-    param([string]$Candidate)
-    if (-not $Candidate) { return $false }
-    if (-not (Test-Path $Candidate)) { return $false }
-    if (-not (Test-Path (Join-Path $Candidate "install.py"))) { return $false }
-    if (-not (Test-Path (Join-Path $Candidate "first-install.sh"))) { return $false }
-    return $true
-}
-
-function Get-VenvPythonCandidates {
-    param([string]$Root)
-    return @(
-        (Join-Path $Root ".venv\Scripts\python.exe"),
-        (Join-Path $Root ".venv\bin\python"),
-        (Join-Path $Root "claude_mcp_servers\.venv\Scripts\python.exe"),
-        (Join-Path $Root "claude_mcp_servers\.venv\bin\python")
-    )
-}
-
-# Candidate venv python locations, canonical-first (same tier order as
-# kg-sync / kg-dedup): explicit override, launcher install root, the
-# file-backed orchestrator root, then clone-relative paths - the last
-# GATED so a user project's venv can never be selected.
-$ProjectEnvRoot = Get-OrchestratorRootFromProjectEnv
-$Candidates = @()
-if ($env:VCT_VENV) {
-    $Candidates += @(
-        (Join-Path $env:VCT_VENV "Scripts\python.exe"),
-        (Join-Path $env:VCT_VENV "bin\python")
-    )
-}
-if ($env:VCT_INSTALL_ROOT) {
-    $Candidates += Get-VenvPythonCandidates $env:VCT_INSTALL_ROOT
-}
-if ($ProjectEnvRoot) {
-    $Candidates += Get-VenvPythonCandidates $ProjectEnvRoot
-}
-if (Test-VcoOrchestratorClone $ProjectRoot) {
-    $Candidates += Get-VenvPythonCandidates $ProjectRoot
-}
-
-$VenvPython = $null
-foreach ($cand in $Candidates) {
-    if ($cand -and (Test-Path $cand) -and (Test-VenvHasDeps $cand)) {
-        $VenvPython = $cand
-        break
-    }
-}
+$VenvPython = Resolve-VctLadderPython -ScriptDir $ScriptDir `
+    -ProjectRoot $ProjectRoot -ImportProbe $LadderImport
 
 # NO BARE `python` FALLBACK - a shipped component does not get a silent
 # fallback (standing rule). Name every candidate and the remedy, exit 1.
 # The refusal goes to STDERR (`>&2` in the bash siblings' shape); the host
 # stream is invisible to 2>nul / CI capture / stderr-scraping consumers.
 if (-not $VenvPython) {
-    [Console]::Error.WriteLine("kg-duplicates: ERROR - no Python environment with VCO's KG dependencies.")
-    [Console]::Error.WriteLine("kg-duplicates: A candidate qualifies only when 'weaviate' imports from it.")
-    [Console]::Error.WriteLine("kg-duplicates: Probed, in order:")
-    if ($Candidates.Count -eq 0) {
-        [Console]::Error.WriteLine("kg-duplicates:   (none - no VCT_VENV, no VCT_INSTALL_ROOT, no")
-        [Console]::Error.WriteLine("kg-duplicates:    VCT_ORCHESTRATOR_ROOT in $ScriptDir\..\env, and")
-        [Console]::Error.WriteLine("kg-duplicates:    $ProjectRoot is not a VCO orchestrator clone)")
-    } else {
-        foreach ($cand in $Candidates) { [Console]::Error.WriteLine("kg-duplicates:   - $cand") }
-    }
-    [Console]::Error.WriteLine("kg-duplicates: Fix by any ONE of:")
-    [Console]::Error.WriteLine("kg-duplicates:   * run this from a launcher-managed session (it exports")
-    [Console]::Error.WriteLine("kg-duplicates:     VCT_INSTALL_ROOT);")
-    [Console]::Error.WriteLine("kg-duplicates:   * `$env:VCT_VENV = 'C:\path\to\orchestrator\.venv';")
-    [Console]::Error.WriteLine("kg-duplicates:   * `$env:VCT_INSTALL_ROOT = 'C:\path\to\orchestrator';")
-    [Console]::Error.WriteLine("kg-duplicates:   * re-run the orchestrator install so this project's")
-    [Console]::Error.WriteLine("kg-duplicates:     .claude\env carries VCT_ORCHESTRATOR_ROOT.")
+    Write-VctLadderRefusal -Tool "kg-duplicates" -ImportProbe $LadderImport `
+        -ScriptDir $ScriptDir -ProjectRoot $ProjectRoot
+    [Console]::Error.WriteLine("kg-duplicates: Refusing to run with an unqualified interpreter - a")
+    [Console]::Error.WriteLine("kg-duplicates: scan that cannot query the collection must never")
+    [Console]::Error.WriteLine("kg-duplicates: report 'no duplicates'.")
     [Console]::Error.WriteLine("kg-duplicates: (exit 1 = did not run)")
+    Write-VctLadderRefusalSummary -Tool "kg-duplicates" -ExitCode 1
     exit 1
 }
 

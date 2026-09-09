@@ -23,6 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.common.wrapper_staging import effective_wrapper_text
 from vco_lib import kg_dedup
 from vco_lib.bundle_globs import script_patterns
 
@@ -413,8 +414,13 @@ def test_ps1_wrapper_has_utf8_bom():
 
 
 def test_wrappers_are_in_lockstep():
-    sh = WRAPPER_SH.read_text(encoding="utf-8")
-    ps1 = WRAPPER_PS1.read_text(encoding="utf-8-sig")
+    # v0.2.94: the ladder tokens (VCT_VENV / VCT_INSTALL_ROOT /
+    # VCT_ORCHESTRATOR_ROOT / the import probe) live in the shared
+    # `vct_venv_ladder.{sh,ps1}` both wrappers source. `effective_wrapper_text`
+    # follows them there, so lockstep is still asserted over what each wrapper
+    # actually executes — without mandating that both keep an inlined copy.
+    sh = effective_wrapper_text(WRAPPER_SH)
+    ps1 = effective_wrapper_text(WRAPPER_PS1, encoding="utf-8-sig")
     for token in (
         "VCT_VENV", "VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT",
         "KG_SYNC_PROJECT_ROOT", "vco_lib.kg_dedup",
@@ -422,9 +428,19 @@ def test_wrappers_are_in_lockstep():
     ):
         assert token in sh, f"{token} missing from the bash wrapper"
         assert token in ps1, f"{token} missing from the ps1 wrapper"
-    # Both refuse rather than falling back to a bare interpreter.
-    assert "kg-dedup: ERROR - no Python environment" in sh
-    assert "kg-dedup: ERROR - no Python environment" in ps1
+    # Both refuse rather than falling back to a bare interpreter. v0.2.94: the
+    # refusal HEADLINE is composed at runtime by the shared ladder from the
+    # tool name each wrapper hands it, so the literal
+    # "kg-dedup: ERROR - ..." is in neither source any more. What each wrapper
+    # still owns is the CALL, under its own name — and the refusal itself is
+    # DRIVEN (bash, live) in tests/test_v0294_wrapper_venv_ladder_parity.py,
+    # which is the stronger check a source scan was standing in for.
+    assert 'vct_venv_ladder_refusal "kg-dedup"' in WRAPPER_SH.read_text(
+        encoding="utf-8"
+    )
+    assert 'Write-VctLadderRefusal -Tool "kg-dedup"' in WRAPPER_PS1.read_text(
+        encoding="utf-8-sig"
+    )
 
 
 def test_wrappers_forward_to_the_single_python_home():

@@ -428,9 +428,18 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"/* ]]; then
             # duplicate detection: …`) is what the ⚠️ "See the error above."
             # verdict points at — filtering it out would surface a report
             # that names an error the reader cannot see.
+            #
+            # v0.2.94 (review item 3): `^<tool>: ERROR` joins the pattern. The
+            # wrapper's REFUSAL — no qualifying interpreter — carried none of
+            # the four markers, so `$_dup_out` came back empty and this scan
+            # was a SILENT no-op on exactly the installs that had something to
+            # report. The wrapper now also ends its refusal with a ⚠️ line
+            # (`vct_venv_ladder_refusal_summary`), so either half alone would
+            # surface it; both exist because a consumer that must REMEMBER a
+            # convention is a consumer that will forget it.
             _dup_out=$(.claude/scripts/kg-duplicates --threshold 0.95 2>&1 \
                 | head -c 204800 | head -200 \
-                | grep -E "(✅|⚠️|📊|❌)" || true)
+                | grep -E "(✅|⚠️|📊|❌|^[A-Za-z0-9_-]+: ERROR)" || true)
             if [ -n "$_dup_out" ]; then
                 {
                     printf '# KG duplicate scan (every-10-edits, %s)\n' \

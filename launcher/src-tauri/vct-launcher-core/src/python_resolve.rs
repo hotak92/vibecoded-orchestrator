@@ -23,13 +23,15 @@
 //!
 //!   1. `$VCT_VENV` — explicit override. May point at a venv DIR or straight
 //!      at the interpreter binary; both shapes are honoured.
-//!   2/3. `$VCT_INSTALL_ROOT` — orchestrator clone root. Probes
-//!      `<root>/.venv` then `<root>/claude_mcp_servers/.venv`.
+//!   2/3. `$VCT_INSTALL_ROOT`, then `$VCT_ORCHESTRATOR_ROOT` — the
+//!      orchestrator clone root. Each probes `<root>/.venv` then
+//!      `<root>/claude_mcp_servers/.venv`.
 //!   4. Walk up from `current_exe()` (≤8 hops) probing the same two venv
 //!      layouts — covers launcher-binary runs where neither env var is set.
-//!   5. PATH fallback (`python3` / `python.exe`). Last resort; the caller
-//!      should still handle this gracefully because a PATH `python3` on a
-//!      PEP-668 machine frequently cannot `import weaviate`.
+//!   5. NOTHING. `None` — v0.2.94 removed the bare-PATH rung: it made every
+//!      caller's `ok_or_else(...)` unreachable while handing back a name that
+//!      on a PEP-668 machine cannot `import weaviate`. A caller that wants a
+//!      deliberate fallback names it via `resolve_python_for_vco_lib_or`.
 //!
 //! Each venv layout is probed for `bin/python`, `bin/python3` (POSIX) and
 //! `Scripts/python.exe` (Windows) so a single call works cross-OS.
@@ -85,15 +87,15 @@ fn venv_in(root: &Path) -> Option<PathBuf> {
 /// Resolve a Python interpreter capable of running `vco_lib` / the code-graph
 /// analyzer, walking the canonical RT-4 ladder documented at module level.
 ///
-/// Always returns `Some(_)`: the final tier is a PATH fallback
-/// (`python3` on POSIX, `python.exe` on Windows) so callers can treat `None`
-/// as impossible, but the caller SHOULD still guard defensively — a PATH
-/// python may lack `import weaviate` on a PEP-668 machine. The reference
-/// call-pattern is:
+/// Returns `None` when NO tier qualifies. That is the answer, not a gap: a
+/// caller that cannot get a vco_lib-capable interpreter must say so rather
+/// than spawn one that will fail on `import vco_lib` in a log nobody reads.
+/// The reference call-pattern is therefore a refusal:
 ///
 /// ```ignore
-/// let py = resolve_python_for_vco_lib()
-///     .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+/// let Some(py) = resolve_python_for_vco_lib() else {
+///     return Err("no Python environment with VCO's dependencies …".into());
+/// };
 /// ```
 /// `String`-returning convenience wrapper over [`resolve_python_for_vco_lib`].
 ///
@@ -109,9 +111,10 @@ fn venv_in(root: &Path) -> Option<PathBuf> {
 /// the orchestrator venv (which HAS `vco_lib`) first, falling back to PATH only
 /// as the last resort — the intended behaviour upgrade.
 ///
-/// Returns `None` only in the theoretically-impossible case that even the PATH
-/// fallback yields nothing (the underlying resolver always returns `Some`), so
-/// callers that previously treated `None` as "no python" keep working.
+/// Returns `None` when no tier qualifies (v0.2.94: the underlying resolver no
+/// longer ends in a PATH rung, so this is now a REACHABLE answer — which is
+/// what the `is_none()` guards at the deferral call-sites were always written
+/// for).
 pub fn resolve_python_for_vco_lib_str() -> Option<String> {
     resolve_python_for_vco_lib().map(|p| p.to_string_lossy().to_string())
 }
@@ -149,10 +152,19 @@ pub fn resolve_python_for_vco_lib() -> Option<PathBuf> {
         }
     }
 
-    // 2 + 3. $VCT_INSTALL_ROOT — orchestrator clone root.
-    if let Ok(root) = std::env::var("VCT_INSTALL_ROOT") {
-        if let Some(p) = venv_in(Path::new(&root)) {
-            return Some(p);
+    // 2 + 3. The orchestrator clone root, from either env var, in the same
+    // order `vco_lib/python_exe.py::INSTALL_ROOT_ENV_VARS` uses.
+    //
+    // v0.2.94 review item 2b: this side read only `VCT_INSTALL_ROOT`, so a
+    // process with a valid `VCT_ORCHESTRATOR_ROOT` and no `VCT_INSTALL_ROOT`
+    // (the shape hooks, `project_move` and `boot_service` publish) resolved
+    // differently here than in the Python half of the SAME ladder. All four
+    // ladders now read the same three env vars.
+    for var in ["VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT"] {
+        if let Ok(root) = std::env::var(var) {
+            if let Some(p) = venv_in(Path::new(&root)) {
+                return Some(p);
+            }
         }
     }
 
@@ -171,12 +183,16 @@ pub fn resolve_python_for_vco_lib() -> Option<PathBuf> {
         }
     }
 
-    // 5. PATH fallback.
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    // NO PATH FALLBACK (v0.2.94 review item 2c).
+    //
+    // This used to end in `Some("python3")`, which made every `ok_or_else(...)`
+    // on the calling side dead code: a caller asking "did the ladder find a
+    // vco_lib-capable interpreter?" was always told yes, and the answer was a
+    // bare name that on a PEP-668 machine cannot `import weaviate` — the exact
+    // 2026-09-09 field shape, one layer up. `None` means "no qualifying
+    // interpreter"; a caller that genuinely wants a deliberate fallback asks
+    // for one BY NAME via `resolve_python_for_vco_lib_or`.
+    None
 }
 
 #[cfg(test)]
@@ -281,18 +297,25 @@ mod tests {
         assert_eq!(resolved, Some(py));
     }
 
+    /// v0.2.94 review item 2c: the ladder no longer invents an answer.
+    ///
+    /// Pointing every env tier at a venv-less directory used to yield
+    /// `Some("python3")`, which made each caller's `ok_or_else(...)` /
+    /// `is_none()` guard unreachable and handed back a name that on a PEP-668
+    /// machine cannot `import weaviate`. The exe-walk tier can still resolve a
+    /// real venv on a dev box, so this asserts what is invariant: whatever
+    /// comes back is a real interpreter FILE, never a bare program name.
     #[test]
-    fn always_falls_back_to_path_python() {
+    fn never_returns_a_bare_program_name() {
         let _g = env_lock().lock().unwrap();
-        // Point both env vars at empty dirs with no venv; the exe-walk may
-        // find a real venv on a dev box, but the function must NEVER return
-        // None — the PATH fallback guarantees Some(_).
         let d = tmpdir("nofallback");
         let saved_venv = std::env::var_os("VCT_VENV");
         let saved_root = std::env::var_os("VCT_INSTALL_ROOT");
+        let saved_orch = std::env::var_os("VCT_ORCHESTRATOR_ROOT");
         unsafe {
             std::env::set_var("VCT_VENV", &d);
             std::env::set_var("VCT_INSTALL_ROOT", &d);
+            std::env::set_var("VCT_ORCHESTRATOR_ROOT", &d);
         }
         let resolved = resolve_python_for_vco_lib();
         unsafe {
@@ -304,7 +327,53 @@ mod tests {
                 Some(v) => std::env::set_var("VCT_INSTALL_ROOT", v),
                 None => std::env::remove_var("VCT_INSTALL_ROOT"),
             }
+            match saved_orch {
+                Some(v) => std::env::set_var("VCT_ORCHESTRATOR_ROOT", v),
+                None => std::env::remove_var("VCT_ORCHESTRATOR_ROOT"),
+            }
         }
-        assert!(resolved.is_some(), "PATH fallback must guarantee Some(_)");
+        if let Some(p) = resolved {
+            assert!(
+                p.is_file(),
+                "the ladder may only return a real interpreter file; got {p:?}"
+            );
+            assert!(
+                p.components().count() > 1,
+                "a bare program name is not a resolution; got {p:?}"
+            );
+        }
+    }
+
+    /// The SECOND install-root env var resolves too (parity with
+    /// `python_exe.INSTALL_ROOT_ENV_VARS`, whose order this mirrors).
+    #[cfg(unix)]
+    #[test]
+    fn orchestrator_root_env_var_resolves() {
+        let _g = env_lock().lock().unwrap();
+        let d = tmpdir("orchroot");
+        let py = make_venv(&d);
+
+        let saved_venv = std::env::var_os("VCT_VENV");
+        let saved_root = std::env::var_os("VCT_INSTALL_ROOT");
+        let saved_orch = std::env::var_os("VCT_ORCHESTRATOR_ROOT");
+        unsafe {
+            std::env::remove_var("VCT_VENV");
+            std::env::remove_var("VCT_INSTALL_ROOT");
+            std::env::set_var("VCT_ORCHESTRATOR_ROOT", &d);
+        }
+        let resolved = resolve_python_for_vco_lib();
+        unsafe {
+            if let Some(v) = saved_venv {
+                std::env::set_var("VCT_VENV", v);
+            }
+            if let Some(v) = saved_root {
+                std::env::set_var("VCT_INSTALL_ROOT", v);
+            }
+            match saved_orch {
+                Some(v) => std::env::set_var("VCT_ORCHESTRATOR_ROOT", v),
+                None => std::env::remove_var("VCT_ORCHESTRATOR_ROOT"),
+            }
+        }
+        assert_eq!(resolved, Some(py));
     }
 }

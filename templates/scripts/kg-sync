@@ -44,119 +44,36 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Validate a venv has BOTH `weaviate` (the upstream client) AND
-# `weaviate_mcp` (our internal editable module installed by install.py
-# A1, v0.2.38) importable. v0.2.49 Bug K: pre-fix this only checked
-# `weaviate` — which let unrelated project venvs through that had pip-
-# installed the upstream lib but lacked weaviate_mcp, causing
-# sync_knowledge_graph.py to crash at `from weaviate_mcp.chunking
-# import Chunker`. Gate on both imports so the picker rejects venvs
-# that can't actually run the script.
-venv_has_kg_deps() {
-    local v="$1"
-    local py=""
-    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
-    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
-    elif [ -x "$v/Scripts/python.exe" ]; then py="$v/Scripts/python.exe"  # Windows (Git Bash / WSL2)
-    elif [ -x "$v/Scripts/python3.exe" ]; then py="$v/Scripts/python3.exe"
-    else return 1
-    fi
-    "$py" -c "import weaviate, weaviate_mcp" 2>/dev/null
-}
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `sync_knowledge_graph.py` hard-imports all three at MODULE scope: `weaviate`,
+# `weaviate_mcp` (the chunker, installed by install.py A1, v0.2.38) and
+# `vco_lib` (embedding_service / kg_truncation_tags / kg_vector_slot / paths).
+# v0.2.94: `vco_lib` was missing from this gate — a venv with the first two
+# passed the check and then died at import time.
+# v0.2.49 Bug K: pre-fix this only checked `weaviate` — which let unrelated
+# project venvs through that had pip-installed the upstream lib but lacked
+# weaviate_mcp, causing sync_knowledge_graph.py to crash at `from
+# weaviate_mcp.chunking import Chunker`. Gate on both imports so the picker
+# rejects venvs that can't actually run the script.
+LADDER_IMPORT="import weaviate, weaviate_mcp, vco_lib"
 
-# v0.2.92 (W3 §4bis): read `VCT_ORCHESTRATOR_ROOT` out of the project's own
-# `.claude/env`. This is the DURABLE tier — the one that works in a plain
-# terminal, in CI, and from any cron: it needs no env inheritance at all,
-# because the value is file-backed and written by the canonical env
-# projection on every install and update.
-#
-# It exists because the field failure had no env at all: a user project with
-# its own dep-less `.venv`, run from a shell with no `VCT_INSTALL_ROOT`, fell
-# through every candidate to a bare `python3` and crashed inside the sync
-# script with `ModuleNotFoundError`. An env-only ladder cannot help there.
-orchestrator_root_from_project_env() {
-    local env_file="$SCRIPT_DIR/../env"
-    [ -r "$env_file" ] || return 1
-    # First assignment wins, `export ` prefix tolerated, one quote pair
-    # stripped — the same line rule `vco_lib/envfile.py::parse_env_lines`
-    # applies, so the file has one meaning on both sides.
-    local line
-    line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?VCT_ORCHESTRATOR_ROOT=' \
-            "$env_file" 2>/dev/null)" || return 1
-    [ -n "$line" ] || return 1
-    line="${line#*=}"
-    line="${line%\"}"; line="${line#\"}"
-    line="${line%\'}"; line="${line#\'}"
-    [ -n "$line" ] || return 1
-    printf '%s' "$line"
-}
-
-# Is $1 a real VCO orchestrator clone (not the user's project that merely
-# happens to own a `.venv`)? Same discriminator as
-# `templates/hooks/_lib/resolve-vco-venv.sh::_is_vco_orchestrator_clone` and
-# as `install.py::validate_source_repo`. Without it, `$SCRIPT_DIR/../../.venv`
-# IS the user's project venv whenever this wrapper is bundled into a project.
-is_vco_orchestrator_clone() {
-    [ -d "$1" ] || return 1
-    [ -f "$1/install.py" ] || return 1
-    [ -f "$1/first-install.sh" ] || return 1
-    return 0
-}
-
-# Probe candidate venvs, canonical first. $VCT_VENV is the explicit override,
-# then the launcher-provided install root, then the file-backed orchestrator
-# root, then clone-relative paths — the last of which are GATED so a user
-# project's venv can never be selected.
-PROJECT_ENV_ROOT="$(orchestrator_root_from_project_env || true)"
-CLONE_ROOT="$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || true)"
-
-CANDIDATES=()
-[ -n "${VCT_VENV:-}" ] && CANDIDATES+=("$VCT_VENV")
-# The `${VCT_INSTALL_ROOT:-}` form is kept verbatim (rather than the bare
-# `$VCT_INSTALL_ROOT` the guard above already makes safe) because the Gap-6b
-# canonical-first ordering gate pins this exact literal across all five
-# wrappers — one shape for five files beats five shapes and a broken gate.
-[ -n "${VCT_INSTALL_ROOT:-}" ] && CANDIDATES+=(
-    "${VCT_INSTALL_ROOT:-}/.venv"
-    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"
-)
-[ -n "$PROJECT_ENV_ROOT" ] && CANDIDATES+=(
-    "$PROJECT_ENV_ROOT/.venv"
-    "$PROJECT_ENV_ROOT/claude_mcp_servers/.venv"
-)
-if [ -n "$CLONE_ROOT" ] && is_vco_orchestrator_clone "$CLONE_ROOT"; then
-    CANDIDATES+=(
-        "$CLONE_ROOT/.venv"
-        "$CLONE_ROOT/claude_mcp_servers/.venv"
-    )
+# v0.2.94: the ladder itself (tiers, Windows shapes, VIRTUAL_ENV export,
+# refusal prose) moved to ONE home shipped beside this wrapper — it had been
+# copied verbatim into `kg-dedup`, while `kg-duplicates` had no ladder at all
+# and its `.ps1` sibling gated on a weaker module list than its script needs.
+# A missing lib is a broken install, not a reason to fall back to a bare
+# interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "kg-sync: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "kg-sync: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  kg-sync did NOT run (exit 3): its shared venv ladder is missing. See the lines above." >&2
+    exit 3
 fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
 
-VENV_PATH=""
-for c in "${CANDIDATES[@]}"; do
-    [ -z "$c" ] && continue
-    if venv_has_kg_deps "$c"; then
-        VENV_PATH="$c"
-        break
-    fi
-done
-
-# v0.2.49 Bug K: invoke the venv's python binary directly rather than
-# `source bin/activate`. The source-then-python pattern was POSIX-only
-# — Windows venvs (incl. those used under Git Bash / WSL2) don't have
-# a `bin/activate` script. Direct invocation works on every OS, and
-# exporting VIRTUAL_ENV keeps any spawned subprocesses informed that a
-# venv is active (some libraries probe $VIRTUAL_ENV directly).
-VENV_PYTHON=""
-if [ -n "$VENV_PATH" ]; then
-    export VIRTUAL_ENV="$VENV_PATH"
-    for p in \
-        "$VENV_PATH/bin/python" \
-        "$VENV_PATH/Scripts/python.exe" \
-        "$VENV_PATH/bin/python3" \
-        "$VENV_PATH/Scripts/python3.exe"; do
-        if [ -x "$p" ]; then VENV_PYTHON="$p"; break; fi
-    done
-fi
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+VENV_PYTHON="$LADDER_PYTHON"
 
 # v0.2.92 (W3 §4bis): NO BARE `python3` FALLBACK.
 #
@@ -180,29 +97,14 @@ fi
 # the two demand opposite responses (fix your install vs. look at the
 # named failures). 3 is the next free rung above the script's 0/1/2.
 if [ -z "$VENV_PYTHON" ]; then
+    vct_venv_ladder_refusal "kg-sync" "$LADDER_IMPORT" "$SCRIPT_DIR"
     {
-        echo "kg-sync: ERROR - no Python environment with VCO's KG dependencies."
-        echo "kg-sync: A candidate qualifies only when BOTH 'weaviate' and"
-        echo "kg-sync: 'weaviate_mcp' import from it. Probed, in order:"
-        if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-            echo "kg-sync:   (none - no VCT_VENV, no VCT_INSTALL_ROOT, no"
-            echo "kg-sync:    VCT_ORCHESTRATOR_ROOT in $SCRIPT_DIR/../env, and"
-            echo "kg-sync:    $CLONE_ROOT is not a VCO orchestrator clone)"
-        else
-            for c in "${CANDIDATES[@]}"; do echo "kg-sync:   - $c"; done
-        fi
-        echo "kg-sync: Fix by any ONE of:"
-        echo "kg-sync:   * run this from a launcher-managed session (it exports"
-        echo "kg-sync:     VCT_INSTALL_ROOT);"
-        echo "kg-sync:   * export VCT_VENV=/path/to/orchestrator/.venv;"
-        echo "kg-sync:   * export VCT_INSTALL_ROOT=/path/to/orchestrator;"
-        echo "kg-sync:   * re-run the orchestrator install so this project's"
-        echo "kg-sync:     .claude/env carries VCT_ORCHESTRATOR_ROOT."
         echo "kg-sync: Refusing to run with an unqualified interpreter - doing so"
         echo "kg-sync: fails later with a misleading ModuleNotFoundError."
         echo "kg-sync: (exit 3 = did not run; 1 would mean the sync ran and"
         echo "kg-sync:  some nodes failed)"
     } >&2
+    vct_venv_ladder_refusal_summary "kg-sync" 3
     exit 3
 fi
 

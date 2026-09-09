@@ -147,9 +147,32 @@ class _Query:
         return _Page()
 
 
+class _VectorConfig:
+    """The schema shape every VCO knowledge collection actually has.
+
+    v0.2.94 (review item 4): the scanner now REFUSES when it cannot read the
+    vector schema — guessing a slot is a guess about the very thing the probe
+    failed to establish. A double without `.config` is therefore an
+    unreadable schema, and every test here would exercise that refusal instead
+    of the stdout routing it exists to pin. The double gains the real shape.
+    """
+
+    def get(self):
+        return self
+
+    vector_config = {
+        "arctic2_embed": object(),
+        "ollama_embed": object(),
+        "openai_embed": object(),
+        "openai_text_embed": object(),
+        "qwen3_embed": object(),
+    }
+
+
 class _Collection:
     def __init__(self, boom: bool = False) -> None:
         self.query = _Query(boom)
+        self.config = _VectorConfig()
 
 
 def _drive_find_duplicates(mod, *, json_mode: bool, boom: bool):

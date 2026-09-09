@@ -361,13 +361,16 @@ def _active_text_slot_name() -> str:
     cold cache here means the capture itself could not have run through the
     service (the inline fallback ran, whose record is empty), so the
     active-slot exclusion is a no-op and the empty record stays honest.
+
+    v0.2.94: the read itself lives in ``vco_lib.kg_vector_slot`` — the ONE
+    home shared with kg-sync's writer and the KG readers. ``slot_for_service``
+    keeps this function's two load-bearing properties exactly: it never
+    constructs a service, and it never raises.
     """
+    from vco_lib.kg_vector_slot import slot_for_service
+
     from . import server
-    svc = getattr(server, "_cached_embed_service", None)
-    try:
-        return str(getattr(svc, "text_vector_slot", "") or "")
-    except Exception:  # noqa: BLE001 — defensive: never break the write
-        return ""
+    return slot_for_service(getattr(server, "_cached_embed_service", None))
 
 
 async def _get_all_kg_embeddings_tagged(

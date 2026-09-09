@@ -21,122 +21,49 @@
 # (`python -m vco_lib.kg_dedup`); this wrapper is a dumb forwarder.
 #
 # PARITY: this file and `kg-dedup.ps1` must stay in lockstep (same tiers,
-# same refusal text, same forwarding). Venv-resolution ladder is the one
-# `kg-sync` uses — see that file for the full rationale of each tier.
+# same refusal text, same forwarding). The venv-resolution ladder is the
+# shared one — `vct_venv_ladder.sh` (v0.2.94), which carries the full
+# rationale for each tier; `kg-sync` and `kg-duplicates` use the same home.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# The probe a candidate interpreter must pass, verbatim as it is executed.
 # A candidate qualifies only when BOTH `weaviate` (the upstream client) and
 # `vco_lib` (which owns the reconcile logic) import from it. `kg-sync` gates
 # on `weaviate_mcp` instead because ITS script needs the chunker; this one
 # does not, so we name what we actually require rather than copy a stricter
 # gate we cannot justify.
-venv_has_dedup_deps() {
-    local v="$1"
-    local py=""
-    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
-    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
-    elif [ -x "$v/Scripts/python.exe" ]; then py="$v/Scripts/python.exe"  # Windows (Git Bash / WSL2)
-    elif [ -x "$v/Scripts/python3.exe" ]; then py="$v/Scripts/python3.exe"
-    else return 1
-    fi
-    "$py" -c "import weaviate, vco_lib" 2>/dev/null
-}
+LADDER_IMPORT="import weaviate, vco_lib"
 
-# Read `VCT_ORCHESTRATOR_ROOT` out of the project's own `.claude/env` — the
-# DURABLE tier that needs no env inheritance (same line rule as
-# `vco_lib/envfile.py::parse_env_lines`).
-orchestrator_root_from_project_env() {
-    local env_file="$SCRIPT_DIR/../env"
-    [ -r "$env_file" ] || return 1
-    local line
-    line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?VCT_ORCHESTRATOR_ROOT=' \
-            "$env_file" 2>/dev/null)" || return 1
-    [ -n "$line" ] || return 1
-    line="${line#*=}"
-    line="${line%\"}"; line="${line#\"}"
-    line="${line%\'}"; line="${line#\'}"
-    [ -n "$line" ] || return 1
-    printf '%s' "$line"
-}
-
-# Is $1 a real VCO orchestrator clone (not the user's project that merely
-# happens to own a `.venv`)? Same discriminator as
-# `templates/hooks/_lib/resolve-vco-venv.sh` and `install.py::validate_source_repo`.
-is_vco_orchestrator_clone() {
-    [ -d "$1" ] || return 1
-    [ -f "$1/install.py" ] || return 1
-    [ -f "$1/first-install.sh" ] || return 1
-    return 0
-}
-
-PROJECT_ENV_ROOT="$(orchestrator_root_from_project_env || true)"
-CLONE_ROOT="$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || true)"
-
-CANDIDATES=()
-[ -n "${VCT_VENV:-}" ] && CANDIDATES+=("$VCT_VENV")
-[ -n "${VCT_INSTALL_ROOT:-}" ] && CANDIDATES+=(
-    "${VCT_INSTALL_ROOT:-}/.venv"
-    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"
-)
-[ -n "$PROJECT_ENV_ROOT" ] && CANDIDATES+=(
-    "$PROJECT_ENV_ROOT/.venv"
-    "$PROJECT_ENV_ROOT/claude_mcp_servers/.venv"
-)
-if [ -n "$CLONE_ROOT" ] && is_vco_orchestrator_clone "$CLONE_ROOT"; then
-    CANDIDATES+=(
-        "$CLONE_ROOT/.venv"
-        "$CLONE_ROOT/claude_mcp_servers/.venv"
-    )
+# v0.2.94: the ladder itself (tiers, probe, refusal prose) moved to ONE home
+# shipped beside this wrapper. It was copied verbatim into `kg-sync`, while
+# `kg-duplicates` had no ladder at all — which is exactly how the two flavours
+# of one decision drifted. A missing lib is a broken install, not a reason to
+# fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "kg-dedup: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "kg-dedup: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  kg-dedup did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
 fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
 
-VENV_PATH=""
-for c in "${CANDIDATES[@]}"; do
-    [ -z "$c" ] && continue
-    if venv_has_dedup_deps "$c"; then
-        VENV_PATH="$c"
-        break
-    fi
-done
-
-VENV_PYTHON=""
-if [ -n "$VENV_PATH" ]; then
-    export VIRTUAL_ENV="$VENV_PATH"
-    for p in \
-        "$VENV_PATH/bin/python" \
-        "$VENV_PATH/Scripts/python.exe" \
-        "$VENV_PATH/bin/python3" \
-        "$VENV_PATH/Scripts/python3.exe"; do
-        if [ -x "$p" ]; then VENV_PYTHON="$p"; break; fi
-    done
-fi
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+VENV_PYTHON="$LADDER_PYTHON"
 
 # NO BARE `python3` FALLBACK — a shipped component does not get a silent
 # fallback (standing rule). Name every candidate and the remedy, exit 1.
-# PARITY: this refusal must match kg-dedup.ps1's.
+# PARITY: this refusal must match kg-dedup.ps1's — both halves, the shared
+# one from the ladder and the tool-specific tail below.
 if [ -z "$VENV_PYTHON" ]; then
+    vct_venv_ladder_refusal "kg-dedup" "$LADDER_IMPORT" "$SCRIPT_DIR"
     {
-        echo "kg-dedup: ERROR - no Python environment with VCO's KG dependencies."
-        echo "kg-dedup: A candidate qualifies only when BOTH 'weaviate' and"
-        echo "kg-dedup: 'vco_lib' import from it. Probed, in order:"
-        if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-            echo "kg-dedup:   (none - no VCT_VENV, no VCT_INSTALL_ROOT, no"
-            echo "kg-dedup:    VCT_ORCHESTRATOR_ROOT in $SCRIPT_DIR/../env, and"
-            echo "kg-dedup:    $CLONE_ROOT is not a VCO orchestrator clone)"
-        else
-            for c in "${CANDIDATES[@]}"; do echo "kg-dedup:   - $c"; done
-        fi
-        echo "kg-dedup: Fix by any ONE of:"
-        echo "kg-dedup:   * run this from a launcher-managed session (it exports"
-        echo "kg-dedup:     VCT_INSTALL_ROOT);"
-        echo "kg-dedup:   * export VCT_VENV=/path/to/orchestrator/.venv;"
-        echo "kg-dedup:   * export VCT_INSTALL_ROOT=/path/to/orchestrator;"
-        echo "kg-dedup:   * re-run the orchestrator install so this project's"
-        echo "kg-dedup:     .claude/env carries VCT_ORCHESTRATOR_ROOT."
         echo "kg-dedup: Refusing to run with an unqualified interpreter - a"
         echo "kg-dedup: reconcile that cannot read the collection must never"
         echo "kg-dedup: report 'no duplicates'."
     } >&2
+    vct_venv_ladder_refusal_summary "kg-dedup" 1
     exit 1
 fi
 

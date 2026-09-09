@@ -118,10 +118,27 @@ class _FilteringQuery(_PaginatingQuery):
         return mock.Mock(objects=[])
 
 
+class _FakeVectorConfig:
+    """The vector schema every VCO knowledge collection actually has.
+
+    v0.2.94: `detect_duplicates` reads the schema to decide which named vector
+    to target, and REFUSES when it cannot (guessing a slot is a guess about the
+    very thing that could not be established). A double without `.config` is an
+    unreadable schema, so the pagination test below would exercise that refusal
+    instead of the cursor walk it exists to pin.
+    """
+
+    def get(self):
+        return self
+
+    vector_config = {"qwen3_embed": object(), "arctic2_embed": object()}
+
+
 class _FakeCollection:
     def __init__(self, objects: list[_FakeObj], data_recorder: list[str] | None = None):
         self.query = _PaginatingQuery(objects)
         self.data = _FakeDataAPI(data_recorder)
+        self.config = _FakeVectorConfig()
 
 
 class _FakeDataAPI:

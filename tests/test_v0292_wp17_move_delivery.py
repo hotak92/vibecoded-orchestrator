@@ -34,6 +34,12 @@ from tests.common.rust_source import (  # noqa: E402
     cfg_test_line_numbers,
     strip_rust_comments,
 )
+from tests.common.wrapper_staging import (  # noqa: E402
+    LADDER_PS1,
+    LADDER_SH,
+    effective_wrapper_text,
+    stage_scripts,
+)
 from vco_lib import path_bearing_keys as pbk  # noqa: E402
 
 RUST_WRITER = (
@@ -421,8 +427,12 @@ def _executed_lines(text: str) -> str:
 
 class TestKgSyncWrappers(unittest.TestCase):
     def setUp(self):
-        self.sh = KG_SYNC.read_text(encoding="utf-8")
-        self.ps1 = KG_SYNC_PS1.read_text(encoding="utf-8-sig")
+        # v0.2.94: the venv ladder moved to ONE home (`vct_venv_ladder.{sh,ps1}`)
+        # that all three KG wrappers source. `effective_wrapper_text` follows it
+        # there, so these gates keep asking "does kg-sync's ladder do X?" without
+        # demanding the ladder stay inlined in kg-sync.
+        self.sh = effective_wrapper_text(KG_SYNC)
+        self.ps1 = effective_wrapper_text(KG_SYNC_PS1, encoding="utf-8-sig")
         self.sh_code = _executed_lines(self.sh)
         self.ps1_code = _executed_lines(self.ps1)
 
@@ -491,8 +501,10 @@ class TestKgSyncWrappers(unittest.TestCase):
 
     def test_both_siblings_gate_the_clone_relative_tier(self):
         """Without the gate, `<script>/../..` IS the user's project root."""
+        # v0.2.94: the discriminator lives in the shared ladder, under the
+        # `VctLadder` prefix its other helpers use. Same gate, one home.
         self.assertIn("is_vco_orchestrator_clone", self.sh_code)
-        self.assertIn("Test-VcoOrchestratorClone", self.ps1_code)
+        self.assertIn("Test-VctLadderVcoClone", self.ps1_code)
         for text, name in ((self.sh_code, "kg-sync"), (self.ps1_code, "kg-sync.ps1")):
             self.assertIn("first-install.sh", text, f"{name}: clone discriminator")
             self.assertIn("install.py", text, f"{name}: clone discriminator")
@@ -509,19 +521,29 @@ class TestKgSyncWrappers(unittest.TestCase):
     def test_bash_wrapper_refuses_with_no_env_channels_live(self):
         """The honest-failure path, executed rather than grepped."""
         import os
-        import shutil
 
         with TemporaryDirectory() as td:
             scripts = Path(td) / ".claude" / "scripts"
-            scripts.mkdir(parents=True)
-            shutil.copy(KG_SYNC, scripts / "kg-sync")
+            # v0.2.94: wrapper + the ladder it sources are ONE shipped unit;
+            # staging only the wrapper stages a BROKEN install.
+            stage_scripts(scripts, "kg-sync")
             (scripts / "sync_knowledge_graph.py").write_text(
                 "raise SystemExit('THE SYNC SCRIPT MUST NOT RUN')\n"
             )
             env = {
                 k: v
                 for k, v in os.environ.items()
-                if k not in ("VCT_INSTALL_ROOT", "VCT_VENV", "VIRTUAL_ENV")
+                # v0.2.94 item 2a: VCT_ORCHESTRATOR_ROOT is a resolution
+                # channel now, so a maintainer shell that exports a real clone
+                # would resolve an interpreter and this would stop exercising
+                # the refusal at all.
+                if k
+                not in (
+                    "VCT_INSTALL_ROOT",
+                    "VCT_VENV",
+                    "VCT_ORCHESTRATOR_ROOT",
+                    "VIRTUAL_ENV",
+                )
             }
             proc = subprocess.run(
                 ["bash", str(scripts / "kg-sync"), "--all"],
@@ -690,8 +712,12 @@ class TestParityClaims(unittest.TestCase):
 
     def test_kg_sync_siblings_probe_the_same_tiers_in_the_same_order(self):
         """Both wrappers claim `same tiers, same order`. This is that claim."""
-        sh = KG_SYNC.read_text(encoding="utf-8")
-        ps1 = KG_SYNC_PS1.read_text(encoding="utf-8-sig")
+        # v0.2.94: the candidate ladder lives in ONE home per flavour, so the
+        # "same tiers, same order" claim is asserted where the order is
+        # actually written — and now covers kg-dedup and kg-duplicates too,
+        # which source the same files.
+        sh = LADDER_SH.read_text(encoding="utf-8")
+        ps1 = LADDER_PS1.read_text(encoding="utf-8-sig")
 
         # Scoped to the CANDIDATES-building region of each file. A whole-file
         # `index()` finds the first MENTION, which for `VCT_INSTALL_ROOT` is a
@@ -700,15 +726,23 @@ class TestParityClaims(unittest.TestCase):
         def region(text: str, start: str, end: str) -> str:
             return text[text.index(start) : text.index(end)]
 
-        sh_region = region(sh, "CANDIDATES=()", 'VENV_PATH=""')
-        ps1_region = region(ps1, "$Candidates = @()", "$VenvPython = $null")
+        sh_region = region(sh, "LADDER_CANDIDATES=()", 'local venv_path=""')
+        ps1_region = region(ps1, "$candidates = @()", "return ,$candidates")
 
         def order(text: str, tokens: list[str]) -> list[int]:
             return [text.index(t) for t in tokens]
 
         sh_order = order(
             sh_region,
-            ["VCT_VENV", "VCT_INSTALL_ROOT", "PROJECT_ENV_ROOT", "CLONE_ROOT"],
+            [
+                "VCT_VENV",
+                "VCT_INSTALL_ROOT",
+                # v0.2.94 item 2a: $VCT_ORCHESTRATOR_ROOT from the ENV, between
+                # the launcher root and the file-backed one.
+                "env_orch_root",
+                "project_env_root",
+                "LADDER_CLONE_ROOT",
+            ],
         )
         self.assertEqual(
             sh_order,
@@ -722,8 +756,9 @@ class TestParityClaims(unittest.TestCase):
             [
                 "env:VCT_VENV",
                 "env:VCT_INSTALL_ROOT",
-                "ProjectEnvRoot",
-                "Test-VcoOrchestratorClone",
+                "envOrchRoot",
+                "projectEnvRoot",
+                "Test-VctLadderVcoClone",
             ],
         )
         self.assertEqual(

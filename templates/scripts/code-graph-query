@@ -4,61 +4,49 @@
 #        code-graph-query similar "full.function.name"
 #        code-graph-query structure dependencies "path/to/module.py"
 #
-# v0.2.37 (Gap 6b + 6c): backports the validate-has-weaviate-client pattern
-# from `code-graph-analyze` AND sets PYTHONPATH so `query_code_graph.py`
-# can import the `claude_mcp_servers` package (parity with the
-# `sync_knowledge_graph.py` helper, which uses `_resolve_mcp_servers_dir()`
-# but `query_code_graph.py` requires `claude_mcp_servers` on PYTHONPATH).
+# Exit codes: whatever `query_code_graph.py` exits; 1 = REFUSAL - no Python
+# environment with the dependencies this wrapper needs (wrapper-only).
+#
+# v0.2.37 (Gap 6c): sets PYTHONPATH so `query_code_graph.py` can import the
+# `claude_mcp_servers` package.
 #
 # Bug history:
 #   - 2026-05-27 (post-update validation): query_code_graph.py crashed
 #     with `ModuleNotFoundError: No module named 'weaviate_mcp'` because
 #     the wrapper activated a venv but never put claude_mcp_servers/ on
 #     PYTHONPATH. The launcher exports VCT_ORCHESTRATOR_ROOT for this
-#     purpose; the OSS install path didn't have it. Alternative
-#     considered + rejected: install weaviate_mcp as a package via
-#     pyproject.toml. That's bigger scope; ship the env-var workaround
-#     for v0.2.37, queue the package-ification for later.
+#     purpose; the OSS install path didn't have it.
+#   - v0.2.94: the venv ladder here was WEAKER than `kg-sync`'s (no
+#     `$VCT_VENV` tier, no `.claude/env` tier, no VCO-clone discriminator),
+#     gated on `weaviate` alone - which has not been enough since
+#     `query_code_graph.py` began importing `vco_lib` at module scope - and
+#     then fell through to a bare `python3`. A shipped component does not get
+#     a silent fallback (standing rule). Ladder + refusal now come from the
+#     ONE home every KG/code-graph wrapper shares.
+#
+# PARITY: this file and `code-graph-query.ps1` must stay in lockstep (same
+# tiers, same gate, same refusal text, same PYTHONPATH, same forwarding).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Validate a venv has the code-graph-query deps installed.
-venv_has_code_graph_deps() {
-    local v="$1"
-    local py=""
-    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
-    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
-    else return 1
-    fi
-    "$py" -c "import weaviate" 2>/dev/null
-}
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `query_code_graph.py` imports `vco_lib.codegraph_references` and
+# `vco_lib.paths` at MODULE scope (unguarded); `weaviate` and
+# `weaviate_mcp.server` are module-scope too, inside `try:` blocks that print
+# and CONTINUE - so their absence produces a degraded run that reports "no
+# matches" instead of failing, which is precisely the verdict the rule says a
+# gate must protect. Gating on `weaviate` alone let both through.
+LADDER_IMPORT="import weaviate, weaviate_mcp, vco_lib"
 
-CANDIDATES=(
-    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
-    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
-    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
-    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
-)
-
-VENV_PATH=""
-for c in "${CANDIDATES[@]}"; do
-    [ -z "$c" ] && continue
-    [ "$c" = "/.venv" ] && continue
-    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
-    if venv_has_code_graph_deps "$c"; then
-        VENV_PATH="$c"
-        break
-    fi
-done
-
-if [ -n "$VENV_PATH" ]; then
-    source "$VENV_PATH/bin/activate"
-fi
-
-# Resolve the orchestrator root for PYTHONPATH. Prefer
+# Resolve the orchestrator root for PYTHONPATH BEFORE probing. Prefer
 # $VCT_ORCHESTRATOR_ROOT (canonical, written into .claude/env by
 # install-bundle as of v0.2.37 Gap 6a), fall back to $VCT_INSTALL_ROOT
 # (legacy alias), then to script-relative paths.
+#
+# v0.2.94: this block used to run AFTER the venv probe, so the probe answered
+# a question the script never faces - `weaviate_mcp` is importable via this
+# PYTHONPATH on installs where it is not pip-installed. Probing with the same
+# environment the script will run under is the only honest order.
 ORCH_ROOT=""
 if [ -n "${VCT_ORCHESTRATOR_ROOT:-}" ] && [ -d "${VCT_ORCHESTRATOR_ROOT}/claude_mcp_servers" ]; then
     ORCH_ROOT="${VCT_ORCHESTRATOR_ROOT}"
@@ -72,5 +60,31 @@ if [ -n "$ORCH_ROOT" ]; then
     export PYTHONPATH="$ORCH_ROOT/claude_mcp_servers:${PYTHONPATH:-}"
 fi
 
-# Run the Python script
-python3 "$SCRIPT_DIR/query_code_graph.py" "$@"
+# The ladder lives in ONE home, shipped beside this wrapper. A missing lib is
+# a broken install, not a reason to fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "code-graph-query: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "code-graph-query: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  code-graph-query did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
+fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
+
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+
+# NO BARE `python3` FALLBACK - see the header. PARITY: the .ps1 sibling
+# refuses identically.
+if [ -z "$LADDER_PYTHON" ]; then
+    vct_venv_ladder_refusal "code-graph-query" "$LADDER_IMPORT" "$SCRIPT_DIR"
+    {
+        echo "code-graph-query: Refusing to run with an unqualified interpreter -"
+        echo "code-graph-query: a query that cannot reach the code graph must"
+        echo "code-graph-query: never report 'no matches'."
+        echo "code-graph-query: (exit 1 = did not run)"
+    } >&2
+    vct_venv_ladder_refusal_summary "code-graph-query" 1
+    exit 1
+fi
+
+exec "$LADDER_PYTHON" "$SCRIPT_DIR/query_code_graph.py" "$@"

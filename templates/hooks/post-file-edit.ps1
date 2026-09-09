@@ -490,7 +490,11 @@ Set-Location -LiteralPath '$rootEsc' -ErrorAction SilentlyContinue
 try {
     # ❌ kept too — the scan's failure line is what the ⚠️ "See the error
     # above." verdict points at (parity with the bash sibling's filter).
-    `$out = $dupExpr | Select-String -Pattern '✅|⚠️|📊|❌' | ForEach-Object { `$_.ToString() }
+    #
+    # v0.2.94 (review item 3): `^<tool>: ERROR` joins the pattern. A wrapper
+    # REFUSAL carried none of the four markers, so this scan was a silent
+    # no-op on exactly the installs that had something to report.
+    `$out = $dupExpr | Select-String -Pattern '✅|⚠️|📊|❌|^[A-Za-z0-9_-]+: ERROR' | ForEach-Object { `$_.ToString() }
     if (`$out) {
         `$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         Set-Content -Path '$reportEsc' -Value (@("# KG duplicate scan (every-10-edits, `$ts)") + `$out) -Encoding utf8

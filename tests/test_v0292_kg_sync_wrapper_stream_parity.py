@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.wrapper_staging import stage_scripts
+
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER_PS1 = REPO / "templates" / "scripts" / "kg-sync.ps1"
 
@@ -53,8 +55,9 @@ def _stage_project(tmp_path: Path) -> Path:
     puts it (``<proj>/.claude/scripts/kg-sync.ps1``) plus a fake sync
     target the happy-path leg can observe."""
     scripts = tmp_path / ".claude" / "scripts"
-    scripts.mkdir(parents=True)
-    shutil.copyfile(WRAPPER_PS1, scripts / "kg-sync.ps1")
+    # v0.2.94: the wrapper and the `vct_venv_ladder.ps1` it dot-sources are
+    # ONE shipped unit; staging only the wrapper stages a BROKEN install.
+    stage_scripts(scripts, "kg-sync.ps1")
     (scripts / "sync_knowledge_graph.py").write_text(textwrap.dedent(
         """
         import os, sys

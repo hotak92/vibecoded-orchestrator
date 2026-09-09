@@ -60,6 +60,7 @@ import uuid
 from pathlib import Path
 
 from tests.common.child_env import child_env
+from tests.common.wrapper_staging import LADDER_SH
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
@@ -320,6 +321,13 @@ class WrapperRootPinningTests(unittest.TestCase):
         self.wrapper.write_text(KG_SYNC_SH.read_text(encoding="utf-8"),
                                 encoding="utf-8")
         self.wrapper.chmod(self.wrapper.stat().st_mode | stat.S_IXUSR)
+        # v0.2.94: the wrapper sources the shared venv ladder, which the
+        # bundle installs beside it. Staging one without the other stages a
+        # BROKEN install, which refuses before reaching the root-pinning
+        # behaviour under test.
+        (scripts / LADDER_SH.name).write_text(
+            LADDER_SH.read_text(encoding="utf-8"), encoding="utf-8"
+        )
         (scripts / "sync_knowledge_graph.py").write_text(
             SCRIPT_PATH.read_text(encoding="utf-8"), encoding="utf-8"
         )

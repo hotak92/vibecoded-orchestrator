@@ -394,15 +394,26 @@ class WrapperHealthEnumeration(unittest.TestCase):
             "kg-search", "kg-search.ps1",
             "kg-info", "kg-info.ps1",
             "code-graph-query", "code-graph-query.ps1",
+            # v0.2.94: the ladder moved to ONE home and these three joined the
+            # wrappers that honour it — by SOURCING it rather than inlining
+            # it, which `LADDER_DELEGATION_MARKER` recognises. `kg-duplicates`
+            # in particular used to have NO ladder at all, so it was excluded
+            # here; it has one now, and a stale copy of it is as dangerous as
+            # a stale kg-sync.
+            "kg-duplicates", "kg-duplicates.ps1",
+            "kg-dedup", "kg-dedup.ps1",
+            "kg-migrate", "kg-migrate.ps1",
+            # The shared ladder itself: a stale copy of it breaks every
+            # wrapper that sources it, so it must be stale-checked too.
+            "vct_venv_ladder.sh", "vct_venv_ladder.ps1",
         ):
             self.assertIn(
                 expected, names,
-                f"{expected} ships the $VCT_INSTALL_ROOT ladder and must be "
-                "stale-checked",
+                f"{expected} honours the $VCT_INSTALL_ROOT ladder (inlined or "
+                "sourced) and must be stale-checked",
             )
-        # Derived exclusions: these carry no ladder in their shipped form, so
-        # marker-checking them would condemn every healthy copy.
-        self.assertNotIn("kg-duplicates", names)
+        # Derived exclusion: carries no ladder in its shipped form, so
+        # marker-checking it would condemn every healthy copy.
         self.assertNotIn("generate-kg-summary.py", names)
 
     def test_marker_survives_every_install_transform(self):
@@ -453,6 +464,15 @@ class WrapperHealthEnumeration(unittest.TestCase):
             f'RESILIENT_WRAPPER_MARKER: &str = "{wrapper_health.RESILIENT_WRAPPER_MARKER}"',
             rust,
             "the Rust mirror of RESILIENT_WRAPPER_MARKER has drifted from "
+            "vco_lib/wrapper_health.py",
+        )
+        # v0.2.94: a wrapper may honour the ladder by SOURCING it. Both sides
+        # must accept the same second shape, or a freshly-installed wrapper
+        # reads healthy on one surface and stale on the other.
+        self.assertIn(
+            f'LADDER_DELEGATION_MARKER: &str = "{wrapper_health.LADDER_DELEGATION_MARKER}"',
+            rust,
+            "the Rust mirror of LADDER_DELEGATION_MARKER has drifted from "
             "vco_lib/wrapper_health.py",
         )
 

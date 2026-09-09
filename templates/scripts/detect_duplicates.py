@@ -34,10 +34,18 @@ import re
 # that directory, which under pytest meant scanning the developer's real home.
 #
 # `$VCT_CLAUDE_DIR` is parsed inline rather than imported from
-# `vco_lib.paths.claude_user_dir` (its single source of truth) because unlike
-# `query_code_graph.py` this script has no other vco_lib import to guarantee
-# importability — a hard import here would be a NEW dependency for a shipped
-# script that currently needs none. Same env key, same default: keep them equal.
+# `vco_lib.paths.claude_user_dir` (its single source of truth) because a hard
+# import HERE would be a MODULE-LEVEL dependency: `--help`, an argparse error,
+# and every import of this file would then require vco_lib.
+#
+# v0.2.94 amends the older rationale, which said this script "has no other
+# vco_lib import". It has one now — `_target_vector` resolves the named-vector
+# slot through `vco_lib.kg_vector_slot` — but deliberately as a FUNCTION-LOCAL
+# import inside the scan, so the requirement lands only where a verdict is
+# actually being produced, and lands with a remedy instead of a bare
+# ModuleNotFoundError at import. That is why this probe stays inline rather
+# than being migrated: migrating it would hoist the dependency to module level.
+# Same env key, same default: keep them equal.
 _vct_claude_dir = os.environ.get("VCT_CLAUDE_DIR", "").strip()
 sys.path.insert(0, str(
     (Path(_vct_claude_dir) if _vct_claude_dir else Path.home() / ".claude")
@@ -161,6 +169,62 @@ def _progress(message: str = "") -> None:
     print(message, file=sys.stderr if _PROGRESS_TO_STDERR else sys.stdout)
 
 
+def _target_vector(collection) -> str:
+    """The named-vector slot every vector query must target ("" = omit).
+
+    v0.2.94 field defect: EVERY VCO knowledge collection is created with
+    multiple named vectors, and Weaviate refuses a vector query on such a
+    class unless the slot is named ("class X has multiple vectors, but no
+    target vectors were provided"). This scanner never passed one, so it died
+    on the FIRST ``near_object`` of every run — 792 nodes fetched, no verdict,
+    on every install since named vectors shipped.
+
+    Resolution lives in ONE home (``vco_lib.kg_vector_slot``) shared with
+    ``kg-sync``'s writer, so a scan can never target a slot the sync did not
+    populate. A module-level function, not a method: the doubles that drive
+    ``find_duplicates`` supply a COLLECTION, and requiring them to also carry a
+    detector method would make this logic untestable through the real scan.
+
+    The import is function-local and re-raised with a remedy: this script's
+    only other vco_lib use is soft (collection-name resolution), so a bare
+    ImportError traceback here would read as a bug in the scanner rather than
+    as the broken install it is. It is NOT softened into "query no slot" —
+    that is the defect itself.
+    """
+    try:
+        from vco_lib.kg_vector_slot import kg_query_target_vector
+    except ImportError as exc:  # broken / partial install — never guess
+        # Two distinct broken-install shapes reach here and the remedy is the
+        # same for both, so the message names both rather than asserting the
+        # one that happens to be more common: vco_lib absent from this
+        # interpreter, OR present but predating v0.2.94 (a half-updated
+        # install, which is what this looked like the first time it fired).
+        raise RuntimeError(
+            "vco_lib.kg_vector_slot is not importable from this interpreter "
+            f"({exc}), so the named-vector slot to query cannot be resolved. "
+            "Either vco_lib is missing here, or it predates v0.2.94. Re-run "
+            "the orchestrator install (`python install.py --update`), or run "
+            "this via `.claude/scripts/kg-duplicates`, which selects a venv "
+            "that carries it."
+        ) from exc
+
+    slot = kg_query_target_vector(collection)
+    if slot is None:
+        # The schema read failed, so which vector to query is UNKNOWN. Guessing
+        # the active slot would be a guess about the very thing that could not
+        # be established — and on a legacy single-unnamed-vector class the
+        # named kwarg is an error, so the scan would die naming a slot instead
+        # of the read that failed. No verdict is the honest outcome.
+        raise RuntimeError(
+            f"cannot read the vector schema of collection {COLLECTION_NAME!r}, "
+            "so the slot to query is unknown. Refusing to guess: a scan that "
+            "queries the wrong vector reports duplicates that are not there, "
+            "or none where there are. Check that Weaviate is reachable and "
+            "that the collection exists."
+        )
+    return slot
+
+
 class DuplicateDetector:
     """Detect potential duplicate nodes in knowledge graph"""
 
@@ -211,6 +275,15 @@ class DuplicateDetector:
         # fully scanned (previously duplicates in nodes 1001+ were
         # silently missed).
         try:
+            # Resolve INSIDE the try: a failure here must surface as
+            # `scan_error` ("Scan did NOT complete — no verdict"), never as a
+            # silent 0-duplicates verdict.
+            target_vector = _target_vector(self.collection)
+            _progress(
+                f"   Vector slot: {target_vector}\n" if target_vector
+                else "   Vector slot: (single unnamed vector — legacy class)\n"
+            )
+
             nodes = []
             cursor = None
             PAGE_SIZE = 1000
@@ -252,13 +325,21 @@ class DuplicateDetector:
                 node_path = node.properties.get("file_path", "")
                 node_uuid = str(node.uuid)
 
-                # Find semantically similar nodes
-                similar = self.collection.query.near_object(
+                # Find semantically similar nodes.
+                #
+                # `target_vector` is passed only when the collection HAS named
+                # vectors — a pre-named-vector class has one unnamed vector and
+                # rejects the kwarg, so omitting it there is what keeps this
+                # backward compatible.
+                near_kwargs = dict(
                     near_object=node_uuid,
                     limit=5,
                     return_metadata=MetadataQuery(distance=True),
-                    return_properties=["title", "file_path", "node_type"]
+                    return_properties=["title", "file_path", "node_type"],
                 )
+                if target_vector:
+                    near_kwargs["target_vector"] = target_vector
+                similar = self.collection.query.near_object(**near_kwargs)
 
                 for similar_node in similar.objects:
                     similar_uuid = str(similar_node.uuid)

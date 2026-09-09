@@ -3,23 +3,74 @@
 #
 # Finds potential duplicate nodes using semantic similarity and title matching.
 #
+# Not to be confused with `kg-dedup`, which reconciles the same source file
+# stored more than once. This one finds semantically similar but DISTINCT
+# nodes and writes a report - it deletes nothing.
+#
 # Usage:
 #   .claude/scripts/kg-duplicates                      # Full scan (threshold 0.95)
 #   .claude/scripts/kg-duplicates --threshold 0.90     # Custom threshold
 #   .claude/scripts/kg-duplicates --output report.md   # Custom output location
+#
+# Exit codes: whatever `detect_duplicates.py` exits (0 = report written, 1 =
+# the scan could not complete); 1 = REFUSAL - no Python environment with the
+# dependencies this wrapper needs (wrapper-only).
+#
+# v0.2.94: this wrapper had NO dependency gate at all. It sourced
+# `$PROJECT_ROOT/.venv` when one existed and otherwise ran whatever `python`
+# was first on PATH - so on a user project it could reach an interpreter with
+# neither `weaviate` nor `vco_lib` and die inside the scanner with a
+# ModuleNotFoundError naming the wrong problem, while its own `.ps1` sibling
+# had carried the hardened ladder since birth. Same ladder for both flavours
+# now, from ONE home (`vct_venv_ladder.sh` / `.ps1`).
+#
+# PARITY: this file and `kg-duplicates.ps1` must stay in lockstep (same
+# tiers, same refusal text, same forwarding).
 
+# `set -e` as shipped before v0.2.94: a refactor may not change this
+# file's failure posture as a side effect. The shared ladder is
+# `set -e`-safe (its `[ … ] && …` guards are non-final members of AND
+# lists, which bash exempts, and `vct_venv_ladder_resolve` ends in an
+# `if` that returns 0 on the miss path) — pinned by
+# tests/test_v0294_wrapper_venv_ladder_parity.py.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Probe canonical .venv locations (OSS install-root first, legacy second).
-for _c in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/claude_mcp_servers/.venv"; do
-    if [ -f "$_c/bin/activate" ]; then
-        source "$_c/bin/activate"
-        break
-    fi
-done
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `weaviate` is the upstream client `detect_duplicates.py` imports at module
+# level; `vco_lib` owns the named-vector slot resolution the scan needs to
+# query a multi-vector collection at all (v0.2.94). Naming what we actually
+# require, in the form it runs, is what keeps this gate from drifting off the
+# script's real dependencies.
+LADDER_IMPORT="import weaviate, vco_lib"
 
-# Run duplicate detection
-exec python "$SCRIPT_DIR/detect_duplicates.py" "$@"
+# The ladder lives in ONE home, shipped beside this wrapper. A missing lib is
+# a broken install, not a reason to fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "kg-duplicates: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "kg-duplicates: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  kg-duplicates did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
+fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
+
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+
+# NO BARE `python` FALLBACK - a shipped component does not get a silent
+# fallback (standing rule). Name every candidate and the remedy, exit 1.
+# PARITY: the .ps1 sibling refuses identically.
+if [ -z "$LADDER_PYTHON" ]; then
+    vct_venv_ladder_refusal "kg-duplicates" "$LADDER_IMPORT" "$SCRIPT_DIR"
+    {
+        echo "kg-duplicates: Refusing to run with an unqualified interpreter - a"
+        echo "kg-duplicates: scan that cannot query the collection must never"
+        echo "kg-duplicates: report 'no duplicates'."
+        echo "kg-duplicates: (exit 1 = did not run)"
+    } >&2
+    vct_venv_ladder_refusal_summary "kg-duplicates" 1
+    exit 1
+fi
+
+exec "$LADDER_PYTHON" "$SCRIPT_DIR/detect_duplicates.py" "$@"
