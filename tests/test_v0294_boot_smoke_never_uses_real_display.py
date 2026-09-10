@@ -123,3 +123,29 @@ def test_no_display_at_all_still_fails_with_the_install_hint(tmp_path):
     assert proc.returncode == 3
     assert "install xvfb" in proc.stderr
     assert not (tmp_path / "ran.txt").exists()
+
+
+def test_check_display_mode_reports_the_rule_without_a_binary(tmp_path):
+    """`--check-display` = the display rule alone, no binary needed.
+
+    The pre-ship gate calls it before its cargo leg so a missing xvfb fails in
+    seconds. Same three outcomes as the real run: refused (3), pinned runner (0),
+    explicit opt-in (0) — and nothing is executed in any of them.
+    """
+    base = _minimal_env(tmp_path)
+    refused = subprocess.run([_bash(), str(SMOKE), "--check-display"],
+                             capture_output=True, text=True, env=base, cwd=str(tmp_path), timeout=60)
+    assert refused.returncode == 3 and "REFUSING" in refused.stderr
+
+    fake_xvfb = tmp_path / "fake-xvfb-run"
+    fake_xvfb.write_text("#!/bin/sh\nshift\nexec \"$@\"\n", encoding="utf-8")
+    fake_xvfb.chmod(fake_xvfb.stat().st_mode | stat.S_IXUSR)
+    pinned = subprocess.run([_bash(), str(SMOKE), "--check-display"], capture_output=True, text=True,
+                            env=_minimal_env(tmp_path, VCT_BOOT_SMOKE_XVFB_RUN=str(fake_xvfb)),
+                            cwd=str(tmp_path), timeout=60)
+    assert pinned.returncode == 0 and "headless via" in pinned.stdout
+
+    opted = subprocess.run([_bash(), str(SMOKE), "--check-display"], capture_output=True, text=True,
+                           env=_minimal_env(tmp_path, VCT_BOOT_SMOKE_REAL_DISPLAY="1"),
+                           cwd=str(tmp_path), timeout=60)
+    assert opted.returncode == 0 and "explicit opt-in" in opted.stdout

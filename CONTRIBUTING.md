@@ -60,6 +60,13 @@ ruff check --fix .
 pyright
 ```
 
+The release gate (`bash scripts/pre-ship-check.sh`) additionally needs **xvfb** on Linux
+(`sudo apt install xvfb`): its launcher boot smoke runs the real launcher binary under
+`xvfb-run`, exactly as `release.yml` does, and refuses to open a window on your live
+desktop — on GNOME/X11 that window flash crashed gnome-shell and ended the whole session
+(2026-09-09). Without xvfb the gate stops in seconds with the install hint;
+`VCT_BOOT_SMOKE_REAL_DISPLAY=1` is the explicit opt-in for platforms without Xvfb.
+
 ---
 
 ## Continuous Integration

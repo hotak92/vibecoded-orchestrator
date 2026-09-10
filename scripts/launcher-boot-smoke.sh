@@ -20,6 +20,10 @@
 # the resume sweeps — alive-but-not-booted must not pass.
 #
 # Usage: launcher-boot-smoke.sh <path-to-vct-launcher> [timeout-seconds]
+#        launcher-boot-smoke.sh --check-display   # display rule only: exit 0 = a
+#            headless run is possible (or the opt-in is set), 3 = it is not; the
+#            pre-ship gate calls this BEFORE its cargo leg so a missing xvfb fails
+#            in seconds, not after a three-minute build.
 #
 # Environment handling:
 #   - HOME/XDG dirs are redirected to a throwaway temp dir so the smoke
@@ -39,15 +43,23 @@
 #     real launcher can't make the smoke instance exit early).
 set -uo pipefail
 
-BIN="${1:?usage: launcher-boot-smoke.sh <path-to-vct-launcher> [timeout-seconds]}"
+CHECK_DISPLAY_ONLY=0
+if [ "${1:-}" = "--check-display" ]; then
+    CHECK_DISPLAY_ONLY=1
+    BIN=/nonexistent
+else
+    BIN="${1:?usage: launcher-boot-smoke.sh <path-to-vct-launcher> [timeout-seconds]}"
+fi
 TIMEOUT_SECS="${2:-180}"
 MARKER="[vct] setup complete"
 
-if [ ! -x "$BIN" ]; then
+if [ "$CHECK_DISPLAY_ONLY" = 0 ] && [ ! -x "$BIN" ]; then
     echo "[boot-smoke] FAIL: binary not found or not executable: $BIN" >&2
     exit 1
 fi
-BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+if [ "$CHECK_DISPLAY_ONLY" = 0 ]; then
+    BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+fi
 BIN_DIR="$(dirname "$BIN")"
 
 SMOKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/vct-boot-smoke.XXXXXX")"
@@ -129,6 +141,14 @@ else
          "VCT_BOOT_SMOKE_XVFB_RUN=/path/to/xvfb-run, or opt in explicitly with" \
          "VCT_BOOT_SMOKE_REAL_DISPLAY=1 (exit 3 = did not run)." >&2
     exit 3
+fi
+if [ "$CHECK_DISPLAY_ONLY" = 1 ]; then
+    if [ -n "$XVFB_RUN" ]; then
+        echo "[boot-smoke] display check: headless via $XVFB_RUN"
+    else
+        echo "[boot-smoke] display check: REAL display by explicit opt-in (VCT_BOOT_SMOKE_REAL_DISPLAY=1)"
+    fi
+    exit 0
 fi
 
 echo "[boot-smoke] booting $BIN (isolated HOME=$SMOKE_HOME, waiting up to ${TIMEOUT_SECS}s for '$MARKER')"

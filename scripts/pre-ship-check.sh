@@ -33,7 +33,11 @@
 #
 # Exit code: 0 = all gates pass, 1 = one or more gates failed.
 #
-# Requires: gh (GitHub CLI, authenticated), cargo, python3, npm.
+# Requires: gh (GitHub CLI, authenticated), cargo, python3, npm, and xvfb
+# (`sudo apt install xvfb`) — the launcher boot smoke (Gate 2b) runs headless
+# under xvfb-run exactly as release.yml does; it never opens a window on the
+# operator's live desktop (that killed a GNOME/X11 session twice, 2026-09-09).
+# The display rule is probed up front so a missing xvfb fails in seconds.
 # Run from the repo root.
 
 set -uo pipefail
@@ -59,6 +63,12 @@ else
 fi
 if [ -z "$EXPECTED_VERSION" ]; then
     echo "ERROR: could not resolve EXPECTED_VERSION (pyproject.toml unreadable?)" >&2
+    exit 2
+fi
+
+# ── Preflight: the boot smoke's display rule (ONE home: the smoke script) ──
+if ! bash "$SCRIPT_DIR/launcher-boot-smoke.sh" --check-display; then
+    echo "ERROR: the launcher boot smoke cannot run headless on this machine — install xvfb (see above); not starting a 20-minute gate that would fail at Gate 2b" >&2
     exit 2
 fi
 

@@ -622,6 +622,14 @@ class BootSmokeDisplayResolutionTests(unittest.TestCase):
     RED-PROOF: on the pre-change file the whole block is
     `if command -v xvfb-run …; then RUNNER=(xvfb-run …); elif [ -z "$DISPLAY" ]
     …` — there is no candidate loop and no note, so both assertions below fail.
+
+    v0.2.94: the "announce the fallback" contract is RETIRED. The announced
+    fallback still opened a window on a live GNOME/X11 desktop and gnome-shell
+    died on a mutter assertion twice on 2026-09-09 (maintainer's machine, no
+    xvfb installed). A real display without xvfb-run is now REFUSED (exit 3)
+    unless `VCT_BOOT_SMOKE_REAL_DISPLAY=1` opts in; behaviour is DRIVEN in
+    `tests/test_v0294_boot_smoke_never_uses_real_display.py`, this class pins
+    the source shape.
     """
 
     def setUp(self) -> None:
@@ -643,18 +651,23 @@ class BootSmokeDisplayResolutionTests(unittest.TestCase):
                 "as templates/hooks/lean-ctx-rewrite.sh's lean-ctx probe",
             )
 
-    def test_falling_back_to_the_real_display_says_so_on_stderr(self) -> None:
-        idx = self.src.index("XVFB_RUN=")
-        block = self.src[idx : idx + 1800]
+    def test_a_real_display_without_xvfb_is_refused_on_stderr(self) -> None:
+        idx = self.src.index('XVFB_RUN=""')
+        block = self.src[idx : idx + 3200]
         self.assertIn(
-            "REAL display",
+            "REFUSING to open the launcher window",
             block,
-            "a fallback onto the operator's display must be announced, not "
-            "silent — that silence IS the window-flash incident",
+            "a real display without xvfb-run must be REFUSED — the announced "
+            "fallback killed the desktop session twice (2026-09-09)",
         )
-        self.assertIn(">&2", block, "the note belongs on stderr, not stdout")
-        # The no-display case still HARD-FAILS rather than warning.
+        self.assertIn(">&2", block, "the refusal belongs on stderr, not stdout")
+        self.assertIn("VCT_BOOT_SMOKE_REAL_DISPLAY", block, "the opt-in is named")
         self.assertIn("exit 3", block)
+        self.assertNotIn(
+            "A launcher window WILL appear briefly. Install xvfb to run headless",
+            self.src,
+            "the retired warn-and-proceed fallback must not come back",
+        )
 
     def test_on_path_behaviour_is_unchanged(self) -> None:
         """When xvfb-run IS on PATH the wrapper chain must be byte-identical to
