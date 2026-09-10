@@ -95,6 +95,12 @@ FALLBACK_PREFIX = "vct"
 # a string is a CANONICAL PROJECT NAME, which is this module's whole subject,
 # and it is pure. The analyzer imports both names and re-exports them under
 # their historical private aliases.
+#
+# Sibling rule, different source of not-a-project names: this one covers
+# throwaway WORKTREE directories; `vco_lib.fixture_class_guard`'s
+# FIXTURE_PROJECT_NAMES covers this repo's TEST FIXTURE project names, which
+# leaked onto a live Weaviate as `Alpha_KnowledgeGraph` (70 real nodes). If you
+# are here looking for "which strings must never mint a collection", read both.
 WORKTREE_PATH_SEGMENTS = (".wt", "worktrees", "vco-wt")
 
 

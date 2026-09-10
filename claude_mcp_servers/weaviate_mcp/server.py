@@ -6822,6 +6822,43 @@ async def store_knowledge_node(
                         "file_written": False,
                     }, indent=2)
 
+        # v0.2.94 W-WEAVIATE: the fixture-shaped class write guard.
+        #
+        # Sits with the other two write gates (shared-KG opt-out, access
+        # matrix) and last among them, because it is the cheapest and the
+        # most absolute: a class whose stem is one of this repo's TEST
+        # FIXTURE project names is not any project's collection, so a write
+        # to it is test or probe-harness residue. `Alpha_KnowledgeGraph` on
+        # the maintainer's live box held 70 real knowledge nodes written
+        # exactly this way. Refuse LOUDLY — the class, the reason, the env
+        # var that declares ownership — and refuse BEFORE the .md file is
+        # written, so `file_written` is honestly False.
+        #
+        # `vco_lib` is a HARD dependency of this module (see the import
+        # bootstrap at the top): a failed import means a BROKEN install and
+        # must surface, never degrade to an unguarded write.
+        from vco_lib.fixture_class_guard import (
+            FixtureClassWriteRefused,
+            guard_fixture_class_write,
+        )
+
+        try:
+            guard_fixture_class_write(
+                target_collection_name,
+                operation="store a knowledge node in",
+                weaviate_url=WEAVIATE_URL,
+            )
+        except FixtureClassWriteRefused as refusal:
+            logger.error(str(refusal))
+            return json.dumps({
+                "status": "error",
+                "error": str(refusal),
+                "target_collection": target_collection_name,
+                "fixture_project_name": refusal.stem,
+                "scope": scope,
+                "file_written": False,
+            }, indent=2)
+
         collection = client.collections.get(target_collection_name)
 
         # --- Auto-correct file_path before anything else -------------------------

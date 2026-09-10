@@ -165,7 +165,8 @@ class EnsureCollectionsTests(unittest.TestCase):
             _Handler.schema = {"classes": [{"class": "TestShared"}]}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "SHARED_KG_COLLECTION": "TestShared"},
             ):
@@ -195,7 +196,8 @@ class EnsureCollectionsTests(unittest.TestCase):
             ]}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "TestShared"},
@@ -222,7 +224,8 @@ class EnsureCollectionsTests(unittest.TestCase):
             ]}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "TestShared"},
@@ -242,7 +245,8 @@ class EnsureCollectionsTests(unittest.TestCase):
             _Handler.schema = {"classes": []}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph"},
@@ -272,7 +276,8 @@ class EnsureCollectionsTests(unittest.TestCase):
             _Handler.schema = {"classes": []}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "TestShared"},
@@ -298,7 +303,8 @@ class EnsureCollectionsTests(unittest.TestCase):
             _Handler.fail_post = True
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev"},
             ):
                 # No exception expected.
@@ -346,7 +352,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             # Clear any inherited env so the basename derivation runs.
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port)},
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port)},
                 clear=False,
             ):
                 for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
@@ -420,7 +427,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             decisions = {"weaviate": {"action": install.ACTION_ADOPT}}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port)},
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port)},
                 clear=False,
             ):
                 for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
@@ -454,7 +462,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             _Handler.schema = {"classes": []}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "SHARED_KG_COLLECTION": "TestShared"},
             ):
@@ -472,7 +481,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             _Handler.schema = {"classes": []}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
                  "SHARED_KG_COLLECTION": "TestShared"},
             ):
@@ -496,7 +506,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             decisions = {"weaviate": {"action": install.ACTION_START}}
             with mock.patch.dict(
                 "os.environ",
-                {"WEAVIATE_PORT": str(port)},
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port)},
                 clear=False,
             ):
                 for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",

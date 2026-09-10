@@ -238,6 +238,44 @@ and tested: through the gateway, the outcome is never worse than native.
   never reached an upgraded table), with a tombstone so a row the user
   deleted stays deleted until an explicit Reseed (migration 045).
 
+### Fixed — a test fixture's name can no longer become a class on a live Weaviate (v0.2.94)
+
+The maintainer's live Weaviate held `Alpha_KnowledgeGraph`: 70 real
+`knowledge/concepts/*.md` nodes in a class nothing reads. `Alpha` is not a
+project — it exists only as this suite's fixture name. Two ordinary leaks met:
+`_fresh_server` sets `KG_COLLECTION=Alpha_KnowledgeGraph` with a documented
+no-restore, and nothing pinned `WEAVIATE_URL`, so a spawned sync child
+(children inherit `os.environ`) synced the real tree into the fixture's class
+on the real backend. The pre-ship full-suite leg and CI both run with the
+ambient environment, so `http://localhost:8081` was never overridden.
+
+- **The suite cannot reach a live backend by default.** `tests/conftest.py`
+  pins `WEAVIATE_URL` at the unroutable `http://127.0.0.1:9` at import AND per
+  test — the per-test half because a suite restoring with
+  `os.environ.update(backup)` cannot remove a key the backup lacked, so one
+  such test un-pinned every test after it. Live-backend tests opt in through
+  the existing per-file frozenset (the pre-ship gate's file is derived from
+  the gate script, and a canary proves the stand-aside still fires). Two suites
+  passed only because the leak let their readiness probe answer from the live
+  instance; they now name their own mock server in `WEAVIATE_URL` rather than
+  relying on the key's absence. Three further tests were CREATING scratch
+  classes there on every full-suite run (`VCO218SchemaTest`,
+  `VcoD2ScratchTombstone`) and now skip, exactly as they already do in CI.
+- **A write to a fixture-shaped class is REFUSED** — at `store_knowledge_node`,
+  `sync_knowledge_graph.main`, and the diagram indexer's one write seam —
+  unless the process declares ownership with `VCT_ALLOW_FIXTURE_CLASS_WRITES=1`
+  (conftest sets it; a bare probe harness must). Refusal names the class, the
+  reason and the variable: an error payload for the MCP, exit 2 before any
+  connection for the scripts. The table (`vco_lib/fixture_class_guard.py`) is
+  curated, not derived — every entry must appear in `tests/`, and no name a
+  real project could own may enter it.
+- **The doctor tells the two ghosts apart.** An unclaimed class whose stem is a
+  fixture name reads "fixture-shaped ghost — written by a test or probe
+  harness, not by any project" and gets a remedy that fits, since there is no
+  project to re-add: verify parity by reading both classes, then decide. No
+  drop command is printed and nothing is deleted — the destructive step stays
+  the user's. Non-fixture leftovers keep the existing wording.
+
 ## [0.2.93] - 2026-09-08
 
 The dogfood-release. v0.2.92's own update to the maintainer's install died
