@@ -1633,7 +1633,7 @@ class CodeGraphAnalyzer:
                         f"  1. Open the launcher and run the 'Legacy code-graph "
                         f"collections' wizard.\n"
                         f"  2. Or manually delete the colliding class: "
-                        f"curl -X DELETE http://localhost:8081/v1/schema/{collider}",
+                        f"curl -X DELETE {self.weaviate_url}/v1/schema/{collider}",
                         file=sys.stderr,
                     )
                     # Re-raise so the caller (which wraps in try/except)

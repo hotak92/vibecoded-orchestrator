@@ -198,13 +198,28 @@ and tested: through the gateway, the outcome is never worse than native.
   instead of running whatever `python3` is on PATH. The stale-wrapper
   detector now keys on the delegation marker in both its homes.
 
-### Added — ruff is a CI gate for the shipped Python (v0.2.94)
+### Added — ruff is a CI gate for the shipped Python, the templates and the tests (v0.2.94)
 
-- `ruff check vco_lib claude_mcp_servers scripts install.py` runs in CI
-  (`Python (ruff)` job) and in `scripts/pre-ship-check.sh`; the version is
-  pinned in `requirements-dev.txt`. It had been a local convention only, so a
-  lint regression could reach main unnoticed. `tests/` (174 pre-existing
-  findings, mostly unused imports) is not gated yet.
+- `ruff check vco_lib claude_mcp_servers scripts install.py tests templates` runs in CI
+  (`Python (ruff)` job) and in `scripts/pre-ship-check.sh`, with one test
+  pinning both gates to the same path list; the version is pinned in
+  `requirements-dev.txt`. It had been a local convention only, so a lint
+  regression could reach main unnoticed. The 174 findings `tests/` carried
+  were each investigated, not silenced: 17 of them were assertions a test
+  had dropped while keeping its name — one golden-file test had never
+  compared its golden and the golden had been wrong since the commit that
+  introduced it, green throughout. The shipped `templates/` Python (every
+  project's `.claude/scripts/*.py`) carried 93 more, one of them live:
+  the code-graph CLI's enrichment fallback read a name it never imported,
+  and a best-effort `except` turned the NameError into "enrichment
+  skipped" on every lean install — both the short-query enrichment and
+  the oversized-query cap were silently off there. Four bare `except:`
+  clauses that also swallowed Ctrl-C are narrowed.
+- **The MCP server's project-root walk no longer accepts the user's home**:
+  from a cwd with no project above it, the ancestor walk reached `$HOME`
+  and took `~/.claude/settings.json` — Claude Code's global config, which
+  every user has — as a project marker, so KG paths and fallbacks pointed
+  at the home directory. The walk stops below home.
 
 ### Fixed — a vendor model is never the panel's Default; the switch starts the gateway it needs (v0.2.94)
 
