@@ -39,7 +39,12 @@ from tests.common.child_env import child_env
 # Test config
 # ─────────────────────────────────────────────────────────────────────
 
-WEAVIATE_URL = "http://localhost:8081"
+# v0.2.94: env-resolved like every other consumer. Hardcoded, this probe
+# asked "is the maintainer's live Weaviate up?" while the analyzer it spawns
+# was pointed somewhere else entirely — so the file ran, and CREATED
+# `<project>_CodeModule` classes on that live instance, whenever a developer
+# happened to have one running. The suite's pin now reaches both.
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
 
 # Where the analyze script lives. We use the templates copy since that's
 # the only one in the repo (the project-installed copy at

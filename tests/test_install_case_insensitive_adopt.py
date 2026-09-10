@@ -166,6 +166,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             with mock.patch.dict(
                 "os.environ",
                 {
+                    "WEAVIATE_URL": f"http://localhost:{port}",
                     "WEAVIATE_PORT": str(port),
                     "KG_COLLECTION": "TestKG",
                     "DEVELOPMENT_COLLECTION": "TestDev",
@@ -209,6 +210,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             with mock.patch.dict(
                 "os.environ",
                 {
+                    "WEAVIATE_URL": f"http://localhost:{port}",
                     "WEAVIATE_PORT": str(port),
                     "KG_COLLECTION": "TestKG",
                     "DEVELOPMENT_COLLECTION": "TestDev",
@@ -245,6 +247,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             with mock.patch.dict(
                 "os.environ",
                 {
+                    "WEAVIATE_URL": f"http://localhost:{port}",
                     "WEAVIATE_PORT": str(port),
                     "KG_COLLECTION": "TestKG",
                     "DEVELOPMENT_COLLECTION": "TestDev",
@@ -285,6 +288,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             with mock.patch.dict(
                 "os.environ",
                 {
+                    "WEAVIATE_URL": f"http://localhost:{port}",
                     "WEAVIATE_PORT": str(port),
                     "KG_COLLECTION": "TestKG",
                     "DEVELOPMENT_COLLECTION": "TestDev",
@@ -344,6 +348,7 @@ class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
             with mock.patch.dict(
                 "os.environ",
                 {
+                    "WEAVIATE_URL": f"http://localhost:{port}",
                     "WEAVIATE_PORT": str(port),
                     "KG_COLLECTION": "TestKG",  # PascalCase request
                     "DEVELOPMENT_COLLECTION": "TestDev",

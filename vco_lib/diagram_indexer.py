@@ -901,6 +901,28 @@ def _weaviate_upsert(
         logger.warning("Weaviate upsert refused: %s", err)
         return False
 
+    # v0.2.94 W-WEAVIATE: refuse a class named for a TEST FIXTURE, unless the
+    # process declares it owns it. The live evidence for THIS seam is an empty
+    # `Foo_Diagrams` class on the maintainer's Weaviate — the same shape as the
+    # `Alpha_KnowledgeGraph` incident, caught one step earlier (creation with
+    # nothing written yet). Refuse the way the sibling refusal above does — log
+    # + `False`, not raise — because the caller enqueues a RETRY on an
+    # exception and this refusal is permanent: a retry queue that can never
+    # drain is worse than the write. ERROR, not WARNING: the neighbour above
+    # rejects a misconfiguration, this one rejects data going somewhere wrong.
+    from vco_lib.fixture_class_guard import (
+        FixtureClassWriteRefused,
+        guard_fixture_class_write,
+    )
+
+    try:
+        guard_fixture_class_write(
+            collection_name, operation="index a diagram into", weaviate_url=url
+        )
+    except FixtureClassWriteRefused as refusal:
+        logger.error("Weaviate upsert refused: %s", refusal)
+        return False
+
     try:
         import weaviate  # type: ignore
         from weaviate.classes.query import Filter  # type: ignore

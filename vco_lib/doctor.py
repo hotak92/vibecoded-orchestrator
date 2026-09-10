@@ -1589,7 +1589,8 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             ),
             detail={"unclaimed": [u.name for u in unclaimed]},
         )
-        if not unclaimed:
+        extra_fixture = list(getattr(scan, "fixture_shaped", ()) or ())
+        if not unclaimed and not extra_fixture:
             return [agreement]
         # v0.2.92 (reported-not-fixed item 3): every REGISTERED project
         # agrees, but populated classes exist that no registered project
@@ -1598,22 +1599,19 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
         # but the CLI text, while a problem finding reaches the ledger and
         # the launcher's Updates page. The remedy text is LOOK-only — this
         # probe names data; it never proposes deleting it.
-        names = ", ".join(f"{u.name} ({u.count} objects)" for u in unclaimed)
         return [
             Finding(
                 probe="kg_binding_evidence",
                 status=STATUS_PROBLEM,
-                summary=(
-                    f"{len(unclaimed)} populated KG class(es) no registered "
-                    f"project claims: {names}"
-                ),
+                summary=_kg_unclaimed_summary(unclaimed, extra_fixture),
                 fix=FIX_DEFER,
                 condition_id=CID_KG_UNCLAIMED,
-                command=_kg_unclaimed_remediation(unclaimed),
+                command=_kg_unclaimed_remediation(unclaimed, extra_fixture),
                 detail={
                     "unclaimed": [
                         {"class": u.name, "count": u.count} for u in unclaimed
                     ],
+                    "fixture_shaped": extra_fixture,
                     "verdicts": jsonable_verdicts(scan),
                 },
             ),
@@ -1651,7 +1649,63 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
     ]
 
 
-def _kg_unclaimed_remediation(unclaimed) -> str:
+def _fixture_shaped_names(names) -> list[str]:
+    """The subset of *names* whose project stem is one of VCO's test fixtures.
+
+    ONE home for the question, asked by the summary, the remedy text and the
+    deferral entry — three surfaces that must agree about which classes are
+    fixture residue. The rule itself lives in
+    :mod:`vco_lib.fixture_class_guard`, beside the write guard that stops new
+    ones being created; this is only the doctor's read of it.
+    """
+    from vco_lib.fixture_class_guard import fixture_stem_of
+
+    return [n for n in names if fixture_stem_of(n) is not None]
+
+
+def _kg_unclaimed_summary(unclaimed, extra_fixture=()) -> str:
+    """The one-line diagnosis for populated classes no project claims.
+
+    A fixture-shaped class is a DIFFERENT diagnosis from a removed project's
+    leftover, and the difference is actionable: there is no owning project to
+    re-add, and there never was one. The 2026-09 field case was
+    ``Alpha_KnowledgeGraph`` with 70 real knowledge nodes — ``Alpha`` being a
+    name that exists only in this repo's tests. Saying "a removed project's
+    leftover" there sends the reader looking for a project that never existed.
+    """
+    fixture = set(_fixture_shaped_names(u.name for u in unclaimed))
+    names = ", ".join(
+        f"{u.name} ({u.count} objects"
+        + (", fixture-shaped)" if u.name in fixture else ")")
+        for u in unclaimed
+    )
+    extra = list(extra_fixture or ())
+    # v0.2.94 (review LOW-1): the ownership analysis above is KG-scoped, so
+    # `Foo_Diagrams` and `<Fixture>_Code*` never reached it. They need no
+    # analysis — the stem is a name no project has — so they are named here.
+    tail = (
+        f" Plus {len(extra)} fixture-shaped class(es) in other families: "
+        f"{', '.join(extra)}."
+        if extra else ""
+    )
+    if not unclaimed:
+        return (
+            f"{len(extra)} fixture-shaped class(es) — written by a test or "
+            f"probe harness, not by any project: {', '.join(extra)}"
+        )
+    if not fixture:
+        return (
+            f"{len(unclaimed)} populated KG class(es) no registered "
+            f"project claims: {names}" + tail
+        )
+    return (
+        f"{len(unclaimed)} populated KG class(es) no registered project "
+        f"claims; {len(fixture)} of them fixture-shaped ghost(s) — written "
+        f"by a test or probe harness, not by any project: {names}" + tail
+    )
+
+
+def _kg_unclaimed_remediation(unclaimed, extra_fixture=()) -> str:
     """The exact block the deferral + the CLI both print. LOOK-only.
 
     The constraint is absolute (v0.2.92 reported-not-fixed item 3): a
@@ -1661,11 +1715,52 @@ def _kg_unclaimed_remediation(unclaimed) -> str:
     shipping one, even unexecuted, is shipping a deletion path, and the
     machine's own Weaviate tooling is where that decision belongs. Dismissal
     is the recorded "this leftover is expected" answer.
+
+    v0.2.94 adds a leading block for the FIXTURE-SHAPED subset, because the
+    three resolutions below all presuppose an owning project and a fixture
+    ghost has none. That block stays inside the same constraint: the parity
+    check it prints is a READ, and the drop it describes is prose the user
+    performs — a destructive step this text still refuses to hand over as a
+    runnable command.
     """
-    names = ", ".join(sorted(u.name for u in unclaimed))
+    names = ", ".join(sorted(u.name for u in unclaimed)) or "(none)"
+    fixture = sorted(
+        set(_fixture_shaped_names(u.name for u in unclaimed))
+        | set(extra_fixture or ())
+    )
+    fixture_block = ""
+    if fixture:
+        # A fixture-shaped ghost needs DIFFERENT instructions: the three
+        # resolutions below (re-add the project / re-bind it / migrate) all
+        # assume an owning project, and there is none. Still LOOK-only — the
+        # parity check is a read, and the destructive step stays prose the
+        # user performs with their own tooling, never a command this text
+        # prints (v0.2.92 item 3's constraint holds here too: shipping a drop
+        # command, even unexecuted, is shipping a deletion path).
+        fixture_block = (
+            f"# Fixture-shaped: {', '.join(fixture)}\n"
+            "#   The name before '_KnowledgeGraph' is one of VCO's own TEST\n"
+            "#   FIXTURE project names (vco_lib/fixture_class_guard.py,\n"
+            "#   FIXTURE_PROJECT_NAMES). No project owns this data and none\n"
+            "#   ever did: a test or an ad-hoc probe harness reached a live\n"
+            "#   Weaviate under a fixture's environment. Nothing below\n"
+            "#   applies — there is no project to re-add.\n"
+            "#   VERIFY PARITY FIRST (both reads, nothing is changed):\n"
+            "#     curl -s \"$WEAVIATE_URL/v1/objects?class=<class>&limit=5\"\n"
+            "#     compare title/file_path against your real KG collection\n"
+            "#   If every object also exists in the project collection it was\n"
+            "#   copied from, the ghost is a duplicate and dropping it loses\n"
+            "#   nothing. THAT DROP IS YOURS TO MAKE: VCO does not print the\n"
+            "#   command and never performs it. If parity does NOT hold, the\n"
+            "#   ghost holds the only copy — migrate it before anything else\n"
+            "#   (python -m vco_lib.project_init migrate-collections --help).\n"
+            "#   New writes of this shape are REFUSED since v0.2.94, so this\n"
+            "#   set cannot grow: the guard is vco_lib/fixture_class_guard.py.\n"
+        )
     return (
         f"# Classes affected: {names}\n"
-        "# These classes hold objects but no registered project reads them.\n"
+        + fixture_block
+        + "# These classes hold objects but no registered project reads them.\n"
         "# Nothing was changed by this report and nothing is deleted by it.\n"
         "# If the owning project still exists: re-add it (launcher Projects\n"
         "#   page -> Add existing folder) so its binding row returns.\n"
@@ -1699,13 +1794,35 @@ def _kg_unclaimed_entry(finding: Finding):
             for c in (finding.detail.get("unclaimed") or [])
             if isinstance(c, dict) and isinstance(c.get("class"), str)
         }
+        # v0.2.94 LOW-1: non-KG fixture-shaped classes key the dismissal too,
+        # so a NEW one re-fires an entry the user had dismissed.
+        | {
+            str(n) for n in (finding.detail.get("fixture_shaped") or [])
+            if isinstance(n, str)
+        }
+    )
+    fixture = sorted(_fixture_shaped_names(classes))
+    fixture_note = (
+        (
+            f"{len(fixture)} of these are FIXTURE-SHAPED "
+            f"({', '.join(fixture)}): the stem is one of VCO's own test "
+            "fixture project names, so no project ever owned the data — a "
+            "test or an ad-hoc probe harness reached a live Weaviate under a "
+            "fixture's environment. There is nothing to re-add or re-bind; "
+            "the printed remedy explains the parity check and leaves the "
+            "drop to you. New writes of this shape are refused since "
+            "v0.2.94, so the set cannot grow. "
+        )
+        if fixture
+        else ""
     )
     return DeferralEntry(
         condition_id=CID_KG_UNCLAIMED,
         title="Populated KG class(es) no registered project claims",
         detected=finding.summary,
         why_deferred=(
-            "This is a diagnosis, not a defect report: the class(es) hold "
+            fixture_note
+            + "This is a diagnosis, not a defect report: the class(es) hold "
             "real objects while no registered project's binding names them "
             "and no registered project's folder anchors their sampled "
             "paths — data with no reader, typically a removed project's "

@@ -14221,8 +14221,10 @@ def _ensure_collections(embed_config: dict,
         )
         return
 
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    weaviate_url = f"http://localhost:{weaviate_port}"
+    # v0.2.94 LOW-3: same chain as the readiness gate below, which honoured
+    # $WEAVIATE_URL while this built from the PORT alone — two targets, one run.
+    weaviate_port = os.environ.get("WEAVIATE_PORT") or str(DEFAULT_WEAVIATE_PORT)
+    weaviate_url = os.environ.get("WEAVIATE_URL") or f"http://localhost:{weaviate_port}"
 
     # v0.2.89 FIX 1: BOUNDED readiness gate. Raises TimeoutError on an
     # unreachable Weaviate so the caller's soft-fail-to-deferral path runs
@@ -14499,7 +14501,14 @@ def _ensure_collections(embed_config: dict,
     created: list[str] = []
     failed: list[tuple[str, str]] = []
     schema_url = f"{weaviate_url}/v1/schema"
+    from vco_lib.fixture_class_guard import FixtureClassWriteRefused, guard_fixture_class_write
     for name, builder in missing:
+        try:
+            # v0.2.94: refuse at ADD time — created here then refused at every sync
+            guard_fixture_class_write(name, operation="create", weaviate_url=weaviate_url)
+        except FixtureClassWriteRefused as refusal:
+            failed.append((name, str(refusal)))
+            continue
         try:
             status, resp_body = _wh.http_request("POST", schema_url, body=builder(name), timeout=15)
             if 200 <= status < 300:

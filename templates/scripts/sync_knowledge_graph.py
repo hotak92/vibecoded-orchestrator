@@ -4287,6 +4287,42 @@ def _validate_argv_flags(argv: "List[str]") -> None:
         sys.exit(2)
 
 
+def _refuse_fixture_shaped_targets() -> None:
+    """Pre-flight refusal: never write a class named for a TEST FIXTURE.
+
+    v0.2.94 W-WEAVIATE. `Alpha_KnowledgeGraph` on the maintainer's live
+    Weaviate held 70 REAL `knowledge/concepts/*.md` nodes, and `Alpha` is not
+    a project — it is a pytest fixture's project name. The writer was this
+    script: a child spawned inside a test session that had leaked
+    `KG_COLLECTION=Alpha_KnowledgeGraph` into `os.environ` while nothing
+    pinned `WEAVIATE_URL` away from the live instance.
+
+    ONE call site, here in `main()`, covers every write the script can make —
+    project nodes, docs, and shared-scope routing all run under it — and it
+    fires BEFORE any backend connection, so a refused run touches nothing.
+    `--check-drift` is already handled above: it is a READ, and this is a
+    write guard.
+
+    Exit 2 (usage / refused root), matching the sibling wrong-root refusal
+    right below it: nothing was attempted, so it is not a sync failure.
+    """
+    from vco_lib.fixture_class_guard import (
+        FixtureClassWriteRefused,
+        guard_fixture_class_write,
+    )
+
+    for target in (COLLECTION_NAME, DEV_COLLECTION_NAME, SHARED_COLLECTION_NAME):
+        if not target:
+            continue
+        try:
+            guard_fixture_class_write(
+                target, operation="sync into", weaviate_url=WEAVIATE_URL
+            )
+        except FixtureClassWriteRefused as refusal:
+            print(f"❌ {refusal}", file=sys.stderr)
+            sys.exit(2)
+
+
 def main():
     """Main entry point.
 
@@ -4331,6 +4367,10 @@ def main():
     if sys.argv[1] == "--check-drift":
         _run_check_drift()
         return
+
+    # v0.2.94 W-WEAVIATE: refuse a write into a TEST-FIXTURE-named class
+    # before anything connects. See `_refuse_fixture_shaped_targets`.
+    _refuse_fixture_shaped_targets()
 
     # v0.2.89 BUG 3 validation leg: refuse to run a TREE sync against a
     # root that has neither knowledge/ nor a docs root — the exact shape of

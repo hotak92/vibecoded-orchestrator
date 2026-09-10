@@ -97,11 +97,12 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 #     `vco_lib/codegraph_naming.py` — they answer "is this string a canonical
 #     project name?", which is that module's whole subject, and they are pure.
 #     The analyzer imports both under their historical private aliases.
-# Net, including that fix: 7227. v0.2.94 (templates ruff sweep): a dead
-# `import requests` and a 3→2-line except block → 7225, and the maximum moved
-# down with it, as this ratchet's rule demands. This is the ONE pin:
-# tests/test_v0292_n35_rewire_transform.py::TestTheRatchetHeld imports it.
-_ANALYZER_LINES_MAX = 7225
+# Net, including that fix: 7227. v0.2.94: the templates ruff sweep removed a dead
+# `import requests` and a 3→2-line except block (−2) and the fixture-guard lane
+# routed `connect()` through `vco_lib.weaviate_helpers` (−1) → 7224, and the
+# maximum moved down with it, as this ratchet's rule demands. This is the ONE
+# pin: tests/test_v0292_n35_rewire_transform.py::TestTheRatchetHeld imports it.
+_ANALYZER_LINES_MAX = 7224
 
 
 def _measure() -> int:

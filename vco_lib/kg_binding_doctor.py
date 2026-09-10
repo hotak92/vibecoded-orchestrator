@@ -238,6 +238,16 @@ class BindingEvidenceScan:
     #: Defaulted so pre-existing constructors (tests, the registry probe)
     #: stay source-compatible; the scan itself always passes it explicitly.
     unclaimed: tuple[UnclaimedClass, ...] = ()
+    #: v0.2.94: classes in ANY shipped family whose project stem is one of
+    #: VCO's TEST FIXTURE names, minus the KG ones already in `unclaimed`.
+    #:
+    #: The ownership analysis above is KG-scoped by construction — it compares
+    #: KG bindings against KG data — so `Foo_Diagrams` and `<Fixture>_Code*`
+    #: were invisible to it. For a fixture-shaped class the analysis is not
+    #: needed: the stem is a name no project has, so nothing can own it. Names
+    #: only, no counts: this is a listing, and adding a per-class Aggregate
+    #: call to a `full`-scope probe buys nothing the report uses.
+    fixture_shaped: tuple[str, ...] = ()
 
     @property
     def mismatches(self) -> tuple[ProjectBindingVerdict, ...]:
@@ -519,8 +529,27 @@ def scan_kg_binding_evidence(
         and cls not in claimed
         and cls != exempt
     )
+    # v0.2.94: fixture-shaped classes in EVERY family (see the field's note).
+    from vco_lib.fixture_class_guard import fixture_stem_of
+
+    # An OWNED class is owned, whatever its stem looks like: a binding row that
+    # names it, or a verdict that claims it, settles the question and this
+    # listing must stay silent. (It cannot arise on a healthy install — the
+    # add-time guard refuses a fixture-named class — but the doctor reports
+    # what it SEES, and reporting someone's bound collection as a ghost is the
+    # false positive that would make the whole reading untrustworthy.)
+    already = {u.name for u in unclaimed} | set(owners) | claimed
+    fixture_shaped = tuple(
+        sorted(
+            name for name in listing
+            if isinstance(name, str)
+            and name not in already
+            and fixture_stem_of(name) is not None
+        )
+    )
     return BindingEvidenceScan(
-        verdicts=tuple(verdicts), unclaimed=unclaimed
+        verdicts=tuple(verdicts), unclaimed=unclaimed,
+        fixture_shaped=fixture_shaped,
     )
 
 
