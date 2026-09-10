@@ -69,7 +69,10 @@ classifiers = [
 # distribution as a dependency of one of its own sub-distributions would make
 # pip resolve the repository as a package of itself).
 dependencies = [
-    "mcp>=1.27.0",
+    # Ceiling MUST match requirements.txt / the root pyproject `mcp` extra: mcp 2.0
+    # removed `mcp.server.fastmcp`, which both shipped servers import. This surface
+    # had no ceiling until v0.2.94 (Dependabot #364 would have lifted it silently).
+    "mcp>=1.27.0,<2",
     "weaviate-client>=4.21.0",
     "aiohttp>=3.13.5",
     "httpx>=0.28.1",
