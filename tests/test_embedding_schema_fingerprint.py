@@ -5,18 +5,10 @@ The fingerprint (`embedding_schema_fingerprint`) and the live probe
 embedding-invalidating change (slot removed / dim changed), NOT on a
 version bump and NOT on a purely-additive optional-slot gap.
 """
-import sys
-from pathlib import Path
 from unittest import mock
 
-import pytest
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from vco_lib import weaviate_schema as ws
 from vco_lib import project_init as pi
+from vco_lib import weaviate_schema as ws
 
 
 # ── Fingerprint ─────────────────────────────────────────────────────────

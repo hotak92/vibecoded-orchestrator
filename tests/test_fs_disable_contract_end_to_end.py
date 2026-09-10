@@ -164,24 +164,27 @@ class TestAgentFsDisableContract:
             text=True,
         )
         # The subprocess might still return non-zero for unrelated
-        # reasons (template path missing in the test fixture etc.). The
-        # load-bearing assertion is: enabled-side file is STILL absent.
-        # If install_project_bundle re-created the file, the FS-disable
-        # contract is broken.
+        # reasons (template path missing in the test fixture etc.), so the
+        # two filesystem assertions below — not the exit code — carry the
+        # contract.
         enabled = tmp_project / ".claude" / "agents" / "coder.md"
         disabled = tmp_project / ".claude" / "agents.disabled" / "coder.md"
         assert disabled.exists(), (
             "post-update: disabled file must STILL exist; the FS-disable "
             "contract requires install-bundle to honour the .disabled/ companion"
         )
-        # We can't assert `!enabled.exists()` strictly without knowing
-        # the bundle's enumeration — if `coder.md` is NOT in the
-        # current bundle's `templates/agents/free/`, the function never
-        # touches that file. The negative we can assert is: if the
-        # template DID ship coder.md, the file should be empty/absent
-        # on the enabled side because skip-disabled fired.
-        # The action list in the JSON output is the load-bearing
-        # check; parse it when present.
+        # The enabled-side negative holds UNCONDITIONALLY, and is the whole
+        # point: `_simulate_disable_agent` renamed the file away, so `enabled`
+        # was already absent going in. It can only exist now if the update
+        # RE-CREATED it — the exact violation this test exists to catch. It is
+        # not conditional on the bundle enumerating `coder.md` either: if the
+        # template never shipped it, nothing wrote it and the file is still gone.
+        assert not enabled.exists(), (
+            "post-update: install-bundle re-created the enabled-side file, "
+            "silently re-enabling an agent the user disabled"
+        )
+        # Belt-and-braces on the JSON when the run succeeded: the action for
+        # coder.md should be skip-disabled.
         if result.returncode == 0 and result.stdout.strip():
             try:
                 payload = json.loads(result.stdout)

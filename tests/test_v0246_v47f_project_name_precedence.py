@@ -22,14 +22,10 @@ gate that asserts this rule.
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
-
-import pytest
 
 
 # Load install.py as a module (same pattern as test_v0246_v47gstub_adopt_contract.py).

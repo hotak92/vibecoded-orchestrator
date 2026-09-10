@@ -18,7 +18,7 @@ Usage:
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from datetime import datetime
 import re
 
@@ -56,7 +56,7 @@ sys.path.insert(0, str(
 # ``AuthlibDeprecationWarning`` from ``weaviate-client``'s transitive
 # ``authlib`` dep.  See ``claude_mcp_servers/weaviate_mcp/server.py``
 # for the canonical filter rationale.
-import warnings as _dd_warnings
+import warnings as _dd_warnings  # noqa: E402 - must follow the sys.path bootstrap above; this line OPENS the AuthlibDeprecationWarning filter block that must itself run before `import weaviate`
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
     _dd_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
@@ -67,8 +67,8 @@ except ImportError:
         category=DeprecationWarning,
     )
 
-import weaviate
-from weaviate.classes.query import Filter, MetadataQuery
+import weaviate  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
+from weaviate.classes.query import Filter, MetadataQuery  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 
 # Configuration
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
@@ -257,7 +257,7 @@ class DuplicateDetector:
         """Close Weaviate connection"""
         try:
             self.client.close()
-        except:
+        except Exception:  # best-effort teardown: never mask an interrupt
             pass
 
     def find_duplicates(self) -> List[Dict]:
@@ -417,10 +417,10 @@ class DuplicateDetector:
                 f"### {i}. Duplicate Pair (Confidence: {confidence_pct:.1f}%)\n",
                 f"**Node 1**: [{dup['node1']['title']}]({dup['node1']['path']})",
                 f"**Node 2**: [{dup['node2']['title']}]({dup['node2']['path']})\n",
-                f"**Similarities**:",
+                "**Similarities**:",
                 f"- Semantic: {semantic_pct:.1f}%",
                 f"- Title: {title_pct:.1f}%\n",
-                f"**Recommendation**:",
+                "**Recommendation**:",
                 ""
             ])
 
@@ -518,7 +518,7 @@ def main():
             output_path.parent.mkdir(parents=True, exist_ok=True)
             detector.generate_report(duplicates, output_path)
 
-            print(f"\n📊 Summary:")
+            print("\n📊 Summary:")
             print(f"   Total duplicates: {len(duplicates)}")
             high_confidence = sum(1 for d in duplicates if d["confidence"] >= 0.98)
             print(f"   High confidence (≥98%): {high_confidence}")

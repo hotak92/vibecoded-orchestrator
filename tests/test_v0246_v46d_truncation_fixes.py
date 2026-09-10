@@ -23,7 +23,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -320,7 +319,7 @@ class DetectDuplicatesTests(unittest.TestCase):
 
         buf = io.StringIO()
         with redirect_stdout(buf):
-            duplicates = finder.find_duplicates()
+            finder.find_duplicates()
 
         output = buf.getvalue()
         # The found-count message should report the actual full count.

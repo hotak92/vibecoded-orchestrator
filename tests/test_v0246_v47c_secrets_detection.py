@@ -362,9 +362,9 @@ class TestMultiLineSecretPreservation:
         # was returned, the second-line material is NOT in its value.
         for entry in result:
             assert "MIIE_real_secret_material_PLACEHOLDER" not in entry.value, (
-                f"audit_env_secrets returned a value that includes "
-                f"second-line material from a multi-line secret. The "
-                f"parser was extended; update this test + the doc."
+                "audit_env_secrets returned a value that includes "
+                "second-line material from a multi-line secret. The "
+                "parser was extended; update this test + the doc."
             )
 
     def test_rewrite_skips_keys_not_in_migrated_list(self, tmp_path: Path) -> None:

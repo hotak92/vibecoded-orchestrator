@@ -167,7 +167,7 @@ except Exception:
 try:
     from weaviate_mcp.query_logger import ToolUsageLogger
     HAS_LOGGER = True
-except Exception as e:
+except Exception:
     HAS_LOGGER = False
 
 def get_weaviate_client():
@@ -263,7 +263,7 @@ def get_node_info(title: str):
             print(f"Tags: {', '.join(props.get('tags', []))}")
             print(f"Links: {len(props.get('links', []))}")
             if props.get('links'):
-                print(f"  Connections:")
+                print("  Connections:")
                 for link in props['links'][:10]:
                     print(f"    - {link}")
                 if len(props['links']) > 10:
@@ -435,9 +435,9 @@ def find_connections(title: str):
         total_connections = len(target_links) + len(inbound)
         if total_connections > 0:
             print(f"\n💡 Tip: Found {total_connections} connections.")
-            print(f"   Use 'kg-info info \"<title>\"' to explore any connected node")
+            print("   Use 'kg-info info \"<title>\"' to explore any connected node")
             if total_connections > 5:
-                print(f"   Consider asking: \"Which of these connections are most relevant for [your task]?\"")
+                print("   Consider asking: \"Which of these connections are most relevant for [your task]?\"")
         print()
 
     finally:

@@ -16,8 +16,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from vco_lib.project_init import (
     _CHUNKER_BUMP_VERSION,
     _crosses_chunker_boundary,
@@ -133,4 +131,5 @@ class TestEmitChunkerResyncDeferral:
             # Test the section header appears EXACTLY ONCE (the YAML
             # frontmatter and the markdown header both contain the
             # condition_id, but each entry has one ## header in the body).
+            assert content_after_first.count("## chunker_preset_overhaul_pending ") == 1
             assert content_after_second.count("## chunker_preset_overhaul_pending ") == 1

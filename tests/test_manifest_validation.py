@@ -14,8 +14,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from tests.common.child_env import child_env
 from vco_lib.manifest_validation import (
     ValidationResult,

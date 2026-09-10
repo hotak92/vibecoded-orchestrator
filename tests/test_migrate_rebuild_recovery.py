@@ -30,7 +30,6 @@ Post-fix contract (tested here):
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import unittest

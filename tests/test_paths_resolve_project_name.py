@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:

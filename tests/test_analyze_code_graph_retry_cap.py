@@ -121,7 +121,8 @@ def temp_repo_with_python_file(tmp_path: Path) -> Path:
 def _create_lowercase_class(class_name: str) -> None:
     """Create a Weaviate class via HTTP — bypasses the weaviate-client
     library so the test has no dep on the v4 schema-builder API."""
-    import urllib.request, json
+    import json
+    import urllib.request
     body = json.dumps({
         "class": class_name,
         "vectorizer": "none",

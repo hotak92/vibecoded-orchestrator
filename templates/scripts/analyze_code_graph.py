@@ -52,7 +52,6 @@ import re
 import sys
 import tempfile
 import uuid
-import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Tuple, Mapping
@@ -1068,7 +1067,7 @@ def _dispatch_name_for_file(file_path: Path) -> str:
 # ``weaviate-client``'s transitive ``authlib`` dep during module import.
 # See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
 # filter at the MCP-server level.  MUST run BEFORE ``import weaviate``.
-import warnings as _cg_warnings
+import warnings as _cg_warnings  # noqa: E402 - must follow the sys.path bootstrap above; this line OPENS the AuthlibDeprecationWarning filter block that must itself run before `import weaviate`
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
     _cg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
@@ -1205,7 +1204,7 @@ except ImportError as _exc:
 # (CodeEmbed service / Ollama / OpenAI) AND the right named-vector slot
 # (codesage_embed / jina_embed / openai_code_embed / qwen3_embed
 # fallback) from env, so this module no longer hardcodes any of it.
-from vco_lib.embedding_service import (
+from vco_lib.embedding_service import (  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
     EmbeddingService,
     NoEmbeddingBackendError,
 )
@@ -4749,9 +4748,8 @@ class CodeGraphAnalyzer:
             try:
                 self.store_entity(entity)
                 count += 1
-            except Exception as exc:
-                # Non-fatal — log and continue
-                pass
+            except Exception as exc:  # non-fatal: skip this row, keep going
+                logger.debug(f"store_entity failed for an interaction: {exc}")
         return count
 
     def _count_stale_rows_in_collection(self, coll) -> Optional[int]:
@@ -6787,7 +6785,7 @@ def main():
         print(f"📁 Collections: {_collection_name('Code*', project_name)}")
         print(f"🔄 Incremental: {args.incremental}")
         if args.named_vectors:
-            print(f"📐 Named vectors: enabled")
+            print("📐 Named vectors: enabled")
         print()
 
     # Handle migration from shared collections
@@ -7045,7 +7043,7 @@ def main():
         else:
             print("✅ Code Graph Analysis Complete")
         print("="*60)
-        print(f"📊 Statistics:")
+        print("📊 Statistics:")
         print(f"   Modules: {stats['modules']}")
         print(f"   Classes: {stats['classes']}")
         print(f"   Functions: {stats['functions']}")

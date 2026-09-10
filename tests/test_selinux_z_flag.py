@@ -23,7 +23,6 @@ integration is wired into `_detect_system`.
 from __future__ import annotations
 
 import io
-import platform
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -89,7 +88,6 @@ class DetectSelinuxEnforcingTests(unittest.TestCase):
     def test_sysfs_fallback_when_getenforce_missing(self) -> None:
         """When `getenforce` is not on PATH (minimal container), fall
         back to reading /sys/fs/selinux/enforce."""
-        m = mock.mock_open(read_data="1")
         with mock.patch.object(install_mod.platform, "system", return_value="Linux"), \
                 mock.patch.object(install_mod.shutil, "which", return_value=None), \
                 mock.patch("install.Path") as mock_path:

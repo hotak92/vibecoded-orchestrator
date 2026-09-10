@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import install  # noqa: E402 — install.py is at repo root
-from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
+from vco_lib.deferral_report import DeferralReport  # noqa: E402
 from vco_lib import weaviate_schema as ws  # noqa: E402
 
 

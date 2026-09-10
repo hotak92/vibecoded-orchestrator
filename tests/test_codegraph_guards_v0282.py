@@ -31,7 +31,6 @@ from __future__ import annotations
 import importlib.util
 import types
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest

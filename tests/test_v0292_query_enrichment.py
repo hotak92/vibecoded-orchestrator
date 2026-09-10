@@ -34,7 +34,6 @@ criteria in PLAN-v0292-WAVE3-2026-09-03.md's WP-E section:
 from __future__ import annotations
 
 import json
-import os
 import traceback
 from pathlib import Path
 
@@ -469,6 +468,10 @@ class TestEnvKnobs:
         # (codesage: target 1100, budget 1843) — there the unclamped value
         # abandons the share ceiling entirely and runs to the budget.
         from vco_lib.query_enrichment import SHARE_MAX, SHARE_MIN
+
+        # The shipped default must not itself need clamping — otherwise every
+        # default-path run is silently clamped and the knob is a lie.
+        assert SHARE_MIN <= DEFAULT_SHARE <= SHARE_MAX
 
         path = _write_transcript(
             tmp_path,

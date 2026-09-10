@@ -16,8 +16,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from claude_mcp_servers.rl_client import citation_pending as cp
 from claude_mcp_servers.rl_client import answer_window as aw
 from claude_mcp_servers.scripts import rl_drain_citations as drain
@@ -265,8 +263,9 @@ class TestSharedModuleImports:
             extract_answer_window, load_messages, find_kg_positions,
             match_position_for_query, token_estimate,
         )
-        assert callable(extract_answer_window)
-        assert callable(match_position_for_query)
+        for fn in (extract_answer_window, load_messages, find_kg_positions,
+                   match_position_for_query, token_estimate):
+            assert callable(fn), fn
 
     def test_citation_compute_importable(self) -> None:
         from claude_mcp_servers.rl_client.citation_compute import compute_citation
@@ -277,7 +276,9 @@ class TestSharedModuleImports:
             stage_pending, read_pending, delete_pending, sweep_expired,
             list_pending_for_session, pending_dir,
         )
-        assert callable(stage_pending)
+        for fn in (stage_pending, read_pending, delete_pending, sweep_expired,
+                   list_pending_for_session, pending_dir):
+            assert callable(fn), fn
 
     def test_mcp_monitor_uses_shared_extract(self) -> None:
         # server.py's _rl_extract_answer_window is now a thin shim that

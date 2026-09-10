@@ -33,7 +33,6 @@ import re
 import sys
 from pathlib import Path
 from types import ModuleType
-from unittest import mock
 
 import pytest
 

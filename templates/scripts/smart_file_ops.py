@@ -25,7 +25,7 @@ def get_file_line_count(file_path: str) -> int:
     try:
         with open(file_path) as f:
             return sum(1 for _ in f)
-    except:
+    except (OSError, UnicodeDecodeError):
         return 0
 
 
@@ -40,7 +40,7 @@ def get_file_section(file_path: str, start_line: int, num_lines: int) -> Optiona
             lines = f.readlines()
             section = lines[start_line:start_line + num_lines]
             return ''.join(section)
-    except:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -57,7 +57,7 @@ def find_in_file(file_path: str, pattern: str) -> Optional[Tuple[int, str]]:
                 if pattern in line:
                     return (i, line.strip())
         return None
-    except:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -77,7 +77,9 @@ def get_file_summary(file_path: str) -> dict:
             "lines": get_file_line_count(file_path),
             "modified": stat.st_mtime
         }
-    except:
+    except OSError:
+        # stat() on a missing / unreadable path; get_file_line_count already
+        # absorbs its own read errors and reports 0.
         return {"exists": False}
 
 

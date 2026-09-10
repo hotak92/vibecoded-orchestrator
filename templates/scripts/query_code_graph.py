@@ -617,7 +617,16 @@ class CodeGraphQuery:
         effective_query = query
         try:
             _svc = _get_or_create_embedding_service()
-            _code_model = _svc.code_model_id if _svc is not None else DEFAULT_CODE_MODEL
+            if _svc is not None:
+                _code_model = _svc.code_model_id
+            else:
+                # No service: lean install, or no embedding backend reachable
+                # (the case NoEmbeddingBackendError names). Fall back to the
+                # SHARED default so the budget still matches the model the
+                # embed path will use — never a literal invented here.
+                from vco_lib.embedding_service import (
+                    DEFAULT_CODE_MODEL as _code_model,
+                )
             from vco_lib.query_enrichment import build_query as _build_query
 
             effective_query = _build_query(

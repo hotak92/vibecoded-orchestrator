@@ -763,7 +763,7 @@ class TestUnmigratedLaddersAreNamedNotForgotten:
     of them is unified, which is the prompt to add it above."""
 
     OTHER_OWNERS = {
-        "analyze_code_graph.py": "not WP-1's file; ratchet-pinned at exactly 7227 lines",
+        "analyze_code_graph.py": "not WP-1's file; under the downward-only line ratchet (tests/test_analyze_code_graph_ratchet.py)",
         "sync_knowledge_graph.py": "WP-4's file",
         "maintain_knowledge_graph.py": "no lane owns it this cycle",
     }

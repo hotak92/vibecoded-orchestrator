@@ -35,10 +35,8 @@ from __future__ import annotations
 import sys
 import urllib.error
 import urllib.request
-from io import BytesIO
 from pathlib import Path
-from typing import Dict, Optional
-from unittest.mock import patch
+from typing import Dict
 
 import pytest
 

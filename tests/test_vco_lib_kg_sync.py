@@ -22,8 +22,6 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
-import pytest
-
 from vco_lib.kg_sync import QUERY_MAX_LIMIT, batch_query_content_hashes
 
 
@@ -199,7 +197,6 @@ class TestOnWarnCallback:
         """Observability failure must NEVER break the caller. A buggy
         on_warn that raises is silently ignored — the helper still
         returns its result normally."""
-        rows = [{"file_path": "a.md", "content_hash": "h"}]
         def _exploding_warn(channel, data):
             raise RuntimeError("on_warn is broken")
         with patch("vco_lib.kg_sync.post_graphql_safe") as mock_post:

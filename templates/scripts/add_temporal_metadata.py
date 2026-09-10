@@ -74,7 +74,7 @@ def get_git_dates(file_path: Path) -> Tuple[Optional[str], Optional[str]]:
                 updated = dt.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00Z")
 
         return created, updated
-    except (subprocess.CalledProcessError, ValueError) as e:
+    except (subprocess.CalledProcessError, ValueError):
         # Fall back to filesystem timestamps on any error (hour precision)
         stat = file_path.stat()
         dt_created = datetime.fromtimestamp(stat.st_ctime)
@@ -220,7 +220,7 @@ def add_frontmatter(file_path: Path, dry_run: bool = False, update: bool = False
     frontmatter += f'created: {created or "unknown"}\n'
     frontmatter += f'updated: {updated or "unknown"}\n'
     frontmatter += f'valid_from: {valid_from or "unknown"}\n'
-    frontmatter += f'valid_until: null\n'
+    frontmatter += 'valid_until: null\n'
     frontmatter += f'status: {status}\n'
     frontmatter += "---\n\n"
 
@@ -276,7 +276,7 @@ def main():
         return 0
 
     print(f"\n{'='*60}")
-    print(f"Temporal Metadata Migration")
+    print("Temporal Metadata Migration")
     print(f"{'='*60}")
     print(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
     print(f"Files to process: {len(files)}")
@@ -294,7 +294,7 @@ def main():
 
     # Summary
     print(f"\n{'='*60}")
-    print(f"Summary:")
+    print("Summary:")
     print(f"  Modified: {modified_count}")
     print(f"  Skipped (already has frontmatter): {skipped_count}")
     print(f"  Total: {len(files)}")

@@ -137,6 +137,122 @@ class TestResolutionContext:
         # allowed to overrule the caller's env.
         assert srv._hub_context_is_authoritative() is False
 
+    # ── v0.2.94: the walk must not climb into the user's HOME ──────────
+    #
+    # EVERY Claude Code user has ~/.claude/settings.json — the GLOBAL config
+    # file, not a project marker. The rung-2 walk probed for exactly that
+    # filename, so from any cwd with no project above it the walk climbed all
+    # the way to $HOME, matched the global config and returned the home
+    # directory as "the project". Everything keyed on the project root (the
+    # KG-collection fallback, KG_BASE_DIR-relative writes, doctor paths) then
+    # pointed at the user's home. A project lives UNDER home, never at or
+    # above it — so home is both rejected and the stopping point.
+
+    def test_user_home_is_never_the_project_root(self, tmp_path, monkeypatch):
+        """A cwd under home with no project above it must NOT resolve to home."""
+        srv = _srv()
+        fake_home = tmp_path / "home" / "someone"
+        (fake_home / ".claude").mkdir(parents=True)
+        # Claude Code's GLOBAL config — present for every real user.
+        (fake_home / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+        scratch = fake_home / "scratch" / "deeper"
+        scratch.mkdir(parents=True)
+
+        monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(fake_home))
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(scratch)
+
+        root, kind = srv._resolution_context()
+        assert root != fake_home.resolve(), (
+            "~/.claude/settings.json is Claude Code's GLOBAL config, not a "
+            "project marker — the walk must never accept the user's home"
+        )
+        assert (root, kind) == (srv._MODULE_OWN_ROOT, srv._CTX_MODULE)
+        # …and the documented degrade still marks the answer a guess, so an
+        # explicit env var beats it.
+        assert srv._hub_context_is_authoritative() is False
+
+    def test_walk_stops_at_home_and_ignores_markers_above_it(
+        self, tmp_path, monkeypatch
+    ):
+        """Nothing at or above home is a candidate, marked or not."""
+        srv = _srv()
+        above = tmp_path / "above"
+        fake_home = above / "someone"
+        (fake_home / "scratch").mkdir(parents=True)
+        # A marker ABOVE home (shared mount, stray file) must stay invisible.
+        (above / ".claude").mkdir()
+        (above / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(fake_home))
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(fake_home / "scratch")
+
+        root, kind = srv._resolution_context()
+        assert root != above.resolve(), "the walk climbed past the home boundary"
+        assert (root, kind) == (srv._MODULE_OWN_ROOT, srv._CTX_MODULE)
+
+    def test_real_project_under_home_still_resolves(self, tmp_path, monkeypatch):
+        """LEAVE-ALONE: the home rule must not cost the normal case."""
+        srv = _srv()
+        fake_home = tmp_path / "home" / "someone"
+        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+        proj = _make_project(fake_home, "realproj")
+        sub = proj / "src" / "deep"
+        sub.mkdir(parents=True)
+
+        monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(fake_home))
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(sub)
+
+        root, kind = srv._resolution_context()
+        assert root == proj.resolve()
+        assert kind == srv._CTX_CWD
+        assert srv._hub_context_is_authoritative() is True
+
+    def test_home_itself_as_cwd_is_not_a_project(self, tmp_path, monkeypatch):
+        """The degenerate case the bug report hit: cwd IS the home directory."""
+        srv = _srv()
+        fake_home = tmp_path / "home" / "someone"
+        (fake_home / ".claude").mkdir(parents=True)
+        (fake_home / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(fake_home))
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(fake_home)
+
+        root, kind = srv._resolution_context()
+        assert root != fake_home.resolve()
+        assert (root, kind) == (srv._MODULE_OWN_ROOT, srv._CTX_MODULE)
+
+    def test_home_override_cannot_defeat_the_boundary(self, tmp_path, monkeypatch):
+        """``VCT_USER_HOME_OVERRIDE`` is a shipped knob — pointing it away from
+        the real home must NOT re-open the bug. The OS home keeps holding the
+        real ``~/.claude/settings.json`` whatever the override says, so it is a
+        boundary too (``_home_boundaries`` returns both)."""
+        srv = _srv()
+        os_home = tmp_path / "os_home"
+        (os_home / ".claude").mkdir(parents=True)
+        (os_home / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+        scratch = os_home / "scratch"
+        scratch.mkdir()
+        elsewhere = tmp_path / "sandbox_home"      # the override points HERE
+        elsewhere.mkdir()
+
+        monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(elsewhere))
+        monkeypatch.setenv("HOME", str(os_home))            # POSIX Path.home()
+        monkeypatch.setenv("USERPROFILE", str(os_home))     # Windows Path.home()
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(scratch)
+
+        root, kind = srv._resolution_context()
+        assert root != os_home.resolve(), (
+            "the OS home was accepted as a project because the config "
+            "override pointed elsewhere — the boundary must cover both homes"
+        )
+        assert (root, kind) == (srv._MODULE_OWN_ROOT, srv._CTX_MODULE)
+
     def test_nonexistent_workspace_env_does_not_win(self, tmp_path, monkeypatch):
         srv = _srv()
         monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "gone"))

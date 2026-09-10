@@ -33,8 +33,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Mapping
-from unittest import mock
+from typing import Mapping
 
 import pytest
 
@@ -341,8 +340,10 @@ def test_json_schema_drift(stub_db, project_folder, capsys):
 
 def test_all_aggregates_worst_exit(tmp_path, monkeypatch, capsys):
     # Two projects: A canonical, B with a mutation.
-    folder_a = tmp_path / "a"; folder_a.mkdir()
-    folder_b = tmp_path / "b"; folder_b.mkdir()
+    folder_a = tmp_path / "a"
+    folder_a.mkdir()
+    folder_b = tmp_path / "b"
+    folder_b.mkdir()
     _write_canonical_surfaces(folder_a, CANONICAL_BUNDLE)
     _write_canonical_surfaces(folder_b, CANONICAL_BUNDLE)
     # Mutate B's settings.

@@ -1356,7 +1356,8 @@ class SnapshotForRebuildTests(unittest.TestCase):
         7b.rebuild snapshot log event with object_count + sample_uuids."""
         actual_legacy = {"class": "Foo_KnowledgeGraph", "properties": []}
         target_kg = project_init._kg_class_definition("Foo_KnowledgeGraph")
-        fetcher = lambda n: actual_legacy if n == "Foo_KnowledgeGraph" else target_kg
+        def fetcher(n):
+            return actual_legacy if n == "Foo_KnowledgeGraph" else target_kg
 
         env_backup = {
             k: os.environ.get(k) for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION")

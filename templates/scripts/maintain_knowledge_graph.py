@@ -33,7 +33,6 @@ VCO_MAINTAIN_SHARED_KG_CONSENT=1 to override (accepting that loss).
 import sys
 import os
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Dict, List, Set, Tuple
 import re
 
@@ -103,12 +102,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # actually exercised it. Switch to the WeaviateWrapper defined in
 # `sync_knowledge_graph` (the only working WeaviateMCPServer-alike), and
 # the central EmbeddingService that owns embed/slot decisions now.
-from sync_knowledge_graph import WeaviateWrapper as WeaviateMCPServer
-from vco_lib.embedding_service import (
+from sync_knowledge_graph import WeaviateWrapper as WeaviateMCPServer  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
+from vco_lib.embedding_service import (  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
     EmbeddingService,
     NoEmbeddingBackendError,
 )
-from weaviate.classes.query import Filter
 
 # Configuration
 # v0.2.18: EMBEDDING_MODEL is no longer read here. This script delegates
@@ -444,13 +442,13 @@ def check_consistency(
                 f"Delete these {len(orphaned_weaviate)} Weaviate object(s)?",
                 assume_yes,
             ):
-                print(f"\n  Fixing orphaned Weaviate entries...")
+                print("\n  Fixing orphaned Weaviate entries...")
                 deleted = delete_orphaned_weaviate_entries(server, orphaned_weaviate)
                 stats["fixed"] += deleted
             else:
                 print("  Skipped orphan deletion (no confirmation).")
     else:
-        print(f"  ✓ No orphaned Weaviate entries")
+        print("  ✓ No orphaned Weaviate entries")
 
     # Check orphaned files
     print("\n📄 Checking for orphaned files...")
@@ -465,11 +463,11 @@ def check_consistency(
             print(f"    ... and {len(orphaned_files) - 10} more")
 
         if fix:
-            print(f"\n  Fixing orphaned files...")
+            print("\n  Fixing orphaned files...")
             synced = sync_orphaned_files(orphaned_files, file_nodes, server)
             stats["fixed"] += synced
     else:
-        print(f"  ✓ No orphaned files")
+        print("  ✓ No orphaned files")
 
     # Check broken links
     print("\n🔗 Checking for broken WikiLinks...")
@@ -487,7 +485,7 @@ def check_consistency(
         if len(broken_links) > 5:
             print(f"    ... and {len(broken_links) - 5} more files")
     else:
-        print(f"  ✓ No broken links")
+        print("  ✓ No broken links")
 
     return stats
 

@@ -615,9 +615,16 @@ class TestTheRuntimeBenefit:
 
 class TestTheRatchetHeld:
     def test_analyze_code_graph_did_not_grow(self):
-        """The region edit REPLACED comment lines rather than adding to a
-        7,227-line monolith; `tests/test_analyze_code_graph_ratchet.py` also
-        fails if this drifts far below the pin."""
+        """The region edit REPLACED comment lines rather than adding to the
+        monolith. Upper bound only, and ONE pin: the ratchet's
+        `_ANALYZER_LINES_MAX` is imported, never restated here — a second
+        number went stale the first time the file shrank (the v0.2.94 ruff
+        sweep removed a dead import), and an equality would have forbidden
+        the shrink the ratchet exists to encourage. The ratchet also fails if
+        this drifts far below it."""
+        from tests.test_analyze_code_graph_ratchet import (  # noqa: PLC0415 - the pin is read at test time from its one home
+            _ANALYZER_LINES_MAX,
+        )
         n = len((SCRIPTS / "analyze_code_graph.py").read_text(
             encoding="utf-8").splitlines())
-        assert n == 7227, n
+        assert n <= _ANALYZER_LINES_MAX, (n, _ANALYZER_LINES_MAX)

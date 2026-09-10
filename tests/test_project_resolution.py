@@ -14,8 +14,6 @@ uses it when it points at an existing directory.
 import importlib
 import os
 import sys
-import tempfile
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -105,8 +103,20 @@ class TestProjectResolutionPrefersEnvVar:
         )
 
     def test_missing_env_falls_back_to_file_path(self):
-        """When CLAUDE_PROJECT_DIR is absent, the resolver must fall back to
-        Path(__file__).parent.parent.parent (the original behavior).
+        """When CLAUDE_PROJECT_DIR is absent, the resolver must still hand the
+        hub a real directory rather than reusing a previous workspace.
+
+        v0.2.92 SUPERSEDED the old ``Path(__file__).parent.parent.parent``
+        fallback: ``_resolution_context()`` now walks CWD's ancestors for a
+        bundled VCO project first (rung 2) and only then falls back to
+        ``_MODULE_OWN_ROOT`` (rung 3). Which of the two it returns depends on
+        where the suite is run from, so the portable statement is the SHAPE:
+        a derived root is a cwd ancestor or the module's own root — and, since
+        v0.2.94, never a home directory.
+
+        ``is_dir()`` alone could not say this: pytest keeps its last three tmp
+        trees, so a stale workspace path from a sibling test is a directory
+        too, and the leak this test names would pass unnoticed.
         """
         captured_paths: list[Path] = []
         spy = _make_spy_resolve(captured_paths)
@@ -128,15 +138,27 @@ class TestProjectResolutionPrefersEnvVar:
                     srv._try_resolve_project_config()
 
         assert len(captured_paths) == 1
-        expected_fallback = Path(
-            __file__
-        ).resolve().parent.parent / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
-        # The fallback is server.py's .parent.parent.parent — verify it's
-        # NOT one of the tmp workspace paths (i.e. it resolved from __file__).
-        # We can't assert the exact path portably, but we can confirm it's
-        # an existing directory that contains the server.
-        assert captured_paths[0].is_dir(), (
-            f"Fallback path must be an existing directory, got: {captured_paths[0]}"
+        captured = captured_paths[0]
+        assert captured.is_dir(), (
+            f"Fallback path must be an existing directory, got: {captured}"
+        )
+        # DERIVED, not inherited from a sibling test's workspace: rung 2 can
+        # only return an ancestor of the cwd, rung 3 only _MODULE_OWN_ROOT.
+        # Any other path means a leaked/remembered workspace.
+        assert captured in (Path.cwd(), *Path.cwd().parents) or (
+            captured == srv._MODULE_OWN_ROOT
+        ), (
+            f"resolver returned {captured}, which is neither a cwd ancestor "
+            f"nor _MODULE_OWN_ROOT ({srv._MODULE_OWN_ROOT}) — it did not "
+            f"derive the root, it remembered one"
+        )
+        # v0.2.94: and never the user's home. Before the home boundary landed,
+        # THIS call returned $HOME on any machine whose checkout carries no
+        # .claude/settings.json — ~/.claude/settings.json is Claude Code's
+        # GLOBAL config and matched the project probe on the way up.
+        assert captured not in srv._home_boundaries(), (
+            f"resolver returned the user's home ({captured}) as the project "
+            f"root — ~/.claude/settings.json is the global config, not a marker"
         )
 
     def test_empty_env_var_falls_back_to_file_path(self):

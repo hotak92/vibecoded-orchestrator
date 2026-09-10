@@ -91,7 +91,6 @@ def _make_synthetic_db(
     # Cohort distribution: `cohort_uniformity` fraction in the dominant
     # cohort, rest split across one other cohort. Pick whole counts.
     dominant_count = int(retrievals * cohort_uniformity)
-    other_count = retrievals - dominant_count
 
     nodes_placed = 0
     embs_placed = 0

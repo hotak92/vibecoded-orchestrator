@@ -24,7 +24,6 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from typing import Any
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

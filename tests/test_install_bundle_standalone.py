@@ -149,7 +149,7 @@ class TestInstallBundleStandaloneWriteEnv(unittest.TestCase):
 
     def test_kg_collection_with_explicit_project_name(self) -> None:
         """--project-name overrides folder basename for KG_COLLECTION derivation."""
-        result = project_init.install_project_bundle(
+        project_init.install_project_bundle(
             self.project,
             orchestrator_root=self.orch,
             write_env=True,

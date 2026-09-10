@@ -18,12 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import platform
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:

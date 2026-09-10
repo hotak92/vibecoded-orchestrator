@@ -14,7 +14,6 @@ reader, the free-tier exit-0 path, the enabled-but-degraded exit-1 path, that
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 from unittest.mock import patch

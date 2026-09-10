@@ -403,10 +403,15 @@ else
 fi
 
 # Gate 3c: ruff (v0.2.94 — the gate MUST match CI). CI's "Python (ruff)" job
-# runs `ruff check vco_lib claude_mcp_servers scripts install.py`; tests/ is
-# not gated yet (174 pre-existing findings, mostly F401). Resolve ruff from
-# the pytest interpreter's venv bin (the version pinned in
-# requirements-dev.txt), then PATH; a MISSING binary is a FAIL, not a skip.
+# runs `ruff check vco_lib claude_mcp_servers scripts install.py tests
+# templates`; tests/ (174 findings) and templates/ (93, incl. an F821 that
+# killed a shipped CLI's fallback branch) joined the gate in v0.2.94 once both
+# were swept. ruff walks a directory for *.py ONLY, so templates/'s .sh/.ps1
+# siblings are not linted here — hook-os-parity owns those. The two path lists
+# are pinned equal by tests/test_v0294_ruff_gate_paths_parity.py — edit both or
+# neither. Resolve ruff from the pytest interpreter's venv bin (the version
+# pinned in requirements-dev.txt), then PATH; a MISSING binary is a FAIL, not
+# a skip.
 echo "  [running ruff check ...]"
 _RUFF_BIN=""
 if [ -n "${_PYTEST_CMD[0]:-}" ] && [ -x "$(dirname "${_PYTEST_CMD[0]}")/ruff" ]; then
@@ -415,11 +420,11 @@ elif command -v ruff >/dev/null 2>&1; then
     _RUFF_BIN="$(command -v ruff)"
 fi
 if [ -z "$_RUFF_BIN" ]; then
-    gate_fail "ruff check (shipped Python)" "ruff not found (venv bin + PATH); CI runs it — install requirements-dev.txt so this gate matches CI"
-elif "$_RUFF_BIN" check vco_lib claude_mcp_servers scripts install.py > /tmp/preship-ruff.log 2>&1; then
-    gate_pass "ruff check (shipped Python)"
+    gate_fail "ruff check (shipped Python + tests + templates)" "ruff not found (venv bin + PATH); CI runs it — install requirements-dev.txt so this gate matches CI"
+elif "$_RUFF_BIN" check vco_lib claude_mcp_servers scripts install.py tests templates > /tmp/preship-ruff.log 2>&1; then
+    gate_pass "ruff check (shipped Python + tests + templates)"
 else
-    gate_fail "ruff check (shipped Python)" "See /tmp/preship-ruff.log"
+    gate_fail "ruff check (shipped Python + tests + templates)" "See /tmp/preship-ruff.log"
 fi
 
 # Gate 4: npm test (svelte-check)
