@@ -178,9 +178,15 @@ class AuthlibDeprecationFilterTests(unittest.TestCase):
         # analyze_code_graph.py wraps the import in try/except, but the
         # filter block must still come before the try statement.
         filter_idx = text.index("AuthlibDeprecationWarning")
-        # The `import weaviate` is inside a try block; find it as a line.
-        weaviate_import_idx = text.index("    import weaviate")
-        self.assertLess(filter_idx, weaviate_import_idx)
+        # The weaviate import is inside a try block. v0.2.94: the analyzer
+        # connects through `vco_lib.weaviate_helpers`, so the bare
+        # `import weaviate` is gone and the FIRST import of the package is
+        # `from weaviate.classes...` — locate whichever form comes first;
+        # it is the package import that triggers authlib, not the spelling.
+        import re
+        m = re.search(r"^\s*(import weaviate\b|from weaviate[.\s])", text, re.M)
+        self.assertIsNotNone(m, "analyze_code_graph.py no longer imports weaviate?")
+        self.assertLess(filter_idx, m.start())
 
     def test_detect_duplicates_filter_block_present(self) -> None:
         """Same order check for templates/scripts/detect_duplicates.py.

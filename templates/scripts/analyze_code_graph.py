@@ -1082,7 +1082,6 @@ except ImportError:
     )
 
 try:
-    import weaviate
     from weaviate.classes.config import Configure, Property, DataType, ReferenceProperty
     from weaviate.classes.query import Filter, QueryReference
 except ImportError:
