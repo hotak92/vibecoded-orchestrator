@@ -379,10 +379,11 @@ class ProcessDocumentsChunkingImportTests(unittest.TestCase):
     def test_imports_chunking_from_package(self) -> None:
         src = (REPO_ROOT / self.SCRIPT).read_text(encoding="utf-8")
         self.assertIn(
-            "from weaviate_mcp.chunking import chunk_text, TokenCounter",
+            "from weaviate_mcp.chunking import chunk_text",
             src,
-            "process_documents.py must import chunk_text/TokenCounter from "
-            "the weaviate_mcp.chunking package",
+            "process_documents.py must import chunk_text from the "
+            "weaviate_mcp.chunking PACKAGE (the identity hazard is the module "
+            "path, not which names ride on it)",
         )
 
     def test_no_toplevel_chunking_import(self) -> None:

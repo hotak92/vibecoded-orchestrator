@@ -95,10 +95,10 @@ def main():
     aa_large = "✅ PASS" if compliance['large_text_aa'] else "❌ FAIL"
     aaa_large = "✅ PASS" if compliance['large_text_aaa'] else "❌ FAIL"
 
-    print(f"Normal Text (< 18pt):")
+    print("Normal Text (< 18pt):")
     print(f"  AA  (4.5:1 required): {aa_normal}")
     print(f"  AAA (7.0:1 required): {aaa_normal}")
-    print(f"\nLarge Text (≥ 18pt or ≥ 14pt bold):")
+    print("\nLarge Text (≥ 18pt or ≥ 14pt bold):")
     print(f"  AA  (3.0:1 required): {aa_large}")
     print(f"  AAA (4.5:1 required): {aaa_large}")
     print(f"{'='*50}\n")

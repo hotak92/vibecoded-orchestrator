@@ -266,7 +266,7 @@ PROJECT_ROOT, _PROJECT_ROOT_SOURCE = _resolve_project_root()
 # user-reported as Known Issue 6).  MUST run BEFORE ``import weaviate``.
 # See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
 # filter at the MCP-server level.
-import warnings as _kg_warnings
+import warnings as _kg_warnings  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
     _kg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
@@ -287,14 +287,14 @@ except ImportError:
 # connect-helper convergence removed the only *runtime* `weaviate.` reference,
 # so ruff now flags F401 — suppressed here because the import's value is the
 # import-time side effect, not the bound name.
-import weaviate  # noqa: F401
-from weaviate.classes.query import Filter
+import weaviate  # noqa: F401,E402 - the value is the import-time side effect (authlib force-installs its own warning filter), not the bound name; and it must follow the filter block above
+from weaviate.classes.query import Filter  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 # W8 (v0.2.92): `Chunker` is no longer imported here — this script does not
 # construct one any more. The plan (gate + boundaries) comes from
 # `kg_chunk_plan.plan_node_chunks`, which binds its OWN sibling `Chunker`;
 # a second binding here could resolve to a different checkout's chunking
 # module and re-open the very divergence W8 closed.
-from weaviate_mcp.chunking import TokenCounter
+from weaviate_mcp.chunking import TokenCounter  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 
 # v0.2.18: central embedding dispatcher. Replaces the inline Ollama call
 # that was hardcoded to qwen3-embedding (and threw RuntimeError when
@@ -303,14 +303,14 @@ from weaviate_mcp.chunking import TokenCounter
 # AND the right named-vector slot (qwen3_embed / openai_text_embed /
 # arctic2_embed / ...) from the environment, so this script no longer
 # cares about ACTIVE_EMBEDDING or EMBEDDING_MODEL directly.
-from vco_lib.embedding_service import (
+from vco_lib.embedding_service import (  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
     EmbeddingService,
     NoEmbeddingBackendError,
 )
 # W3 (v0.2.92 wiring audit): the truncation-tag properties are derived by the
 # ONE shared stamper (vco_lib home — importable from every writer layer), so
 # kg-sync, the MCP store, and the single-slot patch writers cannot drift.
-from vco_lib.kg_truncation_tags import truncation_tag_properties
+from vco_lib.kg_truncation_tags import truncation_tag_properties  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 # v0.2.94: the named-vector slot has ONE home. The WRITER (this script) and
 # every READER (detect_duplicates.py, search_knowledge.py, the MCP write path)
 # resolve it through the same helper, so a scan cannot target a slot the sync
@@ -321,7 +321,7 @@ from vco_lib.kg_vector_slot import active_text_vector_slot  # noqa: E402 — mus
 # is pure + dependency-free (see its docstring); importing it loudly here
 # (never an inline copy) because every Weaviate write below must store ONE
 # shape so delete-by-file_path upserts stay idempotent across OSes.
-from vco_lib.paths import to_posix_rel
+from vco_lib.paths import to_posix_rel  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 
 # Try to import query logger.
 #
@@ -336,7 +336,7 @@ from vco_lib.paths import to_posix_rel
 try:
     from weaviate_mcp.query_logger import ToolUsageLogger
     HAS_LOGGER = True
-except Exception as e:
+except Exception:
     HAS_LOGGER = False
 
 # Configuration - Read from environment variables (set by MCP servers or project settings)
@@ -1540,7 +1540,7 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
                     else:
                         created_dt = datetime.strptime(val_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                     temporal_data['created'] = created_dt.isoformat()
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError):
                 pass
 
         if 'updated' in frontmatter and frontmatter['updated'] != 'unknown':
@@ -1768,7 +1768,7 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
 
                 # Add typed_links property if missing
                 if 'typed_links' not in existing_props:
-                    print(f"  Adding property: typed_links (nested objects)")
+                    print("  Adding property: typed_links (nested objects)")
                     collection.config.add_property(
                         Property(
                             name="typed_links",
@@ -1782,7 +1782,7 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
 
                 # Add external_links property if missing (RDF-inspired)
                 if 'external_links' not in existing_props:
-                    print(f"  Adding property: external_links (JSON text)")
+                    print("  Adding property: external_links (JSON text)")
                     collection.config.add_property(
                         Property(name="external_links", data_type=DataType.TEXT)
                     )
@@ -1790,7 +1790,7 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                 # Add cross-reference property if missing
                 from weaviate.classes.config import ReferenceProperty
                 if 'linksTo' not in existing_refs:
-                    print(f"  Adding cross-reference: linksTo")
+                    print("  Adding cross-reference: linksTo")
                     collection.config.add_reference(
                         ReferenceProperty(
                             name="linksTo",
@@ -1798,7 +1798,7 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                         )
                     )
 
-                print(f"✓ Schema up to date")
+                print("✓ Schema up to date")
             except Exception as e:
                 print(f"⚠️  Could not update schema: {e}")
 
@@ -2363,9 +2363,9 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                         global _RECHUNKED_COUNT
                         _RECHUNKED_COUNT += 1
                         print(
-                            f"   ♻️  Re-chunking: stored chunk plan predates "
-                            f"the current chunker revision "
-                            f"(revision-crossing repair)"
+                            "   ♻️  Re-chunking: stored chunk plan predates "
+                            "the current chunker revision "
+                            "(revision-crossing repair)"
                         )
                 if _self_consistent and _plan_ok:
                     elapsed = time.time() - start_time
@@ -2618,7 +2618,7 @@ def infer_tags_from_typed_links(
                         tag not in ["test", "project", "concept", "tool"]):
                         inferred_tags.append(tag)
 
-    except Exception as e:
+    except Exception:
         # Inference is best-effort - don't fail sync if it errors
         pass
 
@@ -3351,8 +3351,8 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     global _RECHUNKED_COUNT
                     _RECHUNKED_COUNT += 1
                     print(
-                        f"   ♻️  Re-chunking: stored chunk plan predates the "
-                        f"current chunker revision (revision-crossing repair)"
+                        "   ♻️  Re-chunking: stored chunk plan predates the "
+                        "current chunker revision (revision-crossing repair)"
                     )
             all_match = _self_consistent and _plan_ok
             if all_match:
@@ -3528,7 +3528,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                                 from_property="linksTo",
                                 to=target_uuid
                             )
-                        except Exception as e:
+                        except Exception:
                             # Silently skip if reference already exists or target not found
                             pass
                     print(f"   ✓ Created {len(target_uuids)} cross-references")
@@ -3641,7 +3641,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                                     from_property="linksTo",
                                     to=target_uuid
                                 )
-                            except Exception as e:
+                            except Exception:
                                 pass
                         print(f"   ✓ Created {len(target_uuids)} cross-references")
 

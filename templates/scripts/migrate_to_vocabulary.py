@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 import re
 import yaml
-from datetime import datetime, timezone
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -28,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import validation function from sync script
 sys.path.insert(0, str(Path(__file__).parent))
-from sync_knowledge_graph import validate_node_against_vocabulary, parse_markdown_node
+from sync_knowledge_graph import validate_node_against_vocabulary, parse_markdown_node  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 
 KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 
@@ -213,7 +212,7 @@ def migrate_node(file_path: Path, apply_fixes: bool = False, interactive: bool =
             if interactive:
                 print(f"\n📝 {file_path.relative_to(KNOWLEDGE_ROOT)}")
                 print(f"   Current tags: {', '.join(original_tags)}")
-                print(f"\n   Suggestions:")
+                print("\n   Suggestions:")
                 for category, tags in tag_suggestions.items():
                     print(f"   - {category}: {', '.join(tags)}")
 
@@ -302,14 +301,14 @@ def main():
             total_issues += 1
             total_changes += len([c for c in changes if c.startswith("✅") or c.startswith("Added") or c.startswith("Fixed")])
 
-    print(f"\n📊 Summary:")
+    print("\n📊 Summary:")
     print(f"   Total nodes scanned: {len(files)}")
     print(f"   Nodes with issues: {total_issues}")
     print(f"   Changes applied: {total_changes}")
 
     if args.check:
-        print(f"\n💡 Run with --fix to apply automatic fixes")
-        print(f"   Or use --interactive for manual review")
+        print("\n💡 Run with --fix to apply automatic fixes")
+        print("   Or use --interactive for manual review")
 
 
 if __name__ == "__main__":

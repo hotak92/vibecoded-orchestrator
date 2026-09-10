@@ -18,7 +18,7 @@ import argparse
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 import yaml
 
 
@@ -184,7 +184,7 @@ def main():
         return 0
 
     print(f"\n{'='*70}")
-    print(f"Temporal Query Results")
+    print("Temporal Query Results")
     print(f"{'='*70}")
 
     if args.date:

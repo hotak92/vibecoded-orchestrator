@@ -20,8 +20,8 @@ import sys
 import os
 import re
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 # VCO-SHARED-BEGIN: _resolve_orchestrator_root (verbatim across templates/scripts/*.py)
 def _resolve_orchestrator_root() -> "Path | None":
@@ -170,14 +170,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # so this script was broken at import-time. Switch to the WeaviateWrapper
 # defined in `sync_knowledge_graph` + the central EmbeddingService that
 # owns embed/slot decisions.
-from sync_knowledge_graph import WeaviateWrapper as WeaviateMCPServer
-from vco_lib.embedding_service import (
+from sync_knowledge_graph import WeaviateWrapper as WeaviateMCPServer  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
+from vco_lib.embedding_service import (  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
     EmbeddingService,
     NoEmbeddingBackendError,
 )
-from weaviate_mcp.chunking import chunk_text, TokenCounter
-from weaviate.classes.query import Filter
-from weaviate.classes.config import Configure, Property, DataType
+from weaviate_mcp.chunking import chunk_text  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
+from weaviate.classes.query import Filter  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
+from weaviate.classes.config import Configure, Property, DataType  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 
 # Configuration
 # v0.2.18: EMBEDDING_MODEL no longer read directly here. The
@@ -278,7 +278,7 @@ def process_pdf(file_path: Path) -> Tuple[str, str]:
     try:
         from docling.document_converter import DocumentConverter
 
-        print(f"  Parsing PDF with docling...")
+        print("  Parsing PDF with docling...")
         converter = DocumentConverter()
         result = converter.convert(str(file_path))
         content = result.document.export_to_markdown()
@@ -289,7 +289,7 @@ def process_pdf(file_path: Path) -> Tuple[str, str]:
         return title, content
 
     except ImportError:
-        print(f"  ⚠️  docling not installed, cannot process PDF")
+        print("  ⚠️  docling not installed, cannot process PDF")
         return None, None
     except Exception as e:
         print(f"  ❌ Error processing PDF: {e}")
@@ -439,7 +439,7 @@ Summary:"""
             summary = response.json()["response"].strip()
             return summary
         else:
-            print(f"  ⚠️  Failed to generate summary, using default")
+            print("  ⚠️  Failed to generate summary, using default")
             return f"Document about {title}"
 
     except Exception as e:
@@ -626,7 +626,7 @@ def process_document(server: WeaviateMCPServer, file_path: Path) -> bool:
         source_path = str(file_path.relative_to(PROJECT_ROOT))
 
         # Chunk document
-        print(f"  Chunking document...")
+        print("  Chunking document...")
         chunks = chunk_document(content, source_id, title, source_path, document_type)
         print(f"  ✓ Created {len(chunks)} chunks")
 
@@ -635,27 +635,27 @@ def process_document(server: WeaviateMCPServer, file_path: Path) -> bool:
             return False
 
         # Generate summary
-        print(f"  Generating summary...")
+        print("  Generating summary...")
         summary = generate_document_summary(server, title, content)
         print(f"  ✓ Summary: {summary[:80]}...")
 
         # Find relevant nodes
-        print(f"  Finding relevant knowledge nodes...")
+        print("  Finding relevant knowledge nodes...")
         relevant_nodes = find_relevant_nodes(server, title, content)
         if relevant_nodes:
             print(f"  ✓ Found {len(relevant_nodes)} relevant nodes: {', '.join(relevant_nodes[:3])}")
         else:
-            print(f"  ℹ️  No relevant nodes found")
+            print("  ℹ️  No relevant nodes found")
 
         # Create knowledge node
-        print(f"  Creating knowledge node...")
-        node_path = create_knowledge_node(
+        print("  Creating knowledge node...")
+        create_knowledge_node(
             title, summary, source_path, document_type, relevant_nodes, len(chunks)
         )
 
         # Update linked nodes with backlinks
         if relevant_nodes:
-            print(f"  Updating linked nodes with backlinks...")
+            print("  Updating linked nodes with backlinks...")
             update_linked_nodes(relevant_nodes, title)
 
         print(f"\n✅ Successfully processed {title}")
@@ -741,7 +741,7 @@ def main():
             try:
                 file_path.relative_to(DOCUMENTS_ROOT)
             except ValueError:
-                print(f"ℹ️  File not in documents/ directory, skipping")
+                print("ℹ️  File not in documents/ directory, skipping")
                 sys.exit(0)
 
             # Process single file

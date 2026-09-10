@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 
@@ -92,10 +91,11 @@ def main() -> None:
 
                     chars = len(result_text)
 
-                    # Identify tool from preceding assistant message
-                    tool_name = block.get("tool_use_id", "")
-                    # Try to find the tool name from context
-                    # We look at the content for patterns
+                    # Identify which tool produced this result from the
+                    # content itself (the tool_result block carries only a
+                    # tool_use_id, not a name): a file_path-bearing payload is
+                    # a read, "matches"/"found" is a search, anything else
+                    # large is a command.
                     if chars > 500 and "file_path" in str(block):
                         path_match = _extract_path(result_text)
                         if path_match:

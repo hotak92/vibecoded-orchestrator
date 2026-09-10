@@ -100,7 +100,7 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # Net, including the fix: 7227 measured 7227 — the pin holds UNCHANGED. (It is
 # also pinned by EXACT equality in tests/test_v0292_n35_rewire_transform.py
 # ::TestTheRatchetHeld, so a change here must move both.)
-_ANALYZER_LINES_MAX = 7227
+_ANALYZER_LINES_MAX = 7225
 
 
 def _measure() -> int:

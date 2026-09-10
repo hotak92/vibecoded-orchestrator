@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import platform
-import shlex
 import shutil
 import subprocess
 import sys
@@ -81,10 +80,11 @@ def _notify_linux(args: argparse.Namespace) -> int:
 def _notify_macos(args: argparse.Namespace) -> int:
     """osascript fires the standard macOS Notification Center toast.
 
-    AppleScript single-quotes its strings; we escape any embedded
-    double quotes by replacing with `'\"'`-style sequences via shlex.quote
-    is not appropriate for AppleScript syntax, so we just strip control
-    chars and inline.
+    The message and title are interpolated into an AppleScript string
+    literal, so ``_esc`` below escapes backslashes first and then double
+    quotes — AppleScript's own two metacharacters. ``shlex.quote`` is NOT
+    usable here: it produces POSIX shell quoting, which AppleScript does
+    not parse.
     """
     if not shutil.which("osascript"):
         return 0
