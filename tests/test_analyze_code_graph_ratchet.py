@@ -97,9 +97,10 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 #     `vco_lib/codegraph_naming.py` — they answer "is this string a canonical
 #     project name?", which is that module's whole subject, and they are pure.
 #     The analyzer imports both under their historical private aliases.
-# Net, including the fix: 7227 measured 7227 — the pin holds UNCHANGED. (It is
-# also pinned by EXACT equality in tests/test_v0292_n35_rewire_transform.py
-# ::TestTheRatchetHeld, so a change here must move both.)
+# Net, including that fix: 7227. v0.2.94 (templates ruff sweep): a dead
+# `import requests` and a 3→2-line except block → 7225, and the maximum moved
+# down with it, as this ratchet's rule demands. This is the ONE pin:
+# tests/test_v0292_n35_rewire_transform.py::TestTheRatchetHeld imports it.
 _ANALYZER_LINES_MAX = 7225
 
 

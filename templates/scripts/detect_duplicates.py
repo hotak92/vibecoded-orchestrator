@@ -56,7 +56,7 @@ sys.path.insert(0, str(
 # ``AuthlibDeprecationWarning`` from ``weaviate-client``'s transitive
 # ``authlib`` dep.  See ``claude_mcp_servers/weaviate_mcp/server.py``
 # for the canonical filter rationale.
-import warnings as _dd_warnings  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
+import warnings as _dd_warnings  # noqa: E402 - must follow the sys.path bootstrap above; this line OPENS the AuthlibDeprecationWarning filter block that must itself run before `import weaviate`
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
     _dd_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)

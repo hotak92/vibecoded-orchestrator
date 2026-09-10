@@ -266,7 +266,7 @@ PROJECT_ROOT, _PROJECT_ROOT_SOURCE = _resolve_project_root()
 # user-reported as Known Issue 6).  MUST run BEFORE ``import weaviate``.
 # See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
 # filter at the MCP-server level.
-import warnings as _kg_warnings  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
+import warnings as _kg_warnings  # noqa: E402 - must follow the sys.path bootstrap above; this line OPENS the AuthlibDeprecationWarning filter block that must itself run before `import weaviate`
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
     _kg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
