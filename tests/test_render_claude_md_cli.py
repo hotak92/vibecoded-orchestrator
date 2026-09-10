@@ -29,7 +29,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.common.child_env import child_env  # noqa: E402
-from vco_lib import project_init  # noqa: E402
 from vco_lib.project_init import (  # noqa: E402
     MANAGED_REGION_OPEN,
     MANAGED_REGION_CLOSE,

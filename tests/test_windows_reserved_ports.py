@@ -24,7 +24,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vco_lib.windows_reserved_ports import (  # noqa: E402
-    check_ports,
     is_windows,
     parse_excluded_ranges,
     port_in_reserved_range,

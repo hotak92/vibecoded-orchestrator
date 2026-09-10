@@ -66,15 +66,10 @@ class ResolveClaudeSessionDirTest(unittest.TestCase):
         must use whatever the hub returns, even if the local-slug
         computation would have produced a different (or no) value.
         """
-        # Build a hub path that has NOTHING to do with the workspace
-        # arg's local slug — proves the helper isn't secretly re-
-        # computing on the side.
-        hub_path = (
-            Path.home() / ".claude" / "projects"
-            / "-arbitrary-hub-chosen-name"
-        )
-        # Ensure the chosen path exists on disk so the helper's
-        # `.exists()` check doesn't reject the hub answer.
+        # The hub answer below has NOTHING to do with the workspace arg's
+        # local slug — that is what proves the helper isn't secretly
+        # re-computing on the side. It must exist on disk, though, or the
+        # helper's `.exists()` gate rejects it.
         with tempfile.TemporaryDirectory() as td:
             existing_hub_dir = Path(td) / "fake-claude-projects" / "hub-slug"
             existing_hub_dir.mkdir(parents=True)

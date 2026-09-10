@@ -776,7 +776,7 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         # No deferral file written.
         deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
         self.assertFalse(deferral_path.exists(),
-                         f"dry_run must not emit deferral .md")
+                         "dry_run must not emit deferral .md")
 
     def test_multiple_user_modified_files_adopted_under_one_backup_dir(self):
         """v0.2.84 PLAN-v0284 D7 (P5/R2): when multiple bundle files diverge,
@@ -1597,8 +1597,6 @@ class DeferralReconcileTests(unittest.TestCase):
         We construct this state by seeding both entries manually, then
         running an install that only resolves one of them.
         """
-        is_windows = platform.system() == "Windows"
-        ext = "ps1" if is_windows else "sh"
         # Seed install.
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=False,
@@ -1791,7 +1789,7 @@ class ProjectLevelTemplatesTests(unittest.TestCase):
         # should NOT fire.
         self.assertFalse(
             report.has_condition("template_review_pending"),
-            f"unexpected template deferral; diverged set should be empty",
+            "unexpected template deferral; diverged set should be empty",
         )
 
     def test_whitespace_only_diff_does_not_flag(self):

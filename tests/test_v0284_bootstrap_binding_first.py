@@ -269,8 +269,6 @@ class BootstrapBindingFirstTests(unittest.TestCase):
     def test_bootstrap_no_folder_name_derives(self):
         """LEAVE-ALONE: bootstrap with no project_folder name-derives (fresh
         create path unchanged)."""
-        captured = {}
-
         with mock.patch.object(
             project_init, "_is_weaviate_reachable", return_value=False,
         ), mock.patch.object(

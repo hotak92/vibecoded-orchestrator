@@ -249,6 +249,11 @@ class RefreshDistBinaryTests(unittest.TestCase):
                 result,
                 "version drift (conf newer than dist) should trigger swap",
             )
+            # ...and the swap actually landed: dist now holds the fresh bytes.
+            self.assertEqual(
+                dist.read_bytes(), b"#!/bin/sh\necho fresh binary\nexit 0\n",
+                "dist binary must carry the freshly-built content after a swap",
+            )
 
     def test_read_tauri_conf_version(self):
         """``_read_tauri_conf_version`` parses the version field reliably."""
@@ -306,7 +311,7 @@ class RegisterMcpsTier3RetryTests(unittest.TestCase):
         captured_cmds: list[list[str]] = []
 
         # Seed a tier-1 binary so _ensure_launcher_binary returns it.
-        dist = _seed_dist_binary(install_root)
+        _seed_dist_binary(install_root)
 
         def fake_run(cmd, *args, **kwargs):
             captured_cmds.append(list(cmd))
@@ -503,8 +508,21 @@ class UpdateDeferredStubTests(unittest.TestCase):
             target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
             self.assertTrue(target.is_file())
             second_content = target.read_text(encoding="utf-8")
-            # Either equal (same-second timestamp) or differ only in timestamp.
+            # Either equal (same-second timestamp) or differ ONLY in the two
+            # timestamp-bearing lines — that is what "overwritten cleanly" means.
             self.assertIn("# No deferrals from update at ", second_content)
+
+            def _drop_timestamps(text: str) -> list[str]:
+                return [
+                    ln for ln in text.splitlines()
+                    if not ln.startswith("generated_at: ")
+                    and not ln.startswith("# No deferrals from update at ")
+                ]
+
+            self.assertEqual(
+                _drop_timestamps(first_content), _drop_timestamps(second_content),
+                "the rewritten stub must differ from the first only in its timestamps",
+            )
 
     def test_stub_creates_parent_dirs(self):
         """``.claude/context/`` may not exist yet — stub creates it."""

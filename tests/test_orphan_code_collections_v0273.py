@@ -22,11 +22,9 @@ HTTP-level mocking only — no live Weaviate / launcher.db required.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import tempfile
 import unittest
-import urllib.error
 from pathlib import Path
 from unittest import mock
 

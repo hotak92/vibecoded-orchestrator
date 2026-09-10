@@ -25,9 +25,7 @@ import os
 import platform
 import sys
 import tempfile
-import time
 import unittest
-from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -162,7 +160,7 @@ class ConsentPromptTests(unittest.TestCase):
     def _make_stale(self, name: str = "weaviate-kg",
                     env: dict | None = None) -> list[tuple[str, str, dict]]:
         return [
-            (name, f"/some/old/install/.venv/bin/python", {
+            (name, "/some/old/install/.venv/bin/python", {
                 "command": "/some/old/install/.venv/bin/python",
                 "env": env or {},
             })

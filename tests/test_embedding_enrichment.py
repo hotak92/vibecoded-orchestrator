@@ -36,7 +36,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -990,8 +990,6 @@ class CliTests(unittest.TestCase):
 
     def test_cli_stream_progress_emits_jsonl(self):
         """--stream-progress prints one JSON line per batch."""
-        progress_calls: list[tuple[float, str]] = []
-
         # The CLI builds its own progress callback that prints jsonl.
         # We simulate one batch via a side-effect that calls back.
         def fake_enrich(*, collection_name, new_slot, project_root,

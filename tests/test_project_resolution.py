@@ -14,8 +14,6 @@ uses it when it points at an existing directory.
 import importlib
 import os
 import sys
-import tempfile
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -105,8 +103,15 @@ class TestProjectResolutionPrefersEnvVar:
         )
 
     def test_missing_env_falls_back_to_file_path(self):
-        """When CLAUDE_PROJECT_DIR is absent, the resolver must fall back to
-        Path(__file__).parent.parent.parent (the original behavior).
+        """When CLAUDE_PROJECT_DIR is absent, the resolver must still hand the
+        hub a real directory rather than reusing a previous workspace.
+
+        v0.2.92 SUPERSEDED the old ``Path(__file__).parent.parent.parent``
+        fallback: ``_resolution_context()`` now walks CWD's ancestors for a
+        bundled VCO project first (rung 2) and only then falls back to
+        ``_MODULE_OWN_ROOT`` (rung 3). Which of the two answers this call gets
+        depends on where the suite is run from, so the portable assertion is
+        the one below — an existing directory, not a tmp workspace path.
         """
         captured_paths: list[Path] = []
         spy = _make_spy_resolve(captured_paths)
@@ -128,13 +133,8 @@ class TestProjectResolutionPrefersEnvVar:
                     srv._try_resolve_project_config()
 
         assert len(captured_paths) == 1
-        expected_fallback = Path(
-            __file__
-        ).resolve().parent.parent / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
-        # The fallback is server.py's .parent.parent.parent — verify it's
-        # NOT one of the tmp workspace paths (i.e. it resolved from __file__).
-        # We can't assert the exact path portably, but we can confirm it's
-        # an existing directory that contains the server.
+        # Not a tmp workspace path: with no CLAUDE_PROJECT_DIR the resolver
+        # must derive the root itself, and what it derives must exist.
         assert captured_paths[0].is_dir(), (
             f"Fallback path must be an existing directory, got: {captured_paths[0]}"
         )

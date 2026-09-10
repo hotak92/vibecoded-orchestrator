@@ -340,7 +340,6 @@ def test_cli_regenerate_invokes_real_recreate(db_with_v033, tmp_path, monkeypatc
     carrying ok/dropped/registered (not action=pending_piece4)."""
     from vco_lib import project_init as pinit
 
-    orch = Path(pinit.__file__).resolve().parent.parent  # real clone root
     folder = tmp_path / "proj"
     folder.mkdir()
     # Fake the actual recreate so no live Weaviate is touched.

@@ -12,7 +12,6 @@ Per docs/INSTALL_ARCHITECTURE_v2.md per-track ownership table.
 from __future__ import annotations
 
 import importlib.util
-import json
 import subprocess
 import sys
 from pathlib import Path

@@ -22,7 +22,6 @@ Python script can emit, and (c) identical in the PowerShell sibling.
 from __future__ import annotations
 
 import ast
-import re
 import subprocess
 import unittest
 from pathlib import Path

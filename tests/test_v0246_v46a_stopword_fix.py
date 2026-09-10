@@ -33,7 +33,6 @@ and ``.claude/context/plans/v0.2.46-design-2026-06-03.md`` § V46-A.
 
 from __future__ import annotations
 
-import io
 import json
 import sys
 import unittest

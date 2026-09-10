@@ -17,15 +17,12 @@ These tests cover all three sub-deliverables + the safety defaults.
 """
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import io
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
-
-import pytest
 
 
 # Load install.py as a module so we can call helpers directly.

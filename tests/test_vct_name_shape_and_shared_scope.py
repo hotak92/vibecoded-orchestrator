@@ -33,7 +33,6 @@ already maintains, and drift between them is the failure mode worth pinning.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path

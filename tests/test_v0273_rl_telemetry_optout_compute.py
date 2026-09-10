@@ -31,7 +31,6 @@ are wrapped in ``asyncio.run`` (mirrors tests/test_search_pipeline.py).
 from __future__ import annotations
 
 import asyncio
-import os
 from unittest.mock import patch
 
 import pytest
@@ -419,7 +418,6 @@ def test_online_rpc_short_circuited_when_online_training_disabled(monkeypatch):
     an RL client for the /rl_update POST (short-circuited) even if a container
     would otherwise be reachable. Local capture is unaffected — verified by the
     capture-gating tests above; here we assert the RPC path is skipped."""
-    import claude_mcp_servers.weaviate_mcp.rl_enrichment as rlmod
     import claude_mcp_servers.weaviate_mcp.server as srv
 
     for k in (

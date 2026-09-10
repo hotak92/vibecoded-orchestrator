@@ -35,13 +35,13 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = PROJECT_ROOT / "claude_mcp_servers"
 for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-
-import pytest
 
 
 def _server():

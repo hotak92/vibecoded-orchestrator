@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 import subprocess
 import re
-import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

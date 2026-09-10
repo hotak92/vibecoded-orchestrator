@@ -209,12 +209,9 @@ def test_drain_batches_all_files_in_one_run(tmp_path: Path) -> None:
     assert len(runs) == 1, f"expected 1 batched run, got {len(runs)}: {runs}"
     argv = runs[0]
     assert "--only-files-from" in argv, "batched run must use --only-files-from"
-    # The list file passed should contain all 3 paths.
-    idx = argv.index("--only-files-from")
-    list_file = Path(argv[idx + 1])
-    # The list file is cleaned up by the detached run; assert the 3 files were
-    # named either in the (possibly-still-present) list OR that one run covered
-    # them (the batch is one process). One run == one batch of 3 is the invariant.
+    # The list file itself is unlinked by the detached run, so its CONTENTS
+    # are not assertable here. The invariant that carries the batching claim
+    # is the run count above: one run == one batch of all 3 files.
     assert argv[0] == str(repo), "repo_path arg is the canonical root"
 
 

@@ -84,6 +84,23 @@ def test_missing_protocol_is_degraded_but_usable():
     assert res.server_protocol is None
 
 
+def test_older_than_min_protocol_is_degraded_but_usable():
+    # The OTHER trigger of the degraded branch: the container advertises a
+    # protocol, but one below what this client requires.
+    c = _client()
+    h = HealthResponse(
+        ok=True,
+        model="rl",
+        protocol_version=MIN_SERVER_PROTOCOL - 1,
+        embedding_dim=1024,
+        embedding_space="qwen3",
+    )
+    res = asyncio.run(c.negotiate(health=h))
+    assert res.compatible is True  # still engaged via extra=allow tolerance
+    assert res.status == "degraded_old_server"
+    assert res.server_protocol == MIN_SERVER_PROTOCOL - 1
+
+
 def test_newer_server_is_incompatible():
     c = _client()
     h = HealthResponse(ok=True, model="rl", protocol_version=PROTOCOL_VERSION + 5)

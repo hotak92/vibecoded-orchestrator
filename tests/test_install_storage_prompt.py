@@ -24,7 +24,6 @@ under tempdirs so no real host state is touched.
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import pytest

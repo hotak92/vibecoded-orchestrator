@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_HOOKS = REPO_ROOT / "templates" / "hooks"

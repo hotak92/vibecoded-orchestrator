@@ -41,17 +41,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter
-from vco_lib.embedding_providers.ollama import (
+from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
+from vco_lib.embedding_providers.ollama import (  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
     OllamaAdapter,
     looks_like_embedding_model,
 )
-from vco_lib.embedding_providers.openai import (
+from vco_lib.embedding_providers.openai import (  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
     KNOWN_OPENAI_EMBEDDING_MODELS,
     OpenAIAdapter,
     ValidationResult,
 )
-from vco_lib.embedding_service import (
+from vco_lib.embedding_service import (  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
     ARCTIC_SECONDARY_MODEL,
     DEFAULT_CODE_MODEL,
     DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
@@ -1536,13 +1536,13 @@ class EmbeddingServiceMethodTests(unittest.TestCase):
             openai_adapter=oa_m,
         ) as svc:
             captured_session = svc.session
+            self.assertIsNotNone(captured_session)
+            # Spy the OWNED session's close so __exit__ is observable.
+            # requests.Session exposes no "is closed" flag, so wrapping the
+            # bound method is the portable way to see the close happen.
+            captured_session.close = MagicMock(wraps=captured_session.close)
             self.assertTrue(svc._owns_session)
-        # Verify that close() was called by attempting to use the
-        # session — requests.Session.close releases the connection
-        # pool but doesn't error on subsequent calls; instead we
-        # check the internal `adapters` dict went through close.
-        # The most portable check: subsequent svc.close() doesn't
-        # error and the flag stays True.
+        captured_session.close.assert_called_once()
         self.assertTrue(svc._owns_session)
 
     def test_close_owned_session_does_not_raise_double_call(self):

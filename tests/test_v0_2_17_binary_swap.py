@@ -24,9 +24,8 @@ import importlib
 import json
 import os
 import sys
-import textwrap
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, List
 
 import pytest
 
@@ -257,7 +256,7 @@ class TestWrapperRoutingStaleSrc:
         """
         _write_vct_module(fake_install, "0.2.17.1")
         _write_manifest(fake_install, "0.2.17")
-        dist_path = _write_fake_dist_binary(fake_install)
+        _write_fake_dist_binary(fake_install)
         # The stale cargo artifact that used to deflect the routing.
         stale_src = self._write_stale_cargo_src(fake_install)
         assert stale_src.is_file()  # sanity

@@ -33,7 +33,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

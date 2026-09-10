@@ -15,7 +15,6 @@ v0.2.55 needs a third binary (vct-updater?).
 from __future__ import annotations
 
 import importlib.util
-import io
 import sys
 import zipfile
 from pathlib import Path
@@ -199,6 +198,9 @@ def test_helper_falls_back_from_gh_to_curl(install_module, tmp_path):
         # curl path: -o <path> <url>
         if cmd[0].endswith("curl"):
             dest = Path(cmd[cmd.index("-o") + 1])
+            # The helper must download under the release-artifact name
+            # (.github/workflows/release.yml naming convention).
+            assert dest.name == artifact, f"{dest.name!r} != {artifact!r}"
             with zipfile.ZipFile(dest, "w") as z:
                 z.writestr(inner, b"fake")
             return MagicMock(returncode=0, stdout="", stderr="")

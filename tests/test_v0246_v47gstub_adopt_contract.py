@@ -31,7 +31,6 @@ import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 
 # Load install.py as a module without importing its argparse-at-top-level

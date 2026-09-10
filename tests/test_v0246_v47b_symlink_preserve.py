@@ -33,13 +33,11 @@ Coverage:
 """
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -49,7 +47,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import symlink_handler  # noqa: E402
-from vco_lib.deferral_report import DeferralReport, DeferralEntry  # noqa: E402
+from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,6 @@ Test surface:
 """
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from pathlib import Path

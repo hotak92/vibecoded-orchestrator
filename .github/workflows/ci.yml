@@ -299,10 +299,12 @@ jobs:
     # v0.2.94: ruff was a local-only convention — the maintainers run it
     # before every push — with no CI gate, so a red ruff could reach main
     # unnoticed (the same gap pyright had until the job above). Scope is
-    # the shipped Python, which is clean today; tests/ carries 174
-    # pre-existing findings (mostly F401) and joins the gate once that
-    # sweep lands. The ruff version is pinned in requirements-dev.txt so
-    # a new upstream rule cannot turn this job red on its own.
+    # the shipped Python PLUS tests/: the 174 pre-existing test findings
+    # were swept in v0.2.94, so tests/ is gated from here on. The ruff
+    # version is pinned in requirements-dev.txt so a new upstream rule
+    # cannot turn this job red on its own. This path list is pinned equal
+    # to scripts/pre-ship-check.sh Gate 3c by
+    # tests/test_v0294_ruff_gate_paths_parity.py — edit both or neither.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -314,7 +316,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: ruff
-        run: ruff check vco_lib claude_mcp_servers scripts install.py
+        run: ruff check vco_lib claude_mcp_servers scripts install.py tests
 
   frontend:
     name: Frontend (svelte-check)

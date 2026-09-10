@@ -9,12 +9,9 @@ Covers V46-F's helper module:
 """
 from __future__ import annotations
 
-import io
 import json
 from typing import Any
 from unittest.mock import patch, MagicMock
-
-import pytest
 
 from vco_lib.weaviate_helpers import (
     WeaviateGraphQLError,

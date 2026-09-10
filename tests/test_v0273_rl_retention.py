@@ -26,14 +26,14 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_mcp_servers.rl_client import rl_retention
+from claude_mcp_servers.rl_client.telemetry_writer import RLTelemetryWriter
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = PROJECT_ROOT / "claude_mcp_servers"
 for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-
-from claude_mcp_servers.rl_client import rl_retention
-from claude_mcp_servers.rl_client.telemetry_writer import RLTelemetryWriter
 
 _NOW_MS = 1_700_000_000_000
 _DAY_MS = 86_400_000

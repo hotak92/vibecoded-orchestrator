@@ -24,8 +24,6 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
-
 from claude_mcp_servers.weaviate_mcp.server import (
     _RL_LITERAL_CITED_MIN_TITLE_LEN,
     _RL_MIN_ANSWER_CHARS_FOR_CITATION,

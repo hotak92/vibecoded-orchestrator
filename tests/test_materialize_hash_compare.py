@@ -171,9 +171,11 @@ class RootRuntimeCopyDriftTests(unittest.TestCase):
         _git("init", "-q")
         # History: ship v1, then bump the template to v2 (both committed).
         tpl.write_text("print('v1 historical')\n", encoding="utf-8")
-        _git("add", "-A"); _git("commit", "-qm", "ship v1")
+        _git("add", "-A")
+        _git("commit", "-qm", "ship v1")
         tpl.write_text("print('v2 current')\n", encoding="utf-8")
-        _git("add", "-A"); _git("commit", "-qm", "ship v2")
+        _git("add", "-A")
+        _git("commit", "-qm", "ship v2")
 
         # Runtime copy = the HISTORICAL v1 bytes, with NO manifest entry (the
         # pre-manifest / manifest-less install shape).

@@ -165,10 +165,9 @@ class TestAgentFsDisableContract:
         )
         # The subprocess might still return non-zero for unrelated
         # reasons (template path missing in the test fixture etc.). The
-        # load-bearing assertion is: enabled-side file is STILL absent.
-        # If install_project_bundle re-created the file, the FS-disable
-        # contract is broken.
-        enabled = tmp_project / ".claude" / "agents" / "coder.md"
+        # load-bearing assertion is: the .disabled/ companion SURVIVED the
+        # update. The enabled-side negative can't be asserted directly —
+        # see the note below the assert.
         disabled = tmp_project / ".claude" / "agents.disabled" / "coder.md"
         assert disabled.exists(), (
             "post-update: disabled file must STILL exist; the FS-disable "

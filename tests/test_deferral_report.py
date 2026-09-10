@@ -14,7 +14,6 @@ Covers:
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -534,7 +533,6 @@ class TestHighFixesIntegration(unittest.TestCase):
 
     def test_high1_migrate_errors_emit_per_collection_deferrals(self) -> None:
         """HIGH-1: each entry in result['errors'] becomes a deferral entry."""
-        from vco_lib import project_init as pi
 
         report = DeferralReport()
 
@@ -872,7 +870,8 @@ class TestHighFixesIntegration(unittest.TestCase):
             "properties": [],
         }
         target = pi._kg_class_definition("Foo_KnowledgeGraph")
-        fetcher = lambda n: actual_legacy if n == "Foo_KnowledgeGraph" else target
+        def fetcher(n):
+            return actual_legacy if n == "Foo_KnowledgeGraph" else target
 
         env_backup = {
             k: os.environ.get(k) for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION")

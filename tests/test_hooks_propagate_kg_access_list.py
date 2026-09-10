@@ -228,7 +228,7 @@ def test_ps1_hook_does_not_strip_access_vars(hook_path: Path) -> None:
             # If `'VCT_KG_ACCESS_LIST'` appears inside such an array, we
             # flag.
             loop_re = re.compile(
-                rf"foreach\s*\(\s*\$\w+\s+in\s+[^)]*['\"]"
+                r"foreach\s*\(\s*\$\w+\s+in\s+[^)]*['\"]"
                 + re.escape(var)
                 + r"['\"]",
                 re.IGNORECASE,

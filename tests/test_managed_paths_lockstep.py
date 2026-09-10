@@ -14,7 +14,6 @@ the Python-side load and to assert the architectural-intent guard
 
 from __future__ import annotations
 
-import re
 import sys
 import unittest
 from pathlib import Path

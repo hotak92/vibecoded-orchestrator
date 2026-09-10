@@ -53,8 +53,7 @@ def _scan_for_local_outside_function(src: str) -> list[tuple[int, str]]:
     offending: list[tuple[int, str]] = []
     brace_depth = 0
     func_stack: list[int] = []  # entry brace_depth of each open function
-    in_heredoc: str | None = None  # delimiter, if any
-    in_pyheredoc = False  # python embedded HEREDOC
+    in_heredoc: str | None = None  # delimiter, if any (python heredocs too)
 
     lines = src.splitlines()
     for i, raw in enumerate(lines, start=1):

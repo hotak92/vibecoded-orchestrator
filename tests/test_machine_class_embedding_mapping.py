@@ -76,11 +76,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import install  # type: ignore  # noqa: E402
-from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter
-from vco_lib.embedding_providers.ollama import OllamaAdapter
-from vco_lib.embedding_providers.openai import OpenAIAdapter, ValidationResult
-from vco_lib.embedding_service import EmbeddingService
+import install  # type: ignore  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
+from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
+from vco_lib.embedding_providers.ollama import OllamaAdapter  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
+from vco_lib.embedding_providers.openai import OpenAIAdapter, ValidationResult  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
+from vco_lib.embedding_service import EmbeddingService  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
 
 
 # ---------------------------------------------------------------------------

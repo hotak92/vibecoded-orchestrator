@@ -14,10 +14,7 @@ gitignore pattern `tests/test_rl_*.py`.
 """
 
 import asyncio
-import os
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 
 # ---------------------------------------------------------------------------

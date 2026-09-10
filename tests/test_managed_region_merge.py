@@ -15,7 +15,6 @@ Covers:
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import unittest
@@ -26,7 +25,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vco_lib import project_init  # noqa: E402
 from vco_lib.project_init import (  # noqa: E402
     MANAGED_REGION_OPEN,
     MANAGED_REGION_CLOSE,
@@ -248,6 +246,9 @@ class FullMergeIntegrationTests(unittest.TestCase):
             merged = merge_managed_region("", "body v1")
             _write_file_atomic(target, merged.encode("utf-8"))
             content_v1 = target.read_text(encoding="utf-8")
+            # Pin round 1 actually landed — otherwise round 2's
+            # assertNotIn("body v1", final) below passes vacuously.
+            self.assertIn("body v1", content_v1)
 
             # User appends some custom content below the closing marker.
             with open(target, "a", encoding="utf-8") as fh:
