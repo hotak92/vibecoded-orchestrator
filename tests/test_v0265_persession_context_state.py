@@ -119,7 +119,8 @@ class _HookHarness(unittest.TestCase):
         if not self.bash:
             self.skipTest("bash not on PATH")
         self.tmp = tempfile.mkdtemp(prefix="v0265_persession_")
-        self.proj = Path(self.tmp)
+        self.proj = Path(self.tmp) / "proj"
+        self.proj.mkdir()
         self.claude = self.proj / ".claude"
         self.context_dir = self.claude / "context"
         self.state_dir = self.claude / "state"
@@ -428,8 +429,11 @@ class HostileSessionIdSanitized(_HookHarness):
         )
 
         # No traversal artifact anywhere outside the two intended state dirs.
-        # Walk the project root and the parent dir for any stray ctx_snapshot_*
-        # / CONTEXT_STATE_* file that escaped .claude/state/ / .claude/context/.
+        # Walk the project root and its parent — the per-test SANDBOX, which is
+        # where a `../../` escape from .claude/state/ lands. (The project is
+        # deliberately nested one level inside the mkdtemp root: scanning the
+        # mkdtemp root directly would rglob all of /tmp, where any unrelated
+        # process's leftover ctx_snapshot_* fails this test.)
         allowed = {self.state_dir.resolve(), self.context_dir.resolve()}
         strays: list[str] = []
         for base in (self.proj, self.proj.parent):

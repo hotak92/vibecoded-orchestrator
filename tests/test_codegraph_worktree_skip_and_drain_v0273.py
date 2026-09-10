@@ -149,11 +149,27 @@ def test_worktree_edit_registered_root_indexes(tmp_path: Path) -> None:
 
 
 def _make_analyzer_stub(path: Path, argv_log: Path) -> None:
+    """Record each analyzer invocation as {"argv": [...], "listed": [...]}.
+
+    ``listed`` is the content of the ``--only-files-from`` batch file, read
+    HERE rather than by the test: the drain unlinks that file (``rm -f
+    "$_list"`` in stop-codegraph-drain.sh) only AFTER the analyzer returns, so
+    the stub is the one place where the contents are guaranteed to exist.
+    """
     path.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env python3
         import json, sys
+        argv = sys.argv[1:]
+        listed = []
+        if "--only-files-from" in argv:
+            _lf = argv[argv.index("--only-files-from") + 1]
+            try:
+                with open(_lf) as _f:
+                    listed = [ln.strip() for ln in _f if ln.strip()]
+            except OSError as exc:
+                listed = ["<unreadable: %s>" % exc]
         with open({json.dumps(str(argv_log))}, "a") as f:
-            f.write(json.dumps(sys.argv[1:]) + "\\n")
+            f.write(json.dumps({{"argv": argv, "listed": listed}}) + "\\n")
     """))
     path.chmod(0o755)
 
@@ -207,11 +223,14 @@ def test_drain_batches_all_files_in_one_run(tmp_path: Path) -> None:
     runs = _wait_for_lines(argv_log, 1)
     # All main-tree files share ONE canonical root → exactly ONE analyzer run.
     assert len(runs) == 1, f"expected 1 batched run, got {len(runs)}: {runs}"
-    argv = runs[0]
+    argv = runs[0]["argv"]
     assert "--only-files-from" in argv, "batched run must use --only-files-from"
-    # The list file itself is unlinked by the detached run, so its CONTENTS
-    # are not assertable here. The invariant that carries the batching claim
-    # is the run count above: one run == one batch of all 3 files.
+    # ONE run is necessary but not sufficient — one run over ONE file also
+    # gives len(runs)==1. The batching claim is that the single run's list
+    # names ALL THREE paths.
+    listed = runs[0]["listed"]
+    assert sorted(listed) == sorted(str(f) for f in files), (
+        f"the batch must name all 3 queued paths, got {listed}")
     assert argv[0] == str(repo), "repo_path arg is the canonical root"
 
 
@@ -316,23 +335,15 @@ def test_drain_consumes_shared_queue_with_per_session(tmp_path: Path) -> None:
     runs = _wait_for_lines(argv_log, 1)
     # Both paths share ONE canonical root (the main repo) → ONE analyzer run.
     assert len(runs) == 1, f"expected 1 batched run over both queues, got {runs}"
-    argv = runs[0]
+    argv = runs[0]["argv"]
     assert "--only-files-from" in argv
-    list_file = Path(argv[argv.index("--only-files-from") + 1])
-    # The list file is cleaned up by the detached run; capture its content fast.
-    import time
-    listed = ""
-    for _ in range(60):
-        if list_file.exists():
-            listed = list_file.read_text()
-            if "a.py" in listed and "b.py" in listed:
-                break
-        time.sleep(0.05)
-    # Even if the list file was already GC'd, one run covering the canonical
-    # root is the invariant; when we DID capture it, both paths must be present.
-    if listed:
-        assert "a.py" in listed and "b.py" in listed, (
-            f"batch must contain both per-session and shared paths: {listed!r}")
+    # The stub captured the list file's contents while it still existed, so
+    # this is an unconditional assertion, not a best-effort one.
+    listed = runs[0]["listed"]
+    assert any(p.endswith("a.py") for p in listed), (
+        f"batch must contain the per-session path: {listed}")
+    assert any(p.endswith("b.py") for p in listed), (
+        f"batch must contain the shared-queue path: {listed}")
 
     # Both queues cleared after a successful drain.
     assert not (state / f"codegraph_drain_{session}.txt").exists(), (

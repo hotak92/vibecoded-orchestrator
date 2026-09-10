@@ -407,6 +407,16 @@ except ImportError as _code_prefix_import_err:
     )
 _HAS_CODE_CANONICAL_PREFIX = True
 
+# v0.2.94: the user's HOME, for the boundary in `_resolution_context()` below.
+# Resolved through the ONE resolver (`VCT_USER_HOME_OVERRIDE` -> `Path.home()`)
+# and never reconstructed inline — an inline `Path.home()` is exactly the shape
+# that let the doctor read the developer's real global config from the test
+# suite (v0.2.92 W-CLAUDE), because nothing could steer it.
+try:
+    from vco_lib.paths import user_home as _user_home
+except ImportError as _user_home_import_err:
+    _reraise_vco_lib_import(_user_home_import_err, "paths.user_home")
+
 
 # ─── v0.2.21 Step 18: per-project config resolver ───────────────────────
 #
@@ -509,6 +519,37 @@ def _looks_like_vco_project(path: Path) -> bool:
         return False
 
 
+def _home_boundaries() -> "frozenset[Path]":
+    """Every directory this process could mean by "the user's home".
+
+    TWO members, deliberately — this is a SAFETY boundary, not a config read,
+    and the two answers can differ:
+
+      * :func:`vco_lib.paths.user_home` — the ONE config resolver
+        (``VCT_USER_HOME_OVERRIDE`` -> ``Path.home()``). Whatever VCO has been
+        told to treat as home.
+      * ``Path.home()`` — the OS home, which keeps holding the real
+        ``~/.claude/settings.json`` no matter what the override says.
+
+    Using only the first would let ``VCT_USER_HOME_OVERRIDE`` — a shipped,
+    user-settable knob — point away from the real home and re-open the very
+    bug this boundary closes; using only the second would ignore the override
+    a sandbox or the test suite legitimately sets. A home is out of bounds if
+    it is EITHER, so neither answer can defeat the guard.
+
+    Never raises: an unresolvable home (no ``$HOME``, no passwd entry) simply
+    contributes no boundary, and :func:`_resolution_context` then walks as it
+    did before rather than inventing one.
+    """
+    found: "set[Path]" = set()
+    for probe in (_user_home, Path.home):
+        try:
+            found.add(probe().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return frozenset(found)
+
+
 def _resolution_context() -> "tuple[Path, str]":
     """Return ``(project_root, context_kind)`` for hub resolution.
 
@@ -520,6 +561,17 @@ def _resolution_context() -> "tuple[Path, str]":
          This is the case a project CLI hits (no ``CLAUDE_PROJECT_DIR``).
       3. ``_MODULE_OWN_ROOT`` — a GUESS. Correct only when the process
          happens to be about the orchestrator itself.
+
+    The rung-2 walk STOPS at the user's home and never accepts it (v0.2.94).
+    EVERY Claude Code user has ``~/.claude/settings.json`` — the harness's
+    GLOBAL config file, not a project marker — so a walk that reaches home
+    matches it and hands back the home directory as "the project". Everything
+    keyed on the project root then points at ``$HOME``: the KG-collection
+    fallback, ``KG_BASE_DIR``-relative writes, doctor paths. A project lives
+    UNDER home, never at or above it, so home is both the rejection and the
+    stopping point; a cwd outside home (``/opt/...``, ``/tmp/...``) never meets
+    the boundary and walks as before. "Home" here means EITHER home this
+    process could have — see :func:`_home_boundaries`.
 
     NOT cached: ``CLAUDE_PROJECT_DIR`` is patched between calls by the
     NEW-6 regression tests, and the cost is a handful of ``is_file()``
@@ -539,7 +591,10 @@ def _resolution_context() -> "tuple[Path, str]":
     except OSError:
         here = None
     if here is not None:
+        homes = _home_boundaries()
         for ancestor in (here, *here.parents):
+            if ancestor in homes:
+                break  # home, and everything above it, is out of bounds
             if _looks_like_vco_project(ancestor):
                 return ancestor, _CTX_CWD
     return _MODULE_OWN_ROOT, _CTX_MODULE

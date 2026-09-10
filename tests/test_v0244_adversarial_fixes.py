@@ -619,11 +619,14 @@ def test_i1_advisory_lock_acquires_and_releases(tmp_path, monkeypatch):
     # honoured by vco_lib.paths.vct_root_dir).
     monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
     # Acquire the lock; should not raise.
-    with install._install_advisory_lock(timeout_seconds=2.0):
-        # Lock file should exist under the resolved vct_root_dir.
-        # The yielded handle may be None if the lock could not be acquired
-        # (rare on an empty tmpdir), but the file itself must exist either
-        # way because we opened it before attempting to lock.
+    with install._install_advisory_lock(timeout_seconds=2.0) as fp:
+        # `_install_advisory_lock` yields `fp if acquired else None`, so a
+        # non-None handle IS the "acquires" half of this test's name. The
+        # lock-file check below cannot carry it: install.py opens that file
+        # BEFORE attempting the lock, so it exists even when locking failed.
+        assert fp is not None, (
+            "lock not acquired on an empty tmpdir — nothing else holds it"
+        )
         lock_path = tmp_path / "install.py.lock"
         assert lock_path.exists(), (
             f"expected lock file at {lock_path}; got {list(tmp_path.iterdir())}"
