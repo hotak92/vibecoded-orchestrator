@@ -254,8 +254,14 @@ ambient environment, so `http://localhost:8081` was never overridden.
   test — the per-test half because a suite restoring with
   `os.environ.update(backup)` cannot remove a key the backup lacked, so one
   such test un-pinned every test after it. Live-backend tests opt in through
-  the existing per-file frozenset (the pre-ship gate's file is derived from
-  the gate script, and a canary proves the stand-aside still fires). Two suites
+  the existing per-file frozenset, applied at BOTH moments from one list — at
+  test execution AND at module IMPORT, via a `pytest_pycollect_makemodule`
+  carve-out, because the two pre-ship live files resolve the URL at module
+  scope and feed it to a `skipUnless` evaluated at import: a stand-aside that
+  reached only the fixture left them skipping while
+  `scripts/pre-ship-check.sh` reported PASS for a leg that asserted nothing.
+  A canary drives real child `pytest` runs and reads the skip REASON, so a
+  stand-aside that stops firing is named rather than silent. Two suites
   passed only because the leak let their readiness probe answer from the live
   instance; they now name their own mock server in `WEAVIATE_URL` rather than
   relying on the key's absence. Three further tests were CREATING scratch
@@ -269,12 +275,60 @@ ambient environment, so `http://localhost:8081` was never overridden.
   connection for the scripts. The table (`vco_lib/fixture_class_guard.py`) is
   curated, not derived — every entry must appear in `tests/`, and no name a
   real project could own may enter it.
+- **The code-graph analyzer joins both containment legs.** It hardcoded
+  `localhost:8081` in two hand-rolled `connect_to_custom` calls, so
+  `self.weaviate_url` was a label the connection ignored: nothing — not
+  `$WEAVIATE_URL`, not the suite pin — could steer it, and the two suites that
+  spawn it minted `<Project>_Code*` classes on whatever instance was listening
+  (a reviewer watched the live schema go 161 -> 166). It now resolves through
+  the same `vco_lib.weaviate_helpers` chain as every other writer and creates
+  through the shared guarded create, net-negative under its line ratchet.
+- **The guard also refuses at ADD time** (`install.py::_ensure_collections`,
+  `project_init._create_class`). A project named for a fixture used to get its
+  classes created and then hit `exit 2` on every sync — created but
+  unwritable; the decision now happens once, where the name is chosen.
 - **The doctor tells the two ghosts apart.** An unclaimed class whose stem is a
   fixture name reads "fixture-shaped ghost — written by a test or probe
   harness, not by any project" and gets a remedy that fits, since there is no
   project to re-add: verify parity by reading both classes, then decide. No
   drop command is printed and nothing is deleted — the destructive step stays
-  the user's. Non-fixture leftovers keep the existing wording.
+  the user's. Non-fixture leftovers keep the existing wording. The reading
+  covers EVERY family, not just `*_KnowledgeGraph` (`Foo_Diagrams` and
+  `<Fixture>_Code*` were invisible to a KG-scoped ownership analysis), while a
+  class a binding actually names is never called a ghost whatever its stem.
+- **Table coverage runs both ways.** A `<Stem>_<Family>` literal in `tests/`
+  whose stem is neither in the table nor in a pinned inventory of real /
+  plausible-real names now FAILS, naming the stem and the files — so a new
+  fixture name is a decision, not a silent gap. That review pass added `Acme`,
+  `AcmeCorp`, `Fake`, `FakeProject`, `Ghost`, `GhostName`, `P1`, `Phantom` and
+  `ProjA`. Stems grounded only in LIVE residue on one machine stay OUT
+  (`Bart_Code*`, 55/92/7 objects): that is a name a real project could own, and
+  the doctor's report — which names it and decides nothing — is its surface.
+
+### Fixed — the suite imports THIS checkout's `weaviate_mcp`, not another tree's (v0.2.94)
+
+`vco_lib` sits at the repo root, so pytest's rootdir prepend keeps it honest.
+`weaviate_mcp` sits one directory deeper, under `claude_mcp_servers/`, and
+nothing put that on `sys.path` — while an editable install's
+`_editable_impl_weaviate_mcp.pth` puts *another* checkout's
+`claude_mcp_servers` there at interpreter start. Measured from `/tmp` with
+`PYTHONPATH` unset: `vco_lib` from the checkout, `weaviate_mcp` from the other
+tree, in one process. 62 test files import `weaviate_mcp`; on a release branch
+they were asserting against the code of the RUNNING install rather than the
+code being released. Only `scripts/pre-ship-check.sh` pinned both roots, and a
+gate that just some invocations satisfy is not a gate.
+
+- `tests/conftest.py` puts both import roots — derived from `__file__`, never
+  from cwd — at the front of `sys.path` before any test module is imported,
+  and evicts (loudly) a `weaviate_mcp` already imported from elsewhere, since
+  `sys.modules` outranks `sys.path`.
+- `tests/common/child_env.py` pins the same second root for SPAWNED children,
+  which inherited the identical shadow through a `PYTHONPATH` that named only
+  the repo root.
+- `tests/test_v0294_weaviate_mcp_imports_from_the_checkout.py` is the canary:
+  it asserts where both packages actually came from — naming the path on
+  failure — and that the checkout's roots really do lead `sys.path`, so it
+  still pins the mechanism on a clean runner where the outcome is free.
 
 ## [0.2.93] - 2026-09-08
 

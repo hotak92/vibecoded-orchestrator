@@ -109,12 +109,24 @@ def _kg_base_sentinel() -> str:
 def child_env(
     base: Optional[Mapping[str, str]] = None, /, **overrides: str,
 ) -> dict[str, str]:
-    """``base`` (default ``os.environ``) with the repo root FIRST on
-    ``PYTHONPATH``, then ``overrides``. Returns a fresh dict every call."""
+    """``base`` (default ``os.environ``) with the checkout's import roots FIRST
+    on ``PYTHONPATH``, then ``overrides``. Returns a fresh dict every call."""
     env = dict(os.environ if base is None else base)
     prior = env.get("PYTHONPATH", "")
     root = str(REPO_ROOT)
-    parts = [root] + [p for p in prior.split(os.pathsep) if p and p != root]
+    # v0.2.94 W-SHADOW: `claude_mcp_servers` is the SECOND import root and it
+    # was missing. `weaviate_mcp` lives inside it, not beside `vco_lib`, so the
+    # repo-root pin above never covered it — and the dev venv's
+    # `_editable_impl_weaviate_mcp.pth` puts ANOTHER checkout's
+    # `claude_mcp_servers` on the child's path at interpreter start. Measured:
+    # a child spawned with this env imported `vco_lib` from the checkout and
+    # `weaviate_mcp` from `<VCO_dev>`, in the same process. Same rule, same
+    # shape, one directory deeper; `tests/conftest.py` carries it for the
+    # in-process side.
+    roots = [root, str(REPO_ROOT / "claude_mcp_servers")]
+    parts = roots + [
+        p for p in prior.split(os.pathsep) if p and p not in roots
+    ]
     env["PYTHONPATH"] = os.pathsep.join(parts)
     # Beats PYTHONPATH in the shipped scripts that read it — see the module
     # docstring. Set BEFORE `overrides` so a caller can still opt out.

@@ -1589,7 +1589,8 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             ),
             detail={"unclaimed": [u.name for u in unclaimed]},
         )
-        if not unclaimed:
+        extra_fixture = list(getattr(scan, "fixture_shaped", ()) or ())
+        if not unclaimed and not extra_fixture:
             return [agreement]
         # v0.2.92 (reported-not-fixed item 3): every REGISTERED project
         # agrees, but populated classes exist that no registered project
@@ -1602,14 +1603,15 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             Finding(
                 probe="kg_binding_evidence",
                 status=STATUS_PROBLEM,
-                summary=_kg_unclaimed_summary(unclaimed),
+                summary=_kg_unclaimed_summary(unclaimed, extra_fixture),
                 fix=FIX_DEFER,
                 condition_id=CID_KG_UNCLAIMED,
-                command=_kg_unclaimed_remediation(unclaimed),
+                command=_kg_unclaimed_remediation(unclaimed, extra_fixture),
                 detail={
                     "unclaimed": [
                         {"class": u.name, "count": u.count} for u in unclaimed
                     ],
+                    "fixture_shaped": extra_fixture,
                     "verdicts": jsonable_verdicts(scan),
                 },
             ),
@@ -1661,7 +1663,7 @@ def _fixture_shaped_names(names) -> list[str]:
     return [n for n in names if fixture_stem_of(n) is not None]
 
 
-def _kg_unclaimed_summary(unclaimed) -> str:
+def _kg_unclaimed_summary(unclaimed, extra_fixture=()) -> str:
     """The one-line diagnosis for populated classes no project claims.
 
     A fixture-shaped class is a DIFFERENT diagnosis from a removed project's
@@ -1677,19 +1679,33 @@ def _kg_unclaimed_summary(unclaimed) -> str:
         + (", fixture-shaped)" if u.name in fixture else ")")
         for u in unclaimed
     )
+    extra = list(extra_fixture or ())
+    # v0.2.94 (review LOW-1): the ownership analysis above is KG-scoped, so
+    # `Foo_Diagrams` and `<Fixture>_Code*` never reached it. They need no
+    # analysis — the stem is a name no project has — so they are named here.
+    tail = (
+        f" Plus {len(extra)} fixture-shaped class(es) in other families: "
+        f"{', '.join(extra)}."
+        if extra else ""
+    )
+    if not unclaimed:
+        return (
+            f"{len(extra)} fixture-shaped class(es) — written by a test or "
+            f"probe harness, not by any project: {', '.join(extra)}"
+        )
     if not fixture:
         return (
             f"{len(unclaimed)} populated KG class(es) no registered "
-            f"project claims: {names}"
+            f"project claims: {names}" + tail
         )
     return (
         f"{len(unclaimed)} populated KG class(es) no registered project "
         f"claims; {len(fixture)} of them fixture-shaped ghost(s) — written "
-        f"by a test or probe harness, not by any project: {names}"
+        f"by a test or probe harness, not by any project: {names}" + tail
     )
 
 
-def _kg_unclaimed_remediation(unclaimed) -> str:
+def _kg_unclaimed_remediation(unclaimed, extra_fixture=()) -> str:
     """The exact block the deferral + the CLI both print. LOOK-only.
 
     The constraint is absolute (v0.2.92 reported-not-fixed item 3): a
@@ -1707,8 +1723,11 @@ def _kg_unclaimed_remediation(unclaimed) -> str:
     performs — a destructive step this text still refuses to hand over as a
     runnable command.
     """
-    names = ", ".join(sorted(u.name for u in unclaimed))
-    fixture = sorted(_fixture_shaped_names(u.name for u in unclaimed))
+    names = ", ".join(sorted(u.name for u in unclaimed)) or "(none)"
+    fixture = sorted(
+        set(_fixture_shaped_names(u.name for u in unclaimed))
+        | set(extra_fixture or ())
+    )
     fixture_block = ""
     if fixture:
         # A fixture-shaped ghost needs DIFFERENT instructions: the three
@@ -1774,6 +1793,12 @@ def _kg_unclaimed_entry(finding: Finding):
             str(c["class"])
             for c in (finding.detail.get("unclaimed") or [])
             if isinstance(c, dict) and isinstance(c.get("class"), str)
+        }
+        # v0.2.94 LOW-1: non-KG fixture-shaped classes key the dismissal too,
+        # so a NEW one re-fires an entry the user had dismissed.
+        | {
+            str(n) for n in (finding.detail.get("fixture_shaped") or [])
+            if isinstance(n, str)
         }
     )
     fixture = sorted(_fixture_shaped_names(classes))

@@ -42,6 +42,7 @@ References:
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import sqlite3
@@ -54,6 +55,82 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ─── W-SHADOW (v0.2.94): every test imports THIS checkout, never another ─────
+#
+# The maintainer's venv holds `_editable_impl_weaviate_mcp.pth`, which puts
+# `<VCO_dev>/claude_mcp_servers` on `sys.path` at interpreter start. `vco_lib`
+# survives that (pytest prepends the rootdir, and the checkout wins), but
+# `weaviate_mcp` lives one directory DEEPER — under `claude_mcp_servers/` —
+# which nothing puts on the path. So from any worktree, and from the
+# orchestrator root under a bare `pytest`, `import weaviate_mcp.server`
+# resolved to the OTHER tree. Measured on this machine, from `/tmp` with
+# `PYTHONPATH` unset:
+#
+#     vco_lib      : <checkout>/vco_lib/__init__.py
+#     weaviate_mcp : <VCO_dev>/claude_mcp_servers/weaviate_mcp/__init__.py
+#
+# 62 test files import `weaviate_mcp`. Every one of them was measuring
+# whatever that path handed over — which on a release branch is the code of
+# the RUNNING install, not the code being released. `scripts/pre-ship-check.sh`
+# pins `PYTHONPATH=$PWD:$PWD/claude_mcp_servers` and so is safe; nothing else
+# is, and a gate that only some invocations satisfy is not a gate.
+#
+# Both roots are derived from `__file__`, never from cwd: a test run from
+# outside the checkout must still measure the checkout.
+#
+# ONE home, and it must be here: conftest.py is imported before any test
+# module, so the path is correct by the time the first `import weaviate_mcp`
+# in a test file executes. `tests/common/child_env.py` carries the same rule
+# for SPAWNED children (its PYTHONPATH pinned only the repo root, so children
+# inherited the identical shadow).
+_CHECKOUT_IMPORT_ROOTS = (_REPO_ROOT, _REPO_ROOT / "claude_mcp_servers")
+for _root in reversed(_CHECKOUT_IMPORT_ROOTS):
+    _root_str = str(_root)
+    while _root_str in sys.path:
+        sys.path.remove(_root_str)
+    sys.path.insert(0, _root_str)
+
+def _evict_modules_imported_outside(package: str, root: Path, modules=None) -> list[str]:
+    """Drop cached ``package[.sub]`` modules whose file lives outside *root*.
+
+    A module already imported from ANOTHER tree survives the path fix above —
+    the ``sys.modules`` cache outranks ``sys.path``. Nothing has RUN at conftest
+    import time (conftest is imported before every test module), so an eviction
+    here cannot strand a live reference; the stderr line is what keeps that
+    claim checkable if the ordering ever changes.
+
+    Takes *modules* so both branches are testable without touching the real
+    cache (``tests/test_v0294_weaviate_mcp_imports_from_the_checkout.py``): an
+    eviction is a mutation, and a mutation gets a test for the act AND for the
+    leave-alone case.
+    """
+    cache = sys.modules if modules is None else modules
+    evicted: list[str] = []
+    for name in [
+        n for n in list(cache)
+        if n == package or n.startswith(package + ".")
+    ]:
+        mod_file = getattr(cache[name], "__file__", None)
+        if not isinstance(mod_file, str):
+            continue
+        # `is_relative_to`, not a string prefix: a sibling checkout named
+        # `<repo>-old` IS a string prefix of `<repo>` and would read as
+        # "inside".
+        if Path(mod_file).resolve().is_relative_to(root):
+            continue
+        print(
+            f"[conftest] evicting pre-imported {name} from {mod_file} — "
+            f"tests must measure {root}",
+            file=sys.stderr,
+        )
+        del cache[name]
+        evicted.append(name)
+    return evicted
+
+
+_evict_modules_imported_outside("weaviate_mcp", _REPO_ROOT)
 
 
 # ─── P5 (v0.2.91): keep the suite out of the PRODUCTION telemetry streams ────
@@ -1219,12 +1296,78 @@ def _weaviate_url_pin_for(test_file: str) -> "str | None":
     return _fixture_guard.UNROUTABLE_SENTINEL_URL
 
 
+@contextlib.contextmanager
+def _weaviate_url_applied_for(test_file: str):
+    """Apply :func:`_weaviate_url_pin_for`'s decision, then restore.
+
+    ONE application point for the two moments that need it — module IMPORT
+    (collection) and test EXECUTION — so a file cannot be pinned at one and
+    ambient at the other, which is exactly the bug this replaced.
+    """
+    prev = os.environ.get("WEAVIATE_URL")
+    target = _weaviate_url_pin_for(test_file)
+    if target is None:
+        os.environ.pop("WEAVIATE_URL", None)
+    else:
+        os.environ["WEAVIATE_URL"] = target
+    try:
+        yield target
+    finally:
+        if prev is None:
+            os.environ.pop("WEAVIATE_URL", None)
+        else:
+            os.environ["WEAVIATE_URL"] = prev
+
+
+class _AmbientWeaviateUrlModule(pytest.Module):
+    """A test module imported with the AMBIENT `WEAVIATE_URL` restored.
+
+    The import-time pin at the top of this file governs collection, and the
+    stand-aside used to live only in the per-test fixture — so an opt-out file
+    that resolves the URL at MODULE scope (both pre-ship live files do: a
+    module-level `WEAVIATE_URL = os.environ.get(...)` feeding an
+    `@unittest.skipUnless(_weaviate_reachable(), ...)` evaluated at import)
+    saw the sentinel, skipped, and `scripts/pre-ship-check.sh` printed PASS for
+    a leg that asserted nothing. A green gate measuring nothing is worse than
+    a red one.
+
+    `collect()` is where pytest imports the module (`self.obj`), so wrapping it
+    puts the env in place for exactly that window and nothing wider.
+    """
+
+    def collect(self):
+        with _weaviate_url_applied_for(self.path.name):
+            return list(super().collect())
+
+
+def _module_needs_ambient_weaviate_url(module_name: str) -> bool:
+    """Does *module_name* have to be IMPORTED with the ambient URL?
+
+    Split out from the hook so both branches are testable without building a
+    pytest collector, and so the decision comes from the SAME frozenset the
+    per-test fixture uses — one list, two moments.
+    """
+    return module_name in _LIVE_WEAVIATE_OPT_OUT_FILES
+
+
+def pytest_pycollect_makemodule(module_path, parent):
+    """Route the opt-out files through the ambient-URL module collector.
+
+    Returning `None` for everything else keeps pytest's default collector — the
+    blast radius is exactly `_LIVE_WEAVIATE_OPT_OUT_FILES` and no other file.
+    """
+    if _module_needs_ambient_weaviate_url(module_path.name):
+        return _AmbientWeaviateUrlModule.from_parent(parent, path=module_path)
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _pin_weaviate_url(request):
     """W-WEAVIATE: re-establish the backend pin for EVERY test.
 
-    The import-time assignment covers collection; this covers the rest of the
-    session, because a suite that sets `WEAVIATE_URL` itself and restores with
+    The import-time assignment (plus `pytest_pycollect_makemodule` above for
+    the opt-out files) covers collection; this covers the rest of the session,
+    because a suite that sets `WEAVIATE_URL` itself and restores with
     `os.environ.update(backup)` cannot remove a key the backup lacked — so
     without this, one such test un-pins every test that follows it. That is
     not hypothetical: it is half of how the incident happened.
@@ -1233,25 +1376,16 @@ def _pin_weaviate_url(request):
     including for the opt-out files: they are still tests, and they still own
     whatever classes they create.
     """
-    prev_url = os.environ.get("WEAVIATE_URL")
     prev_allow = os.environ.get(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV)
-    target = _weaviate_url_pin_for(request.node.fspath.basename)
-    if target is None:
-        os.environ.pop("WEAVIATE_URL", None)
-    else:
-        os.environ["WEAVIATE_URL"] = target
-    os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
-    try:
-        yield
-    finally:
-        if prev_url is None:
-            os.environ.pop("WEAVIATE_URL", None)
-        else:
-            os.environ["WEAVIATE_URL"] = prev_url
-        if prev_allow is None:
-            os.environ.pop(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV, None)
-        else:
-            os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = prev_allow
+    with _weaviate_url_applied_for(request.node.fspath.basename):
+        os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
+        try:
+            yield
+        finally:
+            if prev_allow is None:
+                os.environ.pop(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV, None)
+            else:
+                os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = prev_allow
 
 
 # Test files that EXPLICITLY exercise `spawn_background_resync`'s launch path

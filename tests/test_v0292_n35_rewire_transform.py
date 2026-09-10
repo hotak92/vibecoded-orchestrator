@@ -616,8 +616,15 @@ class TestTheRuntimeBenefit:
 class TestTheRatchetHeld:
     def test_analyze_code_graph_did_not_grow(self):
         """The region edit REPLACED comment lines rather than adding to a
-        7,227-line monolith; `tests/test_analyze_code_graph_ratchet.py` also
-        fails if this drifts far below the pin."""
+        ~7,226-line monolith; `tests/test_analyze_code_graph_ratchet.py` also
+        fails if this drifts far below the pin.
+
+        v0.2.94: re-pinned DOWNWARD 7227 -> 7226. Routing `connect()` and the
+        migrate helper through `vco_lib.weaviate_helpers` (instead of two
+        hand-rolled `connect_to_custom` calls that hardcoded localhost:8081)
+        was net-negative even after adding the guarded create. Both ratchets
+        move together, and only ever down.
+        """
         n = len((SCRIPTS / "analyze_code_graph.py").read_text(
             encoding="utf-8").splitlines())
-        assert n == 7227, n
+        assert n == 7226, n

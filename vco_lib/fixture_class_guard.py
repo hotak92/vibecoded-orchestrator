@@ -85,6 +85,7 @@ __all__ = [
     "fixture_stem_of",
     "fixture_writes_allowed",
     "guard_fixture_class_write",
+    "guarded_collection_create",
     "is_fixture_shaped_class",
     "refusal_text",
 ]
@@ -111,14 +112,37 @@ UNROUTABLE_SENTINEL_URL = "http://127.0.0.1:9"
 #:     ``VCT_KG_ACCESS_LIST`` fixtures).
 #:   * Metasyntactic — ``Foo`` has live residue too (an empty ``Foo_Diagrams``
 #:     class), which is the same shape one creation-only step earlier.
+#:   * Placeholder-company and negative-space words the suite uses for
+#:     "a project that is not real" — ``Acme``/``AcmeCorp`` (the world's
+#:     placeholder company), ``Fake``/``FakeProject``, ``Ghost``/``GhostName``
+#:     (the unclaimed-class fixtures), ``Phantom``, and the enumerations
+#:     ``P1``/``ProjA``. Added v0.2.94 after review: they are fixture names by
+#:     provenance, and the guard is only as good as its coverage of them.
+#:
+#: NOT admitted: stems grounded only in LIVE residue on one machine. The
+#: maintainer's Weaviate carries ``Bart_CodeClass/Function/Module`` (55/92/7
+#: real objects) whose stem appears in no test file — and that is exactly a
+#: name a real project could own. Live residue on one box is hearsay for every
+#: other user; the doctor's unclaimed-class report is the right surface for it
+#: (it NAMES the class and leaves the decision to the human), not this table,
+#: which silently refuses writes. Every entry must be grounded in ``tests/``.
 FIXTURE_PROJECT_NAMES: frozenset[str] = frozenset({
+    "Acme",
+    "AcmeCorp",
     "Alpha",
     "Bar",
     "Baz",
     "Beta",
+    "Fake",
+    "FakeProject",
     "Foo",
     "Foobar",
     "Gamma",
+    "Ghost",
+    "GhostName",
+    "P1",
+    "Phantom",
+    "ProjA",
     "Quux",
 })
 
@@ -218,6 +242,20 @@ def refusal_text(
         f"project's name, set the same variable — and consider renaming, "
         f"because VCO's own fixtures use that name too."
     )
+
+
+def guarded_collection_create(client, name: str, **create_kwargs):
+    """``client.collections.create(name=..., **kw)`` with the guard in front.
+
+    The seam for callers whose create is a bare v4 call: they swap one line
+    and inherit the refusal, instead of growing an inline copy of it. Used by
+    ``templates/scripts/analyze_code_graph.py``, whose five ``<Prefix>_Code*``
+    classes are the families with the most live residue on the maintainer's
+    box (``Wt_foo_Code*``, ``LaneCProbe*_Code*``) and which sits under a
+    downward-only line ratchet, so an inline guard there was not available.
+    """
+    guard_fixture_class_write(name, operation="create")
+    return client.collections.create(name=name, **create_kwargs)
 
 
 def guard_fixture_class_write(

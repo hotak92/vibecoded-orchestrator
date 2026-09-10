@@ -1301,6 +1301,15 @@ def _create_class(payload: dict, weaviate_url: Optional[str] = None) -> None:
     existing = _fetch_schema(name, weaviate_url=weaviate_url)
     if existing is not None:
         return
+    # v0.2.94 W-WEAVIATE: the ADD-TIME create path. Without this, a project
+    # named for one of VCO's test fixtures got the worst of both worlds — the
+    # classes were created here, and then every kg-sync refused to write to
+    # them (exit 2). One rule, one escape (`VCT_ALLOW_FIXTURE_CLASS_WRITES=1`),
+    # decided ONCE at add time instead of surfacing at every later sync.
+    # Placed AFTER the idempotency return: an existing class is not a write.
+    from vco_lib.fixture_class_guard import guard_fixture_class_write
+
+    guard_fixture_class_write(name, operation="create", weaviate_url=base)
     status, body = _http_request("POST", f"{base}/v1/schema", body=payload, timeout=30)
     if status not in (200, 201):
         raise RuntimeError(f"POST /v1/schema ({name}) → HTTP {status}: {body[:300]!r}")

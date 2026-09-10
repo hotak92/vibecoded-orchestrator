@@ -65,6 +65,15 @@ def _class_names_used_by_tests() -> set[str]:
     return found
 
 
+def _files_naming(class_name: str) -> set[str]:
+    """Which test files write *class_name* down — so a failure can name them."""
+    hits = set()
+    for path in TESTS_DIR.rglob("*.py"):
+        if class_name in path.read_text(encoding="utf-8", errors="replace"):
+            hits.add(path.name)
+    return hits
+
+
 def test_every_table_entry_is_grounded_in_the_test_corpus():
     """No invented entries: each stem must really be a fixture name here.
 
@@ -80,6 +89,129 @@ def test_every_table_entry_is_grounded_in_the_test_corpus():
             f"{TESTS_DIR} names a '{stem}_<family>' class. Either a test was "
             f"deleted (drop the entry) or the entry was invented."
         )
+
+
+#: Stems that appear in `tests/` as `<Stem>_<Family>` and are DELIBERATELY not
+#: in the table. Two kinds, and the distinction is the whole point:
+#:
+#:   * REAL names the suite legitimately writes down — the shipped shared
+#:     default, the maintainer's own project, historical spellings. Refusing
+#:     these would refuse the product.
+#:   * GENERIC words a real user's folder plausibly IS (`Demo`, `Test`,
+#:     `Project`, `Shared`, `Widget`, `MyApp`, single letters, …). The guard's
+#:     own failure mode is refusing a real install, so a stem this ordinary
+#:     stays out even though the suite uses it as a fixture.
+#:
+#: This inventory is a TRIPWIRE, not a blessing: it is pinned so that a stem
+#: appearing for the FIRST time fails the test below, naming the stem and the
+#: file, and forcing the author to choose — table (it is a fixture) or here
+#: (with the reason it cannot be). One paragraph of reasoning for a bucket is
+#: honest; 200 hand-written per-stem reasons would be a rubber stamp.
+_UNTABLED_STEMS_SNAPSHOT = frozenset({
+    "1foo", "_ProjectA", "A", "Absent", "ACME_widget", "ACME_widget_old",
+    "ACME_widget_team", "AcmeHospitality", "ACMERoot", "ACMEShared",
+    "ACMEWidget", "AcmeWidget", "ACMEWIDGET", "ACMEWidgetArchive",
+    "ACMEWidgetKnowledgeGraph", "ACMEWidgetOld", "ACMEWidgetry",
+    "ACMEWidgetShell", "ACMEWidgetTeam", "Actual", "AgapeTest",
+    "Alphabet", "AlphaBeta", "AmbientProject", "Anything", "ArcAgi",
+    "ARTup", "B", "Bazquux", "Big", "Bystander", "C", "Canon",
+    "CanonicalShared", "ClaudeOrchestrator", "Client_b_portal", "ClientA",
+    "ClientAlpha", "ClientApp", "CsRoute", "Cur", "Decoy", "Demo",
+    "Demo_project", "Drifted", "Dst", "E2EProject", "Empty", "EnvOnly",
+    "EnvProj", "EnvSaid", "Existing", "ExplicitOverride", "ExplicitProj",
+    "Fallback", "Foo_Bar", "ForkBrand", "Fresh", "FreshCreate", "FromDb",
+    "FromEnv", "G", "Ghost_Prefix", "GhostA", "GhostB", "Gone",
+    "GuardPrefix", "Hub", "Hub_Shared", "HubSaid", "ImageDataset", "Kept",
+    "Leftover", "Legacy", "Legacy_prefix", "LegacyPeer", "Legacypeera",
+    "Legacypeerb", "LegacyShape", "Live", "LiveName", "MeetApp",
+    "migrate_collections_partial_failure_Foo",
+    "migrate_collections_partial_failure_X", "Mine", "Missing",
+    "MissingPeer", "My", "My_Cool_App", "MyAlpha", "MyApp", "Myapp",
+    "MyCoolApp", "MyCustom", "MyKG", "MyOrch", "MyProj", "Myproject",
+    "MyProject", "MyTest", "New_Name", "NewName", "Nobody",
+    "NonexistentPeer", "NotYetCreated", "NoValidUntil", "Old", "Old_Name",
+    "OldCanonical", "OldName", "OldProject", "Operator",
+    "OperatorsOwnProject", "Orchestrator", "Orchestrator_root",
+    "OrchestratorFixtureProj", "Other", "OtherProj", "OtherProject", "P",
+    "ParityFixture", "ParityTest", "Pasted", "Peer", "Peer1", "Peer2",
+    "PeerOne", "PeerTwo", "Populated", "PostRename", "PreExisting",
+    "Prefixexampleorchestrator", "PrefixExampleOrchestrator", "PreRename",
+    "Proj", "Proj_Backend", "ProjCodeless", "Project", "ProjectA", "Q",
+    "Quuux", "R", "Real", "RealName", "Recloned", "Registered", "Renamed",
+    "RePicked", "ResidueProj", "RlTest", "Same", "Sample",
+    "schema_reingest_incomplete_P1", "Shared", "SimRaceTest_AI",
+    "SimRaceTestAI", "Small", "Snapshotted", "SoftFail", "Solo",
+    "Someone_Elses", "SomeOther", "SomeProject", "Src", "Synthetic", "T",
+    "TargetProject", "TeamWide", "Test", "TestInstall", "TestProj",
+    "TestProject", "Third", "TP", "TProj", "TypoName", "Unrelated",
+    "V0243Test", "V0289DualTest", "V0289Proj", "V0289Shared", "V0292D17",
+    "V0292T", "V0292T_Shared", "V0292WPB1", "Vco_v0243_A_install",
+    "Vco_v0243_B_rust", "Vco_v0243_C_cleanup", "VcoD2Scratch", "VCODev",
+    "Vcodev", "vcodev", "VcoDev", "vct", "Vct_coordination",
+    "VCT_transcrypt", "VctMigrateTest", "Vibecoded_orchestrator",
+    "VibeCoded_Orchestrator", "Vibecodedorchestrator",
+    "VibecodedOrchestrator", "VibeCodedOrchestrator", "VibeCodedTools",
+    "VideoFrames", "W3Tag", "W3Tag_Shared", "W8Parity", "W8Parity_Shared",
+    "WDGT", "Weirdproject", "WeirdProject", "WhiteLabel", "Widget",
+    "WireProj", "WrongName", "X", "Y", "Z", "Zombie", "Zzz",
+})
+
+
+def test_no_untabled_fixture_stem_appears_without_a_decision():
+    """MEDIUM-1: coverage runs BOTH ways.
+
+    `test_every_table_entry_is_grounded_in_the_test_corpus` proves nothing
+    invented got IN. This proves nothing new slipped PAST: a `<Stem>_<Family>`
+    literal whose stem is neither in the table nor in the pinned inventory
+    fails here, named, with the files that introduced it.
+    """
+    used = _class_names_used_by_tests()
+    families = "|".join(re.escape(f) for f in fcg.COLLECTION_FAMILY_SUFFIXES)
+    pattern = re.compile(rf"\A([A-Za-z0-9_]+)_(?:{families})\Z")
+
+    tabled = {n.casefold() for n in fcg.FIXTURE_PROJECT_NAMES}
+    known = tabled | {n.casefold() for n in _UNTABLED_STEMS_SNAPSHOT}
+
+    undecided: dict[str, set[str]] = {}
+    for class_name in used:
+        match = pattern.match(class_name)
+        if not match:
+            continue
+        stem = match.group(1)
+        if stem.casefold() in known:
+            continue
+        undecided.setdefault(stem, set()).update(_files_naming(class_name))
+
+    assert not undecided, (
+        "new `<Stem>_<Family>` literal(s) in tests/ that no one has classified:\n"
+        + "\n".join(
+            f"  {stem} — {', '.join(sorted(files))}"
+            for stem, files in sorted(undecided.items())
+        )
+        + "\n\nAdd the stem to vco_lib.fixture_class_guard.FIXTURE_PROJECT_NAMES "
+          "if it is a fixture name (the guard will then refuse writes to "
+          "`<stem>_*`), or to _UNTABLED_STEMS_SNAPSHOT if it is a real name or "
+          "a word a user's project could plausibly be called."
+    )
+
+
+def test_the_inventory_holds_no_stem_the_tests_stopped_using():
+    """The inventory is a snapshot, so it must not rot into fiction either."""
+    used_stems = set()
+    families = "|".join(re.escape(f) for f in fcg.COLLECTION_FAMILY_SUFFIXES)
+    pattern = re.compile(rf"\A([A-Za-z0-9_]+)_(?:{families})\Z")
+    for class_name in _class_names_used_by_tests():
+        match = pattern.match(class_name)
+        if match:
+            used_stems.add(match.group(1).casefold())
+
+    stale = sorted(
+        s for s in _UNTABLED_STEMS_SNAPSHOT if s.casefold() not in used_stems
+    )
+    assert not stale, (
+        f"_UNTABLED_STEMS_SNAPSHOT names stems no test uses any more: {stale}. "
+        f"Drop them — a snapshot that keeps dead entries stops being evidence."
+    )
 
 
 def test_the_incident_stems_are_covered():
@@ -292,11 +424,11 @@ class _RecordingCollections:
         self.requested: list[str] = []
         self.created: list[str] = []
 
-    def get(self, name):  # pragma: no cover - must never be reached
+    def get(self, name: str):  # pragma: no cover - must never be reached
         self.requested.append(name)
         raise AssertionError(f"guard let a write through to {name!r}")
 
-    def create(self, name=None, **kwargs):
+    def create(self, name: str = "", **kwargs):
         self.created.append(name)
         return True
 
@@ -309,46 +441,24 @@ class _RecordingClient:
         self.collections = _RecordingCollections()
 
 
-def _weaviate_mcp_modules() -> list[str]:
-    return [
-        name
-        for name in list(sys.modules)
-        if name == "weaviate_mcp" or name.startswith("weaviate_mcp.")
-    ]
-
-
 @pytest.fixture
 def mcp_server_module():
-    """``weaviate_mcp.server`` FROM THIS CHECKOUT, not from the dev venv's pin.
+    """``weaviate_mcp.server``, with a check that it came from THIS checkout.
 
-    This machine's venv carries an editable ``.pth`` that puts the
-    MAINTAINER's clone (``…/VCO_dev/claude_mcp_servers``) on ``sys.path``, so a
-    bare ``import weaviate_mcp.server`` from a worktree loads ANOTHER tree's
-    copy — the in-process twin of the shadow ``tests/common/child_env.py``
-    documents for child processes. A guard test that measured that copy would
-    pass or fail for reasons unrelated to the change under test, so pin the
-    path, purge the cache, assert what we got, and restore both.
+    The path pin itself lives in ``tests/conftest.py`` (W-SHADOW) — one home,
+    applied before any test module imports. This only re-states the OUTCOME at
+    the point of use, because a guard test that silently measured the
+    maintainer's other clone would pass or fail for reasons unrelated to the
+    change under test. ``tests/test_v0294_weaviate_mcp_imports_from_the_
+    checkout.py`` is the canary that pins the mechanism.
     """
-    local = str(REPO_ROOT / "claude_mcp_servers")
-    saved = {name: sys.modules[name] for name in _weaviate_mcp_modules()}
-    for name in saved:
-        del sys.modules[name]
-    sys.path.insert(0, local)
-    try:
-        mod = importlib.import_module("weaviate_mcp.server")
-        assert Path(mod.__file__).is_relative_to(REPO_ROOT), (
-            f"loaded {mod.__file__} instead of this checkout's copy — the "
-            f"test would be measuring a different tree"
-        )
-        yield mod
-    finally:
-        try:
-            sys.path.remove(local)
-        except ValueError:  # pragma: no cover - defensive
-            pass
-        for name in _weaviate_mcp_modules():
-            del sys.modules[name]
-        sys.modules.update(saved)
+    mod = importlib.import_module("weaviate_mcp.server")
+    where = getattr(mod, "__file__", None)
+    assert isinstance(where, str) and Path(where).is_relative_to(REPO_ROOT), (
+        f"loaded {where} instead of this checkout's copy — the test would be "
+        f"measuring a different tree"
+    )
+    return mod
 
 
 def _unwrap(tool):
@@ -503,6 +613,130 @@ def _diagram_row():
     )
 
 
+@pytest.fixture(scope="module")
+def analyzer_mod() -> types.ModuleType:
+    path = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+    spec = importlib.util.spec_from_file_location(
+        "_v0294_fixture_guard_analyzer", str(path)
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover
+        pytest.skip(f"cannot load the analyzer from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:  # pragma: no cover - weaviate-client absent
+        pytest.skip("weaviate-client unavailable — analyzer cannot be loaded")
+    return mod
+
+
+def _fake_analyzer(analyzer_mod, client):
+    obj = analyzer_mod.CodeGraphAnalyzer.__new__(analyzer_mod.CodeGraphAnalyzer)
+    obj.client = client
+    obj.weaviate_url = "http://localhost:8081"
+    return obj
+
+
+def test_analyzer_connects_to_the_env_resolved_url(monkeypatch, analyzer_mod):
+    """HIGH-2: the analyzer was hardcoded to `localhost:8081`.
+
+    `self.weaviate_url` was a label the connection ignored, so neither
+    `$WEAVIATE_URL` nor the suite's pin could steer it — and the two suites
+    that spawn the real analyzer minted `<Project>_Code*` classes on whatever
+    instance was listening (the maintainer's live schema went 161 -> 166 while
+    a reviewer watched). BOTH seams are recorded here, so nothing connects to
+    anything: the assertion is which target the analyzer aimed at.
+    """
+    monkeypatch.setenv("WEAVIATE_URL", "http://127.0.0.9:9998")
+    aimed: list[object] = []
+
+    monkeypatch.setattr(
+        analyzer_mod._wh, "connect_v4",
+        lambda url=None, **kw: aimed.append(url) or object(),
+    )
+    monkeypatch.setattr(
+        analyzer_mod.weaviate, "connect_to_custom",
+        lambda **kw: aimed.append(f"{kw.get('http_host')}:{kw.get('http_port')}")
+        or object(),
+    )
+
+    analyzer = analyzer_mod.CodeGraphAnalyzer("SomeProject")
+    assert analyzer.weaviate_url == "http://127.0.0.9:9998", (
+        f"the constructor ignored $WEAVIATE_URL: {analyzer.weaviate_url}"
+    )
+    assert analyzer.connect() is True
+    assert aimed == ["http://127.0.0.9:9998"], (
+        f"connect() aimed at {aimed} — not the env-resolved target"
+    )
+
+
+def test_analyzer_refuses_to_create_a_fixture_code_class(monkeypatch, analyzer_mod):
+    """Its ONE create chokepoint routes through the shared guarded create."""
+    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
+    client = _RecordingClient()
+    analyzer = _fake_analyzer(analyzer_mod, client)
+    with pytest.raises(fcg.FixtureClassWriteRefused):
+        analyzer._create_class_with_retry("Foo_CodeModule")
+    assert client.collections.created == []
+
+
+def test_analyzer_still_creates_a_real_code_class(monkeypatch, analyzer_mod):
+    """The leave-alone half, driven — the guard must not break the analyzer."""
+    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
+    client = _RecordingClient()
+    analyzer = _fake_analyzer(analyzer_mod, client)
+    assert analyzer._create_class_with_retry("VCODev_CodeModule") is True
+    assert client.collections.created == ["VCODev_CodeModule"]
+
+
+def test_project_init_refuses_a_fixture_class_at_add_time(monkeypatch):
+    """MEDIUM-2: the ADD-TIME create path, so the install cannot be half-done.
+
+    Before this, a project named for a fixture got its classes created here and
+    then hit `exit 2` on every kg-sync — created but unwritable. One decision,
+    at add time, with the documented escape.
+    """
+    from vco_lib import project_init
+
+    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
+    monkeypatch.setattr(project_init, "_fetch_schema", lambda *a, **k: None)
+
+    posted: list = []
+    monkeypatch.setattr(
+        project_init, "_http_request",
+        lambda *a, **k: posted.append(a) or (200, b""),
+    )
+
+    with pytest.raises(fcg.FixtureClassWriteRefused):
+        project_init._create_class(
+            {"class": "Beta_KnowledgeGraph"}, weaviate_url="http://127.0.0.1:9"
+        )
+    assert posted == [], "the class was POSTed despite the refusal"
+
+
+def test_project_init_creates_a_real_projects_class(monkeypatch):
+    """The leave-alone half — a real add must be untouched."""
+    from vco_lib import project_init
+
+    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
+    monkeypatch.setattr(project_init, "_fetch_schema", lambda *a, **k: None)
+    posted: list = []
+    monkeypatch.setattr(
+        project_init, "_http_request",
+        lambda *a, **k: posted.append(a) or (200, b""),
+    )
+
+    project_init._create_class(
+        {"class": "VCODev_KnowledgeGraph"}, weaviate_url="http://127.0.0.1:9"
+    )
+    assert len(posted) == 1
+
+
+# NOTE: `install.py::_ensure_collections`' create loop is driven in
+# `tests/test_install_shared_containers.py::EnsureCollectionsFixtureGuardTests`
+# — that file already owns the mock-Weaviate harness, and a second copy of it
+# here would be the duplication this repo's own rule forbids.
+
+
 def test_diagram_upsert_refuses_a_fixture_collection(monkeypatch, caplog):
     """The diagram indexer's ONE write seam.
 
@@ -591,6 +825,41 @@ def test_doctor_labels_a_fixture_shaped_ghost():
             f"the unclaimed remedy must never print a destructive command "
             f"({destructive!r} found)"
         )
+
+
+def test_doctor_names_fixture_shaped_classes_in_every_family():
+    """LOW-1: the ownership analysis is KG-scoped, so these were invisible.
+
+    `Foo_Diagrams` (empty, live on the maintainer's box) and a fixture-shaped
+    code family need no ownership analysis — the stem is a name no project
+    has — so they are named directly.
+    """
+    from vco_lib import doctor
+
+    extra = ["Foo_Diagrams", "Gamma_CodeModule"]
+    summary = doctor._kg_unclaimed_summary(
+        _unclaimed(("AgapeTest_KnowledgeGraph", 84)), extra
+    )
+    assert "fixture-shaped class(es) in other families" in summary
+    assert "Foo_Diagrams" in summary and "Gamma_CodeModule" in summary
+
+    remedy = doctor._kg_unclaimed_remediation(
+        _unclaimed(("AgapeTest_KnowledgeGraph", 84)), extra
+    )
+    assert "Fixture-shaped: Foo_Diagrams, Gamma_CodeModule" in remedy
+
+    # And with NOTHING unclaimed, a fixture-shaped class still reports.
+    only = doctor._kg_unclaimed_summary([], ["Foo_Diagrams"])
+    assert only.startswith("1 fixture-shaped class(es)")
+
+
+# The LEAVE-ALONE half of LOW-1 — "an OWNED class is owned, whatever its stem
+# looks like" — is driven in
+# `tests/test_v0292_unclaimed_kg_classes.py::test_clean_machine_ok_finding_
+# names_zero_unclaimed`, which binds `Acme_KnowledgeGraph` (an in-table stem)
+# to a REGISTERED project and asserts the doctor stays OK. That file owns the
+# FakeMachine harness; it went red on the first cut of this feature and green
+# once the scan started subtracting owned/claimed classes.
 
 
 def test_doctor_keeps_todays_wording_for_a_non_fixture_ghost():

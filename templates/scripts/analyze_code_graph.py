@@ -419,6 +419,9 @@ try:
     # alias — its `classify_row` (embed decision SKIP/STAMP/EMBED) is DISTINCT
     # from codegraph_row_classify.classify_row (prune owed/not_owed/purgeable).
     from vco_lib import codegraph_guards as _guards
+    # v0.2.94: the ONE connect factory + URL resolver, and the guarded create.
+    from vco_lib import weaviate_helpers as _wh
+    from vco_lib.fixture_class_guard import guarded_collection_create
     # v0.2.92: extractor-generation re-index — the force-rewalk flag
     # resolution, the all-chunks-SKIP verdict, and the completion stamp all
     # live there; this file keeps only the I/O seams.
@@ -1390,10 +1393,11 @@ def embed_module(module_summary: str) -> Optional[Any]:
 class CodeGraphAnalyzer:
     """Analyzes codebase and extracts entities into Weaviate code graph."""
 
-    def __init__(self, project_name: str, weaviate_url: str = "http://localhost:8081",
+    def __init__(self, project_name: str, weaviate_url: "str | None" = None,
                  grpc_port: int = 50052, named_vectors: bool = DUAL_EMBEDDING_ENABLED):
         self.project_name = project_name
-        self.weaviate_url = weaviate_url
+        # v0.2.94: env-resolved (`$WEAVIATE_URL`), not a hardcoded literal.
+        self.weaviate_url = weaviate_url or _wh.weaviate_url_default()
         self.grpc_port = grpc_port
         self.named_vectors = named_vectors
         self.client = None
@@ -1494,16 +1498,14 @@ class CodeGraphAnalyzer:
         self.force_rewalk: bool = False
 
     def connect(self):
-        """Connect to Weaviate."""
+        """Connect through the SAME resolver every other writer uses (v0.2.94).
+
+        The hand-rolled `connect_to_custom` here hardcoded `localhost:8081`, so
+        nothing could redirect the analyzer and suites that spawn it minted
+        `<Project>_Code*` classes on whatever instance was listening.
+        """
         try:
-            self.client = weaviate.connect_to_custom(
-                http_host='localhost',
-                http_port=8081,
-                http_secure=False,
-                grpc_host='localhost',
-                grpc_port=50052,
-                grpc_secure=False
-            )
+            self.client = _wh.connect_v4(self.weaviate_url, grpc_port=self.grpc_port)
             print(f"✅ Connected to Weaviate at {self.weaviate_url}")
             return True
         except Exception as e:
@@ -1598,7 +1600,7 @@ class CodeGraphAnalyzer:
 
         for attempt_idx, sleep_after in enumerate(backoff_schedule):
             try:
-                self.client.collections.create(name=name, **create_kwargs)
+                guarded_collection_create(self.client, name, **create_kwargs)
                 return True
             except Exception as exc:
                 last_exc = exc
@@ -6230,10 +6232,7 @@ class CodeGraphAnalyzer:
 def _migrate_from_shared(project_name: str, named_vectors: bool = False) -> int:
     """Migrate objects from shared collections to per-project collections."""
     try:
-        client = weaviate.connect_to_custom(
-            http_host='localhost', http_port=8081, http_secure=False,
-            grpc_host='localhost', grpc_port=50052, grpc_secure=False
-        )
+        client = _wh.connect_v4()  # env-resolved, like every other writer
     except Exception as e:
         print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
         return 1

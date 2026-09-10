@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests import conftest as _conftest  # noqa: E402
+from vco_lib.fixture_class_guard import UNROUTABLE_SENTINEL_URL  # noqa: E402
 
 
 def test_this_file_is_registered_as_a_stand_aside():
@@ -61,3 +62,77 @@ def test_a_non_opted_out_file_would_still_be_pinned():
         _conftest._weaviate_url_pin_for("test_some_other_file.py")
         == UNROUTABLE_SENTINEL_URL
     )
+
+
+# ---------------------------------------------------------------------------
+# COLLECTION TIME — the moment the per-test fixture cannot reach
+# ---------------------------------------------------------------------------
+#
+# Both pre-ship live files resolve `WEAVIATE_URL` at MODULE scope and feed it
+# to an `@unittest.skipUnless(...)` evaluated at IMPORT. A stand-aside that
+# lives only in a per-test fixture is therefore too late: the module already
+# saw the sentinel, every live test skipped, and `scripts/pre-ship-check.sh`
+# printed PASS for a leg that asserted nothing.
+#
+# The probe below needs no backend and writes nothing: it hands the child an
+# ambient URL that is unreachable but DISTINCT (`:9998`), so the skip REASON
+# names whichever value the module actually read. Sentinel in the reason means
+# the stand-aside did not fire.
+
+#: Loopback, nothing listening, and deliberately NOT a superstring of the
+#: sentinel — `http://127.0.0.1:9` IS a prefix of `http://127.0.0.1:9998`, so a
+#: same-host port would make the "sentinel absent" half of the assertion
+#: vacuously false. Different octet, no substring relation either way.
+_DISTINCT_AMBIENT = "http://127.0.0.9:9998"
+
+
+def _child_skip_reasons(target: str, ambient: str) -> str:
+    import subprocess
+
+    from tests.common.child_env import child_env
+
+    env = child_env()
+    env["WEAVIATE_URL"] = ambient
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs",
+         str(REPO_ROOT / "tests" / target)],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:]
+    return proc.stdout
+
+
+def test_the_collection_carve_out_is_exactly_the_opt_out_frozenset():
+    """The decision, pure — one list drives both moments."""
+    for name in sorted(_conftest._LIVE_WEAVIATE_OPT_OUT_FILES):
+        assert _conftest._module_needs_ambient_weaviate_url(name), name
+    for name in ("test_some_other_file.py", "test_weaviate_schema.py",
+                 "conftest.py"):
+        assert not _conftest._module_needs_ambient_weaviate_url(name), name
+    # `None` from the hook means "use pytest's default collector".
+    assert _conftest.pytest_pycollect_makemodule(
+        Path("test_some_other_file.py"), None
+    ) is None
+
+
+def test_an_opt_out_module_reads_the_ambient_url_at_import():
+    """WIRING, driven: a real child pytest, the real modules, real skip text."""
+    for target in ("test_v0246_v46b_live_ci10_diff_gate.py",
+                   "test_v0246_kg_sync_live.py"):
+        out = _child_skip_reasons(target, _DISTINCT_AMBIENT)
+        assert _DISTINCT_AMBIENT in out, (
+            f"{target} did not read the ambient WEAVIATE_URL at import — "
+            f"pre-ship's live leg would SKIP and still report PASS.\n{out[-1500:]}"
+        )
+        assert UNROUTABLE_SENTINEL_URL not in out, (
+            f"{target} saw the suite pin at import:\n{out[-1500:]}"
+        )
+
+
+def test_a_non_opt_out_live_module_still_sees_the_pin():
+    """The control — otherwise the test above would pass with no pin at all."""
+    out = _child_skip_reasons("test_weaviate_schema.py", _DISTINCT_AMBIENT)
+    assert UNROUTABLE_SENTINEL_URL in out, (
+        f"a NON-opt-out live module reached the ambient backend:\n{out[-1500:]}"
+    )
+    assert _DISTINCT_AMBIENT not in out, out[-1500:]

@@ -531,6 +531,58 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             server.shutdown()
 
 
+class EnsureCollectionsFixtureGuardTests(unittest.TestCase):
+    """v0.2.94 W-WEAVIATE (review MEDIUM-2): the ADD-TIME create path.
+
+    A project named for one of VCO's test fixtures used to get its classes
+    created here and then hit `exit 2` on every kg-sync — created but
+    unwritable, the worst of both. The guard now decides ONCE, at add time,
+    with the same documented escape (`VCT_ALLOW_FIXTURE_CLASS_WRITES=1`).
+
+    Driven against the same mock Weaviate the rest of this file uses, so the
+    assertion is what was POSTed, not what the source says.
+    """
+
+    def setUp(self):
+        _Handler.schema = {"classes": []}
+        _Handler.posted = []
+        _Handler.fail_post = False
+        # The suite sets the declaration for every test; these two need the
+        # production default (undeclared) to exercise the guard at all.
+        self._prev = os.environ.pop("VCT_ALLOW_FIXTURE_CLASS_WRITES", None)
+
+    def tearDown(self):
+        if self._prev is not None:
+            os.environ["VCT_ALLOW_FIXTURE_CLASS_WRITES"] = self._prev
+
+    def _run(self, kg_name: str) -> list:
+        server, port, _ = _start_server()
+        try:
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_URL": f"http://localhost:{port}",
+                 "WEAVIATE_PORT": str(port), "KG_COLLECTION": kg_name,
+                 "DEVELOPMENT_COLLECTION": "RealDev",
+                 "SHARED_KG_COLLECTION": "RealShared"},
+            ):
+                install._ensure_collections({})
+            return [p.get("class") for p in _Handler.posted]
+        finally:
+            server.shutdown()
+
+    def test_a_fixture_named_kg_class_is_never_created(self):
+        posted = self._run("Beta_KnowledgeGraph")
+        self.assertNotIn("Beta_KnowledgeGraph", posted,
+                         "the installer created a fixture-named class")
+        # The siblings still go through — one refusal is not a whole-install
+        # failure, and the report names the refused one.
+        self.assertIn("RealDev", posted)
+
+    def test_a_real_project_kg_class_is_still_created(self):
+        posted = self._run("RealProjectKg")
+        self.assertIn("RealProjectKg", posted)
+
+
 class DeriveProjectKgNameTests(unittest.TestCase):
     """install._derive_project_kg_name basename → class-name conversion."""
 
