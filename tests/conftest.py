@@ -331,6 +331,44 @@ if not _ALLOW_REAL_STATE:
     os.environ["WEAVIATE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
 
+# ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
+#
+# `weaviate_mcp.server._resolution_context()` answers "whose project is this?"
+# by (1) `CLAUDE_PROJECT_DIR`, (2) a cwd-ancestor walk, (3) its own module root
+# — the checkout. With nothing pinned, every test that reached
+# `store_knowledge_node` from a cwd outside a project took rung 3 and wrote its
+# deferral rows into `<checkout>/.claude/context/UPDATE_DEFERRED.md` (found
+# 2026-09-10: a `gate_skipped_no_project_id` row for `Alpha_KnowledgeGraph`,
+# git-ignored so nobody saw it; the launcher boot smoke then rendered the
+# reminder block into the TRACKED CLAUDE.md). The checkout is a repository, not
+# an install and not a project. Pinned at import (any module snapshot taken
+# during collection sees it) AND per test below (a suite that pops the key
+# cannot un-pin the tests after it). Opt-outs see the key ABSENT:
+# `test_project_resolution.py` asserts the MCP's fallback rungs, and three
+# hook suites copy a shipped hook into a staged project and drive it through
+# the hook's own fallback (`${CLAUDE_PROJECT_DIR:-<script-relative root>}`),
+# which a pinned value would redirect to the scratch project.
+_SCRATCH_PROJECT_DIR = _VCO_TEST_STATE / "scratch_project"
+(_SCRATCH_PROJECT_DIR / ".claude").mkdir(parents=True, exist_ok=True)
+_AMBIENT_CLAUDE_PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR")
+_CLAUDE_PROJECT_DIR_OPT_OUT_FILES: frozenset = frozenset({
+    "test_project_resolution.py",
+    "test_post_file_edit_diagrams_branch.py",
+    "test_pre_edit_hook_dedup_regression.py",
+    "test_v0291_perf_quickwins.py",
+})
+
+
+def _claude_project_dir_pin_for(test_file: str) -> "str | None":
+    """The value `CLAUDE_PROJECT_DIR` must carry for *test_file*; `None` = absent."""
+    if test_file in _CLAUDE_PROJECT_DIR_OPT_OUT_FILES:
+        return None
+    return str(_SCRATCH_PROJECT_DIR)
+
+
+if not _ALLOW_REAL_STATE:
+    os.environ["CLAUDE_PROJECT_DIR"] = str(_SCRATCH_PROJECT_DIR)
+
 
 # Files that isolate the state dir THEMSELVES and must not have `VCT_STATE_DIR`
 # pinned over the top of their own mechanism. The redirect is POPPED for these,
@@ -1359,6 +1397,29 @@ def pytest_pycollect_makemodule(module_path, parent):
     if _module_needs_ambient_weaviate_url(module_path.name):
         return _AmbientWeaviateUrlModule.from_parent(parent, path=module_path)
     return None
+
+
+@pytest.fixture(autouse=True)
+def _pin_claude_project_dir(request):
+    """W-PROJECT-DIR: re-establish the scratch project for EVERY test (see the
+    import-time block). Opt-out files see the key ABSENT — they assert the
+    fallback rungs — and get the ambient value restored afterwards."""
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    prev = os.environ.get("CLAUDE_PROJECT_DIR")
+    pinned = _claude_project_dir_pin_for(request.node.fspath.basename)
+    if pinned is None:
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+    else:
+        os.environ["CLAUDE_PROJECT_DIR"] = pinned
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        else:
+            os.environ["CLAUDE_PROJECT_DIR"] = prev
 
 
 @pytest.fixture(autouse=True)

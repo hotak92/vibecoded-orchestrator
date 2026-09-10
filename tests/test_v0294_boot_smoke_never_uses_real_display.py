@@ -149,3 +149,44 @@ def test_check_display_mode_reports_the_rule_without_a_binary(tmp_path):
                            env=_minimal_env(tmp_path, VCT_BOOT_SMOKE_REAL_DISPLAY="1"),
                            cwd=str(tmp_path), timeout=60)
     assert opted.returncode == 0 and "explicit opt-in" in opted.stdout
+
+
+def test_the_launcher_runs_from_a_scratch_root_and_the_checkout_stays_untouched(tmp_path):
+    """The launcher resolves its install root by walking up from its own binary
+    to `vct-module.json`. A binary inside the checkout therefore treats the
+    checkout as the install and writes there — its boot census re-rendered the
+    TRACKED CLAUDE.md during a pre-ship run (2026-09-10). The smoke now runs a
+    COPY from a scratch root that carries only the manifest.
+
+    Driven: the stub launcher does what the real one does — finds its root by
+    the manifest and writes into it. The fake checkout must not change.
+    """
+    checkout = tmp_path / "checkout"
+    (checkout / "launcher" / "dist" / "x").mkdir(parents=True)
+    (checkout / "vct-module.json").write_text('{"name": "stub"}\n', encoding="utf-8")
+    (checkout / "CLAUDE.md").write_text("# stub\n", encoding="utf-8")
+    binary = checkout / "launcher" / "dist" / "x" / "vct-launcher"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'd="$(cd "$(dirname "$0")" && pwd)"\n'
+        'while [ "$d" != "/" ]; do [ -f "$d/vct-module.json" ] && break; d="$(dirname "$d")"; done\n'
+        'echo "written by the launcher" >> "$d/CLAUDE.md"\n'
+        'mkdir -p "$d/.claude/context" && echo x > "$d/.claude/context/UPDATE_DEFERRED.md"\n'
+        f'echo "$d" > "{tmp_path}/root-seen.txt"\n'
+        f"echo '{MARKER}'\nsleep 5\n",
+        encoding="utf-8",
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    fake_xvfb = tmp_path / "fake-xvfb-run"
+    fake_xvfb.write_text("#!/bin/sh\nshift\nexec \"$@\"\n", encoding="utf-8")
+    fake_xvfb.chmod(fake_xvfb.stat().st_mode | stat.S_IXUSR)
+
+    proc = _run(tmp_path, binary, _minimal_env(tmp_path, VCT_BOOT_SMOKE_XVFB_RUN=str(fake_xvfb)))
+    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    assert "running a copy from scratch root" in proc.stdout
+    root_seen = (tmp_path / "root-seen.txt").read_text(encoding="utf-8").strip()
+    assert root_seen != str(checkout), "the launcher resolved the CHECKOUT as its install root"
+    assert (checkout / "CLAUDE.md").read_text(encoding="utf-8") == "# stub\n", (
+        "the launcher wrote into the checkout's CLAUDE.md"
+    )
+    assert not (checkout / ".claude").exists(), "the launcher wrote a ledger into the checkout"

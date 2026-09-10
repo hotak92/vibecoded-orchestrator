@@ -1,16 +1,3 @@
-<!-- vco-deferral-reminder-begin -->
-**Pending VCO action**: `.claude/context/UPDATE_DEFERRED.md` exists.
-Read it at session start — it contains commands to resolve
-unresolved VCO install actions.
-Currently: **1 actionable**, 0 informational/records.
-
-To remove THIS reminder block: once the deferral is resolved (e.g.
-via `--update --force`), VCO's next install run will delete
-UPDATE_DEFERRED.md AND strip this block. Manual cleanup if needed:
-delete everything between the HTML-comment markers wrapping this
-block.
-<!-- vco-deferral-reminder-end -->
-
 # VibeCoded Orchestrator
 
 This file is auto-materialized by `install.py` from

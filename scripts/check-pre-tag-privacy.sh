@@ -139,6 +139,18 @@ fi
 # (folder names under the maintainer's local project directory that
 # are NOT part of VCO and should never appear in the public repo)
 # ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# Operational state rendered into a tracked file. The deferral reminder
+# block is written into a project's CLAUDE.md by `vco_lib/deferral_report.py`
+# whenever that project's .claude/context/UPDATE_DEFERRED.md has rows; the
+# checkout is not a project, but tools that mistake it for one (a launcher
+# booted from a binary inside it, an MCP falling back to its module root)
+# render the block into the TRACKED stub — and `git add -A` at release time
+# committed it in v0.2.92. The writer and its tests legitimately name the
+# marker; no other tracked file may carry it.
+# ─────────────────────────────────────────────────────────────────────
+check_pattern "VCO deferral reminder block rendered into a tracked file" "vco-deferral-reminder-begin" "^vco_lib/deferral_report\.py$|^tests/"
+
 check_pattern "AI_hive personal-project leak" "AI_hive"
 check_pattern "ARTup personal-project leak" "\bARTup\b"
 check_pattern "SD15 personal-project leak (in code/comments, NOT as model name)" "\bSD15\b"

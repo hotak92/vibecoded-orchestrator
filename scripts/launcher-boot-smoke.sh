@@ -62,8 +62,44 @@ if [ "$CHECK_DISPLAY_ONLY" = 0 ]; then
 fi
 BIN_DIR="$(dirname "$BIN")"
 
+# The launcher finds its INSTALL ROOT by walking up from its own binary to
+# `vct-module.json` (`orchestrator_manifest::find_orchestrator_manifest`).
+# A binary built or unpacked INSIDE the checkout therefore treats the
+# checkout as the install: its boot census wrote the checkout's
+# `.claude/context/UPDATE_DEFERRED.md` and re-rendered the TRACKED
+# `CLAUDE.md` (2026-09-10, pre-ship "Working tree clean" went red). So the
+# smoke runs a COPY of the binary from a scratch root that carries only the
+# manifest: every root-relative write lands in $SMOKE_HOME, and the checkout
+# the binary came from is asserted byte-identical afterwards.
+ORIG_ROOT=""
+if [ "$CHECK_DISPLAY_ONLY" = 0 ]; then
+    _p="$BIN_DIR"
+    while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+        if [ -f "$_p/vct-module.json" ]; then ORIG_ROOT="$_p"; break; fi
+        _p="$(dirname "$_p")"
+    done
+fi
+
 SMOKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/vct-boot-smoke.XXXXXX")"
 LOG="$SMOKE_HOME/boot-smoke.log"
+if [ "$CHECK_DISPLAY_ONLY" = 0 ] && [ -n "$ORIG_ROOT" ]; then
+    SCRATCH_ROOT="$SMOKE_HOME/root"
+    mkdir -p "$SCRATCH_ROOT/launcher/dist/smoke"
+    cp "$ORIG_ROOT/vct-module.json" "$SCRATCH_ROOT/vct-module.json"
+    cp -p "$BIN" "$SCRATCH_ROOT/launcher/dist/smoke/$(basename "$BIN")"
+    # The launcher auto-starts a hub from its own dir when one is there.
+    for _sib in vct-hub vct-hub.exe; do
+        [ -f "$BIN_DIR/$_sib" ] && cp -p "$BIN_DIR/$_sib" "$SCRATCH_ROOT/launcher/dist/smoke/$_sib"
+    done
+    BIN="$SCRATCH_ROOT/launcher/dist/smoke/$(basename "$BIN")"
+    BIN_DIR="$(dirname "$BIN")"
+    if git -C "$ORIG_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        ORIG_STATUS_BEFORE="$(git -C "$ORIG_ROOT" status --porcelain 2>/dev/null)"
+    else
+        ORIG_STATUS_BEFORE=""
+    fi
+    echo "[boot-smoke] running a copy from scratch root $SCRATCH_ROOT (checkout $ORIG_ROOT must stay untouched)"
+fi
 
 fail() {
     echo "[boot-smoke] FAIL: $1" >&2
@@ -188,6 +224,15 @@ while [ "$elapsed" -lt "$TIMEOUT_SECS" ]; do
         fail "Rust panic during boot"
     fi
     if grep -aF "$MARKER" "$LOG" >/dev/null 2>&1; then
+        if [ -n "${ORIG_ROOT:-}" ] && git -C "$ORIG_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            _after="$(git -C "$ORIG_ROOT" status --porcelain 2>/dev/null)"
+            if [ "$_after" != "${ORIG_STATUS_BEFORE:-}" ]; then
+                echo "[boot-smoke] FAIL: the launcher wrote into the checkout $ORIG_ROOT during the smoke:" >&2
+                diff <(printf '%s\n' "${ORIG_STATUS_BEFORE:-}") <(printf '%s\n' "$_after") >&2 || true
+                echo "[boot-smoke] (the scratch install root did not isolate it — the launcher resolved the checkout as its root)" >&2
+                exit 1
+            fi
+        fi
         echo "[boot-smoke] PASS: setup complete after ${elapsed}s, no panics"
         exit 0
     fi
