@@ -72,7 +72,7 @@ dependencies = [
     # Ceiling MUST match requirements.txt / the root pyproject `mcp` extra: mcp 2.0
     # removed `mcp.server.fastmcp`, which both shipped servers import. This surface
     # had no ceiling until v0.2.94 (Dependabot #364 would have lifted it silently).
-    "mcp>=1.27.0,<2",
+    "mcp>=2.1.1,<3",
     "weaviate-client>=4.21.0",
     "aiohttp>=3.13.5",
     "httpx>=0.28.1",
