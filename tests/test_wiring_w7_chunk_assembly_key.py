@@ -27,7 +27,7 @@ this machine (1 545 rows):
     by (kg-sync's delete, the embed-skip gate and
     ``_stored_plan_matches_current`` all filter on ``file_path``).
   * Colliding titles are NOT a VCODev curiosity: 3 of the 21 collections
-    have them — ``ARTup_Development`` has **10** titles mapping to more
+    have them — ``SomeProject_Development`` has **10** titles mapping to more
     than one file_path, ``VCODev_Development`` and
     ``VCODev_KnowledgeGraph`` two each.
   * ``source_node_id`` — also 100% populated, but it is a per-WRITE uuid4

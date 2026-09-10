@@ -17,7 +17,7 @@ announced the result affirmatively::
     INFO:weaviate_mcp.server:weaviate-kg: resolved collections
     (kg='VCODev_KnowledgeGraph' src=hub, ...)
 
-…from inside a project whose ``KG_COLLECTION`` was ``MeetApp_KnowledgeGraph``.
+…from inside a project whose ``KG_COLLECTION`` was ``OtherProj_KnowledgeGraph``.
 The CLI's *effective query scope* was never wrong (it resolves its own
 collections), so this was a lying log plus a landmine for the next consumer of
 those constants — not a wrong query. The fix is therefore in the resolution and

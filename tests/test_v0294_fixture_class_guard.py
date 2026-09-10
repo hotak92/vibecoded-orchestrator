@@ -114,7 +114,7 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "ACMEWidgetKnowledgeGraph", "ACMEWidgetOld", "ACMEWidgetry",
     "ACMEWidgetShell", "ACMEWidgetTeam", "Actual", "AgapeTest",
     "Alphabet", "AlphaBeta", "AmbientProject", "Anything", "ArcAgi",
-    "ARTup", "B", "Bazquux", "Big", "Bystander", "C", "Canon",
+    "B", "Bazquux", "Big", "Bystander", "C", "Canon",
     "CanonicalShared", "ClaudeOrchestrator", "Client_b_portal", "ClientA",
     "ClientAlpha", "ClientApp", "CsRoute", "Cur", "Decoy", "Demo",
     "Demo_project", "Drifted", "Dst", "E2EProject", "Empty", "EnvOnly",
@@ -123,7 +123,7 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "FromEnv", "G", "Ghost_Prefix", "GhostA", "GhostB", "Gone",
     "GuardPrefix", "Hub", "Hub_Shared", "HubSaid", "ImageDataset", "Kept",
     "Leftover", "Legacy", "Legacy_prefix", "LegacyPeer", "Legacypeera",
-    "Legacypeerb", "LegacyShape", "Live", "LiveName", "MeetApp",
+    "Legacypeerb", "LegacyShape", "Live", "LiveName",
     "migrate_collections_partial_failure_Foo",
     "migrate_collections_partial_failure_X", "Mine", "Missing",
     "MissingPeer", "My", "My_Cool_App", "MyAlpha", "MyApp", "Myapp",
@@ -653,8 +653,14 @@ def test_analyzer_connects_to_the_env_resolved_url(monkeypatch, analyzer_mod):
         analyzer_mod._wh, "connect_v4",
         lambda url=None, **kw: aimed.append(url) or object(),
     )
+    # The direct-dial seam is patched on the PACKAGE, not on an attribute of
+    # the analyzer module: since the analyzer connects through
+    # `vco_lib.weaviate_helpers` it no longer imports the bare package at
+    # all, and a module-attribute patch would only prove the attribute
+    # exists. Patching the package catches any direct dial, however reached.
+    weaviate_pkg = pytest.importorskip("weaviate")
     monkeypatch.setattr(
-        analyzer_mod.weaviate, "connect_to_custom",
+        weaviate_pkg, "connect_to_custom",
         lambda **kw: aimed.append(f"{kw.get('http_host')}:{kw.get('http_port')}")
         or object(),
     )
