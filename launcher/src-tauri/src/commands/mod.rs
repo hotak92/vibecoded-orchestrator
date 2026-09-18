@@ -243,6 +243,11 @@ pub mod secret_value_shape;
 pub mod secrets_cmd;
 pub mod secrets_import;
 pub mod self_update;
+// v0.2.95 (ruling R2): the Preferences → Startup switch for the session-start
+// tray-only launch. A one-key preference this process WRITES and never reads —
+// its reader is `vco_lib/launcher_ensure.py`, running when this process is by
+// definition not.
+pub mod session_autostart;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
 // `update_all_projects` and `update_orchestrator_at` today. Lives in its own

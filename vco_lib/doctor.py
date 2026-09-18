@@ -104,6 +104,14 @@ trip. The precise contract now:
   object, so ``vco doctor`` never changes the repository it reports on;
 * and it arrives through ``DoctorResolvers.source_facts``, so a test replaces
   the whole repo state with a dataclass and touches no network at all.
+
+One thing outside the probe set can still reach the wire, deliberately: the
+v0.2.95 standalone preflight (see :func:`reconcile_probe_cleared`) re-runs the
+REGISTRY clear probes over the ledger — the same bounded, read-only probes
+install.py's re-probe pass runs — and one of those may poll the local hub's
+``/api/v1/health`` on the resolved port. Loopback-only, sub-second, and the
+same verdict install.py would have reached; noted here so the "exactly one"
+sentence above stays about the DOCTOR's own probes, which it still is.
 """
 from __future__ import annotations
 
@@ -138,6 +146,14 @@ FIX_DEFER = "defer"
 #: the CLI run. See :data:`PROBES` for what each excludes and why.
 SCOPE_FULL = "full"
 SCOPE_BOOT = "boot"
+
+#: v0.2.95 F4. The exact command that (re)produces the bootstrap envelope a
+#: standalone ``vco doctor`` needs for ``prereqs`` / ``launcher_binary_fresh``.
+#: A printed command is shipped code (the promise rule), so the CLI test suite
+#: asserts this is a real ``install.py`` surface that answers on stdout — the
+#: probes print it whenever they must report ``unknown`` for want of the
+#: envelope, so "not evaluated" always names what WOULD evaluate it.
+BOOTSTRAP_COMMAND = "python install.py --bootstrap --json"
 
 #: condition_id emitted when a bare-name MCP command cannot be resolved.
 #: Registered ``action_required`` + install-owned, so it disappears on the
@@ -186,6 +202,13 @@ CID_KG_UNCLAIMED = "kg_unclaimed_populated_classes"
 #: re-probes in the SAME run, so the entry is dropped by the run that fixes it.
 CID_CODE_EMBED_IMAGE_STALE = "code_embed_image_stale"
 
+#: v0.2.95 R5c. The model gateway's login-time registration exists and its
+#: baked entry point cannot run — the state this machine sat in for eight
+#: hours on 2026-09-10 while the launcher toggle read "registered". Shared
+#: with ``vco_lib.gateway_ensure`` (the SessionStart emitter); both read the
+#: same function, so the two surfaces cannot disagree.
+CID_GATEWAY_UNRUNNABLE = "gateway_registered_but_unrunnable"
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -193,7 +216,7 @@ CID_CODE_EMBED_IMAGE_STALE = "code_embed_image_stale"
 DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_NPX_MISSING, CID_DISK_SPACE_LOW, CID_VCO_LIB_SHADOWED,
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
-    CID_CODE_EMBED_IMAGE_STALE,
+    CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -203,7 +226,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
 #: invocation point, not only at the next ``--update``.
 DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
-    CID_CODE_EMBED_IMAGE_STALE,
+    CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -353,6 +376,32 @@ class DoctorResolvers:
     #: Injected so the code-embed staleness probe is driven from a described
     #: machine — no service, no container runtime, no network.
     code_embed_state: Optional[Callable[[Path], Any]] = None
+    #: () -> :class:`vco_lib.gateway_ensure.GatewayEnsureResult`. Injected so
+    #: the gateway probe is driven from a described machine: no systemd, no
+    #: launchd, no schtasks, and no spawn of a registered entry point.
+    gateway_state: Optional[Callable[[], Any]] = None
+
+    def resolve_gateway_state(self):
+        """The model gateway's registration verdict, from its ONE home.
+
+        Delegates to :mod:`vco_lib.gateway_ensure` rather than re-reading a
+        unit file here, so the doctor's finding, the SessionStart ensure and
+        the registry's clear probe cannot disagree. Soft-fail: an exception
+        reads as "not registered", which produces NO findings — the
+        conservative answer, because the alternative is telling a user their
+        opt-in daemon is broken on the strength of a probe that crashed.
+        """
+        if self.gateway_state is not None:
+            return self.gateway_state()
+        from vco_lib import gateway_ensure
+
+        try:
+            return gateway_ensure.gateway_status()
+        except Exception:  # noqa: BLE001 — could not look is not a verdict
+            return gateway_ensure.GatewayEnsureResult(
+                state=gateway_ensure.GatewayState.NOT_REGISTERED,
+                reason="the gateway registration probe could not run",
+            )
 
     def resolve_code_embed_state(self, install_root: Path):
         """The code-embed image verdict, composed from its ONE home.
@@ -715,6 +764,14 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
     look healthy. :func:`probe_source_currency` asks whether the tree itself is
     current, and the two are only meaningful together; the ``ok`` summary says
     so rather than leaving the inference to the reader.
+
+    v0.2.95 F4: when the caller supplies no extras the standalone CLI has
+    already TRIED to obtain them from the install root
+    (:func:`supply_missing_install_context`). Reaching this branch without
+    extras therefore means the facts could not be produced, and the finding
+    says so tri-state — ``unknown``, never ``ok`` — naming the exact command
+    that would evaluate it. "Not evaluated" must not read as absence of a
+    problem; it must read as an unanswered question with the question attached.
     """
     extras = ctx.get("launcher_probe_extras") or {}
     if not extras:
@@ -723,10 +780,12 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
                 probe="launcher_binary_fresh",
                 status=STATUS_UNKNOWN,
                 summary=(
-                    "launcher freshness not evaluated — the caller supplied no "
-                    "dist/binary facts (OS→dist-subdir mapping has one home in "
-                    "install.py)"
+                    "launcher freshness not evaluated — no dist/binary facts "
+                    "could be obtained from the install root (the OS→dist-"
+                    "subdir mapping has one home in install.py). To produce "
+                    f"them yourself, run: {BOOTSTRAP_COMMAND}"
                 ),
+                command=BOOTSTRAP_COMMAND,
             )
         ]
     from vco_lib import deferral_probes
@@ -886,8 +945,12 @@ def probe_prereqs(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding
     """Consume the ``--bootstrap`` envelope's ``missing_prereqs``.
 
     install.py INJECTS the envelope it already built rather than the doctor
-    shelling back into install.py (which would be circular and slow). Without
-    an injected envelope this probe reports ``unknown`` — never a false OK.
+    shelling back into install.py mid-run (which would be circular and slow).
+    A standalone ``vco doctor`` — which has no caller to hand it one — obtains
+    the same envelope itself, in-process, through the SAME producer functions
+    (:func:`supply_missing_install_context`); only when THAT fails does this
+    probe report ``unknown`` — never a false OK — naming the exact command
+    that would produce the facts.
 
     This is the "consumer that acts after install" report 6 §B.1 says is
     missing: the envelope's findings previously died in a stdout block.
@@ -898,7 +961,12 @@ def probe_prereqs(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding
             Finding(
                 probe="prereqs",
                 status=STATUS_UNKNOWN,
-                summary="no bootstrap envelope supplied — prereqs not re-checked",
+                summary=(
+                    "prereqs not re-checked — no bootstrap envelope could be "
+                    "obtained from the install root. To produce one, run: "
+                    f"{BOOTSTRAP_COMMAND}"
+                ),
+                command=BOOTSTRAP_COMMAND,
             )
         ]
     missing = [m for m in (envelope.get("missing_prereqs") or []) if isinstance(m, dict)]
@@ -1503,6 +1571,62 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
             probe="code_embed_image",
             status=STATUS_UNKNOWN,
             summary=getattr(state, "summary", "code_embed: image state unknown."),
+            detail=detail,
+        )
+    ]
+
+
+def probe_model_gateway_runnable(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Can the gateway's login-time registration actually run?
+
+    Returns NO findings when the gateway is not registered, which is the
+    DEFAULT and the majority case: autostart is opt-in, and an ``unknown`` line
+    on every machine that never opted in is noise, not evidence (the
+    ``code_embed_image`` precedent).
+
+    The reading is :func:`vco_lib.gateway_ensure.gateway_status` — the same one
+    the SessionStart ensure acts on and the same one the clear probe re-runs —
+    so the three surfaces cannot disagree about a single machine. It reads the
+    argv back out of the INSTALLED artefact rather than re-resolving it: "what
+    would we write now" is a different question from "what does the thing on
+    this machine run", and only the second one could have caught 2026-09-10.
+
+    ``full`` scope only: it runs the registered entry point with ``--version``,
+    which is a process spawn — past the boot subset's file-read budget, and the
+    answer changes exactly when an install/update runs.
+    """
+    from vco_lib import gateway_ensure  # noqa: PLC0415
+
+    found = res.resolve_gateway_state()
+    state = getattr(found, "state", None)
+    if state is None or state is gateway_ensure.GatewayState.NOT_REGISTERED:
+        return []
+    detail = found.to_dict() if hasattr(found, "to_dict") else {}
+    if state is gateway_ensure.GatewayState.REGISTERED_BUT_UNRUNNABLE:
+        return [
+            Finding(
+                probe="model_gateway_runnable",
+                status=STATUS_PROBLEM,
+                summary=f"model gateway: {found.reason}",
+                fix=FIX_DEFER,
+                condition_id=CID_GATEWAY_UNRUNNABLE,
+                command=remedy_shell.steps(
+                    f"cd {remedy_shell.quote(Path(folder).resolve())}",
+                    "python install.py --update",
+                ),
+                detail=detail,
+            )
+        ]
+    return [
+        Finding(
+            probe="model_gateway_runnable",
+            status=STATUS_OK,
+            # The cid rides the OK finding so the self-resolve pass can see
+            # WHICH condition this reading clears (the `disk_space` pattern).
+            # `deferral_entries_for` only ever walks `report.problems`, so it
+            # can never emit from here.
+            condition_id=CID_GATEWAY_UNRUNNABLE,
+            summary=f"model gateway: {found.reason}",
             detail=detail,
         )
     ]
@@ -3246,7 +3370,156 @@ PROBES: dict = {
     # probe's docstring for why this is the only service whose IMAGE can go
     # stale under a healthy update.
     "code_embed_image": (probe_code_embed_image, (SCOPE_FULL,)),
+    # v0.2.95 R5c: full-only — it RUNS the registered entry point
+    # (`--version`), and it reports nothing at all on the majority of machines,
+    # where the gateway's login-time autostart was never opted into.
+    "model_gateway_runnable": (probe_model_gateway_runnable, (SCOPE_FULL,)),
 }
+
+
+#: v0.2.95 F4 — per-process cache for the checkout's install.py, loaded by
+#: path. ``None`` (cached failure) matters as much as a module: it stops a
+#: standalone doctor run re-executing a broken file once per probe.
+_INSTALL_MODULE_CACHE: dict = {}
+
+
+def _load_install_module(install_root: Path):
+    """Load the install root's ``install.py`` BY PATH and cache it.
+
+    The bootstrap envelope and the OS→``launcher/dist/<arch>/`` mapping each
+    have exactly ONE home — install.py — and the doctor must not mirror either
+    (cross-language rule A: reuse, never duplicate). This loader is how the
+    STANDALONE CLI reaches those producer functions directly, in-process: no
+    shell-out, no second interpreter, and the producers' own per-sub-probe
+    timeouts bound the cost. ``main()`` is guarded by ``__name__`` so importing
+    is side-effect-free apart from cheap top-level constants; the ONE
+    import-time exit (the Python-version sentinel) is caught here so a
+    too-old interpreter yields "facts unavailable", not a dead CLI.
+
+    Returns the module, or ``None`` when the file is absent or failed to
+    import. Never raises.
+    """
+    try:
+        root = Path(install_root)
+        key = str(root.resolve()) if root.exists() else str(root)
+        if key in _INSTALL_MODULE_CACHE:
+            return _INSTALL_MODULE_CACHE[key]
+        mod = None
+        path = root / "install.py"
+        if path.is_file():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "_vco_doctor_install_producer", path
+            )
+            if spec is not None and spec.loader is not None:
+                candidate = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = candidate
+                try:
+                    spec.loader.exec_module(candidate)
+                    mod = candidate
+                except (Exception, SystemExit):  # noqa: BLE001 — no producer, no verdict
+                    mod = None
+        _INSTALL_MODULE_CACHE[key] = mod
+        return mod
+    except Exception:  # noqa: BLE001 — obtaining facts must never break the pass
+        return None
+
+
+def supply_missing_install_context(folder: Path, ctx: dict) -> dict:
+    """Fill ONLY the missing install.py-owned context keys. Never raises.
+
+    v0.2.95 F4: a standalone ``vco doctor`` used to print
+    ``launcher_binary_fresh`` / ``prereqs`` as "not evaluated — the caller
+    supplied no envelope", which reads as ABSENCE of a problem. It now obtains
+    the facts itself through the SAME producers install.py's own doctor phase
+    calls (``_bootstrap_build_envelope`` / ``_launcher_binary_relative_path``
+    + ``_read_launcher_version``), loaded by path — one home, two callers.
+
+    Keys the caller already supplied (install.py injects both mid-run) are
+    never overwritten, so the in-run path is byte-identical to before. A
+    producer that fails leaves its key ABSENT on purpose: the probes then
+    report tri-state ``unknown`` naming :data:`BOOTSTRAP_COMMAND`, which is
+    the honest sentence — not evaluated, and here is what would evaluate it.
+    """
+    try:
+        root = Path(folder)
+        need_envelope = "bootstrap_envelope" not in ctx
+        need_launcher = "launcher_probe_extras" not in ctx
+        if not (need_envelope or need_launcher):
+            return ctx
+        mod = _load_install_module(root)
+        if mod is None:
+            return ctx
+        if need_envelope:
+            try:
+                envelope = mod._bootstrap_build_envelope(root)
+            except (Exception, SystemExit):  # noqa: BLE001 — facts stay absent
+                envelope = None
+            if isinstance(envelope, dict):
+                ctx["bootstrap_envelope"] = envelope
+        if need_launcher:
+            try:
+                from vco_lib import deferral_probes
+
+                subdir, fname = mod._launcher_binary_relative_path()
+                ctx["launcher_probe_extras"] = deferral_probes.launcher_probe_extras(
+                    subdir, fname, mod._read_launcher_version(root)
+                )
+            except (Exception, SystemExit):  # noqa: BLE001 — facts stay absent
+                pass
+    except Exception:  # noqa: BLE001 — supplying context is best-effort
+        pass
+    return ctx
+
+
+def reconcile_probe_cleared(
+    folder: Path, *, extras: Optional[dict] = None, log: Callable[[str], None] = print
+) -> list:
+    """Resolve ledger entries whose registry probe says they are provably over.
+
+    v0.2.95 F1: ``hub_restart_failed_after_abort`` could survive forever — its
+    only clearer ran BEFORE the hub restart step inside ``install.py --update``,
+    and a standalone doctor never re-probed foreign cids at all
+    (:func:`resolve_healthy_findings` is scoped to doctor-OWNED conditions).
+    The doctor is the reconciler's OBSERVE step and runs LAST
+    (arch review §7, steps 2–5), so this pass is where a hub that is back up
+    gets its row removed — on every surface that renders the ledger, not only
+    on the next ``--update``.
+
+    Read → probe → resolve, all through the shared machinery: the report is
+    read ONLY (no unlocked write-back — the resolve goes through the ONE
+    locked emitter), every entry is probed by the SAME
+    :func:`vco_lib.deferral_probes.probe_report` install.py uses, and ONLY a
+    positive ``False`` clears; "still applies" and "could not determine" both
+    keep the entry. That asymmetry is the safety property. Every clear leaves
+    a B-F9 audit row (``resolved_by_registry_probe``) naming the probe.
+
+    Returns the cleared cids. Never raises.
+    """
+    try:
+        from vco_lib import deferral_probes
+        from vco_lib.deferral_emit import resolve_conditions
+        from vco_lib.deferral_report import DeferralReport
+
+        root = Path(folder)
+        report = DeferralReport.read(root)
+        if not list(getattr(report, "entries", []) or []):
+            return []
+        result = deferral_probes.probe_report(root, report, extras)
+        cleared: list = []
+        for cid in list(result.resolvable):
+            name = deferral_probes.registry_probe_name(cid) or ""
+            if resolve_conditions(root, [cid]) > 0:
+                deferral_probes.record_probe_resolution(root, cid, name)
+                cleared.append(cid)
+                log(
+                    f"[doctor] reconcile: {cid} cleared — registry probe "
+                    f"`{name}` re-derived the state and the condition is over."
+                )
+        return cleared
+    except Exception:  # noqa: BLE001 — reconcile is best-effort observability
+        return []
 
 
 def run_doctor(
@@ -3469,6 +3742,34 @@ def _code_embed_image_entry(finding: Finding):
     )
 
 
+def _gateway_unrunnable_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id=CID_GATEWAY_UNRUNNABLE,
+        title="The model gateway is registered to start at login, but cannot run",
+        detected=finding.summary,
+        why_deferred=(
+            "Nothing here can fix it in place: the argv baked into the "
+            "registration is what fails, and re-writing that registration is "
+            "an install/update action. The init system is meanwhile retrying "
+            "it on its own schedule, so a start from anywhere else would only "
+            "add attempts that fail the same way. It is REPORTED because the "
+            "failure is silent from outside: the unit is enabled, the launcher "
+            "toggle reads `registered`, and on 2026-09-10 a machine sat in "
+            "exactly this state for eight hours — the previous gateway process "
+            "kept serving until the first restart, and then nothing did. "
+            "`python install.py --update` re-renders the registration from the "
+            "install root's venv and now verifies the entry point before "
+            "writing it, so the run that fixes this also clears this entry."
+        ),
+        command_to_apply=finding.command,
+        severity="warning",
+        disposition="action_required",
+        kg_node_refs=["docs/CONFIGURATION.md"],
+    )
+
+
 _ENTRY_BUILDERS: dict = {
     CID_NPX_MISSING: _npx_entry,
     CID_DISK_SPACE_LOW: _disk_space_entry,
@@ -3476,6 +3777,7 @@ _ENTRY_BUILDERS: dict = {
     CID_KG_BINDING_EVIDENCE_MISMATCH: _kg_binding_evidence_entry,
     CID_KG_UNCLAIMED: _kg_unclaimed_entry,
     CID_CODE_EMBED_IMAGE_STALE: _code_embed_image_entry,
+    CID_GATEWAY_UNRUNNABLE: _gateway_unrunnable_entry,
 }
 
 
@@ -3625,9 +3927,30 @@ def run_and_report(
     else is mid-write, and the driver is detached) and the on-demand CLI. The
     install-time pass still REPORTS the owed work by name, so it is visible
     either way. See :mod:`vco_lib.deferral_retry` for the gate order.
+
+    v0.2.95 F1/F4 — a standalone pass (``sink is None``: the CLI, not an
+    in-flight install run) first PREFLIGHTS: it obtains the install.py-owned
+    facts it was not handed (:func:`supply_missing_install_context`) and then
+    reconciles the ledger through the registry probes
+    (:func:`reconcile_probe_cleared`) BEFORE probing, so the report this pass
+    prints describes the ledger as it stands after provably-over entries were
+    cleared — a doctor that reports an entry as actionable and then, moments
+    later in the same run, clears it is the F1 defect shape in miniature. The
+    reconcile is gated on ``emit`` for the same reason the retries are:
+    ``--no-emit`` means "tell me, change nothing". With a sink (the install
+    path) both preflight halves are skipped: install.py injects the facts
+    itself, its own re-probe pass owns the mid-run clears, and one writer per
+    run stays the simpler invariant.
     """
     out = printer or print
-    report = run_doctor(folder, scope=scope, resolvers=resolvers, context=context)
+    ctx = dict(context or {})
+    if sink is None:
+        supply_missing_install_context(Path(folder), ctx)
+        if emit:
+            reconcile_probe_cleared(
+                Path(folder), extras=ctx.get("launcher_probe_extras") or {}, log=out
+            )
+    report = run_doctor(folder, scope=scope, resolvers=resolvers, context=ctx)
     out("")
     out("[doctor] Environment check:")
     for line in report.render_lines():
@@ -3697,7 +4020,18 @@ def run_from_args(args: argparse.Namespace) -> int:
     emit = getattr(args, "emit", True)
     auto_fix = getattr(args, "auto_fix", True)
     if args.json:
-        report = run_doctor(folder, scope=args.scope)
+        # v0.2.95 F1/F4: the --json surface is a STANDALONE doctor too, so it
+        # gets the same preflight as run_and_report — obtain the facts, then
+        # reconcile the ledger — with the reconcile honouring --no-emit and
+        # the log line silenced (stdout is a machine contract on this path;
+        # the cleared cids are observable through the payload's ledger probe).
+        ctx: dict = {}
+        supply_missing_install_context(folder, ctx)
+        if emit:
+            reconcile_probe_cleared(
+                folder, extras=ctx.get("launcher_probe_extras") or {}, log=lambda _l: None
+            )
+        report = run_doctor(folder, scope=args.scope, context=ctx or None)
         if emit:
             emit_findings(folder, report)
         print(json.dumps(report.to_dict()))
@@ -3716,6 +4050,7 @@ def run_from_args(args: argparse.Namespace) -> int:
 
 
 __all__ = [
+    "BOOTSTRAP_COMMAND",
     "CID_CODE_EMBED_IMAGE_STALE",
     "CID_DISK_SPACE_LOW",
     "CID_KG_BINDING_EVIDENCE_MISMATCH",
@@ -3768,11 +4103,13 @@ __all__ = [
     "probe_source_currency",
     "probe_stale_vct_deploy",
     "probe_vco_lib_editable",
+    "reconcile_probe_cleared",
     "resolve_healthy_findings",
     "run_and_report",
     "run_doctor",
     "run_from_args",
     "same_location",
+    "supply_missing_install_context",
 ]
 
 

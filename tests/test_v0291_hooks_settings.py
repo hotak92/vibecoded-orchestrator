@@ -85,7 +85,7 @@ def _realistic_settings() -> dict:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "bash .claude/hooks/cost-tracker.sh",
+                            "command": "bash .claude/hooks/notify-stop.sh",
                             "timeout": 5,
                         }
                     ]
@@ -159,7 +159,7 @@ class ListTests(_TempProject):
         commands = [e["command"] for e in entries]
         self.assertEqual(len(commands), 5, commands)
         self.assertIn("bash .claude/hooks/post-file-edit.sh", commands)
-        self.assertIn("bash .claude/hooks/cost-tracker.sh", commands)
+        self.assertIn("bash .claude/hooks/notify-stop.sh", commands)
 
     def test_group_without_matcher_normalizes_to_empty_string(self) -> None:
         doc = hs.load_settings(self.settings)
@@ -211,7 +211,7 @@ class DisableTests(_TempProject):
     def test_every_unrelated_key_survives_verbatim(self) -> None:
         before = self.read()
         doc = hs.load_settings(self.settings)
-        hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         hs.write_settings(doc)
         after = self.read()
 
@@ -221,7 +221,7 @@ class DisableTests(_TempProject):
 
     def test_emptied_group_and_event_are_removed(self) -> None:
         doc = hs.load_settings(self.settings)
-        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         hs.write_settings(doc)
         self.assertNotIn("Stop", self.read()["hooks"])
         self.assertTrue(parked["group_removed"])
@@ -283,7 +283,7 @@ class EnableTests(_TempProject):
         """The `Stop` group has NO `matcher` key. Removing its only hook
         drops the group; restoring must NOT grow a `matcher: ""`."""
         doc = hs.load_settings(self.settings)
-        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         hs.write_settings(doc)
 
         doc2 = hs.load_settings(self.settings)
@@ -295,7 +295,7 @@ class EnableTests(_TempProject):
 
     def test_enable_is_idempotent_when_the_command_is_already_present(self) -> None:
         doc = hs.load_settings(self.settings)
-        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         hs.write_settings(doc)
         doc2 = hs.load_settings(self.settings)
         hs.insert_hook(doc2, parked)
@@ -492,7 +492,7 @@ class EnableTests(_TempProject):
         the ordinal keys are optional, and their absence falls back to the
         old append behaviour rather than refusing to restore."""
         doc = hs.load_settings(self.settings)
-        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        parked = hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         hs.write_settings(doc)
         legacy = {
             k: v
@@ -505,7 +505,7 @@ class EnableTests(_TempProject):
         hs.write_settings(doc2)
         self.assertEqual(
             [h["command"] for h in self.read()["hooks"]["Stop"][0]["hooks"]],
-            ["bash .claude/hooks/cost-tracker.sh"],
+            ["bash .claude/hooks/notify-stop.sh"],
         )
 
     def test_rejects_a_parked_entry_of_an_unknown_schema(self) -> None:
@@ -689,7 +689,7 @@ class RefusalTests(_TempProject):
         self.settings.symlink_to(real)
 
         doc = hs.load_settings(self.settings)
-        hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         with self.assertRaises(hs.HooksSettingsError) as ctx:
             hs.write_settings(doc)
         self.assertEqual(ctx.exception.code, "symlink_blocked")
@@ -712,7 +712,7 @@ class RefusalTests(_TempProject):
         (self.project / ".claude").symlink_to(real_dir, target_is_directory=True)
 
         doc = hs.load_settings(self.settings)
-        hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+        hs.remove_hook(doc, "Stop", "", "bash .claude/hooks/notify-stop.sh")
         with self.assertRaises(hs.HooksSettingsError) as ctx:
             hs.write_settings(doc)
         self.assertEqual(ctx.exception.code, "symlink_blocked")
@@ -1071,7 +1071,7 @@ class CliTests(_TempProject):
             "--matcher",
             "",
             "--command",
-            "bash .claude/hooks/cost-tracker.sh",
+            "bash .claude/hooks/notify-stop.sh",
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         parked = json.loads(r.stdout)["parked"]
@@ -1108,7 +1108,7 @@ class CliTests(_TempProject):
             "--matcher",
             "",
             "--command",
-            "bash .claude/hooks/cost-tracker.sh",
+            "bash .claude/hooks/notify-stop.sh",
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         payload = json.loads(r.stdout)

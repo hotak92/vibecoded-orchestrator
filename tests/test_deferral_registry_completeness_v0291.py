@@ -216,6 +216,18 @@ _V0293_OWNED_ADDITIONS = frozenset({
     "update_install_phase_failed",
 })
 
+# v0.2.95 (R1): the rendered-file reconcile record. The EMITTER is install.py's
+# own renderer step, adding the row to THIS run's report, so owned-drop-when-
+# absent is family A proper (nothing is written behind finalize's back). Its
+# re-detection input is the launcher's hand-off state file, which the emit
+# CONSUMES — so the next --update genuinely does not re-detect it and finalize
+# drops it. That one-shot expiry is the whole lifecycle: the row records a
+# completed action (tracked blob advanced to upstream, local rendered copy kept,
+# AUTO block re-rendered) and must not need a human to disappear.
+_V0295_OWNED_ADDITIONS = frozenset({
+    "rendered_file_upstream_changed",
+})
+
 
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
@@ -519,7 +531,10 @@ class TestOwnershipMigrationPin(unittest.TestCase):
         added = self.owned - _V0290_OWNED_IDS
         self.assertEqual(
             added,
-            _V0291_OWNED_ADDITIONS | _V0292_OWNED_ADDITIONS | _V0293_OWNED_ADDITIONS,
+            _V0291_OWNED_ADDITIONS
+            | _V0292_OWNED_ADDITIONS
+            | _V0293_OWNED_ADDITIONS
+            | _V0295_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

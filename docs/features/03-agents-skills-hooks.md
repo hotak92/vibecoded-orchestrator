@@ -331,9 +331,6 @@ Both OS flavours shell out to one shared implementation, `templates/scripts/mcp_
 ### `config-change-audit.sh` — ConfigChange (background)
 Log all settings.json changes to `.claude/logs/config_changes.jsonl` for audit trail.
 
-### `cost-tracker.sh` — Stop (background)
-Parse the Stop event payload and append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, auth_mode, cost_usd}` to `~/.claude/metrics/costs.jsonl`. `auth_mode` is `"subscription"` (OAuth login — `cost_usd: null`, tokens free) or `"api"` (API key — cost calculated from token counts).
-
 ### `notify-stop.sh` — Stop (background)
 Send a desktop notification (`notify-send`) when Claude finishes a response. Note: Stop hooks do not fire in the VS Code extension (CLI/Desktop only).
 
@@ -379,6 +376,22 @@ Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and ca
 ### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M)
 KG context injection before `Bash` tool calls. Reads the proposed command, runs a `hybrid_search` for related concepts, and injects matches as `additionalContext`. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so downstream invocations of `rl_kg_search.py` are attributable to the same session.
 
+**v0.2.95 — query shape.** When the same write-target parser used by `post-bash-file-sync` recovers a target from the command, the query is built the way `pre-edit-context-inject.sh` builds it: module name from the basename plus a content snippet (the heredoc body, when the target is under `knowledge/`/`docs/` and carries no credential shape), and the written file is passed as `--anchor` / `--exclude-file` on the code-graph leg. With no recoverable target — the overwhelmingly common case — the query is byte-for-byte the pre-v0.2.95 noise-stripped command. The 500-char KG threshold and its `VCT_BASH_KG_THRESHOLD_CHARS` override are unchanged, and the code-graph branch still runs *before* that threshold.
+
+### `post-bash-file-sync.sh` — PostToolUse Bash (v0.2.95)
+Gives a **CLI write** the same treatment an `Edit`/`Write` gets. `post-file-edit.sh` is registered on matcher `Edit|Write` only, so before v0.2.95 a `cat > knowledge/foo.md <<EOF`, a `sed -i` on a `docs/` page or a `cp` into a source tree reached Weaviate *never*. This hook parses the executed command for write targets (`vco_lib/bash_write_targets.py` — redirections, heredocs, `tee`, `sed -i`, `cp`/`mv`/`install` destinations, `touch`, `dd of=`, long `--output` flags; chains / wrapper verbs / `bash -c` come from the shared `vco_lib/bash_command_walk`) and feeds each one to the SAME routing home `post-file-edit.sh` uses, `_lib/route-touched-path.sh`. PowerShell sibling ships alongside.
+
+Two costs are deliberately bounded:
+
+- A **pure-shell prefilter** (`_lib/bash-write-targets.sh`) rejects routine commands — `ls`, `git status`, `pytest`, and any command whose only redirections are `2>&1` / `>/dev/null` — with no subprocess at all. Python is spawned only for a command that plausibly wrote something.
+- A write performed by an interpreter from its own source (`python - <<EOF … open(p,'w') … EOF`) **cannot** be read out of the command text. For `knowledge/` and `docs/` it is recovered by a watermarked mtime scan of those two directories only (lookback capped at 300 s, ~3 ms for a 1 134-file tree, at most 32 results), triggered only when the parse found nothing and the command has an opaque-write shape. **Code files written that way are a known miss** — a whole-repo walk per Bash call is unbounded, and the next `Edit` re-queues the file for the code-graph drain. Both misses are recorded in the hook's own header.
+
+### `_lib/route-touched-path.{sh,ps1}` — the routing home (v0.2.95)
+`knowledge/**` → `kg-sync` (KG collection), `docs/**.md` → `kg-sync` (development collection), `.claude/diagrams/*.{mmd,excalidraw}` → `vco_lib.diagram_indexer` (60 s throttle), code extensions → the per-turn code-graph drain queue — each gated by the Phase-8 access matrix and coalesced by the per-file debounce. Extracted from `post-file-edit.{sh,ps1}` when `post-bash-file-sync` became a second consumer; both hooks call it, neither re-implements it.
+
+### `_lib/code-extensions.{sh,ps1}` — "is this a code file?" (v0.2.95)
+One home for the extension alternation the code graph acts on. `pre-edit-context-inject`, `pre-bash-context-inject` and the routing home read it; four remaining pairs (`pre-tool-use`, `code-graph-incremental`, `stop-codegraph-drain`, `_lib/command-noise-strip`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home.
+
 ### `post-bash-context-record.sh` — PostToolUse Bash (V52-M)
 Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. PowerShell sibling ships alongside.
 
@@ -411,6 +424,12 @@ When the user toggles a per-project agent or skill off via the launcher GUI, the
 **Why move, not flag**: the FS layout doubles as the source-of-truth. `install-bundle --update` is idempotent UPSERT against the same directories; the `.disabled/` sibling location means a disabled row survives bundle updates without being silently re-enabled. The user instruction in `CLAUDE.md` ("don't delete `.claude/{agents,skills,hooks}/*.md` to uninstall — disable via the launcher") relies on this contract.
 
 v0.2.53 Track F (B2) verified the end-to-end contract: GUI toggle off → `mv` to `.disabled/` → `install-bundle --update` respects it → toggle on → `mv` back. Test at `tests/test_fs_disable_contract_end_to_end.py`. Per-project bundle code at `vco_lib/project_init.py:3063–3245` honours the `.disabled/` companion location at update time so preservation entries are NOT written for items the user has deliberately disabled.
+
+### Retired hook REGISTRATIONS (v0.2.95)
+
+A hook's `.claude/settings.json` entry is merged by `_merge_hooks_for_bundle`, which recognises a VCO hook by the presence of its script identity in the CURRENT template: a shipped command whose form changed SUPERSEDES the stale one, while anything it does not recognise is the user's own hook and is preserved byte-for-byte. That rule has one blind spot — when a hook stops being shipped at all, its registration stops being recognised as VCO's and survives every future update, invoking a script the same update deleted.
+
+`vco_lib/hook_retirements.py` closes it by declaring retired registrations as data (event, matcher, reason, retiring release, replacement). The bundle engine consults that table on every run, removes a matching inner hook, prunes an emptied group and writes one `record_auto_resolution` row per removal into `.claude/logs/auto-resolutions.jsonl`. Matching is deliberately narrow — a `.claude/hooks/` retiree by invoked-script identity, an inline one by whole-command equality — so a user command that merely *mentions* a retired path keeps running untouched.
 
 ---
 

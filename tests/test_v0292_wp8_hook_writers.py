@@ -128,7 +128,7 @@ def _digests(directory: Path) -> "dict[str, str]":
 
 
 # --------------------------------------------------------------------------- #
-# cost-tracker (Stop)
+# a Stop-event payload (shared by the partial-install tests below)
 # --------------------------------------------------------------------------- #
 
 
@@ -142,94 +142,6 @@ _STOP_PAYLOAD = {
         },
     },
 }
-
-
-def test_cost_tracker_writes_to_the_new_home__act(home, tmp_path):
-    project = _project(tmp_path)
-    result = _run("cost-tracker.sh", home, project, _STOP_PAYLOAD)
-
-    assert result.returncode == 0, result.stderr
-    rows = [
-        json.loads(ln)
-        for ln in _new(home, "costs.jsonl").read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    assert len(rows) == 1
-    assert rows[0]["session_id"] == "sess-1"
-    assert rows[0]["input_tokens"] == 10
-
-
-def test_cost_tracker_writes_nothing_under_the_claude_dir__leave_alone(
-    home, tmp_path
-):
-    project = _project(tmp_path)
-    before = _digests(home / ".claude" / "metrics")
-
-    _run("cost-tracker.sh", home, project, _STOP_PAYLOAD)
-
-    assert _digests(home / ".claude" / "metrics") == before
-    assert not _archive(home, "costs.jsonl").exists(), (
-        "the directive: VCO writes nothing under ~/.claude that the harness "
-        "did not ask for"
-    )
-
-
-def test_cost_tracker_stays_on_the_archive_until_the_copy_is_verified(
-    home, tmp_path
-):
-    """The user's amendment, at runtime.
-
-    An archive holding rows and no sentinel means the copy is still owed, so
-    the writer keeps appending where that machine's history already is.
-    Nothing is stranded and nothing is double-counted.
-    """
-    project = _project(tmp_path)
-    (home / ".claude" / "metrics").mkdir(parents=True, exist_ok=True)
-    _archive(home, "costs.jsonl").write_text('{"pre":1}\n', encoding="utf-8")
-
-    result = _run("cost-tracker.sh", home, project, _STOP_PAYLOAD)
-
-    assert result.returncode == 0, result.stderr
-    assert not _new(home, "costs.jsonl").exists()
-    assert len(_archive(home, "costs.jsonl").read_text().splitlines()) == 2
-
-
-def test_cost_tracker_moves_to_the_new_home_once_the_copy_is_verified(
-    home, tmp_path
-):
-    """The other half of the same decision — the act, after the gate opens."""
-    project = _project(tmp_path)
-    (home / ".claude" / "metrics").mkdir(parents=True, exist_ok=True)
-    _archive(home, "costs.jsonl").write_text('{"pre":1}\n', encoding="utf-8")
-
-    from vco_lib.metrics_migration import migrate_metrics
-
-    migration = migrate_metrics(
-        home / ".claude" / "metrics", home / ".vct" / "metrics"
-    )
-    assert migration.ok, migration.to_dict()
-    archive_after_copy = _digests(home / ".claude" / "metrics")
-
-    result = _run("cost-tracker.sh", home, project, _STOP_PAYLOAD)
-
-    assert result.returncode == 0, result.stderr
-    rows = _new(home, "costs.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 2, "the copied row plus the new one"
-    assert _digests(home / ".claude" / "metrics") == archive_after_copy, (
-        "the archive is frozen once copied"
-    )
-
-
-def test_cost_tracker_ignores_a_zero_token_payload(home, tmp_path):
-    """Pre-existing behaviour preserved across the move."""
-    project = _project(tmp_path)
-    payload = {
-        "session_id": "s",
-        "message": {"model": "m", "usage": {"input_tokens": 0, "output_tokens": 0}},
-    }
-    result = _run("cost-tracker.sh", home, project, payload)
-    assert result.returncode == 0
-    assert not _new(home, "costs.jsonl").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -437,7 +349,7 @@ def test_embedding_surface_runs_the_copy_once_on_session_start__act(
     _archive(home, "embedding_failures.jsonl").write_text(
         '{"m":1}\n', encoding="utf-8"
     )
-    _archive(home, "costs.jsonl").write_text('{"c":1}\n', encoding="utf-8")
+    _archive(home, "failures.jsonl").write_text('{"c":1}\n', encoding="utf-8")
     archive_before = _digests(home / ".claude" / "metrics")
 
     env = _env(home, project)
@@ -449,7 +361,7 @@ def test_embedding_surface_runs_the_copy_once_on_session_start__act(
 
     assert result.returncode == 0, result.stderr
     # ACT: the whole archive came across, verified, with the sentinel written.
-    assert _new(home, "costs.jsonl").read_text(encoding="utf-8") == '{"c":1}\n'
+    assert _new(home, "failures.jsonl").read_text(encoding="utf-8") == '{"c":1}\n'
     assert _new(home, "embedding_failures.jsonl").is_file()
     assert (home / ".vct" / "metrics" / ".migrated-from-claude.json").is_file()
     # ...and the hint now names the new home, because that is where the rows
@@ -466,7 +378,7 @@ def test_embedding_surface_copy_is_idempotent_across_sessions__leave_alone(
     project = _project(tmp_path)
     _hint(project)
     (home / ".claude" / "metrics").mkdir(parents=True, exist_ok=True)
-    _archive(home, "costs.jsonl").write_text('{"c":1}\n', encoding="utf-8")
+    _archive(home, "failures.jsonl").write_text('{"c":1}\n', encoding="utf-8")
 
     env = _env(home, project)
     env["VCT_VENV"] = str(_shim_venv(tmp_path))
@@ -477,10 +389,10 @@ def test_embedding_surface_copy_is_idempotent_across_sessions__leave_alone(
         )
         assert proc.returncode == 0, proc.stderr
 
-    assert _new(home, "costs.jsonl").read_text(encoding="utf-8") == '{"c":1}\n', (
+    assert _new(home, "failures.jsonl").read_text(encoding="utf-8") == '{"c":1}\n', (
         "a second session must not double the copied rows"
     )
-    assert _archive(home, "costs.jsonl").read_text(encoding="utf-8") == '{"c":1}\n'
+    assert _archive(home, "failures.jsonl").read_text(encoding="utf-8") == '{"c":1}\n'
 
 
 def test_embedding_surface_prefers_the_new_home_when_it_has_the_rows(
@@ -505,7 +417,7 @@ def test_embedding_surface_prefers_the_new_home_when_it_has_the_rows(
 
 
 @pytest.mark.parametrize(
-    "hook", ["cost-tracker.sh", "post-compact.sh", "stop-failure-notify.sh",
+    "hook", ["post-compact.sh", "stop-failure-notify.sh",
              "kg-update-nudge.sh", "embedding-failures-surface.sh"]
 )
 def test_a_hook_without_the_helper_exits_cleanly_and_writes_nowhere(

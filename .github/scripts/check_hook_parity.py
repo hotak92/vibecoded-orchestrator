@@ -257,9 +257,11 @@ def file_exists_on_base(repo_root: Path, path: str, base_ref: str | None) -> boo
         # `git cat-file -e` returns 0 if the object exists; non-zero
         # otherwise. Suppress stderr — non-existence is the answer, not
         # a failure to report.
-        result = run_git(
-            ["cat-file", "-e", f"origin/{base_ref}:{path}"], cwd=repo_root
-        )
+        # The CALL is the check: run_git raises RuntimeError on a non-zero
+        # exit, so reaching the next line means the object exists. Nothing
+        # to bind — an assignment here would read as a result someone
+        # forgot to inspect.
+        run_git(["cat-file", "-e", f"origin/{base_ref}:{path}"], cwd=repo_root)
         return True
     except RuntimeError:
         return False

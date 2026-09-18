@@ -147,9 +147,11 @@ from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
 from vco_lib import install_companions as _install_companions  # noqa: E402
+from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
+from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
@@ -1131,19 +1133,19 @@ def _bootstrap_launcher_dist_subdir() -> Optional[str]:
     return None
 
 
-def _run_metrics_migration_hook() -> None:
-    """v0.2.92 WP-D (register item 20, WP-8 recipe R1): the every-run legacy
-    metrics-archive migration (was SessionStart-hook-only, so the history
-    copy ran late for frequent updaters). Soft-fail; COPY-never-MOVE.
+def _run_machine_migrations() -> None:
+    """Every one-time MACHINE-level migration, on every run. Soft-fail.
+
+    THE LEGS AND THE REASONING LIVE IN :mod:`vco_lib.machine_migrations`
+    (v0.2.95): the v0.2.92 WP-D metrics-archive copy + the Q1 panel
+    ``ANTHROPIC_MODEL`` pin removal. The NAME stays a module global: main()
+    calls it as one, and a test monkeypatches it there.
     """
     try:
-        from vco_lib.metrics_migration import ensure_metrics_migrated
-
-        result = ensure_metrics_migrated()
-        if result.status == "failed":
-            _log_install_event("metrics_migration", "warn", f"metrics migration failed: {'; '.join(result.errors)}")
+        from vco_lib import machine_migrations
+        machine_migrations.run_every_run(on_event=_log_install_event)
     except Exception as exc:  # noqa: BLE001 — best-effort by design
-        _log_install_event("metrics_migration", "warn", f"metrics migration could not run: {exc}")
+        _log_install_event("machine_migrations", "warn", f"could not run: {exc}")
 
 
 def _bootstrap_resolve_vco_version(root: Path) -> tuple[str, Optional[str]]:
@@ -2890,7 +2892,7 @@ def _detect_third_party_project(install_path: Path) -> dict | None:
             # adopt mode on it. The update flow proceeds normally.
             return None
 
-        manifest_path = install_path / ".claude" / ".vco-manifest.json"
+        manifest_path = _manifest_paths.manifest_path(install_path)
         manifest_status = _v47g_classify_manifest(manifest_path)
         if manifest_status == "valid":
             # Existing well-formed VCO project — never prompt.
@@ -3264,7 +3266,7 @@ def _print_adopt_dry_run_manifest(install_path: Path) -> None:
             venv_found = True
             desc = _v47g_describe_venv(candidate)
             print(f"  Found: {venv_name}/ ({desc})")
-            manifest_path = install_path / ".claude" / ".vco-manifest.json"
+            manifest_path = _manifest_paths.manifest_path(install_path)
             if not manifest_path.is_file():
                 print("  Action: skip-no-manifest (preserve existing venv).")
                 print("          Use --rebuild-venv to override.")
@@ -3685,7 +3687,7 @@ def _venv_triage(install_path: Path,
     # v0.2.46 V47-D: figure out whether VCO has a manifest record proving
     # it owns this venv. Absence of .vco-manifest.json is the load-bearing
     # signal that this is a 3rd-party environment we must not destroy.
-    manifest_path = install_path / ".claude" / ".vco-manifest.json"
+    manifest_path = _manifest_paths.manifest_path(install_path)
     has_manifest = manifest_path.is_file()
     requirements_path = install_path / "requirements.txt"
     has_requirements = requirements_path.is_file()
@@ -3854,7 +3856,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         # We attach the entry here so the venv-skip rationale is
         # contiguous with the triage decision in the log timeline.
         _venv_path = PROJECT_ROOT / ".venv"
-        _manifest_path = PROJECT_ROOT / ".claude" / ".vco-manifest.json"
+        _manifest_path = _manifest_paths.manifest_path(PROJECT_ROOT)
         # We can't add to the deferral report until it's instantiated
         # later; stash the entry payload on the args namespace so the
         # later block can pick it up. The args namespace is the only
@@ -5271,7 +5273,10 @@ def _replay_compose_override_resolutions(override_result, deferral_report) -> No
             )
 
 
-def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
+def _run_root_claude_dir_install(
+    args: argparse.Namespace,
+    deferral_report: "DeferralReport | None" = None,
+) -> dict:
     """Step 5b (v0.2.85, PLAN-v0285 D1/D2/D4/D5): delegate the orchestrator-
     self runtime ``.claude/`` install to the shared ``install-bundle`` engine.
 
@@ -5290,6 +5295,11 @@ def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
     the action counts). Soft-fail throughout — a parse/launch failure yields a
     PARTIAL warning and the install continues (mirrors the launcher).
 
+    ``deferral_report`` (v0.2.95 R1) is threaded into the rendered-root-files
+    step so a pre-pull rendered-file reconcile performed by the launcher lands
+    its ``rendered_file_upstream_changed`` row in THIS run's report. Callers
+    that omit it (tests) still render; they just record nothing.
+
     Living in install.py (not vco_lib) because it is the thin orchestration
     shim that must supply install.py's module globals (``PROJECT_ROOT``,
     ``_log_install_event``) and call the kept in-process ``_materialize_
@@ -5300,7 +5310,7 @@ def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
     # construction — the .vco-manifest.json is the installed marker (same
     # marker family the bundle itself consults). --update forces update mode;
     # otherwise the manifest's presence decides.
-    manifest = PROJECT_ROOT / ".claude" / ".vco-manifest.json"
+    manifest = _manifest_paths.manifest_path(PROJECT_ROOT)
     update_mode = bool(getattr(args, "update", False)) or manifest.exists()
 
     # D5 flag mapping (no feature removal, no legacy branches):
@@ -5368,7 +5378,14 @@ def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
     _skip_claude_dir = bool(getattr(args, "skip_materialize_claude_dir", False))
     _dry = bool(getattr(args, "adopt_project_dry_run", False))
     if not _dry and not _skip_claude_dir:
-        _materialize_orchestrator_self_claude_md(PROJECT_ROOT)
+        # v0.2.95 R1: the report is threaded so the renderer can record the
+        # launcher's pre-pull rendered-file reconcile (`rendered_file_upstream_
+        # changed`) in THIS run's ledger. An install.py-owned cid emitted by a
+        # separate writer mid-run would be dropped by this run's own finalize;
+        # going through the run report is what makes it survive.
+        _materialize_orchestrator_self_claude_md(
+            PROJECT_ROOT, deferral_report=deferral_report
+        )
     return result
 
 
@@ -5938,8 +5955,8 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 — seeding is best-effort
         _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
 
-    # v0.2.92 WP-D (register item 20): metrics migration on every run (helper above).
-    _run_metrics_migration_hook()
+    # One-time machine migrations on every run (helper above; v0.2.92 WP-D).
+    _run_machine_migrations()
 
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
@@ -6129,7 +6146,7 @@ def main() -> int:
     # _seed_weaviate so the KG-sync hooks exist when seeding runs. Replaces the
     # deleted Steps 5b/9b (bespoke materialize + agents/skills install), also
     # fixing F-NEW-1 (one manifest writer remains by construction).
-    _run_root_claude_dir_install(args)
+    _run_root_claude_dir_install(args, deferral_report=_deferral_report)
 
     _project_init.materialize_root_knowledge(PROJECT_ROOT, log_event=_log_install_event)  # Step 4d (v0.2.81): seed root knowledge/ == shared
 
@@ -6761,17 +6778,14 @@ def main() -> int:
     # (_deferral_folder is resolved at the top of main(), next to the A-2
     # disk seed — see the HIGH-2 comment there.)
 
-    # v0.2.91 WP-B (#5) re-probe pass + WP-D doctor phase — see the helper.
-    _post_install_probe_phase(_deferral_report, _deferral_folder, args=args)
-
     # A-11 (v0.2.73): the mid-run `_deferral_report.write()` that used to sit
     # here was REMOVED. With an empty in-memory report it unlinked the on-disk
     # file (and stripped the CLAUDE.md reminder) minutes before the final
     # write — a hard kill in that window lost every foreign entry with not
-    # even a stub. Nothing between here and the final write reads the file
-    # back (only `--apply-deferred` does, and it runs above), so the final
-    # write at the end of main() is the ONLY writer. Fix 6 (v0.2.13) already
-    # established the final write as the authoritative one.
+    # even a stub. Nothing between here and the final write WRITES the file
+    # back (the v0.2.95 re-probe pass below only READS it, by design), so the
+    # final write at the end of main() is the ONLY writer. Fix 6 (v0.2.13)
+    # already established the final write as the authoritative one.
 
     # Drop the install-manifest at state/install-manifest.json so the launcher
     # (and operators auditing an install) can verify install actually finished.
@@ -7001,6 +7015,9 @@ def main() -> int:
     # See `_persist_orchestrator_root_kg_collection` docstring for the
     # resolution priority + soft-fail semantics.
     _persist_orchestrator_root_kg_collection(_deferral_report)
+    # v0.2.91 WP-B (#5) re-probe + WP-D doctor phase — v0.2.95 F1: runs AFTER
+    # the hub restart (rationale in the helper; order pinned in test_v0295).
+    _post_install_probe_phase(_deferral_report, _deferral_folder, args=args)
 
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
@@ -7143,6 +7160,13 @@ def _post_install_probe_phase(
        assumptions against what was actually registered and delivered, prints
        the authoritative report, emits registry-classed conditions for what it
        defers, and dispatches the WP-H retries for owed work.
+
+    v0.2.95 F1: the phase runs AFTER `_deploy_and_start_vct_hub` and the
+    boot-unit steps (its caller in ``main()`` sits below them), so the
+    re-probe reads the executor outcomes of THIS run — the restarted hub
+    answering `/api/v1/health` is what clears a `hub_restart_failed_after_abort`
+    row. When this phase ran above the restart (pre-v0.2.95), that row could
+    never clear inside an update.
 
     Doctor runs AFTER the re-probe so a condition the re-probe just cleared is
     not immediately re-listed by the ledger summary, and BEFORE
@@ -7848,150 +7872,6 @@ def _apply_deferred_entries(
                 "purpose. Marking resolved."
             )
             current_run_report.mark_resolved(cid)
-
-        elif cid == "hub_restart_failed_after_abort":
-            # v0.2.89: the launcher writes this entry when the abort-path hub
-            # restart's health poll fails — i.e. after a conflict-ABORTED
-            # update the launcher tried to bring vct-hub back with
-            # `--start-if-not-running` and the post-restart liveness poll
-            # timed out (emitted by installer.rs). Unlike
-            # generated_files_reconciled (a pure historical audit record with
-            # nothing to re-probe), this is an ACTIONABLE FAILURE record: the
-            # hub genuinely did not come back at abort time, so it must NOT be
-            # unconditionally cleared — it self-clears only once the hub is
-            # confirmed refreshed. It is FOREIGN (Rust-emitted, not in
-            # _INSTALL_OWNED_CONDITION_IDS — a foreign cid listed there would
-            # be silently clobbered on the next update, the A-2 data-loss bug).
-            #
-            # Re-probe (mirrors launcher_update_diverged's hub leg): install.py
-            # Step 8 restarts the hub (`--start-if-not-running`), so by the
-            # time this handler runs the hub is normally back up. We resolve the
-            # 'hub down' record ONLY when BOTH are true:
-            #   (1) the on-disk hub sidecar version
-            #       (`vct-hub[.exe].metadata.json::launcher_version`) >= source
-            #       — proving the binary was REFRESHED, and
-            #   (2) a LIVE `_probe_vct_hub_health()` succeeds — proving the hub
-            #       is actually UP right now.
-            # (1) alone is insufficient (re-review MAJOR-2): Step 8 is soft-fail,
-            # so a run whose hub start FAILED its /health poll still reaches this
-            # handler with a freshly-deployed binary — clearing on version alone
-            # would delete an actionable 'hub down' record while the hub is
-            # genuinely down. If either check fails (or the probe raises), the
-            # entry is PRESERVED so it survives to the next run — never wrongly
-            # clear an actionable failure.
-            try:
-                source_version = _read_launcher_version(project_root)
-                subdir, fname = _launcher_binary_relative_path()
-                dist_dir = project_root / "launcher" / "dist" / subdir
-
-                def _read_dist_meta_version(meta_name: str) -> "str | None":
-                    p = dist_dir / meta_name
-                    if not p.is_file():
-                        return None
-                    try:
-                        m = json.loads(p.read_text(encoding="utf-8"))
-                    except Exception:
-                        return None
-                    raw = m.get("launcher_version")
-                    return raw.strip() if isinstance(raw, str) and raw.strip() else None
-
-                hub_meta_name = (
-                    "vct-hub.exe.metadata.json"
-                    if fname.endswith(".exe")
-                    else "vct-hub.metadata.json"
-                )
-                on_disk_hub_version = _read_dist_meta_version(hub_meta_name)
-
-                def _vparts(v: str) -> list[int]:
-                    out: list[int] = []
-                    for p in v.split("."):
-                        digits = ""
-                        for ch in p:
-                            if ch.isdigit():
-                                digits += ch
-                            else:
-                                break
-                        out.append(int(digits) if digits else 0)
-                    return out
-
-                def _ge(a_str: str, b_str: str) -> bool:
-                    a, b = _vparts(a_str), _vparts(b_str)
-                    n = max(len(a), len(b))
-                    a += [0] * (n - len(a))
-                    b += [0] * (n - len(b))
-                    return a >= b
-
-                # Unlike launcher_update_diverged (which treats an absent hub
-                # sidecar as "hub OK" so a caught-up launcher isn't blocked by
-                # a missing hub meta), THIS condition is specifically about the
-                # hub — an absent/unparseable sidecar means we cannot POSITIVELY
-                # confirm the hub caught up, so we keep the actionable entry
-                # (conservative: never wrongly clear a failure record).
-                version_caught_up = bool(
-                    source_version and on_disk_hub_version
-                    and _ge(on_disk_hub_version, source_version)
-                )
-
-                # v0.2.89 MAJOR-2: a caught-up sidecar VERSION only proves the
-                # hub BINARY was refreshed on disk — NOT that the hub is UP.
-                # Step 8 (_deploy_and_start_vct_hub) is soft-fail, so a run whose
-                # /health poll FAILED still reaches here; clearing the entry on
-                # version alone would wrongly delete an actionable "hub down"
-                # record while the hub is genuinely down. AND-in a LIVE health
-                # confirmation (reuse the existing probe — do NOT invent a new
-                # one). If the probe is unavailable/raises, PRESERVE (conservative:
-                # never wrongly clear an actionable failure).
-                health_ok = False
-                if version_caught_up:
-                    try:
-                        health_ok = _probe_vct_hub_health()
-                    except Exception:  # noqa: BLE001 — probe must never crash the handler
-                        health_ok = False
-
-                resolved = version_caught_up and health_ok
-
-                if resolved:
-                    print(
-                        f"  [ok]   {cid}: on-disk hub v{on_disk_hub_version} "
-                        f">= source v{source_version} AND /health is live — the "
-                        "hub has been refreshed and is UP; the abort-time restart "
-                        "failure is resolved. Marking resolved."
-                    )
-                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
-                    # FOREIGN cid (Rust-emitted, not in the owned set): the A-2
-                    # seed imported the on-disk copy into current_run_report and
-                    # the P1 pre-write re-merge would re-import it — without
-                    # mark_resolved here the 'do NOT re-add' resolution is inert
-                    # (same pattern launcher_update_diverged uses).
-                    current_run_report.mark_resolved(cid)
-                elif not version_caught_up:
-                    print(
-                        f"  [skip] {cid}: hub binary has not reached source "
-                        f"v{source_version or '<unknown>'} yet (on-disk hub "
-                        f"v{on_disk_hub_version or '<none>'}); the hub has not "
-                        "caught up, so the abort-time restart failure stands. "
-                        "Keeping entry."
-                    )
-                    current_run_report.add_entry(entry)
-                else:
-                    # Version caught up BUT the live /health probe did not confirm
-                    # the hub is up → the hub binary was refreshed but the hub is
-                    # NOT answering. This is EXACTLY the "hub down" state the entry
-                    # records — preserve it (never clear an actionable failure on
-                    # version alone).
-                    print(
-                        f"  [skip] {cid}: on-disk hub v{on_disk_hub_version} "
-                        f">= source v{source_version} BUT /health did not answer "
-                        "— the hub binary was refreshed yet the hub is NOT up; the "
-                        "abort-time restart failure still stands. Keeping entry."
-                    )
-                    current_run_report.add_entry(entry)
-            except Exception as exc:  # noqa: BLE001 — soft-fail
-                print(
-                    f"  [fail] {cid}: hub version re-probe failed ({exc}). "
-                    "Keeping entry."
-                )
-                current_run_report.add_entry(entry)
 
         else:  # no handler: expire an owned record, else preserve verbatim
             _deferral_probes.settle_unhandled_entry(
@@ -11846,90 +11726,75 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     _log_install_event("4/10", "ok", "weaviate_mcp submodule imports verified (FN-5b)")
 
 
-def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
-    """v0.2.50 Track A: render templates/ORCHESTRATOR-CLAUDE.md.template
-    to ``<install_root>/CLAUDE.md``.
+def _materialize_orchestrator_self_claude_md(
+    install_root: Path,
+    deferral_report: "Optional[DeferralReport]" = None,
+) -> None:
+    """v0.2.50 Track A / v0.2.95 R1 — step 4c: render every RENDERED ROOT FILE.
 
-    The template uses ``{{ORCHESTRATOR_ROOT}}`` for the resolved install
-    root path. The rendered content is wrapped in HTML comment markers
-    (``<!-- BEGIN: AUTO -->`` / ``<!-- END: AUTO -->``) so that on
-    ``--update`` re-runs, only the AUTO block is replaced — user-added
-    content OUTSIDE those markers is preserved.
+    The rendered set is NOT a hand list kept beside this step: it is
+    ``vco_lib/rendered_root_files.toml``, which ``render_all`` iterates and
+    which the launcher's pre-pull reconcile classifies against (one table, two
+    parsers, no drift — see that module and
+    ``launcher/src-tauri/src/commands/git_user_editable_merge.rs``). Only the
+    AUTO block is replaced, so user content outside the markers is preserved.
+    The table holds exactly one entry today, ``CLAUDE.md``, which is why this
+    function keeps its CLAUDE.md-specific name; a second entry makes renaming it
+    (and its three referencing test modules) part of that change.
 
-    Idempotent:
-    - First run (no CLAUDE.md or CLAUDE.md without AUTO markers): writes
-      the rendered template as the entire file.
-    - Subsequent runs (CLAUDE.md has AUTO markers): replaces only the
-      block between BEGIN/END AUTO; preserves content before/after.
+    When the launcher resolved a rendered file's divergence before the pull it
+    leaves a hand-off state file; with a ``deferral_report`` in hand this emits
+    the ``rendered_file_upstream_changed`` record AFTER the re-render above —
+    the only moment "and it was re-rendered" is true — and consumes the state
+    file so the install.py-owned row drains on the next run. Without a report
+    (direct callers, tests) the state file is LEFT for the next real run rather
+    than silently discarded.
 
-    Soft-fail: any error here is logged but does not abort the install.
-    A missing CLAUDE.md is not fatal — the orchestrator still runs.
+    Soft-fail throughout: every failure is logged and the install continues.
     """
-    template_path = install_root / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
-    target_path = install_root / "CLAUDE.md"
-
+    from vco_lib.rendered_root_files import (
+        build_upstream_changed_deferral_text, consume_reconcile_state,
+        read_reconcile_state, render_all,
+    )
     print("[4c/10] Materializing orchestrator CLAUDE.md from template ... ",
           end="", flush=True)
     _log_install_event("4c/10", "start",
-                       "rendering CLAUDE.md from ORCHESTRATOR-CLAUDE.md.template")
-
-    if not template_path.is_file():
-        print("SKIP (template missing)")
-        _log_install_event(
-            "4c/10", "skip",
-            f"template not found at {template_path}",
-        )
-        return
-
+                       "rendering root files from rendered_root_files.toml")
     try:
-        rendered = template_path.read_text(encoding="utf-8")
-        # Placeholder substitution.
-        rendered = rendered.replace("{{ORCHESTRATOR_ROOT}}", str(install_root))
+        outcomes = render_all(install_root)
+    except (RuntimeError, OSError) as exc:
+        print(f"FAILED ({exc})")
+        _log_install_event("4c/10", "warn",
+                           f"cannot read the rendered-root-files table: {exc}")
+        return
+    for outcome in outcomes:
+        level = "warn" if outcome.is_failure else (
+            "skip" if outcome.status == "template_missing" else "ok")
+        _log_install_event("4c/10", level, f"{outcome.path} — {outcome.detail}")
+    print("; ".join(f"{o.path}: {o.detail}" for o in outcomes)
+          if outcomes else "SKIP (table empty)")
 
-        if target_path.is_file():
-            existing = target_path.read_text(encoding="utf-8")
-            begin_marker = "<!-- BEGIN: AUTO"
-            end_marker = "<!-- END: AUTO -->"
-            begin_idx = existing.find(begin_marker)
-            end_idx = existing.find(end_marker)
-            if begin_idx >= 0 and end_idx > begin_idx:
-                # Preserve content outside AUTO markers; replace AUTO block.
-                prefix = existing[:begin_idx]
-                suffix = existing[end_idx + len(end_marker):]
-                merged = prefix + rendered.rstrip() + suffix
-                # Avoid no-op writes that would still bump mtime.
-                if merged != existing:
-                    target_path.write_text(merged, encoding="utf-8")
-                print("OK (AUTO block updated)")
-                _log_install_event(
-                    "4c/10", "ok",
-                    "CLAUDE.md AUTO block updated; user content preserved",
-                )
-            else:
-                # No AUTO markers in existing file — write rendered as-is.
-                # (Existing content is replaced because the AUTO markers are
-                # the contract for "preserve me"; without them, the template
-                # is the source of truth.)
-                target_path.write_text(rendered, encoding="utf-8")
-                print("OK (full rewrite — no AUTO markers found)")
-                _log_install_event(
-                    "4c/10", "ok",
-                    "CLAUDE.md fully rewritten (no AUTO markers in prior version)",
-                )
-        else:
-            # Fresh install — write rendered as-is.
-            target_path.write_text(rendered, encoding="utf-8")
-            print("OK (created)")
-            _log_install_event(
-                "4c/10", "ok",
-                "CLAUDE.md created from template",
-            )
-    except OSError as e:
-        print(f"FAILED ({e})")
+    if deferral_report is None:
+        return
+    try:
+        payload = read_reconcile_state(install_root)
+    except (ValueError, RuntimeError, OSError) as exc:
         _log_install_event(
             "4c/10", "warn",
-            f"failed to materialize CLAUDE.md: {e}",
-        )
+            f"rendered-reconcile state unreadable ({exc}); left for the next run")
+        return
+    if payload is None:
+        return  # no reconcile happened this update — nothing to record
+    fields = build_upstream_changed_deferral_text(payload)
+    if fields is not None:
+        title, detected, why_deferred, command_to_apply = fields
+        deferral_report.add_entry(_make_deferral(
+            "rendered_file_upstream_changed", title=title, detected=detected,
+            why_deferred=why_deferred, command_to_apply=command_to_apply,
+            severity="info"))
+        _log_install_event("4c/10", "ok",
+                           f"recorded rendered_file_upstream_changed: {title}")
+    consume_reconcile_state(install_root)
 
 
 def _materialize_vct_secrets_shared_readme(install_root: Path) -> None:
@@ -18342,29 +18207,21 @@ def _user_home_for_install() -> Path:
 def _rerender_model_gateway_boot_service(args: argparse.Namespace) -> None:
     """Refresh an EXISTING model-gateway boot registration on ``--update``.
 
-    Creates nothing: the gateway's autostart is opt-in (a login-time daemon
-    holding an OAuth passthrough is the user's decision, not an installer's),
-    so this only re-resolves the absolute paths baked into a unit the user
-    already asked for. Without it, a clone that moved leaves that unit
-    pointing at an ``ExecStart`` which no longer exists and the gateway
-    silently stops coming up at login — the same failure the container
-    stack's ``_repair_systemd_unit_working_dir`` exists to prevent.
-
-    Soft-fail: never blocks an install, on any OS.
+    Creates nothing (the autostart is opt-in) and never blocks an install, on
+    any OS. THE BODY AND THE REASONING LIVE IN
+    :mod:`vco_lib.gateway_boot_render` (v0.2.95): why a moved clone needs
+    this, why the entry point is RUN before it is baked (R5a), and why a
+    refusal is logged here but recorded in the ledger by the doctor phase of
+    this same run. The NAME stays because two call sites resolve it as a
+    module global and a test monkeypatches it there.
     """
-    if not getattr(args, "update", False):
-        return
-    try:
-        _boot_service.rerender_if_registered(
-            _boot_service.model_gateway_spec(os_key=platform.system()),
-            templates_root=PROJECT_ROOT,
-            on_event=_boot_service_event,
-        )
-    except Exception as exc:  # noqa: BLE001 — soft-fail catch-all
-        _log_install_event(
-            "boot-service", "warn",
-            f"model-gateway boot re-render raised: {exc.__class__.__name__}: {exc}",
-        )
+    _gateway_boot_render.rerender_on_update(
+        update=bool(getattr(args, "update", False)),
+        templates_root=PROJECT_ROOT,
+        install_root=PROJECT_ROOT,
+        on_event=_boot_service_event,
+        log=_log_install_event,
+    )
 
 
 def _materialize_boot_service_linux(
@@ -23425,11 +23282,11 @@ def _check_claude_cli() -> None:
 #   - Audit log path uses `vco_lib.paths.claude_metrics_dir()` (v0.2.92:
 #     was an inline `Path.home()`, which resolved the REAL ~/.claude at
 #     import time and ignored $VCT_CLAUDE_DIR) — same `~/.claude/metrics/`
-#     convention as `costs.jsonl`, `failures.jsonl`, `kg_update_tokens.jsonl`.
+#     convention as `failures.jsonl`, `kg_update_tokens.jsonl`.
 
 _NPM_PATH: str | None = shutil.which("npm")  # cached at import time
 
-# Audit log location — sibling of cost-tracker / stop-failure outputs.
+# Audit log location — sibling of the stop-failure-notify hook's output.
 _BUNDLED_VERSIONS_AUDIT_LOG: Path = (
     _paths.claude_metrics_dir() / "bundled_versions.jsonl"
 )

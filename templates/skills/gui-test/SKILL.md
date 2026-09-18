@@ -33,7 +33,7 @@ Runs visual testing using the gui_testing framework + Playwright MCP. Supports w
 /gui-test http://localhost:7861                        # full suite, specific URL
 /gui-test http://localhost:1420 CommsTab               # full suite, focus on component
 /gui-test presentation slides.html quick               # quick presentation check
-/gui-test website https://vibecodedtools.it standard   # standard website review
+/gui-test website https://vibecodedtools.com standard   # standard website review
 /gui-test document http://localhost:8080/report quick   # quick document check
 ```
 

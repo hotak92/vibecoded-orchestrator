@@ -219,7 +219,30 @@ _MAIN_SPAN_MAX = 1687
 # `--update` re-render of an existing gateway registration, and the
 # per-OS artefact name for the uninstall plan.
 # ALL outside main() (+0 span).
-_TOTAL_LINES_MAX = 24202
+#
+# v0.2.95 (FIX lane, review MAJOR-2) — re-pinned DOWN to the measured 24059
+# (-143). NOTHING in this cycle earned that budget: three lanes SHRANK the
+# file and none re-pinned —
+#   * R1   (the update-divergence lane) — the A0 rendered-file legs;
+#   * R5-py (the model-gateway registration lane) — the venv-argv render +
+#     `resolve_gateway_secret_project` moved to `vco_lib/boot_service.py`;
+#   * F1+F4 (the deferral-probe lane) — the hub-restart probe moved to
+#     `vco_lib/deferral_probes.py`; that pair measured 24 058 at its close.
+# A pin left 143 lines above the measurement is a hidden-growth budget: it
+# passes while the file GROWS, which is the opposite of what a ratchet's name
+# claims, and it is the same shape the `project_init` ceiling had when it
+# absorbed +854 lines unnoticed.
+#
+# THE RULE, so no future re-pin has to re-derive it: the TOTAL pin is the
+# measured `wc -l install.py` EXACTLY. Not "measured plus a little" — every
+# line of headroom is a line a later change can add without justifying
+# itself, and the justification is the whole mechanism. Shrink the file, then
+# re-pin; never raise the pin to fit a change that could have been an
+# extraction. (`test_pins_are_not_slack` catches the opposite drift — a pin
+# left far ABOVE a shrunken file — but only past a 1 200-line slack window,
+# so it cannot police a 143-line gap. This comment is the policy; that test
+# is the backstop.)
+_TOTAL_LINES_MAX = 24059
 
 
 def _measure() -> tuple:
@@ -262,6 +285,13 @@ class TestInstallMainRatchet(unittest.TestCase):
         )
 
     def test_total_lines_soft_ratchet(self):
+        """install.py must not grow, and the pin must equal the measurement.
+
+        The pin is `wc -l install.py` EXACTLY, never "measured plus a little":
+        headroom is budget a later change spends without justifying itself,
+        and the justification is the point of the ratchet. Shrink the file,
+        then re-pin DOWNWARD.
+        """
         total, _ = _measure()
         self.assertLessEqual(
             total, _TOTAL_LINES_MAX,
@@ -274,7 +304,13 @@ class TestInstallMainRatchet(unittest.TestCase):
     def test_pins_are_not_slack(self):
         """Keep the ratchet honest: if install.py shrinks, tighten the pins
         (fails when the measured value drifts far below the pin, which
-        would let regrowth hide under stale slack)."""
+        would let regrowth hide under stale slack).
+
+        This is a BACKSTOP, not the policy: the windows below (400 / 1200)
+        are wide enough that a gap of a few dozen lines passes here. The
+        policy — TOTAL pinned at the measurement exactly — lives in the
+        `_TOTAL_LINES_MAX` comment and is enforced by review.
+        """
         total, span = _measure()
         self.assertGreater(
             span, _MAIN_SPAN_MAX - 400,

@@ -278,15 +278,19 @@ def test_both_hooks_apply_the_same_scan_filter_including_the_refusal_shape():
     Red-proof: drop `^[A-Za-z0-9_-]+: ERROR` from either file and this fails
     naming that file; the driven bash test then also fails for its half.
     """
-    hook_sh = REPO / "templates" / "hooks" / "post-file-edit.sh"
-    sh_hits = _filter_lines(hook_sh, f'grep -E "({_SCAN_FILTER})"')
-    ps1_hits = _filter_lines(HOOK_PS1, f"Select-String -Pattern '{_SCAN_FILTER}'")
+    # v0.2.95 (lane F10): the every-10-writes scan moved into the ONE routing
+    # home both write hooks call (_lib/route-touched-path.{sh,ps1}), so the
+    # parity pin follows it there.
+    route_sh = REPO / "templates" / "hooks" / "_lib" / "route-touched-path.sh"
+    route_ps1 = REPO / "templates" / "hooks" / "_lib" / "route-touched-path.ps1"
+    sh_hits = _filter_lines(route_sh, f'grep -E "({_SCAN_FILTER})"')
+    ps1_hits = _filter_lines(route_ps1, f"Select-String -Pattern '{_SCAN_FILTER}'")
     assert len(sh_hits) == 1, (
-        f"post-file-edit.sh must apply the scan filter {_SCAN_FILTER!r} exactly "
-        f"once; found at lines {sh_hits}"
+        f"route-touched-path.sh must apply the scan filter {_SCAN_FILTER!r} "
+        f"exactly once; found at lines {sh_hits}"
     )
     assert len(ps1_hits) == 1, (
-        f"post-file-edit.ps1 must apply the SAME scan filter {_SCAN_FILTER!r} "
-        f"exactly once (parity with post-file-edit.sh:{sh_hits[0]}); found at "
-        f"lines {ps1_hits}"
+        f"route-touched-path.ps1 must apply the SAME scan filter "
+        f"{_SCAN_FILTER!r} exactly once (parity with "
+        f"route-touched-path.sh:{sh_hits[0]}); found at lines {ps1_hits}"
     )

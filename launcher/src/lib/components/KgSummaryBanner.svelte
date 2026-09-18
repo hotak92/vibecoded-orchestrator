@@ -19,10 +19,18 @@
   // independent failures behind a single status indicator. Keeping
   // them parallel preserves the v0.2.2 mental model.
 
+  // v0.2.95 R7: the chrome (markup skeleton + the ~150 CSS lines this file
+  // admitted were "cloned verbatim from KgSyncBanner / CodeGraphBuildBanner")
+  // moved to the shared `StatusBannerShell.svelte`. Labels, counters, retry
+  // semantics and visibility policy stay here — the rendered result is
+  // unchanged.
+
   import { onDestroy, onMount } from 'svelte';
   import { listen, invoke, safeInvoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { KgSummaryStatus, KgSummaryView } from '$lib/types/launcher';
+  import StatusBannerShell from './StatusBannerShell.svelte';
+  import { toneForKgSummaryStatus } from './status-banner-tone';
 
   interface Props {
     projectId: string;
@@ -211,213 +219,56 @@
 </script>
 
 {#if view && visible}
-  <div
-    class="bg-banner status-{view.status}"
-    role={view.status === 'failed' ? 'alert' : 'status'}
-    aria-live="polite"
+  <StatusBannerShell
+    tone={toneForKgSummaryStatus(view.status)}
+    glyph={statusGlyph(view.status)}
+    spinning={view.status === 'running'}
+    title={statusLabel(view)}
+    detail={detailLine(view)}
+    alert={view.status === 'failed'}
+    showExpanded={expanded && (view.status === 'failed' || view.status === 'skipped')}
+    expandedLabel="KG summary failure detail"
   >
-    <div class="bg-row">
-      <span class="bg-glyph" class:spin={view.status === 'running'} aria-hidden="true">
-        {statusGlyph(view.status)}
-      </span>
-      <div class="bg-text">
-        <div class="bg-label">{statusLabel(view)}</div>
-        {#if detailLine(view)}
-          <div class="bg-detail">{detailLine(view)}</div>
-        {/if}
-      </div>
-      <div class="bg-actions">
-        {#if view.status === 'failed' || view.status === 'skipped'}
-          <button
-            type="button"
-            class="bg-btn-secondary"
-            onclick={() => (expanded = !expanded)}
-            aria-expanded={expanded}
-          >
-            {expanded ? 'Hide details' : 'Show details'}
-          </button>
-          <button
-            type="button"
-            class="bg-btn-primary"
-            onclick={retry}
-            disabled={retrying}
-          >
-            {retrying ? 'Retrying…' : 'Retry'}
-          </button>
-        {/if}
-        {#if view.status === 'success' || view.status === 'skipped'}
-          <button
-            type="button"
-            class="bg-btn-x"
-            aria-label="Dismiss banner"
-            onclick={() => (dismissed = true)}
-          >×</button>
-        {/if}
-      </div>
-    </div>
+    {#snippet actions()}
+      {#if view?.status === 'failed' || view?.status === 'skipped'}
+        <button
+          type="button"
+          class="bg-btn-secondary"
+          onclick={() => (expanded = !expanded)}
+          aria-expanded={expanded}
+        >
+          {expanded ? 'Hide details' : 'Show details'}
+        </button>
+        <button
+          type="button"
+          class="bg-btn-primary"
+          onclick={retry}
+          disabled={retrying}
+        >
+          {retrying ? 'Retrying…' : 'Retry'}
+        </button>
+      {/if}
+      {#if view?.status === 'success' || view?.status === 'skipped'}
+        <button
+          type="button"
+          class="bg-btn-x"
+          aria-label="Dismiss banner"
+          onclick={() => (dismissed = true)}
+        >×</button>
+      {/if}
+    {/snippet}
 
-    {#if expanded && (view.status === 'failed' || view.status === 'skipped')}
-      <div class="bg-expand" role="dialog" aria-label="KG summary failure detail">
+    {#snippet expandedContent()}
+      <div class="bg-expand-row">
+        <strong>{view?.status === 'skipped' ? 'Reason' : 'Error'}</strong>
+        <pre class="bg-pre">{view?.error_message ?? 'No detail persisted (check launcher logs).'}</pre>
+      </div>
+      {#if view?.log_tail}
         <div class="bg-expand-row">
-          <strong>{view.status === 'skipped' ? 'Reason' : 'Error'}</strong>
-          <pre class="bg-pre">{view.error_message ?? 'No detail persisted (check launcher logs).'}</pre>
+          <strong>Log tail</strong>
+          <pre class="bg-pre">{view.log_tail}</pre>
         </div>
-        {#if view.log_tail}
-          <div class="bg-expand-row">
-            <strong>Log tail</strong>
-            <pre class="bg-pre">{view.log_tail}</pre>
-          </div>
-        {/if}
-      </div>
-    {/if}
-  </div>
+      {/if}
+    {/snippet}
+  </StatusBannerShell>
 {/if}
-
-<style>
-  /* Styles cloned verbatim from KgSyncBanner / CodeGraphBuildBanner —
-     the three banners share the same visual language. Kept inline rather
-     than factored to a shared stylesheet to match how `.orch-banner` and
-     `BrowserModeBanner` already live with their own inline styles (no
-     shared theme module exists today). */
-  .bg-banner {
-    display: block;
-    border-bottom: 1px solid transparent;
-    font-size: 13px;
-    line-height: 1.4;
-  }
-  .bg-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 24px;
-  }
-  .bg-glyph {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    font-family: ui-monospace, monospace;
-    font-size: 12px;
-    font-weight: 600;
-    flex-shrink: 0;
-  }
-  .bg-glyph.spin { animation: bg-spin 1.4s linear infinite; }
-  @keyframes bg-spin {
-    from { transform: rotate(0deg); }
-    to   { transform: rotate(360deg); }
-  }
-  .bg-text { flex: 1; min-width: 0; }
-  .bg-label { font-weight: 600; }
-  .bg-detail { font-size: 12px; color: rgba(255,255,255,0.55); margin-top: 2px; }
-  .bg-actions {
-    display: flex;
-    gap: 8px;
-    flex-shrink: 0;
-  }
-
-  .bg-btn-secondary, .bg-btn-primary {
-    padding: 4px 12px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    border: 1px solid transparent;
-    font-family: inherit;
-  }
-  .bg-btn-secondary {
-    background: rgba(255,255,255,0.06);
-    color: #ccc;
-    border-color: rgba(255,255,255,0.12);
-  }
-  .bg-btn-secondary:hover { background: rgba(255,255,255,0.1); }
-  .bg-btn-primary {
-    background: rgb(0,191,166);
-    color: #001a17;
-  }
-  .bg-btn-primary:hover:not(:disabled) { background: rgb(0,210,180); }
-  .bg-btn-primary:disabled { opacity: 0.5; cursor: default; }
-  .bg-btn-x {
-    background: none; border: none; color: inherit;
-    font-size: 18px; line-height: 1; cursor: pointer;
-    padding: 0 8px; border-radius: 6px;
-    opacity: 0.6;
-  }
-  .bg-btn-x:hover { opacity: 1; background: rgba(255,255,255,0.06); }
-
-  .bg-expand {
-    padding: 8px 24px 14px 56px;
-    font-size: 12px;
-    border-top: 1px dashed rgba(255,255,255,0.08);
-  }
-  .bg-expand-row { margin-bottom: 8px; }
-  .bg-expand-row strong {
-    display: block;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: rgba(255,255,255,0.5);
-    margin-bottom: 4px;
-  }
-  .bg-pre {
-    margin: 0;
-    padding: 6px 8px;
-    background: rgba(255,255,255,0.04);
-    border-radius: 4px;
-    font-family: ui-monospace, monospace;
-    font-size: 11px;
-    line-height: 1.45;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 220px;
-    overflow-y: auto;
-    color: rgba(255,255,255,0.85);
-  }
-
-  .status-pending {
-    background: rgba(255,255,255,0.04);
-    border-bottom-color: rgba(255,255,255,0.10);
-    color: var(--color-mid, #999);
-  }
-  .status-pending .bg-glyph {
-    background: rgba(255,255,255,0.06);
-    color: #999;
-  }
-  .status-running {
-    background: rgba(0,191,166,0.08);
-    border-bottom-color: rgba(0,191,166,0.30);
-    color: rgb(0,191,166);
-  }
-  .status-running .bg-glyph {
-    background: rgba(0,191,166,0.15);
-    color: rgb(0,191,166);
-  }
-  .status-success {
-    background: rgba(70, 200, 120, 0.08);
-    border-bottom-color: rgba(70, 200, 120, 0.30);
-    color: rgb(120, 220, 160);
-  }
-  .status-success .bg-glyph {
-    background: rgba(70, 200, 120, 0.18);
-    color: rgb(120, 220, 160);
-  }
-  .status-failed {
-    background: rgba(255, 79, 160, 0.10);
-    border-bottom-color: rgba(255, 79, 160, 0.35);
-    color: rgb(255, 130, 180);
-  }
-  .status-failed .bg-glyph {
-    background: rgba(255, 79, 160, 0.18);
-    color: rgb(255, 130, 180);
-  }
-  .status-skipped {
-    background: rgba(245, 179, 66, 0.08);
-    border-bottom-color: rgba(245, 179, 66, 0.30);
-    color: rgb(245, 179, 66);
-  }
-  .status-skipped .bg-glyph {
-    background: rgba(245, 179, 66, 0.18);
-    color: rgb(245, 179, 66);
-  }
-</style>

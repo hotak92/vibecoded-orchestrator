@@ -25,6 +25,11 @@
   // `commands/artifact_tool.rs` for the merge discipline that file demands.
   import ArtifactToolPanel from '$lib/components/ArtifactToolPanel.svelte';
   import { focusOnMount, focusTrap } from '$lib/actions/focusManagement';
+  import {
+    DEFAULT_SESSION_AUTOSTART,
+    resolveSessionAutostart,
+    sessionAutostartHint,
+  } from '$lib/session-autostart';
   import type {
     EmbeddingCatalog,
     ModelChoice,
@@ -1508,6 +1513,50 @@
     }
   }
 
+  // ── Startup (launcher tray-only start with a session) ─────────────────
+  // v0.2.95, ruling R2. A DIFFERENT mechanism from the toggle above and
+  // deliberately not merged with it: the hub toggle writes an OS boot
+  // registration that fires at LOGIN, this one writes an `app_state` row
+  // that the SessionStart hook reads when VS Code opens a folder or a
+  // Claude Code session starts. Same section because the user's question
+  // ("what starts by itself?") is one question; two switches because the
+  // events, the stores and the failure modes are all different.
+  //
+  // Binary state, not tri-state: unlike boot registration there is no host
+  // capability to inspect — every machine with a launcher can run this.
+  let sessionAutostart = $state(DEFAULT_SESSION_AUTOSTART);
+  let sessionAutostartBusy = $state(false);
+  let sessionAutostartError = $state<string | null>(null);
+
+  async function loadSessionAutostart() {
+    try {
+      sessionAutostart = resolveSessionAutostart(
+        await invoke<boolean>('get_launcher_session_autostart'),
+      );
+    } catch (e) {
+      // Unreachable command (browser mode / partial install): show the
+      // SHIPPED default, because that is what the hook will do.
+      sessionAutostart = resolveSessionAutostart(null);
+      console.warn('get_launcher_session_autostart failed', e);
+    }
+  }
+
+  async function toggleSessionAutostart(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    sessionAutostartBusy = true;
+    sessionAutostartError = null;
+    try {
+      await invoke('set_launcher_session_autostart', { enabled: enable });
+      sessionAutostart = enable;
+    } catch (e) {
+      sessionAutostartError = e instanceof Error ? e.message : String(e);
+      target.checked = sessionAutostart;
+    } finally {
+      sessionAutostartBusy = false;
+    }
+  }
+
   // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────
   // Read-only probe of the per-machine Weaviate / Ollama / code_embed
   // instances every orchestrator install reuses (per-install isolation
@@ -1924,6 +1973,8 @@
     void loadStateDir();
     // Startup section: read the hub boot-autostart state.
     void loadBootAutostart();
+    // Startup section: and the launcher's own session-start switch (R2).
+    void loadSessionAutostart();
     // v0.2.91 WP-F2: window behaviour is launcher-global — loaded once,
     // independent of whether a project is selected.
     void loadWindowPrefs();
@@ -3248,8 +3299,9 @@
       </div>
     </section>
 
-    <!-- Startup: hub boot autostart. The single real per-machine startup
-         knob, backed by `vct-hub --{register,unregister,}-boot`. -->
+    <!-- Startup: two independent switches — the background hub's OS boot
+         registration (login), and the launcher's own tray-only start with
+         a Claude Code session / VS Code folder open (v0.2.95, R2). -->
     <section class="pr-section" aria-labelledby="pr-startup-title">
       <h2 class="pr-section-title" id="pr-startup-title">Startup</h2>
       <div class="pr-onboarding-row">
@@ -3276,6 +3328,24 @@
           checked={bootAutostartState === 'enabled'}
           disabled={bootAutostartBusy || bootAutostartState === 'loading' || bootAutostartState === 'unsupported'}
           onchange={toggleBootAutostart}
+        />
+      </div>
+
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Start the launcher with a Claude Code session</strong>
+          <span class="pr-onboarding-hint">
+            {sessionAutostartHint(sessionAutostart)}
+          </span>
+          {#if sessionAutostartError}
+            <span class="pr-onboarding-hint pr-startup-error">{sessionAutostartError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          checked={sessionAutostart}
+          disabled={sessionAutostartBusy}
+          onchange={toggleSessionAutostart}
         />
       </div>
     </section>

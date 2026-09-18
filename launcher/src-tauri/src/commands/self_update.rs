@@ -1079,18 +1079,6 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // private fork's `origin`.
     ensure_upstream_remote(&repo).await?;
 
-    // Step 1: clean-tree assertion. `git status --porcelain` lists every
-    // path with an unstaged or staged change; we filter out untracked-in-
-    // user-owned-dirs and only block on actual conflicts.
-    let dirty = run_git(&repo, &["status", "--porcelain"]).await?;
-    if let Some(blocker) = first_blocking_change(&dirty) {
-        return Err(format!(
-            "Uncommitted changes on tracked file '{}' would be lost. Commit, stash, \
-             or revert before updating.",
-            blocker
-        ));
-    }
-
     // Step 2: detect what changed BEFORE pulling so we can decide what
     // to rebuild. We diff the current HEAD against vco_upstream/<branch>.
     // v0.2.92 WP-13: through the ONE resolver — pre-fix this was the
@@ -1113,6 +1101,42 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // for the diff and the subsequent pull. Without this, a fresh `vco_upstream`
     // remote has no tracking refs yet and the diff returns empty.
     fetch_upstream(&repo).await?;
+
+    // Step 1 (v0.2.95: moved BELOW the fetch, deliberately). The guard asks
+    // whether any dirty tracked path can be hurt by this pull, and that is only
+    // answerable against the upstream tip — which is what the fetch just made
+    // current. Nothing between Step 0 and here needs a clean tree
+    // (`ensure_upstream_remote`, `resolve_branch` and `fetch_upstream` are all
+    // read-only with respect to the working tree), so the move costs a refused
+    // update one extra read-only fetch and buys the guard the only fact that
+    // makes it accurate.
+    //
+    // WHAT CHANGED, and why. This used to refuse on ANY dirty tracked file
+    // outside the generated allowlist. That is the blunt "tree clean" proxy
+    // v0.2.58 removed from `update_orchestrator` after a real install hit the
+    // divergence modal with 540 dirty entries and ZERO overlap with what
+    // upstream changed — and it survived here, on the surface that offers a
+    // DESTRUCTIVE resync as its only forward action. It refused every
+    // orchestrator-root install outright, because `install.py` renders
+    // `CLAUDE.md` over its tracked blob on every run.
+    //
+    // The refusal STANDS for the set that can genuinely lose content: a dirty
+    // tracked path that upstream also changed and that no downstream leg
+    // resolves. It names the path and says what to do.
+    let dirty = git_cmd::run_git_raw(&repo, &["status", "--porcelain", "-z"]).await?;
+    if !dirty.status.success() {
+        return Err(format!(
+            "git status failed in {} — refusing to update a tree we could not inspect.",
+            repo.display()
+        ));
+    }
+    if let Some(blocker) = first_change_at_risk(&repo, &branch, &dirty.stdout).await {
+        return Err(format!(
+            "Uncommitted changes on tracked file '{}' would be lost — this update also \
+             changes it. Commit, stash, or revert it before updating.",
+            blocker
+        ));
+    }
 
     // v0.2.92 WP-13: `.unwrap_or_default()` here was the THIRD laundering of
     // the same missing ref. An empty diff because `vco_upstream/HEAD` does not
@@ -1236,6 +1260,34 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         }
     };
 
+    // v0.2.95 R1: this surface has no A0 pre-merge step, so the RENDERED_LOCAL
+    // reconcile (which the installer surface reaches through
+    // `pre_merge_user_editable`) is wired in HERE — same helper, one home. It
+    // must run BEFORE F1 and the generated reconcile, mirroring the installer's
+    // ordering, and before `resolve_divergence_pull_plan`: after it, a rendered
+    // file's tracked blob equals upstream's, so the merge has nothing to change
+    // for that path, the pop-probe sees base == theirs and the plan resolves
+    // `RealMerge` instead of this surface's resync modal.
+    //
+    // Its `committed` flag is deliberately NOT threaded into the plan call
+    // below: the commit is patch-identical to upstream's own change for that
+    // path, so the merge-tree probe folds it cleanly; forcing the rebase arm
+    // would replay a commit that is already upstream.
+    let rendered_reconcile =
+        crate::commands::git_user_editable_merge::resolve_rendered_files_keep_local(
+            &repo, &branch,
+        )
+        .await;
+    if !rendered_reconcile.reconciled.is_empty() {
+        tracing::info!(
+            "[vct] apply_launcher_update: kept the local rendered copy of {} file(s) and took \
+             upstream's tracked blob — {} (synthetic commit: {}; install.py re-renders the \
+             AUTO block)",
+            rendered_reconcile.reconciled.len(),
+            rendered_reconcile.reconciled.join(", "),
+            rendered_reconcile.committed
+        );
+    }
     let f1_restored =
         crate::commands::git_user_editable_merge::auto_restore_byte_identical_tracked_mods(
             &repo, &branch,
@@ -1795,23 +1847,62 @@ pub(crate) fn json_escape(s: &str) -> String {
 /// pattern list and its glob semantics are not restated here). Everything else
 /// still blocks: a hand-edited `Cargo.toml` / `*.rs` / `*.py` is a real signal
 /// and must not be silently pulled over.
-fn first_blocking_change(porcelain: &str) -> Option<String> {
+///
+/// v0.2.95 — RENDERED root files are ignored too, for the SAME reason and by
+/// the same precedent. `resolve_rendered_files_keep_local` was wired into this
+/// surface (`apply_launcher_update`, just after the pre-pull rename) so a
+/// rendered path would stop forcing the resync modal — but it sits BELOW this
+/// Step-1 guard, so for the one path that class exists to protect it was
+/// unreachable exactly as the generated reconcile had been. `install.py`
+/// RENDERS `CLAUDE.md` over its tracked blob at first install and at every
+/// `--update`, so **every orchestrator-root install is permanently dirty on it
+/// by construction** and this guard refused the launcher self-update for all of
+/// them, with no forward action but the destructive resync. That is the blunt
+/// proxy v0.2.58 removed from the `update_orchestrator` surface and never
+/// removed from this one (see
+/// `knowledge/concepts/update-gate-pop-conflict-risk-not-dirty-tree-2026-06-14.md`).
+///
+/// SCOPE, and why it stops here. Only classes this surface actually RESOLVES
+/// downstream are exempted. `USER_EDITABLE_PATTERNS` is deliberately NOT
+/// exempted: its 3-way merge (`run_pre_merge_user_editable`) has exactly two
+/// call sites, both in `commands::installer` — this surface has no A0
+/// pre-merge step, so a dirty `knowledge/**/*.md` here has nothing downstream
+/// to protect it. Exempting it would trade a clear, actionable refusal for an
+/// opaque `git` abort routed to the resync modal, whose only forward action is
+/// `reset --hard`. A refusal the user can act on is better than a modal that
+/// offers to delete their work.
+/// The one-path view of [`blocking_changes`], for the tests that pin the
+/// CLASSIFICATION half of this guard (which dirty paths a downstream leg
+/// claims) independently of the upstream-overlap half.
+///
+/// `#[cfg(test)]` on purpose: since v0.2.95 production refuses through
+/// [`first_change_at_risk`], which needs the whole list. Leaving this callable
+/// from production would invite a future caller back onto the blunt gate this
+/// release removed.
+#[cfg(test)]
+fn first_blocking_change(status_z: &[u8]) -> Option<String> {
+    blocking_changes(status_z).into_iter().next()
+}
+
+/// Every tracked-modified path that no downstream leg of THIS surface
+/// resolves, in `git status` order.
+///
+/// `first_blocking_change` is the one-path view of this, kept because a
+/// refusal names one path. The caller needs the FULL list: it intersects it
+/// with the upstream-changed set, and "the first unresolved path" and "the
+/// first path that can actually conflict" are not the same path.
+fn blocking_changes(status_z: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
     // Built once per call; four patterns. On a (never-observed) malformed
     // pattern, fall back to "exclude nothing" — the pre-v0.2.91 behaviour,
     // which blocks rather than silently pulling over a dirty file.
     let generated =
         crate::commands::git_user_editable_merge::build_generated_release_controlled_globset().ok();
-    for line in porcelain.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        // `?? path` → untracked, safe.
-        // ` M path` / `M  path` / `MM path` / `A  path` / etc. → blocking.
-        let code = &line[..2];
-        if code == "??" {
-            continue;
-        }
-        let path = line[3..].to_string();
+    // v0.2.95 MINOR-A: the SHARED `-z` walk, not a second porcelain parser.
+    // The result is intersected with `tracked_modified_overlapping_upstream`'s,
+    // so the two must produce the same SPELLING of a path — see that function's
+    // docs for the rename / quoted-path divergence this removes.
+    for path in crate::commands::git_user_editable_merge::parse_tracked_modified_z(status_z) {
         if let Some(gs) = generated.as_ref() {
             if crate::commands::git_user_editable_merge::is_generated_release_controlled(&path, gs)
             {
@@ -1819,9 +1910,86 @@ fn first_blocking_change(porcelain: &str) -> Option<String> {
                 continue;
             }
         }
-        return Some(path);
+        // Handled downstream by `resolve_rendered_files_keep_local`, which this
+        // surface calls before the pull. Table-driven (`is_rendered_root_file`
+        // reads `vco_lib/rendered_root_files.toml`), so adding a rendered path
+        // there exempts it here with no second list to keep in step.
+        if crate::commands::git_user_editable_merge::is_rendered_root_file(&path) {
+            continue;
+        }
+        out.push(path);
     }
-    None
+    out
+}
+
+/// The path this surface must refuse on, or `None` when nothing can conflict.
+///
+/// v0.2.95 — the second half of removing the blunt proxy. `blocking_changes`
+/// answers "which dirty tracked paths has no downstream leg claimed"; this
+/// answers the question that actually decides a refusal: *can the pull hurt any
+/// of them*. It can only hurt a path upstream ALSO changed — the v0.2.58 risk
+/// set `tracked-modified ∩ upstream-changed`, reused here through the SAME
+/// helper `update_orchestrator` uses rather than a second intersection.
+/// A tracked-modified file upstream did not touch survives both arms of the
+/// pull untouched: `--ff-only` only rewrites entries whose merged value
+/// differs, and an `--autostash` pop replays cleanly onto unchanged content.
+///
+/// CONSERVATIVE ON EVERY UNKNOWN. If the merge base or the upstream tip cannot
+/// be resolved, or the helper reports it could not read status, we refuse on
+/// the first unresolved path exactly as before. "I could not prove this is
+/// safe" must read as "block", never as "proceed" — the whole point of the
+/// guard is that the user's uncommitted work is unrecoverable if we are wrong.
+async fn first_change_at_risk(repo: &Path, branch: &str, status_z: &[u8]) -> Option<String> {
+    let candidates = blocking_changes(status_z);
+    let first = candidates.first()?.clone();
+
+    use crate::commands::git_user_editable_merge as gum;
+    let (Ok(Some(base)), Ok(Some(theirs))) = (
+        gum::compute_base_sha(repo, branch).await,
+        gum::compute_theirs_sha(repo, branch).await,
+    ) else {
+        tracing::warn!(
+            "[vct] apply_launcher_update: could not resolve the merge base / upstream tip for \
+             {} — refusing on '{}' without narrowing (conservative)",
+            branch,
+            first
+        );
+        return Some(first);
+    };
+
+    let risky = match gum::tracked_modified_overlapping_upstream(repo, &base, &theirs).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] apply_launcher_update: could not compute the pop-conflict-risk set ({}) \
+                 — refusing on '{}' without narrowing (conservative)",
+                e,
+                first
+            );
+            return Some(first);
+        }
+    };
+    // The helper signals "I could not read `git status`" with this sentinel
+    // rather than an Err. It is not a path, so a naive intersection would
+    // silently come out EMPTY and UNBLOCK — the dangerous direction.
+    if risky.iter().any(|p| p == "<status-read-failed>") {
+        tracing::warn!(
+            "[vct] apply_launcher_update: the risk set could not be read — refusing on '{}' \
+             without narrowing (conservative)",
+            first
+        );
+        return Some(first);
+    }
+
+    let blocker = candidates.into_iter().find(|c| risky.contains(c));
+    if blocker.is_none() {
+        tracing::info!(
+            "[vct] apply_launcher_update: {} dirty tracked path(s) upstream did not touch — not \
+             a pop-conflict risk, proceeding (v0.2.58 model, now on this surface too)",
+            risky.len().max(1)
+        );
+    }
+    blocker
 }
 
 /// True if any path in the diff lives under `src-tauri/` — we need a
@@ -2452,23 +2620,37 @@ pub fn check_running_version_lags_tag(running: String, latest_tag: String) -> bo
 mod tests {
     use super::*;
 
+    /// Build `git status --porcelain -z` stdout from logical rows.
+    ///
+    /// `-z` is NUL-separated with no trailing newline; a rename/copy row is
+    /// written here as two entries (new path first, then the old one) exactly
+    /// as git emits it.
+    fn z(rows: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for r in rows {
+            out.extend_from_slice(r.as_bytes());
+            out.push(0);
+        }
+        out
+    }
+
     #[test]
     fn blocking_change_ignores_untracked() {
-        let porcelain = "?? .claude/CONTEXT_STATE.md\n?? state/runtime.db\n";
-        assert_eq!(first_blocking_change(porcelain), None);
+        let porcelain = z(&["?? .claude/CONTEXT_STATE.md", "?? state/runtime.db"]);
+        assert_eq!(first_blocking_change(&porcelain), None);
     }
 
     #[test]
     fn blocking_change_catches_modified_tracked() {
-        let porcelain = " M Cargo.toml\n?? .claude/CONTEXT_STATE.md\n";
-        assert_eq!(first_blocking_change(porcelain), Some("Cargo.toml".into()));
+        let porcelain = z(&[" M Cargo.toml", "?? .claude/CONTEXT_STATE.md"]);
+        assert_eq!(first_blocking_change(&porcelain), Some("Cargo.toml".into()));
     }
 
     #[test]
     fn blocking_change_catches_staged() {
-        let porcelain = "M  src-tauri/src/lib.rs\n";
+        let porcelain = z(&["M  src-tauri/src/lib.rs"]);
         assert_eq!(
-            first_blocking_change(porcelain),
+            first_blocking_change(&porcelain),
             Some("src-tauri/src/lib.rs".into())
         );
     }
@@ -2482,9 +2664,9 @@ mod tests {
     /// The only forward action left to the user was the destructive resync.
     #[test]
     fn blocking_change_ignores_generated_release_controlled_dist_binaries() {
-        let porcelain = " M launcher/dist/windows-x64/vct-launcher.exe\n";
+        let porcelain = z(&[" M launcher/dist/windows-x64/vct-launcher.exe"]);
         assert_eq!(
-            first_blocking_change(porcelain),
+            first_blocking_change(&porcelain),
             None,
             "a dirty dist binary must not block the self-update surface — F1 + the \
              take-upstream reconcile downstream own it"
@@ -2503,7 +2685,7 @@ mod tests {
             "launcher/dist/windows-x64/vct-launcher.exe.metadata.json",
         ] {
             assert_eq!(
-                first_blocking_change(&format!(" M {}\n", p)),
+                first_blocking_change(&z(&[&format!(" M {}", p)])),
                 None,
                 "{} is release-controlled and must not block",
                 p
@@ -2527,7 +2709,7 @@ mod tests {
             "launcher/package.json.bak",
         ] {
             assert_eq!(
-                first_blocking_change(&format!(" M {}\n", p)),
+                first_blocking_change(&z(&[&format!(" M {}", p)])),
                 Some(p.to_string()),
                 "{} is hand-authored — a local edit there is a real signal",
                 p
@@ -2540,12 +2722,68 @@ mod tests {
     /// first excluded row).
     #[test]
     fn blocking_change_scans_past_excluded_rows() {
-        let porcelain = " M launcher/dist/windows-x64/vct-launcher.exe\n\
-                         ?? .claude/CONTEXT_STATE.md\n\
-                         M  launcher/src-tauri/src/lib.rs\n";
+        let porcelain = z(&[
+            " M launcher/dist/windows-x64/vct-launcher.exe",
+            "?? .claude/CONTEXT_STATE.md",
+            "M  launcher/src-tauri/src/lib.rs",
+        ]);
         assert_eq!(
-            first_blocking_change(porcelain),
+            first_blocking_change(&porcelain),
             Some("launcher/src-tauri/src/lib.rs".into())
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.95 — the Step-1 guard is no longer a blunt "is the tree dirty"
+    // proxy. Two halves, tested separately:
+    //   * CLASSIFICATION (`blocking_changes`) — which dirty tracked paths
+    //     has no downstream leg of THIS surface claimed;
+    //   * HAZARD (`first_change_at_risk`) — of those, can the pull hurt any.
+    // -----------------------------------------------------------------
+
+    /// `install.py` renders CLAUDE.md over its tracked blob on every run, so
+    /// EVERY orchestrator-root install is permanently dirty here. It used to
+    /// hard-refuse this surface for all of them while
+    /// `resolve_rendered_files_keep_local` — wired in below the guard,
+    /// precisely to handle it — was unreachable.
+    #[test]
+    fn a_dirty_rendered_file_is_not_a_blocking_change() {
+        assert_eq!(first_blocking_change(&z(&[" M CLAUDE.md"])), None);
+        // Case-folded + backslash-separated, as Windows `git status` can emit.
+        assert_eq!(first_blocking_change(&z(&[" M claude.md"])), None);
+    }
+
+    /// The exemption is table-driven, not a second hardcoded list: it must
+    /// cover exactly what `vco_lib/rendered_root_files.toml` declares.
+    #[test]
+    fn the_rendered_exemption_reads_the_shared_table() {
+        for entry in crate::commands::git_user_editable_merge::rendered_root_files() {
+            assert_eq!(
+                first_blocking_change(&z(&[&format!(" M {}", entry.path)])),
+                None,
+                "{} is declared RENDERED in rendered_root_files.toml, so the Step-1 guard must \
+                 defer to resolve_rendered_files_keep_local instead of refusing",
+                entry.path
+            );
+        }
+    }
+
+    /// The caller intersects with the upstream-changed set, so it needs every
+    /// unresolved path — not just the first.
+    #[test]
+    fn blocking_changes_lists_every_unresolved_path_in_order() {
+        let porcelain = z(&[
+            " M CLAUDE.md",
+            "?? scratch.txt",
+            "M  vco_lib/a.py",
+            "M  launcher/dist/linux-x64/vct-launcher",
+            "M  vco_lib/b.py",
+        ]);
+        assert_eq!(
+            blocking_changes(&porcelain),
+            vec!["vco_lib/a.py".to_string(), "vco_lib/b.py".to_string()],
+            "rendered + untracked + generated are resolved downstream; the two hand-authored \
+             files are not"
         );
     }
 
@@ -2750,6 +2988,277 @@ mod tests {
             return None;
         }
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Seed a bare upstream + a clone wired to it as `vco_upstream`, so
+    /// `compute_base_sha` / `compute_theirs_sha` resolve for real.
+    fn init_upstream_pair() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let local = root.join("local");
+
+        let g = |dir: &Path, args: &[&str]| {
+            let ok = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("git")
+                .success();
+            assert!(ok, "git {:?} failed", args);
+        };
+
+        assert!(StdCommand::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&remote)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git init --bare")
+            .success());
+
+        std::fs::create_dir_all(seed.join("vco_lib")).unwrap();
+        std::fs::create_dir_all(seed.join("knowledge").join("concepts")).unwrap();
+        g(&seed, &["init", "--initial-branch=main"]);
+        g(&seed, &["config", "user.email", "t@example.com"]);
+        g(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("CLAUDE.md"), "# stub\n").unwrap();
+        std::fs::write(seed.join("other.txt"), "base\n").unwrap();
+        std::fs::write(seed.join("vco_lib").join("foo.py"), "def base(): pass\n").unwrap();
+        std::fs::write(seed.join("vco_lib").join("bar.py"), "def base(): pass\n").unwrap();
+        std::fs::write(
+            seed.join("knowledge").join("concepts").join("foo.md"),
+            "# foo\nbase\n",
+        )
+        .unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-m", "seed"]);
+        g(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        g(&seed, &["push", "origin", "main"]);
+
+        assert!(StdCommand::new("git")
+            .args(["clone"])
+            .arg(remote.to_str().unwrap())
+            .arg(&local)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git clone")
+            .success());
+        g(&local, &["config", "user.email", "t@example.com"]);
+        g(&local, &["config", "user.name", "T"]);
+        g(
+            &local,
+            &["remote", "add", VCO_UPSTREAM_REMOTE, remote.to_str().unwrap()],
+        );
+
+        // Advance upstream by one commit that touches `other.txt` only, then
+        // make the clone's `vco_upstream/main` current.
+        std::fs::write(seed.join("other.txt"), "base\nupstream\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-m", "upstream moves"]);
+        g(&seed, &["push", "origin", "main"]);
+        g(&local, &["fetch", VCO_UPSTREAM_REMOTE]);
+
+        (tmp, local)
+    }
+
+    /// Helper: commit an extra upstream change to `rel`, then refresh the
+    /// clone's remote-tracking ref.
+    fn upstream_touch(tmp: &tempfile::TempDir, local: &Path, rel: &str, body: &str) {
+        let seed = tmp.path().join("seed");
+        let target = seed.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, body).unwrap();
+        for args in [
+            vec!["add", "."],
+            vec!["commit", "-m", "upstream change"],
+            vec!["push", "origin", "main"],
+        ] {
+            assert!(StdCommand::new("git")
+                .args(&args)
+                .current_dir(&seed)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("git")
+                .success());
+        }
+        assert!(StdCommand::new("git")
+            .args(["fetch", VCO_UPSTREAM_REMOTE])
+            .current_dir(local)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git fetch")
+            .success());
+    }
+
+    /// THE DEFECT, end to end at the guard: a rendered CLAUDE.md that upstream
+    /// ALSO changed — the exact 0.2.93→0.2.94 shape — no longer refuses.
+    #[tokio::test]
+    async fn dirty_rendered_file_upstream_changed_does_not_refuse() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "CLAUDE.md", "# stub v2\n");
+        std::fs::write(repo.join("CLAUDE.md"), "# rendered\nMY OWN NOTES\n").unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M CLAUDE.md"])).await,
+            None,
+            "a RENDERED path is resolved by resolve_rendered_files_keep_local before the pull"
+        );
+    }
+
+    /// The v0.2.58 model, now on this surface: a tracked-modified file upstream
+    /// did NOT touch cannot pop-conflict, so it must not block. A fork that
+    /// tracks its KG nodes hit this on every single update.
+    #[tokio::test]
+    async fn dirty_tracked_file_upstream_did_not_touch_does_not_refuse() {
+        skip_if_no_git!();
+        let (_tmp, repo) = init_upstream_pair();
+        std::fs::write(
+            repo.join("knowledge").join("concepts").join("foo.md"),
+            "# foo\nmy local edit\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M knowledge/concepts/foo.md"])).await,
+            None,
+            "upstream's commit touched other.txt only — this file cannot conflict"
+        );
+    }
+
+    /// The refusal STANDS where content can genuinely be lost, and it names the
+    /// path. This is the case git itself aborts on ("Your local changes to the
+    /// following files would be overwritten by merge").
+    #[tokio::test]
+    async fn dirty_tracked_file_upstream_also_changed_still_refuses_and_names_it() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "vco_lib/foo.py", "def upstream(): pass\n");
+        std::fs::write(repo.join("vco_lib").join("foo.py"), "def mine(): pass\n").unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M vco_lib/foo.py"])).await,
+            Some("vco_lib/foo.py".to_string())
+        );
+    }
+
+    /// The guard picks the path that can actually conflict, not merely the
+    /// first dirty one — the reason the caller needs the whole list.
+    #[tokio::test]
+    async fn the_named_path_is_the_one_upstream_changed() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "vco_lib/bar.py", "def upstream(): pass\n");
+        std::fs::write(repo.join("vco_lib").join("foo.py"), "def mine(): pass\n").unwrap();
+        std::fs::write(repo.join("vco_lib").join("bar.py"), "def mine(): pass\n").unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M vco_lib/foo.py", " M vco_lib/bar.py"])).await,
+            Some("vco_lib/bar.py".to_string()),
+            "foo.py is dirty but upstream never touched it; bar.py is the real hazard"
+        );
+    }
+
+    // --- v0.2.95 MINOR-A: the two parsers must spell a path identically ---
+
+    /// A `-z` rename is TWO records (new path, then old). The guard must read
+    /// the NEW path — the one the merge cares about, and the one the risk-set
+    /// helper reports — not `old -> new` (which is what NON-`-z` porcelain
+    /// gives, and which can never intersect the risk set).
+    #[test]
+    fn a_staged_rename_is_read_as_the_new_path() {
+        let porcelain = z(&["R  vco_lib/renamed.py", "vco_lib/foo.py"]);
+        assert_eq!(blocking_changes(&porcelain), vec!["vco_lib/renamed.py"]);
+    }
+
+    /// `-z` reports paths literally; NON-`-z` porcelain would hand back
+    /// `"caf\303\251 note.py"` (quoted + octal-escaped under `core.quotePath`),
+    /// a spelling the risk set never produces.
+    #[test]
+    fn unusual_paths_are_read_literally() {
+        let porcelain = z(&[" M vco_lib/café note.py"]);
+        assert_eq!(blocking_changes(&porcelain), vec!["vco_lib/café note.py"]);
+    }
+
+    /// Both sides of the intersection come from ONE function, so a fixture
+    /// cannot be parsed two ways.
+    #[test]
+    fn the_guard_and_the_risk_set_share_one_parser() {
+        let porcelain = z(&["R  vco_lib/renamed.py", "vco_lib/foo.py", " M vco_lib/café.py"]);
+        assert_eq!(
+            crate::commands::git_user_editable_merge::parse_tracked_modified_z(&porcelain),
+            blocking_changes(&porcelain),
+            "no class excludes these paths, so the shared parse must be the whole answer"
+        );
+    }
+
+    /// THE BEHAVIOURAL PROOF of MINOR-A. A staged rename onto a path upstream
+    /// also added is a genuine hazard. Parsed as `old -> new` it could never
+    /// intersect the risk set, so the guard waved it through and the user met
+    /// an opaque autostash abort instead of a sentence naming the file.
+    #[tokio::test]
+    async fn a_staged_rename_onto_an_upstream_path_still_refuses() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "vco_lib/renamed.py", "def upstream(): pass\n");
+        assert!(StdCommand::new("git")
+            .args(["mv", "vco_lib/foo.py", "vco_lib/renamed.py"])
+            .current_dir(&repo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git mv")
+            .success());
+
+        // Read the REAL `-z` status, exactly as production does, so this test
+        // cannot drift from the call site's format.
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain", "-z"])
+            .current_dir(&repo)
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.starts_with(b"R "),
+            "fixture sanity: the rename must be staged as an R record, got {:?}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &status.stdout).await,
+            Some("vco_lib/renamed.py".to_string())
+        );
+    }
+
+    /// Unknown ⇒ block. If the upstream tip cannot be resolved we cannot prove
+    /// anything is safe, and the user's uncommitted work is unrecoverable if we
+    /// guess wrong.
+    #[tokio::test]
+    async fn an_unresolvable_upstream_refuses_conservatively() {
+        skip_if_no_git!();
+        let (_tmp, repo) = init_repo();
+        // No `vco_upstream` remote at all ⇒ compute_theirs_sha yields None.
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M vco_lib/foo.py"])).await,
+            Some("vco_lib/foo.py".to_string())
+        );
+    }
+
+    /// A clean tree never refuses, whatever the upstream state.
+    #[tokio::test]
+    async fn nothing_dirty_never_refuses() {
+        skip_if_no_git!();
+        let (_tmp, repo) = init_upstream_pair();
+        assert_eq!(first_change_at_risk(&repo, "main", b"").await, None);
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&["?? scratch.txt"])).await,
+            None
+        );
     }
 
     #[tokio::test]

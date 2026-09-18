@@ -29,6 +29,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK_SH = REPO_ROOT / "templates" / "hooks" / "post-file-edit.sh"
+ROUTE_LIB = REPO_ROOT / "templates" / "hooks" / "_lib" / "route-touched-path.sh"
 
 
 def _have_bash() -> bool:
@@ -54,12 +55,21 @@ def test_hook_bash_syntax_valid():
 @pytest.mark.skipif(not _have_bash(), reason="bash unavailable")
 def test_hook_contains_diagrams_branch():
     """Light static check — the diagrams branch must be present in the
-    same file we exercise dynamically below."""
+    routing home the hook delegates to, and the hook must delegate.
+
+    v0.2.95 (lane F10): the branch itself moved to
+    ``_lib/route-touched-path.sh`` so post-bash-file-sync.sh routes a CLI
+    write identically. The dynamic tests below still drive the branch
+    through post-file-edit.sh end to end — this check only pins that the
+    delegation exists and the branch did not evaporate in the move."""
     text = HOOK_SH.read_text()
-    assert "DIAGRAMS_DIR=" in text
-    assert ".claude/diagrams" in text
-    assert "vco_lib.diagram_indexer" in text
-    assert "diagram_idx_" in text  # throttle file key prefix
+    assert "_lib/route-touched-path.sh" in text
+    assert "vco_route_touched_path" in text
+    lib = ROUTE_LIB.read_text()
+    assert "DIAGRAMS_DIR=" in lib
+    assert ".claude/diagrams" in lib
+    assert "vco_lib.diagram_indexer" in lib
+    assert "diagram_idx_" in lib  # throttle file key prefix
 
 
 @pytest.mark.skipif(not _have_bash(), reason="bash unavailable")
@@ -79,6 +89,8 @@ def test_non_diagram_edit_does_not_touch_throttle(tmp_path: Path):
         "emit-context.sh",
         "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
         "kg-sync-debounce.sh",  # 2026-06-18 write-amplification debounce
+        "route-touched-path.sh",  # v0.2.95 F10: the routing itself
+        "code-extensions.sh",  # v0.2.95 F10: the is-this-code decision
     ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
@@ -151,6 +163,8 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
         "emit-context.sh",
         "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
         "kg-sync-debounce.sh",  # 2026-06-18 write-amplification debounce
+        "route-touched-path.sh",  # v0.2.95 F10: the routing itself
+        "code-extensions.sh",  # v0.2.95 F10: the is-this-code decision
     ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
@@ -278,6 +292,8 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
         "emit-context.sh",
         "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
         "kg-sync-debounce.sh",  # 2026-06-18 write-amplification debounce
+        "route-touched-path.sh",  # v0.2.95 F10: the routing itself
+        "code-extensions.sh",  # v0.2.95 F10: the is-this-code decision
     ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():

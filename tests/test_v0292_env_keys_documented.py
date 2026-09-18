@@ -284,7 +284,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_PREBASH_SESSION": "pre-bash-context-inject hook -> embedded-python channel",
     "VCT_PREBASH_TASK_ID": "pre-bash-context-inject hook -> embedded-python channel",
     "VCT_PREBASH_TS_MS": "pre-bash-context-inject hook -> embedded-python channel",
-    "VCT_PROJECT_ID": "per-project identity handed to MCP wrappers by VCO",
     "VCT_PROJECT_PATH": "per-project identity handed to the search MCP wrapper by VCO",
     "VCT_PROJECT_ROOT": "per-project root handed to embedded python by the pre-bash hook",
     "VCT_PYTHON": "python-interpreter handoff between bundled hooks and children",

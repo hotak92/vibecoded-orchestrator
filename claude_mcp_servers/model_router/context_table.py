@@ -8,7 +8,15 @@ it assumes a conservative default, so a 1M-context vendor model reads as far
 fuller than it is and compaction fires early. The client's own convention for
 the 1M variant is an ``[1m]`` suffix on the id, and it accepts that suffix on
 custom ids — so advertising ``<id>[1m]`` in ``/v1/models`` gives the client the
-right assumption. This table decides which ids get it.
+right assumption.
+
+This table is the AUTHORITY on which ids deserve it, and no longer the sole
+input: :func:`model_router.catalog.resolve_window` consults it first, falls
+back to the window the upstream states for itself, and finally to the previous
+version in the same family. A cited row here still wins over both — which is
+what keeps the standing rule about the shipped vendor ("never guess that
+vendor's windows") true — but an id nobody has tabulated is no longer
+automatically advertised at the client's default.
 
 EXACT keys only, and why that is not pedantry
 ---------------------------------------------
@@ -75,11 +83,13 @@ DELETED rather than ABSENT: a listed id resolves to nothing, seed included.
 An absent ``tombstones`` key is an empty list, so an export written by an
 older launcher keeps working unchanged.
 
-**An id with no row anywhere gets no ``[1m]`` advert**, which is the honest
-outcome: Claude Code then applies its own conservative assumption (200K) for
-an id it does not recognise. The gateway does not invent a window for a model
-nobody has documented — that is the same rule as the citation requirement
-above, one layer out.
+**An id with no row anywhere falls through to the catalog's remaining
+sources** — the window the upstream publishes for itself, then the previous
+version in the same family — and gets no ``[1m]`` advert when neither has
+anything to say. That last case is the honest outcome: Claude Code then
+applies its own conservative assumption (200K) for an id it does not
+recognise. The gateway still invents nothing; it just no longer treats an
+absent ROW as an absent WINDOW when the model's own publisher stated one.
 """
 
 from __future__ import annotations
@@ -90,6 +100,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
+
+from .model_family import is_older_sibling, parse_model_id
+from .routing import split_namespace
+from .vendors import VENDORS
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +120,50 @@ SOURCE_SEED_MALFORMED = "seed(export-malformed)"
 SOURCE_SEED_UNSUPPORTED = "seed(export-schema-unsupported)"
 SOURCE_NONE = "none"
 
+#: The window Claude Code assumes when an id carries the ``[1m]`` suffix, and
+#: therefore the threshold a resolved window must reach to earn one. Defined
+#: HERE rather than in :mod:`model_router.catalog` because it is a property of
+#: model windows, which is what this module is about; the catalog imports it,
+#: so the number exists once in the package.
+ONE_M_WINDOW = 1_000_000
+
+#: What to assume for a model no row names and whose family nothing in the
+#: table knows. OWNER RULING 2026-09-17, verbatim: "if model from an unknown
+#: family I'd assume 256k context until we manually research the true size and
+#: add it to the table we have."
+#:
+#: It is an ASSUMPTION, never a published figure: the gateway's catalog still
+#: refuses to invent a window for an id nobody has tabulated
+#: (:func:`model_router.catalog.resolve_window` answers ``unknown``), because
+#: that number would be shown to the user as if it were read from a vendor
+#: page. This one is consumed by a DECISION that has to be made either way —
+#: does a settings value get the ``[1m]`` hint — and 256K answers it with "no",
+#: which is the conservative direction.
+UNKNOWN_FAMILY_WINDOW = 256_000
+
+#: Which step of :meth:`ContextTable.assume_window` produced the answer.
+ASSUMED_FROM_TABLE = "table"
+ASSUMED_FROM_FAMILY = "family"
+ASSUMED_FLOOR = "floor"
+
 
 @dataclass(frozen=True)
 class ModelContext:
-    """One row. ``window_1m`` is the only field the gateway acts on today;
-    the other two are carried so a status card can show them without a second
-    source of truth."""
+    """One row, as the gateway reads it.
+
+    ``context_window`` and ``max_output`` are ACTED ON, not merely carried:
+    :func:`model_router.catalog.resolve_window` takes this row as the highest
+    authority below a tombstone, and the window it yields decides both the
+    row's ``description`` and whether it earns an ``[1m]`` advert. (Until
+    v0.2.95 only ``window_1m`` was read, and the note here said so; the two
+    fields could therefore contradict each other unnoticed, which is why the
+    catalog now warns when they do.)
+
+    ``window_1m`` remains the field
+    :func:`vco_lib.vscode_settings.decorate_1m` reads, so it is still a
+    published part of the schema and still worth keeping honest — but the
+    gateway derives its own advert from ``context_window``, because that is
+    the number the citation is for."""
 
     model_id: str
     vendor: str
@@ -120,6 +172,31 @@ class ModelContext:
     window_1m: bool
     source: str
     source_note: str = ""
+
+
+@dataclass(frozen=True)
+class AssumedWindow:
+    """What to ASSUME about one model id's context window, and from where.
+
+    Distinct from :class:`model_router.catalog.WindowResolution`, and the
+    difference is the point of both: that one may answer "unknown", because it
+    feeds what the gateway PUBLISHES and publishing a number nobody verified
+    would be an invention. This one always answers, because it feeds a binary
+    decision — does this settings value carry the client's ``[1m]`` hint — and
+    a caller who must decide is better served by a stated assumption than by a
+    ``None`` it would have to turn into one anyway, differently each time.
+
+    Attributes:
+        window: tokens. Never ``None``; see above.
+        source: :data:`ASSUMED_FROM_TABLE`, :data:`ASSUMED_FROM_FAMILY` or
+            :data:`ASSUMED_FLOOR`.
+        inherited_from: the sibling whose window was inherited, when
+            ``source`` is :data:`ASSUMED_FROM_FAMILY`; ``None`` otherwise.
+    """
+
+    window: int
+    source: str
+    inherited_from: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -163,9 +240,138 @@ class ContextTable:
             return self.fallback_rows.get(model_id)
         return row
 
+    def assume_window(self, model_id: str) -> AssumedWindow:
+        """The window to ASSUME for ``model_id``. Always answers.
+
+        Three steps, in the order the OWNER RULED on 2026-09-17 (verbatim:
+        "new model versions inherit the highest context in the family (i.e.
+        any new Sonnet model has 1m even if old sonnet used to have 256k), if
+        model from an unknown family I'd assume 256k context until we manually
+        research the true size and add it to the table we have"):
+
+        1. **this id's own row**, exact match, tombstone-aware — the table
+           stays the authority for every model it names, so adding a row is
+           still how anyone corrects this answer, and a named model NEVER
+           inherits anything (the ruling's "until we manually research it"
+           only ends when a row exists). A row whose window is not a positive
+           number says nothing usable and falls through rather than handing a
+           caller a zero to act on;
+        2. **the HIGHEST window among strictly-older members of the same
+           family** (:func:`model_router.model_family.is_older_sibling`) — the
+           auto-update half of the ruling. A ``claude-sonnet-6`` that ships
+           tomorrow is assumed 1M because ``claude-sonnet-5`` is, without
+           anyone editing a file; ``claude-haiku-5`` looks only at haiku rows,
+           so one family's jump to 1M never leaks into another's;
+        3. **:data:`UNKNOWN_FAMILY_WINDOW`** — nothing here knows this family.
+
+        A TOMBSTONED id short-circuits to step 3 before any of this: the
+        export declared it deleted, and a deletion a sibling could undo is
+        not a deletion.
+
+        Siblings are restricted to the queried id's VENDOR whenever the id
+        carries a vendor namespace, because two vendors may publish the same
+        family stem and an id alone cannot tell them apart. For a bare id (no
+        namespace) that restriction is unavailable, and the family stem is all
+        there is; the failure case is therefore narrow and named: a bare query
+        whose family stem is also published by a SECOND vendor in the same
+        table would pool both vendors' rows and take the larger window. No
+        shipped table has such a pair (``claude-*`` vs ``glm*``), and a row's
+        ``vendor`` field is what a future refinement would key on.
+        """
+        parts = parse_model_id(model_id)
+        if parts.bare_id in self.tombstones:
+            # "Deleted, seed included" has to mean deleted, FAMILY included:
+            # inheriting a sibling's window would hand back a 1M claim for the
+            # exact id the user removed in the GUI, which is the same
+            # deleted-is-not-absent argument :meth:`lookup` makes one level
+            # up. The floor is what is left to assume, and it is the
+            # conservative answer.
+            return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
+        row = self.lookup(parts.bare_id)
+        if row is not None and row.context_window > 0:
+            return AssumedWindow(row.context_window, ASSUMED_FROM_TABLE)
+
+        vendor, _remainder = split_namespace(model_id, VENDORS)
+        vendor_id = vendor.vendor_id if vendor is not None else None
+        best: Optional[ModelContext] = None
+        for candidate in self._known_rows():
+            if vendor_id is not None and candidate.vendor != vendor_id:
+                continue
+            if candidate.context_window <= 0:
+                continue
+            if not is_older_sibling(parse_model_id(candidate.model_id), parts):
+                continue
+            if (
+                best is None
+                or candidate.context_window > best.context_window
+                # Deterministic tie-break: two siblings with the same window
+                # must not make the answer depend on dict order.
+                or (
+                    candidate.context_window == best.context_window
+                    and candidate.model_id < best.model_id
+                )
+            ):
+                best = candidate
+        if best is not None:
+            return AssumedWindow(
+                best.context_window, ASSUMED_FROM_FAMILY, best.model_id,
+            )
+        return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
+
+    def _known_rows(self) -> tuple[ModelContext, ...]:
+        """Every row a lookup could answer with: export first, seed behind it.
+
+        Tombstoned ids are excluded here as well as in :meth:`lookup` — a row
+        the user deleted must not come back as somebody else's inherited
+        window, which is the same "deleted is not absent" argument one level
+        up.
+        """
+        merged: dict[str, ModelContext] = {}
+        for source in (self.fallback_rows, self.rows):
+            for model_id, row in source.items():
+                if model_id in self.tombstones:
+                    continue
+                merged[model_id] = row
+        return tuple(merged.values())
+
     def advertise_1m(self, model_id: str) -> bool:
-        row = self.lookup(model_id)
-        return bool(row and row.window_1m)
+        """Should this id carry Claude Code's ``[1m]`` hint?
+
+        One consumer: :func:`vco_lib.vscode_settings.decorate_1m`, which
+        appends the hint to a settings value naming a 1M model.
+
+        A row in the table answers with its own ``window_1m`` FLAG — that
+        field is the published schema and the table is the authority for
+        every model it names. An id NO row names is answered from
+        :meth:`assume_window`, which NARROWS — it does not close — the
+        asymmetry this docstring used to describe: before v0.2.95 a 1M model
+        with no row was advertised by the gateway (whose catalog resolves a
+        window) and NOT decorated in the settings file, so a brand-new 1M
+        model sat in the picker with a 200K budget until somebody edited a
+        table. It now inherits its family's highest TABULATED window, and an
+        unknown family assumes :data:`UNKNOWN_FAMILY_WINDOW` — below 1M, so
+        the answer there is "no", which is the conservative direction.
+
+        What remains, deliberately: the catalog's own family floor
+        (``model_router.catalog._family_floor``) also inherits from an
+        UPSTREAM-STATED window, and this table cannot see one — nothing here
+        reads the network, by design (below). So a vendor family with no
+        cited row, whose upstream states 1M, is still published ``[1m]`` in
+        the picker and still assumes 256K here. That residue is the OWNER'S
+        RULED behaviour for an unknown family, not a gap to close: a cited
+        row is how a vendor family gets verified, and the pair it narrows to
+        is small — Anthropic's ``/v1/models`` states no window at all, the
+        panel Default is first-party only, and a slot value is the one path
+        that reaches this function.
+
+        No network, in either branch: the resolution reads this table and
+        nothing else, so a settings write can never block on (or be wrong
+        because of) a gateway that is not running.
+        """
+        row = self.lookup(parse_model_id(model_id).bare_id)
+        if row is not None:
+            return bool(row.window_1m)
+        return self.assume_window(model_id).window >= ONE_M_WINDOW
 
 
 def _parse(

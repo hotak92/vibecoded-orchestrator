@@ -125,6 +125,150 @@ function Start-KgDebounceChild {
     Start-VcoDetachedPwsh -Command $ChildScript -PowerShellExe $psExe
 }
 
+# ─── failure visibility (v0.2.95) ──────────────────────────────────────────
+#
+# WHY (field report 2026-09-14): every debounced sync ran with its
+# output discarded and its failure swallowed (`catch { }` here, `|| true` in
+# the POSIX sibling). A `kg-sync` exit-3 refusal — "I did NOT run, no
+# interpreter with VCO's KG dependencies" — was invisible on the edit path,
+# and a whole session's knowledge nodes appeared to sync and did not.
+#
+# The shape mirrors `embedding_failures.jsonl`: full stderr into a
+# project-local log, ONE structured row per session per channel into a
+# metrics stream, surfaced once by the SessionStart hook
+# `session-start-retrieval-health.ps1`.
+#
+# MUST MATCH _lib/kg-sync-debounce.sh (same log file, same jsonl name, same
+# sentinel shape, same one-row-per-session-per-channel rule).
+
+# Bound for the stderr log; past this it is restarted rather than grown
+# without limit. MUST MATCH $_KG_DEBOUNCE_LOG_MAX_BYTES in the .sh sibling.
+$script:KgDebounceLogMaxBytes = 262144
+
+# Absolute path of the stderr log for $ProjectRoot, after ensuring the
+# directory exists and the file is inside its size bound. "" when unusable —
+# callers then discard stderr, exactly as before this existed.
+function Get-KgDebounceLogPath {
+    param([string]$ProjectRoot)
+    if (-not $ProjectRoot) { return "" }
+    $dir = Join-Path $ProjectRoot ".claude/logs"
+    try {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+        }
+    } catch { return "" }
+    $log = Join-Path $dir "kg-sync-hook.log"
+    try {
+        if (Test-Path -LiteralPath $log -PathType Leaf) {
+            if ((Get-Item -LiteralPath $log).Length -gt $script:KgDebounceLogMaxBytes) {
+                Set-Content -LiteralPath $log -Value "" -NoNewline -ErrorAction SilentlyContinue
+            }
+        }
+    } catch { }
+    return $log
+}
+
+# The session key the failure row is deduped by. Sanitised to the same
+# [A-Za-z0-9_-] charset `_lib/session-id.ps1` enforces (it is interpolated
+# into a FILE NAME); anything else collapses to "default", an absent id to
+# "nosession". MUST MATCH _kg_debounce_session_key in the .sh sibling.
+function Get-KgDebounceSessionKey {
+    $raw = $env:VCT_SESSION_ID
+    if (-not $raw) { $raw = $env:CLAUDE_SESSION_ID }
+    if (-not $raw) { return "nosession" }
+    if ($raw -match '^[A-Za-z0-9_-]+$') { return $raw }
+    return "default"
+}
+
+# Record ONE failure row for this session+channel. Best-effort in every
+# direction: an unresolvable metrics dir, an unwritable sentinel or a JSON
+# error all end in "no row", never in a failed sync path.
+function Write-KgDebounceFailureRow {
+    param(
+        [string]$ProjectRoot,
+        [string]$Channel,
+        [int]$ExitCode,
+        [string]$LogPath
+    )
+    if (-not $ProjectRoot) { return }
+    try {
+        $stateDir = Join-Path $ProjectRoot ".claude/state"
+        if (-not (Test-Path -LiteralPath $stateDir -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $stateDir -ErrorAction Stop | Out-Null
+        }
+        $sentinel = Join-Path $stateDir ("kg_sync_failure_{0}_{1}" -f (Get-KgDebounceSessionKey), $Channel)
+        if (Test-Path -LiteralPath $sentinel) { return }
+
+        if (-not (Get-Command Get-VcoMetricsDir -ErrorAction SilentlyContinue)) {
+            $mlib = Join-Path $PSScriptRoot "metrics-dir.ps1"
+            if (-not (Test-Path -LiteralPath $mlib)) { return }
+            . $mlib
+        }
+        $metricsDir = Get-VcoMetricsDir
+        if (-not $metricsDir) { return }
+
+        $tail = ""
+        if ($LogPath -and (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+            $lines = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue |
+                       Where-Object { $_ -and $_.Trim() })
+            if ($lines.Count -gt 0) {
+                $tail = [string]$lines[-1]
+                if ($tail.Length -gt 300) { $tail = $tail.Substring(0, 300) }
+            }
+        }
+        $row = [ordered]@{
+            ts           = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            kind         = "kg_sync_failed"
+            project_root = $ProjectRoot
+            channel      = $Channel
+            exit         = $ExitCode
+            session      = (Get-KgDebounceSessionKey)
+            log          = $LogPath
+            last_stderr  = $tail
+        }
+        $json = ($row | ConvertTo-Json -Compress -Depth 4)
+        Add-Content -LiteralPath (Join-Path $metricsDir "kg_sync_failures.jsonl") `
+            -Value $json -ErrorAction Stop
+        # Written only AFTER the row landed, so a failed append is retried by
+        # the next failing edit rather than silently marked reported.
+        Set-Content -LiteralPath $sentinel -Value "" -NoNewline -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+# THE one runner every debounced sync goes through: cd, run with stderr
+# captured to the log, record a row when it failed. Never throws.
+function Invoke-KgDebounceRunCommand {
+    param([string]$WorkingDir, [string]$Channel, [string]$Command)
+    if (-not $Command) { return }
+    if (-not $Channel) { $Channel = "kg" }
+    if ($WorkingDir) { Set-Location -LiteralPath $WorkingDir -ErrorAction SilentlyContinue }
+    $log = Get-KgDebounceLogPath -ProjectRoot $WorkingDir
+    $code = 0
+    try {
+        $global:LASTEXITCODE = 0
+        if ($log) {
+            # stdout discarded (progress chatter nobody reads here); stderr
+            # APPENDED to the log, which is the half that carries refusals.
+            Invoke-Expression $Command 2>>$log | Out-Null
+        } else {
+            Invoke-Expression $Command 2>&1 | Out-Null
+        }
+        if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+    } catch {
+        # A PowerShell-level throw (bad command, missing exe) is a failure
+        # with no exit code of its own; record it as 1 and put the message in
+        # the log so the notice has something to quote.
+        $code = 1
+        if ($log) {
+            try { Add-Content -LiteralPath $log -Value ([string]$_) -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    if ($code -ne 0) {
+        Write-KgDebounceFailureRow -ProjectRoot $WorkingDir -Channel $Channel `
+            -ExitCode $code -LogPath $log
+    }
+}
+
 # Shared child-script fragment that ATOMICALLY CLAIMS a work dir, runs its
 # recorded cmd EXACTLY ONCE, and cleans up — emitted into every detached
 # child so the flusher's normal completion and the reaper's recovery use
@@ -140,6 +284,9 @@ function Start-KgDebounceChild {
 #   $BaseExpr  — expression for the lock base name (e.g. "kg_<md5>.lock")
 function Get-KgDebounceRunWonFragment {
     param([string]$WonExpr, [string]$StateExpr, [string]$BaseExpr)
+    # Absolute path of THIS lib, embedded so the detached child can dot-source
+    # it (mirrors $_KG_DEBOUNCE_LIB in the POSIX sibling).
+    $libEsc = ((Join-Path $PSScriptRoot "kg-sync-debounce.ps1") -replace "'", "''")
     return @"
 `$won  = $WonExpr
 `$st   = $StateExpr
@@ -159,7 +306,23 @@ if (Test-Path `$cmdFile) {
     } catch { }
 }
 if (`$wd) { Set-Location -LiteralPath `$wd -ErrorAction SilentlyContinue }
-if (`$cmd) { try { Invoke-Expression `$cmd } catch { } }
+# v0.2.95: the run goes through the ONE runner, which captures the child's
+# stderr and records a failure row. The child is a SEPARATE process, so it
+# dot-sources this lib to reach the runner — the same re-source-with-fallback
+# shape the POSIX sibling's flusher uses. Falling back to the bare
+# Invoke-Expression keeps the sync running (failure merely stays invisible)
+# when the lib is unreadable; dropping the sync would not be acceptable.
+`$chan = (`$base -split '_', 2)[0]
+if (-not `$chan) { `$chan = 'kg' }
+`$dbLib = '$libEsc'
+if (`$cmd) {
+    if (`$dbLib -and (Test-Path -LiteralPath `$dbLib)) {
+        try { . `$dbLib; Invoke-KgDebounceRunCommand -WorkingDir `$wd -Channel `$chan -Command `$cmd }
+        catch { try { Invoke-Expression `$cmd } catch { } }
+    } else {
+        try { Invoke-Expression `$cmd } catch { }
+    }
+}
 Remove-Item -LiteralPath `$claimed -Recurse -Force -ErrorAction SilentlyContinue
 "@
 }
@@ -260,12 +423,28 @@ function Get-KgDebounceKey {
 # Run a sync command directly, detached + immediately (no lock machinery).
 # Used for the debounce-disabled (window==0) and fail-open paths where there
 # is no lock to coalesce against — the cmd is built by the caller.
+#
+# v0.2.95: routed through the same runner as the lock paths, so a failure on
+# the immediate path is recorded too. A failure that is visible only when the
+# debounce window happens to be non-zero is not visible.
 function Start-KgDebounceImmediate {
-    param([string]$WorkingDir, [string]$Command)
+    param([string]$WorkingDir, [string]$Command, [string]$Channel = "kg")
     $wdEsc = ($WorkingDir -replace "'", "''")
+    $cmdEsc = ($Command -replace "'", "''")
+    $chanEsc = ($Channel -replace "'", "''")
+    $libEsc = ((Join-Path $PSScriptRoot "kg-sync-debounce.ps1") -replace "'", "''")
     $childScript = @"
-if ('$wdEsc') { Set-Location -LiteralPath '$wdEsc' -ErrorAction SilentlyContinue }
-try { $Command } catch { }
+`$dbLib = '$libEsc'
+if (`$dbLib -and (Test-Path -LiteralPath `$dbLib)) {
+    try { . `$dbLib; Invoke-KgDebounceRunCommand -WorkingDir '$wdEsc' -Channel '$chanEsc' -Command '$cmdEsc' }
+    catch {
+        if ('$wdEsc') { Set-Location -LiteralPath '$wdEsc' -ErrorAction SilentlyContinue }
+        try { $Command } catch { }
+    }
+} else {
+    if ('$wdEsc') { Set-Location -LiteralPath '$wdEsc' -ErrorAction SilentlyContinue }
+    try { $Command } catch { }
+}
 "@
     Start-KgDebounceChild -ChildScript $childScript
 }
@@ -423,7 +602,7 @@ function Invoke-KgDebounceSchedule {
 
     # Debounce disabled → preserve legacy "sync immediately" behaviour.
     if ($window -eq 0) {
-        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command
+        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command -Channel $Channel
         return
     }
 
@@ -438,7 +617,7 @@ function Invoke-KgDebounceSchedule {
     } catch {
         # Can't create state dir → fail OPEN to legacy path so a
         # permission problem never silently drops the sync.
-        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command
+        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command -Channel $Channel
         return
     }
 
@@ -450,7 +629,7 @@ function Invoke-KgDebounceSchedule {
     # sync their own files. MIRRORS the bash sibling's ceiling fall-through.
     $lockCount = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '*.lock' -ErrorAction SilentlyContinue).Count
     if ($lockCount -ge $script:KgDebounceLockCeiling) {
-        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command
+        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command -Channel $Channel
         return
     }
 

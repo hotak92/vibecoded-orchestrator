@@ -33,6 +33,14 @@ const PAGE_SRC = `${REPO_ROOT}launcher/src/routes/services/+page.svelte`;
 /**
  * Services the hub reports from `/services/status` — the `(name, port, url)`
  * tuples inside `canonical_service_skeletons()`.
+ *
+ * Matches on the NAME only, never on the port: a port may be a literal
+ * (`8081u16`) or a resolved binding (`gateway_port`, v0.2.95 — the gateway's
+ * port comes from `vct_launcher_core::services::model_gateway_port`). An
+ * earlier version of this regex required a digit after the name and so lost
+ * `model_gateway` the moment its hardcoded 11436 was correctly removed —
+ * a test that went red because the code got BETTER. The `>= 4` guard in the
+ * first case below is what caught it; keep it.
  */
 export function hubServiceNames(rustSource: string): string[] {
   const start = rustSource.indexOf('fn canonical_service_skeletons()');
@@ -41,7 +49,7 @@ export function hubServiceNames(rustSource: string): string[] {
   const end = rustSource.indexOf('.iter()', start);
   if (end < 0) throw new Error('tuple array terminator not found');
   const body = rustSource.slice(start, end);
-  return [...body.matchAll(/\(\s*"([a-z_]+)"\s*,\s*\d+u?\d*/g)].map((m) => m[1]);
+  return [...body.matchAll(/\(\s*"([a-z_]+)"\s*,/g)].map((m) => m[1]);
 }
 
 /** The `kind: '<service>'` arms of the page's `ContainerFullness` union. */

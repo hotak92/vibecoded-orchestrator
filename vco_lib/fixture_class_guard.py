@@ -74,6 +74,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from vco_lib.manifest_paths import MANIFEST_REL_POSIX
 from vco_lib.weaviate_schema import _CODE_COLLECTION_SUFFIXES
 
 __all__ = [
@@ -81,6 +82,7 @@ __all__ = [
     "COLLECTION_FAMILY_SUFFIXES",
     "FIXTURE_PROJECT_NAMES",
     "FixtureClassWriteRefused",
+    "UNREGISTERED_FOLDER_OPENERS",
     "UNROUTABLE_SENTINEL_URL",
     "fixture_stem_of",
     "fixture_writes_allowed",
@@ -88,6 +90,7 @@ __all__ = [
     "guarded_collection_create",
     "is_fixture_shaped_class",
     "refusal_text",
+    "unregistered_folder_warning_text",
 ]
 
 #: The env var a process sets to declare "I am a test/harness and I OWN the
@@ -241,6 +244,78 @@ def refusal_text(
         f"sets it for the whole suite). If '{stem}' is genuinely your "
         f"project's name, set the same variable — and consider renaming, "
         f"because VCO's own fixtures use that name too."
+    )
+
+
+#: Opening clause per surface for :func:`unregistered_folder_warning_text`.
+#: TWO entries, because the same condition reaches the user as a completed
+#: write (``store_knowledge_node``) and as a failed lookup (the weaviate-kg
+#: MCP's schema-error hint), and one text that claimed "this write" on a
+#: search would be a false statement in a message whose whole job is to
+#: correct a false impression. The parallel to :func:`refusal_text`'s
+#: ``operation`` parameter is deliberate.
+UNREGISTERED_FOLDER_OPENERS: "dict[str, str]" = {
+    "write": "This write went to",
+    "search": "This search targeted",
+}
+
+
+def unregistered_folder_warning_text(
+    collection: str,
+    reason: str,
+    *,
+    operation: str = "write",
+    weaviate_url: Optional[str] = None,
+) -> str:
+    """The ONE text every surface shows for a call from an UNREGISTERED folder.
+
+    Sibling of :func:`refusal_text`, and here rather than in its caller because
+    the two are one vocabulary family: an unmarked process writing where
+    nothing will read it. The severities differ — that one REFUSES, this one
+    ALLOWS and says so — which is exactly why they must not be written by two
+    authors in two files. Keeping them adjacent is what makes a user who meets
+    both read one rule instead of two.
+
+    The cases are different enough that this does not CALL ``refusal_text``:
+    there, a class name is fixture-shaped and the fix is an env declaration;
+    here, the folder carries no bundle manifest and the fix is the launcher's
+    Adopt flow. What is shared is the shape (name the class, say why, name the
+    fix) and the incident both cite.
+
+    Args:
+        collection: the class the call ACTUALLY targeted — never the project
+            default, because a ``scope="shared"`` write lands somewhere else
+            and naming the wrong one sends the user to check the wrong place.
+        reason: why this process counts as unregistered, quoted verbatim from
+            the caller's own rule (the two branches — "no manifest here" vs
+            "no folder to check" — are different problems and only the user
+            can tell which they are in).
+        operation: which surface is speaking; see
+            :data:`UNREGISTERED_FOLDER_OPENERS`. An unknown value falls back
+            to the write opener rather than raising — a warning that can
+            raise would be a worse defect than the silence it replaces.
+        weaviate_url: the backend, when the caller knows it.
+
+    Pure: no environment, no filesystem, no import of the caller. Everything
+    the sentence states is passed in.
+    """
+    where = f" at {weaviate_url}" if weaviate_url else ""
+    opener = UNREGISTERED_FOLDER_OPENERS.get(
+        operation, UNREGISTERED_FOLDER_OPENERS["write"]
+    )
+    return (
+        f"{opener} '{collection}'{where}, but this folder is NOT registered "
+        f"with VCO ({reason}). VCO's MCP servers are registered globally and "
+        f"stay callable from any folder, so nothing refused the call — it used "
+        f"whatever collection this process happened to resolve, which nothing "
+        f"in this folder reads. That is the same shape as the 2026-09 "
+        f"fixture-class incident, in which 70 real knowledge nodes were "
+        f"written where nothing reads them. Register the folder and knowledge "
+        f"lands in its OWN collection: launcher -> Projects -> Add project -> "
+        f"Adopt this folder. Adopt creates {MANIFEST_REL_POSIX}, "
+        f"binds this folder to its own collections, and syncs the existing "
+        f"knowledge/**/*.md nodes during setup (no manual kg-sync needed). "
+        f"Until then every write from here keeps landing in '{collection}'."
     )
 
 

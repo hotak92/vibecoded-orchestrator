@@ -2702,6 +2702,14 @@ mod tests {
         use crate::db::models::ProjectHost;
         use crate::secrets::{self, SecretScope};
 
+        // 2026-09-17: this test seeds the PRODUCTION GitHub-PAT tuple
+        // (`shared/_user_shared_/user/github_pat`). The `MockGuard` below keeps
+        // the value in a thread-local map, but the keychain baton is what makes
+        // that a guarantee rather than a coincidence: it installs the hermetic
+        // `vct-test-<pid>` namespace, so even a future assertion here that
+        // dropped the mock could not reach the developer's real PAT.
+        // `secrets::for_tests::assert_not_production_pat_slot` enforces it.
+        let _kc_lock = secrets::test_serialize::keychain_serialize_lock();
         let _g = secrets::for_tests::MockGuard::new();
         let db = Db::open_in_memory().unwrap();
         db.insert_project(

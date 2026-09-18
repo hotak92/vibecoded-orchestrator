@@ -170,4 +170,204 @@ print("Retrieval: %s, %s." % (kg_part, code_part))
 try {
     & $PY -c $pyCode 2>$null
 } catch { }
+
+# -- KG WRITE path (v0.2.95) ------------------------------------------------
+#
+# The two probes above are RETRIEVAL only. Nothing checked whether a knowledge
+# node written in this session could reach Weaviate at all - and that is the
+# half that failed silently in the field (field report 2026-09-14): `kg-sync` refused
+# with exit 3 on every edit for a whole session, behind a swallowed failure,
+# while the retrieval line kept reporting a healthy (stale) index.
+#
+# No network and no Weaviate write: the question is ONLY "is there an
+# interpreter that can run the sync", which the shared ladder answers. Probe +
+# refusal text come from `vct_venv_ladder.ps1` - the same file `kg-sync.ps1`
+# dot-sources - so this line cannot drift from what the sync will do.
+#
+# STDOUT, not stderr: Claude Code injects a SessionStart hook's stdout as a
+# system-reminder and discards its stderr. The ladder's refusal printer writes
+# to stderr (correct for a wrapper), so it is captured and re-emitted here
+# rather than re-worded - one home for the prose, two streams.
+#
+# MUST MATCH session-start-retrieval-health.sh.
+$KgWriteProbe = "import weaviate, weaviate_mcp, vco_lib"
+$LadderScriptsDir = Join-Path (Split-Path -Parent $PSScriptRootLocal) "scripts"
+$LadderLib = Join-Path $LadderScriptsDir "vct_venv_ladder.ps1"
+$ProjectRootLocal = Split-Path -Parent (Split-Path -Parent $PSScriptRootLocal)
+if (Test-Path -LiteralPath $LadderLib) {
+    try {
+        . $LadderLib
+        $LadderPython = Resolve-VctLadderPython -ScriptDir $LadderScriptsDir `
+            -ProjectRoot $ProjectRootLocal -ImportProbe $KgWriteProbe
+        if ($LadderPython) {
+            $tier = if ($script:VctLadderTier) { $script:VctLadderTier } else { "unknown" }
+            Write-Output "KG write path: OK ($LadderPython, tier: $tier)"
+        } else {
+            Write-Output "KG write path: REFUSED - every knowledge/ edit this session will fail to sync."
+            $refusal = (Write-VctLadderRefusal -Tool "kg-sync" -ImportProbe $KgWriteProbe `
+                -ScriptDir $LadderScriptsDir -ProjectRoot $ProjectRootLocal) 2>&1
+            foreach ($line in @($refusal)) { Write-Output ("  " + $line) }
+        }
+    } catch {
+        Write-Output "KG write path: unknown (the venv ladder could not be evaluated: $_)"
+    }
+} else {
+    Write-Output "KG write path: unknown (no .claude\scripts\vct_venv_ladder.ps1 - broken install;"
+    Write-Output "  re-run the orchestrator install, or update this project's bundle)."
+}
+
+# The OTHER half of "can this session write": an interpreter that can run the
+# sync is useless if the hooks that DECIDE to call it are not on disk. Three
+# `_lib/` files carry that decision (routing a touched path, recovering what a
+# CLI command wrote, telling code from prose), and a project missing any of
+# them keeps working minus that whole leg while the ladder probe above still
+# reports OK. That blind spot is the v0.2.95 review's MAJOR-1, and MAJOR-2
+# because this probe first covered only one of the three.
+#
+# The set is NOT enumerated here: it is Get-VcoRequiredHookLibs in
+# `_lib/emit-context.ps1`, the same home the in-session notices take their
+# wording from. Cheap: one Test-Path per file, no subprocess.
+# MUST MATCH session-start-retrieval-health.sh.
+$EmitContextLibPath = Join-Path $PSScriptRootLocal "_lib/emit-context.ps1"
+if (Test-Path $EmitContextLibPath) { . $EmitContextLibPath }
+if (-not (Get-Command Get-VcoRequiredHookLibs -ErrorAction SilentlyContinue)) {
+    # The file that holds the set is itself missing: the same broken install,
+    # one layer up. "unknown" beats printing OK about a list we cannot read.
+    Write-Output "KG write routing: unknown (no .claude\hooks\_lib\emit-context.ps1 -"
+    Write-Output "  broken install; update this project's bundle to restore it)."
+} else {
+    $RhMissing = @()
+    $RhPresent = @()
+    foreach ($rhLib in (Get-VcoRequiredHookLibs)) {
+        if (Test-Path (Join-Path $PSScriptRootLocal "_lib/$rhLib.ps1")) {
+            $RhPresent += "_lib/$rhLib.ps1"
+        } else {
+            $RhMissing += $rhLib
+        }
+    }
+    if ($RhMissing.Count -eq 0) {
+        Write-Output ("KG write routing: OK ({0} present)" -f ($RhPresent -join ", "))
+    } else {
+        Write-Output "KG write routing: BROKEN - this project's hooks are incomplete."
+        foreach ($rhLib in $RhMissing) {
+            Write-Output "  .claude\hooks\_lib\$rhLib.ps1 is missing or unreadable: it is the"
+            Write-Output ("  one home for {0}." -f (Get-VcoHookLibRole $rhLib))
+        }
+        Write-Output "  Fix: python -m vco_lib.project_init install-bundle --folder $ProjectRootLocal ``"
+        Write-Output "         --orchestrator-root <orchestrator-root> --update"
+        Write-Output "  (or the launcher's per-project Settings page -> ""Update bundle"")."
+    }
+}
+
+# -- kg-sync failures recorded since the last session (v0.2.95) -------------
+#
+# Reader for the rows `_lib/kg-sync-debounce.ps1::Write-KgDebounceFailureRow`
+# appends when a debounced sync exits non-zero. Same
+# writer->jsonl->SessionStart-notice shape `embedding-failures-surface.ps1`
+# uses for embedding fidelity.
+#
+# The payload below is a BYTE-IDENTICAL copy of the .sh sibling's KGFAILEOF
+# heredoc body, for the same reason $pyCode is: a shared defect must not be
+# fixable on one side only. Edit the .sh, then re-copy.
+#
+# Parsed with $PY (the plain interpreter `_lib/find-python.ps1` found), NOT
+# with the VCO venv: the condition being reported is frequently "there is no
+# usable VCO venv", so a reader that needed one would go quiet exactly when it
+# had something to say.
+$kgFailCode = @'
+import json
+import os
+
+jsonl = os.environ.get("KG_FAIL_JSONL", "")
+root = os.environ.get("KG_FAIL_ROOT", "")
+marker = os.environ.get("KG_FAIL_MARKER", "")
+
+try:
+    size = os.path.getsize(jsonl)
+except OSError:
+    raise SystemExit(0)
+
+seen = 0
+try:
+    with open(marker, "r", encoding="utf-8") as fh:
+        seen = int((fh.read() or "0").strip() or 0)
+except (OSError, ValueError):
+    seen = 0
+if seen < 0 or seen > size:
+    seen = 0            # log rotated / truncated → re-read from the start
+if size == seen:
+    raise SystemExit(0)
+
+rows = []
+try:
+    with open(jsonl, "r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(seen)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("kind") != "kg_sync_failed":
+                continue
+            # Only THIS project's rows: the stream is machine-wide.
+            if root and row.get("project_root") and row["project_root"] != root:
+                continue
+            rows.append(row)
+except OSError:
+    raise SystemExit(0)
+
+# Advance the marker even when every new row belonged to another project —
+# they will never become this project's rows, and re-reading them every
+# session would be a permanent no-op cost.
+try:
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(str(size))
+except OSError:
+    pass
+
+if not rows:
+    raise SystemExit(0)
+
+last = rows[-1]
+channels = sorted({str(r.get("channel", "?")) for r in rows})
+print(
+    "KG sync FAILED %d time(s) since the last session (channel(s): %s; last exit %s)."
+    % (len(rows), ", ".join(channels), last.get("exit", "?"))
+)
+detail = str(last.get("last_stderr", "") or "").strip()
+if detail:
+    print("  last error: %s" % detail)
+log = str(last.get("log", "") or "").strip()
+if log:
+    print("  full stderr: %s" % log)
+print(
+    "  Edits to knowledge/ were NOT indexed. Fix the environment (see the "
+    "KG write path line above), then re-run `.claude/scripts/kg-sync --all`."
+)
+'@
+
+$MetricsLib = Join-Path $LibDir "metrics-dir.ps1"
+if (Test-Path -LiteralPath $MetricsLib) {
+    try {
+        . $MetricsLib
+        $KgFailJsonl = Get-VcoMetricsReadFile -Name "kg_sync_failures.jsonl"
+        if ($KgFailJsonl -and (Test-Path -LiteralPath $KgFailJsonl -PathType Leaf)) {
+            $KgFailRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { $ProjectRootLocal }
+            $KgFailState = Join-Path $KgFailRoot ".claude/state"
+            if (-not (Test-Path -LiteralPath $KgFailState -PathType Container)) {
+                New-Item -ItemType Directory -Force -Path $KgFailState -ErrorAction SilentlyContinue | Out-Null
+            }
+            $env:KG_FAIL_JSONL = $KgFailJsonl
+            $env:KG_FAIL_ROOT = $KgFailRoot
+            $env:KG_FAIL_MARKER = Join-Path $KgFailState "kg-sync-failures.seen"
+            & $PY -c $kgFailCode 2>$null
+        }
+    } catch { }
+}
+
 exit 0

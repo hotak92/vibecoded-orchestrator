@@ -38,6 +38,15 @@ pub mod adoption;
 pub mod container_runtime;
 pub mod gpu_mode;
 
+// v0.2.95: the model gateway's port/file/service constants and the resolution
+// chain over them. Extracted from THREE Rust copies — the launcher's Services
+// card, the hub's gateway supervisor, and the hub's `/services/status`
+// skeleton, which had simply hard-coded 11436 and therefore reported a health
+// URL nothing served on any machine whose gateway had fallen back. The module
+// is pure (env + two small file reads via `crate::paths::vct_root_dir`) and
+// carries the parity test against the daemon's own `model_router/config.py`.
+pub mod model_gateway_port;
+
 // v0.2.54 Track I: per-boot bearer-token primitives (generate /
 // persist-0o600 / constant-time-compare / Bearer parse). Extracted
 // from vct-hub's auth.rs so the launcher's diagrams local server

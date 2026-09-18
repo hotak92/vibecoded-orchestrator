@@ -335,18 +335,48 @@ class DeliveryAuditTests(unittest.TestCase):
         behaviour. Ceiling pinned 28 lines above the current size, per the
         lesson below.
 
-        A LESSON about this gate, for whoever lowers it next: 16_030 was pinned
-        to an instantaneous 16_028, and the very next legitimate change — four
-        lines adding Windows equivalents to POSIX-only printed remedies, which
-        R42 requires — tripped it. The first instinct was to shave comment
-        prose to fit, which is gaming the gate, not obeying it. Pin the ceiling
-        with a handful of lines of headroom, or accept that every small
-        addition owes an extraction. Both are fine; shaving prose is not.
+        Lowered 15_880 -> 15_730 (2026-09-16, suite-reds lane): the v0.2.95
+        retired-registration work threaded a ``retired_removed`` accumulator
+        through the settings merge and put the file 4 lines over, which is the
+        gate working. The extraction that followed took the settings.json merge
+        ALGORITHM — the user-wins recursive merge and the per-event hooks merge
+        it delegates to — into ``vco_lib/settings_merge.py`` (~193 lines moved
+        verbatim, one production caller, pure: dicts in, a new dict out, no
+        filesystem and no module state). ``project_init`` keeps the I/O half
+        (``_merge_settings_template_for_bundle``: read, merge, write atomically)
+        as the thin orchestration shim CLAUDE.md sanctions, and re-exports the
+        two private names as ALIASES so the ~30 existing call-sites keep
+        working on the same objects rather than on a copy
+        (``tests/test_v0295_settings_merge.py`` pins that by identity). Net
+        15_884 -> 15_711, i.e. smaller than before the cycle's work despite
+        gaining the behaviour. The move also retired a stale promise it was
+        carrying: both
+        functions still called themselves "mirror of
+        ``install.py:_smart_merge_settings``", a name v0.2.85 (D2) deleted when
+        the root install started going through this one engine.
+
+        THE RULE, so no future re-pin has to re-derive it (identical to
+        ``test_install_main_ratchet``'s, and stated here because this gate
+        broke it): the ceiling is the measured ``wc -l`` EXACTLY. Not
+        "measured plus a little". 15_730 over a 15_711-line file was 19 lines
+        of hidden growth budget — 19 lines a later change could add without
+        justifying itself, and the justification IS the mechanism; a guard
+        whose bound is looser than the property it guards fails toward GREEN,
+        which is the one direction a guard may not fail (v0.2.95 ship-gate
+        review MINOR-1; the same shape was adjudicated on ``install.py`` in
+        rev 2 — "11 lines of headroom is the same defect as 143, smaller").
+        So: shrink the file, then re-pin at the new measurement. Never raise
+        the pin to fit a change that could have been an extraction, and never
+        shave comment prose to fit — that games the gate rather than obeying
+        it (the 16_030 → 16_028 episode, where four lines adding Windows
+        equivalents to POSIX-only printed remedies tripped it and the first
+        instinct was to cut prose). A small addition that owes an extraction
+        owes it; that is the gate working, not a reason for slack.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_880,
+            n, 15_711,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

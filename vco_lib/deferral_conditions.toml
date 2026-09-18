@@ -541,6 +541,29 @@ run, so installing Node makes the entry disappear by itself. The launcher's \
 registration badge renders the same fact (gui_badge) via \
 `python -m vco_lib.npx_resolver --json`."""
 
+[conditions.gateway_registered_but_unrunnable]
+class = "action_required"
+owner = "vco_lib.gateway_ensure"
+clear_probe = "probe:py:gateway_exec_still_unrunnable"
+emit_surfaces = ["ledger"]
+notes = """v0.2.95 R5c. A THIRD state, between "not registered" and "running": \
+the model gateway's login-time registration exists and is enabled, and the \
+entry point baked into it cannot run. Measured on 2026-09-10 — \
+`install.py --update` re-rendered the unit with whichever interpreter ran the \
+installer (a system python that cannot import `model_router`), so the unit was \
+unrunnable from the moment it was written, and it stayed invisible for eight \
+hours because the PREVIOUS process was still serving. The launcher toggle said \
+"registered" throughout. Two emitters, one lifecycle: the SessionStart ensure \
+(`vco_lib.gateway_ensure`) writes it into the project whose session started, \
+and `vco_lib.doctor`'s `model_gateway_runnable` probe writes it into the \
+install root during an install/update run. Both read the same function, and \
+the clear probe re-runs that same reading, so the entry clears itself the \
+moment the registration can run (or the gateway is running, or the user \
+unregistered it). action_required because the exit is an install/update run: \
+that is what re-renders the registration, now verifying the argv before it \
+writes. No dismiss_key: an unrunnable registration is a real break, not a \
+description of the machine to acknowledge."""
+
 [conditions.code_embed_image_stale]
 class = "action_required"
 owner = "vco_lib.doctor"
@@ -1005,10 +1028,18 @@ v0.2.91 promotion means that now happens on EVERY --update, not only under \
 [conditions.hub_restart_failed_after_abort]
 class = "action_required"
 owner = "launcher/src-tauri/src/commands/installer.rs"
-clear_probe = "paired-resolution"
+clear_probe = "probe:py:hub_back_after_restart_failure"
 emit_surfaces = ["ledger"]
-notes = """Re-probed by the install.py re-probe pass; clears ONLY on positive \
-evidence (hub sidecar version caught up AND a live /health answer)."""
+notes = """v0.2.95 F1: the entry records that the abort-path hub restart's \
+health poll failed (the hub did not come back). Cleared by the registry \
+probe `hub_back_after_restart_failure` wherever a re-probe pass runs — \
+install.py's end-of-run phase (now ordered AFTER the hub restart step), \
+the bundle engine, and `vco doctor`'s reconcile — when the hub answers \
+`/api/v1/health` on the resolved port. Positive evidence only: a silent \
+hub keeps the entry. (Pre-v0.2.95 the ONLY resolver was an install.py \
+branch that AND-ed a hub-sidecar version comparison and ran BEFORE both \
+the binary refresh and the hub restart, so it could never observe the \
+hub up — the row was immortal in the field.)"""
 
 [conditions.codegraph_rename_split_pending]
 class = "informational_record"
@@ -1034,6 +1065,24 @@ maintainer's own install). The entry names its `<path>.from-upstream-<sha>` \
 sidecars; once the user has accepted or deleted every one of them the \
 condition is objectively over, so the probe resolves it. Follows the \
 `stale_codegraph_wrapper_pending` probed-clear precedent."""
+
+[conditions.rendered_file_upstream_changed]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.95 R1 (owner ruling 2026-09-10: a conflict must never arise on a \
+file the install RENDERS). Upstream changed the tracked copy of a path listed in \
+`vco_lib/rendered_root_files.toml` (CLAUDE.md today). The launcher's pre-pull \
+`resolve_rendered_files_keep_local` advanced the tracked blob to upstream's while \
+leaving the user's rendered working-tree copy in place, so the pull could not \
+conflict and no divergence modal was shown; install.py then re-rendered the AUTO \
+block from the NEW template and writes THIS row. Nothing is pending — it is a \
+record of a completed action. install.py OWNS it and re-detects it only from the \
+launcher's hand-off state file, which the emit consumes, so the next --update \
+does not re-detect it and `InstallDeferralFlow.finalize()` drops it (the \
+`owned-drop-when-absent` one-shot-expiry shape, same as the Rust-emitted \
+`stale_unit_retired_` precedent)."""
 
 [conditions.launcher_binary_stale]
 class = "action_required"

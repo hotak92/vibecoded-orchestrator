@@ -23,6 +23,8 @@
 
 import { invoke } from '$lib/tauri';
 import type {
+  GatewayRegistration,
+  HubGatewayCondition,
   ModelGatewayStatus,
   StopOutcome,
   VSCodeInspection,
@@ -475,6 +477,56 @@ export function vendorDefaultWarning(report: PanelModeReport | null): string {
 }
 
 /**
+ * The endpoint gate, in ONE sentence — and this constant is its only home.
+ *
+ * Claude Code >= 2.1.196 refuses Remote Control whenever
+ * `ANTHROPIC_BASE_URL` names anything but api.anthropic.com. It is the
+ * ENDPOINT, not the auth: a claude.ai sign-in does not bypass it, and
+ * env-token auth (API key, `setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`) fails a
+ * second, independent full-scope-login gate. No configuration of the panel or
+ * the gateway can change either. Live-verified against Claude Code 2.1.258
+ * (2026-09-04) and re-checked against the published docs 2026-09-16.
+ *
+ * Two surfaces say it — the Services-page warning BEFORE pointing
+ * (`pointPanelWarnings`) and the status-bar notice WHILE pointed
+ * (`remoteControlGateNotice`) — and a second copy of the sentence is how the
+ * two would drift into disagreeing about a fact.
+ */
+export const REMOTE_CONTROL_GATE =
+  'Remote Control is refused while the panel points at a gateway (Claude Code ≥ 2.1.196 requires api.anthropic.com).';
+
+/**
+ * The two ways out, named as things the user can actually do.
+ *
+ * Neither is a workaround for the gate — they are the two supported shapes:
+ * give the panel back to the stock client, or leave the panel on the gateway
+ * and run Remote Control as a separate machine-level server. `rc-native` is
+ * a SHIPPED skill (`templates/skills/rc-native/` + `templates/scripts/
+ * rc-native.{sh,ps1}`), so naming it here points at something the user has.
+ */
+export const REMOTE_CONTROL_EXITS =
+  'Two ways out: switch this panel to Remote Control mode (the pill in this status bar), or keep the gateway and run a detached native-auth server for the whole machine — the bundled rc-native skill, or `claude --remote-control` in a plain terminal.';
+
+/**
+ * The gate, said where the user meets it: the status bar, while the panel is
+ * in Multimodel mode.
+ *
+ * Until now this lived only in pill TOOLTIPS ("Remote Control unavailable"),
+ * which is a sentence nobody reads before clicking and nobody sees when
+ * `/remote-control` fails in the panel. The launcher cannot observe that
+ * failure — it happens inside Claude Code — so the honest surface is a
+ * standing statement of the state that causes it.
+ *
+ * Scoped to `multimodel` on purpose: that is the state VCO itself creates.
+ * An `unmanaged` custom endpoint is also gated, but VCO does not know what
+ * that endpoint is and its own copy already says it leaves it alone.
+ */
+export function remoteControlGateNotice(report: PanelModeReport | null): string {
+  if (report?.mode !== 'multimodel') return '';
+  return `${REMOTE_CONTROL_GATE} ${REMOTE_CONTROL_EXITS}`;
+}
+
+/**
  * Why a pill is disabled, in the user's terms. Empty when clickable.
  *
  * Both need a settings file to write. An unparseable file is refused by the
@@ -810,7 +862,7 @@ export function pointPanelWarnings(inspection: VSCodeInspection | null): string[
   const out: string[] = [];
   if (!inspection) return out;
   out.push(
-    'Remote Control (/remote-control, phone access from the Claude app) does not work in a panel pointed at the gateway: Claude Code enables it only in sessions talking directly to api.anthropic.com, and claude.ai sign-in does not change that. Keep a native terminal session for it — claude --remote-control — alongside the gateway panel (docs/TROUBLESHOOTING.md, "Remote Control").',
+    `${REMOTE_CONTROL_GATE} That is the endpoint, not the auth: a claude.ai sign-in does not change it, and it applies to the paste-ready block too. ${REMOTE_CONTROL_EXITS} (docs/TROUBLESHOOTING.md, "Remote Control".)`,
   );
   if (inspection.parseable === false) {
     out.push(
@@ -979,4 +1031,141 @@ export function describeOAuthExpiry(s: ModelGatewayStatus | null): StatusLine | 
     detail:
       'Run `claude` (or open a native panel) once before then: the gateway reads that login and never refreshes it itself.',
   };
+}
+
+/**
+ * The login registration, in THREE states — v0.2.95, R5c.
+ *
+ * "Start at login" was a checkbox with two positions, and that is one short.
+ * A registration can be present and unable to run: a unit whose `ExecStart`
+ * names an interpreter that cannot import the gateway is `enabled`, ticks the
+ * box, fails every start, and is parked by systemd's own start limit. That is
+ * the state the 2026-09-10 machine sat in for eight hours while the card said
+ * "registered".
+ *
+ * So the three are kept apart and each says what to DO about it:
+ *   * not registered — an offer, not a fault. The gateway is opt-in.
+ *   * registered but unrunnable — loud, with the reason and the one command
+ *     that repairs it.
+ *   * registered (running, or idle and runnable) — quiet.
+ *
+ * `null` is returned when there is nothing to add to the main status line:
+ * either the registration was not asked for (the gateway is serving, which
+ * is proof enough) or it is registered and healthy.
+ */
+export function describeRegistration(s: ModelGatewayStatus | null): StatusLine | null {
+  const reg: GatewayRegistration | null | undefined = s?.registration;
+  // Not asked. NOT the same as "not registered", and never rendered as it.
+  if (!reg) return null;
+  switch (reg.state) {
+    case 'registered_but_unrunnable':
+      return {
+        tone: 'down',
+        label: 'registered at login, but it cannot run',
+        detail: `${reg.reason}${
+          reg.unit_path ? ` (${reg.unit_path})` : ''
+        } Until that is repaired, every start — yours, the login service's and the hub's — fails the same way.`,
+      };
+    case 'not_registered':
+      return {
+        tone: 'unknown',
+        label: 'not registered at login',
+        detail:
+          'Nothing starts the gateway when you log in. Tick "Start at login" to register it — VCO never registers it for you.',
+      };
+    case 'disabled_by_env':
+      return {
+        tone: 'unknown',
+        label: 'login autostart disabled by environment',
+        detail: reg.reason,
+      };
+    case 'start_failed':
+      return {
+        tone: 'warn',
+        label: 'registered, but the start could not be issued',
+        detail: reg.reason,
+      };
+    case 'registered_not_running':
+      return {
+        tone: 'warn',
+        label: 'registered and runnable, but not running',
+        detail:
+          'The registration is sound — its entry point was just verified — so Start, or your next login, will bring it up.',
+      };
+    default:
+      // `running`, or a state a newer Python knows and this build does not.
+      return null;
+  }
+}
+
+/**
+ * What the HUB's supervisor concluded, when it gave up.
+ *
+ * The hub restarts a gateway that dies, bounded: three attempts in ten
+ * minutes, then it stops and records why. Without this line that record lives
+ * only in a log the detached hub writes where nobody looks — and "it stopped
+ * trying" is exactly the fact a user needs, because it is the difference
+ * between "wait a moment" and "this needs you".
+ *
+ * `null` while nothing is recorded, which is the normal state: the hub
+ * deletes the row the moment the gateway serves again.
+ */
+export function describeHubCondition(s: ModelGatewayStatus | null): StatusLine | null {
+  const c: HubGatewayCondition | null | undefined = s?.hub_condition;
+  if (!c) return null;
+  const when = c.observed_at_ms ? new Date(c.observed_at_ms).toLocaleString() : 'recently';
+  return {
+    tone: 'down',
+    label: `the hub stopped trying to restart the gateway (${c.attempts} attempt${
+      c.attempts === 1 ? '' : 's'
+    })`,
+    detail: `${c.reason} Last checked ${when} on port ${c.port}. The hub will supervise it again as soon as it is seen serving.`,
+  };
+}
+
+/**
+ * Whether the gateway can see the vendor keys you configured — `/health`'s
+ * `secret_scope` (R5b).
+ *
+ * A daemon whose working directory is not a registered project resolves no
+ * keys at all, and the symptom is indistinguishable from "you have not added
+ * one": `vendors: ["…"]` beside an empty `vendor_keys_cached`. This says
+ * which of the two it is. `resolvable: null` is reported as UNKNOWN rather
+ * than as a failure — nothing has probed it yet, and a probe that has not run
+ * is not evidence of absence.
+ */
+export function describeSecretScope(s: ModelGatewayStatus | null): StatusLine | null {
+  const scope = s?.health?.secret_scope;
+  if (!scope) return null;
+  if (scope.resolvable === false) {
+    return {
+      tone: 'down',
+      label: 'vendor keys are unreachable from this gateway',
+      detail: `${scope.reason} Its secret scope is \`${scope.project}\`, which does not resolve to a registered project — so keys you add in the launcher cannot be found by it, however correct they are.`,
+    };
+  }
+  if (scope.resolvable === null) {
+    return {
+      tone: 'unknown',
+      label: 'vendor key scope not probed yet',
+      detail: `The gateway has not had to resolve a vendor key since it started, so it cannot say whether its scope (\`${scope.project}\`) works. The first vendor request settles it.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * One line for the usage ledger: where per-chat token rows land.
+ *
+ * Shown because a ledger whose path could not be resolved silently accounts
+ * for nothing, and "0 rows" on a machine that has been answering requests is
+ * the visible form of that.
+ */
+export function describeUsageLedger(s: ModelGatewayStatus | null): string {
+  const ledger = s?.health?.usage_ledger;
+  if (!ledger) return '';
+  if (!ledger.path) {
+    return 'no metrics home could be resolved, so per-chat token rows are not being written';
+  }
+  return `${ledger.rows_written} row${ledger.rows_written === 1 ? '' : 's'} written to ${ledger.path}`;
 }

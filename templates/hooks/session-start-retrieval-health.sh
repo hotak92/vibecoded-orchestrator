@@ -8,15 +8,25 @@
 # finding R8 flagged (schema-missing / all-below-floor warnings go to MCP
 # stderr, which the hook contract drops — the user never sees them).
 #
-# Output (exactly one line, examples):
+# Output (the retrieval line, examples):
 #   Retrieval: KG 412 nodes, codegraph 3897 functions.
 #   Retrieval: KG collection 'X' empty, codegraph not built (no class 'Y_CodeFunction').
 #   Retrieval: KG 412 nodes, codegraph unknown (CODE_GRAPH_PROJECT unset).
 #   Retrieval: unavailable (weaviate down).
 #
-# Fast (<1s: two GraphQL Aggregate round-trips with a 0.8s timeout each) and
-# soft-fail (any error → an "unknown"/"unavailable" line, NEVER an exception /
+# …plus, since v0.2.95, a WRITE-path line and (only when there is one) a
+# kg-sync failure notice — see the two blocks at the bottom of this file.
+#
+# Soft-fail (any error → an "unknown"/"unavailable" line, NEVER an exception /
 # never blocks session start; exit 0 always).
+#
+# COST: two GraphQL Aggregate round-trips with a 0.8s timeout each, plus (from
+# v0.2.95) ONE interpreter spawn for the write-path probe — ~0.4s on a warm
+# install, once per session. That probe is the SAME `python -c` gate kg-sync
+# runs, deliberately: a cheaper approximation (``importlib.util.find_spec``)
+# could report a healthy write path for an environment kg-sync then refuses,
+# and a probe whose verdict differs from the reader's is the false positive
+# this hook's own header spends a paragraph warning about.
 #
 # THREE-STATE CONTRACT (v0.2.92 — the KG-3 correctness fix). A probe has to
 # distinguish three outcomes that the pre-fix code collapsed into one:
@@ -205,5 +215,207 @@ else:
 
 print("Retrieval: %s, %s." % (kg_part, code_part))
 PYEOF
+
+# ── KG WRITE path (v0.2.95) ────────────────────────────────────────────────
+#
+# The two probes above are RETRIEVAL only. Nothing checked whether a knowledge
+# node written in this session could reach Weaviate at all — and that is the
+# half that failed silently in the field (field report 2026-09-14): `kg-sync` refused
+# with exit 3 on every edit for a whole session, behind a `|| true`, while the
+# retrieval line kept reporting a healthy (stale) index. Retrieval health is
+# not write health; reporting only the first is how the second stays hidden.
+#
+# No network and no Weaviate write: the question is ONLY "is there an
+# interpreter that can run the sync", which is exactly what the shared ladder
+# answers. Probe + refusal text come from `vct_venv_ladder.sh` — the same file
+# `kg-sync` sources — so this line cannot drift from what the sync will do.
+#
+# STDOUT, not stderr: Claude Code injects a SessionStart hook's stdout as a
+# system-reminder and discards its stderr. The ladder's refusal printer writes
+# to stderr (correct for a wrapper), so it is captured and re-emitted here
+# rather than re-worded — one home for the prose, two streams.
+#
+# MUST MATCH session-start-retrieval-health.ps1.
+KG_WRITE_PROBE="import weaviate, weaviate_mcp, vco_lib"
+LADDER_SCRIPTS_DIR="$(cd "$SCRIPT_DIR/../scripts" 2>/dev/null && pwd || printf '')"
+if [ -n "$LADDER_SCRIPTS_DIR" ] && [ -r "$LADDER_SCRIPTS_DIR/vct_venv_ladder.sh" ]; then
+    # shellcheck source=../scripts/vct_venv_ladder.sh disable=SC1091
+    . "$LADDER_SCRIPTS_DIR/vct_venv_ladder.sh"
+    vct_venv_ladder_resolve "$LADDER_SCRIPTS_DIR" "$KG_WRITE_PROBE" || true
+    if [ -n "${LADDER_PYTHON:-}" ]; then
+        echo "KG write path: OK (${LADDER_PYTHON}, tier: ${LADDER_TIER:-unknown})"
+    else
+        echo "KG write path: REFUSED — every knowledge/ edit this session will fail to sync."
+        vct_venv_ladder_refusal "kg-sync" "$KG_WRITE_PROBE" "$LADDER_SCRIPTS_DIR" 2>&1 \
+            | sed 's/^/  /'
+    fi
+else
+    echo "KG write path: unknown (no .claude/scripts/vct_venv_ladder.sh — broken install;"
+    echo "  re-run the orchestrator install, or update this project's bundle)."
+fi
+
+# The OTHER half of "can this session write": an interpreter that can run the
+# sync is useless if the hooks that DECIDE to call it are not on disk. Three
+# `_lib/` files carry that decision — routing a touched path, recovering what
+# a CLI command wrote, and telling code from prose — and a project missing any
+# of them keeps working, silently, minus that whole leg, while the ladder
+# probe above still reports OK because the interpreter is fine. That
+# combination is the blind spot the v0.2.95 review found twice: MAJOR-1 for
+# the routing lib, and MAJOR-2 because the fix (and this probe) covered ONLY
+# that one, so this line printed OK while every CLI write was being dropped.
+#
+# The set is NOT enumerated here: it is `vco_required_hook_libs` in
+# `_lib/emit-context.sh`, the same home the in-session notices take their
+# wording from, so a fourth required lib is probed without editing this file.
+# `vco_hook_lib_role` supplies the consequence sentence per file.
+#
+# Cheap by construction: one `[ -r ]` test per file, no subprocess.
+# MUST MATCH session-start-retrieval-health.ps1.
+#
+# The project root is resolved here rather than assumed: the printed fix is a
+# command the user is meant to RUN, so its `--folder` has to be a real path.
+# CLAUDE_PROJECT_DIR first (worktree-isolated sessions), script-relative
+# otherwise — the same order post-file-edit.sh and post-tool-security.sh use.
+_RH_PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || printf '<project>')}"
+# shellcheck source=_lib/emit-context.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
+if ! command -v vco_required_hook_libs >/dev/null 2>&1; then
+    # The file that holds the set is itself missing: that is the same broken
+    # install, one layer up, and saying "unknown" beats printing OK about a
+    # list we cannot read.
+    echo "KG write routing: unknown (no .claude/hooks/_lib/emit-context.sh —"
+    echo "  broken install; update this project's bundle to restore it)."
+else
+    _RH_MISSING=""
+    _RH_PRESENT=""
+    for _rh_lib in $(vco_required_hook_libs); do
+        if [ -r "$SCRIPT_DIR/_lib/${_rh_lib}.sh" ]; then
+            if [ -n "$_RH_PRESENT" ]; then
+                _RH_PRESENT="$_RH_PRESENT, _lib/${_rh_lib}.sh"
+            else
+                _RH_PRESENT="_lib/${_rh_lib}.sh"
+            fi
+        else
+            _RH_MISSING="$_RH_MISSING $_rh_lib"
+        fi
+    done
+    if [ -z "$_RH_MISSING" ]; then
+        echo "KG write routing: OK ($_RH_PRESENT present)"
+    else
+        echo "KG write routing: BROKEN — this project's hooks are incomplete."
+        for _rh_lib in $_RH_MISSING; do
+            echo "  .claude/hooks/_lib/${_rh_lib}.sh is missing or unreadable: it is the"
+            echo "  one home for $(vco_hook_lib_role "$_rh_lib")."
+        done
+        echo "  Fix: python -m vco_lib.project_init install-bundle --folder $_RH_PROJECT_ROOT \\"
+        echo "         --orchestrator-root <orchestrator-root> --update"
+        echo "  (or the launcher's per-project Settings page → \"Update bundle\")."
+    fi
+fi
+
+# ── kg-sync failures recorded since the last session (v0.2.95) ─────────────
+#
+# The writer is `_lib/kg-sync-debounce.sh::_kg_debounce_record_failure`: when a
+# debounced sync exits non-zero it appends ONE row per session per channel to
+# `kg_sync_failures.jsonl` and keeps the full stderr in
+# `.claude/logs/kg-sync-hook.log`. This is the reader — the same
+# writer→jsonl→SessionStart-notice shape `embedding-failures-surface.sh` uses
+# for embedding fidelity.
+#
+# Parsed with `$PY` (the plain interpreter `_lib/find-python.sh` found), NOT
+# with the VCO venv: the condition being reported is frequently "there is no
+# usable VCO venv", so a reader that needed one would go quiet exactly when it
+# had something to say.
+#
+# Deduped by a byte-offset marker, so a row is announced once and a session
+# with nothing new prints nothing.
+KG_FAIL_JSONL=""
+if [ -f "$SCRIPT_DIR/_lib/metrics-dir.sh" ]; then
+    # shellcheck source=_lib/metrics-dir.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/metrics-dir.sh"
+    KG_FAIL_JSONL="$(vco_metrics_read_file "kg_sync_failures.jsonl" 2>/dev/null || printf '')"
+fi
+if [ -n "$KG_FAIL_JSONL" ] && [ -f "$KG_FAIL_JSONL" ]; then
+    KG_FAIL_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || printf '')}"
+    KG_FAIL_MARKER="$KG_FAIL_ROOT/.claude/state/kg-sync-failures.seen"
+    mkdir -p "$KG_FAIL_ROOT/.claude/state" 2>/dev/null || true
+    KG_FAIL_JSONL="$KG_FAIL_JSONL" KG_FAIL_ROOT="$KG_FAIL_ROOT" \
+    KG_FAIL_MARKER="$KG_FAIL_MARKER" "$PY" - <<'KGFAILEOF' 2>/dev/null || true
+import json
+import os
+
+jsonl = os.environ.get("KG_FAIL_JSONL", "")
+root = os.environ.get("KG_FAIL_ROOT", "")
+marker = os.environ.get("KG_FAIL_MARKER", "")
+
+try:
+    size = os.path.getsize(jsonl)
+except OSError:
+    raise SystemExit(0)
+
+seen = 0
+try:
+    with open(marker, "r", encoding="utf-8") as fh:
+        seen = int((fh.read() or "0").strip() or 0)
+except (OSError, ValueError):
+    seen = 0
+if seen < 0 or seen > size:
+    seen = 0            # log rotated / truncated → re-read from the start
+if size == seen:
+    raise SystemExit(0)
+
+rows = []
+try:
+    with open(jsonl, "r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(seen)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("kind") != "kg_sync_failed":
+                continue
+            # Only THIS project's rows: the stream is machine-wide.
+            if root and row.get("project_root") and row["project_root"] != root:
+                continue
+            rows.append(row)
+except OSError:
+    raise SystemExit(0)
+
+# Advance the marker even when every new row belonged to another project —
+# they will never become this project's rows, and re-reading them every
+# session would be a permanent no-op cost.
+try:
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(str(size))
+except OSError:
+    pass
+
+if not rows:
+    raise SystemExit(0)
+
+last = rows[-1]
+channels = sorted({str(r.get("channel", "?")) for r in rows})
+print(
+    "KG sync FAILED %d time(s) since the last session (channel(s): %s; last exit %s)."
+    % (len(rows), ", ".join(channels), last.get("exit", "?"))
+)
+detail = str(last.get("last_stderr", "") or "").strip()
+if detail:
+    print("  last error: %s" % detail)
+log = str(last.get("log", "") or "").strip()
+if log:
+    print("  full stderr: %s" % log)
+print(
+    "  Edits to knowledge/ were NOT indexed. Fix the environment (see the "
+    "KG write path line above), then re-run `.claude/scripts/kg-sync --all`."
+)
+KGFAILEOF
+fi
 
 exit 0

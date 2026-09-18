@@ -70,6 +70,55 @@ impl Db {
         Ok(())
     }
 
+    /// v0.2.95: poison-tolerant WRITER, for the hub's detached supervisor
+    /// tasks — the sibling [`Db::app_state_get_bool_nonpanicking`] has been
+    /// waiting for since v0.2.62.
+    ///
+    /// Same semantics as [`Db::app_state_set`] (upsert, stamps `updated_at`)
+    /// but acquires the lock via [`Db::lock_recover`], so a mutex poisoned by
+    /// some unrelated panicking holder does not take the caller down with it.
+    ///
+    /// The reason it now exists: `vct_hub::gateway_watchdog` must WRITE (it
+    /// persists the condition the launcher's Services card renders), and the
+    /// infra watchdog before it had sidestepped the whole question by never
+    /// writing. Without this, the only way for a never-crash task to call a
+    /// `lock()`-based writer was to wrap it in `catch_unwind` at the call
+    /// site — a guard every future writer would have to remember, which is
+    /// the kind of convention some call-site eventually forgets.
+    ///
+    /// Reading through a recovered guard is sound here for the same reason it
+    /// is in the getter: the SQLite connection is not left invalid by a panic
+    /// that merely held the lock (rusqlite drops the panicking caller's
+    /// in-flight statement), and this is one short upsert.
+    pub fn app_state_set_nonpanicking(&self, key: &str, value: &str) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock_recover();
+        guard
+            .execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at",
+                params![key, value, now],
+            )
+            .map_err(|e| format!("app_state_set_nonpanicking({}): {}", key, e))?;
+        Ok(())
+    }
+
+    /// v0.2.95: poison-tolerant [`Db::app_state_delete_like`], the other half
+    /// of what a detached supervisor needs — a condition row that is WRITTEN
+    /// on give-up must be CLEARABLE the moment the condition ends, or it
+    /// outlives what it describes. Same recovery rationale as
+    /// [`Db::app_state_set_nonpanicking`].
+    pub fn app_state_delete_like_nonpanicking(&self, pattern: &str) -> Result<usize, String> {
+        let guard = self.lock_recover();
+        let n = guard
+            .execute("DELETE FROM app_state WHERE key LIKE ?1", params![pattern])
+            .map_err(|e| format!("app_state_delete_like_nonpanicking({}): {}", pattern, e))?;
+        Ok(n)
+    }
+
     /// Delete rows whose keys match a SQL LIKE pattern. Returns the number
     /// of rows removed. Used by v0.2.34 launcher-version-change cache-bust
     /// to wipe `module_catalog.cache*` entries (envelope + fetched-at)
@@ -296,6 +345,55 @@ mod tests {
         // upsert overwrites
         db.app_state_set("hello", "there").unwrap();
         assert_eq!(db.app_state_get("hello").unwrap().as_deref(), Some("there"));
+    }
+
+    // ─── v0.2.95: the poison-tolerant writers ───────────────────────────
+
+    #[test]
+    fn nonpanicking_writers_behave_exactly_like_their_panicking_siblings() {
+        // The ACT half. Recovery changes how the lock is taken, nothing else:
+        // a caller must not have to choose between "never crashes" and
+        // "writes correctly".
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.app_state_set_nonpanicking("k", "v1").unwrap();
+        assert_eq!(db.app_state_get("k").unwrap().as_deref(), Some("v1"));
+        db.app_state_set_nonpanicking("k", "v2").unwrap();
+        assert_eq!(db.app_state_get("k").unwrap().as_deref(), Some("v2"));
+
+        db.app_state_set("other", "keep").unwrap();
+        assert_eq!(db.app_state_delete_like_nonpanicking("k%").unwrap(), 1);
+        assert_eq!(db.app_state_get("k").unwrap(), None);
+        assert_eq!(
+            db.app_state_get("other").unwrap().as_deref(),
+            Some("keep"),
+            "a LIKE delete must not take rows the pattern does not match"
+        );
+        // Matching nothing is not an error.
+        assert_eq!(db.app_state_delete_like_nonpanicking("nope.%").unwrap(), 0);
+    }
+
+    #[test]
+    fn nonpanicking_writers_survive_a_poisoned_mutex() {
+        // The reason they exist. A prior holder panicked WHILE holding the
+        // lock; `lock()` would now `expect("db mutex poisoned")` and take the
+        // detached supervisor task down for the rest of the hub's life.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = db.lock();
+            panic!("poison the mutex while holding it");
+        }));
+        assert!(poisoner.is_err(), "the helper must actually have panicked");
+
+        db.app_state_set_nonpanicking("after_poison", "written").unwrap();
+        assert_eq!(
+            db.app_state_get_bool_nonpanicking("after_poison").unwrap(),
+            Some(false),
+            "\"written\" is not a truthy flag — but it READ, which is the point"
+        );
+        assert_eq!(
+            db.app_state_delete_like_nonpanicking("after_poison").unwrap(),
+            1
+        );
     }
 
     #[test]

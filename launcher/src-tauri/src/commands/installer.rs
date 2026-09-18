@@ -14970,15 +14970,29 @@ MemAvailable:   23456789 kB
     //     var. The dashboard tests don't touch `VCT_SECRETS_DIR`, so
     //     the two modules can run concurrently safely.
     //   * Keychain-touching tests probe via `keyring_available()` and
-    //     skip silently when CI hosts lack a keychain backend.
-    //   * Each keychain-touching test calls `delete_keychain()` at
-    //     entry + exit so leftover state from a previous test (or a
-    //     parallel run targeting the same well-known keychain entry
-    //     `vct._user_shared_.shared.user/github_pat` — post-2026-05-10;
-    //     pre-fix this was `installer/github_pat`) doesn't leak in.
-    //     The module_id consolidation tests also clear the legacy
-    //     `installer/` slot so a residual canary there doesn't mask
-    //     a regression.
+    //     skip silently when CI hosts lack a keychain backend. A host that
+    //     HAS a backend runs them — hermetically (next bullet), not skipped.
+    //   * 2026-09-17 — HERMETIC NAMESPACE. `setup_temp_env()` takes
+    //     `secrets::test_serialize::keychain_serialize_lock()`, and that
+    //     guard installs the `vct-test-<pid>` service namespace for the
+    //     duration of the test. So every `(Shared{_user_shared_},
+    //     GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY)` op below reaches a REAL OS
+    //     keychain through the REAL production constants and the REAL call
+    //     path — but at `vct-test-<pid>._user_shared_.shared.user`, never at
+    //     `vct._user_shared_.shared.user`.
+    //
+    //     Before that fix these tests addressed the production slot itself
+    //     and `delete_keychain()` wiped it at entry AND exit, so `cargo test`
+    //     DESTROYED the developer's stored GitHub PAT. `HOME` redirection
+    //     does not help: the Linux Secret Service is a session D-Bus daemon,
+    //     not a `$HOME`-scoped file. `secrets::for_tests::
+    //     assert_not_production_pat_slot` now panics if a future test here
+    //     (or anywhere) reaches that slot without the guard.
+    //   * Each keychain-touching test still calls `delete_keychain()` at
+    //     entry + exit so leftover state from a previous test in the same
+    //     namespace doesn't leak in. The module_id consolidation tests also
+    //     clear the legacy `installer/` slot so a residual canary there
+    //     doesn't mask a regression.
     //
     // These tests use `pub(crate)` helpers (`migrate_github_pat_file_to_keychain`,
     // `github_pat_for_env`) and the module-private constants from the
@@ -15086,6 +15100,12 @@ MemAvailable:   23456789 kB
             // Wipe BOTH slots (post-2026-05-10 + pre-2026-05-10) so a
             // residue from a previous test run targeting either slot
             // doesn't mask a regression. `delete` returns Ok on NoEntry.
+            //
+            // 2026-09-17: these deletes are only safe because every caller is
+            // inside a `setup_temp_env()` guard, which redirects the service
+            // namespace to `vct-test-<pid>`. Call it from anywhere else and
+            // it wipes the REAL user's GitHub PAT — which is what it used to
+            // do. `assert_not_production_pat_slot` now panics on that.
             let _ = crate::secrets::delete(
                 crate::secrets::SecretScope::Shared {
                     project_id: SENTINEL_SHARED,
@@ -15691,6 +15711,67 @@ MemAvailable:   23456789 kB
             assert_ne!(
                 GITHUB_PAT_MODULE_ID, GITHUB_PAT_LEGACY_MODULE_ID,
                 "the migration must walk OLD → NEW; identical consts collapse the migration to a no-op",
+            );
+        }
+
+        /// 2026-09-17 parity pin for the ONE mirror this fix introduces.
+        ///
+        /// `vct_launcher_core::secrets::for_tests::PROTECTED_PAT_SLOT` is the
+        /// tripwire's copy of the slot identity. It has to be a mirror —
+        /// `vct-launcher-core` is a DEPENDENCY of this crate, so it cannot
+        /// import these constants — so this test is what stops the two drifting.
+        /// If it fails, the tripwire is guarding a slot nobody writes to, which
+        /// is the same as no tripwire at all.
+        #[test]
+        fn protected_pat_slot_mirror_matches_production_constants() {
+            assert_eq!(
+                crate::secrets::for_tests::PROTECTED_PAT_SLOT,
+                (
+                    GITHUB_PAT_MODULE_ID,
+                    GITHUB_PAT_LEGACY_MODULE_ID,
+                    GITHUB_PAT_KEY
+                ),
+                "the keychain tripwire in vct-launcher-core guards a DIFFERENT \
+                 slot than the one this module writes — update \
+                 secrets::for_tests::PROTECTED_PAT_SLOT to match",
+            );
+        }
+
+        /// The isolation, proven from THIS module: every test here runs under
+        /// `setup_temp_env()`, and while that guard is held the service string
+        /// the production constants resolve to is NOT the real user's slot.
+        ///
+        /// This is the behavioural form of "no test addresses
+        /// `user`/`github_pat`" — it does not scan source, it observes the
+        /// namespace the code under test actually uses.
+        #[test]
+        fn setup_temp_env_makes_this_module_hermetic_to_the_real_keychain() {
+            let production = "vct._user_shared_.shared.user";
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            assert_eq!(
+                scope.service_name(GITHUB_PAT_MODULE_ID),
+                production,
+                "sanity: unguarded, these constants DO name the real user slot \
+                 — which is exactly why the fixture must redirect them",
+            );
+
+            let (home, guard) = setup_temp_env();
+            let under_fixture = scope.service_name(GITHUB_PAT_MODULE_ID);
+            let legacy_under_fixture = scope.service_name(GITHUB_PAT_LEGACY_MODULE_ID);
+            drop(guard);
+            std::fs::remove_dir_all(&home).ok();
+
+            assert_ne!(
+                under_fixture, production,
+                "setup_temp_env must redirect the PAT slot away from the real \
+                 keychain; without this, `cargo test` deletes the developer's \
+                 stored GitHub PAT",
+            );
+            assert_ne!(
+                legacy_under_fixture, "vct._user_shared_.shared.installer",
+                "the legacy slot delete_keychain() also wipes must be redirected too",
             );
         }
 

@@ -304,7 +304,7 @@ Small fixes and bug reports especially welcome. See [CONTRIBUTING.md](CONTRIBUTI
 ## Links
 
 - [Report Issues](https://github.com/hotak92/vibecoded-orchestrator/issues)
-- [vibecodedtools.it](https://vibecodedtools.it)
+- [vibecodedtools.com](https://vibecodedtools.com)
 
 ---
 

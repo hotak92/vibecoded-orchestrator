@@ -404,9 +404,13 @@ fi
 
 # Gate 3c: ruff (v0.2.94 — the gate MUST match CI). CI's "Python (ruff)" job
 # runs `ruff check vco_lib claude_mcp_servers scripts install.py tests
-# templates`; tests/ (174 findings) and templates/ (93, incl. an F821 that
-# killed a shipped CLI's fallback branch) joined the gate in v0.2.94 once both
-# were swept. ruff walks a directory for *.py ONLY, so templates/'s .sh/.ps1
+# templates VCThelpers .github/scripts`; tests/ (174 findings) and templates/
+# (93, incl. an F821 that killed a shipped CLI's fallback branch) joined the
+# gate in v0.2.94 once both were swept, and VCThelpers/ + .github/scripts/
+# joined in v0.2.95 at 0 findings (review MINOR-5 — VCThelpers IS shipped
+# Python, install.py pre-compiles it; .github/scripts IS gate code, and an
+# F841 had sat there unnoticed). The scope rule lives in ci.yml's comment —
+# read it before adding or dropping a path. ruff walks a directory for *.py ONLY, so templates/'s .sh/.ps1
 # siblings are not linted here — hook-os-parity owns those. The two path lists
 # are pinned equal by tests/test_v0294_ruff_gate_paths_parity.py — edit both or
 # neither. Resolve ruff from the pytest interpreter's venv bin (the version
@@ -421,7 +425,7 @@ elif command -v ruff >/dev/null 2>&1; then
 fi
 if [ -z "$_RUFF_BIN" ]; then
     gate_fail "ruff check (shipped Python + tests + templates)" "ruff not found (venv bin + PATH); CI runs it — install requirements-dev.txt so this gate matches CI"
-elif "$_RUFF_BIN" check vco_lib claude_mcp_servers scripts install.py tests templates > /tmp/preship-ruff.log 2>&1; then
+elif "$_RUFF_BIN" check vco_lib claude_mcp_servers scripts install.py tests templates VCThelpers .github/scripts > /tmp/preship-ruff.log 2>&1; then
     gate_pass "ruff check (shipped Python + tests + templates)"
 else
     gate_fail "ruff check (shipped Python + tests + templates)" "See /tmp/preship-ruff.log"

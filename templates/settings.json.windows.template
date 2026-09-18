@@ -302,12 +302,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/cost-tracker.ps1",
-            "timeout": 5,
-            "async": true
-          },
-          {
-            "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/notify-stop.ps1",
             "timeout": 5,
             "async": true
@@ -375,6 +369,16 @@
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-bash-context-record.ps1",
             "timeout": 5,
             "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-bash-file-sync.ps1",
+            "timeout": 10
           }
         ]
       },

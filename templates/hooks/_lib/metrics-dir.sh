@@ -4,7 +4,7 @@
 #
 # _lib/metrics-dir.sh — the ONE shell-side answer to "where do VCO's metrics
 # live?". Sourced by every hook that reads or writes a `*.jsonl` telemetry
-# stream (cost-tracker, post-compact, stop-failure-notify, kg-update-nudge,
+# stream (post-compact, stop-failure-notify, kg-update-nudge,
 # subagent-stop-reconcile, embedding-failures-surface).
 #
 # Lockstep sibling: `_lib/metrics-dir.ps1`. Change one, change both — they are

@@ -5,6 +5,8 @@
 Routes (each also served with a trailing slash — see :func:`_add_route`)::
 
     GET  /health                    liveness; no auth, no blocking work
+    GET  /usage                     per-chat token accounting, newest row per
+                                    chat (``?session=<id>`` filters to one)
     GET  /v1/models                 union catalog
     POST /v1/messages               proxied, streaming or not
     POST /v1/messages/count_tokens  proxied
@@ -42,12 +44,25 @@ key resolvable) — plus ONE documented exception, a vendor 402/429, which
 becomes a 429 naming the vendor (:mod:`model_router.quota` has the incident
 that bought it).
 
-Bodies are otherwise not read, with one further exception in the same spirit:
-on a vendor route the tool ids in the response are normalised
-(:mod:`model_router.tool_ids`), because a vendor's ``call_…`` id in a
-``server_tool_use`` block kills every LATER Anthropic request in that session
-and the transcript is append-only, so relaying it faithfully is relaying a
-booby trap.
+Bodies are otherwise not EDITED, with two exceptions, both in the same spirit
+and both confined to a vendor route:
+
+* the tool ids in the response are normalised (:mod:`model_router.tool_ids`),
+  because a vendor's ``call_…`` id in a ``server_tool_use`` block kills every
+  LATER Anthropic request in that session and the transcript is append-only,
+  so relaying it faithfully is relaying a booby trap;
+* a ``count_tokens`` answer of zero tokens for a conversation that plainly has
+  some is replaced by the gateway's own estimate and LABELLED with where the
+  number came from (:func:`model_router.usage.guard_count_tokens`). A zero
+  there is worse than having no counter at all, because the client's own
+  fallback would have been positive — the proxy invariant breaking in the one
+  direction this daemon may not allow.
+
+Neither edit is ever made to a first-party response: adding or changing a
+field Anthropic did not send is itself "worse than native".
+
+One body is READ without being edited: the ``usage`` block of every relayed
+answer — see the usage policy below.
 
 Body-size policy: **the gateway never refuses a request for its size.** A
 proxy that answers what the upstream would have served is a failure the user
@@ -73,7 +88,11 @@ repair is skipped; it is a repair, and the request is the point.
 Logging policy: never a body (DEBUG-only for a quota refusal), never a
 credential. ONE line per request in ONE shape —
 ``requested=… route=… forward=… status=… ms=… stream=…`` — where ``requested``
-is what the CLIENT asked for. That field is the one the field incident could
+is what the CLIENT asked for. Every line a relayed request writes then carries
+the turn's token counts in the same five fields,
+``in=… cache_c=… cache_r=… out=… ctx=…``, with a ``-`` for anything the
+response did not report: a zero and a silence are different observations and
+the log is the place that has to keep telling them apart. That field is the one the field incident could
 not answer: the gateway logged only the forwarded name, so a session that
 silently changed models left no evidence of what had been selected.
 
@@ -83,6 +102,20 @@ terminal outcome the log was silent about — and it is the one a user asks
 about ("the gateway is not answering me"). It is logged in the same shape,
 rate-capped per peer (:data:`UNAUTHORISED_LOG_WINDOW_S`) because it is the
 only line a caller WITHOUT the host token can cause.
+
+Usage policy: every 2xx that REPORTS tokens is accounted, per chat, for EVERY
+model — :mod:`model_router.usage` reads the ``usage`` block out of the bytes
+already being relayed and writes one JSONL row. The chat is identified by the
+``x-claude-code-session-id`` header, so two conversations and their subagents
+separate without a body ever being opened for it. That accounting is for
+CONTEXT, never for cost: nothing in this daemon prices a token.
+
+Three consequences are deliberate. A response that reports NO usage (a 204, a
+body in a shape this gateway does not read) gets its access line and no row —
+a row of zeros in a context monitor reads as "this chat is empty", which is
+the one wrong answer that costs the user something. ``count_tokens`` is never
+accounted: it is a question about a conversation, not a turn in one. And a
+non-2xx is logged only, because the tokens a refusal reports are not context.
 """
 
 from __future__ import annotations
@@ -92,6 +125,7 @@ import ipaddress
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Mapping, NamedTuple, Optional
 
 import aiohttp
@@ -99,7 +133,7 @@ from aiohttp import web
 
 from . import __version__
 from .auth import OAuthReader, token_matches
-from .catalog import CatalogService, to_models_response
+from .catalog import CatalogEntry, CatalogService, resolve_window, to_models_response
 from .config import SERVICE_NAME, UPSTREAM_CONNECT_TIMEOUT_S, GatewayConfig
 from .context_table import ContextTableLoader
 from .fileperms import OwnerOnlyState
@@ -112,6 +146,16 @@ from .quota import (
 )
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
+from .usage import (
+    UsageAccumulator,
+    UsageLedger,
+    access_extra,
+    build_record,
+    count_tokens_estimate,
+    guard_count_tokens,
+    note_count_substitution,
+    read_identity,
+)
 from .tool_ids import (
     COMPACT_JSON,
     JSON_BUFFER_LIMIT_BYTES,
@@ -360,7 +404,13 @@ class Gateway:
         self.anthropic = anthropic
         self.oauth = oauth_reader or OAuthReader(config.credentials_file)
         self.keys = key_resolver or VendorKeyResolver(
-            project=config.secret_project, ttl_s=config.key_ttl_s,
+            project=config.secret_project,
+            ttl_s=config.key_ttl_s,
+            # The DAEMON wants its secret scope diagnosed when a key comes
+            # back empty (R5b); an injected resolver keeps the quiet default,
+            # so nothing a test or an embedder builds reaches the hub on its
+            # own. See `VendorKeyResolver.probe_scope`.
+            probe_scope_on_miss=True,
         )
         self.context = ContextTableLoader(config.context_table_file)
         self.token_permissions = token_permissions
@@ -371,6 +421,11 @@ class Gateway:
         self._id_maps: dict[str, BoundedIdMap] = {}
         #: peer -> (when its last 401 line was written, how many since).
         self._unauthorised_seen: dict[str, tuple[float, int]] = {}
+        #: Per-chat token accounting. Built here rather than in ``create_app``
+        #: so a handler reaches it the same way it reaches every other piece
+        #: of shared state, and so a test can swap it on the gateway object.
+        #: It resolves its own file path lazily and never on the request path.
+        self.usage = UsageLedger()
         self.catalog = CatalogService(
             vendors=vendors,
             anthropic=anthropic,
@@ -387,6 +442,12 @@ class Gateway:
             self._session = aiohttp.ClientSession()
 
     async def stop(self) -> None:
+        # Queued ledger appends first: they are scheduled on the loop's
+        # executor and a shutdown that tore the loop down under them would
+        # drop the last rows of the session — the ones a user looking at a
+        # context monitor cares most about. Bounded by the number of requests
+        # still in flight, which at shutdown is none or nearly none.
+        await self.usage.drain()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -482,6 +543,20 @@ class Gateway:
 #: Typed application key (aiohttp warns on bare-string keys since 3.9).
 APP_KEY: web.AppKey[Gateway] = web.AppKey("vct_model_gateway", Gateway)
 
+#: Handle on the one-shot secret-scope probe the DAEMON schedules at startup
+#: (``model_router.__main__._probe_secret_scope_at_startup``). It lives here,
+#: beside :data:`APP_KEY`, for two reasons: every app key this package uses is
+#: typed and declared in ONE home — a bare string raises ``NotAppKeyWarning``
+#: and the gateway's gate set runs warnings as errors — and ``__main__``
+#: deliberately imports nothing heavier than the stdlib at module scope, so it
+#: cannot name a ``web.AppKey`` of its own without breaking ``--version`` on a
+#: half-installed machine. A reference must be held at all: an un-referenced
+#: task can be garbage-collected mid-run and the probe would silently never
+#: happen.
+SCOPE_PROBE_TASK_KEY: "web.AppKey[asyncio.Task]" = web.AppKey(
+    "vct_secret_scope_probe", asyncio.Task,
+)
+
 
 def _add_route(
     app: web.Application,
@@ -524,13 +599,36 @@ async def health_handler(request: web.Request) -> web.Response:
     ``ok`` (bool), ``service``, ``version``, ``port``, ``host``,
     ``catalog_source`` (family -> ``live``/``static``/``unfetched``/
     ``unavailable``),
+    ``catalog_filter`` (``latest``/``all`` — which versions of a family reach
+    the picker), ``catalog_hidden`` (int, how many rows the last catalog build
+    withheld under that filter; ``0`` before the picker has ever opened, which
+    reads the same as "nothing hidden" and correctly so),
     ``context_table_source``, ``context_table_path``, ``oauth_present``
     (bool), ``oauth_state`` (``present``/``expired``/``absent``/
     ``unreadable``), ``oauth_expires_in_s`` (int seconds, negative once past,
     ``null`` when the file states no expiry), ``vendors``,
     ``vendor_keys_cached``,
+    ``secret_scope`` (``project`` — the scope vendor keys resolve in, which is
+    the pin when there is one and this process's working directory when there
+    is not, because that is what the resolver itself falls back to;
+    ``resolvable`` — ``true`` when that scope maps to a hub project id,
+    ``false`` when it does not, ``null`` when nothing has probed it yet, which
+    is a different claim and is reported as one; ``reason`` — why, in key names
+    and paths only. Read from CACHE: the verdict is produced at startup and
+    refreshed on a key miss, never by this route, so a scope probe can never
+    make a liveness check block. It exists because ``vendors`` beside an empty
+    ``vendor_keys_cached`` reads like "no key configured yet", while the actual
+    2026-09-10 state was "this daemon's scope cannot see any key you
+    configure"),
     ``token_file_permissions`` (``owner_only``/``broader``/``unknown``,
-    sampled at startup — probing it here would shell out on Windows).
+    sampled at startup — probing it here would shell out on Windows),
+    ``usage_ledger`` (``path`` — where per-chat token rows land, ``null`` on
+    an install where the metrics home could not be resolved; ``rows_written``,
+    how many rows THIS process has appended; ``last_write_ts``, the ``ts`` of
+    the newest one, ``null`` before the first. Two in-memory counters and a
+    path string that is resolved once and remembered: no file is opened, no
+    directory is created and nothing is probed, which is what lets a liveness
+    probe carry it).
     """
     gateway: Gateway = request.app[APP_KEY]
     oauth = gateway.oauth.read()
@@ -545,6 +643,11 @@ async def health_handler(request: web.Request) -> web.Response:
             "port": gateway.config.port,
             "host": gateway.config.host,
             "catalog_source": gateway.catalog.sources(),
+            # Both read from CACHED state — neither builds a catalog. A
+            # liveness probe that could block on two upstream fetches is the
+            # thing /health exists not to be.
+            "catalog_filter": gateway.config.catalog_filter,
+            "catalog_hidden": gateway.catalog.hidden_count(),
             "context_table_source": table.source,
             "context_table_path": str(table.path) if table.path else None,
             "oauth_present": oauth.present,
@@ -559,7 +662,56 @@ async def health_handler(request: web.Request) -> web.Response:
             "oauth_expires_in_s": _expires_in_s(oauth.expires_at_ms),
             "vendors": sorted(gateway.vendors.keys()),
             "vendor_keys_cached": list(gateway.keys.cached_vendor_ids()),
+            # Cached verdict only — `scope_status` touches no store. The two
+            # fields above say WHICH vendors exist and which have a live key;
+            # this one says whether a key could be found at all.
+            "secret_scope": gateway.keys.scope_status().to_dict(),
             "token_file_permissions": gateway.token_permissions,
+            # Cached counters and a resolved path — no directory is created
+            # and no file is opened, so /health's "never blocks" holds.
+            "usage_ledger": gateway.usage.health(),
+        }
+    )
+
+
+async def usage_handler(request: web.Request) -> web.Response:
+    """Per-chat token accounting: the newest row for every chat seen.
+
+    ``{"sessions": {<session-id>: <row>}, "ledger_path": …, "rows_written": N}``
+    where a row is one :class:`model_router.usage.UsageRecord`.
+    ``?session=<id>`` narrows it to one chat, which is what a monitor watching
+    a single conversation should ask for rather than fetching every chat and
+    discarding all but one.
+
+    Host-token authorised like ``/v1/models`` and ``/v1/messages``, and behind
+    the same loopback middleware: the rows name model ids, chat ids and token
+    counts for every conversation on this machine. ``/health`` is the only
+    unauthenticated route and it deliberately carries counters, not rows.
+
+    Answers from MEMORY. The ledger's map is updated synchronously as each
+    request finishes while the file append is scheduled off the request path,
+    so a poll immediately after a turn sees that turn — the ``rows_written``
+    counter beside it is the one that lags, and it says what it means: rows
+    that have reached the FILE.
+
+    A chat that sent no ``x-claude-code-session-id`` header is absent here and
+    present in the file: its tokens are real, but "no chat" is not a key, and
+    bucketing every such request under one synthetic id would merge unrelated
+    callers into a conversation that never happened.
+    """
+    gateway: Gateway = request.app[APP_KEY]
+    started = time.monotonic()
+    if not gateway.authorised(request):
+        _log_unauthorised(gateway, request, started=started)
+        return _unauthorised()
+    only = request.query.get("session") or None
+    ledger = gateway.usage
+    path = ledger.path
+    return web.json_response(
+        {
+            "sessions": ledger.sessions(only),
+            "ledger_path": str(path) if path is not None else None,
+            "rows_written": ledger.rows_written,
         }
     )
 
@@ -575,20 +727,143 @@ async def models_handler(request: web.Request) -> web.Response:
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
     table = gateway.context.current()
-    entries, sources = await gateway.catalog.union(
-        advertise_1m=table.advertise_1m,
+    catalog = await gateway.catalog.union(
+        table=table,
+        catalog_filter=gateway.config.catalog_filter,
     )
     logger.info(
-        "model-gateway: /v1/models -> %d entries (%s)",
-        len(entries),
-        ", ".join(f"{k}={v}" for k, v in sorted(sources.items())),
+        "model-gateway: /v1/models -> %d entries (%s)%s",
+        len(catalog.entries),
+        ", ".join(f"{k}={v}" for k, v in sorted(catalog.sources.items())),
+        # Named in the SAME line as the counts, because "the picker is short"
+        # and "the gateway hid some rows" are the same observation and
+        # reading them from two places is how they get blamed on each other.
+        (
+            f", {len(catalog.hidden)} hidden by "
+            f"catalog={gateway.config.catalog_filter}"
+            if catalog.hidden else ""
+        ),
     )
-    return web.json_response(to_models_response(entries, sources))
+    return web.json_response(
+        to_models_response(catalog.entries, catalog.sources, catalog.hidden),
+    )
+
+
+#: The one route that is a QUESTION about a conversation rather than a turn
+#: in it. Named once, because two things key off it — the usage ledger skips
+#: it, and the vendor zero-guard fires only on it — and a second spelling is
+#: how those two would drift apart.
+COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
+
+
+def _canonical_path(request: web.Request) -> str:
+    """The request path without the trailing slash a lenient client may send."""
+    return request.path.rstrip("/") or request.path
+
+
+@dataclass(frozen=True)
+class RequestFacts:
+    """What the handler learned that the RELAY needs after the fact.
+
+    Assembled once in :func:`messages_handler` and carried into
+    :func:`_proxy`, because both things in here are read out of the REQUEST
+    (its headers, its body) and acted on when the RESPONSE ends — and a relay
+    that had to re-derive them would be re-reading a body it has already
+    forwarded.
+
+    Frozen: these are observations of one request, and a mutable carrier is
+    how the second request in a keep-alive connection ends up labelled with
+    the first one's chat.
+    """
+
+    #: ``x-claude-code-session-id`` — the chat. ``None`` when the client sent
+    #: none (curl, an SDK, a probe), which is recorded rather than invented.
+    session: Optional[str]
+    #: ``x-claude-code-agent-id`` — present only on a SUBAGENT's requests.
+    agent: Optional[str]
+    #: ``x-claude-code-parent-agent-id`` — present on a nested agent's.
+    parent_agent: Optional[str]
+    #: This request is :data:`COUNT_TOKENS_PATH`.
+    count_tokens: bool
+    #: The gateway's own bytes/4 floor over the client's ``messages`` +
+    #: ``system``, for the vendor zero-guard. ``None`` when there is nothing
+    #: to count, or when the body was never parsed (the over-buffer path).
+    count_estimate: Optional[int]
 
 
 def _route_label(decision: Route) -> str:
     """``anthropic`` or ``vendor:<id>`` — the field the access log turns on."""
     return "anthropic" if decision.is_anthropic else f"vendor:{decision.family_id}"
+
+
+def _actual_window(
+    gateway: "Gateway", requested: str,
+) -> "tuple[Optional[int], str]":
+    """The REAL window of ``requested``, and which step of the resolver said so.
+
+    Routed through :func:`model_router.catalog.resolve_window` rather than
+    re-reading the table here, so a tombstone, a damaged row and the
+    positive-integer rule all mean the same thing on this path as they do in
+    the picker.
+
+    The entry is SYNTHETIC — id only — which confines the answer to the
+    resolver's first two steps: the tombstone check and the table. That is
+    deliberate. The upstream and family-floor steps need a built catalog, and
+    building one can fetch two upstreams; a request path that could do that
+    would put a vendor's outage inside every user turn. A model the table does
+    not name therefore reads ``unknown`` and the row's ``pct_actual`` is
+    ``null``, which is the honest answer rather than a guessed one.
+    """
+    table = gateway.context.current()
+    entry = CatalogEntry(id=requested, display_name=requested)
+    resolution = resolve_window(entry, table=table, family_floor=None)
+    return resolution.window, resolution.source
+
+
+def _submit_usage(
+    gateway: "Gateway",
+    decision: Route,
+    facts: Optional[RequestFacts],
+    *,
+    requested: str,
+    route: str,
+    status: int,
+    stream: bool,
+    totals: Mapping[str, int],
+    usage_complete: bool,
+) -> None:
+    """Write one ledger row for a finished request, or decline to.
+
+    Declines in three cases, each for its own reason (the module docstring's
+    usage policy states them together): a ``count_tokens`` call, which is a
+    question about a conversation and not a turn in one; a non-2xx, whose
+    numbers are not context; and a 2xx that reported no usage at all, because
+    a row of zeros in a context monitor reads as "this chat is empty".
+    """
+    if facts is None or facts.count_tokens:
+        return
+    if not 200 <= status < 300:
+        return
+    window_actual, window_source = _actual_window(gateway, requested)
+    record = build_record(
+        session=facts.session,
+        agent=facts.agent,
+        parent_agent=facts.parent_agent,
+        requested=requested,
+        route=route,
+        forward=decision.forward_model,
+        stream=stream,
+        status=status,
+        totals=totals,
+        usage_complete=usage_complete,
+        window_actual=window_actual,
+        window_source=window_source,
+    )
+    try:
+        loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover — handlers always have a loop
+        loop = None
+    gateway.usage.submit(record, loop=loop)
 
 
 def _access_line(
@@ -1072,6 +1347,25 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
         )
 
+    # Everything the RELAY will need about this request once the RESPONSE
+    # ends. Assembled here because this is the last point at which both the
+    # client's headers and its parsed body are in hand.
+    session, agent, parent_agent = read_identity(request.headers)
+    is_count_tokens = _canonical_path(request) == COUNT_TOKENS_PATH
+    facts = RequestFacts(
+        session=session,
+        agent=agent,
+        parent_agent=parent_agent,
+        count_tokens=is_count_tokens,
+        # Only a VENDOR count_tokens can need it, and computing it otherwise
+        # would serialise a whole conversation for an answer nobody reads.
+        count_estimate=(
+            count_tokens_estimate(payload)
+            if is_count_tokens and not decision.is_anthropic
+            else None
+        ),
+    )
+
     headers = gateway.forward_headers(request)
     # ``None`` on the over-buffer path — there is no parsed body to rewrite,
     # and every rewrite below is guarded by that rather than by re-testing the
@@ -1196,8 +1490,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
 
     # Canonical path, i.e. the trailing slash a lenient client may have sent
     # is not passed upstream. Query string IS passed through untouched.
-    canonical_path = request.path.rstrip("/") or request.path
-    url = f"{decision.upstream}{canonical_path}"
+    url = f"{decision.upstream}{_canonical_path(request)}"
     if request.query_string:
         url = f"{url}?{request.query_string}"
 
@@ -1212,6 +1505,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         stream_requested=stream_requested,
         started=started,
         note=note,
+        facts=facts,
     )
 
 
@@ -1256,6 +1550,7 @@ async def _proxy(
     started: Optional[float] = None,
     note: str = "",
     allow_oauth_retry: bool = True,
+    facts: Optional[RequestFacts] = None,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
 
@@ -1277,6 +1572,14 @@ async def _proxy(
     deliberately dropped: there is no longer a client to deliver it to, and
     writing to a closed transport would replace a routine "user hit Esc" with
     an exception in the log.
+
+    ``facts`` carries the chat id and the ``count_tokens`` flags the ledger
+    and the zero-guard need; ``None`` means "do not account this request",
+    which is what an internal caller without a client request gets.
+    Accounting reads a COPY of the bytes already going to the client — after
+    the rewriter, so it observes exactly what the client observes — and every
+    entry point is behind :func:`_guarded`, so a defect in it abandons the
+    accounting and not the stream.
     """
     started = time.monotonic() if started is None else started
     route_label = _route_label(decision)
@@ -1285,14 +1588,35 @@ async def _proxy(
     #: at any point of the relay while the line is written at the end — and
     #: one request must still mean one line.
     rewrite_failed = False
+    #: Reads the ``usage`` block out of the relayed bytes. ``None`` until the
+    #: response's content type says whether it is a stream, and ``None`` again
+    #: the moment a :func:`_guarded` call abandons it.
+    accumulator: Optional[UsageAccumulator] = None
 
     def access(status: int, *, stream: bool, extra: str = "") -> None:
+        nonlocal accumulator
         parts = [part for part in (extra, note) if part]
         # Once, however many passes were abandoned: the handler may already
         # have put it in `note` for a REQUEST-side failure, and one line
         # saying the same thing twice reads as two events.
         if rewrite_failed and "note=rewrite_failed" not in note:
             parts.append("note=rewrite_failed")
+        # THE terminal point of this request, so it is also where the
+        # accounting is closed: one access line and at most one ledger row,
+        # written from the same place, can never disagree about how a request
+        # ended. A truncated stream and a client that walked away both arrive
+        # here, and both are real token spends.
+        totals: Mapping[str, int] = {}
+        seen = False
+        complete = False
+        if accumulator is not None:
+            if _guarded(accumulator.close, what="usage accounting") is _ABANDON:
+                accumulator = None
+            else:
+                totals = accumulator.totals()
+                seen = accumulator.saw_anything
+                complete = accumulator.complete
+        parts.append(access_extra(totals, seen=seen))
         logger.info(
             _access_line(
                 requested=requested_model or decision.forward_model,
@@ -1304,6 +1628,25 @@ async def _proxy(
                 extra=" ".join(parts),
             )
         )
+        if seen:
+            # A lambda because ``_guarded`` forwards positional arguments
+            # only, and every argument here is keyword-named on purpose:
+            # ``status``/``stream``/``totals`` are three values a positional
+            # call would be free to transpose.
+            _guarded(
+                lambda: _submit_usage(
+                    gateway,
+                    decision,
+                    facts,
+                    requested=requested_model or decision.forward_model,
+                    route=route_label,
+                    status=status,
+                    stream=stream,
+                    totals=totals,
+                    usage_complete=complete,
+                ),
+                what="usage ledger",
+            )
 
     try:
         upstream_ctx = gateway.session.post(
@@ -1365,6 +1708,13 @@ async def _proxy(
             content_type = upstream.headers.get("Content-Type", "application/json")
             is_stream = _STREAM_CHUNK_HINT in content_type
 
+            # Built here, where the framing is finally known: an SSE body is
+            # read event by event, a JSON one is buffered (bounded) and parsed
+            # at the end. Not built at all when ``facts`` says this request is
+            # not accounted — the work is small, but so is the reason to do it.
+            if facts is not None and not facts.count_tokens:
+                accumulator = UsageAccumulator(stream=is_stream)
+
             if (
                 vendor is not None
                 and not is_stream
@@ -1372,7 +1722,15 @@ async def _proxy(
                 and "json" in content_type.lower()
             ):
                 return await _relay_vendor_json(
-                    request, gateway, vendor, upstream, relay, access,
+                    request,
+                    gateway,
+                    vendor,
+                    upstream,
+                    relay,
+                    access,
+                    decision=decision,
+                    facts=facts,
+                    accumulator=accumulator,
                 )
 
             rewriter = (
@@ -1458,6 +1816,14 @@ async def _proxy(
                             rewriter = None
                             rewrite_failed = True
                     if out:
+                        # AFTER the rewrite and BEFORE the write: the
+                        # accumulator must see exactly the bytes the client
+                        # sees, and it must not be able to delay them. It
+                        # returns nothing — these bytes are already committed.
+                        if accumulator is not None and _guarded(
+                            accumulator.feed, out, what="usage accounting",
+                        ) is _ABANDON:
+                            accumulator = None
                         if not await send(out):
                             # The CLIENT went away (closed a tab, hit Esc). Routine,
                             # not an error, and NOT something to abort over: there
@@ -1476,6 +1842,10 @@ async def _proxy(
                         tail = rewriter.take_pending()
                         rewrite_failed = True
                     if tail:
+                        if accumulator is not None and _guarded(
+                            accumulator.feed, tail, what="usage accounting",
+                        ) is _ABANDON:
+                            accumulator = None
                         if not await send(tail):
                             access(
                                 upstream.status,
@@ -1598,8 +1968,9 @@ async def _quota_response(
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
-    The ONE documented exception to verbatim relay (see
-    :mod:`model_router.quota` for the incident). The upstream body is read —
+    The ONE documented exception to relaying a vendor's ERROR verbatim, and
+    the only place a status is rewritten (see :mod:`model_router.quota` for
+    the incident). The upstream body is read —
     bounded — for a reset hint and then logged at DEBUG, so support can still
     see the vendor's own words without them reaching a user who would read
     them as an Anthropic limit.
@@ -1693,6 +2064,10 @@ async def _relay_vendor_json(
     upstream: aiohttp.ClientResponse,
     relay: dict[str, str],
     access: Callable[..., None],
+    *,
+    decision: Optional[Route] = None,
+    facts: Optional[RequestFacts] = None,
+    accumulator: Optional[UsageAccumulator] = None,
 ) -> web.StreamResponse:
     """Buffer a vendor's JSON response, normalise its tool ids, relay it.
 
@@ -1707,6 +2082,16 @@ async def _relay_vendor_json(
     ``read(limit + 1)`` because that call reads ONE chunk, not ``limit + 1``
     bytes: a response split across TCP segments came back truncated, which is
     a relayed half-document, not a missed rewrite.
+
+    Two things ride on the body already being held here, and neither is worth
+    a second copy of it:
+
+    * the ``usage`` block is handed to ``accumulator`` rather than re-buffered;
+    * a ``count_tokens`` answer is checked for the vendor zero (see
+      :func:`model_router.usage.guard_count_tokens`) and labelled with where
+      its number came from. That label is added on the VENDOR route only —
+      decorating a first-party response with a field Anthropic never sent is
+      the "worse than native" this gateway exists not to be.
     """
     raw, overflowed = await _buffer_bounded(
         upstream.content, JSON_BUFFER_LIMIT_BYTES,
@@ -1734,6 +2119,13 @@ async def _relay_vendor_json(
         payload = json.loads(raw) if raw else None
     except ValueError:
         payload = None
+    if accumulator is not None:
+        # The bytes are already in hand, so this is a parse and not a copy.
+        _guarded(accumulator.observe_body, raw, what="usage accounting")
+    #: The body as it currently stands, through both edits below. ``out`` is
+    #: only re-serialised when this object stops being the one ``raw``
+    #: decoded to, which is what keeps an untouched response byte-identical.
+    body_obj: Any = payload
     normalised = _guarded(
         normalise_vendor_response,
         payload,
@@ -1745,14 +2137,39 @@ async def _relay_vendor_json(
         patched, stats = normalised
         if stats.changed:
             _log_repair(vendor.vendor_id, stats)
+            body_obj = patched
             out = json.dumps(patched, **COMPACT_JSON).encode("utf-8")
+    note = " note=rewrite_failed" if failed else ""
+    if (
+        facts is not None
+        and facts.count_tokens
+        and 200 <= upstream.status < 300
+    ):
+        guarded = _guarded(
+            guard_count_tokens,
+            body_obj,
+            facts.count_estimate,
+            what="count_tokens zero-guard",
+        )
+        if guarded is not _ABANDON:
+            labelled, substituted = guarded
+            if labelled is not body_obj:
+                body_obj = labelled
+                out = json.dumps(labelled, **COMPACT_JSON).encode("utf-8")
+            if substituted:
+                note = f"{note} note=count_tokens_estimated"
+                _guarded(
+                    note_count_substitution,
+                    vendor.vendor_id,
+                    decision.forward_model if decision is not None else "-",
+                    what="count_tokens substitution notice",
+                )
     # Relaying the vendor's own bytes is the fallback: a cosmetic id costs
     # the NEXT request a repair, a 500 costs this one entirely.
-    extra = f"bytes={len(out)}"
     access(
         upstream.status,
         stream=False,
-        extra=f"{extra} note=rewrite_failed" if failed else extra,
+        extra=f"bytes={len(out)}{note}",
     )
     return web.Response(status=upstream.status, headers=relay, body=out)
 
@@ -1778,7 +2195,8 @@ async def not_found_handler(request: web.Request) -> web.Response:
         404,
         "not_found_error",
         f"the model gateway has no route for {request.path!r}. It serves "
-        "/health, /v1/models, /v1/messages and /v1/messages/count_tokens.",
+        "/health, /usage, /v1/models, /v1/messages and "
+        "/v1/messages/count_tokens.",
     )
 
 
@@ -1807,6 +2225,7 @@ def create_app(
     app[APP_KEY] = gateway
 
     _add_route(app, "GET", "/health", health_handler, name="health")
+    _add_route(app, "GET", "/usage", usage_handler, name="usage")
     _add_route(app, "HEAD", "/api/hello", hello_handler, name="hello_head")
     _add_route(app, "GET", "/api/hello", hello_handler, name="hello_get")
     _add_route(app, "GET", "/v1/models", models_handler, name="models")
@@ -1833,10 +2252,14 @@ def create_app(
 
 __all__ = [
     "APP_KEY",
+    "COUNT_TOKENS_PATH",
     "RETRYABLE_HEADERS",
     "REWRITE_BUFFER_NOTE",
+    "SCOPE_PROBE_TASK_KEY",
     "UNBOUNDED_CLIENT_MAX_SIZE",
     "Gateway",
+    "RequestFacts",
     "create_app",
     "loopback_only_middleware",
+    "usage_handler",
 ]

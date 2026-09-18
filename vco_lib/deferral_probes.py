@@ -42,6 +42,7 @@ import platform
 import re
 import shutil
 import sys
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -632,7 +633,126 @@ def code_embed_image_still_stale(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
+    """``gateway_registered_but_unrunnable`` — can the registration run YET?
+
+    The SAME reading :func:`vco_lib.gateway_ensure.gateway_status` returns, so
+    the probe that clears the entry and the two sites that emit it (the
+    SessionStart ensure and the doctor) cannot disagree. It reads the argv back
+    out of the INSTALLED artefact and runs it with ``--version``; nothing is
+    started and nothing is written.
+
+    Returns:
+        True  — still registered, still unable to run.
+        False — provably over: either the registration now runs, or the
+                gateway is running, or it is no longer registered at all
+                (an entry about a registration that does not exist describes
+                nothing).
+        None  — never reached today; kept as the honest answer if a future
+                state cannot be classified, because "could not look" must not
+                read as "fixed".
+    """
+    from vco_lib import gateway_ensure
+
+    try:
+        found = gateway_ensure.gateway_status()
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if found.state is gateway_ensure.GatewayState.REGISTERED_BUT_UNRUNNABLE:
+        return True
+    if found.state in (
+        gateway_ensure.GatewayState.NOT_REGISTERED,
+        gateway_ensure.GatewayState.RUNNING,
+        gateway_ensure.GatewayState.REGISTERED_NOT_RUNNING,
+        gateway_ensure.GatewayState.STARTED,
+    ):
+        return False
+    return None
+
+
+#: Socket timeout for the hub health read. Mirrors the timeout
+#: ``install.py::_probe_vct_hub_health`` uses — the two must stay in step
+#: because they read the SAME endpoint (see :func:`hub_answers_health`).
+_HUB_HEALTH_TIMEOUT_SECONDS = 0.5
+
+
+def hub_answers_health() -> Optional[bool]:
+    """Does the hub answer ``/api/v1/health`` on the resolved port?
+
+    The port comes from the ONE resolution chain
+    (``vco_lib.access_resolver._hub_port``: ``$VCT_HUB_PORT`` →
+    ``<state dir>/hub.port`` → 7700) — this module does not re-derive it.
+    The GET is the vco_lib twin of ``install.py::_probe_vct_hub_health``
+    (same endpoint, same intentionally-AUTH-FREE request, same
+    ``status < 400`` bar); install.py's copy is unreachable from
+    ``vco_lib`` and cannot be shared without importing the 24k-line
+    installer, so the contract is pinned by name here and by behaviour
+    tests in ``tests/test_v0295_deferral_reconcile_hub_restart.py``.
+
+    Returns:
+        True  — the hub answered with status < 400.
+        False — the port answered with an error status, or nothing
+                answered at all (refused / timeout / HTTP error).
+        None  — the port itself could not be resolved (the check could not
+                run; never read as "hub down" NOR as "hub up").
+    """
+    try:
+        # Same-package seam on purpose: `_hub_port` is the one home of the
+        # env > state-file > default chain (`access_resolver.py`); a second
+        # copy here would be the fourth port resolver in the tree.
+        from vco_lib.access_resolver import _hub_port
+
+        port = _hub_port()
+    except Exception:  # noqa: BLE001 — no port is not a verdict
+        return None
+    url = f"http://127.0.0.1:{port}/api/v1/health"
+    try:
+        with urllib.request.urlopen(
+            url, timeout=_HUB_HEALTH_TIMEOUT_SECONDS
+        ) as resp:
+            return resp.status < 400
+    except Exception:  # noqa: BLE001 — refused/timeout/HTTP-error = not answering
+        return False
+
+
+def hub_back_after_restart_failure(ctx: ProbeContext) -> Optional[bool]:
+    """``hub_restart_failed_after_abort`` — is the hub back up?
+
+    The entry records a fact about the PAST: the abort-path hub restart's
+    health poll failed (``installer.rs`` emits it only after a conflict-aborted
+    update left the hub not answering within 30 s). The STATE question —
+    the only one a clear may key on (R26) — is whether that still describes
+    the machine: does the hub answer NOW?
+
+    The pre-v0.2.95 resolver lived only in ``install.py``'s re-probe pass and
+    AND-ed a hub-sidecar version comparison, a conjunction that could never
+    fire there: the pass ran BEFORE both the dist-binary refresh and the hub
+    restart, i.e. before the executor outcomes it wanted to read — the row
+    survived two further updates and a ``vco doctor`` run in the field. A
+    caught-up BINARY is anyway not what the entry claims: it claims the hub
+    did not come back. The hub answering ``/api/v1/health`` is positive
+    evidence that it has (via :func:`hub_answers_health`, so the probe and
+    every other health reader share one reading).
+
+    Returns:
+        True  — the hub is not answering → the recorded failure still
+                stands. KEEP.
+        False — the hub answered → the hub is back; the abort-time failure
+                no longer describes the machine. CLEAR.
+        None  — could not look (port resolution failed). KEEP.
+    """
+    try:
+        answered = hub_answers_health()
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if answered is None:
+        return None
+    return not answered
+
+
 PROBES: dict[str, ProbeFn] = {
+    "gateway_exec_still_unrunnable": gateway_exec_still_unrunnable,
+    "hub_back_after_restart_failure": hub_back_after_restart_failure,
     "orchestrator_sidecars_still_present": orchestrator_sidecars_still_present,
     "launcher_dist_still_dirty": launcher_dist_still_dirty,
     "launcher_binary_stale_still_applies": launcher_binary_stale_still_applies,
@@ -1203,6 +1323,8 @@ __all__ = [
     "probe_status_sentence",
     "record_owned_record_expiry",
     "disk_space_still_low",
+    "hub_answers_health",
+    "hub_back_after_restart_failure",
     "evaluate",
     "launcher_binary_stale_still_applies",
     "launcher_dist_still_dirty",

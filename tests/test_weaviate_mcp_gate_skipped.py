@@ -13,8 +13,20 @@ disabled. SB1 closes the visibility hole by emitting two surfaces:
      (user-facing; deduped per session).
 
 Per the user's 2026-06-08 Q1 directive, the gate's empty-PID branch
-still ALLOWS the write — silent-allow is the contract. The surfaces
-are visibility-only; no stderr WARNING by default.
+still ALLOWS the write. The 2026-09-14 ruling REVISED the other half of
+that directive: the allow stands, the SILENCE does not. So "silent-allow
+is the contract" is no longer true of this branch, and the assertions
+below say nothing about silence — they pin the two SB1 surfaces, which
+are unchanged.
+
+Since v0.2.95 (R6), a write from a folder VCO never installed into
+(no ``VCT_PROJECT_ID`` AND no ``.claude/.vco-manifest.json``) additionally
+carries a ``warning`` field on the tool result and logs one stderr WARNING
+per session. Its own suite is ``tests/test_v0295_mcp_unregistered_folder_
+warning.py``; the wording has one home beside the fixture-class guard's
+refusal text (``vco_lib.fixture_class_guard``). A folder that HAS the
+manifest but no id is not that case — it gets these two surfaces and no
+R6 warning.
 """
 
 from __future__ import annotations

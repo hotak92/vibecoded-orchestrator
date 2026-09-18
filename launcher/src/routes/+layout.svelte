@@ -69,6 +69,10 @@
   // bundle + post-bundle) finishes in the background while the user has
   // already navigated to the new project. Adapter feeds the shared
   // OperationProgressBanner from the project-setup store singleton.
+  //
+  // v0.2.95 R7 (field report, repeat): it renders in `.shell-banners`, BELOW
+  // the MenuBar — see the markup note there. It used to sit above MenuBar,
+  // which put it at the window's top edge, glued to the titlebar.
   import ProjectSetupBanner from '$lib/components/ProjectSetupBanner.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): one-time legacy-collection notice. Auto-
   // shown when (a) Weaviate has at least one ClaudeOrchestrator_<Suffix>
@@ -357,11 +361,23 @@
          above MenuBar so it's the first thing the user sees regardless
          of which page they're on when install.py finishes. -->
     <LauncherRestartBanner />
-    <!-- Defect B (v0.2.68): async project-setup progress. Survives the
-         post-add route change because it lives in the shell, not the
-         (now-closed) New Project modal. -->
-    <ProjectSetupBanner />
     <MenuBar />
+    <!-- v0.2.95 R7 (field report, repeat): the shell's BELOW-HEADER banner
+         stack. Long-running background operations report here, in the same
+         visual family as the project page's KG-sync / code-graph banners —
+         NOT pinned above the chrome where the previous mount put the setup
+         progress bar (top edge of the window, glued to the titlebar,
+         detached from the content it describes). `.menu-bar` is the
+         window's drag region, so anything rendered before it reads as part
+         of the titlebar.
+         Banners stack in a flex column and never overlap; add future
+         global operation banners here rather than above MenuBar.
+         Defect B (v0.2.68): ProjectSetupBanner survives the post-add route
+         change because it lives in the shell, not in the (now-closed) New
+         Project modal. -->
+    <div class="shell-banners">
+      <ProjectSetupBanner />
+    </div>
     <div class="app-body">
       <Sidebar />
       <main class="main-content" bind:this={mainEl}>
@@ -480,6 +496,16 @@
     flex-direction: column;
     height: 100vh;
     overflow: hidden;
+  }
+
+  /* Below-header banner stack. `flex-shrink: 0` so a banner is never
+     squeezed to nothing by the scrolling body, and a column so several
+     banners stack instead of overlapping. Empty (zero-height) when no
+     operation is in flight — it costs nothing when idle. */
+  .shell-banners {
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
   }
 
   .app-body {

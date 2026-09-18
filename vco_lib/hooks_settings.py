@@ -16,14 +16,14 @@ module is that edit, and it is deliberately the ONLY implementation:
 
 * **Why Python, not a second Rust JSON writer (A>B>C, A-leg).** The
   settings.json *shape* is already owned Python-side —
-  :func:`vco_lib.project_init._merge_settings_template_for_bundle` and its
-  ``_smart_merge_for_bundle`` / ``_merge_hooks_for_bundle`` helpers are
+  :func:`vco_lib.project_init._merge_settings_template_for_bundle` and the
+  merge algorithm it delegates to (:mod:`vco_lib.settings_merge`) are
   what create and update the file on every install and bundle update, and
   the canonical on-disk form (``json.dumps(..., indent=2)`` + trailing
   newline) is *their* output. A Rust writer would be a second home for
-  that shape knowledge, and the drift that produces is already documented
-  in :func:`vco_lib.project_init._merge_settings_template_for_bundle` for the install.py /
-  project_init.py pair. The launcher calls this module as
+  that shape knowledge, and a second home for this exact shape has already
+  had to be closed once: install.py carried a mirror of the merge until
+  v0.2.85 (D2) routed the root install through the one bundle engine. The launcher calls this module as
   ``python -m vco_lib.hooks_settings`` over the RT-4 interpreter ladder
   (``python_resolve::resolve_python_for_vco_lib``) — the same shape
   ``projects_v2.rs`` already uses for ``vco_lib.project_init
@@ -31,8 +31,9 @@ module is that edit, and it is deliberately the ONLY implementation:
   ms-scale path, so the subprocess cost is irrelevant and the A-leg
   applies.
 * The invoked-script tokenizer is shared with
-  :func:`vco_lib.project_init._vco_hook_script_identity` (which now
-  delegates here) rather than re-derived — same rule.
+  :func:`vco_lib.hook_retirements.vco_hook_script_identity` (which delegates
+  here, and which ``project_init`` re-exports under its historical private
+  name ``_vco_hook_script_identity``) rather than re-derived — same rule.
 
 Operations
 ==========
@@ -740,7 +741,8 @@ def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
 
     Raises:
         HooksSettingsError: ``parked_entry_invalid`` when the stored blob
-            is not a restorable parked entry.
+            is not a restorable parked entry; ``hook_retired`` when it names a
+            registration :mod:`vco_lib.hook_retirements` declares dead.
     """
     if not isinstance(parked, dict):
         raise HooksSettingsError(
@@ -762,6 +764,45 @@ def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
     raw_matcher = parked.get("matcher")
     matcher = raw_matcher if isinstance(raw_matcher, str) else ""
     command = item.get("command")
+
+    # F7 (v0.2.95). A parked entry OUTLIVES the thing it restores.
+    #
+    # Disabling a hook from the launcher REMOVES its settings.json entry and
+    # parks the removed bytes in `project_hooks.disabled_entry_json`. The
+    # bundle scrub (`hook_retirements.scrub_retired_registrations`) then walks
+    # settings.json on every update — and a parked entry is BY DEFINITION not
+    # in settings.json, so the scrub cannot see it. A hook the user disabled
+    # before its retirement therefore keeps a row that says "Disabled
+    # (restorable)", and Enable would put a dead registration back: the script
+    # it invokes was deleted by the same update that retired it.
+    #
+    # The refusal lives HERE, in the restore itself, because this is the one
+    # place every restorer passes through — the launcher's Hooks tab, the
+    # hub's `PATCH /hooks/{id}` routes, and the shipped `vco hooks enable`
+    # CLI. Putting it in any one caller would leave the other two able to
+    # write the dead entry back.
+    #
+    # Refusal, not silent removal: the parked bytes are the user's, and a
+    # click that produces nothing with no reason is the placebo this whole
+    # subsystem was built to end. The message names the replacement.
+    if isinstance(command, str) and command:
+        # Imported lazily: `hook_retirements` imports `invoked_script_tokens`
+        # from THIS module, so a module-level import here would be a cycle.
+        from vco_lib.hook_retirements import (
+            match_retired_registration,
+            vco_hook_script_identity,
+        )
+
+        retired = match_retired_registration(
+            event, command, hook_identity=vco_hook_script_identity(command)
+        )
+        if retired is not None:
+            raise HooksSettingsError(
+                "hook_retired",
+                f"`{command}` was retired in {retired.retired_in} and will not be "
+                f"restored: {retired.reason}. It is replaced by "
+                f"{retired.audit_replacement}. Nothing was written.",
+            )
 
     # Idempotency FIRST, before any structural edit: the natural key is
     # (event, matcher, command), so a double-click — or a re-enable after

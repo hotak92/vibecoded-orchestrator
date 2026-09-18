@@ -62,6 +62,9 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
 )
 import install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
+from tests.common.scratch_dirs import (  # noqa: E402
+    scratch_state_dir as _scratch_state_dir,
+)
 
 
 # ─── Stub Weaviate HTTP server (schema + aggregate) ──────────────────────
@@ -221,11 +224,7 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
     """v0.2.40 W40-A — second-pass cross-prefix adoption."""
 
     def setUp(self):
-        self._tmp = (
-            Path(__file__).resolve().parent
-            / f"_tmp_cross_prefix_{os.getpid()}_{id(self)}"
-        )
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._tmp = _scratch_state_dir("cross_prefix")
         self._db_path = self._tmp / "launcher.db"
         self._env_patch = mock.patch.dict(
             os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False

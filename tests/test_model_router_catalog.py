@@ -20,8 +20,41 @@ import unittest
 from pathlib import Path
 
 from model_router import catalog as cat
-from model_router.context_table import load_seed
+from model_router.context_table import ContextTable, ModelContext, load_seed
 from model_router.vendors import ANTHROPIC_FAMILY, VENDORS, AnthropicFamily, Vendor
+
+
+def table_of(
+    windows: dict[str, int] | None = None,
+    *,
+    tombstones: tuple[str, ...] = (),
+) -> ContextTable:
+    """A context table from ``{model_id: context_window}``.
+
+    Cited, because an uncited row is dropped by the real parser and a fixture
+    that skipped the citation would test a code path no export can reach.
+    """
+    return ContextTable(
+        rows={
+            model_id: ModelContext(
+                model_id=model_id,
+                vendor="acme",
+                context_window=window,
+                max_output=window // 8,
+                window_1m=window >= cat.ONE_M_WINDOW,
+                source="https://docs.acme.example/cited",
+            )
+            for model_id, window in (windows or {}).items()
+        },
+        source="test",
+        path=None,
+        tombstones=frozenset(tombstones),
+    )
+
+
+#: No row for any id: every window resolves from upstream, the family floor,
+#: or not at all. The state a machine with no export and no seed row is in.
+NO_TABLE = table_of()
 
 ACME = Vendor(
     vendor_id="acme",
@@ -144,17 +177,20 @@ class SourceReportingTests(unittest.IsolatedAsyncioTestCase):
             },
             clock=_Clock(),
         )
-        _, sources = await service.union(advertise_1m=lambda _id: False)
-        self.assertEqual(sources, {"anthropic": cat.SOURCE_LIVE, "acme": cat.SOURCE_LIVE})
+        catalog = await service.union(table=NO_TABLE)
+        self.assertEqual(
+            catalog.sources,
+            {"anthropic": cat.SOURCE_LIVE, "acme": cat.SOURCE_LIVE},
+        )
 
     async def test_a_failed_fetch_reports_static_not_live(self) -> None:
         """A family served from the snapshot must never claim to be live."""
         service = _service(responses={}, clock=_Clock())
-        _, sources = await service.union(advertise_1m=lambda _id: False)
+        catalog = await service.union(table=NO_TABLE)
         # 'acme' has no snapshot block, so it is genuinely unavailable; the
         # first-party family does, so it falls back.
-        self.assertEqual(sources["anthropic"], cat.SOURCE_STATIC)
-        self.assertEqual(sources["acme"], cat.SOURCE_EMPTY)
+        self.assertEqual(catalog.sources["anthropic"], cat.SOURCE_STATIC)
+        self.assertEqual(catalog.sources["acme"], cat.SOURCE_EMPTY)
 
     async def test_no_oauth_token_means_no_first_party_fetch_at_all(self) -> None:
         calls: list[str] = []
@@ -162,7 +198,7 @@ class SourceReportingTests(unittest.IsolatedAsyncioTestCase):
             responses={"first.example": {"data": [{"id": "claude-x"}]}},
             clock=_Clock(), token=None, calls=calls,
         )
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         self.assertFalse([c for c in calls if "first.example" in c])
 
     async def test_no_vendor_key_means_no_vendor_fetch_at_all(self) -> None:
@@ -171,7 +207,7 @@ class SourceReportingTests(unittest.IsolatedAsyncioTestCase):
             responses={"acme.example": {"data": [{"id": "acme-1"}]}},
             clock=_Clock(), key=None, calls=calls,
         )
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         self.assertFalse([c for c in calls if "acme.example" in c])
 
 
@@ -183,13 +219,13 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
             responses={"acme.example": {"data": [{"id": "acme-1"}]}},
             clock=clock, live_ttl_s=600, calls=calls,
         )
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         vendor_calls = len([c for c in calls if "acme.example" in c])
         clock.now += 599
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         self.assertEqual(len([c for c in calls if "acme.example" in c]), vendor_calls)
         clock.now += 2
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         self.assertGreater(len([c for c in calls if "acme.example" in c]), vendor_calls)
 
     async def test_a_static_fallback_is_retried_on_the_short_ttl(self) -> None:
@@ -200,10 +236,10 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
         service = _service(
             responses={}, clock=clock, live_ttl_s=21600, static_ttl_s=300, calls=calls,
         )
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         first = len([c for c in calls if "first.example" in c])
         clock.now += 301
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         self.assertGreater(len([c for c in calls if "first.example" in c]), first)
 
 
@@ -213,42 +249,43 @@ class AssemblyTests(unittest.IsolatedAsyncioTestCase):
             responses={"first.example": {"data": [{"id": "claude-x", "display_name": "X"}]}},
             clock=_Clock(),
         )
-        entries, _ = await service.union(advertise_1m=lambda _id: False)
-        self.assertIn(cat.CatalogEntry("claude-x", "X"), entries)
+        catalog = await service.union(table=NO_TABLE)
+        row = next(e for e in catalog.entries if e.id == "claude-x")
+        self.assertEqual(row.display_name, "X")
 
     async def test_vendor_ids_are_namespaced_and_suffixed(self) -> None:
         service = _service(
             responses={"acme.example": {"data": [{"id": "acme-1"}]}},
             clock=_Clock(),
         )
-        entries, _ = await service.union(advertise_1m=lambda mid: mid == "acme-1")
-        match = [e for e in entries if e.id.startswith("claude-acme/")]
+        catalog = await service.union(table=table_of({"acme-1": cat.ONE_M_WINDOW}))
+        match = [e for e in catalog.entries if e.id.startswith("claude-acme/")]
         self.assertEqual(match[0].id, "claude-acme/acme-1[1m]")
         self.assertIn("Acme", match[0].display_name)
         self.assertIn("1M ctx", match[0].display_name)
 
-    async def test_the_one_m_decision_comes_from_the_caller_not_a_pattern(self) -> None:
-        """The table decides, by exact id; the catalog never guesses.
+    async def test_the_one_m_decision_is_the_window_not_a_name_pattern(self) -> None:
+        """The advert follows the RESOLVED WINDOW, by exact id, never a shape.
 
-        Since v0.2.94 the question is asked for FIRST-PARTY ids as well —
-        that is what puts a ``claude-…[1m]`` row in the picker — so the
-        assertion is on the exact ids asked, not merely on their count.
+        Two ids one character apart, one tabulated at 1M and one not: a rule
+        that keyed on a family prefix would give both the suffix and overstate
+        the second by 5x. This is the case the exact-key rule exists for, at
+        the catalog layer rather than the table's.
         """
-        asked: list[str] = []
-
-        def advertise(model_id: str) -> bool:
-            asked.append(model_id)
-            return False
-
         service = _service(
             responses={
                 "first.example": {"data": [{"id": "claude-x"}]},
-                "acme.example": {"data": [{"id": "acme-1"}, {"id": "acme-2"}]},
+                "acme.example": {"data": [{"id": "acme-1"}, {"id": "acme-1x"}]},
             },
             clock=_Clock(),
         )
-        await service.union(advertise_1m=advertise)
-        self.assertEqual(asked, ["claude-x", "acme-1", "acme-2"])
+        catalog = await service.union(table=table_of({"acme-1": cat.ONE_M_WINDOW}))
+        ids = [e.id for e in catalog.entries]
+        self.assertIn("claude-acme/acme-1[1m]", ids)
+        self.assertIn("claude-acme/acme-1x", ids)
+        self.assertNotIn("claude-acme/acme-1x[1m]", ids)
+        # ...and the first-party row, which no table names, gets none either.
+        self.assertEqual([i for i in ids if i.startswith("claude-x")], ["claude-x"])
 
     async def test_first_party_entries_are_sorted_and_vendor_order_is_stable(self) -> None:
         service = _service(
@@ -258,8 +295,13 @@ class AssemblyTests(unittest.IsolatedAsyncioTestCase):
             },
             clock=_Clock(),
         )
-        entries, _ = await service.union(advertise_1m=lambda _id: False)
-        ids = [e.id for e in entries]
+        # ``all``: ``acme-1`` and ``acme-2`` are one family two versions
+        # apart, so the default filter would publish one of them and this
+        # test would be about the filter instead of about ordering.
+        catalog = await service.union(
+            table=NO_TABLE, catalog_filter=cat.CATALOG_FILTER_ALL,
+        )
+        ids = [e.id for e in catalog.entries]
         self.assertEqual(ids[:2], ["claude-a", "claude-z"])
         self.assertEqual(ids[2:], ["claude-acme/acme-2", "claude-acme/acme-1"])
 
@@ -269,9 +311,12 @@ class AssemblyTests(unittest.IsolatedAsyncioTestCase):
                 service = _service(
                     responses={"acme.example": payload}, clock=_Clock(),
                 )
-                entries, sources = await service.union(advertise_1m=lambda _id: False)
-                self.assertIsInstance(entries, list)
-                self.assertIn(sources["acme"], (cat.SOURCE_STATIC, cat.SOURCE_EMPTY))
+                catalog = await service.union(table=NO_TABLE)
+                self.assertIsInstance(catalog.entries, list)
+                self.assertIn(
+                    catalog.sources["acme"],
+                    (cat.SOURCE_STATIC, cat.SOURCE_EMPTY),
+                )
 
 
 class ResponseShapeTests(unittest.TestCase):
@@ -296,6 +341,17 @@ class ResponseShapeTests(unittest.TestCase):
         body = cat.to_models_response([], {})
         self.assertIsNone(body["first_id"])
         self.assertIsNone(body["last_id"])
+
+    def test_the_three_fields_the_client_reads_are_never_omitted(self) -> None:
+        """``id``, ``display_name`` and ``description`` — and nothing else in
+        a row reaches Claude Code at all. The window fields below them are a
+        relay for other consumers; see ``test_v0295_gateway_catalog_windows``
+        for the rest of the row's contract.
+        """
+        body = cat.to_models_response([cat.CatalogEntry("a", "A")], {})
+        self.assertLessEqual(
+            {"type", "id", "display_name", "description"}, set(body["data"][0]),
+        )
 
 
 class StaticLoaderDamageTests(unittest.TestCase):
@@ -336,8 +392,10 @@ class VendorDeclaredFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def _fallback_payload(self, vendor: Vendor) -> dict:
         """Drive a full ``/v1/models`` body with every live fetch failing."""
         service = _service(responses={}, clock=_Clock(), vendor=vendor)
-        entries, sources = await service.union(advertise_1m=lambda _id: False)
-        return cat.to_models_response(entries, sources)
+        catalog = await service.union(table=NO_TABLE)
+        return cat.to_models_response(
+            catalog.entries, catalog.sources, catalog.hidden,
+        )
 
     @staticmethod
     def _vendor_rows(body: dict) -> list[dict]:
@@ -402,10 +460,10 @@ class VendorDeclaredFallbackTests(unittest.IsolatedAsyncioTestCase):
             live_ttl_s=3600, static_ttl_s=60,
             vendor=self.ACME_WITH_IDS,
         )
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         first = len(calls)
         clock.now += 61
-        await service.union(advertise_1m=lambda _id: False)
+        await service.union(table=NO_TABLE)
         self.assertGreater(len(calls), first)
 
     async def test_a_live_catalog_still_beats_a_declared_fallback(self) -> None:
@@ -415,9 +473,9 @@ class VendorDeclaredFallbackTests(unittest.IsolatedAsyncioTestCase):
             clock=_Clock(),
             vendor=self.ACME_WITH_IDS,
         )
-        entries, sources = await service.union(advertise_1m=lambda _id: False)
-        ids = [e.id for e in entries]
-        self.assertEqual(sources["acme"], cat.SOURCE_LIVE)
+        catalog = await service.union(table=NO_TABLE)
+        ids = [e.id for e in catalog.entries]
+        self.assertEqual(catalog.sources["acme"], cat.SOURCE_LIVE)
         self.assertIn("claude-acme/acme-live", ids)
         self.assertNotIn("claude-acme/acme-large", ids)
 

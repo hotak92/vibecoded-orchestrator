@@ -203,7 +203,6 @@ What moves the bill most?
 
 For ongoing tracking, recommend:
 - LLM provider dashboards (Anthropic Console, OpenAI usage) — daily review.
-- Self-built `costs.jsonl` (the orchestrator's cost tracker is one example) — per-call cost per workflow_id.
 - Cloud cost alerts (AWS Budgets, GCP Budget Alerts) — fire at 50%, 80%, 100% of expected.
 
 ## Knowledge graph integration

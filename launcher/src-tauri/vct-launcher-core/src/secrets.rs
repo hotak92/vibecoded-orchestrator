@@ -159,6 +159,32 @@ use keyring::Entry;
 
 const SERVICE_PREFIX: &str = "vct";
 
+/// The service-string prefix in force for the CURRENT thread.
+///
+/// Production: always [`SERVICE_PREFIX`] (`"vct"`) — there is no way to reach
+/// anything else, because the only writer of the alternative is the test-only
+/// [`for_tests::KeychainNamespaceGuard`], which nothing in a shipped code path
+/// constructs.
+///
+/// Test/debug builds (`cfg(any(test, debug_assertions))` — the same gate the
+/// mock-keychain seam uses): while a test holds
+/// [`test_serialize::keychain_serialize_lock`] the prefix becomes
+/// `vct-test-<pid>`, so keychain entries the test writes land BESIDE the real
+/// user's entries instead of ON them. The (scope, module_id, key) tuple the
+/// test passes is unchanged — same production constants, same call path, same
+/// real OS keychain — only the OS-level service namespace moves. See the
+/// "Hermetic keychain namespace" section in [`for_tests`] for the incident
+/// this closes.
+fn current_service_prefix() -> std::borrow::Cow<'static, str> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if let Some(ns) = for_tests::active_keychain_namespace() {
+            return std::borrow::Cow::Owned(ns);
+        }
+    }
+    std::borrow::Cow::Borrowed(SERVICE_PREFIX)
+}
+
 // ─── Keychain primitive abstraction (v0.3.0 WP-K) ─────────────────────────────
 //
 // The `set`/`get`/`delete` hot paths construct a `KeychainEntry` INSIDE the
@@ -300,15 +326,16 @@ impl<'a> SecretScope<'a> {
     /// the full namespace and `username` as the secret key to keep entries
     /// discoverable in the OS credential manager UI.
     pub fn service_name(&self, module_id: &str) -> String {
+        let prefix = current_service_prefix();
         match self {
             SecretScope::PerProject { project_id } => {
-                format!("{}.{}.{}", SERVICE_PREFIX, project_id, module_id)
+                format!("{}.{}.{}", prefix, project_id, module_id)
             }
             SecretScope::Global => {
-                format!("{}.global.{}", SERVICE_PREFIX, module_id)
+                format!("{}.global.{}", prefix, module_id)
             }
             SecretScope::Shared { project_id } => {
-                format!("{}.{}.shared.{}", SERVICE_PREFIX, project_id, module_id)
+                format!("{}.{}.shared.{}", prefix, project_id, module_id)
             }
         }
     }
@@ -1997,6 +2024,11 @@ fn set_raw(
     if let Some(locked) = background_lock_gate(ctx) {
         return Err(locked);
     }
+    // 2026-09-17: refuse a test write to the real user's PAT slot. BEFORE the
+    // mock branch so an un-namespaced test panics instead of reaching either
+    // backing store.
+    #[cfg(any(test, debug_assertions))]
+    for_tests::assert_not_production_pat_slot(scope, module_id, key, "write");
     #[cfg(any(test, debug_assertions))]
     note_entry_construction();
     #[cfg(any(test, debug_assertions))]
@@ -2096,6 +2128,11 @@ pub fn get_with_context(
     // access happened). Consulted AFTER the lock gate (posture unchanged) and
     // only when a `SecretReadSession` is active on this thread; outside a
     // session `session_memo_lookup` is always `None` → pre-v0.2.84 behaviour.
+    // 2026-09-17: a READ of the production PAT slot is not destructive, but it
+    // hands a test the real user's token — which then reaches assertion
+    // messages and CI logs. Same tripwire, same reasoning.
+    #[cfg(any(test, debug_assertions))]
+    for_tests::assert_not_production_pat_slot(scope, module_id, key, "read");
     let service = scope.service_name(module_id);
     if let Some(cached) = session_memo_lookup(&service, key) {
         return Ok(cached);
@@ -2196,6 +2233,10 @@ pub fn delete_with_context(
     if let Some(locked) = background_lock_gate(ctx) {
         return Err(locked);
     }
+    // 2026-09-17: this is the operation that destroyed the maintainer's PAT.
+    // Refuse it from any un-namespaced test. See `for_tests`.
+    #[cfg(any(test, debug_assertions))]
+    for_tests::assert_not_production_pat_slot(scope, module_id, key, "delete");
     #[cfg(any(test, debug_assertions))]
     note_entry_construction();
     #[cfg(any(test, debug_assertions))]
@@ -2340,13 +2381,21 @@ pub mod test_serialize {
     /// launcher (which paces on that same file), not just against sibling test
     /// binaries.
     ///
-    /// Drop order in Rust is field-declaration order — `_proc_lock` drops first
-    /// (releases the in-process mutex), then `_file_lock` (the test lockfile),
-    /// then `_prod_pace_guard` (the production pace flock + reentrancy flag)
-    /// LAST. Correct order: let in-process readers proceed first, hand the
-    /// test-binary baton on next, and only THEN release the production baton to
-    /// a waiting launcher.
+    /// Drop order in Rust is field-declaration order — `_namespace` drops first
+    /// (2026-09-17: restores the production service prefix while this thread
+    /// still holds every baton), then `_proc_lock` (releases the in-process
+    /// mutex), then `_file_lock` (the test lockfile), then `_prod_pace_guard`
+    /// (the production pace flock + reentrancy flag) LAST. Correct order: leave
+    /// the prefix as we found it, let in-process readers proceed next, hand the
+    /// test-binary baton on after that, and only THEN release the production
+    /// baton to a waiting launcher.
     pub struct KeychainGuard {
+        /// 2026-09-17: FIRST field on purpose — Rust drops in declaration
+        /// order, so the hermetic `vct-test-<pid>` namespace is restored
+        /// BEFORE any baton is handed on. Every holder of this guard therefore
+        /// runs against a test namespace instead of the real user's keychain
+        /// slots; see `for_tests`'s "Hermetic keychain namespace" section.
+        _namespace: super::for_tests::KeychainNamespaceGuard,
         _proc_lock: MutexGuard<'static, ()>,
         _file_lock: Option<file_lock::FileLock>,
         /// T-1: production keyring.pace flock (unix; `None` on any flock
@@ -2366,6 +2415,15 @@ pub mod test_serialize {
     /// is `vct._user_shared_.shared.user/github_pat`, post-2026-05-10
     /// module_id unification — pre-fix this was the `installer/` slot).
     /// Release happens automatically on drop.
+    ///
+    /// 2026-09-17: the guard ALSO installs the hermetic `vct-test-<pid>`
+    /// service namespace for the calling thread, so a test holding it can no
+    /// longer address the real user's keychain slots at all — the serialisation
+    /// above stops tests clobbering EACH OTHER, the namespace stops them
+    /// clobbering the USER. Take this guard on any test that touches the
+    /// keychain; nothing else is needed, and
+    /// `for_tests::assert_not_production_pat_slot` panics on a test that
+    /// forgets.
     ///
     /// Returns a [`KeychainGuard`] (not a raw `MutexGuard`) since
     /// v0.2.14 (2026-05-17) — the guard also holds a cross-process
@@ -2401,7 +2459,11 @@ pub mod test_serialize {
         let proc_lock = KEYCHAIN_SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Installed LAST (so it covers only the window in which this thread
+        // actually holds the baton) and dropped FIRST (field order above).
+        let namespace = super::for_tests::KeychainNamespaceGuard::install();
         KeychainGuard {
+            _namespace: namespace,
             _proc_lock: proc_lock,
             _file_lock: file_lock,
             #[cfg(unix)]
@@ -2611,6 +2673,140 @@ pub mod for_tests {
     use super::SecretScope;
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // ─── Hermetic keychain namespace (2026-09-17) ────────────────────────
+    //
+    // WHY THIS EXISTS. `commands::installer`'s github_pat tests addressed the
+    // REAL slot `vct._user_shared_.shared.user/github_pat` — the slot a user's
+    // GitHub PAT occupies — and called `delete` on it at test entry AND exit.
+    // The surrounding fixture redirects `HOME`, but the Linux Secret Service is
+    // a per-session D-Bus daemon, NOT a `$HOME`-scoped file: redirecting HOME
+    // isolates nothing. So `cargo test` on any machine with a populated
+    // keychain DESTROYED the developer's stored PAT. The same fixed slot was
+    // also shared by several tests, so they raced each other.
+    //
+    // THE FIX IS ISOLATION, NOT LESS COVERAGE. These tests genuinely need the
+    // real keychain path, so nothing here mocks or skips: while a test holds
+    // `test_serialize::keychain_serialize_lock()`, `SecretScope::service_name`
+    // resolves its prefix to `vct-test-<pid>` instead of `vct`. The test still
+    // passes the production `(Shared{_user_shared_}, "user", "github_pat")`
+    // tuple through the production API to a real OS keychain — only the
+    // OS-level service namespace moves. `vct-test-<pid>` can never collide with
+    // a production `vct.` service (the separator after `vct` differs), and it is
+    // per-PROCESS, so two test binaries running concurrently under
+    // `cargo test --workspace` no longer share one slot.
+    //
+    // It rides on the keychain baton rather than on a second thing each test
+    // must remember: one home, no opt-in, impossible to forget.
+
+    thread_local! {
+        /// The namespace in force on this thread. `None` outside tests.
+        static KEYCHAIN_NAMESPACE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Flipped the first time ANY namespace is installed in this process, which
+    /// only a test can do. Arms [`assert_not_production_pat_slot`]; in a shipped
+    /// build it stays `false` forever, so the tripwire is inert there.
+    static NAMESPACE_EVER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// The production PAT slot this module refuses to let a test address:
+    /// `(module_id, legacy_module_id, key)`.
+    ///
+    /// MUST MATCH `commands::installer::{GITHUB_PAT_MODULE_ID,
+    /// GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY}` in the launcher crate.
+    /// A mirror (rule C) because that crate depends on this one, not the other
+    /// way round; the parity is pinned by
+    /// `commands::installer::…::protected_pat_slot_mirror_matches_production_constants`.
+    pub const PROTECTED_PAT_SLOT: (&str, &str, &str) = ("user", "installer", "github_pat");
+
+    /// Per-process namespace string. Stable WITHIN a process on purpose: a test
+    /// run then leaves at most a couple of entries behind (which the tests' own
+    /// `delete` cleanup removes) rather than one fresh orphan per test.
+    fn namespace_for_this_process() -> String {
+        format!("{}-test-{}", super::SERVICE_PREFIX, std::process::id())
+    }
+
+    /// The namespace in force on this thread, if any. Read by
+    /// `super::current_service_prefix`.
+    pub(super) fn active_keychain_namespace() -> Option<String> {
+        KEYCHAIN_NAMESPACE.with(|c| c.borrow().clone())
+    }
+
+    /// RAII installer for the hermetic namespace. Held as the FIRST field of
+    /// `test_serialize::KeychainGuard`, so it is dropped (namespace restored)
+    /// BEFORE the in-process mutex and the cross-process flocks are released —
+    /// the next holder of the baton always starts from a clean prefix.
+    pub struct KeychainNamespaceGuard {
+        prev: Option<String>,
+    }
+
+    impl KeychainNamespaceGuard {
+        /// Install the namespace for this thread. Re-entrant: the previous
+        /// value is restored on drop, so nesting degrades to a no-op rather
+        /// than to a surprise.
+        pub fn install() -> Self {
+            let ns = namespace_for_this_process();
+            let prev = KEYCHAIN_NAMESPACE.with(|c| c.borrow_mut().replace(ns));
+            NAMESPACE_EVER_INSTALLED.store(true, Ordering::SeqCst);
+            Self { prev }
+        }
+    }
+
+    impl Drop for KeychainNamespaceGuard {
+        fn drop(&mut self) {
+            let prev = self.prev.take();
+            KEYCHAIN_NAMESPACE.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+
+    /// Behavioural tripwire: once ANY test in this process has gone hermetic,
+    /// a keychain read/write/delete that addresses the PRODUCTION GitHub-PAT
+    /// slot from a thread with NO namespace installed is a bug — it means a new
+    /// test reached the real user's credential. Panic loudly instead of
+    /// destroying it.
+    ///
+    /// Deliberately NOT exempt for the thread-local mock. The mock would
+    /// indeed absorb the op, but "hold the keychain baton before you touch the
+    /// PAT tuple" is one rule a reader can apply without first working out
+    /// which backing store a given test happens to be on — and a test that
+    /// starts mock-backed and later grows a real-keychain assertion would
+    /// otherwise silently lose its protection.
+    ///
+    /// Inert in shipped builds: `NAMESPACE_EVER_INSTALLED` is set only by
+    /// [`KeychainNamespaceGuard::install`] and [`enable_mock`], neither of
+    /// which any shipped code path calls. Checked BEFORE the mock branch and
+    /// before any `KeychainEntry` construction, so it fires whether or not a
+    /// keychain backend exists.
+    pub(super) fn assert_not_production_pat_slot(
+        scope: SecretScope<'_>,
+        module_id: &str,
+        key: &str,
+        op: &str,
+    ) {
+        if !NAMESPACE_EVER_INSTALLED.load(Ordering::SeqCst) {
+            return;
+        }
+        let (prod_module, legacy_module, pat_key) = PROTECTED_PAT_SLOT;
+        if key != pat_key || !matches!(scope, SecretScope::Shared { .. }) {
+            return;
+        }
+        if module_id != prod_module && module_id != legacy_module {
+            return;
+        }
+        if active_keychain_namespace().is_some() {
+            return;
+        }
+        panic!(
+            "[vct-tests] refusing to {op} the PRODUCTION github_pat keychain slot \
+             (shared/{module_id}/{key}) from a test: this is the slot a real \
+             user's GitHub PAT occupies, and `HOME` redirection does not isolate \
+             the OS keychain. Hold \
+             `secrets::test_serialize::keychain_serialize_lock()` for the \
+             duration of the test — it installs the hermetic `vct-test-<pid>` \
+             namespace automatically."
+        );
+    }
 
     // Thread-local store: Some(map) when mock is active, None when inactive.
     thread_local! {
@@ -2667,6 +2863,14 @@ pub mod for_tests {
     /// `enable_mock` when the mock is already active is a no-op (preserves
     /// any entries already in the map).
     pub fn enable_mock() {
+        // 2026-09-17: arming the PAT tripwire here as well as in
+        // `KeychainNamespaceGuard::install` makes it engage as early as
+        // possible in a test binary — `for_tests` and `test_serialize` are the
+        // only two test-only entry points into this module, and no shipped code
+        // path calls either, so the tripwire still cannot fire in production.
+        // (Residual: a test that touches the PAT slot BEFORE any test in the
+        // process has used either seam is unguarded. Nothing observed does.)
+        NAMESPACE_EVER_INSTALLED.store(true, Ordering::SeqCst);
         MOCK_STORE.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
@@ -2902,6 +3106,104 @@ mod tests {
     fn service_name_per_project_includes_project_id() {
         let scope = SecretScope::PerProject { project_id: "p1" };
         assert_eq!(scope.service_name("mod"), "vct.p1.mod");
+    }
+
+    // ─── Hermetic keychain namespace (2026-09-17) ────────────────────────
+
+    /// The isolation itself: while the keychain baton is held, the service
+    /// string a test resolves is NOT the production one, and the moment the
+    /// baton is dropped it is again. Pure + deterministic — no keychain
+    /// backend needed, so it also runs on headless CI where the keychain
+    /// tests skip.
+    #[test]
+    fn keychain_baton_redirects_service_away_from_the_production_namespace() {
+        let production = "vct._user_shared_.shared.user";
+        let scope = SecretScope::Shared {
+            project_id: "_user_shared_",
+        };
+        assert_eq!(
+            scope.service_name("user"),
+            production,
+            "outside a test baton the prefix must be the production one",
+        );
+
+        let hermetic = {
+            let _lock = test_serialize::keychain_serialize_lock();
+            let s = scope.service_name("user");
+            assert_ne!(
+                s, production,
+                "a test holding the keychain baton must NOT address the real \
+                 user's github_pat slot",
+            );
+            assert!(
+                s.starts_with(&format!("{}-test-", SERVICE_PREFIX)),
+                "expected the vct-test-<pid> namespace, got {s}",
+            );
+            s
+        };
+        // `vct-test-…` and `vct.…` can never be the same string: the character
+        // after `vct` differs, so no namespace can shadow a production service.
+        assert!(!hermetic.starts_with(&format!("{}.", SERVICE_PREFIX)));
+
+        assert_eq!(
+            scope.service_name("user"),
+            production,
+            "dropping the baton must restore the production prefix",
+        );
+    }
+
+    /// The guard that stops a FUTURE test re-introducing the defect: an
+    /// un-namespaced write to the production PAT slot panics rather than
+    /// reaching the user's credential. `MockGuard` is held so that IF the
+    /// tripwire ever regressed, this test would write to a thread-local map
+    /// rather than to the real OS keychain.
+    #[test]
+    #[should_panic(expected = "PRODUCTION github_pat keychain slot")]
+    fn un_namespaced_write_to_the_production_pat_slot_panics() {
+        // Arm the tripwire: it only engages once this process has gone
+        // hermetic at least once (so it can never fire in a shipped build).
+        drop(test_serialize::keychain_serialize_lock());
+        let _mock = for_tests::MockGuard::new();
+        let _ = set(
+            SecretScope::Shared {
+                project_id: "_user_shared_",
+            },
+            "user",
+            "github_pat",
+            "ghp_0123456789abcdef0123456789abcdef0123",
+        );
+    }
+
+    /// Same tripwire on the DELETE arm — the operation that actually destroyed
+    /// the maintainer's PAT.
+    #[test]
+    #[should_panic(expected = "PRODUCTION github_pat keychain slot")]
+    fn un_namespaced_delete_of_the_legacy_pat_slot_panics() {
+        drop(test_serialize::keychain_serialize_lock());
+        let _mock = for_tests::MockGuard::new();
+        let _ = delete(
+            SecretScope::Shared {
+                project_id: "_user_shared_",
+            },
+            "installer",
+            "github_pat",
+        );
+    }
+
+    /// A namespaced write to the SAME tuple is allowed — the tripwire gates on
+    /// hermeticity, not on the tuple, so coverage of the production slot's
+    /// semantics is fully preserved.
+    #[test]
+    fn namespaced_write_to_the_same_pat_tuple_is_allowed() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Shared {
+            project_id: "_user_shared_",
+        };
+        set(scope, "user", "github_pat", "ghp_0123456789abcdef0123456789abcdef0123")
+            .expect("a hermetic write at the production tuple must succeed");
+        assert!(get(scope, "user", "github_pat").unwrap().is_some());
+        delete(scope, "user", "github_pat").expect("hermetic delete");
     }
 
     // ─── v0.3.0 (WP-K): persistent Secret-Service connection surface ──────────

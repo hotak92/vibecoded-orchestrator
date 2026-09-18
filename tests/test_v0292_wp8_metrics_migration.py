@@ -154,7 +154,7 @@ def test_update_copies_every_stream__act(homes):
     archive, new_home = homes
     _seed(
         archive,
-        costs__jsonl='{"n":1}\n{"n":2}\n',
+        compactions__jsonl='{"n":1}\n{"n":2}\n',
         failures__jsonl='{"e":"boom"}\n',
         kg_update_tokens__jsonl='{"session_id":"s"}\n',
     )
@@ -164,10 +164,10 @@ def test_update_copies_every_stream__act(homes):
     assert result.status == "migrated", result.to_dict()
     assert result.ok
     assert {f.name for f in result.files} == {
-        "costs.jsonl", "failures.jsonl", "kg_update_tokens.jsonl"
+        "compactions.jsonl", "failures.jsonl", "kg_update_tokens.jsonl"
     }
     assert all(f.verified for f in result.files)
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}', '{"n":2}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}', '{"n":2}']
     assert _rows(new_home / "failures.jsonl") == ['{"e":"boom"}']
 
 
@@ -176,7 +176,7 @@ def test_update_leaves_the_originals_byte_identical__leave_alone(homes):
     archive, _ = homes
     before = _seed(
         archive,
-        costs__jsonl='{"n":1}\n{"n":2}\n',
+        compactions__jsonl='{"n":1}\n{"n":2}\n',
         failures__jsonl='{"e":"boom"}\n',
     )
 
@@ -196,7 +196,7 @@ def test_the_migration_reports_the_leave_alone_itself__leave_alone(homes):
     than waiting for a test to notice.
     """
     archive, _ = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
 
     result = mm.migrate_metrics()
 
@@ -207,14 +207,14 @@ def test_the_migration_reports_the_leave_alone_itself__leave_alone(homes):
 def test_nothing_deletes_the_archive__leave_alone(homes):
     """No entry point removes an original. Not the API, not the CLI."""
     archive, _ = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
 
     mm.migrate_metrics()
     mm.ensure_metrics_migrated()
     proc = _run_cli(homes)
     assert proc.returncode == 0, proc.stderr
 
-    assert (archive / "costs.jsonl").is_file(), (
+    assert (archive / "compactions.jsonl").is_file(), (
         "the old files are deleted by NOBODY — user-initiated cleanup only"
     )
     # And there is no code path that COULD do it. Asserted against the module's
@@ -238,12 +238,12 @@ def test_nothing_deletes_the_archive__leave_alone(homes):
 def test_only_jsonl_streams_are_copied(homes):
     """A user's own file in the archive is not hoovered into VCO's state root."""
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
     (archive / "my-notes.txt").write_text("private\n", encoding="utf-8")
 
     mm.migrate_metrics()
 
-    assert (new_home / "costs.jsonl").is_file()
+    assert (new_home / "compactions.jsonl").is_file()
     assert not (new_home / "my-notes.txt").exists()
 
 
@@ -255,7 +255,7 @@ def test_only_jsonl_streams_are_copied(homes):
 def test_running_twice_changes_nothing_the_second_time(homes):
     """Idempotence is the property that makes an interrupted run safe."""
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n{"n":2}\n', failures__jsonl='{"e":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n{"n":2}\n', failures__jsonl='{"e":1}\n')
 
     first = mm.migrate_metrics()
     after_first = _digests(new_home)
@@ -280,16 +280,16 @@ def test_interrupted_after_one_file_finishes_the_rest(homes):
     The next run must complete the job without duplicating what landed.
     """
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n{"n":2}\n', failures__jsonl='{"e":1}\n')
-    # Simulate the crash: costs.jsonl fully copied, no sentinel, failures absent.
+    _seed(archive, compactions__jsonl='{"n":1}\n{"n":2}\n', failures__jsonl='{"e":1}\n')
+    # Simulate the crash: compactions.jsonl fully copied, no sentinel, failures absent.
     new_home.mkdir(parents=True, exist_ok=True)
-    (new_home / "costs.jsonl").write_text('{"n":1}\n{"n":2}\n', encoding="utf-8")
+    (new_home / "compactions.jsonl").write_text('{"n":1}\n{"n":2}\n', encoding="utf-8")
     assert not (new_home / mm.SENTINEL_NAME).exists()
 
     result = mm.migrate_metrics()
 
     assert result.ok, result.to_dict()
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}', '{"n":2}'], (
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}', '{"n":2}'], (
         "the already-copied file must not be doubled"
     )
     assert _rows(new_home / "failures.jsonl") == ['{"e":1}']
@@ -299,27 +299,27 @@ def test_interrupted_after_one_file_finishes_the_rest(homes):
 def test_interrupted_mid_file_appends_only_the_missing_tail(homes):
     """A half-written destination gets exactly its missing rows, once."""
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n{"n":2}\n{"n":3}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n{"n":2}\n{"n":3}\n')
     new_home.mkdir(parents=True, exist_ok=True)
-    (new_home / "costs.jsonl").write_text('{"n":1}\n', encoding="utf-8")
+    (new_home / "compactions.jsonl").write_text('{"n":1}\n', encoding="utf-8")
 
     result = mm.migrate_metrics()
 
     assert result.ok
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}', '{"n":2}', '{"n":3}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}', '{"n":2}', '{"n":3}']
 
 
 def test_a_torn_last_line_is_repaired_before_appending(homes):
     """A destination whose last append was cut short must not glue rows."""
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":2}\n')
+    _seed(archive, compactions__jsonl='{"n":2}\n')
     new_home.mkdir(parents=True, exist_ok=True)
-    (new_home / "costs.jsonl").write_text('{"n":1}', encoding="utf-8")  # no \n
+    (new_home / "compactions.jsonl").write_text('{"n":1}', encoding="utf-8")  # no \n
 
     result = mm.migrate_metrics()
 
     assert result.ok, result.to_dict()
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}', '{"n":2}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}', '{"n":2}']
 
 
 def test_new_rows_written_after_the_copy_are_preserved(homes):
@@ -329,36 +329,36 @@ def test_new_rows_written_after_the_copy_are_preserved(homes):
     (a bundle update, say) must keep the new rows.
     """
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"old":1}\n')
+    _seed(archive, compactions__jsonl='{"old":1}\n')
     mm.migrate_metrics()
-    with open(new_home / "costs.jsonl", "a", encoding="utf-8") as fh:
+    with open(new_home / "compactions.jsonl", "a", encoding="utf-8") as fh:
         fh.write('{"new":1}\n')
 
     mm.migrate_metrics()
 
-    assert _rows(new_home / "costs.jsonl") == ['{"old":1}', '{"new":1}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"old":1}', '{"new":1}']
 
 
 def test_a_stale_hook_appending_to_the_archive_is_picked_up_later(homes):
     """The user-modified-hook case: the archive KEEPS growing after the copy.
 
-    `templates/**` files are bundled, so a user who edited `cost-tracker.sh`
+    `templates/**` files are bundled, so a user who edited `stop-failure-notify.sh`
     has it PRESERVED by `install-bundle --update`
     (`bundle_user_modified_preserved`) and it goes on appending to the
     archive. A later migration run must carry the new rows across and only
     those.
     """
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
     mm.migrate_metrics()
-    with open(archive / "costs.jsonl", "a", encoding="utf-8") as fh:
+    with open(archive / "compactions.jsonl", "a", encoding="utf-8") as fh:
         fh.write('{"n":2}\n')  # the preserved old hook, still writing here
 
     result = mm.migrate_metrics()
 
     assert result.status == "migrated"
     assert result.appended_lines == 1
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}', '{"n":2}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}', '{"n":2}']
 
 
 # --------------------------------------------------------------------------- #
@@ -374,23 +374,23 @@ def test_duplicate_rows_in_the_source_survive_the_copy(homes):
     loss — which the amendment's "leave everything intact" spirit forbids.
     """
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n{"n":1}\n{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n{"n":1}\n{"n":1}\n')
 
     mm.migrate_metrics()
 
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}'] * 3
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}'] * 3
 
 
 def test_a_row_already_in_the_destination_is_not_appended_again(homes):
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n{"n":1}\n')
     new_home.mkdir(parents=True, exist_ok=True)
-    (new_home / "costs.jsonl").write_text('{"n":1}\n', encoding="utf-8")
+    (new_home / "compactions.jsonl").write_text('{"n":1}\n', encoding="utf-8")
 
     result = mm.migrate_metrics()
 
     assert result.appended_lines == 1  # the SECOND copy only
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}', '{"n":1}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}', '{"n":1}']
 
 
 # --------------------------------------------------------------------------- #
@@ -400,26 +400,26 @@ def test_a_row_already_in_the_destination_is_not_appended_again(homes):
 
 def test_sentinel_is_written_only_after_every_file_verified(homes):
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
 
     result = mm.migrate_metrics()
 
     assert result.sentinel_written
     payload = json.loads((new_home / mm.SENTINEL_NAME).read_text(encoding="utf-8"))
     assert payload["version"] == mm.SENTINEL_VERSION
-    assert payload["files"]["costs.jsonl"]["source_lines"] == 1
+    assert payload["files"]["compactions.jsonl"]["source_lines"] == 1
     assert "never writes to them and never deletes them" in payload["note"]
 
 
 def test_dry_run_writes_nothing_at_all(homes):
     archive, new_home = homes
-    before = _seed(archive, costs__jsonl='{"n":1}\n')
+    before = _seed(archive, compactions__jsonl='{"n":1}\n')
 
     result = mm.migrate_metrics(dry_run=True)
 
     assert result.dry_run
     assert result.files[0].appended_lines == 1
-    assert not new_home.exists() or not (new_home / "costs.jsonl").exists()
+    assert not new_home.exists() or not (new_home / "compactions.jsonl").exists()
     assert not (new_home / mm.SENTINEL_NAME).exists()
     assert _digests(archive) == before
 
@@ -427,7 +427,7 @@ def test_dry_run_writes_nothing_at_all(homes):
 def test_an_unparseable_sentinel_causes_a_re_merge_not_a_trusted_skip(homes):
     """"I could not read the record" must not read as "everything is fine"."""
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
     new_home.mkdir(parents=True, exist_ok=True)
     (new_home / mm.SENTINEL_NAME).write_text("{not json", encoding="utf-8")
 
@@ -435,12 +435,12 @@ def test_an_unparseable_sentinel_causes_a_re_merge_not_a_trusted_skip(homes):
 
     assert result.ok
     assert result.status == "migrated"
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}']
 
 
 def test_a_wrong_version_sentinel_causes_a_re_merge(homes):
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
     new_home.mkdir(parents=True, exist_ok=True)
     (new_home / mm.SENTINEL_NAME).write_text(
         json.dumps({"version": mm.SENTINEL_VERSION + 99}), encoding="utf-8"
@@ -449,7 +449,7 @@ def test_a_wrong_version_sentinel_causes_a_re_merge(homes):
     result = mm.migrate_metrics()
 
     assert result.ok
-    assert _rows(new_home / "costs.jsonl") == ['{"n":1}']
+    assert _rows(new_home / "compactions.jsonl") == ['{"n":1}']
 
 
 # --------------------------------------------------------------------------- #
@@ -461,7 +461,7 @@ def test_source_equal_to_destination_is_refused(tmp_path, monkeypatch):
     """Copying a directory onto itself would double every row. Refuse."""
     shared = tmp_path / "same"
     (shared / "metrics").mkdir(parents=True)
-    (shared / "metrics" / "costs.jsonl").write_text('{"n":1}\n', encoding="utf-8")
+    (shared / "metrics" / "compactions.jsonl").write_text('{"n":1}\n', encoding="utf-8")
     monkeypatch.setenv("VCT_CLAUDE_DIR", str(shared))
     monkeypatch.setenv("VCT_STATE_DIR", str(shared))
 
@@ -469,7 +469,7 @@ def test_source_equal_to_destination_is_refused(tmp_path, monkeypatch):
 
     assert result.status == "failed"
     assert "same directory" in " ".join(result.errors)
-    assert _rows(shared / "metrics" / "costs.jsonl") == ['{"n":1}']
+    assert _rows(shared / "metrics" / "compactions.jsonl") == ['{"n":1}']
 
 
 def test_an_unwritable_destination_fails_loudly_and_keeps_the_source(
@@ -477,7 +477,7 @@ def test_an_unwritable_destination_fails_loudly_and_keeps_the_source(
 ):
     """A failed copy must report `failed` — never a green "already_current"."""
     archive, new_home = homes
-    before = _seed(archive, costs__jsonl='{"n":1}\n')
+    before = _seed(archive, compactions__jsonl='{"n":1}\n')
 
     def _boom(*_a, **_k):
         raise OSError("disk full")
@@ -506,7 +506,7 @@ def test_ensure_is_a_single_stat_when_there_is_no_archive(homes):
 
 def test_cli_json_reports_both_halves(homes):
     archive, _ = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
 
     proc = _run_cli(homes, "--json")
 
@@ -520,7 +520,7 @@ def test_cli_json_reports_both_halves(homes):
 
 def test_cli_quiet_is_silent_on_success_but_not_on_failure(homes, tmp_path):
     archive, _ = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
 
     ok = _run_cli(homes, "--quiet")
     assert ok.returncode == 0
@@ -529,13 +529,13 @@ def test_cli_quiet_is_silent_on_success_but_not_on_failure(homes, tmp_path):
 
 def test_cli_dry_run_does_not_write(homes):
     archive, new_home = homes
-    _seed(archive, costs__jsonl='{"n":1}\n')
+    _seed(archive, compactions__jsonl='{"n":1}\n')
 
     proc = _run_cli(homes, "--dry-run")
 
     assert proc.returncode == 0, proc.stderr
     assert "would copy" in proc.stdout
-    assert not (new_home / "costs.jsonl").exists()
+    assert not (new_home / "compactions.jsonl").exists()
 
 
 # --------------------------------------------------------------------------- #

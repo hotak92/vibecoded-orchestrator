@@ -72,7 +72,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -1254,12 +1254,113 @@ def _update_frontmatter_timestamp(file_path: Path, content: str) -> str:
     return new_content
 
 
-def parse_frontmatter(content: str) -> Tuple[Optional[Dict], str]:
+def _split_tags_string(raw: str) -> List[str]:
+    """Split a ``tags:`` value given as a STRING into a list of tag tokens.
+
+    ``"a, b c"`` → ``["a", "b", "c"]``; a ``#``-prefixed token loses the
+    ``#``; an empty/whitespace-only string → ``[]``. Order preserved,
+    duplicates dropped (the inline-harvest path dedupes the same way).
     """
-    Parse YAML frontmatter from markdown content.
+    tags: List[str] = []
+    for token in re.split(r'[,\s]+', raw.strip()):
+        token = token.lstrip('#').strip()
+        if token and token not in tags:
+            tags.append(token)
+    return tags
+
+
+def _normalise_frontmatter(fm: Any, file_label: Optional[str] = None) -> Any:
+    """Normalise parsed frontmatter so every consumer sees ONE shape.
+
+    Two frontmatter dialects exist in the wild. The canonical one (all
+    shipped templates) keeps every key at the top level::
+
+        title: … / type: … / tags: […] / created: … / updated: … / status: …
+
+    The nested one — written by agents copying the Claude Code skill/memory
+    frontmatter contract — tucks the node keys under a ``metadata:`` mapping
+    and names the node with ``name:`` instead of ``title:``::
+
+        ---
+        name: artup-pay-payment-orchestration
+        description: …
+        metadata:
+          type: concept
+          tags: [Acme, Acme-PAY, payments]
+        ---
+
+    Before v0.2.95 the parser read the top level only, so a nested-dialect
+    node silently lost its tags/type — and the inline ``#tag`` body harvest
+    then scraped issue references like ``#4`` out of the prose as tags,
+    while the folder name ("concepts") became the node type. Three
+    normalisations applied here, so EVERY consumer of
+    :func:`parse_frontmatter` sees one shape:
+
+    1. ``metadata:`` mapping → each of its keys is promoted to the top
+       level ONLY where the top level does not already declare that key
+       (top level always wins). Promotion is generic — it covers every key
+       the parse path reads at the top level (``title``/``name``, ``tags``,
+       ``type``, ``created``, ``updated``, ``status``, ``valid_from``,
+       ``valid_until``, ``external_links``, ``scope``) and anything added
+       later.
+    2. ``name:`` → used as ``title:`` when ``title:`` is absent. It slots
+       ABOVE the first ``# H1`` in the title precedence — ``name:`` is
+       explicit frontmatter metadata, and declared frontmatter beats
+       body-derived values everywhere else in this parser (tags, type); an
+       H1 in a skill-dialect file is often a directive heading, not the
+       node's name. Full precedence: ``title:`` > ``name:`` > first
+       ``# H1`` > filename stem.
+    3. ``tags:`` given as a string → split into a list
+       (:func:`_split_tags_string`); list values pass through unchanged.
+
+    When the nested dialect was promoted and ``file_label`` is given, one
+    line naming the file is printed to stdout, so a bulk resync shows how
+    many nodes came from the foreign dialect.
+    """
+    if not isinstance(fm, dict):
+        return fm
+
+    nested = fm.get('metadata')
+    if isinstance(nested, dict):
+        promoted = [key for key in nested if key not in fm]
+        for key in promoted:
+            fm[key] = nested[key]
+        if promoted and file_label:
+            print(
+                f"  ↳ frontmatter: promoted nested `metadata:` keys "
+                f"({', '.join(promoted)}) for '{file_label}'"
+            )
+
+    if 'title' not in fm:
+        name = fm.get('name')
+        if isinstance(name, str) and name.strip():
+            fm['title'] = name.strip()
+
+    raw_tags = fm.get('tags')
+    if isinstance(raw_tags, str):
+        fm['tags'] = _split_tags_string(raw_tags)
+
+    return fm
+
+
+def parse_frontmatter(
+    content: str, file_label: Optional[str] = None
+) -> Tuple[Optional[Dict], str]:
+    """
+    Parse YAML frontmatter from markdown content, normalised to ONE shape
+    (see :func:`_normalise_frontmatter`).
+
+    A frontmatter block that exists but is empty or fails YAML parsing
+    yields an EMPTY mapping, not ``None``: an existing block DECLARES
+    frontmatter (so consumers such as the tag harvester must not fall back
+    to body scraping), and every existing consumer already treats ``{}``
+    like the old ``None`` (truthiness checks / ``fm or {}``). ``None`` is
+    returned only when there is no frontmatter block at all.
 
     Args:
         content: Markdown file content
+        file_label: Optional file name used to attribute the nested-dialect
+            promotion note on stdout.
 
     Returns:
         Tuple of (frontmatter_dict, content_without_frontmatter)
@@ -1273,10 +1374,13 @@ def parse_frontmatter(content: str) -> Tuple[Optional[Dict], str]:
 
     try:
         frontmatter = yaml.safe_load(parts[1])
-        content_without_fm = parts[2].strip()
-        return frontmatter, content_without_fm
     except yaml.YAMLError:
-        return None, content
+        frontmatter = None
+    if frontmatter is None:
+        # Empty block (`---` `---`) or malformed YAML — a block EXISTS.
+        frontmatter = {}
+    content_without_fm = parts[2].strip()
+    return _normalise_frontmatter(frontmatter, file_label), content_without_fm
 
 
 # Node types shipped with every project. The vocabulary is deliberately OPEN:
@@ -1459,12 +1563,17 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     Returns:
         Dictionary with node data (title, tags, links, etc.)
     """
-    # Parse YAML frontmatter (if present)
-    frontmatter, content_body = parse_frontmatter(content)
+    # Parse YAML frontmatter (if present), normalised to one shape (nested
+    # `metadata:` dialect promoted, `name:` → title, string tags split) —
+    # see _normalise_frontmatter.
+    frontmatter, content_body = parse_frontmatter(content, file_label=str(file_path))
 
     lines = content.strip().split('\n')
 
-    # Extract title (from frontmatter or first # heading)
+    # Extract title — precedence: frontmatter `title:` (a nested-dialect
+    # `name:` is promoted to it by _normalise_frontmatter) > first #
+    # heading > filename. Declared frontmatter beats the body-derived H1
+    # for the same reason it does for tags and type below.
     if frontmatter and 'title' in frontmatter:
         title = frontmatter['title']
     else:
@@ -1474,17 +1583,32 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
                 title = line[2:].strip()
                 break
 
-    # Extract tags (from frontmatter or inline)
+    # Extract tags — from frontmatter ONLY when a frontmatter block exists
+    # (even empty/malformed — parse_frontmatter returns {} for those): a
+    # node that declares frontmatter declares its tags, and harvesting
+    # inline `#tag` tokens from such a body returns WRONG data (prose
+    # issue/section references like `#4`/`#12`), not missing data. The
+    # inline harvest below stays for files with NO frontmatter at all —
+    # the Obsidian-style use it was written for.
     tags = []
-    if frontmatter and 'tags' in frontmatter:
-        # Frontmatter tags (array format) - convert all to strings
-        raw_tags = frontmatter['tags'] if isinstance(frontmatter['tags'], list) else []
+    if frontmatter is not None:
+        # Frontmatter tags (list format — a string value was already split
+        # into a list by _normalise_frontmatter) - convert all to strings
+        raw_tags = (
+            frontmatter['tags']
+            if isinstance(frontmatter, dict) and isinstance(frontmatter.get('tags'), list)
+            else []
+        )
         tags = [str(tag) for tag in raw_tags]
     else:
-        # Inline tags (Obsidian style: #tag)
+        # Inline tags (Obsidian style: #tag) — no-frontmatter files only.
+        # Purely numeric tokens (`#4`, `#12`) are dropped: a number after a
+        # hash is an issue/section reference, never a tag.
         tag_pattern = r'#([a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*)'
         for match in re.finditer(tag_pattern, content):
             tag = match.group(1)
+            if tag.isdigit():
+                continue
             if tag not in tags:
                 tags.append(tag)
 
@@ -1515,7 +1639,8 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
             if target_title not in links:
                 links.append(target_title)
 
-    # Node type (from frontmatter or directory)
+    # Node type (from frontmatter — promoted, for the nested dialect — or
+    # directory)
     if frontmatter and 'type' in frontmatter:
         node_type = frontmatter['type']
     else:

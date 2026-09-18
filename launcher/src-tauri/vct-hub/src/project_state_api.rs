@@ -994,7 +994,7 @@ mod tests {
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/cost-tracker.sh",
+            "command": "bash .claude/hooks/notify-stop.sh",
             "timeout": 5
           }
         ]
@@ -1019,7 +1019,7 @@ mod tests {
                 project_id,
                 "Stop",
                 "",
-                "bash .claude/hooks/cost-tracker.sh",
+                "bash .claude/hooks/notify-stop.sh",
                 "project",
                 None,
                 None,
@@ -1051,12 +1051,12 @@ mod tests {
              a 204 status"
         );
         assert!(
-            !after.contains("cost-tracker.sh"),
+            !after.contains("notify-stop.sh"),
             "the disabled hook's entry must be gone from the file: {}",
             after
         );
         assert!(
-            h.0.get_parked_project_hook_entry("hook-http-1", "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+            h.0.get_parked_project_hook_entry("hook-http-1", "Stop", "", "bash .claude/hooks/notify-stop.sh")
                 .unwrap()
                 .is_some(),
             "the removed entry must be parked for an exact re-enable"
