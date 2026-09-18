@@ -78,6 +78,58 @@ describe('placement classifier (red-proof fixtures)', () => {
   });
 });
 
+describe('script/style/comments are removed by a scanner, not by a pattern', () => {
+  // The previous implementation removed the three regions with
+  // `.replace(/<script[\s\S]*?<\/script>/gi, '')` and two siblings, and every
+  // case below (bar the last two) was RED against it. A regex denylist over
+  // markup cannot be made complete — CodeQL says so as js/bad-tag-filter
+  // (`</script >`) and js/incomplete-multi-character-sanitization (`<script`,
+  // `<style`, `<!--`) — and an incomplete one here means a mention inside a
+  // script element or a comment CAN satisfy a placement check, which is
+  // exactly what the helper promises it cannot. The strings below are the
+  // ones those two rules name.
+
+  const CLOSERS = ['</script>', '</script >', '</script\t>', '</SCRIPT >', '</script foo>'];
+
+  it.each(CLOSERS)('a script element ended with %s hides its content', (closer) => {
+    const source = `<script lang="ts">\n  <ProjectSetupBanner />\n${closer}\n<MenuBar />`;
+    expect(templateOf(source)).not.toContain('ProjectSetupBanner');
+    expect(placementRelativeToHeader(source, 'ProjectSetupBanner')).toBe('absent');
+  });
+
+  it('`</style >` ends a style element too', () => {
+    const source = `<style>\n  /* <ProjectSetupBanner /> */\n</style >\n<MenuBar />`;
+    expect(templateOf(source)).not.toContain('ProjectSetupBanner');
+    expect(placementRelativeToHeader(source, 'ProjectSetupBanner')).toBe('absent');
+  });
+
+  it('an unclosed `<script` does not leak its body into the template', () => {
+    const source = `<MenuBar />\n<script>\n  <ProjectSetupBanner />`;
+    expect(templateOf(source)).not.toContain('ProjectSetupBanner');
+  });
+
+  it('an unterminated `<!--` comment cannot smuggle a mount', () => {
+    const source = `<MenuBar />\n<!-- <ProjectSetupBanner /> and the file ends here`;
+    expect(templateOf(source)).not.toContain('ProjectSetupBanner');
+  });
+
+  it('`<scr<script>ipt>` does not reopen what the scan just closed', () => {
+    const source = `<MenuBar />\n<scr<script>ipt>\n  <ProjectSetupBanner />\n</script >`;
+    expect(templateOf(source)).not.toContain('ProjectSetupBanner');
+  });
+
+  it('a `>` inside a quoted attribute does not end the open tag early', () => {
+    const source = `<script data-note="a > b">\n  <ProjectSetupBanner />\n</script>\n<MenuBar />`;
+    expect(templateOf(source)).not.toContain('ProjectSetupBanner');
+  });
+
+  it('leaves ordinary markup — and a bare `<` in an expression — alone', () => {
+    const source = `<MenuBar />\n{#if count < 3}<ProjectSetupBanner />{/if}`;
+    expect(templateOf(source)).toContain('{#if count < 3}');
+    expect(placementRelativeToHeader(source, 'ProjectSetupBanner')).toBe('below-header');
+  });
+});
+
 describe('the real shell', () => {
   it('mounts the setup banner below the header, not on the titlebar', () => {
     expect(placementRelativeToHeader(LAYOUT, 'ProjectSetupBanner')).toBe('below-header');

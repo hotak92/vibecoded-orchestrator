@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — two code-scanning findings, each closed as a CLASS rather than as an instance
+
+- **The shell-placement helper filtered markup with a regex denylist.** CodeQL
+  ranked it four times (`js/bad-tag-filter` on `</script >`, which
+  `/<script[\s\S]*?<\/script>/` does not match; `js/incomplete-multi-character-
+  sanitization` on `<script`, `<style` and `<!--`), and the rule is right as a
+  class: a pattern list over markup cannot be completed, only lengthened. The
+  thing it protects is a PROMISE — that a mention of `<MenuBar />` inside a
+  script element or a comment can never satisfy a placement check — and the
+  regex did not keep it: `</script >`, `</SCRIPT >`, `</script foo>` and an
+  unterminated `<script` or `<!--` all leaked their content into what the tests
+  read as template. `templateOf` is now a single-pass scanner that skips the
+  regions the HTML tokenizer skips, and the file says in its own header that it
+  is NOT a sanitiser: its input is component source read off disk by a test,
+  its output is searched as text, and the launcher's vitest run has no DOM to
+  inject into. Eight new cases, all of them red against the pattern version.
+- **The model gateway's access line scrubbed its model ids but not the fields
+  around them.** `py/log-injection` named the refusal line, whose `extra`
+  carries the request METHOD and PATH; the same shape sat unranked on three
+  upstream-failure warnings that interpolate `decision.forward_model` — the
+  client's own id, with no `repr()` in front of it and only its ENDS stripped
+  by `routing._vendor_route`, so a newline in the middle survives to the log.
+  A value with a CR/LF in it does not merely look odd in a record: it ends that
+  record and writes the next one, and the next one can read `status=200` for a
+  call that never happened. `_log_safe` now spells CR and LF as `\r` and `\n`
+  and escapes every other non-printable, applied on `_access_line` (the one
+  builder all five access-line call sites pass through) and on those three
+  warnings plus the quota-body peek. The value stays readable — a forged id
+  reads as an id with a `\n` in it, which is itself the evidence someone tried.
+
 ### Fixed — four deferral entries that could never end, or pointed somewhere that could not help
 
 - **`chunker_preset_overhaul_pending` had no resolver in either language.** Both

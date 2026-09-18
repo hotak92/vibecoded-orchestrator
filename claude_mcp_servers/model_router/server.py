@@ -866,6 +866,37 @@ def _submit_usage(
     gateway.usage.submit(record, loop=loop)
 
 
+def _log_safe(value: object) -> str:
+    """``value`` rendered so it can never be more than part of ONE log line.
+
+    A log line is a record with a shape, so a value that carries a newline
+    does not merely look odd in it — it ENDS that record and writes the next
+    one itself, and the next one can read ``requested='claude-opus-5'
+    route=native status=200`` for a call that never happened. Control
+    characters do the same job more quietly: a CR rewinds the line on a
+    terminal, an ESC can repaint what is already on it.
+
+    So CR and LF become the two characters that SPELL them, and every other
+    non-printable becomes ``\\xNN`` / ``\\uNNNN``. The value stays readable —
+    a forged id reads as an id with a ``\\n`` in it, which is itself the
+    evidence that someone tried — while the record stays one line. A value
+    that was never hostile passes through unchanged, which is why this can
+    sit on the shared builder instead of at every call site.
+    """
+    text = (
+        str(value)
+        .replace("\r\n", "\\r\\n")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return "".join(
+        ch
+        if ch.isprintable()
+        else (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+        for ch in text
+    )
+
+
 def _access_line(
     *,
     requested: str,
@@ -897,7 +928,13 @@ def _access_line(
         f"forward={(forward or '-')!r} status={status} ms={elapsed_ms} "
         f"stream={str(bool(stream)).lower()}"
     )
-    return f"{line} {extra}" if extra else line
+    # The scrub lives HERE, on the one builder every access line goes through,
+    # rather than at the five call sites — ``extra`` is assembled by callers
+    # out of request paths, methods and refusal reasons, and "one request, one
+    # line" has to hold for all of them or it holds for none. repr() above
+    # already escapes a newline inside the model ids; this closes the fields
+    # it does not reach.
+    return _log_safe(f"{line} {extra}" if extra else line)
 
 
 #: How often ONE peer's unauthorised refusals reach the log.
@@ -1289,7 +1326,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             # happen natively: a refusal the user cannot appeal to anyone.
             logger.info(
                 "model-gateway: request body not parseable (%s); forwarding "
-                "it to the first-party upstream unread", exc,
+                "it to the first-party upstream unread", _log_safe(exc),
             )
             unparseable = True
             requested_model = ""
@@ -1793,7 +1830,8 @@ async def _proxy(
                         # premature close.
                         logger.warning(
                             "model-gateway: %s -> %s stream ended early after %dB: %s",
-                            decision.forward_model, decision.family_id, total, exc,
+                            _log_safe(decision.forward_model), decision.family_id,
+                            total, _log_safe(exc),
                         )
                         access(
                             upstream.status,
@@ -1896,7 +1934,7 @@ async def _proxy(
     except asyncio.TimeoutError:
         logger.warning(
             "model-gateway: %s -> %s went quiet for %ss",
-            decision.forward_model, decision.family_id,
+            _log_safe(decision.forward_model), decision.family_id,
             gateway.config.upstream_idle_timeout_s,
         )
         access(502, stream=stream_requested, extra="note=upstream_timeout")
@@ -1910,7 +1948,7 @@ async def _proxy(
     except aiohttp.ClientError as exc:
         logger.warning(
             "model-gateway: %s -> %s unreachable: %s",
-            decision.forward_model, decision.family_id, exc,
+            _log_safe(decision.forward_model), decision.family_id, _log_safe(exc),
         )
         access(502, stream=stream_requested, extra="note=upstream_unreachable")
         return _json_error(
@@ -1994,7 +2032,9 @@ async def _quota_response(
     logger.debug(
         "model-gateway: %s quota refusal HTTP %d body=%s",
         vendor.vendor_id, upstream.status,
-        raw.decode("utf-8", "replace"),
+        # A body the gateway did not author, on a log line: same forging shape
+        # as a client-controlled model id, one actor further out.
+        _log_safe(raw.decode("utf-8", "replace")),
     )
     hint = find_reset_hint(raw, upstream.headers)
     classification = classify_quota(upstream.status, raw, upstream.headers)
