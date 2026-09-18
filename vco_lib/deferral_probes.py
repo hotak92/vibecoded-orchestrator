@@ -66,9 +66,12 @@ _TRUNCATED_LIST_RE = re.compile(r"^\s*-\s+\.\.\. and \d+ more\s*$", re.MULTILINE
 #: Directories the legacy-entry sidecar sweep never descends into. Sidecars are
 #: parked NEXT TO the user-editable file the 3-way merge touched, and the
 #: allowlist (``CLAUDE.md``, ``knowledge/**``, ``docs/**``, ``.claude/**``)
-#: never reaches inside a VCS store, a virtualenv or a build output — so
-#: pruning these is not a heuristic about where sidecars "probably" are, it is
-#: the set of trees the emitter provably cannot write into.
+#: never reaches inside a VCS store, a virtualenv or a build output.
+#:
+#: These names are matched at any depth, which is only safe OUTSIDE the
+#: allowlisted trees: ``docs/build/`` and ``knowledge/target/`` are ordinary
+#: content directories whose files the merge does park sidecars beside. See
+#: :func:`_sidecar_scan_prunes_here`, which stands the pruning down there.
 _SIDECAR_SCAN_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "target", "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache",
@@ -79,6 +82,35 @@ _SIDECAR_SCAN_SKIP_DIRS = frozenset({
 #: completion, and a partial walk is NOT evidence of absence — the sweep
 #: returns ``None`` (unknown) rather than a conclusion it did not earn.
 _SIDECAR_SCAN_MAX_ENTRIES = 400_000
+
+#: Trees the sidecar allowlist reaches with a ``**`` glob, so a skip-name can
+#: legitimately occur INSIDE them as an ordinary content directory.
+_SIDECAR_ALLOWLIST_TREES = ("knowledge", "docs")
+
+
+def _sidecar_scan_prunes_here(root: Path, dirpath: str) -> bool:
+    """Is ``dirpath`` a place where the skip-name pruning must stand DOWN?
+
+    v0.2.95 F4 MINOR. :data:`_SIDECAR_SCAN_SKIP_DIRS` is matched by NAME at any
+    depth, and its comment justifies that as "the set of trees the emitter
+    provably cannot write into". That is true of a VCS store or a virtualenv
+    anywhere; it is NOT true of ``build``, ``dist`` or ``target`` inside the
+    allowlisted trees — ``docs/build/guide.md`` and ``knowledge/target/x.md``
+    are ordinary user-editable files the 3-way merge parks sidecars beside, and
+    the sweep skipped them, so a lone orphan there could still let the entry
+    clear. The comment was part of the defect, which is why it moved too.
+
+    Returns True once the walk is INSIDE ``knowledge/`` or ``docs/``, where
+    every subdirectory is content and nothing is pruned. Outside them the
+    pruning is unchanged (a repo's own ``node_modules`` / ``target`` is still
+    skipped, which is what keeps the sweep bounded). Unresolvable paths prune
+    normally: an unreadable path is not a reason to walk a build tree.
+    """
+    try:
+        parts = Path(dirpath).resolve().relative_to(Path(root).resolve()).parts
+    except (OSError, ValueError):
+        return False
+    return bool(parts) and parts[0] in _SIDECAR_ALLOWLIST_TREES
 
 
 @dataclass
@@ -162,10 +194,11 @@ def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
     visited = 0
     try:
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _SIDECAR_SCAN_SKIP_DIRS
-            ]
+            if not _sidecar_scan_prunes_here(root, dirpath):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in _SIDECAR_SCAN_SKIP_DIRS
+                ]
             visited += len(dirnames) + len(filenames)
             for name in filenames:
                 if ".from-upstream-" in name:
@@ -330,6 +363,18 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     delete a record of real outstanding work. Positive evidence only: a
     truncated list yields ``None`` (unknown, keep) unless a named sidecar is
     still present, which is positive evidence the other way (``True``).
+
+    v0.2.95 F4 — the NAMED-SUBSET hole, the same shape one layer in. An entry
+    is last-write-wins per condition_id, so run N's entry REPLACES run N-1's
+    while run N-1's sidecars stay on disk: the maintainer's own install has
+    ``CLAUDE.md.from-upstream-89a5530`` (named) beside
+    ``CLAUDE.md.from-upstream-f1f5488`` (not named by any live entry). Clearing
+    once the named ones are gone would retire the only record of the other and
+    leave it parked and invisible — "cleared on a subset of real outstanding
+    work", which is exactly what the truncation arm above exists to refuse. So
+    the complete-list arm ends in the SAME bounded sweep the list-less arm
+    uses: every sidecar this condition can create is accounted for, not the
+    subset one entry happened to name.
     """
     paths = upstream_sidecar_paths(ctx.entry)
     if not paths:
@@ -343,7 +388,7 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
         return None
     if sidecar_list_is_truncated(ctx.entry):
         return None
-    return False
+    return any_upstream_sidecar_on_disk(ctx.folder)
 
 
 def launcher_dist_still_dirty(ctx: ProbeContext) -> Optional[bool]:
@@ -750,7 +795,38 @@ def hub_back_after_restart_failure(ctx: ProbeContext) -> Optional[bool]:
     return not answered
 
 
+def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``chunker_preset_overhaul_pending`` — has the re-sync remedy been run?
+
+    A thin wrapper over :func:`vco_lib.chunker_revision.resync_still_owed`,
+    which owns the whole chunker-resync lifecycle (the sentinel the gate
+    compares, the remedy text both emitters print, and the half-stamps the two
+    remedy scripts write). One home for the rule: a second reading here could
+    clear an entry the gate would immediately re-emit.
+
+    v0.2.95 F1 — this cid was the last IMMORTAL one. It declared
+    ``paired-resolution`` and named a clearing site that does not exist in
+    either language, while its own emitters promise the user it
+    "self-resolves on the next bundle update". The registry-completeness test
+    validates only ``probe:py:`` names, so a sentinel family whose site is
+    prose failed nothing.
+
+    Returns:
+        True  — a half of the remedy has not run under the current revision.
+        False — both halves are recorded at the current revision: the entry
+                describes work that has been done.
+        None  — could not look (unreadable chunker revision or corrupt stamp).
+    """
+    from vco_lib import chunker_revision
+
+    try:
+        return chunker_revision.resync_still_owed(ctx.folder)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+
+
 PROBES: dict[str, ProbeFn] = {
+    "chunker_resync_still_owed": chunker_resync_still_owed,
     "gateway_exec_still_unrunnable": gateway_exec_still_unrunnable,
     "hub_back_after_restart_failure": hub_back_after_restart_failure,
     "orchestrator_sidecars_still_present": orchestrator_sidecars_still_present,

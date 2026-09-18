@@ -9,6 +9,12 @@ a ``vco_lib`` module the analyzer imports, not inline". The wave-3 MAJOR-1 fix
 needed a THIRD one (the paired clear), so the whole family moved here and the
 analyzer keeps three thin wrappers.
 
+v0.2.95 F1 folded a FOURTH consequence of a completed walk — the code-graph
+half-stamp of ``chunker_preset_overhaul_pending`` — into
+:func:`record_successful_walk` beside the paired clear, rather than adding a
+second call site to the capped monolith. Same trigger point, same root, one
+line at the analyzer.
+
 The tenancy
 -----------
 Two conditions, one owner:
@@ -104,6 +110,43 @@ def clear_backend_deferrals(
     return resolve_conditions(Path(install_root), tuple(condition_ids))
 
 
+def record_successful_walk(
+    install_root: Path, force_recreate: bool = False,
+) -> int:
+    """Everything a COMPLETED analyzer walk owes the ledger, in one call.
+
+    The analyzer reaches one point that proves the walk happened — after the
+    data-loss gates, before ``return 0`` — and two conditions key off it. Both
+    live here rather than as two call sites in the monolith the ratchet caps:
+
+    * :func:`clear_backend_deferrals` — unchanged, always. A walk that wrote
+      its objects falsifies "the backend was unreachable", whatever flags ran.
+    * the code-graph half of ``chunker_preset_overhaul_pending`` (v0.2.95 F1),
+      but ONLY under ``--force-recreate``. That distinction is the whole
+      value: the remedy the entry prints is
+      ``code-graph-analyze … --force-recreate`` precisely because an
+      incremental walk hash-SKIPS unchanged entities, so it re-chunks nothing
+      and proves nothing about stale boundaries. Stamping on a plain walk
+      would retire the entry for work nobody did.
+
+    ``install_root`` is the ledger root the caller resolved
+    (``--deferral-root``, else its default): emit-root == clear-root ==
+    stamp-root, the MAJOR-A invariant, so a retry cannot record in one tree
+    what another tree is read for.
+
+    Returns what :func:`clear_backend_deferrals` returned. Never raises on the
+    stamp leg — :func:`vco_lib.chunker_revision.record_resync_half` is
+    soft-fail by contract and the analyzer's exit code must not depend on
+    bookkeeping.
+    """
+    removed = clear_backend_deferrals(install_root)
+    if force_recreate:
+        from vco_lib.chunker_revision import record_resync_half
+
+        record_resync_half(Path(install_root), "codegraph")
+    return removed
+
+
 def emit_no_backend(install_root: Path, exc: BaseException) -> bool:
     """Emit ``code_graph_no_embedding_backend``.
 
@@ -194,4 +237,5 @@ __all__ = [
     "clear_backend_deferrals",
     "emit_code_backend_down",
     "emit_no_backend",
+    "record_successful_walk",
 ]

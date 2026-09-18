@@ -376,6 +376,11 @@ class DoctorResolvers:
     #: Injected so the code-embed staleness probe is driven from a described
     #: machine — no service, no container runtime, no network.
     code_embed_state: Optional[Callable[[Path], Any]] = None
+    #: () -> :class:`vco_lib.code_embed_image.RebuildContext` — the compose
+    #: invocation this host has, plus the compose identity that OWNS the
+    #: running container. Injected so the rebuild remediation is rendered
+    #: from a described machine: no runtime, no container, no inspect.
+    code_embed_rebuild_context: Optional[Callable[[], Any]] = None
     #: () -> :class:`vco_lib.gateway_ensure.GatewayEnsureResult`. Injected so
     #: the gateway probe is driven from a described machine: no systemd, no
     #: launchd, no schtasks, and no spawn of a registered entry point.
@@ -423,6 +428,30 @@ class DoctorResolvers:
                 code_embed_image.UNKNOWN,
                 "code_embed: the image-state probe could not run.",
             )
+
+    def resolve_code_embed_rebuild_context(self):
+        """What the printed rebuild command needs to know about the machine.
+
+        v0.2.95 F2. Composed from :mod:`vco_lib.code_embed_image` for the same
+        reason as the verdict above: the command the entry prints and the
+        ownership rule the installer's step-5 guard applies are the same fact,
+        and a second reading here could print a rebuild in a project that does
+        not own the container. Injected so the remediation's tests describe a
+        machine (foreign project, own project, nothing running) without a
+        container runtime.
+
+        Soft-fail: any exception yields the default context, i.e. the
+        installer's own compose project — the shape that is right for every
+        machine that has no foreign owner, and never a claim about one.
+        """
+        from vco_lib import code_embed_image
+
+        if self.code_embed_rebuild_context is not None:
+            return self.code_embed_rebuild_context()
+        try:
+            return code_embed_image.rebuild_context()
+        except Exception:  # noqa: BLE001 — a probe never fails the doctor
+            return code_embed_image.RebuildContext()
 
     def resolve_source_facts(self, folder: Path, *, ask_remote: bool) -> "SourceFacts":
         if self.source_facts is not None:
@@ -1562,7 +1591,17 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
                 summary=state.summary,
                 fix=FIX_DEFER,
                 condition_id=CID_CODE_EMBED_IMAGE_STALE,
-                command=_code_embed_rebuild_remediation(root),
+                # The reading that produced this finding is the image state;
+                # the rebuild context only decides how the remedy is PHRASED.
+                # A context that could not be read must therefore cost the
+                # phrasing, never the finding — dropping a STALE verdict
+                # because a container label was unreadable would lose the
+                # data-integrity signal to a cosmetic failure. (The seam's own
+                # default is soft-fail; this covers an INJECTED one that is
+                # not, which is how the gap was found.)
+                command=_code_embed_rebuild_remediation(
+                    root, _safe_rebuild_context(res),
+                ),
                 detail=detail,
             )
         ]
@@ -1632,16 +1671,76 @@ def probe_model_gateway_runnable(folder: Path, res: DoctorResolvers, ctx: dict) 
     ]
 
 
-def _code_embed_rebuild_remediation(root: Path) -> str:
+def _safe_rebuild_context(res: DoctorResolvers):
+    """The rebuild context, or the default one — never a raise.
+
+    ``None`` is returned by nothing here: the remediation always gets a
+    context, so the second step is always printed. See the call site for why
+    the finding must outlive a failure to read this.
+    """
+    from vco_lib import code_embed_image  # noqa: PLC0415
+
+    try:
+        return res.resolve_code_embed_rebuild_context()
+    except Exception:  # noqa: BLE001 — phrasing must not cost the finding
+        return code_embed_image.RebuildContext()
+
+
+def _code_embed_rebuild_remediation(root: Path, context=None) -> str:
     """The command that refreshes the image, ORDERED against the code-graph re-sync.
 
     Order is load-bearing and is the reason this is one string rather than two
     lines the user might reorder: re-walking the code graph FIRST would embed
     every entity through the old, truncating service and then report success.
+
+    v0.2.95 F2 — why there is a SECOND step. ``install.py --update`` refreshes
+    the image only where the installer's own compose project owns the
+    container. Where it does not, step 5 applies
+    :func:`vco_lib.install_services_guard.apply_recreate_guard`, which strips
+    ``code_embed`` from ``build_services`` (correctly — a build under a
+    different project name produces an image the running container never
+    loads) and prints ``[skip-recreate] code_embed``. The entry then told the
+    user to run the update that had just refused, on a condition whose live
+    cost is code silently truncated into the code graph: a closed loop, and a
+    printed command that could not help. The explicit rebuild — built by
+    :func:`vco_lib.code_embed_image.rebuild_command` from the OWNING project's
+    own labels when there is one — is the leg that can.
+
+    ``context`` is :class:`vco_lib.code_embed_image.RebuildContext`; ``None``
+    (a caller that has no machine reading) falls back to the default context,
+    so the step is always present and never invented.
     """
+    from vco_lib import code_embed_image  # noqa: PLC0415
+
+    ctx = context if context is not None else code_embed_image.RebuildContext()
+    owner = getattr(ctx, "identity", None)
+    explicit = code_embed_image.rebuild_command(
+        Path(root).resolve(),
+        compose_cmd=getattr(ctx, "compose_cmd", "docker compose"),
+        identity=owner,
+    )
+    note = (
+        "# 2. The running container was created by compose "
+        f"{owner.describe()},\n"
+        "#    so step 1 will NOT rebuild its image — it prints "
+        "`[skip-recreate] code_embed`\n"
+        "#    and leaves the service on the old, TRUNCATING image. Rebuild "
+        "inside the\n"
+        "#    project that owns it:"
+        if owner is not None and getattr(owner, "working_dir", "")
+        else
+        "# 2. If step 1 printed `[skip-recreate] code_embed`, its compose did "
+        "NOT own the\n"
+        "#    running container and the image was NOT rebuilt. Rebuild it "
+        "explicitly:"
+    )
     return remedy_shell.steps(
+        "# 1. The update rebuilds the image where its own compose owns the "
+        "container:",
         f"cd {remedy_shell.quote(Path(root).resolve())}",
         "python install.py --update",
+        note,
+        explicit,
     )
 
 

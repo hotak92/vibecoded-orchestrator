@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — four deferral entries that could never end, or pointed somewhere that could not help
+
+- **`chunker_preset_overhaul_pending` had no resolver in either language.** Both
+  emitters promise, in the entry the user reads, that it *"self-resolves on the
+  next bundle update"* once the two printed commands have been run. Nothing
+  implemented that: the registry declared `clear_probe = "paired-resolution"`
+  and named a Rust site that has no resolve call, and the gate re-stamps its own
+  sentinel at EMIT time, so no later comparison could re-derive anything. The
+  row was immortal by construction — and `sync_knowledge_graph.py` arms a
+  per-node chunk-plan comparison *while the ledger carries the cid*, a cost its
+  own comment justifies as transitional. Each half of the remedy now stamps
+  `.claude/state/chunker-resync.json` at the one point that proves it ran (a
+  fully successful `kg-sync --all` **whose plan comparison was armed** — an
+  unarmed one hash-skips every node and re-chunks nothing; a completed
+  `code-graph-analyze --force-recreate`), and
+  `probe:py:chunker_resync_still_owed` retires the row —
+  and the comparison cost with it — once both name the current revision. A later
+  revision crossing re-arms it for free.
+- **`code_embed_image_stale` printed a command that its own installer strips.**
+  The remediation was `python install.py --update`; on any machine whose
+  container was created by another compose project, step 5 removes `code_embed`
+  from the build list (correctly — compose derives the image NAME from the
+  project) and prints `[skip-recreate] code_embed`. The fix could never fix the
+  thing, on a condition whose live cost is over-window code silently truncated
+  into the code graph. The entry now carries a second step built from
+  `code_embed_image.rebuild_command()` — which shipped in v0.2.92 with zero
+  callers while the doctor's docstring promised "the explicit compose command" —
+  rendered against the OWNING project's own labels: the label's `-f` paths
+  absolutised against the container's working directory (podman-compose records
+  them exactly as typed, so they are usually bare filenames that would resolve
+  against the wrong directory), the project passed explicitly with `-p`, and no
+  `--project-directory` (podman-compose has no such flag, and it is redundant
+  once the files are absolute).
+- **Both D18 entries could offer a TEST-FIXTURE-named class as a binding
+  target**, one of them with a copy-paste `UPDATE project_kg_bindings` line —
+  while `fixture_class_guard` refuses every write to such a class. A
+  fixture-stemmed class that no binding row names is no longer a binding
+  candidate at all; it is reported where it belongs, as fixture-shaped residue,
+  with the LOOK-only instructions written for that case. Both entries can now
+  clear themselves on a machine whose only "rival" collection was residue.
+- **The upstream-sidecar probe cleared on the entry's NAMED subset**, so an
+  earlier run's orphaned `*.from-upstream-*` file was silently un-recorded (the
+  ledger is last-write-wins per condition, so run N's entry replaces run N-1's
+  while its sidecars stay parked). The complete-list arm now ends in the same
+  bounded sweep the list-less arm already used — and that sweep no longer
+  prunes `build`/`dist`/`target` INSIDE `knowledge/` and `docs/`, where they are
+  ordinary content directories the merge does park sidecars in.
+- **The prefix-adopt self-heal could bind a project to a fixture-named class**
+  too — the same rule, one surface over, now shared with the evidence scan.
+
 ### Fixed — the launcher self-update no longer refuses every orchestrator-root install
 
 - **"Uncommitted changes on tracked file 'CLAUDE.md' would be lost" is gone,

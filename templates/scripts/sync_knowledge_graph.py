@@ -505,8 +505,13 @@ def _plan_for(server, content: str, *, source_id: str = "",
 #: that a boundary change is pending repair — no new app_state key or
 #: kg_syncs column is needed: the ledger already carries exactly this
 #: "crossing detected, remedy owed" state, and it is what the user is told
-#: to act on. It clears through its existing lifecycle (next update
-#: reconcile), at which point the comparison stops being paid.
+#: to act on. v0.2.95 F1: that lifecycle now EXISTS — the entry's own
+#: promise ("self-resolves on the next bundle update") was unimplemented, so
+#: this comparison was in fact paid forever. Both halves of the remedy stamp
+#: `.claude/state/chunker-resync.json` (`_record_chunker_resync_kg_half` here;
+#: `analyze_code_graph.py` for the code graph) and the registry probe
+#: `chunker_resync_still_owed` retires the row once both name the current
+#: revision — at which point the comparison stops being paid, as intended.
 _CHUNKER_RESYNC_CID = "chunker_preset_overhaul_pending"
 
 #: Lazily-filled per-process cache of the ledger probe (the ledger does not
@@ -4161,6 +4166,37 @@ def _clear_drift_deferral(project_root: Path) -> None:
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
 
 
+def _record_chunker_resync_kg_half(project_root: Path) -> None:
+    """Record that the KG half of the chunker re-sync remedy has run.
+
+    v0.2.95 F1. ``chunker_preset_overhaul_pending`` tells the user, in the
+    entry itself, that it "self-resolves on the next bundle update" once the
+    two printed commands have been run — and until now nothing recorded that
+    they had, so the row was immortal and the plan comparison below
+    (``_chunker_resync_pending``) was paid forever. This is the KG half's
+    half of the evidence; the code-graph half is stamped by
+    ``analyze_code_graph.py`` at its own success point, and the registry probe
+    ``chunker_resync_still_owed`` clears the entry when BOTH name the current
+    revision.
+
+    NARROW, exactly like the three clears beside this call, and narrower still
+    (review MAJOR-2). The caller must establish ALL THREE before calling:
+    zero failures, the knowledge tree actually walked, and
+    :func:`_chunker_resync_pending` true for this run. Only then did the
+    re-chunk happen — the plan comparison is what rewrites stale boundaries,
+    and it runs only while it is armed. An unarmed ``--all`` hash-skips every
+    unchanged node, so recording it would stamp work nobody did.
+
+    Soft-fail: a sync's exit code never depends on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.chunker_revision import record_resync_half
+
+        record_resync_half(project_root, "kg")
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (chunker re-sync stamp failed: {inner})", file=sys.stderr)
+
+
 def _clear_node_formats_deferral(project_root: Path) -> None:
     """Resolve :data:`_NODE_FORMATS_CID` after a refresh that exited 0.
 
@@ -4633,6 +4669,23 @@ def main():
                 # true about, so a stale one is safe to retire.
                 if kg_tally.total > 0 or not KNOWLEDGE_ROOT.exists():
                     _clear_drift_deferral(PROJECT_ROOT)
+                    # v0.2.95 F1: the same run is the KG half of the chunker
+                    # re-sync remedy. Same guard for the same reason — a run
+                    # that considered ZERO knowledge nodes re-chunked nothing,
+                    # so it must not count as the half having been done.
+                    #
+                    # AND the comparison must have been ARMED (review MAJOR-2):
+                    # re-chunking happens only while `_chunker_resync_pending()`
+                    # is true, so an unarmed run hash-skips every unchanged node
+                    # and re-chunks nothing. That window is reachable by hand —
+                    # an orchestrator that has updated while a project's bundle
+                    # still lags, plus the `kg-sync --all` some OTHER entry's
+                    # remedy prints — and stamping there would retire the
+                    # deferral for work nobody did, which is the exact failure
+                    # this whole mechanism exists to end. Cached per run, so
+                    # this reads the value that was in force DURING the walk.
+                    if _chunker_resync_pending():
+                        _record_chunker_resync_kg_half(PROJECT_ROOT)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted

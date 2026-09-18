@@ -141,7 +141,15 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "RePicked", "ResidueProj", "RlTest", "Same", "Sample",
     "schema_reingest_incomplete_P1", "Shared", "SimRaceTest_AI",
     "SimRaceTestAI", "Small", "Snapshotted", "SoftFail", "Solo",
-    "Someone_Elses", "SomeOther", "SomeProject", "Src", "Synthetic", "T",
+    "Someone_Elses", "SomeOther", "SomeProject", "Src",
+    # v0.2.95 F3 — `Stray` MUST stay out of the table, not merely happen to be
+    # out of it: the D18 suites use `Stray_KnowledgeGraph` as the unbound class
+    # the evidence heal legitimately re-points a binding to, and a fixture-
+    # stemmed class is no longer a binding candidate at all. Tabling it would
+    # make those tests assert the behaviour the rule forbids — which is exactly
+    # what `Ghost`/`GhostName` silently did after v0.2.94 added them here.
+    "Stray",
+    "Synthetic", "T",
     "TargetProject", "TeamWide", "Test", "TestInstall", "TestProj",
     "TestProject", "Third", "TP", "TProj", "TypoName", "Unrelated",
     "V0243Test", "V0289DualTest", "V0289Proj", "V0289Shared", "V0292D17",

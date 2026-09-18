@@ -296,7 +296,16 @@ class _Base(unittest.TestCase):
         # and holds somebody else's paths.
         self.m.klass(bound, paths=["knowledge/other/z.md"], count=1)
         # The ghost: every sampled path is a real file under p1's folder.
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=len(files))
+        #
+        # v0.2.95 F3: this class is named `Stray_`, not `Ghost_`, deliberately.
+        # `Ghost` entered `fixture_class_guard.FIXTURE_PROJECT_NAMES` in
+        # v0.2.94, and VCO REFUSES writes to a fixture-stemmed class — so a
+        # heal that re-pointed a binding there would hand the project a
+        # collection it can never write. A fixture-stemmed class is no longer
+        # a binding candidate at all (`kg_binding_doctor`), which is the rule
+        # under test in `FixtureShapedClassIsNeverABindingTarget`; using one
+        # HERE would make these tests assert the behaviour that rule forbids.
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=len(files))
         return files
 
     def cids(self, report):
@@ -316,7 +325,7 @@ class HealFiresTests(_Base):
         self.seed_ghost_shape()
         report = self.m.run_update()
 
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
         self.assertIn(REPOINT_CID, self.cids(report))
 
     def test_the_repoint_is_visible_and_reversible(self):
@@ -333,14 +342,14 @@ class HealFiresTests(_Base):
         blob = f"{entry.title}\n{entry.detected}\n{entry.why_deferred}\n" \
                f"{entry.command_to_apply}"
         self.assertIn("Old_KnowledgeGraph", blob)
-        self.assertIn("Ghost_KnowledgeGraph", blob)
+        self.assertIn("Stray_KnowledgeGraph", blob)
         self.assertIn("Identity", blob)  # the reversal route
         self.assertEqual(entry.severity, "info")
 
         audit = self.m.config_of("p1").get("evidence_repoint")
         assert isinstance(audit, dict), f"no repoint audit record: {audit!r}"
         self.assertEqual(audit["from"], "Old_KnowledgeGraph")
-        self.assertEqual(audit["to"], "Ghost_KnowledgeGraph")
+        self.assertEqual(audit["to"], "Stray_KnowledgeGraph")
         # NOT laundered as a human pick — that sentinel is the thing every
         # automated pass must not forge.
         self.assertNotIn("manual_override", self.m.config_of("p1"))
@@ -352,7 +361,7 @@ class HealFiresTests(_Base):
         MUTATION: move the D18 pass after pass 4 — red."""
         self.seed_ghost_shape()
         self.m.run_update()
-        self.assertIn("Ghost_KnowledgeGraph", self.m.access_rows("p1"))
+        self.assertIn("Stray_KnowledgeGraph", self.m.access_rows("p1"))
 
     def test_repoints_to_the_evidence_class_not_the_name_derived_one(self):
         """THE R38 PIN. `Acme_KnowledgeGraph` — the name-derived class — is
@@ -368,10 +377,10 @@ class HealFiresTests(_Base):
         self.m.klass("Acme_KnowledgeGraph",
                      paths=["knowledge/nope/a.md", "knowledge/nope/b.md"],
                      count=9)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=4)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=4)
 
         self.m.run_update()
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
 
     def test_the_previous_class_stays_in_the_drop_protection_keep_set(self):
         """A repoint must not turn live data into a drop candidate.
@@ -397,7 +406,7 @@ class HealFiresTests(_Base):
             normalise_for_match("Old_KnowledgeGraph"), after,
             "the class the repoint moved OFF must stay drop-protected",
         )
-        self.assertIn(normalise_for_match("Ghost_KnowledgeGraph"), after)
+        self.assertIn(normalise_for_match("Stray_KnowledgeGraph"), after)
 
     def test_second_run_is_a_no_op(self):
         """Idempotent by construction: once re-pointed, the ONE class that
@@ -421,7 +430,7 @@ class HealFiresTests(_Base):
         first = self.m.config_of("p1")["evidence_repoint"]["at_ms"]
 
         report2 = self.m.run_update()
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
         self.assertNotIn(REPOINT_CID, self.cids(report2))
         self.assertEqual(
             self.m.config_of("p1")["evidence_repoint"]["at_ms"], first,
@@ -521,7 +530,7 @@ class HealRefusesTests(_Base):
         self.m.project("p1", "Acme", primary="Old_KnowledgeGraph", files=files)
         self.m.klass("Old_KnowledgeGraph", paths=["knowledge/other/z.md"],
                      count=1)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=1)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=1)
 
         self.assert_untouched(self.m.run_update())
 
@@ -534,7 +543,7 @@ class HealRefusesTests(_Base):
         self.m.project("p1", "Acme", primary="Old_KnowledgeGraph", files=files)
         self.m.klass("Old_KnowledgeGraph", paths=["knowledge/other/z.md"],
                      count=1)
-        self.m.klass("Ghost_KnowledgeGraph",
+        self.m.klass("Stray_KnowledgeGraph",
                      paths=[*files, "knowledge/gone/x.md",
                             "knowledge/gone/y.md"], count=5)
 
@@ -553,7 +562,7 @@ class HealRefusesTests(_Base):
         # The bound class holds the project's files TOO — e.g. the project
         # wrote to the ghost for a while and was re-bound afterwards.
         self.m.klass("Old_KnowledgeGraph", paths=files, count=4)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=9)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=9)
 
         self.assert_untouched(self.m.run_update())
 
@@ -581,14 +590,14 @@ class HealRefusesTests(_Base):
         (the same gate `..._orphan_binding_row_...` pins)."""
         files = [f"knowledge/concepts/n{i}.md" for i in range(4)]
         self.m.project("p1", "Acme", primary="Old_KnowledgeGraph", files=files)
-        self.m.project("p2", "Other", primary="Ghost_KnowledgeGraph")
+        self.m.project("p2", "Other", primary="Stray_KnowledgeGraph")
         self.m.klass("Old_KnowledgeGraph", paths=["knowledge/other/z.md"],
                      count=1)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=4)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=4)
 
         report = self.m.run_update()
         self.assert_untouched(report)
-        self.assertEqual(self.m.primary_of("p2"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p2"), "Stray_KnowledgeGraph")
 
     def test_target_owned_by_an_orphan_binding_row_is_refused_at_write_time(
             self):
@@ -607,10 +616,10 @@ class HealRefusesTests(_Base):
         files = [f"knowledge/concepts/n{i}.md" for i in range(4)]
         self.m.project("p1", "Acme", primary="Old_KnowledgeGraph", files=files)
         add_kg_binding(self.m.db, "ghost-project-id", "primary",
-                       "Ghost_KnowledgeGraph")
+                       "Stray_KnowledgeGraph")
         self.m.klass("Old_KnowledgeGraph", paths=["knowledge/other/z.md"],
                      count=1)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=4)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=4)
         # Unbound, populated, and NOT this project's data — it exists only to
         # keep the precondition open so the scan actually runs.
         self.m.klass("Decoy_KnowledgeGraph",
@@ -631,11 +640,11 @@ class HealRefusesTests(_Base):
         files = [f"knowledge/concepts/n{i}.md" for i in range(4)]
         self.m.project("p1", "Acme", primary="Missing_KnowledgeGraph",
                        files=files)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=4)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=4)
 
         report = self.m.run_update()
 
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
         cfg = self.m.config_of("p1")
         self.assertEqual(cfg.get("manual_override"), "v0.2.40-prefix-adopt")
         self.assertNotIn(
@@ -663,7 +672,7 @@ class HealRefusesTests(_Base):
         plan = kbh.EvidenceHealPlan(repoints=(kbh.EvidenceRepoint(
             project_id="p1", project_name="Acme", folder=str(self.tmp),
             old_name="Snapshotted_KnowledgeGraph",
-            new_name="Ghost_KnowledgeGraph",
+            new_name="Stray_KnowledgeGraph",
             object_count=4, matched_paths=4, sampled_paths=4,
         ),))
         conn = connect(self.m.db)
@@ -700,7 +709,7 @@ class HealRefusesTests(_Base):
         plan = kbh.resolve_evidence_heal_plan(
             db_path=self.tmp / "does-not-exist.db",
             weaviate_url=f"http://127.0.0.1:{self.m.port}",
-            existing_classes={"Ghost_KnowledgeGraph"},
+            existing_classes={"Stray_KnowledgeGraph"},
         )
         self.assertIsNone(plan)
 
@@ -718,7 +727,7 @@ class HealRefusesTests(_Base):
             kbh.resolve_evidence_heal_plan(
                 db_path=self.m.db,
                 weaviate_url=f"http://127.0.0.1:{self.m.port}",
-                existing_classes={"Ghost_KnowledgeGraph"},
+                existing_classes={"Stray_KnowledgeGraph"},
                 scan_evidence=lambda **kw: None,
             )
         )
@@ -1151,7 +1160,7 @@ class EvidenceRuleIsNotForkedTests(_Base):
         self.m.project("p1", "Acme", primary="Old_KnowledgeGraph", files=files)
         self.m.klass("Old_KnowledgeGraph", paths=["knowledge/other/z.md"],
                      count=1)
-        self.m.klass("Ghost_KnowledgeGraph", paths=files, count=1)
+        self.m.klass("Stray_KnowledgeGraph", paths=files, count=1)
 
         # At the shipped floor (2 distinct matching paths) this is below-bar.
         self.m.run_update()
@@ -1159,14 +1168,14 @@ class EvidenceRuleIsNotForkedTests(_Base):
 
         with mock.patch.object(kbd, "MIN_MATCHED_PATHS", 1):
             self.m.run_update()
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
 
     def test_lowering_the_doctor_fraction_makes_the_heal_fire(self):
         files = [f"knowledge/concepts/n{i}.md" for i in range(3)]
         self.m.project("p1", "Acme", primary="Old_KnowledgeGraph", files=files)
         self.m.klass("Old_KnowledgeGraph", paths=["knowledge/other/z.md"],
                      count=1)
-        self.m.klass("Ghost_KnowledgeGraph",
+        self.m.klass("Stray_KnowledgeGraph",
                      paths=[*files, "knowledge/gone/x.md",
                             "knowledge/gone/y.md"], count=5)
 
@@ -1175,7 +1184,7 @@ class EvidenceRuleIsNotForkedTests(_Base):
 
         with mock.patch.object(kbd, "OWNERSHIP_MATCH_FRACTION", 0.5):
             self.m.run_update()
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
 
     def test_raising_the_doctor_fraction_stops_a_heal_that_otherwise_fires(
             self):
@@ -1185,7 +1194,7 @@ class EvidenceRuleIsNotForkedTests(_Base):
         self.assertEqual(self.m.primary_of("p1"), "Old_KnowledgeGraph")
 
         self.m.run_update()
-        self.assertEqual(self.m.primary_of("p1"), "Ghost_KnowledgeGraph")
+        self.assertEqual(self.m.primary_of("p1"), "Stray_KnowledgeGraph")
 
 
 if __name__ == "__main__":

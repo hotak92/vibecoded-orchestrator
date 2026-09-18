@@ -619,8 +619,11 @@ class ExitZeroIsNotProofTests(unittest.TestCase):
         analyzer = (REPO_ROOT / "templates" / "scripts"
                     / "analyze_code_graph.py").read_text(encoding="utf-8")
         self.assertIn(
-            '_deferral_op("clear_backend_deferrals", deferral_root)', analyzer,
-            "the analyzer must CALL its clear on the success path",
+            '_deferral_op("record_successful_walk", deferral_root, '
+            'args.force_recreate)', analyzer,
+            "the analyzer must CALL its clear on the success path "
+            "(v0.2.95 F1: composed with the chunker-resync half-stamp under "
+            "`record_successful_walk`, which performs the same clear)",
         )
         # …and the tenancy itself (both cids + the clear) lives in the one
         # vco_lib home the analyzer's thin wrappers delegate to.
@@ -630,7 +633,14 @@ class ExitZeroIsNotProofTests(unittest.TestCase):
             set(codegraph_deferrals.CODE_GRAPH_BACKEND_CIDS),
             {CG_CID, CG_CODE_CID},
         )
-        self.assertIn("clear_backend_deferrals", analyzer)
+        # The clear reaches the ledger through the module's composed entry
+        # point; assert on the CALLABLE, not on a name in the analyzer's text.
+        self.assertTrue(
+            callable(getattr(codegraph_deferrals, "clear_backend_deferrals", None))
+        )
+        self.assertTrue(
+            callable(getattr(codegraph_deferrals, "record_successful_walk", None))
+        )
         self.assertTrue(callable(codegraph_deferrals.clear_backend_deferrals))
 
 
