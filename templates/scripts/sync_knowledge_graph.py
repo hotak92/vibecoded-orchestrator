@@ -316,7 +316,7 @@ from vco_lib.kg_truncation_tags import truncation_tag_properties  # noqa: E402 -
 # resolve it through the same helper, so a scan cannot target a slot the sync
 # never populated — the divergence that left the duplicate scanner querying no
 # slot at all on multi-vector collections.
-from vco_lib.kg_vector_slot import active_text_vector_slot  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
+from vco_lib.kg_vector_slot import active_text_vector_slot, collection_vector_slots  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
 # v0.2.92 WP-B1 (D13): the canonical file_path shape helper. `to_posix_rel`
 # is pure + dependency-free (see its docstring); importing it loudly here
 # (never an inline copy) because every Weaviate write below must store ONE
@@ -2300,6 +2300,126 @@ class SyncTally:
         return f"{self.succeeded} succeeded, {self.failed} failed, {self.skipped} skipped"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.95 WP-5 — the ACTIVE named-vector slot gate for the embed-skip.
+#
+# ONE home for "may this row set be skipped, given the slot the running
+# backend actually reads and writes?". `sync_node` and `sync_doc` both
+# call it, so the two fast paths can no longer answer the same question
+# differently — which is precisely what they did until now: `sync_doc`
+# checked the slot, `sync_node` did not, and the comment asserting
+# otherwise was the WP-0(a) false promise.
+#
+# WHY THIS IS NARROWER THAN A NAIVE "no vector ⇒ re-embed".
+# `vco_lib/kg_vector_slot.py` records the standing rule for this exact
+# question — "cannot confirm → do nothing" — together with the reason a
+# guess is dangerous here: a LEGACY class carrying one UNNAMED vector
+# still exists in the field (that module verified one live), and asking
+# it for a NAMED slot is an ERROR, not an empty answer. A gate reading
+# "active slot not found ⇒ re-embed" would therefore re-embed every row
+# of such a collection on EVERY sync, forever — and the re-embed could
+# never clear the objection, because the slot is missing from the
+# SCHEMA, which only `migrate-collections` can change. An unbounded,
+# self-perpetuating re-embed is a worse defect than the one WP-5 fixes.
+#
+# So the gate engages only where a re-embed can actually repair what it
+# objects to:
+#
+#   schema unreadable            (None) → INCONCLUSIVE   → skip permitted
+#   no named vectors (legacy)      (()) → not applicable → skip permitted
+#   named, active slot undeclared       → schema matter  → skip permitted
+#   named, active slot declared         → GATE APPLIES, per object
+#
+# and inside the applying case an object whose vector payload cannot be
+# read is inconclusive as well. The ONLY verdict that forces work is a
+# positively-observed EMPTY active slot on a slot the class declares —
+# and that one a re-embed does repair, because every write path here puts
+# a vector in `server.text_vector_slot` (`_build_vector_arg`; the
+# shipped-ingest path REQUIRES an active-slot hit or returns None and
+# computes). The gate therefore cannot loop.
+#
+# Cost: one `collection.config.get()` per COLLECTION per process, cached
+# below — not one per node. The gate is evaluated only after the cheap
+# hash/count/shape checks have already voted to skip.
+# ──────────────────────────────────────────────────────────────────────
+
+#: Named-vector schema probe cache, keyed by collection name. A schema does
+#: not change under a running sync (a migration is a separate, consented
+#: operation), so one probe per collection is both correct and the reason
+#: the gate costs nothing at tree scale.
+_SLOT_SCHEMA_CACHE: "Dict[str, Optional[Tuple[str, ...]]]" = {}
+
+
+def _collection_declares_slot(
+    collection: object, collection_name: str, slot: str
+) -> Optional[bool]:
+    """Does *collection*'s live schema declare named-vector *slot*?
+
+    Returns True / False, or **None for UNDETERMINABLE** — the third
+    answer `collection_vector_slots` exists to preserve. False covers both
+    "this class has named vectors but not that one" and "this class has
+    one unnamed vector"; neither is repairable by re-embedding, so both
+    are treated identically by the caller.
+    """
+    if collection_name in _SLOT_SCHEMA_CACHE:
+        slots = _SLOT_SCHEMA_CACHE[collection_name]
+    else:
+        slots = collection_vector_slots(collection)
+        _SLOT_SCHEMA_CACHE[collection_name] = slots
+    if slots is None:
+        return None
+    return slot in slots
+
+
+def _active_slot_gate_ok(
+    collection: object,
+    collection_name: str,
+    objects: object,
+    active_slot: str,
+    *,
+    vectors_requested: bool,
+) -> bool:
+    """True when the active vector slot does NOT veto an embed-skip.
+
+    Args:
+        collection: the Weaviate collection the rows came from (schema probe).
+        collection_name: its name — the cache key.
+        objects: the fetched row objects (``obj.vector`` is consulted).
+        active_slot: ``server.text_vector_slot``; ``""`` disables the gate.
+        vectors_requested: whether the fetch that produced *objects* asked
+            for vectors. False means every ``obj.vector`` is empty BY
+            CONSTRUCTION and says nothing — the gate must not read that as
+            "no vector stored".
+
+    Returns False only on a positively-observed empty active slot for a
+    slot the class declares. Every other path returns True, preserving the
+    pre-existing (content_hash + chunk_count) skip semantics.
+    """
+    if not active_slot or not vectors_requested:
+        return True
+    try:
+        rows = list(objects or [])
+    except Exception:  # noqa: BLE001 — unreadable result → inconclusive
+        return True
+    if not rows:
+        return True
+    if _collection_declares_slot(collection, collection_name, active_slot) is not True:
+        return True
+    for obj in rows:
+        vec_field = getattr(obj, "vector", None)
+        if not isinstance(vec_field, dict):
+            # Nothing to judge (older client / double that drops vectors).
+            return True
+        slot_vec = vec_field.get(active_slot)
+        try:
+            populated = bool(slot_vec) and len(slot_vec) > 0
+        except Exception:  # noqa: BLE001 — unreadable payload → inconclusive
+            populated = True
+        if not populated:
+            return False
+    return True
+
+
 def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """Sync a single docs/ file to the development collection.
 
@@ -2390,6 +2510,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # Pull existing objects WITH vectors so we can verify the active
         # slot is populated. `include_vector=True` returns `obj.vector` as
         # a dict keyed by slot name for named-vector collections.
+        _vectors_requested = True
         try:
             existing = coll.query.fetch_objects(
                 filters=_file_path_filter(doc_data["file_path"]),
@@ -2404,6 +2525,14 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # `include_vector` keyword → fall back to the basic fetch and
             # skip the active-slot check (defer to content_hash + chunk
             # count). Any real client supports this kw since Weaviate v4.
+            #
+            # v0.2.95 WP-5: that promise is now KEPT. Until this release the
+            # fallback did the opposite of what this comment says — with no
+            # vectors in hand, every row scored "slot not populated" and the
+            # whole docs tree re-embedded on every sync. `_vectors_requested`
+            # is the flag that makes the sentence true: the shared gate reads
+            # it as "no information", not as "no vector stored".
+            _vectors_requested = False
             print(f"   (fetch_objects(include_vector=True) failed: "
                   f"{fetch_err}; falling back to hash-only check)")
             try:
@@ -2418,16 +2547,32 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 existing = None  # forces fall-through to re-embed
 
         # EMBED-SKIP fast path. Mirrors sync_node's v0.2.17 implementation
-        # with the added active-slot check (which sync_node's fast-path
-        # also relies on implicitly via the chunk_count gate, but Dev gets
-        # it explicit because Dev rows are more likely to have a chunk
-        # written under one slot and not yet enriched under another).
+        # plus an active-slot check that sync_node does NOT perform.
+        #
+        # v0.2.95 WP-0(a) — TRUTH REPAIR. This comment used to claim that
+        # "sync_node's fast-path also relies on [the active-slot check]
+        # implicitly via the chunk_count gate". It does not, and a comment
+        # describing a guard is part of that guard, so the claim was itself
+        # the defect. The real asymmetry, stated once:
+        #
+        #   * `chunk_count_ok` counts OBJECTS — each row's stored
+        #     `total_chunks` against the number of rows returned. It reads
+        #     no vector and can say nothing about one.
+        #   * sync_node does not even ASK for vectors: its fetch omits
+        #     `include_vector`, so `obj.vector` is empty there by
+        #     construction. Nothing in its gate could consult a slot.
+        #
+        # Consequence, one-directional: a row set whose `content_hash`
+        # matches while the ACTIVE named-vector slot is empty is caught
+        # here and skipped forever by sync_node. That is exactly the state
+        # an aborted embedding-model change leaves behind — and it is why
+        # `last_installed_active_embedding` had no repair path on the KG
+        # side (see install.py's leg-(b) gate).
         if existing is not None and existing.objects:
             try:
                 existing_hashes: List[str] = []
                 existing_total_chunks: List[int] = []
                 existing_file_paths: List[str] = []
-                active_slot_populated: List[bool] = []
                 for obj in existing.objects:
                     props = obj.properties or {}
                     existing_hashes.append(props.get("content_hash", "") or "")
@@ -2437,22 +2582,6 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     except (TypeError, ValueError):
                         existing_total_chunks.append(0)
                     existing_file_paths.append(props.get("file_path", "") or "")
-                    # `obj.vector` is a dict {slot: list[float]} for
-                    # named-vector collections; missing/None when the
-                    # fetch didn't include vectors (older client).
-                    vec_field = getattr(obj, "vector", None)
-                    if isinstance(vec_field, dict) and active_slot:
-                        slot_vec = vec_field.get(active_slot)
-                        active_slot_populated.append(
-                            bool(slot_vec) and len(slot_vec) > 0
-                        )
-                    else:
-                        # Couldn't inspect → be conservative, treat as
-                        # NOT populated so we re-embed. Exception: if
-                        # active_slot is empty (no wrapper info), skip
-                        # the active-slot gate altogether (back to
-                        # content_hash + chunk_count).
-                        active_slot_populated.append(not active_slot)
 
                 chunk_count_ok = (
                     len(existing_total_chunks) > 0
@@ -2474,7 +2603,21 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 shapes_ok = all(
                     fp in ("", doc_data["file_path"]) for fp in existing_file_paths
                 )
-                slots_ok = all(active_slot_populated)
+                # v0.2.95 WP-5: ONE home for this decision — the same
+                # `_active_slot_gate_ok` `sync_node` now calls. The inline
+                # loop that used to live here judged an unreadable vector
+                # payload as "slot empty", which re-embedded the entire
+                # tree whenever the vector fetch degraded; the shared gate
+                # treats every unverifiable state as inconclusive and only
+                # forces work on a POSITIVELY observed empty slot in a slot
+                # the class declares. See its header for the full table.
+                slots_ok = _active_slot_gate_ok(
+                    coll,
+                    DEV_COLLECTION_NAME,
+                    existing.objects,
+                    active_slot,
+                    vectors_requested=_vectors_requested,
+                )
                 # v0.2.92 chunk-plan transition repair — same rule as
                 # sync_node's fast path (see the block above it): while a
                 # chunker-revision crossing is pending, a self-consistent
@@ -3395,16 +3538,49 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # read the wrong store.
         collection = server.client.collections.get(target_collection_name)
 
+        # v0.2.95 WP-5: the slot the running backend reads and writes.
+        # Soft-fail to "" (gate disabled → pre-existing semantics) exactly
+        # as `sync_doc` does: a wrapper that cannot name its slot must not
+        # be read as "the slot is empty".
+        try:
+            _active_slot_for_gate = server.text_vector_slot
+        except Exception:  # noqa: BLE001 — degenerate wrapper / double
+            _active_slot_for_gate = ""
+
         # Query for existing nodes with same file_path — BOTH spellings
         # (v0.2.92 WP-B1 / D13): a legacy Windows-written row carries the
         # backslash variant; an exact POSIX-only filter would miss it, the
         # delete below would skip it, and the insert would duplicate it.
         where_filter = _file_path_filter(node_data["file_path"])
-        existing = collection.query.fetch_objects(
-            filters=where_filter,
-            limit=100,
-            return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
-        )
+        # v0.2.95 WP-5: request VECTORS too, so the embed-skip gate below can
+        # see whether the ACTIVE named-vector slot is actually populated.
+        # Until now this fetch omitted `include_vector`, which is why a node
+        # with a matching content_hash and an EMPTY active slot was skipped
+        # forever (the state an aborted embedding-model change leaves).
+        #
+        # `_vectors_requested` records whether the ask SUCCEEDED. On the
+        # fallback fetch every `obj.vector` is empty BY CONSTRUCTION, and the
+        # gate must read that as "no information", never as "no vector
+        # stored" — otherwise one client incompatibility re-embeds the whole
+        # knowledge graph. A failure of the FALLBACK fetch still propagates
+        # exactly as it did before this change.
+        _vectors_requested = True
+        try:
+            existing = collection.query.fetch_objects(
+                filters=where_filter,
+                limit=100,
+                return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
+                include_vector=True,
+            )
+        except Exception as _vec_fetch_err:  # noqa: BLE001 — older/mocked client
+            print(f"   (fetch_objects(include_vector=True) failed: "
+                  f"{_vec_fetch_err}; falling back to hash-only check)")
+            _vectors_requested = False
+            existing = collection.query.fetch_objects(
+                filters=where_filter,
+                limit=100,
+                return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
+            )
 
         # v0.2.17 (plan 0.2): EMBED-SKIP fast path. If every existing
         # object for this file_path has content_hash matching the
@@ -3464,13 +3640,44 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # majority); changed plan → fall through to delete-and-re-embed
             # so this entry re-chunks. No crossing pending → exactly the
             # pre-v0.2.92 semantics (no plan CPU paid).
-            _self_consistent = (
+            _hashes_and_shape_ok = (
                 len(existing_hashes) > 0
                 and all(h == current_content_hash for h in existing_hashes)
                 and all(h for h in existing_hashes)  # no empty strings
                 and chunk_count_ok
                 and shapes_canonical
             )
+            # v0.2.95 WP-5: the ACTIVE named-vector slot gate (shared home:
+            # `_active_slot_gate_ok`, the same one `sync_doc` calls). A row
+            # set can be perfectly self-consistent on hash, count and shape
+            # and STILL carry no vector in the slot the running backend
+            # reads — the residue of an embedding-model change whose sync
+            # aborted part-way. content_hash is computed from file bytes
+            # alone and carries no model identity, so nothing else in this
+            # gate can see that state.
+            #
+            # Evaluated only when the cheap checks already voted to skip:
+            # a row set that is re-embedding anyway must not pay a schema
+            # probe. Conservative by construction — see the helper's header
+            # for every inconclusive path and why each keeps the
+            # pre-existing skip semantics instead of forcing work.
+            _slots_ok = True
+            if _hashes_and_shape_ok:
+                _slots_ok = _active_slot_gate_ok(
+                    collection,
+                    target_collection_name,
+                    existing.objects,
+                    _active_slot_for_gate,
+                    vectors_requested=_vectors_requested,
+                )
+                if not _slots_ok:
+                    print(
+                        f"   ♻️  Re-embedding: active vector slot "
+                        f"{_active_slot_for_gate!r} is empty on at least one "
+                        f"stored chunk (content unchanged — model/slot change "
+                        f"residue)"
+                    )
+            _self_consistent = _hashes_and_shape_ok and _slots_ok
             _plan_ok = True
             if _self_consistent and _chunker_resync_pending():
                 _plan_ok = _stored_plan_matches_current(
@@ -4697,6 +4904,21 @@ def main():
                         f"{doc_tally.failed} doc(s)"
                     ),
                 )
+            # This exit code is READ, and by more than a shell. install.py's
+            # v0.2.95 WP-4 carve-out advances the context triple
+            # (`last_installed_active_embedding` + the two collection names)
+            # only when a leg-(b) run exits 0, because a non-zero exit cannot
+            # distinguish "one node failed" from "died early, most of the tree
+            # never visited" — and stamping the second shape leaves previous-
+            # model vectors in place permanently. Consequence, deliberate and
+            # named in that comment (ship-gate MINOR-5): a PERMANENTLY failing
+            # node keeps this non-zero, so every later `--update` re-enters leg
+            # (b) and walks `--all` again. Bounded, not free: WP-5's active-slot
+            # gate skips the embed for every node already current, so the repeat
+            # is a fetch per node rather than a re-embed, and the owed work is on
+            # the ledger as `kg_sync_failures_pending`. Do not "fix" that by
+            # exiting 0 on partial success — the exit code is the only signal
+            # install.py has, and softening it re-opens the silent state.
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
             doc_tally = sync_all_docs(server)

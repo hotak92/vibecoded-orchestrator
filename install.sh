@@ -20,6 +20,30 @@ set -euo pipefail
 # binary (Rust/Go) or use `uv` (Astral) to provision Python; both are
 # tracked for v1.1. For v1.0 the lightest touch is a shell wrapper that
 # leans on the system package manager.
+#
+# Flags this wrapper consumes itself (everything else is forwarded to
+# install.py, whose `--help` lists the full set):
+#   --non-interactive | --quiet   Never prompt; refuse to auto-install
+#                                 Python/Node/Podman and just print a hint.
+#                                 `CI=1` or `VCT_NON_INTERACTIVE=1` or a
+#                                 non-TTY stdin have the same effect.
+#
+# WHAT YOU GET AT THE END, and how this differs from first-install.sh
+# (v0.2.95 WP-8 — previously undocumented here):
+#   * The launcher binary and the desktop entry ARE installed. This wrapper
+#     does not call scripts/post-install-launcher.sh itself; install.py runs
+#     it as its final step (`_run_desktop_icon_step`, v0.2.6 "Bug C1"), so a
+#     plain `./install.sh` still ends with a launcher and a desktop icon.
+#     Opt out with `--no-desktop-icon` or `VCT_NO_DESKTOP_ICON=1`.
+#   * The launcher GUI is NOT auto-opened. That is deliberate: install.sh is
+#     the CLI/automation entry point (it honours `CI`, goes non-interactive
+#     without a TTY, and is what scripted installs call), and popping a GUI
+#     window there would be wrong. `first-install.sh` — the double-click /
+#     first-time path, and what README documents — is the one that ends with
+#     the window open.
+#     To open it afterwards:  ./start-launcher.sh
+#   * To add the desktop icon later if you declined it:
+#       python install.py --desktop-icon-only
 
 echo "=== VibeCoded Tools — Orchestrator Installer ==="
 echo ""
@@ -45,19 +69,26 @@ fi
 # ---------------------------------------------------------------------------
 find_python() {
     local cmd version major minor
-    # CROSS-LANGUAGE PARITY (v0.2.53 NEW-3): this POSIX candidate list is a
-    # MIRROR — it must stay identical, in order, to the other two bootstrap
-    # Python probes:
+    # CROSS-LANGUAGE PARITY (v0.2.53 NEW-3; sibling list corrected v0.2.95
+    # WP-7): this POSIX candidate list is a MIRROR — it must stay identical,
+    # in order, to the other FOUR bootstrap Python probes:
     #   * install.ps1  → Find-Python `$candidates`
+    #   * first-install.sh      → its `for cand in ...` cascade (bare names)
+    #   * first-install.command → its `for cand in ...` cascade (bare names)
     #   * launcher/src-tauri/src/commands/installer.rs → detect_python POSIX
     #     `else { vec![...] }` branch
+    # (The two first-install.* shims may prepend/append ABSOLUTE Homebrew or
+    # Linuxbrew paths; the bare names must match this list exactly. They were
+    # unlocked until v0.2.95 — a drift there was invisible to every test.)
     # The mirror is deliberate (C-tier, justified): these run at bootstrap on a
     # fresh machine with NO jq / interpreter / launcher available, so a shared
     # data file cannot be safely parsed here. Instead the drift is locked by
-    # tests/test_python_candidate_parity.py, which extracts all three literal
-    # lists and asserts sh == ps1 == rs for the POSIX branch. Edit all three +
-    # keep that test green when this list changes. (Windows intentionally
-    # diverges — `py` first, no version suffixes — see the installer.rs note.)
+    # tests/test_python_candidate_parity.py (sh == ps1 == rs) plus
+    # tests/test_v0295_wp7_bootstrap_cascade_parity.py (adds both shims) and
+    # tests/test_v0295_wp7_cascade_behaviour.py (runs the scripts against stub
+    # interpreters and asserts which one is invoked). Edit all five + keep
+    # those green. (Windows intentionally diverges — `py` first, no version
+    # suffixes — see the installer.rs note.)
     for cmd in python3.13 python3.12 python3.11 python3 python; do
         if command -v "$cmd" &>/dev/null; then
             # Python 2/3-compatible probe (no f-strings).
@@ -650,8 +681,10 @@ fi
 cd "$(dirname "$0")"
 
 # Translate install.sh-only flags to ones install.py accepts.
-# install.sh advertises --non-interactive in its own help (used to skip
-# the Python auto-install prompt). Earlier versions forwarded the literal
+# install.sh advertises --non-interactive in its own header block above
+# (`--help` itself is forwarded to install.py, which owns the full flag
+# list) — it skips the Python auto-install prompt. Earlier versions
+# forwarded the literal
 # string to install.py, which argparse-rejected because install.py only
 # knows --yes / --quiet. Translate before forwarding so the public flag
 # surface stays consistent. (Reported 2026-05-06: bash first-install.sh

@@ -1029,10 +1029,29 @@ struct HeldRenderedFile {
     action: RenderedAction,
 }
 
-/// Branch-resolving entry point: resolve base/theirs for `branch`, then run
-/// [`resolve_rendered_files_keep_local_at`]. Used by
-/// `self_update::apply_launcher_update`, which has no A0 pre-merge step of its
-/// own. Conservative: an unresolvable ref ⇒ no-op.
+/// Branch-resolving front door: resolve base/theirs for `branch`, then run
+/// [`resolve_rendered_files_keep_local_at`]. Conservative: an unresolvable ref
+/// ⇒ no-op.
+///
+/// **`#[cfg(test)]`-only since v0.2.95 phase 2**, deliberately, and this is the
+/// same disposition v0.2.95 gave `self_update::first_blocking_change`: a
+/// function whose production caller went away, kept because the TESTS below
+/// legitimately want this shape (eleven of them drive the class from a branch,
+/// which is the state a repo fixture is actually in) — but taken out of the
+/// production surface so nothing can reach it there by accident.
+///
+/// Its production caller was `self_update::apply_launcher_update`, which had no
+/// A0 pre-merge step of its own and so called this class DIRECTLY. That surface
+/// now shares the update pipeline and reaches the class through
+/// `pre_merge_user_editable`, exactly as the installer surface does — ledger
+/// row 12's "one helper, two entry points" is down to one entry point.
+///
+/// Nothing was lost in the fold. `installer::run_pre_merge_user_editable`
+/// resolves base/theirs from the pull branch through the same
+/// `compute_base_sha` / `compute_theirs_sha` pair with the same
+/// unresolvable-ref posture, and now threads the BRANCH through too — which was
+/// this wrapper's one advantage over the `_at` form.
+#[cfg(test)]
 pub(crate) async fn resolve_rendered_files_keep_local(
     install_path: &Path,
     branch: &str,
@@ -1048,7 +1067,8 @@ pub(crate) async fn resolve_rendered_files_keep_local(
     resolve_rendered_files_keep_local_at(install_path, &base, &theirs, branch).await
 }
 
-/// The engine (one home; both entry points reach it).
+/// The engine (one home; the production path reaches it through
+/// `pre_merge_user_editable`).
 ///
 /// For each RENDERED root path, act ONLY when all of these hold — the trigger
 /// is the live repo STATE, never "how many releases behind are you", so a
@@ -1667,6 +1687,7 @@ pub(crate) async fn pre_merge_user_editable(
     install_path: &Path,
     base_sha: &str,
     theirs_sha: &str,
+    branch: &str,
 ) -> Result<Vec<MergeOutcome>, String> {
     let globset = build_user_editable_globset()?;
 
@@ -1679,19 +1700,34 @@ pub(crate) async fn pre_merge_user_editable(
     // RENDERED_LOCAL section above for why that shape, and why a
     // `.gitattributes` merge driver cannot do this job).
     //
-    // `branch` is passed EMPTY here on purpose: this entry point receives
-    // base/theirs, not the pull branch, and inventing one would put a guess in
-    // the audit row. The row's load-bearing field is the base..theirs range,
-    // which we do have; install.py words the branch as "the pull branch" when
-    // it is absent. `self_update::apply_launcher_update` calls the
-    // branch-resolving entry point and records the real name.
-    let rendered = resolve_rendered_files_keep_local_at(
-        install_path,
-        base_sha,
-        theirs_sha,
-        "",
-    )
-    .await;
+    // CORRECTED v0.2.95 phase 2: `branch` used to be passed EMPTY here, on the
+    // reasoning that "this entry point receives base/theirs, not the pull
+    // branch, and inventing one would put a guess in the audit row" — with the
+    // note that `self_update::apply_launcher_update` called the branch-resolving
+    // entry point instead and recorded the real name. That second entry point
+    // is gone (its surface now shares this one), so the note would have become
+    // a claim about a caller that no longer exists, and EVERY rendered-reconcile
+    // row would have lost the branch. It is not a guess: the caller
+    // (`installer::run_pre_merge_user_editable`) derived `base_sha`/`theirs_sha`
+    // FROM this branch, so it is the same fact one step earlier. It threads it
+    // through rather than re-deriving it.
+    let rendered =
+        resolve_rendered_files_keep_local_at(install_path, base_sha, theirs_sha, branch).await;
+    if !rendered.reconciled.is_empty() {
+        // v0.2.95 phase 2: this log moved here from
+        // `self_update::apply_launcher_update`, which had the rendered class
+        // wired in directly and reported it. Folding that surface onto the
+        // shared pipeline would otherwise have silently dropped the only line
+        // saying this ran — and left `RenderedReconcileOutcome::committed`
+        // with no reader at all, which is the same defect one layer down.
+        tracing::info!(
+            "[vct] pre_merge: kept the local rendered copy of {} file(s) and took upstream's \
+             tracked blob — {} (synthetic commit: {}; install.py re-renders the AUTO block)",
+            rendered.reconciled.len(),
+            rendered.reconciled.join(", "),
+            rendered.committed,
+        );
+    }
     let rendered_resolved: std::collections::HashSet<String> =
         rendered.reconciled.iter().cloned().collect();
 
@@ -4298,8 +4334,13 @@ later update verifies HEAD reached upstream.\n\
 // Tests
 // ---------------------------------------------------------------------------
 
+// `pub(crate)` (test builds only): `commands::update_pipeline`'s tests drive
+// the real pull sequence against the SAME temp repo-pair fixture. One fixture,
+// one home — a second copy of `init_repo_pair` would drift from this one, and
+// the seed contents (which paths are RENDERED, which are merely user-editable)
+// are exactly what those tests assert on.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::{Command as StdCommand, Stdio};
 
@@ -4324,7 +4365,7 @@ mod tests {
     /// The tempdir is held by the caller to keep the test environment
     /// alive (drop = remove). The local clone has a `vco_upstream`
     /// remote pointing at the bare repo.
-    fn init_repo_pair() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    pub(crate) fn init_repo_pair() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
         let remote = root.join("remote.git");
@@ -4388,7 +4429,7 @@ mod tests {
 
     /// Advance the upstream by committing in the seed workdir + pushing
     /// to remote.git, then re-fetch vco_upstream in the local clone.
-    fn push_upstream_change(seed_root: &Path, local: &Path, file: &str, body: &str) {
+    pub(crate) fn push_upstream_change(seed_root: &Path, local: &Path, file: &str, body: &str) {
         std::fs::create_dir_all(seed_root.join(file).parent().unwrap_or(seed_root)).unwrap();
         std::fs::write(seed_root.join(file), body).unwrap();
         run_git(seed_root, &["add", file]);
@@ -4419,7 +4460,7 @@ mod tests {
     /// success rather than returning a `Result`. It must not grow any
     /// decision logic — anything a production path would want (branch
     /// resolution, behind-counts, remote tags) belongs in `git_cmd`.
-    fn run_git(cwd: &Path, args: &[&str]) {
+    pub(crate) fn run_git(cwd: &Path, args: &[&str]) {
         let out = StdCommand::new("git")
             .args(args)
             .current_dir(cwd)
@@ -4686,7 +4727,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         // vco_lib/foo.py is not in the allowlist → no outcome emitted.
         let vco_lib_foo: &Path = Path::new("vco_lib/foo.py");
@@ -4723,7 +4764,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         // Should produce one `Merged` outcome for README.md.
         let claude = outcomes
@@ -4771,7 +4812,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         let claude = outcomes
             .iter()
@@ -4822,7 +4863,7 @@ mod tests {
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
         // Must NOT panic and must NOT emit a Merged outcome (we skip
         // binary files; git pull handles them the legacy way).
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
         assert!(
             outcomes.iter().all(|o| !matches!(
                 o.kind,
@@ -5046,7 +5087,7 @@ mod tests {
         base: &str,
         theirs: &str,
     ) -> Vec<MergeOutcome> {
-        let outcomes = pre_merge_user_editable(local, base, theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(local, base, theirs, "main").await.unwrap();
         let mut merged_any = false;
         for outcome in &outcomes {
             if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
@@ -6025,7 +6066,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         let gitignore = outcomes
             .iter()
@@ -6092,7 +6133,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         let gitignore = outcomes
             .iter()
@@ -6514,18 +6555,26 @@ mod tests {
         );
     }
 
-    /// ANTI-DRIFT: BOTH update surfaces (installer::update_orchestrator and
-    /// self_update::apply_launcher_update) must derive their PullPlan from the
-    /// SAME `resolve_divergence_pull_plan` for identical repo state. Pre-v0.2.71
-    /// only installer.rs had the probe; self_update.rs did a blind --ff-only and
-    /// reset --hard on any divergence. This test constructs one repo state and
-    /// asserts the shared fn yields the SAME plan when called the way EACH
-    /// surface calls it (installer with pre_merge_committed possibly true after
-    /// A0; self_update ALWAYS pre_merge_committed=false since it has no A0 step).
-    /// For the clean-committed-divergence state both must agree on RealMerge
-    /// when neither pre-merged — proving the surfaces converged.
+    /// Clean COMMITTED divergence (the encouraged "your Claude committed a KG
+    /// node" case) must fold via `RealMerge` rather than surfacing a modal.
+    /// Pre-v0.2.71 only installer.rs had the probe; self_update.rs did a blind
+    /// `--ff-only` and offered a hard reset on any divergence.
+    ///
+    /// REPLACES `resolve_plan_anti_drift_both_surfaces_agree` (v0.2.95 phase 2).
+    /// That test called `resolve_divergence_pull_plan(&local, "main", false,
+    /// false)` TWICE with identical arguments and asserted the two results
+    /// equal — `f(x) == f(x)`, which cannot fail and so could not detect the
+    /// drift it was named for. Worse, its own doc said the surfaces differ on
+    /// `pre_merge_committed`, so the one axis it claimed to guard was the one
+    /// axis both calls pinned to `false`.
+    ///
+    /// The real anti-drift assertion now lives where it can fail:
+    /// `update_pipeline::tests::both_surfaces_render_the_same_pipeline_error_into_their_own_payload`
+    /// drives the shared pipeline to a real divergence and renders the ONE
+    /// resulting error through BOTH surfaces' serialisers. What survives here
+    /// is this test's second, genuinely meaningful assertion.
     #[tokio::test]
-    async fn resolve_plan_anti_drift_both_surfaces_agree() {
+    async fn resolve_plan_clean_committed_divergence_folds_via_real_merge() {
         skip_if_no_git!();
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
@@ -6534,22 +6583,15 @@ mod tests {
         commit_local_change(&local, "knowledge/concepts/drift_node.md", "# node\n");
         refetch_upstream(&local);
 
-        // installer::update_orchestrator path when its A0 pre-merge produced NO
-        // synthetic commit (the common committed-KG-divergence case):
-        let installer_plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
-        // self_update::apply_launcher_update path (NEVER has an A0 step →
-        // ALWAYS pre_merge_committed=false):
-        let self_update_plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
-
+        // Both surfaces reach this with `pre_merge_committed=false`: the
+        // installer surface when its A0 pre-merge synthesised no commit (the
+        // common committed-KG-divergence case), the launcher surface always,
+        // because the A0 step is not on its path.
+        let plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
         assert_eq!(
-            installer_plan, self_update_plan,
-            "the two update surfaces must produce the SAME PullPlan for the same \
-             repo state (shared resolve_divergence_pull_plan — no drift)"
-        );
-        assert_eq!(
-            installer_plan,
+            plan,
             PullPlan::RealMerge,
-            "clean committed divergence should fold via RealMerge on BOTH surfaces"
+            "clean committed divergence should fold via RealMerge, not surface a modal"
         );
     }
 
@@ -9331,7 +9373,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         assert!(
             !outcomes.iter().any(|o| o.path == PathBuf::from("CLAUDE.md")),

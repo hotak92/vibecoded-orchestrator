@@ -629,20 +629,118 @@ def test_the_module_runs_as_a_subprocess_the_hooks_can_call():
     does not have. `KG_BASE_DIR` is deliberately absent: with a caller-built
     `base` the helper leaves the root channels alone, and this child reaches
     no embedding backend.
+
+    WHAT THIS TEST MAY NOT ASSERT (v0.2.95, this lane)
+    --------------------------------------------------
+    It used to end on ``payload["state"] == "disabled_by_env"``, and that made
+    it a test of the DEVELOPER'S MACHINE. A child process cannot be handed an
+    injected scanner — injection is an in-process seam — so the ONE input it
+    reads from reality is the process table, and `decide` answers RUNNING
+    first, deliberately: "is the launcher up?" has one true answer and no flag
+    changes it (that ordering is pinned by
+    ``test_status_answers_running_even_when_the_preference_is_off``, and the
+    kill switch governs AUTOSTART, not the truth about a live process). So the
+    old assertion held on CI, where no launcher runs, and failed on the
+    maintainer's desktop, where one does — green and red for reasons that have
+    nothing to do with the code under test.
+
+    What survives is everything the leg exists for, expressed so that BOTH
+    machines satisfy it: the module is importable and runnable as
+    ``-m``, it emits the full JSON contract, its exit code agrees with THIS
+    checkout's table for whatever state it reported, and the interpreter that
+    produced it imported this tree's module rather than another checkout's.
+    The kill-switch DECISION — the part that needs a controlled process
+    table — is asserted in-process by the two tests below.
     """
+    env = child_env({"PATH": "/usr/bin:/bin"}, **{le.DISABLE_ENV: "1"})
     proc = subprocess.run(
         [sys.executable, "-m", "vco_lib.launcher_ensure", "status", "--json"],
         cwd=str(REPO_ROOT),
-        env=child_env({"PATH": "/usr/bin:/bin"}, **{le.DISABLE_ENV: "1"}),
+        env=env,
         capture_output=True,
         timeout=60,
         check=False,
     )
-    assert proc.returncode == 0, proc.stderr.decode()
     import json
 
+    # A crash exits 1 and argparse exits 2; `test_every_state_has_an_exit_code`
+    # pins that no state may claim either, so "the code is one a state claims"
+    # is a real liveness assertion, not a tautology.
+    assert proc.returncode in set(le.ENSURE_EXIT_CODES.values()), (
+        f"rc={proc.returncode} stderr={proc.stderr.decode()}"
+    )
+    assert proc.stdout.strip(), (
+        f"`python -m vco_lib.launcher_ensure status --json` printed nothing "
+        f"(rc={proc.returncode}) — the module is not runnable the way the "
+        f"hooks run it; stderr: {proc.stderr.decode()}"
+    )
     payload = json.loads(proc.stdout.decode())
+    # Raises ValueError on a state this checkout does not define.
+    state = le.LauncherState(payload["state"])
+    assert proc.returncode == le.ENSURE_EXIT_CODES[state], (
+        f"{state.value} exits {le.ENSURE_EXIT_CODES[state]} in this checkout, "
+        f"the child exited {proc.returncode}"
+    )
+    assert set(payload) == set(
+        le.LauncherEnsureResult(state=state).to_dict()
+    ), "the CLI payload lost (or grew) a key a caller branches on"
+    assert payload["running"] is (state is le.LauncherState.RUNNING)
+
+    # The import pin the docstring argues for, asserted rather than assumed:
+    # same env, same interpreter, and the module has to come from HERE.
+    where = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import vco_lib.launcher_ensure as m; print(m.__file__)",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert where.returncode == 0, where.stderr.decode()
+    assert Path(where.stdout.decode().strip()) == (
+        REPO_ROOT / "vco_lib" / "launcher_ensure.py"
+    ), "the child imported a DIFFERENT checkout's launcher_ensure"
+
+
+def test_the_kill_switch_is_read_from_the_real_environment(capsys, monkeypatch):
+    """ACT arm of the CLI's env channel: `main` passes no `env=`, so the
+    kill switch has to arrive from `os.environ` — the path the hooks use.
+
+    The process table is the one thing a CLI caller cannot inject, so it is
+    stubbed HERE (in-process, which the subprocess leg above cannot do) at
+    "no launcher running". That is what makes the assertion about the code
+    instead of about whichever machine runs the suite.
+    """
+    monkeypatch.setattr(le, "launcher_pid", lambda _scanner=None: None)
+    monkeypatch.setenv(le.DISABLE_ENV, "1")
+    rc = le.main(["status", "--json"])
+    import json
+
+    payload = json.loads(capsys.readouterr().out)
     assert payload["state"] == "disabled_by_env"
+    assert rc == 0
+
+
+def test_an_absent_kill_switch_lets_the_leg_continue(capsys, monkeypatch):
+    """LEAVE-ALONE arm: with the variable gone the env gate must fall THROUGH
+    to the next one rather than short-circuit on an empty string.
+
+    The preference is stubbed off so the run stops at a named state without
+    resolving a binary — the assertion is `disabled_by_pref`, i.e. the leg got
+    PAST the env gate, which `disabled_by_env` would disprove.
+    """
+    monkeypatch.setattr(le, "launcher_pid", lambda _scanner=None: None)
+    monkeypatch.setattr(le, "autostart_enabled", lambda _reader=None: False)
+    monkeypatch.delenv(le.DISABLE_ENV, raising=False)
+    rc = le.main(["status", "--json"])
+    import json
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "disabled_by_pref"
+    assert rc == 0
 
 
 # ---------------------------------------------------------------------------

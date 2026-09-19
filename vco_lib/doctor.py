@@ -118,6 +118,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -209,6 +210,20 @@ CID_CODE_EMBED_IMAGE_STALE = "code_embed_image_stale"
 #: same function, so the two surfaces cannot disagree.
 CID_GATEWAY_UNRUNNABLE = "gateway_registered_but_unrunnable"
 
+#: condition_id emitted when ``state/install-manifest.json`` attests a source
+#: that this install's ``.claude/.vco-manifest.json`` — written ONLY by the
+#: bundle engine — does not corroborate. The v0.2.95 surface map's H1/H2/H3:
+#: the launcher's ``apply_launcher_update`` / ``force_resync_launcher`` /
+#: ``update_orchestrator_at`` each advance the source and refresh the marker
+#: without running install.py, so ``installed: true`` at the NEW version is
+#: written over a venv/hooks/templates/MCP/KG/schema set still at the old one.
+#: Registered ``action_required`` + install-owned (the ``vco_lib_shadowed``
+#: precedent): the exit is an install/update run, which rewrites BOTH records
+#: from one tree, and the doctor re-probes at the end of that same run — so
+#: the entry is dropped by the very run that fixes it. Read-only detection;
+#: this probe never writes a manifest and never touches an update path.
+CID_INSTALL_MARKER_UNBACKED = "install_manifest_attests_uninstalled_source"
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -217,6 +232,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_NPX_MISSING, CID_DISK_SPACE_LOW, CID_VCO_LIB_SHADOWED,
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
+    CID_INSTALL_MARKER_UNBACKED,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -2839,6 +2855,381 @@ def probe_last_update_run(folder: Path, res: DoctorResolvers, ctx: dict) -> list
 
 
 # ---------------------------------------------------------------------------
+# Install completeness — does the completion marker rest on an installer run?
+# ---------------------------------------------------------------------------
+
+#: ``state/install-manifest.json``, relative to the install root.
+INSTALL_MANIFEST_REL = ("state", "install-manifest.json")
+
+#: ``install_method`` values only the RUST writer
+#: (``launcher/src-tauri/src/commands/manifest.rs::refresh_install_manifest``)
+#: produces. install.py's own writer spells ``install.py`` / ``update`` /
+#: ``lightweight``, so seeing one of these means the LAST hand on the marker
+#: was a path that never ran install.py. Carried in the summary as the
+#: EXPLANATION; never the conviction on its own — a resync that pulled nothing
+#: writes one of these and owes no work.
+RUST_INSTALL_METHODS: tuple[str, ...] = ("launcher_update", "orchestrator_update")
+
+#: A git object name, for the commit leg. ``vco_commit`` is a *short* SHA and
+#: ``source_commit`` a full one, so the comparison is a prefix test — but only
+#: after both sides are proven to BE object names. ``recorded_manifest_version``
+#: passes the dedicated ``vco_commit`` field through unvalidated (a hand-edited
+#: ``"unknown"`` survives it), and comparing that against a real SHA would
+#: convict on a string nobody promised was a commit.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _read_json_dict(path: Path) -> Optional[dict]:
+    """``path`` parsed as a JSON object, or ``None``. Never raises."""
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _commits_disagree(attested: Any, built: Any) -> Optional[bool]:
+    """Do two recorded commits name different objects? ``None`` = unknowable.
+
+    ``None`` whenever either side is absent or is not an object name — the
+    ``.git/HEAD`` reader install.py uses returns ``None`` for a PACKED ref, so
+    a perfectly healthy clone can record no ``source_commit`` at all, and that
+    must never read as disagreement.
+    """
+    a = attested.strip().lower() if isinstance(attested, str) else ""
+    b = built.strip().lower() if isinstance(built, str) else ""
+    if not _SHA_RE.match(a) or not _SHA_RE.match(b):
+        return None
+    return not (a.startswith(b) or b.startswith(a))
+
+
+def probe_install_completeness(
+    folder: Path, res: DoctorResolvers, ctx: dict
+) -> list[Finding]:
+    """Does ``install-manifest.json``'s claim rest on an installer run?
+
+    The state this exists for (the v0.2.95 surface map's H1/H2/H3): the
+    launcher's ``apply_launcher_update`` / ``force_resync_launcher`` advance
+    the whole source tree and rebuild only the launcher, and
+    ``update_orchestrator_at`` file-copies a newer tree into another clone.
+    None of the three runs ``install.py``, so venv, pip, hooks, templates, MCP
+    registrations, the KG seed, the schema and the boot service all stay at the
+    OLD version — and then each one calls ``refresh_install_manifest``, which
+    re-asserts ``installed: true`` over them. The marker attests work that
+    nothing did, and **nothing looked**: ``source_currency`` is 0-behind
+    afterwards (so :func:`_currency_finding` drops the install age it only
+    appends to a PROBLEM), and ``probe_last_update_run`` reports the stale date
+    as ``ok`` by design.
+
+    What that writer does TODAY, because it decides which leg below can fire.
+    v0.2.95 WP-1 changed ``commands::manifest::refresh_install_manifest``: it no
+    longer re-reads ``version`` nor stamps ``completed_at`` (install.py is now
+    the only writer of both), it still advances ``source_commit`` from
+    ``.git/HEAD``, and it stamps ``post_source_only: true`` — the writer NAMING
+    the state instead of leaving it to be inferred. So the population this probe
+    serves splits three ways, and the three legs are not redundant:
+
+    * a marker last written by a PRE-0.2.95 launcher carries the version that
+      launcher pulled, and the bundle manifest does not → the VERSION leg. That
+      population is real: it is everyone who arrives by upgrading INTO 0.2.95;
+    * a marker last written by a 0.2.95+ launcher agrees on version by
+      construction, so only the COMMIT leg can speak — and it is silent
+      whenever ``.git/HEAD`` did not move (``update_orchestrator_at``
+      file-copies a tree into a clone and leaves its HEAD alone) or could not
+      be read (a packed ref, a worktree HEAD file: ``read_git_rev`` returns
+      ``None`` and the old ``source_commit`` survives untouched);
+    * the FLAG leg is the only one that survives both of those, and it is the
+      writer's own word. A probe that ignored it would answer ``ok`` — "rests
+      on a real installer run" — for a manifest that says in as many words that
+      the last hand on it installed nothing.
+
+    Why this probe may judge where its neighbour deliberately does not.
+    ``probe_last_update_run`` refuses to grade the install AGE because age is a
+    proxy with two causes — deliberately pinned, or silently not updating — and
+    one reading cannot separate them. This probe never reads age as evidence.
+    It compares two INDEPENDENT records of one fact, and the fact is not "is
+    this install old" but "which source was this install built from":
+
+    * ``state/install-manifest.json`` — written by install.py AND by the three
+      launcher paths above;
+    * ``.claude/.vco-manifest.json`` — written ONLY by the bundle engine
+      (``project_init.install_project_bundle``, which install.py reaches
+      through ``self_install``). No launcher update path writes it, and it is
+      gitignored, so ``update_orchestrator_at``'s gitignore-aware copy does not
+      carry the source clone's copy into the target either.
+
+    Two records, one writer in common. When they name different sources, the
+    completion marker was advanced by something that did not run the
+    installer — positive evidence, not a proxy, and the ambiguity that stops
+    its neighbour from judging does not arise. A user who is happily pinned
+    has one install.py run behind both records and reads ``ok`` here forever.
+    The flag leg is the same evidence arriving by declaration rather than by
+    comparison, and it is not a proxy either: only a path that advanced the
+    source tree without installing writes it, and only an installer run clears
+    it (install.py's ``_write_install_manifest`` rebuilds the manifest from a
+    literal dict, so the key simply does not survive a real run).
+
+    Conservative in every direction that matters. No manifest, an unparseable
+    one, a pre-v0.2.92 bundle manifest whose ``vco_version`` holds a git SHA
+    (``recorded_manifest_version`` hands that back as a COMMIT, never as a
+    version), a packed ref that left ``source_commit`` empty, an ABSENT
+    ``post_source_only`` (which is every manifest written before v0.2.95, and
+    every manifest install.py writes at all) — each yields ``unknown`` or
+    ``ok``, never ``problem``. A false problem here would tell a healthy
+    install it is broken and send its owner into an update they do not need,
+    which is worse than the silence this closes.
+
+    Read-only: three file reads, no subprocess in the decision path. The one
+    subprocess (``vco_version.resolve`` → ``git rev-parse --short HEAD``) runs
+    only AFTER a problem is established, to name the checkout in the report.
+    """
+    root = Path(folder)
+    try:
+        from vco_lib.paths import looks_like_orchestrator_root
+    except Exception:  # noqa: BLE001
+        return []
+    if not looks_like_orchestrator_root(root):
+        # Not the orchestrator clone. Same fourth state `probe_source_currency`
+        # names: not-applicable, which is neither `unknown` nor a finding.
+        return []
+
+    manifest_path = root.joinpath(*INSTALL_MANIFEST_REL)
+    manifest = _read_json_dict(manifest_path)
+    if manifest is None or manifest.get("installed") is not True:
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"no completed install is recorded at {manifest_path} — "
+                    "nothing to corroborate (run `python install.py --update` "
+                    "from this root to write one)"
+                ),
+                detail={
+                    "install_manifest": str(manifest_path),
+                    "exists": manifest_path.exists(),
+                },
+            )
+        ]
+
+    try:
+        from vco_lib.manifest_paths import manifest_path as bundle_manifest_path
+        from vco_lib.vco_version import recorded_manifest_version
+    except Exception as exc:  # noqa: BLE001 — a broken import is unknown, never a verdict
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_UNKNOWN,
+                summary=f"could not load the bundle-manifest reader: {exc}",
+                detail={"install_manifest": str(manifest_path)},
+            )
+        ]
+
+    bundle_path = bundle_manifest_path(root)
+    bundle = _read_json_dict(bundle_path)
+    built_version, built_commit = recorded_manifest_version(bundle or {})
+    if bundle is None or (built_version is None and built_commit is None):
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"{bundle_path} records no source this install was built "
+                    "from, so the install manifest's claim cannot be "
+                    "corroborated"
+                ),
+                detail={
+                    "install_manifest": str(manifest_path),
+                    "bundle_manifest": str(bundle_path),
+                    "bundle_manifest_exists": bundle_path.exists(),
+                },
+            )
+        ]
+
+    attested_version = manifest.get("version")
+    attested_version = (
+        attested_version.strip() if isinstance(attested_version, str) else ""
+    )
+    attested_commit = manifest.get("source_commit")
+    install_method = manifest.get("install_method")
+    install_method = install_method if isinstance(install_method, str) else ""
+    completed_at = _parse_install_ts(manifest.get("completed_at"))
+
+    session_row = last_successful_install(root)
+    session_ts_raw = session_row.get("ts") if isinstance(session_row, dict) else None
+    session_ts = _parse_install_ts(session_ts_raw)
+
+    # The WRITER's own name for this state (v0.2.95 WP-1).
+    # ``manifest::refresh_install_manifest`` stamps ``post_source_only: true``
+    # on every path that advances the source tree without running install.py,
+    # and install.py's ``_write_install_manifest`` rebuilds the manifest from a
+    # literal dict, so a real installer run drops it. That makes it evidence a
+    # comparison cannot produce — see the docstring for the two shapes where
+    # both other legs are structurally blind.
+    #
+    # ``is True`` EXACTLY, and what the other answers mean:
+    #
+    # * ABSENT — no evidence, never innocence. Every manifest written before
+    #   v0.2.95 lacks the key; so does every manifest install.py writes, at any
+    #   version; so does one written by a pre-0.2.95 launcher binary that took
+    #   a source-only path. Convicting on absence would convict every healthy
+    #   install on the planet, so absence leaves the verdict entirely to the
+    #   version and commit legs (which is exactly the population they cover).
+    # * ``false`` / a string / a number — no writer produces these; a
+    #   hand-edited or foreign value is not the writer speaking, so it is read
+    #   as absent rather than guessed at.
+    #
+    # The flag's truthfulness is the WRITER's contract, and convicting on it
+    # makes that contract load-bearing in one direction: a refresh call from a
+    # path that did NOT move the source tree would fire this probe (and
+    # `install_stale`) on a healthy install. Nothing readable from the manifest
+    # can separate "nothing moved" from "a tree was copied in without moving
+    # .git/HEAD" — both leave two agreeing records — so the invariant lives with
+    # the callers of `refresh_install_manifest`, which is where v0.2.95 put it:
+    # `ArtefactSource::Unchanged` exists precisely so the already-up-to-date
+    # branch records nothing instead of claiming a source advance. If a future
+    # caller stamps the flag without advancing the tree, THAT is the defect —
+    # do not soften the leg here to absorb it.
+    post_source_only = manifest.get("post_source_only") is True
+
+    detail = {
+        "install_manifest": str(manifest_path),
+        "bundle_manifest": str(bundle_path),
+        "attested_version": attested_version or None,
+        "attested_commit": attested_commit if isinstance(attested_commit, str) else None,
+        "built_version": built_version,
+        "built_commit": built_commit,
+        "install_method": install_method or None,
+        "marker_written_by_launcher_path": install_method in RUST_INSTALL_METHODS,
+        "post_source_only": post_source_only,
+        "completed_at": manifest.get("completed_at"),
+        "last_install_session_ok": session_ts_raw,
+    }
+
+    # ACQUITTAL, and the one place the install log is load-bearing. install.py
+    # logs `session ok` and only THEN writes the manifest, so on every run it
+    # performs the session stamp is at or before `completed_at`. A stamp that
+    # is strictly LATER means an installer run finished after the marker was
+    # written — its (soft-fail) manifest write did not land. The marker is then
+    # BEHIND the work, not ahead of it: stale bookkeeping, nothing owed.
+    #
+    # It acquits `post_source_only` too, which is why the flag leg is placed
+    # AFTER this and not before: the only way a surviving flag coexists with a
+    # LATER installer session is the same soft-failed manifest write (a run that
+    # completed cannot have written the flag — install.py never writes it), so
+    # the flag is stale bookkeeping in exactly the case this leg already covers.
+    # Measured on the live root, `session ok` precedes `completed_at` by ~4s on
+    # a healthy run, which is why the gap is an acquittal and never a trigger.
+    if session_ts is not None and completed_at is not None and session_ts > completed_at:
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_OK,
+                summary=(
+                    f"an install.py session completed at {session_ts_raw}, after "
+                    f"the install manifest was last written ({manifest.get('completed_at')}) "
+                    "— the marker lags the installer rather than running ahead of it"
+                ),
+                detail=detail,
+            )
+        ]
+
+    versions_disagree = (
+        attested_version != ""
+        and built_version is not None
+        and attested_version.lstrip("v") != built_version
+    )
+    commits_disagree = _commits_disagree(attested_commit, built_commit)
+    detail["versions_disagree"] = versions_disagree
+    detail["commits_disagree"] = commits_disagree
+
+    if not versions_disagree and commits_disagree is not True and not post_source_only:
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_OK,
+                summary=(
+                    "the install manifest and the bundle manifest name the same "
+                    f"source ({attested_version or built_version or '?'}"
+                    + (f" / {built_commit}" if built_commit else "")
+                    + ") — this install's completion marker rests on a real "
+                    "installer run"
+                ),
+                detail=detail,
+            )
+        ]
+
+    # Conviction precedence is REPORTING precedence, not confidence: whichever
+    # leg can name the two sources most usefully goes in the summary. The flag
+    # names no source, so it is last — and it is the one that fires alone
+    # exactly where the other two are structurally blind.
+    if versions_disagree:
+        detail["convicted_on"] = "version"
+    elif commits_disagree is True:
+        detail["convicted_on"] = "commit"
+    else:
+        detail["convicted_on"] = "post_source_only"
+    # Name the checkout too, so the report says what the user would be moving
+    # FROM and TO. Only on the problem path: this is the probe's one subprocess.
+    try:
+        from vco_lib import vco_version as _vv
+
+        here = _vv.resolve(root)
+        detail["checkout_version"] = here.semver
+        detail["checkout_commit"] = here.commit
+    except Exception:  # noqa: BLE001 — enrichment never decides and never raises
+        detail["checkout_version"] = None
+        detail["checkout_commit"] = None
+
+    if versions_disagree:
+        head = (
+            f"install-manifest.json attests version {attested_version} as "
+            f"installed, but this install's `.claude/` bundle was last written "
+            f"at {built_version}"
+        )
+    elif commits_disagree is True:
+        head = (
+            f"install-manifest.json attests commit {_short(attested_commit)}, "
+            f"but this install's `.claude/` bundle was last written at "
+            f"{_short(built_commit)}"
+        )
+    else:
+        head = (
+            "install-manifest.json carries `post_source_only`, the flag its "
+            "writer sets when a path advances the source tree without running "
+            "install.py — so the `installed: true` beside it covers the tree as "
+            f"it stood at the last installer run "
+            f"({attested_version or built_version or '?'}), not the tree on "
+            "disk now"
+        )
+    tail = ""
+    if install_method in RUST_INSTALL_METHODS:
+        tail = (
+            f" — the marker was last written by the launcher's `{install_method}` "
+            "path, which advances the source tree and rebuilds the launcher "
+            "without running install.py"
+        )
+    if session_ts_raw:
+        tail += f"; the last completed install.py run here was {session_ts_raw}"
+    else:
+        tail += "; no completed install.py session is recorded on this root at all"
+    return [
+        Finding(
+            probe="install_completeness",
+            status=STATUS_PROBLEM,
+            summary=head + tail,
+            fix=FIX_DEFER,
+            condition_id=CID_INSTALL_MARKER_UNBACKED,
+            command=remedy_shell.steps(
+                f"cd {remedy_shell.quote(root.resolve())}",
+                "python install.py --update",
+            ),
+            detail=detail,
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics list — the ask, generated from reality
 # ---------------------------------------------------------------------------
 
@@ -3449,6 +3840,21 @@ PROBES: dict = {
     "vco_lib_editable": (probe_vco_lib_editable, (SCOPE_FULL,)),
     "source_currency": (probe_source_currency, (SCOPE_FULL,)),
     "last_update_run": (probe_last_update_run, (SCOPE_FULL,)),
+    # v0.2.95 WP-2: full-only, for a COST reason this time (the v0.2.92
+    # probes above are full-only for a promise reason — no registered
+    # condition — which does not apply here: this one has a row in
+    # `deferral_conditions.toml`, so the launcher's boot counter could
+    # legitimately point at the Updates panel for it). The decision itself is
+    # three file reads, but one of them goes through
+    # :func:`last_successful_install`, which scans the WHOLE append-only
+    # `install.jsonl` — 34 ms on the 4.4 MB log of a two-year-old install
+    # root, and the file has no rotation, so that number only grows. Boot
+    # latency is user-visible; the question is about a COMPLETED install, and
+    # its readers are install.py's end-of-run report and `vco doctor`.
+    # Promoting it to `boot` is a real option and a scope decision, not a
+    # refactor: it would make the launcher's own self-update the surface that
+    # reports its own omission at the very next boot.
+    "install_completeness": (probe_install_completeness, (SCOPE_FULL,)),
     "diagnostic_files": (probe_diagnostic_files, (SCOPE_FULL,)),
     "stale_vct_deploy": (probe_stale_vct_deploy, (SCOPE_FULL,)),
     # v0.2.92 WP-D (R27 surface a): full-only — the census runs one engine
@@ -3869,6 +4275,50 @@ def _gateway_unrunnable_entry(finding: Finding):
     )
 
 
+def _install_marker_unbacked_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id=CID_INSTALL_MARKER_UNBACKED,
+        title="This install's completion marker names a source it was never installed from",
+        detected=finding.summary,
+        why_deferred=(
+            "Re-running the installer is minutes of work the user must choose "
+            "to start (it rebuilds the venv's editable install, re-propagates "
+            "the `.claude/` bundle, re-registers the MCPs and may re-seed the "
+            "KG), so VCO reports it rather than starting one from a read-only "
+            "health check. It is reported because the failure is QUIET by "
+            "construction: `apply_launcher_update`, `force_resync_launcher` "
+            "and `update_orchestrator_at` advance the whole source tree, "
+            "rebuild only the launcher, and then re-assert `installed: true` "
+            "over a venv, hooks, templates, MCP registrations, KG seed and "
+            "schema none of them touched — after which the checkout is "
+            "0-behind upstream, so the currency probe reports health and the "
+            "install-age reading is dropped as not decision-relevant. Since "
+            "v0.2.95 that write leaves `version` alone (install.py owns it) "
+            "and stamps `post_source_only` instead, which does light the "
+            "launcher's Updates badge — but a badge is a running launcher's "
+            "affordance, and the states this catches include a CLI-only "
+            "install and a SECOND clone updated in place by "
+            "`update_orchestrator_at`, whose launcher may never start. The "
+            "evidence used here needs none of that: the install manifest is "
+            "written by those paths and says so, while the `.claude/` bundle "
+            "manifest is written only by the bundle engine an installer run "
+            "reaches. "
+            "`python install.py --update` rewrites BOTH from the one tree and "
+            "rebuilds the install manifest from scratch (so `post_source_only` "
+            "does not survive it), after re-doing the venv, hooks, templates, "
+            "MCP registrations, KG seed and schema work the marker already "
+            "claimed; the doctor re-probes at the end of that same run — so "
+            "the run that fixes this is the run that clears it."
+        ),
+        command_to_apply=finding.command,
+        severity="warning",
+        disposition="action_required",
+        kg_node_refs=["docs/post-install/UPDATE-RECOVERY.md"],
+    )
+
+
 _ENTRY_BUILDERS: dict = {
     CID_NPX_MISSING: _npx_entry,
     CID_DISK_SPACE_LOW: _disk_space_entry,
@@ -3877,6 +4327,7 @@ _ENTRY_BUILDERS: dict = {
     CID_KG_UNCLAIMED: _kg_unclaimed_entry,
     CID_CODE_EMBED_IMAGE_STALE: _code_embed_image_entry,
     CID_GATEWAY_UNRUNNABLE: _gateway_unrunnable_entry,
+    CID_INSTALL_MARKER_UNBACKED: _install_marker_unbacked_entry,
 }
 
 
@@ -4152,6 +4603,7 @@ __all__ = [
     "BOOTSTRAP_COMMAND",
     "CID_CODE_EMBED_IMAGE_STALE",
     "CID_DISK_SPACE_LOW",
+    "CID_INSTALL_MARKER_UNBACKED",
     "CID_KG_BINDING_EVIDENCE_MISMATCH",
     "CID_NPX_MISSING",
     "CID_VCO_LIB_SHADOWED",
@@ -4162,6 +4614,8 @@ __all__ = [
     "DOCTOR_SELF_RESOLVING_CIDS",
     "GIT_TIMEOUT_SECONDS",
     "INSTALL_LOG_REL",
+    "INSTALL_MANIFEST_REL",
+    "RUST_INSTALL_METHODS",
     "SOURCE_FALLBACK_BRANCH",
     "UPSTREAM_REMOTE",
     "VCT_CLI_REL",
@@ -4197,6 +4651,7 @@ __all__ = [
     "parse_vct_guards",
     "probe_diagnostic_files",
     "probe_disk_space",
+    "probe_install_completeness",
     "probe_kg_binding_evidence",
     "probe_last_update_run",
     "probe_source_currency",

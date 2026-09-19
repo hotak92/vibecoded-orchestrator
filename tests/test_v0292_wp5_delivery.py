@@ -41,13 +41,13 @@ import pytest
 from vco_lib import codegraph_guards as _guards
 from vco_lib.codegraph_content_hash import _CONTENT_HASH_EXCLUDE
 from vco_lib.codegraph_extractor_generation import (
+    EXTRACTOR_GENERATION_NON_BUMPS,
     EXTRACTOR_GENERATION_BUMPS,
     REASON_CROSSES_BUMP,
     REASON_NO_GRAPH,
     REASON_STAMP_CURRENT,
     REASON_UNKNOWN_GENERATION,
     decide,
-    parse_semver,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,15 +72,20 @@ def test_the_generation_ladder_covers_the_release_being_tagged() -> None:
     version is still the previous one (0.2.92 was appended during the 0.2.91
     -> 0.2.92 cycle, before the version bump).
     """
-    newest = parse_semver(EXTRACTOR_GENERATION_BUMPS[-1])
-    declared = parse_semver(_declared_package_version())
-    assert newest is not None and declared is not None
-    assert newest >= declared, (
-        f"EXTRACTOR_GENERATION_BUMPS ends at {EXTRACTOR_GENERATION_BUMPS[-1]} but "
-        f"the package version is {_declared_package_version()} — append the "
-        "release version to the ladder, or extractor fixes in it never reach "
-        "an existing graph"
+    covered_bump = _declared_package_version() in EXTRACTOR_GENERATION_BUMPS
+    covered_non = _declared_package_version() in EXTRACTOR_GENERATION_NON_BUMPS
+    assert covered_bump != covered_non, (
+        f"release {_declared_package_version()} appears in "
+        f"{'BOTH' if covered_bump else 'NEITHER'} EXTRACTOR_GENERATION_BUMPS and "
+        "EXTRACTOR_GENERATION_NON_BUMPS \u2014 decide which it is and record why. "
+        "Appending to the ladder charges every project with a graph one forced "
+        "re-walk; recording a non-bump costs users nothing. The wrong answer is "
+        "the one taken without looking at the extractor diff."
     )
+    if covered_non:
+        assert EXTRACTOR_GENERATION_NON_BUMPS[_declared_package_version()].strip(), (
+            "a non-bump needs a reason naming the evidence, not an empty string"
+        )
 
 
 def test_wp5_rides_the_existing_0292_bump_rather_than_adding_one() -> None:

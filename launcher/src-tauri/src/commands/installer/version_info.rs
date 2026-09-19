@@ -52,6 +52,25 @@ pub(crate) fn read_manifest_version(install_path: &Path) -> Option<String> {
     None
 }
 
+/// Read a boolean flag from `state/install-manifest.json`. Absent file, absent
+/// key, or a non-boolean value all read as `false`.
+///
+/// v0.2.95 WP-1 — the reader for `post_source_only`, which
+/// `manifest::refresh_install_manifest` writes whenever a path advanced the
+/// source tree WITHOUT running install.py. Conservative in the direction that
+/// matters: an unreadable manifest must not fabricate a stale-install badge,
+/// because the badge's action is a multi-minute `install.py --update`.
+pub(crate) fn install_manifest_flag(install_path: &Path, key: &str) -> bool {
+    let manifest = install_path.join("state").join("install-manifest.json");
+    let Ok(txt) = std::fs::read_to_string(&manifest) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return false;
+    };
+    val.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// v0.2.60 (Piece 5): read `vct-module.json::min_upgradable_from` — the
 /// oldest installed version this release can update IN-PLACE from. Below
 /// this floor, the update routes to the guided hard-cut instead of an

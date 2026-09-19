@@ -355,6 +355,26 @@ class DeliveryAuditTests(unittest.TestCase):
         ``install.py:_smart_merge_settings``", a name v0.2.85 (D2) deleted when
         the root install started going through this one engine.
 
+        Lowered 15_711 -> 15_661 (2026-09-18, WP-9 lane): moving the schema
+        auto-apply CLASSIFICATION into ``vco_lib/migration_plan_classify.py``
+        (so the launcher reads a published verdict instead of re-deriving the
+        policy in Rust) cost this file ~20 lines of import + call + rationale,
+        and the gate caught them. The extraction that paid for it — and then
+        some — took the ``schema_migration_required`` emit-or-clear GATE out of
+        ``_cmd_migrate_collections`` and put it next to the emitter it drives,
+        ``vco_lib/migrate_deferral.reconcile_schema_migration_deferral`` (~95
+        lines, one production caller, and the emitter had already moved there in
+        v0.2.92 — the gate was the half left behind). Behaviour moved verbatim,
+        including the four-condition gate and both soft-fail arms; the tests
+        that reach ``project_init._emit_migrate_required_deferral`` call the
+        re-exported function itself and are untouched. Net 15_711 -> 15_661,
+        i.e. smaller than before the lane's work despite gaining the behaviour.
+        (The last 6 of those lines are the reason the re-export now carries a
+        per-line `pyright: ignore[reportUnusedImport]`: WP-9 moved its last
+        in-module caller out, so the name survives only as the promise the
+        v0.2.92 move made to its callers. Written down rather than shaved off
+        to hit a rounder number, per THE RULE below.)
+
         THE RULE, so no future re-pin has to re-derive it (identical to
         ``test_install_main_ratchet``'s, and stated here because this gate
         broke it): the ceiling is the measured ``wc -l`` EXACTLY. Not
@@ -376,7 +396,7 @@ class DeliveryAuditTests(unittest.TestCase):
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_711,
+            n, 15_661,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

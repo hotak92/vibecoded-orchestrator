@@ -110,8 +110,10 @@ Scope and caveats:
   belongs to the existing `update_resume_required` / "Continue Update" flow.
   Once that concludes, the next update resolves the rendered file normally.
 - Same first-release caveat as above: the updater running the release is the
-  *installed* launcher, so the update that ships this can still hit the modal
-  once; from the next one it auto-resolves.
+  *installed* launcher, so the update that ships this can still stop once — at the
+  modal on the orchestrator surface, or, on ≤ v0.2.94, at a flat refusal on
+  Preferences → Launcher updates (see the decision table). From the next update
+  it auto-resolves on both.
 
 ---
 
@@ -261,6 +263,7 @@ Scope and caveats:
 | **Update says "Already up to date", source IS current, but the launcher version never changes** | **stale dist binary (frozen exe) — see the stale-exe recipe below** | **v0.2.91+ heals it at boot/update-check; on older builds use the manual recipe** |
 | Hub still on old version after update | pre-v0.2.54 hub-restart-before-staging ordering | `vct-hub --stop` then relaunch the launcher |
 | **Preferences → Launcher updates has said "Up to date" for weeks, `Branch: HEAD`, `Commits behind: 0`, `Running:` and `Latest source release:` show the SAME version** | **detached HEAD on a build before v0.2.92 — the check was structurally blind, see below** | **update once by hand (below), then use the GUI's Reattach button** |
+| **Preferences → Launcher updates → "Update now" refuses with "Uncommitted changes on tracked file 'CLAUDE.md' would be lost"** | **you are on a build ≤ v0.2.94, whose clean-tree assertion predates the rendered-file class — `install.py` renders `CLAUDE.md` over its tracked blob on every run, so every orchestrator-root install is dirty there by construction and this surface refused all of them** | **take this one hop from the MenuBar update badge instead (it runs `update_orchestrator`, which has used the precise risk set since v0.2.58); the refusal is narrowed on both surfaces from v0.2.95. Do NOT revert `CLAUDE.md` — it discards your edits and the next render brings the refusal straight back** |
 
 ---
 

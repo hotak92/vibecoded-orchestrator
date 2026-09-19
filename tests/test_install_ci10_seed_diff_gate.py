@@ -20,6 +20,7 @@ and subprocess.run so tests run quickly in CI.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -120,6 +121,7 @@ class SeedDiffGateTest(unittest.TestCase):
         args=None,
         sync_kg_path: str | None = None,
         venv_py_path: str | None = None,
+        enrichment_report: dict | None = None,
     ) -> list[tuple]:
         """Run _seed_weaviate with mocked fs + Weaviate helpers.
 
@@ -131,6 +133,19 @@ class SeedDiffGateTest(unittest.TestCase):
             captured_calls.append(tuple(cmd))
             class _Ret:
                 returncode = 0
+                stdout = ""
+                stderr = ""
+            if "vco_lib.embedding_enrichment" in str(cmd):
+                # v0.2.95 WP-6: the enrichment CLI answers with a JSON report
+                # on stdout. `enrichment_report` lets a test choose the shape;
+                # the default is a clean pass so the SUCCESS path is what a
+                # test has to opt out of, not opt into.
+                _Ret.stdout = json.dumps(
+                    enrichment_report
+                    if enrichment_report is not None
+                    else {"total": 3, "enriched": 3, "skipped": 0,
+                          "failed": 0, "failures": []}
+                )
             return _Ret()
 
         tmp_dir = Path(self.tmp)
@@ -232,29 +247,110 @@ class SeedDiffGateTest(unittest.TestCase):
 
     # ── Test 3: embedding change → full sync ─────────────────────────────
 
-    def test_embedding_change_forces_full_sync(self):
-        """When active_embedding changes, full --all sync is triggered."""
-        # Store a DIFFERENT embedding in app_state.
-        conn = connect(self.db_path)
-        conn.execute(
-            "UPDATE app_state SET value=? WHERE key=?",
-            ("arctic2", install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
-        )
-        conn.commit()
-        conn.close()
+    def test_pure_slot_change_enriches_instead_of_re_embedding(self):
+        """v0.2.95 WP-6: an embedding-model change is NOT a collection rename.
 
-        # Matching hashes (shouldn't matter — full sync forced by context change).
+        Every row is still correct except for one empty named-vector slot,
+        which `vco_lib.embedding_enrichment` fills per object, UPDATE-only and
+        idempotently. Re-embedding the tree for it was the defect that punished
+        the user who did the recommended thing: fill the slot from the launcher
+        and the next `--update` used to re-embed everything anyway, because
+        enrichment never writes `last_installed_active_embedding` (install.py
+        is its only writer) so the context still read as changed.
+        """
+        install._write_app_state_key(
+            install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, "arctic2",
+        )
+
         file_a = f"{self.tmp}/knowledge/concepts/foo.md"
         hashes = {file_a: "aabbcc"}
 
         calls = self._run_seed_with_mocks(
             on_disk_hashes=hashes,
-            stored_hashes=hashes,  # identical → would be empty diff
+            stored_hashes=hashes,  # identical → nothing to re-embed
+        )
+
+        enrich_calls = [
+            c for c in calls if "vco_lib.embedding_enrichment" in str(c)
+        ]
+        self.assertTrue(
+            enrich_calls,
+            "a pure embedding-profile change must reach enrichment",
+        )
+        self.assertTrue(
+            any("--new-slot" in c for c in enrich_calls),
+            "enrichment must be told which slot to fill",
+        )
+        kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
+        self.assertFalse(
+            [c for c in kg_sync_calls if "--all" in c],
+            "after a successful in-place enrichment the tree must NOT be "
+            "re-embedded — the content is unchanged and the slot is filled",
+        )
+
+        rows = {
+            r[0]: r[1] for r in
+            connect(self.db_path)
+            .execute("SELECT key, value FROM app_state").fetchall()
+        }
+        self.assertEqual(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING), "qwen3",
+            "the new profile must be STAMPED after a complete enrichment — "
+            "leaving it stale is what made the next update re-embed again",
+        )
+
+    def test_enrichment_failure_falls_back_to_full_sync(self):
+        """Partial enrichment must never be recorded as a finished change.
+
+        Same conservative rule WP-4 applies to an incomplete leg-(b) sync: if
+        the slot was not provably filled, do the expensive thing.
+        """
+        install._write_app_state_key(
+            install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, "arctic2",
+        )
+        file_a = f"{self.tmp}/knowledge/concepts/foo.md"
+        hashes = {file_a: "aabbcc"}
+
+        calls = self._run_seed_with_mocks(
+            on_disk_hashes=hashes,
+            stored_hashes=hashes,
+            enrichment_report={"total": 3, "enriched": 1, "skipped": 0,
+                               "failed": 2, "failures": []},
         )
 
         kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
-        found_all = any("--all" in c for c in kg_sync_calls)
-        self.assertTrue(found_all, "embedding change must force --all sync")
+        self.assertTrue(
+            any("--all" in c for c in kg_sync_calls),
+            "an incomplete enrichment must fall back to the full re-embed",
+        )
+
+    def test_absent_previous_profile_still_forces_full_sync(self):
+        """No RECORDED profile is not a model change — it is no record.
+
+        It is also what a never-seeded install looks like, and only `--all`
+        seeds `docs/` (the per-file diff path covers `knowledge/` only), so
+        this case deliberately keeps its pre-v0.2.95 path.
+        """
+        conn = connect(self.db_path)
+        conn.execute(
+            "DELETE FROM app_state WHERE key=?",
+            (install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING,),
+        )
+        conn.commit()
+        conn.close()
+
+        file_a = f"{self.tmp}/knowledge/concepts/foo.md"
+        hashes = {file_a: "aabbcc"}
+        calls = self._run_seed_with_mocks(
+            on_disk_hashes=hashes, stored_hashes=hashes,
+        )
+
+        self.assertFalse(
+            [c for c in calls if "vco_lib.embedding_enrichment" in str(c)],
+            "an absent record must not be treated as a slot change",
+        )
+        kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
+        self.assertTrue(any("--all" in c for c in kg_sync_calls))
 
     # ── Test 4: collection rename → full sync ────────────────────────────
 
@@ -280,6 +376,13 @@ class SeedDiffGateTest(unittest.TestCase):
         kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
         found_all = any("--all" in c for c in kg_sync_calls)
         self.assertTrue(found_all, "collection rename must force --all sync")
+        # v0.2.95 WP-6: the half of leg (b) that enrichment CANNOT answer.
+        # A renamed class has no rows to enrich — filling a slot on nothing
+        # would report a clean pass and stamp a collection that is empty.
+        self.assertFalse(
+            [c for c in calls if "vco_lib.embedding_enrichment" in str(c)],
+            "a collection rename must not be routed to enrichment",
+        )
 
     # ── Test 5: pre-v0.2.17 install (no content_hash in Weaviate) ────────
 
@@ -388,13 +491,19 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def _run_seed(self, *, subprocess_side_effect, write_sync_script=True):
+    def _run_seed(self, *, subprocess_side_effect, write_sync_script=True,
+                  deferral_report=None):
         """Run install._seed_weaviate with a controllable subprocess stub.
 
         subprocess_side_effect(cmd, **kwargs) is called for every subprocess.run;
         it may return a fake completed-process or raise (e.g. CalledProcessError).
         When write_sync_script is False, the sync_knowledge_graph.py stub is NOT
         created → sync_kg.exists() is False → the subprocess never runs.
+
+        v0.2.95 WP-4: `deferral_report` is the run report install.py threads in
+        so an INCOMPLETE context change can record owed work. Passing one makes
+        the ledger side observable; omitting it keeps the pre-v0.2.95 call
+        shape, which must still work.
         """
         tmp_dir = Path(self.tmp)
         scripts_dir = tmp_dir / ".claude" / "scripts"
@@ -422,18 +531,42 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         ), mock.patch(
             "subprocess.run", side_effect=subprocess_side_effect,
         ):
-            install._seed_weaviate(_make_args())
+            install._seed_weaviate(
+                _make_args(), deferral_report=deferral_report,
+            )
 
-    # ── (i) subprocess ran but exited non-zero → context triple PERSISTED ──
+    # ── (i) leg (b), non-zero exit → context triple NOT advanced ─────────
+    #
+    # This is the one decision v0.2.95 WP-4 REVERSES, and the reversal is
+    # narrow: it applies to leg (b) — the branch taken when the embedding
+    # model or a collection NAME changed — and to nothing else.
+    #
+    # SEG-1 (v0.2.73) chose the opposite, and was right to, on the evidence it
+    # had: gating the persist on success meant one transient node failure left
+    # `last_installed_active_embedding` at None forever, and every subsequent
+    # `--update` paid a full ~2590-node re-embed. Stamping was the cheaper
+    # error. Its worked example — "2589 of 2590 succeeded; the next update's
+    # content-hash diff re-picks-up only the failed node" — is still true for a
+    # node whose WRITE failed: that node has no stored hash, so the diff finds
+    # it. `test_leg_c_nonzero_exit_still_persists_context_triple` below pins it.
+    #
+    # What the exit code cannot distinguish is the OTHER leg-(b) failure: a run
+    # that died early with most of the tree never visited. Those nodes keep
+    # rows whose content_hash matches — the hash is computed from file bytes
+    # and carries no model identity — so the diff sees nothing, and a stamped
+    # triple retires leg (b) too. The collection then keeps previous-model
+    # vectors permanently, unrecorded.
+    #
+    # The cost side of SEG-1's trade-off was removed by v0.2.95 WP-5: the
+    # embed-skip now also requires the ACTIVE vector slot to be populated, so a
+    # repeated leg-(b) `--all` re-embeds only what never landed. Cheap enough
+    # that honesty wins.
 
-    def test_nonzero_exit_still_persists_context_triple(self):
-        """Core regression: a sync that EXECUTED but exited non-zero (≥1 node
-        failed) must still persist last_installed_active_embedding == current."""
+    def test_leg_b_nonzero_exit_does_not_advance_the_context_triple(self):
+        """A context change that did not finish must not be recorded as done."""
         import subprocess as _sp
 
         def _raise_nonzero(cmd, **kwargs):
-            # Only the per-project KG sync raises; other subprocess.run calls
-            # (e.g. shared-KG seed) succeed. Identify by the sync script path.
             if "sync_knowledge_graph.py" in str(cmd):
                 raise _sp.CalledProcessError(returncode=1, cmd=cmd)
             class _Ret:
@@ -443,19 +576,136 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         self._run_seed(subprocess_side_effect=_raise_nonzero)
 
         rows = self._read_triple()
-        self.assertEqual(
-            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING), "qwen3",
-            "SEG-1: context embedding MUST be persisted even when the sync "
-            "subprocess exited non-zero (1 node failed of many)",
+        self.assertIsNone(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
+            "WP-4: an INCOMPLETE leg-(b) re-embed must not advance "
+            "last_installed_active_embedding — that marker is the only thing "
+            "that makes the next --update try again",
         )
-        self.assertEqual(
-            rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION),
-            "TestProject_KnowledgeGraph",
-            "SEG-1: kg collection must be persisted on non-zero exit too",
-        )
-        # Stats/timestamp recorded too (they reflect the attempt reality).
+        # The attempt itself is still recorded: withholding these would hide
+        # that a run happened, which is a different (and also wrong) claim.
         self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_AT, rows)
         self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_STATS, rows)
+
+    def test_leg_b_nonzero_exit_records_owed_work_that_can_clear(self):
+        """A withheld marker the user cannot see is not a report.
+
+        The entry must also be one that PROVABLY clears: this project treats a
+        deferral with no way out as a defect, and the registry is where that
+        is checked.
+        """
+        import subprocess as _sp
+        from vco_lib import deferral_registry as _dr
+        from vco_lib.deferral_report import DeferralReport
+
+        def _raise_nonzero(cmd, **kwargs):
+            if "sync_knowledge_graph.py" in str(cmd):
+                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
+            class _Ret:
+                returncode = 0
+            return _Ret()
+
+        report = DeferralReport()
+        self._run_seed(
+            subprocess_side_effect=_raise_nonzero, deferral_report=report,
+        )
+
+        cids = [e.condition_id for e in report.entries]
+        self.assertIn(
+            install._SEED_OWED_WORK_CONDITION_ID, cids,
+            "an incomplete context change left no ledger entry — the owed "
+            "re-embed would be invisible to the user and to the doctor",
+        )
+        self.assertTrue(
+            _dr.matches_registered_pattern(
+                install._SEED_OWED_WORK_CONDITION_ID
+            ),
+            "the emitted condition id is not in the registry",
+        )
+        self.assertTrue(
+            _dr.retry_handler_for(install._SEED_OWED_WORK_CONDITION_ID),
+            "the entry is emitted as owed work but resolves to no retry "
+            "handler, so the dispatcher cannot select it — the exact "
+            "classification-mistaken-for-implementation state the registry "
+            "exists to end",
+        )
+        self.assertEqual(
+            _dr.clear_probe_for(install._SEED_OWED_WORK_CONDITION_ID),
+            "paired-resolution",
+            "an install.py-OWNED id would be dropped by any later install.py "
+            "run that does not re-detect it, retiring the record while the "
+            "embedding work is still owed",
+        )
+
+    def test_leg_b_exit_zero_advances_the_triple(self):
+        """The positive case: a context change that DID finish is recorded, so
+        the next --update takes the cheap diff path."""
+        def _ok(cmd, **kwargs):
+            class _Ret:
+                returncode = 0
+            return _Ret()
+
+        report = self._new_report()
+        self._run_seed(subprocess_side_effect=_ok, deferral_report=report)
+
+        rows = self._read_triple()
+        self.assertEqual(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING), "qwen3",
+        )
+        self.assertNotIn(
+            install._SEED_OWED_WORK_CONDITION_ID,
+            [e.condition_id for e in report.entries],
+            "a clean run must not record owed work",
+        )
+
+    def _new_report(self):
+        from vco_lib.deferral_report import DeferralReport
+        return DeferralReport()
+
+    def test_leg_c_nonzero_exit_still_persists_context_triple(self):
+        """SEG-1's guarantee, unchanged, on the leg it was argued for.
+
+        Context UNCHANGED (stored triple == current), so this run takes the
+        per-file diff path. A node fails; the subprocess exits non-zero. The
+        triple and the attempt record are still written — and no owed-work
+        entry is raised, because on this leg the next run's content-hash diff
+        genuinely does re-pick-up the failed node.
+        """
+        import subprocess as _sp
+
+        # Complete the stored triple so context_changed is False. Written
+        # through the production upsert (the db path is already patched at it)
+        # rather than raw SQL, so the row carries every column the real schema
+        # requires.
+        install._write_app_state_key(
+            install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, "qwen3",
+        )
+
+        def _raise_nonzero(cmd, **kwargs):
+            if "sync_knowledge_graph.py" in str(cmd):
+                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
+            class _Ret:
+                returncode = 0
+            return _Ret()
+
+        report = self._new_report()
+        self._run_seed(
+            subprocess_side_effect=_raise_nonzero, deferral_report=report,
+        )
+
+        rows = self._read_triple()
+        self.assertEqual(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING), "qwen3",
+            "SEG-1: on leg (c) a non-zero exit must still persist the context "
+            "triple — the v0.2.95 carve-out is leg-(b)-only",
+        )
+        self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_AT, rows)
+        self.assertNotIn(
+            install._SEED_OWED_WORK_CONDITION_ID,
+            [e.condition_id for e in report.entries],
+            "leg (c) has its own recovery (the per-file diff) and must not "
+            "raise the leg-(b) owed-work entry",
+        )
 
     # ── (ii) sync script MISSING → context triple NOT persisted ───────────
 
@@ -489,21 +739,19 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             "SEG-1: no sync-at timestamp when the subprocess never ran",
         )
 
-    # ── (iii) two-update integration: transient failure → diff path next ──
+    # ── (iii) two-update integration: the retry TERMINATES ───────────────
 
-    def test_transient_failure_then_next_update_takes_diff_path(self):
-        """Simulate two consecutive --update runs. Run 1 has a transient node
-        failure (non-zero exit). After the fix, run 1 persists the context
-        triple, so at run 2 `context_changed` is computable as False (the diff
-        path), not the full-sync path.
+    def test_incomplete_leg_b_retries_next_update_and_then_stops(self):
+        """The property that makes WP-4 safe rather than a re-run treadmill.
 
-        We assert the intermediate state directly: after run 1 the stored triple
-        equals the current context, which is exactly the precondition the
-        run-2 context-change check reads at install.py:16087-16091.
+        Run 1 is a leg-(b) re-embed that exits non-zero → the triple is NOT
+        advanced, so run 2 re-enters leg (b) (this is the intended retry, and
+        since v0.2.95 WP-5 it re-embeds only what never landed). Run 2 exits 0
+        → the triple IS advanced, so a run 3 would compute context_changed ==
+        False and take the cheap diff path. The loop ends.
         """
         import subprocess as _sp
 
-        # RUN 1 — 1 node fails (non-zero exit).
         def _raise_nonzero(cmd, **kwargs):
             if "sync_knowledge_graph.py" in str(cmd):
                 raise _sp.CalledProcessError(returncode=1, cmd=cmd)
@@ -511,27 +759,44 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
                 returncode = 0
             return _Ret()
 
-        self._run_seed(subprocess_side_effect=_raise_nonzero)
+        def _ok(cmd, **kwargs):
+            class _Ret:
+                returncode = 0
+            return _Ret()
 
+        # RUN 1 — incomplete.
+        self._run_seed(subprocess_side_effect=_raise_nonzero)
+        rows = self._read_triple()
+        self.assertIsNone(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
+            "run 1 did not finish; the marker must still say so",
+        )
+
+        # RUN 2 would therefore recompute a context change — the retry.
+        self.assertTrue(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
+            != os.environ["ACTIVE_EMBEDDING"],
+            "run 2 must re-enter the full-sync branch",
+        )
+
+        # RUN 2 — completes.
+        self._run_seed(subprocess_side_effect=_ok)
         rows = self._read_triple()
         stored_embedding = rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
         stored_kg = rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION)
         stored_shared = rows.get(install._APP_STATE_KEY_LAST_SHARED_KG_COLLECTION)
 
-        # This is the exact comparison install.py runs at the top of run 2.
-        current_active_embedding = os.environ["ACTIVE_EMBEDDING"]
-        current_kg = os.environ["KG_COLLECTION"]
-        current_shared = os.environ["SHARED_KG_COLLECTION"]
+        # This is the exact comparison install.py runs at the top of run 3.
         context_changed = (
-            stored_embedding != current_active_embedding
-            or stored_kg != current_kg
-            or stored_shared != current_shared
+            stored_embedding != os.environ["ACTIVE_EMBEDDING"]
+            or stored_kg != os.environ["KG_COLLECTION"]
+            or stored_shared != os.environ["SHARED_KG_COLLECTION"]
         )
         self.assertFalse(
             context_changed,
-            "SEG-1: after a transient-failure run, the next --update must NOT "
-            "see a context change → it takes the content-hash DIFF path (re-embed "
-            "only the failed node), not a full 2590-node re-embed",
+            "after a COMPLETED context change, the next --update must take "
+            "the content-hash diff path — otherwise WP-4 would have turned a "
+            "one-off retry into a permanent full re-embed",
         )
 
 

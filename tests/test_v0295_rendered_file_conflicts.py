@@ -50,11 +50,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.rust_source import read_rust_code  # noqa: E402
 from vco_lib import rendered_root_files as rrf  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 MERGE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
 SELF_UPDATE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/self_update.rs"
+INSTALLER_RS = REPO_ROOT / "launcher/src-tauri/src/commands/installer.rs"
+# v0.2.95 phase 2: the pull sequence BOTH update surfaces run, and therefore
+# the one place the A0 pre-merge (and with it the rendered reconcile) is wired.
+UPDATE_PIPELINE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/update_pipeline.rs"
 
 TEMPLATE_V1 = (
     "<!-- BEGIN: AUTO (rendered) -->\n"
@@ -130,10 +135,20 @@ class TestRenderedRootFilesTable(unittest.TestCase):
 
 
 class TestCrossLanguageLockstep(unittest.TestCase):
-    """Tier-(B) shared config: two parsers, ONE table, no second copy."""
+    """Tier-(B) shared config: two parsers, ONE table, no second copy.
+
+    Every scan below reads Rust through ``tests.common.rust_source`` — the ONE
+    comment-blanking home — rather than raw ``read_text``. v0.2.95 ship-gate
+    MINOR-7: these pins were comment-BLIND, so a name appearing only in a
+    comment satisfied them, and one of them carried a third private stripper
+    (``line.split("//", 1)[0]``, which cuts inside a ``"…//…"`` string literal).
+    String literals are kept verbatim by that home, which matters here: the
+    ``include_str!`` path and the ``const`` line being pinned ARE string/code
+    text, not prose.
+    """
 
     def test_rust_embeds_this_exact_table_at_the_same_version(self) -> None:
-        src = MERGE_RS.read_text(encoding="utf-8")
+        src = read_rust_code(MERGE_RS)
         self.assertIn(
             'include_str!("../../../../vco_lib/rendered_root_files.toml")',
             src,
@@ -148,7 +163,7 @@ class TestCrossLanguageLockstep(unittest.TestCase):
         )
 
     def test_rust_keeps_no_second_copy_of_the_path_list_or_state_path(self) -> None:
-        src = MERGE_RS.read_text(encoding="utf-8")
+        src = read_rust_code(MERGE_RS)
         state = rrf.state_file_rel_path()
         self.assertNotIn(
             f'"{state}"',
@@ -160,29 +175,75 @@ class TestCrossLanguageLockstep(unittest.TestCase):
         # comments and tests, never a classification list.
         reconcile_start = src.index("pub(crate) async fn resolve_rendered_files_keep_local_at")
         reconcile_end = src.index("fn write_rendered_reconcile_state")
+        # `src` is already comment-free (read through the one home), so the
+        # third private stripper that used to stand here — `line.split("//",
+        # 1)[0]`, which also cuts inside a `"…//…"` string literal — is gone.
         body = src[reconcile_start:reconcile_end]
-        for line in body.splitlines():
-            code = line.split("//", 1)[0]
-            self.assertNotIn(
-                "CLAUDE.md",
-                code,
-                "the reconcile must classify from the table, not from a hard-coded path",
-            )
+        self.assertNotIn(
+            "CLAUDE.md",
+            body,
+            "the reconcile must classify from the table, not from a hard-coded path",
+        )
 
     def test_both_update_surfaces_reach_the_same_reconcile(self) -> None:
-        merge_src = MERGE_RS.read_text(encoding="utf-8")
-        self_update_src = SELF_UPDATE_RS.read_text(encoding="utf-8")
-        # Installer surfaces reach it through the A0 pre-merge entry point.
+        """Both update surfaces must reach the rendered reconcile.
+
+        v0.2.95 phase 2 — the property is unchanged; the WAY the launcher
+        self-update surface satisfies it is not. It used to have no A0 step and
+        so called `resolve_rendered_files_keep_local` DIRECTLY; it now pulls
+        through the shared `update_pipeline`, which runs the A0 pre-merge for
+        both surfaces. So there is ONE entry point where there were two, and
+        asserting the old direct call would now report that consolidation as a
+        regression.
+
+        What is asserted instead is the property itself, per surface:
+        `pre_merge_user_editable` runs the reconcile, and BOTH surfaces reach
+        `pre_merge_user_editable` — the launcher one via the pipeline's A0 step,
+        which is the single call the pipeline makes on behalf of both.
+
+        The behavioural half of this lives in
+        `update_pipeline::tests::pull_sequence_reaches_the_rendered_reconcile_
+        through_the_a0_step`: it drives the real pull sequence over a clone in
+        the state every install is in and asserts the OBSERVABLE consequence
+        (the pull lands, the rendered bytes survive, HEAD carries upstream's
+        blob). That is the guard that cannot be satisfied by a name in a
+        comment; this one pins the wiring either surface could quietly lose.
+        """
+        merge_src = read_rust_code(MERGE_RS)
+        pipeline_src = read_rust_code(UPDATE_PIPELINE_RS)
+        self_update_src = read_rust_code(SELF_UPDATE_RS)
+
+        # The A0 pre-merge runs the rendered reconcile FIRST.
         self.assertIn(
             "resolve_rendered_files_keep_local_at(",
             merge_src.split("pub(crate) async fn pre_merge_user_editable")[1],
-            "the A0 pre-merge (installer surfaces) must run the rendered reconcile first",
+            "the A0 pre-merge must run the rendered reconcile first",
         )
-        # The launcher self-update surface has no A0 step, so it calls it directly.
+        # The shared pipeline runs the A0 pre-merge …
         self.assertIn(
+            "run_pre_merge_user_editable(",
+            pipeline_src,
+            "the shared update pipeline must run the A0 pre-merge",
+        )
+        # … and BOTH surfaces pull through that pipeline, which is how they
+        # reach it. `installer::update_orchestrator` and
+        # `self_update::apply_launcher_update` each call it exactly once.
+        for name, src in (
+            ("installer.rs", read_rust_code(INSTALLER_RS)),
+            ("self_update.rs", self_update_src),
+        ):
+            self.assertIn(
+                "prepare_and_pull_orchestrator_repo(",
+                src,
+                f"{name}'s update surface must pull through the shared pipeline — "
+                "that is how it reaches the rendered reconcile",
+            )
+        # And the launcher surface must not keep a second, divergent entry
+        # point into the same class.
+        self.assertNotIn(
             "git_user_editable_merge::resolve_rendered_files_keep_local(",
             self_update_src,
-            "apply_launcher_update must wire the same helper (one home, both surfaces)",
+            "one entry point: the direct call was folded into the pipeline's A0 step",
         )
 
 

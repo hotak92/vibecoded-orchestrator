@@ -94,6 +94,7 @@ belongs in the Rust syntax profile in ``vco_lib/codegraph_lang/_shared.py``
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple
 
 from vco_lib.codegraph_lang._shared import _scrub_line_stateful, _syntax_for
@@ -101,6 +102,7 @@ from vco_lib.codegraph_lang._shared import _scrub_line_stateful, _syntax_for
 __all__ = [
     "scrub_rust_lines",
     "strip_rust_comments",
+    "read_rust_code",
     "cfg_test_spans",
     "cfg_test_line_numbers",
     "cfg_test_gate_indices",
@@ -171,6 +173,29 @@ def strip_rust_comments(source: str) -> List[str]:
         )
         stripped.append(text)
     return stripped
+
+
+def read_rust_code(path: Path) -> str:
+    """A ``.rs`` file read as CODE: comments gone, string literals verbatim.
+
+    The question every source-scanning lint in this suite actually asks. Six
+    call sites already answered it by hand-rolling
+    ``"\\n".join(strip_rust_comments(p.read_text(encoding="utf-8")))``; naming
+    it here is what stops the seventh from being written as a private lexer
+    again — which is exactly what happened in v0.2.95
+    (``test_v0291_binary_delivery_chain.read_code``: a per-line ``//`` cutter
+    with its own quote tracker, blind to block comments and to ``r#"…"#``).
+
+    Use it for ``assertIn``: this project's rule is "never guard wiring with a
+    source scan — a name in a comment satisfies it", and stripping comments is
+    what removes that specific way a scan lies. ``assertNotIn`` benefits in the
+    other direction: a comment explaining why a call was REMOVED no longer
+    fails the pin.
+
+    Encoding is fixed at UTF-8 because that is what the Rust toolchain
+    requires of a source file, so a caller never has a decision to make here.
+    """
+    return "\n".join(strip_rust_comments(path.read_text(encoding="utf-8")))
 
 
 def _predicate_mentions_test_only(

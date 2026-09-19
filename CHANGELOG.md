@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.95] - 2026-09-19
+
+### Fixed — the launcher self-update could leave your install half-updated, and then report it complete (v0.2.95)
+
+- **Preferences → Launcher updates advanced the whole orchestrator source tree, rebuilt
+  only the launcher, and never ran `install.py`** — leaving the venv, the bundled hooks,
+  `templates/`, the MCP registrations, the knowledge seed and the collection schema at the
+  version you came from. It then refreshed `install-manifest.json` to the NEW version with
+  `installed: true`. The update badge keys on commits-behind, which was now zero, so the
+  half-updated install was **durable and invisible**. Present since that surface was written
+  (2026-04-27) and shipped in every tag since.
+  - **The surface now runs `install.py --update`**, through the same pipeline the orchestrator
+    update uses. The cargo/npm rebuild it used to do is the fallback for when install.py is
+    unavailable.
+  - **Only `install.py` may advance the manifest's `version`.** A path that moves the source
+    without running the installer writes `source_commit`, `install_method` and a new
+    `post_source_only: true`, and leaves `version` where the last real install left it.
+  - **A run that changes nothing now writes nothing.** "Already up to date" used to stamp the
+    manifest anyway, which lit `install_stale` — so a click that did nothing ended by demanding
+    a full install.
+  - `force_resync_launcher` now stops the hub before `git reset --hard` writes over
+    `launcher/dist/*/vct-hub`, a TRACKED file. That hazard was never a decision: the function
+    was written on 2026-05-07 and the hub binary became tracked two weeks later.
+
+### Added — `vco doctor` can see a half-executed install (v0.2.95)
+
+- New probe **`install_completeness`** compares `install-manifest.json` against the bundle
+  manifest and the last successful session in `state/logs/install.jsonl`. It convicts on three
+  legs — versions disagree, commits disagree, or the manifest says `post_source_only` — and
+  **acquits when the marker merely LAGS its installer** (install.py logs the session, then
+  writes the manifest; the gap is real and measured at ~4 s). Anything it cannot positively
+  establish returns "not evaluated", never a verdict.
+- **An ABSENT `post_source_only` never convicts.** No manifest written before this release
+  carries the flag, and treating its absence as guilt would condemn every healthy install.
+- No doctor probe read `install-manifest.json` before this (other callers do): the currency probe
+  deliberately treats
+  install age as "not decision-relevant on a healthy checkout", and after a source-only update
+  the checkout is zero commits behind — so it read healthy.
+
+### Changed — the two update code paths became one (v0.2.95)
+
+- The launcher had two update commands that were **never designed as two**: `update_orchestrator`
+  (2026-04-26: pull + install.py) and `apply_launcher_update` (2026-04-27: pull + rebuild +
+  restart). They converged in capability over sixteen months while only their HELPERS were ever
+  shared — the *sequence* never was, so each git-safety fix landed on one surface and reached
+  the other weeks to months later, or not at all.
+- The pre-flight, fetch, the rendered / generated / user-editable reconciles, the pull-plan
+  decision, the pull itself, the post-pull verification and the audit-row collection now live in
+  one **`update_pipeline.rs`** that both commands call; each keeps only its own tail.
+- **The anti-drift test that existed to prevent this could not fail**: it called the same function
+  twice with identical arguments and asserted the results matched. Replaced by one that drives the
+  pipeline and renders a single error through both surfaces' serialisers.
+- **`LC_ALL=C` was pinned on one surface's pull and not the other's**, and every conflict
+  classifier matches English substrings — so unifying without noticing would have REGRESSED the
+  surface that had it. Both have it now.
+
+### Fixed — every command that writes the orchestrator clone takes the same claim (v0.2.95)
+
+- **None of these commands took a shared claim before this release; thirteen sites take it now** —
+  twelve commands plus the shared collision helper. The merge / rebase / abort / resume commands, the
+  autostash-pop and untracked-collision resolvers, `apply_pending_install`, both
+  conflict-resolution buttons and `apply_hardware_reconfig` could all run concurrently against
+  one clone. That stopped being theoretical this release: a conflict now leaves the resume
+  sentinel standing *and* renders the resync modal, so **"Continue Update" and "Resync now" — one
+  of which is `git reset --hard` — were offered at the same time** with only one taking a claim.
+- Nested callers hand the claim down rather than re-taking it; claiming naively at the top of each
+  command would have dead-locked every recovery button.
+- The wiring test's docstring claimed it covered "every surface that WRITES the orchestrator
+  clone" while enumerating four. The enumeration is now complete and fails when a surface is added
+  without a claim.
+- Three more fixes on the same recovery paths: `install.py`'s output pipes are drained
+  concurrently, so a child writing more than 64 KiB to stderr no longer deadlocks the update; the
+  post-pull recovery tail closes the launcher's `launcher.db` connection for the install.py window,
+  as the main path already did, so install.py stops contending for the writer lock on Windows; and
+  `force_resync` aborts an in-progress merge or rebase before `git reset --hard`, which does not
+  clear `.git/rebase-merge` on its own.
+
+### Fixed — the desktop-icon step could never create an icon on Linux or macOS (v0.2.95)
+
+- `install.py::_run_desktop_icon_step` always passes `--no-auto-launch`, and that flag's `exit 0`
+  sat **before** the desktop-shortcut step — because the gate landed on 2026-04-27 and the
+  shortcut step was appended to the end of the same file the next day. So the step whose entire
+  purpose is creating the icon could not create one. The Windows sibling has always ordered it
+  correctly, which is why this survived five months.
+
+### Fixed — knowledge re-embedding: an empty vector slot is repaired, unchanged content is not re-embedded (v0.2.95)
+
+- **`sync_node` never checked whether the ACTIVE vector slot was populated**, so a node whose
+  content hash matched but whose active slot was empty was skipped forever. It now checks — but
+  deliberately **not** by mirroring `sync_doc`'s fallback, which scored an unreadable vector
+  payload as "slot empty ⇒ re-embed": that re-embeds the whole tree whenever a fetch degrades,
+  and loops forever on a legacy single-unnamed-vector class where the slot is missing from the
+  *schema* and no repair is possible. One shared gate now engages only when the schema is readable
+  AND declares the active slot; every other case keeps pre-existing skip semantics. `sync_doc`
+  calls that same home and re-embeds strictly LESS than before: its degraded-fetch fallback still
+  runs, but no longer forces a re-embed. `sync_node` re-embeds strictly MORE, by exactly one set — the nodes whose active slot was
+  never filled, which it used to skip forever. That set is the defect; embedding it once is the fix.
+- **The install now records what enrichment did.** `vco_lib/embedding_enrichment.py` performs the
+  per-object, idempotent slot fill but writes no marker of its own — `install.py` is the only writer
+  of `last_installed_active_embedding`, and its leg (b) never stamped after an enrich. So doing the
+  recommended thing and then updating re-embedded the entire collection. Leg (b) now distinguishes a
+  *slot change* (enrich, then stamp) from a *collection rename* (full re-seed).
+- A model/collection-change run that fails part-way no longer advances the marker as if it had
+  succeeded; it leaves the owed work recorded as `kg_sync_failures_pending`, which has a real retry
+  action and clears when the work lands.
+
+### Changed — one home for the interpreter cascade, the schema verdict, and the install.py spawn (v0.2.95)
+
+- The python-candidate cascade existed in **five** entry points; a parity test covered three, and
+  the two `first-install` shims carried no mirror notice at all. The lock now covers all five and
+  was red-proved by reversing one cascade and watching the old test stay green.
+- The "is this schema change additive enough to apply unattended" verdict had a Rust copy and a
+  Python copy. It now has one home in `vco_lib`: Python computes it and publishes it in the
+  migrate-collections envelope, and the launcher READS the published verdict and ANDs its own
+  process evidence instead of re-deriving the rule. Both arms tested.
+- All six hand-rolled `install.py` spawn sites route through one builder — `apply_pending_install`
+  was missing `PYTHONIOENCODING`/`PYTHONUTF8`, whose absence crashes install.py mid-update on a
+  Windows cp1252 console.
+- `install.py` shrank from 24 059 at 0.2.94 to **24 005** lines and its ratchet was re-pinned downward to the
+  exact measurement; `vco_lib/project_init.py` from 15 711 to 15 661, likewise.
+
 ### Fixed — two code-scanning findings, each closed as a CLASS rather than as an instance
 
 - **The shell-placement helper filtered markup with a regex denylist.** CodeQL
@@ -127,6 +248,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     refusal into an opaque autostash abort. Both now call one
     `parse_tracked_modified_z`, on raw bytes, and a failing `git status` is an
     error rather than an empty answer.
+  - **Upgrading FROM 0.2.94 runs the OLD guard, once.** The pre-flight executes
+    in the launcher you are RUNNING, not the one you are fetching, so the
+    0.2.94→0.2.95 hop is still refused on Preferences → Updates with
+    "Uncommitted changes on tracked file 'CLAUDE.md' would be lost". Take that
+    one hop through the **MenuBar update badge** instead — it calls
+    `update_orchestrator`, which has used the precise risk set since v0.2.58 and
+    is unaffected; from 0.2.95 onward both surfaces agree. Do NOT follow the old
+    message's advice to revert `CLAUDE.md`: it discards your edits and
+    `install.py` re-renders the file on the next run, so the refusal returns.
 
 ### Fixed — a rendered file REMOVED upstream no longer wedges the update
 
@@ -350,6 +480,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heading, as it already did for tags and type), and a `tags:` string is
   split into a list. A bulk resync prints one line per promoted file, so you
   can see how many nodes came from the foreign dialect.
+- **Known limitation — this repairs new and changed nodes, NOT nodes already
+  stored.** The sync's skip gate hashes the file's TEXT, not the parsed
+  properties, so a node whose frontmatter used the nested dialect keeps its
+  wrong `tags`/`type` in Weaviate until that FILE changes. `kg-sync --all` does
+  not repair it either: the skip path returns without rewriting any property, so
+  a bulk run prints the promoted-file line and leaves the stored row as it was.
+  Nothing regresses and no data is lost — every new write is correct and the
+  embedding is unaffected — but if you came here to repair an existing node, the
+  only thing that does it today is editing the file. Delivering the repair means
+  salting the content signature for promoted files, and that signature has five
+  consumers, so it is deliberately NOT a tag-day change.
 - **The inline `#tag` harvest is suppressed whenever frontmatter exists** —
   including an empty or malformed block, which now parses to `{}` rather than
   `None`, because a block that EXISTS declares the node's tags. Harvesting a
@@ -940,7 +1081,11 @@ unchanged, and the launcher's Rust consumer reads the verdict generically
   pin that was not there.
 - Housekeeping: `install.py`'s metrics-migration helper became
   `_run_machine_migrations`, a thin call into the new module, so the file did
-  not grow (its size ratchet is unchanged at 24 059).
+  not grow. Its size ratchet stood at 24 059 for this change; later work in
+  this same release moved three more units out to `vco_lib/install_weaviate.py`
+  and re-pinned it **downward to 24 005** (see the install/update unification
+  entry below) — the pin is always the exact measurement, never the measurement
+  plus headroom.
 
 ### Added — a model that ships tomorrow gets its real context window today (v0.2.95)
 

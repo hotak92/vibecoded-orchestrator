@@ -32,6 +32,21 @@ cd "$SCRIPT_DIR"
 # /opt/homebrew (default since 2020); Intel Homebrew under /usr/local.
 # Try Apple Silicon first since it's the modern default; fall back
 # to PATH probes which catch Intel Homebrew + python.org installs.
+#
+# CROSS-LANGUAGE PARITY (v0.2.95 WP-7): the five BARE names at the end of
+# the list below are a MIRROR — they must stay identical, in order, to
+# every other bootstrap Python probe:
+#   * install.sh                     -> find_python `for cmd in ...`
+#   * install.ps1                    -> Find-Python `$candidates`
+#   * first-install.sh               -> its own `for cand in ...`
+#   * launcher/.../installer/hardware.rs -> detect_python POSIX branch
+# Only the ABSOLUTE paths may differ per OS (the Homebrew prefixes here,
+# Linuxbrew in first-install.sh) — an extra bare NAME belongs in the
+# canonical list, not here. The mirror is deliberate and C-tier-justified:
+# this runs before any interpreter exists, so no shared library or parsed
+# rule table is reachable (docs/INSTALL_ARCHITECTURE_v2.md §1).
+# Locked by tests/test_v0295_wp7_bootstrap_cascade_parity.py and
+# tests/test_v0295_wp7_cascade_behaviour.py. Edit all four + keep green.
 PYTHON=""
 for cand in \
     /opt/homebrew/opt/python@3.13/bin/python3.13 \

@@ -841,6 +841,7 @@ class TestHighFixesIntegration(unittest.TestCase):
         verify the code structure without spinning up Weaviate)."""
         import install
         import inspect
+        import re
         src = inspect.getsource(install.main)
         # Locate the try-block that catches Weaviate errors during update.
         # The `except Exception as _weaviate_err:` line is unique enough.
@@ -848,10 +849,16 @@ class TestHighFixesIntegration(unittest.TestCase):
         # The fixed code calls _seed_weaviate inside the same try (and on
         # the restart-retry branch). Two _seed_weaviate calls inside main
         # — one in the try, one in the restart retry.
-        seed_calls = src.count("_seed_weaviate(args)")
+        #
+        # v0.2.95 WP-4: matched on the CALL, not on a fixed argument list.
+        # The seed gained a `deferral_report=` keyword (so an incomplete
+        # embedding-model change can record owed work), which a literal
+        # `_seed_weaviate(args)` scan reported as ZERO calls — a stale
+        # pattern claiming the wiring was gone while it was intact.
+        seed_calls = len(re.findall(r"_seed_weaviate\(\s*args\b", src))
         self.assertGreaterEqual(
             seed_calls, 2,
-            f"expected >=2 _seed_weaviate(args) calls in install.main "
+            f"expected >=2 _seed_weaviate(args, ...) calls in install.main "
             f"(one in try, one in restart retry); got {seed_calls}",
         )
 

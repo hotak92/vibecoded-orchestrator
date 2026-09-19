@@ -242,7 +242,23 @@ _MAIN_SPAN_MAX = 1687
 # left far ABOVE a shrunken file — but only past a 1 200-line slack window,
 # so it cannot police a 143-line gap. This comment is the policy; that test
 # is the backstop.)
-_TOTAL_LINES_MAX = 24059
+#
+# v0.2.95 (ratchet lane) — re-pinned DOWN to the measured 24005 (-54 against
+# the 24059 pin; -284 against the 24289 the embedding-correctness lane left
+# behind, which is what put this assertion in the red). That lane added the
+# WP-4/WP-6 seed work here and extracted as far as its own file boundary
+# allowed; the rest went where it always belonged, `vco_lib/install_weaviate.py`:
+#   * `_migrate_kg_named_vector_slots` (V0243-2, the 5-slot catalog migration);
+#   * `_detect_legacy_shared_kg_class` (PR-34, the pre-v0.2.12 class probe);
+#   * `_SEED_OWED_WORK_CONDITION_ID` + `_emit_context_change_incomplete_deferral`
+#     (WP-4's owed-work ledger entry).
+# install.py keeps a thin same-signature wrapper for the first two (their names
+# are the test suite's and main()'s call contract) and a one-line alias for the
+# constant; the emitter's single call site moved to the new home outright.
+# Bodies moved VERBATIM — the only edits are the renames the new home forces
+# (`_log_install_event` → the passed-in logger, `_make_deferral` → the passed-in
+# builder). ALL outside main() (+0 span; main() stays at its own 1687 pin).
+_TOTAL_LINES_MAX = 24005
 
 
 def _measure() -> tuple:

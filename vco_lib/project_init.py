@@ -68,6 +68,11 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 from vco_lib.paths import to_posix_rel
 from vco_lib import codegraph_orphan_snapshot as _cos
 from vco_lib import codegraph_prefix_record as _cpr
+# v0.2.95 WP-9: "which plan actions may be applied without consent" is a policy,
+# not plumbing, and it had a second implementation in Rust. One home now; this
+# module publishes its verdict on the `migrate-collections --json` envelope and
+# the launcher reads it. See `vco_lib/migration_plan_classify.py`.
+from vco_lib import migration_plan_classify as _mpc
 # v0.2.92 W3 (§3 item 11): `.git/info/exclude` computation + append moved to
 # their own module when the project-move engine became a third caller.
 from vco_lib import git_exclude as _git_exclude
@@ -5977,8 +5982,17 @@ def _run_rl_client_setup(folder: Path) -> dict:
 # this ratchet-capped file. Re-exported so `project_init._emit_...` keeps
 # resolving for its existing callers and tests.
 from vco_lib.migrate_deferral import (  # noqa: E402,F401
-    _emit_migrate_required_deferral,
+    # A deliberate RE-EXPORT, not a live call site: v0.2.95 (WP-9) moved this
+    # module's last caller into `migrate_deferral` itself, but four test
+    # modules and any out-of-tree caller still reach the emitter as
+    # `project_init._emit_migrate_required_deferral`, and the v0.2.92 move
+    # promised that name would keep resolving. Kept per pyrightconfig.json's
+    # own rule for deliberate re-exports (per-line ignore + reason).
+    _emit_migrate_required_deferral,  # pyright: ignore[reportUnusedImport]
 )
+# v0.2.95 WP-9: the module itself, for `reconcile_schema_migration_deferral`
+# (the emit-or-clear gate, moved there out of `_cmd_migrate_collections`).
+from vco_lib import migrate_deferral as _migrate_deferral  # noqa: E402
 
 
 def _cleanup_legacy_bash_env_in_project(
@@ -13547,96 +13561,32 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
 
-        # PR 5: drift-detection deferral (pre-update path).
-        if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
-            # v0.2.70: `copy` is ALWAYS lossless — the staging double-copy
-            # round-trips every EXISTING UUID + named vector + property byte-for-byte
-            # via `_copy_collection_with_vectors` (no re-embedding; the live
-            # collection is not dropped until the staging swap's count-match
-            # assertion passes). So `copy` must AUTO-APPLY without consent — only
-            # genuinely data-losing actions defer, and `action == "rebuild"` is the
-            # exact lossy set here. `legacy_single_vector` classifies `rebuild`
-            # (never `copy`). A same-name/different-dim slot is INVISIBLE to
-            # `_schema_delta` (name-only comparison): on its own it yields `noop`;
-            # when it COEXISTS with a genuinely-missing slot, `_classify_action`
-            # returns `copy` (driven by the missing slot) and the mismatch slot
-            # rides along — but copy still only round-trips the EXISTING vectors
-            # verbatim (it neither fixes nor worsens the dim-mismatch, and never
-            # re-embeds/drops), so it remains lossless + data-safe. Genuine
-            # dim-mismatch remediation is owned by the schema_migration_runner
-            # subsystem (it defers). The dry-run plan strips `delta`, leaving
-            # `action` as the only signal here — sufficient given that proof.
-            #
-            # NOTE: this auto-apply is NEW behavior, NOT a mirror of
-            # `install.py --update` (whose drift detector EXCLUDES the additive
-            # v0.2.18 slots and never reaches the apply for an additive 3->5 drift).
-            # It is justified purely by losslessness. The launcher's WET follow-up
-            # that actually applies the additive subset lives in
-            # `projects_v2.rs::run_migrate_dry_run` (the dry-run probe here only
-            # stops deferring — it never mutates).
-            destructive = [
-                e for e in result.get("plan", [])
-                if e.get("action") == "rebuild"
-            ]
-            resolved_folder = Path(project_folder).resolve()
-            if destructive:
-                try:
-                    _emit_migrate_required_deferral(
-                        resolved_folder,
-                        project_name=args.name,
-                        weaviate_url=args.weaviate_url or _weaviate_url_default(),
-                        plan_entries=destructive,
-                    )
-                    result["deferral_emitted"] = True
-                except Exception as e:
-                    # Soft-fail: a deferral write failure must not abort the
-                    # whole update flow. Report via errors[] so the Rust caller
-                    # surfaces it as a warning toast.
-                    result["errors"].append({
-                        "collection": None,
-                        "action": "deferral",
-                        "error": f"migrate-required deferral write failed: "
-                                 f"{type(e).__name__}: {e}",
-                    })
-            else:
-                # v0.2.55 (stale-migration-deferral fix): the dry-run is CLEAN (no
-                # copy/rebuild needed). PRE-v0.2.55 this branch did nothing, so
-                # a `schema_migration_required` entry written by an EARLIER
-                # update (when a migration WAS pending) survived forever even
-                # after the migration was applied or the schema healed —
-                # exactly the stale-deferral carry-forward bug (the entry was re-read by
-                # `DeferralReport.read()` on every subsequent bundle update and
-                # never cleared because the emitter is gated on `destructive`).
-                # Re-probe-clears-stale, matching the Track D `--apply-deferred`
-                # discipline: a clean dry-run IS the re-probe; clear the stale
-                # entry. Soft-fail — never abort the update over a deferral
-                # housekeeping write.
-                try:
-                    # v0.2.83 PLAN-v0283 WP-B2: resolve via the ONE locked emitter
-                    # home (read-modify-write under the exclusive lock; foreign
-                    # entries preserved). resolve_conditions returns the count it
-                    # actually cleared, so the flag is set only when it fired.
-                    from vco_lib import deferral_emit as _de
-                    cleared = _de.resolve_conditions(
-                        resolved_folder, ["schema_migration_required"],
-                    )
-                    if cleared:
-                        result["stale_migrate_deferral_cleared"] = True
-                        # stderr (not stdout) so `--json` output stays parseable.
-                        print(
-                            "  [ok] schema_migration_required: dry-run clean — "
-                            "cleared stale migration deferral (no copy/rebuild "
-                            "needed).",
-                            file=sys.stderr,
-                        )
-                except Exception as e:
-                    # Housekeeping only — report but don't fail.
-                    result["errors"].append({
-                        "collection": None,
-                        "action": "deferral-clear",
-                        "error": f"stale migrate-deferral clear failed: "
-                                 f"{type(e).__name__}: {e}",
-                    })
+        # PR 5: drift-detection deferral (pre-update path). v0.2.95 WP-9: the
+        # policy — when a dry-run may write `schema_migration_required`, which
+        # plan entries force it, and when a clean re-probe clears a stale one —
+        # now lives beside the emitter it drives, in
+        # `vco_lib/migrate_deferral.py`. It arrived here as ~95 inline lines in
+        # a CLI handler; the gate moved with it because the gate IS part of the
+        # policy. `result` is mutated in place exactly as before.
+        _migrate_deferral.reconcile_schema_migration_deferral(
+            result,
+            project_folder=project_folder,
+            project_name=args.name,
+            weaviate_url=args.weaviate_url or _weaviate_url_default(),
+            dry_run=bool(args.dry_run),
+            all_projects=all_projects,
+        )
+
+        # v0.2.95 WP-9 (surface-map D4): publish the auto-apply classification
+        # so the launcher READS it instead of re-deriving the policy in Rust.
+        # Computed here, after every step that can append to `errors[]`, so the
+        # verdict describes the run as it finished rather than as it started —
+        # a probe that hit a deferral-write error saw the drift only partly.
+        # The caller still ANDs its own evidence that the PROCESS exited 0,
+        # which no payload can vouch for about itself.
+        _verdict = _mpc.classify_migration_plan(result)
+        result[_mpc.AUTO_APPLY_KEY] = _verdict["auto_apply_additive"]
+        result[_mpc.ADDITIVE_COLLECTIONS_KEY] = _mpc.additive_collections(result)
 
         if args.json:
             print(json.dumps(result))

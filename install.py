@@ -6388,7 +6388,7 @@ def main() -> int:
             _ensure_collections(embed_config, decisions=decisions, args=args)
             # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
             # safe to re-run on update.
-            _seed_weaviate(args)
+            _seed_weaviate(args, deferral_report=_deferral_report)
             _seed_succeeded = True
         except Exception as _weaviate_err:
             # PR 6: Weaviate is unreachable (or refused connection) after the
@@ -6426,7 +6426,7 @@ def main() -> int:
                 # a still-unreachable port raises TimeoutError (→ deferral below)
                 # rather than hanging the re-embed after a no-op `podman start`.
                 _ensure_collections(embed_config, decisions=decisions, args=args)
-                _seed_weaviate(args)
+                _seed_weaviate(args, deferral_report=_deferral_report)
                 _restarted = True
                 _seed_succeeded = True
             except Exception:
@@ -15220,7 +15220,58 @@ def _resolve_orchestrator_root_canonical(
     )
 
 
-def _seed_weaviate(args: argparse.Namespace) -> None:
+def _enrich_slot_change(
+    venv_py: Path,
+    profile: str,
+    kg_collection: str,
+    shared_kg_collection: str,
+) -> bool:
+    """Thin call site for the enrichment driver (v0.2.95 WP-6).
+
+    The driver itself lives in :mod:`vco_lib.embedding_enrichment` — the
+    module whose CLI contract it depends on — so install.py carries only the
+    decision to use it. A failed import is a BROKEN install, but this is a
+    cost optimisation on a path that has a correct (if expensive) fallback:
+    return False and the caller re-embeds, which is what every release before
+    v0.2.95 did.
+    """
+    try:
+        from vco_lib.embedding_enrichment import (
+            enrich_collections_for_slot_change,
+        )
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        print(f"  CI-10: enrichment unavailable ({exc}) → full re-embed")
+        return False
+    return enrich_collections_for_slot_change(
+        venv_python=venv_py,
+        profile=profile,
+        kg_collection=kg_collection,
+        shared_kg_collection=shared_kg_collection,
+        dev_collection=os.environ.get("DEVELOPMENT_COLLECTION", "") or "",
+        project_root=PROJECT_ROOT,
+        env=_subprocess_env_with_embedding(),
+        log=lambda msg: print(msg),
+        audit=lambda data: _log_install_event(
+            "7c/10", "info",
+            "CI-10: slot change enriched in place (no full re-embed)",
+            data=data,
+        ),
+    )
+
+
+#: v0.2.95 WP-4: the owed-work condition an INCOMPLETE embedding-model /
+#: collection change records. The id, the reasoning behind reusing an
+#: EXISTING registered condition rather than minting one, and the emitter
+#: all live in :mod:`vco_lib.install_weaviate`; this alias exists because
+#: the name is part of install.py's surface (the CI-10 seed tests read
+#: ``install._SEED_OWED_WORK_CONDITION_ID``).
+_SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
+
+
+def _seed_weaviate(
+    args: argparse.Namespace,
+    deferral_report: "Optional[DeferralReport]" = None,
+) -> None:
     """v0.2.44 V44-I: thin wrapper around :func:`_seed_weaviate_impl`
     that guarantees the ``_DUAL_CLONE_DETECTED_THIS_RUN`` module-level
     flag is reset to False after the call returns (even if the impl
@@ -15235,12 +15286,15 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     global _DUAL_CLONE_DETECTED_THIS_RUN
     try:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
-        return _seed_weaviate_impl(args)
+        return _seed_weaviate_impl(args, deferral_report=deferral_report)
     finally:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
 
 
-def _seed_weaviate_impl(args: argparse.Namespace) -> None:
+def _seed_weaviate_impl(
+    args: argparse.Namespace,
+    deferral_report: "Optional[DeferralReport]" = None,
+) -> None:
     """Seed Weaviate with bundled knowledge/ + docs/.
 
     v0.2.42 CI-10: on ``--update`` runs (not fresh install), gate the sync
@@ -15326,6 +15380,11 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # is needed. See function docstring for full algorithm.
     is_update = getattr(args, "update", False)
     _sync_all = True          # default: run --all (set False for diff path)
+    # v0.2.95 WP-4: was leg (b) — the context-CHANGE branch — taken? Leg (b)
+    # and leg (c) fail differently and must be marked differently; see the
+    # amended SEG-1 note at the persist block below.
+    _context_change_run = False
+    _context_change_reason = ""
     _diff_files: "list[str]" = []  # set when doing a partial sync
     _nodes_skipped = 0
     _nodes_synced = 0
@@ -15442,6 +15501,42 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
             or stored_shared_kg != current_shared_kg
         )
 
+        # v0.2.95 WP-6: leg (b) is two different questions wearing one branch. A
+        # collection RENAME means the target class has no rows and only a full
+        # re-embed can fill it. An embedding-model change means every row is
+        # still correct except for one empty named-vector slot — which
+        # `vco_lib.embedding_enrichment` fills per object, UPDATE-only and
+        # idempotently (it EMBEDS too — ship-gate MINOR-6; its docstring says
+        # where the saving is and is not). Split here: downstream is unchanged.
+        _collections_changed = (
+            stored_kg != current_kg_collection
+            or stored_shared_kg != current_shared_kg
+        )
+        if (
+            context_changed
+            and not _collections_changed
+            and current_kg_collection
+            # A previously RECORDED profile is required. An absent
+            # `last_installed_active_embedding` is not a model change — it is
+            # the absence of any record, which is also what a never-seeded
+            # install looks like, and that needs the full `--all` (it is the
+            # only shape that also seeds `docs/`; the per-file diff path
+            # covers `knowledge/` only). Keeping that case on its existing
+            # path is why this condition is narrower than "context_changed".
+            and stored_embedding
+        ):
+            if _enrich_slot_change(
+                venv_py, current_active_embedding,
+                current_kg_collection, current_shared_kg,
+            ):
+                # The context change has been RESOLVED, not ignored: the
+                # collections now carry vectors in the active slot. What
+                # remains for this run is the ordinary per-file diff, so hand
+                # the run to leg (c) — and let the persist below stamp the
+                # triple, which is the whole point (doing the recommended
+                # thing must not cost a full re-embed on the next update).
+                context_changed = False
+
         if context_changed:
             # Full sync required — context changed since last run.
             reason = (
@@ -15456,6 +15551,8 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
                 data={"reason": "context_change"},
             )
             _sync_all = True
+            _context_change_run = True
+            _context_change_reason = reason
         elif not current_kg_collection:
             # No KG_COLLECTION configured — can't query Weaviate for diff.
             # Fall back to full sync to be safe.
@@ -15573,7 +15670,13 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # chunk → sync_knowledge_graph.py exits 1) left last_installed_active_embedding
     # at None forever, forcing a full ~2590-node re-embed on EVERY subsequent
     # --update (CI-10 "pay once" defeated). See the persist block below.
+    #
+    # v0.2.95 WP-4 AMENDS that rule for leg (b) only — `sync_exit_zero` is the
+    # extra fact the persist block needs to do it. The SEG-1 rationale above
+    # stands unchanged for leg (c); read the persist block for why leg (b) is
+    # different and what had to land first for the amendment to be safe.
     sync_subprocess_ran = False
+    sync_exit_zero = False
     if sync_kg.exists():
         if _sync_all:
             cmd_args = ["--all"]
@@ -15614,6 +15717,7 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
             )
             # Subprocess executed AND exited 0 — clean sync.
             sync_subprocess_ran = True
+            sync_exit_zero = True
         except subprocess.CalledProcessError as e:
             # Subprocess EXECUTED but exited non-zero — e.g. 1/2590 nodes failed
             # (oversize chunk, transient embed error). The other 2589 WERE
@@ -15654,10 +15758,49 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # they record "we last attempted a sync at T, embedding N/K nodes" — reality
     # regardless of the one failed node — so they belong with the context triple,
     # not under a stricter success check.
-    if sync_subprocess_ran:
+    #
+    # ── v0.2.95 WP-4: the leg-(b) carve-out, and why SEG-1 still stands ──
+    #
+    # SEG-1's reasoning above is a LEG-(C) argument. Its worked example — "2589
+    # of 2590 succeeded; the next --update's content-hash diff re-picks-up only
+    # the failed node" — holds because a node whose WRITE failed has no stored
+    # hash, so the diff sees it. Nothing below changes that.
+    #
+    # It does NOT hold on leg (b), for a reason the exit code alone cannot show:
+    # a leg-(b) run can also die EARLY (backend death, kill, crash) with most of
+    # the tree NEVER VISITED. Those nodes keep rows whose content_hash still
+    # matches — it is computed from file bytes only and carries no model
+    # identity — so the next run's diff finds nothing to do. Stamp the triple and
+    # leg (b) never fires again either: the collection keeps PREVIOUS-MODEL
+    # vectors permanently, with no ledger row and no probe that looks. install.py
+    # cannot tell that shape from a per-node write failure; both are exit != 0.
+    #
+    # So on leg (b) the triple advances only on exit 0. What made that safe is
+    # v0.2.95 WP-5 (the active-slot gate in `sync_node`), which LANDED FIRST and
+    # dissolved the dilemma SEG-1 was choosing inside: before WP-5, not stamping
+    # cost a full ~2590-node re-embed on every subsequent --update, forever (why
+    # SEG-1 chose to stamp); after it, the repeated `--all` skips every node
+    # whose content_hash matches AND whose ACTIVE slot is populated, re-embedding
+    # only what never landed — once — after which exit 0 advances the triple.
+    #
+    # PRICE, named (ship-gate MINOR-5): a PERMANENTLY failing node — an oversize
+    # chunk the backend always refuses — holds the exit non-zero, so every later
+    # --update re-enters leg (b) and WALKS `--all` (a fetch per node, embeds
+    # gated by WP-5) instead of the seconds-scale diff. Accepted: it is not
+    # silent (the sync emits `kg_sync_failures_pending` with the count and
+    # `retry:py:kg_seed`), and the alternative — stamping on a non-zero exit — is
+    # the permanent previous-model state above, unlogged and unprobed. If WP-5 is
+    # removed or weakened, revisit this carve-out in the SAME change.
+    #
+    # The sync-AT timestamp and sync-STATS are deliberately NOT part of the
+    # carve-out: they record "an attempt happened at T, embedding N/K" — true of
+    # an incomplete run too — withholding them would hide the attempt itself.
+    _context_change_incomplete = _context_change_run and not sync_exit_zero
+    if sync_subprocess_ran and not _context_change_incomplete:
         _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)
+    if sync_subprocess_ran:
         import datetime as _dt
         _write_app_state_key(
             _APP_STATE_KEY_LAST_KG_SYNC_AT,
@@ -15666,6 +15809,11 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
         _write_app_state_key(
             _APP_STATE_KEY_LAST_KG_SYNC_STATS,
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
+        )
+    if _context_change_incomplete:
+        _install_weaviate.emit_context_change_incomplete_deferral(
+            deferral_report, _context_change_reason,
+            make_deferral=_make_deferral,
         )
 
     # v0.2.44 V44-A: always prune on --update.
@@ -16168,139 +16316,17 @@ def _translate_migration_report_to_deferrals(
 
 
 def _migrate_kg_named_vector_slots(deferral_report: "DeferralReport") -> None:
-    """V0243-2 — Ensure $KG_COLLECTION and $DEVELOPMENT_COLLECTION carry all
-    5 named-vector slots from the v0.2.18 catalog.
+    """Thin wrapper over
+    :func:`vco_lib.install_weaviate.migrate_kg_named_vector_slots`.
 
-    Background: collections created before v0.2.18 were built with 3 slots
-    (qwen3_embed, ollama_embed, openai_embed). v0.2.18 added arctic2_embed +
-    openai_text_embed. The drift-detector intentionally does NOT fire on the
-    two new slots (so basic search still works), but every install/update
-    should silently patch them in when missing.
-
-    Strategy: additive patch_props (UNION) — vector slots can be added
-    without re-embedding existing data. The new slots start empty; the
-    embedding-enrichment step (commit 9 / EmbeddingService) fills them
-    lazily as the user runs sync or queries.
-
-    Idempotent: running twice produces 0 additions on the second pass
-    (every slot present → all Skipped).
-
-    Soft-fail: Weaviate unreachable or collection missing → skip silently
-    (those are existing deferred conditions upstream). Any per-slot error
-    is captured as a deferral entry and does NOT abort install.
-
-    Scope: per-project KG ($KG_COLLECTION) + per-project Development
-    ($DEVELOPMENT_COLLECTION). Shared KG and code-graph collections are
-    handled separately by `migrate_collections_to_v0218_schema`.
+    v0.2.95 (ratchet lane): the V0243-2 five-slot-catalog migration moved to
+    vco_lib. install.py keeps this same-signature entry point because both
+    the step-7d call site and ``tests/test_v0243_kg_named_vector_migration``
+    reach it by this name, and because threading ``_log_install_event`` in
+    from here is what lets a test patching it still steer the log.
     """
-    from vco_lib.weaviate_schema import (
-        KG_NAMED_VECTORS,
-        migrate_collection_to_target,
-    )
-
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
-    kg_coll = os.environ.get("KG_COLLECTION", "")
-    dev_coll = os.environ.get("DEVELOPMENT_COLLECTION", "")
-
-    targets = [(n, "kg") for n in [kg_coll] if n] + [
-        (n, "dev") for n in [dev_coll] if n
-    ]
-
-    if not targets:
-        _log_install_event(
-            "7d/10", "skip",
-            "kg_named_vector_slots: no KG_COLLECTION/DEVELOPMENT_COLLECTION set",
-        )
-        return
-
-    print("[7d/10] Migrating KG named-vector slots (V0243-2) ... ", flush=True)
-    _log_install_event(
-        "7d/10", "start",
-        "kg_named_vector_slots: ensuring 5-slot catalog on KG + Dev",
-        data={"kg": kg_coll, "dev": dev_coll, "weaviate_url": weaviate_url},
-    )
-
-    all_ok = True
-    for coll_name, coll_type in targets:
-        try:
-            report = migrate_collection_to_target(
-                coll_name,
-                KG_NAMED_VECTORS,
-                weaviate_url=weaviate_url,
-            )
-        except Exception as exc:
-            # Transport failure, missing collection, etc. — skip silently.
-            print(f"  [kg_named_vector_slots] {coll_name}: skipped ({exc})")
-            _log_install_event(
-                "7d/10", "warn",
-                f"kg_named_vector_slots: {coll_name} skipped: {type(exc).__name__}",
-                data={"collection": coll_name, "error": str(exc)[:200]},
-            )
-            continue
-
-        if report.added_slots:
-            print(f"  [kg_named_vector_slots] {coll_name}: "
-                  f"added {report.added_slots}")
-        elif report.skipped_slots:
-            print(f"  [kg_named_vector_slots] {coll_name}: "
-                  f"all slots present (noop)")
-        if report.errors:
-            all_ok = False
-            for err in report.errors:
-                slot = err.get("slot", "?")
-                reason = err.get("reason", "?")
-                print(f"  [kg_named_vector_slots] {coll_name}: "
-                      f"slot {slot} error: {reason}")
-                deferral_report.add_entry(
-                    DeferralEntry(
-                        condition_id=f"kg_named_vector_slot_error_{coll_name}_{slot}",
-                        title=(
-                            f"Named-vector slot migration failed: "
-                            f"{coll_name}/{slot}"
-                        ),
-                        detected=(
-                            f"Migration of vector slot `{slot}` on collection "
-                            f"`{coll_name}` failed during install step 7d: "
-                            f"{reason}"
-                        ),
-                        why_deferred=(
-                            "Adding a vector slot failed. The collection will "
-                            "continue to work with the existing slots, but new "
-                            "embedding backends (arctic2_embed / "
-                            "openai_text_embed) will not be available until "
-                            "the migration succeeds."
-                        ),
-                        command_to_apply=(
-                            f"python -m vco_lib.project_init "
-                            f"migrate-collections --name "
-                            f"{os.environ.get('PROJECT_NAME', 'YourProject')} "
-                            f"--json"
-                        ),
-                        severity="warning",
-                        kg_node_refs=[],
-                    )
-                )
-        _log_install_event(
-            "7d/10",
-            "ok" if not report.errors else "warn",
-            f"kg_named_vector_slots: {coll_name} done",
-            data={
-                "collection": coll_name,
-                "added": report.added_slots,
-                "skipped": report.skipped_slots,
-                "errors": report.errors,
-            },
-        )
-
-    if all_ok:
-        print("  [kg_named_vector_slots] OK")
-    _log_install_event(
-        "7d/10",
-        "ok" if all_ok else "warn",
-        "kg_named_vector_slots: migration pass completed",
+    _install_weaviate.migrate_kg_named_vector_slots(
+        deferral_report, log_event=_log_install_event,
     )
 
 
@@ -16446,96 +16472,16 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
 
 
 def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
-    """PR-34 (v0.2.12, Group M) — soft-fail migration deferral.
+    """Thin wrapper over
+    :func:`vco_lib.install_weaviate.detect_legacy_shared_kg_class`.
 
-    When `python install.py --update` runs against a Weaviate that still
-    carries the pre-rename `VibeCodedTools_KnowledgeGraph` class (created
-    by an install <v0.2.12), emit a `legacy_shared_kg_class_present`
-    deferral entry pointing the user at the launcher's "Manage shared KG
-    collection" picker. We NEVER auto-rename or auto-drop the class —
-    that is destructive (would lose any cross-project KG content the user
-    has written) and the picker is the consent mechanism.
-
-    Idempotent + soft-fail:
-      * Weaviate unreachable → skip silently (the schema-rebuild flow
-        upstream already emits a `weaviate_unreachable` deferral).
-      * Legacy class absent → no-op.
-      * Legacy class present → one deferral entry, severity=info.
-
-    The picker (launcher Settings → Identity → "Manage shared KG
-    collection") handles three resolution paths: (a) accept the new
-    canonical and migrate content, (b) keep the legacy name as the
-    per-project shared-KG override, (c) ignore (dismissable).
+    v0.2.95 (ratchet lane): the PR-34 legacy-class probe moved to vco_lib.
+    The wrapper stays so main()'s update branch keeps its single-line call
+    site (main() sits exactly on its own ratchet pin) and so a test patching
+    ``install._log_install_event`` still steers the log.
     """
-    # Resolve Weaviate URL: prefer env, fall back to canonical default.
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
-    try:
-        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
-            f"{weaviate_url}/v1/schema", timeout=5,
-        )
-        schema = json.loads(resp.read())
-    except Exception:
-        # Soft-fail: skip silently. Other code paths already deferral
-        # on Weaviate unreachability.
-        return
-
-    classes = {c.get("class", "") for c in schema.get("classes", [])}
-    legacy_name = "VibeCodedTools_KnowledgeGraph"
-    canonical_name = "VibeCodedOrchestrator_KnowledgeGraph"
-    # v0.2.23 B1: also recognise the lowercase-c v0.2.12–v0.2.22 default
-    # as "canonical-present" (case-insensitive) so a user upgrading from
-    # that range doesn't get a spurious "canonical not yet created"
-    # message when their on-disk class is the lowercase-c variant.
-    legacy_lowercase_c = "VibecodedOrchestrator_KnowledgeGraph"
-
-    if legacy_name not in classes:
-        return  # No legacy class — nothing to migrate.
-
-    canonical_present = (
-        canonical_name in classes or legacy_lowercase_c in classes
-    )
-    detected_msg = (
-        f"Weaviate at {weaviate_url} still carries the pre-v0.2.12 "
-        f"shared-KG class `{legacy_name}`. The post-rename canonical "
-        f"name is `{canonical_name}` "
-        f"({'already present' if canonical_present else 'not yet created'})."
-    )
-
-    deferral_report.add_entry(
-        DeferralEntry(
-            condition_id="legacy_shared_kg_class_present",
-            title="Legacy shared-KG class still on disk (pre-v0.2.12 PR-26)",
-            detected=detected_msg,
-            why_deferred=(
-                "The shared cross-project KG class was renamed from "
-                f"`{legacy_name}` to `{canonical_name}` in v0.2.12 PR-26. "
-                "The legacy class is still on disk because the rename is "
-                "metadata-only; install.py does NOT auto-rename or "
-                "auto-drop a populated class (destructive — would lose "
-                "any cross-project KG content). Resolve via the "
-                "launcher's Settings → Identity → \"Manage shared KG "
-                "collection\" picker, which lets you pick which class "
-                "becomes the active shared KG for each project."
-            ),
-            command_to_apply=(
-                "Open the launcher (`./vct-launcher`), pick a project, "
-                "go to Settings → Identity, click \"Manage shared KG "
-                "collection\", and select either the legacy "
-                f"`{legacy_name}` or the canonical "
-                f"`{canonical_name}` as the shared KG for that project."
-            ),
-            severity="info",
-            kg_node_refs=[],
-        )
-    )
-    _log_install_event(
-        "7d/10", "info",
-        "legacy shared-KG class detected; deferral emitted",
-        data={"legacy_class": legacy_name,
-              "canonical_present": canonical_present},
+    _install_weaviate.detect_legacy_shared_kg_class(
+        deferral_report, log_event=_log_install_event,
     )
 
 

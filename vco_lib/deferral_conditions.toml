@@ -593,6 +593,56 @@ re-runs that same comparison, so a user who rebuilds by hand and re-runs \
 image BEFORE any code-graph re-sync — re-walking the graph first embeds every \
 entity through the old, truncating service and then reports success."""
 
+[conditions.install_manifest_attests_uninstalled_source]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.95 WP-2 — the detector the half-executed install states lacked. \
+`state/install-manifest.json` has TWO writers: install.py, and \
+`manifest.rs::refresh_install_manifest`, which the launcher's \
+`apply_launcher_update`, `force_resync_launcher` and `update_orchestrator_at` \
+each call. Those three advance the whole source tree, rebuild only the \
+launcher binary, and never run install.py — and then re-assert \
+`installed: true` over it. So venv, pip, hooks, templates, MCP registrations, \
+the KG seed, the schema and the boot service stay where the last installer \
+run left them while the marker says the install is complete, and every other \
+surface reports health: the checkout is 0-behind upstream, so \
+`source_currency` is `ok` and `_currency_finding` drops the install age it \
+appends only to a PROBLEM, while `probe_last_update_run` reports the stale \
+date as `ok` by design (age has two causes and cannot separate them). Before \
+this row no doctor probe read install-manifest.json at all. THREE legs, and \
+which one can speak depends on WHICH launcher wrote the marker. Until v0.2.95 \
+that writer re-read `version` from the files it had just pulled, so the \
+version leg catches every install arriving from a pre-0.2.95 launcher. WP-1 \
+stopped it writing `version` and `completed_at` (install.py is their only \
+writer now) and made it stamp `post_source_only: true` instead — so for a \
+0.2.95+ launcher the versions agree by construction and only the commit leg \
+can speak, and that one is silent whenever `.git/HEAD` did not move \
+(`update_orchestrator_at` file-copies a tree and leaves the target's HEAD \
+alone) or could not be read (packed ref / worktree HEAD → `read_git_rev` \
+returns None and the old `source_commit` stands). The FLAG leg is the writer \
+naming the state itself, and the only one that survives both. None of the \
+three is a proxy: `.claude/.vco-manifest.json` is written ONLY by the bundle \
+engine an installer run reaches, is gitignored (so `update_orchestrator_at`'s \
+gitignore-aware copy does not carry the source clone's copy into the target), \
+and no launcher update path writes it; `post_source_only` is written only by \
+a path that advanced the tree without installing, and cleared only by an \
+installer run (install.py rebuilds the manifest from a literal dict, so the \
+key does not survive). Conservative everywhere else: a missing or unparseable \
+manifest, a pre-v0.2.92 bundle manifest whose `vco_version` holds a git SHA, \
+a packed ref that left `source_commit` empty, or an ABSENT `post_source_only` \
+(every manifest written before v0.2.95, and every manifest install.py writes) \
+all yield `unknown` or `ok`, never `problem` — a false problem here would \
+send the owner of a healthy install into an update they do not need. \
+owned-drop-when-absent on the `vco_lib_shadowed_by_venv_copy` precedent: \
+`python install.py --update` (the printed remedy, and a real flag on \
+install.py's argparse) rewrites BOTH records from the one tree at the end of \
+a run that has already re-done the skipped work, and the doctor phase \
+re-probes AFTER both writes in that same run — so the entry is dropped by \
+the run that fixes it. No dismiss_key: a marker attesting work nothing did \
+is a real break, not a description of the machine to acknowledge."""
+
 [conditions.vco_lib_shadowed_by_venv_copy]
 class = "action_required"
 owner = "vco_lib.doctor"
