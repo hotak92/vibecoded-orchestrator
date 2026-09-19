@@ -32,7 +32,7 @@ top-level configuration code at import time).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
 
 def _install_log(log_event: Optional[Callable]) -> Callable:
@@ -188,6 +188,36 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
             # treats it as stale (forces a re-sync attempt).
             result[str(md_file)] = ""
     return result
+
+
+def content_hash_diff(
+    on_disk: "Mapping[str, str]",
+    stored_hashes: "Mapping[str, str]",
+    project_root: Path,
+) -> "list[str]":
+    """The ``knowledge/`` files whose on-disk hash differs from Weaviate's.
+
+    PURE. v0.2.95 moved this loop out of ``install.py``'s leg (c) so it sits
+    with the two helpers that produce its inputs —
+    :func:`_compute_on_disk_content_hashes` and
+    :func:`_batch_query_weaviate_content_hashes` — rather than inline in the
+    monolith. Behaviour is VERBATIM: match the stored hash by absolute path
+    first, then by the project-relative form (``sync_knowledge_graph.py``
+    writes ``file_path`` either way depending on ``KG_BASE_DIR``), and treat a
+    missing or empty stored hash as changed.
+    """
+    diff_files: "list[str]" = []
+    for file_path_str, disk_hash in on_disk.items():
+        stored_hash = stored_hashes.get(file_path_str, "")
+        if not stored_hash:
+            try:
+                rel = str(Path(file_path_str).relative_to(project_root))
+                stored_hash = stored_hashes.get(rel, "")
+            except ValueError:
+                pass
+        if disk_hash != stored_hash:
+            diff_files.append(file_path_str)
+    return diff_files
 
 
 def _safe_inside_project(candidate: "Path", project_root: Path) -> bool:
@@ -1859,3 +1889,192 @@ def emit_context_change_incomplete_deferral(
         ))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"  ! (deferral emit failed: {inner})", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.95 WP-7 — the ONE-TIME KG metadata-repair pass, and what triggers it
+# ---------------------------------------------------------------------------
+#
+# WHAT IS REPAIRED. `templates/scripts/sync_knowledge_graph.py` brings a
+# node's stored `title` / `node_type` / `tags` / `external_links` up to
+# today's parse on its EMBED-SKIP path (decision in
+# `vco_lib.kg_metadata_repair`): when the text is unchanged but the stored
+# properties predate v0.2.95's frontmatter dialects, the row is PATCHED —
+# zero embeds, `content_hash` untouched, no re-chunk.
+#
+# WHY IT NEEDED A TRIGGER. That repair is reachable only from a run that
+# VISITS the node, and on an ordinary `--update` nothing visits it. The
+# node's content hash MATCHES — its text never changed, which is the
+# defect's whole premise — so install.py's leg (c) computes an EMPTY diff
+# and returns without spawning a sync at all. The same equality makes
+# `vco_lib.kg_sync_drift` report no drift, so the bundle-update gate does
+# not spawn one either, and the edit hook only ever visits the file being
+# edited. A 0.2.94 user with nested-dialect nodes could therefore update to
+# 0.2.95 and keep prose-scraped `tags` and a folder-derived `node_type`
+# forever, with tag filters silently excluding those nodes. Only a manual
+# `kg-sync --all` reached the repair, and nothing told the user to run one.
+#
+# THE TRIGGER, in one sentence: the first whole-tree sync after upgrading
+# runs as `--all` so every node is visited once, and only a run that exits 0
+# records the pass as done.
+#
+# ── Why an app_state stamp and NOT `crosses_version_boundary` ──
+#
+# `crosses_version_boundary(prev, running, "0.2.95")` is this codebase's
+# established "was this artifact produced by an older version of us" test and
+# is the obvious shape here. It cannot carry this gate ALONE, for two
+# independent reasons:
+#
+#   1. The only per-install "previous version" it could read is
+#      `state/install-manifest.json`, and `install.py::_write_install_manifest`
+#      advances that UNCONDITIONALLY near the end of main() — AFTER
+#      `_seed_weaviate` — with no knowledge of whether the seed succeeded. So
+#      an update whose repair pass died part-way still records 0.2.95, and the
+#      NEXT update (0.2.95 -> 0.2.96) no longer crosses the boundary: the
+#      repair is skipped forever, silently. That is precisely the outcome the
+#      exit-0 rule exists to prevent. A crossing cannot be withheld; a stamp
+#      can, and withholding it IS the retry.
+#   2. It answers False on an ABSENT or unparseable `prev` (its own docstring:
+#      malformed input on any of the three -> False), so an install with no
+#      manifest or a corrupt one would never be repaired.
+#      `codegraph_extractor_generation.decide`'s rule 5 exists for exactly
+#      that: unknown must be OWED, because a needless repeat costs one
+#      zero-embed pass while a wrongly-skipped repair costs permanently wrong
+#      retrieval metadata.
+#
+# The stamp answers both. The semver comparison is still NOT forked:
+# `generation_is_current` from that same detector module does it, so a future
+# release that teaches the parser a THIRD dialect appends one entry to
+# KG_METADATA_REPAIR_BUMPS and both the "already done" and the "owed again"
+# answers follow from it.
+
+#: `app_state` key holding the newest metadata-repair generation that a
+#: WHOLE-TREE sync completed cleanly for. Absent — the free-tier/no-launcher
+#: case, a failed read, and every install that has not yet run the pass —
+#: reads as OWED.
+KG_METADATA_REPAIR_STATE_KEY = "last_kg_metadata_repair_version"
+
+#: The releases whose stored-metadata parse differs from the one before them.
+#: APPEND to this when a future release teaches
+#: `sync_knowledge_graph.py::_normalise_frontmatter` another dialect — a stamp
+#: below the newest entry then reads as owed again. Never re-use an entry: the
+#: stamp records WHICH generation was satisfied, not how many passes have run.
+KG_METADATA_REPAIR_BUMPS: "tuple[str, ...]" = ("0.2.95",)
+
+#: What a certified pass writes to :data:`KG_METADATA_REPAIR_STATE_KEY`.
+KG_METADATA_REPAIR_STAMP = KG_METADATA_REPAIR_BUMPS[-1]
+
+
+def kg_metadata_repair_due(
+    stamped_version: "Optional[str]",
+    *,
+    bumps: "Sequence[str]" = KG_METADATA_REPAIR_BUMPS,
+) -> bool:
+    """Does this install still owe the whole-tree metadata-repair pass?
+
+    PURE. *stamped_version* is whatever
+    :data:`KG_METADATA_REPAIR_STATE_KEY` holds: ``None`` when the key is
+    unset, when there is no ``launcher.db`` at all, or when the read failed
+    (``install.py::_read_app_state_key`` soft-fails to ``None`` for all
+    three).
+
+    Every one of those reads as OWED, deliberately. The pass costs one fetch
+    per node and ZERO embeds; skipping it leaves a node's `tags` /
+    `node_type` / `title` permanently wrong with no error anywhere. That is
+    the same asymmetry `codegraph_extractor_generation.decide` settles in its
+    rule 5, and the comparison itself is that module's
+    `generation_is_current`, so the two can never disagree about what "at
+    least this generation" means.
+
+    A launcher-less install cannot record the stamp at all
+    (``_write_app_state_key`` soft-fails), so it would be due on every
+    update — except that it never reaches this gate: with no stored context
+    triple, leg (b) already takes such an install down the `--all` branch on
+    every update, which performs the repair. The behaviour there is
+    unchanged by this gate, not degraded by it.
+    """
+    from vco_lib.codegraph_extractor_generation import generation_is_current
+
+    return not generation_is_current(stamped_version, tuple(bumps))
+
+
+def kg_metadata_repair_certified(sync_all: bool, sync_exit_zero: bool) -> bool:
+    """May this seed run record the metadata-repair pass as done?
+
+    PURE. Only a WHOLE-TREE run (``--all``) that exited 0 may. The repair
+    fires per node on the embed-skip path, so a run handed an explicit file
+    list judged only those files, and a run that exited non-zero may have
+    died before reaching the rest.
+
+    That second half is v0.2.95 WP-4's rule, for WP-4's reason. A node this
+    pass never reached keeps a `content_hash` that still MATCHES — it is
+    computed from file bytes alone and carries no metadata identity — so no
+    later diff can see that the node is still owed. Stamping a partial run
+    would therefore retire the repair permanently with the work undone. Note
+    this is the failure shape SEG-1's leg-(c) argument does NOT cover: there,
+    a failed node has no stored hash and the next diff re-picks it.
+
+    Withholding the stamp costs at most one further zero-embed `--all` on a
+    later update. That is the cheap direction, and it is the retry.
+    """
+    return bool(sync_all) and bool(sync_exit_zero)
+
+
+def kg_metadata_repair_due_now(
+    read_app_state_key: "Callable[[str], Optional[str]]",
+) -> bool:
+    """I/O seam over :func:`kg_metadata_repair_due` — read, then decide.
+
+    Pairs with :func:`stamp_kg_metadata_repair`; the two are symmetric so the
+    key name is named in exactly one place per direction. install.py passes
+    its own ``_read_app_state_key``, which soft-fails to ``None`` on an
+    absent ``launcher.db`` / missing key / sqlite error, and which is also
+    the module attribute its test suite already patches — so a test steers
+    this gate through the accessor it knows rather than a new surface.
+    """
+    return kg_metadata_repair_due(read_app_state_key(KG_METADATA_REPAIR_STATE_KEY))
+
+
+def stamp_kg_metadata_repair(
+    sync_all: bool,
+    sync_exit_zero: bool,
+    write_app_state_key: "Callable[[str, str], None]",
+) -> bool:
+    """Record the metadata-repair pass as done, if this run earned it.
+
+    I/O seam over :func:`kg_metadata_repair_certified`; returns whether the
+    stamp was written, so a caller (and a test) can assert the DECISION and
+    not merely the absence of an error.
+
+    Soft-fail on the write is inherited from install.py's
+    ``_write_app_state_key``, and it fails in the safe direction: a stamp
+    that does not land leaves the pass owed, which costs one more zero-embed
+    `--all` — never a silently-skipped repair.
+    """
+    if not kg_metadata_repair_certified(sync_all, sync_exit_zero):
+        return False
+    write_app_state_key(KG_METADATA_REPAIR_STATE_KEY, KG_METADATA_REPAIR_STAMP)
+    return True
+
+
+def announce_kg_metadata_repair_leg(log_event: "Optional[Callable]" = None) -> None:
+    """Report that leg (d) — the one-time metadata-repair pass — was chosen.
+
+    Its own home rather than inline in ``install.py``: every other seed leg
+    names its reason on stdout AND in the install ledger, and a leg that did
+    not would make "why did my update run a full sync?" unanswerable from the
+    ledger. Kept beside the gate that selects it so the two cannot drift.
+
+    The wording states the cost, because the honest answer to "a full sync?"
+    here is that nothing is re-embedded: the pass visits every node so the
+    embed-skip path can patch stale stored properties, and a node whose
+    content hash matches is never re-embedded to do it.
+    """
+    print("  CI-10: KG metadata repair owed → full sync (property patches, "
+          "no re-embeds)")
+    _install_log(log_event)(
+        "7c/10", "info",
+        "WP-7: stored KG metadata predates this release's frontmatter parse "
+        "→ one whole-tree pass; patches properties, embeds nothing",
+        data={"reason": "metadata_repair"},
+    )

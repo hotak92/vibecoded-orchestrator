@@ -499,12 +499,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The repair is all-or-nothing across a node's chunks, and declines to act on
     any node whose stored state it cannot positively read — an unreadable row
     keeps the exact v0.2.94 behaviour rather than being rewritten on a guess.
-  - What you will see: the first `--all` after upgrading patches every node whose
-    stored metadata predates the v0.2.95 parse — the nested `metadata:` dialect,
-    `name:`-titled nodes, string `tags:`, **and** nodes whose frontmatter block was
-    empty or malformed (v0.2.94 parsed both to `None`, so the inline `#tag` harvest
-    scraped their prose). One row update per differing node, zero embeds, then it
-    converges and stays quiet.
+  - **And something actually runs it.** The repair sits on the sync's SKIP path, and
+    no upgrade reached that path: `install.py --update` passes only the
+    content-hash diff, and for these rows the hash MATCHES — which is the whole
+    defect. The first install-or-update with no `last_kg_metadata_repair_version`
+    stamp in `app_state` (i.e. every install coming from 0.2.94 or earlier) now runs
+    the knowledge sync as `--all` once, so every node is visited and its stored
+    `title`/`node_type`/`tags` brought up to this release's parse. It records itself
+    **only after exiting 0**, so a run that dies part-way is retried on the next
+    update instead of being marked done — the version-crossing gate used elsewhere
+    could not be used here, because the manifest version is advanced by a later step
+    that does not know whether the seed succeeded, and a crossing cannot be withheld.
+  - What the pass costs: one fetch per node, one property patch per stale node,
+    **zero embeds**, no `content_hash` changed. It covers the nested `metadata:`
+    dialect, `name:`-titled nodes, string `tags:`, **and** nodes whose frontmatter
+    block was empty or malformed (0.2.94 parsed both to `None`, so the inline `#tag`
+    harvest scraped their prose). Then it converges and stays quiet.
 - **The inline `#tag` harvest is suppressed whenever frontmatter exists** —
   including an empty or malformed block, which now parses to `{}` rather than
   `None`, because a block that EXISTS declares the node's tags. Harvesting a

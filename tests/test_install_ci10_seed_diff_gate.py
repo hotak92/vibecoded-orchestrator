@@ -37,6 +37,7 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
     create_empty_launcher_db,
     make_launcher_db,
 )
+from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
 import install  # noqa: E402
 
 
@@ -91,10 +92,21 @@ class SeedDiffGateTest(unittest.TestCase):
         os.environ["SHARED_KG_COLLECTION"] = ""  # shared seed skipped
 
         # Make a minimal launcher.db with the "same" context stored.
+        #
+        # v0.2.95 WP-7: the repair stamp belongs in this fixture because every
+        # test below asserts what a STEADY-STATE install does — one that has
+        # already paid its one-time metadata-repair pass. Without it, leg (d)
+        # legitimately forces `--all` and these four assertions read that as a
+        # re-embed. The not-yet-stamped shape is the subject of
+        # tests/test_v0295_kg_metadata_repair_trigger.py, not of this file.
         self.db_path = _make_db_with_state(
             last_installed_active_embedding="qwen3",
             last_installed_kg_collection="TestProject_KnowledgeGraph",
             last_installed_shared_kg_collection="",
+            **{
+                _install_weaviate.KG_METADATA_REPAIR_STATE_KEY:
+                    _install_weaviate.KG_METADATA_REPAIR_STAMP,
+            },
         )
         # Override the db discovery to return our temp db.
         self._db_patcher = mock.patch.object(

@@ -15557,6 +15557,16 @@ def _seed_weaviate_impl(
             # No KG_COLLECTION configured — can't query Weaviate for diff.
             # Fall back to full sync to be safe.
             _sync_all = True
+        elif _install_weaviate.kg_metadata_repair_due_now(_read_app_state_key):
+            # v0.2.95 WP-7 — leg (d), the ONE-TIME metadata-repair pass. The
+            # repair runs per node on the sync's embed-skip path, so only a
+            # run that VISITS a node reaches it — and leg (c) below visits
+            # none of them precisely when it is owed. Its own arm, not folded
+            # into leg (b): those are different questions and WP-6 split that
+            # arm for saying so. Rationale, the exit-0 stamp rule and this
+            # leg's own reporting: `vco_lib.install_weaviate`.
+            _install_weaviate.announce_kg_metadata_repair_leg(_log_install_event)
+            _sync_all = True
         else:
             # Context unchanged — attempt per-file content-hash diff.
             knowledge_root = PROJECT_ROOT / "knowledge"
@@ -15565,23 +15575,9 @@ def _seed_weaviate_impl(
                 current_kg_collection, weaviate_url,
             )
 
-            # Build diff: files whose on-disk hash differs from stored
-            # (or whose stored hash is missing / empty).
-            diff_files: list[str] = []
-            for file_path_str, disk_hash in on_disk.items():
-                # Match stored hash by absolute path OR by file_path relative
-                # forms. Weaviate stores file_path as written by sync_kg (may
-                # be absolute or relative depending on KG_BASE_DIR).
-                stored_hash = stored_hashes.get(file_path_str, "")
-                if not stored_hash:
-                    # Try relative path form as fallback.
-                    try:
-                        rel = str(Path(file_path_str).relative_to(PROJECT_ROOT))
-                        stored_hash = stored_hashes.get(rel, "")
-                    except ValueError:
-                        pass
-                if disk_hash != stored_hash:
-                    diff_files.append(file_path_str)
+            diff_files = _install_weaviate.content_hash_diff(
+                on_disk, stored_hashes, PROJECT_ROOT,
+            )
 
             total_files = len(on_disk)
             _nodes_skipped = total_files - len(diff_files)
@@ -15810,6 +15806,10 @@ def _seed_weaviate_impl(
             _APP_STATE_KEY_LAST_KG_SYNC_STATS,
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
         )
+    # v0.2.95 WP-7: only a WHOLE-TREE run that exited 0 visited and judged
+    # every node, so only it may retire the metadata-repair pass — the
+    # leg-(b) carve-out rule above, for the same reason.
+    _install_weaviate.stamp_kg_metadata_repair(_sync_all, sync_exit_zero, _write_app_state_key)
     if _context_change_incomplete:
         _install_weaviate.emit_context_change_incomplete_deferral(
             deferral_report, _context_change_reason,
