@@ -480,17 +480,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heading, as it already did for tags and type), and a `tags:` string is
   split into a list. A bulk resync prints one line per promoted file, so you
   can see how many nodes came from the foreign dialect.
-- **Known limitation — this repairs new and changed nodes, NOT nodes already
-  stored.** The sync's skip gate hashes the file's TEXT, not the parsed
-  properties, so a node whose frontmatter used the nested dialect keeps its
-  wrong `tags`/`type` in Weaviate until that FILE changes. `kg-sync --all` does
-  not repair it either: the skip path returns without rewriting any property, so
-  a bulk run prints the promoted-file line and leaves the stored row as it was.
-  Nothing regresses and no data is lost — every new write is correct and the
-  embedding is unaffected — but if you came here to repair an existing node, the
-  only thing that does it today is editing the file. Delivering the repair means
-  salting the content signature for promoted files, and that signature has five
-  consumers, so it is deliberately NOT a tag-day change.
+- **Nodes ALREADY stored are repaired too, without re-embedding anything.** The
+  sync's skip gate hashes the file's TEXT, not the parsed properties — so on its
+  own the new parse would have reached only nodes whose file later changed, and
+  `kg-sync --all` would not have helped either (the skip path returned without
+  rewriting any property). The skip path now compares the STORED `title`,
+  `node_type`, `tags` and `external_links` against the freshly-parsed values and
+  PATCHES the row when they differ: no re-chunk, no re-embed, and the stored
+  `content_hash` is left exactly as it was, so none of the SEVEN independent
+  consumers of that hash observe anything.
+  - Salting the signature for promoted files — the obvious alternative — was
+    rejected on evidence: the install-time seed gate and the drift probe both
+    RECOMPUTE the signature from the file and know nothing about dialects, so a
+    salted stored value mismatches forever — a re-sync that never converges and
+    a drift deferral that can never clear. A third consumer keys the shipped
+    vector sidecar on it and a fourth gates a file deletion. **A content hash
+    with independent recomputers is not a lever; repair the property, not the key.**
+  - The repair is all-or-nothing across a node's chunks, and declines to act on
+    any node whose stored state it cannot positively read — an unreadable row
+    keeps the exact v0.2.94 behaviour rather than being rewritten on a guess.
+  - What you will see: the first `--all` after upgrading patches every node whose
+    stored metadata predates the v0.2.95 parse — the nested `metadata:` dialect,
+    `name:`-titled nodes, string `tags:`, **and** nodes whose frontmatter block was
+    empty or malformed (v0.2.94 parsed both to `None`, so the inline `#tag` harvest
+    scraped their prose). One row update per differing node, zero embeds, then it
+    converges and stays quiet.
 - **The inline `#tag` harvest is suppressed whenever frontmatter exists** —
   including an empty or malformed block, which now parses to `{}` rather than
   `None`, because a block that EXISTS declares the node's tags. Harvesting a

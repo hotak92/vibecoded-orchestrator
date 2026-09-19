@@ -322,6 +322,16 @@ from vco_lib.kg_vector_slot import active_text_vector_slot, collection_vector_sl
 # (never an inline copy) because every Weaviate write below must store ONE
 # shape so delete-by-file_path upserts stay idempotent across OSes.
 from vco_lib.paths import to_posix_rel  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
+# v0.2.95: the embed-skip path's METADATA repair. The decision (which stored
+# properties are stale, and may they be judged at all) is pure and lives in
+# vco_lib next to the code graph's SKIP/STAMP/EMBED classifier whose
+# vocabulary it reuses; only the `data.update` call stays here.
+from vco_lib.kg_metadata_repair import (  # noqa: E402 — same import-order constraint as the group above
+    REPAIRABLE_PROPERTIES,
+    RowAction as _MetadataRowAction,
+    apply_metadata_repair,
+    plan_metadata_repair,
+)
 
 # Try to import query logger.
 #
@@ -521,6 +531,16 @@ _resync_pending_cache: "Optional[bool]" = None
 #: Run-level count of entries re-embedded ONLY because their stored chunk
 #: plan predates the current chunker revision (mirrors _SHARED_ROUTED_COUNT).
 _RECHUNKED_COUNT = 0
+
+#: v0.2.95: run-level count of NODES whose stored metadata was patched on the
+#: embed-skip path (text unchanged, properties stale — see
+#: `_repair_stale_metadata`). Zero embeds are attributable to these.
+_METADATA_REPAIRED_COUNT = 0
+
+#: v0.2.95: run-level count of nodes whose metadata repair could NOT complete.
+#: Separate from the success counter on purpose — a repair that failed is owed
+#: work, and a soft-fail that never reaches the run report is a silent one.
+_METADATA_REPAIR_FAILED_COUNT = 0
 
 
 def _chunker_resync_pending() -> bool:
@@ -2420,6 +2440,137 @@ def _active_slot_gate_ok(
     return True
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.95 — METADATA REPAIR on the embed-skip path.
+#
+# The skip gate above answers "is the stored TEXT current?" (content_hash)
+# and "is the stored VECTOR usable?" (the slot gate). Nothing answered "are
+# the stored PROPERTIES what today's parser derives from this file?" — and
+# after v0.2.95 taught `_normalise_frontmatter` two frontmatter dialects,
+# that question has a different answer than it did when the row was
+# written. A node stored under the old parse keeps its wrong `tags` /
+# `node_type` / `title` for as long as its text is untouched, and a bulk
+# `--all` did not repair it either: the skip returned having written
+# nothing, printing its "promoted nested `metadata:` keys" line over a row
+# it then left exactly as wrong as it found it.
+#
+# The repair is a PROPERTY PATCH, never a re-embed and never a hash change.
+# The content hash matching is the proof the text — and therefore the
+# stored vector — is still valid, so re-embedding here would spend a model
+# call to rewrite bytes that did not change. It is also why the hash must
+# NOT be perturbed to force the rewrite: `install.py`'s CI-10 seed-diff
+# gate and `vco_lib.kg_sync_drift` both RECOMPUTE that signature from the
+# file with no knowledge of frontmatter dialects, the shipped-vector
+# sidecar is KEYED on it, and the curated provenance registry gates a
+# DELETION on it. A hash whose writer and reader disagree is the
+# 2026-07-20 sidecar incident; this path does not re-enter it.
+#
+# Decision + the never-half-write discipline live in
+# `vco_lib.kg_metadata_repair` (pure, reusing the code graph's
+# SKIP/STAMP/EMBED vocabulary — EMBED never returned here); this function
+# is the I/O seam and the reporting.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _repair_stale_metadata(
+    collection: object,
+    objects: object,
+    node_data: Dict,
+    *,
+    metadata_props_available: bool,
+) -> "Tuple[int, Optional[str]]":
+    """Patch stale stored properties for an about-to-be-skipped node.
+
+    Args:
+        collection: the Weaviate collection the rows came from.
+        objects: the fetched row objects (every chunk of THIS node).
+        node_data: the freshly parsed node — the desired values.
+        metadata_props_available: whether the fetch that produced *objects*
+            actually asked for the repairable properties. False means every
+            stored value is absent BY CONSTRUCTION and says nothing — the
+            repair must not read that as "they differ".
+
+    Returns ``(rows_patched, error)``. ``error`` is non-None only when a
+    patch was attempted and failed; the caller reports it and counts it.
+
+    Conservative on every uncertainty: a fetch that could not carry the
+    properties, a row whose properties are unreadable, a stored value of an
+    unexpected type, a parse whose value is unusable — each leaves the node
+    entirely alone. A wrong "they differ" verdict would rewrite every row of
+    a knowledge graph, so only a positively-established difference writes.
+    """
+    global _METADATA_REPAIRED_COUNT, _METADATA_REPAIR_FAILED_COUNT
+
+    if not metadata_props_available:
+        return 0, None
+
+    try:
+        rows = [
+            (getattr(obj, "uuid", None), getattr(obj, "properties", None))
+            for obj in (objects or [])
+        ]
+        desired = {
+            name: node_data.get(name)
+            for name in REPAIRABLE_PROPERTIES
+            if name in node_data
+        }
+        plan = plan_metadata_repair(rows, desired)
+    except Exception as plan_err:  # noqa: BLE001 — cannot judge → do nothing
+        print(f"   (metadata repair check skipped: {plan_err})")
+        return 0, None
+
+    if plan.verdict is not _MetadataRowAction.STAMP:
+        return 0, None
+
+    def _patch(row_uuid: str, payload: Dict) -> None:
+        collection.data.update(uuid=row_uuid, properties=payload)
+
+    patched, error = apply_metadata_repair(plan, _patch)
+
+    if error is None:
+        _METADATA_REPAIRED_COUNT += 1
+        print(
+            f"   🔧 Metadata repair: {patched} chunk row(s) patched "
+            f"[{', '.join(plan.fields)}] — content unchanged, no re-embed"
+        )
+        return patched, None
+
+    # Loud, counted, and RETRYABLE: the rows already patched now hold the
+    # correct value (reverting them would write the wrong one back), the
+    # rest are untouched, and the next run sees the same matching hash with
+    # the same remaining difference — so it retries exactly what is left.
+    _METADATA_REPAIR_FAILED_COUNT += 1
+    print(
+        f"   ⚠️  Metadata repair INCOMPLETE: {patched} of "
+        f"{plan.row_count} chunk row(s) patched before {error} — the next "
+        f"sync retries the rest"
+    )
+    return patched, error
+
+
+def _print_metadata_repair_report() -> None:
+    """Name the run's metadata repairs — both halves, one home.
+
+    Called by every driver that prints a run report (``--all`` and the
+    file-list path the kg-sync-on-edit hook uses), so a repair cannot be
+    visible in one run shape and silent in the other. Prints nothing when
+    nothing was repaired and nothing failed, which is the ordinary case
+    after the first post-upgrade sync.
+    """
+    if _METADATA_REPAIRED_COUNT:
+        print(
+            f"🔧 Repaired stored metadata on {_METADATA_REPAIRED_COUNT} "
+            f"unchanged node(s) — tags/type/title re-read from frontmatter, "
+            f"zero re-embeds"
+        )
+    if _METADATA_REPAIR_FAILED_COUNT:
+        print(
+            f"⚠️ Metadata repair could not complete on "
+            f"{_METADATA_REPAIR_FAILED_COUNT} node(s) (named above with the "
+            f"reason) — still owed; the next sync retries them"
+        )
+
+
 def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """Sync a single docs/ file to the development collection.
 
@@ -3564,23 +3715,48 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # stored" — otherwise one client incompatibility re-embeds the whole
         # knowledge graph. A failure of the FALLBACK fetch still propagates
         # exactly as it did before this change.
+        #
+        # v0.2.95 metadata repair: the SAME fetch also carries the
+        # repairable properties, so the repair costs no extra roundtrip.
+        # They are asked for in their own ARM, not appended to the arms
+        # below: Weaviate errors a read that names a property the class
+        # does not declare, and a collection old enough to lack one of
+        # these must keep exactly the behaviour it had before this release
+        # — which is why a failure here retries the PRE-EXISTING ask
+        # (vectors, base properties) before the pre-existing hash-only
+        # fallback. `_metadata_props_available` records which arm answered:
+        # on either fallback the repairable properties are absent BY
+        # CONSTRUCTION, and the repair must read that as "no information".
+        _base_return_props = [
+            "file_path", "content_hash", "chunk_num", "total_chunks",
+        ]
         _vectors_requested = True
+        _metadata_props_available = True
         try:
             existing = collection.query.fetch_objects(
                 filters=where_filter,
                 limit=100,
-                return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
+                return_properties=_base_return_props + list(REPAIRABLE_PROPERTIES),
                 include_vector=True,
             )
-        except Exception as _vec_fetch_err:  # noqa: BLE001 — older/mocked client
-            print(f"   (fetch_objects(include_vector=True) failed: "
-                  f"{_vec_fetch_err}; falling back to hash-only check)")
-            _vectors_requested = False
-            existing = collection.query.fetch_objects(
-                filters=where_filter,
-                limit=100,
-                return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
-            )
+        except Exception as _meta_fetch_err:  # noqa: BLE001 — older client / legacy schema
+            _metadata_props_available = False
+            try:
+                existing = collection.query.fetch_objects(
+                    filters=where_filter,
+                    limit=100,
+                    return_properties=_base_return_props,
+                    include_vector=True,
+                )
+            except Exception as _vec_fetch_err:  # noqa: BLE001 — older/mocked client
+                print(f"   (fetch_objects(include_vector=True) failed: "
+                      f"{_vec_fetch_err}; falling back to hash-only check)")
+                _vectors_requested = False
+                existing = collection.query.fetch_objects(
+                    filters=where_filter,
+                    limit=100,
+                    return_properties=_base_return_props,
+                )
 
         # v0.2.17 (plan 0.2): EMBED-SKIP fast path. If every existing
         # object for this file_path has content_hash matching the
@@ -3709,12 +3885,36 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 # leftover project rows from a partially-failed earlier
                 # migration get cleaned even when the shared rows are
                 # already up to date.
+                #
+                # v0.2.95: and the stored PROPERTIES are brought up to
+                # today's parse before returning — the one thing a matching
+                # content_hash does NOT prove current. Guarded so it can
+                # never reach the `except` below: that handler falls
+                # through to delete-and-re-embed, and a metadata repair
+                # must not be able to cause the re-embed of text it just
+                # proved unchanged.
+                _repair_reason = ""
+                try:
+                    _, _repair_err = _repair_stale_metadata(
+                        collection,
+                        existing.objects,
+                        node_data,
+                        metadata_props_available=_metadata_props_available,
+                    )
+                    if _repair_err:
+                        _repair_reason = f"; metadata repair incomplete ({_repair_err})"
+                except Exception as _repair_exc:  # noqa: BLE001 — never re-embeds
+                    global _METADATA_REPAIR_FAILED_COUNT
+                    _METADATA_REPAIR_FAILED_COUNT += 1
+                    _repair_reason = f"; metadata repair failed ({_repair_exc})"
+                    print(f"   ⚠️  Metadata repair failed: {_repair_exc}")
                 if targets_shared:
                     _finish_shared_scope_write(server, node_data["file_path"])
                 return SyncOutcome(
                     OUTCOME_EMBED_SKIPPED,
                     node_data["file_path"],
-                    "content_hash match — already current in Weaviate",
+                    "content_hash match — already current in Weaviate"
+                    + _repair_reason,
                 )
         except Exception as skip_err:  # noqa: BLE001 — soft-fail by design
             # Fall through to delete-and-re-embed. Log so future
@@ -4829,6 +5029,10 @@ def main():
                     f"chunk plan predates the current chunker revision "
                     f"(boundaries rewritten; unchanged entries were skipped)"
                 )
+            # v0.2.95: same reporting rule for the metadata repair — a row
+            # patched on the skip path is work this run DID, and a repair
+            # that could not complete is work it still owes.
+            _print_metadata_repair_report()
             # v0.2.92 WP-B1 / D12: name every non-synced path (failures AND
             # skips, with reasons) instead of burying them in the counts.
             _print_run_details(kg_tally, doc_tally, run_kind="--all")
@@ -4966,6 +5170,9 @@ def main():
 
             if len(raw_args) > 1:
                 print(f"📊 List: {tally.summary_fragment()}")
+            # v0.2.95: the hook path repairs metadata too (a single edited
+            # node resyncs through here), so it reports it the same way.
+            _print_metadata_repair_report()
             _print_run_details(tally, run_kind="file list")
             # v0.2.92 D17: explicit-file sync failures (the kg-sync-on-edit
             # hook path) are owed work too. NO clear on a clean list run —

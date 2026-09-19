@@ -154,6 +154,14 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "TestProject", "Third", "TP", "TProj", "TypoName", "Unrelated",
     "V0243Test", "V0289DualTest", "V0289Proj", "V0289Shared", "V0292D17",
     "V0292T", "V0292T_Shared", "V0292WPB1", "V0295T", "V0295T_Shared",
+    # v0.2.95 metadata-repair suite — classified exactly as its neighbour
+    # `V0295T`/`V0295T_Shared` (same release, same in-memory-fake pattern):
+    # a release-stemmed collection literal that exists only inside one test
+    # module. Not tabled in FIXTURE_PROJECT_NAMES for the same reason those
+    # are not — nothing outside that module can name it, so a refusal rule
+    # would protect nothing while making two adjacent, identical fixtures
+    # behave differently.
+    "V0295R", "V0295R_Shared",
     "Vco_v0243_A_install",
     "Vco_v0243_B_rust", "Vco_v0243_C_cleanup", "VcoD2Scratch", "VCODev",
     "Vcodev", "vcodev", "VcoDev", "vct", "Vct_coordination",
