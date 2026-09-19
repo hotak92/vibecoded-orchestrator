@@ -2078,8 +2078,8 @@ fn acquire_migrate_lock(
     )
 }
 
-/// v0.2.70: pure predicate — does this dry-run plan describe an
-/// additive-only (lossless) drift that should be auto-applied?
+/// v0.2.70: does this dry-run plan describe an additive-only (lossless) drift
+/// that should be auto-applied?
 ///
 /// True iff the plan has at least one additive action (`copy`/`patch_props`),
 /// NO lossy action (`rebuild`), and the probe itself was clean (status success
@@ -2091,25 +2091,71 @@ fn acquire_migrate_lock(
 /// detector excludes the additive v0.2.18 slots and never reaches an apply). It
 /// is justified purely by losslessness — `copy` round-trips every UUID + named
 /// vector + property byte-for-byte via `_copy_collection_with_vectors`.
+///
+/// v0.2.95 (WP-9, surface-map duplicate D4): **the classification is no longer
+/// made here.** `vco_lib/migration_plan_classify.py` owns the "which action is
+/// lossless" policy for both languages, and `migrate-collections --json`
+/// publishes its verdict as [`AUTO_APPLY_ADDITIVE_KEY`]. What stays in Rust is
+/// the one piece of evidence the JSON cannot carry: that the probe PROCESS
+/// exited cleanly. A run that dies after printing, or exits 2 on argparse,
+/// is not a clean probe no matter what its payload says — so the published
+/// verdict is ANDed with `probe_status_ok` rather than trusted alone.
+///
+/// An absent/ill-typed field means the Python side did not classify (a
+/// mismatched-vintage checkout, or a payload from something else). That is
+/// answered `false`: the cost of not auto-applying additive drift is one
+/// deferred update cycle, the cost of guessing `true` is an unconsented
+/// migration. It is logged rather than silently swallowed.
 pub(crate) fn should_auto_apply_additive(v: &serde_json::Value, probe_status_ok: bool) -> bool {
-    let plan = match v.get("plan").and_then(|p| p.as_array()) {
-        Some(p) => p,
-        None => return false,
-    };
-    let actions: Vec<&str> = plan
-        .iter()
-        .filter_map(|e| e.get("action").and_then(|a| a.as_str()))
-        .collect();
-    let has_lossy = actions.iter().any(|a| *a == "rebuild");
-    let has_additive = actions
-        .iter()
-        .any(|a| matches!(*a, "copy" | "patch_props"));
-    let errors_empty = v
-        .get("errors")
-        .and_then(|x| x.as_array())
-        .map_or(true, |a| a.is_empty());
-    let probe_clean = probe_status_ok && errors_empty;
-    has_additive && !has_lossy && probe_clean
+    match v.get(AUTO_APPLY_ADDITIVE_KEY).and_then(|x| x.as_bool()) {
+        Some(classified) => classified && probe_status_ok,
+        None => {
+            tracing::warn!(
+                "[vct] migrate-collections payload carries no `{}` — \
+                 additive schema drift left un-applied this cycle (the \
+                 classification lives in vco_lib/migration_plan_classify.py; \
+                 an orchestrator checkout older than the launcher cannot \
+                 publish it)",
+                AUTO_APPLY_ADDITIVE_KEY
+            );
+            false
+        }
+    }
+}
+
+/// The wire keys `migrate-collections --json` publishes for the launcher.
+///
+/// Both are produced by `vco_lib.migration_plan_classify` (`AUTO_APPLY_KEY`
+/// and the `additive_collections` list it derives from the same read of the
+/// plan). They are pinned cross-language by
+/// `tests/test_v0295_migration_plan_classify.py`, which reads these very
+/// literals out of this file — so renaming one here without renaming it there
+/// fails the suite rather than silently disabling auto-apply.
+pub(crate) const AUTO_APPLY_ADDITIVE_KEY: &str = "auto_apply_additive";
+pub(crate) const ADDITIVE_COLLECTIONS_KEY: &str = "additive_collections";
+
+/// The collections a WET `migrate-collections` run reports as additively
+/// migrated, for the post-apply toast.
+///
+/// v0.2.95 (WP-9): this used to filter the plan by `matches!(a, "copy" |
+/// "patch_props")` — a SECOND copy of the vocabulary
+/// `should_auto_apply_additive` stopped re-deriving, one layer down. Reading
+/// the published list instead leaves `ADDITIVE_ACTIONS` with exactly one home.
+///
+/// An absent list yields an empty vec, which renders as NO toast line rather
+/// than as a guess: a toast that names collections is a claim about what was
+/// written to the user's Weaviate, and the only honest source for that claim
+/// is the side that classified the plan.
+fn additive_collections_from(v: &serde_json::Value) -> Vec<String> {
+    v.get(ADDITIVE_COLLECTIONS_KEY)
+        .and_then(|p| p.as_array())
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|n| n.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// v0.2.70: shared subprocess plumbing for the migrate-collections CLI.
@@ -2488,22 +2534,7 @@ pub(crate) async fn run_migrate_apply_additive(
                 }
             }
             if !had_error && out.status.success() {
-                let applied: Vec<String> = v
-                    .get("plan")
-                    .and_then(|p| p.as_array())
-                    .map(|plan| {
-                        plan.iter()
-                            .filter(|e| {
-                                e.get("action")
-                                    .and_then(|a| a.as_str())
-                                    .map_or(false, |a| matches!(a, "copy" | "patch_props"))
-                            })
-                            .filter_map(|e| {
-                                e.get("collection").and_then(|c| c.as_str()).map(String::from)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let applied: Vec<String> = additive_collections_from(&v);
                 if !applied.is_empty() {
                     warnings.push(format!(
                         "additive schema migration auto-applied ({} collection(s), \
@@ -12894,66 +12925,87 @@ export BY_HAND_KEY=\"user_typed\"
         drop(g3);
     }
 
-    /// Pure predicate: additive-only + clean probe → auto-apply; any rebuild,
-    /// or a dirty probe (errors / non-success status), → do NOT auto-apply.
+    /// v0.2.95 (WP-9): the ACTION MATRIX that used to live here — which plan
+    /// actions are lossless, what a mixed plan means, what an `errors[]` entry
+    /// does — moved to `vco_lib/migration_plan_classify.py` and is asserted by
+    /// `tests/test_v0295_migration_plan_classify.py`. Re-testing it here would
+    /// recreate the very duplicate the work package removed, and a Rust copy
+    /// that agreed with Python today is exactly how D4 came about.
+    ///
+    /// What is Rust's to decide, and therefore Rust's to test, is what it does
+    /// with the published verdict: AND it with the process's own exit status,
+    /// and refuse when no verdict was published.
     #[test]
-    fn should_auto_apply_additive_matrix() {
-        // additive-only (copy) + clean → apply.
+    fn should_auto_apply_additive_reads_the_published_verdict() {
+        // Verdict true + the probe process exited 0 → apply.
         let v = serde_json::json!({
+            "auto_apply_additive": true,
             "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
             "errors": [],
         });
         assert!(should_auto_apply_additive(&v, true));
 
-        // patch_props (additive) + clean → apply.
-        let v = serde_json::json!({
-            "plan": [{"collection": "Foo_Development", "action": "patch_props"}],
-            "errors": [],
-        });
-        assert!(should_auto_apply_additive(&v, true));
-
-        // mixed copy + rebuild → has_lossy → do NOT auto-apply (defer the
-        // rebuild subset; the additive subset is left for a later apply once
-        // the user consents to the rebuild).
-        let v = serde_json::json!({
-            "plan": [
-                {"collection": "Foo_KnowledgeGraph", "action": "copy"},
-                {"collection": "Foo_Development", "action": "rebuild"},
-            ],
-            "errors": [],
-        });
-        assert!(!should_auto_apply_additive(&v, true));
-
-        // rebuild only → do NOT auto-apply.
-        let v = serde_json::json!({
-            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "rebuild"}],
-            "errors": [],
-        });
-        assert!(!should_auto_apply_additive(&v, true));
-
-        // noop only → no additive action → do NOT auto-apply (nothing to do).
-        let v = serde_json::json!({
-            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "noop"}],
-            "errors": [],
-        });
-        assert!(!should_auto_apply_additive(&v, true));
-
-        // additive + clean BUT non-success status → not clean → no apply.
-        let v = serde_json::json!({
-            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
-            "errors": [],
-        });
+        // Verdict true BUT the process did not exit 0 → the payload cannot
+        // vouch for its own process; refuse.
         assert!(!should_auto_apply_additive(&v, false));
 
-        // additive + non-empty errors → not clean → no apply.
+        // Verdict false → refuse, whatever else the payload carries. The plan
+        // here is deliberately additive-looking: if Rust were still deriving
+        // the answer from `action`, this case would wrongly apply.
         let v = serde_json::json!({
+            "auto_apply_additive": false,
             "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
-            "errors": [{"collection": "Foo_KnowledgeGraph", "action": "copy", "error": "boom"}],
+            "errors": [],
         });
         assert!(!should_auto_apply_additive(&v, true));
 
-        // empty / missing plan → no apply.
+        // No verdict at all (a checkout too old to classify, or a payload
+        // from something else) → refuse. Un-applied additive drift costs one
+        // update cycle; a guessed `true` costs an unconsented migration.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
+            "errors": [],
+        });
+        assert!(!should_auto_apply_additive(&v, true));
         assert!(!should_auto_apply_additive(&serde_json::json!({}), true));
+
+        // Ill-typed verdict → not a bool → refuse.
+        let v = serde_json::json!({"auto_apply_additive": "true"});
+        assert!(!should_auto_apply_additive(&v, true));
+    }
+
+    /// The post-apply toast names collections; that list is a claim about what
+    /// was written to the user's Weaviate, so it is read, never re-derived.
+    #[test]
+    fn additive_collections_come_from_the_published_list() {
+        let v = serde_json::json!({
+            "additive_collections": ["Foo_KnowledgeGraph", "Foo_Development"],
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
+        });
+        assert_eq!(
+            additive_collections_from(&v),
+            vec![
+                "Foo_KnowledgeGraph".to_string(),
+                "Foo_Development".to_string()
+            ]
+        );
+
+        // Absent list → empty → the caller emits NO toast line. The plan below
+        // is additive, so a Rust-side re-derivation would produce one name;
+        // that it produces none is the assertion.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
+        });
+        assert!(additive_collections_from(&v).is_empty());
+
+        // Non-string members are skipped rather than panicking.
+        let v = serde_json::json!({
+            "additive_collections": ["Foo_KnowledgeGraph", 7, null],
+        });
+        assert_eq!(
+            additive_collections_from(&v),
+            vec!["Foo_KnowledgeGraph".to_string()]
+        );
     }
 
     /// W-F5 (non-optional): the dry-run deferral warning is the rebuild-only

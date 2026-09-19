@@ -166,14 +166,21 @@ class ScanDecisionTests(unittest.TestCase):
             m.add_project("p1", "RealName", kg_primary="RealName_KnowledgeGraph",
                           files=files)
             m.add_class("RealName_KnowledgeGraph", paths=files, count=5)
-            m.add_class("GhostName_KnowledgeGraph", paths=files, count=5)
+            # v0.2.95 F3: the UNBOUND ghost is `Stray_`, not `GhostName_`.
+            # `GhostName` is in `fixture_class_guard.FIXTURE_PROJECT_NAMES`, and
+            # a fixture-stemmed class no binding row names is no longer a
+            # binding CANDIDATE — VCO refuses writes to it, so reporting it as
+            # "where your data should be bound" is advice the product blocks.
+            # Every OTHER use of `GhostName_` in this file is the BOUND class,
+            # which the rule deliberately leaves alone.
+            m.add_class("Stray_KnowledgeGraph", paths=files, count=5)
             scan = m.scan()
             (v,) = scan.verdicts
             self.assertTrue(v.mismatch)
             self.assertEqual(v.bound, "RealName_KnowledgeGraph")
             self.assertEqual(
                 [e.name for e in v.unbound_evidence],
-                ["GhostName_KnowledgeGraph"],
+                ["Stray_KnowledgeGraph"],
             )
 
     def test_custom_bound_name_with_data_in_it_is_not_a_mismatch(self):

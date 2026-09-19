@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.92 regclean item 3 — two docstrings promised PRESERVE; the code ADOPTS.
+"""v0.2.92 regclean item 3 — the docstring promised PRESERVE; the code ADOPTS.
 
-`templates/scripts/cost-summary.py` and `vco_lib/paths.py::metrics_read_dirs`
-both justified their dual-directory read partly with this claim:
+`vco_lib/paths.py::metrics_read_dirs` justified its dual-directory read
+partly with this claim:
 
-    the user edited ``cost-tracker.sh``, so ``install-bundle --update``
+    the user edited a shipped hook, so ``install-bundle --update``
     PRESERVED their copy (``bundle_user_modified_preserved``)
 
 **That has been false since v0.2.84 D7 / ruling R2.**
@@ -23,29 +23,24 @@ This file pins BOTH halves, because either alone would rot:
 
 1. the BEHAVIOUR — `_file_action` really returns ``adopt`` for a divergent
    bundle-shipped file, and still ``preserve`` for user-owned `knowledge/**`;
-2. the TEXT — neither docstring asserts the false claim any more, and both name
+2. the TEXT — the docstring no longer asserts the false claim and names
    the real terminal state.
 
 It also verifies the thing the brief said to verify rather than assume: **no
-code change was required**. `metrics_read_dirs` and `cost-summary.metrics_dirs`
-return BOTH directories unconditionally; states 1 (mid-migration) and 3
-(rollback) never depended on the preserve claim, and the residual
-backup-failure arm keeps state 2 real, just rare.
+code change was required**. `metrics_read_dirs` returns BOTH directories
+unconditionally; states 1 (mid-migration) and 3 (rollback) never depended on
+the preserve claim, and the residual backup-failure arm keeps state 2 real,
+just rare.
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
-import sys
 from pathlib import Path
 
-import pytest
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_COST_SUMMARY = _REPO_ROOT / "templates" / "scripts" / "cost-summary.py"
 
-#: The exact false sentence, in the two spellings the two files used.
+#: The exact false sentence, in the spellings the docstring used.
 _FALSE_CLAIMS = (
     "``install-bundle --update`` PRESERVES a copy the user edited",
     "``install-bundle --update``\n   PRESERVED their copy",
@@ -53,21 +48,8 @@ _FALSE_CLAIMS = (
 )
 
 
-@pytest.fixture(scope="module")
-def cost_summary_mod():
-    spec = importlib.util.spec_from_file_location(
-        "vco_test_cost_summary_adopt", _COST_SUMMARY
-    )
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    yield mod
-    sys.modules.pop(spec.name, None)
-
-
 # --------------------------------------------------------------------------- #
-# 1. The behaviour the docstrings now describe
+# 1. The behaviour the docstring now describes
 # --------------------------------------------------------------------------- #
 
 
@@ -78,28 +60,28 @@ def _op(source: Path, dest_rel: str):
 
 
 def test_a_divergent_shipped_hook_is_adopted_not_preserved(tmp_path):
-    """The load-bearing behavioural assertion behind both docstring fixes."""
+    """The load-bearing behavioural assertion behind the docstring fix."""
     from vco_lib.project_init import _file_action
 
-    shipped = tmp_path / "cost-tracker.sh"
+    shipped = tmp_path / "notify-stop.sh"
     shipped.write_bytes(b"#!/bin/bash\n# v0.2.92 shipped body\n")
-    installed = tmp_path / "project" / ".claude" / "hooks" / "cost-tracker.sh"
+    installed = tmp_path / "project" / ".claude" / "hooks" / "notify-stop.sh"
     installed.parent.mkdir(parents=True)
     installed.write_bytes(b"#!/bin/bash\n# the user edited this\n")
 
     prior = hashlib.sha256(b"#!/bin/bash\n# v0.2.91 shipped body\n").hexdigest()
-    manifest = {"files": {".claude/hooks/cost-tracker.sh": {"sha256": prior}}}
+    manifest = {"files": {".claude/hooks/notify-stop.sh": {"sha256": prior}}}
 
     action, _bytes = _file_action(
-        _op(shipped, ".claude/hooks/cost-tracker.sh"),
+        _op(shipped, ".claude/hooks/notify-stop.sh"),
         installed,
         update_mode=True,
         manifest=manifest,
     )
 
     assert action == "adopt", (
-        f"_file_action returned {action!r}; the two docstrings this test "
-        f"guards describe 'adopt', and if the engine really went back to "
+        f"_file_action returned {action!r}; the docstring this test "
+        f"guards describes 'adopt', and if the engine really went back to "
         f"'preserve' it is the DOCS that were right and the code that "
         f"regressed — fix the engine, do not relax this."
     )
@@ -109,7 +91,7 @@ def test_a_divergent_knowledge_node_is_still_preserved(tmp_path):
     """The carve-out that must NOT move: KG nodes are user-owned state.
 
     Named here because it is the one case where "preserve" is still the right
-    terminal state, so a reader of the fixed docstrings does not conclude that
+    terminal state, so a reader of the fixed docstring does not conclude that
     adoption is universal.
     """
     from vco_lib.project_init import _file_action
@@ -136,7 +118,7 @@ def test_a_divergent_knowledge_node_is_still_preserved(tmp_path):
 def test_the_preserve_fallback_still_exists_in_the_loop():
     """State 2 is rare, not gone — so the dual read is still justified.
 
-    The docstrings now say ``preserve`` is reached only on a backup-write
+    The docstring now says ``preserve`` is reached only on a backup-write
     failure. That sentence is itself a promise, and this is its backing: the
     adopt branch has an `except` arm that sets ``action = "preserve"``.
     """
@@ -163,21 +145,11 @@ def test_paths_docstring_no_longer_promises_preserve():
     assert "bundle-adoptions" in doc
 
 
-def test_cost_summary_docstring_no_longer_promises_preserve(cost_summary_mod):
-    doc = cost_summary_mod.__doc__ or ""
-    for claim in _FALSE_CLAIMS:
-        assert claim not in doc, f"cost-summary.py still asserts: {claim!r}"
-    assert "ADOPT" in doc or "adopt" in doc
-    assert "bundle-adoptions" in doc
-
-
-def test_both_files_name_the_release_that_changed_it():
+def test_paths_docstring_names_the_release_that_changed_it():
     """The correction is dated, so the next reader can check it rather than trust it."""
     from vco_lib.paths import metrics_read_dirs
 
-    for doc in (metrics_read_dirs.__doc__ or "",
-                _COST_SUMMARY.read_text(encoding="utf-8")):
-        assert "v0.2.84" in doc
+    assert "v0.2.84" in (metrics_read_dirs.__doc__ or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -199,15 +171,3 @@ def test_metrics_read_dirs_still_returns_both_unconditionally(tmp_path, monkeypa
     # caller's job — states 1 and 3 do not depend on the adopt/preserve
     # question at all, which is why the docstring fix needed no code change.
     assert metrics_read_dirs() == (vct_metrics_dir(), legacy_claude_metrics_dir())
-
-
-def test_cost_summary_still_reads_both_dirs(cost_summary_mod, tmp_path, monkeypatch):
-    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setenv("VCT_CLAUDE_DIR", str(tmp_path / "claude_home"))
-
-    dirs = cost_summary_mod.metrics_dirs()
-
-    assert dirs == [
-        tmp_path / "state" / "metrics",
-        tmp_path / "claude_home" / "metrics",
-    ]

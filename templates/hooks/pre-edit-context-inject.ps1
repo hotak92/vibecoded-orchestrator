@@ -103,6 +103,10 @@ $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
 $CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
 if (Test-Path $CodegraphLib) { . $CodegraphLib }
+# v0.2.95 (lane F10): the code-file extension test now has ONE home, shared
+# with pre-bash-context-inject.ps1 and _lib/route-touched-path.ps1.
+$CodeExtLib = Join-Path $LibDir "code-extensions.ps1"
+if (Test-Path $CodeExtLib) { . $CodeExtLib }
 # v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
 $QueryCacheLib = Join-Path $LibDir "query-cache.ps1"
 if (Test-Path $QueryCacheLib) { . $QueryCacheLib }
@@ -402,12 +406,16 @@ $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 # hook still exits 0 without blocking the edit.
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
 
-# v0.2.70 Stream C: keep the IS_CODE regex in lockstep with pre-tool-use.ps1 +
-# post-file-edit.ps1 (MUST MATCH). (v0.2.91 P2: the decision moved ABOVE the
-# search launch so the merged single-interpreter path knows up-front whether the
-# code-graph leg is wanted.)
+# v0.2.95 (lane F10): "is this a code file" is ONE decision with ONE home,
+# _lib/code-extensions.ps1. v0.2.70 Stream C kept it as a C-tier mirror here,
+# in pre-tool-use.ps1 and in post-file-edit.ps1 with a "MUST MATCH" comment;
+# a second consumer (the Bash-write routing) made that untenable.
+# A partial install without the helper is treated as NOT-code.
+# (v0.2.91 P2: the decision stays ABOVE the search launch so the merged
+# single-interpreter path knows up-front whether the code-graph leg is wanted.)
 $IsCode = $false
-if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
+if ((Get-Command Test-VcoIsCodeFile -ErrorAction SilentlyContinue) -and
+    (Test-VcoIsCodeFile $FilePath)) {
     $IsCode = $true
 }
 $ProjArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }

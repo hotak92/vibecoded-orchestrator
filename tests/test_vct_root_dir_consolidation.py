@@ -281,16 +281,6 @@ def test_no_inline_reconstructions_outside_paths_module():
         # extraction from generate-kg-summary.py into summary_backends.py
         # (`_read_app_state_value`). Same exception, new home.
         repo_root / "templates" / "scripts" / "summary_backends.py",
-        # v0.2.92 W7: same exception, same reason, one more file. The metrics
-        # home moved to `<vct_root>/metrics`, so `cost-summary.py` — which
-        # ships into every project's `.claude/scripts/` and must run on a bare
-        # stdlib interpreter with no VCO packages installed — has to resolve
-        # `~/.vct` inline. The mirror is not unenforced: `metrics_dirs()` is
-        # compared to `vco_lib.paths.metrics_read_dirs()` by
-        # `tests/test_v0292_wp8_cost_summary_reader.py::
-        # test_the_inline_rule_agrees_with_vco_lib_paths`, which reds if
-        # either side moves. Documented class-C mirror, not drift.
-        repo_root / "templates" / "scripts" / "cost-summary.py",
         # v0.2.53: bootstrap exception. install.py runs BEFORE vco_lib is
         # importable in some flows (it sets up the venv that contains
         # vco_lib). Diagnostic-output functions that reconstruct ~/.vct

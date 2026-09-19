@@ -104,12 +104,21 @@ trip. The precise contract now:
   object, so ``vco doctor`` never changes the repository it reports on;
 * and it arrives through ``DoctorResolvers.source_facts``, so a test replaces
   the whole repo state with a dataclass and touches no network at all.
+
+One thing outside the probe set can still reach the wire, deliberately: the
+v0.2.95 standalone preflight (see :func:`reconcile_probe_cleared`) re-runs the
+REGISTRY clear probes over the ledger — the same bounded, read-only probes
+install.py's re-probe pass runs — and one of those may poll the local hub's
+``/api/v1/health`` on the resolved port. Loopback-only, sub-second, and the
+same verdict install.py would have reached; noted here so the "exactly one"
+sentence above stays about the DOCTOR's own probes, which it still is.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -138,6 +147,14 @@ FIX_DEFER = "defer"
 #: the CLI run. See :data:`PROBES` for what each excludes and why.
 SCOPE_FULL = "full"
 SCOPE_BOOT = "boot"
+
+#: v0.2.95 F4. The exact command that (re)produces the bootstrap envelope a
+#: standalone ``vco doctor`` needs for ``prereqs`` / ``launcher_binary_fresh``.
+#: A printed command is shipped code (the promise rule), so the CLI test suite
+#: asserts this is a real ``install.py`` surface that answers on stdout — the
+#: probes print it whenever they must report ``unknown`` for want of the
+#: envelope, so "not evaluated" always names what WOULD evaluate it.
+BOOTSTRAP_COMMAND = "python install.py --bootstrap --json"
 
 #: condition_id emitted when a bare-name MCP command cannot be resolved.
 #: Registered ``action_required`` + install-owned, so it disappears on the
@@ -186,6 +203,27 @@ CID_KG_UNCLAIMED = "kg_unclaimed_populated_classes"
 #: re-probes in the SAME run, so the entry is dropped by the run that fixes it.
 CID_CODE_EMBED_IMAGE_STALE = "code_embed_image_stale"
 
+#: v0.2.95 R5c. The model gateway's login-time registration exists and its
+#: baked entry point cannot run — the state this machine sat in for eight
+#: hours on 2026-09-10 while the launcher toggle read "registered". Shared
+#: with ``vco_lib.gateway_ensure`` (the SessionStart emitter); both read the
+#: same function, so the two surfaces cannot disagree.
+CID_GATEWAY_UNRUNNABLE = "gateway_registered_but_unrunnable"
+
+#: condition_id emitted when ``state/install-manifest.json`` attests a source
+#: that this install's ``.claude/.vco-manifest.json`` — written ONLY by the
+#: bundle engine — does not corroborate. The v0.2.95 surface map's H1/H2/H3:
+#: the launcher's ``apply_launcher_update`` / ``force_resync_launcher`` /
+#: ``update_orchestrator_at`` each advance the source and refresh the marker
+#: without running install.py, so ``installed: true`` at the NEW version is
+#: written over a venv/hooks/templates/MCP/KG/schema set still at the old one.
+#: Registered ``action_required`` + install-owned (the ``vco_lib_shadowed``
+#: precedent): the exit is an install/update run, which rewrites BOTH records
+#: from one tree, and the doctor re-probes at the end of that same run — so
+#: the entry is dropped by the very run that fixes it. Read-only detection;
+#: this probe never writes a manifest and never touches an update path.
+CID_INSTALL_MARKER_UNBACKED = "install_manifest_attests_uninstalled_source"
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -193,7 +231,8 @@ CID_CODE_EMBED_IMAGE_STALE = "code_embed_image_stale"
 DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_NPX_MISSING, CID_DISK_SPACE_LOW, CID_VCO_LIB_SHADOWED,
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
-    CID_CODE_EMBED_IMAGE_STALE,
+    CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
+    CID_INSTALL_MARKER_UNBACKED,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -203,7 +242,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
 #: invocation point, not only at the next ``--update``.
 DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
-    CID_CODE_EMBED_IMAGE_STALE,
+    CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -353,6 +392,37 @@ class DoctorResolvers:
     #: Injected so the code-embed staleness probe is driven from a described
     #: machine — no service, no container runtime, no network.
     code_embed_state: Optional[Callable[[Path], Any]] = None
+    #: () -> :class:`vco_lib.code_embed_image.RebuildContext` — the compose
+    #: invocation this host has, plus the compose identity that OWNS the
+    #: running container. Injected so the rebuild remediation is rendered
+    #: from a described machine: no runtime, no container, no inspect.
+    code_embed_rebuild_context: Optional[Callable[[], Any]] = None
+    #: () -> :class:`vco_lib.gateway_ensure.GatewayEnsureResult`. Injected so
+    #: the gateway probe is driven from a described machine: no systemd, no
+    #: launchd, no schtasks, and no spawn of a registered entry point.
+    gateway_state: Optional[Callable[[], Any]] = None
+
+    def resolve_gateway_state(self):
+        """The model gateway's registration verdict, from its ONE home.
+
+        Delegates to :mod:`vco_lib.gateway_ensure` rather than re-reading a
+        unit file here, so the doctor's finding, the SessionStart ensure and
+        the registry's clear probe cannot disagree. Soft-fail: an exception
+        reads as "not registered", which produces NO findings — the
+        conservative answer, because the alternative is telling a user their
+        opt-in daemon is broken on the strength of a probe that crashed.
+        """
+        if self.gateway_state is not None:
+            return self.gateway_state()
+        from vco_lib import gateway_ensure
+
+        try:
+            return gateway_ensure.gateway_status()
+        except Exception:  # noqa: BLE001 — could not look is not a verdict
+            return gateway_ensure.GatewayEnsureResult(
+                state=gateway_ensure.GatewayState.NOT_REGISTERED,
+                reason="the gateway registration probe could not run",
+            )
 
     def resolve_code_embed_state(self, install_root: Path):
         """The code-embed image verdict, composed from its ONE home.
@@ -374,6 +444,30 @@ class DoctorResolvers:
                 code_embed_image.UNKNOWN,
                 "code_embed: the image-state probe could not run.",
             )
+
+    def resolve_code_embed_rebuild_context(self):
+        """What the printed rebuild command needs to know about the machine.
+
+        v0.2.95 F2. Composed from :mod:`vco_lib.code_embed_image` for the same
+        reason as the verdict above: the command the entry prints and the
+        ownership rule the installer's step-5 guard applies are the same fact,
+        and a second reading here could print a rebuild in a project that does
+        not own the container. Injected so the remediation's tests describe a
+        machine (foreign project, own project, nothing running) without a
+        container runtime.
+
+        Soft-fail: any exception yields the default context, i.e. the
+        installer's own compose project — the shape that is right for every
+        machine that has no foreign owner, and never a claim about one.
+        """
+        from vco_lib import code_embed_image
+
+        if self.code_embed_rebuild_context is not None:
+            return self.code_embed_rebuild_context()
+        try:
+            return code_embed_image.rebuild_context()
+        except Exception:  # noqa: BLE001 — a probe never fails the doctor
+            return code_embed_image.RebuildContext()
 
     def resolve_source_facts(self, folder: Path, *, ask_remote: bool) -> "SourceFacts":
         if self.source_facts is not None:
@@ -715,6 +809,14 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
     look healthy. :func:`probe_source_currency` asks whether the tree itself is
     current, and the two are only meaningful together; the ``ok`` summary says
     so rather than leaving the inference to the reader.
+
+    v0.2.95 F4: when the caller supplies no extras the standalone CLI has
+    already TRIED to obtain them from the install root
+    (:func:`supply_missing_install_context`). Reaching this branch without
+    extras therefore means the facts could not be produced, and the finding
+    says so tri-state — ``unknown``, never ``ok`` — naming the exact command
+    that would evaluate it. "Not evaluated" must not read as absence of a
+    problem; it must read as an unanswered question with the question attached.
     """
     extras = ctx.get("launcher_probe_extras") or {}
     if not extras:
@@ -723,10 +825,12 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
                 probe="launcher_binary_fresh",
                 status=STATUS_UNKNOWN,
                 summary=(
-                    "launcher freshness not evaluated — the caller supplied no "
-                    "dist/binary facts (OS→dist-subdir mapping has one home in "
-                    "install.py)"
+                    "launcher freshness not evaluated — no dist/binary facts "
+                    "could be obtained from the install root (the OS→dist-"
+                    "subdir mapping has one home in install.py). To produce "
+                    f"them yourself, run: {BOOTSTRAP_COMMAND}"
                 ),
+                command=BOOTSTRAP_COMMAND,
             )
         ]
     from vco_lib import deferral_probes
@@ -886,8 +990,12 @@ def probe_prereqs(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding
     """Consume the ``--bootstrap`` envelope's ``missing_prereqs``.
 
     install.py INJECTS the envelope it already built rather than the doctor
-    shelling back into install.py (which would be circular and slow). Without
-    an injected envelope this probe reports ``unknown`` — never a false OK.
+    shelling back into install.py mid-run (which would be circular and slow).
+    A standalone ``vco doctor`` — which has no caller to hand it one — obtains
+    the same envelope itself, in-process, through the SAME producer functions
+    (:func:`supply_missing_install_context`); only when THAT fails does this
+    probe report ``unknown`` — never a false OK — naming the exact command
+    that would produce the facts.
 
     This is the "consumer that acts after install" report 6 §B.1 says is
     missing: the envelope's findings previously died in a stdout block.
@@ -898,7 +1006,12 @@ def probe_prereqs(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding
             Finding(
                 probe="prereqs",
                 status=STATUS_UNKNOWN,
-                summary="no bootstrap envelope supplied — prereqs not re-checked",
+                summary=(
+                    "prereqs not re-checked — no bootstrap envelope could be "
+                    "obtained from the install root. To produce one, run: "
+                    f"{BOOTSTRAP_COMMAND}"
+                ),
+                command=BOOTSTRAP_COMMAND,
             )
         ]
     missing = [m for m in (envelope.get("missing_prereqs") or []) if isinstance(m, dict)]
@@ -1494,7 +1607,17 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
                 summary=state.summary,
                 fix=FIX_DEFER,
                 condition_id=CID_CODE_EMBED_IMAGE_STALE,
-                command=_code_embed_rebuild_remediation(root),
+                # The reading that produced this finding is the image state;
+                # the rebuild context only decides how the remedy is PHRASED.
+                # A context that could not be read must therefore cost the
+                # phrasing, never the finding — dropping a STALE verdict
+                # because a container label was unreadable would lose the
+                # data-integrity signal to a cosmetic failure. (The seam's own
+                # default is soft-fail; this covers an INJECTED one that is
+                # not, which is how the gap was found.)
+                command=_code_embed_rebuild_remediation(
+                    root, _safe_rebuild_context(res),
+                ),
                 detail=detail,
             )
         ]
@@ -1508,16 +1631,132 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
     ]
 
 
-def _code_embed_rebuild_remediation(root: Path) -> str:
+def probe_model_gateway_runnable(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Can the gateway's login-time registration actually run?
+
+    Returns NO findings when the gateway is not registered, which is the
+    DEFAULT and the majority case: autostart is opt-in, and an ``unknown`` line
+    on every machine that never opted in is noise, not evidence (the
+    ``code_embed_image`` precedent).
+
+    The reading is :func:`vco_lib.gateway_ensure.gateway_status` — the same one
+    the SessionStart ensure acts on and the same one the clear probe re-runs —
+    so the three surfaces cannot disagree about a single machine. It reads the
+    argv back out of the INSTALLED artefact rather than re-resolving it: "what
+    would we write now" is a different question from "what does the thing on
+    this machine run", and only the second one could have caught 2026-09-10.
+
+    ``full`` scope only: it runs the registered entry point with ``--version``,
+    which is a process spawn — past the boot subset's file-read budget, and the
+    answer changes exactly when an install/update runs.
+    """
+    from vco_lib import gateway_ensure  # noqa: PLC0415
+
+    found = res.resolve_gateway_state()
+    state = getattr(found, "state", None)
+    if state is None or state is gateway_ensure.GatewayState.NOT_REGISTERED:
+        return []
+    detail = found.to_dict() if hasattr(found, "to_dict") else {}
+    if state is gateway_ensure.GatewayState.REGISTERED_BUT_UNRUNNABLE:
+        return [
+            Finding(
+                probe="model_gateway_runnable",
+                status=STATUS_PROBLEM,
+                summary=f"model gateway: {found.reason}",
+                fix=FIX_DEFER,
+                condition_id=CID_GATEWAY_UNRUNNABLE,
+                command=remedy_shell.steps(
+                    f"cd {remedy_shell.quote(Path(folder).resolve())}",
+                    "python install.py --update",
+                ),
+                detail=detail,
+            )
+        ]
+    return [
+        Finding(
+            probe="model_gateway_runnable",
+            status=STATUS_OK,
+            # The cid rides the OK finding so the self-resolve pass can see
+            # WHICH condition this reading clears (the `disk_space` pattern).
+            # `deferral_entries_for` only ever walks `report.problems`, so it
+            # can never emit from here.
+            condition_id=CID_GATEWAY_UNRUNNABLE,
+            summary=f"model gateway: {found.reason}",
+            detail=detail,
+        )
+    ]
+
+
+def _safe_rebuild_context(res: DoctorResolvers):
+    """The rebuild context, or the default one — never a raise.
+
+    ``None`` is returned by nothing here: the remediation always gets a
+    context, so the second step is always printed. See the call site for why
+    the finding must outlive a failure to read this.
+    """
+    from vco_lib import code_embed_image  # noqa: PLC0415
+
+    try:
+        return res.resolve_code_embed_rebuild_context()
+    except Exception:  # noqa: BLE001 — phrasing must not cost the finding
+        return code_embed_image.RebuildContext()
+
+
+def _code_embed_rebuild_remediation(root: Path, context=None) -> str:
     """The command that refreshes the image, ORDERED against the code-graph re-sync.
 
     Order is load-bearing and is the reason this is one string rather than two
     lines the user might reorder: re-walking the code graph FIRST would embed
     every entity through the old, truncating service and then report success.
+
+    v0.2.95 F2 — why there is a SECOND step. ``install.py --update`` refreshes
+    the image only where the installer's own compose project owns the
+    container. Where it does not, step 5 applies
+    :func:`vco_lib.install_services_guard.apply_recreate_guard`, which strips
+    ``code_embed`` from ``build_services`` (correctly — a build under a
+    different project name produces an image the running container never
+    loads) and prints ``[skip-recreate] code_embed``. The entry then told the
+    user to run the update that had just refused, on a condition whose live
+    cost is code silently truncated into the code graph: a closed loop, and a
+    printed command that could not help. The explicit rebuild — built by
+    :func:`vco_lib.code_embed_image.rebuild_command` from the OWNING project's
+    own labels when there is one — is the leg that can.
+
+    ``context`` is :class:`vco_lib.code_embed_image.RebuildContext`; ``None``
+    (a caller that has no machine reading) falls back to the default context,
+    so the step is always present and never invented.
     """
+    from vco_lib import code_embed_image  # noqa: PLC0415
+
+    ctx = context if context is not None else code_embed_image.RebuildContext()
+    owner = getattr(ctx, "identity", None)
+    explicit = code_embed_image.rebuild_command(
+        Path(root).resolve(),
+        compose_cmd=getattr(ctx, "compose_cmd", "docker compose"),
+        identity=owner,
+    )
+    note = (
+        "# 2. The running container was created by compose "
+        f"{owner.describe()},\n"
+        "#    so step 1 will NOT rebuild its image — it prints "
+        "`[skip-recreate] code_embed`\n"
+        "#    and leaves the service on the old, TRUNCATING image. Rebuild "
+        "inside the\n"
+        "#    project that owns it:"
+        if owner is not None and getattr(owner, "working_dir", "")
+        else
+        "# 2. If step 1 printed `[skip-recreate] code_embed`, its compose did "
+        "NOT own the\n"
+        "#    running container and the image was NOT rebuilt. Rebuild it "
+        "explicitly:"
+    )
     return remedy_shell.steps(
+        "# 1. The update rebuilds the image where its own compose owns the "
+        "container:",
         f"cd {remedy_shell.quote(Path(root).resolve())}",
         "python install.py --update",
+        note,
+        explicit,
     )
 
 
@@ -2616,6 +2855,381 @@ def probe_last_update_run(folder: Path, res: DoctorResolvers, ctx: dict) -> list
 
 
 # ---------------------------------------------------------------------------
+# Install completeness — does the completion marker rest on an installer run?
+# ---------------------------------------------------------------------------
+
+#: ``state/install-manifest.json``, relative to the install root.
+INSTALL_MANIFEST_REL = ("state", "install-manifest.json")
+
+#: ``install_method`` values only the RUST writer
+#: (``launcher/src-tauri/src/commands/manifest.rs::refresh_install_manifest``)
+#: produces. install.py's own writer spells ``install.py`` / ``update`` /
+#: ``lightweight``, so seeing one of these means the LAST hand on the marker
+#: was a path that never ran install.py. Carried in the summary as the
+#: EXPLANATION; never the conviction on its own — a resync that pulled nothing
+#: writes one of these and owes no work.
+RUST_INSTALL_METHODS: tuple[str, ...] = ("launcher_update", "orchestrator_update")
+
+#: A git object name, for the commit leg. ``vco_commit`` is a *short* SHA and
+#: ``source_commit`` a full one, so the comparison is a prefix test — but only
+#: after both sides are proven to BE object names. ``recorded_manifest_version``
+#: passes the dedicated ``vco_commit`` field through unvalidated (a hand-edited
+#: ``"unknown"`` survives it), and comparing that against a real SHA would
+#: convict on a string nobody promised was a commit.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _read_json_dict(path: Path) -> Optional[dict]:
+    """``path`` parsed as a JSON object, or ``None``. Never raises."""
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _commits_disagree(attested: Any, built: Any) -> Optional[bool]:
+    """Do two recorded commits name different objects? ``None`` = unknowable.
+
+    ``None`` whenever either side is absent or is not an object name — the
+    ``.git/HEAD`` reader install.py uses returns ``None`` for a PACKED ref, so
+    a perfectly healthy clone can record no ``source_commit`` at all, and that
+    must never read as disagreement.
+    """
+    a = attested.strip().lower() if isinstance(attested, str) else ""
+    b = built.strip().lower() if isinstance(built, str) else ""
+    if not _SHA_RE.match(a) or not _SHA_RE.match(b):
+        return None
+    return not (a.startswith(b) or b.startswith(a))
+
+
+def probe_install_completeness(
+    folder: Path, res: DoctorResolvers, ctx: dict
+) -> list[Finding]:
+    """Does ``install-manifest.json``'s claim rest on an installer run?
+
+    The state this exists for (the v0.2.95 surface map's H1/H2/H3): the
+    launcher's ``apply_launcher_update`` / ``force_resync_launcher`` advance
+    the whole source tree and rebuild only the launcher, and
+    ``update_orchestrator_at`` file-copies a newer tree into another clone.
+    None of the three runs ``install.py``, so venv, pip, hooks, templates, MCP
+    registrations, the KG seed, the schema and the boot service all stay at the
+    OLD version — and then each one calls ``refresh_install_manifest``, which
+    re-asserts ``installed: true`` over them. The marker attests work that
+    nothing did, and **nothing looked**: ``source_currency`` is 0-behind
+    afterwards (so :func:`_currency_finding` drops the install age it only
+    appends to a PROBLEM), and ``probe_last_update_run`` reports the stale date
+    as ``ok`` by design.
+
+    What that writer does TODAY, because it decides which leg below can fire.
+    v0.2.95 WP-1 changed ``commands::manifest::refresh_install_manifest``: it no
+    longer re-reads ``version`` nor stamps ``completed_at`` (install.py is now
+    the only writer of both), it still advances ``source_commit`` from
+    ``.git/HEAD``, and it stamps ``post_source_only: true`` — the writer NAMING
+    the state instead of leaving it to be inferred. So the population this probe
+    serves splits three ways, and the three legs are not redundant:
+
+    * a marker last written by a PRE-0.2.95 launcher carries the version that
+      launcher pulled, and the bundle manifest does not → the VERSION leg. That
+      population is real: it is everyone who arrives by upgrading INTO 0.2.95;
+    * a marker last written by a 0.2.95+ launcher agrees on version by
+      construction, so only the COMMIT leg can speak — and it is silent
+      whenever ``.git/HEAD`` did not move (``update_orchestrator_at``
+      file-copies a tree into a clone and leaves its HEAD alone) or could not
+      be read (a packed ref, a worktree HEAD file: ``read_git_rev`` returns
+      ``None`` and the old ``source_commit`` survives untouched);
+    * the FLAG leg is the only one that survives both of those, and it is the
+      writer's own word. A probe that ignored it would answer ``ok`` — "rests
+      on a real installer run" — for a manifest that says in as many words that
+      the last hand on it installed nothing.
+
+    Why this probe may judge where its neighbour deliberately does not.
+    ``probe_last_update_run`` refuses to grade the install AGE because age is a
+    proxy with two causes — deliberately pinned, or silently not updating — and
+    one reading cannot separate them. This probe never reads age as evidence.
+    It compares two INDEPENDENT records of one fact, and the fact is not "is
+    this install old" but "which source was this install built from":
+
+    * ``state/install-manifest.json`` — written by install.py AND by the three
+      launcher paths above;
+    * ``.claude/.vco-manifest.json`` — written ONLY by the bundle engine
+      (``project_init.install_project_bundle``, which install.py reaches
+      through ``self_install``). No launcher update path writes it, and it is
+      gitignored, so ``update_orchestrator_at``'s gitignore-aware copy does not
+      carry the source clone's copy into the target either.
+
+    Two records, one writer in common. When they name different sources, the
+    completion marker was advanced by something that did not run the
+    installer — positive evidence, not a proxy, and the ambiguity that stops
+    its neighbour from judging does not arise. A user who is happily pinned
+    has one install.py run behind both records and reads ``ok`` here forever.
+    The flag leg is the same evidence arriving by declaration rather than by
+    comparison, and it is not a proxy either: only a path that advanced the
+    source tree without installing writes it, and only an installer run clears
+    it (install.py's ``_write_install_manifest`` rebuilds the manifest from a
+    literal dict, so the key simply does not survive a real run).
+
+    Conservative in every direction that matters. No manifest, an unparseable
+    one, a pre-v0.2.92 bundle manifest whose ``vco_version`` holds a git SHA
+    (``recorded_manifest_version`` hands that back as a COMMIT, never as a
+    version), a packed ref that left ``source_commit`` empty, an ABSENT
+    ``post_source_only`` (which is every manifest written before v0.2.95, and
+    every manifest install.py writes at all) — each yields ``unknown`` or
+    ``ok``, never ``problem``. A false problem here would tell a healthy
+    install it is broken and send its owner into an update they do not need,
+    which is worse than the silence this closes.
+
+    Read-only: three file reads, no subprocess in the decision path. The one
+    subprocess (``vco_version.resolve`` → ``git rev-parse --short HEAD``) runs
+    only AFTER a problem is established, to name the checkout in the report.
+    """
+    root = Path(folder)
+    try:
+        from vco_lib.paths import looks_like_orchestrator_root
+    except Exception:  # noqa: BLE001
+        return []
+    if not looks_like_orchestrator_root(root):
+        # Not the orchestrator clone. Same fourth state `probe_source_currency`
+        # names: not-applicable, which is neither `unknown` nor a finding.
+        return []
+
+    manifest_path = root.joinpath(*INSTALL_MANIFEST_REL)
+    manifest = _read_json_dict(manifest_path)
+    if manifest is None or manifest.get("installed") is not True:
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"no completed install is recorded at {manifest_path} — "
+                    "nothing to corroborate (run `python install.py --update` "
+                    "from this root to write one)"
+                ),
+                detail={
+                    "install_manifest": str(manifest_path),
+                    "exists": manifest_path.exists(),
+                },
+            )
+        ]
+
+    try:
+        from vco_lib.manifest_paths import manifest_path as bundle_manifest_path
+        from vco_lib.vco_version import recorded_manifest_version
+    except Exception as exc:  # noqa: BLE001 — a broken import is unknown, never a verdict
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_UNKNOWN,
+                summary=f"could not load the bundle-manifest reader: {exc}",
+                detail={"install_manifest": str(manifest_path)},
+            )
+        ]
+
+    bundle_path = bundle_manifest_path(root)
+    bundle = _read_json_dict(bundle_path)
+    built_version, built_commit = recorded_manifest_version(bundle or {})
+    if bundle is None or (built_version is None and built_commit is None):
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"{bundle_path} records no source this install was built "
+                    "from, so the install manifest's claim cannot be "
+                    "corroborated"
+                ),
+                detail={
+                    "install_manifest": str(manifest_path),
+                    "bundle_manifest": str(bundle_path),
+                    "bundle_manifest_exists": bundle_path.exists(),
+                },
+            )
+        ]
+
+    attested_version = manifest.get("version")
+    attested_version = (
+        attested_version.strip() if isinstance(attested_version, str) else ""
+    )
+    attested_commit = manifest.get("source_commit")
+    install_method = manifest.get("install_method")
+    install_method = install_method if isinstance(install_method, str) else ""
+    completed_at = _parse_install_ts(manifest.get("completed_at"))
+
+    session_row = last_successful_install(root)
+    session_ts_raw = session_row.get("ts") if isinstance(session_row, dict) else None
+    session_ts = _parse_install_ts(session_ts_raw)
+
+    # The WRITER's own name for this state (v0.2.95 WP-1).
+    # ``manifest::refresh_install_manifest`` stamps ``post_source_only: true``
+    # on every path that advances the source tree without running install.py,
+    # and install.py's ``_write_install_manifest`` rebuilds the manifest from a
+    # literal dict, so a real installer run drops it. That makes it evidence a
+    # comparison cannot produce — see the docstring for the two shapes where
+    # both other legs are structurally blind.
+    #
+    # ``is True`` EXACTLY, and what the other answers mean:
+    #
+    # * ABSENT — no evidence, never innocence. Every manifest written before
+    #   v0.2.95 lacks the key; so does every manifest install.py writes, at any
+    #   version; so does one written by a pre-0.2.95 launcher binary that took
+    #   a source-only path. Convicting on absence would convict every healthy
+    #   install on the planet, so absence leaves the verdict entirely to the
+    #   version and commit legs (which is exactly the population they cover).
+    # * ``false`` / a string / a number — no writer produces these; a
+    #   hand-edited or foreign value is not the writer speaking, so it is read
+    #   as absent rather than guessed at.
+    #
+    # The flag's truthfulness is the WRITER's contract, and convicting on it
+    # makes that contract load-bearing in one direction: a refresh call from a
+    # path that did NOT move the source tree would fire this probe (and
+    # `install_stale`) on a healthy install. Nothing readable from the manifest
+    # can separate "nothing moved" from "a tree was copied in without moving
+    # .git/HEAD" — both leave two agreeing records — so the invariant lives with
+    # the callers of `refresh_install_manifest`, which is where v0.2.95 put it:
+    # `ArtefactSource::Unchanged` exists precisely so the already-up-to-date
+    # branch records nothing instead of claiming a source advance. If a future
+    # caller stamps the flag without advancing the tree, THAT is the defect —
+    # do not soften the leg here to absorb it.
+    post_source_only = manifest.get("post_source_only") is True
+
+    detail = {
+        "install_manifest": str(manifest_path),
+        "bundle_manifest": str(bundle_path),
+        "attested_version": attested_version or None,
+        "attested_commit": attested_commit if isinstance(attested_commit, str) else None,
+        "built_version": built_version,
+        "built_commit": built_commit,
+        "install_method": install_method or None,
+        "marker_written_by_launcher_path": install_method in RUST_INSTALL_METHODS,
+        "post_source_only": post_source_only,
+        "completed_at": manifest.get("completed_at"),
+        "last_install_session_ok": session_ts_raw,
+    }
+
+    # ACQUITTAL, and the one place the install log is load-bearing. install.py
+    # logs `session ok` and only THEN writes the manifest, so on every run it
+    # performs the session stamp is at or before `completed_at`. A stamp that
+    # is strictly LATER means an installer run finished after the marker was
+    # written — its (soft-fail) manifest write did not land. The marker is then
+    # BEHIND the work, not ahead of it: stale bookkeeping, nothing owed.
+    #
+    # It acquits `post_source_only` too, which is why the flag leg is placed
+    # AFTER this and not before: the only way a surviving flag coexists with a
+    # LATER installer session is the same soft-failed manifest write (a run that
+    # completed cannot have written the flag — install.py never writes it), so
+    # the flag is stale bookkeeping in exactly the case this leg already covers.
+    # Measured on the live root, `session ok` precedes `completed_at` by ~4s on
+    # a healthy run, which is why the gap is an acquittal and never a trigger.
+    if session_ts is not None and completed_at is not None and session_ts > completed_at:
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_OK,
+                summary=(
+                    f"an install.py session completed at {session_ts_raw}, after "
+                    f"the install manifest was last written ({manifest.get('completed_at')}) "
+                    "— the marker lags the installer rather than running ahead of it"
+                ),
+                detail=detail,
+            )
+        ]
+
+    versions_disagree = (
+        attested_version != ""
+        and built_version is not None
+        and attested_version.lstrip("v") != built_version
+    )
+    commits_disagree = _commits_disagree(attested_commit, built_commit)
+    detail["versions_disagree"] = versions_disagree
+    detail["commits_disagree"] = commits_disagree
+
+    if not versions_disagree and commits_disagree is not True and not post_source_only:
+        return [
+            Finding(
+                probe="install_completeness",
+                status=STATUS_OK,
+                summary=(
+                    "the install manifest and the bundle manifest name the same "
+                    f"source ({attested_version or built_version or '?'}"
+                    + (f" / {built_commit}" if built_commit else "")
+                    + ") — this install's completion marker rests on a real "
+                    "installer run"
+                ),
+                detail=detail,
+            )
+        ]
+
+    # Conviction precedence is REPORTING precedence, not confidence: whichever
+    # leg can name the two sources most usefully goes in the summary. The flag
+    # names no source, so it is last — and it is the one that fires alone
+    # exactly where the other two are structurally blind.
+    if versions_disagree:
+        detail["convicted_on"] = "version"
+    elif commits_disagree is True:
+        detail["convicted_on"] = "commit"
+    else:
+        detail["convicted_on"] = "post_source_only"
+    # Name the checkout too, so the report says what the user would be moving
+    # FROM and TO. Only on the problem path: this is the probe's one subprocess.
+    try:
+        from vco_lib import vco_version as _vv
+
+        here = _vv.resolve(root)
+        detail["checkout_version"] = here.semver
+        detail["checkout_commit"] = here.commit
+    except Exception:  # noqa: BLE001 — enrichment never decides and never raises
+        detail["checkout_version"] = None
+        detail["checkout_commit"] = None
+
+    if versions_disagree:
+        head = (
+            f"install-manifest.json attests version {attested_version} as "
+            f"installed, but this install's `.claude/` bundle was last written "
+            f"at {built_version}"
+        )
+    elif commits_disagree is True:
+        head = (
+            f"install-manifest.json attests commit {_short(attested_commit)}, "
+            f"but this install's `.claude/` bundle was last written at "
+            f"{_short(built_commit)}"
+        )
+    else:
+        head = (
+            "install-manifest.json carries `post_source_only`, the flag its "
+            "writer sets when a path advances the source tree without running "
+            "install.py — so the `installed: true` beside it covers the tree as "
+            f"it stood at the last installer run "
+            f"({attested_version or built_version or '?'}), not the tree on "
+            "disk now"
+        )
+    tail = ""
+    if install_method in RUST_INSTALL_METHODS:
+        tail = (
+            f" — the marker was last written by the launcher's `{install_method}` "
+            "path, which advances the source tree and rebuilds the launcher "
+            "without running install.py"
+        )
+    if session_ts_raw:
+        tail += f"; the last completed install.py run here was {session_ts_raw}"
+    else:
+        tail += "; no completed install.py session is recorded on this root at all"
+    return [
+        Finding(
+            probe="install_completeness",
+            status=STATUS_PROBLEM,
+            summary=head + tail,
+            fix=FIX_DEFER,
+            condition_id=CID_INSTALL_MARKER_UNBACKED,
+            command=remedy_shell.steps(
+                f"cd {remedy_shell.quote(root.resolve())}",
+                "python install.py --update",
+            ),
+            detail=detail,
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics list — the ask, generated from reality
 # ---------------------------------------------------------------------------
 
@@ -3226,6 +3840,21 @@ PROBES: dict = {
     "vco_lib_editable": (probe_vco_lib_editable, (SCOPE_FULL,)),
     "source_currency": (probe_source_currency, (SCOPE_FULL,)),
     "last_update_run": (probe_last_update_run, (SCOPE_FULL,)),
+    # v0.2.95 WP-2: full-only, for a COST reason this time (the v0.2.92
+    # probes above are full-only for a promise reason — no registered
+    # condition — which does not apply here: this one has a row in
+    # `deferral_conditions.toml`, so the launcher's boot counter could
+    # legitimately point at the Updates panel for it). The decision itself is
+    # three file reads, but one of them goes through
+    # :func:`last_successful_install`, which scans the WHOLE append-only
+    # `install.jsonl` — 34 ms on the 4.4 MB log of a two-year-old install
+    # root, and the file has no rotation, so that number only grows. Boot
+    # latency is user-visible; the question is about a COMPLETED install, and
+    # its readers are install.py's end-of-run report and `vco doctor`.
+    # Promoting it to `boot` is a real option and a scope decision, not a
+    # refactor: it would make the launcher's own self-update the surface that
+    # reports its own omission at the very next boot.
+    "install_completeness": (probe_install_completeness, (SCOPE_FULL,)),
     "diagnostic_files": (probe_diagnostic_files, (SCOPE_FULL,)),
     "stale_vct_deploy": (probe_stale_vct_deploy, (SCOPE_FULL,)),
     # v0.2.92 WP-D (R27 surface a): full-only — the census runs one engine
@@ -3246,7 +3875,156 @@ PROBES: dict = {
     # probe's docstring for why this is the only service whose IMAGE can go
     # stale under a healthy update.
     "code_embed_image": (probe_code_embed_image, (SCOPE_FULL,)),
+    # v0.2.95 R5c: full-only — it RUNS the registered entry point
+    # (`--version`), and it reports nothing at all on the majority of machines,
+    # where the gateway's login-time autostart was never opted into.
+    "model_gateway_runnable": (probe_model_gateway_runnable, (SCOPE_FULL,)),
 }
+
+
+#: v0.2.95 F4 — per-process cache for the checkout's install.py, loaded by
+#: path. ``None`` (cached failure) matters as much as a module: it stops a
+#: standalone doctor run re-executing a broken file once per probe.
+_INSTALL_MODULE_CACHE: dict = {}
+
+
+def _load_install_module(install_root: Path):
+    """Load the install root's ``install.py`` BY PATH and cache it.
+
+    The bootstrap envelope and the OS→``launcher/dist/<arch>/`` mapping each
+    have exactly ONE home — install.py — and the doctor must not mirror either
+    (cross-language rule A: reuse, never duplicate). This loader is how the
+    STANDALONE CLI reaches those producer functions directly, in-process: no
+    shell-out, no second interpreter, and the producers' own per-sub-probe
+    timeouts bound the cost. ``main()`` is guarded by ``__name__`` so importing
+    is side-effect-free apart from cheap top-level constants; the ONE
+    import-time exit (the Python-version sentinel) is caught here so a
+    too-old interpreter yields "facts unavailable", not a dead CLI.
+
+    Returns the module, or ``None`` when the file is absent or failed to
+    import. Never raises.
+    """
+    try:
+        root = Path(install_root)
+        key = str(root.resolve()) if root.exists() else str(root)
+        if key in _INSTALL_MODULE_CACHE:
+            return _INSTALL_MODULE_CACHE[key]
+        mod = None
+        path = root / "install.py"
+        if path.is_file():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "_vco_doctor_install_producer", path
+            )
+            if spec is not None and spec.loader is not None:
+                candidate = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = candidate
+                try:
+                    spec.loader.exec_module(candidate)
+                    mod = candidate
+                except (Exception, SystemExit):  # noqa: BLE001 — no producer, no verdict
+                    mod = None
+        _INSTALL_MODULE_CACHE[key] = mod
+        return mod
+    except Exception:  # noqa: BLE001 — obtaining facts must never break the pass
+        return None
+
+
+def supply_missing_install_context(folder: Path, ctx: dict) -> dict:
+    """Fill ONLY the missing install.py-owned context keys. Never raises.
+
+    v0.2.95 F4: a standalone ``vco doctor`` used to print
+    ``launcher_binary_fresh`` / ``prereqs`` as "not evaluated — the caller
+    supplied no envelope", which reads as ABSENCE of a problem. It now obtains
+    the facts itself through the SAME producers install.py's own doctor phase
+    calls (``_bootstrap_build_envelope`` / ``_launcher_binary_relative_path``
+    + ``_read_launcher_version``), loaded by path — one home, two callers.
+
+    Keys the caller already supplied (install.py injects both mid-run) are
+    never overwritten, so the in-run path is byte-identical to before. A
+    producer that fails leaves its key ABSENT on purpose: the probes then
+    report tri-state ``unknown`` naming :data:`BOOTSTRAP_COMMAND`, which is
+    the honest sentence — not evaluated, and here is what would evaluate it.
+    """
+    try:
+        root = Path(folder)
+        need_envelope = "bootstrap_envelope" not in ctx
+        need_launcher = "launcher_probe_extras" not in ctx
+        if not (need_envelope or need_launcher):
+            return ctx
+        mod = _load_install_module(root)
+        if mod is None:
+            return ctx
+        if need_envelope:
+            try:
+                envelope = mod._bootstrap_build_envelope(root)
+            except (Exception, SystemExit):  # noqa: BLE001 — facts stay absent
+                envelope = None
+            if isinstance(envelope, dict):
+                ctx["bootstrap_envelope"] = envelope
+        if need_launcher:
+            try:
+                from vco_lib import deferral_probes
+
+                subdir, fname = mod._launcher_binary_relative_path()
+                ctx["launcher_probe_extras"] = deferral_probes.launcher_probe_extras(
+                    subdir, fname, mod._read_launcher_version(root)
+                )
+            except (Exception, SystemExit):  # noqa: BLE001 — facts stay absent
+                pass
+    except Exception:  # noqa: BLE001 — supplying context is best-effort
+        pass
+    return ctx
+
+
+def reconcile_probe_cleared(
+    folder: Path, *, extras: Optional[dict] = None, log: Callable[[str], None] = print
+) -> list:
+    """Resolve ledger entries whose registry probe says they are provably over.
+
+    v0.2.95 F1: ``hub_restart_failed_after_abort`` could survive forever — its
+    only clearer ran BEFORE the hub restart step inside ``install.py --update``,
+    and a standalone doctor never re-probed foreign cids at all
+    (:func:`resolve_healthy_findings` is scoped to doctor-OWNED conditions).
+    The doctor is the reconciler's OBSERVE step and runs LAST
+    (arch review §7, steps 2–5), so this pass is where a hub that is back up
+    gets its row removed — on every surface that renders the ledger, not only
+    on the next ``--update``.
+
+    Read → probe → resolve, all through the shared machinery: the report is
+    read ONLY (no unlocked write-back — the resolve goes through the ONE
+    locked emitter), every entry is probed by the SAME
+    :func:`vco_lib.deferral_probes.probe_report` install.py uses, and ONLY a
+    positive ``False`` clears; "still applies" and "could not determine" both
+    keep the entry. That asymmetry is the safety property. Every clear leaves
+    a B-F9 audit row (``resolved_by_registry_probe``) naming the probe.
+
+    Returns the cleared cids. Never raises.
+    """
+    try:
+        from vco_lib import deferral_probes
+        from vco_lib.deferral_emit import resolve_conditions
+        from vco_lib.deferral_report import DeferralReport
+
+        root = Path(folder)
+        report = DeferralReport.read(root)
+        if not list(getattr(report, "entries", []) or []):
+            return []
+        result = deferral_probes.probe_report(root, report, extras)
+        cleared: list = []
+        for cid in list(result.resolvable):
+            name = deferral_probes.registry_probe_name(cid) or ""
+            if resolve_conditions(root, [cid]) > 0:
+                deferral_probes.record_probe_resolution(root, cid, name)
+                cleared.append(cid)
+                log(
+                    f"[doctor] reconcile: {cid} cleared — registry probe "
+                    f"`{name}` re-derived the state and the condition is over."
+                )
+        return cleared
+    except Exception:  # noqa: BLE001 — reconcile is best-effort observability
+        return []
 
 
 def run_doctor(
@@ -3469,6 +4247,78 @@ def _code_embed_image_entry(finding: Finding):
     )
 
 
+def _gateway_unrunnable_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id=CID_GATEWAY_UNRUNNABLE,
+        title="The model gateway is registered to start at login, but cannot run",
+        detected=finding.summary,
+        why_deferred=(
+            "Nothing here can fix it in place: the argv baked into the "
+            "registration is what fails, and re-writing that registration is "
+            "an install/update action. The init system is meanwhile retrying "
+            "it on its own schedule, so a start from anywhere else would only "
+            "add attempts that fail the same way. It is REPORTED because the "
+            "failure is silent from outside: the unit is enabled, the launcher "
+            "toggle reads `registered`, and on 2026-09-10 a machine sat in "
+            "exactly this state for eight hours — the previous gateway process "
+            "kept serving until the first restart, and then nothing did. "
+            "`python install.py --update` re-renders the registration from the "
+            "install root's venv and now verifies the entry point before "
+            "writing it, so the run that fixes this also clears this entry."
+        ),
+        command_to_apply=finding.command,
+        severity="warning",
+        disposition="action_required",
+        kg_node_refs=["docs/CONFIGURATION.md"],
+    )
+
+
+def _install_marker_unbacked_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id=CID_INSTALL_MARKER_UNBACKED,
+        title="This install's completion marker names a source it was never installed from",
+        detected=finding.summary,
+        why_deferred=(
+            "Re-running the installer is minutes of work the user must choose "
+            "to start (it rebuilds the venv's editable install, re-propagates "
+            "the `.claude/` bundle, re-registers the MCPs and may re-seed the "
+            "KG), so VCO reports it rather than starting one from a read-only "
+            "health check. It is reported because the failure is QUIET by "
+            "construction: `apply_launcher_update`, `force_resync_launcher` "
+            "and `update_orchestrator_at` advance the whole source tree, "
+            "rebuild only the launcher, and then re-assert `installed: true` "
+            "over a venv, hooks, templates, MCP registrations, KG seed and "
+            "schema none of them touched — after which the checkout is "
+            "0-behind upstream, so the currency probe reports health and the "
+            "install-age reading is dropped as not decision-relevant. Since "
+            "v0.2.95 that write leaves `version` alone (install.py owns it) "
+            "and stamps `post_source_only` instead, which does light the "
+            "launcher's Updates badge — but a badge is a running launcher's "
+            "affordance, and the states this catches include a CLI-only "
+            "install and a SECOND clone updated in place by "
+            "`update_orchestrator_at`, whose launcher may never start. The "
+            "evidence used here needs none of that: the install manifest is "
+            "written by those paths and says so, while the `.claude/` bundle "
+            "manifest is written only by the bundle engine an installer run "
+            "reaches. "
+            "`python install.py --update` rewrites BOTH from the one tree and "
+            "rebuilds the install manifest from scratch (so `post_source_only` "
+            "does not survive it), after re-doing the venv, hooks, templates, "
+            "MCP registrations, KG seed and schema work the marker already "
+            "claimed; the doctor re-probes at the end of that same run — so "
+            "the run that fixes this is the run that clears it."
+        ),
+        command_to_apply=finding.command,
+        severity="warning",
+        disposition="action_required",
+        kg_node_refs=["docs/post-install/UPDATE-RECOVERY.md"],
+    )
+
+
 _ENTRY_BUILDERS: dict = {
     CID_NPX_MISSING: _npx_entry,
     CID_DISK_SPACE_LOW: _disk_space_entry,
@@ -3476,6 +4326,8 @@ _ENTRY_BUILDERS: dict = {
     CID_KG_BINDING_EVIDENCE_MISMATCH: _kg_binding_evidence_entry,
     CID_KG_UNCLAIMED: _kg_unclaimed_entry,
     CID_CODE_EMBED_IMAGE_STALE: _code_embed_image_entry,
+    CID_GATEWAY_UNRUNNABLE: _gateway_unrunnable_entry,
+    CID_INSTALL_MARKER_UNBACKED: _install_marker_unbacked_entry,
 }
 
 
@@ -3625,9 +4477,30 @@ def run_and_report(
     else is mid-write, and the driver is detached) and the on-demand CLI. The
     install-time pass still REPORTS the owed work by name, so it is visible
     either way. See :mod:`vco_lib.deferral_retry` for the gate order.
+
+    v0.2.95 F1/F4 — a standalone pass (``sink is None``: the CLI, not an
+    in-flight install run) first PREFLIGHTS: it obtains the install.py-owned
+    facts it was not handed (:func:`supply_missing_install_context`) and then
+    reconciles the ledger through the registry probes
+    (:func:`reconcile_probe_cleared`) BEFORE probing, so the report this pass
+    prints describes the ledger as it stands after provably-over entries were
+    cleared — a doctor that reports an entry as actionable and then, moments
+    later in the same run, clears it is the F1 defect shape in miniature. The
+    reconcile is gated on ``emit`` for the same reason the retries are:
+    ``--no-emit`` means "tell me, change nothing". With a sink (the install
+    path) both preflight halves are skipped: install.py injects the facts
+    itself, its own re-probe pass owns the mid-run clears, and one writer per
+    run stays the simpler invariant.
     """
     out = printer or print
-    report = run_doctor(folder, scope=scope, resolvers=resolvers, context=context)
+    ctx = dict(context or {})
+    if sink is None:
+        supply_missing_install_context(Path(folder), ctx)
+        if emit:
+            reconcile_probe_cleared(
+                Path(folder), extras=ctx.get("launcher_probe_extras") or {}, log=out
+            )
+    report = run_doctor(folder, scope=scope, resolvers=resolvers, context=ctx)
     out("")
     out("[doctor] Environment check:")
     for line in report.render_lines():
@@ -3697,7 +4570,18 @@ def run_from_args(args: argparse.Namespace) -> int:
     emit = getattr(args, "emit", True)
     auto_fix = getattr(args, "auto_fix", True)
     if args.json:
-        report = run_doctor(folder, scope=args.scope)
+        # v0.2.95 F1/F4: the --json surface is a STANDALONE doctor too, so it
+        # gets the same preflight as run_and_report — obtain the facts, then
+        # reconcile the ledger — with the reconcile honouring --no-emit and
+        # the log line silenced (stdout is a machine contract on this path;
+        # the cleared cids are observable through the payload's ledger probe).
+        ctx: dict = {}
+        supply_missing_install_context(folder, ctx)
+        if emit:
+            reconcile_probe_cleared(
+                folder, extras=ctx.get("launcher_probe_extras") or {}, log=lambda _l: None
+            )
+        report = run_doctor(folder, scope=args.scope, context=ctx or None)
         if emit:
             emit_findings(folder, report)
         print(json.dumps(report.to_dict()))
@@ -3716,8 +4600,10 @@ def run_from_args(args: argparse.Namespace) -> int:
 
 
 __all__ = [
+    "BOOTSTRAP_COMMAND",
     "CID_CODE_EMBED_IMAGE_STALE",
     "CID_DISK_SPACE_LOW",
+    "CID_INSTALL_MARKER_UNBACKED",
     "CID_KG_BINDING_EVIDENCE_MISMATCH",
     "CID_NPX_MISSING",
     "CID_VCO_LIB_SHADOWED",
@@ -3728,6 +4614,8 @@ __all__ = [
     "DOCTOR_SELF_RESOLVING_CIDS",
     "GIT_TIMEOUT_SECONDS",
     "INSTALL_LOG_REL",
+    "INSTALL_MANIFEST_REL",
+    "RUST_INSTALL_METHODS",
     "SOURCE_FALLBACK_BRANCH",
     "UPSTREAM_REMOTE",
     "VCT_CLI_REL",
@@ -3763,16 +4651,19 @@ __all__ = [
     "parse_vct_guards",
     "probe_diagnostic_files",
     "probe_disk_space",
+    "probe_install_completeness",
     "probe_kg_binding_evidence",
     "probe_last_update_run",
     "probe_source_currency",
     "probe_stale_vct_deploy",
     "probe_vco_lib_editable",
+    "reconcile_probe_cleared",
     "resolve_healthy_findings",
     "run_and_report",
     "run_doctor",
     "run_from_args",
     "same_location",
+    "supply_missing_install_context",
 ]
 
 

@@ -21,6 +21,14 @@ WHAT THIS PINS
 3. The list still contains ``tests`` — the v0.2.94 sweep cleared tests/'s 174
    pre-existing findings specifically so it could join the gate, and a silent
    removal would strand that work.
+4. The list still contains ``VCThelpers`` (shipped Python — ``install.py``
+   pre-compiles it as an orchestrator-managed dir; it holds the license +
+   telemetry code) and ``.github/scripts`` (GATE code — the hook-parity gate
+   lives there, and an F841 sat in it unnoticed while the gate that enforces
+   other gates was itself ungated). Both joined in v0.2.95 at 0 findings,
+   which is the only moment adding a surface is free; dropping either one
+   again would have to pay that cost twice. See ci.yml's comment for the
+   scope rule the list now follows.
 
 The assertions read the SHIPPED bytes of both files and extract the list from
 the real command line — editing either file edits what this test measures, so
@@ -99,6 +107,23 @@ def test_tests_directory_is_gated(ci_paths, pre_ship_paths) -> None:
             f"findings so this could be gated; dropping it re-opens the hole. "
             f"Got: {paths}"
         )
+
+
+def test_shipped_helpers_and_gate_code_are_gated(ci_paths, pre_ship_paths) -> None:
+    """VCThelpers/ and .github/scripts/ joined the gate in v0.2.95 (MINOR-5).
+
+    They are the two surfaces the v0.2.94 list omitted with no recorded
+    decision: one is shipped Python, the other is the code that enforces the
+    other gates. Both were 0-findings when added — a later removal would put
+    that cleanliness back at risk silently, so pin it here.
+    """
+    for surface in ("VCThelpers", ".github/scripts"):
+        for name, paths in (("ci.yml", ci_paths), ("pre-ship-check.sh", pre_ship_paths)):
+            assert surface in paths, (
+                f"{name} stopped gating {surface}/. It joined in v0.2.95 at 0 "
+                f"findings (shipped Python / gate code); dropping it re-opens "
+                f"the hole. Got: {paths}"
+            )
 
 
 def test_every_gated_path_exists() -> None:

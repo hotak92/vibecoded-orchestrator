@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from aiohttp import ClientTimeout, web
 from aiohttp.test_utils import TestClient, TestServer
@@ -39,7 +41,7 @@ from model_router.auth import OAuthReader
 from model_router.catalog import SOURCE_LIVE, SOURCE_STATIC, SOURCE_UNFETCHED
 from model_router.config import GatewayConfig
 from model_router.secrets import VendorKeyResolver
-from model_router.server import create_app
+from model_router.server import APP_KEY, create_app
 from model_router.vendors import ANTHROPIC_FAMILY, VENDORS, AnthropicFamily, Vendor
 
 HOST_TOKEN = "wp9-host-token-not-a-real-secret"
@@ -151,6 +153,22 @@ class GatewayTestBase(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="wp9-srv-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+
+        # Every gateway built here owns a usage ledger, and a ledger writes a
+        # JSONL file under ``vco_lib.paths.vct_metrics_dir()``. The suite-wide
+        # conftest redirect already keeps that out of the user's real
+        # ``~/.vct``; this narrows it further to THIS test, so one test's rows
+        # can never be counted by the next one's assertion. Every subclass —
+        # including the files that import this base and are owned elsewhere —
+        # inherits the isolation without doing anything.
+        state = mock.patch.dict(
+            os.environ, {"VCT_STATE_DIR": str(self.root / "vct")},
+        )
+        state.start()
+        self.addCleanup(state.stop)
+        self.usage_ledger_path = (
+            self.root / "vct" / "metrics" / "gateway-usage.jsonl"
+        )
 
         self.vendor_up = _Upstream()
         self.anthropic_up = _Upstream()
@@ -647,9 +665,11 @@ class HealthTests(GatewayTestBase):
     #: Kept in step with ``health_handler``'s docstring by the test below.
     DOCUMENTED_FIELDS = {
         "ok", "service", "version", "port", "host", "catalog_source",
+        "catalog_filter", "catalog_hidden",
         "context_table_source", "context_table_path", "oauth_present",
         "oauth_state", "oauth_expires_in_s", "vendors", "vendor_keys_cached",
-        "token_file_permissions",
+        "secret_scope",
+        "token_file_permissions", "usage_ledger",
     }
 
     async def test_health_needs_no_token(self) -> None:
@@ -668,6 +688,29 @@ class HealthTests(GatewayTestBase):
         doc = health_handler.__doc__ or ""
         for field in self.DOCUMENTED_FIELDS:
             self.assertIn(f"``{field}``", doc, f"/health field {field} undocumented")
+
+    async def test_health_reports_the_secret_scope_it_resolves_keys_in(self) -> None:
+        """R5b: `vendors` beside an empty `vendor_keys_cached` reads like "no
+        key configured yet". This field is what tells those two apart from
+        "this daemon's scope cannot see any key you configure"."""
+        body = await (await self.client.get("/health")).json()
+        scope = body["secret_scope"]
+        self.assertEqual(set(scope), {"project", "resolvable", "reason"})
+        # Unprobed is `null`, NOT `false`: a probe that has not run is not
+        # evidence of absence.
+        self.assertIsNone(scope["resolvable"])
+
+    async def test_health_never_probes_the_scope_itself(self) -> None:
+        """The verdict is produced at startup and refreshed on a key miss. A
+        liveness route that could reach the hub can hang when the hub is
+        down — the thing /health exists not to do."""
+        gateway = self.client.app[APP_KEY]
+        probed: list[str] = []
+        gateway.keys._scope_prober = lambda arg: probed.append(arg) or "id"
+
+        await self.client.get("/health")
+
+        self.assertEqual(probed, [])
 
     async def test_health_answers_while_the_secret_resolver_is_wedged(self) -> None:
         """Gotcha 4: a short-timeout probe must not break its own pipe."""
@@ -746,7 +789,9 @@ class CatalogSurfaceTests(GatewayTestBase):
         ids = [row["id"] for row in body["data"]]
         self.assertIn("claude-opus-5", ids)
         self.assertIn("claude-gw/glm-5.3[1m]", ids)
-        self.assertIn("claude-gw/glm-5.1", ids)
+        # Withheld by the default ``latest`` filter, and named as withheld
+        # rather than dropped: a short picker must still have an answer.
+        self.assertIn("claude-gw/glm-5.1", body["_vct_catalog_hidden"])
 
     async def test_every_advertised_id_survives_client_side_discovery(self) -> None:
         """Claude Code keeps only ids containing claude/anthropic; an entry
@@ -777,7 +822,12 @@ class CatalogSurfaceTests(GatewayTestBase):
         forwarded = {
             json.loads(r["body"])["model"] for r in self.vendor_up.message_requests
         }
-        self.assertEqual(forwarded, {"glm-5.3", "glm-5.1", "glm-4.5-air"})
+        # ``glm-5.1`` is not posted because the picker never showed it — the
+        # loop above walks ``body["data"]``. It is still SELECTABLE by name,
+        # which is what the hidden list promises, so it is asserted there
+        # rather than dropped from the test.
+        self.assertEqual(forwarded, {"glm-5.3", "glm-4.5-air"})
+        self.assertIn("claude-gw/glm-5.1", body["_vct_catalog_hidden"])
 
     async def test_static_fallback_is_marked_never_silent(self) -> None:
         self.anthropic_up.models_payload = None

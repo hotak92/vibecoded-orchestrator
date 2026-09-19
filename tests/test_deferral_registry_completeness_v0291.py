@@ -34,6 +34,8 @@ import re
 import unittest
 from pathlib import Path
 
+from tests.common.rust_source import cfg_test_line_numbers
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Directories the scan never walks: tests (fixtures deliberately use fake cids),
@@ -216,6 +218,31 @@ _V0293_OWNED_ADDITIONS = frozenset({
     "update_install_phase_failed",
 })
 
+# v0.2.95 (R1): the rendered-file reconcile record. The EMITTER is install.py's
+# own renderer step, adding the row to THIS run's report, so owned-drop-when-
+# absent is family A proper (nothing is written behind finalize's back). Its
+# re-detection input is the launcher's hand-off state file, which the emit
+# CONSUMES — so the next --update genuinely does not re-detect it and finalize
+# drops it. That one-shot expiry is the whole lifecycle: the row records a
+# completed action (tracked blob advanced to upstream, local rendered copy kept,
+# AUTO block re-rendered) and must not need a human to disappear.
+#
+# WP-2's detector is the other v0.2.95 addition, and it is family A on the
+# `vco_lib_shadowed_by_venv_copy` / `npx_missing_mcp_unspawnable` precedents
+# directly: the doctor phase emits it from INSIDE the install.py run, into that
+# run's own report (sink=), never behind finalize's back. Ownership is what
+# makes its clear route REAL rather than documented — the state it reports is
+# "install-manifest.json attests a source this install's `.claude/` bundle
+# manifest does not corroborate", and an `install.py --update` rewrites BOTH
+# records from the one tree (bundle at step 5b, manifest at the end) BEFORE the
+# doctor phase re-probes. So the run that fixes it is the run that drops it,
+# with no dismissal. `action_required` rather than record-class: something is
+# genuinely owed until that run happens.
+_V0295_OWNED_ADDITIONS = frozenset({
+    "rendered_file_upstream_changed",
+    "install_manifest_attests_uninstalled_source",
+})
+
 
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
@@ -260,21 +287,40 @@ def scan_emitted_condition_ids() -> dict:
 
     for rel, path in _iter_source_files({".rs"}):
         text = path.read_text(encoding="utf-8", errors="replace")
-        # Everything from the first `#[cfg(test)]` is test scaffolding whose
-        # fixture cids are intentionally fake.
-        cut = text.find("#[cfg(test)]")
-        if cut != -1:
-            text = text[:cut]
+        # `#[cfg(test)]` items are scaffolding whose fixture cids are
+        # intentionally fake, so their lines are excluded.
+        #
+        # PER-ITEM, not tail-of-file. This used to do
+        # `text = text[: text.find("#[cfg(test)]")]`, which assumed every test
+        # item sits at the END of its file and blinded the scanner to every
+        # production emitter after the FIRST one. v0.2.95 turned that
+        # assumption into a false red: a `#[cfg(test)]` helper was added near
+        # the top of `git_user_editable_merge.rs` (line ~1054) and the
+        # `launcher_update_diverged` emitter at ~4115 — untouched, still very
+        # much production — vanished from the scan.
+        #
+        # `cfg_test_line_numbers` is the ONE span algorithm for this question
+        # (`tests/common/rust_source.py`), already used by
+        # `test_deferral_command_argparse_sweep._scan_lines`, whose own comment
+        # records this same bug class as the v0.2.90 lesson. Reused rather than
+        # reimplemented — a second answer to "where does the test code stop" is
+        # how the two got to disagree in the first place.
+        skip_lines = cfg_test_line_numbers(text)
+
+        def _emit(val: str, start: int, _rel=rel, _text=text, _skip=skip_lines) -> None:
+            line = _text[:start].count("\n") + 1
+            if line in _skip:
+                return
+            add(val, f"{_rel}:{line}")
+
         consts = {m.group("name"): m.group("val") for m in _RS_CONST.finditer(text)}
         for pattern in (_RS_LITERAL, _RS_EMIT_DEFERRAL, _RS_MD_SECTION):
             for m in pattern.finditer(text):
-                line = text[: m.start()].count("\n") + 1
-                add(m.group("val"), f"{rel}:{line}")
+                _emit(m.group("val"), m.start())
         for m in _RS_NAME.finditer(text):
             name = m.group("name")
             if name in consts:
-                line = text[: m.start()].count("\n") + 1
-                add(consts[name], f"{rel}:{line}")
+                _emit(consts[name], m.start())
 
     return found
 
@@ -519,7 +565,10 @@ class TestOwnershipMigrationPin(unittest.TestCase):
         added = self.owned - _V0290_OWNED_IDS
         self.assertEqual(
             added,
-            _V0291_OWNED_ADDITIONS | _V0292_OWNED_ADDITIONS | _V0293_OWNED_ADDITIONS,
+            _V0291_OWNED_ADDITIONS
+            | _V0292_OWNED_ADDITIONS
+            | _V0293_OWNED_ADDITIONS
+            | _V0295_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

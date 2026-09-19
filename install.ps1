@@ -13,6 +13,15 @@
     — install.py needs Python to run. A standalone bootstrap binary
     (Rust/Go) and an `uv` (Astral) bootstrap are tracked for v1.1. For v1.0
     the lightest touch is a wrapper that leans on winget.
+
+    What you get at the end (v0.2.95 WP-8 — previously undocumented here):
+    after install.py exits 0 this script runs scripts\post-install-launcher.ps1,
+    which refreshes the Desktop + Start Menu shortcuts and then opens the
+    launcher GUI. Pass -NoAutoLaunch to keep the shortcuts but skip the GUI
+    spawn, or -NoDesktopIcon / VCT_NO_DESKTOP_ICON=1 to decline the shortcuts.
+    (The POSIX sibling install.sh deliberately does NOT open the GUI: it is
+    the CLI/automation entry point. first-install.bat is the Windows
+    double-click path and forwards here.)
 .PARAMETER NoContainers
     Skip Docker/Podman service setup
 .PARAMETER Gpu
@@ -44,6 +53,13 @@
     modules will be ~50-200ms slower; useful for dev/CI runs.
 .PARAMETER NonInteractive
     Refuse to auto-install Python; fail with a hint instead.
+.PARAMETER NoAutoLaunch
+    Skip the post-install launcher GUI spawn. The Desktop / Start Menu
+    shortcuts are still created — declining the window is not declining the
+    icon (see -NoDesktopIcon for that).
+.PARAMETER NoDesktopIcon
+    Skip desktop + Start Menu shortcut creation. Equivalent to
+    VCT_NO_DESKTOP_ICON=1.
 .PARAMETER Help
     Print usage and exit 0 with no side effects. Also accepted in
     .bat-forwarded form: --help / -h / /help / /? (see the $args walk).
@@ -258,18 +274,22 @@ if ($IsWindows -or $env:OS -eq 'Windows_NT') {
 # Python detection
 # ---------------------------------------------------------------------------
 function Find-Python {
-    # CROSS-LANGUAGE PARITY (v0.2.53 NEW-3): this candidate list is a MIRROR —
-    # it must stay identical, in order, to the other two bootstrap Python
-    # probes:
+    # CROSS-LANGUAGE PARITY (v0.2.53 NEW-3; sibling list corrected v0.2.95
+    # WP-7): this candidate list is a MIRROR — it must stay identical, in
+    # order, to the other FOUR bootstrap Python probes:
     #   * install.sh   -> find_python `for cmd in ...`
+    #   * first-install.sh      -> its `for cand in ...` cascade (bare names)
+    #   * first-install.command -> its `for cand in ...` cascade (bare names)
     #   * launcher/src-tauri/src/commands/installer.rs -> detect_python POSIX
     #     `else { vec![...] }` branch
-    # The mirror is deliberate (C-tier, justified): these run at bootstrap on a
-    # fresh machine with NO jq / interpreter / launcher available, so a shared
-    # data file cannot be safely parsed here. The drift is locked by
-    # tests/test_python_candidate_parity.py (extracts all three literal lists,
-    # asserts sh == ps1 == rs for the POSIX list). Edit all three + keep that
-    # test green when this list changes.
+    # (The two first-install.* shims may add ABSOLUTE Homebrew/Linuxbrew
+    # paths; their bare names must match this list exactly.)
+    # A .ps1 cannot source the .sh, so this stays a mirror — deliberate and
+    # C-tier-justified: these run at bootstrap on a fresh machine with NO jq /
+    # interpreter / launcher available, so a shared data file cannot be safely
+    # parsed here. The drift is locked by tests/test_python_candidate_parity.py
+    # (sh == ps1 == rs) plus tests/test_v0295_wp7_bootstrap_cascade_parity.py
+    # (adds both shims). Edit all five + keep those green.
     $candidates = @("python3.13", "python3.12", "python3.11", "python3", "python")
     foreach ($cmd in $candidates) {
         $found = Get-Command $cmd -ErrorAction SilentlyContinue

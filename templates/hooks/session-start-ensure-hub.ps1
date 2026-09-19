@@ -4,7 +4,14 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
-# SessionStart hook: ensure vct-hub is running (Step 9, v0.2.21).
+# SessionStart hook: ensure VCO's detached services are running -- vct-hub
+# (Step 9, v0.2.21) and, since v0.2.95, a model gateway the user REGISTERED for
+# autostart plus the launcher GUI (tray-only, ruling R2). One hook for all
+# three, per ruling R20 ("one ensure mechanism, not a second"); the file name
+# predates the other two services and is kept because renaming a shipped hook
+# churns every project's manifest for nothing. `.vscode/tasks.json` runs this
+# same file on VS Code's `folderOpen`, which is what makes "auto-start when VS
+# Code starts" true without a Claude Code session.
 # PowerShell port of session-start-ensure-hub.sh — same semantics.
 #
 # Idempotent: `python -m vco_lib.hub_ensure ensure` leaves a live hub alone
@@ -129,17 +136,97 @@ if (-not $HubRes) {
         Remove-Item $HubErr -Force -ErrorAction SilentlyContinue
     }
     Write-Output "session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$HubRc): $HubWhy; skipping"
-    exit 0
 }
-
-# Soft-fail contract: the module exits 3 (no binary) / 4 (spawn failed) LOUDLY
-# with a named reason; the hook reports it once and still exits 0, because a
-# SessionStart hook must never block Claude Code from starting.
-if ($HubRc -ne 0) {
+elseif ($HubRc -ne 0) {
+    # Soft-fail contract: the module exits 3 (no binary) / 4 (spawn failed)
+    # LOUDLY with a named reason; the hook reports it once and still exits 0,
+    # because a SessionStart hook must never block Claude Code from starting.
     Write-Output "[vct] $($HubRes.reason)"
-    exit 0
+}
+else {
+    $HubWhat = if ($HubRes.binary) { $HubRes.binary } else { "pid $($HubRes.pid)" }
+    Write-Debug-Line "vct-hub $($HubRes.state): $HubWhat"
 }
 
-$HubWhat = if ($HubRes.binary) { $HubRes.binary } else { "pid $($HubRes.pid)" }
-Write-Debug-Line "vct-hub $($HubRes.state): $HubWhat"
+# ---------------------------------------------------------------------------
+# Model gateway (v0.2.95, R5c) -- ensure a REGISTERED gateway is running.
+#
+# Here rather than in a hook of its own, per ruling R20: one ensure mechanism
+# per session, not two registrations, two settings-template entries and two
+# copies of the update gate above. The file KEEPS its name -- renaming a
+# shipped hook churns every project's manifest and the retirement registry for
+# a cosmetic gain -- so read it as "ensure VCO's detached services", of which
+# the hub is the first and the gateway the second.
+#
+# It runs even when the hub leg failed, and that is deliberate: the gateway
+# starts fine without the hub (vendor-key resolution is lazy and retried), so
+# making its availability depend on the hub's would be an invented dependency.
+#
+# `vco_lib.gateway_ensure` decides everything; this leg is a call and a report.
+# On Windows the registration is a Scheduled Task and the start is
+# `schtasks /Run`, which the task's own MultipleInstancesPolicy=IgnoreNew makes
+# safe to issue while one is already running. "not_registered" is the default
+# and a silent success: autostart is opt-in and NOTHING here registers it.
+# ---------------------------------------------------------------------------
+$GwFolder = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+$GwArgs = @("-m", "vco_lib.gateway_ensure", "ensure", "--json", "--folder", $GwFolder)
+$GwRes = $null
+$GwRc = $null
+$GwErr = [System.IO.Path]::GetTempFileName()
+try {
+    $GwJson = & $RunPy @GwArgs 2>$GwErr
+    $GwRc = $LASTEXITCODE
+    if ($GwRc -in 0, 3, 4) { $GwRes = ($GwJson | Out-String) | ConvertFrom-Json }
+} catch { $GwRes = $null }
+if (-not $GwRes) {
+    $GwWhy = ""
+    if (Test-Path $GwErr) {
+        $GwWhy = ((Get-Content $GwErr -Tail 3 -ErrorAction SilentlyContinue) -join " ").Trim()
+    }
+    Write-Output "session-start-ensure-hub: vco_lib.gateway_ensure failed (rc=$GwRc): $GwWhy; skipping"
+}
+else {
+    if ($GwRc -ne 0) { Write-Output "[vct] $($GwRes.reason)" }
+    Write-Debug-Line "model-gateway $($GwRes.state): $($GwRes.reason)"
+}
+if (Test-Path $GwErr) { Remove-Item $GwErr -Force -ErrorAction SilentlyContinue }
+
+# ---------------------------------------------------------------------------
+# Launcher GUI (v0.2.95, R2) -- ensure it is running, TRAY ONLY.
+#
+# Parity with the .sh sibling; see its comment for the full rationale. The
+# ruling is "the launcher and the hub must auto-start when VS Code starts",
+# and this file is already wired to that event twice (Claude Code SessionStart
+# + `.vscode/tasks.json` on `folderOpen`), which a login-time boot
+# registration is not.
+#
+# Windows specifics of the same guarantees: the spawn passes `--start-hidden`,
+# which the launcher applies to its window config before `CreateWindowEx`, so
+# no window is created and none is given SW_SHOW / SetForegroundWindow -- the
+# taskbar never flashes. "Is it running" is `tasklist /FI IMAGENAME eq
+# vct-launcher.exe`, and the single-instance plugin refuses a duplicate that
+# races the probe. No launcher binary on the machine is a silent success.
+# ---------------------------------------------------------------------------
+$GuiArgs = @("-m", "vco_lib.launcher_ensure", "ensure", "--json", "--repo-root", $RepoRoot)
+$GuiRes = $null
+$GuiRc = $null
+$GuiErr = [System.IO.Path]::GetTempFileName()
+try {
+    $GuiJson = & $RunPy @GuiArgs 2>$GuiErr
+    $GuiRc = $LASTEXITCODE
+    if ($GuiRc -in 0, 3, 4) { $GuiRes = ($GuiJson | Out-String) | ConvertFrom-Json }
+} catch { $GuiRes = $null }
+if (-not $GuiRes) {
+    $GuiWhy = ""
+    if (Test-Path $GuiErr) {
+        $GuiWhy = ((Get-Content $GuiErr -Tail 3 -ErrorAction SilentlyContinue) -join " ").Trim()
+    }
+    Write-Output "session-start-ensure-hub: vco_lib.launcher_ensure failed (rc=$GuiRc): $GuiWhy; skipping"
+}
+else {
+    if ($GuiRc -ne 0) { Write-Output "[vct] $($GuiRes.reason)" }
+    Write-Debug-Line "launcher $($GuiRes.state): $($GuiRes.reason)"
+}
+if (Test-Path $GuiErr) { Remove-Item $GuiErr -Force -ErrorAction SilentlyContinue }
+
 exit 0

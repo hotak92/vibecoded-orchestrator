@@ -106,42 +106,6 @@ pub(crate) async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Like [`run_git`] but on FAILURE returns the COMBINED stdout+stderr (and
-/// forces `LC_ALL=C` so git emits C-locale English wording).
-///
-/// v0.2.71 (BLOCKER-1): git writes `CONFLICT (...)` lines to STDOUT, not
-/// stderr, so the plain stderr-only error made `is_merge_conflict` silently
-/// miss a real merge conflict — the pull error looked generic and dead-ended
-/// at a raw toast while leaving `.git/MERGE_HEAD` on disk. This helper feeds
-/// the shared `is_pull_conflict` classifier BOTH streams. The `LC_ALL=C` pin
-/// matches the classifier's English-substring assumption (LOW-4).
-///
-/// Success return is identical to [`run_git`] (trimmed stdout).
-pub(crate) async fn run_git_combined(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = TokioCommand::new("git")
-        .silent()
-        .args(args)
-        .env("LC_ALL", "C")
-        .current_dir(repo)
-        .output();
-    let output = tokio::time::timeout(GIT_TIMEOUT, fut)
-        .await
-        .map_err(|_| format!("git {} timed out", args.join(" ")))?
-        .map_err(|e| format!("git {} failed: {}", args.join(" "), e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "git {}: {}\n{}",
-            args.join(" "),
-            stderr.trim(),
-            stdout.trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// Spawn git and hand back the RAW [`std::process::Output`].
 ///
 /// Contract deliberately differs from [`run_git`]: `Err` is a SPAWN failure

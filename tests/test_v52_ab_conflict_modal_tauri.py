@@ -127,10 +127,20 @@ class RustTauriCommandsTests(unittest.TestCase):
             self.installer,
             "missing shared helper resolve_conflict_and_resume",
         )
+        # v0.2.95 ship-gate MAJOR-3: the delegation target is now the
+        # claim-receiving half. Both one-click commands take the shared
+        # orchestrator-clone single-flight claim before their
+        # `git checkout --ours|--theirs` + commit, and HAND IT DOWN to the
+        # resume tail — calling the claim-TAKING `resume_orchestrator_update`
+        # here would refuse against the claim the caller already holds.
+        # The guarantee this test exists for (a successful resolution always
+        # reaches the resume tail, so install.py is guaranteed to run) is
+        # unchanged; only the callee's name moved.
         self.assertIn(
-            "resume_orchestrator_update(app, path, window).await",
+            "resume_orchestrator_update_with_claim(app, path, window, flight).await",
             self.installer,
-            "resolve_conflict_and_resume must delegate to resume_orchestrator_update",
+            "resolve_conflict_and_resume must delegate to the resume tail "
+            "(`resume_orchestrator_update_with_claim`)",
         )
 
         # Both public commands must call resolve_conflict_and_resume.

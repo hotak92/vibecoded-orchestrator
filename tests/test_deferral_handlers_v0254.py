@@ -281,135 +281,124 @@ class TestGeneratedFilesReconciledSelfClears(unittest.TestCase):
 
 
 class TestHubRestartFailedAfterAbortReprobe(unittest.TestCase):
-    """v0.2.89: `hub_restart_failed_after_abort` is an ACTIONABLE failure
-    record (the abort-path hub restart's health poll failed). It self-clears
-    ONLY once the on-disk hub sidecar version >= source (Step 8 refreshed the
-    hub binary) AND the live /health probe confirms the hub is UP (MAJOR-2 — a
-    caught-up binary is not proof the hub is running; Step 8 is soft-fail).
-    Otherwise the actionable failure survives to the next run. Re-probe
-    discipline: act only on a confirmed premise change."""
+    """v0.2.95 F1 REWRITE. The v0.2.89 contract ("sidecar version >= source
+    AND live /health") lived in a hand-written install.py branch that ran
+    BEFORE the hub-restart step of the same update — so it could never see
+    the hub it had just restarted, and the row was immortal (the 0.2.94
+    dogfood). The branch is GONE (arch review §7: collapse the duplicate
+    deciders); the lifecycle is now the STATE-keyed registry probe
+    `hub_back_after_restart_failure` declared in deferral_conditions.toml —
+    "does the hub answer /api/v1/health on the resolved port?" — settled by
+    the generic probe-first dispatch wherever a re-probe pass runs. The
+    version AND was dropped deliberately: the entry records a HEALTH failure
+    ("did not come back within 30 s"), so a hub that is up NOW is the
+    premise changing, whatever version it runs (R26: state-keyed, never
+    "this release fixed it").
 
-    def test_resolved_when_hub_caught_up_and_healthy(self):
+    Hermeticity: the hub here is a local http.server on an ephemeral port,
+    pinned via VCT_HUB_PORT (the ONE resolution chain). The old tests mocked
+    `install._probe_vct_hub_health`, which no longer exists as a dispatch
+    point — the probe lives in vco_lib.deferral_probes and consults neither
+    install.py nor the machine's real port when VCT_HUB_PORT is pinned.
+    """
+
+    CID = "hub_restart_failed_after_abort"
+
+    def test_hub_up_clears_through_the_registry_probe(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 — http.server API
+                body = json.dumps({"status": "ok"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):  # noqa: A002 — base API name
+                pass
+
         with TemporaryDirectory() as td:
             folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, "0.2.89")
-            with mock.patch.object(
-                install, "_read_launcher_version", return_value="0.2.89"
-            ), mock.patch.object(
-                install, "_probe_vct_hub_health", return_value=True
-            ):
-                result = _apply(folder)
-            self.assertNotIn("hub_restart_failed_after_abort", _cids(result),
-                             "on-disk hub >= source AND /health live = hub "
-                             "refreshed + up = failure resolved")
+            _persist(folder, _entry(self.CID))
+            server = HTTPServer(("127.0.0.1", 0), _Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.dict(
+                    os.environ, {"VCT_HUB_PORT": str(server.server_address[1])}
+                ):
+                    result = _apply(folder)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            self.assertNotIn(
+                self.CID, _cids(result),
+                "hub answering /health = the recorded failure is over")
+            trail = folder / ".claude" / "logs" / "auto-resolutions.jsonl"
+            self.assertTrue(trail.is_file(), "a clear must leave a B-F9 trail")
+            rows = [json.loads(ln) for ln in
+                    trail.read_text(encoding="utf-8").splitlines() if ln]
+            self.assertTrue(any(
+                r.get("condition_id") == self.CID
+                and r.get("action") == "resolved_by_registry_probe"
+                for r in rows))
 
-    def test_resolved_when_hub_ahead_of_source_and_healthy(self):
-        # >= not == : a hub sidecar ahead of source is still resolved (when up).
+    def test_hub_down_keeps_the_actionable_failure(self):
+        """Nothing answering on the resolved port is exactly the state the
+        entry records — PRESERVE it."""
+        import socket
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
         with TemporaryDirectory() as td:
             folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, "0.2.90")
-            with mock.patch.object(
-                install, "_read_launcher_version", return_value="0.2.89"
-            ), mock.patch.object(
-                install, "_probe_vct_hub_health", return_value=True
-            ):
+            _persist(folder, _entry(self.CID))
+            with mock.patch.dict(os.environ, {"VCT_HUB_PORT": str(port)}):
                 result = _apply(folder)
-            self.assertNotIn("hub_restart_failed_after_abort", _cids(result))
+            self.assertIn(
+                self.CID, _cids(result),
+                "hub down = the failure stands; only positive evidence clears")
 
-    def test_preserved_when_version_caught_up_but_health_fails(self):
-        """MAJOR-2: version caught up BUT the live /health probe fails → the hub
-        binary was refreshed yet the hub is NOT up (Step 8 soft-failed). This is
-        exactly the 'hub down' state the entry records — PRESERVE it; clearing
-        on version alone would wrongly delete an actionable failure."""
+    def test_unresolvable_port_keeps_the_entry(self):
+        """Could-not-look is not a verdict: the probe must decline (None),
+        never clear on an unanswerable question."""
+        from vco_lib import access_resolver
+
+        def _boom():
+            raise RuntimeError("no port in this universe")
+
         with TemporaryDirectory() as td:
             folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, "0.2.89")
-            with mock.patch.object(
-                install, "_read_launcher_version", return_value="0.2.89"
-            ), mock.patch.object(
-                install, "_probe_vct_hub_health", return_value=False
-            ):
+            _persist(folder, _entry(self.CID))
+            with mock.patch.object(access_resolver, "_hub_port", _boom):
                 result = _apply(folder)
-            self.assertIn("hub_restart_failed_after_abort", _cids(result),
-                          "version caught up but hub down = keep the actionable "
-                          "failure record (MAJOR-2)")
-
-    def test_preserved_when_hub_behind_source(self):
-        """The actionable-failure-survives leg: on-disk hub < source means the
-        hub has NOT caught up, so the abort-time restart failure stands. The
-        health probe is not even consulted (version gate fails first), but a
-        stubbed-live probe must NOT rescue a behind-version hub."""
-        with TemporaryDirectory() as td:
-            folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, "0.2.60")
-            with mock.patch.object(
-                install, "_read_launcher_version", return_value="0.2.89"
-            ), mock.patch.object(
-                install, "_probe_vct_hub_health", return_value=True
-            ):
-                result = _apply(folder)
-            self.assertIn("hub_restart_failed_after_abort", _cids(result),
-                          "hub behind source = not caught up = keep the "
-                          "actionable failure record (even if /health is live)")
-
-    def test_preserved_when_sidecar_missing(self):
-        """Missing hub sidecar → cannot POSITIVELY confirm the hub caught up →
-        conservatively preserve (unlike launcher_update_diverged, which treats
-        an absent hub sidecar as OK; THIS cid is specifically about the hub)."""
-        with TemporaryDirectory() as td:
-            folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, None)  # sidecar intentionally absent
-            with mock.patch.object(
-                install, "_read_launcher_version", return_value="0.2.89"
-            ), mock.patch.object(
-                install, "_probe_vct_hub_health", return_value=True
-            ):
-                result = _apply(folder)
-            self.assertIn("hub_restart_failed_after_abort", _cids(result),
-                          "absent sidecar = unconfirmed = keep")
-
-    def test_preserved_on_probe_exception(self):
-        """Any exception during the version re-probe must preserve (never
-        wrongly clear an actionable failure)."""
-        with TemporaryDirectory() as td:
-            folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, "0.2.89")
-            with mock.patch.object(
-                install, "_read_launcher_version",
-                side_effect=RuntimeError("boom"),
-            ):
-                result = _apply(folder)
-            self.assertIn("hub_restart_failed_after_abort", _cids(result),
+            self.assertIn(self.CID, _cids(result),
                           "probe failure must NOT clear the entry")
 
-    def test_preserved_when_health_probe_raises(self):
-        """MAJOR-2: if the live /health probe itself RAISES (rather than
-        returning False), the handler must still PRESERVE — never wrongly clear
-        on an unconfirmable health state."""
-        with TemporaryDirectory() as td:
-            folder = Path(td)
-            _persist(folder, _entry("hub_restart_failed_after_abort"))
-            _write_hub_sidecar(folder, "0.2.89")
-            with mock.patch.object(
-                install, "_read_launcher_version", return_value="0.2.89"
-            ), mock.patch.object(
-                install, "_probe_vct_hub_health",
-                side_effect=RuntimeError("probe boom"),
-            ):
-                result = _apply(folder)
-            self.assertIn("hub_restart_failed_after_abort", _cids(result),
-                          "a raising health probe = unconfirmed = keep")
+    def test_the_hand_written_branch_is_gone_and_the_probe_declared(self):
+        """The old branch is unreachable by construction (probe-first
+        dispatch) and its clear condition could never fire in-run; pin that
+        it was COLLAPSED into the declared probe, not kept as dead code."""
+        from vco_lib import deferral_probes
+
+        src = (Path(__file__).resolve().parent.parent
+               / "install.py").read_text(encoding="utf-8")
+        self.assertNotIn(f'elif cid == "{self.CID}":', src)
+        self.assertEqual(
+            deferral_probes.registry_probe_name(self.CID),
+            "hub_back_after_restart_failure",
+        )
 
     def test_foreign_cid_not_in_owned_set(self):
         """FOREIGN (Rust-emitted): must NOT be in _INSTALL_OWNED_CONDITION_IDS
-        (else the A-2 data-loss clobber). It self-clears via the re-probe
-        mark_resolved leg, same as launcher_update_diverged."""
+        (else the A-2 data-loss clobber). It clears via the registry probe's
+        mark_resolved leg, same as before."""
         self.assertNotIn(
             "hub_restart_failed_after_abort",
             install._INSTALL_OWNED_CONDITION_IDS,

@@ -72,7 +72,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -316,12 +316,22 @@ from vco_lib.kg_truncation_tags import truncation_tag_properties  # noqa: E402 -
 # resolve it through the same helper, so a scan cannot target a slot the sync
 # never populated — the divergence that left the duplicate scanner querying no
 # slot at all on multi-vector collections.
-from vco_lib.kg_vector_slot import active_text_vector_slot  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
+from vco_lib.kg_vector_slot import active_text_vector_slot, collection_vector_slots  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
 # v0.2.92 WP-B1 (D13): the canonical file_path shape helper. `to_posix_rel`
 # is pure + dependency-free (see its docstring); importing it loudly here
 # (never an inline copy) because every Weaviate write below must store ONE
 # shape so delete-by-file_path upserts stay idempotent across OSes.
 from vco_lib.paths import to_posix_rel  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
+# v0.2.95: the embed-skip path's METADATA repair. The decision (which stored
+# properties are stale, and may they be judged at all) is pure and lives in
+# vco_lib next to the code graph's SKIP/STAMP/EMBED classifier whose
+# vocabulary it reuses; only the `data.update` call stays here.
+from vco_lib.kg_metadata_repair import (  # noqa: E402 — same import-order constraint as the group above
+    REPAIRABLE_PROPERTIES,
+    RowAction as _MetadataRowAction,
+    apply_metadata_repair,
+    plan_metadata_repair,
+)
 
 # Try to import query logger.
 #
@@ -505,8 +515,13 @@ def _plan_for(server, content: str, *, source_id: str = "",
 #: that a boundary change is pending repair — no new app_state key or
 #: kg_syncs column is needed: the ledger already carries exactly this
 #: "crossing detected, remedy owed" state, and it is what the user is told
-#: to act on. It clears through its existing lifecycle (next update
-#: reconcile), at which point the comparison stops being paid.
+#: to act on. v0.2.95 F1: that lifecycle now EXISTS — the entry's own
+#: promise ("self-resolves on the next bundle update") was unimplemented, so
+#: this comparison was in fact paid forever. Both halves of the remedy stamp
+#: `.claude/state/chunker-resync.json` (`_record_chunker_resync_kg_half` here;
+#: `analyze_code_graph.py` for the code graph) and the registry probe
+#: `chunker_resync_still_owed` retires the row once both name the current
+#: revision — at which point the comparison stops being paid, as intended.
 _CHUNKER_RESYNC_CID = "chunker_preset_overhaul_pending"
 
 #: Lazily-filled per-process cache of the ledger probe (the ledger does not
@@ -516,6 +531,16 @@ _resync_pending_cache: "Optional[bool]" = None
 #: Run-level count of entries re-embedded ONLY because their stored chunk
 #: plan predates the current chunker revision (mirrors _SHARED_ROUTED_COUNT).
 _RECHUNKED_COUNT = 0
+
+#: v0.2.95: run-level count of NODES whose stored metadata was patched on the
+#: embed-skip path (text unchanged, properties stale — see
+#: `_repair_stale_metadata`). Zero embeds are attributable to these.
+_METADATA_REPAIRED_COUNT = 0
+
+#: v0.2.95: run-level count of nodes whose metadata repair could NOT complete.
+#: Separate from the success counter on purpose — a repair that failed is owed
+#: work, and a soft-fail that never reaches the run report is a silent one.
+_METADATA_REPAIR_FAILED_COUNT = 0
 
 
 def _chunker_resync_pending() -> bool:
@@ -1254,12 +1279,113 @@ def _update_frontmatter_timestamp(file_path: Path, content: str) -> str:
     return new_content
 
 
-def parse_frontmatter(content: str) -> Tuple[Optional[Dict], str]:
+def _split_tags_string(raw: str) -> List[str]:
+    """Split a ``tags:`` value given as a STRING into a list of tag tokens.
+
+    ``"a, b c"`` → ``["a", "b", "c"]``; a ``#``-prefixed token loses the
+    ``#``; an empty/whitespace-only string → ``[]``. Order preserved,
+    duplicates dropped (the inline-harvest path dedupes the same way).
     """
-    Parse YAML frontmatter from markdown content.
+    tags: List[str] = []
+    for token in re.split(r'[,\s]+', raw.strip()):
+        token = token.lstrip('#').strip()
+        if token and token not in tags:
+            tags.append(token)
+    return tags
+
+
+def _normalise_frontmatter(fm: Any, file_label: Optional[str] = None) -> Any:
+    """Normalise parsed frontmatter so every consumer sees ONE shape.
+
+    Two frontmatter dialects exist in the wild. The canonical one (all
+    shipped templates) keeps every key at the top level::
+
+        title: … / type: … / tags: […] / created: … / updated: … / status: …
+
+    The nested one — written by agents copying the Claude Code skill/memory
+    frontmatter contract — tucks the node keys under a ``metadata:`` mapping
+    and names the node with ``name:`` instead of ``title:``::
+
+        ---
+        name: artup-pay-payment-orchestration
+        description: …
+        metadata:
+          type: concept
+          tags: [Acme, Acme-PAY, payments]
+        ---
+
+    Before v0.2.95 the parser read the top level only, so a nested-dialect
+    node silently lost its tags/type — and the inline ``#tag`` body harvest
+    then scraped issue references like ``#4`` out of the prose as tags,
+    while the folder name ("concepts") became the node type. Three
+    normalisations applied here, so EVERY consumer of
+    :func:`parse_frontmatter` sees one shape:
+
+    1. ``metadata:`` mapping → each of its keys is promoted to the top
+       level ONLY where the top level does not already declare that key
+       (top level always wins). Promotion is generic — it covers every key
+       the parse path reads at the top level (``title``/``name``, ``tags``,
+       ``type``, ``created``, ``updated``, ``status``, ``valid_from``,
+       ``valid_until``, ``external_links``, ``scope``) and anything added
+       later.
+    2. ``name:`` → used as ``title:`` when ``title:`` is absent. It slots
+       ABOVE the first ``# H1`` in the title precedence — ``name:`` is
+       explicit frontmatter metadata, and declared frontmatter beats
+       body-derived values everywhere else in this parser (tags, type); an
+       H1 in a skill-dialect file is often a directive heading, not the
+       node's name. Full precedence: ``title:`` > ``name:`` > first
+       ``# H1`` > filename stem.
+    3. ``tags:`` given as a string → split into a list
+       (:func:`_split_tags_string`); list values pass through unchanged.
+
+    When the nested dialect was promoted and ``file_label`` is given, one
+    line naming the file is printed to stdout, so a bulk resync shows how
+    many nodes came from the foreign dialect.
+    """
+    if not isinstance(fm, dict):
+        return fm
+
+    nested = fm.get('metadata')
+    if isinstance(nested, dict):
+        promoted = [key for key in nested if key not in fm]
+        for key in promoted:
+            fm[key] = nested[key]
+        if promoted and file_label:
+            print(
+                f"  ↳ frontmatter: promoted nested `metadata:` keys "
+                f"({', '.join(promoted)}) for '{file_label}'"
+            )
+
+    if 'title' not in fm:
+        name = fm.get('name')
+        if isinstance(name, str) and name.strip():
+            fm['title'] = name.strip()
+
+    raw_tags = fm.get('tags')
+    if isinstance(raw_tags, str):
+        fm['tags'] = _split_tags_string(raw_tags)
+
+    return fm
+
+
+def parse_frontmatter(
+    content: str, file_label: Optional[str] = None
+) -> Tuple[Optional[Dict], str]:
+    """
+    Parse YAML frontmatter from markdown content, normalised to ONE shape
+    (see :func:`_normalise_frontmatter`).
+
+    A frontmatter block that exists but is empty or fails YAML parsing
+    yields an EMPTY mapping, not ``None``: an existing block DECLARES
+    frontmatter (so consumers such as the tag harvester must not fall back
+    to body scraping), and every existing consumer already treats ``{}``
+    like the old ``None`` (truthiness checks / ``fm or {}``). ``None`` is
+    returned only when there is no frontmatter block at all.
 
     Args:
         content: Markdown file content
+        file_label: Optional file name used to attribute the nested-dialect
+            promotion note on stdout.
 
     Returns:
         Tuple of (frontmatter_dict, content_without_frontmatter)
@@ -1273,10 +1399,13 @@ def parse_frontmatter(content: str) -> Tuple[Optional[Dict], str]:
 
     try:
         frontmatter = yaml.safe_load(parts[1])
-        content_without_fm = parts[2].strip()
-        return frontmatter, content_without_fm
     except yaml.YAMLError:
-        return None, content
+        frontmatter = None
+    if frontmatter is None:
+        # Empty block (`---` `---`) or malformed YAML — a block EXISTS.
+        frontmatter = {}
+    content_without_fm = parts[2].strip()
+    return _normalise_frontmatter(frontmatter, file_label), content_without_fm
 
 
 # Node types shipped with every project. The vocabulary is deliberately OPEN:
@@ -1459,12 +1588,17 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     Returns:
         Dictionary with node data (title, tags, links, etc.)
     """
-    # Parse YAML frontmatter (if present)
-    frontmatter, content_body = parse_frontmatter(content)
+    # Parse YAML frontmatter (if present), normalised to one shape (nested
+    # `metadata:` dialect promoted, `name:` → title, string tags split) —
+    # see _normalise_frontmatter.
+    frontmatter, content_body = parse_frontmatter(content, file_label=str(file_path))
 
     lines = content.strip().split('\n')
 
-    # Extract title (from frontmatter or first # heading)
+    # Extract title — precedence: frontmatter `title:` (a nested-dialect
+    # `name:` is promoted to it by _normalise_frontmatter) > first #
+    # heading > filename. Declared frontmatter beats the body-derived H1
+    # for the same reason it does for tags and type below.
     if frontmatter and 'title' in frontmatter:
         title = frontmatter['title']
     else:
@@ -1474,17 +1608,32 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
                 title = line[2:].strip()
                 break
 
-    # Extract tags (from frontmatter or inline)
+    # Extract tags — from frontmatter ONLY when a frontmatter block exists
+    # (even empty/malformed — parse_frontmatter returns {} for those): a
+    # node that declares frontmatter declares its tags, and harvesting
+    # inline `#tag` tokens from such a body returns WRONG data (prose
+    # issue/section references like `#4`/`#12`), not missing data. The
+    # inline harvest below stays for files with NO frontmatter at all —
+    # the Obsidian-style use it was written for.
     tags = []
-    if frontmatter and 'tags' in frontmatter:
-        # Frontmatter tags (array format) - convert all to strings
-        raw_tags = frontmatter['tags'] if isinstance(frontmatter['tags'], list) else []
+    if frontmatter is not None:
+        # Frontmatter tags (list format — a string value was already split
+        # into a list by _normalise_frontmatter) - convert all to strings
+        raw_tags = (
+            frontmatter['tags']
+            if isinstance(frontmatter, dict) and isinstance(frontmatter.get('tags'), list)
+            else []
+        )
         tags = [str(tag) for tag in raw_tags]
     else:
-        # Inline tags (Obsidian style: #tag)
+        # Inline tags (Obsidian style: #tag) — no-frontmatter files only.
+        # Purely numeric tokens (`#4`, `#12`) are dropped: a number after a
+        # hash is an issue/section reference, never a tag.
         tag_pattern = r'#([a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*)'
         for match in re.finditer(tag_pattern, content):
             tag = match.group(1)
+            if tag.isdigit():
+                continue
             if tag not in tags:
                 tags.append(tag)
 
@@ -1515,7 +1664,8 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
             if target_title not in links:
                 links.append(target_title)
 
-    # Node type (from frontmatter or directory)
+    # Node type (from frontmatter — promoted, for the nested dialect — or
+    # directory)
     if frontmatter and 'type' in frontmatter:
         node_type = frontmatter['type']
     else:
@@ -2170,6 +2320,257 @@ class SyncTally:
         return f"{self.succeeded} succeeded, {self.failed} failed, {self.skipped} skipped"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.95 WP-5 — the ACTIVE named-vector slot gate for the embed-skip.
+#
+# ONE home for "may this row set be skipped, given the slot the running
+# backend actually reads and writes?". `sync_node` and `sync_doc` both
+# call it, so the two fast paths can no longer answer the same question
+# differently — which is precisely what they did until now: `sync_doc`
+# checked the slot, `sync_node` did not, and the comment asserting
+# otherwise was the WP-0(a) false promise.
+#
+# WHY THIS IS NARROWER THAN A NAIVE "no vector ⇒ re-embed".
+# `vco_lib/kg_vector_slot.py` records the standing rule for this exact
+# question — "cannot confirm → do nothing" — together with the reason a
+# guess is dangerous here: a LEGACY class carrying one UNNAMED vector
+# still exists in the field (that module verified one live), and asking
+# it for a NAMED slot is an ERROR, not an empty answer. A gate reading
+# "active slot not found ⇒ re-embed" would therefore re-embed every row
+# of such a collection on EVERY sync, forever — and the re-embed could
+# never clear the objection, because the slot is missing from the
+# SCHEMA, which only `migrate-collections` can change. An unbounded,
+# self-perpetuating re-embed is a worse defect than the one WP-5 fixes.
+#
+# So the gate engages only where a re-embed can actually repair what it
+# objects to:
+#
+#   schema unreadable            (None) → INCONCLUSIVE   → skip permitted
+#   no named vectors (legacy)      (()) → not applicable → skip permitted
+#   named, active slot undeclared       → schema matter  → skip permitted
+#   named, active slot declared         → GATE APPLIES, per object
+#
+# and inside the applying case an object whose vector payload cannot be
+# read is inconclusive as well. The ONLY verdict that forces work is a
+# positively-observed EMPTY active slot on a slot the class declares —
+# and that one a re-embed does repair, because every write path here puts
+# a vector in `server.text_vector_slot` (`_build_vector_arg`; the
+# shipped-ingest path REQUIRES an active-slot hit or returns None and
+# computes). The gate therefore cannot loop.
+#
+# Cost: one `collection.config.get()` per COLLECTION per process, cached
+# below — not one per node. The gate is evaluated only after the cheap
+# hash/count/shape checks have already voted to skip.
+# ──────────────────────────────────────────────────────────────────────
+
+#: Named-vector schema probe cache, keyed by collection name. A schema does
+#: not change under a running sync (a migration is a separate, consented
+#: operation), so one probe per collection is both correct and the reason
+#: the gate costs nothing at tree scale.
+_SLOT_SCHEMA_CACHE: "Dict[str, Optional[Tuple[str, ...]]]" = {}
+
+
+def _collection_declares_slot(
+    collection: object, collection_name: str, slot: str
+) -> Optional[bool]:
+    """Does *collection*'s live schema declare named-vector *slot*?
+
+    Returns True / False, or **None for UNDETERMINABLE** — the third
+    answer `collection_vector_slots` exists to preserve. False covers both
+    "this class has named vectors but not that one" and "this class has
+    one unnamed vector"; neither is repairable by re-embedding, so both
+    are treated identically by the caller.
+    """
+    if collection_name in _SLOT_SCHEMA_CACHE:
+        slots = _SLOT_SCHEMA_CACHE[collection_name]
+    else:
+        slots = collection_vector_slots(collection)
+        _SLOT_SCHEMA_CACHE[collection_name] = slots
+    if slots is None:
+        return None
+    return slot in slots
+
+
+def _active_slot_gate_ok(
+    collection: object,
+    collection_name: str,
+    objects: object,
+    active_slot: str,
+    *,
+    vectors_requested: bool,
+) -> bool:
+    """True when the active vector slot does NOT veto an embed-skip.
+
+    Args:
+        collection: the Weaviate collection the rows came from (schema probe).
+        collection_name: its name — the cache key.
+        objects: the fetched row objects (``obj.vector`` is consulted).
+        active_slot: ``server.text_vector_slot``; ``""`` disables the gate.
+        vectors_requested: whether the fetch that produced *objects* asked
+            for vectors. False means every ``obj.vector`` is empty BY
+            CONSTRUCTION and says nothing — the gate must not read that as
+            "no vector stored".
+
+    Returns False only on a positively-observed empty active slot for a
+    slot the class declares. Every other path returns True, preserving the
+    pre-existing (content_hash + chunk_count) skip semantics.
+    """
+    if not active_slot or not vectors_requested:
+        return True
+    try:
+        rows = list(objects or [])
+    except Exception:  # noqa: BLE001 — unreadable result → inconclusive
+        return True
+    if not rows:
+        return True
+    if _collection_declares_slot(collection, collection_name, active_slot) is not True:
+        return True
+    for obj in rows:
+        vec_field = getattr(obj, "vector", None)
+        if not isinstance(vec_field, dict):
+            # Nothing to judge (older client / double that drops vectors).
+            return True
+        slot_vec = vec_field.get(active_slot)
+        try:
+            populated = bool(slot_vec) and len(slot_vec) > 0
+        except Exception:  # noqa: BLE001 — unreadable payload → inconclusive
+            populated = True
+        if not populated:
+            return False
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.95 — METADATA REPAIR on the embed-skip path.
+#
+# The skip gate above answers "is the stored TEXT current?" (content_hash)
+# and "is the stored VECTOR usable?" (the slot gate). Nothing answered "are
+# the stored PROPERTIES what today's parser derives from this file?" — and
+# after v0.2.95 taught `_normalise_frontmatter` two frontmatter dialects,
+# that question has a different answer than it did when the row was
+# written. A node stored under the old parse keeps its wrong `tags` /
+# `node_type` / `title` for as long as its text is untouched, and a bulk
+# `--all` did not repair it either: the skip returned having written
+# nothing, printing its "promoted nested `metadata:` keys" line over a row
+# it then left exactly as wrong as it found it.
+#
+# The repair is a PROPERTY PATCH, never a re-embed and never a hash change.
+# The content hash matching is the proof the text — and therefore the
+# stored vector — is still valid, so re-embedding here would spend a model
+# call to rewrite bytes that did not change. It is also why the hash must
+# NOT be perturbed to force the rewrite: `install.py`'s CI-10 seed-diff
+# gate and `vco_lib.kg_sync_drift` both RECOMPUTE that signature from the
+# file with no knowledge of frontmatter dialects, the shipped-vector
+# sidecar is KEYED on it, and the curated provenance registry gates a
+# DELETION on it. A hash whose writer and reader disagree is the
+# 2026-07-20 sidecar incident; this path does not re-enter it.
+#
+# Decision + the never-half-write discipline live in
+# `vco_lib.kg_metadata_repair` (pure, reusing the code graph's
+# SKIP/STAMP/EMBED vocabulary — EMBED never returned here); this function
+# is the I/O seam and the reporting.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _repair_stale_metadata(
+    collection: object,
+    objects: object,
+    node_data: Dict,
+    *,
+    metadata_props_available: bool,
+) -> "Tuple[int, Optional[str]]":
+    """Patch stale stored properties for an about-to-be-skipped node.
+
+    Args:
+        collection: the Weaviate collection the rows came from.
+        objects: the fetched row objects (every chunk of THIS node).
+        node_data: the freshly parsed node — the desired values.
+        metadata_props_available: whether the fetch that produced *objects*
+            actually asked for the repairable properties. False means every
+            stored value is absent BY CONSTRUCTION and says nothing — the
+            repair must not read that as "they differ".
+
+    Returns ``(rows_patched, error)``. ``error`` is non-None only when a
+    patch was attempted and failed; the caller reports it and counts it.
+
+    Conservative on every uncertainty: a fetch that could not carry the
+    properties, a row whose properties are unreadable, a stored value of an
+    unexpected type, a parse whose value is unusable — each leaves the node
+    entirely alone. A wrong "they differ" verdict would rewrite every row of
+    a knowledge graph, so only a positively-established difference writes.
+    """
+    global _METADATA_REPAIRED_COUNT, _METADATA_REPAIR_FAILED_COUNT
+
+    if not metadata_props_available:
+        return 0, None
+
+    try:
+        rows = [
+            (getattr(obj, "uuid", None), getattr(obj, "properties", None))
+            for obj in (objects or [])
+        ]
+        desired = {
+            name: node_data.get(name)
+            for name in REPAIRABLE_PROPERTIES
+            if name in node_data
+        }
+        plan = plan_metadata_repair(rows, desired)
+    except Exception as plan_err:  # noqa: BLE001 — cannot judge → do nothing
+        print(f"   (metadata repair check skipped: {plan_err})")
+        return 0, None
+
+    if plan.verdict is not _MetadataRowAction.STAMP:
+        return 0, None
+
+    def _patch(row_uuid: str, payload: Dict) -> None:
+        collection.data.update(uuid=row_uuid, properties=payload)
+
+    patched, error = apply_metadata_repair(plan, _patch)
+
+    if error is None:
+        _METADATA_REPAIRED_COUNT += 1
+        print(
+            f"   🔧 Metadata repair: {patched} chunk row(s) patched "
+            f"[{', '.join(plan.fields)}] — content unchanged, no re-embed"
+        )
+        return patched, None
+
+    # Loud, counted, and RETRYABLE: the rows already patched now hold the
+    # correct value (reverting them would write the wrong one back), the
+    # rest are untouched, and the next run sees the same matching hash with
+    # the same remaining difference — so it retries exactly what is left.
+    _METADATA_REPAIR_FAILED_COUNT += 1
+    print(
+        f"   ⚠️  Metadata repair INCOMPLETE: {patched} of "
+        f"{plan.row_count} chunk row(s) patched before {error} — the next "
+        f"sync retries the rest"
+    )
+    return patched, error
+
+
+def _print_metadata_repair_report() -> None:
+    """Name the run's metadata repairs — both halves, one home.
+
+    Called by every driver that prints a run report (``--all`` and the
+    file-list path the kg-sync-on-edit hook uses), so a repair cannot be
+    visible in one run shape and silent in the other. Prints nothing when
+    nothing was repaired and nothing failed, which is the ordinary case
+    after the first post-upgrade sync.
+    """
+    if _METADATA_REPAIRED_COUNT:
+        print(
+            f"🔧 Repaired stored metadata on {_METADATA_REPAIRED_COUNT} "
+            f"unchanged node(s) — tags/type/title re-read from frontmatter, "
+            f"zero re-embeds"
+        )
+    if _METADATA_REPAIR_FAILED_COUNT:
+        print(
+            f"⚠️ Metadata repair could not complete on "
+            f"{_METADATA_REPAIR_FAILED_COUNT} node(s) (named above with the "
+            f"reason) — still owed; the next sync retries them"
+        )
+
+
 def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """Sync a single docs/ file to the development collection.
 
@@ -2260,6 +2661,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # Pull existing objects WITH vectors so we can verify the active
         # slot is populated. `include_vector=True` returns `obj.vector` as
         # a dict keyed by slot name for named-vector collections.
+        _vectors_requested = True
         try:
             existing = coll.query.fetch_objects(
                 filters=_file_path_filter(doc_data["file_path"]),
@@ -2274,6 +2676,14 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # `include_vector` keyword → fall back to the basic fetch and
             # skip the active-slot check (defer to content_hash + chunk
             # count). Any real client supports this kw since Weaviate v4.
+            #
+            # v0.2.95 WP-5: that promise is now KEPT. Until this release the
+            # fallback did the opposite of what this comment says — with no
+            # vectors in hand, every row scored "slot not populated" and the
+            # whole docs tree re-embedded on every sync. `_vectors_requested`
+            # is the flag that makes the sentence true: the shared gate reads
+            # it as "no information", not as "no vector stored".
+            _vectors_requested = False
             print(f"   (fetch_objects(include_vector=True) failed: "
                   f"{fetch_err}; falling back to hash-only check)")
             try:
@@ -2288,16 +2698,32 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 existing = None  # forces fall-through to re-embed
 
         # EMBED-SKIP fast path. Mirrors sync_node's v0.2.17 implementation
-        # with the added active-slot check (which sync_node's fast-path
-        # also relies on implicitly via the chunk_count gate, but Dev gets
-        # it explicit because Dev rows are more likely to have a chunk
-        # written under one slot and not yet enriched under another).
+        # plus an active-slot check that sync_node does NOT perform.
+        #
+        # v0.2.95 WP-0(a) — TRUTH REPAIR. This comment used to claim that
+        # "sync_node's fast-path also relies on [the active-slot check]
+        # implicitly via the chunk_count gate". It does not, and a comment
+        # describing a guard is part of that guard, so the claim was itself
+        # the defect. The real asymmetry, stated once:
+        #
+        #   * `chunk_count_ok` counts OBJECTS — each row's stored
+        #     `total_chunks` against the number of rows returned. It reads
+        #     no vector and can say nothing about one.
+        #   * sync_node does not even ASK for vectors: its fetch omits
+        #     `include_vector`, so `obj.vector` is empty there by
+        #     construction. Nothing in its gate could consult a slot.
+        #
+        # Consequence, one-directional: a row set whose `content_hash`
+        # matches while the ACTIVE named-vector slot is empty is caught
+        # here and skipped forever by sync_node. That is exactly the state
+        # an aborted embedding-model change leaves behind — and it is why
+        # `last_installed_active_embedding` had no repair path on the KG
+        # side (see install.py's leg-(b) gate).
         if existing is not None and existing.objects:
             try:
                 existing_hashes: List[str] = []
                 existing_total_chunks: List[int] = []
                 existing_file_paths: List[str] = []
-                active_slot_populated: List[bool] = []
                 for obj in existing.objects:
                     props = obj.properties or {}
                     existing_hashes.append(props.get("content_hash", "") or "")
@@ -2307,22 +2733,6 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     except (TypeError, ValueError):
                         existing_total_chunks.append(0)
                     existing_file_paths.append(props.get("file_path", "") or "")
-                    # `obj.vector` is a dict {slot: list[float]} for
-                    # named-vector collections; missing/None when the
-                    # fetch didn't include vectors (older client).
-                    vec_field = getattr(obj, "vector", None)
-                    if isinstance(vec_field, dict) and active_slot:
-                        slot_vec = vec_field.get(active_slot)
-                        active_slot_populated.append(
-                            bool(slot_vec) and len(slot_vec) > 0
-                        )
-                    else:
-                        # Couldn't inspect → be conservative, treat as
-                        # NOT populated so we re-embed. Exception: if
-                        # active_slot is empty (no wrapper info), skip
-                        # the active-slot gate altogether (back to
-                        # content_hash + chunk_count).
-                        active_slot_populated.append(not active_slot)
 
                 chunk_count_ok = (
                     len(existing_total_chunks) > 0
@@ -2344,7 +2754,21 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 shapes_ok = all(
                     fp in ("", doc_data["file_path"]) for fp in existing_file_paths
                 )
-                slots_ok = all(active_slot_populated)
+                # v0.2.95 WP-5: ONE home for this decision — the same
+                # `_active_slot_gate_ok` `sync_node` now calls. The inline
+                # loop that used to live here judged an unreadable vector
+                # payload as "slot empty", which re-embedded the entire
+                # tree whenever the vector fetch degraded; the shared gate
+                # treats every unverifiable state as inconclusive and only
+                # forces work on a POSITIVELY observed empty slot in a slot
+                # the class declares. See its header for the full table.
+                slots_ok = _active_slot_gate_ok(
+                    coll,
+                    DEV_COLLECTION_NAME,
+                    existing.objects,
+                    active_slot,
+                    vectors_requested=_vectors_requested,
+                )
                 # v0.2.92 chunk-plan transition repair — same rule as
                 # sync_node's fast path (see the block above it): while a
                 # chunker-revision crossing is pending, a self-consistent
@@ -3265,16 +3689,74 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # read the wrong store.
         collection = server.client.collections.get(target_collection_name)
 
+        # v0.2.95 WP-5: the slot the running backend reads and writes.
+        # Soft-fail to "" (gate disabled → pre-existing semantics) exactly
+        # as `sync_doc` does: a wrapper that cannot name its slot must not
+        # be read as "the slot is empty".
+        try:
+            _active_slot_for_gate = server.text_vector_slot
+        except Exception:  # noqa: BLE001 — degenerate wrapper / double
+            _active_slot_for_gate = ""
+
         # Query for existing nodes with same file_path — BOTH spellings
         # (v0.2.92 WP-B1 / D13): a legacy Windows-written row carries the
         # backslash variant; an exact POSIX-only filter would miss it, the
         # delete below would skip it, and the insert would duplicate it.
         where_filter = _file_path_filter(node_data["file_path"])
-        existing = collection.query.fetch_objects(
-            filters=where_filter,
-            limit=100,
-            return_properties=["file_path", "content_hash", "chunk_num", "total_chunks"],
-        )
+        # v0.2.95 WP-5: request VECTORS too, so the embed-skip gate below can
+        # see whether the ACTIVE named-vector slot is actually populated.
+        # Until now this fetch omitted `include_vector`, which is why a node
+        # with a matching content_hash and an EMPTY active slot was skipped
+        # forever (the state an aborted embedding-model change leaves).
+        #
+        # `_vectors_requested` records whether the ask SUCCEEDED. On the
+        # fallback fetch every `obj.vector` is empty BY CONSTRUCTION, and the
+        # gate must read that as "no information", never as "no vector
+        # stored" — otherwise one client incompatibility re-embeds the whole
+        # knowledge graph. A failure of the FALLBACK fetch still propagates
+        # exactly as it did before this change.
+        #
+        # v0.2.95 metadata repair: the SAME fetch also carries the
+        # repairable properties, so the repair costs no extra roundtrip.
+        # They are asked for in their own ARM, not appended to the arms
+        # below: Weaviate errors a read that names a property the class
+        # does not declare, and a collection old enough to lack one of
+        # these must keep exactly the behaviour it had before this release
+        # — which is why a failure here retries the PRE-EXISTING ask
+        # (vectors, base properties) before the pre-existing hash-only
+        # fallback. `_metadata_props_available` records which arm answered:
+        # on either fallback the repairable properties are absent BY
+        # CONSTRUCTION, and the repair must read that as "no information".
+        _base_return_props = [
+            "file_path", "content_hash", "chunk_num", "total_chunks",
+        ]
+        _vectors_requested = True
+        _metadata_props_available = True
+        try:
+            existing = collection.query.fetch_objects(
+                filters=where_filter,
+                limit=100,
+                return_properties=_base_return_props + list(REPAIRABLE_PROPERTIES),
+                include_vector=True,
+            )
+        except Exception as _meta_fetch_err:  # noqa: BLE001 — older client / legacy schema
+            _metadata_props_available = False
+            try:
+                existing = collection.query.fetch_objects(
+                    filters=where_filter,
+                    limit=100,
+                    return_properties=_base_return_props,
+                    include_vector=True,
+                )
+            except Exception as _vec_fetch_err:  # noqa: BLE001 — older/mocked client
+                print(f"   (fetch_objects(include_vector=True) failed: "
+                      f"{_vec_fetch_err}; falling back to hash-only check)")
+                _vectors_requested = False
+                existing = collection.query.fetch_objects(
+                    filters=where_filter,
+                    limit=100,
+                    return_properties=_base_return_props,
+                )
 
         # v0.2.17 (plan 0.2): EMBED-SKIP fast path. If every existing
         # object for this file_path has content_hash matching the
@@ -3334,13 +3816,44 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # majority); changed plan → fall through to delete-and-re-embed
             # so this entry re-chunks. No crossing pending → exactly the
             # pre-v0.2.92 semantics (no plan CPU paid).
-            _self_consistent = (
+            _hashes_and_shape_ok = (
                 len(existing_hashes) > 0
                 and all(h == current_content_hash for h in existing_hashes)
                 and all(h for h in existing_hashes)  # no empty strings
                 and chunk_count_ok
                 and shapes_canonical
             )
+            # v0.2.95 WP-5: the ACTIVE named-vector slot gate (shared home:
+            # `_active_slot_gate_ok`, the same one `sync_doc` calls). A row
+            # set can be perfectly self-consistent on hash, count and shape
+            # and STILL carry no vector in the slot the running backend
+            # reads — the residue of an embedding-model change whose sync
+            # aborted part-way. content_hash is computed from file bytes
+            # alone and carries no model identity, so nothing else in this
+            # gate can see that state.
+            #
+            # Evaluated only when the cheap checks already voted to skip:
+            # a row set that is re-embedding anyway must not pay a schema
+            # probe. Conservative by construction — see the helper's header
+            # for every inconclusive path and why each keeps the
+            # pre-existing skip semantics instead of forcing work.
+            _slots_ok = True
+            if _hashes_and_shape_ok:
+                _slots_ok = _active_slot_gate_ok(
+                    collection,
+                    target_collection_name,
+                    existing.objects,
+                    _active_slot_for_gate,
+                    vectors_requested=_vectors_requested,
+                )
+                if not _slots_ok:
+                    print(
+                        f"   ♻️  Re-embedding: active vector slot "
+                        f"{_active_slot_for_gate!r} is empty on at least one "
+                        f"stored chunk (content unchanged — model/slot change "
+                        f"residue)"
+                    )
+            _self_consistent = _hashes_and_shape_ok and _slots_ok
             _plan_ok = True
             if _self_consistent and _chunker_resync_pending():
                 _plan_ok = _stored_plan_matches_current(
@@ -3372,12 +3885,36 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 # leftover project rows from a partially-failed earlier
                 # migration get cleaned even when the shared rows are
                 # already up to date.
+                #
+                # v0.2.95: and the stored PROPERTIES are brought up to
+                # today's parse before returning — the one thing a matching
+                # content_hash does NOT prove current. Guarded so it can
+                # never reach the `except` below: that handler falls
+                # through to delete-and-re-embed, and a metadata repair
+                # must not be able to cause the re-embed of text it just
+                # proved unchanged.
+                _repair_reason = ""
+                try:
+                    _, _repair_err = _repair_stale_metadata(
+                        collection,
+                        existing.objects,
+                        node_data,
+                        metadata_props_available=_metadata_props_available,
+                    )
+                    if _repair_err:
+                        _repair_reason = f"; metadata repair incomplete ({_repair_err})"
+                except Exception as _repair_exc:  # noqa: BLE001 — never re-embeds
+                    global _METADATA_REPAIR_FAILED_COUNT
+                    _METADATA_REPAIR_FAILED_COUNT += 1
+                    _repair_reason = f"; metadata repair failed ({_repair_exc})"
+                    print(f"   ⚠️  Metadata repair failed: {_repair_exc}")
                 if targets_shared:
                     _finish_shared_scope_write(server, node_data["file_path"])
                 return SyncOutcome(
                     OUTCOME_EMBED_SKIPPED,
                     node_data["file_path"],
-                    "content_hash match — already current in Weaviate",
+                    "content_hash match — already current in Weaviate"
+                    + _repair_reason,
                 )
         except Exception as skip_err:  # noqa: BLE001 — soft-fail by design
             # Fall through to delete-and-re-embed. Log so future
@@ -4036,6 +4573,37 @@ def _clear_drift_deferral(project_root: Path) -> None:
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
 
 
+def _record_chunker_resync_kg_half(project_root: Path) -> None:
+    """Record that the KG half of the chunker re-sync remedy has run.
+
+    v0.2.95 F1. ``chunker_preset_overhaul_pending`` tells the user, in the
+    entry itself, that it "self-resolves on the next bundle update" once the
+    two printed commands have been run — and until now nothing recorded that
+    they had, so the row was immortal and the plan comparison below
+    (``_chunker_resync_pending``) was paid forever. This is the KG half's
+    half of the evidence; the code-graph half is stamped by
+    ``analyze_code_graph.py`` at its own success point, and the registry probe
+    ``chunker_resync_still_owed`` clears the entry when BOTH name the current
+    revision.
+
+    NARROW, exactly like the three clears beside this call, and narrower still
+    (review MAJOR-2). The caller must establish ALL THREE before calling:
+    zero failures, the knowledge tree actually walked, and
+    :func:`_chunker_resync_pending` true for this run. Only then did the
+    re-chunk happen — the plan comparison is what rewrites stale boundaries,
+    and it runs only while it is armed. An unarmed ``--all`` hash-skips every
+    unchanged node, so recording it would stamp work nobody did.
+
+    Soft-fail: a sync's exit code never depends on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.chunker_revision import record_resync_half
+
+        record_resync_half(project_root, "kg")
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (chunker re-sync stamp failed: {inner})", file=sys.stderr)
+
+
 def _clear_node_formats_deferral(project_root: Path) -> None:
     """Resolve :data:`_NODE_FORMATS_CID` after a refresh that exited 0.
 
@@ -4461,6 +5029,10 @@ def main():
                     f"chunk plan predates the current chunker revision "
                     f"(boundaries rewritten; unchanged entries were skipped)"
                 )
+            # v0.2.95: same reporting rule for the metadata repair — a row
+            # patched on the skip path is work this run DID, and a repair
+            # that could not complete is work it still owes.
+            _print_metadata_repair_report()
             # v0.2.92 WP-B1 / D12: name every non-synced path (failures AND
             # skips, with reasons) instead of burying them in the counts.
             _print_run_details(kg_tally, doc_tally, run_kind="--all")
@@ -4508,6 +5080,23 @@ def main():
                 # true about, so a stale one is safe to retire.
                 if kg_tally.total > 0 or not KNOWLEDGE_ROOT.exists():
                     _clear_drift_deferral(PROJECT_ROOT)
+                    # v0.2.95 F1: the same run is the KG half of the chunker
+                    # re-sync remedy. Same guard for the same reason — a run
+                    # that considered ZERO knowledge nodes re-chunked nothing,
+                    # so it must not count as the half having been done.
+                    #
+                    # AND the comparison must have been ARMED (review MAJOR-2):
+                    # re-chunking happens only while `_chunker_resync_pending()`
+                    # is true, so an unarmed run hash-skips every unchanged node
+                    # and re-chunks nothing. That window is reachable by hand —
+                    # an orchestrator that has updated while a project's bundle
+                    # still lags, plus the `kg-sync --all` some OTHER entry's
+                    # remedy prints — and stamping there would retire the
+                    # deferral for work nobody did, which is the exact failure
+                    # this whole mechanism exists to end. Cached per run, so
+                    # this reads the value that was in force DURING the walk.
+                    if _chunker_resync_pending():
+                        _record_chunker_resync_kg_half(PROJECT_ROOT)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted
@@ -4519,6 +5108,21 @@ def main():
                         f"{doc_tally.failed} doc(s)"
                     ),
                 )
+            # This exit code is READ, and by more than a shell. install.py's
+            # v0.2.95 WP-4 carve-out advances the context triple
+            # (`last_installed_active_embedding` + the two collection names)
+            # only when a leg-(b) run exits 0, because a non-zero exit cannot
+            # distinguish "one node failed" from "died early, most of the tree
+            # never visited" — and stamping the second shape leaves previous-
+            # model vectors in place permanently. Consequence, deliberate and
+            # named in that comment (ship-gate MINOR-5): a PERMANENTLY failing
+            # node keeps this non-zero, so every later `--update` re-enters leg
+            # (b) and walks `--all` again. Bounded, not free: WP-5's active-slot
+            # gate skips the embed for every node already current, so the repeat
+            # is a fetch per node rather than a re-embed, and the owed work is on
+            # the ledger as `kg_sync_failures_pending`. Do not "fix" that by
+            # exiting 0 on partial success — the exit code is the only signal
+            # install.py has, and softening it re-opens the silent state.
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
             doc_tally = sync_all_docs(server)
@@ -4566,6 +5170,9 @@ def main():
 
             if len(raw_args) > 1:
                 print(f"📊 List: {tally.summary_fragment()}")
+            # v0.2.95: the hook path repairs metadata too (a single edited
+            # node resyncs through here), so it reports it the same way.
+            _print_metadata_repair_report()
             _print_run_details(tally, run_kind="file list")
             # v0.2.92 D17: explicit-file sync failures (the kg-sync-on-edit
             # hook path) are owed work too. NO clear on a clean list run —

@@ -65,6 +65,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from vco_lib.manifest_paths import manifest_path as _manifest_path
+
 #: Registry condition owned by this module (row in
 #: ``vco_lib/deferral_conditions.toml``; the completeness gate scans for this
 #: literal, so the row must ship in the same change as this file).
@@ -220,7 +222,7 @@ def _classify_registered_project(
             ref.id, ref.name, str(folder), _VERDICT_UNKNOWN, "folder_missing"
         )
 
-    manifest_path = folder / ".claude" / ".vco-manifest.json"
+    manifest_path = _manifest_path(folder)
     if not manifest_path.is_file():
         return _project_row(
             ref.id, ref.name, str(folder), _VERDICT_UNKNOWN, "manifest_missing"
@@ -652,9 +654,7 @@ def self_check(
     if manifest_written and running.semver is not None:
         try:
             manifest = json.loads(
-                (folder / ".claude" / ".vco-manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                _manifest_path(folder).read_text(encoding="utf-8")
             )
             recorded, _commit = _vv.recorded_manifest_version(manifest)
         except (OSError, ValueError):

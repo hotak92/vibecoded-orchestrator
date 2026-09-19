@@ -125,6 +125,78 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
         self.assertIs(verdict, True)
 
     # -----------------------------------------------------------------
+    # v0.2.95 F4 — the NAMED-SUBSET hole.
+    #
+    # The ledger is last-write-wins per condition_id, so run N's entry
+    # REPLACES run N-1's while run N-1's sidecars stay parked. Measured on the
+    # maintainer's install: `CLAUDE.md.from-upstream-89a5530` (named by the
+    # live entry) beside `CLAUDE.md.from-upstream-f1f5488` (named by nothing).
+    # Deleting the named one cleared the row and left the orphan invisible —
+    # "cleared on a subset of real outstanding work", which is precisely what
+    # the truncation arm above exists to refuse, one layer in.
+    # -----------------------------------------------------------------
+
+    def test_a_sidecar_the_entry_never_named_keeps_the_entry(self):
+        """LEAVE-ALONE: every NAMED sidecar is gone and the list is complete,
+        but an earlier run's orphan is still parked. RED before the fix: the
+        complete-list arm returned False and deleted the last record of it."""
+        self._touch("CLAUDE.md.from-upstream-f1f5488")
+        entry = _sidecar_entry("CLAUDE.md.from-upstream-89a5530")
+        self.assertIs(
+            dp.orchestrator_sidecars_still_present(
+                dp.ProbeContext(folder=self.folder, entry=entry)
+            ),
+            True,
+        )
+
+    def test_a_sidecar_under_a_build_named_dir_inside_docs_is_seen(self):
+        """The skip set is matched by NAME at any depth, and its own comment
+        called that "the set of trees the emitter provably cannot write into".
+        Not so inside the allowlisted trees: `docs/**/*.md` is user-editable,
+        so `docs/build/guide.md` gets a sidecar like any other file — and the
+        sweep used to walk straight past it, letting the entry clear on an
+        orphan it never saw."""
+        for rel in (
+            "docs/build/guide.md.from-upstream-4c44eb8",
+            "knowledge/target/n.md.from-upstream-4c44eb8",
+            "knowledge/dist/concepts/x.md.from-upstream-4c44eb8",
+        ):
+            with self.subTest(rel=rel):
+                self._touch(rel)
+                entry = _sidecar_entry("CLAUDE.md.from-upstream-89a5530")
+                self.assertIs(
+                    dp.orchestrator_sidecars_still_present(
+                        dp.ProbeContext(folder=self.folder, entry=entry)
+                    ),
+                    True,
+                )
+                (self.folder / rel).unlink()
+
+    def test_a_build_dir_OUTSIDE_the_allowlisted_trees_is_still_pruned(self):
+        """The bound stays: a repo's own build output is not walked, which is
+        what keeps the sweep from having to visit a node_modules tree."""
+        self._touch("node_modules/pkg/README.md.from-upstream-4c44eb8")
+        self._touch("target/debug/x.md.from-upstream-4c44eb8")
+        entry = _sidecar_entry("CLAUDE.md.from-upstream-89a5530")
+        self.assertIs(
+            dp.orchestrator_sidecars_still_present(
+                dp.ProbeContext(folder=self.folder, entry=entry)
+            ),
+            False,
+        )
+
+    def test_the_named_arm_is_unknown_when_the_sweep_cannot_complete(self):
+        """Same positive-evidence rule as the list-less arm: a sweep that
+        could not finish must not resolve the entry."""
+        entry = _sidecar_entry("docs/A.md.from-upstream-5a9ae53")
+        with mock.patch.object(dp.os, "walk", side_effect=OSError("boom")):
+            self.assertIsNone(
+                dp.orchestrator_sidecars_still_present(
+                    dp.ProbeContext(folder=self.folder, entry=entry)
+                )
+            )
+
+    # -----------------------------------------------------------------
     # v0.2.91 dogfood fix — the LEGACY / list-less arm.
     #
     # Pre-fix an entry naming no sidecar returned None UNCONDITIONALLY: not

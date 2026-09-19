@@ -123,16 +123,17 @@ fn installer_production_code_spawns_git_only_through_the_runner() {
          src/commands/installer.rs — route the call through \
          `crate::commands::git_cmd` instead:\n\n  \
          run_git(repo, &[..])          -> trimmed stdout, Err on non-zero, 30s ceiling\n  \
-         run_git_combined(repo, &[..]) -> as run_git, but stdout+stderr on failure (LC_ALL=C)\n  \
          run_git_raw(repo, &[..])      -> raw Output, Err only on spawn failure, untimed\n  \
          run_git_raw_env(repo, &[..], &[(\"K\", \"V\")]) -> run_git_raw plus env overrides\n\n\
+         (raw_env is how you get BOTH streams under a pinned locale; the old \n  \
+         run_git_combined helper was removed in v0.2.95 with its last caller.)\n\n\
          Why: `git_cmd` is where the launcher decides HOW git runs — `.silent()` \
          (no console-window flash on Windows), capture-never-inherit, the C-locale \
          pin, the timeout, and the error contract. A site that spawns git itself \
          gets none of those, and the next fix made in `git_cmd` will not reach it. \
          That is exactly how 31 sites in this file ended up bypassing a module \
          whose doc comment called itself \"the ONE home\".\n\n\
-         If your call genuinely cannot be expressed by the four helpers above, \
+         If your call genuinely cannot be expressed by the three helpers above, \
          EXTEND git_cmd.rs rather than opening a 32nd raw spawn.\n\n\
          Findings ({} in the production region):\n  {}",
         findings.len(),

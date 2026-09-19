@@ -113,5 +113,14 @@ if (-not $env:KG_SYNC_PROJECT_ROOT) {
 # `Resolve-VctLadderPython`, beside the resolution that knows the venv root,
 # so kg-dedup.ps1 and kg-duplicates.ps1 get it too instead of only this file.
 
+# v0.2.95: SAY WHICH ENVIRONMENT ANSWERED. Success was silent, which is how a
+# field install spent a session appearing to sync and not syncing - several
+# trees on one machine held a `weaviate_mcp` and nothing said which was live.
+# ONE line, stderr (stdout is the sync's own surface), `[kg-sync]`-prefixed,
+# an interpreter path and a tier LABEL - never an env VALUE.
+# PARITY: the bash sibling prints the same line, same prefix, same stream.
+$LadderTier = if ($script:VctLadderTier) { $script:VctLadderTier } else { "unknown" }
+[Console]::Error.WriteLine("[kg-sync] venv: $VenvPython (tier: $LadderTier)")
+
 & $VenvPython (Join-Path $ScriptDir "sync_knowledge_graph.py") @args
 exit $LASTEXITCODE

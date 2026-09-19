@@ -159,8 +159,8 @@ class EnrichedQuery:
 
 
 #: Stream name under :func:`vco_lib.paths.vct_metrics_dir` — the SAME JSONL
-#: telemetry home the hooks already write ``costs.jsonl`` / ``failures.jsonl``
-#: / ``kg_update_tokens.jsonl`` into. Not a new channel, one more file in the
+#: telemetry home the hooks already write ``failures.jsonl`` /
+#: ``kg_update_tokens.jsonl`` into. Not a new channel, one more file in the
 #: existing one.
 OBSERVATION_STREAM = "query_enrichment.jsonl"
 

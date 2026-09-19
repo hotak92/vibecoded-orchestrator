@@ -501,21 +501,47 @@ def start_hub(
         if f.exists():
             f.unlink()
 
-    proc = subprocess.Popen(
-        [str(hub_binary)],
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # Diagnostics go to FILES, never to an undrained pipe. `subprocess.PIPE`
+    # on a long-lived process nothing reads is a deadlock with a fuse on it:
+    # the hub logs to stderr for its whole life, the kernel pipe buffer is
+    # finite (4 KiB on Windows — the smallest of the three OSes we run here),
+    # and once it fills the hub blocks inside the write holding Rust's
+    # process-wide stderr lock. Request handlers that log then block too, so
+    # a request is accepted and never answered and the client times out in
+    # `getresponse()`. See `SandboxLayout.hub_stderr_log` for the full note.
+    # Files also mean a failing CI cell can SHOW the hub's own account of it.
+    stdout_log = layout.hub_stdout_log()
+    stderr_log = layout.hub_stderr_log()
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
+    out_fh = stdout_log.open("wb")
+    err_fh = stderr_log.open("wb")
+    try:
+        proc = subprocess.Popen(
+            [str(hub_binary)],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_fh,
+            stderr=err_fh,
+        )
+    finally:
+        # The child holds its own dups of these descriptors; the parent's
+        # copies are dead weight (and on Windows an open handle the teardown
+        # would have to fight over).
+        out_fh.close()
+        err_fh.close()
+
+    def _hub_stderr() -> str:
+        try:
+            return stderr_log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
 
     deadline = time.time() + startup_timeout_s
     last_err: Optional[str] = None
     while time.time() < deadline:
         if proc.poll() is not None:
-            err = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
             raise RuntimeError(
-                f"vct-hub exited early with code {proc.returncode}:\n{err}"
+                f"vct-hub exited early with code {proc.returncode}:\n{_hub_stderr()}"
             )
         port_file = layout.hub_port_file()
         token_file = layout.hub_token_file()
@@ -535,15 +561,9 @@ def start_hub(
         proc.wait(timeout=2.0)
     except subprocess.TimeoutExpired:
         proc.kill()
-    err = ""
-    if proc.stderr:
-        try:
-            err = proc.stderr.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
     raise TimeoutError(
         f"vct-hub did not write hub.port + hub.token within "
-        f"{startup_timeout_s}s (last_err={last_err!r}); stderr: {err}"
+        f"{startup_timeout_s}s (last_err={last_err!r}); stderr: {_hub_stderr()}"
     )
 
 

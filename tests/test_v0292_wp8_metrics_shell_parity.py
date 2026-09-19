@@ -64,7 +64,7 @@ def _tree(tmp_path: Path, name: str, *, rows: bool, sentinel: bool,
     if archive_dir:
         (claude / "metrics").mkdir(parents=True)
         if rows:
-            (claude / "metrics" / "costs.jsonl").write_text(
+            (claude / "metrics" / "failures.jsonl").write_text(
                 '{"n":1}\n', encoding="utf-8"
             )
     if sentinel:
@@ -266,14 +266,14 @@ def test_reader_prefers_the_new_home_then_falls_back_to_the_archive(tmp_path):
         tmp_path, "read", rows=True, sentinel=False, archive_dir=True
     )
     # Only the archive has it.
-    assert _read_file_sh(claude, state, "costs.jsonl") == str(
-        claude / "metrics" / "costs.jsonl"
+    assert _read_file_sh(claude, state, "failures.jsonl") == str(
+        claude / "metrics" / "failures.jsonl"
     )
     # Once the new home has it too, the new home wins.
     (state / "metrics").mkdir(parents=True, exist_ok=True)
-    (state / "metrics" / "costs.jsonl").write_text('{"n":1}\n', encoding="utf-8")
-    assert _read_file_sh(claude, state, "costs.jsonl") == str(
-        state / "metrics" / "costs.jsonl"
+    (state / "metrics" / "failures.jsonl").write_text('{"n":1}\n', encoding="utf-8")
+    assert _read_file_sh(claude, state, "failures.jsonl") == str(
+        state / "metrics" / "failures.jsonl"
     )
     # Neither has this one.
     assert _read_file_sh(claude, state, "nope.jsonl") == "(none)"

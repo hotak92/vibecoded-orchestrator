@@ -58,6 +58,14 @@ $SessionIdLib = Join-Path $LibDir "session-id.ps1"
 if (Test-Path $SessionIdLib) { . $SessionIdLib }
 $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
+# v0.2.95 (lane F10): the write-target parser (shared with
+# post-bash-file-sync.ps1) and the ONE home for the code-file extension test
+# (shared with pre-edit-context-inject.ps1). Sourced only if present;
+# without them this hook keeps its pre-v0.2.95 behaviour exactly.
+$WriteTargetsLib = Join-Path $LibDir "bash-write-targets.ps1"
+if (Test-Path $WriteTargetsLib) { . $WriteTargetsLib }
+$CodeExtLib = Join-Path $LibDir "code-extensions.ps1"
+if (Test-Path $CodeExtLib) { . $CodeExtLib }
 $CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
 if (Test-Path $CodegraphLib) { . $CodegraphLib }
 # v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
@@ -93,36 +101,76 @@ function Emit-CgContextJson([string]$ctx) {
         Emit-AdditionalContext $ctx 'PreToolUse'
     }
 }
-if ((Get-Command Test-VcoCodegraphBashGate -ErrorAction SilentlyContinue) -and (Test-VcoCodegraphBashGate -Command $Command)) {
+# === v0.2.95 (lane F10): does this command WRITE a file? ===================
+# Owner, 2026-09-16: "the query to KG/CodeGraph should be structured as it
+# would be if the operation was performed through write/edit tools".
+# pre-edit-context-inject.ps1 builds its query from the FILE -- module name
+# from the basename + a content snippet -- and anchors the code-graph leg on
+# that path. This hook used the raw first 500 chars of the COMMAND.
+#
+# So: when the shared parser recovers a write TARGET, the queries below are
+# built the pre-edit way from that path. When it does not (the common case)
+# every line below behaves exactly as it did before v0.2.95.
+# MUST MATCH pre-bash-context-inject.sh.
+$WriteTarget = ""
+$WriteSnippet = ""
+$WriteModule = ""
+if ((Get-Command Test-VcoWriteSuspicious -ErrorAction SilentlyContinue) -and
+    (Test-VcoWriteSuspicious $Command)) {
+    Initialize-VcoBashWriteTargets -HooksDir $ScriptDir -FallbackPython $PY
+    $parts = Get-VcoBashWritePreBash -Command $Command -ProjectRoot $ProjectRoot
+    if ($parts.Count -ge 1) { $WriteTarget = [string]$parts[0] }
+    if ($parts.Count -ge 2) { $WriteSnippet = [string]$parts[1] }
+}
+if ($WriteTarget) {
+    $wtLeaf = Split-Path $WriteTarget -Leaf
+    $WriteModule = [System.IO.Path]::GetFileNameWithoutExtension($wtLeaf)
+}
+
+$cgSym = ""
+$cgAnchor = ""
+$cgExclude = ""
+$cgHeader = ""
+if ($WriteTarget -and (Get-Command Test-VcoIsCodeFile -ErrorAction SilentlyContinue) -and
+    (Test-VcoIsCodeFile $WriteTarget)) {
+    # v0.2.95 (lane F10): the pre-edit shape -- module name + content snippet
+    # as the query, the written file as BOTH -Anchor and -ExcludePath.
+    $cgSym = if ($WriteSnippet) { "$WriteModule $WriteSnippet" } else { $WriteModule }
+    $cgAnchor = $WriteTarget
+    $cgExclude = $WriteTarget
+    $cgHeader = "Code-graph context for " + (Split-Path $WriteTarget -Leaf)
+} elseif ((Get-Command Test-VcoCodegraphBashGate -ErrorAction SilentlyContinue) -and (Test-VcoCodegraphBashGate -Command $Command)) {
     $cgSym = $Command
     if (Get-Command Get-VcoCodegraphSymbol -ErrorAction SilentlyContinue) {
         $cgSym = Get-VcoCodegraphSymbol -Text $Command
     }
-    $cgRaw = ""
-    # P1e (v0.2.75): Get-VcoCodegraphSymbol now returns EMPTY when no discrete
-    # code symbol is isolable (env-assignment / path-only / regex fragment /
-    # `git diff sha..HEAD` etc.). An empty symbol means NO injection — a
-    # garbage whole-command query is worse than none. Skip explicitly (the
-    # query helper also guards on empty, but the explicit skip keeps the
-    # no-injection contract obvious). MUST MATCH pre-bash-context-inject.sh.
     # v0.2.72 P2: the extracted symbol doubles as -Anchor so the CLI's shared
     # pipeline biases the rerank toward code call-linked to it.
-    if ($cgSym -and (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) {
-        $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath "" -Anchor $cgSym -PromptId $PromptId -TranscriptPath $TranscriptPath
+    $cgAnchor = $cgSym
+    $cgHeader = "Code-graph context for symbol: ${cgSym}"
+}
+# P1e (v0.2.75): Get-VcoCodegraphSymbol returns EMPTY when no discrete code
+# symbol is isolable (env-assignment / path-only / regex fragment /
+# `git diff sha..HEAD` etc.). An empty symbol means NO injection -- a garbage
+# whole-command query is worse than none. Skip explicitly (the query helper
+# also guards on empty, but the explicit skip keeps the no-injection contract
+# obvious). MUST MATCH pre-bash-context-inject.sh.
+$cgRaw = ""
+if ($cgSym -and (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) {
+    $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath $cgExclude -Anchor $cgAnchor -PromptId $PromptId -TranscriptPath $TranscriptPath
+}
+if ($cgRaw) {
+    $cgInj = ""
+    $cgRd = ""
+    if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
+        $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
     }
-    if ($cgRaw) {
-        $cgInj = ""
-        $cgRd = ""
-        if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-            $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-            $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-        }
-        if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
-            $cgRaw = Invoke-VcoFilterSeenBlocks -InputText $cgRaw -InjectFile $cgInj -ReadsFile $cgRd
-        }
-        if (($cgRaw -replace '\s+', '')) {
-            Emit-CgContextJson "[Code-graph context for symbol: ${cgSym}]:`n`n$cgRaw"
-        }
+    if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+        $cgRaw = Invoke-VcoFilterSeenBlocks -InputText $cgRaw -InjectFile $cgInj -ReadsFile $cgRd
+    }
+    if (($cgRaw -replace '\s+', '')) {
+        Emit-CgContextJson "[${cgHeader}]:`n`n$cgRaw"
     }
 }
 
@@ -190,6 +238,20 @@ if (Get-Command Get-VcoCommandNoiseStripped -ErrorAction SilentlyContinue) {
     $Query = $QueryRaw
 }
 if (-not $Query) { $Query = $QueryRaw }
+
+# v0.2.95 (lane F10): when the command WRITES a file, structure the query the
+# way pre-edit-context-inject.ps1 does -- "<module-name> <content snippet>" --
+# instead of leading with command text. The heredoc body is the closest
+# analogue of pre-edit's new_string snippet; without one the noise-stripped
+# command keeps its role as the content signal, prefixed by the module name.
+# No write target => this block is inert. MUST MATCH the .sh sibling.
+if ($WriteTarget) {
+    if ($WriteSnippet) {
+        $Query = "$WriteModule $WriteSnippet"
+    } else {
+        $Query = "$WriteModule $Query"
+    }
+}
 
 # === F-LOG (v0.2.70): emit the pre_bash pairing event ===
 # OS-PARITY: mirrors the .sh sibling. pre_bash was declared but never written

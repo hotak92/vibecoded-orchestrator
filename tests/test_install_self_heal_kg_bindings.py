@@ -58,6 +58,9 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
 )
 import install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
+from tests.common.scratch_dirs import (  # noqa: E402
+    scratch_state_dir as _scratch_state_dir,
+)
 
 
 # ─── Stub Weaviate HTTP server ────────────────────────────────────────────
@@ -190,8 +193,7 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
     def setUp(self):
         # Per-test temp dir — VCT_STATE_DIR points at it so launcher.db
         # resolves there. Cleanup in tearDown.
-        self._tmp = Path(__file__).resolve().parent / f"_tmp_self_heal_{os.getpid()}_{id(self)}"
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._tmp = _scratch_state_dir("self_heal")
         self._db_path = self._tmp / "launcher.db"
         # Patch VCT_STATE_DIR via env so `_discover_app_state_db_path`
         # resolves here instead of `~/.vct`.
@@ -766,11 +768,7 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self._tmp = (
-            Path(__file__).resolve().parent
-            / f"_tmp_self_heal_acc_{os.getpid()}_{id(self)}"
-        )
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._tmp = _scratch_state_dir("self_heal_acc")
         self._db_path = self._tmp / "launcher.db"
         self._env_patch = mock.patch.dict(
             os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
@@ -1349,11 +1347,7 @@ class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
     a case-mismatched binding, a realistic co-occurring heal need)."""
 
     def setUp(self):
-        self._tmp = (
-            Path(__file__).resolve().parent
-            / f"_tmp_self_heal_deadrow_{os.getpid()}_{id(self)}"
-        )
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._tmp = _scratch_state_dir("self_heal_deadrow")
         self._db_path = self._tmp / "launcher.db"
         self._env_patch = mock.patch.dict(
             os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
@@ -1467,11 +1461,7 @@ class SelfHealIdentityPickRemedyEndToEndTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self._tmp = (
-            Path(__file__).resolve().parent
-            / f"_tmp_self_heal_pick_{os.getpid()}_{id(self)}"
-        )
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._tmp = _scratch_state_dir("self_heal_pick")
         self._db_path = self._tmp / "launcher.db"
         self._env_patch = mock.patch.dict(
             os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False

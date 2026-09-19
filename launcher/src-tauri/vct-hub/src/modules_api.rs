@@ -1332,6 +1332,12 @@ mod tests {
     #[test]
     #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn paused_secret_does_not_leak_to_hub_subprocess_env() {
+        // 2026-09-17: this test writes a real keychain entry at
+        // `vct.global.user`. Taking the keychain baton both serialises it and
+        // — since the baton now installs the `vct-test-<pid>` namespace —
+        // keeps its canary out of the user's real login keyring. Pre-fix it
+        // left `HUB_CANARY_KEY_*` residue there on every run.
+        let _lock = h1_lock();
 
         let db = Db::open_in_memory().unwrap();
         let scope_str = "global";
@@ -1474,6 +1480,11 @@ mod tests {
 
     #[tokio::test]
     async fn project_env_returns_404_envelope_for_unknown_project() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let (base, _h) = spawn_modules_api_hub().await;
         let resp = reqwest::get(format!("{}/projects/ghost-id/env", base))
             .await
@@ -1498,6 +1509,11 @@ mod tests {
 
     #[tokio::test]
     async fn project_env_includes_baked_in_vct_project_keys_for_registered_project() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "p-test-1", "Test Project", "/tmp/test-project-1");
 
@@ -1526,6 +1542,11 @@ mod tests {
 
     #[tokio::test]
     async fn project_env_filter_by_key_returns_404_when_key_not_active() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "p-test-2", "Test Project Two", "/tmp/test-project-2");
 
@@ -1547,6 +1568,11 @@ mod tests {
 
     #[tokio::test]
     async fn project_env_filter_by_key_returns_baked_in_vct_project_id() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         // The baked-in VCT_PROJECT_* keys are always "active" for a
         // registered project, so a key=VCT_PROJECT_ID query MUST round-trip
         // a 200-OK with that single key — proves the filter path works
@@ -1577,6 +1603,11 @@ mod tests {
 
     #[tokio::test]
     async fn project_env_filter_rejects_empty_key_with_400() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "p-test-4", "Test Project Four", "/tmp/test-project-4");
         let resp = reqwest::get(format!(
@@ -1717,6 +1748,16 @@ mod tests {
     // and `commands::dashboard::tests`. That closes the cross-module
     // race where parallel keychain writes to the same slot would
     // overwrite each other's canaries.
+    //
+    // 2026-09-17: the same guard now also installs the `vct-test-<pid>`
+    // service namespace, so "the SAME keychain slot" above means the same
+    // TUPLE — `(shared/_user_shared_, user, github_pat)`, exactly as
+    // `vct-module.json` declares it — resolved into a per-process test
+    // namespace. The manifest still doesn't need forking, and the real
+    // user's GitHub PAT is no longer what these tests write over and delete.
+    // `#[tokio::test]` is a CURRENT-THREAD runtime, so the namespace (a
+    // thread-local, like the `secrets::for_tests` mock these tests already
+    // rely on) covers the spawned hub task too.
 
     /// Acquire the process-wide keychain mutex + cross-process file
     /// lock. See `vct_launcher_core::secrets::test_serialize::keychain_serialize_lock`
@@ -2273,6 +2314,11 @@ mod tests {
     /// through `GET /env?key=` — the sanctioned agent path.
     #[tokio::test]
     async fn hub_env_serves_per_project_user_secret() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "u-proj-1", "User Secret Project", "/tmp/u-proj-1");
@@ -2491,6 +2537,11 @@ mod tests {
     /// past the per-(secret × requester) active flag.
     #[tokio::test]
     async fn hub_env_honours_requester_pause_on_user_secret() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "u-proj-2", "User Pause Project", "/tmp/u-proj-2");
@@ -2540,6 +2591,11 @@ mod tests {
     /// bridge writes ref rows only for per-project scope).
     #[tokio::test]
     async fn hub_env_serves_shared_user_secret_with_no_ref_row() {
+        // 2026-09-17: `GET /env` walks the orchestrator manifest's
+        // `bundled_secrets`, which declares `github_pat` — so this test
+        // READS the real user's PAT slot unless it holds the keychain
+        // baton, which redirects it to the `vct-test-<pid>` namespace.
+        let _kc_lock = h1_lock();
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "u-proj-3", "Shared User Secret Project", "/tmp/u-proj-3");

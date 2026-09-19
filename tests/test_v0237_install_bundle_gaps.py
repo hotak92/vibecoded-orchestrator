@@ -151,36 +151,82 @@ class InstallBundleEnvOrchestratorRootTests(unittest.TestCase):
                 f"missing VCT_INSTALL_ROOT export. Body:\n{env_text}",
             )
 
-    def test_apply_canonical_env_without_orchestrator_root_omits_keys(self):
-        """When `orchestrator_root` is None (back-compat call path), the
-        portability keys MUST NOT be written. Avoids forcing absent
-        values into `.claude/env`."""
+    def _apply_with_db(self, project_id: str, project_name: str, tdp: Path):
+        """Run the projection for a fresh temp project, returning its result.
+
+        Extracted so the two `orchestrator_root=None` arms below differ only
+        in what they patch, not in their scaffolding.
+        """
         from vco_lib import project_init
 
-        with tempfile.TemporaryDirectory() as td:
-            tdp = Path(td)
-            project_folder = tdp / "test_proj"
-            project_folder.mkdir()
-            state_dir = tdp / "vct-state"
-            state_dir.mkdir()
-            db_path = state_dir / "launcher.db"
-            self._make_launcher_db(
-                db_path,
-                project_id="proj-uuid-no-orch",
-                project_name="V37CNoOrch",
-                project_folder=str(project_folder.resolve()),
+        project_folder = tdp / "test_proj"
+        project_folder.mkdir()
+        state_dir = tdp / "vct-state"
+        state_dir.mkdir()
+        self._make_launcher_db(
+            state_dir / "launcher.db",
+            project_id=project_id,
+            project_name=project_name,
+            project_folder=str(project_folder.resolve()),
+        )
+        with patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
+            return project_init._apply_canonical_env_via_config_projection(
+                project_folder, orchestrator_root=None,
             )
 
-            with patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
-                result = project_init._apply_canonical_env_via_config_projection(
-                    project_folder, orchestrator_root=None,
+    def test_apply_canonical_env_without_a_caller_root_resolves_from_the_module(self):
+        """v0.2.95 (was: "omits the keys"). `orchestrator_root=None` is what
+        the launcher passes whenever its own `resolve_orchestrator_root` fails
+        — and because an apply REBUILDS the managed block, omitting the keys
+        does not merely skip them, it REMOVES the ones an earlier bundle update
+        wrote. That is the field state reported 2026-09-14: a `.claude/env` whose header
+        advertises the portability keys and carries none of them, which is what
+        made a correctly-installed orchestrator undiscoverable.
+
+        So the projection now resolves the clone from its OWN module location
+        (`vco_lib` ships inside it, installed editable) and emits the keys.
+        """
+        from vco_lib import config_projection
+
+        with tempfile.TemporaryDirectory() as td:
+            result = self._apply_with_db("proj-uuid-no-orch", "V37CNoOrch", Path(td))
+
+        self.assertEqual(result["action"], "applied")
+        resolved = result["resolved_values"]
+        expected = config_projection._orchestrator_root_from_module()
+        self.assertIsNotNone(
+            expected,
+            "this test runs from the checkout, so the module walk must confirm "
+            "a clone; if it cannot, the fallback under test is untestable here",
+        )
+        self.assertEqual(resolved.get("VCT_ORCHESTRATOR_ROOT"), str(expected))
+        self.assertEqual(
+            resolved.get("VCT_INFRASTRUCTURE_DIR"),
+            str(Path(str(expected)) / "infrastructure"),
+        )
+        self.assertEqual(resolved.get("VCT_INSTALL_ROOT"), str(expected))
+
+    def test_keys_stay_omitted_when_the_clone_cannot_be_confirmed(self):
+        """The conservative arm. A non-editable `vco_lib` copy in some venv's
+        site-packages has no `vct-module.json` above it, so the walk returns
+        None and the keys are omitted — pre-v0.2.95 behaviour, unchanged.
+        A WRONG absolute pointer written into every project would be worse
+        than an absent one."""
+        from vco_lib import config_projection
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(
+                config_projection, "_orchestrator_root_from_module", return_value=None,
+            ):
+                result = self._apply_with_db(
+                    "proj-uuid-unconfirmed", "V37CUnconfirmed", Path(td),
                 )
 
-            self.assertEqual(result["action"], "applied")
-            resolved = result["resolved_values"]
-            self.assertNotIn("VCT_ORCHESTRATOR_ROOT", resolved)
-            self.assertNotIn("VCT_INFRASTRUCTURE_DIR", resolved)
-            self.assertNotIn("VCT_INSTALL_ROOT", resolved)
+        self.assertEqual(result["action"], "applied")
+        resolved = result["resolved_values"]
+        self.assertNotIn("VCT_ORCHESTRATOR_ROOT", resolved)
+        self.assertNotIn("VCT_INFRASTRUCTURE_DIR", resolved)
+        self.assertNotIn("VCT_INSTALL_ROOT", resolved)
 
     def test_install_bundle_passes_orchestrator_root_to_env_projector(self):
         """`install_project_bundle` threads its `orchestrator_root` arg

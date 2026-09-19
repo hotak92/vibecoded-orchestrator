@@ -93,6 +93,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from vco_lib import remedy_shell
 
 from vco_lib import git_exclude as _git_exclude
+from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import path_bearing_keys as _pbk
 from vco_lib.atomic import atomic_copy_file, atomic_write_text
 from vco_lib.hashing import sha256_file
@@ -142,9 +143,11 @@ SENTINEL_REL = Path(".claude") / "context" / ".vco-move-in-progress.json"
 #: two provenances distinguishable in a tree that has seen both.
 MOVED_SIBLING_SUFFIX = ".vco-moved"
 
-#: Relative path of the bundle manifest (mirrors ``project_init._MANIFEST_REL``
-#: — read-only use, and the constant is one path segment, not logic).
-_MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
+#: Relative path of the bundle manifest. Alias of the one home
+#: (:data:`vco_lib.manifest_paths.MANIFEST_REL`, v0.2.95) — it used to be a
+#: second definition with a comment asking the reader to keep it in step with
+#: ``project_init``'s.
+_MANIFEST_REL = _manifest_paths.MANIFEST_REL
 
 #: Deferral condition ids. Declared in ``vco_lib/deferral_conditions.toml``;
 #: the completeness test scans these literals.
@@ -466,7 +469,10 @@ USER_ADJACENT_SPECS: tuple[str, ...] = (
 #: namespace, each for a stated reason. Being explicit here is the difference
 #: between a decision and an oversight.
 NOT_COPIED_SPECS: dict[str, str] = {
-    ".claude/.vco-manifest.json": (
+    # Key from the one home, not a fourth spelling: this table's keys are
+    # matched against project-relative paths, so a drifted key would report a
+    # file as "stays in the old folder" while the copier moved it.
+    _manifest_paths.MANIFEST_REL_POSIX: (
         "Phase 2 writes a FRESH manifest at D describing what was actually "
         "materialized there. Copying S's would claim D holds files it may "
         "not, and would make every later update classify from a lie. S's copy "

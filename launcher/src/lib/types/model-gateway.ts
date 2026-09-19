@@ -36,8 +36,41 @@ export interface GatewayHealth {
   oauth_expires_in_s: number | null;
   vendors: string[];
   vendor_keys_cached: string[];
+  /**
+   * The scope the gateway's vendor keys resolve in, and whether it resolves
+   * (v0.2.95, R5b).
+   *
+   * `vendors` beside an empty `vendor_keys_cached` reads like "no key
+   * configured yet"; on 2026-09-10 the truth was "this daemon's working
+   * directory is not a registered project, so it can see no key you
+   * configure". `resolvable` is TRI-state — `null` means nothing has probed
+   * it, which is a different claim from `false` and is rendered as one.
+   */
+  secret_scope?: GatewaySecretScope | null;
+  /** Where per-chat token rows land, and how many this process has written. */
+  usage_ledger?: GatewayUsageLedger | null;
   /** `owner_only` | `broader` | `unknown` for the gateway's token file. */
   token_file_permissions: string;
+}
+
+/** `/health`'s `secret_scope` block. */
+export interface GatewaySecretScope {
+  /** The project the gateway resolves secrets as. */
+  project: string;
+  /** `true` resolves, `false` does not, `null` nothing probed it yet. */
+  resolvable: boolean | null;
+  /** Why, in key names and paths only — never a value. */
+  reason: string;
+}
+
+/** `/health`'s `usage_ledger` block. Counters and a path, never rows. */
+export interface GatewayUsageLedger {
+  /** `null` when the metrics home could not be resolved. */
+  path: string | null;
+  /** Rows THIS gateway process has appended. */
+  rows_written: number;
+  /** `ts` of the newest row, `null` before the first. */
+  last_write_ts?: string | null;
 }
 
 /** One check inside a dogfood run. */
@@ -74,6 +107,48 @@ export type GatewaySupervision =
   | 'unknown'
   | 'not_running';
 
+/**
+ * The login registration's state — the toggle's THIRD position.
+ *
+ * `--boot-status` answers a binary question ("is a registration present?").
+ * That is one state short of the truth, and the missing one is the state this
+ * machine sat in for eight hours on 2026-09-10: registered, enabled, and
+ * unable to run. Mirrors `vco_lib.gateway_ensure.GatewayState`.
+ */
+export type GatewayRegistrationState =
+  | 'running'
+  | 'registered_not_running'
+  | 'registered_but_unrunnable'
+  | 'not_registered'
+  | 'start_failed'
+  | 'disabled_by_env';
+
+export interface GatewayRegistration {
+  state: GatewayRegistrationState;
+  /** The sentence to show. Every state is named, the silent ones included. */
+  reason: string;
+  /** `true` / `false` / `null` = not probed. Never collapsed to a boolean. */
+  runnable: boolean | null;
+  /** The unit / plist / task path, for a card that has to say WHERE. */
+  unit_path: string | null;
+}
+
+/**
+ * What the HUB's gateway supervisor concluded when it stopped retrying.
+ *
+ * The hub is detached and its stderr goes nowhere a user looks, so this row
+ * is how "I tried three times and gave up" reaches the Services card. It is
+ * deleted by the hub the moment the gateway serves again, so its presence is
+ * always current.
+ */
+export interface HubGatewayCondition {
+  state: string;
+  reason: string;
+  attempts: number;
+  port: number;
+  observed_at_ms: number;
+}
+
 export interface ModelGatewayStatus {
   process: GatewayProcessState;
   pid: number | null;
@@ -97,6 +172,17 @@ export interface ModelGatewayStatus {
   health: GatewayHealth | null;
   health_error: string | null;
   boot: BootAutostart;
+  /**
+   * The registration in full, including "registered but unrunnable".
+   *
+   * Absent means NOT ASKED — which is the case while the gateway answers,
+   * because a serving gateway is proof its registration runs and the answer
+   * costs a subprocess. It never means "not registered"; that is
+   * `{ state: 'not_registered' }`.
+   */
+  registration?: GatewayRegistration | null;
+  /** The hub supervisor's verdict, when it gave up. Absent = nothing wrong. */
+  hub_condition?: HubGatewayCondition | null;
   token_present: boolean;
   python: string | null;
 }

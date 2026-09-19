@@ -164,6 +164,13 @@ pub const ENV_INTERVAL: &str = "VCT_HUB_INFRA_WATCHDOG_INTERVAL_SECS";
 /// containers-only, because every name in it can reach `compose up <name>`.
 /// Pinned by `watchdog_never_supervises_the_model_gateway_process`.
 ///
+/// v0.2.95 (R5c): the gateway IS supervised now — by
+/// [`crate::gateway_watchdog`], a sibling task that probes `/health` and
+/// heals through `python -m vco_lib.gateway_ensure`. It is a separate module
+/// precisely so this list keeps its one-sentence meaning. "Absent from this
+/// list" therefore means "healed by compose is the wrong verb for it", not
+/// "nothing looks after it".
+///
 /// `(compose_service_name, container_name)`.
 pub const CANONICAL_INFRA_SERVICES: [(&str, &str); 3] = [
     ("weaviate", "vco_weaviate"),
@@ -249,10 +256,21 @@ pub fn parse_enabled(raw: Option<&str>) -> bool {
 /// Parse the interval override into a seconds value, applying the
 /// [`MIN_INTERVAL_SECS`] floor. Unset / unparseable → default.
 pub fn parse_interval_secs(raw: Option<&str>) -> u64 {
+    parse_interval_with(raw, DEFAULT_INTERVAL_SECS, MIN_INTERVAL_SECS)
+}
+
+/// The same parse with the default and the floor as arguments.
+///
+/// v0.2.95: extracted so [`crate::gateway_watchdog`] — which ticks faster
+/// than the container watchdog and therefore has its own default — reads its
+/// env var through THIS function rather than growing a second copy of
+/// "unset means default, too small means floor, garbage means default". The
+/// two watchdogs disagree about the numbers, never about the rule.
+pub fn parse_interval_with(raw: Option<&str>, default_secs: u64, floor_secs: u64) -> u64 {
     match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(n) if n >= MIN_INTERVAL_SECS => n,
-        Some(_) => MIN_INTERVAL_SECS, // 0 / too-small → floor (no busy-loop)
-        None => DEFAULT_INTERVAL_SECS,
+        Some(n) if n >= floor_secs => n,
+        Some(_) => floor_secs, // 0 / too-small → floor (no busy-loop)
+        None => default_secs,
     }
 }
 
@@ -1220,7 +1238,7 @@ mod tests {
         assert_eq!(names, vec!["weaviate", "ollama", "code_embed"]);
     }
 
-    /// v0.2.92 (WP-12) LEAVE-ALONE: the model gateway is a PROCESS, and the
+    /// v0.2.92 (WP-12) LEAVE-ALONE: the model gateway is a PROCESS, and THIS
     /// watchdog only knows how to heal containers.
     ///
     /// `lifecycle_api::canonical_service_skeletons` gained a `model_gateway`
@@ -1231,6 +1249,16 @@ mod tests {
     /// and at worst a build of something unrelated. The exclusion is
     /// structural — nothing to add — and this test is what keeps it that
     /// way when someone later "syncs the two lists".
+    ///
+    /// v0.2.95 (R5c) RESTATES rather than relaxes the rule. The gateway now
+    /// HAS a hub supervisor — `gateway_watchdog`, which probes `/health` and
+    /// heals through `python -m vco_lib.gateway_ensure` — and it is a sibling
+    /// module for exactly the reason this assertion exists: the two share no
+    /// probe, no heal and no gate, so the only thing a merged list would buy
+    /// is a name in an allowlist that can no longer be read as "these reach
+    /// compose". The second half of this test pins that the sibling exists,
+    /// so "the watchdog does not do it" can never again be read as "nobody
+    /// does".
     #[test]
     fn watchdog_never_supervises_the_model_gateway_process() {
         let names: Vec<&str> = CANONICAL_INFRA_SERVICES.iter().map(|(s, _)| *s).collect();
@@ -1238,6 +1266,15 @@ mod tests {
             !names.contains(&"model_gateway"),
             "model_gateway is a process, not a vco_* container; the watchdog \
              must not try to heal it with a compose invocation"
+        );
+        // The supervision it is excluded FROM has a home. Calling the
+        // sibling's decision function is what proves the module is compiled
+        // in — a comment naming it would not.
+        assert_eq!(
+            crate::gateway_watchdog::disposition_for("registered_but_unrunnable"),
+            crate::gateway_watchdog::Disposition::Unrunnable,
+            "the gateway's own supervisor must exist; this list's exclusion is \
+             a division of labour, not an absence of one"
         );
     }
 

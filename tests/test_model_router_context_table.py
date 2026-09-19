@@ -37,12 +37,15 @@ EXPECTED_VENDOR_SEED_IDS = {
     "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
 }
 
-#: The first-party rows. They exist for ONE reader —
-#: ``vco_lib.vscode_settings.decorate_1m`` — so a slot/default naming a 1M
-#: Claude model carries the client's own ``[1m]`` hint (a plain id is
-#: assumed 200K; field symptom: "0% context remaining" right after
-#: compaction). The gateway's ``/v1/models`` never reads them: first-party
-#: ids are published verbatim (pinned below).
+#: The first-party rows, read by TWO consumers.
+#: ``vco_lib.vscode_settings.decorate_1m`` reads ``window_1m``, so a
+#: slot/default naming a 1M Claude model carries the client's own ``[1m]``
+#: hint (a plain id is assumed 200K; field symptom: "0% context remaining"
+#: right after compaction). The gateway's ``/v1/models`` reads
+#: ``context_window`` — since v0.2.95 a first-party id is published verbatim
+#: AND, when its resolved window is 1M, with an ``[1m]`` companion (pinned
+#: below). An earlier version of this note said the gateway never read these
+#: rows; that was true when it was written and is not true now.
 EXPECTED_CLAUDE_SEED_IDS = {
     "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5",
 }
@@ -141,8 +144,11 @@ class SeedTests(unittest.TestCase):
         model, so a session compacted at a fifth of the window the user was
         paying for. Both entries are published — the plain id is still the
         200K behaviour, and nobody loses the ability to ask for it. Driven
-        through the real ``CatalogService.union`` with the real seed's
-        ``advertise_1m``, so the wiring is what is pinned, not a helper."""
+        through the real ``CatalogService.union`` with the real SEED as its
+        table, so the wiring is what is pinned, not a helper. (Since v0.2.95
+        the union reads the table itself rather than being handed an
+        ``advertise_1m`` callable: the advert follows the resolved window,
+        and a cited seed row is the first thing that resolution consults.)"""
         import asyncio
 
         from model_router import catalog as cat
@@ -169,12 +175,14 @@ class SeedTests(unittest.TestCase):
             static_ttl_s=60,
             clock=lambda: 100.0,
         )
-        entries, _ = asyncio.run(service.union(advertise_1m=seed.advertise_1m))
-        ids = {e.id for e in entries}
+        catalog = asyncio.run(service.union(table=seed))
+        ids = {e.id for e in catalog.entries}
         self.assertIn("claude-opus-5", ids, "first-party id still published verbatim")
         self.assertIn("claude-opus-5[1m]", ids, "the seed row decorates it too")
         self.assertIn("claude-gw/glm-5.3[1m]", ids, "the vendor row still does")
-        companion = next(e for e in entries if e.id == "claude-opus-5[1m]")
+        companion = next(
+            e for e in catalog.entries if e.id == "claude-opus-5[1m]"
+        )
         self.assertIn("1M context", companion.display_name)
         self.assertTrue(companion.display_name.startswith("Opus 5"))
 

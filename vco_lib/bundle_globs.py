@@ -52,7 +52,7 @@ def script_patterns() -> tuple[str, ...]:
     de-duplicate matches across patterns (several overlap by design).
     """
     return (
-        "*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary",
+        "*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*",
         # v0.2.54: extension-less bash wrappers for the workflow tooling.
         "detect-workflow-needs", "generate-workflow",
     )

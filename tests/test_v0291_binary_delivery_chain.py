@@ -31,10 +31,15 @@ import re
 import unittest
 from pathlib import Path
 
+from tests.common.rust_source import read_rust_code
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "launcher" / "src-tauri" / "src"
 INSTALLER_RS = SRC / "commands" / "installer.rs"
 SELF_UPDATE_RS = SRC / "commands" / "self_update.rs"
+# v0.2.95 phase 2: the pull sequence BOTH update surfaces run. Several
+# invariants below used to live in `installer.rs` alone and now span the two.
+UPDATE_PIPELINE_RS = SRC / "commands" / "update_pipeline.rs"
 LIB_RS = SRC / "lib.rs"
 FRESHNESS_RS = SRC / "services" / "binary_freshness.rs"
 SERVICES_MOD_RS = SRC / "services" / "mod.rs"
@@ -45,6 +50,25 @@ UPDATE_HANDOFF_RS = SRC / "commands" / "update_handoff.rs"
 
 def read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
+
+
+#: `read`, with Rust comments gone and string literals verbatim.
+#:
+#: This project's rule is "never guard wiring with a source scan — a name in a
+#: comment satisfies it", and this file is full of necessary source scans (the
+#: call-sites it pins are Tauri commands and `tauri::Builder` hooks that no
+#: Rust unit test can reach). Stripping comments removes the specific way a
+#: scan lies: a helper named only in a comment explaining why it was REMOVED
+#: would otherwise keep the assertion green.
+#:
+#: v0.2.95 ship-gate MINOR-7 — this was a PRIVATE line-comment cutter with its
+#: own quote tracker, written here while `tests/common/rust_source.py` already
+#: answered the same question for six other lints. Two homes for one concern,
+#: and the private one was the weaker: it handled neither block comments nor
+#: `r#"…"#` raw strings, and carried no cross-line lexer state. It now names
+#: the shared home, which is also the home the module's own docstring instructs
+#: callers to extend ("do not add a fourth copy").
+read_code = read_rust_code
 
 
 class SharedHomeTests(unittest.TestCase):
@@ -163,33 +187,69 @@ class Wi3NonClobberingRevertTests(unittest.TestCase):
 
 
 class Wi2AlreadyUpToDateHealsTests(unittest.TestCase):
-    """WI-2 — the early-return branches must still reconcile the binary."""
+    """WI-2 — the early-return branches must still reconcile the binary.
 
-    def _branch_bodies(self, src: str) -> list[str]:
-        out = []
-        for m in re.finditer(r'if pull_output\.contains\("Already up to date"\)', src):
-            out.append(src[m.start() : m.start() + 3000])
+    The property: EVERY "Already up to date" early return reconciles the
+    at-rest dist binary before it returns success. Miss one and that install
+    has no path back to a fresh binary — every later update says "Already up
+    to date" and changes nothing, forever (RC-2).
+
+    **The property follows the code across homes; the count does not move.**
+    v0.2.95 phase 2 extracted the `update_orchestrator` branch into
+    `commands/update_pipeline.rs`, leaving one branch in `installer.rs`. A scan
+    of `installer.rs` alone then reported "1 not greater than or equal to 2"
+    and read as a REGRESSION, when both branches were intact and both still
+    reconciled. Scanning the union keeps the assertion honest about what it
+    asserts: two branches exist, wherever they live, and each reconciles.
+
+    The pipeline's branch ALSO has a behavioural test now —
+    `update_pipeline::tests::already_up_to_date_still_probes_the_dist_binary_
+    for_staleness` drives it over a temp repo with a stale dist sidecar and
+    asserts the staleness comes back. That is the stronger guard, and it is
+    available because `reconcile_and_pull` is reachable from a unit test. The
+    sibling branch is not: it sits inside `merge_orchestrator_with_upstream`, a
+    Tauri command needing an `AppHandle` + `Window` + a live clone, which is
+    exactly the call-site class this file exists to cover.
+    """
+
+    #: Every file that may hold an "Already up to date" early return.
+    HOMES = (INSTALLER_RS, UPDATE_PIPELINE_RS)
+
+    def _branch_bodies(self) -> list[tuple[str, str]]:
+        """`(home, body)` for every branch, across all homes."""
+        out: list[tuple[str, str]] = []
+        for path in self.HOMES:
+            src = read(path)
+            for m in re.finditer(
+                r'if pull_output\.contains\("Already up to date"\)', src
+            ):
+                out.append((path.name, src[m.start() : m.start() + 3000]))
         return out
 
     def test_every_already_up_to_date_branch_reconciles_before_returning(self) -> None:
-        src = read(INSTALLER_RS)
-        bodies = self._branch_bodies(src)
+        bodies = self._branch_bodies()
         self.assertGreaterEqual(
-            len(bodies), 2, "expected the update_orchestrator + merge siblings"
+            len(bodies),
+            2,
+            "expected the update-pipeline + merge siblings across "
+            f"{[p.name for p in self.HOMES]}; a DROP here is the real regression "
+            "this guards (a branch deleted, not a branch relocated)",
         )
-        for i, body in enumerate(bodies):
+        for home, body in bodies:
             self.assertIn(
                 "reconcile_dist_at_rest(",
                 body,
-                f'"Already up to date" branch #{i} returns without reconciling the '
-                "dist binary — that is the RC-2 dead end",
+                f'"Already up to date" branch in {home} returns without reconciling '
+                "the dist binary — that is the RC-2 dead end",
             )
             idx_reconcile = body.index("reconcile_dist_at_rest(")
-            idx_return = body.index("return Ok(")
+            idx_return = min(
+                i for i in (body.find("return Ok("), body.find("return Err(")) if i >= 0
+            )
             self.assertLess(
                 idx_reconcile,
                 idx_return,
-                f"branch #{i} must reconcile BEFORE returning success",
+                f"the branch in {home} must reconcile BEFORE returning",
             )
 
 
@@ -204,29 +264,136 @@ class Wi4SurfaceBParityTests(unittest.TestCase):
         self.assertIn("build_generated_release_controlled_globset(", body)
 
     def test_surface_b_does_a_pre_pull_rename_and_reverts_it(self) -> None:
-        src = read(SELF_UPDATE_RS)
-        self.assertIn("binary_freshness::pre_pull_rename_running_binary(", src)
-        # Every failure return after the pull must revert first.
+        """WI-4's property, followed across homes (v0.2.95 phase 2).
+
+        It used to read `self_update.rs` for an inline
+        `pre_pull_rename_running_binary(` plus three
+        `revert_rename(pre_pull_renamed.as_deref())` call-sites. Surface B now
+        pulls through the SHARED pipeline, so both the rename and the revert
+        live there — and the property got STRONGER on the way: the pipeline
+        renames the hub binary too (`launcher/dist/*/vct-hub*` are tracked
+        files, which surface B used to pull straight over), and each failure
+        group restores through `abort_update_restore_binaries_and_hub`, which
+        reverts non-clobberingly AND brings the hub back up.
+
+        Asserting the old inline shape would now report a consolidation as a
+        regression — the exact mistake `test_abort_tail_reports_and_records_an_
+        averted_clobber` calls out for its own seam.
+        """
+        src = read_code(UPDATE_PIPELINE_RS)
+        self.assertIn("pre_pull_rename_running_binary(", src)
+        self.assertIn(
+            "pre_pull_rename_vct_hub_binary(",
+            src,
+            "the shared pipeline must rename the HUB binary too — the gap that "
+            "made surface B pull over a running vct-hub",
+        )
+        # One restore per failure GROUP reachable after the renames: the
+        # non-zero-exit block (which fronts merge-in-progress /
+        # untracked-collision / conflict / non-FF / generic), the post-pull
+        # unmerged-tree block, the HEAD-did-not-advance guard, and the
+        # "Already up to date" no-op return.
         self.assertGreaterEqual(
-            src.count("revert_rename(pre_pull_renamed.as_deref())"),
-            3,
-            "each post-rename failure path must revert the rename",
+            src.count("abort_update_restore_binaries_and_hub("),
+            4,
+            "every post-rename exit must restore the binaries and the hub",
+        )
+        # …and surface B must not keep a second copy of the machinery.
+        self.assertNotIn(
+            "pre_pull_rename_running_binary(",
+            read_code(SELF_UPDATE_RS),
+            "one home: surface B renames through the pipeline, not inline",
         )
 
-    def test_surface_b_renames_before_the_generated_file_reconcile(self) -> None:
-        """Ordering parity with `update_orchestrator`. The reconcile's
-        `git checkout HEAD -- launcher/dist/**` cannot rewrite a mapped running
-        `.exe`; renaming ourselves aside first is what makes the take-upstream
-        reconcile actually able to resolve the dist-divergence class it exists
-        for."""
-        src = read(SELF_UPDATE_RS)
-        start = src.index("pub async fn apply_launcher_update")
+    def test_renames_happen_before_the_pull_sequence_that_reconciles(self) -> None:
+        """Ordering, load-bearing, pinned at BOTH levels it now spans.
+
+        The reconcile's `git checkout HEAD -- launcher/dist/**` cannot rewrite a
+        mapped running `.exe`; renaming aside first is what makes the
+        take-upstream reconcile able to resolve the dist-divergence class it
+        exists for, and what stops `git pull` aborting on
+        ERROR_SHARING_VIOLATION.
+
+        Phase 2 split the steps across two functions — the renames in
+        `prepare_and_pull_orchestrator_repo`, F1 and the generated reconcile
+        inside the `reconcile_and_pull` it then calls.
+
+        CORRECTED v0.2.95 phase 3. The hub stop and both renames were written
+        out FOUR times (pipeline / merge / rebase / resume) and were MISSING
+        from `force_resync_launcher`, whose `git reset --hard` writes the same
+        tracked binaries; they now have one home,
+        `stop_hub_and_rename_binaries_aside`. This test asserted the LITERAL
+        LOCATION of the two rename calls, so a legitimate extraction reddened
+        it — the recurring shape a source gate must be written against. It now
+        asserts the PROPERTY, at both levels:
+
+          * the pipeline prepares the binaries BEFORE the sequence that
+            reconciles and pulls, and
+          * that preparation is stop-hub → rename hub → rename launcher.
+
+        Either link broken and the ordering guards nothing, so both are pinned.
+        """
+        src = read_code(UPDATE_PIPELINE_RS)
+        start = src.index("pub(crate) async fn prepare_and_pull_orchestrator_repo")
+        body = src[start : src.index("\nasync fn reconcile_and_pull", start)]
+        idx_prepare = body.index("stop_hub_and_rename_binaries_aside(")
+        idx_sequence = body.index("reconcile_and_pull(")
+        self.assertLess(
+            idx_prepare,
+            idx_sequence,
+            "the hub stop + renames must precede the pull sequence",
+        )
+
+        # Level 2: the one home really does all three, in order. Without this
+        # the assertion above is satisfied by a call to an empty function.
+        hstart = src.index("pub(crate) fn stop_hub_and_rename_binaries_aside")
+        home = src[hstart : src.index("\npub(crate) async fn prepare_and_pull", hstart)]
+        idx_stop = home.index("ensure_hub_stopped_for_update(")
+        idx_hub = home.index("pre_pull_rename_vct_hub_binary(")
+        idx_launcher = home.index("pre_pull_rename_running_binary(")
+        self.assertLess(
+            idx_stop,
+            idx_hub,
+            "the hub must be STOPPED before its binary is renamed aside",
+        )
+        self.assertLess(idx_stop, idx_launcher)
+
+        # And inside the sequence, F1 and the generated reconcile are still
+        # there to be protected — otherwise the ordering above guards nothing.
+        seq = src[src.index("\nasync fn reconcile_and_pull") :]
+        self.assertIn("auto_restore_byte_identical_tracked_mods(", seq)
+        self.assertIn("resolve_generated_files_to_upstream(", seq)
+
+    def test_the_resync_surface_reaches_the_same_one_home(self) -> None:
+        """v0.2.95 phase 3 — `force_resync_launcher` was the surface with NO
+        hub handling at all, and its act is `git reset --hard`, which writes
+        `launcher/dist/<arch>/vct-hub{,.exe}` exactly as a pull would.
+
+        Pinned here because the same class of regression (a surface quietly
+        dropping the choreography) is what this file exists to catch. The
+        BEHAVIOURAL proof lives in
+        `self_update::tests::resync_hub_choreography` — two tests over a temp
+        clone with a redirected state dir, which assert that the hub stop's own
+        side effect (a stale `hub.pid` removed) is visible even when the reset
+        FAILS, i.e. that the stop preceded the write.
+        """
+        src = read_code(SELF_UPDATE_RS)
+        start = src.index("async fn stop_hub_then_hard_reset")
         body = src[start : src.index("\n#[command]", start)]
-        idx_rename = body.index("pre_pull_rename_running_binary(")
-        idx_f1 = body.index("auto_restore_byte_identical_tracked_mods(")
-        idx_reconcile = body.index("resolve_generated_files_to_upstream(")
-        self.assertLess(idx_rename, idx_f1)
-        self.assertLess(idx_rename, idx_reconcile)
+        idx_prepare = body.index("stop_hub_and_rename_binaries_aside(")
+        idx_reset = body.index('"reset", "--hard"')
+        self.assertLess(
+            idx_prepare,
+            idx_reset,
+            "the resync must stop the hub and rename the binaries BEFORE it "
+            "hard-resets the tree",
+        )
+        self.assertIn(
+            "abort_update_restore_binaries_and_hub(",
+            body,
+            "a failed reset must put the binaries back and restart the hub it "
+            "stopped — otherwise a failed resync leaves a perma-stopped hub",
+        )
 
     def test_both_surfaces_use_the_shared_handoff_tail(self) -> None:
         for path in (INSTALLER_RS, SELF_UPDATE_RS):
@@ -237,11 +404,18 @@ class Wi4SurfaceBParityTests(unittest.TestCase):
             )
 
     def test_surface_b_exits_for_the_handoff_only_after_its_bookkeeping(self) -> None:
-        """Load-bearing ordering: unlike the installer surface, this flow never
-        runs install.py, so the desktop-shortcut / install-manifest /
-        hardware-redetect updates below are the ONLY place the new version gets
-        recorded. Exiting straight out of the staging call would skip all
-        three."""
+        """Load-bearing ordering: exiting straight out of the staging call
+        would skip the desktop-shortcut / install-manifest / hardware-redetect
+        bookkeeping below it.
+
+        CORRECTED v0.2.95 phase 2: the reason used to be "unlike the installer
+        surface, this flow never runs install.py, so those updates are the ONLY
+        place the new version gets recorded". It usually DOES run install.py
+        now, and the manifest write below stands down when it did — install.py
+        records the version itself, truthfully. The ordering still matters for
+        the shortcut refresh and the hardware-redetect flag, which nothing else
+        writes, and for the manifest on the source-only paths.
+        """
         src = read(SELF_UPDATE_RS)
         start = src.index("async fn finish_apply_after_pull")
         body = src[start : src.index("\n#[command]", start)]
@@ -568,18 +742,43 @@ class FixRoundWiringTests(unittest.TestCase):
     def test_minor1_self_update_checks_the_revert_outcome(self) -> None:
         """MINOR-1: Surface B discarded the `RevertOutcome`, so an averted
         clobber there produced no deferral, no audit row and no trace — while
-        the installer surface recorded both."""
-        src = read(SELF_UPDATE_RS)
-        start = src.index("let revert_rename = |backup: Option<&std::path::Path>|")
-        body = src[start : start + 1600]
-        self.assertNotIn(
-            "let _ = crate::services::binary_freshness::revert_pre_pull_rename(",
-            body,
-            "the revert outcome must not be discarded",
+        the installer surface recorded both.
+
+        v0.2.95 phase 2 — the invariant is unchanged, its mechanism moved. The
+        revert now happens inside the shared pipeline's abort tail, which
+        RETURNS whether a clobber was averted; the pipeline carries that on the
+        error (`record_binary_clobber_averted`), and surface B writes the audit
+        row when rendering it, because the Db handle is the command's. So the
+        thing to assert is that surface B still reacts to the outcome rather
+        than dropping it on the floor — not that it holds a particular closure.
+        """
+        pipeline = read_code(UPDATE_PIPELINE_RS)
+        self.assertIn(
+            "record_binary_clobber_averted",
+            pipeline,
+            "the pipeline must REPORT an averted clobber to its caller",
         )
-        self.assertIn("revert_and_record(", body)
-        self.assertIn("RevertOutcome::ClobberAverted", body)
-        self.assertIn('"update_binary_clobber_averted"', body)
+        self.assertIn(
+            "restore.clobber_averted",
+            pipeline,
+            "…and it must read the abort tail's outcome to know, not assume",
+        )
+
+        src = read_code(SELF_UPDATE_RS)
+        start = src.index("async fn render_pipeline_error")
+        body = src[start:]
+        self.assertIn("record_binary_clobber_averted", body)
+        self.assertIn(
+            '"update_binary_clobber_averted"',
+            body,
+            "surface B must still write the audit row for an averted clobber",
+        )
+        self.assertEqual(
+            body.count('"update_binary_clobber_averted"'),
+            2,
+            "both clobber-carrying classifications (conflict and "
+            "autostash-pop-after-success) must record it",
+        )
 
 
 class Wi6CommentCorrectionTests(unittest.TestCase):

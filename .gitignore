@@ -385,3 +385,19 @@ supabase/.temp/
 # agents were terminated mid-suite by upstream rate limits. Ignored so
 # a crashed run cannot leave a launcher.db that `git add -A` commits.
 tests/_tmp_orchroot_*/
+# v0.2.95 (review MINOR-3): the same shape recurred — an interrupted
+# run of test_install_self_heal_kg_bindings.py left a 618 KB
+# tests/_tmp_self_heal_acc_*/launcher.db in the tree. The CAUSE is fixed
+# (those fixtures now build their scratch dir with tempfile.mkdtemp via
+# tests/common/scratch_dirs.py, outside the repo entirely), so nothing
+# should write here any more. This glob is the belt to that fix's braces:
+# it costs nothing and it catches the NEXT fixture written the old way
+# before a release commit does.
+tests/_tmp_*/
+
+# Merge / patch backup artefacts. `git merge`, `patch` and several editors
+# drop these beside the file they rewrote; one (a 912 KB CHANGELOG.md.orig)
+# reached the v0.2.95 tree untracked and would have shipped in a `git add -A`
+# release commit. They are never worth committing.
+*.orig
+*.rej

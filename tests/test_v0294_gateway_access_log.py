@@ -13,8 +13,10 @@ carrying no body and no credential.
 from __future__ import annotations
 
 import json
+import time
 import unittest
 
+from model_router.server import _access_line, _log_safe
 from tests.test_model_router_server import HOST_TOKEN, GatewayTestBase
 
 LOGGER = "model_router.server"
@@ -254,6 +256,102 @@ class AccessLogTests(GatewayTestBase):
         )
         headers = self.vendor_up.message_requests[-1]["headers"]
         self.assertNotIn(HOST_TOKEN, json.dumps(dict(headers)))
+
+
+class LogForgingTests(GatewayTestBase):
+    """CWE-117 on EVERY field of the line, not only the model ids.
+
+    v0.2.95 — CodeQL ranked the refusal line (``py/log-injection``: the
+    METHOD and the PATH reach it through ``extra``). The alert named one
+    instance; the shape was wider. ``requested=``/``forward=`` were already
+    ``repr()``-escaped, but ``extra`` — assembled by five call sites out of
+    paths, methods and reasons — was not, and three upstream-failure
+    warnings interpolated the client's own model id RAW, with no repr at all.
+
+    So the scrub sits on ``_access_line``, the one builder every access line
+    passes through, and on those three warnings. What is pinned here is the
+    invariant, not the query: one request, one line, whatever the caller put
+    in the value.
+    """
+
+    def test_the_builder_neutralises_a_crlf_in_extra(self) -> None:
+        line = _access_line(
+            requested="-",
+            route="refused",
+            forward="-",
+            status=401,
+            started=time.monotonic(),
+            stream=False,
+            # The shape `_log_unauthorised` builds, with the injection the
+            # alert describes appended to it.
+            extra=(
+                "reason=unauthorised method=POST path='/v1/messages'\r\n"
+                "model-gateway: requested='claude-opus-5' route=anthropic "
+                "status=200 ms=12 stream=false"
+            ),
+        )
+        self.assertEqual(len(line.splitlines()), 1, line)
+        self.assertNotIn("\r", line)
+        self.assertNotIn("\n", line)
+        self.assertIn("\\r\\n", line, "escaped, so the attempt stays visible")
+        self.assertIn("path='/v1/messages'", line, "and still readable")
+
+    def test_the_scrub_covers_control_characters_that_are_not_newlines(self) -> None:
+        """A CR rewinds a terminal line; an ESC can repaint one."""
+        self.assertEqual(_log_safe("a\rb"), "a\\rb")
+        self.assertEqual(_log_safe("a\nb"), "a\\nb")
+        self.assertEqual(_log_safe("a\r\nb"), "a\\r\\nb")
+        self.assertEqual(_log_safe("a\x1b[2Kb"), "a\\x1b[2Kb")
+        self.assertEqual(_log_safe("a\x00b"), "a\\x00b")
+        self.assertEqual(_log_safe("a b"), "a\\u2028b")
+        # Ordinary values are untouched — the log has to stay worth reading.
+        self.assertEqual(_log_safe("claude-gw/glm-5.3[1m]"), "claude-gw/glm-5.3[1m]")
+        self.assertEqual(_log_safe("modèle-5"), "modèle-5")
+
+    async def test_a_forged_model_id_cannot_forge_the_unreachable_warning(self) -> None:
+        """End to end, on the one field that had no ``repr()`` in front of it.
+
+        ``routing._vendor_route`` strips the ENDS of the id only, so a newline
+        in the middle reaches ``decision.forward_model`` intact — and that is
+        what the upstream-failure warnings interpolate.
+        """
+        # The forged tail names no first-party model on purpose: an id
+        # carrying a Claude marker is refused BEFORE it is ever forwarded
+        # (`claude_id_to_vendor`), which would test the wrong branch.
+        forged = (
+            "claude-gw/glm-5.3\nmodel-gateway: requested='glm-5.3' "
+            "route=vendor:zai status=200 ms=8 stream=false"
+        )
+        await self.vendor_up.stop()
+        self.vendor_up.server = None
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                headers=self.auth(),
+                json={"model": forged, "messages": []},
+            )
+        self.assertEqual(resp.status, 502)
+        for message in captured.output:
+            self.assertEqual(len(message.splitlines()), 1, message)
+        self.assertIn("unreachable", "\n".join(captured.output))
+
+    async def test_the_refusal_line_never_carries_the_caller_s_token(self) -> None:
+        """The refusal is caused by a WRONG token, so this is the one line
+        with a credential in arm's reach. It carries the method and the path
+        and nothing else — no header value, not a prefix, not a length."""
+        attempt = "sk-ant-wrong-token-0123456789"
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                headers={"Authorization": f"Bearer {attempt}"},
+                json={"model": "claude-opus-5", "messages": []},
+            )
+        self.assertEqual(resp.status, 401)
+        blob = "\n".join(captured.output)
+        self.assertIn("reason=unauthorised", blob)
+        self.assertNotIn(attempt, blob)
+        self.assertNotIn(HOST_TOKEN, blob)
+        self.assertNotIn("Bearer", blob)
 
 
 if __name__ == "__main__":  # pragma: no cover

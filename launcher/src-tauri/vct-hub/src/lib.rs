@@ -35,6 +35,14 @@ pub mod cli;
 pub mod cli_api;
 pub mod config_api;
 pub mod db;
+// v0.2.95 (R5c): supervision for the MODEL GATEWAY process. Sibling of
+// `infra_watchdog` rather than a row in it — that module's service list is an
+// allowlist where every name reaches `compose up <name>`, and the gateway is
+// a process healed through `python -m vco_lib.gateway_ensure`. Probes
+// `/health` on the resolved port; on a miss it spends one of a bounded number
+// of ensure attempts, then persists a condition the launcher's Services card
+// renders instead of retrying forever.
+pub mod gateway_watchdog;
 // v0.2.91 wave 5 residual close — real enforcement for the two hub routes
 // that toggle a project hook (`project_state_api::patch_hook` and
 // `cli_api::set_hook_enabled`, the latter reachable from the shipped

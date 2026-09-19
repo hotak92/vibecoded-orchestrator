@@ -145,6 +145,31 @@ class SandboxLayout:
     def hub_pid_file(self) -> Path:
         return self.state_dir / "hub.pid"
 
+    def hub_stdout_log(self) -> Path:
+        return self.state_dir / "hub.stdout.log"
+
+    def hub_stderr_log(self) -> Path:
+        """Where a spawned hub's diagnostics are REDIRECTED to.
+
+        The hub logs every diagnostic to stderr for the lifetime of the
+        process (see vct-hub/src/main.rs's "Diagnostics" section); real
+        callers send that to a file or /dev/null. A test harness that
+        hands it ``subprocess.PIPE`` and never reads the pipe gives it a
+        fixed-size kernel buffer instead — 4 KiB on Windows, 64 KiB on
+        Linux, 16 KiB on macOS — and when that buffer fills the hub
+        BLOCKS inside the write, holding Rust's process-wide stderr lock,
+        so every request handler that logs blocks with it. The symptom is
+        a request that is accepted and then never answered: the client
+        times out in ``getresponse()``, not at connect. Windows sees it
+        first because its buffer is the smallest.
+
+        A regular file never blocks, so the redirect removes the hazard
+        outright rather than racing a reader thread against it — and it
+        leaves the hub's own account of a failure on disk, which a pipe
+        that was drained into a discard would not.
+        """
+        return self.state_dir / "hub.stderr.log"
+
     def cache_dir(self) -> Path:
         return self.state_dir / "cache"
 

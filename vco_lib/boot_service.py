@@ -56,9 +56,13 @@ from __future__ import annotations
 import html
 import os
 import platform
+import plistlib
+import re
+import shlex
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -983,12 +987,23 @@ def run_register_boot(
     *,
     templates_root: Optional[Path] = None,
     stream=None,
+    registrar: Optional[Callable[..., bool]] = None,
 ) -> int:
     """``--register-boot``: 0 on success, 1 on failure. Enables AND starts.
 
     Mirrors ``boot.rs::run_register_boot`` including the enable-and-start
     decision: a user who asks for autostart expects the service running on
     the same invocation, not after a reboot.
+
+    ``registrar`` replaces the plain :func:`register` for a service that must
+    PROVE something before it writes — today only the model gateway, whose
+    entry point is run with ``--version`` first (see
+    :func:`gateway_registrar`). It is called as
+    ``registrar(spec, templates_root=…, on_event=…)`` and returns the same
+    truthy "a unit was written" value; anything it refuses to do it explains
+    through ``on_event``, so the printed lines below are the whole story
+    either way. One runner, one printed contract, no second copy of the
+    kill-switch gate or the exit-code mapping.
     """
     out = stream if stream is not None else sys.stderr
     if boot_registration_disabled():
@@ -1004,7 +1019,7 @@ def run_register_boot(
     def sink(phase: str, detail: str, data: Optional[dict] = None) -> None:
         messages.append(f"{phase}: {detail}")
 
-    ok = register(spec, templates_root=root, on_event=sink)
+    ok = (registrar or register)(spec, templates_root=root, on_event=sink)
     for message in messages:
         print(f"{spec.service_id}: {message}", file=out)
     if not ok:
@@ -1141,26 +1156,330 @@ def container_stack_unregister_spec() -> BootServiceSpec:
     )
 
 
-def resolve_gateway_exec() -> list[str]:
-    """The argv a boot unit runs to start the model gateway.
+#: Console-script names probed beside a candidate interpreter, in order. The
+#: ``.exe`` sibling is probed on EVERY OS for the same reason
+#: :data:`vco_lib.python_exe.VENV_INTERPRETER_NAMES` is not per-OS: probing a
+#: name that cannot exist costs one ``is_file()``, and a per-OS branch is one
+#: more place for two resolvers to disagree about the same machine.
+GATEWAY_SCRIPT_NAMES = ("vct-model-gateway", "vct-model-gateway.exe")
 
-    Preferred: the ``vct-model-gateway`` console script beside the running
-    interpreter, because that is the shipped entry point and it carries the
-    right interpreter with it. Fallback: ``<this python> -m model_router``,
-    which resolves from any working directory (``claude_mcp_servers/`` has
-    no ``__init__.py``, so the dotted ``claude_mcp_servers.model_router``
-    form only ever worked from the repo root and is never used here).
+#: The module form. NOT ``claude_mcp_servers.model_router``:
+#: ``claude_mcp_servers/`` has no ``__init__.py``, so the dotted form only ever
+#: resolved from the repository root, which a daemon must never assume.
+GATEWAY_MODULE = "model_router"
 
-    Resolved at REGISTRATION time and baked into the unit — the same choice
-    ``boot.rs`` makes with ``current_exe()``. A clone that later moves needs
+#: The flag that asks a candidate argv "can you run at all?".
+#: ``model_router.__main__.main`` answers ``--version`` from the stdlib alone,
+#: before it imports ``vco_lib`` or touches the network, a file or a port — so
+#: the probe measures exactly what it claims to (this interpreter can import
+#: this package) and nothing else. It is appended to the FULL baked argv,
+#: ``serve`` included, because ``--version`` is checked ahead of the ``command``
+#: positional: what is verified is then byte-for-byte what the unit runs.
+GATEWAY_VERIFY_ARG = "--version"
+
+#: Wall-clock cap on ONE verification run. Generous — a cold page cache can
+#: make a first interpreter start take seconds — and bounded, because this runs
+#: inside an install/update and inside a user's ``--register-boot``.
+GATEWAY_VERIFY_TIMEOUT_S = 20
+
+
+@dataclass(frozen=True)
+class GatewayExec:
+    """A resolved gateway entry point, and whether it was PROVEN to run."""
+
+    argv: tuple[str, ...]
+    #: True only when :func:`verify_gateway_exec` ran ``argv --version`` and
+    #: it exited 0. ``False`` with a populated :attr:`argv` means "resolved
+    #: but not proven" (verification was not asked for).
+    verified: bool
+    #: Always populated — every outcome, success or refusal, is NAMED.
+    reason: str = ""
+    #: ``(argv-as-text, why it failed)`` for every candidate that did not
+    #: verify, in probe order, so a refusal can say what was tried.
+    tried: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def argv_list(self) -> list[str]:
+        return list(self.argv)
+
+
+def _run_capture(cmd: Sequence[str], timeout: float) -> tuple[Optional[int], str]:
+    """Run ``cmd``, returning ``(returncode, last stderr/stdout line)``.
+
+    ``None`` as the return code means the process could not be spawned or
+    timed out — a state the caller must tell from "ran and failed", because
+    only the first one can be a missing file rather than a broken import.
+    """
+    try:
+        proc = subprocess.run(
+            list(cmd), check=False, capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"no answer within {timeout:g}s"
+    except OSError as exc:
+        return None, str(exc)
+    text = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if not text:
+        text = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    tail = text.splitlines()[-1] if text else ""
+    return proc.returncode, tail
+
+
+def verify_gateway_exec(
+    argv: Sequence[str],
+    *,
+    runner: Optional[Callable[[Sequence[str], float], tuple[Optional[int], str]]] = None,
+    timeout: float = GATEWAY_VERIFY_TIMEOUT_S,
+) -> tuple[bool, str]:
+    """Can ``argv`` actually start the gateway? ``(ok, why not)``.
+
+    The 2026-09-10 field defect in one sentence: a unit was written whose
+    ``ExecStart`` named an interpreter that cannot import ``model_router``, so
+    it was unrunnable from the moment it was written — and nothing noticed for
+    eight hours, because the PREVIOUS process was still serving. A resolver
+    that only inspects paths cannot see that; running the thing can.
+    """
+    probe = [*[str(part) for part in argv], GATEWAY_VERIFY_ARG]
+    run = runner or _run_capture
+    try:
+        code, detail = run(probe, timeout)
+    except Exception as exc:  # noqa: BLE001 — a probe never raises to a caller
+        return False, f"{type(exc).__name__}: {exc}"
+    if code == 0:
+        return True, ""
+    if code is None:
+        return False, detail or "could not be spawned"
+    return False, f"exited {code}" + (f": {detail}" if detail else "")
+
+
+def gateway_exec_candidates(
+    *,
+    install_root: "str | Path | None" = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> list[list[str]]:
+    """Every argv that could start the gateway on this machine, best first.
+
+    Resolved from the INSTALL ROOT's venv through the one interpreter ladder
+    (:func:`vco_lib.python_exe.ladder_candidates`: ``$VCT_VENV``, then
+    ``<install_root>/.venv``, then the legacy
+    ``<install_root>/claude_mcp_servers/.venv``), NOT from ``sys.executable``.
+    That inversion is the R5a fix: ``install.py --update`` re-renders the unit
+    for every user who registered it, so whichever interpreter happened to run
+    the installer used to be baked in — on 2026-09-10 that was a system python
+    which cannot import ``model_router`` at all.
+
+    Per rung the console script wins over the module form: it is the shipped
+    entry point and it carries its own interpreter, so it keeps working if the
+    caller's environment does not. ``sys.executable`` is kept as the LAST rung
+    (deduplicated — it is usually the first one already): when no venv resolves
+    the install is broken, and this is the only remaining chance of a working
+    unit. Which of them is actually used is decided by
+    :func:`verify_gateway_exec`, not by this ordering.
+    """
+    from vco_lib.python_exe import ladder_candidates  # noqa: PLC0415 — see below
+
+    out: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def _add(argv: list[str]) -> None:
+        key = tuple(argv)
+        if key not in seen:
+            seen.add(key)
+            out.append(argv)
+
+    def _from_interpreter(interpreter: Path) -> None:
+        bindir = interpreter.parent
+        for name in GATEWAY_SCRIPT_NAMES:
+            script = bindir / name
+            try:
+                present = script.is_file()
+            except OSError:  # pragma: no cover — defensive
+                present = False
+            if present:
+                _add([str(script)])
+        _add([str(interpreter), "-m", GATEWAY_MODULE])
+
+    for cand in ladder_candidates(
+        install_root=install_root, env=dict(env) if env is not None else None,
+    ):
+        if cand.ok and cand.path:
+            _from_interpreter(Path(cand.path))
+    if sys.executable:
+        _from_interpreter(Path(sys.executable))
+    return out
+
+
+def resolve_gateway_exec(
+    *,
+    install_root: "str | Path | None" = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> list[str]:
+    """The best-guess argv a boot unit runs to start the model gateway.
+
+    PURE: paths only, no subprocess — every caller that merely needs the spec's
+    NAMES (status, unregister, the uninstaller) pays nothing. The callers that
+    are about to WRITE a unit use :func:`resolve_gateway_exec_verified`
+    instead, because a resolved path is not evidence that it runs.
+
+    Resolved at registration time and baked into the unit — the same choice
+    ``boot.rs`` makes with ``current_exe()``, from the install root's venv
+    rather than from this process's interpreter. A clone that later moves needs
     a re-register, which is what ``install.py --update``'s re-render does.
     """
-    bindir = Path(sys.executable).parent
-    for name in ("vct-model-gateway", "vct-model-gateway.exe"):
-        candidate = bindir / name
-        if candidate.exists():
-            return [str(candidate)]
-    return [sys.executable, "-m", "model_router"]
+    candidates = gateway_exec_candidates(install_root=install_root, env=env)
+    if candidates:
+        return list(candidates[0])
+    # Only reachable with an empty `sys.executable` (an embedded interpreter).
+    return [sys.executable or "python3", "-m", GATEWAY_MODULE]
+
+
+def resolve_gateway_exec_verified(
+    *,
+    install_root: "str | Path | None" = None,
+    env: Optional[Mapping[str, str]] = None,
+    runner: Optional[Callable[[Sequence[str], float], tuple[Optional[int], str]]] = None,
+    timeout: float = GATEWAY_VERIFY_TIMEOUT_S,
+) -> GatewayExec:
+    """The first candidate argv that ANSWERS ``--version``, or a refusal.
+
+    ``verified=False`` carries an empty :attr:`GatewayExec.argv`: there is no
+    "best effort" answer here on purpose. Writing a unit that cannot start is
+    strictly worse than writing none — the unit is enabled, so the init system
+    keeps trying it, and the failure lands in a boot log nobody reads while the
+    launcher toggle says "registered".
+    """
+    tried: list[tuple[str, str]] = []
+    for argv in gateway_exec_candidates(install_root=install_root, env=env):
+        ok, detail = verify_gateway_exec(argv, runner=runner, timeout=timeout)
+        if ok:
+            return GatewayExec(
+                argv=tuple(argv),
+                verified=True,
+                reason=f"{' '.join(argv)} answered {GATEWAY_VERIFY_ARG}",
+                tried=tuple(tried),
+            )
+        tried.append((" ".join(argv), detail))
+    if tried:
+        detail = "; ".join(f"{argv} → {why}" for argv, why in tried)
+    else:
+        detail = "no candidate interpreter resolved at all"
+    return GatewayExec(
+        argv=(),
+        verified=False,
+        reason=(
+            "no model-gateway entry point on this machine could answer "
+            f"`{GATEWAY_VERIFY_ARG}`: {detail}. The install's venv is the one "
+            "that must be able to import `model_router` — re-run "
+            "`python install.py --update` from the orchestrator root."
+        ),
+        tried=tuple(tried),
+    )
+
+
+#: Env var pinning the SECRET SCOPE a gateway daemon resolves vendor keys in.
+#: Declared by ``model_router.config`` and documented in ``docs/CONFIGURATION.md``.
+GATEWAY_SECRET_PROJECT_ENV = "VCT_MODEL_GATEWAY_SECRET_PROJECT"
+
+
+def _same_secret_scope(a: str, b: str) -> bool:
+    """Do two secret-scope strings name the same place?
+
+    ``Path`` equality rather than string equality: it normalises a trailing
+    separator and doubled separators, and on Windows it compares
+    case-insensitively, which a string compare does not. Deliberately NO
+    ``resolve()`` — that stats the filesystem and follows symlinks, and this
+    question has to be answerable about an install root that has since MOVED,
+    whose old path may no longer exist.
+    """
+    if a == b:
+        return True
+    try:
+        return Path(a) == Path(b)
+    except (TypeError, ValueError):  # pragma: no cover — defensive
+        return False
+
+
+def resolve_gateway_secret_project(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    installed: Optional[str] = None,
+    install_root: "str | Path | None" = None,
+) -> str:
+    """Which project scope the unit PINS for vendor-key resolution. ``""`` = none.
+
+    The answer on a healthy install is ``""`` — **the rendered unit carries no
+    derived value at all**, and the daemon resolves its own scope at runtime.
+    A non-empty answer means somebody CHOSE a scope; it is never something
+    this function worked out.
+
+    Why, since v0.2.95 did it the other way round first. R5b saw that a boot
+    unit runs with ``WorkingDirectory=<VCT_STATE_DIR>``, which is not a
+    registered project — and ``agent_secrets`` resolves tier 1 (the hub's
+    ``/env`` route, the ONLY route to an OS-keychain key) against
+    ``project or Path.cwd()`` — so a daemon started at login answered every
+    vendor request "no key found" while the identical key resolved in
+    milliseconds from any project's cwd. R5b's fix was to BAKE the install
+    root here, at registration time. Q3 then fixed the same defect one layer
+    down, in the daemon: with nothing pinned it no longer falls back to its
+    cwd but resolves this install's orchestrator root at RUNTIME
+    (``model_router.secrets._default_install_root``), which reaches every
+    start path — the launcher's, a bare ``vct-model-gateway serve``, an OS
+    with no boot registration — and not merely a rendered unit.
+
+    Keeping the bake after that would have DEFEATED the runtime default
+    everywhere the gateway is boot-started: the daemon would answer
+    ``scope_origin() == "pin"``, ``/health`` would report a pin the user never
+    set, and rung 2 below would carry that frozen path forward through every
+    later re-render — an install root that MOVED would keep naming the old
+    one, which is precisely the defect the hand-written systemd drop-in was.
+    A path frozen at render time cannot self-heal; a value resolved by the
+    running process can. So rung 3 renders EMPTY and the daemon decides.
+
+    The hub-route alternative (serving shared-scope secrets with no project
+    id) was put to the owner and is SETTLED as unnecessary — 2026-09-17,
+    *"gateway secrets should be shared in the VCO system, but user can
+    override per-project"*. It would not have delivered that: the per-project
+    override, the launcher's per-requester pause and the
+    ``.no-shared-fallback`` marker are all gated on WHO is asking, and a route
+    with no project id has no requester to gate on. The hub's auth surface is
+    therefore untouched.
+
+    Precedence, and why:
+
+    1. ``$VCT_MODEL_GATEWAY_SECRET_PROJECT`` in the registering process — an
+       explicit pin by the user or the launcher outranks everything. This is
+       the per-project OVERRIDE, and it stays available on purpose.
+    2. The value already in the INSTALLED artefact — a re-render must not
+       silently drop a scope somebody chose (by registering with the variable
+       set, by hand-editing the unit, or through a systemd drop-in, which
+       :func:`installed_gateway_facts` folds in). ONE carve-out: when that
+       value names exactly what this install's root resolves to NOW, it was
+       derived rather than chosen — by a pre-fix render or by the drop-in this
+       release replaces — and dropping it changes nothing, because the runtime
+       default answers with the same path and keeps answering after a move.
+       That carve-out is what stops an updating machine from inheriting the
+       bake for life.
+    3. ``""``: pin nothing. It renders as an empty assignment, which
+       ``GatewayConfig.from_env`` reads back as ``None``, which is what makes
+       the daemon resolve its own root. Guessing a project here would be worse
+       than the gap it fills.
+    """
+    environ = os.environ if env is None else env
+    pinned = (environ.get(GATEWAY_SECRET_PROJECT_ENV) or "").strip()
+    if pinned:
+        return pinned
+    installed_scope = (installed or "").strip()
+    if not installed_scope:
+        return ""
+    try:
+        from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+
+        root = resolve_install_root(install_root)
+    except Exception:  # noqa: BLE001 — cannot compare ⇒ keep what is installed
+        return installed_scope
+    if root is not None and _same_secret_scope(installed_scope, str(root)):
+        return ""
+    return installed_scope
 
 
 def model_gateway_spec(
@@ -1171,12 +1490,18 @@ def model_gateway_spec(
     log_file: Optional[Path] = None,
     state_dir: Optional[Path] = None,
     task_xml_path: Optional[Path] = None,
+    secret_project: Optional[str] = None,
 ) -> BootServiceSpec:
     """The model gateway's spec.
 
     Every argument defaults to something resolved at call time rather than
     at import time, so a redirected ``VCT_STATE_DIR`` (dev launchers) is
     honoured and no build-host path can be baked in.
+
+    ``secret_project`` pins the scope the daemon resolves vendor keys in
+    (R5b — see :func:`resolve_gateway_secret_project`). ``None`` means "work
+    it out now"; ``""`` means "pin nothing", which renders as an empty
+    assignment and reads back as unset.
 
     ``enable_now=True``: unlike the container stack this is only ever
     reached because a user asked for it, and they expect the gateway
@@ -1185,6 +1510,10 @@ def model_gateway_spec(
     argv = [*(list(exec_argv) if exec_argv else resolve_gateway_exec()), "serve"]
     root = state_dir if state_dir is not None else vct_root_dir()
     wd = working_dir if working_dir is not None else root
+    scope = (
+        secret_project if secret_project is not None
+        else resolve_gateway_secret_project()
+    )
     if os_key == "Windows":
         substitutions = {
             # `cmd.exe /c "set VAR=…&& <command> <args> >> log 2>&1"` is the
@@ -1194,6 +1523,10 @@ def model_gateway_spec(
             "EXEC_ARGUMENTS": " ".join(argv[1:]),
             "WORKING_DIR": _windows_forward(wd),
             "STATE_DIR": _windows_forward(root),
+            # Forward-slash form like every other path in this task, and
+            # EMPTY when nothing is pinned: `set VAR=` clears the variable
+            # rather than setting a literal.
+            "SECRET_PROJECT": _windows_forward(Path(scope)) if scope else "",
         }
     elif os_key == "Darwin":
         substitutions = {
@@ -1204,14 +1537,21 @@ def model_gateway_spec(
                 f"        <string>{xml_escape_content(part)}</string>"
                 for part in argv
             ),
-            "WORKING_DIR": str(wd),
-            "STATE_DIR": str(root),
+            # Every value here lands in plist ELEMENT CONTENT, so every value
+            # is escaped — the argv array was, and these were not, which made
+            # a home directory containing `&` render an unparseable plist that
+            # launchd rejects outright (the same class v0.2.92 fixed centrally
+            # for the Windows Task XML).
+            "WORKING_DIR": xml_escape_content(wd),
+            "STATE_DIR": xml_escape_content(root),
+            "SECRET_PROJECT": xml_escape_content(scope),
         }
     else:
         substitutions = {
             "EXEC_START": " ".join(_posix_quote(part) for part in argv),
             "WORKING_DIR": str(wd),
             "STATE_DIR": str(root),
+            "SECRET_PROJECT": scope,
         }
     return BootServiceSpec(
         service_id="model-gateway",
@@ -1251,16 +1591,484 @@ def _posix_quote(token: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# What is ACTUALLY installed — read back from the artefact, never re-derived
+# ---------------------------------------------------------------------------
+
+#: Placeholder argv for a spec built to carry NAMES ONLY (unit name, plist
+#: label, task name, task-XML path). Never rendered: the callers that pass it
+#: read an artefact or ask for a status, they never write one.
+_NAMES_ONLY_ARGV = ("-",)
+
+#: Pulls the command and its arguments out of the Windows task's single
+#: ``cmd.exe /c "…"`` argument string. The shape is fixed by the shipped
+#: template: ``set VAR=…&& "<command>" <args> >> "<log>" 2>&1``.
+_WIN_EXEC_RE = re.compile(r'&&\s*"([^"]+)"\s*(.*?)\s*>>')
+
+
+@dataclass(frozen=True)
+class GatewayUnitFacts:
+    """What the artefact on THIS machine actually says.
+
+    Read back rather than re-derived, because the two answer different
+    questions. "What would we resolve now?" is what a re-render writes;
+    "what does the installed unit run?" is the only thing that can tell a user
+    their registration is broken — which for eight hours on 2026-09-10 it was.
+    """
+
+    #: Where the artefact lives (``None`` on an OS with no known location).
+    path: Optional[Path]
+    exists: bool
+    #: The argv the init system runs, ``serve`` verb included. Empty when the
+    #: artefact is absent or could not be parsed.
+    argv: tuple[str, ...] = ()
+    #: The pinned secret scope, or ``None`` when the unit pins none.
+    secret_project: Optional[str] = None
+    #: Why a PRESENT artefact yielded no argv. ``None`` when there was nothing
+    #: to parse or the parse succeeded — absence is not a parse failure.
+    parse_error: Optional[str] = None
+
+
+def gateway_names_spec(
+    os_key: str,
+    *,
+    state_dir: Optional[Path] = None,
+    task_xml_path: Optional[Path] = None,
+) -> BootServiceSpec:
+    """The gateway spec with NAMES ONLY — no resolution, no subprocess.
+
+    The :func:`container_stack_unregister_spec` precedent: a caller that only
+    inspects (status, read-back, ensure) must not pay for, or depend on, the
+    entry-point resolution a REGISTRATION needs.
+    """
+    return model_gateway_spec(
+        os_key=os_key,
+        exec_argv=_NAMES_ONLY_ARGV,
+        state_dir=state_dir,
+        task_xml_path=task_xml_path,
+        secret_project="",
+    )
+
+
+def _facts_from_systemd(text: str) -> tuple[tuple[str, ...], Optional[str], Optional[str]]:
+    """Parse ONE systemd unit body. Last assignment wins, empty one resets.
+
+    systemd's own rule, and the reason it is applied here rather than
+    "first ExecStart wins": a DROP-IN (``<unit>.service.d/*.conf``) is
+    concatenated after the unit, and the idiom for replacing a command there is
+    an empty ``ExecStart=`` followed by the new one. A parser that stopped at
+    the first line would report the command the machine does NOT run.
+    """
+    argv: tuple[str, ...] = ()
+    scope: Optional[str] = None
+    error: Optional[str] = None
+    seen_exec = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ExecStart="):
+            seen_exec = True
+            raw = stripped[len("ExecStart="):].strip()
+            if not raw:
+                argv = ()  # the reset form; a later line supplies the new one
+                continue
+            try:
+                argv = tuple(shlex.split(raw))
+                error = None
+            except ValueError as exc:
+                argv = ()
+                error = f"ExecStart= is not parseable: {exc}"
+        elif stripped.startswith(f"Environment={GATEWAY_SECRET_PROJECT_ENV}="):
+            scope = stripped.split("=", 2)[2].strip().strip("'\"")
+    if not argv and error is None:
+        error = "no ExecStart= line" if not seen_exec else "ExecStart= is empty"
+    return argv, scope, error
+
+
+def systemd_dropin_paths(unit_path: Path) -> list[Path]:
+    """``<unit>.service.d/*.conf``, in the order systemd applies them.
+
+    Lexical order by filename, which is systemd's own ordering rule. VCO writes
+    none of these; a user (or a distribution) may, and reading the unit without
+    them would report a command this machine does not run — the maintainer's
+    own machine carried exactly such a drop-in while this was being written.
+    """
+    directory = unit_path.with_name(unit_path.name + ".d")
+    try:
+        return sorted(p for p in directory.glob("*.conf") if p.is_file())
+    except OSError:  # pragma: no cover — defensive
+        return []
+
+
+def _facts_from_plist(data: bytes) -> tuple[tuple[str, ...], Optional[str], Optional[str]]:
+    try:
+        parsed = plistlib.loads(data)
+    except Exception as exc:  # noqa: BLE001 — any malformed plist is one state
+        return (), None, f"plist is not parseable: {type(exc).__name__}: {exc}"
+    argv = parsed.get("ProgramArguments") if isinstance(parsed, dict) else None
+    env = parsed.get("EnvironmentVariables") if isinstance(parsed, dict) else None
+    scope = None
+    if isinstance(env, dict):
+        value = env.get(GATEWAY_SECRET_PROJECT_ENV)
+        if isinstance(value, str):
+            scope = value
+    if not isinstance(argv, list) or not argv:
+        return (), scope, "no ProgramArguments array"
+    return tuple(str(part) for part in argv), scope, None
+
+
+def _facts_from_task_xml(text: str) -> tuple[tuple[str, ...], Optional[str], Optional[str]]:
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        return (), None, f"task XML is not parseable: {exc}"
+    arguments = None
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == "Arguments":
+            arguments = element.text or ""
+            break
+    if arguments is None:
+        return (), None, "no <Arguments> element"
+    scope_match = re.search(
+        rf"set {re.escape(GATEWAY_SECRET_PROJECT_ENV)}=(.*?)&&", arguments,
+    )
+    scope = scope_match.group(1).strip() if scope_match else None
+    exec_match = _WIN_EXEC_RE.search(arguments)
+    if exec_match is None:
+        return (), scope, "the cmd.exe argument string names no quoted command"
+    command, tail = exec_match.group(1), exec_match.group(2).strip()
+    try:
+        args = shlex.split(tail) if tail else []
+    except ValueError as exc:
+        return (), scope, f"task arguments are not parseable: {exc}"
+    return (command, *args), scope, None
+
+
+def installed_gateway_facts(
+    *,
+    home: Optional[Path] = None,
+    system: Optional[str] = None,
+    state_dir: Optional[Path] = None,
+    task_xml_path: Optional[Path] = None,
+) -> GatewayUnitFacts:
+    """Read the installed gateway artefact. Never raises.
+
+    On Windows the artefact read is the rendered Task XML this module wrote,
+    not ``schtasks /Query``: the XML is the same bytes that were imported, it
+    is readable without spawning anything, and ``schtasks`` output is
+    localised (the lesson :func:`parse_windows_status_output` carries).
+    Whether the TASK still exists is :func:`status`'s question; this one is
+    "what does the registration run?".
+    """
+    os_name = system or platform.system()
+    spec = gateway_names_spec(
+        os_name, state_dir=state_dir, task_xml_path=task_xml_path,
+    )
+    if os_name == "Linux":
+        path = systemd_unit_path(spec, home)
+        reader = _facts_from_systemd
+        binary = False
+    elif os_name == "Darwin":
+        path = launchd_plist_path(spec, home)
+        reader = _facts_from_plist  # type: ignore[assignment]
+        binary = True
+    elif os_name == "Windows":
+        path = spec.windows_task_xml_path
+        reader = _facts_from_task_xml
+        binary = False
+    else:
+        return GatewayUnitFacts(path=None, exists=False)
+
+    if path is None or not path.is_file():
+        return GatewayUnitFacts(path=path, exists=False)
+    try:
+        payload = path.read_bytes() if binary else path.read_text(encoding="utf-8")
+        if os_name == "Linux":
+            # Drop-ins are part of the unit systemd runs, so they are part of
+            # the unit this function reports. Appended in systemd's own order;
+            # the parser's last-wins rule then yields the effective command.
+            for extra in systemd_dropin_paths(path):
+                payload = f"{payload}\n{extra.read_text(encoding='utf-8')}"
+    except OSError as exc:
+        return GatewayUnitFacts(
+            path=path, exists=True, parse_error=f"could not be read: {exc}",
+        )
+    argv, scope, error = reader(payload)  # type: ignore[arg-type]
+    return GatewayUnitFacts(
+        path=path,
+        exists=True,
+        argv=argv,
+        secret_project=scope or None,
+        parse_error=error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# REGISTER the gateway — verified before anything is written
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GatewayRegistration:
+    """Outcome of :func:`register_model_gateway`."""
+
+    #: What :func:`register` reported: the artefact is on disk AND the init
+    #: system accepted it. It is deliberately NOT "a file was written" —
+    #: ``register_linux`` returns False on a machine with no ``systemctl``,
+    #: having correctly left a unit behind for the user to enable later, and a
+    #: field that called that a write would make the CLI exit 0 on a
+    #: registration nothing will start. What happened either way is on
+    #: ``on_event``.
+    registered: bool
+    #: Nothing was written BECAUSE no entry point could be proven to run.
+    refused: bool
+    exec_result: GatewayExec
+    #: The spec that was rendered, or ``None`` when nothing was.
+    spec: Optional[BootServiceSpec]
+    reason: str
+
+
+def register_model_gateway(
+    *,
+    templates_root: Path,
+    on_event: EventSink = _noop_event,
+    system: Optional[str] = None,
+    home: Optional[Path] = None,
+    update_only: bool = False,
+    install_root: "str | Path | None" = None,
+    env: Optional[Mapping[str, str]] = None,
+    runner: Optional[Callable[[Sequence[str], float], tuple[Optional[int], str]]] = None,
+    state_dir: Optional[Path] = None,
+    log_file: Optional[Path] = None,
+    verify: bool = True,
+) -> GatewayRegistration:
+    """The ONE home for writing a model-gateway boot registration.
+
+    Both writers go through here — ``vct-model-gateway --register-boot``
+    (fresh) and ``install.py --update`` (``update_only=True``, which creates
+    nothing) — so the verify-before-write rule cannot hold on one path and not
+    the other.
+
+    Order is load-bearing:
+
+    1. ``update_only`` asks :func:`status` FIRST, so a machine that never
+       opted in pays no subprocess and keeps its "no registration" state.
+    2. The entry point is resolved AND run (:func:`resolve_gateway_exec_verified`).
+    3. Only then is anything written. A refusal leaves an existing artefact
+       BYTE-IDENTICAL: the unit that is there may be broken, but replacing it
+       with a second broken one helps nobody, and the caller is told.
+    """
+    os_name = system or platform.system()
+    if boot_registration_disabled():
+        on_event("skip", f"{DISABLE_ENV}=1 — skipping", None)
+        return GatewayRegistration(
+            registered=False, refused=False,
+            exec_result=GatewayExec(argv=(), verified=False, reason="kill switch"),
+            spec=None, reason=f"{DISABLE_ENV}=1",
+        )
+
+    facts = installed_gateway_facts(
+        home=home, system=os_name, state_dir=state_dir,
+    )
+    names = gateway_names_spec(os_name, state_dir=state_dir)
+    if update_only and status(names, home=home, system=os_name) is BootStatus.NOT_INSTALLED:
+        return GatewayRegistration(
+            registered=False, refused=False,
+            exec_result=GatewayExec(
+                argv=(), verified=False, reason="not registered",
+            ),
+            spec=None,
+            reason="no existing model-gateway registration — nothing to re-render",
+        )
+
+    if verify:
+        resolution = resolve_gateway_exec_verified(
+            install_root=install_root, env=env, runner=runner,
+        )
+    else:
+        argv = resolve_gateway_exec(install_root=install_root, env=env)
+        resolution = GatewayExec(
+            argv=tuple(argv), verified=False,
+            reason="verification skipped by the caller",
+        )
+    if verify and not resolution.verified:
+        on_event("warn", f"model-gateway: {resolution.reason}", {
+            "tried": [argv for argv, _ in resolution.tried],
+        })
+        return GatewayRegistration(
+            registered=False, refused=True, exec_result=resolution, spec=None,
+            reason=resolution.reason,
+        )
+
+    spec = model_gateway_spec(
+        os_key=os_name,
+        exec_argv=resolution.argv_list,
+        state_dir=state_dir,
+        log_file=log_file,
+        secret_project=resolve_gateway_secret_project(
+            env=env, installed=facts.secret_project, install_root=install_root,
+        ),
+    )
+    if update_only:
+        accepted = rerender_if_registered(
+            spec, templates_root=templates_root, on_event=on_event,
+            system=os_name, home=home,
+        )
+    else:
+        accepted = register(
+            spec, templates_root=templates_root, on_event=on_event,
+            system=os_name, home=home,
+        )
+    return GatewayRegistration(
+        registered=bool(accepted), refused=False, exec_result=resolution, spec=spec,
+        reason=resolution.reason,
+    )
+
+
+def gateway_registrar(
+    *,
+    install_root: "str | Path | None" = None,
+    state_dir: Optional[Path] = None,
+    log_file: Optional[Path] = None,
+    runner: Optional[Callable[[Sequence[str], float], tuple[Optional[int], str]]] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Callable[..., bool]:
+    """A :func:`run_register_boot` registrar that VERIFIES before it writes.
+
+    The ``spec`` handed to it supplies the service IDENTITY the runner prints
+    with; the spec actually rendered is rebuilt by
+    :func:`register_model_gateway` around the entry point that answered
+    ``--version``, which is the whole point — a registration must never bake
+    an argv nobody ran.
+    """
+
+    def _registrar(
+        spec: BootServiceSpec,
+        *,
+        templates_root: Path,
+        on_event: EventSink = _noop_event,
+    ) -> bool:
+        result = register_model_gateway(
+            templates_root=templates_root,
+            on_event=on_event,
+            install_root=install_root,
+            state_dir=state_dir,
+            log_file=log_file,
+            runner=runner,
+            env=env,
+        )
+        if result.refused:
+            on_event(
+                "warn",
+                "nothing was written: an unrunnable unit is worse than none, "
+                "because the init system keeps retrying it while the launcher "
+                "toggle reads `registered`",
+                None,
+            )
+        return result.registered
+
+    return _registrar
+
+
+# ---------------------------------------------------------------------------
+# ENSURE — start a registration that already exists
+# ---------------------------------------------------------------------------
+
+#: Per-OS "start it if it is not already running", as command TEMPLATES the
+#: caller fills with the spec's names. Documented together because the three
+#: differ in one way that matters and in one that does not:
+#:
+#: * Linux NEEDS a ``reset-failed`` first. A unit parked by ``StartLimitBurst``
+#:   answers ``start`` with "start request repeated too quickly" and does
+#:   nothing — a no-op exactly when the ensure is needed. ``reset-failed`` on a
+#:   healthy unit is itself a no-op, so it is issued unconditionally rather
+#:   than after a second probe.
+#: * macOS and Windows have no equivalent park: launchd throttles (10 s,
+#:   ``ThrottleInterval``) and Task Scheduler retries a bounded number of times
+#:   (``RestartOnFailure``); neither latches a unit out of startability.
+#: * ``launchctl kickstart`` WITHOUT ``-k`` starts a job only if it is not
+#:   running; ``-k`` would KILL a healthy gateway mid-stream, which is the
+#:   opposite of an ensure. ``schtasks /Run`` is safe for the same reason from
+#:   the other direction: the task declares ``IgnoreNew``.
+_ENSURE_SUPPORTED_OS = ("Linux", "Darwin", "Windows")
+
+
+def ensure_commands(spec: BootServiceSpec, *, system: Optional[str] = None) -> list[list[str]]:
+    """The commands that start ``spec``'s registered service, in order.
+
+    Returns ``[]`` when the OS is unsupported or the init tool is absent —
+    "nothing to run" rather than a guess. The tool paths come from
+    :func:`shutil.which` so a test can make the whole set absent or present.
+    """
+    os_name = system or platform.system()
+    if os_name == "Linux":
+        systemctl = shutil.which("systemctl")
+        if not systemctl:
+            return []
+        return [
+            [systemctl, "--user", "reset-failed", spec.unit_name],
+            [systemctl, "--user", "start", spec.unit_name],
+        ]
+    if os_name == "Darwin":
+        launchctl = shutil.which("launchctl")
+        if not launchctl:
+            return []
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        return [[launchctl, "kickstart", f"gui/{uid}/{spec.plist_label}"]]
+    if os_name == "Windows":
+        schtasks = shutil.which("schtasks")
+        if not schtasks:
+            return []
+        return [[schtasks, "/Run", "/TN", spec.task_name]]
+    return []
+
+
+def start_if_registered(
+    spec: BootServiceSpec,
+    *,
+    home: Optional[Path] = None,
+    system: Optional[str] = None,
+    runner: Optional[Callable[..., Optional[int]]] = None,
+) -> tuple[bool, list[list[str]], str]:
+    """Start ``spec``'s service IF it is registered. ``(started, cmds, why)``.
+
+    The leave-alone case is first and it is silent: an unregistered service is
+    an OPT-IN the user has not taken, and a session-start ensure that
+    registered one would be making that decision for them.
+    """
+    os_name = system or platform.system()
+    if status(spec, home=home, system=os_name) is BootStatus.NOT_INSTALLED:
+        return False, [], "not registered"
+    commands = ensure_commands(spec, system=os_name)
+    if not commands:
+        return False, [], (
+            f"no init-system tool available to start {spec.service_id} on {os_name}"
+        )
+    run = runner or run_quiet
+    for cmd in commands:
+        run(cmd)
+    return True, commands, f"{spec.service_id} start requested"
+
+
+# ---------------------------------------------------------------------------
 # Gateway runtime state — the "path off the machine" half of delivery
 # ---------------------------------------------------------------------------
 
 #: Files the model gateway (and the launcher's export of its context table)
 #: leave under the state root. Basenames only — the root is resolved by the
 #: caller so ``VCT_STATE_DIR`` is honoured.
+#: The daemon's single-instance lockfile and port file, under the state root.
+#: Named constants because a READER exists (``vco_lib.gateway_ensure``, which
+#: reports "already running" from the daemon's own guard rather than adding a
+#: second one) and a second literal is how the scrub list and the reader drift
+#: apart. ``model_router.config`` builds the same paths for the daemon itself;
+#: ``test_the_scrub_list_matches_the_paths_the_gateway_actually_uses`` is what
+#: keeps the two sides honest.
+GATEWAY_PID_BASENAME = "model-gateway.pid"
+GATEWAY_PORT_BASENAME = "model-gateway.port"
+
 GATEWAY_STATE_FILES = (
     "model-gateway.token",
-    "model-gateway.pid",
-    "model-gateway.port",
+    GATEWAY_PID_BASENAME,
+    GATEWAY_PORT_BASENAME,
     "logs/model-gateway.log",
     "model-gateway/chat_model_context.json",
     # Written ONLY when something already occupied the export path before
@@ -1343,19 +2151,34 @@ __all__ = [
     "CONTAINER_STACK_TASK_NAME",
     "CONTAINER_STACK_UNIT_NAME",
     "DISABLE_ENV",
+    "GATEWAY_MODULE",
+    "GATEWAY_PID_BASENAME",
+    "GATEWAY_PORT_BASENAME",
+    "GATEWAY_SCRIPT_NAMES",
+    "GATEWAY_SECRET_PROJECT_ENV",
     "GATEWAY_STATE_DIRS",
     "GATEWAY_STATE_FILES",
+    "GATEWAY_VERIFY_ARG",
+    "GATEWAY_VERIFY_TIMEOUT_S",
     "MODEL_GATEWAY_PLIST_LABEL",
     "MODEL_GATEWAY_TASK_NAME",
     "MODEL_GATEWAY_UNIT_NAME",
     "BootServiceSpec",
     "BootStatus",
+    "GatewayExec",
+    "GatewayRegistration",
+    "GatewayUnitFacts",
     "backup_and_write_idempotent",
     "boot_log_file",
     "boot_registration_disabled",
     "container_stack_spec",
     "default_templates_root",
+    "ensure_commands",
+    "gateway_exec_candidates",
+    "gateway_names_spec",
+    "gateway_registrar",
     "gateway_state_paths",
+    "installed_gateway_facts",
     "launchd_plist_path",
     "linux_log_file",
     "macos_log_file",
@@ -1365,16 +2188,22 @@ __all__ = [
     "register",
     "register_linux",
     "register_macos",
+    "register_model_gateway",
     "register_windows",
     "remove_gateway_state",
     "render_template",
     "rerender_if_registered",
     "resolve_gateway_exec",
+    "resolve_gateway_exec_verified",
+    "resolve_gateway_secret_project",
     "run_boot_status",
     "run_quiet",
     "run_register_boot",
     "run_unregister_boot",
+    "start_if_registered",
     "status",
+    "verify_gateway_exec",
+    "systemd_dropin_paths",
     "systemd_unit_path",
     "unregister",
     "unregister_hub_boot_service",

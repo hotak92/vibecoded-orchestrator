@@ -32,7 +32,38 @@ top-level configuration code at import time).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional, Sequence
+
+
+def _install_log(log_event: Optional[Callable]) -> Callable:
+    """Adapt an optional install-time logger to a never-raising callable.
+
+    Every function in this module takes install.py's ``_log_install_event``
+    as an OPTIONAL parameter, which means each one needs the same three
+    accommodations: tolerate ``None`` (non-install callers pass nothing),
+    tolerate a logger whose signature predates the ``data=`` kwarg, and
+    never let an observability call change the outcome of the operation it
+    is describing.
+
+    v0.2.95: this is the ONE home for that. Four near-identical closures had
+    accumulated inline (one per consumer) and had already drifted apart —
+    two spelled ``data`` keyword-only, one positional-or-keyword, and one
+    dropped it entirely and tried the fallback in the opposite order. The
+    drift was invisible precisely because each copy was correct on its own;
+    a single home is what keeps the next accommodation from having to be
+    made four times. The union signature below is the widest of the four,
+    so every pre-existing call shape still resolves.
+    """
+    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:
+            # Older log_event signatures may not accept the `data` kwarg.
+            log_event(step, phase, detail)
+
+    return _log
 
 
 def _batch_query_weaviate_content_hashes(
@@ -82,13 +113,7 @@ def _batch_query_weaviate_content_hashes(
     """
     from vco_lib.kg_sync import batch_query_content_hashes
 
-    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
-        if log_event is not None:
-            try:
-                log_event(step, phase, detail, data=data)
-            except TypeError:
-                # Older log_event signatures may not accept `data` kwarg.
-                log_event(step, phase, detail)
+    _log = _install_log(log_event)
 
     def _on_warn(channel: str, payload: "dict") -> None:
         # Map the helper's structured warn channels back into the
@@ -163,6 +188,36 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
             # treats it as stale (forces a re-sync attempt).
             result[str(md_file)] = ""
     return result
+
+
+def content_hash_diff(
+    on_disk: "Mapping[str, str]",
+    stored_hashes: "Mapping[str, str]",
+    project_root: Path,
+) -> "list[str]":
+    """The ``knowledge/`` files whose on-disk hash differs from Weaviate's.
+
+    PURE. v0.2.95 moved this loop out of ``install.py``'s leg (c) so it sits
+    with the two helpers that produce its inputs —
+    :func:`_compute_on_disk_content_hashes` and
+    :func:`_batch_query_weaviate_content_hashes` — rather than inline in the
+    monolith. Behaviour is VERBATIM: match the stored hash by absolute path
+    first, then by the project-relative form (``sync_knowledge_graph.py``
+    writes ``file_path`` either way depending on ``KG_BASE_DIR``), and treat a
+    missing or empty stored hash as changed.
+    """
+    diff_files: "list[str]" = []
+    for file_path_str, disk_hash in on_disk.items():
+        stored_hash = stored_hashes.get(file_path_str, "")
+        if not stored_hash:
+            try:
+                rel = str(Path(file_path_str).relative_to(project_root))
+                stored_hash = stored_hashes.get(rel, "")
+            except ValueError:
+                pass
+        if disk_hash != stored_hash:
+            diff_files.append(file_path_str)
+    return diff_files
 
 
 def _safe_inside_project(candidate: "Path", project_root: Path) -> bool:
@@ -272,12 +327,7 @@ def _prune_stale_kg_rows(
 
     Soft-fail throughout: any error is logged but never raises into the caller.
     """
-    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
-        if log_event is not None:
-            try:
-                log_event(step, phase, detail, data=data)
-            except TypeError:
-                log_event(step, phase, detail)
+    _log = _install_log(log_event)
 
     if dry_run is None:
         dry_run = not (
@@ -776,12 +826,7 @@ def build_orphan_dev_deferral(
     as REFERENCED (returns None) so a destructive-drop deferral is never emitted
     on a check we could not positively complete.
     """
-    def _log(step: str, phase: str, detail: str = "") -> None:
-        if log_event is not None:
-            try:
-                log_event(step, phase, detail)
-            except TypeError:  # logger with a data= kwarg
-                log_event(step, phase, detail, data=None)
+    _log = _install_log(log_event)
 
     candidate = (candidate or "").strip()
     if not candidate or candidate not in class_map:
@@ -1237,13 +1282,7 @@ def quarantine_stale_mcp_json_shadow(
     import json
     import os
 
-    def _log(step: str, phase: str, detail: str = "", data=None) -> None:
-        if log_event is None:
-            return
-        try:
-            log_event(step, phase, detail, data=data)
-        except TypeError:  # logger without a data= kwarg
-            log_event(step, phase, detail)
+    _log = _install_log(log_event)
 
     # MAJOR-4.3: explicit user opt-out — checked HERE (the one shared helper)
     # so it covers every caller (install.py root check + bundle engine).
@@ -1481,3 +1520,561 @@ def quarantine_stale_mcp_json_shadow(
     except Exception as exc:  # noqa: BLE001 — soft-fail
         _log("mcp_json_shadow_check", "warn", f"could not check .mcp.json shadow: {exc}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# v0.2.95 (ratchet lane) — the install-time KG SCHEMA + SEED-LEDGER slice
+#
+# Three units moved out of install.py verbatim. All three are "did Weaviate's
+# KG state drift from what this install expects?" work, which is this module's
+# subject, and none of them carried anything install-flow-specific: their only
+# couplings to install.py were the observability logger and the shared
+# deferral-phrasing helper, both of which now arrive as parameters (the same
+# contract the IN-1 family at the top of this file already uses).
+#
+# install.py keeps thin same-signature wrappers so its call sites — and the
+# `install.<name>` accessors the test suite patches — resolve unchanged.
+#
+# Each function keeps its function-local imports rather than hoisting them to
+# module scope. That is load-bearing for two of them: the unit tests patch
+# `vco_lib.weaviate_schema.migrate_collection_to_target` on the MODULE object,
+# which only takes effect if the name is resolved at call time.
+# ---------------------------------------------------------------------------
+
+
+def migrate_kg_named_vector_slots(deferral_report, *, log_event=None) -> None:
+    """V0243-2 — Ensure $KG_COLLECTION and $DEVELOPMENT_COLLECTION carry all
+    5 named-vector slots from the v0.2.18 catalog.
+
+    Background: collections created before v0.2.18 were built with 3 slots
+    (qwen3_embed, ollama_embed, openai_embed). v0.2.18 added arctic2_embed +
+    openai_text_embed. The drift-detector intentionally does NOT fire on the
+    two new slots (so basic search still works), but every install/update
+    should silently patch them in when missing.
+
+    Strategy: additive patch_props (UNION) — vector slots can be added
+    without re-embedding existing data. The new slots start empty; the
+    embedding-enrichment step (commit 9 / EmbeddingService) fills them
+    lazily as the user runs sync or queries.
+
+    Idempotent: running twice produces 0 additions on the second pass
+    (every slot present → all Skipped).
+
+    Soft-fail: Weaviate unreachable or collection missing → skip silently
+    (those are existing deferred conditions upstream). Any per-slot error
+    is captured as a deferral entry and does NOT abort install.
+
+    Scope: per-project KG ($KG_COLLECTION) + per-project Development
+    ($DEVELOPMENT_COLLECTION). Shared KG and code-graph collections are
+    handled separately by `migrate_collections_to_v0218_schema`.
+
+    ``deferral_report`` is the run-scoped :class:`DeferralReport`;
+    ``log_event`` is install.py's ``_log_install_event`` (optional).
+    """
+    import os
+
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib.weaviate_schema import (
+        KG_NAMED_VECTORS,
+        migrate_collection_to_target,
+    )
+
+    _log = _install_log(log_event)
+
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    kg_coll = os.environ.get("KG_COLLECTION", "")
+    dev_coll = os.environ.get("DEVELOPMENT_COLLECTION", "")
+
+    targets = [(n, "kg") for n in [kg_coll] if n] + [
+        (n, "dev") for n in [dev_coll] if n
+    ]
+
+    if not targets:
+        _log(
+            "7d/10", "skip",
+            "kg_named_vector_slots: no KG_COLLECTION/DEVELOPMENT_COLLECTION set",
+        )
+        return
+
+    print("[7d/10] Migrating KG named-vector slots (V0243-2) ... ", flush=True)
+    _log(
+        "7d/10", "start",
+        "kg_named_vector_slots: ensuring 5-slot catalog on KG + Dev",
+        data={"kg": kg_coll, "dev": dev_coll, "weaviate_url": weaviate_url},
+    )
+
+    all_ok = True
+    for coll_name, coll_type in targets:
+        try:
+            report = migrate_collection_to_target(
+                coll_name,
+                KG_NAMED_VECTORS,
+                weaviate_url=weaviate_url,
+            )
+        except Exception as exc:
+            # Transport failure, missing collection, etc. — skip silently.
+            print(f"  [kg_named_vector_slots] {coll_name}: skipped ({exc})")
+            _log(
+                "7d/10", "warn",
+                f"kg_named_vector_slots: {coll_name} skipped: {type(exc).__name__}",
+                data={"collection": coll_name, "error": str(exc)[:200]},
+            )
+            continue
+
+        if report.added_slots:
+            print(f"  [kg_named_vector_slots] {coll_name}: "
+                  f"added {report.added_slots}")
+        elif report.skipped_slots:
+            print(f"  [kg_named_vector_slots] {coll_name}: "
+                  f"all slots present (noop)")
+        if report.errors:
+            all_ok = False
+            for err in report.errors:
+                slot = err.get("slot", "?")
+                reason = err.get("reason", "?")
+                print(f"  [kg_named_vector_slots] {coll_name}: "
+                      f"slot {slot} error: {reason}")
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id=f"kg_named_vector_slot_error_{coll_name}_{slot}",
+                        title=(
+                            f"Named-vector slot migration failed: "
+                            f"{coll_name}/{slot}"
+                        ),
+                        detected=(
+                            f"Migration of vector slot `{slot}` on collection "
+                            f"`{coll_name}` failed during install step 7d: "
+                            f"{reason}"
+                        ),
+                        why_deferred=(
+                            "Adding a vector slot failed. The collection will "
+                            "continue to work with the existing slots, but new "
+                            "embedding backends (arctic2_embed / "
+                            "openai_text_embed) will not be available until "
+                            "the migration succeeds."
+                        ),
+                        command_to_apply=(
+                            f"python -m vco_lib.project_init "
+                            f"migrate-collections --name "
+                            f"{os.environ.get('PROJECT_NAME', 'YourProject')} "
+                            f"--json"
+                        ),
+                        severity="warning",
+                        kg_node_refs=[],
+                    )
+                )
+        _log(
+            "7d/10",
+            "ok" if not report.errors else "warn",
+            f"kg_named_vector_slots: {coll_name} done",
+            data={
+                "collection": coll_name,
+                "added": report.added_slots,
+                "skipped": report.skipped_slots,
+                "errors": report.errors,
+            },
+        )
+
+    if all_ok:
+        print("  [kg_named_vector_slots] OK")
+    _log(
+        "7d/10",
+        "ok" if all_ok else "warn",
+        "kg_named_vector_slots: migration pass completed",
+    )
+
+
+def detect_legacy_shared_kg_class(deferral_report, *, log_event=None) -> None:
+    """PR-34 (v0.2.12, Group M) — soft-fail migration deferral.
+
+    When `python install.py --update` runs against a Weaviate that still
+    carries the pre-rename `VibeCodedTools_KnowledgeGraph` class (created
+    by an install <v0.2.12), emit a `legacy_shared_kg_class_present`
+    deferral entry pointing the user at the launcher's "Manage shared KG
+    collection" picker. We NEVER auto-rename or auto-drop the class —
+    that is destructive (would lose any cross-project KG content the user
+    has written) and the picker is the consent mechanism.
+
+    Idempotent + soft-fail:
+      * Weaviate unreachable → skip silently (the schema-rebuild flow
+        upstream already emits a `weaviate_unreachable` deferral).
+      * Legacy class absent → no-op.
+      * Legacy class present → one deferral entry, severity=info.
+
+    The picker (launcher Settings → Identity → "Manage shared KG
+    collection") handles three resolution paths: (a) accept the new
+    canonical and migrate content, (b) keep the legacy name as the
+    per-project shared-KG override, (c) ignore (dismissable).
+
+    ``deferral_report`` is the run-scoped :class:`DeferralReport`;
+    ``log_event`` is install.py's ``_log_install_event`` (optional).
+    """
+    import json
+    import os
+    import urllib.request
+
+    from vco_lib.deferral_report import DeferralEntry
+
+    _log = _install_log(log_event)
+
+    # Resolve Weaviate URL: prefer env, fall back to canonical default.
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    try:
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            f"{weaviate_url}/v1/schema", timeout=5,
+        )
+        schema = json.loads(resp.read())
+    except Exception:
+        # Soft-fail: skip silently. Other code paths already deferral
+        # on Weaviate unreachability.
+        return
+
+    classes = {c.get("class", "") for c in schema.get("classes", [])}
+    legacy_name = "VibeCodedTools_KnowledgeGraph"
+    canonical_name = "VibeCodedOrchestrator_KnowledgeGraph"
+    # v0.2.23 B1: also recognise the lowercase-c v0.2.12–v0.2.22 default
+    # as "canonical-present" (case-insensitive) so a user upgrading from
+    # that range doesn't get a spurious "canonical not yet created"
+    # message when their on-disk class is the lowercase-c variant.
+    legacy_lowercase_c = "VibecodedOrchestrator_KnowledgeGraph"
+
+    if legacy_name not in classes:
+        return  # No legacy class — nothing to migrate.
+
+    canonical_present = (
+        canonical_name in classes or legacy_lowercase_c in classes
+    )
+    detected_msg = (
+        f"Weaviate at {weaviate_url} still carries the pre-v0.2.12 "
+        f"shared-KG class `{legacy_name}`. The post-rename canonical "
+        f"name is `{canonical_name}` "
+        f"({'already present' if canonical_present else 'not yet created'})."
+    )
+
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="legacy_shared_kg_class_present",
+            title="Legacy shared-KG class still on disk (pre-v0.2.12 PR-26)",
+            detected=detected_msg,
+            why_deferred=(
+                "The shared cross-project KG class was renamed from "
+                f"`{legacy_name}` to `{canonical_name}` in v0.2.12 PR-26. "
+                "The legacy class is still on disk because the rename is "
+                "metadata-only; install.py does NOT auto-rename or "
+                "auto-drop a populated class (destructive — would lose "
+                "any cross-project KG content). Resolve via the "
+                "launcher's Settings → Identity → \"Manage shared KG "
+                "collection\" picker, which lets you pick which class "
+                "becomes the active shared KG for each project."
+            ),
+            command_to_apply=(
+                "Open the launcher (`./vct-launcher`), pick a project, "
+                "go to Settings → Identity, click \"Manage shared KG "
+                "collection\", and select either the legacy "
+                f"`{legacy_name}` or the canonical "
+                f"`{canonical_name}` as the shared KG for that project."
+            ),
+            severity="info",
+            kg_node_refs=[],
+        )
+    )
+    _log(
+        "7d/10", "info",
+        "legacy shared-KG class detected; deferral emitted",
+        data={"legacy_class": legacy_name,
+              "canonical_present": canonical_present},
+    )
+
+
+#: v0.2.95 WP-4: the condition an INCOMPLETE embedding-model / collection
+#: change records. Deliberately the EXISTING registered id rather than a new
+#: one, for three reasons that all point the same way:
+#:
+#:   * the owed work is the same work — nodes that exist on disk and are not
+#:     in Weaviate under the active model — and the remedy is the same
+#:     command, so a second id would be a second name for one condition;
+#:   * it already declares a REAL `retry_action` (`retry:py:kg_seed`, which
+#:     re-runs `sync_knowledge_graph.py --all`, content-hash gated) AND a
+#:     paired clear that fires at the end of a FULLY successful `--all`. The
+#:     entry therefore provably clears — the property this project treats a
+#:     deferral as defective without;
+#:   * its `clear_probe` is `paired-resolution`, NOT `owned-drop-when-absent`.
+#:     An install.py-OWNED id is dropped by any later install.py run that does
+#:     not re-detect it, which for owed embedding work would retire the record
+#:     while the work is still owed.
+#:
+#: Registry note for whoever owns `vco_lib/deferral_conditions.toml`: that
+#: row's `owner` names the sync script alone; install.py is now a second
+#: emitter of it. The row's class, retry and clear are all correct as they
+#: stand — only the prose under-describes reality.
+SEED_OWED_WORK_CONDITION_ID = "kg_sync_failures_pending"
+
+
+def emit_context_change_incomplete_deferral(
+    deferral_report,
+    reason: str,
+    *,
+    make_deferral: Callable,
+) -> None:
+    """Record that a leg-(b) re-embed did not finish, so it is retried.
+
+    Leg (b) is the branch install.py takes when the embedding model or a KG
+    collection name differs from what the last run recorded. Its whole job is
+    to re-embed the tree under the NEW context; a non-zero exit means it did
+    not. v0.2.95 WP-4 withholds the context triple in that case, which is what
+    makes the next `--update` try again — but a marker the user never sees is
+    not a report, so the owed work is also written to the ledger here.
+
+    Soft-fail by contract: ledger bookkeeping must never change the outcome of
+    a seed. A missing report is LOUD rather than silent — dropping the record
+    quietly is the failure mode this entry exists to end.
+
+    ``make_deferral`` is install.py's ``_make_deferral`` — the shared
+    phrasing helper that dedents the triple-quoted fields below. It is passed
+    in rather than re-implemented so there stays exactly one home for that
+    phrasing, and so a caller patching it still steers this entry's text.
+    """
+    if deferral_report is None:
+        print(
+            "  ! KG re-embed under the new embedding context did not complete, "
+            "and no run report was available to record it. Re-run "
+            "`install.py --update`, or "
+            "`python templates/scripts/sync_knowledge_graph.py --all`.",
+            flush=True,
+        )
+        return
+    try:
+        deferral_report.add_entry(make_deferral(
+            SEED_OWED_WORK_CONDITION_ID,
+            title=(
+                "KG re-embed under the new embedding context did not complete "
+                "— retry pending"
+            ),
+            detected=f"""
+                The embedding context changed ({reason}), so this run started a
+                FULL re-embed of knowledge/ + docs/ — and the sync subprocess
+                exited non-zero before finishing. Some nodes are therefore
+                either missing from Weaviate or still carry vectors produced by
+                the PREVIOUS model.
+            """,
+            why_deferred="""
+                `last_installed_active_embedding` / `_kg_collection` /
+                `_shared_kg_collection` were deliberately NOT advanced, so the
+                next `install.py --update` re-enters the same full-sync branch
+                and finishes the job. Advancing them would have silenced that
+                retry permanently: a stored `content_hash` is computed from file
+                bytes alone and carries no model identity, so the per-file diff
+                the next run would otherwise use cannot see a node that still
+                holds the old model's vectors.
+
+                The retry is cheap, not a second full re-embed: since v0.2.95
+                the sync's embed-skip also requires the ACTIVE named-vector slot
+                to be populated, so nodes already embedded under the new model
+                skip and only the ones that never landed are re-embedded. This
+                entry is auto-retryable — VCO's retry dispatcher re-runs the
+                sync for you once a backend answers — and it clears at the end
+                of the next FULLY successful `--all` tree sync.
+            """,
+            command_to_apply="""
+                # Finish the re-embed under the new embedding context:
+                python templates/scripts/sync_knowledge_graph.py --all
+            """,
+            severity="warning",
+        ))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"  ! (deferral emit failed: {inner})", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.95 WP-7 — the ONE-TIME KG metadata-repair pass, and what triggers it
+# ---------------------------------------------------------------------------
+#
+# WHAT IS REPAIRED. `templates/scripts/sync_knowledge_graph.py` brings a
+# node's stored `title` / `node_type` / `tags` / `external_links` up to
+# today's parse on its EMBED-SKIP path (decision in
+# `vco_lib.kg_metadata_repair`): when the text is unchanged but the stored
+# properties predate v0.2.95's frontmatter dialects, the row is PATCHED —
+# zero embeds, `content_hash` untouched, no re-chunk.
+#
+# WHY IT NEEDED A TRIGGER. That repair is reachable only from a run that
+# VISITS the node, and on an ordinary `--update` nothing visits it. The
+# node's content hash MATCHES — its text never changed, which is the
+# defect's whole premise — so install.py's leg (c) computes an EMPTY diff
+# and returns without spawning a sync at all. The same equality makes
+# `vco_lib.kg_sync_drift` report no drift, so the bundle-update gate does
+# not spawn one either, and the edit hook only ever visits the file being
+# edited. A 0.2.94 user with nested-dialect nodes could therefore update to
+# 0.2.95 and keep prose-scraped `tags` and a folder-derived `node_type`
+# forever, with tag filters silently excluding those nodes. Only a manual
+# `kg-sync --all` reached the repair, and nothing told the user to run one.
+#
+# THE TRIGGER, in one sentence: the first whole-tree sync after upgrading
+# runs as `--all` so every node is visited once, and only a run that exits 0
+# records the pass as done.
+#
+# ── Why an app_state stamp and NOT `crosses_version_boundary` ──
+#
+# `crosses_version_boundary(prev, running, "0.2.95")` is this codebase's
+# established "was this artifact produced by an older version of us" test and
+# is the obvious shape here. It cannot carry this gate ALONE, for two
+# independent reasons:
+#
+#   1. The only per-install "previous version" it could read is
+#      `state/install-manifest.json`, and `install.py::_write_install_manifest`
+#      advances that UNCONDITIONALLY near the end of main() — AFTER
+#      `_seed_weaviate` — with no knowledge of whether the seed succeeded. So
+#      an update whose repair pass died part-way still records 0.2.95, and the
+#      NEXT update (0.2.95 -> 0.2.96) no longer crosses the boundary: the
+#      repair is skipped forever, silently. That is precisely the outcome the
+#      exit-0 rule exists to prevent. A crossing cannot be withheld; a stamp
+#      can, and withholding it IS the retry.
+#   2. It answers False on an ABSENT or unparseable `prev` (its own docstring:
+#      malformed input on any of the three -> False), so an install with no
+#      manifest or a corrupt one would never be repaired.
+#      `codegraph_extractor_generation.decide`'s rule 5 exists for exactly
+#      that: unknown must be OWED, because a needless repeat costs one
+#      zero-embed pass while a wrongly-skipped repair costs permanently wrong
+#      retrieval metadata.
+#
+# The stamp answers both. The semver comparison is still NOT forked:
+# `generation_is_current` from that same detector module does it, so a future
+# release that teaches the parser a THIRD dialect appends one entry to
+# KG_METADATA_REPAIR_BUMPS and both the "already done" and the "owed again"
+# answers follow from it.
+
+#: `app_state` key holding the newest metadata-repair generation that a
+#: WHOLE-TREE sync completed cleanly for. Absent — the free-tier/no-launcher
+#: case, a failed read, and every install that has not yet run the pass —
+#: reads as OWED.
+KG_METADATA_REPAIR_STATE_KEY = "last_kg_metadata_repair_version"
+
+#: The releases whose stored-metadata parse differs from the one before them.
+#: APPEND to this when a future release teaches
+#: `sync_knowledge_graph.py::_normalise_frontmatter` another dialect — a stamp
+#: below the newest entry then reads as owed again. Never re-use an entry: the
+#: stamp records WHICH generation was satisfied, not how many passes have run.
+KG_METADATA_REPAIR_BUMPS: "tuple[str, ...]" = ("0.2.95",)
+
+#: What a certified pass writes to :data:`KG_METADATA_REPAIR_STATE_KEY`.
+KG_METADATA_REPAIR_STAMP = KG_METADATA_REPAIR_BUMPS[-1]
+
+
+def kg_metadata_repair_due(
+    stamped_version: "Optional[str]",
+    *,
+    bumps: "Sequence[str]" = KG_METADATA_REPAIR_BUMPS,
+) -> bool:
+    """Does this install still owe the whole-tree metadata-repair pass?
+
+    PURE. *stamped_version* is whatever
+    :data:`KG_METADATA_REPAIR_STATE_KEY` holds: ``None`` when the key is
+    unset, when there is no ``launcher.db`` at all, or when the read failed
+    (``install.py::_read_app_state_key`` soft-fails to ``None`` for all
+    three).
+
+    Every one of those reads as OWED, deliberately. The pass costs one fetch
+    per node and ZERO embeds; skipping it leaves a node's `tags` /
+    `node_type` / `title` permanently wrong with no error anywhere. That is
+    the same asymmetry `codegraph_extractor_generation.decide` settles in its
+    rule 5, and the comparison itself is that module's
+    `generation_is_current`, so the two can never disagree about what "at
+    least this generation" means.
+
+    A launcher-less install cannot record the stamp at all
+    (``_write_app_state_key`` soft-fails), so it would be due on every
+    update — except that it never reaches this gate: with no stored context
+    triple, leg (b) already takes such an install down the `--all` branch on
+    every update, which performs the repair. The behaviour there is
+    unchanged by this gate, not degraded by it.
+    """
+    from vco_lib.codegraph_extractor_generation import generation_is_current
+
+    return not generation_is_current(stamped_version, tuple(bumps))
+
+
+def kg_metadata_repair_certified(sync_all: bool, sync_exit_zero: bool) -> bool:
+    """May this seed run record the metadata-repair pass as done?
+
+    PURE. Only a WHOLE-TREE run (``--all``) that exited 0 may. The repair
+    fires per node on the embed-skip path, so a run handed an explicit file
+    list judged only those files, and a run that exited non-zero may have
+    died before reaching the rest.
+
+    That second half is v0.2.95 WP-4's rule, for WP-4's reason. A node this
+    pass never reached keeps a `content_hash` that still MATCHES — it is
+    computed from file bytes alone and carries no metadata identity — so no
+    later diff can see that the node is still owed. Stamping a partial run
+    would therefore retire the repair permanently with the work undone. Note
+    this is the failure shape SEG-1's leg-(c) argument does NOT cover: there,
+    a failed node has no stored hash and the next diff re-picks it.
+
+    Withholding the stamp costs at most one further zero-embed `--all` on a
+    later update. That is the cheap direction, and it is the retry.
+    """
+    return bool(sync_all) and bool(sync_exit_zero)
+
+
+def kg_metadata_repair_due_now(
+    read_app_state_key: "Callable[[str], Optional[str]]",
+) -> bool:
+    """I/O seam over :func:`kg_metadata_repair_due` — read, then decide.
+
+    Pairs with :func:`stamp_kg_metadata_repair`; the two are symmetric so the
+    key name is named in exactly one place per direction. install.py passes
+    its own ``_read_app_state_key``, which soft-fails to ``None`` on an
+    absent ``launcher.db`` / missing key / sqlite error, and which is also
+    the module attribute its test suite already patches — so a test steers
+    this gate through the accessor it knows rather than a new surface.
+    """
+    return kg_metadata_repair_due(read_app_state_key(KG_METADATA_REPAIR_STATE_KEY))
+
+
+def stamp_kg_metadata_repair(
+    sync_all: bool,
+    sync_exit_zero: bool,
+    write_app_state_key: "Callable[[str, str], None]",
+) -> bool:
+    """Record the metadata-repair pass as done, if this run earned it.
+
+    I/O seam over :func:`kg_metadata_repair_certified`; returns whether the
+    stamp was written, so a caller (and a test) can assert the DECISION and
+    not merely the absence of an error.
+
+    Soft-fail on the write is inherited from install.py's
+    ``_write_app_state_key``, and it fails in the safe direction: a stamp
+    that does not land leaves the pass owed, which costs one more zero-embed
+    `--all` — never a silently-skipped repair.
+    """
+    if not kg_metadata_repair_certified(sync_all, sync_exit_zero):
+        return False
+    write_app_state_key(KG_METADATA_REPAIR_STATE_KEY, KG_METADATA_REPAIR_STAMP)
+    return True
+
+
+def announce_kg_metadata_repair_leg(log_event: "Optional[Callable]" = None) -> None:
+    """Report that leg (d) — the one-time metadata-repair pass — was chosen.
+
+    Its own home rather than inline in ``install.py``: every other seed leg
+    names its reason on stdout AND in the install ledger, and a leg that did
+    not would make "why did my update run a full sync?" unanswerable from the
+    ledger. Kept beside the gate that selects it so the two cannot drift.
+
+    The wording states the cost, because the honest answer to "a full sync?"
+    here is that nothing is re-embedded: the pass visits every node so the
+    embed-skip path can patch stale stored properties, and a node whose
+    content hash matches is never re-embedded to do it.
+    """
+    print("  CI-10: KG metadata repair owed → full sync (property patches, "
+          "no re-embeds)")
+    _install_log(log_event)(
+        "7c/10", "info",
+        "WP-7: stored KG metadata predates this release's frontmatter parse "
+        "→ one whole-tree pass; patches properties, embeds nothing",
+        data={"reason": "metadata_repair"},
+    )

@@ -249,7 +249,7 @@ def route(
 def advertised_id(vendor: Vendor, model_id: str, one_m: bool) -> str:
     """The id to publish in ``/v1/models`` for a vendor model.
 
-    ``one_m`` comes from the chat-model context table keyed by FULL model id —
+    ``one_m`` comes from ``catalog.resolve_window``, keyed by FULL model id —
     never a family wildcard. That is not pedantry: within one shipped vendor,
     one model version has a 1M window while the previous minor version has
     200K, so a ``<family>*`` wildcard would misreport the window by 5x.

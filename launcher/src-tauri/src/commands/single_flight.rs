@@ -65,6 +65,24 @@ pub const OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects";
 /// Operation key: the orchestrator-clone refresh (`installer.rs`).
 pub const OP_UPDATE_ORCHESTRATOR_AT: &str = "update_orchestrator_at";
 
+/// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by BOTH
+/// `installer::update_orchestrator` (the MenuBar badge) and
+/// `self_update::apply_launcher_update` (Preferences → Launcher updates).
+///
+/// ONE key for two commands, which is the opposite of the split above, and the
+/// difference is the TARGET rather than the command: `update_all_projects` and
+/// `update_orchestrator_at` act on different trees, so guarding one must not
+/// block the other. These two act on the SAME clone — the launcher's own
+/// checkout — and both `git pull` it and then run `install.py --update` against
+/// it. Two keys would let a MenuBar click and a Preferences click interleave
+/// those on one tree, which is the catastrophic case (prior review §4.8) rather
+/// than an inconvenience.
+///
+/// The pipeline's `UpdateInProgressGuard` does NOT close this: its lockfile is
+/// a signal the MCP servers read to exit 75, written soft-fail and never
+/// consulted as a claim, so it cannot refuse a second run. This can.
+pub const OP_UPDATE_ORCHESTRATOR_CLONE: &str = "orchestrator_update";
+
 /// Key prefix for the per-project additive-migration claim (DS-F2). Prefixed
 /// so a project id can never collide with an operation name above.
 const MIGRATE_COLLECTIONS_PREFIX: &str = "migrate_collections:";
@@ -148,6 +166,35 @@ pub fn begin_or_refuse(key: &str) -> Result<SingleFlightGuard, String> {
     try_begin(key).ok_or_else(|| refusal_message(key))
 }
 
+/// Serialises the TESTS that take [`OP_UPDATE_ORCHESTRATOR_CLONE`].
+///
+/// v0.2.95 phase 3. [`IN_FLIGHT`] is process-global and `cargo test` runs a
+/// binary's tests on parallel threads, so two tests that both claim this key
+/// race: whichever loses sees a refusal it did not stage, or a claim it
+/// expected to be free. That is not hypothetical — this key now has callers'
+/// tests in three modules (`single_flight`, `installer`'s collision resolver,
+/// and anything the next surface adds).
+///
+/// Every test that claims this key must hold this lock for the duration. It is
+/// deliberately NOT a production mechanism: the production answer to
+/// contention is the refusal itself.
+#[cfg(test)]
+pub(crate) static ORCHESTRATOR_CLAIM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Claim the orchestrator-clone update, or fail with the refusal.
+///
+/// The ONE entry point for [`OP_UPDATE_ORCHESTRATOR_CLONE`], and it exists
+/// rather than having both commands write `begin_or_refuse(OP_…)` because the
+/// invariant that matters is not "each command takes a claim" but "both take
+/// the SAME claim". Spelled as two call sites naming a constant, that survives
+/// only as long as nobody adds a second constant; spelled as one function, the
+/// two cannot disagree. Prior review §4.8 is what a disagreement costs: a
+/// MenuBar click and a Preferences click interleaving a `git pull` and an
+/// `install.py --update` on one tree.
+pub fn begin_orchestrator_update_or_refuse() -> Result<SingleFlightGuard, String> {
+    begin_or_refuse(OP_UPDATE_ORCHESTRATOR_CLONE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +226,49 @@ mod tests {
         assert!(!is_in_flight(OP), "dropping the guard releases the claim");
         let second = try_begin(OP).expect("sequential re-run must be allowed");
         drop(second);
+    }
+
+    /// BOTH ARMS of the guard the two update commands now share — and the
+    /// point is the arm that REFUSES, because until v0.2.95 neither command was
+    /// guarded at all and the second click simply ran.
+    ///
+    /// The commands themselves cannot be driven from a unit test (Tauri
+    /// `AppHandle` + `Window` + a live clone), which is exactly why the claim
+    /// is taken through ONE function instead of two literal call sites: what
+    /// this asserts about `begin_orchestrator_update_or_refuse` holds for every
+    /// caller of it by construction.
+    #[test]
+    fn the_orchestrator_update_claim_refuses_a_second_holder_and_frees_afterwards() {
+        let _serial = ORCHESTRATOR_CLAIM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // ACT arm: the first caller proceeds, the second is refused — a
+        // Preferences update while the MenuBar update is mid-`install.py`.
+        let first = begin_orchestrator_update_or_refuse().expect("first update must proceed");
+        let refused = begin_orchestrator_update_or_refuse()
+            .expect_err("a second concurrent orchestrator update must be refused");
+        assert!(
+            refused.contains(OP_UPDATE_ORCHESTRATOR_CLONE),
+            "the refusal must name what is already running: {refused}"
+        );
+
+        // LEAVE-ALONE arm: the claim is not a latch. A guard that never
+        // released would break BOTH update buttons for the rest of the
+        // process's life after the first successful update — worse than the
+        // race it prevents.
+        drop(first);
+        let second = begin_orchestrator_update_or_refuse()
+            .expect("a sequential re-run must be allowed once the first finished");
+        drop(second);
+    }
+
+    /// The shared claim must not collide with the two per-target keys, or a
+    /// running orchestrator update would block an unrelated update-all.
+    #[test]
+    fn the_orchestrator_update_key_is_distinct_from_the_per_target_ones() {
+        assert_ne!(OP_UPDATE_ORCHESTRATOR_CLONE, OP_UPDATE_ALL_PROJECTS);
+        assert_ne!(OP_UPDATE_ORCHESTRATOR_CLONE, OP_UPDATE_ORCHESTRATOR_AT);
     }
 
     /// Claims are per-key: holding one operation never blocks another.

@@ -25,8 +25,11 @@ the finding in the first place.
 from __future__ import annotations
 
 import re
+import tempfile
 import unittest
 from pathlib import Path
+
+from tests.common.rust_source import cfg_test_line_numbers
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER_SRC = REPO_ROOT / "launcher" / "src"
@@ -80,16 +83,55 @@ def _command_bodies_from_src(src: str) -> dict[str, str]:
     return out
 
 
+def _production_source(src: str) -> str:
+    """`src` with every `#[cfg(test)]`-gated ITEM blanked out, line-for-line.
+
+    Two things have to be true at once here, and until v0.2.95 this file got
+    the second one wrong:
+
+    1. **Test-module text must not reach a command body.** `_command_bodies_*`
+       slices each command's body up to the NEXT command, so a trailing
+       `#[cfg(test)] mod tests` lands inside the LAST command's slice — and
+       that module's assertions name the commands and quote `require_tier(`.
+       A gate whose whole job is "this command calls `require_tier`" would
+       then be satisfied by the TEST that says it should. That is the hazard
+       the original `src.find("\\n#[cfg(test)]")` truncation was written for,
+       and it is real.
+
+    2. **Production code AFTER a gated item must stay visible.** Truncating at
+       the FIRST marker assumes the test module is last. The moment a file
+       gates a mid-file helper, every command below it disappears from the
+       scan — silently, and toward GREEN, because a command that is not seen
+       cannot be reported as ungated. A concurrent v0.2.95 lane hit exactly
+       this shape in `git_user_editable_merge.rs` (a `#[cfg(test)]` helper
+       near the top hid a production emitter 3 000 lines below it), and it is
+       the same v0.2.90 lesson `tests/common/rust_source.py` was extracted to
+       hold.
+
+    So the span question is answered by the ONE home for it —
+    `cfg_test_line_numbers`, per-item and brace-balanced, with the Rust lexer
+    that knows a brace inside a string is not a brace — and the gated lines
+    are BLANKED rather than removed so line-for-line correspondence (and the
+    ordering `_command_bodies_from_src` slices by) survives.
+
+    `include_any_test` stays at its strict default: `#[cfg(any(test,
+    debug_assertions))]` compiles into a debug build, so such a command is
+    reachable by a user running one and must keep being policed.
+    """
+    gated = cfg_test_line_numbers(src)
+    if not gated:
+        return src
+    return "\n".join(
+        "" if n in gated else line
+        for n, line in enumerate(src.splitlines(), start=1)
+    )
+
+
 def _command_bodies(path: Path) -> dict[str, str]:
     """Map `#[command] fn name` → its body text (up to the next top-level `}`)."""
-    src = path.read_text(encoding="utf-8")
-    # The trailing `#[cfg(test)] mod tests` block is not part of any
-    # command's body — cut it off so the LAST command doesn't swallow it
-    # (its own name appears in the test module's assertions).
-    cut = src.find("\n#[cfg(test)]")
-    if cut > 0:
-        src = src[:cut]
-    return _command_bodies_from_src(src)
+    return _command_bodies_from_src(
+        _production_source(path.read_text(encoding="utf-8"))
+    )
 
 
 def _pro_only_routes(sidebar_src: str) -> set[str]:
@@ -232,10 +274,9 @@ class CommandLocatorSelfCheck(unittest.TestCase):
 
     def test_command_count_matches_a_regex_independent_line_count(self) -> None:
         for path in (COORDINATION_RS, HUB_PROXY_RS):
-            src = path.read_text(encoding="utf-8")
-            cut = src.find("\n#[cfg(test)]")
-            if cut > 0:
-                src = src[:cut]
+            # Same production view as `_command_bodies` — one answer to "where
+            # does the test code stop", not a second one that can disagree.
+            src = _production_source(path.read_text(encoding="utf-8"))
             self.assertEqual(
                 len(_command_bodies_from_src(src)),
                 _plain_command_attribute_count(src),
@@ -267,6 +308,106 @@ class CommandLocatorSelfCheck(unittest.TestCase):
         )
         bodies = _command_bodies_from_src(synthetic)
         self.assertIn("another_synthetic_command", bodies)
+
+
+class TheProductionViewKeepsBothProperties(unittest.TestCase):
+    """v0.2.95 — the two things `_production_source` has to do at once.
+
+    Both arms are here because they pull in OPPOSITE directions: cut too much
+    and a production command vanishes (the gate silently stops policing it);
+    cut too little and a test module's own text satisfies the gate FOR the
+    command it is testing. `#[cfg(test)]` is not a file terminator, so neither
+    property can be had by position alone.
+
+    Synthetic sources, deliberately: `coordination.rs` and `hub_proxy.rs`
+    happen to gate their test module LAST today, so a real-file test would
+    pass under the old truncation too and prove nothing.
+    """
+
+    #: A gated item in the MIDDLE. `first` is gated on nothing; the helper
+    #: module in between is; `second` is production code the old truncation
+    #: could not see.
+    MID_FILE_GATE = (
+        "use tauri::command;\n"
+        "\n"
+        "#[command]\n"
+        "pub fn first_production_command() -> Result<(), String> {\n"
+        "    require_tier(MIN_TIER, \"coordination\")?;\n"
+        "    Ok(())\n"
+        "}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod helpers {\n"
+        "    pub fn fixture() -> &'static str {\n"
+        "        \"require_tier( lives in this fixture string, and a { brace }\"\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "#[command]\n"
+        "pub fn second_production_command() -> Result<(), String> {\n"
+        "    Ok(())\n"
+        "}\n"
+    )
+
+    #: The ORIGINAL hazard: a trailing test module whose assertions name the
+    #: gate. Nothing in `ungated_command` calls `require_tier`.
+    TRAILING_TEST_MODULE = (
+        "#[command]\n"
+        "pub fn ungated_command() -> Result<(), String> {\n"
+        "    Ok(())\n"
+        "}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn the_command_is_gated() {\n"
+        "        assert!(SRC.contains(\"require_tier(\"));\n"
+        "    }\n"
+        "}\n"
+    )
+
+    def test_a_command_after_a_gated_item_is_still_located(self) -> None:
+        bodies = _command_bodies_from_src(
+            _production_source(self.MID_FILE_GATE)
+        )
+        self.assertIn(
+            "second_production_command",
+            bodies,
+            "a `#[command]` below a mid-file `#[cfg(test)]` item fell out of "
+            "the scan — an ungated Pro command there would ship unnoticed",
+        )
+        self.assertIn("first_production_command", bodies)
+
+    def test_the_gated_items_text_never_reaches_a_command_body(self) -> None:
+        bodies = _command_bodies_from_src(
+            _production_source(self.TRAILING_TEST_MODULE)
+        )
+        self.assertNotIn(
+            "require_tier(",
+            bodies["ungated_command"],
+            "the trailing test module's text landed in the command's body — "
+            "the gate would be satisfied by the test that asserts it",
+        )
+
+    def test_the_file_entry_point_shares_the_view(self) -> None:
+        """`_command_bodies` (path in, bodies out) is what the gates call —
+        pin the fix there, not only on the pure helper."""
+        with tempfile.TemporaryDirectory() as td:
+            synthetic = Path(td) / "synthetic_commands.rs"
+            synthetic.write_text(self.MID_FILE_GATE, encoding="utf-8")
+            bodies = _command_bodies(synthetic)
+        self.assertIn("second_production_command", bodies)
+
+    def test_the_self_check_counts_commands_below_a_gated_item(self) -> None:
+        """The locator self-check runs on the same view, so its denominator
+        includes commands below a gated item."""
+        src = _production_source(self.MID_FILE_GATE)
+        self.assertEqual(
+            len(_command_bodies_from_src(src)),
+            2,
+            "the self-check's denominator lost a command to the test gate",
+        )
+        self.assertEqual(_plain_command_attribute_count(src), 2)
 
 
 class SidebarClaimIsTrue(unittest.TestCase):

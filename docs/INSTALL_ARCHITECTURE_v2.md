@@ -256,6 +256,25 @@ overwrites user `knowledge/**` (the preserve carve-out is unconditional).
 Soft-fail throughout: subprocess errors surface as warnings, never abort the
 install.
 
+### 6.0 Rendered root files (v0.2.95)
+
+Some tracked paths at the install root are **rendered**, not delivered:
+`install.py` writes their body from a template and preserves whatever the user
+wrote outside the AUTO markers. The set lives in
+`vco_lib/rendered_root_files.toml` (one table, two parsers — the renderer
+iterates it, and the launcher's pre-pull reconcile in
+`launcher/src-tauri/src/commands/git_user_editable_merge.rs` classifies against
+it), because a rendered path needs the OPPOSITE handling of both other bias
+classes at update time: upstream owns the tracked blob, the user owns the
+working-tree file.
+
+The reconcile therefore takes upstream's blob into HEAD and puts the user's
+bytes straight back, so the pull cannot conflict on the path and the renderer
+refreshes the AUTO block right after. One `rendered_file_upstream_changed`
+record (class `informational_record`) is written per update that did it. See
+`docs/post-install/UPDATE-RECOVERY.md` for the user-facing version, including
+the hand-run-`git pull` caveat.
+
 ### 6.1 The deferral lifecycle contract (v0.2.91)
 
 "Deferral entries self-clear on the next run once their condition no longer

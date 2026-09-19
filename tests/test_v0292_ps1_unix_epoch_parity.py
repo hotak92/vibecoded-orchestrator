@@ -87,7 +87,9 @@ def _extract_assignment(path: Path, variable: str) -> str:
 @pytest.mark.parametrize(
     ("hook", "variable"),
     [
-        ("post-file-edit.ps1", "nowTs"),
+        # v0.2.95 (lane F10): the diagram-throttle stamp moved with the
+        # rest of the routing into the ONE home both write hooks call.
+        ("_lib/route-touched-path.ps1", "nowTs"),
         ("_lib/kg-sync-debounce.ps1", "nowEpoch"),
         # v0.2.92 final sweep: the three telemetry hooks write MILLISECONDS
         # ($*TsMs) into the same JSONL their .sh siblings write

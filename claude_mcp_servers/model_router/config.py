@@ -38,9 +38,22 @@ Environment knobs (all optional; every one is read by code in this package)
     Path to the exported chat-model context table. Defaults to
     ``<vct_root>/model-gateway/chat_model_context.json``.
 ``VCT_MODEL_GATEWAY_SECRET_PROJECT``
-    Project scope passed to the vct-secrets resolver. Default: unset, which
-    means the shared scope in the file store and a by-path lookup in the hub.
-    Set it when the vendor key was stored against a specific project.
+    Project scope passed to the vct-secrets resolver — the PER-PROJECT
+    OVERRIDE. Unset (the default) leaves ``secret_project`` ``None``, and
+    :class:`model_router.secrets.VendorKeyResolver` then resolves this
+    install's orchestrator root at runtime, through which SHARED secrets
+    answer. Set it when the vendor key was stored against a specific project:
+    that project's own key outranks the shared one, in both stores.
+``VCT_MODEL_GATEWAY_CATALOG``
+    Which versions of a model family reach the ``/model`` picker:
+    :data:`CATALOG_FILTER_LATEST` (the default — only the newest version of
+    each family, so the picker is the list of models a user would actually
+    choose from) or :data:`CATALOG_FILTER_ALL` (every version the upstreams
+    return). Withheld ids are reported in ``_vct_catalog_hidden`` and counted
+    in ``/health``, never silently dropped. An unrecognised value is an
+    error at startup (:func:`resolve_catalog_filter`) rather than a silent
+    fall back to the default: a knob whose typo does nothing is the failure
+    mode this project has paid for before.
 ``VCT_MODEL_GATEWAY_CATALOG_TTL`` / ``VCT_MODEL_GATEWAY_STATIC_RETRY_TTL`` /
 ``VCT_MODEL_GATEWAY_KEY_TTL``
     Cache lifetimes in seconds. Present so the smoke tests can drive the
@@ -66,6 +79,19 @@ from typing import Optional
 
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import claude_user_dir, vct_root_dir
+
+# The filter VOCABULARY lives beside the code that applies it, and this
+# module imports it rather than declaring a second copy. The direction
+# matters and is not arbitrary: ``catalog`` must stay importable without
+# ``vco_lib`` (the wheel ships it without the root distribution, and
+# ``tests/test_model_router_packaging.py`` installs exactly that), so the
+# dependency can only run this way.
+from .catalog import (
+    CATALOG_FILTER_ALL,
+    CATALOG_FILTER_LATEST,
+    CATALOG_FILTERS,
+    DEFAULT_CATALOG_FILTER,
+)
 
 #: Documented in CLAUDE.md as the model-router port. The field prototype ran
 #: on 8787; the shipped daemon uses the documented port and the collision with
@@ -326,6 +352,37 @@ def resolve_port() -> int:
     return port_candidates()[0]
 
 
+class CatalogFilterError(ValueError):
+    """``VCT_MODEL_GATEWAY_CATALOG`` names a filter that does not exist."""
+
+
+def resolve_catalog_filter() -> str:
+    """Which catalog filter is in force, or an error naming the real ones.
+
+    Unset or empty is the default. Anything else must be a value this module
+    implements — a typo REFUSES to start rather than running as ``latest``
+    and leaving the user to discover, some hours later, that the setting they
+    made never took. That is the same judgement :func:`resolve_host` makes
+    and the opposite of :func:`_env_int`'s, deliberately: a bad number has a
+    safe value to fall back to, while a bad ENUM has only a wrong one.
+
+    Case and surrounding space are forgiven; ``LATEST`` from a shell script
+    is not a typo, it is a shell script.
+    """
+    raw = (os.environ.get("VCT_MODEL_GATEWAY_CATALOG") or "").strip().lower()
+    if not raw:
+        return DEFAULT_CATALOG_FILTER
+    if raw not in CATALOG_FILTERS:
+        raise CatalogFilterError(
+            f"VCT_MODEL_GATEWAY_CATALOG={raw!r} is not a catalog filter. Use "
+            f"one of: {', '.join(CATALOG_FILTERS)}. "
+            f"{CATALOG_FILTER_LATEST!r} (the default) publishes only the "
+            f"newest version of each model family; {CATALOG_FILTER_ALL!r} "
+            "publishes every version the upstreams return.",
+        )
+    return raw
+
+
 class HostNotLoopbackError(ValueError):
     """A non-loopback bind address was requested."""
 
@@ -413,6 +470,11 @@ class GatewayConfig:
     #: streamed upstream unrewritten rather than refused. See
     #: :data:`REWRITE_BUFFER_LIMIT_BYTES`.
     rewrite_buffer_bytes: int = REWRITE_BUFFER_LIMIT_BYTES
+    #: Which versions of a model family reach the picker. Read by
+    #: :func:`model_router.server.models_handler` and handed to
+    #: ``CatalogService.union``; reported in ``/health`` so the answer to "why
+    #: is my picker short?" does not require knowing the knob exists.
+    catalog_filter: str = DEFAULT_CATALOG_FILTER
 
     @classmethod
     def from_env(cls, *, token: str = "") -> "GatewayConfig":
@@ -437,10 +499,17 @@ class GatewayConfig:
                 (os.environ.get("VCT_MODEL_GATEWAY_SECRET_PROJECT") or "").strip()
                 or None
             ),
+            catalog_filter=resolve_catalog_filter(),
         )
 
 
 __all__ = [
+    "CATALOG_FILTERS",
+    "CATALOG_FILTER_ALL",
+    "CATALOG_FILTER_LATEST",
+    "DEFAULT_CATALOG_FILTER",
+    "CatalogFilterError",
+    "resolve_catalog_filter",
     "DEFAULT_CATALOG_TTL_S",
     "DEFAULT_HOST",
     "DEFAULT_KEY_TTL_S",

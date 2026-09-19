@@ -25,21 +25,30 @@
   Log paths: launchd refuses to start a job whose StandardOutPath directory
   does not exist, so boot_service.py creates it before bootstrapping.
 
-  Template substitutions:
-    {{INSTALLED_AT_PATH}} — absolute path where this plist landed
-    {{LABEL}}             — launchd label (reverse-DNS, must match filename)
-    {{EXEC_ARGV_PLIST}}   — the ProgramArguments array body, pre-rendered as
-                            <string> elements: the gateway entry point
-                            resolved at registration time plus the `serve`
-                            verb
-    {{WORKING_DIR}}       — directory the daemon runs in
-    {{STATE_DIR}}         — VCT state root pinned at registration time
-    {{BOOT_LOG_FILE}}     — where launchd captures the PROCESS's own output
-                            (startup refusals, tracebacks). Deliberately NOT
-                            the daemon's own log file: the daemon logs to
-                            stderr as well as to that file, so pointing
-                            launchd at the same path would write every
-                            record twice.
+  Template substitutions. NAMED WITHOUT THEIR BRACES on purpose (v0.2.95):
+  boot_service.render_template substitutes every occurrence of a token,
+  comments included, so a documented token here would be replaced by the
+  VALUE — and a value containing a double hyphen (any path with one in it,
+  which is legal everywhere) would then close this comment early and produce
+  a plist launchd rejects outright. The braced forms appear below, in the
+  document itself, which is the only place they belong.
+
+    INSTALLED_AT_PATH — absolute path where this plist landed
+    LABEL             — launchd label (reverse-DNS, must match filename)
+    EXEC_ARGV_PLIST   — the ProgramArguments array body, pre-rendered as
+                        <string> elements: the gateway entry point resolved
+                        at registration time plus the `serve` verb
+    WORKING_DIR       — directory the daemon runs in
+    STATE_DIR         — VCT state root pinned at registration time
+    SECRET_PROJECT    — the per-project OVERRIDE for the scope the daemon
+                        resolves vendor keys in. EMPTY on every install that
+                        did not ask for one, which is what leaves the daemon
+                        resolving its own install root at RUNTIME
+    BOOT_LOG_FILE     — where launchd captures the PROCESS's own output
+                        (startup refusals, tracebacks). Deliberately NOT the
+                        daemon's own log file: the daemon logs to stderr as
+                        well as to that file, so pointing launchd at the same
+                        path would write every record twice.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -79,6 +88,26 @@
              the next login. -->
         <key>VCT_STATE_DIR</key>
         <string>{{STATE_DIR}}</string>
+
+        <!-- The PER-PROJECT OVERRIDE for the scope the daemon resolves
+             vendor keys in. Normally EMPTY, and empty is the working state:
+             it reads back as unset, and the daemon then resolves THIS
+             INSTALL'S orchestrator root itself, at startup
+             (model_router.secrets). WorkingDirectory below is the state root,
+             which is NOT a registered project — and `agent_secrets` resolves
+             its hub tier (the ONLY route to an OS-keychain key) against
+             `project or cwd()` — so before v0.2.95 a login-started gateway
+             answered every vendor request "no key found" while the identical
+             key resolved in milliseconds from any project's cwd (measured on
+             Linux 2026-09-10; the cwd rule is the same on macOS). Resolving
+             at RUNTIME rather than baking a path here is what makes that fix
+             survive a MOVED install. Set this only to point the gateway at a
+             specific project's own key;
+             `vco_lib.boot_service.resolve_gateway_secret_project` never
+             derives a value for it, and preserves one you set across every
+             re-render. -->
+        <key>VCT_MODEL_GATEWAY_SECRET_PROJECT</key>
+        <string>{{SECRET_PROJECT}}</string>
     </dict>
 
     <key>StandardOutPath</key>

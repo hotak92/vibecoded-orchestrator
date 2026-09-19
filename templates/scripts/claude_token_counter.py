@@ -62,8 +62,9 @@ Verified 2026-05-01 against live transcript + Anthropic public docs:
   - input_tokens: streaming placeholder, ~75% are 0 or 1 — UNRELIABLE
   - output_tokens: undercounted ~10-17x vs statusbar (uniform per model
     → OK as a *relative* threshold signal) — RELIABLE for work-counting
-  - cache_creation_input_tokens: matches statusbar 1x — RELIABLE for
-    cost (kept exposed via ScanResult for cost-tracker), NOT for work
+  - cache_creation_input_tokens: matches statusbar 1x — RELIABLE as a
+    raw cache-size signal (kept exposed via ScanResult for any consumer;
+    the nudge is the only current one), NOT for work
   - cache_read_input_tokens: matches statusbar 1x for cache hits
 
 Claude Code emits ~3 JSONL entries per actual API request during streaming;
@@ -185,8 +186,9 @@ class ScanResult:
     """Aggregated session totals from a transcript scan.
 
     `work_units_total` is the v10.1 work-done proxy (used by kg-update-nudge).
-    `cache_creation_total` and `cache_read_total` are kept for cost-tracker
-    callers — do NOT use cache_creation as a work signal.
+    `cache_creation_total` and `cache_read_total` are exposed for any consumer
+    (the nudge is the only current one) — do NOT use cache_creation as a work
+    signal.
     """
 
     work_units_total: int = 0          # v10.1 — the work-done counter

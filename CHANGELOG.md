@@ -7,6 +7,1213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.95] - 2026-09-19
+
+### Fixed — the launcher self-update could leave your install half-updated, and then report it complete (v0.2.95)
+
+- **Preferences → Launcher updates advanced the whole orchestrator source tree, rebuilt
+  only the launcher, and never ran `install.py`** — leaving the venv, the bundled hooks,
+  `templates/`, the MCP registrations, the knowledge seed and the collection schema at the
+  version you came from. It then refreshed `install-manifest.json` to the NEW version with
+  `installed: true`. The update badge keys on commits-behind, which was now zero, so the
+  half-updated install was **durable and invisible**. Present since that surface was written
+  (2026-04-27) and shipped in every tag since.
+  - **The surface now runs `install.py --update`**, through the same pipeline the orchestrator
+    update uses. The cargo/npm rebuild it used to do is the fallback for when install.py is
+    unavailable.
+  - **Only `install.py` may advance the manifest's `version`.** A path that moves the source
+    without running the installer writes `source_commit`, `install_method` and a new
+    `post_source_only: true`, and leaves `version` where the last real install left it.
+  - **A run that changes nothing now writes nothing.** "Already up to date" used to stamp the
+    manifest anyway, which lit `install_stale` — so a click that did nothing ended by demanding
+    a full install.
+  - `force_resync_launcher` now stops the hub before `git reset --hard` writes over
+    `launcher/dist/*/vct-hub`, a TRACKED file. That hazard was never a decision: the function
+    was written on 2026-05-07 and the hub binary became tracked two weeks later.
+
+### Added — `vco doctor` can see a half-executed install (v0.2.95)
+
+- New probe **`install_completeness`** compares `install-manifest.json` against the bundle
+  manifest and the last successful session in `state/logs/install.jsonl`. It convicts on three
+  legs — versions disagree, commits disagree, or the manifest says `post_source_only` — and
+  **acquits when the marker merely LAGS its installer** (install.py logs the session, then
+  writes the manifest; the gap is real and measured at ~4 s). Anything it cannot positively
+  establish returns "not evaluated", never a verdict.
+- **An ABSENT `post_source_only` never convicts.** No manifest written before this release
+  carries the flag, and treating its absence as guilt would condemn every healthy install.
+- No doctor probe read `install-manifest.json` before this (other callers do): the currency probe
+  deliberately treats
+  install age as "not decision-relevant on a healthy checkout", and after a source-only update
+  the checkout is zero commits behind — so it read healthy.
+
+### Changed — the two update code paths became one (v0.2.95)
+
+- The launcher had two update commands that were **never designed as two**: `update_orchestrator`
+  (2026-04-26: pull + install.py) and `apply_launcher_update` (2026-04-27: pull + rebuild +
+  restart). They converged in capability over sixteen months while only their HELPERS were ever
+  shared — the *sequence* never was, so each git-safety fix landed on one surface and reached
+  the other weeks to months later, or not at all.
+- The pre-flight, fetch, the rendered / generated / user-editable reconciles, the pull-plan
+  decision, the pull itself, the post-pull verification and the audit-row collection now live in
+  one **`update_pipeline.rs`** that both commands call; each keeps only its own tail.
+- **The anti-drift test that existed to prevent this could not fail**: it called the same function
+  twice with identical arguments and asserted the results matched. Replaced by one that drives the
+  pipeline and renders a single error through both surfaces' serialisers.
+- **`LC_ALL=C` was pinned on one surface's pull and not the other's**, and every conflict
+  classifier matches English substrings — so unifying without noticing would have REGRESSED the
+  surface that had it. Both have it now.
+
+### Fixed — every command that writes the orchestrator clone takes the same claim (v0.2.95)
+
+- **None of these commands took a shared claim before this release; thirteen sites take it now** —
+  twelve commands plus the shared collision helper. The merge / rebase / abort / resume commands, the
+  autostash-pop and untracked-collision resolvers, `apply_pending_install`, both
+  conflict-resolution buttons and `apply_hardware_reconfig` could all run concurrently against
+  one clone. That stopped being theoretical this release: a conflict now leaves the resume
+  sentinel standing *and* renders the resync modal, so **"Continue Update" and "Resync now" — one
+  of which is `git reset --hard` — were offered at the same time** with only one taking a claim.
+- Nested callers hand the claim down rather than re-taking it; claiming naively at the top of each
+  command would have dead-locked every recovery button.
+- The wiring test's docstring claimed it covered "every surface that WRITES the orchestrator
+  clone" while enumerating four. The enumeration is now complete and fails when a surface is added
+  without a claim.
+- Three more fixes on the same recovery paths: `install.py`'s output pipes are drained
+  concurrently, so a child writing more than 64 KiB to stderr no longer deadlocks the update; the
+  post-pull recovery tail closes the launcher's `launcher.db` connection for the install.py window,
+  as the main path already did, so install.py stops contending for the writer lock on Windows; and
+  `force_resync` aborts an in-progress merge or rebase before `git reset --hard`, which does not
+  clear `.git/rebase-merge` on its own.
+
+### Fixed — the desktop-icon step could never create an icon on Linux or macOS (v0.2.95)
+
+- `install.py::_run_desktop_icon_step` always passes `--no-auto-launch`, and that flag's `exit 0`
+  sat **before** the desktop-shortcut step — because the gate landed on 2026-04-27 and the
+  shortcut step was appended to the end of the same file the next day. So the step whose entire
+  purpose is creating the icon could not create one. The Windows sibling has always ordered it
+  correctly, which is why this survived five months.
+
+### Fixed — knowledge re-embedding: an empty vector slot is repaired, unchanged content is not re-embedded (v0.2.95)
+
+- **`sync_node` never checked whether the ACTIVE vector slot was populated**, so a node whose
+  content hash matched but whose active slot was empty was skipped forever. It now checks — but
+  deliberately **not** by mirroring `sync_doc`'s fallback, which scored an unreadable vector
+  payload as "slot empty ⇒ re-embed": that re-embeds the whole tree whenever a fetch degrades,
+  and loops forever on a legacy single-unnamed-vector class where the slot is missing from the
+  *schema* and no repair is possible. One shared gate now engages only when the schema is readable
+  AND declares the active slot; every other case keeps pre-existing skip semantics. `sync_doc`
+  calls that same home and re-embeds strictly LESS than before: its degraded-fetch fallback still
+  runs, but no longer forces a re-embed. `sync_node` re-embeds strictly MORE, by exactly one set — the nodes whose active slot was
+  never filled, which it used to skip forever. That set is the defect; embedding it once is the fix.
+- **The install now records what enrichment did.** `vco_lib/embedding_enrichment.py` performs the
+  per-object, idempotent slot fill but writes no marker of its own — `install.py` is the only writer
+  of `last_installed_active_embedding`, and its leg (b) never stamped after an enrich. So doing the
+  recommended thing and then updating re-embedded the entire collection. Leg (b) now distinguishes a
+  *slot change* (enrich, then stamp) from a *collection rename* (full re-seed).
+- A model/collection-change run that fails part-way no longer advances the marker as if it had
+  succeeded; it leaves the owed work recorded as `kg_sync_failures_pending`, which has a real retry
+  action and clears when the work lands.
+
+### Changed — one home for the interpreter cascade, the schema verdict, and the install.py spawn (v0.2.95)
+
+- The python-candidate cascade existed in **five** entry points; a parity test covered three, and
+  the two `first-install` shims carried no mirror notice at all. The lock now covers all five and
+  was red-proved by reversing one cascade and watching the old test stay green.
+- The "is this schema change additive enough to apply unattended" verdict had a Rust copy and a
+  Python copy. It now has one home in `vco_lib`: Python computes it and publishes it in the
+  migrate-collections envelope, and the launcher READS the published verdict and ANDs its own
+  process evidence instead of re-deriving the rule. Both arms tested.
+- All six hand-rolled `install.py` spawn sites route through one builder — `apply_pending_install`
+  was missing `PYTHONIOENCODING`/`PYTHONUTF8`, whose absence crashes install.py mid-update on a
+  Windows cp1252 console.
+- `install.py` shrank from 24 059 at 0.2.94 to **24 005** lines and its ratchet was re-pinned downward to the
+  exact measurement; `vco_lib/project_init.py` from 15 711 to 15 661, likewise.
+
+### Fixed — two code-scanning findings, each closed as a CLASS rather than as an instance
+
+- **The shell-placement helper filtered markup with a regex denylist.** CodeQL
+  ranked it four times (`js/bad-tag-filter` on `</script >`, which
+  `/<script[\s\S]*?<\/script>/` does not match; `js/incomplete-multi-character-
+  sanitization` on `<script`, `<style` and `<!--`), and the rule is right as a
+  class: a pattern list over markup cannot be completed, only lengthened. The
+  thing it protects is a PROMISE — that a mention of `<MenuBar />` inside a
+  script element or a comment can never satisfy a placement check — and the
+  regex did not keep it: `</script >`, `</SCRIPT >`, `</script foo>` and an
+  unterminated `<script` or `<!--` all leaked their content into what the tests
+  read as template. `templateOf` is now a single-pass scanner that skips the
+  regions the HTML tokenizer skips, and the file says in its own header that it
+  is NOT a sanitiser: its input is component source read off disk by a test,
+  its output is searched as text, and the launcher's vitest run has no DOM to
+  inject into. Eight new cases, all of them red against the pattern version.
+- **The model gateway's access line scrubbed its model ids but not the fields
+  around them.** `py/log-injection` named the refusal line, whose `extra`
+  carries the request METHOD and PATH; the same shape sat unranked on three
+  upstream-failure warnings that interpolate `decision.forward_model` — the
+  client's own id, with no `repr()` in front of it and only its ENDS stripped
+  by `routing._vendor_route`, so a newline in the middle survives to the log.
+  A value with a CR/LF in it does not merely look odd in a record: it ends that
+  record and writes the next one, and the next one can read `status=200` for a
+  call that never happened. `_log_safe` now spells CR and LF as `\r` and `\n`
+  and escapes every other non-printable, applied on `_access_line` (the one
+  builder all five access-line call sites pass through) and on those three
+  warnings plus the quota-body peek. The value stays readable — a forged id
+  reads as an id with a `\n` in it, which is itself the evidence someone tried.
+
+### Fixed — four deferral entries that could never end, or pointed somewhere that could not help
+
+- **`chunker_preset_overhaul_pending` had no resolver in either language.** Both
+  emitters promise, in the entry the user reads, that it *"self-resolves on the
+  next bundle update"* once the two printed commands have been run. Nothing
+  implemented that: the registry declared `clear_probe = "paired-resolution"`
+  and named a Rust site that has no resolve call, and the gate re-stamps its own
+  sentinel at EMIT time, so no later comparison could re-derive anything. The
+  row was immortal by construction — and `sync_knowledge_graph.py` arms a
+  per-node chunk-plan comparison *while the ledger carries the cid*, a cost its
+  own comment justifies as transitional. Each half of the remedy now stamps
+  `.claude/state/chunker-resync.json` at the one point that proves it ran (a
+  fully successful `kg-sync --all` **whose plan comparison was armed** — an
+  unarmed one hash-skips every node and re-chunks nothing; a completed
+  `code-graph-analyze --force-recreate`), and
+  `probe:py:chunker_resync_still_owed` retires the row —
+  and the comparison cost with it — once both name the current revision. A later
+  revision crossing re-arms it for free.
+- **`code_embed_image_stale` printed a command that its own installer strips.**
+  The remediation was `python install.py --update`; on any machine whose
+  container was created by another compose project, step 5 removes `code_embed`
+  from the build list (correctly — compose derives the image NAME from the
+  project) and prints `[skip-recreate] code_embed`. The fix could never fix the
+  thing, on a condition whose live cost is over-window code silently truncated
+  into the code graph. The entry now carries a second step built from
+  `code_embed_image.rebuild_command()` — which shipped in v0.2.92 with zero
+  callers while the doctor's docstring promised "the explicit compose command" —
+  rendered against the OWNING project's own labels: the label's `-f` paths
+  absolutised against the container's working directory (podman-compose records
+  them exactly as typed, so they are usually bare filenames that would resolve
+  against the wrong directory), the project passed explicitly with `-p`, and no
+  `--project-directory` (podman-compose has no such flag, and it is redundant
+  once the files are absolute).
+- **Both D18 entries could offer a TEST-FIXTURE-named class as a binding
+  target**, one of them with a copy-paste `UPDATE project_kg_bindings` line —
+  while `fixture_class_guard` refuses every write to such a class. A
+  fixture-stemmed class that no binding row names is no longer a binding
+  candidate at all; it is reported where it belongs, as fixture-shaped residue,
+  with the LOOK-only instructions written for that case. Both entries can now
+  clear themselves on a machine whose only "rival" collection was residue.
+- **The upstream-sidecar probe cleared on the entry's NAMED subset**, so an
+  earlier run's orphaned `*.from-upstream-*` file was silently un-recorded (the
+  ledger is last-write-wins per condition, so run N's entry replaces run N-1's
+  while its sidecars stay parked). The complete-list arm now ends in the same
+  bounded sweep the list-less arm already used — and that sweep no longer
+  prunes `build`/`dist`/`target` INSIDE `knowledge/` and `docs/`, where they are
+  ordinary content directories the merge does park sidecars in.
+- **The prefix-adopt self-heal could bind a project to a fixture-named class**
+  too — the same rule, one surface over, now shared with the evidence scan.
+
+### Fixed — the launcher self-update no longer refuses every orchestrator-root install
+
+- **"Uncommitted changes on tracked file 'CLAUDE.md' would be lost" is gone,
+  and the file it named was never at risk.** `apply_launcher_update`
+  (Preferences → Updates) opened with a clean-tree assertion that refused on
+  ANY dirty tracked path outside the generated allowlist. `install.py` RENDERS
+  `CLAUDE.md` over its tracked blob at first install *and every update*, so
+  **every orchestrator-root install is permanently dirty there by
+  construction** — this surface refused all of them, and the only forward
+  action it offers is the DESTRUCTIVE resync (`git reset --hard`). It is the
+  same blunt "tree clean" proxy v0.2.58 removed from the `update_orchestrator`
+  surface, left behind on this one; v0.2.95's `RENDERED_LOCAL` class fixed the
+  merge legs but sits BELOW the guard, so for the one path it exists to protect
+  it was unreachable — exactly the v0.2.91 WI-4 shape, one class later.
+  - **The guard now asks whether the pull can actually hurt the path**, not
+    whether the tree is dirty: the v0.2.58 risk set `tracked-modified ∩
+    upstream-changed`, computed through the SAME helper the other surface uses,
+    minus the classes this surface resolves downstream (generated
+    take-upstream, `RENDERED_LOCAL` keep-local). A tracked-modified file
+    upstream did not touch survives both pull arms untouched, so it no longer
+    blocks — a fork that tracks its KG nodes was refused on every update.
+  - **The refusal stands where content can genuinely be lost** — a dirty
+    tracked path upstream also changed, which no downstream leg claims — and it
+    now says so: it names the path *and* that the update also changes it.
+    `USER_EDITABLE_PATTERNS` is deliberately NOT exempted: its 3-way merge has
+    two call sites, both on the installer surface, so on this one there is
+    nothing downstream to protect it.
+  - **Every unknown still blocks.** An unresolvable merge base or upstream tip,
+    or an unreadable status, refuses on the first unresolved path exactly as
+    before. The guard moved below the fetch (the only way to know what upstream
+    changed); nothing between needs a clean tree.
+  - **One parser, one home.** The guard and the risk set INTERSECT their
+    results, so they must agree on a path's *spelling*, not merely its intent —
+    and they did not: the guard read non-`-z` porcelain (a rename is
+    `R  old -> new`, unusual paths are quoted and escaped) while the risk set
+    read `-z` (literal, rename old-path in its own record). A staged rename or a
+    quoted path could therefore never match, silently escaping the narrowed
+    refusal into an opaque autostash abort. Both now call one
+    `parse_tracked_modified_z`, on raw bytes, and a failing `git status` is an
+    error rather than an empty answer.
+  - **Upgrading FROM 0.2.94 runs the OLD guard, once.** The pre-flight executes
+    in the launcher you are RUNNING, not the one you are fetching, so the
+    0.2.94→0.2.95 hop is still refused on Preferences → Updates with
+    "Uncommitted changes on tracked file 'CLAUDE.md' would be lost". Take that
+    one hop through the **MenuBar update badge** instead — it calls
+    `update_orchestrator`, which has used the precise risk set since v0.2.58 and
+    is unaffected; from 0.2.95 onward both surfaces agree. Do NOT follow the old
+    message's advice to revert `CLAUDE.md`: it discards your edits and
+    `install.py` re-renders the file on the next run, so the refusal returns.
+
+### Fixed — a rendered file REMOVED upstream no longer wedges the update
+
+- **`git` aborts a pull that deletes a locally-modified tracked file**
+  (`error: Your local changes to the following files would be overwritten by
+  merge`), and a rendered file is locally modified on every install — so the
+  release that stops tracking one would have wedged every existing install
+  permanently: the pull aborts, the next install re-renders the same
+  modification, the abort repeats. `resolve_rendered_files_keep_local` handles
+  that case now instead of skipping it — its comment claimed "the existing flow
+  handles it", which was not true. It holds the working-tree bytes, drops the
+  index entry, and writes the bytes back, so the incoming removal is a no-op
+  and the user's file simply becomes untracked with its content intact —
+  including the text OUTSIDE the AUTO markers, which is uncommitted and exists
+  nowhere else. A PRISTINE copy is left to the merge (no pointless commit), a
+  path absent on both sides is not treated as a removal, and any git failure
+  leaves the tree exactly as found.
+
+### Added — a file written from the CLI now syncs like a file written with Edit
+
+- **`cat > knowledge/foo.md <<EOF`, `sed -i` on a docs page and `cp` into a
+  source tree reach Weaviate.** `post-file-edit` is registered on `PostToolUse`
+  matcher `Edit|Write` only, so until now a write made through the Bash tool
+  synced *never* — and the standing "write knowledge with Write/Edit, never a
+  heredoc" rule existed to work around exactly that. The new
+  `post-bash-file-sync.{sh,ps1}` hook closes it: it parses the executed command
+  for write targets and feeds each one to the SAME routing
+  (`knowledge/` → `kg-sync`, `docs/**.md` → the development collection,
+  `.claude/diagrams/` → the indexer, code files → the end-of-turn code-graph
+  drain), through the same access-matrix gate and the same per-file debounce.
+  A CLI-written KG node also gets its LLM summary, by re-dispatching the
+  existing `kg-summary-generator` hook rather than duplicating it.
+  - **One home, not a second copy.** The routing moved out of
+    `post-file-edit.{sh,ps1}` into `_lib/route-touched-path.{sh,ps1}`, which
+    both hooks call; the command parse is `vco_lib/bash_write_targets.py`,
+    which shares its chain / wrapper-verb / env-prefix / `bash -c` walk with
+    `vco_lib/diagram_delete_parser` via the new `vco_lib/bash_command_walk`.
+    `post-file-edit`'s behaviour is unchanged — its existing end-to-end tests
+    pass untouched, and mutating the extracted function turns them red.
+  - **What it catches**: `>`/`>>` redirections (including fd-prefixed and
+    attached forms), heredocs — with the body stripped first, so `see a > b`
+    inside a node cannot forge a target — `tee`, `sed -i` / `sed --in-place` /
+    `perl -i`, `cp`/`mv`/`install` destinations (including `-t DIR` and the
+    `cp a b DIR/` shape), `touch`, `dd of=`, and long `--output` flags. Short
+    `-o` is deliberately not read: `curl -o file` writes a file and
+    `ssh -o Opt=val` does not.
+  - **What it provably cannot catch, and what happens instead.** A write an
+    interpreter performs from its own source (`python - <<EOF … open(p,'w')`)
+    is not recoverable from the command text. For `knowledge/` and `docs/` it
+    is recovered by a watermarked mtime scan of those two directories only —
+    lookback capped at 300 s, at most 32 results — and only when all three of
+    these hold: the parse found nothing, the command TEXT shows a write (a
+    redirect, a heredoc, a write verb, an interpreter, or one of the opaque
+    writers `patch` / `rsync` / `git checkout|restore`), and that write could
+    have landed in the scanned directories. A command that merely NAMES one of
+    them — `cat docs/x.md`, `grep -rn foo knowledge/`, `ls docs/` — starts no
+    interpreter and runs no scan. Code files written opaquely remain a
+    documented miss (a whole-repo walk per Bash call is unbounded; the next
+    `Edit` re-queues them). A relative path written after an unresolvable `cd`
+    is dropped rather than guessed. All of it is stated in the hook's own
+    header, which is now the same set of conditions the code applies.
+  - **Cost**: a pure-shell prefilter rejects `ls`, `git status`, `pytest` and
+    any command whose only redirections are `2>&1` / `>/dev/null` with no
+    subprocess at all, so the steady-state price on a Bash call is one string
+    scan.
+
+### Changed — the pre-bash retrieval query is built like the pre-edit one
+
+- **When a Bash command writes a file, the KG and code-graph queries are now
+  shaped from the TARGET PATH, not from the command text.**
+  `pre-bash-context-inject` embedded the raw first 500 characters of the
+  command; `pre-edit-context-inject` derives a module name from the basename,
+  adds a content snippet and passes `--anchor <file>` to the code-graph leg —
+  so the same edit retrieved materially worse through Bash than through Edit.
+  It now uses the same parser as `post-bash-file-sync`: module name + content
+  snippet (the heredoc body, when the target is under `knowledge/`/`docs/` and
+  carries no credential shape — the snippet reaches a subprocess's argv), with
+  the written file as `--anchor` and `--exclude-file`. With no recoverable
+  target the query is byte-for-byte what it was before; the 500-char threshold,
+  its `VCT_BASH_KG_THRESHOLD_CHARS` override, and the code-graph branch running
+  *before* that threshold are all unchanged.
+- **"Is this a code file?" has one home.** The extension alternation was
+  written out in eight shipped files, each with a "MUST MATCH" comment only a
+  human could enforce. `_lib/code-extensions.{sh,ps1}` is now the home;
+  `pre-edit-context-inject`, `pre-bash-context-inject` and the routing home
+  read it, and the four pairs not migrated in this pass are pinned to it by a
+  test that names whichever file drifts.
+
+### Fixed — a missing routing helper is now loud instead of a silent no-op
+
+- **A project whose `.claude/hooks/_lib/route-touched-path.{sh,ps1}` is absent
+  synced nothing, and said nothing.** Both write-side hooks source that
+  library conditionally and skip their routing when it is gone — correct, a
+  `PostToolUse` hook may never error on your Edit. But once this release moved
+  ALL routing into that one file, "skip the routing" became "sync nothing at
+  all", on every Edit, Write and CLI write, with no surface saying so: the
+  failure ledger only sees `kg-sync` runs that happened, and the SessionStart
+  write-path probe tested the Python import, not this file. A hand-copied
+  hooks directory, a half-applied bundle or an over-eager cleanup was enough.
+- **Three surfaces now report it, and the hooks still exit 0.** Once per
+  session each hook writes the condition to stderr (for you) and into its
+  single `additionalContext` envelope (for Claude — plain `PostToolUse`
+  stdout is discarded), naming the file and the `install-bundle --update`
+  command that restores it. `session-start-retrieval-health.{sh,ps1}` gained a
+  `KG write routing:` line beside its `KG write path:` line, so the condition
+  is visible BEFORE the session's first edit. The notice is deduped by a
+  `.claude/state/route_lib_missing_<session>` sentinel — the same shape the
+  `kg-sync` failure rows use — so a hook that fires 200 times a session prints
+  once.
+
+### Fixed — a read-only `cat docs/x.md` no longer starts an interpreter or re-syncs your knowledge
+
+- **Naming a directory is not writing to it.** The new Bash write-sync's
+  prefilter treated ANY command containing `knowledge/` or `docs/` as a
+  candidate write — before it even looked for a redirect. So `cat docs/x.md`,
+  `grep -rn foo knowledge/`, `ls docs/`, `git diff docs/x.md` each started a
+  Python interpreter, ran the fallback mtime scan and re-routed every
+  knowledge/docs file modified in the previous 300 s — including files the
+  Edit tool had written and already synced seconds earlier, costing a second
+  debounced `kg-sync` each (a content-hash no-op at Weaviate, but a process
+  per file). The hook header promised the scan ran only for "an opaque-write
+  shape"; nothing enforced that, and no test covered a read-only command.
+- **The directory mention now needs a write-shaped token beside it**, in all
+  three places that decide: the bash prefilter, the PowerShell prefilter and
+  `should_fallback_scan`. A redirect, a heredoc, a write verb, an interpreter
+  or one of the opaque writers the module documents (`patch`, `rsync`,
+  `git checkout|restore|apply|stash|reset`) qualifies; a bare mention does
+  not. The hook header and the module docstring now state the exact
+  three-part trigger, and the unmeasured "~3 ms" cost claim is replaced by the
+  number that actually governs (how often the interpreter starts, not how
+  fast the walk is).
+- **The two prefilters are finally pinned equal across operating systems** —
+  the `.ps1` header had claimed a test did that since the file was written,
+  and none did. Both are now driven from one corpus of 26 commands.
+
+### Fixed — a model-gateway vendor key is a SHARED secret, and the daemon can finally see one
+
+- **The gateway resolves its vendor key in the shared scope by default; a
+  project may override it** (owner ruling, 2026-09-17). Nothing new was built
+  to do this: both stores that can hold such a key already resolve
+  project-first-then-shared for whoever asks — the hub's
+  `/api/v1/projects/{id}/env` walks per-project → shared → global, first wins,
+  each bucket gated on the ASKING project, and the file store tries
+  `projects/<NAME>/<key>` then `shared/<key>`. What the daemon lacked was a
+  registered identity to ask AS. Shared keychain secrets live in their own
+  bucket (`_user_shared_`), owned by no project, and there is no hub route
+  that serves them without a project id — so a daemon whose scope defaulted to
+  `Path.cwd()` (the state root, for a login-started unit) skipped the keychain
+  tier entirely and answered every vendor request "no key found", while
+  `/health` showed the vendor present with an empty key cache.
+  - **The default is now this install's orchestrator root, resolved at
+    runtime** — the one project the launcher always registers. Runtime, not
+    baked into the boot unit: a path frozen at render time is the same defect
+    as a hand-written systemd drop-in, and this way the fix reaches every start
+    path (the launcher's, a bare `vct-model-gateway serve`, an OS with no boot
+    registration), not only a rendered unit, and a moved install self-heals.
+  - **The rendered boot unit carries no derived value**, which is what makes
+    the line above true rather than merely intended. The systemd unit /
+    LaunchAgent / Scheduled Task ships `VCT_MODEL_GATEWAY_SECRET_PROJECT`
+    EMPTY — an empty assignment reads back as unset, which is exactly what
+    hands the decision to the runtime default. A non-empty value in a unit is
+    therefore always a scope somebody chose, and it is preserved across every
+    re-render; the one exception is a value that equals what this install's
+    root resolves to now, which an earlier render (or the hand-written drop-in
+    this replaces) derived rather than chose — that one is dropped on the next
+    re-render, so no machine inherits a frozen path for life.
+  - **`VCT_MODEL_GATEWAY_SECRET_PROJECT` is the per-project override**, and it
+    is the SAME env var doing the same thing — a pinned project's own key
+    outranks the shared one, and that project's `.no-shared-fallback` marker is
+    honoured, because there is one chain and no second mechanism.
+  - **The hub's auth surface did not move.** The alternative — a shared-scope
+    route needing no project id — was considered and rejected on the merits:
+    the per-project override, the launcher's per-requester pause and the
+    opt-out marker are all gated on WHO is asking, so a route with no requester
+    could not have delivered the ruling it was meant to serve.
+  - **Loud, where a user looks.** The startup scope probe stored its verdict
+    and logged nothing, so a keyless daemon's first evidence was a 503 inside
+    Claude Code with no local trace. It now logs the verdict — WARNING with the
+    remedy when the scope cannot reach the keychain, INFO when it can —
+    edge-triggered, so a stable state is stated once and a genuine change
+    (a hub that comes up later) is stated again. A full miss now names WHERE to
+    put a key rather than only that none was found: the launcher's Secrets
+    panel at scope `shared`, or `vct set --shared --key <name>`, plus the
+    override env var for the per-project case. And a pin that no longer
+    resolves is told the path the daemon is actually running from, which is the
+    value that would work.
+
+### Changed — lint scope: the shipped helpers and the gate code are gated too
+
+- `VCThelpers/` (shipped Python — `install.py` pre-compiles it; it holds the
+  license and telemetry code) and `.github/scripts/` (the code that RUNS the
+  hook-parity gate, where an F841 had sat unnoticed) join the ruff gate in
+  both homes, CI and `pre-ship-check.sh` Gate 3c. Both measured 0 findings
+  when added, which is the only moment adding a surface is free. The scope
+  rule the list follows — everything this repo ships or enforces with — is
+  now written into `ci.yml`'s comment instead of being an accretion nobody
+  had recorded.
+- `.github/scripts/` also joins the pyright gate (0 errors / 0 warnings).
+  `VCThelpers/` does NOT, with the cost recorded in `pyrightconfig.json`
+  rather than left to be re-derived: 5 `reportAttributeAccessIssue` errors on
+  `winreg` attributes in `license/validator.py`, an artefact of running
+  pyright on Linux against correctly platform-guarded code. Backlogged.
+
+### Fixed — a knowledge node whose frontmatter nests under `metadata:` keeps its tags and type
+
+- **Two frontmatter dialects exist in the wild and the KG sync only read
+  one.** Every shipped template puts the node keys at the top level
+  (`title:` / `type:` / `tags:`), but agents copying the Claude Code
+  skill/memory contract write `name:` plus a nested `metadata:` mapping.
+  `sync_knowledge_graph.py` read the top level only, so such a node lost its
+  declared tags and type outright — and the inline `#tag` body harvest then
+  filled the gap with WRONG data, scraping prose issue references
+  (`#4`, `#2`, `#1`, `#14`) in as tags while the folder name became the type.
+  A node like that is not merely unlabelled at `hybrid_search`; it is
+  mislabelled, which is worse, and tag filters silently exclude it.
+- **One normalisation, before every consumer.** `parse_frontmatter` now
+  returns a single shape: `metadata:` keys are promoted to the top level
+  (the top level always wins where both declare a key), `name:` becomes
+  `title:` when `title:` is absent (precedence `title:` > `name:` >
+  first `# H1` > filename stem — declared frontmatter beats a body-derived
+  heading, as it already did for tags and type), and a `tags:` string is
+  split into a list. A bulk resync prints one line per promoted file, so you
+  can see how many nodes came from the foreign dialect.
+- **Nodes ALREADY stored are repaired too, without re-embedding anything.** The
+  sync's skip gate hashes the file's TEXT, not the parsed properties — so on its
+  own the new parse would have reached only nodes whose file later changed, and
+  `kg-sync --all` would not have helped either (the skip path returned without
+  rewriting any property). The skip path now compares the STORED `title`,
+  `node_type`, `tags` and `external_links` against the freshly-parsed values and
+  PATCHES the row when they differ: no re-chunk, no re-embed, and the stored
+  `content_hash` is left exactly as it was, so none of the SEVEN independent
+  consumers of that hash observe anything.
+  - Salting the signature for promoted files — the obvious alternative — was
+    rejected on evidence: the install-time seed gate and the drift probe both
+    RECOMPUTE the signature from the file and know nothing about dialects, so a
+    salted stored value mismatches forever — a re-sync that never converges and
+    a drift deferral that can never clear. A third consumer keys the shipped
+    vector sidecar on it and a fourth gates a file deletion. **A content hash
+    with independent recomputers is not a lever; repair the property, not the key.**
+  - The repair is all-or-nothing across a node's chunks, and declines to act on
+    any node whose stored state it cannot positively read — an unreadable row
+    keeps the exact v0.2.94 behaviour rather than being rewritten on a guess.
+  - **And something actually runs it.** The repair sits on the sync's SKIP path, and
+    no upgrade reached that path: `install.py --update` passes only the
+    content-hash diff, and for these rows the hash MATCHES — which is the whole
+    defect. The first install-or-update with no `last_kg_metadata_repair_version`
+    stamp in `app_state` (i.e. every install coming from 0.2.94 or earlier) now runs
+    the knowledge sync as `--all` once, so every node is visited and its stored
+    `title`/`node_type`/`tags` brought up to this release's parse. It records itself
+    **only after exiting 0**, so a run that dies part-way is retried on the next
+    update instead of being marked done — the version-crossing gate used elsewhere
+    could not be used here, because the manifest version is advanced by a later step
+    that does not know whether the seed succeeded, and a crossing cannot be withheld.
+  - What the pass costs: one fetch per node, one property patch per stale node,
+    **zero embeds**, no `content_hash` changed. It covers the nested `metadata:`
+    dialect, `name:`-titled nodes, string `tags:`, **and** nodes whose frontmatter
+    block was empty or malformed (0.2.94 parsed both to `None`, so the inline `#tag`
+    harvest scraped their prose). Then it converges and stays quiet.
+- **The inline `#tag` harvest is suppressed whenever frontmatter exists** —
+  including an empty or malformed block, which now parses to `{}` rather than
+  `None`, because a block that EXISTS declares the node's tags. Harvesting a
+  body that already declared its tags returns wrong data, not missing data.
+  Files with no frontmatter at all keep the Obsidian-style harvest they were
+  written for, minus purely numeric tokens: a number after a hash is an
+  issue or section reference, never a tag.
+
+### Added — the launcher comes up with your editor, in the tray, without taking focus
+- **The launcher GUI now starts when you open a project, if it is not already
+  running.** The hook that already ensures `vct-hub` and the model gateway
+  (`session-start-ensure-hub`, run by Claude Code on `SessionStart` **and** by
+  `.vscode/tasks.json` on VS Code's `folderOpen`) gained a third leg calling
+  `python -m vco_lib.launcher_ensure ensure`. Default ON; switch it off in
+  **Preferences → Startup → "Start the launcher with a Claude Code session"**.
+  - **It opens no window and takes no focus.** The launcher is started with
+    `--start-hidden`, which it applies to its own window configuration *before*
+    `tauri::Builder` — so no window is created, and the same one mechanism
+    covers all three platforms (nothing to map on X11/Wayland, nothing to
+    `makeKeyAndOrderFront` on macOS, nothing to `SW_SHOW` on Windows). Creating
+    and destroying a window as a side effect is not a cosmetic concern: it is
+    what aborted mutter and ended a whole GNOME session twice on 2026-09-09.
+  - **Never a second instance.** The leg spawns only when a process scan finds
+    no launcher — reusing `dist_binary_repair.scan_for_launcher_pid` rather
+    than adding a second guard — and `tauri-plugin-single-instance` refuses a
+    duplicate that races the probe. That callback now reads the second
+    process's argv, so an ensure-spawned duplicate no longer makes the running
+    launcher jump in front of whatever the user was doing, while a genuine
+    re-launch still focuses the window as before.
+  - **A stale launcher binary is left alone, not started.** A binary older than
+    this release does not know the flag and would open a window with focus, so
+    the capability is confirmed by scanning the binary for the flag's literal
+    bytes. `binary_too_old` names the state and points at `install.py --update`
+    (probing with `--version` would have been worse than useless: the
+    launcher's CLI dispatch falls through to the GUI for unknown arguments).
+  - **Silent, successful no-ops** where there is nothing to do: a Linux session
+    with no `$DISPLAY`/`$WAYLAND_DISPLAY` (CLI over SSH, a container, CI), a
+    machine with no launcher binary (fresh clone, headless install), and
+    `VCT_DISABLE_LAUNCHER_AUTOSTART=1`. A launcher already running costs one
+    `pgrep`/`tasklist` and stops there.
+  - **Delivery needs no migration**: the default lives in code on all three
+    sides (Python reader, Rust writer, Svelte toggle), so an existing install
+    picks the behaviour up when the bundle update lands the new hook, and only
+    a user who turns it OFF ever causes an `app_state` row to exist.
+  - Boot registration was the rejected alternative: it fires at LOGIN, not when
+    an editor opens, cannot recover a launcher the user quit, and would have
+    added a third home for boot registration beside `vct-hub --register-boot`
+    and `vco_lib/boot_service.py`.
+  - The four-step binary-discovery chain is now shared rather than copied:
+    `hub_ensure.find_dist_binary(stem, …)` is the hub's own walk, parameterised
+    — a fifth hand-written copy is exactly what
+    `tests/test_launcher_dist_subdir_parity.py` exists to prevent.
+
+### Fixed — the window-state plugin no longer shows and focuses the launcher on every launch
+- `tauri-plugin-window-state` was registered with its default flags, which
+  include `VISIBLE` — and its restore ends in `show()` **and** `set_focus()`.
+  Two consequences, both now gone: the shipped "Start launcher minimized to
+  tray" preference could only hide a window the plugin had just put in front of
+  the user, and the plugin persisted the last visibility, so quitting from the
+  tray while hidden made the NEXT launch open no window at all. `VISIBLE` is
+  dropped from the flag set; size, position, maximized, decorations and
+  fullscreen — the reason the plugin is there — still restore, and window
+  visibility now has exactly one home.
+
+### Added — the hub supervises the model gateway, and the launcher can say "registered but unrunnable"
+- **`vct-hub` now restarts a model gateway that has stopped serving.** A new
+  `gateway_watchdog` task probes the gateway's `/health` on the RESOLVED port
+  (env pin, then the running daemon's port file, then the launcher's
+  last-started-port record, then 11436) every 30 s; when nothing answers it
+  spends one of a bounded number of attempts on
+  `python -m vco_lib.gateway_ensure ensure --json` — the same entry point the
+  SessionStart hook calls, so no start logic exists twice. Nothing is
+  registered to get this: it is code inside the hub binary, which
+  `install.py --update` refreshes and restarts, so an existing install has
+  supervision on its next hub start. Opt out with
+  `VCT_HUB_GATEWAY_WATCHDOG=0`; interval via
+  `VCT_HUB_GATEWAY_WATCHDOG_INTERVAL_SECS`.
+  - **Bounded on purpose.** The shipped systemd unit bounds its own crash loop
+    and the heal path calls `reset-failed`, which clears that bound — so the
+    supervisor's budget is TIGHTER than systemd's: 3 attempts per 10 minutes,
+    then it stops, records a condition the launcher's Services card renders
+    (launcher.db `app_state` + an `audit_log` row, since a detached hub's
+    stderr reaches nobody) and logs one line saying so. It resumes the moment
+    the gateway is seen serving, and clears the recorded condition then.
+  - **Four leave-alone cases, each tested.** A gateway that is NOT registered
+    is never registered for the user (the opt-in is theirs); a registration
+    that cannot RUN is reported and never restart-looped (that is the state
+    the 2026-09-10 machine sat in for eight hours); a process the daemon's own
+    pid guard reports alive is never signalled — this supervisor kills
+    nothing it did not start; and a port answering with someone ELSE's service
+    is left alone rather than pushed onto a fallback port behind the user's
+    back. It is a sibling of the container watchdog, not a row in it, and that
+    module's "never supervises the gateway" assertion now also pins that the
+    sibling exists — "not healed by compose" can no longer be read as "nobody
+    looks after it".
+- **The gateway card has three registration states instead of two.** "Start at
+  login" answers a binary question; a registration can also be PRESENT and
+  unable to run. The card now reads `vco_lib.gateway_ensure status --json` —
+  and only when nothing is serving, since a serving gateway is proof enough —
+  and renders `not registered` / `registered but unrunnable` (with the reason,
+  the unit path and the repair command) / running, plus whatever the hub
+  supervisor last concluded. `/health`'s new `secret_scope` and `usage_ledger`
+  blocks are surfaced too: "this gateway cannot reach the keys you configured"
+  is now a sentence on the card rather than an empty `vendor_keys_cached` that
+  reads like "you have not added one yet".
+- **Fixed on the way past**: `GatewayHealth` never carried
+  `oauth_expires_in_s`, so the "Claude login expires in N min" warning the GUI
+  has had since v0.2.94 could not fire on any machine — the field was dropped
+  in the Rust hop between the gateway and the card.
+
+### Fixed — a hook disabled before its retirement can no longer be re-enabled as a dead registration
+- **Parked entries are matched against the retirement table (F7).** Disabling a
+  hook in the launcher REMOVES its `settings.json` entry and parks the bytes in
+  `project_hooks.disabled_entry_json`; the bundle scrub that retires dead
+  registrations walks `settings.json`, where a parked entry by definition is
+  not. So a hook a user disabled before it was retired kept a row reading
+  "Disabled (restorable)", and Enable would have written back a registration
+  whose script the same update deleted. The restore itself now refuses it —
+  in `vco_lib.hooks_settings.insert_hook`, which is the ONE path the launcher's
+  Hooks tab, the hub's two `PATCH` routes and the shipped `vco hooks enable`
+  CLI all pass through — with a message naming the release that retired it and
+  what replaced it. The launcher then releases the parked bytes, so the row
+  stops claiming a restore it cannot perform and renders as the orphan it is.
+  A refusal that is NOT a retirement (an unparseable `settings.json`, a missing
+  interpreter) leaves the parked entry exactly where it was: it is the user's
+  only copy.
+
+### Fixed — a file the install RENDERS can no longer stop an update at the divergence modal
+- **`CLAUDE.md` (and any other rendered root file) auto-resolves on update.**
+  `install.py` renders the install root's `CLAUDE.md` from
+  `templates/ORCHESTRATOR-CLAUDE.md.template`, keeping whatever the user wrote
+  outside the AUTO markers — so the tracked path is divergent on every install,
+  by design. When upstream also edited the tracked copy (0.2.94 stripped a
+  block from the stub), the pair "locally modified ∩ upstream changed" forced
+  `--ff-only` and the divergence modal, which is what every 0.2.93→0.2.94
+  updater hit. The update now resolves it before the pull: it holds the
+  working-tree bytes, advances the TRACKED blob to upstream's in a synthetic
+  commit, and writes the bytes straight back — after which the merge has
+  nothing to change for that path, so it can neither refuse the dirty file nor
+  conflict on it. `install.py --update` then re-renders the AUTO block from the
+  NEW template, and one `rendered_file_upstream_changed` row (class
+  `informational_record`) records the file and the upstream commit range.
+  The user's text outside the markers is never parked in a sidecar someone has
+  to restore — it goes back before the pull runs.
+  - The protected set is NOT a second list: `vco_lib/rendered_root_files.toml`
+    is the table the renderer itself iterates, and the launcher embeds the same
+    file (`include_str!`, the `mcp_scan_rules.toml` precedent) so the classifier
+    cannot drift from the renderer. `CLAUDE.md` is the only entry today.
+  - Wired into all three update surfaces from ONE helper
+    (`resolve_rendered_files_keep_local`): the two installer surfaces reach it
+    through the A0 pre-merge step, `apply_launcher_update` calls it directly.
+  - Scoped deliberately: a genuinely user-edited NON-rendered file still gets
+    the 3-way merge, the sidecar and the modal (a real divergence signal), a
+    tree left mid-conflict by a halted update is left to the existing
+    `update_resume_required` flow, and a hand-run `git pull` is still refused by
+    git before any merge logic runs (`docs/post-install/UPDATE-RECOVERY.md`
+    documents the one-line recovery). A `.gitattributes merge=ours` driver was
+    rejected for three independent reasons, recorded at the implementation:
+    it cannot fire on an uncommitted rendered file, "ours" means UPSTREAM during
+    a rebase, and an unregistered driver degrades silently.
+
+### Removed
+- **Cost telemetry.** The Stop hook `cost-tracker.{sh,ps1}` (appended
+  `{timestamp, session_id, model, token counts, cost_usd}` rows to
+  `costs.jsonl`), the `cost-summary` CLI (bash shim + `cost-summary.py`)
+  and their registrations in the shipped `settings.json` templates are
+  removed at the owner's request — the feature was never asked for and
+  nobody read the stream. Token accounting for CONTEXT management moves
+  to the model gateway. Already-installed copies of the retired files are
+  cleaned up by the bundle manifest reconcile (orphan-retired), and the
+  Stop registration is removed from existing projects' `settings.json` by
+  the retired-hook scrub — see the companion entry under Fixed.
+
+### Changed — the model picker: latest-only, real windows, and a description that tells the truth
+- Hooks tab: parked ("Disabled — restorable") rows whose command matches a RETIRED shipped hook are pruned at tab load and refused on Enable — both halves through the one matcher in `vco_lib/hook_retirements.py` (new `python -m vco_lib.hook_retirements match --json`); a retired registration can no longer be re-inserted from the launcher, the hub routes or the CLI (v0.2.95, companion of the retired-hook scrub).
+- Model gateway port resolution has ONE home: `vct-launcher-core/src/services/model_gateway_port.rs` (constants + `resolve_port`), called by the hub watchdog and the launcher; the C-tier mirror in `vct-hub` is gone and the Python↔Rust parity test moved with it. `/services/status` no longer hardcodes the gateway health URL to 11436 (v0.2.95).
+- Hub: `app_state_set_nonpanicking` / `app_state_delete_like_nonpanicking` — state writes on best-effort paths log and continue instead of panicking the daemon (v0.2.95).
+- `.claude/.vco-manifest.json` is spelled ONCE (`vco_lib/manifest_paths.py`); the twelve former literal spellings across `vco_lib`, the MCP and the templates now import it, pinned by a ratchet test (v0.2.95).
+- `requirements-dev.txt`: `playwright>=1.63.0` (was `>=1.61.0`), tracking the current release; the dev extra still does not pull it in (owner-approved 2026-09-16).
+
+- **The picker lists only the newest version of each model family.** Fable 5.1
+  without Fable 5, one GLM 5 row instead of six, and each variant line
+  (`-flash`, `-turbo`, `-air`) treated as the family it is rather than folded
+  into the one it resembles. Nothing is lost quietly: the withheld ids come
+  back in `_vct_catalog_hidden` on `/v1/models`, are counted in `/health`, and
+  are named in the daemon's own log line — and a hidden id is still selectable
+  by name, because the filter narrows the PICKER, never the router.
+  `VCT_MODEL_GATEWAY_CATALOG=all` publishes every version; an unrecognised
+  value is refused at startup rather than silently ignored.
+- **A model's context window now resolves in one stated order** — the
+  GUI-editable table, then the window upstream publishes for itself, then the
+  previous version in the same family — and each row reports which step
+  answered (`_vct_window_source`). The family floor is what makes the catalog
+  auto-update: a model that ships tomorrow is advertised at no less than its
+  predecessor's window instead of reading as unverified until somebody edits a
+  file. It only ever inherits forwards in time, never across families, never
+  across vendors, and never from another inherited figure. An id nobody has
+  documented reads `unverified` — the gateway still invents nothing.
+- **Which rows get the `[1m]` suffix follows the resolved window**, so a
+  first-party 1M model that Anthropic starts returning needs no table edit to
+  become usable at its full context. A table row whose `window_1m` flag
+  contradicts its own `context_window` is now reported instead of quietly
+  deciding the advert on its own.
+- **Every row carries a `description`** — the one field besides the name that
+  Claude Code displays: which subscription answers, the real window, the
+  output cap, and a qualifier ONLY when the client's own assumption for that
+  row is wrong (it budgets 1M for an `[1m]` id and 200K for anything else
+  behind a gateway). A 128K model's row says compaction will fire late; a 1M
+  model's plain row points at its `(1M context)` twin.
+- Upstream's `max_input_tokens` / `max_tokens` / `created_at` / `capabilities`
+  are relayed when stated and omitted when not. **Correction to a claim made
+  while this was being built**: relaying them does not fix a context bar and
+  dropping them never broke one — Claude Code reads only `id`, `display_name`
+  and `description` from a gateway and budgets context by the ID. They are
+  carried for the proxy invariant and for the consumers that are not Claude
+  Code; the `[1m]` rows are what correct the budget. The docstrings, the
+  shipped seed's comments and the tests that repeated the wrong diagnosis are
+  corrected in the same change.
+
+### Added — per-chat token accounting at the gateway
+
+- **Every request the gateway relays is now accounted for context, per chat,
+  for every model.** The gateway reads the `usage` block out of the bytes it
+  is already relaying and writes one JSONL row per turn to
+  `<vct-state-dir>/metrics/gateway-usage.jsonl` — the same metrics home as
+  `failures.jsonl` and `compactions.jsonl`. Nothing is priced: this replaces
+  the cost telemetry removed above with the thing that was actually wanted,
+  "how much of this chat's context is used".
+- **Chats and their subagents separate on their own**, because the key is the
+  `x-claude-code-session-id` header the client already sends (plus the agent /
+  parent-agent headers on a subagent's requests) rather than anything in the
+  body. Two conversations through one gateway, each with subagents, each get
+  their own monitoring, and no request body is opened to find out whose it is.
+- **Two windows per row, and they are allowed to disagree.** `window_client`
+  is what the CLIENT budgets — keyed purely on the id it asked for, so 1M
+  exactly when that id carried `[1m]`, 200K otherwise. `window_actual` is what
+  the model really has, via the same resolver the picker uses. When they
+  differ, `pct_client` against `pct_actual` is "why did compaction fire at a
+  fifth of the context I am paying for?" answered in one line.
+- **`GET /usage`** (host-token authorised, loopback like every other route)
+  returns the newest row per chat, `?session=<id>` for one of them, and
+  `/health` gains a `usage_ledger` block with the path and the row counters.
+  The access line gains the same figures — `in= cache_c= cache_r= out= ctx=`,
+  with `-` for anything the response did not report.
+- The reader merges `message_start` and `message_delta` field by field,
+  because the two upstreams put their numbers in opposite halves of the
+  stream: a later zero never overwrites an earlier positive and a later
+  positive always replaces an earlier zero, so neither shape is lost. It sees
+  a COPY of bytes already on their way to the client, so it can neither alter
+  nor delay them, and it is guarded like every other pass — a defect in the
+  accounting costs a row, never an answer. The file rotates at 50 MiB and the
+  in-memory map is capped at 256 chats, so an always-on daemon stays bounded.
+- A response that reports no usage at all gets its access line and no row: a
+  row of zeros in a context monitor reads as "this chat is empty".
+  `count_tokens` is never accounted — it is a question about a conversation,
+  not a turn in one.
+
+### Fixed — a gateway registered to start at login is now proven runnable, can see your keys, and comes back after a session start (v0.2.95)
+
+- **A boot registration is never written with an entry point nobody ran.** The
+  argv is resolved from the INSTALL ROOT's venv through the one interpreter
+  ladder — the `vct-model-gateway` console script there, else `<that venv's
+  python> -m model_router` — and then RUN with `--version`. Nothing answering
+  means nothing is written, loudly, and an existing registration is left
+  byte-identical. Until now the resolution keyed off `sys.executable`, so
+  `install.py --update` baked whichever interpreter ran the installer into
+  every opted-in user's unit; on a system python that cannot import
+  `model_router` the unit was unrunnable from the moment it was written, and
+  it stayed invisible for eight hours because the previous process kept
+  serving until the first restart.
+- **The registration pins the secret scope it resolves vendor keys in.** A
+  boot unit's working directory is the state root, which is not a registered
+  project, and the secrets resolver keys its hub tier — the only route to an
+  OS-keychain key — on a project. So every vendor key saved in the launcher's
+  Secrets panel was unreachable from a login-started gateway, which answered
+  503 "no key found" while the identical key resolved in milliseconds from any
+  project's working directory. The daemon now resolves this install's
+  orchestrator root (always a registered project) for itself at startup; the
+  three unit shapes carry `VCT_MODEL_GATEWAY_SECRET_PROJECT` EMPTY so that
+  runtime answer is the one in force, and a value you pinned yourself is
+  preserved verbatim by a re-render.
+- **`/health` says so.** A new `secret_scope` block reports the scope in force,
+  whether it resolves to a project the hub knows, and why not — `null` while
+  nothing has probed it, which is a different claim from `false` and is
+  reported as one. `vendors: ["zai"]` beside an empty `vendor_keys_cached`
+  read like "no key configured yet" while the truth was "this daemon cannot
+  see any key you configure". The verdict is produced at startup and refreshed
+  on a key miss; `/health` only ever reads the cache, so it still blocks on
+  nothing.
+- **Every Claude Code session ensures a REGISTERED gateway**, through the hook
+  that already ensures the hub (one ensure mechanism, not a second). It
+  registers nothing — autostart stays opt-in — leaves a running daemon alone
+  via the daemon's own pid/port guard, and on Linux issues `reset-failed`
+  before `start`, because a unit parked by its own `StartLimitBurst` answers a
+  plain `start` by doing nothing, which is a no-op exactly when the ensure is
+  needed.
+- **"Registered but unrunnable" is now a state**, distinct from "not
+  registered" and "running": `python -m vco_lib.gateway_ensure status --json`,
+  `vco doctor`, and a `gateway_registered_but_unrunnable` ledger row that
+  clears itself the moment the registration can run again. The state is read
+  back from the INSTALLED artefact rather than re-derived, because "what would
+  we write now" and "what does this machine run" are different questions and
+  only the second one could have caught this.
+- The systemd unit's own note about its restart limit said a broken start gave
+  up after ~50 seconds; at the `RestartSec=2s` it ships with, the fifth
+  attempt lands about 8 seconds in. Corrected, along with the two XML-family
+  unit templates, which documented their substitution tokens in braces — so
+  `render_template` replaced them inside their own comments, and a value
+  containing a double hyphen (any path may hold one) produced XML that launchd
+  and `schtasks` reject outright.
+
+### Fixed — a vendor `count_tokens` of zero no longer tells the client its conversation is empty
+
+- One shipped vendor's Anthropic-compatible `count_tokens` answers
+  `{"input_tokens": 0}` for a body with real content, while a sibling model on
+  the same endpoint answers a real figure. Relaying that zero is strictly
+  worse than having no counter at all, because a client with no counter falls
+  back to an estimate of its own that would have been positive. On a vendor
+  route the gateway now substitutes its own byte-based floor and says so in
+  the body (`_vct_count_source`), which also labels a genuine vendor count as
+  the vendor's. The substitution is logged once per vendor and model. The
+  first-party route is relayed untouched — adding a field Anthropic did not
+  send is the same invariant breaking in the other direction.
+
+### Changed — the SSE split loop has one home (v0.2.95)
+
+- The rewriter and the usage reader each carried their own copy of the loop
+  that splits a stream into events, sharing only the boundary pattern. They
+  now share the loop itself (`model_router.tool_ids.split_sse_frames`), which
+  returns each event WITH its separator — the rewriter re-emits the original
+  bytes so a CRLF stream stays CRLF, and the reader projects the separator
+  away. A test mutates the shared function and asserts both callers change,
+  because a test that merely called each of them would pass against two copies
+  just as happily.
+
+### Fixed — the project-setup progress bar reports below the header, in the launcher's own banner family (v0.2.95)
+
+- Adopting a project showed "Setting up <project> — Installing project bundle…"
+  in a strip pinned to the top edge of the window, above every other piece of
+  chrome and visually detached from the content it described. The cause was
+  mount order: the banner was rendered BEFORE `<MenuBar />`, and the menu bar
+  is the window's drag region, so anything above it reads as titlebar. It now
+  renders in a below-header banner stack, directly under the header, where
+  several banners stack in flow instead of overlapping. Reported twice from
+  the field; the remedy is the reporter's own proposal. Deliberately still not
+  a modal — the operation runs in the background for a few seconds and must
+  not block the user.
+- **One banner shell instead of four clones.** `KgSyncBanner`,
+  `KgSummaryBanner`, `CodeGraphBuildBanner` and `OperationProgressBanner`
+  carried byte-identical copies of the same ~150 lines of chrome CSS (their
+  own comments said so). All four now render through
+  `StatusBannerShell.svelte`, which owns the markup skeleton and one palette;
+  each banner keeps only its labels, its action verbs and its own state. The
+  per-status colour is chosen through a single tone vocabulary, so "skipped",
+  "deferred" and a partial code-graph prune read as amber/informational
+  everywhere rather than per-banner guesswork. One visible consequence of the
+  merge: a successful code-graph build's text is now the same green as the
+  other banners' success rows instead of teal.
+- The setup banner's view-model (stage wording, elapsed, the 30s auto-hide for
+  `done`/`deferred`, failure keeping its error text and its Retry) moved into a
+  pure module and is unit-tested, as is the below-header placement itself — a
+  regression that re-mounts the banner above the header now fails a test.
+
+### Fixed — `.claude/env` duplicate keys: the venv ladder now agrees with `source` (v0.2.95)
+
+- A project's `.claude/env` is read by two readers with opposite precedence
+  when a key appears more than once: `source .claude/env` (the shell channel
+  every hook uses) takes the LAST assignment, while the venv ladder's
+  file-backed `VCT_ORCHESTRATOR_ROOT` reader took the FIRST — so a user who
+  appended an override at the bottom of the file (the natural way to
+  override, and realistic since the env writer preserves user-edited lines
+  and a header comment advertises the key) got the new root in hooks and the
+  OLD root in `kg-sync`'s venv resolution. Both flavours of the reader
+  (`vct_venv_ladder.sh` / `.ps1`) now take the LAST assignment, matching
+  `source` semantics; the bash side also strips the trailing carriage return
+  a CRLF (Windows hand-edited) file used to leak into the value — a path
+  with a stray CR never resolves. Pinned by tests that drive the real
+  reader functions in both flavours plus an end-to-end staged-wrapper run
+  proving the interpreter that runs comes from the last root's venv.
+
+### Fixed — writing knowledge from an unregistered folder now says so, at write time (v0.2.95)
+
+VCO's MCP servers are registered globally, so `store_knowledge_node` stays
+callable from a folder VCO has never installed into. It would take the write:
+with no `VCT_PROJECT_ID` the access-matrix gate cannot name the project and
+falls through to allow, and the node lands in whatever collection the process
+resolved — the orchestrator's own, when the hub answers for the module-path
+fallback. The two surfaces that recorded this both speak after the fact (a
+`dropped_writes.jsonl` row and an `UPDATE_DEFERRED.md` entry read at the NEXT
+session start), so in the field the problem was discovered when a later search
+came back empty. The same folder could instead produce "could not find class
+ClaudeKnowledgeGraph" — the other face of one condition, because with no hub
+answer `KG_COLLECTION` falls to its bundled default, a class no Weaviate has.
+
+The write is still ALLOWED — this revises the 2026-06-08 ruling on visibility,
+not on refusal. What changed is that `store_knowledge_node` now returns a
+`warning` field naming the collection the write landed in, saying the folder is
+not registered, and pointing at the launcher's Adopt flow (Projects → Add
+project → Adopt this folder), which creates the bundle manifest and syncs the
+folder's existing `knowledge/**/*.md` during setup. The same text is logged
+once per session, rides the failure payload so the class-not-found branch
+carries it too, and is appended to the read-side class-not-found hint — where
+`install.py --update` alone was advice about somebody else's project. A folder
+that HAS the bundle manifest is registered and gets none of this, even without
+the env var: its remedy is the existing one. Wording deliberately reuses the
+v0.2.94 fixture-class guard's, because it is the same defect family — a write
+landing where nothing will read it.
+
+### Fixed — shipped user-facing URLs follow the website's .com consolidation (v0.2.95)
+
+The product website consolidated on `vibecodedtools.com` (the old `.it`
+host now 301s to it, path-preserving), but a handful of shipped strings
+still pointed at the old host. Every URL a shipped artefact shows a user
+or fetches at runtime was live-probed and repointed at a target proven to
+serve 200: the README's website link, the telemetry consent prompt's
+privacy link (`vibecodedtools.com/privacy`), the gui-test skill's example
+invocation, and TROUBLESHOOTING's community-channel pointer. Strings
+whose target page does not exist on either host yet were deliberately
+LEFT on the old host rather than swapped to a new 404: every
+`vibecodedtools.it/account` mention in the licensing messages and docs,
+and the `vibecodedtools.it/modules/rl-reranker` homepage in the L0 seed
+and its Rust fixture — the existing 301 delivers them the moment the site
+grows those pages. `$schema` identifiers
+(`vibecodedtools.it/schemas/vct-module-v1.json`) are versioned names, not
+links, and are unchanged. Pinned by a new source ratchet
+(`tests/test_v0295_shipped_urls_dot_com.py`) that fails on any tracked
+user-facing use of the `.it` host outside a documented allowlist.
+
+### Fixed — the panel mode switch says why Remote Control is refused, and "native" is now an asserted invariant (v0.2.95)
+
+- **Remote Control's refusal is named where the user meets it.** While the
+  panel is in Multimodel mode, `/remote-control` inside Claude Code always
+  fails: the client refuses it whenever `ANTHROPIC_BASE_URL` is anything but
+  api.anthropic.com (since 2.1.196), and a claude.ai sign-in does not bypass
+  that. Everything the launcher said about it lived in pill TOOLTIPS — copy
+  nobody reads before clicking and nobody sees when the failure arrives in
+  another process. The status bar now carries one standing sentence while the
+  panel is on the gateway, naming the gate and BOTH ways out: switch the panel
+  to Remote Control mode, or keep the gateway and run the detached
+  native-auth server the bundled `rc-native` skill starts. It renders in a
+  neutral tone, not the warning tone — nothing is broken when it shows; it
+  states a property of the mode that was chosen. The sentence has one home,
+  shared with the pre-point warning on the Services page, so the two surfaces
+  cannot drift into disagreeing about a fact.
+- **`remote-control` means the stock client, and that is now pinned rather
+  than described.** The guarantee is an ABSENCE — VCO writes none of
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_DISABLE_1M_CONTEXT` or
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, in either mode, which is exactly what
+  leaves Claude Code sizing its own context window from the model id and
+  counting its own tokens from each response's `usage`. An absence rots
+  unnoticed, so it is now asserted as a CLOSURE: across every writer in the
+  panel module and a grid of starting files, the set of env-block keys a write
+  can ADD is a subset of the routing keys plus the model and slot keys — a set
+  that provably excludes all three knobs, including through the one channel
+  that feeds outside names in (a tampered mode stash). Alongside it: after the
+  `remote-control` leg no routing key and no gateway-only model id survives,
+  every key that is not VCO's own survives byte-for-byte, a knob the USER set
+  is carried through untouched, and two consecutive switches lose nothing a
+  single one would have kept. Each assertion was red-proofed against a
+  deliberately broken writer.
+- Docstring correction in the same module, no behaviour change:
+  `ANTHROPIC_MODEL` was described as "the model the client falls back to".
+  It is an env PIN that OUTRANKS the choice `/model` saves, so the next launch
+  returns to it whatever was saved — the documented order being `/model`
+  (this session) > `--model` > `ANTHROPIC_MODEL` > the `model` key in
+  `~/.claude/settings.json` > `ANTHROPIC_DEFAULT_MODEL`. "Fallback"
+  understated the key that caused the 2026-09-08 incident this module exists
+  to prevent. `docs/CONFIGURATION.md` gains a short paragraph stating both
+  modes plainly, including which picker rows carry the 1M window.
+
+### Fixed — the dogfood proof's paid leg runs through the Claude Code CLI, not raw HTTP (v0.2.95)
+
+`dogfood --paid` used to drive a `max_tokens: 1` streamed completion with
+raw `http.client` requests carrying the user's claude.ai OAuth token. That
+transport can never pass for a subscription user: Anthropic honours a
+subscription OAuth token only when a first-party client presents it, and
+every raw `/v1/messages` request carrying one is answered
+`429 rate_limit_error` — direct or through the gateway, in every header
+shape tried (verified 2026-09-10). Worse, the leg's failure text ("the
+gateway stream did not end with message_stop", reason `dogfood:stream`)
+blamed the proxy for an upstream refusal. The paid leg now runs the Claude
+Code CLI as a subprocess — `claude -p hi --model <id> --output-format
+json` with `ANTHROPIC_BASE_URL` pointed at the gateway and the HOST token
+— once for the first-party Default id and once for a vendor id when
+`/v1/models` advertises one; field-verified to return 200 through the
+gateway on both a Claude id and a `claude-gw/glm-5.3` id. The result shape
+is additive (same top-level keys, new `reason` values only): no CLI on
+PATH is a `skipped` with `dogfood:no_client` (the message says the paid
+leg needs the Claude Code CLI — the cost-free checks still ran); a
+completed answer is `ok`; an API error carrying an HTTP status is
+`refused` with `upstream_refused:<status>`, the message naming the status
+and saying the gateway forwarded the upstream's refusal faithfully
+(retry later / check the account); anything else (timeout, malformed
+output) is `refused` with `dogfood:client` and the captured output tail.
+The `dogfood:stream` reason is gone. The cost-free legs (the two
+`count_tokens` comparisons, `/v1/models`, the version check) are
+unchanged, and the launcher's Rust consumer reads the verdict generically
+(status/reason/message), so no Rust change was needed.
+
+### Fixed — an immortal deferral row and a doctor that said "not evaluated" (0.2.94 dogfood F1/F4)
+- **`hub_restart_failed_after_abort` now clears when the hub is actually back
+  (F1).** The entry records that the abort-path hub restart's health poll
+  failed — but its only resolver was a hand-written branch inside install.py's
+  re-probe pass, and that pass ran BEFORE the hub-restart step of the same
+  update, so the branch could never see the hub it had just restarted; a
+  standalone `vco doctor` never re-probed foreign condition ids at all. The
+  row survived hub recovery, two updates, and a doctor pass. The lifecycle is
+  now a STATE-keyed registry probe (`hub_back_after_restart_failure`): "does
+  the hub answer `/api/v1/health` on the resolved port?" — re-derived on every
+  pass, wherever a pass runs. The old branch is REMOVED (with a declared
+  probe, the generic probe-first dispatch made it unreachable dead code), the
+  update's re-probe/doctor phase now runs AFTER `_deploy_and_start_vct_hub`
+  (so the run that brings the hub back clears the row), and
+  `vco doctor`'s new standalone reconcile pass — the doctor is the
+  reconciler's OBSERVE step and runs last — clears it on the CLI surface too,
+  leaving the usual `resolved_by_registry_probe` audit line. Only positive
+  evidence clears: a hub that is still down keeps its row, and a port that
+  cannot be resolved keeps it too.
+- **A standalone `vco doctor` no longer reports its install-time probes as
+  "not evaluated — the caller supplied no envelope" (F4).** That sentence
+  reads as absence of a problem, and a probe that cannot run must never read
+  as OK or absent. The standalone CLI now obtains the facts itself through
+  the SAME producers install.py's own doctor phase calls — the
+  `--bootstrap` envelope and the OS→launcher-dist mapping — loading
+  `install.py` by path and calling the functions directly (no shell-out, no
+  second interpreter; a failed load is cached per process). Only when that
+  cannot be produced do `prereqs` / `launcher_binary_fresh` print a tri-state
+  `unknown` that names the exact runnable command
+  (`python install.py --bootstrap --json`) in both the human summary and the
+  machine-readable `command` field — and the shipped command is pinned by a
+  test that actually drives it and parses the JSON it prints. install.py's
+  in-run path (envelope injected, doctor sinking into the run report) is
+  byte-for-byte unchanged.
+
+### Changed — the settings.json merge algorithm has its own home
+
+- **`vco_lib/settings_merge.py`.** The recursive USER-WINS merge that decides
+  what a bundle update may change in a project's `.claude/settings.json`, and
+  the per-event hooks merge underneath it (scrub retired registrations,
+  supersede a stale VCO command, append genuinely-new ones per command), moved
+  out of `vco_lib/project_init.py` verbatim. `project_init` keeps the I/O half
+  — read the template, read the target, write atomically — and re-exports the
+  two private names as aliases, so every existing call-site runs the same
+  objects rather than a copy; a test pins that by identity, and another pins
+  that the new module never imports `project_init` back. Behaviour is
+  unchanged: the merge's existing coverage
+  (`tests/test_install_bundle.py`, `tests/test_v0295_hook_retirements.py`,
+  `tests/test_v0291_hooks_settings.py`, `tests/test_install_hooks.py`) passes
+  untouched.
+  - The extraction was forced by the line-count ratchet on `project_init.py`,
+    which the v0.2.95 retired-registration threading put 4 lines over. The
+    ceiling was LOWERED (15_880 → 15_730), never raised: the file is now
+    15_711 lines, smaller than before the cycle's work despite gaining the
+    behaviour.
+  - It also retired a stale promise the pair was carrying: both functions
+    still described themselves as a "mirror of
+    `install.py:_smart_merge_settings`", a name v0.2.85 deleted when the root
+    install started going through the one bundle engine. There is no mirror;
+    the docstrings now say so, and `vco_lib/hooks_settings.py` no longer
+    points readers at the retired record.
+
+### Changed — VCO no longer pins the panel's Default model; your `/model` choice governs (v0.2.95)
+
+- **`ANTHROPIC_MODEL` is an env PIN, and the documented precedence puts it ABOVE
+  the model `/model` saves** — so a panel that restarts returns to the pin,
+  whatever you picked. That is the field report "the GUI shows GLM, the requests
+  go to Opus". VCO now leaves the key alone: `point` writes it only for an
+  explicit `--model` (or the launcher's opt-in "Also set the picker's Default
+  entry" checkbox, off by default), and what governs otherwise is the `model`
+  key in `~/.claude/settings.json` — the choice your own client saves and
+  remembers across sessions. VCO does not write that file.
+- **A machine that already carries a pin is migrated, once.** Every install and
+  update now runs `vco_lib.machine_migrations`, whose panel leg removes a
+  FIRST-PARTY `ANTHROPIC_MODEL` from every detected VS Code settings file, backs
+  the file up as always, and PRINTS the value it took plus the one command that
+  puts it back. Once per machine: the ledger under
+  `<vct_root>/model-gateway/vscode-default-pin-migration.json` is the guard, so a
+  pin you set afterwards is yours and survives every later update.
+- **A vendor Default is never touched.** VCO could not have written one (the
+  2026-09-08 rule refuses a vendor id at both write sites), so the migration
+  leaves it exactly where it is and says so; the launcher's "Clear default" is
+  still how you remove it. That rule is unchanged and is now pinned from the
+  other side too: a closure test drives every writer, the migration included,
+  and asserts no gateway-only id can reach the Default or a tier slot.
+- **The mode switch is unaffected**: it still stashes only what it drops and
+  restores it verbatim, and the one `ANTHROPIC_MODEL` it can stash is a
+  gateway-only id, which the restore refuses — so neither leg can introduce a
+  pin that was not there.
+- Housekeeping: `install.py`'s metrics-migration helper became
+  `_run_machine_migrations`, a thin call into the new module, so the file did
+  not grow. Its size ratchet stood at 24 059 for this change; later work in
+  this same release moved three more units out to `vco_lib/install_weaviate.py`
+  and re-pinned it **downward to 24 005** (see the install/update unification
+  entry below) — the pin is always the exact measurement, never the measurement
+  plus headroom.
+
+### Added — a model that ships tomorrow gets its real context window today (v0.2.95)
+
+- **Claude Code sizes its context bar and its `/compact` threshold from the model
+  ID** (`[1m]` ⇒ 1M, otherwise a 200K budget behind a gateway), and the settings
+  writer only decorated ids the chat-model context table already named. A
+  brand-new 1M model therefore sat in the picker with a fifth of its capacity
+  until somebody edited a file. `ContextTable.assume_window()` now answers for
+  any id, in one place and from the table that already exists — no second rule
+  table, and no network read on a settings path:
+  1. the id's own row, exact match (the table stays the authority for every
+     model it names, and adding a row is still how you correct this);
+  2. otherwise, the HIGHEST window among strictly-older members of the same
+     family — a `claude-sonnet-6` is assumed 1M because `claude-sonnet-5` is,
+     while a new Haiku looks only at Haiku rows;
+  3. otherwise 256 000 tokens, the stated assumption for an unknown family until
+     someone researches the real figure and adds a cited row.
+- A tombstoned id short-circuits to step 3: a row you deleted in the GUI must not
+  come back as a sibling's inherited window.
+- The inheritance rule ("same family, strictly older") now has ONE home,
+  `model_family.is_older_sibling`, called by both the gateway catalog's floor and
+  the table's; `ONE_M_WINDOW` moved beside the table it belongs to and is
+  re-exported from `catalog`, so 1 000 000 is spelled once in the package.
+
+### Fixed — ship-gate review: a probe that reported OK for a broken pipeline
+
+- **The "silent no-op" class is closed for every `_lib` file the write
+  pipeline needs, not for the one file that was in front of the fix.**
+  `post-bash-file-sync` exited 0 without a word when `_lib/bash-write-targets`
+  was missing — under a comment restating the finding that forbids it — and a
+  missing `_lib/code-extensions` routed no code file to the end-of-turn drain,
+  silently. Meanwhile the SessionStart probe built for the first finding
+  checked only `_lib/route-touched-path`, so it printed "KG write routing: OK"
+  while every CLI write was being dropped. The SET of required libraries now
+  has one home per flavour (`vco_required_hook_libs` /
+  `Get-VcoRequiredHookLibs` in `_lib/emit-context.{sh,ps1}`), together with the
+  per-file sentence saying what stops without it — the notice body used to be
+  hard-wired to one file's role, which was a FALSE sentence for the other two.
+  The probe iterates that set (and says `unknown`, not OK, when the set's own
+  file is missing), the hooks report through it, and the test drives every row
+  and FAILS on a row it has no driver for, so a fourth required library cannot
+  arrive uncovered.
+- **The gateway's boot unit no longer bakes a derived secret scope.** See the
+  shared-secret entry above: rendering the install root into the unit made the
+  daemon answer `scope_origin() == "pin"` for a pin nobody set, killed the
+  runtime default on every boot-started gateway, and would have frozen a path
+  that a moved install could never heal — including on machines updating from
+  0.2.94, since the update re-renders every registered unit.
+- Documentation correction (pre-existing): `VCT_MODEL_GATEWAY_CONTEXT_TABLE`
+  was documented as having no writer and being normally absent. The launcher
+  has written it since v0.2.92 (`chat_model_context.rs`, on boot and on every
+  GUI edit) — the row was true when it was written, in the same release that
+  added the writer, and nobody revisited it. The code is right; the sentence
+  was stale.
+- The shipped curated KG node for the hook system lists `post-bash-file-sync`
+  (the surface this release added) and no longer advertises the cost telemetry
+  removed above; `ContextTable.advertise_1m`'s docstring says that it NARROWS
+  the picker/settings asymmetry rather than closing it — a vendor family with
+  no cited row can still be published `[1m]` from an upstream-stated window the
+  settings path cannot see, which is the ruled behaviour, not a gap.
+- `project_init.py`'s size ratchet is re-pinned at the measured 15 711 (it sat
+  19 lines above), and its docstring now carries the same rule the `install.py`
+  ratchet does: a bound looser than the property it guards fails toward green.
+
+### Fixed — `cargo test` no longer deletes the developer's stored GitHub PAT
+
+- **The test suite addressed the real credential, not a fixture.** The
+  `github_pat` tests in `commands/installer.rs` wrote and DELETED
+  `vct._user_shared_.shared.user/github_pat` — the exact OS-keychain slot a
+  user's GitHub PAT occupies — at the start and end of every test, plus the
+  legacy `installer/` slot beside it. The fixture redirects `HOME`, which reads
+  like isolation and is not: on Linux the Secret Service is a session D-Bus
+  daemon, not a `$HOME`-scoped file, so `HOME` redirection moves nothing. Any
+  developer with a populated keychain lost their PAT to a routine
+  `cargo test`. Sharing that one fixed slot also made the tests race each
+  other, which is how the defect surfaced.
+- **The fix is isolation, not less coverage.** These tests genuinely need the
+  real keychain path, so nothing is mocked away or skipped: while a test holds
+  `secrets::test_serialize::keychain_serialize_lock()` — the baton every
+  keychain test already takes — `SecretScope::service_name` resolves its prefix
+  to `vct-test-<pid>` instead of `vct`. The production constants, the
+  `(scope, module_id, key)` tuple, the call path and the backing OS keychain are
+  all unchanged; only the OS-level service namespace moves. `vct-test-` can
+  never collide with a production `vct.` service (the character after `vct`
+  differs), and being per-process it also ends the shared-slot race under
+  `cargo test --workspace`. Riding on the existing baton means there is no
+  second thing for a test author to remember.
+- **A tripwire stops the next test re-introducing it.** Once any test in the
+  process has used a test-only seam, `secrets::for_tests::
+  assert_not_production_pat_slot` panics on any read, write or delete of the
+  production PAT slot from a thread with no namespace installed — checked before
+  the mock branch and before any `KeychainEntry` construction, so it fires with
+  or without a keychain backend, and it is inert in shipped builds because
+  nothing there can arm it. It is behavioural, not a source scan.
+- **It immediately found nine more offenders** that review had not: a
+  mock-backed test in `project_env_settings.rs` seeding the production PAT
+  tuple, and eight `/env` tests in `vct-hub`'s `modules_api.rs` — NOT
+  `#[ignore]`d, so they ran on every `cargo test` — which READ the real user's
+  PAT because the route walks the orchestrator manifest's `bundled_secrets`.
+  Reads are not destructive, but they put the user's live token into test code
+  and one assertion message away from a log. All now hold the baton.
+- Keychain test canaries stop accumulating in the user's login keyring as a
+  side effect: three full suite runs now leave it byte-for-byte unchanged.
+
 ## [0.2.94] - 2026-09-09
 
 The incident release. A Claude Code panel restart put a chat back on the
@@ -17,6 +1224,136 @@ every non-root project while a project with zero knowledge nodes was told
 there was nothing to re-embed. Every one of those is fixed at its root here
 and pinned by tests, six Fable review rounds deep; the ruff gate that would
 have caught the one real `NameError` in shipped source is now part of CI.
+
+### Fixed — a retired hook stops FIRING, not just shipping (v0.2.95)
+
+Retiring a hook has two halves — the script stops shipping, and the
+registration in the project's `settings.json` stops firing. Only the first
+was ever done. `_merge_hooks_for_bundle` recognises a VCO hook by its
+presence in the CURRENT template, so the moment a hook stopped being
+shipped its stale registration stopped being recognised as VCO's and was
+preserved byte-for-byte as "the user's own" — forever, on every update.
+Field report 2026-09-14: two `sync_knowledge_graph.py` registrations VCO
+wrote in 2026-04/05 were still firing on every `Edit` a year later, each
+dying with `ModuleNotFoundError: No module named 'weaviate_mcp'` behind a
+`|| true` that hid the failure completely.
+
+- **New `vco_lib/hook_retirements.py`** declares retired registrations as
+  DATA: event, matcher, reason, the release that retired it and the
+  replacement to name. Seeded with the two inline `sync_knowledge_graph.py`
+  shapes (bash and PowerShell, quoted verbatim from this repo's git
+  history) and — as the **companion to the cost-telemetry removal above** —
+  `cost-tracker.sh` / `.ps1`, whose script the same update deletes.
+- **The bundle engine consults it wherever an existing `settings.json` is
+  merged** (every `--update`, and a first install onto a project that already
+  has the file): a matching inner hook is removed, an emptied group is
+  pruned, and ONE `record_auto_resolution` row per removal names the
+  command dropped and what replaced it. State-keyed — it matches on what
+  is in the project NOW, never on "what changed since the last release" —
+  and idempotent.
+- Conservative by construction: a `.claude/hooks/` retiree is matched
+  through the existing anchored invoked-script walk, and an inline retiree
+  by whole-command equality. A user command that merely mentions a retired
+  path, invokes a different script, or embeds a retired snippet inside
+  something larger is preserved byte-for-byte. Pinned by
+  `tests/test_v0295_hook_retirements.py` (act AND leave-alone, plus an
+  end-to-end `--update` against an already-damaged install).
+
+### Fixed — `.claude/env` always carries `VCT_ORCHESTRATOR_ROOT` (v0.2.95)
+
+A correctly installed orchestrator plus a correctly installed project
+could still produce a non-discoverable environment: the project's
+`.claude/env` advertised the portability keys in its own header and
+carried none of them, so the venv ladder's DURABLE (file-backed) tier had
+nothing to read and `kg-sync` refused while a perfectly good venv sat two
+directories away. The keys were emitted only when a CALLER passed a
+resolved root, and the launcher passes `None` whenever its own
+`resolve_orchestrator_root` fails — and because an apply rebuilds the
+managed block from scratch, such a run does not merely skip the keys, it
+REMOVES the ones an earlier bundle update wrote.
+
+- `project_env_from_db` now resolves the clone from its OWN module
+  location when the caller cannot: `vco_lib` ships inside the orchestrator
+  and is installed editable, so the module file's path names the clone.
+  Confirmed positively (a `vct-module.json` manifest with a sibling
+  `vco_lib/`), never guessed — a non-editable copy in some venv's
+  `site-packages` still omits the keys rather than writing a wrong
+  absolute pointer into every project.
+- One writer, unchanged: the values still flow through the single
+  canonical-env projection, so every project is backfilled on its next
+  ordinary bundle update. Pinned by
+  `tests/test_v0295_project_env_root_keys.py`.
+
+### Fixed — kg-sync says which environment answered, and its failures on the edit path are no longer invisible (v0.2.95)
+
+Same field report: a session's worth of knowledge writes appeared to sync
+and did not. Three silences combined — the edit path discarded the sync's
+output and swallowed its exit code, a successful run said nothing about
+WHICH of several trees on that machine it had used, and the SessionStart
+health hook reported retrieval only, so a stale index kept reading healthy
+while the write path was dead.
+
+- **`kg-sync` / `kg-sync.ps1` disclose on success**: one `[kg-sync] venv:
+  <interpreter> (tier: <rung>)` line on stderr, naming the ladder rung that
+  answered (`VCT_VENV`, `VCT_INSTALL_ROOT`, the exported or the file-backed
+  `VCT_ORCHESTRATOR_ROOT`, or clone-relative). The tier is derived by the
+  shared ladder after resolution, so the candidate region the cross-flavour
+  order gate reads is untouched.
+- **A failing debounced sync is recorded, once**: `_lib/kg-sync-debounce.{sh,ps1}`
+  now route every run — flusher, reaper AND the immediate path — through one
+  runner that captures the child's stderr into `.claude/logs/kg-sync-hook.log`
+  (bounded) and appends ONE structured row per session per channel to
+  `kg_sync_failures.jsonl` via the shared metrics-dir resolver. Not per edit:
+  a per-edit report is noise, and noise is how the previous one stayed unread.
+- **SessionStart reports the WRITE path too**: `session-start-retrieval-health.{sh,ps1}`
+  gained a `KG write path: OK (<python>, tier: …)` line — or, when the ladder
+  refuses, the ladder's own refusal text re-emitted on stdout where a
+  SessionStart hook is actually read — plus a one-line notice for any
+  kg-sync failure rows recorded since the last session. The probe is the
+  same `python -c` gate kg-sync runs (one interpreter spawn, ~0.4s); a
+  cheaper approximation could report a healthy write path for an
+  environment kg-sync then refuses.
+- Pinned by `tests/test_v0295_kg_sync_visibility.py` (disclosure, tier
+  attribution, failure capture, per-session dedup, the success case that
+  must record NOTHING, and the SessionStart surfaces).
+
+### Fixed — KG frontmatter dialects: nested `metadata:` parsed, string `tags:` split, prose `#refs` no longer harvested as tags (v0.2.95)
+
+Field defect (read-only survey 2026-09-16): 57 of 71 nodes in one project
+use a nested frontmatter dialect — written by agents copying the Claude
+Code skill/memory frontmatter contract, with the node keys tucked under a
+`metadata:` mapping and the node named via `name:` instead of `title:`.
+`sync_knowledge_graph.py` read only the top level, so those nodes synced
+with their tags and type silently lost: the inline `#tag` body harvest
+fired instead and returned issue/section references from the prose as tags
+(`['4', '12', '14', …]` — not a string indexed character-wise), and the
+folder name became the node type ("concepts" instead of "concept").
+
+- **`parse_frontmatter` now normalises both dialects into one shape**
+  (`_normalise_frontmatter`, called from the parse path so every consumer
+  sees it): each key of a `metadata:` mapping is promoted to the top level
+  only where the top level doesn't declare it (the canonical top-level
+  dialect — the only one shipped templates use — always wins), and `name:`
+  is accepted as the title when `title:` is absent, slotted above the
+  first `# H1` (declared frontmatter beats body-derived values, the same
+  rule the parser already applies to tags and type). A one-line note
+  naming the file is printed when the nested dialect was promoted, so a
+  bulk resync shows how many nodes came from the foreign dialect.
+- **`tags:` given as a string is split** on commas/whitespace into a list
+  (`"a, b c"` → `["a", "b", "c"]`, a `#`-prefixed token loses the `#`,
+  empty string → `[]`); list values pass through unchanged.
+- **The inline `#tag` harvest no longer runs when a frontmatter block
+  exists at all** — including empty or malformed-YAML blocks, which now
+  parse to an empty mapping instead of `None` (every existing consumer
+  already treats `{}` like `None`). A node that declares frontmatter
+  declares its tags; harvesting its prose produces wrong data, not missing
+  data. The harvest stays for files with no frontmatter (the Obsidian
+  style it was written for), and purely numeric tokens (`#4`) are dropped
+  there — a number after a hash is an issue/section reference, never a
+  tag.
+- Pinned by `tests/test_v0295_kg_frontmatter_dialects.py` (pure parsing,
+  no Weaviate/Ollama), including a regression test for the exact field
+  shape.
 
 ### Fixed — the model gateway: vendor tool ids, vendor quota errors, `[1m]`, and one access-log line (v0.2.94)
 

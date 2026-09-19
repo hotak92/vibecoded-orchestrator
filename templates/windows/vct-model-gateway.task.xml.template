@@ -27,24 +27,50 @@
   directly. There is no PowerShell wrapper in between because the gateway
   needs no runtime detection: `boot_service.resolve_gateway_exec()` already
   decided, at registration time, between the `vct-model-gateway` console
-  script and `<python> -m model_router`, and baked the answer in below.
+  script and `<python> -m model_router` — both resolved from the INSTALL
+  ROOT's venv, never from whichever interpreter ran the installer — and
+  `register_model_gateway` PROVED the answer by running it with the `version`
+  flag before baking it in below. A candidate that cannot answer is refused:
+  no task is written rather than one that cannot start.
 
-  Template substitutions:
-    {{LABEL}}           — task name (no path separators)
-    {{EXEC_COMMAND}}    — the gateway executable, forward-slash form
-    {{EXEC_ARGUMENTS}}  — its arguments (may be empty for the console
-                          script; `-m model_router` for the fallback), with
-                          the `serve` verb already appended
-    {{WORKING_DIR}}     — directory the task runs in
-    {{STATE_DIR}}       — VCT state root pinned at registration time
-    {{BOOT_LOG_FILE}}   — file cmd.exe appends the process's own output to.
-                          Deliberately NOT the daemon's own log file: the
-                          daemon logs to stderr as well as to that file, so
-                          redirecting into the same path would write every
-                          record twice.
-    {{CREATED_AT}}      — ISO8601 timestamp at registration time
-    {{USER_ID}}         — Windows user id (DOMAIN\user) for the logon
-                          trigger context
+  Template substitutions. NAMED WITHOUT THEIR BRACES on purpose (v0.2.95):
+  `boot_service.render_template` substitutes every occurrence of a token,
+  comments included, so a documented token here would be replaced by the
+  VALUE — and a value containing a double hyphen (any path with one in it,
+  which is legal everywhere) would then close this comment early and produce
+  XML that `schtasks /Create /XML` rejects outright, exactly like the
+  unescaped `&` this template already carries a note about. The braced forms
+  appear below, in the document itself, which is the only place they belong.
+
+    LABEL           — task name (no path separators)
+    EXEC_COMMAND    — the gateway executable, forward-slash form
+    EXEC_ARGUMENTS  — its arguments (may be empty for the console script;
+                      `-m model_router` for the fallback), with the `serve`
+                      verb already appended
+    WORKING_DIR     — directory the task runs in
+    STATE_DIR       — VCT state root pinned at registration time
+    SECRET_PROJECT  — the PER-PROJECT OVERRIDE for the scope the daemon
+                      resolves vendor keys in. Normally EMPTY, and empty is
+                      the working state: `set VAR=` clears the variable
+                      rather than setting a literal, which reads back as
+                      unset, and the daemon then resolves THIS INSTALL'S
+                      orchestrator root itself, at startup. It has to resolve
+                      something, because the task's working directory is the
+                      state root, which is NOT a registered project, and the
+                      secrets resolver's hub tier (the only route to an
+                      OS-keychain key) is keyed on a project. Resolving at
+                      RUNTIME rather than baking a path here is what makes
+                      that survive a MOVED install. Set it only to point the
+                      gateway at a specific project's own key;
+                      `resolve_gateway_secret_project` never derives a value
+                      for it, and preserves one you set across re-renders.
+    BOOT_LOG_FILE   — file cmd.exe appends the process's own output to.
+                      Deliberately NOT the daemon's own log file: the daemon
+                      logs to stderr as well as to that file, so redirecting
+                      into the same path would write every record twice.
+    CREATED_AT      — ISO8601 timestamp at registration time
+    USER_ID         — Windows user id (DOMAIN\user) for the logon trigger
+                      context
 
   Every substituted value is XML-escaped once, centrally, by
   `boot_service.register_windows` — an install path containing `&` used to
@@ -110,7 +136,7 @@
   <Actions Context="Author">
     <Exec>
       <Command>cmd.exe</Command>
-      <Arguments>/c "set VCT_STATE_DIR={{STATE_DIR}}&amp;&amp; &quot;{{EXEC_COMMAND}}&quot; {{EXEC_ARGUMENTS}} &gt;&gt; &quot;{{BOOT_LOG_FILE}}&quot; 2&gt;&amp;1"</Arguments>
+      <Arguments>/c "set VCT_STATE_DIR={{STATE_DIR}}&amp;&amp; set VCT_MODEL_GATEWAY_SECRET_PROJECT={{SECRET_PROJECT}}&amp;&amp; &quot;{{EXEC_COMMAND}}&quot; {{EXEC_ARGUMENTS}} &gt;&gt; &quot;{{BOOT_LOG_FILE}}&quot; 2&gt;&amp;1"</Arguments>
       <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
     </Exec>
   </Actions>

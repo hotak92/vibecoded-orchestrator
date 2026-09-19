@@ -302,6 +302,22 @@ jobs:
     # the shipped Python PLUS tests/ and templates/: their pre-existing
     # findings (174 and 93, one of them an F821 that killed a shipped CLI's
     # fallback branch) were swept in v0.2.94, so both are gated from here on.
+    #
+    # THE SCOPE RULE (v0.2.95 review MINOR-5 — written down because the list
+    # had been an accretion, and two surfaces were missing with no recorded
+    # decision): every directory of Python this repo SHIPS or ENFORCES WITH
+    # is in scope. Shipped = it reaches a user's machine (vco_lib,
+    # claude_mcp_servers, scripts, install.py, templates, and VCThelpers —
+    # the license + telemetry package install.py pre-compiles as an
+    # orchestrator-managed dir). Enforces-with = the code that runs the other
+    # gates (.github/scripts — the hook-parity gate lives there, and an F841
+    # sat in it unnoticed precisely because the gate code was ungated).
+    # tests/ is in scope because a broken test file is a broken gate.
+    # Nothing is excluded for being "not important enough"; a directory is
+    # excluded ONLY with a recorded finding count and a CHANGELOG backlog
+    # entry, the same contract pyrightconfig.json states for its exclusions.
+    # VCThelpers and .github/scripts joined in v0.2.95 at 0 findings — the
+    # only moment adding a surface is free.
     # `templates/` also holds shell and PowerShell: ruff walks a directory for
     # *.py ONLY, so the .sh/.ps1 siblings are untouched by this job — their
     # gate is hook-os-parity, not this one. The ruff version is pinned in
@@ -320,7 +336,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: ruff
-        run: ruff check vco_lib claude_mcp_servers scripts install.py tests templates
+        run: ruff check vco_lib claude_mcp_servers scripts install.py tests templates VCThelpers .github/scripts
 
   frontend:
     name: Frontend (svelte-check)

@@ -9,7 +9,7 @@ status: active
 
 # Orchestrator Hook System
 
-The hook system is the orchestrator's nervous system. By intercepting Claude Code lifecycle events — session start, tool use, file edits, compaction, stop — hooks turn Claude Code into an automated workflow engine with security enforcement, knowledge-graph sync, cost tracking, and context preservation built in.
+The hook system is the orchestrator's nervous system. By intercepting Claude Code lifecycle events — session start, tool use, file edits, compaction, stop — hooks turn Claude Code into an automated workflow engine with security enforcement, knowledge-graph sync and context preservation built in.
 
 [[implements::Agentic Workflow Patterns]] [[uses::Claude Code]] [[relatedTo::Orchestrator Context Management]] [[relatedTo::Orchestrator Security]]
 
@@ -20,7 +20,7 @@ Hooks are shell scripts (with a few Python helpers) registered in `.claude/setti
 - **Security enforcement** — scan commands before execution, scrub credentials
 - **Knowledge sync** — push edited KG/doc/code files to Weaviate automatically
 - **Context preservation** — save state before compaction, reinject after
-- **Cost tracking** — log token usage and USD cost every session
+- **Token accounting** — for CONTEXT management, not cost: the model gateway keeps the per-chat ledger (`<vct-state-dir>/metrics/gateway-usage.jsonl`, served at `/usage`). The Stop-hook cost tracker that used to write `~/.claude/metrics/costs.jsonl`, and its `cost-summary` CLI, were removed in v0.2.95 at the owner's request — no price is recorded anywhere.
 - **Quality gates** — validate agent output before marking tasks done
 - **Developer experience** — auto-format Python, type-check, compile-check
 
@@ -41,7 +41,7 @@ User action / Claude turn
 [PostToolUse]           — sync KG, lint, type-check, credential scan
         |
         v
-[Stop / StopFailure]    — cost tracking, notification
+[Stop / StopFailure]    — end-of-turn drains, notification
 ```
 
 Compaction path:
@@ -190,6 +190,11 @@ Context nearing limit
 **kg-summary-generator.sh** (matcher: `mcp__weaviate-kg__store_knowledge_node`)
 - Refreshes the sidecar summary when a node is written through the MCP tool rather than a file edit.
 
+**post-bash-file-sync.sh** (matcher: `Bash`)
+- Closes the CLI half of the sync gap: a file written from a shell command (`cat > knowledge/x.md <<EOF`, a heredoc, `sed -i` on a docs page, `cp` into a source tree) never reached Weaviate, because `post-file-edit.sh` is registered on `Edit|Write` only.
+- The command is parsed for the paths it wrote, and each one goes through the SAME routing home (`_lib/route-touched-path.sh`) that the Edit/Write hook uses, so a CLI write syncs identically. A pure-shell prefilter rejects the routine commands (`ls`, `git status`, a redirect to `/dev/null`) with no subprocess at all.
+- Writes an interpreter performs from its own source text (`python - <<EOF`, `patch`, `git checkout --`) cannot be recovered from the command string; for `knowledge/` and `docs/` those are caught by a bounded, watermarked mtime scan of those two directories.
+
 **post-bash-context-record.sh** (matcher: `Bash`)
 - Records Bash context for later retrieval; **post-git-commit-kg-sync.sh** + **post-file-delete.sh** also fire on `Bash` to sync KG on commit and prune deleted-file entries.
 
@@ -202,10 +207,6 @@ Context nearing limit
 - Logs `.claude/settings.json` modifications to a JSONL audit trail.
 
 ### Stop
-
-**cost-tracker.sh**
-- Appends `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`.
-- Summary CLI: `python .claude/scripts/cost-summary.py [--days N]` (portable, all OSes; bash `cost-summary` shim delegates to it on POSIX).
 
 **notify-stop.sh**
 - Desktop notification via `notify-send`.
@@ -249,7 +250,7 @@ Every shell hook in `templates/hooks/*.sh` carries:
 - All hooks share `.claude/logs/` for output.
 - Security hooks share credential patterns with `bash_security.py`.
 - KG sync hooks all route through `sync_knowledge_graph.py`.
-- Cost tracking integrates with the metrics dashboard at `~/.claude/metrics/`.
+- Session metrics (compactions, failures) land under `~/.claude/metrics/`; gateway token accounting is separate, under the VCT state dir.
 
 ## Technical Details
 

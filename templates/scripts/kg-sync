@@ -125,4 +125,18 @@ if [ -z "${KG_SYNC_PROJECT_ROOT:-}" ]; then
     export KG_SYNC_PROJECT_ROOT
 fi
 
+# v0.2.95: SAY WHICH ENVIRONMENT ANSWERED.
+#
+# Success was silent, and that is how a field install (field report 2026-09-14)
+# spent a session appearing to sync and not syncing: four trees on that
+# machine held a `weaviate_mcp`, three of them wrong, and nothing in the
+# output or the env file said which one was live. The refusal path already
+# names every tier it probed; the success path named nothing.
+#
+# ONE line, stderr (stdout is the sync's own surface and is parsed by the
+# launcher's kg_sync.rs), `[kg-sync]`-prefixed, no secrets — an interpreter
+# path and a tier LABEL, never an env VALUE.
+# PARITY: kg-sync.ps1 prints the same line, same prefix, same stream.
+echo "[kg-sync] venv: $VENV_PYTHON (tier: ${LADDER_TIER:-unknown})" >&2
+
 "$VENV_PYTHON" "$SCRIPT_DIR/sync_knowledge_graph.py" "$@"

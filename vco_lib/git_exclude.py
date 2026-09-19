@@ -29,7 +29,16 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 from vco_lib.atomic import atomic_write_bytes
+from vco_lib.manifest_paths import MANIFEST_BASENAME
 from vco_lib.paths import to_posix_rel
+
+#: Root-anchored exclude pattern for the bundle manifest. Composed from the
+#: one home's BASENAME (v0.2.95) rather than re-spelled: git's exclude
+#: patterns are root-anchored, so this is the same FILE as
+#: ``.claude/.vco-manifest.json`` reached by a different route, and a rename
+#: that missed this line would leave the manifest visible in `git status` on
+#: every safe-added project.
+_MANIFEST_EXCLUDE_PATTERN = "/" + MANIFEST_BASENAME
 
 __all__ = [
     "SAFE_ADD_SIDECAR_SUFFIX",
@@ -56,7 +65,7 @@ SAFE_ADD_SIDECAR_SUFFIX = ".vco.reference"
 #: for.
 VCO_EXCLUSIVE_TOPLEVEL: dict[str, str] = {
     ".claude": "/.claude/",
-    ".vco-manifest.json": "/.vco-manifest.json",
+    MANIFEST_BASENAME: _MANIFEST_EXCLUDE_PATTERN,
 }
 
 
@@ -110,7 +119,7 @@ def exclude_entries_for_created_paths(
             _add("/" + rel_posix)
 
     if include_manifest:
-        _add("/.vco-manifest.json")
+        _add(_MANIFEST_EXCLUDE_PATTERN)
 
     # The Rust launcher writes the `.env` reference sidecar before this step.
     sidecar = ".env" + SAFE_ADD_SIDECAR_SUFFIX

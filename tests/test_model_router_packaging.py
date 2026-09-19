@@ -71,6 +71,8 @@ REQUIRED_WHEEL_MEMBERS = (
     "model_router/fileperms.py",
     "model_router/quota.py",
     "model_router/tool_ids.py",
+    "model_router/model_family.py",
+    "model_router/usage.py",
     "model_router/chat_model_context.seed.json",
     "model_router/static_catalog.json",
 )

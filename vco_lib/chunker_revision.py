@@ -104,6 +104,179 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------------------------------------------------------------------------
+# The RESYNC half-stamps — the clear mechanism the deferral always promised
+# ---------------------------------------------------------------------------
+#
+# Both emitters of ``chunker_preset_overhaul_pending`` tell the user, in the
+# shipped entry text: *"Once you run the re-sync commands below, this deferral
+# self-resolves on the next bundle update."* Until v0.2.95 nothing implemented
+# that. The registry declared ``clear_probe = "paired-resolution"`` ("the
+# component that emitted this entry clears it when its owed work completes")
+# and named "the Rust chunker-revision flow" as the site — which has no
+# resolve call, in either language. Worse, :func:`gate` re-stamps
+# :data:`STATE_REL` at EMIT time, so every later run reads stored == live and
+# the only comparison that could have re-derived anything is permanently
+# satisfied. The row was immortal by construction, and it is load-bearing in a
+# second place: ``templates/scripts/sync_knowledge_graph.py`` arms a per-node
+# chunk-plan comparison *while the ledger carries the cid* and documents that
+# cost as transitional. A cid that never clears made it forever.
+#
+# The fix keeps the promise instead of retiring it (the standing rule: a false
+# promise is MADE TRUE by default; deleting one is the user's call). The
+# remedy :func:`resync_commands` prints has exactly two halves, so the
+# evidence does too: each half stamps the revision it ran under, and the
+# registry probe ``chunker_resync_still_owed`` reports the condition over only
+# when BOTH name the CURRENT revision.
+#
+# Why a stamp rather than re-measuring the stores: re-deriving "are any stored
+# chunk boundaries stale?" means fetching every KG row and re-planning it —
+# the exact work the comparison does, on a probe that runs on every ledger
+# render. The stamp is written at the ONE point that proves the half ran (a
+# fully successful tree sync; a completed ``--force-recreate`` walk), which is
+# the same narrowness the sibling paired clears in both scripts already use.
+#
+# A LATER revision crossing re-arms everything for free: :func:`gate` emits
+# again, and stamps recorded under the old revision no longer match, so the
+# probe says "still owed" without anyone having to clear them.
+
+#: Per-project record of which halves of the re-sync remedy have run, relative
+#: to the project folder. Sibling of :data:`STATE_REL` and deliberately a
+#: SEPARATE file: that one answers "which revision did this project last
+#: observe?" (written by the gate), this one "which halves of the remedy have
+#: run, and under which revision?" (written by the remedy scripts).
+RESYNC_STATE_REL = Path(".claude") / "state" / "chunker-resync.json"
+
+#: The halves of :func:`resync_commands`, in the order it prints them. Both
+#: must name the current revision before the deferral describes work that is
+#: over — clearing on one would retire an entry whose other store is still
+#: chunked under the old boundaries.
+RESYNC_HALVES = ("kg", "codegraph")
+
+
+def resync_state_path(folder: Path) -> Path:
+    """Absolute path of the half-stamp file under ``folder``."""
+    return Path(folder) / RESYNC_STATE_REL
+
+
+def current_revision() -> Optional[str]:
+    """The live ``_CHUNKER_REVISION``, or ``None`` when it cannot be read.
+
+    ONE soft-failing accessor for the readers that must not raise (the stamp
+    writers and the clear probe). :func:`gate` keeps its own call because it
+    turns the failure into an ``error:`` outcome; here "could not look" is
+    simply unknown, which every caller maps to "change nothing".
+    """
+    try:
+        from vco_lib.project_init import current_chunker_revision
+
+        revision = current_chunker_revision()
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    return revision if isinstance(revision, str) and revision.strip() else None
+
+
+def read_resync_stamps(folder: Path) -> Optional[dict]:
+    """The recorded half → revision map for ``folder``.
+
+    Returns:
+        ``{}``   — no stamp file yet: nothing has been recorded, which is a
+                   KNOWN state (no half has run), not an unreadable one.
+        ``dict`` — the recorded halves (only ``str`` → non-empty ``str``
+                   pairs survive; anything else is dropped as unrecorded).
+        ``None`` — the file exists and could not be read or parsed. Unknown,
+                   never "nothing recorded": the difference decides whether a
+                   user-visible entry may be deleted.
+    """
+    path = resync_state_path(folder)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    halves = data.get("halves")
+    if not isinstance(halves, dict):
+        return None
+    return {
+        k: v.strip()
+        for k, v in halves.items()
+        if isinstance(k, str) and isinstance(v, str) and v.strip()
+    }
+
+
+def record_resync_half(
+    folder: Path, half: str, revision: Optional[str] = None,
+) -> bool:
+    """Record that ``half`` of the re-sync remedy completed under ``revision``.
+
+    Merges into whatever is already recorded — the two halves are run
+    independently, in either order, often days apart, so a write that replaced
+    the file would make each half retire the other.
+
+    ``revision`` defaults to :func:`current_revision`; ``None`` (unreadable
+    chunker) records NOTHING and returns False rather than stamping a guess,
+    because a wrong revision here either retires a live entry or immortalises
+    a dead one.
+
+    Never raises. Returns whether the stamp landed, so a caller can log it —
+    never gate on it: the remedy's real work already succeeded, and a failed
+    stamp only means the entry survives until the half is run again.
+    """
+    if half not in RESYNC_HALVES:
+        return False
+    rev = (revision or "").strip() or current_revision()
+    if not rev:
+        return False
+    existing = read_resync_stamps(folder)
+    halves = dict(existing) if isinstance(existing, dict) else {}
+    halves[half] = rev
+    try:
+        target = resync_state_path(folder)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps({"halves": halves, "updated_at": _now_iso()}) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+        return True
+    except OSError:
+        return False
+
+
+def resync_still_owed(folder: Path) -> Optional[bool]:
+    """Is the chunker re-sync ``folder``'s ledger entry describes still owed?
+
+    The registry clear probe for ``chunker_preset_overhaul_pending``
+    (``probe:py:chunker_resync_still_owed``).
+
+    Returns:
+        True  — at least one half has not run under the current revision
+                (including "no stamp file at all", the state every machine
+                that has not acted is in).
+        False — provably over: every half in :data:`RESYNC_HALVES` is
+                recorded at the CURRENT revision.
+        None  — could not look (the chunker revision is unreadable, or the
+                stamp file exists and is corrupt). Positive evidence only: an
+                unreadable stamp never retires a user-visible record of owed
+                work.
+    """
+    current = current_revision()
+    if not current:
+        return None
+    stamps = read_resync_stamps(folder)
+    if stamps is None:
+        return None
+    return not all(stamps.get(half) == current for half in RESYNC_HALVES)
+
+
 def resync_commands(folder: Path, tail_comment: str) -> str:
     """The ONE re-chunk remediation both chunker deferrals emit.
 

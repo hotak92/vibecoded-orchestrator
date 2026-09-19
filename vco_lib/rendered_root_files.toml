@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# RENDERED ROOT FILES — cross-language single source of truth (v0.2.95 R1)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The paths in the orchestrator ROOT that the install RENDERS: a tracked file
+# whose installed content is DERIVED (a template + placeholder substitution +
+# the user's own content outside the AUTO markers), not the tracked blob.
+#
+# ## Why this file exists
+#
+# A rendered path diverges from its tracked blob on EVERY install, by design.
+# When upstream also changes the tracked copy, git sees "both sides changed
+# the same file" and the orchestrator update stops at the divergence modal —
+# which is what every 0.2.93-to-0.2.94 updater hit on `CLAUDE.md`. The owner's
+# ruling (2026-09-10): a conflict must never arise on a file the install
+# renders and expects to change; the update resolves it automatically (keep
+# the local rendered content, re-render from the new template) and records a
+# deferral row.
+#
+# Two languages must agree on WHICH paths those are:
+#
+#   * Python - `vco_lib/rendered_root_files.py` (`render_all`), called by
+#     install.py's step-4c shim `_materialize_orchestrator_self_claude_md`
+#     (CLAUDE.md-specific name kept for its callers and tests while the table
+#     holds one entry). The renderer is DRIVEN by this table: the rendered set
+#     is not a hand list kept beside the renderer, it IS what it iterates.
+#   * Rust - `launcher/src-tauri/src/commands/git_user_editable_merge.rs`
+#     (`RENDERED_ROOT_FILES_TOML` / `resolve_rendered_files_keep_local`), the
+#     pre-pull bias class that keeps the working-tree copy and advances the
+#     tracked blob to upstream's so the pull cannot conflict.
+#
+# Tier (B) of the A>B>C rule in CLAUDE.md ("Share, don't mirror"): ONE
+# committed table both sides PARSE. Tier (A) - Rust shelling out to Python -
+# is deliberately NOT used here for the same reason `mcp_scan_rules.toml`
+# gives: the launcher is the REPAIR tool and must classify these paths even
+# when the project venv is mid-update or broken, which is exactly when an
+# update runs. The Rust side embeds this file with `include_str!` at COMPILE
+# time (no runtime missing-file arm); `tests/test_v0295_rendered_file_conflicts.py`
+# holds the two parsers in lockstep.
+#
+# ## Parse rules (identical across languages)
+#
+#   * `format_version` must equal 1. A schema change bumps it here AND in both
+#     loaders in the same commit.
+#   * `path` - POSIX-separated, relative to the orchestrator root. Matching is
+#     case-insensitive (HFS+/APFS/NTFS) with `\` normalised to `/`.
+#   * `template` - POSIX-separated, relative to the orchestrator root.
+#   * `begin_marker` / `end_marker` - the AUTO-block delimiters. On a re-render
+#     only the text BETWEEN them is replaced; everything outside is the user's
+#     and is preserved. A target file without both markers is rewritten whole
+#     (the markers are the "preserve me" contract).
+#   * `substitutions` - placeholder names the renderer resolves in the template
+#     body (written `{{NAME}}` there). A name no renderer knows makes that
+#     entry FAIL loudly (printed + logged, nothing written) - the renderer
+#     never writes a file carrying an unresolved placeholder.
+#   * `state_file` - where the launcher's pre-pull reconcile records what it
+#     did, and where install.py's renderer reads it back to emit the
+#     `rendered_file_upstream_changed` deferral row. Both sides take the path
+#     from HERE; it is gitignored (`.claude/state/`), so writing it never
+#     dirties the tree the update is about to merge.
+#
+# ## Deliberately NOT in `orchestrator-managed-paths.txt`
+#
+# The three sibling tables there (`bundled_mcp_versions.toml`,
+# `mcp_scan_rules.toml`, `deferral_conditions.toml`) are whitelisted so the
+# copy-based `update_orchestrator_at` path propagates table edits. This one is
+# not, on purpose: that path copies no `vco_lib/*.py`, so a whitelisted table
+# could arrive NEWER than the `rendered_root_files.py` that reads it, and a
+# format-version mismatch is a loud RuntimeError that would stop CLAUDE.md being
+# rendered at all. Table and reader ship as a pair through the `git pull` every
+# real update performs. Add the entry only together with a copy rule for the
+# module.
+#
+# ## Scope: the orchestrator ROOT only
+#
+# Project-level `CLAUDE.md` is also rendered (from `templates/CLAUDE.md.template`
+# by `vco_lib/project_init.py`), but a user project is NOT a clone of this repo:
+# its bundle update reconciles by manifest hash (adopt + backup under
+# `.claude/backups/bundle-adoptions/`), never by `git merge`, so the conflict
+# class this table exists for cannot arise there. Do NOT add project-level
+# paths here expecting them to be protected - extend the bundle engine instead.
+
+format_version = 1
+state_file = ".claude/state/rendered-files-reconciled.json"
+
+[[rendered]]
+path = "CLAUDE.md"
+template = "templates/ORCHESTRATOR-CLAUDE.md.template"
+begin_marker = "<!-- BEGIN: AUTO"
+end_marker = "<!-- END: AUTO -->"
+substitutions = ["ORCHESTRATOR_ROOT"]

@@ -41,7 +41,10 @@
 //!           → pull**.
 //!         - Conflict (exit 1 from `merge-file`) → leaves the LOCAL
 //!           content in place and writes the upstream version
-//!           side-by-side as `<path>.from-upstream-<short_sha>`. Emits
+//!           side-by-side as `<path>.from-upstream-<short_sha>`. (v0.2.95 R1:
+//!           a RENDERED path never reaches this leg — the RENDERED_LOCAL
+//!           reconcile above resolves it first and this loop skips it, which
+//!           is why `CLAUDE.md` no longer accumulates those sidecars.) Emits
 //!           an `orchestrator_user_modified_preserved` deferral entry so
 //!           the launcher's UPDATE_DEFERRED.md viewer shows the user
 //!           where to find the upstream version + how to accept it.
@@ -72,6 +75,21 @@
 //! v0.2.24 but deliberately NOT built — no user demand surfaced across 45+
 //! releases, and a hardcoded list keeps the trust boundary auditable in one
 //! place (a config file would let any repo silently widen what auto-merges).
+//!
+//! Third bias class — RENDERED_LOCAL (v0.2.95 R1)
+//! ----------------------------------------------
+//! The two hardcoded lists below are joined by a THIRD class whose members are
+//! NOT hardcoded here: the paths install.py RENDERS, read from the shared table
+//! `vco_lib/rendered_root_files.toml` (`CLAUDE.md` today). A rendered path is
+//! divergent on every install BY DESIGN, so when upstream also edits the
+//! tracked copy the pair (locally-modified ∩ upstream-changed) forces the
+//! divergence modal — which is what every 0.2.93→0.2.94 updater hit.
+//! `resolve_rendered_files_keep_local` resolves it BEFORE the pull by advancing
+//! the tracked blob to upstream's while leaving the rendered working-tree copy
+//! untouched; install.py then re-renders the AUTO block from the new template
+//! and records a `rendered_file_upstream_changed` row. See the RENDERED_LOCAL
+//! section further down for the mechanics, the data-safety argument and why a
+//! `.gitattributes merge=ours` driver cannot do this job.
 //!
 //! Sibling allowlist — `GENERATED_RELEASE_CONTROLLED_PATTERNS` (v0.2.89)
 //! --------------------------------------------------------------------
@@ -111,6 +129,14 @@ use vct_launcher_core::process::CommandExt as _;
 pub(crate) const USER_EDITABLE_PATTERNS: &[&str] = &[
     // The user-facing CLAUDE.md is the most-edited file by far — every
     // project adds its own Dev Constraints / KG conventions to it.
+    //
+    // v0.2.95 R1: it is ALSO a RENDERED root file, and the RENDERED_LOCAL
+    // reconcile runs first and resolves it. Its membership here is the
+    // FALLBACK bias for the case where that reconcile declines to act (a git
+    // failure, or an upstream change this class does not model yet) — both
+    // classes preserve local content, so this is a refinement, not a second
+    // opinion. Do NOT read this entry as "CLAUDE.md is 3-way merged": it is
+    // only 3-way merged when the rendered reconcile did nothing for it.
     "CLAUDE.md",
     // Gitignored anyway, but defense-in-depth: if a user adds it to
     // their fork's tracked set, we still want non-blocking merges.
@@ -793,6 +819,717 @@ pub(crate) fn is_generated_release_controlled(rel_path: &str, globset: &GlobSet)
     globset.is_match(&normalised)
 }
 
+// ---------------------------------------------------------------------------
+// v0.2.95 R1 — RENDERED_LOCAL: the third bias class (keep-local + re-render)
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM. `install.py` RENDERS some tracked root paths: it writes a body
+// derived from a template into a file the repo also tracks (`CLAUDE.md` from
+// `templates/ORCHESTRATOR-CLAUDE.md.template`, wrapped in AUTO markers so the
+// user's own text outside them survives). So on EVERY install the path is
+// locally divergent BY DESIGN. When upstream then edits the tracked copy —
+// the 0.2.93→0.2.94 release stripped the CLAUDE.md stub's reminder block —
+// the path is (locally-modified ∩ upstream-changed), which is exactly the set
+// that forces `--ff-only` and the divergence modal. Every updater hit it.
+//
+// THE RULING (owner, 2026-09-10): "those conflicts should not arise at all for
+// 3rd party users on files that are expected to change like CLAUDE.md", and on
+// the remedy "ok to always be deferred in case of conflict" — resolve it
+// AUTOMATICALLY (keep the local rendered content, re-render from the new
+// template), record a deferral row, never stop at a modal.
+//
+// THE RESOLUTION, and why it is shaped this way. For a rendered path the two
+// sides own DIFFERENT things: upstream owns the TRACKED BLOB (nobody reads it
+// on an installed clone — the file on disk is rendered), the user owns the
+// WORKING-TREE FILE (their text outside the AUTO markers lives ONLY there; it
+// is uncommitted, so it exists nowhere else). So, before the pull:
+//
+//   1. hold the working-tree bytes in memory;
+//   2. `git checkout <theirs> -- <path>` — index + worktree take upstream's blob;
+//   3. commit it, pathspec-scoped, under the mechanical identity;
+//   4. write the held bytes back over the working-tree file.
+//
+// After that HEAD:path == theirs:path, so the merge that follows has NOTHING
+// to change for this path: git neither refuses the dirty file ("would be
+// overwritten by merge" only fires for paths whose merged entry DIFFERS from
+// the current one) nor conflicts on it, and an `--autostash` pop replays the
+// rendered bytes over an unchanged blob. `install.py` then re-renders the AUTO
+// block from the NEW template. If the install step never runs, the user's file
+// is still exactly as it was — this class NEVER parks their content in a
+// sidecar it depends on someone restoring.
+//
+// WHY NOT `.gitattributes merge=ours` + a `merge.ours.driver` (the other
+// candidate in the plan). Three independent reasons, any one fatal:
+//   * it cannot fire in the field case. The rendered copy is UNCOMMITTED, and
+//     git refuses the pull at the dirty-worktree check, BEFORE any merge
+//     driver runs. A driver only helps a divergence that reaches the merge.
+//   * `ours` means "the side being merged INTO", which under `git pull
+//     --rebase` (the arm the A0 pre-merge commit selects) is UPSTREAM — the
+//     driver would DISCARD precisely the user content the ruling protects. A
+//     direction-sensitive rule cannot express "always keep the rendered copy".
+//   * it needs per-clone config (`merge.ours.driver=true`) that a fresh
+//     `git clone` does not have, and an undefined driver falls back to the
+//     built-in text merge silently — a shipped safety mechanism that quietly
+//     stops working is the failure class CLAUDE.md forbids. (And the A0 leg
+//     uses `git merge-file`, which does not consult `.gitattributes` at all —
+//     already documented above.)
+// A hand-run `git pull` is therefore NOT covered by either design; that user
+// is served by the existing recovery documented in `docs/UPDATE-RECOVERY.md`.
+//
+// RELATION TO THE OTHER TWO BIAS LISTS. `GENERATED_RELEASE_CONTROLLED_PATTERNS`
+// is take-upstream (discard local); RENDERED_LOCAL must never overlap it (one
+// path, one bias — pinned by `rendered_and_generated_classes_are_disjoint`).
+// `USER_EDITABLE_PATTERNS` is the other PRESERVE-LOCAL class and it still
+// lists `CLAUDE.md`: RENDERED_LOCAL is a REFINEMENT of it, not an opposite, so
+// the two may overlap and the rendered class simply runs FIRST —
+// `pre_merge_user_editable` skips any path this reconcile already resolved, so
+// no path is resolved twice and the user-editable 3-way remains the behaviour
+// if this class ever declines to act.
+//
+// THE PATH SET IS NOT HARD-CODED HERE. It comes from
+// `vco_lib/rendered_root_files.toml`, the same table install.py's renderer
+// ITERATES — so "which paths are rendered" has one home and the two languages
+// cannot drift (tier (B) of CLAUDE.md's A>B>C rule; the cross-language pin is
+// `tests/test_v0295_rendered_file_conflicts.py`). It is embedded at COMPILE
+// time exactly as `mcp_scan_rules.toml` is, and for the same stated reason:
+// the launcher is the repair tool and must classify these paths even when the
+// project venv is mid-update, which is when updates happen.
+
+/// The rendered-root-files table, embedded at compile time.
+///
+/// Path: 4 levels up from this file (`commands` → `src` → `src-tauri` →
+/// `launcher` → repo root), then into `vco_lib/` — the same include shape
+/// `vct-launcher-core`'s `mcp_scan_rules.rs` uses. The table lives under
+/// `vco_lib/` so it ships in the Python wheel; this include path must follow
+/// any future move in lockstep.
+const RENDERED_ROOT_FILES_TOML: &str =
+    include_str!("../../../../vco_lib/rendered_root_files.toml");
+
+/// Table format version this loader understands. A schema change bumps the
+/// .toml, this constant and `vco_lib/rendered_root_files.py` in one commit.
+const RENDERED_TABLE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Deserialize)]
+struct RenderedRootFilesTable {
+    format_version: u32,
+    state_file: String,
+    #[serde(default)]
+    rendered: Vec<RenderedRootFile>,
+}
+
+/// One rendered orchestrator-root path. Fields mirror the table keys; the
+/// launcher consumes `path` (classification) and `template` (the deferral's
+/// audit text). `begin_marker` / `end_marker` / `substitutions` are the
+/// renderer's half of the contract and are parsed but not used here — serde
+/// tolerates them being present, and naming them keeps the struct a faithful
+/// model of the table rather than a lossy subset.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct RenderedRootFile {
+    pub path: String,
+    pub template: String,
+}
+
+/// Parsed table. Panics on a malformed/unsupported table — it is embedded at
+/// compile time, so a defect cannot be a runtime-environment problem and IS
+/// caught by `rendered_root_files_table_parses` in every `cargo test` run.
+/// Same posture (and same reasoning) as `mcp_scan_rules`'s `LazyLock`.
+static RENDERED_ROOT_FILES: std::sync::LazyLock<RenderedRootFilesTable> =
+    std::sync::LazyLock::new(|| {
+        let table: RenderedRootFilesTable = toml::from_str(RENDERED_ROOT_FILES_TOML)
+            .expect("vco_lib/rendered_root_files.toml must parse (compile-time embedded)");
+        assert_eq!(
+            table.format_version, RENDERED_TABLE_FORMAT_VERSION,
+            "vco_lib/rendered_root_files.toml format_version must match this loader"
+        );
+        assert!(
+            !table.rendered.is_empty(),
+            "vco_lib/rendered_root_files.toml must declare at least one [[rendered]] entry"
+        );
+        assert!(
+            !table.state_file.is_empty(),
+            "vco_lib/rendered_root_files.toml must declare a non-empty state_file"
+        );
+        table
+    });
+
+/// Every rendered orchestrator-root path, in table order.
+pub(crate) fn rendered_root_files() -> &'static [RenderedRootFile] {
+    &RENDERED_ROOT_FILES.rendered
+}
+
+/// Relative path (POSIX separators) of the hand-off state file this reconcile
+/// writes and install.py's renderer reads back. Taken from the table so the
+/// two sides cannot write/read different files.
+pub(crate) fn rendered_state_file_rel_path() -> &'static str {
+    &RENDERED_ROOT_FILES.state_file
+}
+
+/// True when `rel_path` (relative to the orchestrator clone root) is a
+/// RENDERED root file. Normalisation matches `vco_lib/rendered_root_files.py`
+/// exactly: `\` → `/` (the v0.2.81 B1 Windows-separator lesson) plus an
+/// ASCII-case-insensitive compare (HFS+/APFS/NTFS fold case, so the same file
+/// can surface as `claude.md`).
+pub(crate) fn is_rendered_root_file(rel_path: &str) -> bool {
+    let normalised = rel_path.replace('\\', "/");
+    rendered_root_files()
+        .iter()
+        .any(|e| e.path.replace('\\', "/").eq_ignore_ascii_case(&normalised))
+}
+
+/// What `resolve_rendered_files_keep_local` did.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RenderedReconcileOutcome {
+    /// Rendered paths whose TRACKED blob was advanced to upstream's while the
+    /// working-tree copy was kept. Empty = this class did nothing (the common
+    /// case: upstream did not touch a rendered file this release).
+    pub reconciled: Vec<String>,
+    /// True when the synthetic take-upstream commit was created. Deliberately
+    /// NOT threaded into `resolve_divergence_pull_plan`'s `pre_merge_committed`
+    /// / `generated_reconcile_committed` arguments: this commit is
+    /// patch-identical to upstream's own change for that path, so the
+    /// merge-tree probe sees identical blobs on both sides and resolves
+    /// `RealMerge` (no modal). Forcing the rebase arm instead would replay a
+    /// commit that is already upstream.
+    pub committed: bool,
+}
+
+impl RenderedReconcileOutcome {
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// How a rendered path was reconciled against upstream. The two arms exist
+/// because upstream can change a rendered file in exactly two ways that matter
+/// here, and the user's working-tree copy is protected identically in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderedAction {
+    /// Upstream CHANGED the tracked copy — we took its blob into HEAD.
+    TookUpstream,
+    /// Upstream REMOVED the tracked copy — we dropped ours from the index, so
+    /// the incoming merge has nothing to delete and the working-tree file
+    /// simply becomes untracked.
+    ///
+    /// This is the END STATE a rendered path should have reached long ago: a
+    /// file every install overwrites has no business being tracked. Until the
+    /// removal lands, `git` refuses the pull outright — a tracked file that is
+    /// locally modified and deleted upstream aborts with "Your local changes to
+    /// the following files would be overwritten by merge" and leaves the
+    /// updater stuck forever, because the next install re-renders the same
+    /// local modification. This arm is what makes that release SHIPPABLE.
+    Untracked,
+}
+
+/// A rendered path whose working-tree bytes are held in memory while its
+/// tracked entry is reconciled to upstream, and written back afterwards.
+struct HeldRenderedFile {
+    path: String,
+    template: String,
+    bytes: Vec<u8>,
+    action: RenderedAction,
+}
+
+/// Branch-resolving front door: resolve base/theirs for `branch`, then run
+/// [`resolve_rendered_files_keep_local_at`]. Conservative: an unresolvable ref
+/// ⇒ no-op.
+///
+/// **`#[cfg(test)]`-only since v0.2.95 phase 2**, deliberately, and this is the
+/// same disposition v0.2.95 gave `self_update::first_blocking_change`: a
+/// function whose production caller went away, kept because the TESTS below
+/// legitimately want this shape (eleven of them drive the class from a branch,
+/// which is the state a repo fixture is actually in) — but taken out of the
+/// production surface so nothing can reach it there by accident.
+///
+/// Its production caller was `self_update::apply_launcher_update`, which had no
+/// A0 pre-merge step of its own and so called this class DIRECTLY. That surface
+/// now shares the update pipeline and reaches the class through
+/// `pre_merge_user_editable`, exactly as the installer surface does — ledger
+/// row 12's "one helper, two entry points" is down to one entry point.
+///
+/// Nothing was lost in the fold. `installer::run_pre_merge_user_editable`
+/// resolves base/theirs from the pull branch through the same
+/// `compute_base_sha` / `compute_theirs_sha` pair with the same
+/// unresolvable-ref posture, and now threads the BRANCH through too — which was
+/// this wrapper's one advantage over the `_at` form.
+#[cfg(test)]
+pub(crate) async fn resolve_rendered_files_keep_local(
+    install_path: &Path,
+    branch: &str,
+) -> RenderedReconcileOutcome {
+    let theirs = match compute_theirs_sha(install_path, branch).await {
+        Ok(Some(t)) => t,
+        Ok(None) | Err(_) => return RenderedReconcileOutcome::none(),
+    };
+    let base = match compute_base_sha(install_path, branch).await {
+        Ok(Some(b)) => b,
+        Ok(None) | Err(_) => return RenderedReconcileOutcome::none(),
+    };
+    resolve_rendered_files_keep_local_at(install_path, &base, &theirs, branch).await
+}
+
+/// The engine (one home; the production path reaches it through
+/// `pre_merge_user_editable`).
+///
+/// For each RENDERED root path, act ONLY when all of these hold — the trigger
+/// is the live repo STATE, never "how many releases behind are you", so a
+/// clone three releases back with the stub changed twice is the same case:
+///   * upstream changed the tracked copy between `base` and `theirs`
+///     (`base:path` != `theirs:path`) — the condition the ruling is about;
+///   * our side is not already there (`HEAD:path` != `theirs:path`), so there
+///     is something to advance;
+///   * the working-tree file exists and differs from upstream's blob (if it is
+///     byte-identical, F1's `auto_restore_byte_identical_tracked_mods` already
+///     resolves it for free and this class must not create a pointless commit).
+///
+/// Then: hold the bytes → `checkout <theirs> -- <path>` → pathspec commit →
+/// write the bytes back. See the module section above for why this ordering is
+/// the one that keeps the user's content AND disarms the merge.
+///
+/// DATA-SAFETY. The only content this touches is the working-tree copy, and it
+/// puts back exactly the bytes it read. On a commit failure it reverts the
+/// checkout (`git checkout HEAD -- <path>`) AND still restores the held bytes,
+/// so a failed reconcile leaves the tree as it found it → the existing modal
+/// flow surfaces (never worse than today). Per-path failures are skipped, not
+/// fatal.
+pub(crate) async fn resolve_rendered_files_keep_local_at(
+    install_path: &Path,
+    base: &str,
+    theirs: &str,
+    branch: &str,
+) -> RenderedReconcileOutcome {
+    // (0) Refuse to run over an IN-PROGRESS merge/rebase — same guard, and the
+    //     same reason, as `resolve_generated_files_to_upstream`: our bare
+    //     pathspec commit would silently CONCLUDE someone else's pending merge
+    //     as a mislabelled reconcile commit. A tree left mid-conflict by a
+    //     previous halted update belongs to the existing conflict/resume flow
+    //     (`update_resume_required` + `abort_orchestrator_merge_or_rebase`);
+    //     once that flow has concluded it, the NEXT update reaches this class
+    //     normally and resolves the rendered file for good.
+    if install_path.join(".git").join("MERGE_HEAD").exists()
+        || install_path.join(".git").join("rebase-merge").exists()
+        || install_path.join(".git").join("rebase-apply").exists()
+    {
+        tracing::error!(
+            "[vct] resolve_rendered_files_keep_local: an in-progress merge/rebase is present \
+             (.git/MERGE_HEAD or .git/rebase-*) — refusing to reconcile rendered files (the \
+             existing conflict/resume flow must conclude it). No-op."
+        );
+        return RenderedReconcileOutcome::none();
+    }
+
+    let mut held: Vec<HeldRenderedFile> = Vec::new();
+
+    for entry in rendered_root_files() {
+        let path = entry.path.as_str();
+
+        // Upstream must actually have changed the tracked copy in base..theirs.
+        let theirs_blob = match read_blob_at_rev(install_path, theirs, path).await {
+            Ok(Some(b)) => b,
+            // DEFINITIVELY absent upstream: the release REMOVED the tracked
+            // copy (the end state this class is aimed at — a rendered file has
+            // no business being tracked, since every install overwrites it).
+            Ok(None) => {
+                if let Some(h) = hold_and_untrack_removed_upstream(install_path, base, entry).await
+                {
+                    held.push(h);
+                }
+                continue;
+            }
+            // Could not TELL (git failure). Never act on a guess: leaving the
+            // path divergent is the existing behaviour, which is a modal —
+            // recoverable — whereas acting on a misread could untrack a file
+            // upstream still ships.
+            Err(_) => continue,
+        };
+        let base_blob = read_blob_at_rev(install_path, base, path)
+            .await
+            .ok()
+            .flatten();
+        if base_blob.as_deref() == Some(theirs_blob.as_slice()) {
+            continue; // upstream did not touch it — nothing for this class to do.
+        }
+        let head_blob = read_blob_at_rev(install_path, "HEAD", path)
+            .await
+            .ok()
+            .flatten();
+        if head_blob.as_deref() == Some(theirs_blob.as_slice()) {
+            continue; // already reconciled (idempotent re-run) — no second commit.
+        }
+
+        // The working-tree copy is what we protect; no file ⇒ nothing to keep,
+        // and the normal checkout/merge handles it.
+        let absolute = install_path.join(path);
+        let worktree_bytes = match std::fs::read(&absolute) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    "[vct] resolve_rendered_files_keep_local: cannot read {} ({}) — skipping",
+                    path,
+                    e
+                );
+                continue;
+            }
+        };
+        if worktree_bytes == theirs_blob {
+            // Byte-identical to the incoming blob: F1 resolves this for free.
+            continue;
+        }
+
+        // Act: take upstream's blob into index + worktree.
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["checkout", theirs, "--", path])
+            .current_dir(install_path)
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                held.push(HeldRenderedFile {
+                    path: path.to_string(),
+                    template: entry.template.clone(),
+                    bytes: worktree_bytes,
+                    action: RenderedAction::TookUpstream,
+                });
+            }
+            Ok(o) => tracing::warn!(
+                "[vct] resolve_rendered_files_keep_local: git checkout {} -- {} failed ({}) \
+                 — leaving it divergent (stays modal-forcing)",
+                short_sha(theirs),
+                path,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::warn!(
+                "[vct] resolve_rendered_files_keep_local: git checkout {} -- {} spawn failed \
+                 ({}) — leaving it divergent (stays modal-forcing)",
+                short_sha(theirs),
+                path,
+                e
+            ),
+        }
+    }
+
+    if held.is_empty() {
+        return RenderedReconcileOutcome::none();
+    }
+
+    // Commit the taken blobs, pathspec-scoped so nothing else the user happens
+    // to have staged is folded in under the mechanical identity. NOTE: a
+    // pathspec commit records the WORKING-TREE content of those paths, which is
+    // why the bytes go back AFTER this, not before.
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let any_untracked = held
+        .iter()
+        .any(|h| h.action == RenderedAction::Untracked);
+    let msg = if any_untracked {
+        format!(
+            "vco: reconcile rendered file(s) to upstream (take-upstream / drop the tracked \
+             copy upstream removed); local rendered content kept in the working tree ({})",
+            ts
+        )
+    } else {
+        format!(
+            "vco: take upstream's tracked copy of rendered file(s); local rendered \
+             content kept in the working tree ({})",
+            ts
+        )
+    };
+    let mut commit_args: Vec<String> = vec![
+        "-c".to_string(),
+        "user.name=VCO Orchestrator".to_string(),
+        "-c".to_string(),
+        "user.email=orchestrator@vibecoded.tools".to_string(),
+        "commit".to_string(),
+        "--no-verify".to_string(),
+        "-m".to_string(),
+        msg,
+        "--".to_string(),
+    ];
+    for h in &held {
+        commit_args.push(h.path.clone());
+    }
+    let commit_result = tokio::process::Command::new("git")
+        .silent()
+        .args(&commit_args)
+        .current_dir(install_path)
+        .output()
+        .await;
+
+    let committed = match commit_result {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            tracing::error!(
+                "[vct] resolve_rendered_files_keep_local: reconcile commit failed (exit {:?}): \
+                 {} — reverting the take-upstream checkouts to HEAD",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                "[vct] resolve_rendered_files_keep_local: reconcile commit spawn failed ({}) \
+                 — reverting the take-upstream checkouts to HEAD",
+                e
+            );
+            false
+        }
+    };
+
+    if !committed {
+        // Revert index+worktree to HEAD, then put the user's bytes back: the
+        // tree ends exactly as we found it.
+        for h in &held {
+            let _ = tokio::process::Command::new("git")
+                .silent()
+                .args(["checkout", "HEAD", "--", h.path.as_str()])
+                .current_dir(install_path)
+                .output()
+                .await;
+            if let Err(e) = atomic_write(&install_path.join(&h.path), &h.bytes) {
+                tracing::error!(
+                    "[vct] resolve_rendered_files_keep_local: could not restore {} after a \
+                     failed reconcile commit: {} — the file now holds HEAD's tracked copy",
+                    h.path,
+                    e
+                );
+            }
+        }
+        return RenderedReconcileOutcome::none();
+    }
+
+    // Put the rendered copies back over the tracked blobs the checkout wrote.
+    let mut reconciled: Vec<String> = Vec::new();
+    for h in &held {
+        let path = h.path.as_str();
+        match atomic_write(&install_path.join(path), &h.bytes) {
+            Ok(()) => {
+                match h.action {
+                    RenderedAction::TookUpstream => tracing::info!(
+                        "[vct] resolve_rendered_files_keep_local: {} — tracked blob advanced to \
+                         upstream ({}), local rendered copy kept in the working tree",
+                        path,
+                        short_sha(theirs)
+                    ),
+                    RenderedAction::Untracked => tracing::info!(
+                        "[vct] resolve_rendered_files_keep_local: {} — upstream ({}) REMOVED the \
+                         tracked copy; dropped ours from the index, local rendered copy kept in \
+                         the working tree as an untracked file",
+                        path,
+                        short_sha(theirs)
+                    ),
+                }
+                reconciled.push(path.to_string());
+            }
+            Err(e) => tracing::error!(
+                "[vct] resolve_rendered_files_keep_local: could not restore the rendered copy \
+                 of {} ({}) — the working tree now holds upstream's tracked copy; \
+                 `python install.py --update` re-renders it",
+                path,
+                e
+            ),
+        }
+    }
+
+    write_rendered_reconcile_state(install_path, &held, base, theirs, branch);
+
+    RenderedReconcileOutcome {
+        reconciled,
+        committed: true,
+    }
+}
+
+/// Upstream REMOVED the tracked copy of a rendered path: hold the user's
+/// working-tree bytes and drop the path from the INDEX, leaving the file itself
+/// on disk. Returns the held entry when it acted, `None` otherwise.
+///
+/// WHY THIS IS NEEDED AT ALL, derived from git's behaviour rather than assumed:
+/// a tracked file that is locally modified and deleted by the incoming commit
+/// makes `git pull` abort — `error: Your local changes to the following files
+/// would be overwritten by merge: <path> … Aborting`. The working-tree copy of
+/// a rendered path is ALWAYS locally modified (install.py renders over the
+/// tracked blob on every run), so without this arm the release that untracks a
+/// rendered file would wedge every existing install: the pull aborts, the next
+/// install re-renders the same modification, and the abort repeats forever.
+/// The file's own doc comment used to claim "the existing flow handles it" —
+/// it does not, and that claim is what this replaces.
+///
+/// THE SHAPE, and why not the obvious alternatives:
+///   * `git rm --cached <path>` stages the removal while leaving the file on
+///     disk — but a PATHSPEC commit re-reads the working tree for those paths
+///     and would silently RE-ADD it (verified empirically). So the file is
+///     removed from disk first (its bytes are already held), the index entry is
+///     dropped, and the shared restore loop writes the bytes back after the
+///     commit — the same hold → act → commit → restore order the take-upstream
+///     arm uses, for the same reason.
+///   * Restoring the path to HEAD and letting the pull delete it also works,
+///     but the write-back would then have to survive ACROSS the pull and every
+///     one of its failure returns. Keeping the whole operation on this side of
+///     the pull means a failure leaves the tree exactly as found.
+///
+/// CONDITIONS — all must hold, and each one is a refusal to guess:
+///   * `base` HAD the path, so this is genuinely a removal in `base..theirs`
+///     and not a path upstream never tracked;
+///   * `HEAD` still has it, so there is an index entry to drop (idempotent
+///     across re-runs);
+///   * the working-tree file exists and DIFFERS from HEAD's blob. A pristine
+///     copy needs no protection: the pull deletes it and install.py re-creates
+///     it from the template.
+async fn hold_and_untrack_removed_upstream(
+    install_path: &Path,
+    base: &str,
+    entry: &RenderedRootFile,
+) -> Option<HeldRenderedFile> {
+    let path = entry.path.as_str();
+
+    // Upstream must have HAD it at the merge base — otherwise "absent at
+    // theirs" says nothing about a removal.
+    match read_blob_at_rev(install_path, base, path).await {
+        Ok(Some(_)) => {}
+        _ => return None,
+    }
+
+    // We must still track it. Already untracked ⇒ nothing to do (and a re-run
+    // after a successful reconcile lands here, which is what makes it
+    // idempotent).
+    let head_blob = match read_blob_at_rev(install_path, "HEAD", path).await {
+        Ok(Some(b)) => b,
+        _ => return None,
+    };
+
+    let absolute = install_path.join(path);
+    let worktree_bytes = match std::fs::read(&absolute) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::info!(
+                "[vct] resolve_rendered_files_keep_local: {} was removed upstream and is not on \
+                 disk ({}) — nothing to protect, the merge removes it",
+                path,
+                e
+            );
+            return None;
+        }
+    };
+    if worktree_bytes == head_blob {
+        // Pristine: the merge deletes it cleanly and install.py re-creates it.
+        return None;
+    }
+
+    // Drop the index entry, file first (see the pathspec note above).
+    if let Err(e) = std::fs::remove_file(&absolute) {
+        tracing::warn!(
+            "[vct] resolve_rendered_files_keep_local: could not move {} aside ({}) — leaving it \
+             tracked (the pull will refuse and surface the existing modal)",
+            path,
+            e
+        );
+        return None;
+    }
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args(["rm", "--cached", "--quiet", "--", path])
+        .current_dir(install_path)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => Some(HeldRenderedFile {
+            path: path.to_string(),
+            template: entry.template.clone(),
+            bytes: worktree_bytes,
+            action: RenderedAction::Untracked,
+        }),
+        other => {
+            // Put the file back: the tree ends exactly as we found it.
+            if let Err(e) = atomic_write(&absolute, &worktree_bytes) {
+                tracing::error!(
+                    "[vct] resolve_rendered_files_keep_local: `git rm --cached {}` failed AND the \
+                     file could not be restored ({}) — its content is lost from disk; \
+                     `git checkout HEAD -- {}` recovers the tracked copy",
+                    path,
+                    e,
+                    path
+                );
+            }
+            match other {
+                Ok(o) => tracing::warn!(
+                    "[vct] resolve_rendered_files_keep_local: git rm --cached {} failed ({}) — \
+                     leaving it tracked (the pull will refuse and surface the existing modal)",
+                    path,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => tracing::warn!(
+                    "[vct] resolve_rendered_files_keep_local: git rm --cached {} spawn failed \
+                     ({}) — leaving it tracked",
+                    path,
+                    e
+                ),
+            }
+            None
+        }
+    }
+}
+
+/// Hand-off to install.py's renderer: record WHAT was reconciled and against
+/// WHICH upstream range, so the `rendered_file_upstream_changed` deferral row
+/// (written by install.py AFTER it re-renders, which is the only moment the
+/// "and it was re-rendered" half is true) can name both. The path comes from
+/// the shared table; `.claude/state/` is gitignored, so writing it cannot
+/// dirty the tree the pull is about to touch.
+///
+/// Best-effort: a write failure costs the audit row, never the update.
+fn write_rendered_reconcile_state(
+    install_path: &Path,
+    held: &[HeldRenderedFile],
+    base: &str,
+    theirs: &str,
+    branch: &str,
+) {
+    let files: Vec<serde_json::Value> = held
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "path": h.path,
+                "template": h.template,
+                // Additive: install.py's reader takes `path` and ignores the
+                // rest, so an older reader stays correct against a newer
+                // writer. It distinguishes "upstream edited the tracked copy"
+                // from "upstream removed it".
+                "action": match h.action {
+                    RenderedAction::TookUpstream => "took_upstream",
+                    RenderedAction::Untracked => "untracked",
+                },
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "reconciled_at": chrono::Utc::now().to_rfc3339(),
+        "branch": branch,
+        "base": base,
+        "theirs": theirs,
+        "files": files,
+    });
+    let target = install_path.join(rendered_state_file_rel_path());
+    let bytes = match serde_json::to_vec_pretty(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] resolve_rendered_files_keep_local: could not serialise the reconcile \
+                 state ({}) — the audit row will be missing",
+                e
+            );
+            return;
+        }
+    };
+    if let Err(e) = atomic_write(&target, &bytes) {
+        tracing::warn!(
+            "[vct] resolve_rendered_files_keep_local: could not write {} ({}) — the audit row \
+             will be missing",
+            target.display(),
+            e
+        );
+    }
+}
+
 /// Result of the `do_3way_merge` primitive.
 #[derive(Debug)]
 enum ThreeWayResult {
@@ -950,8 +1687,49 @@ pub(crate) async fn pre_merge_user_editable(
     install_path: &Path,
     base_sha: &str,
     theirs_sha: &str,
+    branch: &str,
 ) -> Result<Vec<MergeOutcome>, String> {
     let globset = build_user_editable_globset()?;
+
+    // v0.2.95 R1 — the RENDERED_LOCAL class runs FIRST, and before the
+    // early-returns below: a rendered file can be divergent through a COMMITTED
+    // fork edit with a clean working tree, which `local_modifications.is_empty()`
+    // would skip. It resolves the "install renders it, upstream also changed it"
+    // case by advancing the tracked blob to upstream's while keeping the
+    // working-tree copy, so the pull cannot conflict on it (see the
+    // RENDERED_LOCAL section above for why that shape, and why a
+    // `.gitattributes` merge driver cannot do this job).
+    //
+    // CORRECTED v0.2.95 phase 2: `branch` used to be passed EMPTY here, on the
+    // reasoning that "this entry point receives base/theirs, not the pull
+    // branch, and inventing one would put a guess in the audit row" — with the
+    // note that `self_update::apply_launcher_update` called the branch-resolving
+    // entry point instead and recorded the real name. That second entry point
+    // is gone (its surface now shares this one), so the note would have become
+    // a claim about a caller that no longer exists, and EVERY rendered-reconcile
+    // row would have lost the branch. It is not a guess: the caller
+    // (`installer::run_pre_merge_user_editable`) derived `base_sha`/`theirs_sha`
+    // FROM this branch, so it is the same fact one step earlier. It threads it
+    // through rather than re-deriving it.
+    let rendered =
+        resolve_rendered_files_keep_local_at(install_path, base_sha, theirs_sha, branch).await;
+    if !rendered.reconciled.is_empty() {
+        // v0.2.95 phase 2: this log moved here from
+        // `self_update::apply_launcher_update`, which had the rendered class
+        // wired in directly and reported it. Folding that surface onto the
+        // shared pipeline would otherwise have silently dropped the only line
+        // saying this ran — and left `RenderedReconcileOutcome::committed`
+        // with no reader at all, which is the same defect one layer down.
+        tracing::info!(
+            "[vct] pre_merge: kept the local rendered copy of {} file(s) and took upstream's \
+             tracked blob — {} (synthetic commit: {}; install.py re-renders the AUTO block)",
+            rendered.reconciled.len(),
+            rendered.reconciled.join(", "),
+            rendered.committed,
+        );
+    }
+    let rendered_resolved: std::collections::HashSet<String> =
+        rendered.reconciled.iter().cloned().collect();
 
     let upstream_files = list_diff_files(install_path, base_sha, theirs_sha).await?;
     if upstream_files.is_empty() {
@@ -976,6 +1754,27 @@ pub(crate) async fn pre_merge_user_editable(
     let mut outcomes = Vec::with_capacity(candidates.len());
 
     for rel_path_str in candidates {
+        // v0.2.95 R1: a path the RENDERED_LOCAL reconcile just resolved is
+        // DONE — its tracked blob now equals upstream's, so a 3-way merge here
+        // would compare the rendered copy against a stub it deliberately does
+        // not track, conflict, and sidecar a file nobody needs (that sidecar is
+        // exactly what the field installs collected). A path that IS rendered
+        // but was NOT resolved means the protection did not fire for it; say so
+        // out loud and fall through to the user-editable 3-way, which is the
+        // fallback bias that keeps its content. `CLAUDE.md` therefore stays in
+        // `USER_EDITABLE_PATTERNS` — one preserve-local class refining another,
+        // not two biases fighting.
+        if is_rendered_root_file(&rel_path_str) {
+            if rendered_resolved.contains(&rel_path_str) {
+                continue;
+            }
+            tracing::warn!(
+                "[vct] pre_merge: {} is a RENDERED root file but the rendered reconcile did \
+                 not resolve it — falling back to the user-editable 3-way merge (a conflict \
+                 there will sidecar upstream's copy and surface the divergence modal)",
+                rel_path_str
+            );
+        }
         // Allowlist filter — non-matching paths fall through to the
         // caller's `git pull` (and the B4 conflict modal if needed).
         if !is_user_editable(&rel_path_str, &globset) {
@@ -1488,6 +2287,56 @@ pub(crate) async fn committed_divergence_merged_tree_oid(
     }
 }
 
+/// Tracked-and-locally-modified paths from `git status --porcelain -z`
+/// stdout, in status order. Untracked (`??`) entries are excluded.
+///
+/// ONE PARSER, ONE HOME (v0.2.95 MINOR-A). Two callers intersect their results
+/// with each other — `tracked_modified_overlapping_upstream` below and
+/// `self_update::blocking_changes` — so they must agree on the path
+/// REPRESENTATION, not merely on the intent. They did not: the self-update
+/// guard parsed NON-`-z` porcelain, which quotes/escapes unusual paths
+/// (`core.quotePath`) and renders a rename as `R  old -> new`, while this side
+/// parsed `-z`, which is literal and emits the rename's old path as a separate
+/// record. A staged rename or a quoted path therefore appeared under two
+/// different spellings and the intersection could NEVER match — the path
+/// silently left the narrowed refusal and the user met an opaque autostash
+/// abort instead of a sentence naming their file. The two formats look correct
+/// in isolation, which is exactly why this had to become one function.
+///
+/// `-z` is the format both use: it is the only one that reports paths
+/// literally, so no un-quoting step can disagree.
+pub(crate) fn parse_tracked_modified_z(stdout: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut records = stdout.split(|b| *b == 0u8);
+    while let Some(rec) = records.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        let x = rec[0];
+        let y = rec[1];
+        // Untracked entry is `?` in both columns — skip (git stash never
+        // touches it, so it can't pop-conflict).
+        if x == b'?' {
+            continue;
+        }
+        // Rename/copy entries (`R`/`C`) emit a SECOND NUL record (the old
+        // path) — consume + ignore it; the new path (this record) is what
+        // a merge cares about.
+        if x == b'R' || x == b'C' {
+            let _ = records.next();
+        }
+        // Any tracked path with a non-clean status (M/A/D/R/C/U in X or Y).
+        if x != b' ' || y != b' ' {
+            if let Ok(path) = std::str::from_utf8(&rec[3..]) {
+                if !path.is_empty() && !out.iter().any(|p| p == path) {
+                    out.push(path.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// v0.2.58: the precise pop-conflict-risk check that replaces the blunt
 /// `working_tree_is_clean` gate for the auto-merge decision.
 ///
@@ -1528,9 +2377,15 @@ pub(crate) async fn tracked_modified_overlapping_upstream(
     //     calling `list_locally_modified` because that helper INCLUDES
     //     untracked entries (which we must exclude — git stash skips them,
     //     so they can't pop-conflict) and returns only the new path for
-    //     renames. The parse below is the same `-z` record walk shape as
-    //     `list_locally_modified` (rename/copy emit two NUL records); a
-    //     future cleanup could extract a shared tracked-only walker.
+    //     renames. The `-z` record walk is now SHARED: v0.2.95 extracted
+    //     `parse_tracked_modified_z` and both this helper and
+    //     `self_update::blocking_changes` call it. That extraction was the
+    //     fix for a real defect, not tidying — the two sides INTERSECT, so
+    //     they had to agree on a path's SPELLING, and while one parsed
+    //     non-`-z` (`R  old -> new`, quoted/escaped unusual paths) and the
+    //     other `-z` (literal, rename's old path in its own record), a
+    //     staged rename or quoted path could never match and silently
+    //     escaped the narrowed refusal into an opaque autostash abort.
     let status = tokio::process::Command::new("git").silent()
         .args(["status", "--porcelain", "-z"])
         .current_dir(install_path)
@@ -1542,35 +2397,8 @@ pub(crate) async fn tracked_modified_overlapping_upstream(
         // sentinel non-empty list so the caller bails to --ff-only/modal.
         return Ok(vec!["<status-read-failed>".to_string()]);
     }
-    let mut tracked_modified: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let bytes = status.stdout;
-    let mut records = bytes.split(|b| *b == 0u8).peekable();
-    while let Some(rec) = records.next() {
-        if rec.len() < 4 {
-            continue;
-        }
-        let x = rec[0];
-        let y = rec[1];
-        // Untracked entry is `?` in both columns — skip (git stash never
-        // touches it, so it can't pop-conflict).
-        if x == b'?' {
-            continue;
-        }
-        // Rename/copy entries (`R`/`C`) emit a SECOND NUL record (the old
-        // path) — consume + ignore it; the new path (this record) is what
-        // a merge cares about.
-        if x == b'R' || x == b'C' {
-            let _ = records.next();
-        }
-        // Any tracked path with a non-clean status (M/A/D/R/C/U in X or Y).
-        if x != b' ' || y != b' ' {
-            if let Ok(path) = std::str::from_utf8(&rec[3..]) {
-                if !path.is_empty() {
-                    tracked_modified.insert(path.to_string());
-                }
-            }
-        }
-    }
+    let tracked_modified: std::collections::HashSet<String> =
+        parse_tracked_modified_z(&status.stdout).into_iter().collect();
     if tracked_modified.is_empty() {
         return Ok(Vec::new()); // nothing tracked-modified → no risk at all.
     }
@@ -3145,7 +3973,8 @@ pub(crate) fn write_launcher_update_diverged_deferral(
                     "`git pull --ff-only {branch}` failed: local `{branch}` (HEAD `{l}`) has \
                      diverged from upstream (`{r}`) by committed history. This is NOT the \
                      normal case of editing CLAUDE.md / CONTEXT_STATE.md / KG nodes — those \
-                     are handled non-blocking by the per-path 3-way merge. It means real \
+                     are handled non-blocking (CLAUDE.md by the rendered-file reconcile, the \
+                     rest by the per-path 3-way merge). It means real \
                      commits exist on your local `{branch}` that upstream doesn't have (e.g. \
                      a clone whose `origin` was repointed at a private fork, or local commits \
                      on `{branch}` instead of a feature branch). git said: `{d}`",
@@ -3505,8 +4334,13 @@ later update verifies HEAD reached upstream.\n\
 // Tests
 // ---------------------------------------------------------------------------
 
+// `pub(crate)` (test builds only): `commands::update_pipeline`'s tests drive
+// the real pull sequence against the SAME temp repo-pair fixture. One fixture,
+// one home — a second copy of `init_repo_pair` would drift from this one, and
+// the seed contents (which paths are RENDERED, which are merely user-editable)
+// are exactly what those tests assert on.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::{Command as StdCommand, Stdio};
 
@@ -3531,7 +4365,7 @@ mod tests {
     /// The tempdir is held by the caller to keep the test environment
     /// alive (drop = remove). The local clone has a `vco_upstream`
     /// remote pointing at the bare repo.
-    fn init_repo_pair() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    pub(crate) fn init_repo_pair() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
         let remote = root.join("remote.git");
@@ -3552,6 +4386,12 @@ mod tests {
         run_git(&seed, &["config", "user.email", "test@example.com"]);
         run_git(&seed, &["config", "user.name", "Test"]);
         std::fs::write(seed.join("CLAUDE.md"), "# base\nLine A\nLine B\n").unwrap();
+        // v0.2.95 R1: README.md carries the SAME body as CLAUDE.md so the A0
+        // 3-way tests below can assert on a user-editable file that is NOT
+        // RENDERED. CLAUDE.md is now resolved by the RENDERED_LOCAL reconcile
+        // before the 3-way leg ever sees it, so it can no longer stand in for
+        // "an ordinary user-editable file".
+        std::fs::write(seed.join("README.md"), "# base\nLine A\nLine B\n").unwrap();
         std::fs::create_dir_all(seed.join("knowledge").join("concepts")).unwrap();
         std::fs::write(
             seed.join("knowledge").join("concepts").join("foo.md"),
@@ -3589,11 +4429,26 @@ mod tests {
 
     /// Advance the upstream by committing in the seed workdir + pushing
     /// to remote.git, then re-fetch vco_upstream in the local clone.
-    fn push_upstream_change(seed_root: &Path, local: &Path, file: &str, body: &str) {
+    pub(crate) fn push_upstream_change(seed_root: &Path, local: &Path, file: &str, body: &str) {
         std::fs::create_dir_all(seed_root.join(file).parent().unwrap_or(seed_root)).unwrap();
         std::fs::write(seed_root.join(file), body).unwrap();
         run_git(seed_root, &["add", file]);
         run_git(seed_root, &["commit", "-m", "upstream change"]);
+        run_git(seed_root, &["push", "origin", "main"]);
+        run_git(local, &["fetch", "vco_upstream"]);
+    }
+
+    /// Upstream REMOVES a tracked path (and gitignores it) — the release that
+    /// stops shipping a tracked copy of a file every install renders anyway.
+    fn push_upstream_removal(seed_root: &Path, local: &Path, file: &str) {
+        run_git(seed_root, &["rm", "--quiet", file]);
+        let gitignore = seed_root.join(".gitignore");
+        let mut body = std::fs::read_to_string(&gitignore).unwrap_or_default();
+        body.push_str(file);
+        body.push('\n');
+        std::fs::write(&gitignore, body).unwrap();
+        run_git(seed_root, &["add", "."]);
+        run_git(seed_root, &["commit", "-m", "untrack the rendered file"]);
         run_git(seed_root, &["push", "origin", "main"]);
         run_git(local, &["fetch", "vco_upstream"]);
     }
@@ -3605,7 +4460,7 @@ mod tests {
     /// success rather than returning a `Result`. It must not grow any
     /// decision logic — anything a production path would want (branch
     /// resolution, behind-counts, remote tags) belongs in `git_cmd`.
-    fn run_git(cwd: &Path, args: &[&str]) {
+    pub(crate) fn run_git(cwd: &Path, args: &[&str]) {
         let out = StdCommand::new("git")
             .args(args)
             .current_dir(cwd)
@@ -3872,7 +4727,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         // vco_lib/foo.py is not in the allowlist → no outcome emitted.
         let vco_lib_foo: &Path = Path::new("vco_lib/foo.py");
@@ -3886,38 +4741,42 @@ mod tests {
     #[tokio::test]
     async fn pre_merge_clean_3way_merge_lands_in_working_tree() {
         skip_if_no_git!();
+        // v0.2.95 R1: the subject is README.md, not README.md. README.md is a
+        // RENDERED root file now — the reconcile resolves it before this leg —
+        // so this test uses another user-editable path to pin the 3-way mechanics
+        // it was written for (unchanged behaviour for every non-rendered file).
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
 
-        // Upstream: append a line to CLAUDE.md.
+        // Upstream: append a line to README.md.
         push_upstream_change(
             &seed,
             &local,
-            "CLAUDE.md",
+            "README.md",
             "# base\nLine A\nLine B\nLine C (from upstream)\n",
         );
         // Local: prepend a line (non-overlapping with upstream's append).
         write_local_mod(
             &local,
-            "CLAUDE.md",
+            "README.md",
             "Line ZZ (from local)\n# base\nLine A\nLine B\n",
         );
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
-        // Should produce one `Merged` outcome for CLAUDE.md.
+        // Should produce one `Merged` outcome for README.md.
         let claude = outcomes
             .iter()
-            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
-            .expect("expected CLAUDE.md outcome");
+            .find(|o| o.path.as_path() == Path::new("README.md"))
+            .expect("expected README.md outcome");
         match &claude.kind {
             MergeOutcomeKind::Merged { .. } => {}
             other => panic!("expected Merged, got {:?}", other),
         }
         // Working tree should now contain both edits.
-        let merged_text = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        let merged_text = std::fs::read_to_string(local.join("README.md")).unwrap();
         assert!(
             merged_text.contains("Line ZZ (from local)"),
             "merged content missing local: {}",
@@ -3933,6 +4792,10 @@ mod tests {
     #[tokio::test]
     async fn pre_merge_conflict_writes_sidecar() {
         skip_if_no_git!();
+        // v0.2.95 R1: the subject is README.md, not README.md. README.md is a
+        // RENDERED root file now — the reconcile resolves it before this leg —
+        // so this test uses another user-editable path to pin the 3-way mechanics
+        // it was written for (unchanged behaviour for every non-rendered file).
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
 
@@ -3940,21 +4803,21 @@ mod tests {
         push_upstream_change(
             &seed,
             &local,
-            "CLAUDE.md",
+            "README.md",
             "# base\nLine A (upstream wins)\nLine B\n",
         );
         // Local: same line, different value → overlapping edit.
         let local_body = "# base\nLine A (local wins)\nLine B\n";
-        write_local_mod(&local, "CLAUDE.md", local_body);
+        write_local_mod(&local, "README.md", local_body);
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         let claude = outcomes
             .iter()
-            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
-            .expect("expected CLAUDE.md outcome");
+            .find(|o| o.path.as_path() == Path::new("README.md"))
+            .expect("expected README.md outcome");
         match &claude.kind {
             MergeOutcomeKind::PreservedWithUpstreamSidecar {
                 upstream_sidecar_path,
@@ -3967,8 +4830,8 @@ mod tests {
                     "sidecar missing upstream content: {}",
                     sidecar
                 );
-                // Local working-tree CLAUDE.md must be UNCHANGED.
-                let local_now = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+                // Local working-tree README.md must be UNCHANGED.
+                let local_now = std::fs::read_to_string(local.join("README.md")).unwrap();
                 assert_eq!(local_now, local_body, "local content was modified");
             }
             other => panic!("expected sidecar outcome, got {:?}", other),
@@ -4000,7 +4863,7 @@ mod tests {
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
         // Must NOT panic and must NOT emit a Merged outcome (we skip
         // binary files; git pull handles them the legacy way).
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
         assert!(
             outcomes.iter().all(|o| !matches!(
                 o.kind,
@@ -4224,7 +5087,7 @@ mod tests {
         base: &str,
         theirs: &str,
     ) -> Vec<MergeOutcome> {
-        let outcomes = pre_merge_user_editable(local, base, theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(local, base, theirs, "main").await.unwrap();
         let mut merged_any = false;
         for outcome in &outcomes {
             if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
@@ -4293,20 +5156,24 @@ mod tests {
         //   4. The follow-up merge pull (the production fallback path)
         //      lands cleanly with both edits.
         skip_if_no_git!();
+        // v0.2.95 R1: the subject is README.md, not README.md. README.md is a
+        // RENDERED root file now — the reconcile resolves it before this leg —
+        // so this test uses another user-editable path to pin the 3-way mechanics
+        // it was written for (unchanged behaviour for every non-rendered file).
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
 
-        // Upstream: append a "section B" paragraph to CLAUDE.md.
+        // Upstream: append a "section B" paragraph to README.md.
         push_upstream_change(
             &seed,
             &local,
-            "CLAUDE.md",
+            "README.md",
             "# base\nLine A\nLine B\n\n## section B (from upstream)\nupstream paragraph\n",
         );
         // Local (uncommitted): prepend a "section A" paragraph.
         write_local_mod(
             &local,
-            "CLAUDE.md",
+            "README.md",
             "## section A (from local)\nlocal paragraph\n# base\nLine A\nLine B\n",
         );
 
@@ -4315,20 +5182,20 @@ mod tests {
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
         let outcomes = pre_merge_stage_and_commit(&local, &base, &theirs).await;
 
-        // Must have produced a Merged outcome for CLAUDE.md.
+        // Must have produced a Merged outcome for README.md.
         let claude = outcomes
             .iter()
-            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
-            .expect("expected CLAUDE.md outcome");
+            .find(|o| o.path.as_path() == Path::new("README.md"))
+            .expect("expected README.md outcome");
         assert!(
             matches!(claude.kind, MergeOutcomeKind::Merged { .. }),
             "expected Merged, got {:?}",
             claude.kind,
         );
 
-        // Working tree CLAUDE.md (after pre-merge + synthetic commit)
+        // Working tree README.md (after pre-merge + synthetic commit)
         // must already contain BOTH edits.
-        let pre_pull = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        let pre_pull = std::fs::read_to_string(local.join("README.md")).unwrap();
         assert!(
             pre_pull.contains("section A (from local)"),
             "pre-pull content missing local: {}",
@@ -4426,7 +5293,7 @@ mod tests {
             String::from_utf8_lossy(&merge_pull.stderr),
             String::from_utf8_lossy(&merge_pull.stdout),
         );
-        let post_pull = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        let post_pull = std::fs::read_to_string(local.join("README.md")).unwrap();
         assert!(
             post_pull.contains("section A (from local)"),
             "post-pull content missing local: {}",
@@ -4454,6 +5321,10 @@ mod tests {
     #[tokio::test]
     async fn pre_merge_then_merge_pull_lands_combined_content() {
         skip_if_no_git!();
+        // v0.2.95 R1: the subject is README.md, not README.md. README.md is a
+        // RENDERED root file now — the reconcile resolves it before this leg —
+        // so this test uses another user-editable path to pin the 3-way mechanics
+        // it was written for (unchanged behaviour for every non-rendered file).
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
 
@@ -4472,17 +5343,17 @@ mod tests {
             &["commit", "-m", "local: unrelated change forcing non-FF"],
         );
 
-        // Upstream: change CLAUDE.md.
+        // Upstream: change README.md.
         push_upstream_change(
             &seed,
             &local,
-            "CLAUDE.md",
+            "README.md",
             "# base\nLine A\nLine B\n\n## section B (from upstream)\nupstream paragraph\n",
         );
-        // Local (uncommitted): change CLAUDE.md non-overlappingly.
+        // Local (uncommitted): change README.md non-overlappingly.
         write_local_mod(
             &local,
-            "CLAUDE.md",
+            "README.md",
             "## section A (from local)\nlocal paragraph\n# base\nLine A\nLine B\n",
         );
 
@@ -4492,8 +5363,8 @@ mod tests {
 
         let claude = outcomes
             .iter()
-            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
-            .expect("expected CLAUDE.md outcome");
+            .find(|o| o.path.as_path() == Path::new("README.md"))
+            .expect("expected README.md outcome");
         assert!(
             matches!(claude.kind, MergeOutcomeKind::Merged { .. }),
             "expected Merged, got {:?}",
@@ -4521,7 +5392,7 @@ mod tests {
         );
 
         // Working tree must contain BOTH edits.
-        let merged_text = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        let merged_text = std::fs::read_to_string(local.join("README.md")).unwrap();
         assert!(
             merged_text.contains("section A (from local)"),
             "post-pull content missing local: {}",
@@ -4550,19 +5421,23 @@ mod tests {
     #[tokio::test]
     async fn pre_merge_conflict_then_pull_fails_as_expected_but_sidecar_exists() {
         skip_if_no_git!();
+        // v0.2.95 R1: the subject is README.md, not README.md. README.md is a
+        // RENDERED root file now — the reconcile resolves it before this leg —
+        // so this test uses another user-editable path to pin the 3-way mechanics
+        // it was written for (unchanged behaviour for every non-rendered file).
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
 
-        // Upstream + local both edit the SAME LINE of CLAUDE.md →
+        // Upstream + local both edit the SAME LINE of README.md →
         // forced 3-way conflict.
         push_upstream_change(
             &seed,
             &local,
-            "CLAUDE.md",
+            "README.md",
             "# base\nLine A (upstream wins)\nLine B\n",
         );
         let local_body = "# base\nLine A (local wins)\nLine B\n";
-        write_local_mod(&local, "CLAUDE.md", local_body);
+        write_local_mod(&local, "README.md", local_body);
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
@@ -4570,8 +5445,8 @@ mod tests {
 
         let claude = outcomes
             .iter()
-            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
-            .expect("expected CLAUDE.md outcome");
+            .find(|o| o.path.as_path() == Path::new("README.md"))
+            .expect("expected README.md outcome");
         let sidecar_path = match &claude.kind {
             MergeOutcomeKind::PreservedWithUpstreamSidecar {
                 upstream_sidecar_path,
@@ -4587,8 +5462,8 @@ mod tests {
             "sidecar missing upstream content: {}",
             sidecar,
         );
-        // Local working-tree CLAUDE.md must be unchanged.
-        let local_now = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        // Local working-tree README.md must be unchanged.
+        let local_now = std::fs::read_to_string(local.join("README.md")).unwrap();
         assert_eq!(local_now, local_body, "local content was modified");
 
         // No synthetic commit should land — sidecar paths are not
@@ -4607,7 +5482,7 @@ mod tests {
         );
 
         // Now attempt git pull — it MUST fail (the working tree is
-        // still dirty: local CLAUDE.md still diverges from HEAD).
+        // still dirty: local README.md still diverges from HEAD).
         // This is the expected behaviour; the B4 modal then surfaces
         // the conflict + the deferral entry (already on disk) tells
         // the user about the sidecar.
@@ -5191,7 +6066,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         let gitignore = outcomes
             .iter()
@@ -5258,7 +6133,7 @@ mod tests {
 
         let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
         let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
-        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
         let gitignore = outcomes
             .iter()
@@ -5680,18 +6555,26 @@ mod tests {
         );
     }
 
-    /// ANTI-DRIFT: BOTH update surfaces (installer::update_orchestrator and
-    /// self_update::apply_launcher_update) must derive their PullPlan from the
-    /// SAME `resolve_divergence_pull_plan` for identical repo state. Pre-v0.2.71
-    /// only installer.rs had the probe; self_update.rs did a blind --ff-only and
-    /// reset --hard on any divergence. This test constructs one repo state and
-    /// asserts the shared fn yields the SAME plan when called the way EACH
-    /// surface calls it (installer with pre_merge_committed possibly true after
-    /// A0; self_update ALWAYS pre_merge_committed=false since it has no A0 step).
-    /// For the clean-committed-divergence state both must agree on RealMerge
-    /// when neither pre-merged — proving the surfaces converged.
+    /// Clean COMMITTED divergence (the encouraged "your Claude committed a KG
+    /// node" case) must fold via `RealMerge` rather than surfacing a modal.
+    /// Pre-v0.2.71 only installer.rs had the probe; self_update.rs did a blind
+    /// `--ff-only` and offered a hard reset on any divergence.
+    ///
+    /// REPLACES `resolve_plan_anti_drift_both_surfaces_agree` (v0.2.95 phase 2).
+    /// That test called `resolve_divergence_pull_plan(&local, "main", false,
+    /// false)` TWICE with identical arguments and asserted the two results
+    /// equal — `f(x) == f(x)`, which cannot fail and so could not detect the
+    /// drift it was named for. Worse, its own doc said the surfaces differ on
+    /// `pre_merge_committed`, so the one axis it claimed to guard was the one
+    /// axis both calls pinned to `false`.
+    ///
+    /// The real anti-drift assertion now lives where it can fail:
+    /// `update_pipeline::tests::both_surfaces_render_the_same_pipeline_error_into_their_own_payload`
+    /// drives the shared pipeline to a real divergence and renders the ONE
+    /// resulting error through BOTH surfaces' serialisers. What survives here
+    /// is this test's second, genuinely meaningful assertion.
     #[tokio::test]
-    async fn resolve_plan_anti_drift_both_surfaces_agree() {
+    async fn resolve_plan_clean_committed_divergence_folds_via_real_merge() {
         skip_if_no_git!();
         let (_tmp, _remote, local) = init_repo_pair();
         let seed = _tmp.path().join("seed");
@@ -5700,22 +6583,15 @@ mod tests {
         commit_local_change(&local, "knowledge/concepts/drift_node.md", "# node\n");
         refetch_upstream(&local);
 
-        // installer::update_orchestrator path when its A0 pre-merge produced NO
-        // synthetic commit (the common committed-KG-divergence case):
-        let installer_plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
-        // self_update::apply_launcher_update path (NEVER has an A0 step →
-        // ALWAYS pre_merge_committed=false):
-        let self_update_plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
-
+        // Both surfaces reach this with `pre_merge_committed=false`: the
+        // installer surface when its A0 pre-merge synthesised no commit (the
+        // common committed-KG-divergence case), the launcher surface always,
+        // because the A0 step is not on its path.
+        let plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
         assert_eq!(
-            installer_plan, self_update_plan,
-            "the two update surfaces must produce the SAME PullPlan for the same \
-             repo state (shared resolve_divergence_pull_plan — no drift)"
-        );
-        assert_eq!(
-            installer_plan,
+            plan,
             PullPlan::RealMerge,
-            "clean committed divergence should fold via RealMerge on BOTH surfaces"
+            "clean committed divergence should fold via RealMerge, not surface a modal"
         );
     }
 
@@ -8009,6 +8885,526 @@ mod tests {
             PullPlan::FfOnly,
             "a committed SOURCE-file divergence must keep the modal (FfOnly) even after the \
              generated reconcile runs"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.95 R1 — RENDERED_LOCAL (keep-local + re-render) tests
+    // -----------------------------------------------------------------
+
+    /// The rendered body an install writes over the tracked stub: the user's own
+    /// text OUTSIDE the AUTO markers plus the rendered template between them.
+    /// That outside text is uncommitted and exists NOWHERE else, which is what
+    /// makes keeping the working-tree copy load-bearing.
+    fn rendered_claude_md(auto_body: &str) -> String {
+        format!(
+            "# My project rules\n\nNEVER lose this line.\n\n\
+             <!-- BEGIN: AUTO (rendered) -->\n{}\n<!-- END: AUTO -->\n\n\
+             ## My tail section\n",
+            auto_body
+        )
+    }
+
+    /// Does `git status --porcelain` show an unmerged (`UU`/`AA`/...) entry?
+    fn has_unmerged_entry(repo: &Path) -> bool {
+        let out = StdCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo)
+            .output()
+            .expect("git status");
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| {
+            let b = l.as_bytes();
+            b.len() >= 2 && (b[0] == b'U' || b[1] == b'U' || (b[0] == b'A' && b[1] == b'A'))
+        })
+    }
+
+    #[test]
+    fn rendered_root_files_table_parses() {
+        // The table is compile-time embedded, so a defect here can only be a
+        // source defect — which is precisely why it must fail in `cargo test`
+        // rather than at a user's update.
+        let files = rendered_root_files();
+        assert!(!files.is_empty(), "the table must declare at least one entry");
+        assert!(
+            files.iter().any(|e| e.path == "CLAUDE.md"),
+            "CLAUDE.md is the canonical rendered root file; table: {:?}",
+            files
+        );
+        let claude = files.iter().find(|e| e.path == "CLAUDE.md").unwrap();
+        assert_eq!(
+            claude.template, "templates/ORCHESTRATOR-CLAUDE.md.template",
+            "the template path is what the deferral row names"
+        );
+        assert!(
+            rendered_state_file_rel_path().starts_with(".claude/state/"),
+            "the hand-off state file must live under the gitignored .claude/state/ \
+             so writing it cannot dirty the tree the pull is about to merge; got {}",
+            rendered_state_file_rel_path()
+        );
+        // Case/separator folding matches vco_lib/rendered_root_files.py.
+        assert!(is_rendered_root_file("CLAUDE.md"));
+        assert!(is_rendered_root_file("claude.md"));
+        assert!(!is_rendered_root_file("README.md"));
+        assert!(!is_rendered_root_file("knowledge/concepts/foo.md"));
+    }
+
+    #[test]
+    fn rendered_and_generated_classes_are_disjoint() {
+        // One path, one bias. RENDERED_LOCAL keeps the working-tree copy;
+        // GENERATED_RELEASE_CONTROLLED discards it. A path in both would mean
+        // the take-upstream leg silently dropping user content.
+        let generated = build_generated_release_controlled_globset().expect("globset");
+        for entry in rendered_root_files() {
+            assert!(
+                !is_generated_release_controlled(&entry.path, &generated),
+                "{} is RENDERED (keep-local) and must never be classified \
+                 generated/release-controlled (take-upstream)",
+                entry.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rendered_reconcile_keeps_local_and_the_pull_then_lands_without_conflict() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // The install renders CLAUDE.md over the tracked stub (uncommitted —
+        // the universal state of an installed clone).
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+
+        // Upstream edits the tracked stub — the 0.2.93→0.2.94 shape.
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# stub v2\nPointer only.\n");
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        assert_eq!(
+            outcome.reconciled,
+            vec!["CLAUDE.md".to_string()],
+            "the rendered file must be reconciled"
+        );
+        assert!(outcome.committed, "the take-upstream blob must be committed");
+
+        // The user's rendered copy is untouched on disk...
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "the working-tree copy (with the user's non-AUTO text) must survive"
+        );
+        // ...while HEAD now carries upstream's tracked stub.
+        let head_blob = read_blob_at_rev(&local, "HEAD", "CLAUDE.md")
+            .await
+            .unwrap()
+            .expect("HEAD blob");
+        assert_eq!(
+            String::from_utf8_lossy(&head_blob),
+            "# stub v2\nPointer only.\n",
+            "HEAD must hold upstream's tracked copy so the merge has nothing to change"
+        );
+
+        // The hand-off state file records what install.py's renderer needs.
+        let state = local.join(rendered_state_file_rel_path());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        assert_eq!(payload["files"][0]["path"], "CLAUDE.md");
+        assert_eq!(payload["branch"], "main");
+        assert!(payload["base"].as_str().unwrap().len() >= 7);
+        assert!(payload["theirs"].as_str().unwrap().len() >= 7);
+
+        // THE POINT: the pull the update would now run lands with no modal.
+        let plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "with the rendered blob reconciled the plan must be a real merge, \
+             not the --ff-only arm that surfaces the divergence modal"
+        );
+        let args = plan.pull_args(crate::commands::self_update::VCO_UPSTREAM_REMOTE, "main");
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = StdCommand::new("git")
+            .args(&refs)
+            .current_dir(&local)
+            .output()
+            .expect("git pull");
+        assert!(
+            out.status.success(),
+            "the pull must succeed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !local.join(".git").join("MERGE_HEAD").exists() && !has_unmerged_entry(&local),
+            "no conflict state may be left behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "the pull must not have replaced the rendered copy (install.py re-renders \
+             only the AUTO block afterwards)"
+        );
+        // And no A0 sidecar was manufactured for it.
+        assert!(
+            !std::fs::read_dir(&local)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("CLAUDE.md.from-upstream-")),
+            "a rendered file must not collect .from-upstream- sidecars any more"
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_reconcile_handles_a_clone_several_releases_behind() {
+        skip_if_no_git!();
+        // R26: the trigger is STATE (is this path rendered, did upstream change
+        // it between base and theirs), never "how many releases behind".
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# stub v2\n");
+        push_upstream_change(&seed, &local, "docs/other.md", "unrelated\n");
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# stub v3\nthird release\n");
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        assert_eq!(outcome.reconciled, vec!["CLAUDE.md".to_string()]);
+        let head_blob = read_blob_at_rev(&local, "HEAD", "CLAUDE.md")
+            .await
+            .unwrap()
+            .expect("HEAD blob");
+        assert_eq!(
+            String::from_utf8_lossy(&head_blob),
+            "# stub v3\nthird release\n",
+            "three releases of stub churn collapse into ONE take-upstream"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered
+        );
+
+        // Idempotent: a second run finds HEAD already at upstream and does nothing.
+        let again = resolve_rendered_files_keep_local(&local, "main").await;
+        assert!(
+            again.reconciled.is_empty() && !again.committed,
+            "a re-run must not manufacture a second commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_reconcile_is_a_noop_when_upstream_left_the_file_alone() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def v2(): pass\n");
+
+        let head_before = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        let head_after = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+
+        assert!(outcome.reconciled.is_empty() && !outcome.committed);
+        assert_eq!(
+            head_before.stdout, head_after.stdout,
+            "a local-only divergence is not this class's business — no commit"
+        );
+        assert!(
+            !local.join(rendered_state_file_rel_path()).exists(),
+            "no reconcile ⇒ no hand-off state file ⇒ no deferral row"
+        );
+    }
+
+    /// THE INVARIANT THAT MATTERS MOST. Upstream stops tracking the rendered
+    /// file (the root fix for this whole class — a file every install
+    /// overwrites has no business being tracked). Without this arm `git`
+    /// ABORTS the pull: a tracked file that is locally modified and deleted by
+    /// the incoming commit yields "Your local changes to the following files
+    /// would be overwritten by merge", and since the next install re-renders
+    /// the same modification the abort repeats forever.
+    ///
+    /// After the reconcile the user's content — including the text OUTSIDE the
+    /// AUTO markers, which is uncommitted and exists nowhere else — must still
+    /// be on disk, and the pull must land.
+    #[tokio::test]
+    async fn rendered_file_removed_upstream_is_untracked_and_the_content_survives() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+        push_upstream_removal(&seed, &local, "CLAUDE.md");
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        assert_eq!(outcome.reconciled, vec!["CLAUDE.md".to_string()]);
+        assert!(outcome.committed);
+
+        // The user's bytes are still on disk, byte for byte.
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "the working-tree copy (with the user's non-AUTO text) must survive"
+        );
+        assert!(
+            rendered.contains("NEVER lose this line."),
+            "fixture sanity: the body carries out-of-marker user text"
+        );
+        // HEAD no longer tracks it — which is what lets the merge through.
+        assert!(
+            read_blob_at_rev(&local, "HEAD", "CLAUDE.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "the index entry must be gone so the incoming removal is a no-op"
+        );
+        // The hand-off record distinguishes this from a take-upstream.
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(local.join(rendered_state_file_rel_path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["files"][0]["action"], "untracked");
+
+        // THE POINT: the pull now lands, and the content is STILL there.
+        let plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
+        let args = plan.pull_args("vco_upstream", "main");
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = StdCommand::new("git")
+            .args(&refs)
+            .current_dir(&local)
+            .output()
+            .expect("git pull");
+        assert!(
+            out.status.success(),
+            "the pull must land; stderr was: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!has_unmerged_entry(&local), "no conflict markers");
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "AFTER the pull the user's content must still be exactly as they left it"
+        );
+    }
+
+    /// v0.2.95 MINOR-B — the `Untracked` COMMIT-FAILURE branch, exercised.
+    ///
+    /// It is dormant until the untrack release ships, which is precisely what
+    /// makes it a good hiding place for a latent defect: nobody would run it
+    /// for a whole cycle. The contract it must honour is the strongest one in
+    /// this module — a failed reconcile leaves the tree EXACTLY as it found
+    /// it, so the existing modal flow takes over and nothing is lost.
+    ///
+    /// The failure is induced at the narrowest possible point: `refs/heads` is
+    /// made read-only, so `git rm --cached` (index only) still succeeds while
+    /// the commit cannot lock the ref. Unix-only — it is the permission model
+    /// that makes the injection precise.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_untrack_commit_restores_the_tree_exactly() {
+        skip_if_no_git!();
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+        push_upstream_removal(&seed, &local, "CLAUDE.md");
+
+        let refs_heads = local.join(".git").join("refs").join("heads");
+        let restore = std::fs::metadata(&refs_heads).unwrap().permissions();
+        std::fs::set_permissions(&refs_heads, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+
+        std::fs::set_permissions(&refs_heads, restore).unwrap();
+
+        assert!(
+            outcome.reconciled.is_empty() && !outcome.committed,
+            "a failed commit must report nothing reconciled"
+        );
+        // The user's bytes are back on disk, untouched.
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "the working-tree copy must be restored byte for byte"
+        );
+        // HEAD still tracks it, and so does the INDEX — the `git rm --cached`
+        // was undone, so the tree is not left holding a staged deletion.
+        assert!(
+            read_blob_at_rev(&local, "HEAD", "CLAUDE.md")
+                .await
+                .unwrap()
+                .is_some(),
+            "HEAD must still carry the tracked copy"
+        );
+        let staged = StdCommand::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&local)
+            .output()
+            .expect("git diff --cached");
+        assert!(
+            !String::from_utf8_lossy(&staged.stdout).contains("CLAUDE.md"),
+            "the index removal must have been reverted, leaving no staged deletion"
+        );
+        // No hand-off state file ⇒ install.py writes no deferral row for a
+        // reconcile that did not happen.
+        assert!(
+            !local.join(rendered_state_file_rel_path()).exists(),
+            "a failed reconcile must not claim one happened"
+        );
+    }
+
+    /// Leave-alone half: a PRISTINE copy (working tree == tracked blob) needs
+    /// no protection — the merge removes it cleanly and install.py re-creates
+    /// it from the template. Acting anyway would mint a pointless commit.
+    #[tokio::test]
+    async fn a_pristine_copy_removed_upstream_is_left_to_the_merge() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+        push_upstream_removal(&seed, &local, "CLAUDE.md");
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        assert!(
+            outcome.reconciled.is_empty() && !outcome.committed,
+            "an unmodified copy is not this class's business"
+        );
+    }
+
+    /// A path upstream never tracked at the merge base is not a removal, and
+    /// must not be untracked on that basis.
+    #[tokio::test]
+    async fn a_path_absent_on_both_sides_is_not_treated_as_a_removal() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+        // Remove it upstream FIRST, pull, so both sides agree it is gone...
+        push_upstream_removal(&seed, &local, "CLAUDE.md");
+        let _ = resolve_rendered_files_keep_local(&local, "main").await;
+        run_git(&local, &["pull", "--no-rebase", "vco_upstream", "main"]);
+        // ...then an unrelated upstream commit. Re-running must be a no-op.
+        push_upstream_change(&seed, &local, "README.md", "# readme v2\n");
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        assert!(
+            outcome.reconciled.is_empty() && !outcome.committed,
+            "idempotent: nothing left to untrack"
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_reconcile_refuses_over_an_in_progress_merge() {
+        skip_if_no_git!();
+        // R17 "already damaged": a tree left mid-conflict by a halted update
+        // belongs to the existing conflict/resume flow (update_resume_required +
+        // abort_orchestrator_merge_or_rebase). Concluding someone else's merge
+        // with our bare pathspec commit would mislabel it.
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# stub v2\n");
+
+        let head_sha = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        std::fs::write(
+            local.join(".git").join("MERGE_HEAD"),
+            String::from_utf8_lossy(&head_sha.stdout).trim(),
+        )
+        .unwrap();
+
+        let outcome = resolve_rendered_files_keep_local(&local, "main").await;
+        assert!(
+            outcome.reconciled.is_empty() && !outcome.committed,
+            "must no-op while a merge is in progress"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "and must not touch the working tree either"
+        );
+
+        // Once the stalled operation is concluded, the SAME mechanism resolves it.
+        std::fs::remove_file(local.join(".git").join("MERGE_HEAD")).unwrap();
+        let after = resolve_rendered_files_keep_local(&local, "main").await;
+        assert_eq!(after.reconciled, vec!["CLAUDE.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a0_pre_merge_skips_the_rendered_file_and_still_sidecars_a_real_conflict() {
+        skip_if_no_git!();
+        // Leave-alone pin: a genuinely user-edited NON-rendered file keeps the
+        // existing 3-way + sidecar + modal-forcing behaviour, while the rendered
+        // file is resolved by the new class within the SAME pre-merge call.
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        let rendered = rendered_claude_md("AUTO v1 body");
+        std::fs::write(local.join("CLAUDE.md"), &rendered).unwrap();
+        // A KG node the user edited on the same lines upstream did.
+        std::fs::write(
+            local.join("knowledge").join("concepts").join("foo.md"),
+            "# foo\nLOCAL rewrite of the same line\n",
+        )
+        .unwrap();
+
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# stub v2\n");
+        push_upstream_change(
+            &seed,
+            &local,
+            "knowledge/concepts/foo.md",
+            "# foo\nUPSTREAM rewrite of the same line\n",
+        );
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
+
+        assert!(
+            !outcomes.iter().any(|o| o.path == PathBuf::from("CLAUDE.md")),
+            "the rendered file is handled by the reconcile, not by the 3-way leg"
+        );
+        let foo = outcomes
+            .iter()
+            .find(|o| o.path == PathBuf::from("knowledge/concepts/foo.md"))
+            .expect("the non-rendered user-editable file must still be processed");
+        match &foo.kind {
+            MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                upstream_sidecar_path,
+                ..
+            } => assert!(
+                upstream_sidecar_path.exists(),
+                "the upstream copy must still be sidecar'd for a real conflict"
+            ),
+            other => panic!("expected a sidecar-preserved outcome, got {:?}", other),
+        }
+        assert_eq!(
+            std::fs::read_to_string(local.join("knowledge").join("concepts").join("foo.md"))
+                .unwrap(),
+            "# foo\nLOCAL rewrite of the same line\n",
+            "the user's content stays in place for the non-rendered file"
+        );
+        // That genuine conflict still forces the conservative arm (the modal),
+        // which is the behaviour this change must NOT widen.
+        assert_eq!(
+            resolve_divergence_pull_plan(&local, "main", false, false).await,
+            PullPlan::FfOnly,
+            "a real user-content conflict must still route to --ff-only/modal"
         );
     }
 }

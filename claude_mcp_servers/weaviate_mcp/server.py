@@ -53,7 +53,7 @@ import asyncio
 import functools
 import uuid
 import warnings
-from typing import Optional
+from typing import Mapping, Optional
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -859,12 +859,9 @@ def _emit_gate_crash_metric(project_id: str, collection: str, exc_str: str) -> N
 # ──────────────────────────────────────────────────────────────────────
 # v0.2.49 SB1: gate-skipped (empty VCT_PROJECT_ID) surfaces
 #
-# The Phase-8 WRITE gate has a silent-bypass when VCT_PROJECT_ID is
-# missing from the MCP environment — the gate's empty-PID branch falls
-# through to allow without any audit trail. SB1 closes that hole by
-# adding two visibility surfaces (per the user's 2026-06-08 Q1
-# directive — silent-allow stays the default; remediation lands in
-# UPDATE_DEFERRED.md, not stderr):
+# The Phase-8 WRITE gate has a bypass when VCT_PROJECT_ID is missing from
+# the MCP environment — the gate's empty-PID branch falls through to
+# allow. SB1 gave that branch two AFTER-THE-FACT visibility surfaces:
 #
 #   1. dropped_writes.jsonl row with reason='gate_skipped_no_project_id'
 #      (audit-trail surface, mirrors gate_crash shape).
@@ -873,6 +870,17 @@ def _emit_gate_crash_metric(project_id: str, collection: str, exc_str: str) -> N
 #
 # Both are idempotent within a server lifetime via a module-level set
 # keyed by session_id so a kg-sync burst doesn't spam either surface.
+#
+# ALLOW STILL STANDS; "SILENT" NO LONGER DOES (owner, 2026-09-14). The
+# 2026-06-08 Q1 directive ("silent-allow stays the default; remediation
+# lands in UPDATE_DEFERRED.md, not stderr") was REVISED after a field
+# report: neither surface speaks AT WRITE TIME — a JSONL row nobody tails
+# and a file read at the NEXT session start — so a user writing from a
+# folder VCO never installed into discovered it only when a later read
+# came back empty. The write is still permitted (the revision is about
+# visibility, not refusal); what changed is that the empty-PID branch now
+# also carries the R6 warning below. Nothing about the two surfaces above
+# changed — they still fire exactly as they did.
 # ──────────────────────────────────────────────────────────────────────
 
 _GATE_SKIPPED_SESSIONS_SEEN: set[str] = set()
@@ -884,6 +892,22 @@ granularity matters for triage).
 """
 
 
+def _session_key() -> str:
+    """The session identity every per-session dedup in this module keys on.
+
+    ``VCT_SESSION_ID`` -> ``CLAUDE_SESSION_ID`` -> the pid (an MCP subprocess
+    lives for the session, so its pid IS a session identity when the harness
+    sets neither). ONE home: the SB1 deferral writer and the R6 warning must
+    dedup on the SAME key, or "once per session" quietly means two different
+    things on the two surfaces that describe the same condition.
+    """
+    return (
+        os.environ.get("VCT_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID", "")
+        or f"pid:{os.getpid()}"
+    )
+
+
 def _emit_gate_skipped_metric(collection: str) -> None:
     """v0.2.49 SB1: emit a dropped-write metric row for the empty-PID
     branch (VCT_PROJECT_ID missing → gate would silently allow).
@@ -891,13 +915,12 @@ def _emit_gate_skipped_metric(collection: str) -> None:
     Mirror of ``_emit_gate_crash_metric`` shape; only the ``reason``
     discriminator differs. Always fires per-call (no dedup) so the
     JSONL is the authoritative count of how many writes hit the
-    silent-bypass path. The companion deferral writer
+    bypass path. The companion deferral writer
     (``_emit_gate_skipped_deferral``) IS deduped per session — the two
     surfaces have different consumers / cardinalities by design.
 
     Never raises; silent on I/O failure so a broken metric path doesn't
-    break the silent-allow contract that the gate's empty-PID branch
-    relies on.
+    break the allow contract that the gate's empty-PID branch relies on.
     """
     try:
         import time as _time
@@ -932,8 +955,13 @@ def _resolve_project_root_for_deferral() -> Optional[Path]:
          orchestrator's own root when this MCP runs from a clone.
 
     Returns None when no candidate resolves to an existing directory —
-    the SB1 deferral writer treats that as "skip" (silent-allow is the
-    contract; we don't want a missing project dir to break the write).
+    the SB1 deferral writer treats that as "skip" (allow is the contract;
+    we don't want a missing project dir to break the write).
+
+    v0.2.95 R6 reuses this resolver — it is the ONE answer to "which
+    folder is this write coming from?" on the empty-PID branch, and a
+    second resolver would let the deferral and the warning disagree about
+    the very folder they are both describing.
     """
     try:
         candidates: list[str] = []
@@ -965,11 +993,15 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
     """v0.2.49 SB1: append an UPDATE_DEFERRED.md entry pointing the
     user at the remediation path for the gate's empty-PID branch.
 
-    Per user Q1 (2026-06-08): silent-allow stays the default for the
-    gate's empty-PID path; the deferral file is the user-facing surface
-    that surfaces the actionable remediation (re-register the project
-    or re-run install.py --update so .claude/env carries
-    VCT_PROJECT_ID).
+    Per user Q1 (2026-06-08): allow stays the default for the gate's
+    empty-PID path; the deferral file is the user-facing surface that
+    surfaces the actionable remediation (re-register the project or
+    re-run install.py --update so .claude/env carries VCT_PROJECT_ID).
+    That remediation is for a folder VCO DID install into — a folder with
+    no bundle manifest needs Adopt instead, which is why the R6 warning
+    below is a separate surface with separate wording rather than more
+    text in this entry. Unchanged by the 2026-09-14 revision: this writer
+    fires exactly when and how it did.
 
     Idempotency: deduped per-server-process via
     ``_GATE_SKIPPED_SESSIONS_SEEN`` — only the FIRST call per session
@@ -988,15 +1020,13 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
     Both soft-fail legs below are unchanged: an unimportable ``vco_lib``
     still means a silent skip, and any I/O failure is still swallowed.
 
-    Never raises; silent on I/O failure so the silent-allow contract
-    isn't broken by a missing project dir / unwritable file.
+    Never raises; silent on I/O failure so the allow contract isn't
+    broken by a missing project dir / unwritable file.
     """
     # Per-session dedup. The session_id is a stable identifier for the
     # life of the MCP subprocess; once we've written the deferral once,
     # further empty-PID writes within the same kg-sync burst are silent.
-    session_key = os.environ.get("VCT_SESSION_ID") or os.environ.get(
-        "CLAUDE_SESSION_ID", ""
-    ) or f"pid:{os.getpid()}"
+    session_key = _session_key()
     if session_key in _GATE_SKIPPED_SESSIONS_SEEN:
         return
     _GATE_SKIPPED_SESSIONS_SEEN.add(session_key)
@@ -1054,8 +1084,164 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
         )
         emit(project_root, entry)
     except Exception:
-        # Any I/O failure here must not break the silent-allow contract.
+        # Any I/O failure here must not break the allow contract.
         pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.95 R6: the unregistered-folder warning — SPOKEN AT WRITE TIME
+#
+# Owner ruling 2026-09-14, revising 2026-06-08 Q1 (see the SB1 header).
+# The write still happens; it no longer happens QUIETLY.
+#
+# The field case (reported 2026-09-10, VCO v0.2.91): a folder VCO had
+# never installed into, with hand-made `knowledge/*.md`, worked on with
+# the GLOBALLY-registered MCPs — which stay callable from any cwd, so
+# nothing stopped the writes. No VCT_PROJECT_ID and no
+# `.claude/settings.json`, so `_resolution_context()` fell through to its
+# module-root GUESS, the hub answered for the ORCHESTRATOR, and the nodes
+# landed in the orchestrator's own collection, where nothing in the user's
+# folder reads them. The SAME folder also produced "could not find class
+# ClaudeKnowledgeGraph" — the other branch of one condition: when the hub
+# answers nothing at all, KG_COLLECTION falls to its BUNDLED DEFAULT
+# (`ClaudeKnowledgeGraph`, see the `_config_field_with_source` call below),
+# a class that exists in no Weaviate. Which branch you get depends only on
+# whether the hub happened to answer; both are "this folder is not
+# registered", so both get this one warning — it is computed BEFORE the
+# insert and re-attached to the failure payload.
+#
+# Vocabulary is deliberately the fixture-class guard's (v0.2.94,
+# `vco_lib/fixture_class_guard.py`): the same defect family — an unmarked
+# process writing where nothing will read it. `refusal_text()` itself is
+# NOT called, because that text refuses and this branch allows; the shape
+# is mirrored (name the class, say why, name the fix) so a user meeting
+# both reads one rule rather than two vocabularies.
+# ──────────────────────────────────────────────────────────────────────
+
+# The bundle manifest is THE marker that VCO installed into a folder
+# (`install-bundle` writes it unconditionally, safe-add included), which is
+# why it and not `.claude/` presence answers "registered?". Imported, never
+# re-spelled: `vco_lib.deferral_dismissal.MANIFEST_REL` is the public copy
+# and is already pinned to `project_init`'s by
+# tests/test_deferral_dismissal_memory_v0291.py. vco_lib is a HARD
+# dependency of this module — a failed import is a BROKEN install, not a
+# fallback case.
+try:
+    from vco_lib.deferral_dismissal import MANIFEST_REL as _BUNDLE_MANIFEST_REL
+except ImportError as _manifest_rel_import_err:
+    _reraise_vco_lib_import(
+        _manifest_rel_import_err, "deferral_dismissal.MANIFEST_REL"
+    )
+
+_UNREGISTERED_FOLDER_SESSIONS_LOGGED: set[str] = set()
+"""Per-process dedup set for the LOG line only, keyed by :func:`_session_key`
+exactly as ``_GATE_SKIPPED_SESSIONS_SEEN`` is. The JSON ``warning`` field is
+NOT deduped: a field the caller reads once per call is not spam, and the
+second write from an unregistered folder is precisely where a repeat earns
+its place.
+"""
+
+
+def unregistered_folder_reason(
+    project_root: Optional[Path],
+    env: "Mapping[str, str]",
+) -> Optional[str]:
+    """Why this process counts as writing from an UNREGISTERED folder, or None.
+
+    Everything the rule decides on is passed in (one stat aside), so the write
+    path, the schema-error hint and the tests all drive the SAME function
+    instead of three readings of the same rule.
+
+    Two conditions, both required:
+
+      * ``VCT_PROJECT_ID`` is absent or blank — the Phase-8 gate cannot name
+        this project. That is the SB1 empty-PID branch above; and
+      * the folder carries no bundle manifest — ``install-bundle`` never ran
+        here, so nothing ever bound this folder to a collection of its own.
+
+    A manifest WITHOUT the env var is deliberately NOT unregistered: that is a
+    project VCO did install into, whose ``.claude/env`` predates v0.2.49 or
+    whose launcher never seeded the id. SB1's own remediation
+    (``install.py --update`` / the Identity tab) is the correct fix there and
+    Adopt would be actively wrong advice, so the two conditions must not blur.
+
+    Returns the reason as prose, because it is quoted verbatim into the
+    user-facing warning — the two branches ("no manifest here" vs "no folder
+    to check") are different problems and the user is the one who can tell
+    which of them they are in.
+    """
+    if (env.get("VCT_PROJECT_ID") or "").strip():
+        return None
+    if project_root is None:
+        return (
+            "no VCT_PROJECT_ID in this MCP's environment, and no project root "
+            "could be resolved (neither CLAUDE_PROJECT_DIR nor KG_BASE_DIR is "
+            "set), so there is no folder to check for a bundle manifest"
+        )
+    try:
+        if (project_root / _BUNDLE_MANIFEST_REL).is_file():
+            return None
+    except OSError:
+        # The path could not be stat'd (permissions, a broken mount). We
+        # cannot positively confirm registration, and the cost of saying so is
+        # one log line plus one JSON field — whereas staying quiet is the exact
+        # defect this warning exists to close. Nothing destructive keys on it.
+        pass
+    return (
+        f"no VCT_PROJECT_ID in this MCP's environment, and no "
+        f"{_BUNDLE_MANIFEST_REL.as_posix()} under {project_root}"
+    )
+
+
+# The WORDING lives beside `refusal_text()` in `vco_lib/fixture_class_guard.py`
+# (v0.2.95): both sentences belong to one vocabulary family — an unmarked
+# process writing where nothing will read it — and the severities differ only
+# in that one REFUSES and this one ALLOWS and says so. Two texts in two files
+# is how that family drifts into two rules, so the text has ONE home and this
+# module calls it. Imported, not wrapped: the name stays a module attribute so
+# every existing caller (and the R6 suite, which drives the surfaces through
+# it) reaches the same function object.
+#
+# Module scope under `_reraise_vco_lib_import`, matching `_BUNDLE_MANIFEST_REL`
+# directly above and the `fixture_class_guard` guard import further down: this
+# text is needed on the write path, and vco_lib is a HARD dependency here — a
+# failed import is a BROKEN install, never a fallback case.
+try:
+    from vco_lib.fixture_class_guard import unregistered_folder_warning_text
+except ImportError as _unregistered_text_import_err:
+    _reraise_vco_lib_import(
+        _unregistered_text_import_err,
+        "fixture_class_guard.unregistered_folder_warning_text",
+    )
+
+
+def _unregistered_folder_warning(collection: str) -> Optional[str]:
+    """This process's unregistered-folder warning, or None when registered.
+
+    Logged at WARNING once per session — the SB1 dedup discipline, on the same
+    key — and returned so the caller can put it in the tool result, which is
+    the surface that actually reaches the agent doing the writing.
+
+    Never raises: a warning that can break a write would be a worse defect
+    than the silence it replaces.
+    """
+    try:
+        reason = unregistered_folder_reason(
+            _resolve_project_root_for_deferral(), os.environ
+        )
+        if reason is None:
+            return None
+        text = unregistered_folder_warning_text(
+            collection, reason, weaviate_url=WEAVIATE_URL
+        )
+        key = _session_key()
+        if key not in _UNREGISTERED_FOLDER_SESSIONS_LOGGED:
+            _UNREGISTERED_FOLDER_SESSIONS_LOGGED.add(key)
+            logger.warning("weaviate-kg: %s", text)
+        return text
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.debug("unregistered-folder warning skipped: %s", exc)
+        return None
 
 
 # ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
@@ -4231,7 +4417,7 @@ def _build_schema_error_hint(exc: Exception, lower_msg: str) -> str:
 
     # "could not find class" / "class not found"
     which = f" ('{named}')" if named else ""
-    return (
+    base = (
         f"Schema error: {exc}. The expected class{which} is not in the "
         f"Weaviate schema. If you just ran a migration, the MCP's client cache "
         f"will be reset on retry. If the class was never created, run "
@@ -4239,6 +4425,22 @@ def _build_schema_error_hint(exc: Exception, lower_msg: str) -> str:
         f"Identity tab 'Manage shared KG collection' picker to designate "
         f"an existing orchestrator-shaped class as canonical. Both are "
         f"additive — neither deletes an existing collection."
+    )
+    # v0.2.95 R6: from an UNREGISTERED folder this message is a red herring.
+    # Nothing was ever created because nothing was ever registered:
+    # KG_COLLECTION fell through to its bundled default and Weaviate has no
+    # such class. `install.py --update` is then advice about the wrong
+    # project, so say what actually happened and point at Adopt instead.
+    unregistered = unregistered_folder_reason(
+        _resolve_project_root_for_deferral(), os.environ
+    )
+    if unregistered is None:
+        return base
+    return base + " " + unregistered_folder_warning_text(
+        named or KG_COLLECTION,
+        unregistered,
+        operation="search",
+        weaviate_url=WEAVIATE_URL,
     )
 
 
@@ -6715,7 +6917,18 @@ async def store_knowledge_node(
     Returns:
         JSON with success status, file_written flag, and absolute_path of the
         markdown file (check these to confirm where the node landed).
+
+        A ``warning`` field appears — on success AND on failure — when the
+        write came from a folder that is not registered with VCO. It names the
+        collection the write went to and the remedy (the launcher's Adopt
+        flow). Surface it to the user: it is the only signal that arrives
+        before a later read comes back empty.
     """
+    # v0.2.95 R6: computed inside the try (it needs the resolved collection)
+    # but declared HERE, because the failure payload must carry it too — the
+    # "could not find class <bundled default>" branch is the SAME condition
+    # arriving as an exception instead of a successful misdirected write.
+    unregistered_warning: Optional[str] = None
     try:
         # v0.2.74 T5-1 backstop (defense-in-depth): refuse-loud on subprocess
         # workspace drift BEFORE resolving KG_COLLECTION — a WRITE fanning out to
@@ -6809,11 +7022,14 @@ async def store_knowledge_node(
             if not project_id_for_gate:
                 # v0.2.49 SB1: empty-PID branch was a silent-bypass
                 # (gate effectively disabled). Per the user's 2026-06-08
-                # Q1 directive, silent-allow stays the default; the two
-                # visibility surfaces (metric + deferral) carry the
-                # remediation. The write itself proceeds — the gate
-                # only blocks on explicit "read" / "none" verdicts, not
-                # on missing identity.
+                # Q1 directive — as REVISED 2026-09-14 — allow stays the
+                # default but no longer stays silent: these two
+                # after-the-fact surfaces (metric + deferral) carry the
+                # remediation for a REGISTERED project missing its id,
+                # and the R6 warning below speaks at write time for a
+                # folder VCO never installed into. The write itself
+                # proceeds — the gate only blocks on explicit "read" /
+                # "none" verdicts, not on missing identity.
                 #
                 # Order is metric-first (always fires) then deferral
                 # (deduped per session) so the JSONL row lands even
@@ -6876,6 +7092,15 @@ async def store_knowledge_node(
                         "scope": scope,
                         "file_written": False,
                     }, indent=2)
+
+        # v0.2.95 R6: is this write coming from a folder VCO never installed
+        # into? Computed OUTSIDE the `_access_resolver_available` branch above
+        # on purpose — the condition is a property of the FOLDER, and a
+        # half-installed vco_lib (which switches that branch off entirely) is
+        # not a reason to go quiet about it. Computed BEFORE the insert so the
+        # log line and the JSON field survive an insert that then raises
+        # "could not find class …" — the other face of the same condition.
+        unregistered_warning = _unregistered_folder_warning(target_collection_name)
 
         # v0.2.94 W-WEAVIATE: the fixture-shaped class write guard.
         #
@@ -7315,6 +7540,12 @@ async def store_knowledge_node(
                 "both unset, so the .md landed in the orchestrator clone. "
                 "Set KG_BASE_DIR or pass an absolute file_path."
             )
+        if unregistered_warning:
+            # R6: the write SUCCEEDED and that is the problem — it succeeded
+            # into a collection this folder does not read. Naming it here is
+            # the only surface that reaches the agent before a later read
+            # comes back empty.
+            result["warning"] = unregistered_warning
         if path_adjustments:
             result["path_adjustments"] = path_adjustments
         if file_write_error:
@@ -7337,10 +7568,21 @@ async def store_knowledge_node(
         }, indent=2)
     except Exception as e:
         logger.error(f"Error storing node: {e}")
-        return json.dumps({
+        failure: dict = {
             "success": False,
-            "error": str(e)
-        }, indent=2)
+            "error": str(e),
+        }
+        if unregistered_warning:
+            # R6, the OTHER branch of the field report: from an unregistered
+            # folder with no hub answer, KG_COLLECTION falls to the bundled
+            # default and Weaviate answers "could not find class
+            # ClaudeKnowledgeGraph". Bare, that reads as a schema problem and
+            # sends the user to migrate a collection they do not own. The
+            # warning names the real cause and the real remedy; it rides along
+            # for EVERY failure from such a folder, because none of them are
+            # diagnosable without knowing the folder is unregistered.
+            failure["warning"] = unregistered_warning
+        return json.dumps(failure, indent=2)
 
 
 @mcp.tool()

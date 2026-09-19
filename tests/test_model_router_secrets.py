@@ -20,9 +20,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import unittest
+from pathlib import Path
 
 from model_router.secrets import NEGATIVE_TTL_CAP_S, VendorKeyResolver
 from model_router.vendors import VENDORS, Vendor
+
+
+def _absent(key, project=None):
+    """A getter for which no declared key name resolves."""
+    raise LookupError("absent")
 
 #: A synthetic value with a shape no real key has, so a leak is unmistakable.
 FAKE_KEY = "wp9-synthetic-not-a-real-key-0000"
@@ -273,6 +279,162 @@ class AsyncResolutionTests(unittest.IsolatedAsyncioTestCase):
         await resolver.aresolve(ACME)
         second = await resolver.aresolve(ACME)
         self.assertEqual(second.state, "cached")
+
+
+class SecretScopeTests(unittest.TestCase):
+    """R5b — the daemon must SAY when its scope cannot reach the keychain.
+
+    The 2026-09-10 shape: a boot unit runs in the state root, which is not a
+    registered project, so ``agent_secrets`` skipped tier 1 (the hub's ``/env``
+    route, the only route to an OS-keychain key) and every vendor request
+    answered "no key found" — while ``/health`` reported the vendor as present
+    with an empty key cache, which reads like "not configured yet".
+    """
+
+    def test_the_effective_scope_is_the_install_root_when_nothing_is_pinned(
+        self,
+    ) -> None:
+        """v0.2.95 (owner ruling 2026-09-17): the DEFAULT scope is this
+        install's orchestrator root, because a shared keychain key is only
+        reachable through the hub's per-project route and the root is the one
+        project that is always registered.
+
+        Until this, the default was ``Path.cwd()`` — which for a boot unit is
+        the state root, unregistered, so tier 1 never ran at all. The full
+        decision (shared by default, project overrides, marker honoured) is
+        driven end-to-end in ``test_v0295_gateway_shared_secret_scope.py``.
+        """
+        resolver = VendorKeyResolver(
+            getter=lambda key, project=None: FAKE_KEY,
+            install_root=lambda: "/opt/vco-clone",
+        )
+        self.assertEqual(resolver.effective_project, "/opt/vco-clone")
+
+    def test_the_effective_scope_is_the_cwd_when_no_clone_resolves(self) -> None:
+        """The pre-v0.2.95 behaviour survives as the LAST resort, for a machine
+        with no orchestrator clone — reported as such, not as a scope."""
+        resolver = VendorKeyResolver(
+            getter=lambda key, project=None: FAKE_KEY, install_root=lambda: None,
+        )
+        self.assertEqual(resolver.effective_project, str(Path.cwd()))
+
+    def test_a_pin_is_the_effective_scope(self) -> None:
+        resolver = VendorKeyResolver(project="/opt/vco", getter=lambda *a, **k: "")
+        self.assertEqual(resolver.effective_project, "/opt/vco")
+
+    def test_an_unprobed_scope_reports_unknown_not_false(self) -> None:
+        """"Not probed" and "does not resolve" are different claims; reporting
+        the first as the second is the "a probe that cannot run reads as
+        absence" defect."""
+        status = VendorKeyResolver(getter=lambda *a, **k: "").scope_status()
+        self.assertIsNone(status.resolvable)
+        self.assertEqual(status.to_dict()["resolvable"], None)
+
+    def test_a_scope_that_maps_to_a_project_id_is_resolvable(self) -> None:
+        resolver = VendorKeyResolver(
+            project="/opt/vco", getter=lambda *a, **k: "",
+            scope_prober=lambda arg: "project-uuid-1",
+        )
+        status = resolver.probe_scope()
+        self.assertIs(status.resolvable, True)
+        self.assertIsNone(status.reason)
+        self.assertEqual(resolver.scope_status().project, "/opt/vco")
+
+    def test_an_unresolvable_scope_names_the_consequence(self) -> None:
+        def prober(arg):
+            raise LookupError(f"no project registered at path: {arg}")
+
+        status = VendorKeyResolver(
+            project="/home/u/.vct", getter=lambda *a, **k: "", scope_prober=prober,
+        ).probe_scope()
+
+        self.assertIs(status.resolvable, False)
+        self.assertIn("keychain", status.reason or "")
+        self.assertIn("VCT_MODEL_GATEWAY_SECRET_PROJECT", status.reason or "")
+
+    def test_the_scope_probe_is_cached_and_re_probed_after_the_negative_ttl(
+        self,
+    ) -> None:
+        clock = _Clock()
+        probes: list[str] = []
+
+        def prober(arg):
+            probes.append(arg)
+            raise LookupError("hub unreachable")
+
+        resolver = VendorKeyResolver(
+            project="/opt/vco", getter=lambda *a, **k: "", scope_prober=prober,
+            clock=clock, ttl_s=3600,
+        )
+        resolver.probe_scope()
+        resolver.probe_scope()
+        self.assertEqual(len(probes), 1, "a cached verdict must not re-probe")
+
+        clock.now += NEGATIVE_TTL_CAP_S + 1
+        resolver.probe_scope()
+        self.assertEqual(
+            len(probes), 2,
+            "a hub that comes up later must be able to flip the verdict",
+        )
+
+    def test_a_key_miss_diagnoses_the_scope_only_when_the_daemon_asked(self) -> None:
+        """A library that reached the hub behind its caller's back would make
+        every test (and every embedder) do network I/O."""
+        probes: list[str] = []
+
+        quiet = VendorKeyResolver(
+            getter=_absent, scope_prober=lambda arg: probes.append(arg) or "id",
+        )
+        quiet.resolve(ACME)
+        self.assertEqual(probes, [])
+
+        daemon = VendorKeyResolver(
+            getter=_absent, probe_scope_on_miss=True,
+            scope_prober=lambda arg: probes.append(arg) or "id",
+        )
+        daemon.resolve(ACME)
+        self.assertEqual(len(probes), 1)
+
+    def test_the_miss_message_says_the_scope_is_the_reason(self) -> None:
+        def prober(arg):
+            raise LookupError("no project registered at path")
+
+        result = VendorKeyResolver(
+            project="/home/u/.vct", getter=_absent, probe_scope_on_miss=True,
+            scope_prober=prober,
+        ).resolve(ACME)
+
+        self.assertIn("THE SCOPE ITSELF DOES NOT RESOLVE", result.problem or "")
+        self.assertNotIn(FAKE_KEY, result.problem or "")
+
+    def test_a_resolvable_scope_adds_no_noise_to_a_miss(self) -> None:
+        """LEAVE-ALONE: when the scope is fine, the miss message must not
+        blame it."""
+        result = VendorKeyResolver(
+            project="/opt/vco", getter=_absent, probe_scope_on_miss=True,
+            scope_prober=lambda arg: "project-uuid-1",
+        ).resolve(ACME)
+
+        self.assertNotIn("THE SCOPE ITSELF", result.problem or "")
+
+    def test_a_successful_resolution_costs_no_scope_probe(self) -> None:
+        probes: list[str] = []
+        resolver = VendorKeyResolver(
+            getter=lambda key, project=None: FAKE_KEY, probe_scope_on_miss=True,
+            scope_prober=lambda arg: probes.append(arg) or "id",
+        )
+        self.assertEqual(resolver.resolve(ACME).key, FAKE_KEY)
+        self.assertEqual(probes, [])
+
+    def test_the_scope_status_never_leaks_a_value(self) -> None:
+        def prober(arg):
+            raise LookupError(f"denied while holding {FAKE_KEY[:0]}")
+
+        status = VendorKeyResolver(
+            project="/opt/vco", getter=lambda *a, **k: FAKE_KEY, scope_prober=prober,
+        ).probe_scope()
+        self.assertNotIn(FAKE_KEY, repr(status))
+        self.assertNotIn(FAKE_KEY, str(status.to_dict()))
 
 
 class ShippedVendorTests(unittest.TestCase):

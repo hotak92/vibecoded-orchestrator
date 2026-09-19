@@ -243,6 +243,11 @@ pub mod secret_value_shape;
 pub mod secrets_cmd;
 pub mod secrets_import;
 pub mod self_update;
+// v0.2.95 (ruling R2): the Preferences → Startup switch for the session-start
+// tray-only launch. A one-key preference this process WRITES and never reads —
+// its reader is `vco_lib/launcher_ensure.py`, running when this process is by
+// definition not.
+pub mod session_autostart;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
 // `update_all_projects` and `update_orchestrator_at` today. Lives in its own
@@ -260,6 +265,17 @@ pub mod telemetry_cmd;
 // Without this gate, Windows users saw ~97 python + ~77 node MCP
 // processes spawn in a respawn loop, requiring manual taskkill.
 pub mod update_gate;
+// v0.2.95 phase 1: the orchestrator-repo update SEQUENCE — in-progress
+// pre-flight → sentinel clear → MCP gate → hub stop → pre-pull renames →
+// fetch → A0 pre-merge → F1 → generated reconcile → pull plan → pull →
+// classification → HEAD-advance. Extracted VERBATIM out of
+// `installer::update_orchestrator`: every shared STEP of the two update
+// surfaces had been extracted over six releases, but never the sequence, so
+// the two commands still drifted in twelve places on the SAME git clone
+// (`.claude/context/reviews/UPDATE-SURFACES-DUPLICATION-2026-09-18.md`).
+// `self_update::apply_launcher_update` is NOT rewired onto it yet — that is a
+// behaviour change (it gains install.py) and belongs to the follow-up.
+pub mod update_pipeline;
 pub mod volumes;
 // v0.2.71 Track T-WT (modes extended v0.2.91): GUI-only per-project worktree-repo mode
 // backing the subagent-git modal. NOT hub-resolved (config_api.rs untouched);

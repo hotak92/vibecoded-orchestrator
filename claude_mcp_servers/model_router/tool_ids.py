@@ -219,6 +219,42 @@ def _line_eol(line: bytes) -> bytes:
     return line[len(_without_eol(line)):]
 
 
+def split_sse_frames(
+    buffer: bytes, *, final: bool,
+) -> "tuple[list[tuple[bytes, bytes]], bytes]":
+    """Complete SSE frames in ``buffer`` as ``(event, separator)``, plus the rest.
+
+    THE split loop — one home, two callers, because there is one framing rule
+    and a second copy of it is a second place to get it wrong:
+
+    * :meth:`SseIdRewriter._drain` rewrites each event and re-emits it with its
+      ORIGINAL separator, so a CRLF stream stays CRLF;
+    * :func:`model_router.usage.split_sse_events` only reads, and projects the
+      separator away.
+
+    The separator is therefore part of the RESULT rather than something the
+    splitter consumes: a splitter that discarded it could not serve the first
+    caller at all, which is why the two loops existed side by side until
+    v0.2.95.
+
+    ``final`` settles the one thing the boundary pattern cannot: a buffer
+    ending in ``\\r`` is either a lone-CR terminator or the first half of a
+    CRLF whose second half has not arrived. Mid-stream the answer is "wait one
+    chunk" — guessing splits a CRLF in half and puts a stray LF at the head of
+    the next event; at EOF nothing more is coming, so the CR IS a terminator.
+    """
+    frames: list[tuple[bytes, bytes]] = []
+    while True:
+        match = _EVENT_BOUNDARY.search(buffer)
+        if match is None:
+            break
+        if not final and match.end() == len(buffer) and buffer.endswith(b"\r"):
+            break
+        frames.append((buffer[: match.start()], match.group(0)))
+        buffer = buffer[match.end():]
+    return frames, buffer
+
+
 class _Unchanged:
     """Sentinel: emit the original bytes. Distinct from ``None`` = suppress."""
 
@@ -286,30 +322,14 @@ class SseIdRewriter:
     def _drain(self, *, final: bool) -> bytearray:
         """Split every COMPLETE event out of the buffer and rewrite it.
 
-        ``final`` says whether more bytes can still arrive. It settles the
-        one thing a pattern cannot: a buffer ending in ``\\r`` is either a
-        lone-CR terminator or the first half of a CRLF. Mid-stream the answer
-        is "wait one chunk"; at EOF nothing more is coming, so the CR IS a
-        terminator and the last event is split and rewritten like every other
-        one.
+        The splitting itself is :func:`split_sse_frames` — the ONE home for
+        the framing rule, shared with :mod:`model_router.usage`. ``final``
+        reaches it unchanged and means the same thing there: a buffer ending
+        in ``\\r`` is ambiguous mid-stream and a terminator at EOF.
         """
         out = bytearray()
-        while True:
-            match = _EVENT_BOUNDARY.search(self._buffer)
-            if match is None:
-                break
-            if (
-                not final
-                and match.end() == len(self._buffer)
-                and self._buffer.endswith(b"\r")
-            ):
-                # Ambiguous until the next byte. Waiting one chunk costs
-                # nothing; guessing splits a CRLF in half and puts a stray LF
-                # at the head of the next event.
-                break
-            event = self._buffer[: match.start()]
-            separator = match.group(0)
-            self._buffer = self._buffer[match.end():]
+        frames, self._buffer = split_sse_frames(self._buffer, final=final)
+        for event, separator in frames:
             rewritten = self._rewrite_event(event)
             # A suppressed event takes its separator with it: emitting the
             # blank line alone would put a stray empty event on the wire.
@@ -470,4 +490,5 @@ __all__ = [
     "normalise_vendor_response",
     "restore_vendor_ids",
     "sanitise_for_anthropic",
+    "split_sse_frames",
 ]

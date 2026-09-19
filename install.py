@@ -147,9 +147,11 @@ from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
 from vco_lib import install_companions as _install_companions  # noqa: E402
+from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
+from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
@@ -1131,19 +1133,19 @@ def _bootstrap_launcher_dist_subdir() -> Optional[str]:
     return None
 
 
-def _run_metrics_migration_hook() -> None:
-    """v0.2.92 WP-D (register item 20, WP-8 recipe R1): the every-run legacy
-    metrics-archive migration (was SessionStart-hook-only, so the history
-    copy ran late for frequent updaters). Soft-fail; COPY-never-MOVE.
+def _run_machine_migrations() -> None:
+    """Every one-time MACHINE-level migration, on every run. Soft-fail.
+
+    THE LEGS AND THE REASONING LIVE IN :mod:`vco_lib.machine_migrations`
+    (v0.2.95): the v0.2.92 WP-D metrics-archive copy + the Q1 panel
+    ``ANTHROPIC_MODEL`` pin removal. The NAME stays a module global: main()
+    calls it as one, and a test monkeypatches it there.
     """
     try:
-        from vco_lib.metrics_migration import ensure_metrics_migrated
-
-        result = ensure_metrics_migrated()
-        if result.status == "failed":
-            _log_install_event("metrics_migration", "warn", f"metrics migration failed: {'; '.join(result.errors)}")
+        from vco_lib import machine_migrations
+        machine_migrations.run_every_run(on_event=_log_install_event)
     except Exception as exc:  # noqa: BLE001 — best-effort by design
-        _log_install_event("metrics_migration", "warn", f"metrics migration could not run: {exc}")
+        _log_install_event("machine_migrations", "warn", f"could not run: {exc}")
 
 
 def _bootstrap_resolve_vco_version(root: Path) -> tuple[str, Optional[str]]:
@@ -2890,7 +2892,7 @@ def _detect_third_party_project(install_path: Path) -> dict | None:
             # adopt mode on it. The update flow proceeds normally.
             return None
 
-        manifest_path = install_path / ".claude" / ".vco-manifest.json"
+        manifest_path = _manifest_paths.manifest_path(install_path)
         manifest_status = _v47g_classify_manifest(manifest_path)
         if manifest_status == "valid":
             # Existing well-formed VCO project — never prompt.
@@ -3264,7 +3266,7 @@ def _print_adopt_dry_run_manifest(install_path: Path) -> None:
             venv_found = True
             desc = _v47g_describe_venv(candidate)
             print(f"  Found: {venv_name}/ ({desc})")
-            manifest_path = install_path / ".claude" / ".vco-manifest.json"
+            manifest_path = _manifest_paths.manifest_path(install_path)
             if not manifest_path.is_file():
                 print("  Action: skip-no-manifest (preserve existing venv).")
                 print("          Use --rebuild-venv to override.")
@@ -3685,7 +3687,7 @@ def _venv_triage(install_path: Path,
     # v0.2.46 V47-D: figure out whether VCO has a manifest record proving
     # it owns this venv. Absence of .vco-manifest.json is the load-bearing
     # signal that this is a 3rd-party environment we must not destroy.
-    manifest_path = install_path / ".claude" / ".vco-manifest.json"
+    manifest_path = _manifest_paths.manifest_path(install_path)
     has_manifest = manifest_path.is_file()
     requirements_path = install_path / "requirements.txt"
     has_requirements = requirements_path.is_file()
@@ -3854,7 +3856,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         # We attach the entry here so the venv-skip rationale is
         # contiguous with the triage decision in the log timeline.
         _venv_path = PROJECT_ROOT / ".venv"
-        _manifest_path = PROJECT_ROOT / ".claude" / ".vco-manifest.json"
+        _manifest_path = _manifest_paths.manifest_path(PROJECT_ROOT)
         # We can't add to the deferral report until it's instantiated
         # later; stash the entry payload on the args namespace so the
         # later block can pick it up. The args namespace is the only
@@ -5271,7 +5273,10 @@ def _replay_compose_override_resolutions(override_result, deferral_report) -> No
             )
 
 
-def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
+def _run_root_claude_dir_install(
+    args: argparse.Namespace,
+    deferral_report: "DeferralReport | None" = None,
+) -> dict:
     """Step 5b (v0.2.85, PLAN-v0285 D1/D2/D4/D5): delegate the orchestrator-
     self runtime ``.claude/`` install to the shared ``install-bundle`` engine.
 
@@ -5290,6 +5295,11 @@ def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
     the action counts). Soft-fail throughout — a parse/launch failure yields a
     PARTIAL warning and the install continues (mirrors the launcher).
 
+    ``deferral_report`` (v0.2.95 R1) is threaded into the rendered-root-files
+    step so a pre-pull rendered-file reconcile performed by the launcher lands
+    its ``rendered_file_upstream_changed`` row in THIS run's report. Callers
+    that omit it (tests) still render; they just record nothing.
+
     Living in install.py (not vco_lib) because it is the thin orchestration
     shim that must supply install.py's module globals (``PROJECT_ROOT``,
     ``_log_install_event``) and call the kept in-process ``_materialize_
@@ -5300,7 +5310,7 @@ def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
     # construction — the .vco-manifest.json is the installed marker (same
     # marker family the bundle itself consults). --update forces update mode;
     # otherwise the manifest's presence decides.
-    manifest = PROJECT_ROOT / ".claude" / ".vco-manifest.json"
+    manifest = _manifest_paths.manifest_path(PROJECT_ROOT)
     update_mode = bool(getattr(args, "update", False)) or manifest.exists()
 
     # D5 flag mapping (no feature removal, no legacy branches):
@@ -5368,7 +5378,14 @@ def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
     _skip_claude_dir = bool(getattr(args, "skip_materialize_claude_dir", False))
     _dry = bool(getattr(args, "adopt_project_dry_run", False))
     if not _dry and not _skip_claude_dir:
-        _materialize_orchestrator_self_claude_md(PROJECT_ROOT)
+        # v0.2.95 R1: the report is threaded so the renderer can record the
+        # launcher's pre-pull rendered-file reconcile (`rendered_file_upstream_
+        # changed`) in THIS run's ledger. An install.py-owned cid emitted by a
+        # separate writer mid-run would be dropped by this run's own finalize;
+        # going through the run report is what makes it survive.
+        _materialize_orchestrator_self_claude_md(
+            PROJECT_ROOT, deferral_report=deferral_report
+        )
     return result
 
 
@@ -5938,8 +5955,8 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 — seeding is best-effort
         _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
 
-    # v0.2.92 WP-D (register item 20): metrics migration on every run (helper above).
-    _run_metrics_migration_hook()
+    # One-time machine migrations on every run (helper above; v0.2.92 WP-D).
+    _run_machine_migrations()
 
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
@@ -6129,7 +6146,7 @@ def main() -> int:
     # _seed_weaviate so the KG-sync hooks exist when seeding runs. Replaces the
     # deleted Steps 5b/9b (bespoke materialize + agents/skills install), also
     # fixing F-NEW-1 (one manifest writer remains by construction).
-    _run_root_claude_dir_install(args)
+    _run_root_claude_dir_install(args, deferral_report=_deferral_report)
 
     _project_init.materialize_root_knowledge(PROJECT_ROOT, log_event=_log_install_event)  # Step 4d (v0.2.81): seed root knowledge/ == shared
 
@@ -6371,7 +6388,7 @@ def main() -> int:
             _ensure_collections(embed_config, decisions=decisions, args=args)
             # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
             # safe to re-run on update.
-            _seed_weaviate(args)
+            _seed_weaviate(args, deferral_report=_deferral_report)
             _seed_succeeded = True
         except Exception as _weaviate_err:
             # PR 6: Weaviate is unreachable (or refused connection) after the
@@ -6409,7 +6426,7 @@ def main() -> int:
                 # a still-unreachable port raises TimeoutError (→ deferral below)
                 # rather than hanging the re-embed after a no-op `podman start`.
                 _ensure_collections(embed_config, decisions=decisions, args=args)
-                _seed_weaviate(args)
+                _seed_weaviate(args, deferral_report=_deferral_report)
                 _restarted = True
                 _seed_succeeded = True
             except Exception:
@@ -6761,17 +6778,14 @@ def main() -> int:
     # (_deferral_folder is resolved at the top of main(), next to the A-2
     # disk seed — see the HIGH-2 comment there.)
 
-    # v0.2.91 WP-B (#5) re-probe pass + WP-D doctor phase — see the helper.
-    _post_install_probe_phase(_deferral_report, _deferral_folder, args=args)
-
     # A-11 (v0.2.73): the mid-run `_deferral_report.write()` that used to sit
     # here was REMOVED. With an empty in-memory report it unlinked the on-disk
     # file (and stripped the CLAUDE.md reminder) minutes before the final
     # write — a hard kill in that window lost every foreign entry with not
-    # even a stub. Nothing between here and the final write reads the file
-    # back (only `--apply-deferred` does, and it runs above), so the final
-    # write at the end of main() is the ONLY writer. Fix 6 (v0.2.13) already
-    # established the final write as the authoritative one.
+    # even a stub. Nothing between here and the final write WRITES the file
+    # back (the v0.2.95 re-probe pass below only READS it, by design), so the
+    # final write at the end of main() is the ONLY writer. Fix 6 (v0.2.13)
+    # already established the final write as the authoritative one.
 
     # Drop the install-manifest at state/install-manifest.json so the launcher
     # (and operators auditing an install) can verify install actually finished.
@@ -7001,6 +7015,9 @@ def main() -> int:
     # See `_persist_orchestrator_root_kg_collection` docstring for the
     # resolution priority + soft-fail semantics.
     _persist_orchestrator_root_kg_collection(_deferral_report)
+    # v0.2.91 WP-B (#5) re-probe + WP-D doctor phase — v0.2.95 F1: runs AFTER
+    # the hub restart (rationale in the helper; order pinned in test_v0295).
+    _post_install_probe_phase(_deferral_report, _deferral_folder, args=args)
 
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
@@ -7143,6 +7160,13 @@ def _post_install_probe_phase(
        assumptions against what was actually registered and delivered, prints
        the authoritative report, emits registry-classed conditions for what it
        defers, and dispatches the WP-H retries for owed work.
+
+    v0.2.95 F1: the phase runs AFTER `_deploy_and_start_vct_hub` and the
+    boot-unit steps (its caller in ``main()`` sits below them), so the
+    re-probe reads the executor outcomes of THIS run — the restarted hub
+    answering `/api/v1/health` is what clears a `hub_restart_failed_after_abort`
+    row. When this phase ran above the restart (pre-v0.2.95), that row could
+    never clear inside an update.
 
     Doctor runs AFTER the re-probe so a condition the re-probe just cleared is
     not immediately re-listed by the ledger summary, and BEFORE
@@ -7848,150 +7872,6 @@ def _apply_deferred_entries(
                 "purpose. Marking resolved."
             )
             current_run_report.mark_resolved(cid)
-
-        elif cid == "hub_restart_failed_after_abort":
-            # v0.2.89: the launcher writes this entry when the abort-path hub
-            # restart's health poll fails — i.e. after a conflict-ABORTED
-            # update the launcher tried to bring vct-hub back with
-            # `--start-if-not-running` and the post-restart liveness poll
-            # timed out (emitted by installer.rs). Unlike
-            # generated_files_reconciled (a pure historical audit record with
-            # nothing to re-probe), this is an ACTIONABLE FAILURE record: the
-            # hub genuinely did not come back at abort time, so it must NOT be
-            # unconditionally cleared — it self-clears only once the hub is
-            # confirmed refreshed. It is FOREIGN (Rust-emitted, not in
-            # _INSTALL_OWNED_CONDITION_IDS — a foreign cid listed there would
-            # be silently clobbered on the next update, the A-2 data-loss bug).
-            #
-            # Re-probe (mirrors launcher_update_diverged's hub leg): install.py
-            # Step 8 restarts the hub (`--start-if-not-running`), so by the
-            # time this handler runs the hub is normally back up. We resolve the
-            # 'hub down' record ONLY when BOTH are true:
-            #   (1) the on-disk hub sidecar version
-            #       (`vct-hub[.exe].metadata.json::launcher_version`) >= source
-            #       — proving the binary was REFRESHED, and
-            #   (2) a LIVE `_probe_vct_hub_health()` succeeds — proving the hub
-            #       is actually UP right now.
-            # (1) alone is insufficient (re-review MAJOR-2): Step 8 is soft-fail,
-            # so a run whose hub start FAILED its /health poll still reaches this
-            # handler with a freshly-deployed binary — clearing on version alone
-            # would delete an actionable 'hub down' record while the hub is
-            # genuinely down. If either check fails (or the probe raises), the
-            # entry is PRESERVED so it survives to the next run — never wrongly
-            # clear an actionable failure.
-            try:
-                source_version = _read_launcher_version(project_root)
-                subdir, fname = _launcher_binary_relative_path()
-                dist_dir = project_root / "launcher" / "dist" / subdir
-
-                def _read_dist_meta_version(meta_name: str) -> "str | None":
-                    p = dist_dir / meta_name
-                    if not p.is_file():
-                        return None
-                    try:
-                        m = json.loads(p.read_text(encoding="utf-8"))
-                    except Exception:
-                        return None
-                    raw = m.get("launcher_version")
-                    return raw.strip() if isinstance(raw, str) and raw.strip() else None
-
-                hub_meta_name = (
-                    "vct-hub.exe.metadata.json"
-                    if fname.endswith(".exe")
-                    else "vct-hub.metadata.json"
-                )
-                on_disk_hub_version = _read_dist_meta_version(hub_meta_name)
-
-                def _vparts(v: str) -> list[int]:
-                    out: list[int] = []
-                    for p in v.split("."):
-                        digits = ""
-                        for ch in p:
-                            if ch.isdigit():
-                                digits += ch
-                            else:
-                                break
-                        out.append(int(digits) if digits else 0)
-                    return out
-
-                def _ge(a_str: str, b_str: str) -> bool:
-                    a, b = _vparts(a_str), _vparts(b_str)
-                    n = max(len(a), len(b))
-                    a += [0] * (n - len(a))
-                    b += [0] * (n - len(b))
-                    return a >= b
-
-                # Unlike launcher_update_diverged (which treats an absent hub
-                # sidecar as "hub OK" so a caught-up launcher isn't blocked by
-                # a missing hub meta), THIS condition is specifically about the
-                # hub — an absent/unparseable sidecar means we cannot POSITIVELY
-                # confirm the hub caught up, so we keep the actionable entry
-                # (conservative: never wrongly clear a failure record).
-                version_caught_up = bool(
-                    source_version and on_disk_hub_version
-                    and _ge(on_disk_hub_version, source_version)
-                )
-
-                # v0.2.89 MAJOR-2: a caught-up sidecar VERSION only proves the
-                # hub BINARY was refreshed on disk — NOT that the hub is UP.
-                # Step 8 (_deploy_and_start_vct_hub) is soft-fail, so a run whose
-                # /health poll FAILED still reaches here; clearing the entry on
-                # version alone would wrongly delete an actionable "hub down"
-                # record while the hub is genuinely down. AND-in a LIVE health
-                # confirmation (reuse the existing probe — do NOT invent a new
-                # one). If the probe is unavailable/raises, PRESERVE (conservative:
-                # never wrongly clear an actionable failure).
-                health_ok = False
-                if version_caught_up:
-                    try:
-                        health_ok = _probe_vct_hub_health()
-                    except Exception:  # noqa: BLE001 — probe must never crash the handler
-                        health_ok = False
-
-                resolved = version_caught_up and health_ok
-
-                if resolved:
-                    print(
-                        f"  [ok]   {cid}: on-disk hub v{on_disk_hub_version} "
-                        f">= source v{source_version} AND /health is live — the "
-                        "hub has been refreshed and is UP; the abort-time restart "
-                        "failure is resolved. Marking resolved."
-                    )
-                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
-                    # FOREIGN cid (Rust-emitted, not in the owned set): the A-2
-                    # seed imported the on-disk copy into current_run_report and
-                    # the P1 pre-write re-merge would re-import it — without
-                    # mark_resolved here the 'do NOT re-add' resolution is inert
-                    # (same pattern launcher_update_diverged uses).
-                    current_run_report.mark_resolved(cid)
-                elif not version_caught_up:
-                    print(
-                        f"  [skip] {cid}: hub binary has not reached source "
-                        f"v{source_version or '<unknown>'} yet (on-disk hub "
-                        f"v{on_disk_hub_version or '<none>'}); the hub has not "
-                        "caught up, so the abort-time restart failure stands. "
-                        "Keeping entry."
-                    )
-                    current_run_report.add_entry(entry)
-                else:
-                    # Version caught up BUT the live /health probe did not confirm
-                    # the hub is up → the hub binary was refreshed but the hub is
-                    # NOT answering. This is EXACTLY the "hub down" state the entry
-                    # records — preserve it (never clear an actionable failure on
-                    # version alone).
-                    print(
-                        f"  [skip] {cid}: on-disk hub v{on_disk_hub_version} "
-                        f">= source v{source_version} BUT /health did not answer "
-                        "— the hub binary was refreshed yet the hub is NOT up; the "
-                        "abort-time restart failure still stands. Keeping entry."
-                    )
-                    current_run_report.add_entry(entry)
-            except Exception as exc:  # noqa: BLE001 — soft-fail
-                print(
-                    f"  [fail] {cid}: hub version re-probe failed ({exc}). "
-                    "Keeping entry."
-                )
-                current_run_report.add_entry(entry)
 
         else:  # no handler: expire an owned record, else preserve verbatim
             _deferral_probes.settle_unhandled_entry(
@@ -11846,90 +11726,75 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     _log_install_event("4/10", "ok", "weaviate_mcp submodule imports verified (FN-5b)")
 
 
-def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
-    """v0.2.50 Track A: render templates/ORCHESTRATOR-CLAUDE.md.template
-    to ``<install_root>/CLAUDE.md``.
+def _materialize_orchestrator_self_claude_md(
+    install_root: Path,
+    deferral_report: "Optional[DeferralReport]" = None,
+) -> None:
+    """v0.2.50 Track A / v0.2.95 R1 — step 4c: render every RENDERED ROOT FILE.
 
-    The template uses ``{{ORCHESTRATOR_ROOT}}`` for the resolved install
-    root path. The rendered content is wrapped in HTML comment markers
-    (``<!-- BEGIN: AUTO -->`` / ``<!-- END: AUTO -->``) so that on
-    ``--update`` re-runs, only the AUTO block is replaced — user-added
-    content OUTSIDE those markers is preserved.
+    The rendered set is NOT a hand list kept beside this step: it is
+    ``vco_lib/rendered_root_files.toml``, which ``render_all`` iterates and
+    which the launcher's pre-pull reconcile classifies against (one table, two
+    parsers, no drift — see that module and
+    ``launcher/src-tauri/src/commands/git_user_editable_merge.rs``). Only the
+    AUTO block is replaced, so user content outside the markers is preserved.
+    The table holds exactly one entry today, ``CLAUDE.md``, which is why this
+    function keeps its CLAUDE.md-specific name; a second entry makes renaming it
+    (and its three referencing test modules) part of that change.
 
-    Idempotent:
-    - First run (no CLAUDE.md or CLAUDE.md without AUTO markers): writes
-      the rendered template as the entire file.
-    - Subsequent runs (CLAUDE.md has AUTO markers): replaces only the
-      block between BEGIN/END AUTO; preserves content before/after.
+    When the launcher resolved a rendered file's divergence before the pull it
+    leaves a hand-off state file; with a ``deferral_report`` in hand this emits
+    the ``rendered_file_upstream_changed`` record AFTER the re-render above —
+    the only moment "and it was re-rendered" is true — and consumes the state
+    file so the install.py-owned row drains on the next run. Without a report
+    (direct callers, tests) the state file is LEFT for the next real run rather
+    than silently discarded.
 
-    Soft-fail: any error here is logged but does not abort the install.
-    A missing CLAUDE.md is not fatal — the orchestrator still runs.
+    Soft-fail throughout: every failure is logged and the install continues.
     """
-    template_path = install_root / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
-    target_path = install_root / "CLAUDE.md"
-
+    from vco_lib.rendered_root_files import (
+        build_upstream_changed_deferral_text, consume_reconcile_state,
+        read_reconcile_state, render_all,
+    )
     print("[4c/10] Materializing orchestrator CLAUDE.md from template ... ",
           end="", flush=True)
     _log_install_event("4c/10", "start",
-                       "rendering CLAUDE.md from ORCHESTRATOR-CLAUDE.md.template")
-
-    if not template_path.is_file():
-        print("SKIP (template missing)")
-        _log_install_event(
-            "4c/10", "skip",
-            f"template not found at {template_path}",
-        )
-        return
-
+                       "rendering root files from rendered_root_files.toml")
     try:
-        rendered = template_path.read_text(encoding="utf-8")
-        # Placeholder substitution.
-        rendered = rendered.replace("{{ORCHESTRATOR_ROOT}}", str(install_root))
+        outcomes = render_all(install_root)
+    except (RuntimeError, OSError) as exc:
+        print(f"FAILED ({exc})")
+        _log_install_event("4c/10", "warn",
+                           f"cannot read the rendered-root-files table: {exc}")
+        return
+    for outcome in outcomes:
+        level = "warn" if outcome.is_failure else (
+            "skip" if outcome.status == "template_missing" else "ok")
+        _log_install_event("4c/10", level, f"{outcome.path} — {outcome.detail}")
+    print("; ".join(f"{o.path}: {o.detail}" for o in outcomes)
+          if outcomes else "SKIP (table empty)")
 
-        if target_path.is_file():
-            existing = target_path.read_text(encoding="utf-8")
-            begin_marker = "<!-- BEGIN: AUTO"
-            end_marker = "<!-- END: AUTO -->"
-            begin_idx = existing.find(begin_marker)
-            end_idx = existing.find(end_marker)
-            if begin_idx >= 0 and end_idx > begin_idx:
-                # Preserve content outside AUTO markers; replace AUTO block.
-                prefix = existing[:begin_idx]
-                suffix = existing[end_idx + len(end_marker):]
-                merged = prefix + rendered.rstrip() + suffix
-                # Avoid no-op writes that would still bump mtime.
-                if merged != existing:
-                    target_path.write_text(merged, encoding="utf-8")
-                print("OK (AUTO block updated)")
-                _log_install_event(
-                    "4c/10", "ok",
-                    "CLAUDE.md AUTO block updated; user content preserved",
-                )
-            else:
-                # No AUTO markers in existing file — write rendered as-is.
-                # (Existing content is replaced because the AUTO markers are
-                # the contract for "preserve me"; without them, the template
-                # is the source of truth.)
-                target_path.write_text(rendered, encoding="utf-8")
-                print("OK (full rewrite — no AUTO markers found)")
-                _log_install_event(
-                    "4c/10", "ok",
-                    "CLAUDE.md fully rewritten (no AUTO markers in prior version)",
-                )
-        else:
-            # Fresh install — write rendered as-is.
-            target_path.write_text(rendered, encoding="utf-8")
-            print("OK (created)")
-            _log_install_event(
-                "4c/10", "ok",
-                "CLAUDE.md created from template",
-            )
-    except OSError as e:
-        print(f"FAILED ({e})")
+    if deferral_report is None:
+        return
+    try:
+        payload = read_reconcile_state(install_root)
+    except (ValueError, RuntimeError, OSError) as exc:
         _log_install_event(
             "4c/10", "warn",
-            f"failed to materialize CLAUDE.md: {e}",
-        )
+            f"rendered-reconcile state unreadable ({exc}); left for the next run")
+        return
+    if payload is None:
+        return  # no reconcile happened this update — nothing to record
+    fields = build_upstream_changed_deferral_text(payload)
+    if fields is not None:
+        title, detected, why_deferred, command_to_apply = fields
+        deferral_report.add_entry(_make_deferral(
+            "rendered_file_upstream_changed", title=title, detected=detected,
+            why_deferred=why_deferred, command_to_apply=command_to_apply,
+            severity="info"))
+        _log_install_event("4c/10", "ok",
+                           f"recorded rendered_file_upstream_changed: {title}")
+    consume_reconcile_state(install_root)
 
 
 def _materialize_vct_secrets_shared_readme(install_root: Path) -> None:
@@ -15355,7 +15220,58 @@ def _resolve_orchestrator_root_canonical(
     )
 
 
-def _seed_weaviate(args: argparse.Namespace) -> None:
+def _enrich_slot_change(
+    venv_py: Path,
+    profile: str,
+    kg_collection: str,
+    shared_kg_collection: str,
+) -> bool:
+    """Thin call site for the enrichment driver (v0.2.95 WP-6).
+
+    The driver itself lives in :mod:`vco_lib.embedding_enrichment` — the
+    module whose CLI contract it depends on — so install.py carries only the
+    decision to use it. A failed import is a BROKEN install, but this is a
+    cost optimisation on a path that has a correct (if expensive) fallback:
+    return False and the caller re-embeds, which is what every release before
+    v0.2.95 did.
+    """
+    try:
+        from vco_lib.embedding_enrichment import (
+            enrich_collections_for_slot_change,
+        )
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        print(f"  CI-10: enrichment unavailable ({exc}) → full re-embed")
+        return False
+    return enrich_collections_for_slot_change(
+        venv_python=venv_py,
+        profile=profile,
+        kg_collection=kg_collection,
+        shared_kg_collection=shared_kg_collection,
+        dev_collection=os.environ.get("DEVELOPMENT_COLLECTION", "") or "",
+        project_root=PROJECT_ROOT,
+        env=_subprocess_env_with_embedding(),
+        log=lambda msg: print(msg),
+        audit=lambda data: _log_install_event(
+            "7c/10", "info",
+            "CI-10: slot change enriched in place (no full re-embed)",
+            data=data,
+        ),
+    )
+
+
+#: v0.2.95 WP-4: the owed-work condition an INCOMPLETE embedding-model /
+#: collection change records. The id, the reasoning behind reusing an
+#: EXISTING registered condition rather than minting one, and the emitter
+#: all live in :mod:`vco_lib.install_weaviate`; this alias exists because
+#: the name is part of install.py's surface (the CI-10 seed tests read
+#: ``install._SEED_OWED_WORK_CONDITION_ID``).
+_SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
+
+
+def _seed_weaviate(
+    args: argparse.Namespace,
+    deferral_report: "Optional[DeferralReport]" = None,
+) -> None:
     """v0.2.44 V44-I: thin wrapper around :func:`_seed_weaviate_impl`
     that guarantees the ``_DUAL_CLONE_DETECTED_THIS_RUN`` module-level
     flag is reset to False after the call returns (even if the impl
@@ -15370,12 +15286,15 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     global _DUAL_CLONE_DETECTED_THIS_RUN
     try:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
-        return _seed_weaviate_impl(args)
+        return _seed_weaviate_impl(args, deferral_report=deferral_report)
     finally:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
 
 
-def _seed_weaviate_impl(args: argparse.Namespace) -> None:
+def _seed_weaviate_impl(
+    args: argparse.Namespace,
+    deferral_report: "Optional[DeferralReport]" = None,
+) -> None:
     """Seed Weaviate with bundled knowledge/ + docs/.
 
     v0.2.42 CI-10: on ``--update`` runs (not fresh install), gate the sync
@@ -15461,6 +15380,11 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # is needed. See function docstring for full algorithm.
     is_update = getattr(args, "update", False)
     _sync_all = True          # default: run --all (set False for diff path)
+    # v0.2.95 WP-4: was leg (b) — the context-CHANGE branch — taken? Leg (b)
+    # and leg (c) fail differently and must be marked differently; see the
+    # amended SEG-1 note at the persist block below.
+    _context_change_run = False
+    _context_change_reason = ""
     _diff_files: "list[str]" = []  # set when doing a partial sync
     _nodes_skipped = 0
     _nodes_synced = 0
@@ -15577,6 +15501,42 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
             or stored_shared_kg != current_shared_kg
         )
 
+        # v0.2.95 WP-6: leg (b) is two different questions wearing one branch. A
+        # collection RENAME means the target class has no rows and only a full
+        # re-embed can fill it. An embedding-model change means every row is
+        # still correct except for one empty named-vector slot — which
+        # `vco_lib.embedding_enrichment` fills per object, UPDATE-only and
+        # idempotently (it EMBEDS too — ship-gate MINOR-6; its docstring says
+        # where the saving is and is not). Split here: downstream is unchanged.
+        _collections_changed = (
+            stored_kg != current_kg_collection
+            or stored_shared_kg != current_shared_kg
+        )
+        if (
+            context_changed
+            and not _collections_changed
+            and current_kg_collection
+            # A previously RECORDED profile is required. An absent
+            # `last_installed_active_embedding` is not a model change — it is
+            # the absence of any record, which is also what a never-seeded
+            # install looks like, and that needs the full `--all` (it is the
+            # only shape that also seeds `docs/`; the per-file diff path
+            # covers `knowledge/` only). Keeping that case on its existing
+            # path is why this condition is narrower than "context_changed".
+            and stored_embedding
+        ):
+            if _enrich_slot_change(
+                venv_py, current_active_embedding,
+                current_kg_collection, current_shared_kg,
+            ):
+                # The context change has been RESOLVED, not ignored: the
+                # collections now carry vectors in the active slot. What
+                # remains for this run is the ordinary per-file diff, so hand
+                # the run to leg (c) — and let the persist below stamp the
+                # triple, which is the whole point (doing the recommended
+                # thing must not cost a full re-embed on the next update).
+                context_changed = False
+
         if context_changed:
             # Full sync required — context changed since last run.
             reason = (
@@ -15591,9 +15551,21 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
                 data={"reason": "context_change"},
             )
             _sync_all = True
+            _context_change_run = True
+            _context_change_reason = reason
         elif not current_kg_collection:
             # No KG_COLLECTION configured — can't query Weaviate for diff.
             # Fall back to full sync to be safe.
+            _sync_all = True
+        elif _install_weaviate.kg_metadata_repair_due_now(_read_app_state_key):
+            # v0.2.95 WP-7 — leg (d), the ONE-TIME metadata-repair pass. The
+            # repair runs per node on the sync's embed-skip path, so only a
+            # run that VISITS a node reaches it — and leg (c) below visits
+            # none of them precisely when it is owed. Its own arm, not folded
+            # into leg (b): those are different questions and WP-6 split that
+            # arm for saying so. Rationale, the exit-0 stamp rule and this
+            # leg's own reporting: `vco_lib.install_weaviate`.
+            _install_weaviate.announce_kg_metadata_repair_leg(_log_install_event)
             _sync_all = True
         else:
             # Context unchanged — attempt per-file content-hash diff.
@@ -15603,23 +15575,9 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
                 current_kg_collection, weaviate_url,
             )
 
-            # Build diff: files whose on-disk hash differs from stored
-            # (or whose stored hash is missing / empty).
-            diff_files: list[str] = []
-            for file_path_str, disk_hash in on_disk.items():
-                # Match stored hash by absolute path OR by file_path relative
-                # forms. Weaviate stores file_path as written by sync_kg (may
-                # be absolute or relative depending on KG_BASE_DIR).
-                stored_hash = stored_hashes.get(file_path_str, "")
-                if not stored_hash:
-                    # Try relative path form as fallback.
-                    try:
-                        rel = str(Path(file_path_str).relative_to(PROJECT_ROOT))
-                        stored_hash = stored_hashes.get(rel, "")
-                    except ValueError:
-                        pass
-                if disk_hash != stored_hash:
-                    diff_files.append(file_path_str)
+            diff_files = _install_weaviate.content_hash_diff(
+                on_disk, stored_hashes, PROJECT_ROOT,
+            )
 
             total_files = len(on_disk)
             _nodes_skipped = total_files - len(diff_files)
@@ -15708,7 +15666,13 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # chunk → sync_knowledge_graph.py exits 1) left last_installed_active_embedding
     # at None forever, forcing a full ~2590-node re-embed on EVERY subsequent
     # --update (CI-10 "pay once" defeated). See the persist block below.
+    #
+    # v0.2.95 WP-4 AMENDS that rule for leg (b) only — `sync_exit_zero` is the
+    # extra fact the persist block needs to do it. The SEG-1 rationale above
+    # stands unchanged for leg (c); read the persist block for why leg (b) is
+    # different and what had to land first for the amendment to be safe.
     sync_subprocess_ran = False
+    sync_exit_zero = False
     if sync_kg.exists():
         if _sync_all:
             cmd_args = ["--all"]
@@ -15749,6 +15713,7 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
             )
             # Subprocess executed AND exited 0 — clean sync.
             sync_subprocess_ran = True
+            sync_exit_zero = True
         except subprocess.CalledProcessError as e:
             # Subprocess EXECUTED but exited non-zero — e.g. 1/2590 nodes failed
             # (oversize chunk, transient embed error). The other 2589 WERE
@@ -15789,10 +15754,49 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # they record "we last attempted a sync at T, embedding N/K nodes" — reality
     # regardless of the one failed node — so they belong with the context triple,
     # not under a stricter success check.
-    if sync_subprocess_ran:
+    #
+    # ── v0.2.95 WP-4: the leg-(b) carve-out, and why SEG-1 still stands ──
+    #
+    # SEG-1's reasoning above is a LEG-(C) argument. Its worked example — "2589
+    # of 2590 succeeded; the next --update's content-hash diff re-picks-up only
+    # the failed node" — holds because a node whose WRITE failed has no stored
+    # hash, so the diff sees it. Nothing below changes that.
+    #
+    # It does NOT hold on leg (b), for a reason the exit code alone cannot show:
+    # a leg-(b) run can also die EARLY (backend death, kill, crash) with most of
+    # the tree NEVER VISITED. Those nodes keep rows whose content_hash still
+    # matches — it is computed from file bytes only and carries no model
+    # identity — so the next run's diff finds nothing to do. Stamp the triple and
+    # leg (b) never fires again either: the collection keeps PREVIOUS-MODEL
+    # vectors permanently, with no ledger row and no probe that looks. install.py
+    # cannot tell that shape from a per-node write failure; both are exit != 0.
+    #
+    # So on leg (b) the triple advances only on exit 0. What made that safe is
+    # v0.2.95 WP-5 (the active-slot gate in `sync_node`), which LANDED FIRST and
+    # dissolved the dilemma SEG-1 was choosing inside: before WP-5, not stamping
+    # cost a full ~2590-node re-embed on every subsequent --update, forever (why
+    # SEG-1 chose to stamp); after it, the repeated `--all` skips every node
+    # whose content_hash matches AND whose ACTIVE slot is populated, re-embedding
+    # only what never landed — once — after which exit 0 advances the triple.
+    #
+    # PRICE, named (ship-gate MINOR-5): a PERMANENTLY failing node — an oversize
+    # chunk the backend always refuses — holds the exit non-zero, so every later
+    # --update re-enters leg (b) and WALKS `--all` (a fetch per node, embeds
+    # gated by WP-5) instead of the seconds-scale diff. Accepted: it is not
+    # silent (the sync emits `kg_sync_failures_pending` with the count and
+    # `retry:py:kg_seed`), and the alternative — stamping on a non-zero exit — is
+    # the permanent previous-model state above, unlogged and unprobed. If WP-5 is
+    # removed or weakened, revisit this carve-out in the SAME change.
+    #
+    # The sync-AT timestamp and sync-STATS are deliberately NOT part of the
+    # carve-out: they record "an attempt happened at T, embedding N/K" — true of
+    # an incomplete run too — withholding them would hide the attempt itself.
+    _context_change_incomplete = _context_change_run and not sync_exit_zero
+    if sync_subprocess_ran and not _context_change_incomplete:
         _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)
+    if sync_subprocess_ran:
         import datetime as _dt
         _write_app_state_key(
             _APP_STATE_KEY_LAST_KG_SYNC_AT,
@@ -15801,6 +15805,15 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
         _write_app_state_key(
             _APP_STATE_KEY_LAST_KG_SYNC_STATS,
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
+        )
+    # v0.2.95 WP-7: only a WHOLE-TREE run that exited 0 visited and judged
+    # every node, so only it may retire the metadata-repair pass — the
+    # leg-(b) carve-out rule above, for the same reason.
+    _install_weaviate.stamp_kg_metadata_repair(_sync_all, sync_exit_zero, _write_app_state_key)
+    if _context_change_incomplete:
+        _install_weaviate.emit_context_change_incomplete_deferral(
+            deferral_report, _context_change_reason,
+            make_deferral=_make_deferral,
         )
 
     # v0.2.44 V44-A: always prune on --update.
@@ -16303,139 +16316,17 @@ def _translate_migration_report_to_deferrals(
 
 
 def _migrate_kg_named_vector_slots(deferral_report: "DeferralReport") -> None:
-    """V0243-2 — Ensure $KG_COLLECTION and $DEVELOPMENT_COLLECTION carry all
-    5 named-vector slots from the v0.2.18 catalog.
+    """Thin wrapper over
+    :func:`vco_lib.install_weaviate.migrate_kg_named_vector_slots`.
 
-    Background: collections created before v0.2.18 were built with 3 slots
-    (qwen3_embed, ollama_embed, openai_embed). v0.2.18 added arctic2_embed +
-    openai_text_embed. The drift-detector intentionally does NOT fire on the
-    two new slots (so basic search still works), but every install/update
-    should silently patch them in when missing.
-
-    Strategy: additive patch_props (UNION) — vector slots can be added
-    without re-embedding existing data. The new slots start empty; the
-    embedding-enrichment step (commit 9 / EmbeddingService) fills them
-    lazily as the user runs sync or queries.
-
-    Idempotent: running twice produces 0 additions on the second pass
-    (every slot present → all Skipped).
-
-    Soft-fail: Weaviate unreachable or collection missing → skip silently
-    (those are existing deferred conditions upstream). Any per-slot error
-    is captured as a deferral entry and does NOT abort install.
-
-    Scope: per-project KG ($KG_COLLECTION) + per-project Development
-    ($DEVELOPMENT_COLLECTION). Shared KG and code-graph collections are
-    handled separately by `migrate_collections_to_v0218_schema`.
+    v0.2.95 (ratchet lane): the V0243-2 five-slot-catalog migration moved to
+    vco_lib. install.py keeps this same-signature entry point because both
+    the step-7d call site and ``tests/test_v0243_kg_named_vector_migration``
+    reach it by this name, and because threading ``_log_install_event`` in
+    from here is what lets a test patching it still steer the log.
     """
-    from vco_lib.weaviate_schema import (
-        KG_NAMED_VECTORS,
-        migrate_collection_to_target,
-    )
-
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
-    kg_coll = os.environ.get("KG_COLLECTION", "")
-    dev_coll = os.environ.get("DEVELOPMENT_COLLECTION", "")
-
-    targets = [(n, "kg") for n in [kg_coll] if n] + [
-        (n, "dev") for n in [dev_coll] if n
-    ]
-
-    if not targets:
-        _log_install_event(
-            "7d/10", "skip",
-            "kg_named_vector_slots: no KG_COLLECTION/DEVELOPMENT_COLLECTION set",
-        )
-        return
-
-    print("[7d/10] Migrating KG named-vector slots (V0243-2) ... ", flush=True)
-    _log_install_event(
-        "7d/10", "start",
-        "kg_named_vector_slots: ensuring 5-slot catalog on KG + Dev",
-        data={"kg": kg_coll, "dev": dev_coll, "weaviate_url": weaviate_url},
-    )
-
-    all_ok = True
-    for coll_name, coll_type in targets:
-        try:
-            report = migrate_collection_to_target(
-                coll_name,
-                KG_NAMED_VECTORS,
-                weaviate_url=weaviate_url,
-            )
-        except Exception as exc:
-            # Transport failure, missing collection, etc. — skip silently.
-            print(f"  [kg_named_vector_slots] {coll_name}: skipped ({exc})")
-            _log_install_event(
-                "7d/10", "warn",
-                f"kg_named_vector_slots: {coll_name} skipped: {type(exc).__name__}",
-                data={"collection": coll_name, "error": str(exc)[:200]},
-            )
-            continue
-
-        if report.added_slots:
-            print(f"  [kg_named_vector_slots] {coll_name}: "
-                  f"added {report.added_slots}")
-        elif report.skipped_slots:
-            print(f"  [kg_named_vector_slots] {coll_name}: "
-                  f"all slots present (noop)")
-        if report.errors:
-            all_ok = False
-            for err in report.errors:
-                slot = err.get("slot", "?")
-                reason = err.get("reason", "?")
-                print(f"  [kg_named_vector_slots] {coll_name}: "
-                      f"slot {slot} error: {reason}")
-                deferral_report.add_entry(
-                    DeferralEntry(
-                        condition_id=f"kg_named_vector_slot_error_{coll_name}_{slot}",
-                        title=(
-                            f"Named-vector slot migration failed: "
-                            f"{coll_name}/{slot}"
-                        ),
-                        detected=(
-                            f"Migration of vector slot `{slot}` on collection "
-                            f"`{coll_name}` failed during install step 7d: "
-                            f"{reason}"
-                        ),
-                        why_deferred=(
-                            "Adding a vector slot failed. The collection will "
-                            "continue to work with the existing slots, but new "
-                            "embedding backends (arctic2_embed / "
-                            "openai_text_embed) will not be available until "
-                            "the migration succeeds."
-                        ),
-                        command_to_apply=(
-                            f"python -m vco_lib.project_init "
-                            f"migrate-collections --name "
-                            f"{os.environ.get('PROJECT_NAME', 'YourProject')} "
-                            f"--json"
-                        ),
-                        severity="warning",
-                        kg_node_refs=[],
-                    )
-                )
-        _log_install_event(
-            "7d/10",
-            "ok" if not report.errors else "warn",
-            f"kg_named_vector_slots: {coll_name} done",
-            data={
-                "collection": coll_name,
-                "added": report.added_slots,
-                "skipped": report.skipped_slots,
-                "errors": report.errors,
-            },
-        )
-
-    if all_ok:
-        print("  [kg_named_vector_slots] OK")
-    _log_install_event(
-        "7d/10",
-        "ok" if all_ok else "warn",
-        "kg_named_vector_slots: migration pass completed",
+    _install_weaviate.migrate_kg_named_vector_slots(
+        deferral_report, log_event=_log_install_event,
     )
 
 
@@ -16581,96 +16472,16 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
 
 
 def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
-    """PR-34 (v0.2.12, Group M) — soft-fail migration deferral.
+    """Thin wrapper over
+    :func:`vco_lib.install_weaviate.detect_legacy_shared_kg_class`.
 
-    When `python install.py --update` runs against a Weaviate that still
-    carries the pre-rename `VibeCodedTools_KnowledgeGraph` class (created
-    by an install <v0.2.12), emit a `legacy_shared_kg_class_present`
-    deferral entry pointing the user at the launcher's "Manage shared KG
-    collection" picker. We NEVER auto-rename or auto-drop the class —
-    that is destructive (would lose any cross-project KG content the user
-    has written) and the picker is the consent mechanism.
-
-    Idempotent + soft-fail:
-      * Weaviate unreachable → skip silently (the schema-rebuild flow
-        upstream already emits a `weaviate_unreachable` deferral).
-      * Legacy class absent → no-op.
-      * Legacy class present → one deferral entry, severity=info.
-
-    The picker (launcher Settings → Identity → "Manage shared KG
-    collection") handles three resolution paths: (a) accept the new
-    canonical and migrate content, (b) keep the legacy name as the
-    per-project shared-KG override, (c) ignore (dismissable).
+    v0.2.95 (ratchet lane): the PR-34 legacy-class probe moved to vco_lib.
+    The wrapper stays so main()'s update branch keeps its single-line call
+    site (main() sits exactly on its own ratchet pin) and so a test patching
+    ``install._log_install_event`` still steers the log.
     """
-    # Resolve Weaviate URL: prefer env, fall back to canonical default.
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
-    try:
-        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
-            f"{weaviate_url}/v1/schema", timeout=5,
-        )
-        schema = json.loads(resp.read())
-    except Exception:
-        # Soft-fail: skip silently. Other code paths already deferral
-        # on Weaviate unreachability.
-        return
-
-    classes = {c.get("class", "") for c in schema.get("classes", [])}
-    legacy_name = "VibeCodedTools_KnowledgeGraph"
-    canonical_name = "VibeCodedOrchestrator_KnowledgeGraph"
-    # v0.2.23 B1: also recognise the lowercase-c v0.2.12–v0.2.22 default
-    # as "canonical-present" (case-insensitive) so a user upgrading from
-    # that range doesn't get a spurious "canonical not yet created"
-    # message when their on-disk class is the lowercase-c variant.
-    legacy_lowercase_c = "VibecodedOrchestrator_KnowledgeGraph"
-
-    if legacy_name not in classes:
-        return  # No legacy class — nothing to migrate.
-
-    canonical_present = (
-        canonical_name in classes or legacy_lowercase_c in classes
-    )
-    detected_msg = (
-        f"Weaviate at {weaviate_url} still carries the pre-v0.2.12 "
-        f"shared-KG class `{legacy_name}`. The post-rename canonical "
-        f"name is `{canonical_name}` "
-        f"({'already present' if canonical_present else 'not yet created'})."
-    )
-
-    deferral_report.add_entry(
-        DeferralEntry(
-            condition_id="legacy_shared_kg_class_present",
-            title="Legacy shared-KG class still on disk (pre-v0.2.12 PR-26)",
-            detected=detected_msg,
-            why_deferred=(
-                "The shared cross-project KG class was renamed from "
-                f"`{legacy_name}` to `{canonical_name}` in v0.2.12 PR-26. "
-                "The legacy class is still on disk because the rename is "
-                "metadata-only; install.py does NOT auto-rename or "
-                "auto-drop a populated class (destructive — would lose "
-                "any cross-project KG content). Resolve via the "
-                "launcher's Settings → Identity → \"Manage shared KG "
-                "collection\" picker, which lets you pick which class "
-                "becomes the active shared KG for each project."
-            ),
-            command_to_apply=(
-                "Open the launcher (`./vct-launcher`), pick a project, "
-                "go to Settings → Identity, click \"Manage shared KG "
-                "collection\", and select either the legacy "
-                f"`{legacy_name}` or the canonical "
-                f"`{canonical_name}` as the shared KG for that project."
-            ),
-            severity="info",
-            kg_node_refs=[],
-        )
-    )
-    _log_install_event(
-        "7d/10", "info",
-        "legacy shared-KG class detected; deferral emitted",
-        data={"legacy_class": legacy_name,
-              "canonical_present": canonical_present},
+    _install_weaviate.detect_legacy_shared_kg_class(
+        deferral_report, log_event=_log_install_event,
     )
 
 
@@ -18342,29 +18153,21 @@ def _user_home_for_install() -> Path:
 def _rerender_model_gateway_boot_service(args: argparse.Namespace) -> None:
     """Refresh an EXISTING model-gateway boot registration on ``--update``.
 
-    Creates nothing: the gateway's autostart is opt-in (a login-time daemon
-    holding an OAuth passthrough is the user's decision, not an installer's),
-    so this only re-resolves the absolute paths baked into a unit the user
-    already asked for. Without it, a clone that moved leaves that unit
-    pointing at an ``ExecStart`` which no longer exists and the gateway
-    silently stops coming up at login — the same failure the container
-    stack's ``_repair_systemd_unit_working_dir`` exists to prevent.
-
-    Soft-fail: never blocks an install, on any OS.
+    Creates nothing (the autostart is opt-in) and never blocks an install, on
+    any OS. THE BODY AND THE REASONING LIVE IN
+    :mod:`vco_lib.gateway_boot_render` (v0.2.95): why a moved clone needs
+    this, why the entry point is RUN before it is baked (R5a), and why a
+    refusal is logged here but recorded in the ledger by the doctor phase of
+    this same run. The NAME stays because two call sites resolve it as a
+    module global and a test monkeypatches it there.
     """
-    if not getattr(args, "update", False):
-        return
-    try:
-        _boot_service.rerender_if_registered(
-            _boot_service.model_gateway_spec(os_key=platform.system()),
-            templates_root=PROJECT_ROOT,
-            on_event=_boot_service_event,
-        )
-    except Exception as exc:  # noqa: BLE001 — soft-fail catch-all
-        _log_install_event(
-            "boot-service", "warn",
-            f"model-gateway boot re-render raised: {exc.__class__.__name__}: {exc}",
-        )
+    _gateway_boot_render.rerender_on_update(
+        update=bool(getattr(args, "update", False)),
+        templates_root=PROJECT_ROOT,
+        install_root=PROJECT_ROOT,
+        on_event=_boot_service_event,
+        log=_log_install_event,
+    )
 
 
 def _materialize_boot_service_linux(
@@ -23425,11 +23228,11 @@ def _check_claude_cli() -> None:
 #   - Audit log path uses `vco_lib.paths.claude_metrics_dir()` (v0.2.92:
 #     was an inline `Path.home()`, which resolved the REAL ~/.claude at
 #     import time and ignored $VCT_CLAUDE_DIR) — same `~/.claude/metrics/`
-#     convention as `costs.jsonl`, `failures.jsonl`, `kg_update_tokens.jsonl`.
+#     convention as `failures.jsonl`, `kg_update_tokens.jsonl`.
 
 _NPM_PATH: str | None = shutil.which("npm")  # cached at import time
 
-# Audit log location — sibling of cost-tracker / stop-failure outputs.
+# Audit log location — sibling of the stop-failure-notify hook's output.
 _BUNDLED_VERSIONS_AUDIT_LOG: Path = (
     _paths.claude_metrics_dir() / "bundled_versions.jsonl"
 )

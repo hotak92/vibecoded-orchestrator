@@ -166,11 +166,10 @@ PROBES: list[tuple[str, str, str]] = [
     ("pre-tool-use.sh", "PreToolUse(Bash routine)", "bash_routine"),
     ("pre-bash-context-inject.sh", "PreToolUse(Bash routine)", "bash_routine"),
     ("pre-bash-context-inject.sh", "PreToolUse(Bash long)", "bash_long"),
-    # Stop event — cost-tracker + notify + RL/codegraph drains.
+    # Stop event — notify + RL/codegraph drains.
     ("stop-drain-citations.sh", "Stop", "stop"),
     ("stop-codegraph-drain.sh", "Stop", "stop"),
     ("stop-codegraph-reminder.sh", "Stop", "stop"),
-    ("cost-tracker.sh", "Stop", "stop"),
     # UserPromptSubmit.
     ("diff-context-inject.sh", "UserPromptSubmit", "prompt"),
     ("user-prompt-submit-reminder.sh", "UserPromptSubmit", "prompt"),

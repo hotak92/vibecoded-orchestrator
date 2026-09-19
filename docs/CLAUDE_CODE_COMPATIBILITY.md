@@ -103,7 +103,7 @@ ceremony, easiest to forget.
   VS Code carve-out, and the
   [VS Code feature-gap table](https://code.claude.com/docs/en/vs-code)
   doesn't list hook events as missing. The orchestrator's
-  `notify-stop.sh` and `cost-tracker.sh` should fire on every
+  `notify-stop.sh` and `stop-failure-notify.sh` should fire on every
   surface that loads `.claude/settings.json`. (If the hooks don't
   fire in practice, file via `/feedback` since docs claim parity.)
 - **Backgrounded subagents**: spawning `run_in_background: true` agents
