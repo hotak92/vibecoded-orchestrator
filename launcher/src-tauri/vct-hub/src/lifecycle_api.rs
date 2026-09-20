@@ -242,6 +242,16 @@ pub struct ServicesRuntimeSnapshot {
 ///     resolve to a routable address on a misconfigured host, and a probe
 ///     URL that does not match the bind is a probe that reports the wrong
 ///     thing.
+///   * v0.2.95: its port is RESOLVED, not assumed. This row used to spell
+///     `11436` twice as a literal, so `/services/status` reported a health
+///     URL nothing served on every machine whose gateway had fallen back off
+///     the documented port — precisely the 2026-09-08 machine, where a legacy
+///     container owned it. The resolution is
+///     `vct_launcher_core::services::model_gateway_port::resolve_port`, the
+///     same chain the launcher's card and the hub's supervisor walk; the
+///     three of them previously held three answers. The other three rows keep
+///     their literals: they are CONTAINER ports, fixed by the compose file,
+///     with no fallback chain to consult.
 ///   * The infra watchdog does NOT gain a row for it and needs no
 ///     exclusion: `infra_watchdog::CANONICAL_INFRA_SERVICES` is its own
 ///     ALLOWLIST of `(compose_service, container_name)` pairs, and the
@@ -249,18 +259,23 @@ pub struct ServicesRuntimeSnapshot {
 ///     work from this table. A process is not something `compose up` can
 ///     heal, so the correct action there is to add nothing.
 fn canonical_service_skeletons() -> Vec<ServiceRuntimeState> {
+    let gateway_port = vct_launcher_core::services::model_gateway_port::resolve_port();
     [
-        ("weaviate", 8081u16, "http://localhost:8081/v1/meta"),
-        ("ollama", 11435u16, "http://localhost:11435/api/tags"),
-        ("code_embed", 11440u16, "http://localhost:11440/health"),
-        ("model_gateway", 11436u16, "http://127.0.0.1:11436/health"),
+        ("weaviate", 8081u16, "http://localhost:8081/v1/meta".to_string()),
+        ("ollama", 11435u16, "http://localhost:11435/api/tags".to_string()),
+        ("code_embed", 11440u16, "http://localhost:11440/health".to_string()),
+        (
+            "model_gateway",
+            gateway_port,
+            vct_launcher_core::services::model_gateway_port::health_url(gateway_port),
+        ),
     ]
     .iter()
     .map(|(name, port, url)| ServiceRuntimeState {
         name: (*name).to_string(),
         running: false,
         port: *port,
-        url: (*url).to_string(),
+        url: url.clone(),
         externally_managed: false,
         adoption_mode: AdoptionMode::Unresolved,
         container_name: None,
@@ -669,6 +684,14 @@ mod tests {
 
     #[tokio::test]
     async fn services_status_returns_degraded_skeleton() {
+        // v0.2.95: the gateway row's port is RESOLVED now, and resolution
+        // reads `<vct_root>/model-gateway.{port,last-port}`. Without this
+        // guard the assertion below would be against the DEVELOPER'S machine
+        // — and it was: this test went red on a box whose last-port record
+        // says 11467, for a code change that is correct. A fresh state dir
+        // makes "no evidence anywhere" true, which is what the documented
+        // defaults below assert.
+        let _state = VctStateDirGuard::new();
         let (base, _h) = spawn_lifecycle_api_hub().await;
         let resp = reqwest::get(format!("{}/services/status", base))
             .await
@@ -907,6 +930,57 @@ mod tests {
         assert_eq!(
             body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
             Some("not_implemented_supervisor_restart"),
+        );
+    }
+
+    // ─── v0.2.95: the gateway row follows the resolver, not a literal ────
+
+    /// The ACT: a port file naming another port moves the skeleton's row.
+    ///
+    /// Before this, both the `port` and the health URL were the literal
+    /// `11436`, so `/services/status` described a gateway that was not there
+    /// on exactly the machines where it mattered — the ones whose documented
+    /// port was already taken by something else, which is why the gateway had
+    /// fallen back in the first place.
+    #[test]
+    fn the_gateway_row_follows_the_resolved_port() {
+        let guard = VctStateDirGuard::new();
+        std::fs::write(
+            guard.vct_root().join(
+                vct_launcher_core::services::model_gateway_port::PORT_BASENAME,
+            ),
+            "11467\n",
+        )
+        .expect("write port file");
+
+        let row = canonical_service_skeletons()
+            .into_iter()
+            .find(|s| s.name == "model_gateway")
+            .expect("the gateway row exists");
+        assert_eq!(row.port, 11467);
+        assert_eq!(row.url, "http://127.0.0.1:11467/health");
+    }
+
+    /// The LEAVE-ALONE: with no evidence anywhere, the row is the documented
+    /// default — and the three CONTAINER rows never move, because their ports
+    /// are fixed by the compose file and have no chain to consult.
+    #[test]
+    fn with_no_port_evidence_the_rows_are_the_documented_defaults() {
+        let _guard = VctStateDirGuard::new();
+        let rows = canonical_service_skeletons();
+        let by_name = |n: &str| {
+            rows.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{} row", n))
+        };
+        assert_eq!(
+            by_name("model_gateway").port,
+            vct_launcher_core::services::model_gateway_port::DEFAULT_GATEWAY_PORT,
+        );
+        assert_eq!(by_name("weaviate").port, 8081);
+        assert_eq!(by_name("ollama").port, 11435);
+        assert_eq!(by_name("code_embed").port, 11440);
+        assert!(
+            by_name("model_gateway").url.starts_with("http://127.0.0.1:"),
+            "the gateway is loopback-bound; localhost can resolve routably"
         );
     }
 

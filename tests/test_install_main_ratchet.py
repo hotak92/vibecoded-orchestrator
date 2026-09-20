@@ -219,7 +219,46 @@ _MAIN_SPAN_MAX = 1687
 # `--update` re-render of an existing gateway registration, and the
 # per-OS artefact name for the uninstall plan.
 # ALL outside main() (+0 span).
-_TOTAL_LINES_MAX = 24202
+#
+# v0.2.95 (FIX lane, review MAJOR-2) — re-pinned DOWN to the measured 24059
+# (-143). NOTHING in this cycle earned that budget: three lanes SHRANK the
+# file and none re-pinned —
+#   * R1   (the update-divergence lane) — the A0 rendered-file legs;
+#   * R5-py (the model-gateway registration lane) — the venv-argv render +
+#     `resolve_gateway_secret_project` moved to `vco_lib/boot_service.py`;
+#   * F1+F4 (the deferral-probe lane) — the hub-restart probe moved to
+#     `vco_lib/deferral_probes.py`; that pair measured 24 058 at its close.
+# A pin left 143 lines above the measurement is a hidden-growth budget: it
+# passes while the file GROWS, which is the opposite of what a ratchet's name
+# claims, and it is the same shape the `project_init` ceiling had when it
+# absorbed +854 lines unnoticed.
+#
+# THE RULE, so no future re-pin has to re-derive it: the TOTAL pin is the
+# measured `wc -l install.py` EXACTLY. Not "measured plus a little" — every
+# line of headroom is a line a later change can add without justifying
+# itself, and the justification is the whole mechanism. Shrink the file, then
+# re-pin; never raise the pin to fit a change that could have been an
+# extraction. (`test_pins_are_not_slack` catches the opposite drift — a pin
+# left far ABOVE a shrunken file — but only past a 1 200-line slack window,
+# so it cannot police a 143-line gap. This comment is the policy; that test
+# is the backstop.)
+#
+# v0.2.95 (ratchet lane) — re-pinned DOWN to the measured 24005 (-54 against
+# the 24059 pin; -284 against the 24289 the embedding-correctness lane left
+# behind, which is what put this assertion in the red). That lane added the
+# WP-4/WP-6 seed work here and extracted as far as its own file boundary
+# allowed; the rest went where it always belonged, `vco_lib/install_weaviate.py`:
+#   * `_migrate_kg_named_vector_slots` (V0243-2, the 5-slot catalog migration);
+#   * `_detect_legacy_shared_kg_class` (PR-34, the pre-v0.2.12 class probe);
+#   * `_SEED_OWED_WORK_CONDITION_ID` + `_emit_context_change_incomplete_deferral`
+#     (WP-4's owed-work ledger entry).
+# install.py keeps a thin same-signature wrapper for the first two (their names
+# are the test suite's and main()'s call contract) and a one-line alias for the
+# constant; the emitter's single call site moved to the new home outright.
+# Bodies moved VERBATIM — the only edits are the renames the new home forces
+# (`_log_install_event` → the passed-in logger, `_make_deferral` → the passed-in
+# builder). ALL outside main() (+0 span; main() stays at its own 1687 pin).
+_TOTAL_LINES_MAX = 24005
 
 
 def _measure() -> tuple:
@@ -262,6 +301,13 @@ class TestInstallMainRatchet(unittest.TestCase):
         )
 
     def test_total_lines_soft_ratchet(self):
+        """install.py must not grow, and the pin must equal the measurement.
+
+        The pin is `wc -l install.py` EXACTLY, never "measured plus a little":
+        headroom is budget a later change spends without justifying itself,
+        and the justification is the point of the ratchet. Shrink the file,
+        then re-pin DOWNWARD.
+        """
         total, _ = _measure()
         self.assertLessEqual(
             total, _TOTAL_LINES_MAX,
@@ -274,7 +320,13 @@ class TestInstallMainRatchet(unittest.TestCase):
     def test_pins_are_not_slack(self):
         """Keep the ratchet honest: if install.py shrinks, tighten the pins
         (fails when the measured value drifts far below the pin, which
-        would let regrowth hide under stale slack)."""
+        would let regrowth hide under stale slack).
+
+        This is a BACKSTOP, not the policy: the windows below (400 / 1200)
+        are wide enough that a gap of a few dozen lines passes here. The
+        policy — TOTAL pinned at the measurement exactly — lives in the
+        `_TOTAL_LINES_MAX` comment and is enforced by review.
+        """
         total, span = _measure()
         self.assertGreater(
             span, _MAIN_SPAN_MAX - 400,

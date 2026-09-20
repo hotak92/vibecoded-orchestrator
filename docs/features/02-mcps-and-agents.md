@@ -75,6 +75,8 @@ Params: `title`, `content`, `node_type`, `tags`, `file_path` (relative or absolu
 
 File path resolution priority: (1) absolute path → written directly; (2) relative + `KG_BASE_DIR` set → `KG_BASE_DIR/file_path`; (3) relative fallback → inferred project root. Always check `file_written: true` and `absolute_path` in the response. Preferred workflow is writing `.md` directly and letting the `post-file-edit.sh` hook sync to Weaviate; this tool is for agents that cannot write files.
 
+A `warning` field appears — on success and on failure alike — when the call came from a folder that VCO never installed into (no `VCT_PROJECT_ID` and no `.claude/.vco-manifest.json`). The MCPs are registered globally and stay callable from any folder, so such a write is allowed rather than refused; the warning names the collection it landed in and points at the launcher's Adopt flow (Projects → Add project → Adopt this folder), which creates the manifest and syncs the folder's existing `knowledge/**/*.md` during setup. Surface it to the user — it is the only signal that arrives before a later read comes back empty. It is logged once per session; the JSON field rides every call.
+
 </details>
 
 ### `search_code_graph`
@@ -269,11 +271,6 @@ Windows users: `.claude/scripts/code-graph-analyze.ps1` PowerShell wrapper also 
 Query the code graph from the shell.
 
 Usage: `.claude/scripts/code-graph-query search "<concept>"` / `similar "<full_name>"` / `structure dependencies|callers|methods|extends|interactions "<target>"`. Backed by `query_code_graph.py`.
-
-### `cost-summary` CLI
-Print a summary of Claude API token costs from `~/.claude/metrics/costs.jsonl`.
-
-Portable entry point (Linux / macOS / Windows, stdlib-only Python, v0.2.54 Track G): `python .claude/scripts/cost-summary.py [--days N] [--session ID]`. The bash `cost-summary` wrapper survives as a POSIX shim delegating to the `.py`.
 
 ### `add_temporal_metadata.py`
 Backfill `valid_from` / `created` / `updated` fields in KG node YAML frontmatter from `git log` history. `--dry-run` previews changes; `--file PATH` scopes to one file.

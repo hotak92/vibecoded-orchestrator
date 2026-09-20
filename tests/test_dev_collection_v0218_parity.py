@@ -97,6 +97,15 @@ class _FakeWrapper:
         return self._all_slots[self.text_vector_slot]
 
 
+#: v0.2.95 WP-5 — "caller said nothing", distinct from an explicit ``None``
+#: (which means "the schema read FAILS"). Both are legitimate fixtures.
+_SCHEMA_DEFAULT = object()
+
+#: The slot `_FakeWrapper` reports as active. Named once so a fixture's
+#: declared schema and the wrapper's active slot cannot drift apart.
+_ACTIVE_SLOT = "qwen3_embed"
+
+
 def _fake_obj(
     *,
     uuid_: str = "00000000-0000-0000-0000-000000000001",
@@ -327,16 +336,45 @@ class SyncDocEmbedSkipTests(unittest.TestCase):
         cls._test_id = id(cls)
         cls._mod = _load_sync_module(cls._test_id)
 
+    def setUp(self) -> None:
+        # v0.2.95 WP-5: the named-vector schema probe is cached for the
+        # LIFETIME OF THE SYNC PROCESS, keyed by collection name — correct
+        # there (a class's schema does not change under a running sync; a
+        # migration is a separate consented operation), but these tests
+        # share one loaded module and one Dev collection name across
+        # fixtures that deliberately answer the probe differently.
+        self._mod._SLOT_SCHEMA_CACHE.clear()
+
     def _make_wrapper_with_coll(
         self,
         *,
         existing_objs: list | None = None,
         fetch_supports_include_vector: bool = True,
+        declared_slots: "tuple[str, ...] | None | object" = _SCHEMA_DEFAULT,
     ):
         """Build a `_FakeWrapper` whose `client.collections.get(name)`
-        returns a stand-in collection with the supplied `existing_objs`."""
+        returns a stand-in collection with the supplied `existing_objs`.
+
+        v0.2.95 WP-5: the collection now also answers the named-vector
+        SCHEMA probe, because the shared active-slot gate consults it
+        before it will veto a skip. ``declared_slots`` follows
+        ``vco_lib.kg_vector_slot.collection_vector_slots``' three-valued
+        contract: a tuple of slot names, ``()`` for a legacy class with
+        one UNNAMED vector, or ``None`` for "the schema could not be
+        read". A bare ``MagicMock()`` answers that probe with neither —
+        it reads as UNDETERMINABLE, which disables the gate, so a fixture
+        that means to exercise the gate must say what the class declares.
+        """
         wrapper = _FakeWrapper()
         coll = MagicMock()
+        if declared_slots is _SCHEMA_DEFAULT:
+            declared_slots = (_ACTIVE_SLOT, "openai_text_embed")
+        if declared_slots is None:
+            coll.config.get = MagicMock(side_effect=RuntimeError("schema read failed"))
+        else:
+            _cfg = MagicMock()
+            _cfg.vector_config = {name: object() for name in declared_slots}
+            coll.config.get = MagicMock(return_value=_cfg)
 
         existing_result = MagicMock()
         existing_result.objects = existing_objs or []
@@ -505,6 +543,88 @@ class SyncDocEmbedSkipTests(unittest.TestCase):
             "Warm-up case must re-embed to populate the new active slot",
         )
         coll.data.insert.assert_called_once()
+
+    def test_sync_doc_undeterminable_schema_does_not_force_reembed(self):
+        """v0.2.95 WP-5 — the narrowing, stated explicitly.
+
+        Same warm-up row as the test above (matching hash, active slot
+        empty, another slot populated), but the collection cannot report
+        its named-vector schema. Before v0.2.95 ``sync_doc`` judged this
+        per object and re-embedded; now it defers, because a schema read
+        that FAILED is the absence of an answer, and the failure modes of
+        guessing are asymmetric: guessing "slot empty" on a legacy class
+        with one UNNAMED vector re-embeds that whole collection on every
+        sync forever, and no re-embed can ever clear the objection (only
+        `migrate-collections` can add a slot). The standing rule this
+        follows is written down at `vco_lib/kg_vector_slot.py`: cannot
+        confirm → do nothing.
+        """
+        self._set_dev_collection()
+        content = "# Warm-up\n\nSchema probe fails here.\n"
+        expected_hash = self._mod._content_signature_excluding_updated(content)
+        existing = [
+            _fake_obj(
+                content_hash=expected_hash,
+                total_chunks=1,
+                chunk_num=1,
+                vector_slots={"openai_text_embed": [0.5] * 1536},
+            )
+        ]
+        wrapper, coll = self._make_wrapper_with_coll(
+            existing_objs=existing, declared_slots=None,
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._write_doc(Path(tmp), content)
+            self.assertTrue(self._mod.sync_doc(wrapper, doc))
+
+        coll.data.delete_by_id.assert_not_called()
+        self.assertEqual(
+            wrapper.embed_calls, [],
+            "an unreadable schema must not cost an embed call",
+        )
+
+    def test_sync_doc_old_client_skips_without_blanking_the_slot_name(self):
+        """v0.2.95 WP-5 — the promise this fast path already made, kept.
+
+        The fallback-fetch comment has always said a client that cannot
+        return vectors "falls back to the basic fetch and skips the
+        active-slot check". It did not: with no vectors in hand every row
+        scored "slot not populated" and the entire docs tree re-embedded
+        on every sync. The pre-existing old-client test could only reach
+        the skip by blanking ``text_vector_slot`` — a hack that was itself
+        the evidence. This test keeps a REAL slot name.
+        """
+        self._set_dev_collection()
+        content = "# Old client\n\nNo include_vector support here.\n"
+        expected_hash = self._mod._content_signature_excluding_updated(content)
+        existing = [
+            _fake_obj(
+                content_hash=expected_hash, total_chunks=1, chunk_num=1,
+                vector_slots=None,
+            )
+        ]
+        wrapper, coll = self._make_wrapper_with_coll(
+            existing_objs=existing, fetch_supports_include_vector=False,
+        )
+        # `obj.vector` stays the EMPTY DICT a real weaviate-client hands
+        # back when vectors were not requested — deliberately not None,
+        # which would be answered by a different (also-conservative)
+        # branch and would let this test pass without the flag under test.
+        self.assertEqual(existing[0].vector, {})
+        self.assertEqual(wrapper.text_vector_slot, _ACTIVE_SLOT)
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._write_doc(Path(tmp), content)
+            self.assertTrue(self._mod.sync_doc(wrapper, doc))
+
+        coll.data.delete_by_id.assert_not_called()
+        self.assertEqual(
+            wrapper.embed_calls, [],
+            "a degraded vector fetch re-embedded an unchanged doc",
+        )
 
     def test_sync_doc_reembeds_when_chunk_count_mismatches(self):
         """If existing objects' total_chunks (e.g. 3) disagrees with the

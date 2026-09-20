@@ -211,9 +211,17 @@ vct list [--project NAME]
     List secret keys for a project (names only, never values).
     Omit --project to list shared secrets.
 
-vct set --project NAME --key KEY  (reads value from stdin)
+vct set (--project NAME | --shared) --key KEY  (reads value from stdin)
     Store a secret. Never takes the value on the command line.
-    Writes to ~/.vct-secrets/projects/<NAME>/<KEY> with chmod 600.
+    --project NAME writes ~/.vct-secrets/projects/<NAME>/<KEY>;
+    --shared     writes ~/.vct-secrets/shared/<KEY>  — the cross-project
+                 fallback tier 2 reads at step 2, and the home for a
+                 machine-level credential such as a model-gateway vendor
+                 key (see CONFIGURATION.md, VCT_MODEL_GATEWAY_SECRET_PROJECT).
+    Both chmod 600. `--project shared` is ALIASED to --shared with a
+    warning: it used to create a project literally NAMED "shared" at
+    projects/shared/<KEY>, which no reader of the shared namespace
+    consults — `vct doctor --fix-shared-scope` migrates such orphans.
 
 vct get --key KEY [--project NAME] [--trusted]
     Print a secret to stdout. Requires --trusted in a TTY (tripwire

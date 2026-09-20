@@ -64,23 +64,29 @@ function Test-VctLadderVenvHasDeps {
 # because the value is file-backed and written by the canonical env projection
 # on every install and update.
 # PARITY: same line rule as `vco_lib/envfile.py::parse_env_lines` and the bash
-# sibling - first assignment wins, `export ` prefix tolerated, one quote pair
-# stripped.
+# sibling - LAST assignment wins (must match `source` semantics, so a user who
+# appends an override at the bottom of the file gets the same root here that
+# every hook's `source .claude\env` already gave them; see
+# tests/test_v0295_project_env_reader_precedence), `export ` prefix tolerated,
+# one quote pair stripped. Get-Content drops the line terminator, so a CRLF
+# file needs no extra handling on this side.
 function Get-VctLadderOrchestratorRootFromProjectEnv {
     param([string]$ScriptDir)
     $envFile = Join-Path $ScriptDir "..\env"
     if (-not (Test-Path $envFile)) { return $null }
+    $last = $null
     foreach ($line in (Get-Content -LiteralPath $envFile -ErrorAction SilentlyContinue)) {
         if ($line -match '^\s*(export\s+)?VCT_ORCHESTRATOR_ROOT\s*=\s*(.*)$') {
-            $val = $Matches[2].Trim()
-            if ($val.Length -ge 2 -and (
-                    ($val.StartsWith('"') -and $val.EndsWith('"')) -or
-                    ($val.StartsWith("'") -and $val.EndsWith("'")))) {
-                $val = $val.Substring(1, $val.Length - 2)
-            }
-            if ($val) { return $val }
-            return $null
+            $last = $Matches[2].Trim()
         }
+    }
+    if ($null -ne $last) {
+        if ($last.Length -ge 2 -and (
+                ($last.StartsWith('"') -and $last.EndsWith('"')) -or
+                ($last.StartsWith("'") -and $last.EndsWith("'")))) {
+            $last = $last.Substring(1, $last.Length - 2)
+        }
+        if ($last) { return $last }
     }
     return $null
 }
@@ -95,6 +101,48 @@ function Test-VctLadderVcoClone {
     if (-not (Test-Path (Join-Path $Candidate "install.py"))) { return $false }
     if (-not (Test-Path (Join-Path $Candidate "first-install.sh"))) { return $false }
     return $true
+}
+
+# Is $Path equal to $Root, or inside it? An empty $Root never matches (an
+# empty prefix would otherwise match every path and mis-attribute the tier).
+# Case-INSENSITIVE, unlike the bash sibling's `case` comparison: that is each
+# flavour matching its own filesystem's rule, not a parity break.
+function Test-VctLadderUnderRoot {
+    param([string]$Path, [string]$Root)
+    if (-not $Root -or -not $Path) { return $false }
+    $p = $Path.Replace('/', '\').TrimEnd('\')
+    $r = $Root.Replace('/', '\').TrimEnd('\')
+    if ($p -ieq $r) { return $true }
+    return $p.StartsWith($r + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# Which TIER produced the resolved interpreter, in the ladder's own order (the
+# first tier that could have supplied it is the tier that did - the resolve
+# loop walks the same order). "unknown" when nothing matched.
+#
+# Derived AFTER resolution rather than recorded during the candidate append, so
+# the candidate region stays nothing but tier appends - which is what the
+# cross-flavour order gate reads. PARITY: `vct_venv_ladder_tier` in the .sh
+# sibling, same labels, same order.
+function Get-VctLadderTier {
+    param([string]$Python)
+    if (-not $Python) { return "unknown" }
+    if ($env:VCT_VENV -and (Test-VctLadderUnderRoot $Python $env:VCT_VENV)) {
+        return "VCT_VENV"
+    }
+    if (Test-VctLadderUnderRoot $Python $env:VCT_INSTALL_ROOT) {
+        return "VCT_INSTALL_ROOT"
+    }
+    if (Test-VctLadderUnderRoot $Python $script:VctLadderEnvOrchRoot) {
+        return "VCT_ORCHESTRATOR_ROOT (env)"
+    }
+    if (Test-VctLadderUnderRoot $Python $script:VctLadderProjectEnvRoot) {
+        return ".claude/env VCT_ORCHESTRATOR_ROOT"
+    }
+    if (Test-VctLadderUnderRoot $Python $script:VctLadderCloneRoot) {
+        return "clone-relative"
+    }
+    return "unknown"
 }
 
 # LAYOUTS and INTERPRETER NAMES, both IN ORDER. The two lists and their order
@@ -136,6 +184,13 @@ function Get-VctLadderCandidates {
     $envOrchRoot = $env:VCT_ORCHESTRATOR_ROOT
     if ($envOrchRoot -and -not (Test-VctLadderVcoClone $envOrchRoot)) { $envOrchRoot = $null }
     if ($envOrchRoot -and ($envOrchRoot -eq $projectEnvRoot)) { $envOrchRoot = $null }
+
+    # Publish the two DERIVED roots (+ the clone root) so `Get-VctLadderTier`
+    # can attribute the winner without recomputing them. Set BEFORE the
+    # candidate region below, which must stay nothing but tier appends.
+    $script:VctLadderProjectEnvRoot = $projectEnvRoot
+    $script:VctLadderEnvOrchRoot = $envOrchRoot
+    $script:VctLadderCloneRoot = $ProjectRoot
 
     $candidates = @()
     if ($env:VCT_VENV) {
@@ -182,10 +237,15 @@ function Get-VctLadderCandidates {
 function Resolve-VctLadderPython {
     param([string]$ScriptDir, [string]$ProjectRoot, [string]$ImportProbe)
     $script:VctLadderCandidates = Get-VctLadderCandidates -ScriptDir $ScriptDir -ProjectRoot $ProjectRoot
+    $script:VctLadderTier = ""
     foreach ($cand in $script:VctLadderCandidates) {
         if ($cand -and (Test-Path $cand) -and (Test-VctLadderVenvHasDeps $cand $ImportProbe)) {
             $venvBinDir = Split-Path -Parent $cand
             $env:VIRTUAL_ENV = Split-Path -Parent $venvBinDir
+            # v0.2.95: WHICH root answered, for the wrapper's success
+            # disclosure. Derived from the winner, published as a script-scope
+            # variable so the caller needs no second resolution pass.
+            $script:VctLadderTier = Get-VctLadderTier $cand
             return $cand
         }
     }

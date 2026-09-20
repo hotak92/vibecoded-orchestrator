@@ -135,6 +135,14 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
     // returns 200 if the class exists, 404 if not.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
+        // A DISCRETE connect timeout, matching the sibling probe
+        // (`weaviate_schema_probe.rs`, which gained one in v0.2.75 and
+        // documents why): the overall `timeout` bounds a request that is
+        // being served, but an UNREACHABLE host is bounded by the OS
+        // connect backoff instead — long on Windows, where this probe was
+        // measured adding ~195 s to a CI job. Keep the two in step; if one
+        // gains a knob the other should too.
+        .connect_timeout(Duration::from_secs(1))
         .build()
         .ok();
     let Some(client) = client else {

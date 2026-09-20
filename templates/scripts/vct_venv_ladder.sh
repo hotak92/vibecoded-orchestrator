@@ -60,6 +60,19 @@
 #   LADDER_PYTHON      — the interpreter, or "" when no candidate qualified
 #   LADDER_CANDIDATES  — array of probed venv DIRECTORIES, in probe order
 #   LADDER_CLONE_ROOT  — the 2-up path, for the refusal's "not a clone" line
+#   LADDER_VENV        — the venv DIRECTORY that qualified, or "" (v0.2.95)
+#   LADDER_TIER        — which TIER produced it (v0.2.95), one of:
+#                        VCT_VENV · VCT_INSTALL_ROOT · VCT_ORCHESTRATOR_ROOT
+#                        (env) · .claude/env VCT_ORCHESTRATOR_ROOT ·
+#                        clone-relative · unknown
+#
+# WHY A TIER LABEL (v0.2.95): success was silent, and silence is how a field
+# install spent a session syncing nothing. Four trees on one machine held a
+# `weaviate_mcp`, three of them wrong; "which root am I running against?" was
+# unanswerable from the outside. The tier is derived AFTER the probe loop by
+# comparing the winner against the same roots the tiers were built from — not
+# recorded during the append, so the candidate region stays exactly the
+# sequence of tier appends the cross-flavour order gate reads.
 
 # Validate a venv by RUNNING the probe in it. Windows shapes
 # (`Scripts/python.exe`) are included so the wrappers work under Git Bash /
@@ -108,13 +121,19 @@ _vct_ladder_venv_has_deps() {
 _vct_ladder_orchestrator_root_from_project_env() {
     local env_file="$1/../env"
     [ -r "$env_file" ] || return 1
-    # First assignment wins, `export ` prefix tolerated, one quote pair
-    # stripped — the same line rule `vco_lib/envfile.py::parse_env_lines`
-    # applies, so the file has one meaning on both sides.
+    # LAST assignment wins — must match `source` semantics, so a user who
+    # appends an override at the bottom of the file gets the same root here
+    # that every hook's `source .claude/env` already gave them; see
+    # tests/test_v0295_project_env_reader_precedence. `export ` prefix
+    # tolerated, one quote pair stripped, trailing CR dropped (a Windows
+    # hand-edit writes CRLF) — the same line rule
+    # `vco_lib/envfile.py::parse_env_lines` applies, so the file has one
+    # meaning on both sides.
     local line
-    line="$(grep -m1 -E '^[[:space:]]*(export[[:space:]]+)?VCT_ORCHESTRATOR_ROOT=' \
-            "$env_file" 2>/dev/null)" || return 1
+    line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?VCT_ORCHESTRATOR_ROOT=' \
+            "$env_file" 2>/dev/null | tail -n 1)"
     [ -n "$line" ] || return 1
+    line="${line%$'\r'}"
     line="${line#*=}"
     line="${line%\"}"; line="${line#\"}"
     line="${line%\'}"; line="${line#\'}"
@@ -132,6 +151,46 @@ _vct_ladder_is_vco_orchestrator_clone() {
     [ -f "$1/install.py" ] || return 1
     [ -f "$1/first-install.sh" ] || return 1
     return 0
+}
+
+# Is $1 equal to $2, or a path INSIDE it? Empty $2 never matches (an empty
+# prefix would otherwise match every absolute path and mis-attribute the tier).
+_vct_ladder_under_root() {
+    [ -n "$2" ] || return 1
+    case "$1" in
+        "$2") return 0 ;;
+        "$2"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Echo which TIER produced `$LADDER_VENV`, in the ladder's own order (the
+# first tier that could have supplied it wins, which is the tier that DID —
+# the probe loop walks the same order). "unknown" when nothing matched, which
+# can only happen if a caller set LADDER_VENV itself.
+#
+# Derived, not recorded: keeping the attribution out of the candidate-append
+# region is what lets the cross-flavour order gate keep reading that region as
+# nothing but tier appends. PARITY: `Get-VctLadderTier` in the .ps1 sibling.
+vct_venv_ladder_tier() {
+    local v="${LADDER_VENV:-}"
+    [ -n "$v" ] || { printf '%s' "unknown"; return 0; }
+    if [ -n "${VCT_VENV:-}" ] && _vct_ladder_under_root "$v" "$VCT_VENV"; then
+        printf '%s' "VCT_VENV"; return 0
+    fi
+    if _vct_ladder_under_root "$v" "${VCT_INSTALL_ROOT:-}"; then
+        printf '%s' "VCT_INSTALL_ROOT"; return 0
+    fi
+    if _vct_ladder_under_root "$v" "${LADDER_ENV_ORCH_ROOT:-}"; then
+        printf '%s' "VCT_ORCHESTRATOR_ROOT (env)"; return 0
+    fi
+    if _vct_ladder_under_root "$v" "${LADDER_PROJECT_ENV_ROOT:-}"; then
+        printf '%s' ".claude/env VCT_ORCHESTRATOR_ROOT"; return 0
+    fi
+    if _vct_ladder_under_root "$v" "${LADDER_CLONE_ROOT:-}"; then
+        printf '%s' "clone-relative"; return 0
+    fi
+    printf '%s' "unknown"
 }
 
 # Resolve the interpreter. Candidates, canonical first: $VCT_VENV explicit
@@ -169,6 +228,14 @@ vct_venv_ladder_resolve() {
     fi
     # Same value from both channels ⇒ probe it once.
     [ -n "$env_orch_root" ] && [ "$env_orch_root" = "$project_env_root" ] && env_orch_root=""
+
+    # Remember the two DERIVED roots so `vct_venv_ladder_tier` can attribute
+    # the winner below without recomputing (and without re-reading the env
+    # file, which may have changed under a long-running caller).
+    LADDER_PROJECT_ENV_ROOT="$project_env_root"
+    LADDER_ENV_ORCH_ROOT="$env_orch_root"
+    LADDER_VENV=""
+    LADDER_TIER=""
 
     # The tier ORDER is the sequence of appends below, and nothing else may
     # live between the array's creation and the probe loop — the parity gate
@@ -217,6 +284,10 @@ vct_venv_ladder_resolve() {
     # (some libraries probe $VIRTUAL_ENV directly).
     if [ -n "$venv_path" ]; then
         LADDER_PYTHON="$(_vct_ladder_interp_for_candidate "$venv_path")"
+        LADDER_VENV="$venv_path"
+        # Read by the WRAPPERS (kg-sync's success line), not by this file.
+        # shellcheck disable=SC2034
+        LADDER_TIER="$(vct_venv_ladder_tier)"
         # VIRTUAL_ENV names the venv ROOT, not the interpreter. When the
         # candidate WAS the interpreter (the RT-4 `$VCT_VENV=/…/bin/python`
         # tier), the root is two directories up — both layouts

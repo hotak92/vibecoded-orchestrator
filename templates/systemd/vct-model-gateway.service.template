@@ -17,18 +17,35 @@
 # launcher/src-tauri/vct-hub/src/boot.rs; the two share a CLI contract
 # (--register-boot / --unregister-boot / --boot-status) but not code.
 #
-# Template substitutions:
-#   {{INSTALLED_AT_PATH}} — absolute path where this unit landed
-#   {{EXEC_START}}        — shell-quoted argv of the gateway entry point,
-#                           resolved at registration time (the console
-#                           script when present, else `<python> -m
-#                           model_router`), with the `serve` verb appended
-#   {{WORKING_DIR}}       — directory the daemon runs in
-#   {{STATE_DIR}}         — VCT state root pinned at registration time
-#   {{BOOT_LOG_FILE}}     — where systemd appends the PROCESS's own output
-#                           (startup refusals, tracebacks); the daemon's own
-#                           structured log is a separate file, so records
-#                           are never written twice
+# Template substitutions. NAMED WITHOUT THEIR BRACES on purpose (v0.2.95):
+# boot_service.render_template substitutes every occurrence of a token,
+# comments included, so a documented token here would be replaced by its
+# VALUE and this list would read as a copy of the unit rather than as
+# documentation of it. (In the XML-shaped siblings the same substitution is
+# not merely confusing but breaking — a value containing a double hyphen ends
+# an XML comment early — which is what made the rule worth stating.) The
+# braced forms appear below, in the unit itself.
+#
+#   INSTALLED_AT_PATH — absolute path where this unit landed
+#   EXEC_START        — shell-quoted argv of the gateway entry point,
+#                       resolved at registration time from the INSTALL ROOT's
+#                       venv (the console script when present, else
+#                       `<that venv's python> -m model_router`) and PROVEN to
+#                       run: `boot_service.register_model_gateway` runs the
+#                       candidate with the version flag and refuses to write
+#                       this file at all when none answers, rather than
+#                       leaving an ExecStart that cannot start. With the
+#                       `serve` verb appended.
+#   WORKING_DIR       — directory the daemon runs in
+#   STATE_DIR         — VCT state root pinned at registration time
+#   SECRET_PROJECT    — the per-project OVERRIDE for the scope the daemon
+#                       resolves vendor keys in. EMPTY on every install that
+#                       did not ask for one, which is what leaves the daemon
+#                       resolving its own install root at RUNTIME
+#   BOOT_LOG_FILE     — where systemd appends the PROCESS's own output
+#                       (startup refusals, tracebacks); the daemon's own
+#                       structured log is a separate file, so records are
+#                       never written twice
 #
 [Unit]
 Description=VCT model gateway (local Anthropic-shaped model picker)
@@ -37,14 +54,18 @@ Documentation=https://github.com/hotak92/vibecoded-orchestrator
 # session to exist, not the network.
 After=default.target
 # STOP a real crash loop. These two must be stated: systemd's defaults are 5
-# starts within 10 SECONDS, and the `RestartSec` below means a loop can never
-# reach 5 starts inside that window — so the default limit never fires and the
-# loop is unbounded. That is not theory: on 2026-09-08 this unit restarted
-# 1442 times over four hours (once every 10s) against a gateway that was
-# already running, appending 294 KB to the boot log.
-# 5 starts within 600s: a genuinely broken start gives up after ~50 seconds
-# and stays failed, where `systemctl --user status vct-model-gateway` shows
-# it, instead of hiding in a loop nobody looks at.
+# starts within 10 SECONDS, and the `RestartSec` this unit shipped with (10s)
+# meant a loop could never reach 5 starts inside that window — so the default
+# limit never fired and the loop was unbounded. That is not theory: on
+# 2026-09-08 this unit restarted 1442 times over four hours (once every 10s)
+# against a gateway that was already running, appending 294 KB to the boot log.
+# 5 starts within 600s: at the `RestartSec=2s` below a genuinely broken start
+# reaches the 5th attempt about 8 seconds in and then stays `failed`, where
+# `systemctl --user status vct-model-gateway` shows it, instead of hiding in a
+# loop nobody looks at. Being parked is the point AND the cost: a unit in
+# `failed` answers `start` with "start request repeated too quickly" and does
+# nothing, so anything that ensures this service must `reset-failed` first —
+# `vco_lib.gateway_ensure`, called from the SessionStart hook, is what does.
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -72,6 +93,22 @@ TimeoutStopSec=60s
 # VCT_STATE_DIR set does not silently contaminate production state on the
 # next login.
 Environment=VCT_STATE_DIR={{STATE_DIR}}
+# The PER-PROJECT OVERRIDE for the scope the daemon resolves vendor keys in.
+# Normally EMPTY, and empty is the working state, not a gap: an empty
+# assignment reads back as unset, and the daemon then resolves THIS INSTALL'S
+# orchestrator root itself, at startup (model_router.secrets). That is
+# deliberate. WorkingDirectory above is the state root, which is NOT a
+# registered project — and `agent_secrets` resolves its hub tier (the ONLY
+# route to an OS-keychain key) against `project or cwd()` — so before v0.2.95
+# every vendor request from a login-started gateway answered "no key found for
+# vendor X" while the identical key resolved in milliseconds from any
+# project's cwd (measured 2026-09-10). Resolving at RUNTIME rather than baking
+# a path here is what makes that fix survive a MOVED install: a frozen path
+# keeps naming the old one. Set this only to point the gateway at a specific
+# project's own key (that project's key then outranks the shared one);
+# `vco_lib.boot_service.resolve_gateway_secret_project` never derives a value
+# for it, and preserves one you set across every re-render.
+Environment=VCT_MODEL_GATEWAY_SECRET_PROJECT={{SECRET_PROJECT}}
 StandardOutput=append:{{BOOT_LOG_FILE}}
 StandardError=append:{{BOOT_LOG_FILE}}
 

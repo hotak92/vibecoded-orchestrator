@@ -50,6 +50,11 @@ _REAL_LIBS = (
     "codegraph-query.sh",
     "query-cache.sh",
     "resolve-vco-venv.sh",
+    # v0.2.95 (lane F10): "is this a code file" moved to ONE home. Without it
+    # the hook takes its conservative partial-install branch (NOT code) and
+    # the code-graph leg never launches — which is correct behaviour, but it
+    # is not the behaviour these sandboxes exist to exercise.
+    "code-extensions.sh",
 )
 
 # Minimal emit_additional_context that wraps the context in the PreToolUse JSON

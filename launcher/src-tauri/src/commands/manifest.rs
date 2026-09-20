@@ -21,8 +21,8 @@
 //!
 //!   1. `<install>/state/install-manifest.json` → `version` field
 //!      — written by install.py at every install / update / lightweight
-//!        run, and refreshed by `refresh_install_manifest` below from the
-//!        Rust update paths. **Authoritative when present.**
+//!        run, and by NOTHING else (v0.2.95 WP-1 — see below).
+//!        **Authoritative when present.**
 //!   2. `<install>/vct-module.json` → `version` field
 //!      — ships with every release, always present in a healthy tree.
 //!   3. `<install>/launcher/package.json` → `version` field
@@ -50,12 +50,27 @@
 //! refresh paths:
 //!
 //!   - `update_orchestrator_at` — refresh after file-copy completes.
-//!     The new `vct-module.json` is present in the install path post-copy,
-//!     so `read_version_from_install_files` returns the new version.
-//!   - `apply_launcher_update` — refresh after cargo+npm rebuild, before
-//!     respawn. The rebuilt binary's version source files are on disk;
-//!     the manifest now reflects the version the new binary is about to
-//!     run as.
+//!   - `force_resync_launcher`, and `apply_launcher_update`'s fallback when
+//!     `install.py` cannot run — refresh after the cargo+npm rebuild, before
+//!     respawn.
+//!
+//! **CORRECTED v0.2.95 (WP-1).** This list used to end "the manifest now
+//! reflects the version the new binary is about to run as", and priority 1
+//! above used to say `version` is "refreshed by `refresh_install_manifest`…
+//! from the Rust update paths". Both described the defect. NONE of the paths
+//! above runs `install.py`, so none of them installs anything beyond the
+//! launcher binary — venv, hooks, `templates/**`, MCP registrations, the KG
+//! seed and the schema all stay where they were. Writing the new version there
+//! made the completion marker attest work nothing had done, and made the
+//! resulting half-install invisible (prior review H1/H2/H3).
+//!
+//! So: **`install.py` is the only writer of `version`.** Priority 1 still holds
+//! — the manifest remains the authoritative answer to "what version is
+//! installed here", and it is authoritative precisely BECAUSE it now names the
+//! last version something actually installed. `refresh_install_manifest`
+//! advances `source_commit` / `source_branch` / `install_method` and sets
+//! `post_source_only`; see its own docs for how those turn the half-state into
+//! a visible, repairable one.
 //!
 //! Soft-fail contract: a manifest-write failure must NOT block the
 //! original action (update / launcher rebuild). The manifest is
@@ -64,7 +79,34 @@
 //!
 //! `installed_at` is preserved across refreshes — the field means "first
 //! ever successful install at this path", not "most recent install run".
-//! `completed_at` carries the latter.
+//! `completed_at` carries the latter, and for the same reason as `version` it
+//! is written ONLY by `install.py`: a run that installed nothing completed no
+//! install.
+//!
+//! ## Known shape: `installed: true` with NO `version` (v0.2.95 ship-gate MINOR-9)
+//!
+//! When the FIRST manifest this path ever gets is written here rather than by
+//! install.py (`refresh_creates_manifest_when_missing` — no prior file, so
+//! nothing to carry `version` from), the result is `{installed: true, …}` with
+//! `version` absent. That combination is deliberate on both legs and each leg
+//! is load-bearing somewhere else:
+//!
+//!   * `installed: true` — `check_install_status` reads a MISSING `installed`
+//!     as "install in progress / aborted" and refuses to promote the path, and
+//!     `doctor.probe_install_completeness` answers `unknown` rather than
+//!     `problem`. Omitting it here would disarm the very probe the
+//!     `post_source_only` flag exists to feed.
+//!   * no `version` — fabricating one from the source files is the WP-1 defect
+//!     in miniature: it would attest an install nothing performed.
+//!
+//! The consequence is worth naming because it is easy to misread as a bug:
+//! such a root reads as *installed at an unknown version* everywhere — and
+//! `read_version_from_install_files` then falls through to `vct-module.json`
+//! (priority 2) exactly as it does for any pre-manifest install, so
+//! `check_for_updates` leaves `install_stale` OFF rather than reporting a
+//! drift it cannot substantiate. Nothing here is silently wrong; the record is
+//! simply less specific than one install.py wrote. Do not "fix" it by
+//! inventing a version.
 
 use std::fs;
 use std::path::Path;
@@ -188,9 +230,8 @@ fn read_cargo_package_version(path: &Path) -> Option<String> {
 }
 
 /// Bug G: refresh `state/install-manifest.json` from the Rust-side
-/// update paths. Preserves `installed_at`; bumps `version` (re-read
-/// fresh from the install tree), `source_commit`, `source_branch`,
-/// `completed_at`, `install_method`. Other prior fields are passed
+/// update paths. Preserves `installed_at`; refreshes `source_commit`,
+/// `source_branch`, `install_method`. Other prior fields are passed
 /// through unchanged so we never regress sysinfo-derived fields we
 /// don't have access to from Rust (e.g. cpu_only flags from install.py
 /// CLI args).
@@ -200,8 +241,58 @@ fn read_cargo_package_version(path: &Path) -> Option<String> {
 /// to the user-initiated action (update / launcher rebuild).
 ///
 /// `install_method` describes which path triggered the refresh:
-///   - "launcher_update"          — apply_launcher_update / force_resync
+///   - "launcher_update"          — force_resync_launcher, and
+///     apply_launcher_update's fallback when install.py cannot run
 ///   - "orchestrator_update"      — update_orchestrator_at
+///
+/// # v0.2.95 WP-1: this function does NOT write `version`, and that is the point
+///
+/// **Every path that reaches here is a path that did NOT run `install.py`.**
+/// That is not an assumption about the future — it is what the two
+/// `install_method` values above ARE, and `vco_lib/doctor.py` independently
+/// declares the same pair as `RUST_INSTALL_METHODS`, "install_method values only
+/// the RUST writer produces … seeing one of these means the LAST hand on the
+/// marker was a path that never ran install.py".
+///
+/// Until v0.2.95 this function nonetheless re-read `version` FRESH from the
+/// files the pull had just landed and stamped `completed_at: now` beside
+/// `installed: true`. So a launcher-only update — new source, OLD venv, OLD
+/// hooks, OLD `templates/**`, OLD MCP registrations, OLD KG seed, OLD schema —
+/// wrote a completion marker attesting a full install at the NEW version. The
+/// half-updated state was durable, and worse, INVISIBLE: after the pull the
+/// badge's commits-behind count is zero, so the one surface that would have
+/// repaired it stopped offering itself (prior review H1/H2/H3, §4.1).
+///
+/// Now `version` is left at whatever the last real installer run recorded, and
+/// **install.py is the only writer of it**. Two things follow, and they are the
+/// whole repair:
+///
+/// * `check_for_updates` computes `install_stale = source_version !=
+///   installed_version` from `vct-module.json` vs THIS field. Freezing it makes
+///   that comparison true the moment a source-only path moves the tree — so the
+///   badge lights up and offers `apply_pending_install`, which is exactly
+///   `install.py --update` without a redundant pull. The repair affordance
+///   appears by itself.
+/// * `source_commit` IS advanced, deliberately. It is the leg
+///   `doctor.probe_install_completeness` convicts on when the version strings
+///   happen to agree: it compares this record against `.claude/.vco-manifest.json`,
+///   which ONLY the bundle engine writes. Freezing the commit too would leave
+///   both records agreeing and make the half-state unprovable again.
+///
+/// `post_source_only` is written so the state is named rather than inferred
+/// from "version and source_commit disagree", and so the case the version
+/// comparison CANNOT see is still caught: a source-only advance between two
+/// commits carrying the same version string (every mid-cycle commit on a
+/// release branch) leaves `source_version == installed_version` and would
+/// otherwise be silent. `check_for_updates` reads it as a second, independent
+/// trigger for `install_stale`.
+///
+/// Nothing needs to clear the flag: `install.py::_write_install_manifest`
+/// rebuilds the manifest from a literal dict, carrying over only the specific
+/// fields it names (`installed_at`, `container_runtime`, the GPU triple), so a
+/// real installer run drops it automatically. That is a property worth not
+/// breaking — if this writer ever gains a field install.py should own, the same
+/// check applies.
 pub(crate) fn refresh_install_manifest(
     install_path: &Path,
     install_method: &str,
@@ -228,7 +319,7 @@ pub(crate) fn refresh_install_manifest(
     // sysinfo-derived flags (cpu_only / use_gpu / low_resource / skipped /
     // python_*). If a field doesn't exist in prior, we don't fabricate it.
     obj.entry("installed_at")
-        .or_insert_with(|| Value::String(now.clone()));
+        .or_insert_with(|| Value::String(now));
     obj.entry("schema_version")
         .or_insert_with(|| Value::Number(1u64.into()));
     obj.insert("installed".to_string(), Value::Bool(true));
@@ -237,15 +328,15 @@ pub(crate) fn refresh_install_manifest(
         Value::String(install_path.display().to_string()),
     );
     obj.insert("install_method".to_string(), Value::String(install_method.to_string()));
-    obj.insert("completed_at".to_string(), Value::String(now));
 
-    // version: re-read fresh from disk every refresh — this is the
-    // whole point of Bug G. Pass include_manifest=false because we're
-    // ABOUT to overwrite the manifest; consulting it as a source would
-    // just re-write the stale value (the bug we're fixing).
-    if let Some(v) = read_version_from_install_files_impl(install_path, false) {
-        obj.insert("version".to_string(), Value::String(v));
-    }
+    // v0.2.95 WP-1: `version` and `completed_at` are NOT touched here. See the
+    // section on this function for the full argument; the short form is that
+    // both attest an installer run, no caller of this function performs one,
+    // and stamping them anyway is what made the half-updated state both
+    // durable and invisible. `completed_at` keeps the last installer run's
+    // timestamp, which is also what `doctor.probe_install_completeness`'s
+    // acquittal leg compares the `session ok` log row against.
+    obj.insert("post_source_only".to_string(), Value::Bool(true));
 
     // source_commit + source_branch: read fresh from .git/ if present.
     let (commit, branch) = read_git_rev(install_path);
@@ -491,12 +582,19 @@ mod tests {
 
     // -------- refresh_install_manifest --------
 
+    /// v0.2.95 WP-1 — the core of the fix, stated as the state it prevents.
+    ///
+    /// A launcher-only path pulled new source over an install completed at
+    /// 0.1.6. Pre-WP-1 this function then wrote `version: "0.2.8"` (re-read
+    /// from the files the pull had just landed) with `completed_at: now`
+    /// beside `installed: true`, and the install-completion marker attested
+    /// work that nothing had done.
     #[test]
-    fn refresh_preserves_installed_at_and_bumps_version() {
+    fn refresh_does_not_advance_version_or_completed_at_on_a_path_that_skipped_install_py() {
         let p = tmp();
         let state = p.join("state");
         fs::create_dir_all(&state).unwrap();
-        // Prior manifest at v0.1.6 (the real-world stale case).
+        // Prior manifest: a REAL install.py run finished at 0.1.6.
         fs::write(
             state.join("install-manifest.json"),
             r#"{
@@ -510,24 +608,43 @@ mod tests {
             }"#,
         )
         .unwrap();
-        // New version source available — vct-module.json says v0.2.8.
+        // The pull landed 0.2.8's source files.
         fs::write(p.join("vct-module.json"), r#"{"version":"0.2.8"}"#).unwrap();
 
         refresh_install_manifest(&p, "orchestrator_update").unwrap();
 
         let txt = fs::read_to_string(state.join("install-manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+
+        // THE assertion: `version` still names the last version anything
+        // actually installed. install.py is its only writer.
+        assert_eq!(
+            v.get("version").and_then(|s| s.as_str()),
+            Some("0.1.6"),
+            "a path that did not run install.py must not claim the new version — \
+             freezing this is what makes `install_stale` true and puts the repair \
+             back in front of the user"
+        );
+        // …and `completed_at` still names when that run completed, which is what
+        // `doctor.probe_install_completeness` compares the install log against.
+        assert_eq!(
+            v.get("completed_at").and_then(|s| s.as_str()),
+            Some("2026-05-06T10:01:00Z"),
+            "completed_at attests a completed installer run; none happened here"
+        );
+        // The state is NAMED, not left to be inferred from two disagreeing fields.
+        assert_eq!(v.get("post_source_only").and_then(|b| b.as_bool()), Some(true));
+        // `source_commit` is still advanced when there is one to read — it is the
+        // leg the doctor probe convicts on when the version strings agree. (No
+        // `.git` in this fixture, so only the flag carries it here; the
+        // advance itself is unchanged code and covered by `read_git_rev`.)
+        assert_eq!(
+            v.get("install_method").and_then(|s| s.as_str()),
+            Some("orchestrator_update")
+        );
         assert_eq!(v.get("installed_at").and_then(|s| s.as_str()), Some("2026-05-06T10:00:00Z"));
-        assert_eq!(v.get("version").and_then(|s| s.as_str()), Some("0.2.8"));
-        assert_eq!(v.get("install_method").and_then(|s| s.as_str()), Some("orchestrator_update"));
         // Preserved field from prior manifest.
         assert_eq!(v.get("cpu_only").and_then(|b| b.as_bool()), Some(false));
-        // completed_at must be different from installed_at — it's the
-        // refresh-now timestamp.
-        assert_ne!(
-            v.get("completed_at").and_then(|s| s.as_str()),
-            Some("2026-05-06T10:01:00Z")
-        );
         fs::remove_dir_all(&p).ok();
     }
 
@@ -538,8 +655,23 @@ mod tests {
         refresh_install_manifest(&p, "launcher_update").unwrap();
         let txt = fs::read_to_string(p.join("state").join("install-manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        // `installed: true` is PRESERVED behaviour and load-bearing in two
+        // places: `check_install_status` treats a manifest whose `installed` is
+        // missing as "install in progress / aborted" and refuses to promote the
+        // path, and `doctor.probe_install_completeness` returns `unknown`
+        // instead of `problem` — i.e. dropping it here would have DISARMED the
+        // very probe this change exists to feed.
         assert_eq!(v.get("installed").and_then(|b| b.as_bool()), Some(true));
-        assert_eq!(v.get("version").and_then(|s| s.as_str()), Some("0.2.8"));
+        // No prior installer run recorded ⇒ no version to carry, and none is
+        // fabricated from the source files. `read_version_from_install_files`
+        // then falls through to `vct-module.json` exactly as it does for any
+        // pre-manifest install, and `check_for_updates` leaves `install_stale`
+        // off rather than reporting a version drift it cannot substantiate.
+        assert!(
+            v.get("version").is_none(),
+            "a first write by a non-installer path must not invent a version"
+        );
+        assert_eq!(v.get("post_source_only").and_then(|b| b.as_bool()), Some(true));
         // installed_at gets stamped to now when prior was absent.
         assert!(v.get("installed_at").and_then(|s| s.as_str()).is_some());
         fs::remove_dir_all(&p).ok();
@@ -560,7 +692,8 @@ mod tests {
         refresh_install_manifest(&p, "orchestrator_update").unwrap();
         let txt = fs::read_to_string(state.join("install-manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-        assert_eq!(v.get("version").and_then(|s| s.as_str()), Some("0.2.8"));
+        assert_eq!(v.get("installed").and_then(|b| b.as_bool()), Some(true));
+        assert_eq!(v.get("post_source_only").and_then(|b| b.as_bool()), Some(true));
         fs::remove_dir_all(&p).ok();
     }
 }

@@ -94,6 +94,22 @@ _KG_BINDING_PREFIX_ADOPT_SUFFIXES: tuple[str, ...] = (
 )
 
 
+def _is_fixture_shaped(class_name: str) -> bool:
+    """Is ``class_name``'s project stem one of VCO's test-fixture names?
+
+    The rule's ONE home is :mod:`vco_lib.fixture_class_guard`, beside the write
+    guard that refuses these classes. Soft-fail to False: a guard defect must
+    never turn into "adopt nothing", which would be a silent regression of the
+    prefix-adopt pass itself.
+    """
+    try:
+        from vco_lib.fixture_class_guard import fixture_stem_of
+
+        return fixture_stem_of(class_name) is not None
+    except Exception:  # noqa: BLE001 — a guard defect is not a verdict
+        return False
+
+
 def _count_weaviate_class_objects(
     weaviate_url: str, class_name: str,
 ) -> Optional[int]:
@@ -361,6 +377,18 @@ def _prefix_adopt_kg_bindings_pass(
             if cand == coll_name:
                 # Won't happen (we already filtered exact-match above),
                 # but keep the guard defensively.
+                continue
+            if _is_fixture_shaped(cand):
+                # v0.2.95 F3 (adjacent site). This pass adopts by PREFIX, and
+                # a fixture-stemmed class is one VCO's own write guard REFUSES
+                # (`fixture_class_guard`), so adopting it would hand the
+                # project a collection every later write bounces off — the
+                # same defect the evidence scan's `_unbindable_fixture_class`
+                # closes one surface over. Reachable only for a project whose
+                # own prefix is a fixture stem, which the add-time guard has
+                # refused since v0.2.94; the rule belongs here anyway, because
+                # "VCO will not write there" and "VCO will not BIND there"
+                # must not be able to drift apart.
                 continue
             cnt = _count(cand)
             if cnt is None:

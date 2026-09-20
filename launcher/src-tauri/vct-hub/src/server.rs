@@ -18,9 +18,9 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::{
-    api, auth, chat_model_context_api, cli_api, config_api, db, infra_watchdog, lifecycle_api,
-    mcp_tool_grants_api, module_db_api, module_supervisor, modules_api, project_state_api,
-    project_tokens, rl_events_api, secrets_api, weaviate_probe,
+    api, auth, chat_model_context_api, cli_api, config_api, db, gateway_watchdog, infra_watchdog,
+    lifecycle_api, mcp_tool_grants_api, module_db_api, module_supervisor, modules_api,
+    project_state_api, project_tokens, rl_events_api, secrets_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -333,6 +333,16 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // boot-time `services_start_all` + the SessionStart hook remain the
     // cold-start path; the watchdog is the always-on safety net.
     infra_watchdog::spawn_infra_watchdog(launcher_state.clone());
+
+    // v0.2.95 (R5c): supervision for the model GATEWAY — a process, not a
+    // container, so it gets its own task rather than a row in the watchdog
+    // above (see that module's `CANONICAL_INFRA_SERVICES` doc). The hub is
+    // the always-on service (ruling R20), so it is where "restart it if it
+    // crashes, and log the reason when it cannot be restarted" belongs. The
+    // SessionStart hook remains the cold-start path; this is the always-on
+    // one, and it heals through the SAME `vco_lib.gateway_ensure` entry
+    // point rather than a second copy of the start logic.
+    gateway_watchdog::spawn_gateway_watchdog(launcher_state.clone());
 
     // E-2: log the ACTUAL bind host, not a hardcoded "127.0.0.1" (the prior
     // string drifted from the real 0.0.0.0 bind). Loopback is always reachable

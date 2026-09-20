@@ -1154,8 +1154,8 @@ class HookMergeSupersedeTests(unittest.TestCase):
         # The real shipped shape: the template `Stop` group carries 3 inner
         # hooks; a project on a prior bundle has only the first 2. Updating
         # must add stop-drain-citations EXACTLY ONCE and NOT re-introduce
-        # cost-tracker / notify-stop as a duplicate second entry.
-        cost = "bash .claude/hooks/cost-tracker.sh"
+        # stop-codegraph-reminder / notify-stop as a duplicate second entry.
+        reminder = "bash .claude/hooks/stop-codegraph-reminder.sh"
         notify = "bash .claude/hooks/notify-stop.sh"
         drain = "bash .claude/hooks/stop-drain-citations.sh"
         user_hooks = {
@@ -1163,7 +1163,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": cost},
+                        {"type": "command", "command": reminder},
                         {"type": "command", "command": notify},
                     ],
                 },
@@ -1174,7 +1174,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": cost},
+                        {"type": "command", "command": reminder},
                         {"type": "command", "command": notify},
                         {"type": "command", "command": drain},
                     ],
@@ -1184,7 +1184,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
         merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
         cmds = self._cmds(merged, "Stop")
         self.assertEqual(
-            cmds.count(cost), 1, f"cost-tracker must not be duplicated; got {cmds}"
+            cmds.count(reminder), 1, f"stop-codegraph-reminder must not be duplicated; got {cmds}"
         )
         self.assertEqual(
             cmds.count(notify), 1, f"notify-stop must not be duplicated; got {cmds}"
@@ -1197,11 +1197,11 @@ class HookMergeSupersedeTests(unittest.TestCase):
     def test_new_inner_hook_append_preserves_per_hook_config(self):
         # The appended inner-hook must carry its own timeout/async, not the
         # sibling's, and not the whole template group.
-        cost = "bash .claude/hooks/cost-tracker.sh"
+        reminder = "bash .claude/hooks/stop-codegraph-reminder.sh"
         drain = "bash .claude/hooks/stop-drain-citations.sh"
         user_hooks = {
             "Stop": [
-                {"matcher": "", "hooks": [{"type": "command", "command": cost, "timeout": 5}]},
+                {"matcher": "", "hooks": [{"type": "command", "command": reminder, "timeout": 5}]},
             ],
         }
         template_hooks = {
@@ -1209,7 +1209,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": cost, "timeout": 5},
+                        {"type": "command", "command": reminder, "timeout": 5},
                         {"type": "command", "command": drain, "timeout": 30, "async": True},
                     ],
                 },
@@ -1229,13 +1229,13 @@ class HookMergeSupersedeTests(unittest.TestCase):
     def test_inner_hook_merge_is_idempotent(self):
         # Re-running the merge against an already-up-to-date project must not
         # grow the command list.
-        cost = "bash .claude/hooks/cost-tracker.sh"
+        reminder = "bash .claude/hooks/stop-codegraph-reminder.sh"
         notify = "bash .claude/hooks/notify-stop.sh"
         drain = "bash .claude/hooks/stop-drain-citations.sh"
         stop_group = {
             "matcher": "",
             "hooks": [
-                {"type": "command", "command": cost},
+                {"type": "command", "command": reminder},
                 {"type": "command", "command": notify},
                 {"type": "command", "command": drain},
             ],
@@ -1243,7 +1243,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
         # First merge brings the project current.
         once = project_init._merge_hooks_for_bundle(
             {"Stop": [{"matcher": "", "hooks": [
-                {"type": "command", "command": cost},
+                {"type": "command", "command": reminder},
                 {"type": "command", "command": notify},
             ]}]},
             {"Stop": [stop_group]},
@@ -1253,14 +1253,14 @@ class HookMergeSupersedeTests(unittest.TestCase):
         cmds_once = sorted(self._cmds(once, "Stop"))
         cmds_twice = sorted(self._cmds(twice, "Stop"))
         self.assertEqual(cmds_once, cmds_twice, "merge is idempotent — no growth")
-        self.assertEqual(cmds_twice.count(cost), 1)
+        self.assertEqual(cmds_twice.count(reminder), 1)
         self.assertEqual(cmds_twice.count(notify), 1)
         self.assertEqual(cmds_twice.count(drain), 1)
 
     def test_user_custom_inner_hook_in_group_preserved_when_inner_appended(self):
         # A user's OWN custom Stop command coexisting with VCO commands in the
         # same group must survive while the new VCO inner-hook is added.
-        cost = "bash .claude/hooks/cost-tracker.sh"
+        reminder = "bash .claude/hooks/stop-codegraph-reminder.sh"
         drain = "bash .claude/hooks/stop-drain-citations.sh"
         custom = "bash ./scripts/my-own-stop-hook.sh"
         user_hooks = {
@@ -1268,7 +1268,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": cost},
+                        {"type": "command", "command": reminder},
                         {"type": "command", "command": custom},
                     ],
                 },
@@ -1279,7 +1279,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": cost},
+                        {"type": "command", "command": reminder},
                         {"type": "command", "command": drain},
                     ],
                 },
@@ -1289,23 +1289,23 @@ class HookMergeSupersedeTests(unittest.TestCase):
         cmds = self._cmds(merged, "Stop")
         self.assertIn(custom, cmds, "user's own Stop hook must be preserved")
         self.assertEqual(cmds.count(custom), 1, "user hook not duplicated")
-        self.assertEqual(cmds.count(cost), 1, "shared cost-tracker not duplicated")
+        self.assertEqual(cmds.count(reminder), 1, "shared reminder hook not duplicated")
         self.assertEqual(cmds.count(drain), 1, "new VCO inner-hook appended once")
 
     def test_inner_granularity_does_not_regress_supersede(self):
         # Stream-G supersede must still replace a stale backslash command even
         # when the per-command append path is exercised: the template Stop
-        # group has a current cost-tracker + a new drain; the user has a STALE
-        # backslash cost-tracker. Uses the real shipped command shapes (full
+        # group has a current reminder hook + a new drain; the user has a STALE
+        # backslash reminder. Uses the real shipped command shapes (full
         # PowerShell flag string) so the `-File` value resolves an identity.
-        # Result: stale gone, current cost once, drain appended once.
-        stale_cost = (
+        # Result: stale gone, current reminder once, drain appended once.
+        stale_reminder = (
             "powershell -NoProfile -ExecutionPolicy Bypass -File "
-            ".claude\\hooks\\cost-tracker.ps1"
+            ".claude\\hooks\\stop-codegraph-reminder.ps1"
         )
-        current_cost = (
+        current_reminder = (
             "powershell -NoProfile -ExecutionPolicy Bypass -File "
-            ".claude/hooks/cost-tracker.ps1"
+            ".claude/hooks/stop-codegraph-reminder.ps1"
         )
         drain = (
             "powershell -NoProfile -ExecutionPolicy Bypass -File "
@@ -1313,7 +1313,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
         )
         user_hooks = {
             "Stop": [
-                {"matcher": "", "hooks": [{"type": "command", "command": stale_cost}]},
+                {"matcher": "", "hooks": [{"type": "command", "command": stale_reminder}]},
             ],
         }
         template_hooks = {
@@ -1321,7 +1321,7 @@ class HookMergeSupersedeTests(unittest.TestCase):
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": current_cost},
+                        {"type": "command", "command": current_reminder},
                         {"type": "command", "command": drain},
                     ],
                 },
@@ -1329,10 +1329,10 @@ class HookMergeSupersedeTests(unittest.TestCase):
         }
         merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
         cmds = self._cmds(merged, "Stop")
-        self.assertNotIn(stale_cost, cmds, "stale backslash command superseded")
-        self.assertEqual(cmds.count(current_cost), 1, "current cost-tracker once")
+        self.assertNotIn(stale_reminder, cmds, "stale backslash command superseded")
+        self.assertEqual(cmds.count(current_reminder), 1, "current reminder hook once")
         self.assertEqual(cmds.count(drain), 1, "new drain inner-hook appended once")
-        self.assertEqual(len(cmds), 2, f"exactly current-cost + drain; got {cmds}")
+        self.assertEqual(len(cmds), 2, f"exactly current-reminder + drain; got {cmds}")
 
 
 # ---------------------------------------------------------------------------

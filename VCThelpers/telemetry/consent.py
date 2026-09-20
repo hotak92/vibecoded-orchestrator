@@ -48,7 +48,7 @@ VibeCoded Tools collects:
   - Routing decisions metadata (agent selection, outcomes)   [OPT-IN]
   - Tool usage patterns (tool names + timing, no content)    [OPT-IN]
 
-Full details: vibecodedtools.it/privacy
+Full details: vibecodedtools.com/privacy
 Opt out entirely: set VIBECODED_TELEMETRY=false in your environment
 
 Accept opt-in items? [Y/n]: """

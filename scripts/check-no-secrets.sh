@@ -41,8 +41,17 @@ BLOCKLIST=(
   # is project-specific and not present in legitimate code.
   "wh_vct_ls_"
 
-  # Supabase project ref leaked alongside the webhook secret. The public
-  # alias https://api.vibecodedtools.it/* should be used instead.
+  # Supabase project ref leaked alongside the webhook secret. There is no
+  # "public alias" to point at, contrary to what this comment claimed until
+  # v0.2.95: the host it named (`https://api.vibecodedtools.it/*`) was never
+  # created — `dig` returns NXDOMAIN, verified 2026-05-06, and the default
+  # that used it was retired then (see `_DEFAULT_VALIDATE_URL` in
+  # VCThelpers/license/validator.py for the full history and the two reasons
+  # the DNS record was not added instead).
+  # What actually replaces the literal is CONFIGURATION: the validate-tier
+  # endpoint is resolved at runtime from VIBECODED_LICENSE_URL /
+  # VCT_VALIDATE_TIER_URL, defaulting to the Supabase function URL — so no
+  # project ref belongs in committed source, which is what this row enforces.
   # Pattern matches the first 6 chars of the 20-char ref — enough to
   # identify it without re-stating the full value.
   "ltnlwh"

@@ -52,10 +52,10 @@ from vco_lib.codegraph_content_hash import (
     _content_hash_for_object,
 )
 from vco_lib.codegraph_extractor_generation import (
+    EXTRACTOR_GENERATION_NON_BUMPS,
     EXTRACTOR_GENERATION_BUMPS,
     REASON_CROSSES_BUMP,
     REASON_NO_GRAPH,
-    parse_semver,
     decide,
 )
 
@@ -83,16 +83,26 @@ def test_the_ladder_still_covers_the_release_being_tagged() -> None:
     """Duplicated deliberately from WP-5's delivery file: the coordinator's
     version bump is part of this lane's delivery too, and a lane that does not
     assert it cannot claim its fixes ship."""
-    text = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    assert m, "pyproject.toml has no top-level version"
-    newest = parse_semver(EXTRACTOR_GENERATION_BUMPS[-1])
-    declared = parse_semver(m.group(1))
-    assert newest is not None and declared is not None
-    assert newest >= declared, (
-        f"ladder ends at {EXTRACTOR_GENERATION_BUMPS[-1]}, package version is "
-        f"{m.group(1)} — append the release version or WP-5b reaches nobody"
+    def _pkg_version() -> str:
+        text = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        assert m, "pyproject.toml has no top-level version"
+        return m.group(1)
+
+    covered_bump = _pkg_version() in EXTRACTOR_GENERATION_BUMPS
+    covered_non = _pkg_version() in EXTRACTOR_GENERATION_NON_BUMPS
+    assert covered_bump != covered_non, (
+        f"release {_pkg_version()} appears in "
+        f"{'BOTH' if covered_bump else 'NEITHER'} EXTRACTOR_GENERATION_BUMPS and "
+        "EXTRACTOR_GENERATION_NON_BUMPS \u2014 decide which it is and record why. "
+        "Appending to the ladder charges every project with a graph one forced "
+        "re-walk; recording a non-bump costs users nothing. The wrong answer is "
+        "the one taken without looking at the extractor diff."
     )
+    if covered_non:
+        assert EXTRACTOR_GENERATION_NON_BUMPS[_pkg_version()].strip(), (
+            "a non-bump needs a reason naming the evidence, not an empty string"
+        )
 
 
 def test_an_existing_pre_bump_graph_owes_the_rewalk() -> None:

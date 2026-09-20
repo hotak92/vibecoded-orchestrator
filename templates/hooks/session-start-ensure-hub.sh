@@ -2,7 +2,14 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
-# SessionStart hook: ensure vct-hub is running (Step 9, v0.2.21).
+# SessionStart hook: ensure VCO's detached services are running — vct-hub
+# (Step 9, v0.2.21) and, since v0.2.95, a model gateway the user REGISTERED for
+# autostart plus the launcher GUI (tray-only, ruling R2). One hook for all
+# three, per ruling R20 ("one ensure mechanism, not a second"); the file name
+# predates the other two services and is kept because renaming a shipped hook
+# churns every project's manifest for nothing. `.vscode/tasks.json` runs this
+# same file on VS Code's `folderOpen`, which is what makes "auto-start when VS
+# Code starts" true without a Claude Code session.
 #
 # Idempotent: `python -m vco_lib.hub_ensure ensure` leaves a live hub alone
 # and otherwise invokes `vct-hub --start-if-not-running` (Step 5's CLI).
@@ -107,12 +114,12 @@ else
     __vco_hub_out="$("$RUN_PY" -m vco_lib.hub_ensure ensure --shell --repo-root "$REPO_ROOT" 2>"$__vco_hub_err")"
     __vco_hub_rc=$?
 fi
+__vco_hub_reported=0
 case "$__vco_hub_rc" in
     0|3|4) eval "$__vco_hub_out" ;;
     *)
         echo "session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$__vco_hub_rc): $(tail -n 3 "$__vco_hub_err" 2>/dev/null | tr '\n' ' ')"
-        rm -f "$__vco_hub_err"
-        exit 0
+        __vco_hub_reported=1
         ;;
 esac
 rm -f "$__vco_hub_err"
@@ -121,9 +128,95 @@ rm -f "$__vco_hub_err"
 # with a named reason; the hook reports it once and still exits 0, because a
 # SessionStart hook must never block Claude Code from starting.
 if [ "$__vco_hub_rc" != "0" ]; then
-    echo "[vct] ${VCO_HUB_REASON:-vct-hub could not be started}"
-    exit 0
+    [ "$__vco_hub_reported" = "1" ] || echo "[vct] ${VCO_HUB_REASON:-vct-hub could not be started}"
+else
+    debug "vct-hub $VCO_HUB_STATE: ${VCO_HUB_BINARY:-pid ${VCO_HUB_PID:-?}}"
 fi
 
-debug "vct-hub $VCO_HUB_STATE: ${VCO_HUB_BINARY:-pid ${VCO_HUB_PID:-?}}"
+# ---------------------------------------------------------------------------
+# Model gateway (v0.2.95, R5c) — ensure a REGISTERED gateway is running.
+#
+# Here rather than in a hook of its own, per ruling R20: one ensure mechanism
+# per session, not two registrations, two settings-template entries and two
+# copies of the update gate above. The file KEEPS its name — renaming a shipped
+# hook churns every project's manifest and the retirement registry for a
+# cosmetic gain — so read it as "ensure VCO's detached services", of which the
+# hub is the first and the gateway the second.
+#
+# It runs even when the hub leg failed, and that is deliberate: the gateway
+# starts fine without the hub (vendor-key resolution is lazy and retried), so
+# making its availability depend on the hub's would be an invented dependency.
+#
+# `vco_lib.gateway_ensure` decides everything; this leg is a call and a report.
+# The three states it can answer with:
+#   not_registered  — the default. Autostart is opt-in, so this is a silent,
+#                     successful no-op. NOTHING here ever registers it.
+#   running         — the daemon's own pid/port guard says so; nothing is done.
+#   registered_but_unrunnable (rc 3) — the eight-hour state of 2026-09-10.
+#                     Reported, never restarted: the init system is already
+#                     retrying an argv that fails the same way every time.
+# On Linux a start is preceded by `systemctl --user reset-failed`, because a
+# unit parked by StartLimitBurst answers `start` with "repeated too quickly"
+# and does nothing — a no-op exactly when the ensure is needed.
+# ---------------------------------------------------------------------------
+__vco_gw_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-gateway-ensure.$$"
+__vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell --folder "${CLAUDE_PROJECT_DIR:-$PWD}" 2>"$__vco_gw_err")"
+__vco_gw_rc=$?
+case "$__vco_gw_rc" in
+    0|3|4)
+        eval "$__vco_gw_out"
+        [ "$__vco_gw_rc" = "0" ] || echo "[vct] ${VCO_GATEWAY_REASON:-the model gateway could not be ensured}"
+        debug "model-gateway ${VCO_GATEWAY_STATE:-?}: ${VCO_GATEWAY_REASON:-}"
+        ;;
+    *)
+        echo "session-start-ensure-hub: vco_lib.gateway_ensure failed (rc=$__vco_gw_rc): $(tail -n 3 "$__vco_gw_err" 2>/dev/null | tr '\n' ' ')"
+        ;;
+esac
+rm -f "$__vco_gw_err"
+
+# ---------------------------------------------------------------------------
+# Launcher GUI (v0.2.95, R2) — ensure it is running, TRAY ONLY.
+#
+# The owner's ruling is "the launcher and the hub must auto-start when VS Code
+# starts". This file is already wired to that event twice: Claude Code fires it
+# on SessionStart, and `.vscode/tasks.json` runs it on VS Code's `folderOpen`
+# (no Claude Code session needed). A login-time boot registration — the other
+# candidate — fires at a DIFFERENT moment, starts a GUI for logins that never
+# open an editor, cannot bring back a launcher the user quit, and would need a
+# third home for boot registration. So the leg lives here, next to the hub's
+# and the gateway's, per ruling R20.
+#
+# `vco_lib.launcher_ensure` decides everything; this leg is a call and a
+# report. What it guarantees, and why each is not left to chance:
+#   * NO WINDOW STEAL — the spawn passes `--start-hidden`, which the launcher
+#     applies to its window config BEFORE any window exists. Nothing is
+#     mapped, activated or destroyed: that sequence as a side effect is what
+#     aborted mutter and killed a whole desktop session on 2026-09-09.
+#   * NO SECOND INSTANCE — it only spawns when a process scan finds nothing,
+#     and the launcher's single-instance plugin refuses a duplicate that races
+#     it (and, seeing the flag in the duplicate's argv, does not take focus
+#     either).
+#   * CHEAP — a launcher already running costs one `pgrep` and stops there.
+#   * SWITCHABLE — `launcher.session_autostart` in the launcher's Preferences →
+#     Startup, default ON. `VCT_DISABLE_LAUNCHER_AUTOSTART=1` is the env kill
+#     switch for CI and headless machines (a Linux session with no $DISPLAY is
+#     already skipped on its own).
+# No launcher binary on the machine is a SILENT success: exit 0, nothing said
+# unless VCO_HOOK_DEBUG=1.
+# ---------------------------------------------------------------------------
+__vco_gui_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-launcher-ensure.$$"
+__vco_gui_out="$("$RUN_PY" -m vco_lib.launcher_ensure ensure --shell --repo-root "$REPO_ROOT" 2>"$__vco_gui_err")"
+__vco_gui_rc=$?
+case "$__vco_gui_rc" in
+    0|3|4)
+        eval "$__vco_gui_out"
+        [ "$__vco_gui_rc" = "0" ] || echo "[vct] ${VCO_LAUNCHER_REASON:-the launcher could not be started}"
+        debug "launcher ${VCO_LAUNCHER_STATE:-?}: ${VCO_LAUNCHER_REASON:-}"
+        ;;
+    *)
+        echo "session-start-ensure-hub: vco_lib.launcher_ensure failed (rc=$__vco_gui_rc): $(tail -n 3 "$__vco_gui_err" 2>/dev/null | tr '\n' ' ')"
+        ;;
+esac
+rm -f "$__vco_gui_err"
+
 exit 0

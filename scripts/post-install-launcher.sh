@@ -1532,11 +1532,18 @@ if [ -z "$LAUNCHER_BIN" ]; then
     exit 0
 fi
 
-if [ "$AUTO_LAUNCH" -eq 0 ]; then
-    echo ""
-    echo "[launcher] --no-auto-launch set. Run start-launcher.sh to open the GUI."
-    exit 0
-fi
+# NOTE: the `--no-auto-launch` gate deliberately does NOT live here. It used to
+# (v0.2.53 .. v0.2.94), and because the desktop-shortcut step below was appended
+# one day later (9d48c080, 2026-04-28) it landed AFTER that `exit 0` — so
+# `--no-auto-launch` silently suppressed the desktop icon too. That made
+# `install.py::_run_desktop_icon_step`, whose entire purpose is creating the
+# icon, incapable of ever creating one on Linux/macOS: it always passes
+# `--no-auto-launch`. The flag means "skip the detached GUI spawn", nothing
+# more — the .ps1 sibling has always had it in the right place (it writes the
+# shortcuts, THEN checks -NoAutoLaunch) and its own header states the contract:
+# "install.py always passes this (it exits right after; the user opens the
+# launcher from the shortcut)". The gate now sits immediately before the spawn,
+# matching the sibling. (v0.2.95 WP-8.)
 
 # ----- Desktop shortcut (opt-out) ---------------------------------------------
 # Create a launcher shortcut so the user can double-click to open the GUI.
@@ -1658,9 +1665,6 @@ _create_macos_app_link() {
 
 _create_desktop_shortcut
 
-echo ""
-echo "Installation complete. Opening launcher..."
-
 # macOS Gatekeeper: anything downloaded carries the com.apple.quarantine
 # extended attribute. Until we have an Apple Developer ID cert, that means
 # Gatekeeper will block the unsigned launcher binary on first launch with
@@ -1680,6 +1684,17 @@ if [ "$OS" = "macos" ]; then
             ;;
     esac
 fi
+
+if [ "$AUTO_LAUNCH" -eq 0 ]; then
+    echo ""
+    echo "[launcher] --no-auto-launch set. Run start-launcher.sh to open the GUI."
+    _log_event "spawn" "skip" "--no-auto-launch set" \
+        "{\"desktop_shortcut\":\"attempted\"}"
+    exit 0
+fi
+
+echo ""
+echo "Installation complete. Opening launcher..."
 
 # Spawn detached. nohup + & + setsid (where available) decouples from this
 # shell so first-install can exit without killing the GUI. Redirect stdio

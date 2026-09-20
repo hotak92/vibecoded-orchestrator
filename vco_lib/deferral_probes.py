@@ -42,6 +42,7 @@ import platform
 import re
 import shutil
 import sys
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -65,9 +66,12 @@ _TRUNCATED_LIST_RE = re.compile(r"^\s*-\s+\.\.\. and \d+ more\s*$", re.MULTILINE
 #: Directories the legacy-entry sidecar sweep never descends into. Sidecars are
 #: parked NEXT TO the user-editable file the 3-way merge touched, and the
 #: allowlist (``CLAUDE.md``, ``knowledge/**``, ``docs/**``, ``.claude/**``)
-#: never reaches inside a VCS store, a virtualenv or a build output — so
-#: pruning these is not a heuristic about where sidecars "probably" are, it is
-#: the set of trees the emitter provably cannot write into.
+#: never reaches inside a VCS store, a virtualenv or a build output.
+#:
+#: These names are matched at any depth, which is only safe OUTSIDE the
+#: allowlisted trees: ``docs/build/`` and ``knowledge/target/`` are ordinary
+#: content directories whose files the merge does park sidecars beside. See
+#: :func:`_sidecar_scan_prunes_here`, which stands the pruning down there.
 _SIDECAR_SCAN_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "target", "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache",
@@ -78,6 +82,35 @@ _SIDECAR_SCAN_SKIP_DIRS = frozenset({
 #: completion, and a partial walk is NOT evidence of absence — the sweep
 #: returns ``None`` (unknown) rather than a conclusion it did not earn.
 _SIDECAR_SCAN_MAX_ENTRIES = 400_000
+
+#: Trees the sidecar allowlist reaches with a ``**`` glob, so a skip-name can
+#: legitimately occur INSIDE them as an ordinary content directory.
+_SIDECAR_ALLOWLIST_TREES = ("knowledge", "docs")
+
+
+def _sidecar_scan_prunes_here(root: Path, dirpath: str) -> bool:
+    """Is ``dirpath`` a place where the skip-name pruning must stand DOWN?
+
+    v0.2.95 F4 MINOR. :data:`_SIDECAR_SCAN_SKIP_DIRS` is matched by NAME at any
+    depth, and its comment justifies that as "the set of trees the emitter
+    provably cannot write into". That is true of a VCS store or a virtualenv
+    anywhere; it is NOT true of ``build``, ``dist`` or ``target`` inside the
+    allowlisted trees — ``docs/build/guide.md`` and ``knowledge/target/x.md``
+    are ordinary user-editable files the 3-way merge parks sidecars beside, and
+    the sweep skipped them, so a lone orphan there could still let the entry
+    clear. The comment was part of the defect, which is why it moved too.
+
+    Returns True once the walk is INSIDE ``knowledge/`` or ``docs/``, where
+    every subdirectory is content and nothing is pruned. Outside them the
+    pruning is unchanged (a repo's own ``node_modules`` / ``target`` is still
+    skipped, which is what keeps the sweep bounded). Unresolvable paths prune
+    normally: an unreadable path is not a reason to walk a build tree.
+    """
+    try:
+        parts = Path(dirpath).resolve().relative_to(Path(root).resolve()).parts
+    except (OSError, ValueError):
+        return False
+    return bool(parts) and parts[0] in _SIDECAR_ALLOWLIST_TREES
 
 
 @dataclass
@@ -161,10 +194,11 @@ def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
     visited = 0
     try:
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _SIDECAR_SCAN_SKIP_DIRS
-            ]
+            if not _sidecar_scan_prunes_here(root, dirpath):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in _SIDECAR_SCAN_SKIP_DIRS
+                ]
             visited += len(dirnames) + len(filenames)
             for name in filenames:
                 if ".from-upstream-" in name:
@@ -329,6 +363,18 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     delete a record of real outstanding work. Positive evidence only: a
     truncated list yields ``None`` (unknown, keep) unless a named sidecar is
     still present, which is positive evidence the other way (``True``).
+
+    v0.2.95 F4 — the NAMED-SUBSET hole, the same shape one layer in. An entry
+    is last-write-wins per condition_id, so run N's entry REPLACES run N-1's
+    while run N-1's sidecars stay on disk: the maintainer's own install has
+    ``CLAUDE.md.from-upstream-89a5530`` (named) beside
+    ``CLAUDE.md.from-upstream-f1f5488`` (not named by any live entry). Clearing
+    once the named ones are gone would retire the only record of the other and
+    leave it parked and invisible — "cleared on a subset of real outstanding
+    work", which is exactly what the truncation arm above exists to refuse. So
+    the complete-list arm ends in the SAME bounded sweep the list-less arm
+    uses: every sidecar this condition can create is accounted for, not the
+    subset one entry happened to name.
     """
     paths = upstream_sidecar_paths(ctx.entry)
     if not paths:
@@ -342,7 +388,7 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
         return None
     if sidecar_list_is_truncated(ctx.entry):
         return None
-    return False
+    return any_upstream_sidecar_on_disk(ctx.folder)
 
 
 def launcher_dist_still_dirty(ctx: ProbeContext) -> Optional[bool]:
@@ -632,7 +678,157 @@ def code_embed_image_still_stale(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
+    """``gateway_registered_but_unrunnable`` — can the registration run YET?
+
+    The SAME reading :func:`vco_lib.gateway_ensure.gateway_status` returns, so
+    the probe that clears the entry and the two sites that emit it (the
+    SessionStart ensure and the doctor) cannot disagree. It reads the argv back
+    out of the INSTALLED artefact and runs it with ``--version``; nothing is
+    started and nothing is written.
+
+    Returns:
+        True  — still registered, still unable to run.
+        False — provably over: either the registration now runs, or the
+                gateway is running, or it is no longer registered at all
+                (an entry about a registration that does not exist describes
+                nothing).
+        None  — never reached today; kept as the honest answer if a future
+                state cannot be classified, because "could not look" must not
+                read as "fixed".
+    """
+    from vco_lib import gateway_ensure
+
+    try:
+        found = gateway_ensure.gateway_status()
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if found.state is gateway_ensure.GatewayState.REGISTERED_BUT_UNRUNNABLE:
+        return True
+    if found.state in (
+        gateway_ensure.GatewayState.NOT_REGISTERED,
+        gateway_ensure.GatewayState.RUNNING,
+        gateway_ensure.GatewayState.REGISTERED_NOT_RUNNING,
+        gateway_ensure.GatewayState.STARTED,
+    ):
+        return False
+    return None
+
+
+#: Socket timeout for the hub health read. Mirrors the timeout
+#: ``install.py::_probe_vct_hub_health`` uses — the two must stay in step
+#: because they read the SAME endpoint (see :func:`hub_answers_health`).
+_HUB_HEALTH_TIMEOUT_SECONDS = 0.5
+
+
+def hub_answers_health() -> Optional[bool]:
+    """Does the hub answer ``/api/v1/health`` on the resolved port?
+
+    The port comes from the ONE resolution chain
+    (``vco_lib.access_resolver._hub_port``: ``$VCT_HUB_PORT`` →
+    ``<state dir>/hub.port`` → 7700) — this module does not re-derive it.
+    The GET is the vco_lib twin of ``install.py::_probe_vct_hub_health``
+    (same endpoint, same intentionally-AUTH-FREE request, same
+    ``status < 400`` bar); install.py's copy is unreachable from
+    ``vco_lib`` and cannot be shared without importing the 24k-line
+    installer, so the contract is pinned by name here and by behaviour
+    tests in ``tests/test_v0295_deferral_reconcile_hub_restart.py``.
+
+    Returns:
+        True  — the hub answered with status < 400.
+        False — the port answered with an error status, or nothing
+                answered at all (refused / timeout / HTTP error).
+        None  — the port itself could not be resolved (the check could not
+                run; never read as "hub down" NOR as "hub up").
+    """
+    try:
+        # Same-package seam on purpose: `_hub_port` is the one home of the
+        # env > state-file > default chain (`access_resolver.py`); a second
+        # copy here would be the fourth port resolver in the tree.
+        from vco_lib.access_resolver import _hub_port
+
+        port = _hub_port()
+    except Exception:  # noqa: BLE001 — no port is not a verdict
+        return None
+    url = f"http://127.0.0.1:{port}/api/v1/health"
+    try:
+        with urllib.request.urlopen(
+            url, timeout=_HUB_HEALTH_TIMEOUT_SECONDS
+        ) as resp:
+            return resp.status < 400
+    except Exception:  # noqa: BLE001 — refused/timeout/HTTP-error = not answering
+        return False
+
+
+def hub_back_after_restart_failure(ctx: ProbeContext) -> Optional[bool]:
+    """``hub_restart_failed_after_abort`` — is the hub back up?
+
+    The entry records a fact about the PAST: the abort-path hub restart's
+    health poll failed (``installer.rs`` emits it only after a conflict-aborted
+    update left the hub not answering within 30 s). The STATE question —
+    the only one a clear may key on (R26) — is whether that still describes
+    the machine: does the hub answer NOW?
+
+    The pre-v0.2.95 resolver lived only in ``install.py``'s re-probe pass and
+    AND-ed a hub-sidecar version comparison, a conjunction that could never
+    fire there: the pass ran BEFORE both the dist-binary refresh and the hub
+    restart, i.e. before the executor outcomes it wanted to read — the row
+    survived two further updates and a ``vco doctor`` run in the field. A
+    caught-up BINARY is anyway not what the entry claims: it claims the hub
+    did not come back. The hub answering ``/api/v1/health`` is positive
+    evidence that it has (via :func:`hub_answers_health`, so the probe and
+    every other health reader share one reading).
+
+    Returns:
+        True  — the hub is not answering → the recorded failure still
+                stands. KEEP.
+        False — the hub answered → the hub is back; the abort-time failure
+                no longer describes the machine. CLEAR.
+        None  — could not look (port resolution failed). KEEP.
+    """
+    try:
+        answered = hub_answers_health()
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if answered is None:
+        return None
+    return not answered
+
+
+def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``chunker_preset_overhaul_pending`` — has the re-sync remedy been run?
+
+    A thin wrapper over :func:`vco_lib.chunker_revision.resync_still_owed`,
+    which owns the whole chunker-resync lifecycle (the sentinel the gate
+    compares, the remedy text both emitters print, and the half-stamps the two
+    remedy scripts write). One home for the rule: a second reading here could
+    clear an entry the gate would immediately re-emit.
+
+    v0.2.95 F1 — this cid was the last IMMORTAL one. It declared
+    ``paired-resolution`` and named a clearing site that does not exist in
+    either language, while its own emitters promise the user it
+    "self-resolves on the next bundle update". The registry-completeness test
+    validates only ``probe:py:`` names, so a sentinel family whose site is
+    prose failed nothing.
+
+    Returns:
+        True  — a half of the remedy has not run under the current revision.
+        False — both halves are recorded at the current revision: the entry
+                describes work that has been done.
+        None  — could not look (unreadable chunker revision or corrupt stamp).
+    """
+    from vco_lib import chunker_revision
+
+    try:
+        return chunker_revision.resync_still_owed(ctx.folder)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+
+
 PROBES: dict[str, ProbeFn] = {
+    "chunker_resync_still_owed": chunker_resync_still_owed,
+    "gateway_exec_still_unrunnable": gateway_exec_still_unrunnable,
+    "hub_back_after_restart_failure": hub_back_after_restart_failure,
     "orchestrator_sidecars_still_present": orchestrator_sidecars_still_present,
     "launcher_dist_still_dirty": launcher_dist_still_dirty,
     "launcher_binary_stale_still_applies": launcher_binary_stale_still_applies,
@@ -1203,6 +1399,8 @@ __all__ = [
     "probe_status_sentence",
     "record_owned_record_expiry",
     "disk_space_still_low",
+    "hub_answers_health",
+    "hub_back_after_restart_failure",
     "evaluate",
     "launcher_binary_stale_still_applies",
     "launcher_dist_still_dirty",

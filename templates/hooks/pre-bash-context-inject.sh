@@ -51,6 +51,15 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
 # shellcheck source=_lib/command-noise-strip.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/command-noise-strip.sh" ] && . "$SCRIPT_DIR/_lib/command-noise-strip.sh"
+# v0.2.95 (lane F10): the write-target parser (shared with
+# post-bash-file-sync.sh) and the ONE home for the code-file extension test
+# (shared with pre-edit-context-inject.sh). Sourced only if present
+# (partial-install tolerance); without them this hook keeps its pre-v0.2.95
+# behaviour exactly.
+# shellcheck source=_lib/bash-write-targets.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/bash-write-targets.sh" ] && . "$SCRIPT_DIR/_lib/bash-write-targets.sh"
+# shellcheck source=_lib/code-extensions.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/code-extensions.sh" ] && . "$SCRIPT_DIR/_lib/code-extensions.sh"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
@@ -119,6 +128,36 @@ except Exception:
 
 [ -z "$COMMAND" ] && exit 0
 
+# === v0.2.95 (lane F10): does this command WRITE a file? ===================
+# Owner, 2026-09-16: "the query to KG/CodeGraph should be structured as it
+# would be if the operation was performed through write/edit tools".
+# pre-edit-context-inject.sh builds its query from the FILE — module name
+# from the basename + a content snippet — and anchors the code-graph leg on
+# that path. This hook used the raw first 500 chars of the COMMAND, which
+# for `cat > knowledge/retrieval-tiers.md <<EOF` is mostly shell syntax.
+#
+# So: when the shared parser recovers a write TARGET from the command, the
+# query below is built the pre-edit way from that path. When it does not
+# (the overwhelmingly common case — `ls`, `git`, `pytest`), every line
+# below behaves exactly as it did before v0.2.95.
+#
+# The prefilter is pure bash and short-circuits with ZERO subprocess for
+# routine commands, so the steady-state cost is one string scan.
+WRITE_TARGET=""
+WRITE_SNIPPET=""
+WRITE_MODULE=""
+if command -v vco_bash_write_prefilter >/dev/null 2>&1 \
+    && vco_bash_write_prefilter "$COMMAND"; then
+    vco_bash_write_init "$SCRIPT_DIR" "$PY"
+    _WT_OUT="$(vco_bash_write_prebash "$COMMAND" "$PROJECT_ROOT")"
+    WRITE_TARGET=$(printf '%s' "$_WT_OUT" | sed -n '1p')
+    WRITE_SNIPPET=$(printf '%s' "$_WT_OUT" | sed -n '2p')
+fi
+if [ -n "$WRITE_TARGET" ]; then
+    _WT_BASENAME="${WRITE_TARGET##*/}"
+    WRITE_MODULE="${_WT_BASENAME%.*}"   # retrieval_rl.py -> retrieval_rl
+fi
+
 # === v0.2.70 Stream C Surface 2: gated code-graph injection on Bash ===
 # Runs on EVERY Bash call BEFORE the (KG-only) 500-char threshold gate, because
 # a short `grep -rn "migrate_collections"` should surface codegraph even though
@@ -127,21 +166,41 @@ except Exception:
 # steady-state cost on a non-code command is one regex chain (~us). Only when the
 # command genuinely navigates code do we spawn the (timeout-bounded) helper.
 # Output is deduped through the SAME shared seen-store as pre-edit/pre-tool-use.
-if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMAND"; then
+_CG_SYM=""
+_CG_ANCHOR=""
+_CG_EXCLUDE=""
+_CG_HEADER=""
+if [ -n "$WRITE_TARGET" ] \
+    && command -v vco_is_code_file >/dev/null 2>&1 \
+    && vco_is_code_file "$WRITE_TARGET"; then
+    # v0.2.95 (lane F10): the pre-edit shape — module name + content
+    # snippet as the query, the written file as BOTH the --anchor (bias the
+    # rerank toward call-linked code) and the exclude (don't hand back the
+    # file the command is rewriting). Byte-for-byte the argument shape
+    # pre-edit-context-inject.sh passes for an Edit of the same file.
+    _CG_SYM="$WRITE_MODULE"
+    [ -n "$WRITE_SNIPPET" ] && _CG_SYM="$WRITE_MODULE $WRITE_SNIPPET"
+    _CG_ANCHOR="$WRITE_TARGET"
+    _CG_EXCLUDE="$WRITE_TARGET"
+    _CG_HEADER="Code-graph context for ${WRITE_TARGET##*/}"
+elif command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMAND"; then
     _CG_SYM="$COMMAND"
     if command -v codegraph_extract_symbol >/dev/null 2>&1; then
         _CG_SYM="$(codegraph_extract_symbol "$COMMAND")"
     fi
-    # P1e (v0.2.75): codegraph_extract_symbol now returns EMPTY when no
-    # discrete code symbol is isolable (env-assignment / path-only / regex
-    # fragment / `git diff sha..HEAD` etc.). An empty symbol means NO
-    # injection — a garbage whole-command query is worse than none. Skip
-    # explicitly here (codegraph_query_block also guards on empty query, but
-    # the explicit skip keeps the no-injection contract obvious).
-    if [ -n "$_CG_SYM" ]; then
     # v0.2.72 P2: the extracted symbol doubles as the --anchor (5th arg) so the
     # CLI's shared pipeline biases the rerank toward code call-linked to it.
-    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" "$_CG_SYM" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
+    _CG_ANCHOR="$_CG_SYM"
+    _CG_HEADER="Code-graph context for symbol: ${_CG_SYM}"
+fi
+# P1e (v0.2.75): codegraph_extract_symbol returns EMPTY when no discrete
+# code symbol is isolable (env-assignment / path-only / regex fragment /
+# `git diff sha..HEAD` etc.). An empty symbol means NO injection — a
+# garbage whole-command query is worse than none. Skip explicitly here
+# (codegraph_query_block also guards on empty query, but the explicit skip
+# keeps the no-injection contract obvious).
+if [ -n "$_CG_SYM" ] && command -v codegraph_query_block >/dev/null 2>&1; then
+    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "$_CG_EXCLUDE" "$_CG_ANCHOR" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
     if [ -n "$_CG_RAW" ]; then
         _CGB_INJECT=""
         _CGB_READS=""
@@ -155,12 +214,11 @@ if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMA
         case "$_CG_RAW" in
             *[![:space:]]*)
                 if command -v emit_additional_context >/dev/null 2>&1; then
-                    emit_additional_context "[Code-graph context for symbol: ${_CG_SYM}]:"$'\n'$'\n'"$_CG_RAW" PreToolUse
+                    emit_additional_context "[${_CG_HEADER}]:"$'\n'$'\n'"$_CG_RAW" PreToolUse
                 fi
                 ;;
         esac
     fi
-    fi  # P1e: end empty-symbol guard
 fi
 
 # === Threshold gate ===
@@ -251,6 +309,21 @@ fi
 # Strip fallback: if noise-removal emptied the query, use the raw command so a
 # genuinely identifier-only long command still searches.
 [ -z "$QUERY" ] && QUERY="$QUERY_RAW"
+
+# v0.2.95 (lane F10): when the command WRITES a file, structure the query the
+# way pre-edit-context-inject.sh does — "<module-name> <content snippet>" —
+# instead of leading with command text. The heredoc body is the closest
+# analogue of pre-edit's `new_string` snippet; when there is none (a `sed -i`,
+# a `cp`) the noise-stripped command keeps its role as the content signal,
+# prefixed by the module name. No write target => this block is inert and the
+# query is byte-for-byte what it was before.
+if [ -n "$WRITE_TARGET" ]; then
+    if [ -n "$WRITE_SNIPPET" ]; then
+        QUERY="$WRITE_MODULE $WRITE_SNIPPET"
+    else
+        QUERY="$WRITE_MODULE $QUERY"
+    fi
+fi
 
 # === F-LOG (v0.2.70): emit the pre_bash pairing event ===
 # The pre_bash event_type was declared in outcome_emit.OUTCOME_EVENT_TYPES but

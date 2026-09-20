@@ -30,6 +30,16 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 RUST = REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
+#: v0.2.95: the PORT half of the Rust mirror moved out of `model_gateway.rs`
+#: into the crate the launcher AND the hub share, so the hub's supervisor and
+#: `/services/status` stop holding their own answers (the latter hard-coded
+#: 11436 and mis-reported every machine whose gateway had fallen back). The
+#: Rust->Python pin below follows it: this is now the ONE Rust home for these
+#: literals, and `model_gateway.rs` keeps only what only it uses.
+RUST_PORTS = (
+    REPO / "launcher" / "src-tauri" / "vct-launcher-core" / "src" / "services"
+    / "model_gateway_port.rs"
+)
 PY = REPO / "vco_lib" / "vscode_settings.py"
 TS = REPO / "launcher" / "src" / "lib" / "api" / "model_gateway.ts"
 SVELTE = REPO / "launcher" / "src" / "routes" / "services" / "+page.svelte"
@@ -37,11 +47,15 @@ TEMPLATE = REPO / "templates" / "CLAUDE.md.template"
 GATEWAY_CONFIG = REPO / "claude_mcp_servers" / "model_router" / "config.py"
 
 
-def rust_const(name: str) -> str:
-    """The literal on the right of `const NAME: T = "...";` or `= 123;`."""
-    src = RUST.read_text(encoding="utf-8")
+def rust_const(name: str, path: Path = RUST) -> str:
+    """The literal on the right of `const NAME: T = "...";` or `= 123;`.
+
+    `path` defaults to the launcher command module; the port/service/basename
+    constants live in `RUST_PORTS` since v0.2.95.
+    """
+    src = path.read_text(encoding="utf-8")
     m = re.search(rf"const {name}\s*:\s*[^=]+=\s*([^;]+);", src)
-    assert m, f"{name} not found in {RUST.name}"
+    assert m, f"{name} not found in {path.name}"
     return m.group(1).strip().strip('"')
 
 
@@ -58,23 +72,33 @@ def py_const(path: Path, name: str) -> str:
 
 
 def test_rust_port_matches_the_gateway_default():
-    assert rust_const("DEFAULT_GATEWAY_PORT") == py_const(GATEWAY_CONFIG, "DEFAULT_PORT")
+    assert rust_const("DEFAULT_GATEWAY_PORT", RUST_PORTS) == py_const(
+        GATEWAY_CONFIG, "DEFAULT_PORT"
+    )
 
 
 @pytest.mark.parametrize(
-    "rust_name,python_name",
+    "rust_name,python_name,rust_path",
     [
-        ("PID_BASENAME", "_PID_BASENAME"),
-        ("PORT_BASENAME", "_PORT_BASENAME"),
-        ("TOKEN_BASENAME", "_TOKEN_BASENAME"),
+        ("PID_BASENAME", "_PID_BASENAME", RUST),
+        ("TOKEN_BASENAME", "_TOKEN_BASENAME", RUST),
+        # v0.2.95: the two PORT files are shared with the hub, so they moved
+        # to the shared crate. The pid and token files are the launcher's
+        # alone and stayed.
+        ("PORT_BASENAME", "_PORT_BASENAME", RUST_PORTS),
+        ("LAST_PORT_BASENAME", "LAST_PORT_BASENAME", RUST_PORTS),
     ],
 )
-def test_rust_state_filenames_match_the_gateway_package(rust_name, python_name):
-    assert rust_const(rust_name) == py_const(GATEWAY_CONFIG, python_name)
+def test_rust_state_filenames_match_the_gateway_package(
+    rust_name, python_name, rust_path
+):
+    assert rust_const(rust_name, rust_path) == py_const(GATEWAY_CONFIG, python_name)
 
 
 def test_rust_port_env_name_is_the_one_the_gateway_reads():
-    assert rust_const("PORT_ENV") in GATEWAY_CONFIG.read_text(encoding="utf-8")
+    assert rust_const("PORT_ENV", RUST_PORTS) in GATEWAY_CONFIG.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_writer_default_port_matches_the_gateway_package():
@@ -189,9 +213,9 @@ def test_the_health_service_name_is_the_same_word_in_all_three_languages():
     server = (
         REPO / "claude_mcp_servers" / "model_router" / "server.py"
     ).read_text(encoding="utf-8")
-    rust = (
-        REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
-    ).read_text(encoding="utf-8")
+    # v0.2.95: the ONE Rust home for this word (shared by the launcher card and
+    # the hub's supervisor, which compares it against `/health`'s answer).
+    rust = RUST_PORTS.read_text(encoding="utf-8")
     ts = TS.read_text(encoding="utf-8")
 
     assert f'GATEWAY_SERVICE: &str = "{vs.GATEWAY_SERVICE_NAME}"' in rust
@@ -237,14 +261,19 @@ def test_the_port_file_names_match_their_owners_on_both_sides():
         in GATEWAY_CONFIG.read_text(encoding="utf-8")
     ), "the writer would honour a pin the gateway does not read"
 
-    rust = (
-        REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
-    ).read_text(encoding="utf-8")
+    # v0.2.95: one Rust home for both basenames — the launcher WRITES the
+    # last-port record and the hub's supervisor READS it, so a per-crate copy
+    # was a record one of them could stop finding.
+    rust = RUST_PORTS.read_text(encoding="utf-8")
     assert f'PORT_BASENAME: &str = "{vs.PORT_BASENAME}"' in rust
     assert f'LAST_PORT_BASENAME: &str = "{vs.LAST_PORT_BASENAME}"' in rust, (
         "the launcher writes the last-port record and the writer reads it; "
         "two names means the record is never found"
     )
+    # The fallback range stayed in the launcher command module: only the
+    # start path consults it, and the hub never starts a gateway on a
+    # port of its own choosing.
+    rust = RUST.read_text(encoding="utf-8")
 
     # ── the collision fallback range, on both sides ───────────────────────
     # CROSS-LANE CONTRACT (v0.2.94): the launcher moves a start off an

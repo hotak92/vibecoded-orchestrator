@@ -73,6 +73,50 @@ Two caveats:
 
 ---
 
+## Rendered files keep YOUR copy and are re-rendered — no modal (v0.2.95)
+
+`CLAUDE.md` at the install root is **rendered**: `install.py` writes the AUTO
+block from `templates/ORCHESTRATOR-CLAUDE.md.template` and preserves everything
+you wrote outside the `<!-- BEGIN: AUTO -->` / `<!-- END: AUTO -->` markers. So
+the file is divergent from its tracked copy on every install, by design — and
+when upstream also edits the tracked copy (0.2.94 stripped a block from it),
+that divergence used to stop the update at the modal for everyone.
+
+It no longer does. Before the pull, the update:
+
+1. holds your working-tree copy in memory,
+2. advances the *tracked* blob to upstream's (a synthetic commit),
+3. writes your copy straight back.
+
+The merge that follows has nothing to change for that path, so it cannot
+conflict; `install.py --update` then re-renders the AUTO block from the NEW
+template. Your text outside the markers is never at risk — it is put back
+before the pull runs, not parked in a sidecar someone has to restore. The
+record lands in `UPDATE_DEFERRED.md` as `rendered_file_upstream_changed`.
+
+Scope and caveats:
+
+- The rendered set is `vco_lib/rendered_root_files.toml` — the same table
+  install.py's renderer iterates, so the protected paths and the rendered paths
+  cannot drift. `CLAUDE.md` is the only entry today.
+- A **hand-run** `git pull` is NOT covered: git refuses it at the dirty-file
+  check before any merge logic runs, and a `.gitattributes merge=ours` driver
+  cannot help there either (it would also mean "keep upstream" during a
+  rebase). Update through the launcher or `python install.py --update`; if you
+  already have a refused pull, `git checkout -- CLAUDE.md` then update — the
+  AUTO block is re-rendered and only text you added outside the markers would
+  need re-adding.
+- A tree left mid-conflict by a halted update is NOT touched by this class: it
+  belongs to the existing `update_resume_required` / "Continue Update" flow.
+  Once that concludes, the next update resolves the rendered file normally.
+- Same first-release caveat as above: the updater running the release is the
+  *installed* launcher, so the update that ships this can still stop once — at the
+  modal on the orchestrator surface, or, on ≤ v0.2.94, at a flat refusal on
+  Preferences → Launcher updates (see the decision table). From the next update
+  it auto-resolves on both.
+
+---
+
 ## State files and what each means
 
 ### `<vct_root>/.update-in-progress.json` (the "update gate", V52-AI)
@@ -191,6 +235,12 @@ Two caveats:
     update abort declined to restore an old binary over freshly-pulled bytes.
     No action needed.
   - `update_resume_required` — see resume sentinel above.
+  - `rendered_file_upstream_changed` (v0.2.95+) — informational record: upstream
+    changed the tracked copy of a file the install RENDERS (`CLAUDE.md`), the
+    update kept your rendered copy and re-rendered its AUTO block from the new
+    template (see the rendered-files section above). It names the file and the
+    upstream commit range. No action needed; it is gone on the next
+    `install.py --update`.
   - `generated_files_reconciled` — informational audit record: an update
     reconciled diverged generated / release-controlled files
     (`launcher/package.json`, `launcher/package-lock.json`,
@@ -213,6 +263,7 @@ Two caveats:
 | **Update says "Already up to date", source IS current, but the launcher version never changes** | **stale dist binary (frozen exe) — see the stale-exe recipe below** | **v0.2.91+ heals it at boot/update-check; on older builds use the manual recipe** |
 | Hub still on old version after update | pre-v0.2.54 hub-restart-before-staging ordering | `vct-hub --stop` then relaunch the launcher |
 | **Preferences → Launcher updates has said "Up to date" for weeks, `Branch: HEAD`, `Commits behind: 0`, `Running:` and `Latest source release:` show the SAME version** | **detached HEAD on a build before v0.2.92 — the check was structurally blind, see below** | **update once by hand (below), then use the GUI's Reattach button** |
+| **Preferences → Launcher updates → "Update now" refuses with "Uncommitted changes on tracked file 'CLAUDE.md' would be lost"** | **you are on a build ≤ v0.2.94, whose clean-tree assertion predates the rendered-file class — `install.py` renders `CLAUDE.md` over its tracked blob on every run, so every orchestrator-root install is dirty there by construction and this surface refused all of them** | **take this one hop from the MenuBar update badge instead (it runs `update_orchestrator`, which has used the precise risk set since v0.2.58); the refusal is narrowed on both surfaces from v0.2.95. Do NOT revert `CLAUDE.md` — it discards your edits and the next render brings the refusal straight back** |
 
 ---
 

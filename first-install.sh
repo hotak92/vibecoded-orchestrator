@@ -26,6 +26,23 @@ cd "$SCRIPT_DIR"
 
 # Python candidate cascade (newest first). Linuxbrew gets a separate
 # /home/linuxbrew/.linuxbrew/bin/... probe after PATH probes.
+#
+# CROSS-LANGUAGE PARITY (v0.2.95 WP-7): the five BARE names below are a
+# MIRROR — they must stay identical, in order, to every other bootstrap
+# Python probe:
+#   * install.sh                     -> find_python `for cmd in ...`
+#   * install.ps1                    -> Find-Python `$candidates`
+#   * first-install.command          -> its own `for cand in ...`
+#   * launcher/.../installer/hardware.rs -> detect_python POSIX branch
+# Only the ABSOLUTE paths may differ per OS (Linuxbrew here, Homebrew in
+# the .command) — an extra bare NAME belongs in the canonical list, not
+# here. The mirror is deliberate and C-tier-justified: this runs at the
+# chicken-and-egg moment, before any interpreter exists, so neither a
+# sourced library nor a parsed rule table is reachable
+# (docs/INSTALL_ARCHITECTURE_v2.md §1, "shims stay ... autonomous").
+# Locked by tests/test_v0295_wp7_bootstrap_cascade_parity.py (list
+# equality) and tests/test_v0295_wp7_cascade_behaviour.py (which
+# interpreter actually gets invoked). Edit all four + keep both green.
 PYTHON=""
 for cand in \
     python3.13 python3.12 python3.11 python3 python \

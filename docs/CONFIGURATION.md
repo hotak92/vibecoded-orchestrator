@@ -231,6 +231,26 @@ vct-hub --boot-status            # check whether boot autostart is registered
 
 When `VCT_STATE_DIR` is non-default, boot registration prints a warning — the autostart will inherit the user's login env, where a custom `VCT_STATE_DIR` typically isn't set, so the booted hub will write to `~/.vct/` instead of the dev path. This is intentional (dev state shouldn't be auto-launched at login).
 
+Note that this toggle governs the **hub** only, and it fires at **login**. The launcher GUI has a separate switch that fires when you open a project — see the next section.
+
+### Starting the launcher GUI with a session (v0.2.95, default ON)
+
+The `session-start-ensure-hub` hook — which Claude Code runs on `SessionStart` and `.vscode/tasks.json` runs on VS Code's `folderOpen` — also brings up the launcher GUI **in the tray only**, when it is not already running. `python -m vco_lib.launcher_ensure {status,ensure}` is the one home for the decision; the hook calls it and reports.
+
+- **No window, no focus.** The launcher is started with `--start-hidden`, which it applies to its own window configuration before any window is created. On every OS this is the same mechanism — a window that is never created visible is never mapped (X11/Wayland), never `makeKeyAndOrderFront`-ed (macOS) and never given `SW_SHOW` (Windows). Left-click the tray icon to open it.
+- **Never a second instance.** The leg spawns only when a process scan finds no launcher, and the single-instance plugin refuses a duplicate that races the probe — without taking focus, because it can see the flag in the duplicate's arguments.
+- **Switch it off** in the launcher's **Preferences → Startup → "Start the launcher with a Claude Code session"**. The preference is `launcher.session_autostart` in `launcher.db`'s `app_state`; no row means ON, so an existing install gets the behaviour after an update without a migration.
+- **Skipped automatically** when there is no desktop to start on: a Linux session with neither `$DISPLAY` nor `$WAYLAND_DISPLAY` (CLI over SSH, a container, CI), and any machine with no launcher binary at all (a fresh clone, a headless install) — both are silent, successful no-ops.
+- **A launcher binary older than v0.2.95 is left alone**, loudly: it would open a window and take focus, so the leg reports `binary_too_old` and points at `python install.py --update` instead of starting it.
+
+Environment keys for this leg:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `VCT_DISABLE_LAUNCHER_AUTOSTART` | unset | Set to anything non-empty to skip the leg entirely, without touching the preference. The per-machine kill switch for CI and headless hosts. |
+| `VCT_LAUNCHER_BIN` | unset | Explicit path to the launcher binary, highest precedence in the discovery chain (the `VCT_HUB_BIN` of this leg). |
+| `VCO_LAUNCHER_STATE` / `VCO_LAUNCHER_PID` / `VCO_LAUNCHER_REASON` | — | Not inputs: what `launcher_ensure ensure --shell` PRINTS for the bash hook to `eval` (the PowerShell sibling reads the same fields from `--json`). |
+
 **Key endpoints**:
 
 | Endpoint | Purpose | Notes |
@@ -430,13 +450,22 @@ Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.
 
 The local model-gateway daemon (`claude_mcp_servers/model_router/`, default port `11436`) is started, stopped and boot-registered by the launcher (Services page). Every knob below is optional and read at daemon startup by `model_router/config.py`; a healthy install needs none of them.
 
+The daemon serves `/health` (unauthenticated liveness), `/usage`, `/v1/models`, `/v1/messages` and
+`/v1/messages/count_tokens`; all but `/health` require the host token and every route is loopback-only.
+`/usage` returns the newest token-accounting row per chat (`?session=<id>` for one of them); the rows are
+appended to `<vct-state-dir>/metrics/gateway-usage.jsonl`, whose path and counters also appear as
+`usage_ledger` in `/health`. The ledger is for CONTEXT management, not cost — no price is recorded anywhere.
+
+**Panel mode — `remote-control` vs `multimodel`.** The launcher's status-bar pills (CLI: `python -m vco_lib.vscode_settings mode --set {multimodel,remote-control} --path <settings.json>`) flip the VS Code Claude Code panel between two states, one at a time — `claudeCode.environmentVariables` is VS Code machine-scope, so there is no per-workspace split. **`remote-control` is the stock client**: the four routing keys and the login-prompt key are removed, the panel talks to api.anthropic.com again, and the `/model` picker, the context-window sizing and the token accounting are all Claude Code's own. VCO writes none of `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_DISABLE_1M_CONTEXT` or `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in *either* mode — that absence is what leaves the accounting native; a knob you set yourself is carried through untouched. **`multimodel` points the panel at the gateway**: the picker becomes the gateway's `/v1/models` catalog (GLM and Claude in one list), and the client takes the context window from the model ID, so pick the "(1M context)" rows — their ids carry the `[1m]` suffix — when you want the 1M budget; ids only the gateway can resolve are stashed on the way to `remote-control` and restored on the way back. Remote Control (`/remote-control`, phone access) therefore works only in `remote-control` mode: Claude Code >= 2.1.196 refuses it whenever `ANTHROPIC_BASE_URL` is not api.anthropic.com, and a claude.ai sign-in does not bypass that. To have both at once, leave the panel on the gateway and run a detached native-auth server with the bundled `rc-native` skill (see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md), "Remote Control").
+
 | Var | Default | Effect |
 |---|---|---|
 | `VCT_MODEL_GATEWAY_PORT` | `11436` | TCP port. Falls back to the port file `<vct-state-dir>/model-gateway.port` (written by the running daemon, same convention as `hub.port`), then to the default. A non-numeric or out-of-range value falls through the same chain rather than being used literally. |
 | `VCT_MODEL_GATEWAY_HOST` | `127.0.0.1` | Bind address. REFUSED at startup unless it resolves to a loopback address: the gateway proxies under your Claude login and is authorised by a local file token, so binding a routable interface is an error, not a configuration. |
 | `VCT_MODEL_GATEWAY_CREDENTIALS` | `~/.claude/.credentials.json` | Path to the Claude CLI's OAuth credentials file (honours `VCT_CLAUDE_DIR`, see next section). Harness-owned: the gateway only ever reads it, never writes or copies it. |
-| `VCT_MODEL_GATEWAY_CONTEXT_TABLE` | `<vct-state-dir>/model-gateway/chat_model_context.json` | Where the daemon looks for an exported chat-model context table (schema: `model_router.context_table`). No writer of this file exists yet; absence is the normal state. |
-| `VCT_MODEL_GATEWAY_SECRET_PROJECT` | unset | Project scope handed to the vct-secrets resolver when the vendor key was stored against a specific project. Unset means the shared scope in the file store and a by-path lookup in the hub. The launcher passes this through when it starts the daemon. |
+| `VCT_MODEL_GATEWAY_CONTEXT_TABLE` | `<vct-state-dir>/model-gateway/chat_model_context.json` | Where the daemon looks for an exported chat-model context table (schema: `model_router.context_table`). Written by the launcher — on boot and on every GUI edit of the table (`launcher/src-tauri/src/commands/chat_model_context.rs`: `seed_and_export_on_boot`, `upsert_and_export`, `export_now`). Absent only before the launcher's first run; the daemon then reads the shipped seed (`claude_mcp_servers/model_router/chat_model_context.seed.json`), and the export wins per ROW over it. |
+| `VCT_MODEL_GATEWAY_SECRET_PROJECT` | unset — the gateway then uses **this install's orchestrator root**, resolved at runtime | **The per-project override for the gateway's vendor keys.** By default a gateway vendor key is a SHARED secret: put it in the launcher's Secrets panel with scope `shared` (OS keychain) or `vct set --shared --key <name>` (file store), and every install resolves it. The daemon still has to ASK as a registered project, because shared keychain secrets are reachable only through the hub's per-project `/env` route (their bucket is `_user_shared_`, owned by no project, and both stores resolve project-first-then-shared for whoever asks) — so with nothing pinned the gateway asks as the orchestrator root, which the launcher always registers. Set this variable to a project's path and THAT project's own key outranks the shared one; its `.no-shared-fallback` marker is honoured too, because there is one chain and no second mechanism. Before v0.2.95 the unpinned default was the process's **working directory**, which for a login-started daemon is the state root — not a registered project, so the hub tier was skipped entirely and every OS-keychain key was invisible while `/health` showed the vendor present with an empty key cache. The default is resolved at runtime, never baked into the boot unit, so a moved install self-heals — the systemd unit / LaunchAgent / Scheduled Task ships this variable EMPTY, and a non-empty one is always a scope you set (it is then preserved across every re-render, and a re-render of an older unit whose value merely equals this install's root drops it, so the runtime default takes over). `/health`'s `secret_scope` reports which scope is in force, where it came from (`pin` / `install_root` / `cwd`) and whether it resolves, and the daemon logs that verdict at startup. The launcher passes the variable through when it starts the daemon from the GUI. |
+| `VCT_MODEL_GATEWAY_CATALOG` | `latest` | Which versions of a model family reach the `/model` picker. `latest` publishes only the newest version of each family (Fable 5.1 without Fable 5; one GLM 5 row instead of six) — variant lines like `-flash`, `-turbo` and `-air` are families of their own and each keep their newest. `all` publishes every version both upstreams return. Nothing is lost quietly either way: withheld ids come back in `_vct_catalog_hidden` on `/v1/models`, are counted as `catalog_hidden` in `/health`, and remain selectable by name — the filter narrows the picker, never the router. An unrecognised value is refused at startup rather than silently treated as the default. |
 | `VCT_MODEL_GATEWAY_CATALOG_TTL` | `21600` (6 h) | Seconds before the live model catalog is re-fetched. |
 | `VCT_MODEL_GATEWAY_STATIC_RETRY_TTL` | `300` | When a live catalog fetch fails and the static fallback is serving, retry the live fetch after this many seconds instead of waiting out the full catalog TTL (a one-minute vendor outage must not cost six hours of a stale picker). |
 | `VCT_MODEL_GATEWAY_KEY_TTL` | `300` | Seconds before the vendor key is re-resolved, so a rotation is picked up — and a hub that was down at boot is retried — without restarting the daemon. |
@@ -445,9 +474,21 @@ The local model-gateway daemon (`claude_mcp_servers/model_router/`, default port
 
 The three TTL knobs exist primarily so the smoke tests can drive the caches without sleeping; they are documented because a knob nobody can find is a knob that gets re-invented.
 
+**Autostart (opt-in), and the three states it can be in.** `vct-model-gateway --register-boot` (or the launcher's gateway toggle) writes a systemd user unit / LaunchAgent / Scheduled Task; nothing an install does creates one, because a login-time daemon holding an OAuth passthrough is your decision. Two properties are worth knowing:
+
+* **The registration is verified before it is written.** The entry point is resolved from the install root's venv — the `vct-model-gateway` console script there, else `<that venv's python> -m model_router` — and then RUN with `--version`. If nothing answers, no unit is written and the reason is printed; an existing unit is left untouched. Before v0.2.95 the interpreter that happened to run `install.py` was baked in instead, so an update run under a system python produced a unit that could never start, silently.
+* **`registered but unrunnable` is its own state**, distinct from "not registered" and from "running". `python -m vco_lib.gateway_ensure status --json` reports it (`.state`), `vco doctor` reports it, and it appears in `UPDATE_DEFERRED.md` as `gateway_registered_but_unrunnable`. `python install.py --update` is the fix: it re-renders the registration, verifying it first, and the same run clears the entry.
+
+Every Claude Code session ensures a registered gateway through the `session-start-ensure-hub` hook (one hook ensures both detached services). It never registers anything, it leaves a running daemon alone — the "only one instance" guarantee is the daemon's own pid/port guard, which the ensure reads rather than duplicating — and on Linux it issues `systemctl --user reset-failed` before `start`, because a unit parked by the unit's own `StartLimitBurst` otherwise ignores a plain `start`.
+
+| Var | Default | Effect |
+|---|---|---|
+| `VCO_GATEWAY_STATE` | set by the hook, per session | **Internal, do not set.** The hook `eval`s `python -m vco_lib.gateway_ensure ensure --shell`, which prints this as the ensure's outcome word — `running`, `started`, `not_registered`, `registered_but_unrunnable`, `registered_not_running`, `start_failed` or `disabled_by_env`. Setting it yourself changes nothing: the next line of the same `eval` overwrites it. Ask for the value with `python -m vco_lib.gateway_ensure status --json` instead. |
+| `VCO_GATEWAY_REASON` | set by the hook, per session | **Internal, do not set.** The one-line explanation printed beside the state above, which the hook forwards when the ensure did not succeed. It follows the same `eval` contract the hub leg of that hook uses for its own variables. |
+
 ### Metrics location and the `~/.claude` migration (v0.2.92)
 
-VCO's JSONL telemetry streams (`costs.jsonl`, `failures.jsonl`, `compactions.jsonl`, `kg_update_tokens.jsonl`, `embedding_failures.jsonl`, `bundled_versions.jsonl`) live under `<`[`VCT_STATE_DIR`](#install-time-env-knobs)`>/metrics` (default `~/.vct/metrics`). Before v0.2.92 they were written to `~/.claude/metrics`; `~/.claude` is Claude Code's own directory and VCO now writes nothing under it the harness did not ask for. The old location is a frozen archive: still read, never deleted, never written by the migration.
+VCO's JSONL telemetry streams (`failures.jsonl`, `compactions.jsonl`, `kg_update_tokens.jsonl`, `embedding_failures.jsonl`, `bundled_versions.jsonl`) live under `<`[`VCT_STATE_DIR`](#install-time-env-knobs)`>/metrics` (default `~/.vct/metrics`). Before v0.2.92 they were written to `~/.claude/metrics`; `~/.claude` is Claude Code's own directory and VCO now writes nothing under it the harness did not ask for. The old location is a frozen archive: still read, never deleted, never written by the migration.
 
 **`VCT_CLAUDE_DIR`** — the one user-settable knob in this story. It overrides `~/.claude` as the Claude Code user directory for every VCO read of it: the MCP workflow config (`workflow/config/mcp-config.json`) and the legacy metrics archive above. All consumers resolve through a single resolver (`vco_lib/paths.py::claude_user_dir`), so one pin steers all of them; the test suite uses the same pin to stay out of real state. Not to be confused with `~/.claude.json` — that is a FILE beside this directory and follows the user-home override, not this one.
 
@@ -461,6 +502,14 @@ The four `VCO_METRICS_*` variables below are **internal — do not set them**. T
 | `VCO_METRICS_DIR` | The write target: the new home once migration is verified, the archive while a copy is still owed. |
 
 Writers switch to the new home only after `vco_lib.metrics_migration` has copied AND verified every archived file (record: `<home>/.migrated-from-claude.json`). Until then they keep appending to the archive — nothing is stranded and nothing is double-counted; the next migration run finishes the job and the writers move on their own.
+
+Three more names belong to the same family and are also **internal — do not set them**. They are shell variables shared between a hook and the `_lib` helper it sources, and they are listed here only so their names are not a mystery in a process listing or a `set` dump:
+
+| Var | Meaning |
+|---|---|
+| `VCO_CODE_EXT_RE` | The one code-file extension alternation, exported by `templates/hooks/_lib/code-extensions.sh` (`.ps1`: `$script:VcoCodeExtRe`). Read by the context hooks and by `_lib/route-touched-path.sh` so "is this a code file?" has ONE answer. Setting it would change which files reach the code graph. |
+| `VCO_ROUTE_NUDGE` | The LLM-visible text `_lib/route-touched-path.sh` leaves for its caller (`post-file-edit.sh` / `post-bash-file-sync.sh`) to emit as one `additionalContext` envelope — currently the pending KG duplicate-scan report. An input value is overwritten on the first routed path. |
+| `VCO_MISSING_LIB_NOTICE` | The broken-install notice `vco_report_missing_hook_lib` (`templates/hooks/_lib/emit-context.sh`; `.ps1`: the return value of `Emit-VcoMissingHookLibNotice`) leaves for its caller to emit — set when a shipped `_lib/` helper the hook needs is missing, empty when the condition was already reported this session (sentinel `.claude/state/route_lib_missing_<session>_<lib>`). An input value is always overwritten. |
 
 For the RL event-retention knobs (`RL_EVENTS_*`) see [Paid-module license framework → RL event retention and archives](#rl-event-retention-and-archives); they apply on free installs too.
 

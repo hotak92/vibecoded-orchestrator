@@ -64,6 +64,9 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
 HOOK_PS1 = HOOKS / "post-file-edit.ps1"
+#: v0.2.95 (lane F10): the diagram index+snapshot spawn moved into the ONE
+#: routing home post-file-edit.ps1 and post-bash-file-sync.ps1 both call.
+ROUTE_LIB_PS1 = HOOKS / "_lib" / "route-touched-path.ps1"
 COMMIT_HOOK_PS1 = HOOKS / "post-git-commit-kg-sync.ps1"
 PS_LIB = HOOKS / "_lib" / "resolve-powershell.ps1"
 

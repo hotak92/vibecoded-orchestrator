@@ -225,7 +225,9 @@ def upload_pending(
     # distinguish from real uploads if they care.
     if _is_pre_launch_stub_endpoint(url):
         try:
-            written = _write_pending_jsonl(body_obj["events"])
+            # Called for its side effect (writes the pending file); the
+            # count it returns is not part of this result shape.
+            _write_pending_jsonl(body_obj["events"])
             marked = q.mark_uploaded(ids)
             return UploadResult(
                 uploaded_count=marked,

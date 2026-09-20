@@ -541,6 +541,29 @@ run, so installing Node makes the entry disappear by itself. The launcher's \
 registration badge renders the same fact (gui_badge) via \
 `python -m vco_lib.npx_resolver --json`."""
 
+[conditions.gateway_registered_but_unrunnable]
+class = "action_required"
+owner = "vco_lib.gateway_ensure"
+clear_probe = "probe:py:gateway_exec_still_unrunnable"
+emit_surfaces = ["ledger"]
+notes = """v0.2.95 R5c. A THIRD state, between "not registered" and "running": \
+the model gateway's login-time registration exists and is enabled, and the \
+entry point baked into it cannot run. Measured on 2026-09-10 — \
+`install.py --update` re-rendered the unit with whichever interpreter ran the \
+installer (a system python that cannot import `model_router`), so the unit was \
+unrunnable from the moment it was written, and it stayed invisible for eight \
+hours because the PREVIOUS process was still serving. The launcher toggle said \
+"registered" throughout. Two emitters, one lifecycle: the SessionStart ensure \
+(`vco_lib.gateway_ensure`) writes it into the project whose session started, \
+and `vco_lib.doctor`'s `model_gateway_runnable` probe writes it into the \
+install root during an install/update run. Both read the same function, and \
+the clear probe re-runs that same reading, so the entry clears itself the \
+moment the registration can run (or the gateway is running, or the user \
+unregistered it). action_required because the exit is an install/update run: \
+that is what re-renders the registration, now verifying the argv before it \
+writes. No dismiss_key: an unrunnable registration is a real break, not a \
+description of the machine to acknowledge."""
+
 [conditions.code_embed_image_stale]
 class = "action_required"
 owner = "vco_lib.doctor"
@@ -569,6 +592,56 @@ re-runs that same comparison, so a user who rebuilds by hand and re-runs \
 `vco doctor` sees the entry go. ORDER MATTERS in the remedy: rebuild the \
 image BEFORE any code-graph re-sync — re-walking the graph first embeds every \
 entity through the old, truncating service and then reports success."""
+
+[conditions.install_manifest_attests_uninstalled_source]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.95 WP-2 — the detector the half-executed install states lacked. \
+`state/install-manifest.json` has TWO writers: install.py, and \
+`manifest.rs::refresh_install_manifest`, which the launcher's \
+`apply_launcher_update`, `force_resync_launcher` and `update_orchestrator_at` \
+each call. Those three advance the whole source tree, rebuild only the \
+launcher binary, and never run install.py — and then re-assert \
+`installed: true` over it. So venv, pip, hooks, templates, MCP registrations, \
+the KG seed, the schema and the boot service stay where the last installer \
+run left them while the marker says the install is complete, and every other \
+surface reports health: the checkout is 0-behind upstream, so \
+`source_currency` is `ok` and `_currency_finding` drops the install age it \
+appends only to a PROBLEM, while `probe_last_update_run` reports the stale \
+date as `ok` by design (age has two causes and cannot separate them). Before \
+this row no doctor probe read install-manifest.json at all. THREE legs, and \
+which one can speak depends on WHICH launcher wrote the marker. Until v0.2.95 \
+that writer re-read `version` from the files it had just pulled, so the \
+version leg catches every install arriving from a pre-0.2.95 launcher. WP-1 \
+stopped it writing `version` and `completed_at` (install.py is their only \
+writer now) and made it stamp `post_source_only: true` instead — so for a \
+0.2.95+ launcher the versions agree by construction and only the commit leg \
+can speak, and that one is silent whenever `.git/HEAD` did not move \
+(`update_orchestrator_at` file-copies a tree and leaves the target's HEAD \
+alone) or could not be read (packed ref / worktree HEAD → `read_git_rev` \
+returns None and the old `source_commit` stands). The FLAG leg is the writer \
+naming the state itself, and the only one that survives both. None of the \
+three is a proxy: `.claude/.vco-manifest.json` is written ONLY by the bundle \
+engine an installer run reaches, is gitignored (so `update_orchestrator_at`'s \
+gitignore-aware copy does not carry the source clone's copy into the target), \
+and no launcher update path writes it; `post_source_only` is written only by \
+a path that advanced the tree without installing, and cleared only by an \
+installer run (install.py rebuilds the manifest from a literal dict, so the \
+key does not survive). Conservative everywhere else: a missing or unparseable \
+manifest, a pre-v0.2.92 bundle manifest whose `vco_version` holds a git SHA, \
+a packed ref that left `source_commit` empty, or an ABSENT `post_source_only` \
+(every manifest written before v0.2.95, and every manifest install.py writes) \
+all yield `unknown` or `ok`, never `problem` — a false problem here would \
+send the owner of a healthy install into an update they do not need. \
+owned-drop-when-absent on the `vco_lib_shadowed_by_venv_copy` precedent: \
+`python install.py --update` (the printed remedy, and a real flag on \
+install.py's argparse) rewrites BOTH records from the one tree at the end of \
+a run that has already re-done the skipped work, and the doctor phase \
+re-probes AFTER both writes in that same run — so the entry is dropped by \
+the run that fixes it. No dismiss_key: a marker attesting work nothing did \
+is a real break, not a description of the machine to acknowledge."""
 
 [conditions.vco_lib_shadowed_by_venv_copy]
 class = "action_required"
@@ -948,10 +1021,26 @@ notes = "A clean migrate-collections dry-run clears it (project_init)."
 
 [conditions.chunker_preset_overhaul_pending]
 class = "action_required"
-owner = "vco_lib.project_init"
-clear_probe = "paired-resolution"
+owner = "vco_lib.chunker_revision"
+clear_probe = "probe:py:chunker_resync_still_owed"
 emit_surfaces = ["ledger"]
-notes = "Settled by the Rust chunker-revision flow once the re-sync lands. v0.2.92 WP-D: the PER-PROJECT state-keyed gate (`vco_lib.chunker_revision.gate` on the `.claude/state/chunker-revision.json` sentinel) now fires inside the ONE bundle engine on all four install/update surfaces; this row's lifecycle is unchanged."
+notes = """v0.2.92 WP-D: the PER-PROJECT state-keyed gate \
+(`vco_lib.chunker_revision.gate` on the `.claude/state/chunker-revision.json` \
+sentinel) fires inside the ONE bundle engine on all four install/update \
+surfaces. v0.2.95 F1 gives it the clear mechanism it always ADVERTISED: both \
+emitters tell the user "once you run the re-sync commands below, this deferral \
+self-resolves on the next bundle update", and nothing implemented that — the \
+row declared `paired-resolution` while naming a Rust site that has no resolve \
+call, and the gate re-stamps its own sentinel at EMIT time, so no later \
+comparison could ever re-derive anything. It was immortal by construction, and \
+`templates/scripts/sync_knowledge_graph.py` pays a per-node chunk-plan \
+comparison for exactly as long as the row lives (documented there as \
+transitional). Now: each half of the printed remedy stamps \
+`.claude/state/chunker-resync.json` at the one point that proves it ran (a \
+fully successful `kg-sync --all`; a completed `code-graph-analyze \
+--force-recreate`), and `probe:py:chunker_resync_still_owed` clears the row \
+when BOTH name the current revision. A later revision crossing re-arms it for \
+free — the gate re-emits and the old stamps no longer match."""
 
 [conditions.project_bundles_stale]
 class = "action_required"
@@ -1005,10 +1094,18 @@ v0.2.91 promotion means that now happens on EVERY --update, not only under \
 [conditions.hub_restart_failed_after_abort]
 class = "action_required"
 owner = "launcher/src-tauri/src/commands/installer.rs"
-clear_probe = "paired-resolution"
+clear_probe = "probe:py:hub_back_after_restart_failure"
 emit_surfaces = ["ledger"]
-notes = """Re-probed by the install.py re-probe pass; clears ONLY on positive \
-evidence (hub sidecar version caught up AND a live /health answer)."""
+notes = """v0.2.95 F1: the entry records that the abort-path hub restart's \
+health poll failed (the hub did not come back). Cleared by the registry \
+probe `hub_back_after_restart_failure` wherever a re-probe pass runs — \
+install.py's end-of-run phase (now ordered AFTER the hub restart step), \
+the bundle engine, and `vco doctor`'s reconcile — when the hub answers \
+`/api/v1/health` on the resolved port. Positive evidence only: a silent \
+hub keeps the entry. (Pre-v0.2.95 the ONLY resolver was an install.py \
+branch that AND-ed a hub-sidecar version comparison and ran BEFORE both \
+the binary refresh and the hub restart, so it could never observe the \
+hub up — the row was immortal in the field.)"""
 
 [conditions.codegraph_rename_split_pending]
 class = "informational_record"
@@ -1034,6 +1131,24 @@ maintainer's own install). The entry names its `<path>.from-upstream-<sha>` \
 sidecars; once the user has accepted or deleted every one of them the \
 condition is objectively over, so the probe resolves it. Follows the \
 `stale_codegraph_wrapper_pending` probed-clear precedent."""
+
+[conditions.rendered_file_upstream_changed]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.95 R1 (owner ruling 2026-09-10: a conflict must never arise on a \
+file the install RENDERS). Upstream changed the tracked copy of a path listed in \
+`vco_lib/rendered_root_files.toml` (CLAUDE.md today). The launcher's pre-pull \
+`resolve_rendered_files_keep_local` advanced the tracked blob to upstream's while \
+leaving the user's rendered working-tree copy in place, so the pull could not \
+conflict and no divergence modal was shown; install.py then re-rendered the AUTO \
+block from the NEW template and writes THIS row. Nothing is pending — it is a \
+record of a completed action. install.py OWNS it and re-detects it only from the \
+launcher's hand-off state file, which the emit consumes, so the next --update \
+does not re-detect it and `InstallDeferralFlow.finalize()` drops it (the \
+`owned-drop-when-absent` one-shot-expiry shape, same as the Rust-emitted \
+`stale_unit_retired_` precedent)."""
 
 [conditions.launcher_binary_stale]
 class = "action_required"

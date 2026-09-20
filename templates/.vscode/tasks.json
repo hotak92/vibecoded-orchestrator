@@ -1,11 +1,11 @@
 {
   "version": "2.0.0",
-  "_comment": "VibeCoded Orchestrator — VS Code tasks template. Belt-and-braces companion to the Claude Code SessionStart hook: starts vct-hub when the project folder is opened in VS Code, even when no Claude Code session has been launched yet. Both invocations are idempotent (vct-hub --start-if-not-running exits 0 whether the hub just started, was already running, or could not start). Bypass with VCT_DISABLE_HOOKS=1 in your environment.",
+  "_comment": "VibeCoded Orchestrator — VS Code tasks template. Belt-and-braces companion to the Claude Code SessionStart hook: it runs that SAME hook (session-start-ensure-hub) when the project folder is opened in VS Code, even when no Claude Code session has been launched yet. Since v0.2.95 the hook ensures THREE things, not one — vct-hub, the model gateway (only when one is registered for this project) and the launcher GUI (only when session-autostart is enabled) — each through its own vco_lib.*_ensure module. Every leg is idempotent: a live service is left alone and the leg exits 0 whether it started something, found it already running, or could not start it. Bypass with VCT_DISABLE_HOOKS=1 in your environment.",
   "tasks": [
     {
       "label": "Start VCT Hub",
       "type": "process",
-      "detail": "Idempotently start vct-hub on folder open (v0.2.21+).",
+      "detail": "Idempotently ensure vct-hub, the model gateway and the launcher on folder open (hub since v0.2.21; gateway + launcher legs since v0.2.95).",
       "presentation": {
         "reveal": "silent",
         "panel": "shared",

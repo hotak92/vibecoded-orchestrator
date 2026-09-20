@@ -86,6 +86,10 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
 # shellcheck source=_lib/codegraph-query.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+# v0.2.95 (lane F10): the code-file extension test now has ONE home, shared
+# with pre-bash-context-inject.sh and _lib/route-touched-path.sh.
+# shellcheck source=_lib/code-extensions.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/code-extensions.sh" ] && . "$SCRIPT_DIR/_lib/code-extensions.sh"
 # v0.2.77 Part 9 task 2: shared TTL result-cache used by codegraph_query_block
 # (and the KG-search wrapper). Sourced only if present (partial-install
 # tolerance) — the query helpers no-op the cache gracefully when it's missing.
@@ -498,13 +502,18 @@ VENV="${VCO_VENV_PYTHON:-}"
 # to the direct call when the cache helper is absent (partial install).
 # Code graph search — only for code files (not markdown, yaml, etc.)
 # Uses auto-detected project so edits in sibling repos query the right collections.
-# v0.2.70 Stream C: keep the IS_CODE extension regex in lockstep with
-# pre-tool-use.sh (Read/Grep branches) and post-file-edit.sh:440 — all three
-# decide "is this a code file" identically. MUST MATCH those two siblings.
-# (v0.2.91 P2: the decision moved ABOVE the search launch so the merged
+# v0.2.95 (lane F10): "is this a code file" is ONE decision with ONE home,
+# _lib/code-extensions.sh. v0.2.70 Stream C kept it as a C-tier mirror here,
+# in pre-tool-use.sh and in post-file-edit.sh with a "MUST MATCH" comment;
+# a second consumer (the Bash-write routing) made that untenable, so the
+# alternation moved to the helper and this reads it.
+# A partial install without the helper is treated as NOT-code: skipping the
+# code-graph leg costs one un-enriched edit, while an empty regex would
+# match EVERY path.
+# (v0.2.91 P2: the decision stays ABOVE the search launch so the merged
 # single-interpreter path knows up-front whether the code-graph leg is wanted.)
 IS_CODE=0
-if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
+if command -v vco_is_code_file >/dev/null 2>&1 && vco_is_code_file "$FILE_PATH"; then
     IS_CODE=1
 fi
 

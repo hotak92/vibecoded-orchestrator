@@ -132,6 +132,31 @@ logger = logging.getLogger(__name__)
 #:          same one :func:`decide` is built on.
 EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94")
 
+#: Releases DELIBERATELY not added to the ladder, each with the evidence that
+#: decided it. A release must appear in EXACTLY ONE of these two structures —
+#: that is the conscious decision the delivery gate forces at every tag.
+#:
+#: Why this exists: the gate used to assert `newest_bump >= package_version`,
+#: which is true on every release and says nothing about the extractor. The
+#: 0.2.93 entry above is the proof — its own comment records that it was
+#: appended ONLY to keep that assertion true. A proxy that fires every release
+#: is answered by appending every release, and appending charges every project
+#: with a graph one forced re-walk. Recording a non-bump costs users nothing.
+EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
+    "0.2.95": (
+        "No extraction-semantics change. `git diff v0.2.94..HEAD` across the "
+        "extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) is "
+        "14 lines in analyze_code_graph.py, all deferral bookkeeping "
+        "(clear_backend_deferrals -> record_successful_walk). _CHUNKER_REVISION "
+        "unchanged at v0.2.92.1; CODEGRAPH_EMBED_REVISION unchanged at 1; "
+        "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7. Projects stranded "
+        "by the 2026-09-09 defect still get their owed walk: decide() rule 4 "
+        "fires on crosses_version_boundary(prev, 0.2.95, 0.2.94)."
+    ),
+}
+
 #: The newest generation a freshly-built graph satisfies.
 CURRENT_EXTRACTOR_GENERATION: str = EXTRACTOR_GENERATION_BUMPS[-1]
 

@@ -25,7 +25,7 @@ admin-license token).
 v0.2.92 W7 — the metrics home moved OUT of ``~/.claude``. The standing
 directive is *"VCO writes NOTHING under ``~/.claude/`` except what the
 harness itself requires"*: ``~/.claude`` belongs to Claude Code, and VCO's
-own telemetry (``costs.jsonl``, ``failures.jsonl``, ``compactions.jsonl``,
+own telemetry (``failures.jsonl``, ``compactions.jsonl``,
 ``kg_update_tokens.jsonl``, ``embedding_failures.jsonl``,
 ``bundled_versions.jsonl``) is not something the harness asked for. Three
 resolvers express that split:
@@ -206,7 +206,7 @@ def claude_user_dir() -> Path:
 def vct_metrics_dir() -> Path:
     """Return ``<vct_root_dir()>/metrics`` — THE home for VCO's JSONL telemetry.
 
-    Every stream VCO produces lands here: ``costs.jsonl``, ``failures.jsonl``,
+    Every stream VCO produces lands here: ``failures.jsonl``,
     ``compactions.jsonl``, ``kg_update_tokens.jsonl`` (the shell hooks),
     ``embedding_failures.jsonl`` (:mod:`vco_lib.embedding_service`) and
     ``bundled_versions.jsonl`` (``install.py`` / :mod:`vco_lib.cli.verify`).
@@ -271,7 +271,7 @@ def metrics_read_dirs() -> tuple[Path, ...]:
        their edit recoverable. ``preserve`` + ``bundle_user_modified_preserved``
        is reached only when the backup write FAILS (full disk, read-only
        ``.claude/``, a symlinked ancestor that redirects the copy), and only
-       THAT user's ``cost-tracker.sh`` keeps its v0.2.91 body and keeps
+       THAT user's ``stop-failure-notify.sh`` keeps its v0.2.91 body and keeps
        appending to ``~/.claude/metrics`` indefinitely.
 
        This docstring asserted plain "PRESERVES" until v0.2.92, which had been

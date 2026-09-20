@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import logging
 import os
 import sys
@@ -136,6 +137,9 @@ __all__ = [
     "UnknownSlotError",
     "SlotNotInSchemaError",
     "SchemaDimMismatchError",
+    # Profile -> slot resolution (the forward direction install.py needs)
+    "active_slot_for_profile",
+    "enrich_collections_for_slot_change",
     # Internals exposed for tests
     "BATCH_SIZE",
     "MAX_FAILURE_DETAILS",
@@ -1036,6 +1040,27 @@ def _profile_to_active_slot(profile: str) -> Optional[str]:
     return slot
 
 
+def active_slot_for_profile(profile: str) -> Optional[str]:
+    """PUBLIC name for "which text slot does this profile embed into?".
+
+    v0.2.95 WP-6. ``install.py`` has to answer this before it can decide what
+    an embedding-model change actually OWES: filling a new named-vector slot
+    (enrichment: per object, UPDATE-only, idempotent) is a different and far
+    cheaper job than re-embedding a renamed collection from nothing, and until
+    now install.py could not tell them apart, so it did the expensive one for
+    both.
+
+    Thin by design — the resolution itself stays single-sourced in
+    :func:`_profile_to_active_slot`, which derives it from
+    ``embedding_service.TEXT_SLOT_MAP``. This exists so a second consumer does
+    not have to reach for a private name (or, worse, re-derive the map).
+
+    Returns None only when ``embedding_service`` is unimportable, which every
+    caller must treat as "no slot could be named" — never as a default slot.
+    """
+    return _profile_to_active_slot(profile)
+
+
 def count_populated_slots(
     collection: str,
     *,
@@ -1156,6 +1181,169 @@ def count_populated_slots(
 # ---------------------------------------------------------------------------
 # CLI entry point (consumed by the Tauri shell-out)
 # ---------------------------------------------------------------------------
+
+
+def enrich_collections_for_slot_change(
+    *,
+    venv_python: "Path | str",
+    profile: str,
+    kg_collection: str,
+    shared_kg_collection: str = "",
+    dev_collection: str = "",
+    project_root: Optional[Path] = None,
+    env: "Optional[dict]" = None,
+    log: Callable[[str], None] = print,
+    audit: Optional[Callable[[dict], None]] = None,
+) -> bool:
+    """Fill the new vector slot in place instead of re-embedding the tree.
+
+    v0.2.95 WP-6. install.py's leg (b) fires when ANY of the context triple
+    changed, and it answered all of them the same way: a full `--all`
+    delete-and-re-embed. For a COLLECTION RENAME that is right — the new class
+    has no rows. For an EMBEDDING-MODEL change it is not, and the cost of
+    conflating them fell on the user who did the recommended thing:
+
+        switch the model in the launcher → the Identity tab's enrichment
+        (`vco_lib.embedding_enrichment`, per object, UPDATE-only, idempotent)
+        fills the new slot → the collection is fully valid → the next
+        `install.py --update` still sees
+        `last_installed_active_embedding != current` (enrichment never wrote
+        that key; install.py is its only writer) and re-embeds every node from
+        scratch.
+
+    So: on a pure slot change, run the SAME enrichment the GUI runs, and on a
+    complete pass treat the context change as resolved — the run then
+    continues into the ordinary per-file content-hash diff, which is what picks
+    up genuinely changed nodes.
+
+    WHERE THE SAVING IS, AND WHERE IT IS NOT (v0.2.95 ship-gate MINOR-6).
+    This is not "a fraction of the embed cost" in general, and stating it that
+    way would misdescribe what a reader is choosing between.
+    :func:`enrich_collection_vectors` EMBEDS every object whose target slot is
+    empty — one vector per object, batched — so against a collection nobody has
+    enriched, the embed volume is the same as a re-embed's. What differs, unconditionally: no delete and
+    recreate, no re-chunking, no re-reading the tree from disk, no INSERTs
+    (UPDATE-only on existing UUIDs), and idempotence — an interrupted pass
+    resumes instead of restarting. What differs DRAMATICALLY, and is the
+    motivating path this exists for: a row whose slot is already populated is
+    skipped outright (``skipped … already current``), so the user who switched
+    the model in the launcher and let the Identity tab fill the slot pays ZERO
+    embeds here, where before v0.2.95 the next ``install.py --update`` charged
+    them a full-tree re-embed for having done the recommended thing.
+
+    Returns True only when every collection enriched with ZERO failures. Any
+    other outcome returns False and the caller falls back to the full sync:
+    a partially-enriched collection must not be recorded as current (the same
+    rule WP-4 applies to an incomplete leg-(b) sync).
+
+    No wall-clock timeout, deliberately — identical reasoning to the seed
+    subprocess below: a legitimate slow pass over a large tree on a cold CPU
+    can exceed any cap, and the per-request guard inside EmbeddingService is
+    the right granularity for catching a wedged backend.
+    """
+    target_slot = active_slot_for_profile(profile)
+    if not target_slot:
+        # "No slot could be named" is never a default slot — see the
+        # resolver's docstring. Fall back to the path that needs no name.
+        log(
+            f"  CI-10: no vector slot resolves for embedding profile "
+            f"{profile!r} → falling back to a full re-embed"
+        )
+        return False
+
+    # Every collection the seed writes, so none is left holding the previous
+    # model's vectors. Shared writes honour the same gate the shared seed does.
+    shared_write_disabled = (
+        os.environ.get("SHARED_KG_WRITE_DISABLED")
+        or os.environ.get("SHARED_KG_OPT_OUT", "")
+    ).lower() in ("1", "true", "yes")
+    targets: list[str] = [kg_collection]
+    if (
+        shared_kg_collection
+        and shared_kg_collection not in targets
+        and not shared_write_disabled
+    ):
+        targets.append(shared_kg_collection)
+    if dev_collection and dev_collection not in targets:
+        targets.append(dev_collection)
+
+    root = Path(project_root) if project_root else Path.cwd()
+    log(
+        f"  CI-10: embedding profile changed to {profile!r} and NO collection "
+        f"was renamed → filling slot {target_slot!r} in place on "
+        f"{len(targets)} collection(s) instead of re-embedding the tree"
+    )
+    for collection in targets:
+        # ONE soft-fail boundary for the whole pass. Every failure shape —
+        # spawn error, non-zero exit, unreadable report, any unexpected
+        # exception — means the same thing here: the slot was not provably
+        # filled, so the caller must fall back to the full re-embed rather
+        # than let a partially-enriched collection be recorded as current.
+        try:
+            proc = subprocess.run(
+                [
+                    str(venv_python), "-m", "vco_lib.embedding_enrichment",
+                    "enrich",
+                    "--collection", collection,
+                    "--new-slot", target_slot,
+                    "--project-root", str(root),
+                    "--json",
+                ],
+                cwd=str(root),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            returncode = getattr(proc, "returncode", 1)
+            stdout = getattr(proc, "stdout", "") or ""
+            if returncode != 0:
+                log(
+                    f"    ! enrichment exited {returncode} for {collection} "
+                    f"({(stdout or getattr(proc, 'stderr', '') or '').strip()[:200]})"
+                )
+                return False
+            report = _last_json_line(stdout)
+            if report is None:
+                log(f"    ! enrichment produced no report for {collection}")
+                return False
+            failed = int(report.get("failed") or 0)
+            if failed:
+                log(
+                    f"    ! enrichment left {failed} object(s) unfilled in "
+                    f"{collection}"
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001 — see the note above
+            log(f"    ! enrichment did not complete for {collection}: {exc}")
+            return False
+        log(
+            f"    ✓ {collection}: {report.get('enriched', 0)} enriched, "
+            f"{report.get('skipped', 0)} already current"
+        )
+    if audit is not None:
+        audit({"slot": target_slot, "collections": targets})
+    return True
+
+
+def _last_json_line(stdout: str) -> "Optional[dict]":
+    """Last JSON object on stdout, or None.
+
+    The enrichment CLI's final report is its last line; with
+    ``--stream-progress`` it is preceded by progress lines (not used here, but
+    parsing the LAST line rather than the whole buffer keeps that contract
+    working if a caller ever turns it on).
+    """
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _build_argparser() -> argparse.ArgumentParser:

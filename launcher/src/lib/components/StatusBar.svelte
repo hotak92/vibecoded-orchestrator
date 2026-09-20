@@ -15,6 +15,7 @@
     listVSCodeTargets,
     modeSwitchDisabledReason,
     multimodelPillLabel,
+    remoteControlGateNotice,
     setPanelMode,
     startModelGateway,
     switchToMultimodel,
@@ -87,6 +88,12 @@
   const gatewayStopped = $derived(report?.gateway === 'stopped');
   const vendorDefault = $derived(vendorDefaultWarning(report));
   const endpointDown = $derived(endpointWarning(report));
+  // v0.2.95 R4: the endpoint gate, said where the user meets it. It is a
+  // standing property of Multimodel mode, not an event — the launcher never
+  // sees /remote-control fail, because that happens inside Claude Code — so
+  // it renders as a neutral state line rather than a warning or a toast.
+  // Copy + the mode test live in `$lib/api/model_gateway`.
+  const remoteControlGate = $derived(remoteControlGateNotice(report));
 
   function pillTitle(target: SettablePanelMode, disabledReason: string): string {
     if (busy) return 'Applying…';
@@ -281,6 +288,11 @@
           <span class="mode-neutral" title={neutralTooltip}>{mode.label}</span>
         {/if}
       </div>
+      {#if remoteControlGate}
+        <span class="mode-gate" role="note">
+          <span class="mode-notice-text" title={remoteControlGate}>{remoteControlGate}</span>
+        </span>
+      {/if}
       {#if gatewayStopped}
         <button
           type="button"
@@ -441,6 +453,22 @@
     border: 1px solid rgba(var(--color-pink-rgb), 0.4);
     background: rgba(var(--color-pink-rgb), 0.1);
     color: var(--color-text);
+  }
+
+  /* Endpoint-gate line: NEUTRAL, not the pink warning tone. Nothing is
+     broken when it shows — it states a property of the mode the user chose,
+     and colouring a correct state as a fault is how a UI trains people to
+     ignore its warnings. */
+  .mode-gate {
+    display: inline-flex;
+    align-items: center;
+    max-width: 38vw;
+    height: 22px;
+    padding: 0 10px;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    background: var(--color-card);
+    color: var(--color-mid);
   }
 
   .mode-neutral {

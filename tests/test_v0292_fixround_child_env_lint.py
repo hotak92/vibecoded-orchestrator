@@ -95,7 +95,6 @@ _ALLOWLIST: dict[str, int] = {
     "tests/test_v0292_regclean_rl_setup_state_root.py": 1,
     "tests/test_v0292_wp17_move_delivery.py": 4,
     "tests/test_v0292_wp18_rename_delivery.py": 1,
-    "tests/test_v0292_wp8_cost_summary_reader.py": 1,
     "tests/test_v0292_wp8_metrics_migration.py": 1,
     "tests/test_v0292_wp8_metrics_shell_parity.py": 1,
     "tests/test_v52_l2_subagent_hooks.py": 1,

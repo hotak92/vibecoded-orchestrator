@@ -206,6 +206,18 @@ pub(crate) enum DriftVerdict {
     Drift { missing: usize, stale: usize, scanned: usize },
     /// Every on-disk node is present in Weaviate at the current content hash.
     Ok { scanned: usize },
+    /// No drift — AND the project still owes the one-time KG metadata-repair
+    /// pass (v0.2.95).
+    ///
+    /// Its own variant, not a flavour of `Drift`: the rows this pass repairs
+    /// have a MATCHING content hash (their text never changed — that is the
+    /// defect's premise), so they are missing from nothing and stale in
+    /// nothing. Reporting them through `missing`/`stale` would make those
+    /// counts lie, and the zero-count `Drift` arm below already treats that
+    /// shape as a contradiction. `Drift` still WINS when both are true: the
+    /// `--all` it spawns performs the repair on its way past every node and
+    /// writes the same stamp, so a second signal would be redundant.
+    MetadataRepairOwed { scanned: usize },
     /// No verdict (no binding, Weaviate down, wrapper failed, unparseable
     /// output). Carries WHY.
     Unavailable { detail: String },
@@ -219,6 +231,8 @@ pub(crate) enum KgSyncSpawnReason {
     /// No `kg_syncs` row, or its last status is `failed`.
     NeverSucceeded { last_status: String },
     DriftDetected { missing: usize, stale: usize, scanned: usize },
+    /// The project has never run the v0.2.95 KG metadata-repair pass.
+    MetadataRepairOwed { scanned: usize },
 }
 
 /// The gate's verdict. `Skip` is split so the caller can be honest about which
@@ -298,6 +312,9 @@ pub(crate) fn decide_kg_sync_on_bundle(
         Some(DriftVerdict::Drift { .. }) => KgSyncDecision::SkipUnverified {
             detail: "drift check reported drift with no drifted nodes".to_string(),
         },
+        Some(DriftVerdict::MetadataRepairOwed { scanned }) => {
+            KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { scanned })
+        }
         Some(DriftVerdict::Ok { scanned }) => KgSyncDecision::SkipConfirmed { scanned },
         Some(DriftVerdict::Unavailable { detail }) => KgSyncDecision::SkipUnverified { detail },
         None => KgSyncDecision::SkipUnverified {
@@ -439,6 +456,59 @@ mod v0294_gate_tests {
                 stale: 5,
                 scanned: 78
             })
+        );
+    }
+
+    /// THE v0.2.95 ship-gate LEG, RED-PROOF (a) at the decision: the store is
+    /// complete and the last sync succeeded — and the project has STILL never
+    /// run the metadata-repair pass, so it is owed one whole-tree walk.
+    ///
+    /// Pre-fix there was no verdict that could say so: the rows in question
+    /// have a matching content hash, so `scan_drift` reported `ok` and this
+    /// function returned `SkipConfirmed` on every update, forever.
+    #[test]
+    fn an_unrepaired_project_spawns_even_with_a_complete_store() {
+        assert_eq!(
+            decide_kg_sync_on_bundle(
+                false,
+                false,
+                &ok_status(),
+                Some(DriftVerdict::MetadataRepairOwed { scanned: 78 }),
+            ),
+            KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { scanned: 78 })
+        );
+    }
+
+    /// RED-PROOF (b): a repair-owed verdict carries no warning, because it is
+    /// an ACTION, not an unconfirmed skip — and the cheap legs still win, so a
+    /// live sync is never doubled up by it.
+    ///
+    /// The "because it is an action" half is asserted, not assumed: `None` is
+    /// what `kg_sync_decision_warning` answers for `SkipConfirmed` too, so a
+    /// gate arm neutered into a confirmed skip would satisfy a warning-only
+    /// check while silently never spawning the repair. Pinning the decision
+    /// FIRST is what makes the warning assertion mean what the name says.
+    #[test]
+    fn the_repair_leg_warns_nobody_and_never_beats_the_in_flight_guard() {
+        let owed = Some(DriftVerdict::MetadataRepairOwed { scanned: 78 });
+        let decision = decide_kg_sync_on_bundle(false, false, &ok_status(), owed.clone());
+        assert!(
+            matches!(
+                decision,
+                KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { scanned: 78 })
+            ),
+            "the repair leg must be an ACTION — a skip of any kind here means the \
+             one-time repair never runs; got {decision:?}"
+        );
+        assert_eq!(kg_sync_decision_warning(&decision), None);
+        assert_eq!(
+            decide_kg_sync_on_bundle(
+                false,
+                false,
+                &LastKgSync::InFlight { status: "running".into() },
+                owed,
+            ),
+            KgSyncDecision::SkipInFlight { status: "running".to_string() }
         );
     }
 

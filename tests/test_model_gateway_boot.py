@@ -469,21 +469,33 @@ def test_update_does_nothing_while_the_kill_switch_is_set(sandbox, monkeypatch):
 
 
 def test_install_py_only_rerenders_on_update(monkeypatch):
-    """The wiring, not just the helper: a plain install must not touch it."""
+    """The wiring, not just the helper: a plain install must not touch it.
+
+    v0.2.95: the re-render goes through ``register_model_gateway``, which
+    VERIFIES the entry point before writing (R5a) and calls
+    ``rerender_if_registered`` underneath — so the create-nothing gate is still
+    one home. What the verified argv is and what a refusal does are asserted in
+    ``test_v0295_gateway_boot_resolution.py``; this test pins the trigger.
+    """
     import argparse
 
     import install  # type: ignore
 
     seen = []
     monkeypatch.setattr(
-        install._boot_service, "rerender_if_registered",
-        lambda *a, **k: seen.append(k) or False,
+        install._boot_service, "register_model_gateway",
+        lambda **k: seen.append(k) or bs.GatewayRegistration(
+            registered=False, refused=False,
+            exec_result=bs.GatewayExec(argv=(), verified=False), spec=None,
+            reason="",
+        ),
     )
     install._rerender_model_gateway_boot_service(argparse.Namespace(update=False))
     assert seen == []
     install._rerender_model_gateway_boot_service(argparse.Namespace(update=True))
     assert len(seen) == 1
     assert seen[0]["templates_root"] == install.PROJECT_ROOT
+    assert seen[0]["update_only"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -818,16 +830,30 @@ def test_the_cli_holds_no_second_copy_of_the_registration_logic():
         )
 
 
+def _venv_clone(root: Path, *, console_script: bool) -> Path:
+    """A tree `looks_like_orchestrator_root` accepts, holding a `.venv`."""
+    (root / "vco_lib").mkdir(parents=True, exist_ok=True)
+    (root / ".claude").mkdir(parents=True, exist_ok=True)
+    bindir = root / ".venv" / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    (bindir / "python").write_text("", encoding="utf-8")
+    if console_script:
+        (bindir / "vct-model-gateway").write_text("#!/bin/sh\n", encoding="utf-8")
+    return root
+
+
 def test_the_gateway_exec_resolution_prefers_the_console_script(tmp_path,
                                                                 monkeypatch):
-    bindir = tmp_path / "venv" / "bin"
-    bindir.mkdir(parents=True)
-    fake_python = bindir / "python"
-    fake_python.write_text("", encoding="utf-8")
-    script = bindir / "vct-model-gateway"
-    script.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(sys, "executable", str(fake_python))
-    assert bs.resolve_gateway_exec() == [str(script)]
+    """v0.2.95 (R5a): "beside the INSTALL ROOT's venv python", not "beside
+    `sys.executable`". The preference for the console script is unchanged —
+    what changed is which interpreter's directory is searched, because the
+    installer's own interpreter is exactly the one that was wrong on
+    2026-09-10. Full coverage in `test_v0295_gateway_boot_resolution.py`."""
+    clone = _venv_clone(tmp_path / "clone", console_script=True)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3.12")
+    assert bs.resolve_gateway_exec(install_root=clone) == [
+        str(clone / ".venv" / "bin" / "vct-model-gateway"),
+    ]
 
 
 def test_the_gateway_exec_resolution_falls_back_to_module_form(tmp_path,
@@ -835,10 +861,8 @@ def test_the_gateway_exec_resolution_falls_back_to_module_form(tmp_path,
     """`python -m model_router`, never `python -m claude_mcp_servers.
     model_router`: `claude_mcp_servers/` has no `__init__.py`, so the dotted
     form only ever resolved from the repository root."""
-    bindir = tmp_path / "venv" / "bin"
-    bindir.mkdir(parents=True)
-    fake_python = bindir / "python"
-    fake_python.write_text("", encoding="utf-8")
-    monkeypatch.setattr(sys, "executable", str(fake_python))
-    argv = bs.resolve_gateway_exec()
-    assert argv == [str(fake_python), "-m", "model_router"]
+    clone = _venv_clone(tmp_path / "clone", console_script=False)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3.12")
+    assert bs.resolve_gateway_exec(install_root=clone) == [
+        str(clone / ".venv" / "bin" / "python"), "-m", "model_router",
+    ]

@@ -557,6 +557,43 @@ def _release_single_instance(pid_path: Path) -> None:
             pass
 
 
+def _probe_secret_scope_at_startup(app) -> None:
+    """Ask ONCE, in the background, whether this daemon's secret scope resolves.
+
+    Why here and not in ``server.create_app``: that factory promises to bind
+    nothing and start no I/O, and a probe reaches the hub. The DAEMON is the
+    only caller that should make a network call on its own behalf — a test or
+    an embedder building the same app must not.
+
+    Fire-and-forget on purpose. Awaiting it would put the hub's connect+read
+    budget (2 s + 5 s) in front of the first request on a machine whose hub is
+    still coming up at login, to answer a question no request needs answered
+    first. The verdict lands in the resolver's cache; ``/health`` reads it from
+    there, reports ``null`` in the sub-second window before it arrives, and a
+    key miss re-probes it afterwards.
+    """
+    import asyncio
+
+    # Both keys are TYPED and declared in `server.py` — a bare-string app key
+    # raises `NotAppKeyWarning`, and this file cannot declare a `web.AppKey`
+    # of its own without importing aiohttp at module scope, which `--version`
+    # and `--print-token-path` deliberately do not depend on.
+    from .server import APP_KEY, SCOPE_PROBE_TASK_KEY
+
+    async def _start(_app) -> None:
+        gateway = _app[APP_KEY]
+        task = asyncio.create_task(gateway.keys.aprobe_scope())
+        _app[SCOPE_PROBE_TASK_KEY] = task
+
+    async def _cleanup(_app) -> None:
+        task = _app.get(SCOPE_PROBE_TASK_KEY)
+        if task is not None and not task.done():
+            task.cancel()
+
+    app.on_startup.append(_start)
+    app.on_cleanup.append(_cleanup)
+
+
 def _serve(port_override: Optional[int]) -> int:
     from aiohttp import web
 
@@ -710,6 +747,7 @@ def _serve(port_override: Optional[int]) -> int:
     # next start.
     try:
         app = create_app(config, token_permissions=owner_only_state(token_path()))
+        _probe_secret_scope_at_startup(app)
         # AFTER the bind, never before: a port file naming a port we did not
         # get is what sends every reader at somebody else's service.
         _write_owner_only(port_path(), f"{port}\n", strict=False)
@@ -997,8 +1035,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if args.register_boot:
         from vco_lib import boot_service
+        from vco_lib.paths import vct_root_dir
 
-        return boot_service.run_register_boot(_boot_spec())
+        from .config import log_path
+
+        # The registrar is what makes this flag REFUSE rather than bake an
+        # argv nobody ran: it resolves the entry point from the install
+        # root's venv and runs it with `--version` before a unit is written
+        # (v0.2.95 R5a). The decision, the per-OS write and the refusal all
+        # stay in `vco_lib.boot_service`; this file remains argument parsing.
+        return boot_service.run_register_boot(
+            _boot_spec(),
+            registrar=boot_service.gateway_registrar(
+                state_dir=vct_root_dir(), log_file=log_path(),
+            ),
+        )
     if args.unregister_boot:
         from vco_lib import boot_service
 

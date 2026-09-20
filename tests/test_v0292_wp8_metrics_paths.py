@@ -235,11 +235,7 @@ def test_shipped_python_does_not_reconstruct_the_metrics_path_inline():
     """One home. A second copy is a path no env pin can steer.
 
     Scope is the shipped Python that has `vco_lib` available — the library and
-    the MCP servers. `templates/scripts/cost-summary.py` is deliberately
-    EXCLUDED and pinned separately (`test_v0292_wp8_cost_summary_reader.py`):
-    it ships into every project's `.claude/scripts/` and must run on a bare
-    stdlib interpreter, so it cannot import `vco_lib` and carries a documented
-    class-C mirror with an enforcing parity test instead.
+    the MCP servers.
     """
     offenders: list[str] = []
     roots = [_REPO_ROOT / "vco_lib", _REPO_ROOT / "claude_mcp_servers"]

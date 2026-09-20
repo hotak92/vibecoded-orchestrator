@@ -768,7 +768,7 @@ if __name__ == "__main__":
     print(f"Tier: {result.tier}")
     print(f"Valid: {result.valid}")
     print(f"Message: {result.message}")
-    print(f"Features unlocked:")
+    print("Features unlocked:")
     for f in TIER_FEATURES:
         marker = "✓" if feature_enabled(f) else "✗"
         print(f"  {marker} {f}")

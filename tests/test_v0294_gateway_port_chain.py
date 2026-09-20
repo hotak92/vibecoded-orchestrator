@@ -48,6 +48,16 @@ from tests.common.ports import free_port as _free_port
 
 REPO = Path(__file__).resolve().parent.parent
 RUST = REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
+#: v0.2.95: the port chain's constants moved out of the launcher command
+#: module into the crate the launcher and the hub share — three Rust readers
+#: (card, supervisor, `/services/status`) had held three answers, and the last
+#: of them simply hard-coded the default. The cross-language pin follows the
+#: constants; the FALLBACK range stays in `RUST` because only the start path
+#: consults it.
+RUST_PORTS = (
+    REPO / "launcher" / "src-tauri" / "vct-launcher-core" / "src" / "services"
+    / "model_gateway_port.rs"
+)
 
 
 class _StateCase(EnvIsolationMixin, unittest.TestCase):
@@ -693,16 +703,20 @@ class RustParityTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.assertTrue(RUST.is_file(), f"{RUST} is missing")
+        self.assertTrue(RUST_PORTS.is_file(), f"{RUST_PORTS} is missing")
         self.src = RUST.read_text(encoding="utf-8")
+        self.ports_src = RUST_PORTS.read_text(encoding="utf-8")
 
     def test_the_port_file_basename_still_matches(self) -> None:
-        match = re.search(r'const PORT_BASENAME:\s*&str\s*=\s*"([^"]+)"', self.src)
+        match = re.search(
+            r'const PORT_BASENAME:\s*&str\s*=\s*"([^"]+)"', self.ports_src,
+        )
         assert match is not None, "PORT_BASENAME not found — parity scan is blind"
         self.assertEqual(match.group(1), gateway_config._PORT_BASENAME)
 
     def test_the_last_port_basename_matches_when_declared(self) -> None:
         match = re.search(
-            r'const LAST_PORT_BASENAME:\s*&str\s*=\s*"([^"]+)"', self.src,
+            r'const LAST_PORT_BASENAME:\s*&str\s*=\s*"([^"]+)"', self.ports_src,
         )
         if match is None:
             self.skipTest(
@@ -730,7 +744,9 @@ class RustParityTests(unittest.TestCase):
         )
 
     def test_the_default_port_still_matches(self) -> None:
-        match = re.search(r"DEFAULT_GATEWAY_PORT:\s*u16\s*=\s*(\d+)", self.src)
+        match = re.search(
+            r"DEFAULT_GATEWAY_PORT:\s*u16\s*=\s*(\d+)", self.ports_src,
+        )
         assert match is not None, "DEFAULT_GATEWAY_PORT not found"
         self.assertEqual(int(match.group(1)), gateway_config.DEFAULT_PORT)
 
@@ -748,13 +764,13 @@ class RustParityTests(unittest.TestCase):
         contains. Both forms fail if Python's name ever changes alone.
         """
         match = re.search(
-            r'const GATEWAY_SERVICE:\s*&str\s*=\s*"([^"]+)"', self.src,
+            r'const GATEWAY_SERVICE:\s*&str\s*=\s*"([^"]+)"', self.ports_src,
         )
         if match is not None:
             self.assertEqual(match.group(1), gateway_config.SERVICE_NAME)
             return
         self.assertIn(
-            f'"{gateway_config.SERVICE_NAME}"', self.src,
+            f'"{gateway_config.SERVICE_NAME}"', self.ports_src,
             "the Rust side must name the same service string — as a literal "
             "now, as GATEWAY_SERVICE once the switch lane extracts it",
         )

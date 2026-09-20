@@ -117,15 +117,33 @@
 # re-sources this file in a fresh `setsid` shell (Item 1) so it can call the
 # in-process helper functions without re-inlining their exactly-once logic.
 # Resolved from $0 fallbacks when BASH_SOURCE is unavailable (POSIX sh).
-if [ -n "${BASH_SOURCE:-}" ]; then
-    _KG_DEBOUNCE_LIB="${BASH_SOURCE}"
-else
-    _KG_DEBOUNCE_LIB="$0"
+#
+# v0.2.95: an ALREADY-SET absolute, readable value is honoured. The detached
+# IMMEDIATE runner is spawned with `sh -c`, where `BASH_SOURCE` is unset and
+# `$0` is literally "sh" — the fallback would then resolve this variable to
+# `<cwd>/sh`, and `_kg_debounce_record_failure` (which locates its sibling
+# `metrics-dir.sh` relative to it) would look in the wrong directory and
+# silently record nothing. The snippet therefore states the path it just
+# sourced. A preset value that is NOT absolute+readable is ignored, so this
+# cannot be used to point the lib at something else.
+_kg_debounce_lib_preset=0
+if [ -n "${_KG_DEBOUNCE_LIB:-}" ]; then
+    case "$_KG_DEBOUNCE_LIB" in
+        /*) [ -r "$_KG_DEBOUNCE_LIB" ] && _kg_debounce_lib_preset=1 ;;
+    esac
 fi
-case "$_KG_DEBOUNCE_LIB" in
-    /*) : ;;  # already absolute
-    *)  _KG_DEBOUNCE_LIB="$(cd "$(dirname "$_KG_DEBOUNCE_LIB")" 2>/dev/null && pwd)/$(basename "$_KG_DEBOUNCE_LIB")" ;;
-esac
+if [ "$_kg_debounce_lib_preset" = "0" ]; then
+    if [ -n "${BASH_SOURCE:-}" ]; then
+        _KG_DEBOUNCE_LIB="${BASH_SOURCE}"
+    else
+        _KG_DEBOUNCE_LIB="$0"
+    fi
+    case "$_KG_DEBOUNCE_LIB" in
+        /*) : ;;  # already absolute
+        *)  _KG_DEBOUNCE_LIB="$(cd "$(dirname "$_KG_DEBOUNCE_LIB")" 2>/dev/null && pwd)/$(basename "$_KG_DEBOUNCE_LIB")" ;;
+    esac
+fi
+unset _kg_debounce_lib_preset
 
 # POSIX single-quote escaper: wraps $1 so it survives `eval` even if it
 # contains spaces or single quotes. A literal ' becomes '\'' (close,
@@ -205,6 +223,154 @@ _kg_debounce_realpid() {
     fi
 }
 
+# ─── failure visibility (v0.2.95) ──────────────────────────────────────────
+#
+# WHY (field report 2026-09-14): every debounced sync ran with
+# `>/dev/null 2>&1 || true`. A `kg-sync` exit-3 refusal — "I did NOT run, no
+# interpreter with VCO's KG dependencies" — was therefore invisible on the
+# edit path, and the knowledge nodes of a whole session appeared to sync and
+# did not. The wrapper's diagnostic was already excellent; nothing read it.
+#
+# The fix is NOT "let it print on every edit": a PostToolUse hook's stdout is
+# dropped by Claude Code and a per-edit stderr line would be noise 200 times a
+# session. It is the shape `embedding_failures.jsonl` already uses:
+#
+#   * full stderr → a project-local LOG file (`.claude/logs/kg-sync-hook.log`,
+#     the log home `post-file-edit.sh` already writes into), bounded;
+#   * ONE structured row per SESSION per channel → a metrics stream
+#     (`kg_sync_failures.jsonl`, via the shared `_lib/metrics-dir.sh`
+#     resolver), deduped by a per-session sentinel in `.claude/state/`;
+#   * the row is read back and surfaced ONCE by the SessionStart hook
+#     `session-start-retrieval-health.{sh,ps1}`.
+#
+# MUST MATCH `_lib/kg-sync-debounce.ps1` (same log file, same jsonl name, same
+# sentinel shape, same one-row-per-session-per-channel rule).
+
+#: Bound for the stderr log. Past this the log is restarted rather than grown
+#: without limit — it is a diagnostic tail, not an archive.
+_KG_DEBOUNCE_LOG_MAX_BYTES=262144
+
+# Absolute path of the stderr log for project root $1, after making sure the
+# directory exists and the file is within its size bound. Echoes "" (and
+# returns non-zero) when the path is unusable — callers then fall back to
+# discarding stderr, exactly as before this existed.
+_kg_debounce_log_path() {
+    local proot="$1" log size
+    [ -n "$proot" ] || return 1
+    mkdir -p "$proot/.claude/logs" 2>/dev/null || return 1
+    log="$proot/.claude/logs/kg-sync-hook.log"
+    if [ -f "$log" ]; then
+        size=$(wc -c < "$log" 2>/dev/null || printf '0')
+        case "$size" in ''|*[!0-9\ ]*) size=0 ;; esac
+        size=$(printf '%s' "$size" | tr -d ' ')
+        [ -n "$size" ] || size=0
+        if [ "$size" -gt "$_KG_DEBOUNCE_LOG_MAX_BYTES" ]; then
+            : > "$log" 2>/dev/null || true
+        fi
+    fi
+    printf '%s' "$log"
+}
+
+# JSON-escape $1 for embedding in a double-quoted string: backslash first,
+# then quote, then strip control characters (a stderr tail can carry both).
+_kg_debounce_json_escape() {
+    printf '%s' "$1" \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'
+}
+
+# The session key used to dedupe the failure row. Sanitised to the same
+# [A-Za-z0-9_-] charset `_lib/session-id.sh` enforces, because it is
+# interpolated into a FILE NAME; anything else collapses to "default", and an
+# absent session id (a wrapper run outside a Claude session) to "nosession".
+_kg_debounce_session_key() {
+    local raw="${VCT_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
+    [ -n "$raw" ] || { printf '%s' "nosession"; return 0; }
+    case "$raw" in
+        *[!a-zA-Z0-9_-]*) printf '%s' "default" ;;
+        *)                printf '%s' "$raw" ;;
+    esac
+}
+
+# Record ONE failure row for this session+channel. Best-effort in every
+# direction: an unresolvable metrics dir, an unwritable sentinel or a missing
+# `date` all end in "no row", never in a failed sync path.
+#   $1 = project root · $2 = channel · $3 = exit code · $4 = stderr log path
+_kg_debounce_record_failure() {
+    local proot="$1" chan="$2" rc="$3" log="$4"
+    local sentinel_dir sentinel metrics_dir tail_line ts row lib_dir
+    [ -n "$proot" ] || return 0
+
+    # Per-session, per-channel dedup. Same sentinel shape as the
+    # `gate_skipped_deferral_<session>` file post-file-edit.sh already writes.
+    sentinel_dir="$proot/.claude/state"
+    mkdir -p "$sentinel_dir" 2>/dev/null || return 0
+    sentinel="$sentinel_dir/kg_sync_failure_$(_kg_debounce_session_key)_${chan}"
+    [ -e "$sentinel" ] && return 0
+
+    lib_dir="$(dirname "$_KG_DEBOUNCE_LIB")"
+    [ -f "$lib_dir/metrics-dir.sh" ] || return 0
+    # shellcheck source=metrics-dir.sh disable=SC1091
+    . "$lib_dir/metrics-dir.sh"
+    metrics_dir="$(vco_metrics_dir 2>/dev/null || printf '')"
+    [ -n "$metrics_dir" ] || return 0
+
+    tail_line=""
+    if [ -n "$log" ] && [ -f "$log" ]; then
+        tail_line="$(grep -v '^[[:space:]]*$' "$log" 2>/dev/null | tail -n 1 || printf '')"
+        # Bound the quoted excerpt; the full text stays in the log file.
+        tail_line="$(printf '%s' "$tail_line" | cut -c1-300)"
+    fi
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '')"
+
+    row="{\"ts\":\"$(_kg_debounce_json_escape "$ts")\""
+    row="$row,\"kind\":\"kg_sync_failed\""
+    row="$row,\"project_root\":\"$(_kg_debounce_json_escape "$proot")\""
+    row="$row,\"channel\":\"$(_kg_debounce_json_escape "$chan")\""
+    row="$row,\"exit\":$rc"
+    row="$row,\"session\":\"$(_kg_debounce_json_escape "$(_kg_debounce_session_key)")\""
+    row="$row,\"log\":\"$(_kg_debounce_json_escape "${log:-}")\""
+    row="$row,\"last_stderr\":\"$(_kg_debounce_json_escape "$tail_line")\"}"
+
+    printf '%s\n' "$row" >> "$metrics_dir/kg_sync_failures.jsonl" 2>/dev/null || return 0
+    # Written only AFTER the row landed, so a failed append is retried by the
+    # next failing edit instead of being silently marked reported.
+    : > "$sentinel" 2>/dev/null || true
+    return 0
+}
+
+# THE one runner every debounced sync goes through: cd, run with stderr
+# captured, record a row when it failed. Returns 0 always — a failing sync
+# must never take the hook (or the reaper loop) down with it.
+#   $1 = working dir · $2 = channel · $3 = the command string to eval
+_kg_debounce_run_cmd() {
+    _rc_wd="$1"; _rc_chan="$2"; _rc_cmd="$3"
+    [ -n "$_rc_cmd" ] || return 0
+    if [ -n "$_rc_wd" ]; then
+        cd "$_rc_wd" 2>/dev/null || true
+    fi
+    _rc_log="$(_kg_debounce_log_path "$_rc_wd" 2>/dev/null || printf '')"
+    _rc_rc=0
+    # SUBSHELL, not a bare `eval`: the command string is assembled by the
+    # hooks and could contain an `exit` (a user-edited hook, a future gated
+    # form). A bare eval would take THIS shell down with it — skipping both
+    # the failure record below AND, on the claimed path, the `rm -rf` that
+    # releases the work dir. Containing it costs one fork.
+    # (POSIX-specific: the PowerShell sibling's `Invoke-Expression` has no
+    # equivalent containment, and the commands post-file-edit.ps1 builds carry
+    # no `exit`; the log/jsonl/sentinel rules are what the two share.)
+    if [ -n "$_rc_log" ]; then
+        # stdout still discarded (it is progress chatter nobody reads here);
+        # stderr APPENDED to the log, which is the half that carries refusals.
+        ( eval "$_rc_cmd" ) >/dev/null 2>>"$_rc_log" || _rc_rc=$?
+    else
+        ( eval "$_rc_cmd" ) >/dev/null 2>&1 || _rc_rc=$?
+    fi
+    if [ "$_rc_rc" -ne 0 ]; then
+        _kg_debounce_record_failure "$_rc_wd" "${_rc_chan:-kg}" "$_rc_rc" "$_rc_log"
+    fi
+    return 0
+}
+
 # Recover ONE atomically-won work dir: re-stamp it with the eval-runner's
 # REAL pid (for the dead-pid sweep), run the recorded sync, then remove it.
 # The dir passed in is ALREADY owned by us (we won its rename), so no
@@ -246,8 +412,12 @@ _kg_debounce_run_claimed() {
         [ -f "$_claimed/cmd" ] && _line=$(head -1 "$_claimed/cmd" 2>/dev/null || echo "")
         _wd=$(printf '%s' "$_line" | cut -f1)
         _cmd=$(printf '%s' "$_line" | cut -f2-)
-        [ -n "$_wd" ] && cd "$_wd" 2>/dev/null || true
-        [ -n "$_cmd" ] && eval "$_cmd" >/dev/null 2>&1 || true
+        # v0.2.95: the run goes through the ONE runner, which captures the
+        # child's stderr and records a failure row (see
+        # `_kg_debounce_run_cmd`). The channel is the lock-name prefix the
+        # scheduler wrote ("kg_<md5>.lock" → "kg").
+        _chan="${base%%_*}"
+        [ -n "$_cmd" ] && _kg_debounce_run_cmd "$_wd" "${_chan:-kg}" "$_cmd"
         # Drop only after the eval finishes so a crash before/during eval
         # leaves a recoverable ".claimed.<realpid>" behind (Sweep B
         # recovers it) rather than dropping the sync.
@@ -289,11 +459,35 @@ _kg_debounce_detach() {
     fi
 }
 
-# Build the snippet a detached IMMEDIATE-sync runs: cd into $1, eval $2.
-# Both args are embedded via _kg_debounce_shquote so paths/cmds with spaces
-# or quotes survive the extra `sh -c` layer.
-#   $1 = working dir, $2 = sync command string
+# Build the snippet a detached IMMEDIATE-sync runs.
+#
+# Preferred form (v0.2.95): re-source this lib in the detached shell and go
+# through `_kg_debounce_run_cmd`, so the immediate path captures stderr and
+# records a failure row exactly like the flusher/reaper path. A failure that
+# is visible only when the debounce window happens to be non-zero is not
+# visible. Same re-source-with-fallback shape `_kg_debounce_spawn_flusher`
+# already uses.
+#
+# Fallback (lib not re-sourceable — an out-of-tree copy, an unreadable path):
+# the pre-v0.2.95 bare `cd; eval`. Degrading to "sync runs, failure invisible"
+# is right; dropping the sync would not be.
+#
+# Every arg is embedded via _kg_debounce_shquote so paths/cmds with spaces or
+# quotes survive the extra `sh -c` layer.
+#   $1 = working dir, $2 = sync command string, $3 = channel (default "kg")
 _kg_debounce_immediate_snip() {
+    if [ -r "$_KG_DEBOUNCE_LIB" ]; then
+        # `_KG_DEBOUNCE_LIB=<path>` BEFORE the source: the child is `sh -c`,
+        # where the lib's own `$0`-based fallback would resolve to `<cwd>/sh`
+        # (see the preset branch at the top of this file).
+        printf '_KG_DEBOUNCE_LIB=%s; . %s; _kg_debounce_run_cmd %s %s %s' \
+            "$(_kg_debounce_shquote "$_KG_DEBOUNCE_LIB")" \
+            "$(_kg_debounce_shquote "$_KG_DEBOUNCE_LIB")" \
+            "$(_kg_debounce_shquote "$1")" \
+            "$(_kg_debounce_shquote "${3:-kg}")" \
+            "$(_kg_debounce_shquote "$2")"
+        return 0
+    fi
     printf 'cd %s 2>/dev/null || true; eval %s' \
         "$(_kg_debounce_shquote "$1")" "$(_kg_debounce_shquote "$2")"
 }
@@ -538,7 +732,7 @@ _kg_debounce_schedule() {
     # Debounce disabled → preserve legacy "sync immediately" behaviour
     # (now detached so it survives the hook's process-group exit — Item 1).
     if [ "$window" = "0" ]; then
-        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd")"
+        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd" "$chan")"
         return 0
     fi
 
@@ -549,7 +743,7 @@ _kg_debounce_schedule() {
     mkdir -p "$dir" 2>/dev/null || {
         # Can't create state dir → fail OPEN to immediate (detached) sync so
         # a permission problem never silently drops the sync.
-        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd")"
+        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd" "$chan")"
         return 0
     }
 
@@ -569,7 +763,7 @@ _kg_debounce_schedule() {
         lock_count=$#
     fi
     if [ "$lock_count" -ge "$_KG_DEBOUNCE_LOCK_CEILING" ]; then
-        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd")"
+        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd" "$chan")"
         return 0
     fi
 

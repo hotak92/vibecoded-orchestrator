@@ -582,6 +582,119 @@ fn reap_stale_install_py_lock() {
 }
 
 
+// ---------------------------------------------------------------------------
+// v0.2.95 (ruling R2) — tray-only start
+// ---------------------------------------------------------------------------
+//
+// `vco_lib/launcher_ensure.py` spawns this binary with HIDDEN_START_FLAG from
+// the SessionStart hook (which VS Code also runs on `folderOpen`), so opening
+// an editor brings the launcher up WITHOUT a window appearing and WITHOUT
+// taking focus. Two things have to be true for that, and each has a mechanism
+// here rather than a hope:
+//
+//  1. THE WINDOW IS NEVER CREATED VISIBLE. `run()` mutates its own
+//     `windows[].visible` to false before `tauri::Builder` sees the config, so
+//     no window is mapped, activated or destroyed. That is not politeness: a
+//     window created + activated + destroyed as a side effect on a live X11
+//     desktop is what made mutter abort and killed the maintainer's GNOME
+//     session twice on 2026-09-09.
+//  2. THE WINDOW-STATE PLUGIN DOES NOT UNDO IT. With its default flags that
+//     plugin calls `show()` AND `set_focus()` on every window it restores,
+//     which would defeat (1) — and silently steals focus on every ordinary
+//     launch too. VISIBLE is dropped from its flag set; size, position,
+//     maximized, decorations and fullscreen still restore.
+//
+// The flag ALSO travels to an already-running launcher: the single-instance
+// plugin hands the second process's argv to the first, which is the one place
+// that can tell "the user launched me again" (focus the window — the reason
+// that callback exists) from "a session-start ensure raced me" (do nothing).
+
+/// Argv flag requesting a tray-only start.
+///
+/// MUST MATCH `vco_lib/launcher_ensure.py::HIDDEN_START_FLAG`, which also
+/// searches the compiled binary for this literal to decide whether a given
+/// launcher is new enough to be started hidden at all. Pinned by
+/// `tests/test_v0295_launcher_ensure.py`.
+pub(crate) const HIDDEN_START_FLAG: &str = "--start-hidden";
+
+/// Was a tray-only start requested? PURE — argv in, decision out.
+///
+/// Matches the flag ANYWHERE in argv, not only at `args[1]`: `handle_cli_args`
+/// owns position 1 for its subcommands, and a future wrapper may prepend its
+/// own arguments.
+pub(crate) fn start_hidden_requested<S: AsRef<str>>(args: &[S]) -> bool {
+    args.iter().any(|a| a.as_ref() == HIDDEN_START_FLAG)
+}
+
+/// What the FIRST launcher should do when a second one is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondInstanceAction {
+    /// The user launched the app again — show and focus the window. This is
+    /// the whole reason the single-instance callback exists.
+    FocusExisting,
+    /// A session-start ensure spawned a duplicate it believed was needed.
+    /// Whatever this window is doing — hidden in the tray, or in front of the
+    /// user on another workspace — must not change.
+    LeaveAlone,
+}
+
+/// PURE decision for the single-instance callback.
+pub(crate) fn second_instance_action<S: AsRef<str>>(argv: &[S]) -> SecondInstanceAction {
+    if start_hidden_requested(argv) {
+        SecondInstanceAction::LeaveAlone
+    } else {
+        SecondInstanceAction::FocusExisting
+    }
+}
+
+/// PURE: apply the tray-only decision to a window configuration.
+///
+/// Returns the number of windows switched to invisible, so a caller can log
+/// what it did instead of asserting it. Separated from
+/// [`hidden_start_context`] because `tauri::generate_context!()` can only be
+/// expanded in the real binary — this half is the part worth testing.
+pub(crate) fn apply_hidden_start(
+    windows: &mut [tauri::utils::config::WindowConfig],
+    hidden: bool,
+) -> usize {
+    if !hidden {
+        return 0;
+    }
+    let mut changed = 0;
+    for window in windows.iter_mut() {
+        if window.visible {
+            window.visible = false;
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// The Tauri context, with `visible` cleared when a tray-only start was asked
+/// for.
+///
+/// This is the ONLY mechanism, and it is the same one on all three platforms:
+/// a window that is never created visible is never mapped by X11/Wayland,
+/// never `makeKeyAndOrderFront`-ed by AppKit, and never given `SW_SHOW` by
+/// Win32 — so there is nothing to steal focus and nothing for a compositor to
+/// race. Hiding the window later (what the `tray_start_minimized` preference
+/// does from `setup`) is NOT equivalent: by then the window exists.
+fn hidden_start_context() -> tauri::Context<tauri::Wry> {
+    let mut context = tauri::generate_context!();
+    let args: Vec<String> = std::env::args().collect();
+    let hidden = start_hidden_requested(&args);
+    let changed = apply_hidden_start(&mut context.config_mut().app.windows, hidden);
+    if hidden {
+        tracing::info!(
+            "[vct] {} — starting in the tray only; {} window(s) created hidden. \
+             Left-click the tray icon to open the launcher.",
+            HIDDEN_START_FLAG,
+            changed,
+        );
+    }
+    context
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // v0.2.12 (unified PR-23 + PR-28 dispatch): CLI subcommand dispatch
@@ -719,7 +832,20 @@ pub fn run() {
         // today — just focus our existing window so the user sees their
         // already-running launcher come to front. Future: route command-
         // line deep-links (vct://...) through here.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // v0.2.95 (R2): argv is the SECOND process's — the only signal
+            // that can distinguish a user re-launching the app from a
+            // session-start ensure that raced a launcher already coming up.
+            // A focus grab is right for the first and wrong for the second,
+            // so the decision is taken from argv, not assumed.
+            if second_instance_action(&argv) == SecondInstanceAction::LeaveAlone {
+                tracing::debug!(
+                    "[vct] single-instance: duplicate launch carried {} — leaving \
+                     this window exactly as it is",
+                    HIDDEN_START_FLAG,
+                );
+                return;
+            }
             // Bring the existing main window to front. If no window exists
             // (rare — possible if user closed the window but tray-icon
             // kept the process alive), show + focus the first available.
@@ -741,7 +867,26 @@ pub fn run() {
         // resize/move/close. Combined with `maximized: true` in
         // tauri.conf.json `windows[]`, first launch opens maximized;
         // every subsequent launch reuses the user's last layout.
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        //
+        // v0.2.95 (R2): VISIBLE is dropped from the flag set. With it, the
+        // plugin ends its restore with `show()` AND `set_focus()` on every
+        // launch — which (a) would defeat the tray-only start below, and
+        // (b) already meant "Start launcher minimized to tray" could only
+        // hide a window the plugin had just put in front of the user. It
+        // also PERSISTED the last visibility, so quitting from the tray
+        // while hidden made the next launch open no window at all. Window
+        // visibility now has exactly one home: the config, as amended by
+        // `hidden_start_context()`. Size / position / maximized /
+        // decorations / fullscreen — the reason this plugin is here —
+        // still restore.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        - tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
         .manage(app_manager)
         .manage(project_store)
         .manage(db_handle)
@@ -3413,6 +3558,14 @@ pub fn run() {
             // `vct-hub --{register,unregister,}-boot`.
             commands::hub_proxy::get_hub_boot_autostart,
             commands::hub_proxy::set_hub_boot_autostart,
+            // v0.2.95 (R2): the launcher's OWN startup switch, next to it in
+            // the same Preferences section. Different mechanism entirely —
+            // the hub toggle writes an OS boot registration, this one writes
+            // an app_state row the SessionStart hook reads — so they are two
+            // commands, not one generalised "startup" command that would
+            // have to branch internally on which service it means.
+            commands::session_autostart::get_launcher_session_autostart,
+            commands::session_autostart::set_launcher_session_autostart,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
@@ -3486,7 +3639,7 @@ pub fn run() {
         // mid-op (e.g. parked on a user unlock prompt) the drain is SKIPPED and
         // the process teardown closes the socket — exit is never stalled on a
         // prompt. No-op on Windows / macOS.
-        .build(tauri::generate_context!())
+        .build(hidden_start_context())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
@@ -4171,5 +4324,103 @@ mod weights_poll_keychain_shape_tests {
             "the weights-poll Err branch must distinguish a locked keychain \
              from a generic error for an honest skip message"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.95 (ruling R2) — tray-only start: the decision, tested both ways
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hidden_start_tests {
+    use super::*;
+    use tauri::utils::config::WindowConfig;
+
+    #[test]
+    fn flag_absent_means_an_ordinary_visible_launch() {
+        let argv = ["vct-launcher".to_string()];
+        assert!(!start_hidden_requested(&argv));
+        let mut windows = vec![WindowConfig::default()];
+        assert_eq!(apply_hidden_start(&mut windows, false), 0);
+        assert!(
+            windows[0].visible,
+            "a launch WITHOUT the flag must keep the shipped `visible: true`; \
+             a regression here makes every ordinary double-click invisible"
+        );
+    }
+
+    #[test]
+    fn flag_present_creates_every_window_hidden() {
+        let argv = ["vct-launcher".to_string(), HIDDEN_START_FLAG.to_string()];
+        assert!(start_hidden_requested(&argv));
+        let mut windows = vec![WindowConfig::default(), WindowConfig::default()];
+        assert_eq!(apply_hidden_start(&mut windows, true), 2);
+        assert!(windows.iter().all(|w| !w.visible));
+    }
+
+    #[test]
+    fn already_hidden_windows_are_not_counted_twice() {
+        // The count is what gets logged; it must report what CHANGED.
+        let mut windows = vec![WindowConfig::default(), WindowConfig::default()];
+        windows[0].visible = false;
+        assert_eq!(apply_hidden_start(&mut windows, true), 1);
+    }
+
+    #[test]
+    fn flag_is_recognised_anywhere_in_argv() {
+        // `handle_cli_args` owns position 1 for its subcommands, and a
+        // wrapper may prepend arguments — so position must not matter.
+        let argv = [
+            "vct-launcher".to_string(),
+            "--whatever".to_string(),
+            HIDDEN_START_FLAG.to_string(),
+        ];
+        assert!(start_hidden_requested(&argv));
+    }
+
+    #[test]
+    fn a_user_relaunch_still_focuses_the_existing_window() {
+        // The leave-alone half of the single-instance decision must NOT
+        // swallow the case the callback exists for.
+        let argv = ["vct-launcher".to_string()];
+        assert_eq!(
+            second_instance_action(&argv),
+            SecondInstanceAction::FocusExisting
+        );
+    }
+
+    #[test]
+    fn an_ensure_spawned_duplicate_never_takes_focus() {
+        let argv = ["vct-launcher".to_string(), HIDDEN_START_FLAG.to_string()];
+        assert_eq!(
+            second_instance_action(&argv),
+            SecondInstanceAction::LeaveAlone
+        );
+    }
+
+    #[test]
+    fn window_state_plugin_must_not_restore_visibility() {
+        // The plugin's restore ends in `show()` + `set_focus()` when the
+        // VISIBLE flag is set, which would defeat the tray-only start on
+        // every platform. Source-pinned because the flag set is builder
+        // configuration with no observable handle to assert on.
+        let src = include_str!("lib.rs");
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains(
+                "StateFlags::all()-tauri_plugin_window_state::StateFlags::VISIBLE"
+            ),
+            "the window-state plugin must be built WITHOUT StateFlags::VISIBLE — \
+             with it, every launch is shown and focused by the plugin"
+        );
+    }
+
+    #[test]
+    fn the_flag_literal_is_the_capability_marker() {
+        // `vco_lib/launcher_ensure.py` searches the COMPILED binary for this
+        // literal to decide whether a launcher is new enough to start hidden.
+        // Renaming it on one side only would make every launcher read as
+        // "too old" — noisy, but never a focus steal. Keep them equal.
+        assert_eq!(HIDDEN_START_FLAG, "--start-hidden");
     }
 }

@@ -320,7 +320,7 @@ mod tests {
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/cost-tracker.sh",
+            "command": "bash .claude/hooks/notify-stop.sh",
             "timeout": 5
           }
         ]
@@ -375,7 +375,7 @@ mod tests {
                 &pid,
                 "Stop",
                 "",
-                "bash .claude/hooks/cost-tracker.sh",
+                "bash .claude/hooks/notify-stop.sh",
                 "project",
                 None,
                 None,
@@ -468,7 +468,7 @@ mod tests {
     async fn the_bare_db_flag_flip_is_provably_inert() {
         let f = Fixture::new();
         let before = f.raw();
-        let hook_id = f.hook_id("bash .claude/hooks/cost-tracker.sh");
+        let hook_id = f.hook_id("bash .claude/hooks/notify-stop.sh");
 
         f.db.set_project_hook_enabled(hook_id, false).unwrap();
 
@@ -481,14 +481,14 @@ mod tests {
             before,
             "…and settings.json is untouched, so Claude Code still runs the hook — the placebo"
         );
-        assert_eq!(f.commands_under("Stop"), vec!["bash .claude/hooks/cost-tracker.sh".to_string()]);
+        assert_eq!(f.commands_under("Stop"), vec!["bash .claude/hooks/notify-stop.sh".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn re_enabling_restores_the_file_byte_for_byte() {
         let f = Fixture::new();
         let before = f.raw();
-        let hook_id = f.hook_id("bash .claude/hooks/cost-tracker.sh");
+        let hook_id = f.hook_id("bash .claude/hooks/notify-stop.sh");
 
         enforce_hook_toggle(&f.db, &f.pid, hook_id, false).await.unwrap();
         assert!(f.commands_under("Stop").is_empty());
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(f.raw(), before, "re-enable restores the exact original bytes");
         assert_eq!(
             f.db
-                .get_parked_project_hook_entry(&f.pid, "Stop", "", "bash .claude/hooks/cost-tracker.sh")
+                .get_parked_project_hook_entry(&f.pid, "Stop", "", "bash .claude/hooks/notify-stop.sh")
                 .unwrap(),
             None,
             "the parked entry is cleared once it is back in the file"
@@ -511,7 +511,7 @@ mod tests {
     async fn enable_refuses_when_nothing_is_parked() {
         let f = Fixture::new();
         let before = f.raw();
-        let hook_id = f.hook_id("bash .claude/hooks/cost-tracker.sh");
+        let hook_id = f.hook_id("bash .claude/hooks/notify-stop.sh");
 
         let err = enforce_hook_toggle(&f.db, &f.pid, hook_id, true)
             .await
@@ -532,7 +532,7 @@ mod tests {
         // ever becoming a global-by-id lookup instead).
         let f = Fixture::new();
         let before = f.raw();
-        let hook_id = f.hook_id("bash .claude/hooks/cost-tracker.sh");
+        let hook_id = f.hook_id("bash .claude/hooks/notify-stop.sh");
 
         // Second project in the SAME db (not a second Db — a hook_id is
         // only ever unique within one shared table).
@@ -615,7 +615,7 @@ mod tests {
         std::env::set_var("VCT_VENV", venv_dir.path());
 
         let f = Fixture::new();
-        let hook_id = f.hook_id("bash .claude/hooks/cost-tracker.sh");
+        let hook_id = f.hook_id("bash .claude/hooks/notify-stop.sh");
         let result = enforce_hook_toggle(&f.db, &f.pid, hook_id, false).await;
 
         match prev_venv {
@@ -654,7 +654,7 @@ mod tests {
         // `not_found` refusal (the entry really is gone from the file now),
         // not silently succeed a second time.
         let f = Fixture::new();
-        let hook_id = f.hook_id("bash .claude/hooks/cost-tracker.sh");
+        let hook_id = f.hook_id("bash .claude/hooks/notify-stop.sh");
 
         enforce_hook_toggle(&f.db, &f.pid, hook_id, false).await.unwrap();
         let after_first = f.raw();

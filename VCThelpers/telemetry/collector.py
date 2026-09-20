@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 
 # Local imports — kept at module level but used behind feature checks so
 # import cost is negligible for telemetry-disabled runs.
-from .consent import load_consent
-from .queue import get_queue
+from .consent import load_consent  # noqa: E402 — deliberate, see comment above
+from .queue import get_queue  # noqa: E402 — deliberate, see comment above
 
 # ---- version ------------------------------------------------------------
 

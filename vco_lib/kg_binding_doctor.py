@@ -480,6 +480,29 @@ def scan_kg_binding_evidence(
         for cls, (count, sample) in samples.items():
             if not sample:
                 continue  # populated but no usable file_path values — no anchor
+            if _unbindable_fixture_class(cls, owners):
+                # v0.2.95 F3. A class whose project stem is one of VCO's TEST
+                # FIXTURE names, named by NO binding row, is not a candidate:
+                # `vco_lib.fixture_class_guard` REFUSES writes to it, and the
+                # add-time guard refuses to create a project that would own
+                # one — so "evidence" here could only ever be residue a probe
+                # harness left behind. Counting it produced advice the product
+                # itself blocks: the maintainer's `Alpha_KnowledgeGraph` (70
+                # residue nodes, all with real `file_path`s under the folder,
+                # so it clears the ownership bar) made the 791-object real
+                # collection look AMBIGUOUS, and both D18 entries then offered
+                # the residue half as the class to bind — one of them with a
+                # copy-paste binding-row UPDATE for the user to paste into
+                # launcher.db.
+                #
+                # Dropping it here is the ONE place that fixes every surface,
+                # because the mismatch finding, the ambiguity ask and the heal
+                # all consume `ProjectBindingVerdict.evidence`. The class is
+                # NOT hidden: with no verdict claiming it, it falls into
+                # `unclaimed` below, where the reading already labels it
+                # fixture-shaped and prints the LOOK-only instructions written
+                # for exactly this case.
+                continue
             distinct = set(sample)
             matched = sum(
                 1 for fp in distinct if file_exists(folder, fp)
@@ -551,6 +574,30 @@ def scan_kg_binding_evidence(
         verdicts=tuple(verdicts), unclaimed=unclaimed,
         fixture_shaped=fixture_shaped,
     )
+
+
+def _unbindable_fixture_class(name: str, owners: dict) -> bool:
+    """Is ``name`` a fixture-stemmed class that no binding row names?
+
+    The narrow question, and the narrowness is the point. An OWNED class is
+    owned whatever its stem looks like — a binding row naming it settles the
+    matter, and removing it from its own project's evidence would report that
+    project as having no data anywhere, a worse lie than the one this fixes.
+    (It cannot arise on a healthy install: the add-time guard refuses a
+    fixture-named class. The doctor still reports what it SEES.)
+
+    The stem rule itself lives in :mod:`vco_lib.fixture_class_guard`, beside
+    the write guard that refuses these classes — one home, so "VCO will not
+    write here" and "VCO will not advise binding here" cannot drift apart.
+    """
+    if name in owners:
+        return False
+    try:
+        from vco_lib.fixture_class_guard import fixture_stem_of
+
+        return fixture_stem_of(name) is not None
+    except Exception:  # noqa: BLE001 — a guard defect must not drop evidence
+        return False
 
 
 def render_three_values(verdict: ProjectBindingVerdict) -> str:

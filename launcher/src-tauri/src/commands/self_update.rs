@@ -50,14 +50,21 @@ use vct_launcher_core::process::CommandExt as _;
 // surfaces leave the SAME durable record. The enum/writer live in
 // `git_user_editable_merge` (relocated from installer.rs-private) so neither
 // surface grows a second copy.
-use crate::commands::git_user_editable_merge::{
-    write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
-};
+// v0.2.95 phase 2: this surface no longer writes that record ITSELF — it pulls
+// through `update_pipeline`, which writes the diverged deferral (and the paired
+// resume sentinel this surface never had) from the one classification. The
+// import is gone with the last call site; the record is not.
+//
 // v0.2.92 WP-13: the ONE git runner + the ONE branch resolver (see
-// `commands::git_cmd`). `run_git` / `run_git_combined` are imported under
-// their old names so the ~16 call sites in this file did not churn during
-// the extraction.
-use crate::commands::git_cmd::{self, run_git, run_git_combined};
+// `commands::git_cmd`). `run_git` is imported under its old name so the call
+// sites in this file did not churn during the extraction.
+//
+// v0.2.95 phase 2: `run_git_combined` dropped from this import — its only
+// caller here was this surface's own `git pull`, which is now the pipeline's.
+// The pipeline pins `LC_ALL=C` on that pull through `run_git_raw_env`, so the
+// C-locale guarantee `run_git_combined` carried is preserved (and extended to
+// the surface that never had it).
+use crate::commands::git_cmd::{self, run_git};
 use vct_launcher_core::check_state::CheckState;
 
 /// Refresh cadence for the daily background check. The user said "once a
@@ -414,19 +421,30 @@ async fn git_available() -> bool {
 // `installer.rs`'s five inline ones, and the disagreement is what made the
 // self-update check structurally blind in a detached HEAD.
 
-/// Abort an in-progress merge/rebase left by a failed RealMerge pull, so the
-/// working tree is clean for the next attempt. v0.2.71 (BLOCKER-1 fix): without
-/// this, a conflicted `apply_launcher_update` left `.git/MERGE_HEAD` / `UU`
-/// markers on disk; the NEXT `apply_launcher_update` then dead-ended at the
-/// Step-1 clean-tree guard (`first_blocking_change`) — a hard stop of the
-/// self-update surface. Best-effort + idempotent: `--abort` is a no-op (errors
-/// harmlessly) when no merge/rebase is in progress, so we ignore the result.
-/// Mirrors `installer::abort_orchestrator_merge_or_rebase`'s on-disk detection
-/// intent (merge first, then rebase) without the Tauri-command wrapper.
-async fn abort_merge_or_rebase_in_progress(repo: &Path) {
-    let _ = run_git(repo, &["merge", "--abort"]).await;
-    let _ = run_git(repo, &["rebase", "--abort"]).await;
-}
+// v0.2.95 phase 2 — `abort_merge_or_rebase_in_progress` REMOVED, and what it
+// protected is now provided differently rather than dropped.
+//
+// It existed for v0.2.71 BLOCKER-1: a conflicted `apply_launcher_update` left
+// `.git/MERGE_HEAD` / `UU` markers, and the NEXT attempt dead-ended at this
+// surface's clean-tree guard. So the surface tore its own conflict down, which
+// left `force_resync_launcher`'s hard reset as the only forward action.
+//
+// Both halves of that are now false. This surface pulls through the shared
+// update pipeline, which deliberately LEAVES a conflicted tree standing and
+// writes the paired resume sentinel + deferral — and a standing conflict is
+// what the non-destructive recoveries need: the MenuBar badge reads the merge
+// state straight from `.git` and offers Continue Update / Abort
+// (`installer::abort_orchestrator_merge_or_rebase`, the same two git commands
+// this held, behind the command the modal already calls). And the dead end is
+// gone too: the pipeline's in-progress-merge refusal now runs BEFORE this
+// surface's dirty-tracked guard, so a second attempt reopens on the stalled
+// state instead of being told about the `UU` entries the wedge left behind.
+
+// v0.2.95 phase 2 — `is_merge_conflict` REMOVED. It was a `pub(crate)` one-line
+// delegator to `git_user_editable_merge::is_pull_conflict` (kept in v0.2.71 so
+// this file's call sites did not churn), and its only caller was this surface's
+// own post-pull classifier. The pipeline classifies now, through that same
+// shared function — which is where the phrase list has lived since v0.2.71.
 
 // v0.2.92 WP-13: `current_branch` DELETED. It returned
 // `git rev-parse --abbrev-ref HEAD` verbatim — which is the literal string
@@ -1074,22 +1092,20 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
 
     let repo = find_launcher_repo_root()?;
 
+    // Ledger step 40 (v0.2.95 phase 2): neither update surface was
+    // single-flighted. The frontend disables its own button, which is exactly
+    // the reasoning v0.2.91 decision #26 rejected — a second window, a reopened
+    // modal or a button double-fire all reach the command again, and here that
+    // means two git pulls plus two `install.py --update` runs interleaving on
+    // ONE tree. The claim is taken by the COMMAND, not inside the pipeline, so
+    // it is still held across install.py and the restart hop; it releases on
+    // every exit path including a panic (RAII).
+    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+
     // Step 0: pin the canonical public upstream (Design B). Must happen
     // BEFORE any fetch/diff/pull so we never accidentally pull from a
     // private fork's `origin`.
     ensure_upstream_remote(&repo).await?;
-
-    // Step 1: clean-tree assertion. `git status --porcelain` lists every
-    // path with an unstaged or staged change; we filter out untracked-in-
-    // user-owned-dirs and only block on actual conflicts.
-    let dirty = run_git(&repo, &["status", "--porcelain"]).await?;
-    if let Some(blocker) = first_blocking_change(&dirty) {
-        return Err(format!(
-            "Uncommitted changes on tracked file '{}' would be lost. Commit, stash, \
-             or revert before updating.",
-            blocker
-        ));
-    }
 
     // Step 2: detect what changed BEFORE pulling so we can decide what
     // to rebuild. We diff the current HEAD against vco_upstream/<branch>.
@@ -1109,10 +1125,20 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         );
     }
 
-    // Fetch upstream so the local refs (vco_upstream/<branch>) are current
-    // for the diff and the subsequent pull. Without this, a fresh `vco_upstream`
-    // remote has no tracking refs yet and the diff returns empty.
-    fetch_upstream(&repo).await?;
+    // Fetch upstream so the local refs (vco_upstream/<branch>) are current for
+    // the dirty-tracked pre-flight and for the rebuild-gating diff below.
+    // Without this, a fresh `vco_upstream` remote has no tracking refs yet and
+    // the diff returns empty.
+    //
+    // v0.2.95 phase 2 (ledger step 7): through the SAME serialized home the
+    // installer surface uses. The plain `fetch_upstream` this used to call was
+    // the last caller still exposed to the A-RC3 FETCH_HEAD race with the
+    // startup badge check that v0.2.83 closed on the other surface — the mutex
+    // plus `--no-write-fetch-head` is the whole fix, and it was never a
+    // surface-specific one. The pipeline fetches again with the same policy;
+    // that second call is a cheap no-op against a just-fetched remote and it is
+    // what makes the pipeline correct for a caller that did NOT pre-fetch.
+    serialized_fetch_upstream(&repo, FetchPolicy::Quick, Some(&branch)).await?;
 
     // v0.2.92 WP-13: `.unwrap_or_default()` here was the THIRD laundering of
     // the same missing ref. An empty diff because `vco_upstream/HEAD` does not
@@ -1126,6 +1152,11 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // of the user's time on a button they explicitly pressed; the cost of a
     // skipped necessary build is a launcher that reports a version it is not
     // running.
+    //
+    // v0.2.95 phase 2 — these two now gate the FALLBACK only. When `install.py`
+    // is available it applies the artefacts (including refreshing the dist
+    // binary from the tracked ones the pull just landed) and no local toolchain
+    // is touched. See `ArtefactSource`.
     let (needs_cargo, needs_npm) = match run_git(
         &repo,
         &[
@@ -1152,279 +1183,536 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         }
     };
 
-    // Step 3: pull from the canonical upstream using the SHARED divergence
-    // decision (v0.2.71 Piece 4). PRE-v0.2.71 this was a blind `--ff-only`:
-    // ANY committed divergence (e.g. a single committed KG node — the
-    // encouraged 3rd-party behaviour) made it refuse non-FF, and the ONLY
-    // forward action on this surface's resync modal is `force_resync_launcher`
-    // = `git reset --hard` (DATA LOSS). Routing through
-    // `resolve_divergence_pull_plan` gives this surface the SAME auto-merge as
-    // the MenuBar badge: conflict-free committed divergence folds silently via
-    // a real merge (RealMerge), and the destructive resync becomes the
-    // genuine-conflict-only fallback rather than the default path.
+    // ---------------------------------------------------------------------
+    // The pull, through the SHARED pipeline.
+    // ---------------------------------------------------------------------
     //
-    // `pre_merge_committed=false`: unlike `update_orchestrator`, this surface
-    // has no A0 pre-merge step (no synthetic commit) — so the plan is either
-    // RealMerge (clean committed divergence, no pop-conflict risk) or FfOnly
-    // (everything else, incl. a clean fast-forwardable tree). We never get
-    // RebaseAutostash here. v0.2.89 §4.3: BEFORE the plan resolves, the shared
-    // generated-file reconcile step (below) takes upstream's blob for any
-    // diverged allowlisted release-controlled file (lockfiles, package.json,
-    // Cargo.lock, dist/**) so the "expected conflict" class auto-resolves
-    // (RealMerge / fast-forward) instead of forcing this surface's resync
-    // modal; its take-upstream commit (if any) is threaded into the plan's
-    // 4th arg. The `needs_cargo`/`needs_npm` rebuild gating above
-    // was computed from the pre-diff `HEAD..vco_upstream/<branch>` (the
-    // upstream-changed set) BEFORE the pull, so it's correct regardless of
-    // whether the pull fast-forwards or produces a merge commit — a RealMerge
-    // leaves HEAD a merge commit but the set of files that changed vs. our old
-    // HEAD is identical, which is what drives the rebuild decision.
-    // v0.2.78 ITEM #0 (F1): same pre-plan auto-restore as the MenuBar surface
-    // (one home — `auto_restore_byte_identical_tracked_mods`). A tracked file
-    // whose working-tree content already == the incoming upstream blob is not a
-    // real modification and must not force the resync modal via the
-    // pop-conflict-risk set. Byte-identity-gated; divergent files left alone.
-    // v0.2.91 WI-4: Windows pre-pull rename, parity with the MenuBar surface.
+    // v0.2.95 phase 2. Everything between "the user clicked Update now" and
+    // "the tree is at the upstream tip" is `update_pipeline`'s, because it is
+    // the same git clone the MenuBar badge updates and the two had drifted in
+    // twelve places (review §2). This call is what closes them — in-progress
+    // merge refusal, MCP kill-sweep + update gate, upstream pinning, HUB STOP,
+    // both pre-pull binary renames, serialized fetch, the A0 user-editable
+    // pre-merge (and with it the RENDERED_LOCAL reconcile this surface used to
+    // reach by its own direct call), F1, the generated-file reconcile, the
+    // shared pull plan, every failure classification INCLUDING the
+    // untracked-collision one, the resume sentinel, the autostash-pop
+    // backstop, the "already up to date" heal and the HEAD-advance guard.
     //
-    // Two jobs, which is why it must sit HERE — before F1 + the generated-file
-    // reconcile, not just before the pull:
-    //   1. the reconcile's `git checkout HEAD -- launcher/dist/**` cannot
-    //      rewrite a mapped running `.exe`; with the canonical path freed it
-    //      can (this is exactly the ordering `update_orchestrator` already
-    //      has, and its absence here is why the reconcile was unreachable for
-    //      the dist-divergence class it was built for);
-    //   2. `git pull` would otherwise either abort atomically on
-    //      ERROR_SHARING_VIOLATION or complete the merge with the binary
-    //      silently skipped (metadata new + exe old + git-dirty).
+    // The hub stop is the one worth naming: `launcher/dist/*/vct-hub*` are
+    // TRACKED files, so this surface has been pulling over a RUNNING hub. On
+    // Windows that aborts the pull atomically or silently skips the binary; on
+    // POSIX the hub keeps serving old code from a deleted inode for the rest of
+    // the session. The pipeline stops it (hard-fail), renames it aside, and
+    // every failure path inside restores both and brings it back up.
     //
-    // No-op on POSIX. Reverted NON-CLOBBERINGLY on every failure return below
-    // (WI-3). Nothing between here and the pull returns early, so the revert
-    // sites below are exhaustive.
-    let pre_pull_renamed =
-        crate::services::binary_freshness::pre_pull_rename_running_binary(&repo);
-    // Revert helper for the failure paths: keeps the freshly-pulled bytes when
-    // the pull already landed them (WI-3) and logs either way.
+    // `first_change_at_risk` STAYS this surface's own refusal — see
+    // `ExtraPreflight`. It is passed IN rather than run before the call so the
+    // in-progress-merge refusal can front it: a tree wedged mid-merge must
+    // reopen on that state, not be told about the `UU` entries the wedge left.
+    let update_start_ms = chrono::Utc::now().timestamp_millis();
+    let head_sha_before = current_sha(&repo).await.ok();
+    let repo_label = repo.display().to_string();
+    write_self_update_audit(
+        &app,
+        "apply_launcher_update_start",
+        serde_json::json!({
+            "old_version": env!("CARGO_PKG_VERSION"),
+            "source_commit": head_sha_before,
+            "branch": branch,
+            "install_path": repo_label,
+        }),
+    );
+
+    let prepared = match crate::commands::update_pipeline::prepare_and_pull_orchestrator_repo(
+        &repo,
+        crate::commands::update_pipeline::UpdatePipelineOptions {
+            surface: "apply_launcher_update",
+            // No progress modal on this surface — the Preferences page renders a
+            // spinner on its own button. A surface that cannot show sub-progress
+            // must not ask install.py to emit it.
+            emit_progress_to: None,
+            install_path_label: &repo_label,
+            start_branch: &branch,
+            head_sha_before: head_sha_before.clone(),
+            update_start_ms,
+            extra_preflight:
+                crate::commands::update_pipeline::ExtraPreflight::RefuseDirtyTrackedAtRisk {
+                    branch: &branch,
+                },
+        },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => return Err(render_pipeline_error(&app, &repo, &branch, err).await),
+    };
+
+    let crate::commands::update_pipeline::UpdatePipelineOutcome {
+        already_up_to_date,
+        dist_binary_stale,
+        pull_branch,
+        pre_pull_renamed,
+        pre_pull_renamed_hub,
+        gate_guard: mut update_gate_guard,
+        db_audit,
+    } = prepared;
+    // The same two paths the abort tails below restore, in the shape the
+    // rebuild-failure recovery in `finish_apply_after_pull` takes. Built once
+    // so the pair cannot be swapped at one call site and not another.
+    let renames = crate::commands::update_pipeline::PrePullRenames {
+        hub: pre_pull_renamed_hub.clone(),
+        launcher: pre_pull_renamed.clone(),
+    };
+    // The pipeline DECIDED these rows; the Db handle is this command's, so the
+    // write is this command's. Ledger step 39 — pre-v0.2.95 a launcher update
+    // was forensically invisible except for a single clobber-averted row.
+    for (operation, detail) in db_audit {
+        write_self_update_audit(&app, &operation, detail);
+    }
+
+    if already_up_to_date {
+        // Nothing was pulled, so there are no artefacts to apply: skip
+        // install.py AND the rebuild. The pipeline has already run the
+        // at-rest dist reconcile (WI-2), which is the whole value of this
+        // branch — the restart below is how the user picks up anything it
+        // staged, so it is deliberately NOT skipped.
+        tracing::info!(
+            "[vct] apply_launcher_update: already up to date{}",
+            if dist_binary_stale {
+                " — the dist binary on disk was newer than the running one; relaunching"
+            } else {
+                ""
+            }
+        );
+        return finish_apply_after_pull(
+            app,
+            &repo,
+            false,
+            false,
+            // v0.2.95 ship-gate MAJOR-2: `Unchanged`, not `SourceOnly`. HEAD
+            // did not move on this branch, so there is no source advance to
+            // record and the manifest must be left exactly as the last real
+            // installer run wrote it. Passing `SourceOnly` here stamped
+            // `post_source_only: true` on an untouched tree, which
+            // `check_for_updates` turns into `install_stale` — a badge
+            // demanding a full re-install after a click that changed nothing.
+            ArtefactSource::Unchanged,
+            Some(&mut update_gate_guard),
+            &renames,
+        )
+        .await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Apply the artefacts. `install.py --update` FIRST, always, when it can run.
+    // ---------------------------------------------------------------------
     //
-    // v0.2.91 fix-round MINOR-1: the outcome is CHECKED, not discarded. An
-    // averted clobber on THIS surface used to produce nothing at all — no
-    // deferral, no audit row, no trace — while the installer surface recorded
-    // both. That asymmetry is the WI-7 silence this release closes: the state
-    // it describes ("the canonical binary now holds NEWER bytes than the
-    // process you are running") is exactly the one the field install sat in for
-    // a month undiagnosed. `revert_and_record` is the shared home for the
-    // revert + durable-condition pair; the audit row is written here because
-    // the Db handle is a property of the surface, not of the revert.
-    let audit_app = app.clone();
-    let revert_rename = |backup: Option<&std::path::Path>| {
-        let Some(b) = backup else { return };
-        let outcome = crate::services::binary_freshness::revert_and_record(&repo, b);
-        if outcome == crate::services::binary_freshness::RevertOutcome::ClobberAverted {
-            use tauri::Manager as _;
-            if let Some(db) = audit_app.try_state::<crate::db::Db>() {
-                let _ = db.audit(
-                    "update_binary_clobber_averted",
-                    None,
-                    None,
-                    &serde_json::json!({
-                        "surface": "apply_launcher_update",
+    // v0.2.95 phase 2 — this is the §4.1 fix, the highest-impact one in the
+    // review. This surface pulled the WHOLE orchestrator repo and then rebuilt
+    // only the launcher: hooks under `.claude/`, MCP registrations in
+    // `~/.claude.json`, the venv, `templates/**` propagation, KG seeds and
+    // schema migrations were all left at the OLD version, and the manifest was
+    // then stamped as a completed install at the NEW one. The half-updated
+    // state was durable AND invisible, because after the pull the badge's
+    // commits-behind count is zero and the surface that would repair it stops
+    // offering itself.
+    //
+    // The cargo/npm rebuild is now the FALLBACK, taken only when install.py
+    // cannot run. That also settles §4.2: a release-binary user with no Rust
+    // toolchain used to get "cargo build failed to start" AFTER the pull had
+    // landed, leaving new source with old artefacts and no way forward.
+    let system = crate::commands::installer::detect_system().await?;
+    let install_py_available = system.has_python && repo.join("install.py").is_file();
+
+    let artefacts = if install_py_available {
+        update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
+        // Hold the launcher.db writer lock open for install.py exactly as the
+        // installer surface does — on Windows SQLite holds it exclusively and
+        // install.py cannot take it while we have it. RAII: reopens on every
+        // exit path below, force-restarting if the reopen fails.
+        let mut db_close_guard = crate::commands::installer::DbUpdateClosedGuard::new(app.clone());
+        let run = crate::commands::update_pipeline::run_install_py_update(
+            &repo,
+            &system.python_cmd,
+            "apply_launcher_update",
+            None,
+        )
+        .await;
+        let run = match run {
+            Ok(run) => run,
+            Err(msg) => {
+                crate::commands::installer::abort_update_restore_binaries_and_hub(
+                    &repo,
+                    pre_pull_renamed.as_deref(),
+                    pre_pull_renamed_hub.as_deref(),
+                );
+                return Err(msg);
+            }
+        };
+        if !run.success {
+            crate::commands::installer::abort_update_restore_binaries_and_hub(
+                &repo,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
+            return Err(format!("Update failed: {}", run.stderr));
+        }
+        db_close_guard.reopen();
+        ArtefactSource::InstallPy
+    } else {
+        tracing::warn!(
+            "[vct] apply_launcher_update: install.py is not runnable here (python detected: {}, \
+             install.py present: {}) — falling back to rebuilding the launcher from source. \
+             Hooks, MCP registrations, templates, the venv, the KG seed and schema migrations \
+             stay at the OLD version until `python install.py --update` runs in {}.",
+            system.has_python,
+            repo.join("install.py").is_file(),
+            repo.display(),
+        );
+        ArtefactSource::SourceOnly
+    };
+
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
+
+    // v0.2.93 (stale status cache): the pull + apply landed — refresh
+    // `~/.vct/launcher-update-state.json` NOW, before the restart hop kills
+    // this process, so the Updates card does not keep reporting the pre-update
+    // "N commits behind". Soft-fail; the daily check would repair it anyway.
+    refresh_cached_state_after_pull(&repo, &pull_branch).await;
+
+    let (rebuild_cargo, rebuild_npm) = match artefacts {
+        // install.py refreshed the dist binary from the tracked ones the pull
+        // just landed, so there is nothing for a local toolchain to do.
+        ArtefactSource::InstallPy => (false, false),
+        // `Unchanged` cannot arrive here — the already-up-to-date branch
+        // returned above. It is named rather than caught by a wildcard so a
+        // future variant has to be classified deliberately instead of
+        // inheriting whichever default `_` happened to sit next to it.
+        ArtefactSource::SourceOnly | ArtefactSource::Unchanged => (needs_cargo, needs_npm),
+    };
+    finish_apply_after_pull(
+        app,
+        &repo,
+        rebuild_cargo,
+        rebuild_npm,
+        artefacts,
+        Some(&mut update_gate_guard),
+        &renames,
+    )
+    .await
+}
+
+/// Which path applied the artefacts before [`finish_apply_after_pull`] runs.
+///
+/// It decides exactly two things, and both are honesty about the install
+/// record: whether the launcher may write `install-manifest.json` (install.py
+/// is the only writer of its `version` — see `commands::manifest`), and which
+/// [`crate::commands::installer::HubRestartContext`] the hub restart may use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArtefactSource {
+    /// `install.py --update` ran and exited 0. It has already written the
+    /// install manifest, truthfully; this tail must not overwrite that record
+    /// with a launcher-path one.
+    InstallPy,
+    /// Only the source tree moved (and possibly a local launcher rebuild):
+    /// `force_resync_launcher`'s hard reset, or the fallback taken when
+    /// install.py cannot run. venv / hooks / templates / MCP registrations / KG
+    /// seed / schema are all still at the old version.
+    SourceOnly,
+    /// NOTHING moved. The tree was already at the upstream tip, so there were
+    /// no artefacts to apply and no source advance to record — the tail runs
+    /// only for the restart hop (and whatever the at-rest dist reconcile
+    /// staged).
+    ///
+    /// v0.2.95 ship-gate MAJOR-2. This branch used to pass `SourceOnly`, whose
+    /// own doc says "only the source tree MOVED" and which
+    /// `manifest::refresh_install_manifest` turns into `post_source_only:
+    /// true` — the durable flag meaning "a path advanced the source tree
+    /// WITHOUT running install.py". On an already-up-to-date pull no path
+    /// advanced anything, so the flag was a false statement, and
+    /// `check_for_updates` reads it as an unconditional `install_stale`: a
+    /// click that changed nothing lit a badge demanding a full
+    /// `apply_pending_install`. Pre-phase-2 the same call was harmless (the
+    /// refresh only re-read `version`, to the same value); the flag is what
+    /// made the no-op observable, so the variant that says "nothing moved" is
+    /// the fix rather than a special case inside the writer.
+    ///
+    /// The hub restart still uses `AbortRecovery` — install.py did not run, so
+    /// there is no cutover sentinel to trust and the /health poll must
+    /// actually happen.
+    Unchanged,
+}
+
+/// Does this tail owe `state/install-manifest.json` a refresh?
+///
+/// Split out of [`finish_apply_after_pull`] for one reason: the tail itself
+/// takes an `AppHandle` and is unreachable from a unit test, so as an inline
+/// `if` the decision could only ever be checked by reading the source. As a
+/// function it is driven for real — the tests below run the actual writer
+/// under each variant against a temp root and compare BYTES, which is what
+/// "the manifest is untouched" actually means.
+///
+/// Every variant is spelled out rather than `_ => false`: which paths may
+/// write this file is the whole of WP-1, and a wildcard would let a future
+/// variant inherit an answer nobody chose for it.
+pub(crate) fn owes_manifest_refresh(artefacts: ArtefactSource) -> bool {
+    match artefacts {
+        // install.py already wrote it, truthfully, seconds ago.
+        ArtefactSource::InstallPy => false,
+        // The tree moved and the installer did not run — the one path whose
+        // whole job is to record that.
+        ArtefactSource::SourceOnly => true,
+        // Nothing moved: no advance to record, and writing anyway would stamp
+        // `post_source_only: true` on an untouched tree (ship-gate MAJOR-2).
+        ArtefactSource::Unchanged => false,
+    }
+}
+
+/// Write one audit row through the app's Db, if it is registered. Soft-fail:
+/// audit is forensics, never a reason to fail a user-initiated update.
+fn write_self_update_audit<R: Runtime>(
+    app: &AppHandle<R>,
+    operation: &str,
+    detail: serde_json::Value,
+) {
+    use tauri::Manager as _;
+    if let Some(db) = app.try_state::<crate::db::Db>() {
+        let _ = db.audit(operation, None, None, &detail);
+    }
+}
+
+/// Render one [`crate::commands::update_pipeline::UpdatePipelineError`] into
+/// THIS surface's error string, and write the audit rows that belong to the
+/// classification.
+///
+/// The pipeline classifies once; each surface renders into the shape its own
+/// frontend parses. This page parses exactly one structured shape —
+/// `kind:"non_fast_forward"`, which opens the resync modal — so the variants
+/// that used to reach that modal still reach it, and the ones that never had a
+/// modal here become worded messages instead of the raw git stderr they were.
+///
+/// What changes for the user is NOT the modal: it is that every one of these
+/// now leaves the durable trail the installer surface leaves. A wedged update
+/// writes the paired resume sentinel + `update_resume_required` deferral, so
+/// the MenuBar offers "Continue Update" and a terminal Claude sees it at
+/// session start — a NON-destructive route out, where this surface previously
+/// offered only `force_resync_launcher`'s hard reset.
+async fn render_pipeline_error<R: Runtime>(
+    app: &AppHandle<R>,
+    repo: &Path,
+    branch: &str,
+    err: crate::commands::update_pipeline::UpdatePipelineError,
+) -> String {
+    use crate::commands::update_pipeline::UpdatePipelineError as PipelineErr;
+
+    // Shared by the two arms that render the resync modal: its payload carries
+    // the SHAs so the user can see what their clone has vs. what upstream has.
+    async fn shas(repo: &Path, branch: &str) -> (Option<String>, Option<String>) {
+        (
+            current_sha(repo).await.ok(),
+            ls_remote_sha(repo, branch).await.ok(),
+        )
+    }
+
+    match err {
+        PipelineErr::MergeInProgress { at_preflight, .. } => {
+            // The payload is the installer surface's conflict-modal shape and
+            // this page does not parse it; relaying the JSON as a toast would
+            // be worse than saying what happened. The state is durable and the
+            // MenuBar badge reads it directly from `.git`, so the honest
+            // message is the one that points there.
+            if at_preflight {
+                write_self_update_audit(
+                    app,
+                    "apply_launcher_update_refused_merge_in_progress",
+                    serde_json::json!({
+                        "install_path": repo.display().to_string(),
                         "branch": branch,
-                        "backup": b.display().to_string(),
+                    }),
+                );
+            }
+            format!(
+                "A merge or rebase is already in progress in {} — the update cannot start a \
+                 second one. Finish or abort it from the launcher's update badge (it offers \
+                 Continue Update / Abort), or resolve it in a terminal.",
+                repo.display()
+            )
+        }
+        PipelineErr::DirtyTrackedAtRisk { path } => format!(
+            "Uncommitted changes on tracked file '{}' would be lost — this update also \
+             changes it. Commit, stash, or revert it before updating.",
+            path
+        ),
+        PipelineErr::UntrackedCollision { .. } => format!(
+            "The update was aborted before merging: untracked local files sit at paths this \
+             release adds, so git refused rather than overwrite them. The colliding paths are \
+             listed in {}/.claude/context/UPDATE_DEFERRED.md, and the launcher's update badge \
+             offers a one-click resolve.",
+            repo.display()
+        ),
+        PipelineErr::Conflict {
+            branch: b,
+            detail,
+            record_binary_clobber_averted,
+            ..
+        } => {
+            if record_binary_clobber_averted {
+                write_self_update_audit(
+                    app,
+                    "update_binary_clobber_averted",
+                    serde_json::json!({
+                        "surface": "apply_launcher_update",
+                        "branch": b,
+                        "pop_conflict_after_success": false,
                         "note": "abort tail kept the freshly-pulled binary (WI-3)",
                     }),
                 );
             }
+            let (local, remote) = shas(repo, &b).await;
+            serialize_non_ff_error(&b, local.as_deref(), remote.as_deref(), &detail)
         }
-    };
-
-    let f1_restored =
-        crate::commands::git_user_editable_merge::auto_restore_byte_identical_tracked_mods(
-            &repo, &branch,
-        )
-        .await;
-    if f1_restored > 0 {
-        tracing::info!(
-            "[vct] apply_launcher_update: F1 auto-restored {} byte-identical tracked file(s) \
-             before divergence-plan resolution",
-            f1_restored
-        );
-    }
-    // v0.2.89 §4.3: after F1 (byte-identical restore) and BEFORE the plan
-    // resolution, reconcile GENERATED / release-controlled files to upstream
-    // (take-upstream bias) — lockfiles, package.json, Cargo.lock, dist/**.
-    // This is the SAME shared helper the installer surface calls (one home):
-    // it classifies the allowlisted committed/worktree divergence, takes
-    // upstream's blob (a synthetic take-upstream commit for the committed set,
-    // a restore-to-HEAD for the worktree set). v0.2.89 MINOR-1: its
-    // `generated_files_reconciled` audit deferral is emitted by THIS surface
-    // AFTER the pull succeeds (search MINOR-1 below), NOT inside the helper — a
-    // pre-pull emit would dirty CLAUDE.md between the reconcile and the pull-plan
-    // decision and could self-inflict the resync modal. Best-effort throughout:
-    // any per-file failure leaves that file divergent → it stays in the
-    // pop-conflict-risk / modal-forcing sets (never worse than today's resync
-    // modal). A divergent SOURCE file still surfaces the modal (a real breakage
-    // signal); only the "expected conflict" class (dep-bump / lockfile / dist
-    // divergence) is auto-resolved.
-    let gen_reconcile =
-        crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
-            &repo, &branch,
-        )
-        .await;
-    if gen_reconcile.reconcile_committed
-        || !gen_reconcile.took_upstream.is_empty()
-        || !gen_reconcile.restored_worktree.is_empty()
-    {
-        tracing::info!(
-            "[vct] apply_launcher_update: reconciled generated/release-controlled file(s) to \
-             upstream — {} committed take-upstream, {} worktree-restored (reconcile_committed={})",
-            gen_reconcile.took_upstream.len(),
-            gen_reconcile.restored_worktree.len(),
-            gen_reconcile.reconcile_committed
-        );
-    }
-    let plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
-        &repo,
-        &branch,
-        // v0.2.89 Phase 2b: this surface has no A0 pre-merge step, so
-        // `pre_merge_committed` is always false here (see the comment block
-        // above). The 4th arg threads the generated-file reconcile result: a
-        // synthetic take-upstream commit falls through to the merge-tree probe
-        // (→ RealMerge on clean end-trees) instead of forcing the modal.
-        false,
-        gen_reconcile.reconcile_committed,
-    )
-    .await;
-    let pull_args = plan.pull_args(VCO_UPSTREAM_REMOTE, &branch);
-    let pull_args_ref: Vec<&str> = pull_args.iter().map(|s| s.as_str()).collect();
-    // v0.2.71 (BLOCKER-1 fix): use run_git_combined so a RealMerge CONFLICT
-    // (whose markers git writes to STDOUT) reaches the classifier — the plain
-    // run_git returned stderr-only and silently missed it.
-    if let Err(e) = run_git_combined(&repo, &pull_args_ref).await {
-        // A genuine merge conflict (RealMerge arm) or a non-FF refusal
-        // (FfOnly arm) both route to the resync modal — the only recovery
-        // this surface offers. The frontend keys the modal off
-        // `kind == "non_fast_forward"`, so serialize that shape for either.
-        // A non-conflict, non-FF failure (broken git, detached HEAD, network)
-        // stays a raw error string toast.
-        if is_non_fast_forward(&e) || is_merge_conflict(&e) {
-            // v0.2.71 (BLOCKER-1 fix): ABORT the in-progress merge/rebase
-            // before returning. Without this, a RealMerge conflict leaves
-            // `.git/MERGE_HEAD` / `UU` markers on disk and the NEXT
-            // apply_launcher_update dead-ends at the Step-1 clean-tree guard.
-            // The user opts into the destructive resync via the modal; until
-            // then the tree must be clean + re-attemptable. (No-op for the
-            // FfOnly/non-FF arm — nothing was merged.)
-            abort_merge_or_rebase_in_progress(&repo).await;
-            // v0.2.91 WI-3/WI-4: put the running binary back at its canonical
-            // path (unless the pull already landed newer bytes there).
-            revert_rename(pre_pull_renamed.as_deref());
-            // Best-effort: capture local + remote SHAs so the modal can
-            // show users what their clone has vs. what upstream has.
-            let local = current_sha(&repo).await.ok();
-            let remote = ls_remote_sha(&repo, &branch).await.ok();
-            // v0.2.71 Sweep-A#3: leave the SAME durable UPDATE_DEFERRED.md
-            // trace the installer surface writes. Best-effort — never blocks
-            // the modal-shaped return below. A dismissed resync modal would
-            // otherwise leave NO record a terminal Claude could find at
-            // session start.
-            write_launcher_update_diverged_deferral(
-                &repo,
-                &branch,
-                LauncherUpdateDivergedKind::NonFastForward {
-                    local_sha: local.clone(),
-                    remote_sha: remote.clone(),
-                    detail: e.clone(),
-                },
+        PipelineErr::AutostashPopConflict {
+            branch: b,
+            detail,
+            record_binary_clobber_averted,
+            ..
+        } => {
+            if record_binary_clobber_averted {
+                write_self_update_audit(
+                    app,
+                    "update_binary_clobber_averted",
+                    serde_json::json!({
+                        "surface": "apply_launcher_update",
+                        "branch": b,
+                        "pop_conflict_after_success": true,
+                        "note": "abort tail kept the freshly-pulled binary (WI-3)",
+                    }),
+                );
+            }
+            let (local, remote) = shas(repo, &b).await;
+            serialize_non_ff_error(&b, local.as_deref(), remote.as_deref(), &detail)
+        }
+        PipelineErr::NonFastForward {
+            branch: b,
+            local_sha,
+            remote_sha,
+            detail,
+            ..
+        } => serialize_non_ff_error(&b, local_sha.as_deref(), remote_sha.as_deref(), &detail),
+        PipelineErr::HeadDidNotAdvance { detail } => {
+            write_self_update_audit(
+                app,
+                "apply_launcher_update_complete",
+                serde_json::json!({
+                    "success": false,
+                    "note": "head_did_not_advance_post_pull",
+                    "branch": branch,
+                }),
             );
-            return Err(serialize_non_ff_error(
-                &branch,
-                local.as_deref(),
-                remote.as_deref(),
-                &e,
-            ));
+            detail
         }
-        revert_rename(pre_pull_renamed.as_deref());
+        PipelineErr::Raw(message) => message,
+    }
+}
+
+/// `force_resync_launcher`'s destructive core: stop the hub, rename the two
+/// binaries aside, hard-reset the tree — and put both back if the reset fails.
+///
+/// v0.2.95 phase 3. Split from the `#[command]` above it for the reason phase 1
+/// split `reconcile_and_pull` from the pipeline: a `#[command]` taking
+/// `AppHandle` is unreachable from a unit test, and this is the span that must
+/// be pinned. Everything it touches is drivable over a temp clone with
+/// `VCT_STATE_DIR` redirected — the hub stop reads `<vct_root_dir()>/hub.pid`,
+/// and its process-identity sweep already refuses under a test harness
+/// (v0.2.92, `update_gate::pre_update_hub_kill_sweep`).
+///
+/// WHY THE HUB STOP IS HERE AT ALL (the gap this closes). `git reset --hard`
+/// writes every tracked file whose content differs from the target, and
+/// `launcher/dist/<arch>/vct-hub{,.exe}` IS tracked — so this path carried the
+/// exact hazard `07101d30` closed for `update_orchestrator` in v0.2.21 Step 12
+/// (Reviewer B blocker B1) and phase 2 closed for the launcher-update surface.
+/// It was never a decision to omit it: `force_resync_launcher` was written on
+/// 2026-05-07 (`b5b3f7ad`), and the hub binary did not become a tracked file
+/// until `120b921c` two weeks later. The hazard arrived UNDER this function.
+///
+/// ORDER IS THE POINT, not the presence: stopping the hub after the reset would
+/// protect nothing. The observable a test keys on is that the hub stop's own
+/// side effect (a stale `hub.pid` is removed) is visible EVEN WHEN THE RESET
+/// FAILS.
+///
+/// On reset failure the pre-pull renames are reverted and the hub restarted
+/// through `abort_update_restore_binaries_and_hub` — the shared tail every
+/// other surface's failure path uses. Without it a failed resync would leave
+/// the user with a perma-stopped hub, which is the failure `07101d30` names.
+///
+/// Returns the renames on success: the caller's tail (`finish_apply_after_pull`)
+/// owes the hub RESTART, and on Windows the staging tail owes the swap.
+async fn stop_hub_then_hard_reset(
+    repo: &Path,
+    reset_target: &str,
+) -> Result<crate::commands::update_pipeline::PrePullRenames, String> {
+    // v0.2.95 ship-gate MINOR-4 — abort BEFORE the reset.
+    //
+    // `git reset --hard` rewrites the tree and moves the branch, and it does
+    // NOT clear `.git/MERGE_HEAD` or `.git/rebase-merge`/`rebase-apply`.
+    // Resetting a mid-operation tree therefore leaves the clone believing it
+    // is still in a merge or rebase — one whose recorded ONTO/HEAD no longer
+    // describes anything on disk. Every later `git pull` is then refused
+    // ("you have not concluded your merge"), and the surface the user would
+    // reach for next is this one, which does the same thing again. "Resync
+    // now" is the wedged-clone rescue; it must not be able to wedge it.
+    //
+    // Reachability, honestly stated: NOT reachable today. The pipeline's B
+    // cannot take the `RebaseAutostash` arm for the inputs `blocking_changes`
+    // refuses, so the resync modal and a mid-rebase tree do not co-occur in
+    // any flow currently shipped. Phase 2 made the merge case co-occur, and
+    // one narrowing of that refusal makes the rebase case co-occur too. This
+    // is two git commands that no-op when nothing is in progress, run on the
+    // path whose entire job is rescuing a clone; that is the right side to be
+    // wrong on.
+    //
+    // The CLAIM-FREE helper, deliberately: `force_resync_launcher` is already
+    // holding the orchestrator-clone claim by the time it gets here, so the
+    // `#[command]` (which takes one) would refuse against its own caller.
+    if let Err(e) = crate::commands::installer::abort_merge_or_rebase_unclaimed(repo).await {
+        // Soft-fail by design. The helper returns Err only when an abort was
+        // genuinely in progress and git refused it; the reset is still the
+        // user's explicitly chosen recovery, and refusing to run it would
+        // strand exactly the tree this button exists for. Log loudly instead.
+        tracing::warn!(
+            "[vct] force_resync_launcher: could not abort the in-progress \
+             merge/rebase before the hard reset ({}) — resetting anyway; if \
+             the clone still reports an unconcluded merge afterwards, run \
+             `git merge --abort` (or `git rebase --abort`) in {} by hand",
+            e,
+            repo.display(),
+        );
+    }
+
+    let renames = crate::commands::update_pipeline::stop_hub_and_rename_binaries_aside(
+        repo,
+        "resync",
+        Some("git reset --hard"),
+        |_stage: &str, _message: &str, _pct: f32| {
+            // This surface has no progress modal — `force_resync_launcher`
+            // takes only an `AppHandle`. A surface with no modal must not
+            // claim one; the events are simply not emitted.
+        },
+    )?;
+
+    if let Err(e) = run_git(repo, &["reset", "--hard", reset_target]).await {
+        // The tree was NOT written. Put the binaries back and restart the hub
+        // we stopped — the same shared tail every other failure path uses.
+        crate::commands::installer::abort_update_restore_binaries_and_hub(
+            repo,
+            renames.launcher.as_deref(),
+            renames.hub.as_deref(),
+        );
         return Err(e);
     }
 
-    // The RealMerge arm uses `--autostash`: it can EXIT 0 yet leave the tree
-    // broken if the autostash pop conflicts (TOCTOU: upstream touched a
-    // locally-modified file between our pop-conflict pre-check and the pull's
-    // fetch). Detect a conflicted tree on the success path and route to the
-    // resync modal instead of rebuilding + restarting on a broken tree. (The
-    // FfOnly arm can't reach this — it never merges.)
-    //
-    // v0.2.92 WP-13: the LAST `.unwrap_or_default()` in this file, and the
-    // same shape as the three the field incident was made of — an errored
-    // `git diff` produced an empty string, an empty string means "no
-    // conflicts", and the launcher would go on to rebuild and restart on a
-    // tree it had not actually inspected. Nothing had ever reported it
-    // because it only bites when git is already misbehaving.
-    //
-    // "I could not check for conflicts" is now its own outcome and it STOPS,
-    // in the safe direction: the pull has already landed, so the user loses
-    // nothing by retrying, whereas restarting into a half-merged tree is the
-    // failure this check exists to prevent. Deliberately NOT routed to the
-    // resync modal — that path is destructive (`reset --hard`) and must never
-    // be reached on a guess.
-    let unmerged = match run_git(&repo, &["diff", "--name-only", "--diff-filter=U"]).await {
-        Ok(out) => out,
-        Err(e) => {
-            tracing::error!(
-                "[vct] apply_launcher_update: could not check for unmerged files after the \
-                 pull ({e}) — refusing to rebuild/restart on an uninspected tree"
-            );
-            revert_rename(pre_pull_renamed.as_deref());
-            return Err(format!(
-                "The pull completed, but the launcher could not verify the working tree is \
-                 free of merge conflicts (`git diff --diff-filter=U` failed: {e}). Nothing \
-                 was rebuilt or restarted. Check `git -C {} status` and click Update again.",
-                repo.display()
-            ));
-        }
-    };
-    if !unmerged.trim().is_empty() {
-        // Abort here too: an autostash-pop conflict leaves the tree dirty +
-        // a dangling stash; clean it so the next attempt isn't blocked.
-        abort_merge_or_rebase_in_progress(&repo).await;
-        // v0.2.91 WI-3: NON-clobbering revert. On this branch the merge may
-        // well have LANDED (only the autostash pop conflicted), in which case
-        // the canonical path already holds the new binary and restoring the
-        // backup over it would freeze this install (RC-1).
-        revert_rename(pre_pull_renamed.as_deref());
-        let local = current_sha(&repo).await.ok();
-        let remote = ls_remote_sha(&repo, &branch).await.ok();
-        let detail = "git pull (auto-merge) left unmerged files (autostash-pop conflict)";
-        // v0.2.71 Sweep-A#3: durable deferral for the autostash-pop-conflict
-        // success-path failure too (same rationale as the non-FF arm above).
-        write_launcher_update_diverged_deferral(
-            &repo,
-            &branch,
-            LauncherUpdateDivergedKind::NonFastForward {
-                local_sha: local.clone(),
-                remote_sha: remote.clone(),
-                detail: detail.to_string(),
-            },
-        );
-        return Err(serialize_non_ff_error(
-            &branch,
-            local.as_deref(),
-            remote.as_deref(),
-            detail,
-        ));
-    }
-
-    // v0.2.89 MINOR-1: emit the generated-file reconcile audit deferral HERE —
-    // AFTER the pull succeeded and the tree is confirmed clean, NOT inside the
-    // shared helper. Emitting injects a reminder block into the tracked
-    // CLAUDE.md; a pre-pull emit would dirty it and could self-inflict the
-    // resync modal. Best-effort (no-op when nothing was reconciled); self-clears
-    // on the install.py --update run inside finish_apply_after_pull below.
-    crate::commands::git_user_editable_merge::emit_generated_reconcile_deferrals(
-        &repo,
-        &gen_reconcile,
-    );
-
-    finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
+    Ok(renames)
 }
 
 /// Recovery path after a non-fast-forward detection. Hard-resets the
@@ -1451,16 +1739,30 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
 /// longer the default forward action for any committed divergence.
 ///
 /// Sequence:
-///   1. fetch vco_upstream/<branch>
-///   2. compute pre-reset diff for rebuild gating (HEAD..vco_upstream/<branch>)
-///   3. reset --hard vco_upstream/<branch>
-///   4. rebuild + restart (shared with `apply_launcher_update`)
+///   1. claim the shared orchestrator-update single-flight (ledger 40)
+///   2. fetch vco_upstream/<branch>
+///   3. compute pre-reset diff for rebuild gating (HEAD..vco_upstream/<branch>)
+///   4. stop the hub + rename both binaries aside, then reset --hard
+///      vco_upstream/<branch> — see `stop_hub_then_hard_reset`
+///   5. rebuild + restart, hub restart included (shared with
+///      `apply_launcher_update`)
 #[command]
 pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     if !git_available().await {
         return Err("git not found on PATH — cannot resync".into());
     }
     let repo = find_launcher_repo_root()?;
+
+    // Ledger step 40, the last update surface to take it (v0.2.95 phase 3).
+    // The SAME claim `update_orchestrator` and `apply_launcher_update` hold,
+    // because this acts on the SAME clone and its act is the most destructive
+    // of the three: a `git reset --hard` interleaved with another surface's
+    // `git pull` or `install.py --update` is §4.8's catastrophic case with the
+    // sharpest edge. Held for the reset, the rebuild and the restart hop;
+    // released by RAII on every exit path. No self-deadlock: the resync modal
+    // is opened only AFTER `apply_launcher_update` has returned and dropped
+    // its own claim.
+    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
     // v0.2.92 WP-13: through the ONE resolver. Pre-fix a detached HEAD made
     // this the literal `"HEAD"`, so the `git reset --hard vco_upstream/HEAD`
     // below hard-errored on a ref that does not exist — i.e. "Resync now"
@@ -1506,35 +1808,116 @@ pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     };
 
     // Destructive step. After this point local divergent commits are gone.
-    run_git(
+    //
+    // v0.2.95 phase 3: the hub is stopped and both binaries renamed aside
+    // first — `launcher/dist/*/vct-hub*` are TRACKED, so this reset writes them
+    // exactly as a pull would. See `stop_hub_then_hard_reset`. The RESTART is
+    // owed by `finish_apply_after_pull` below, which already performs it
+    // (`ArtefactSource::SourceOnly` -> `HubRestartContext::AbortRecovery`,
+    // which polls /health rather than trusting a cutover sentinel install.py
+    // never wrote on this path).
+    let renames = stop_hub_then_hard_reset(
         &repo,
-        &[
-            "reset",
-            "--hard",
-            &format!("{}/{}", VCO_UPSTREAM_REMOTE, branch),
-        ],
+        &format!("{}/{}", VCO_UPSTREAM_REMOTE, branch),
     )
     .await?;
 
-    finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
+    // v0.2.95 phase 2: the reset SUPERSEDES any half-finished update, so clear
+    // the paired resume sentinel + deferral it leaves behind.
+    //
+    // This is new only because the state is new. Pre-phase-2 a conflict on this
+    // surface aborted the merge and wrote no sentinel; now the shared pipeline
+    // leaves the tree conflicted and writes the paired record, which is what
+    // gives the user a NON-destructive way out (the MenuBar's Continue Update).
+    // A user who instead opts into this destructive one must not be left with a
+    // badge still offering to resume an update that no longer exists — the
+    // sentinel would otherwise outlive the thing it describes. Same paired
+    // helper the pipeline itself clears with, so the two cannot be written or
+    // cleared apart (v0.2.51 Bug A / v0.2.53 DEDUP-14).
+    crate::commands::installer::clear_update_resume_sentinel(&repo);
+    crate::commands::installer::clear_update_resume_deferral_if_solo(&repo);
+
+    // `SourceOnly`: this path resets the tree and rebuilds the launcher. It has
+    // never run install.py and still does not — so hooks, templates, MCP
+    // registrations, the venv, the KG seed and the schema stay at the old
+    // version, and the manifest must say so rather than claim a completed
+    // install at the new one (the H2 half-state).
+    // No update gate on this path: `force_resync_launcher` arms none.
+    finish_apply_after_pull(
+        app,
+        &repo,
+        needs_cargo,
+        needs_npm,
+        ArtefactSource::SourceOnly,
+        None,
+        &renames,
+    )
+    .await
+}
+
+/// A rebuild failed with the hub stopped and the binaries renamed aside: put
+/// them back, restart the hub, and hand the caller its error unchanged.
+///
+/// v0.2.95 phase 3. One home for the two rebuild legs so they cannot disagree
+/// about whether the recovery runs — the shape this project keeps finding is
+/// "same failure, one leg short" (phase 2 §3 item 3 was that exact defect on
+/// the install.py spawn legs).
+fn restore_after_failed_rebuild(
+    repo: &Path,
+    renames: &crate::commands::update_pipeline::PrePullRenames,
+    err: String,
+) -> String {
+    tracing::warn!(
+        "[vct] finish_apply_after_pull: rebuild failed ({}) — restoring the \
+         pre-update binaries and restarting vct-hub before reporting",
+        err
+    );
+    crate::commands::installer::abort_update_restore_binaries_and_hub(
+        repo,
+        renames.launcher.as_deref(),
+        renames.hub.as_deref(),
+    );
+    err
 }
 
 /// Shared post-pull / post-reset rebuild + restart sequence. Extracted so
 /// `apply_launcher_update` and `force_resync_launcher` can't drift apart.
+///
+/// `artefacts` says which path applied the artefacts before this tail ran, and
+/// it is NOT a stylistic parameter — see [`ArtefactSource`]. Two things in here
+/// are only correct for one of its values, and both used to be done
+/// unconditionally on the assumption that install.py never runs on this
+/// surface. Since v0.2.95 phase 2 it usually does.
 async fn finish_apply_after_pull<R: Runtime>(
     app: AppHandle<R>,
     repo: &Path,
     needs_cargo: bool,
     needs_npm: bool,
+    artefacts: ArtefactSource,
+    gate: Option<&mut crate::commands::update_gate::UpdateInProgressGuard>,
+    renames: &crate::commands::update_pipeline::PrePullRenames,
 ) -> Result<(), String> {
     // Step 4: rebuild. We do this synchronously (the user clicked "Update
     // now" / "Resync now" — they're waiting). Failures bubble up and the
     // launcher stays on the old binary, which is the safe behavior.
+    //
+    // v0.2.95 phase 3 — but they no longer bubble up BARE. Both callers reach
+    // here with the hub STOPPED and (on Windows) both binaries renamed aside:
+    // the pipeline stops it for `apply_launcher_update`, and
+    // `stop_hub_then_hard_reset` for `force_resync_launcher`. A bare `?` here
+    // returned with the hub still down and the binaries still aside — a
+    // perma-stopped hub after a failed `cargo build`, which is precisely the
+    // failure `07101d30` added the revert-on-every-early-return for on the
+    // installer surface. Same shared tail, same reason.
     if needs_cargo {
-        rebuild_cargo(repo).await?;
+        if let Err(e) = rebuild_cargo(repo).await {
+            return Err(restore_after_failed_rebuild(repo, renames, e));
+        }
     }
     if needs_npm {
-        rebuild_frontend(repo).await?;
+        if let Err(e) = rebuild_frontend(repo).await {
+            return Err(restore_after_failed_rebuild(repo, renames, e));
+        }
     }
 
     // v0.2.91 WI-4: Surface B parity — route through the SHARED staging +
@@ -1553,14 +1936,76 @@ async fn finish_apply_after_pull<R: Runtime>(
     // ORDERING (load-bearing): staged + armed HERE, but the exit hop happens
     // at the very bottom — AFTER the desktop-shortcut / install-manifest /
     // hardware-redetect bookkeeping below. Exiting straight from here would
-    // skip all three on the handoff path, and unlike the installer surface
-    // this flow never runs install.py, so nothing else would record the new
-    // version.
+    // skip all three on the handoff path.
+    //
+    // CORRECTED v0.2.95 phase 2: this used to add "and unlike the installer
+    // surface this flow never runs install.py, so nothing else would record
+    // the new version". On the `ArtefactSource::InstallPy` path install.py DID
+    // run and DID record it, and the manifest write below now stands down for
+    // exactly that reason. The ordering argument stands on its own: the
+    // shortcut and the hardware-redetect flag are still only written here.
+    // V52-AI: explicit lockfile cleanup BEFORE the restart/exit hop, and
+    // before staging — the SAME ordering, for the same reason, that
+    // `installer::finalize_update_and_restart` documents at length.
+    //
+    // This arrives with v0.2.95 phase 2 because the guard does: this surface
+    // never armed one before it started pulling through the shared pipeline.
+    // Relying on `Drop` here would be the C-2 bug class verbatim — this
+    // function ends in `app.exit(0)`, which on Windows can terminate the
+    // process before the guard's `Drop` runs, leaving a
+    // `.update-in-progress.json` with a fresh 15-minute deadline that makes
+    // every MCP spawn exit 75 until it lapses.
+    //
+    // Before staging, not after: `binary_freshness` treats an armed gate as
+    // "an update owns the tree" and stands its at-rest pass down, and the
+    // staging below is this update's own delivery step.
+    //
+    // `None` for `force_resync_launcher`, which arms no gate.
+    if let Some(guard) = gate {
+        guard.disarm_and_cleanup();
+    }
+
     let handoff = crate::services::binary_freshness::stage_and_handoff_after_update(
         repo,
         &repo.display().to_string(),
     )
     .await;
+
+    // The pipeline STOPPED the hub before the pull (`launcher/dist/*/vct-hub*`
+    // are tracked files), so whoever stopped it owes the restart. The installer
+    // surface does this inside `finalize_update_and_restart`; this is the same
+    // call with the same C-1 ordering constraint — AFTER staging, so a freshly
+    // restarted hub cannot hold a Windows lock on `vct-hub.exe` while
+    // `vct-updater` tries to swap it.
+    //
+    // Skipped entirely on the handoff path for that reason: the updater owns
+    // the swap and will start from a clean slate, and the next launcher boot
+    // runs `hub_launcher::ensure_hub_running` anyway.
+    //
+    // The context is not a detail. `PostInstall` trusts install.py's own
+    // /health probe via the cutover sentinel; on a source-only path install.py
+    // never wrote that sentinel, so reading its absence as "health validated"
+    // is the v0.2.89 §7.2 hole — `AbortRecovery` refuses the skip and actually
+    // polls. Soft-fail by contract: never block the restart.
+    if !handoff.handoff_active {
+        let ctx = match artefacts {
+            ArtefactSource::InstallPy => crate::commands::installer::HubRestartContext::PostInstall,
+            // `Unchanged` shares `SourceOnly`'s context for the same reason
+            // and not by accident: install.py did not run on either, so there
+            // is no cutover sentinel whose absence could be read as "health
+            // already validated", and the /health poll must really happen.
+            ArtefactSource::SourceOnly | ArtefactSource::Unchanged => {
+                crate::commands::installer::HubRestartContext::AbortRecovery
+            }
+        };
+        if let Err(e) = crate::commands::installer::ensure_hub_started_after_update(repo, ctx) {
+            tracing::warn!(
+                "[apply_launcher_update] vct-hub restart after update reported: {} \
+                 (non-fatal; the next launcher boot retries)",
+                e
+            );
+        }
+    }
 
     // Step 5: restart. Spawn the same binary path as a new process, then
     // exit the current one. On all three platforms `current_exe()` returns
@@ -1598,19 +2043,42 @@ async fn finish_apply_after_pull<R: Runtime>(
         );
     }
 
-    // Bug G (v0.2.8): refresh the install-manifest's `version` /
-    // `source_commit` / `completed_at` so the next session reports the
-    // new launcher version. `repo` here is the launcher's enclosing
-    // install root (find_launcher_repo_root returns the dir containing
-    // launcher/). The cargo+npm rebuild above has already produced the
-    // new binary; the version-source files (vct-module.json,
-    // package.json, Cargo.toml, tauri.conf.json) are all on disk in the
-    // new state. Soft-fail: never block restart.
-    if let Err(e) = crate::commands::manifest::refresh_install_manifest(repo, "launcher_update") {
-        tracing::warn!(
-            "[apply_launcher_update] install-manifest refresh failed (non-fatal): {}",
-            e
-        );
+    // Bug G (v0.2.8): refresh the install-manifest so the next session reports
+    // the right source. `repo` here is the launcher's enclosing install root
+    // (find_launcher_repo_root returns the dir containing launcher/).
+    // Soft-fail: never block restart.
+    //
+    // v0.2.95 phase 2 (WP-1) — this is now conditional, and which way it goes
+    // is the whole point:
+    //
+    // * `InstallPy` — install.py already wrote the manifest, truthfully, a few
+    //   seconds ago: `install_method` "update", `version` re-read from the new
+    //   tree, `completed_at` now. Writing over it here would replace an honest
+    //   installer record with a launcher-path one and make
+    //   `doctor.probe_install_completeness` explain a healthy install with
+    //   "the marker was last written by the launcher's `launcher_update` path,
+    //   which advances the source tree without running install.py" — a
+    //   sentence that would then be false.
+    // * `SourceOnly` — the source tree moved and the installer did NOT run, so
+    //   the refresh is what records that honestly. `refresh_install_manifest`
+    //   advances `source_commit` and stamps `post_source_only`, and
+    //   deliberately does NOT advance `version`; see `commands::manifest` for
+    //   why that single choice is what makes the state both visible and
+    //   repairable.
+    // * `Unchanged` — NOTHING moved, so there is nothing to record and the
+    //   manifest must come out of this byte-identical (v0.2.95 ship-gate
+    //   MAJOR-2). The write is not merely redundant here: it would stamp
+    //   `post_source_only: true`, which is a claim about an advance that did
+    //   not happen, and `check_for_updates` turns that claim into an
+    //   `install_stale` badge demanding a full re-install.
+    if owes_manifest_refresh(artefacts) {
+        if let Err(e) = crate::commands::manifest::refresh_install_manifest(repo, "launcher_update")
+        {
+            tracing::warn!(
+                "[apply_launcher_update] install-manifest refresh failed (non-fatal): {}",
+                e
+            );
+        }
     }
 
     // v0.2.34 (Agent B): mark the next launcher boot as needing a
@@ -1702,19 +2170,6 @@ pub(crate) fn is_non_fast_forward(err: &str) -> bool {
         || lower.contains("refusing to merge unrelated histories")
 }
 
-/// Detect a genuine MERGE CONFLICT (or dirty-tree refusal) in git output.
-///
-/// v0.2.71 (BLOCKER-1 fix): thin delegator to the ONE shared classifier
-/// `git_user_editable_merge::is_pull_conflict`. Pre-v0.2.71 this was a second
-/// hand-synced copy of installer's phrase list (drift hazard, called out in the
-/// old comment). The phrases now live in exactly one place; both surfaces
-/// classify identically by construction. Feed it COMBINED stdout+stderr (see
-/// `run_git_combined` — git writes `CONFLICT` lines to stdout, so a
-/// stderr-only string silently misses real conflicts).
-pub(crate) fn is_merge_conflict(err: &str) -> bool {
-    crate::commands::git_user_editable_merge::is_pull_conflict(err)
-}
-
 /// Serialize a non-FF error as a JSON string the Svelte side can parse.
 /// Frontend tries `JSON.parse(err)` and falls back to displaying the raw
 /// string if it doesn't look like JSON. The `kind` field is the
@@ -1729,7 +2184,7 @@ pub(crate) fn is_merge_conflict(err: &str) -> bool {
 ///     "remote_sha": "def..." | null,
 ///     "git_stderr": "<raw error>"
 ///   }
-fn serialize_non_ff_error(
+pub(crate) fn serialize_non_ff_error(
     branch: &str,
     local: Option<&str>,
     remote: Option<&str>,
@@ -1795,23 +2250,62 @@ pub(crate) fn json_escape(s: &str) -> String {
 /// pattern list and its glob semantics are not restated here). Everything else
 /// still blocks: a hand-edited `Cargo.toml` / `*.rs` / `*.py` is a real signal
 /// and must not be silently pulled over.
-fn first_blocking_change(porcelain: &str) -> Option<String> {
+///
+/// v0.2.95 — RENDERED root files are ignored too, for the SAME reason and by
+/// the same precedent. `resolve_rendered_files_keep_local` was wired into this
+/// surface (`apply_launcher_update`, just after the pre-pull rename) so a
+/// rendered path would stop forcing the resync modal — but it sits BELOW this
+/// Step-1 guard, so for the one path that class exists to protect it was
+/// unreachable exactly as the generated reconcile had been. `install.py`
+/// RENDERS `CLAUDE.md` over its tracked blob at first install and at every
+/// `--update`, so **every orchestrator-root install is permanently dirty on it
+/// by construction** and this guard refused the launcher self-update for all of
+/// them, with no forward action but the destructive resync. That is the blunt
+/// proxy v0.2.58 removed from the `update_orchestrator` surface and never
+/// removed from this one (see
+/// `knowledge/concepts/update-gate-pop-conflict-risk-not-dirty-tree-2026-06-14.md`).
+///
+/// SCOPE, and why it stops here. Only classes this surface actually RESOLVES
+/// downstream are exempted. `USER_EDITABLE_PATTERNS` is deliberately NOT
+/// exempted: its 3-way merge (`run_pre_merge_user_editable`) has exactly two
+/// call sites, both in `commands::installer` — this surface has no A0
+/// pre-merge step, so a dirty `knowledge/**/*.md` here has nothing downstream
+/// to protect it. Exempting it would trade a clear, actionable refusal for an
+/// opaque `git` abort routed to the resync modal, whose only forward action is
+/// `reset --hard`. A refusal the user can act on is better than a modal that
+/// offers to delete their work.
+/// The one-path view of [`blocking_changes`], for the tests that pin the
+/// CLASSIFICATION half of this guard (which dirty paths a downstream leg
+/// claims) independently of the upstream-overlap half.
+///
+/// `#[cfg(test)]` on purpose: since v0.2.95 production refuses through
+/// [`first_change_at_risk`], which needs the whole list. Leaving this callable
+/// from production would invite a future caller back onto the blunt gate this
+/// release removed.
+#[cfg(test)]
+fn first_blocking_change(status_z: &[u8]) -> Option<String> {
+    blocking_changes(status_z).into_iter().next()
+}
+
+/// Every tracked-modified path that no downstream leg of THIS surface
+/// resolves, in `git status` order.
+///
+/// `first_blocking_change` is the one-path view of this, kept because a
+/// refusal names one path. The caller needs the FULL list: it intersects it
+/// with the upstream-changed set, and "the first unresolved path" and "the
+/// first path that can actually conflict" are not the same path.
+fn blocking_changes(status_z: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
     // Built once per call; four patterns. On a (never-observed) malformed
     // pattern, fall back to "exclude nothing" — the pre-v0.2.91 behaviour,
     // which blocks rather than silently pulling over a dirty file.
     let generated =
         crate::commands::git_user_editable_merge::build_generated_release_controlled_globset().ok();
-    for line in porcelain.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        // `?? path` → untracked, safe.
-        // ` M path` / `M  path` / `MM path` / `A  path` / etc. → blocking.
-        let code = &line[..2];
-        if code == "??" {
-            continue;
-        }
-        let path = line[3..].to_string();
+    // v0.2.95 MINOR-A: the SHARED `-z` walk, not a second porcelain parser.
+    // The result is intersected with `tracked_modified_overlapping_upstream`'s,
+    // so the two must produce the same SPELLING of a path — see that function's
+    // docs for the rename / quoted-path divergence this removes.
+    for path in crate::commands::git_user_editable_merge::parse_tracked_modified_z(status_z) {
         if let Some(gs) = generated.as_ref() {
             if crate::commands::git_user_editable_merge::is_generated_release_controlled(&path, gs)
             {
@@ -1819,9 +2313,106 @@ fn first_blocking_change(porcelain: &str) -> Option<String> {
                 continue;
             }
         }
-        return Some(path);
+        // Handled downstream by the rendered reconcile, which still runs
+        // BEFORE the pull — but no longer by a call from this surface.
+        // v0.2.95 phase 2 moved it into the shared pipeline's A0 step, so the
+        // reach is transitive: `prepare_and_pull_orchestrator_repo` →
+        // `reconcile_and_pull` → `run_pre_merge_user_editable` →
+        // `git_user_editable_merge::pre_merge_user_editable` →
+        // `resolve_rendered_files_keep_local_at`. Grepping THIS file for the
+        // reconcile finds nothing, which is why the sentence is worth
+        // correcting rather than deleting: a reader who checks the old claim,
+        // finds no call, and concludes the exemption is unbacked would delete
+        // an exemption that is still earned.
+        // Table-driven (`is_rendered_root_file` reads
+        // `vco_lib/rendered_root_files.toml`), so adding a rendered path there
+        // exempts it here with no second list to keep in step.
+        if crate::commands::git_user_editable_merge::is_rendered_root_file(&path) {
+            continue;
+        }
+        out.push(path);
     }
-    None
+    out
+}
+
+/// The path this surface must refuse on, or `None` when nothing can conflict.
+///
+/// v0.2.95 — the second half of removing the blunt proxy. `blocking_changes`
+/// answers "which dirty tracked paths has no downstream leg claimed"; this
+/// answers the question that actually decides a refusal: *can the pull hurt any
+/// of them*. It can only hurt a path upstream ALSO changed — the v0.2.58 risk
+/// set `tracked-modified ∩ upstream-changed`, reused here through the SAME
+/// helper `update_orchestrator` uses rather than a second intersection.
+/// A tracked-modified file upstream did not touch survives both arms of the
+/// pull untouched: `--ff-only` only rewrites entries whose merged value
+/// differs, and an `--autostash` pop replays cleanly onto unchanged content.
+///
+/// CONSERVATIVE ON EVERY UNKNOWN. If the merge base or the upstream tip cannot
+/// be resolved, or the helper reports it could not read status, we refuse on
+/// the first unresolved path exactly as before. "I could not prove this is
+/// safe" must read as "block", never as "proceed" — the whole point of the
+/// guard is that the user's uncommitted work is unrecoverable if we are wrong.
+///
+/// v0.2.95 phase 2: the CALL moved into the shared pipeline (as
+/// `update_pipeline::ExtraPreflight::RefuseDirtyTrackedAtRisk`) so it runs
+/// AFTER the in-progress-merge refusal and still before anything mutates. The
+/// decision stays here, and stays this surface's alone — see that enum's doc
+/// for why the installer surface must NOT have it.
+pub(crate) async fn first_change_at_risk(
+    repo: &Path,
+    branch: &str,
+    status_z: &[u8],
+) -> Option<String> {
+    let candidates = blocking_changes(status_z);
+    let first = candidates.first()?.clone();
+
+    use crate::commands::git_user_editable_merge as gum;
+    let (Ok(Some(base)), Ok(Some(theirs))) = (
+        gum::compute_base_sha(repo, branch).await,
+        gum::compute_theirs_sha(repo, branch).await,
+    ) else {
+        tracing::warn!(
+            "[vct] apply_launcher_update: could not resolve the merge base / upstream tip for \
+             {} — refusing on '{}' without narrowing (conservative)",
+            branch,
+            first
+        );
+        return Some(first);
+    };
+
+    let risky = match gum::tracked_modified_overlapping_upstream(repo, &base, &theirs).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] apply_launcher_update: could not compute the pop-conflict-risk set ({}) \
+                 — refusing on '{}' without narrowing (conservative)",
+                e,
+                first
+            );
+            return Some(first);
+        }
+    };
+    // The helper signals "I could not read `git status`" with this sentinel
+    // rather than an Err. It is not a path, so a naive intersection would
+    // silently come out EMPTY and UNBLOCK — the dangerous direction.
+    if risky.iter().any(|p| p == "<status-read-failed>") {
+        tracing::warn!(
+            "[vct] apply_launcher_update: the risk set could not be read — refusing on '{}' \
+             without narrowing (conservative)",
+            first
+        );
+        return Some(first);
+    }
+
+    let blocker = candidates.into_iter().find(|c| risky.contains(c));
+    if blocker.is_none() {
+        tracing::info!(
+            "[vct] apply_launcher_update: {} dirty tracked path(s) upstream did not touch — not \
+             a pop-conflict risk, proceeding (v0.2.58 model, now on this surface too)",
+            risky.len().max(1)
+        );
+    }
+    blocker
 }
 
 /// True if any path in the diff lives under `src-tauri/` — we need a
@@ -2452,23 +3043,151 @@ pub fn check_running_version_lags_tag(running: String, latest_tag: String) -> bo
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------
+    // v0.2.95 ship-gate MAJOR-2 — a no-op "Update now" must not stamp the
+    // manifest.
+    // -----------------------------------------------------------------
+
+    /// A temp install root carrying the manifest a REAL install.py run wrote.
+    /// Returns the guard (kept alive by the caller) and the manifest path.
+    fn root_with_installer_written_manifest() -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_path_buf();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(
+            root.join("state").join("install-manifest.json"),
+            "{\n  \"schema_version\": 1,\n  \"installed\": true,\n  \
+             \"installed_at\": \"2026-09-01T10:00:00Z\",\n  \
+             \"completed_at\": \"2026-09-01T10:05:00Z\",\n  \
+             \"version\": \"0.2.95\",\n  \
+             \"install_method\": \"update\",\n  \
+             \"source_commit\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("vct-module.json"), "{\"version\":\"0.2.95\"}").unwrap();
+        let manifest = root.join("state").join("install-manifest.json");
+        (td, manifest)
+    }
+
+    /// Run the tail's manifest step exactly as `finish_apply_after_pull` does
+    /// — the decision function plus the one writer it gates — and hand back
+    /// the manifest bytes afterwards.
+    fn manifest_bytes_after_tail(root: &Path, manifest: &Path, artefacts: ArtefactSource) -> Vec<u8> {
+        if owes_manifest_refresh(artefacts) {
+            crate::commands::manifest::refresh_install_manifest(root, "launcher_update").unwrap();
+        }
+        std::fs::read(manifest).unwrap()
+    }
+
+    /// THE ship-gate MAJOR-2 assertion, as bytes rather than as a claim.
+    ///
+    /// `apply_launcher_update`'s already-up-to-date branch reaches the tail
+    /// with `Unchanged`. HEAD did not move, so `state/install-manifest.json`
+    /// must come out of the click exactly as it went in — byte for byte,
+    /// `post_source_only` included (its absence is what keeps
+    /// `check_for_updates` from raising `install_stale` and demanding a full
+    /// `apply_pending_install` after a click that changed nothing).
+    ///
+    /// Revert the call site to `ArtefactSource::SourceOnly`, or widen
+    /// `owes_manifest_refresh` to answer `true` for `Unchanged`, and this goes
+    /// red on the byte comparison.
+    #[test]
+    fn an_already_up_to_date_update_leaves_the_install_manifest_byte_identical() {
+        let (_td, manifest) = root_with_installer_written_manifest();
+        let root = manifest.parent().unwrap().parent().unwrap().to_path_buf();
+        let before = std::fs::read(&manifest).unwrap();
+
+        let after = manifest_bytes_after_tail(&root, &manifest, ArtefactSource::Unchanged);
+
+        assert_eq!(
+            before, after,
+            "an already-up-to-date update moved nothing, so it must not \
+             rewrite the install manifest at all",
+        );
+        // And specifically: the flag that lights `install_stale` was not added.
+        let v: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        assert!(
+            v.get("post_source_only").is_none(),
+            "a no-op update must not claim the source tree advanced without \
+             install.py: {v}",
+        );
+    }
+
+    /// The LEAVE-ALONE arm's counterpart: the variant that DOES mean "the tree
+    /// moved without install.py" still writes. Without this, the fix above
+    /// could be "never refresh", which would silently retire the WP-1 repair
+    /// affordance (the whole point of `post_source_only`).
+    #[test]
+    fn a_source_only_update_still_records_the_advance_in_the_manifest() {
+        let (_td, manifest) = root_with_installer_written_manifest();
+        let root = manifest.parent().unwrap().parent().unwrap().to_path_buf();
+        let before = std::fs::read(&manifest).unwrap();
+
+        let after = manifest_bytes_after_tail(&root, &manifest, ArtefactSource::SourceOnly);
+
+        assert_ne!(
+            before, after,
+            "a source-only advance must be recorded, or the half-updated \
+             state goes back to being invisible",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        assert_eq!(
+            v.get("post_source_only").and_then(|b| b.as_bool()),
+            Some(true),
+            "the source-only path names the state it left behind",
+        );
+        // …and `version` is still install.py's alone (WP-1).
+        assert_eq!(v.get("version").and_then(|s| s.as_str()), Some("0.2.95"));
+    }
+
+    /// The third arm. install.py wrote the manifest itself moments ago; the
+    /// tail overwriting it with a launcher-path record is the state WP-1
+    /// exists to prevent.
+    #[test]
+    fn an_install_py_update_leaves_the_manifest_to_install_py() {
+        let (_td, manifest) = root_with_installer_written_manifest();
+        let root = manifest.parent().unwrap().parent().unwrap().to_path_buf();
+        let before = std::fs::read(&manifest).unwrap();
+
+        let after = manifest_bytes_after_tail(&root, &manifest, ArtefactSource::InstallPy);
+
+        assert_eq!(
+            before, after,
+            "install.py is the only writer of its own completion record",
+        );
+    }
+
+    /// Build `git status --porcelain -z` stdout from logical rows.
+    ///
+    /// `-z` is NUL-separated with no trailing newline; a rename/copy row is
+    /// written here as two entries (new path first, then the old one) exactly
+    /// as git emits it.
+    fn z(rows: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for r in rows {
+            out.extend_from_slice(r.as_bytes());
+            out.push(0);
+        }
+        out
+    }
+
     #[test]
     fn blocking_change_ignores_untracked() {
-        let porcelain = "?? .claude/CONTEXT_STATE.md\n?? state/runtime.db\n";
-        assert_eq!(first_blocking_change(porcelain), None);
+        let porcelain = z(&["?? .claude/CONTEXT_STATE.md", "?? state/runtime.db"]);
+        assert_eq!(first_blocking_change(&porcelain), None);
     }
 
     #[test]
     fn blocking_change_catches_modified_tracked() {
-        let porcelain = " M Cargo.toml\n?? .claude/CONTEXT_STATE.md\n";
-        assert_eq!(first_blocking_change(porcelain), Some("Cargo.toml".into()));
+        let porcelain = z(&[" M Cargo.toml", "?? .claude/CONTEXT_STATE.md"]);
+        assert_eq!(first_blocking_change(&porcelain), Some("Cargo.toml".into()));
     }
 
     #[test]
     fn blocking_change_catches_staged() {
-        let porcelain = "M  src-tauri/src/lib.rs\n";
+        let porcelain = z(&["M  src-tauri/src/lib.rs"]);
         assert_eq!(
-            first_blocking_change(porcelain),
+            first_blocking_change(&porcelain),
             Some("src-tauri/src/lib.rs".into())
         );
     }
@@ -2482,9 +3201,9 @@ mod tests {
     /// The only forward action left to the user was the destructive resync.
     #[test]
     fn blocking_change_ignores_generated_release_controlled_dist_binaries() {
-        let porcelain = " M launcher/dist/windows-x64/vct-launcher.exe\n";
+        let porcelain = z(&[" M launcher/dist/windows-x64/vct-launcher.exe"]);
         assert_eq!(
-            first_blocking_change(porcelain),
+            first_blocking_change(&porcelain),
             None,
             "a dirty dist binary must not block the self-update surface — F1 + the \
              take-upstream reconcile downstream own it"
@@ -2503,7 +3222,7 @@ mod tests {
             "launcher/dist/windows-x64/vct-launcher.exe.metadata.json",
         ] {
             assert_eq!(
-                first_blocking_change(&format!(" M {}\n", p)),
+                first_blocking_change(&z(&[&format!(" M {}", p)])),
                 None,
                 "{} is release-controlled and must not block",
                 p
@@ -2527,7 +3246,7 @@ mod tests {
             "launcher/package.json.bak",
         ] {
             assert_eq!(
-                first_blocking_change(&format!(" M {}\n", p)),
+                first_blocking_change(&z(&[&format!(" M {}", p)])),
                 Some(p.to_string()),
                 "{} is hand-authored — a local edit there is a real signal",
                 p
@@ -2540,12 +3259,68 @@ mod tests {
     /// first excluded row).
     #[test]
     fn blocking_change_scans_past_excluded_rows() {
-        let porcelain = " M launcher/dist/windows-x64/vct-launcher.exe\n\
-                         ?? .claude/CONTEXT_STATE.md\n\
-                         M  launcher/src-tauri/src/lib.rs\n";
+        let porcelain = z(&[
+            " M launcher/dist/windows-x64/vct-launcher.exe",
+            "?? .claude/CONTEXT_STATE.md",
+            "M  launcher/src-tauri/src/lib.rs",
+        ]);
         assert_eq!(
-            first_blocking_change(porcelain),
+            first_blocking_change(&porcelain),
             Some("launcher/src-tauri/src/lib.rs".into())
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.95 — the Step-1 guard is no longer a blunt "is the tree dirty"
+    // proxy. Two halves, tested separately:
+    //   * CLASSIFICATION (`blocking_changes`) — which dirty tracked paths
+    //     has no downstream leg of THIS surface claimed;
+    //   * HAZARD (`first_change_at_risk`) — of those, can the pull hurt any.
+    // -----------------------------------------------------------------
+
+    /// `install.py` renders CLAUDE.md over its tracked blob on every run, so
+    /// EVERY orchestrator-root install is permanently dirty here. It used to
+    /// hard-refuse this surface for all of them while
+    /// `resolve_rendered_files_keep_local` — wired in below the guard,
+    /// precisely to handle it — was unreachable.
+    #[test]
+    fn a_dirty_rendered_file_is_not_a_blocking_change() {
+        assert_eq!(first_blocking_change(&z(&[" M CLAUDE.md"])), None);
+        // Case-folded + backslash-separated, as Windows `git status` can emit.
+        assert_eq!(first_blocking_change(&z(&[" M claude.md"])), None);
+    }
+
+    /// The exemption is table-driven, not a second hardcoded list: it must
+    /// cover exactly what `vco_lib/rendered_root_files.toml` declares.
+    #[test]
+    fn the_rendered_exemption_reads_the_shared_table() {
+        for entry in crate::commands::git_user_editable_merge::rendered_root_files() {
+            assert_eq!(
+                first_blocking_change(&z(&[&format!(" M {}", entry.path)])),
+                None,
+                "{} is declared RENDERED in rendered_root_files.toml, so the Step-1 guard must \
+                 defer to resolve_rendered_files_keep_local instead of refusing",
+                entry.path
+            );
+        }
+    }
+
+    /// The caller intersects with the upstream-changed set, so it needs every
+    /// unresolved path — not just the first.
+    #[test]
+    fn blocking_changes_lists_every_unresolved_path_in_order() {
+        let porcelain = z(&[
+            " M CLAUDE.md",
+            "?? scratch.txt",
+            "M  vco_lib/a.py",
+            "M  launcher/dist/linux-x64/vct-launcher",
+            "M  vco_lib/b.py",
+        ]);
+        assert_eq!(
+            blocking_changes(&porcelain),
+            vec!["vco_lib/a.py".to_string(), "vco_lib/b.py".to_string()],
+            "rendered + untracked + generated are resolved downstream; the two hand-authored \
+             files are not"
         );
     }
 
@@ -2750,6 +3525,277 @@ mod tests {
             return None;
         }
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Seed a bare upstream + a clone wired to it as `vco_upstream`, so
+    /// `compute_base_sha` / `compute_theirs_sha` resolve for real.
+    fn init_upstream_pair() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let local = root.join("local");
+
+        let g = |dir: &Path, args: &[&str]| {
+            let ok = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("git")
+                .success();
+            assert!(ok, "git {:?} failed", args);
+        };
+
+        assert!(StdCommand::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&remote)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git init --bare")
+            .success());
+
+        std::fs::create_dir_all(seed.join("vco_lib")).unwrap();
+        std::fs::create_dir_all(seed.join("knowledge").join("concepts")).unwrap();
+        g(&seed, &["init", "--initial-branch=main"]);
+        g(&seed, &["config", "user.email", "t@example.com"]);
+        g(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("CLAUDE.md"), "# stub\n").unwrap();
+        std::fs::write(seed.join("other.txt"), "base\n").unwrap();
+        std::fs::write(seed.join("vco_lib").join("foo.py"), "def base(): pass\n").unwrap();
+        std::fs::write(seed.join("vco_lib").join("bar.py"), "def base(): pass\n").unwrap();
+        std::fs::write(
+            seed.join("knowledge").join("concepts").join("foo.md"),
+            "# foo\nbase\n",
+        )
+        .unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-m", "seed"]);
+        g(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        g(&seed, &["push", "origin", "main"]);
+
+        assert!(StdCommand::new("git")
+            .args(["clone"])
+            .arg(remote.to_str().unwrap())
+            .arg(&local)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git clone")
+            .success());
+        g(&local, &["config", "user.email", "t@example.com"]);
+        g(&local, &["config", "user.name", "T"]);
+        g(
+            &local,
+            &["remote", "add", VCO_UPSTREAM_REMOTE, remote.to_str().unwrap()],
+        );
+
+        // Advance upstream by one commit that touches `other.txt` only, then
+        // make the clone's `vco_upstream/main` current.
+        std::fs::write(seed.join("other.txt"), "base\nupstream\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "-m", "upstream moves"]);
+        g(&seed, &["push", "origin", "main"]);
+        g(&local, &["fetch", VCO_UPSTREAM_REMOTE]);
+
+        (tmp, local)
+    }
+
+    /// Helper: commit an extra upstream change to `rel`, then refresh the
+    /// clone's remote-tracking ref.
+    fn upstream_touch(tmp: &tempfile::TempDir, local: &Path, rel: &str, body: &str) {
+        let seed = tmp.path().join("seed");
+        let target = seed.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, body).unwrap();
+        for args in [
+            vec!["add", "."],
+            vec!["commit", "-m", "upstream change"],
+            vec!["push", "origin", "main"],
+        ] {
+            assert!(StdCommand::new("git")
+                .args(&args)
+                .current_dir(&seed)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("git")
+                .success());
+        }
+        assert!(StdCommand::new("git")
+            .args(["fetch", VCO_UPSTREAM_REMOTE])
+            .current_dir(local)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git fetch")
+            .success());
+    }
+
+    /// THE DEFECT, end to end at the guard: a rendered CLAUDE.md that upstream
+    /// ALSO changed — the exact 0.2.93→0.2.94 shape — no longer refuses.
+    #[tokio::test]
+    async fn dirty_rendered_file_upstream_changed_does_not_refuse() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "CLAUDE.md", "# stub v2\n");
+        std::fs::write(repo.join("CLAUDE.md"), "# rendered\nMY OWN NOTES\n").unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M CLAUDE.md"])).await,
+            None,
+            "a RENDERED path is resolved by resolve_rendered_files_keep_local before the pull"
+        );
+    }
+
+    /// The v0.2.58 model, now on this surface: a tracked-modified file upstream
+    /// did NOT touch cannot pop-conflict, so it must not block. A fork that
+    /// tracks its KG nodes hit this on every single update.
+    #[tokio::test]
+    async fn dirty_tracked_file_upstream_did_not_touch_does_not_refuse() {
+        skip_if_no_git!();
+        let (_tmp, repo) = init_upstream_pair();
+        std::fs::write(
+            repo.join("knowledge").join("concepts").join("foo.md"),
+            "# foo\nmy local edit\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M knowledge/concepts/foo.md"])).await,
+            None,
+            "upstream's commit touched other.txt only — this file cannot conflict"
+        );
+    }
+
+    /// The refusal STANDS where content can genuinely be lost, and it names the
+    /// path. This is the case git itself aborts on ("Your local changes to the
+    /// following files would be overwritten by merge").
+    #[tokio::test]
+    async fn dirty_tracked_file_upstream_also_changed_still_refuses_and_names_it() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "vco_lib/foo.py", "def upstream(): pass\n");
+        std::fs::write(repo.join("vco_lib").join("foo.py"), "def mine(): pass\n").unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M vco_lib/foo.py"])).await,
+            Some("vco_lib/foo.py".to_string())
+        );
+    }
+
+    /// The guard picks the path that can actually conflict, not merely the
+    /// first dirty one — the reason the caller needs the whole list.
+    #[tokio::test]
+    async fn the_named_path_is_the_one_upstream_changed() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "vco_lib/bar.py", "def upstream(): pass\n");
+        std::fs::write(repo.join("vco_lib").join("foo.py"), "def mine(): pass\n").unwrap();
+        std::fs::write(repo.join("vco_lib").join("bar.py"), "def mine(): pass\n").unwrap();
+
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M vco_lib/foo.py", " M vco_lib/bar.py"])).await,
+            Some("vco_lib/bar.py".to_string()),
+            "foo.py is dirty but upstream never touched it; bar.py is the real hazard"
+        );
+    }
+
+    // --- v0.2.95 MINOR-A: the two parsers must spell a path identically ---
+
+    /// A `-z` rename is TWO records (new path, then old). The guard must read
+    /// the NEW path — the one the merge cares about, and the one the risk-set
+    /// helper reports — not `old -> new` (which is what NON-`-z` porcelain
+    /// gives, and which can never intersect the risk set).
+    #[test]
+    fn a_staged_rename_is_read_as_the_new_path() {
+        let porcelain = z(&["R  vco_lib/renamed.py", "vco_lib/foo.py"]);
+        assert_eq!(blocking_changes(&porcelain), vec!["vco_lib/renamed.py"]);
+    }
+
+    /// `-z` reports paths literally; NON-`-z` porcelain would hand back
+    /// `"caf\303\251 note.py"` (quoted + octal-escaped under `core.quotePath`),
+    /// a spelling the risk set never produces.
+    #[test]
+    fn unusual_paths_are_read_literally() {
+        let porcelain = z(&[" M vco_lib/café note.py"]);
+        assert_eq!(blocking_changes(&porcelain), vec!["vco_lib/café note.py"]);
+    }
+
+    /// Both sides of the intersection come from ONE function, so a fixture
+    /// cannot be parsed two ways.
+    #[test]
+    fn the_guard_and_the_risk_set_share_one_parser() {
+        let porcelain = z(&["R  vco_lib/renamed.py", "vco_lib/foo.py", " M vco_lib/café.py"]);
+        assert_eq!(
+            crate::commands::git_user_editable_merge::parse_tracked_modified_z(&porcelain),
+            blocking_changes(&porcelain),
+            "no class excludes these paths, so the shared parse must be the whole answer"
+        );
+    }
+
+    /// THE BEHAVIOURAL PROOF of MINOR-A. A staged rename onto a path upstream
+    /// also added is a genuine hazard. Parsed as `old -> new` it could never
+    /// intersect the risk set, so the guard waved it through and the user met
+    /// an opaque autostash abort instead of a sentence naming the file.
+    #[tokio::test]
+    async fn a_staged_rename_onto_an_upstream_path_still_refuses() {
+        skip_if_no_git!();
+        let (tmp, repo) = init_upstream_pair();
+        upstream_touch(&tmp, &repo, "vco_lib/renamed.py", "def upstream(): pass\n");
+        assert!(StdCommand::new("git")
+            .args(["mv", "vco_lib/foo.py", "vco_lib/renamed.py"])
+            .current_dir(&repo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git mv")
+            .success());
+
+        // Read the REAL `-z` status, exactly as production does, so this test
+        // cannot drift from the call site's format.
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain", "-z"])
+            .current_dir(&repo)
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.starts_with(b"R "),
+            "fixture sanity: the rename must be staged as an R record, got {:?}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &status.stdout).await,
+            Some("vco_lib/renamed.py".to_string())
+        );
+    }
+
+    /// Unknown ⇒ block. If the upstream tip cannot be resolved we cannot prove
+    /// anything is safe, and the user's uncommitted work is unrecoverable if we
+    /// guess wrong.
+    #[tokio::test]
+    async fn an_unresolvable_upstream_refuses_conservatively() {
+        skip_if_no_git!();
+        let (_tmp, repo) = init_repo();
+        // No `vco_upstream` remote at all ⇒ compute_theirs_sha yields None.
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&[" M vco_lib/foo.py"])).await,
+            Some("vco_lib/foo.py".to_string())
+        );
+    }
+
+    /// A clean tree never refuses, whatever the upstream state.
+    #[tokio::test]
+    async fn nothing_dirty_never_refuses() {
+        skip_if_no_git!();
+        let (_tmp, repo) = init_upstream_pair();
+        assert_eq!(first_change_at_risk(&repo, "main", b"").await, None);
+        assert_eq!(
+            first_change_at_risk(&repo, "main", &z(&["?? scratch.txt"])).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -3311,15 +4357,26 @@ mod tests {
     ///
     /// We exercise the writer directly (the full `apply_launcher_update`
     /// command needs an `AppHandle` + live git network, so a whole-command
-    /// integration test is impractical) — but we use the EXACT kind +
-    /// detail string the autostash-pop-conflict success-path branch passes,
-    /// so this guards that specific call-site's shape, not a generic one.
+    /// integration test is impractical).
+    ///
+    /// CORRECTED v0.2.95 phase 2: this used to add "we use the EXACT kind +
+    /// detail string the autostash-pop-conflict success-path branch passes, so
+    /// this guards that specific call-site's shape". That call site is gone —
+    /// `apply_launcher_update` pulls through `update_pipeline`, which
+    /// classifies an autostash-pop conflict as its OWN condition
+    /// (`write_autostash_pop_conflict_deferral`) rather than folding it into
+    /// the diverged one, and writes the diverged record for the conflict and
+    /// non-FF classes. So what this pins is the WRITER's durable output shape,
+    /// which is what both surfaces now reach. Naming a call site it no longer
+    /// guards would be the false claim, not the coverage.
     #[test]
     fn self_update_failure_writes_durable_launcher_update_diverged_deferral() {
+        use crate::commands::git_user_editable_merge::{
+            write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let install = dir.path().to_path_buf();
 
-        // The literal detail the success-path unmerged-tree branch uses.
         let detail = "git pull (auto-merge) left unmerged files (autostash-pop conflict)";
         write_launcher_update_diverged_deferral(
             &install,
@@ -4053,6 +5110,207 @@ mod tests {
                 sha
             );
             assert!(local.join("mine.txt").exists());
+        }
+    }
+
+    // ===================================================================
+    // v0.2.95 phase 3 — the RESYNC surface's hub choreography
+    // ===================================================================
+    //
+    // `force_resync_launcher`'s `git reset --hard` writes every tracked file
+    // that differs from the target, and `launcher/dist/<arch>/vct-hub{,.exe}`
+    // IS tracked — so this surface carried the hazard v0.2.21 Step 12 closed
+    // for `update_orchestrator` and phase 2 closed for `apply_launcher_update`.
+    //
+    // WHY THESE TESTS ARE SAFE ON A DEVELOPER'S MACHINE, which is the reason
+    // no earlier test ever drove this code:
+    //   * `VCT_STATE_DIR` is redirected, so the hub stop reads a SCRATCH
+    //     `hub.pid` rather than `~/.vct/hub.pid`;
+    //   * the pid it names is provably DEAD (spawn + reap), so nothing is
+    //     signalled and `vct-hub --stop` is never spawned;
+    //   * `update_gate::pre_update_hub_kill_sweep` refuses under a test
+    //     harness (v0.2.92), so the process-identity backstop reaps nothing;
+    //   * `installer::ensure_hub_started_after_update` refuses under a test
+    //     harness too (v0.2.95 phase 3 — the spawning half of the same
+    //     defect), so the failure arm below cannot start a REAL hub bound to
+    //     the scratch state dir.
+    //
+    // THE OBSERVABLE both tests key on is that the stop's own side effect — a
+    // stale `hub.pid` is REMOVED — is visible after the call. That is what
+    // makes "the hub was stopped" a fact rather than an adjacency in the
+    // source, and the second test makes it an ORDERING fact: the removal is
+    // there even when the tree-write FAILS, so the stop provably preceded it.
+    mod resync_hub_choreography {
+        use super::*;
+        use crate::commands::git_user_editable_merge::tests::{
+            init_repo_pair, push_upstream_change, run_git as fixture_git,
+        };
+        use std::process::{Command as StdCommand, Stdio};
+
+        macro_rules! skip_if_no_git {
+            () => {
+                if StdCommand::new("git")
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| !s.success())
+                    .unwrap_or(true)
+                {
+                    eprintln!("skipping: git not on PATH");
+                    return;
+                }
+            };
+        }
+
+        /// A pid that is provably dead: spawn a trivial child, reap it, give
+        /// the kernel a moment. Same pattern as
+        /// `installer::tests::hub_stop_tests::ensure_hub_stopped_cleans_up_stale_dead_pid`.
+        fn provably_dead_pid() -> u32 {
+            #[cfg(unix)]
+            let mut child = StdCommand::new("true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn true");
+            #[cfg(windows)]
+            let mut child = StdCommand::new("cmd")
+                .args(["/c", "exit"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn cmd /c exit");
+            let pid = child.id();
+            let _ = child.wait();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            pid
+        }
+
+        /// A clone that has DIVERGED from upstream: one local-only commit,
+        /// one upstream-only commit. A resync must discard the first and
+        /// land the second — which is how the tests below tell a reset that
+        /// ran from one that did not.
+        fn diverged_clone() -> (tempfile::TempDir, PathBuf, String) {
+            let (tmp, _remote, local) = init_repo_pair();
+            let seed = tmp.path().join("seed");
+            push_upstream_change(&seed, &local, "upstream_only.txt", "from upstream\n");
+
+            std::fs::write(local.join("local_only.txt"), "my divergent work\n").unwrap();
+            fixture_git(&local, &["add", "-A"]);
+            fixture_git(&local, &["commit", "-m", "local divergence"]);
+
+            let head = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .expect("git rev-parse");
+            let head_before = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            (tmp, local, head_before)
+        }
+
+        fn head_of(repo: &Path) -> String {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .expect("git rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// ACT ARM. The resync lands, and the hub was stopped on the way.
+        ///
+        /// MUTATION RED-PROOF: delete the
+        /// `stop_hub_and_rename_binaries_aside` call from
+        /// `stop_hub_then_hard_reset` and the `hub.pid` assertion below fails
+        /// — the reset still succeeds, which is exactly why "the reset
+        /// worked" was never evidence that the hub was handled.
+        #[tokio::test]
+        async fn resync_stops_the_hub_before_it_hard_resets_the_tree() {
+            skip_if_no_git!();
+            let (_tmp, local, head_before) = diverged_clone();
+
+            let env = vct_launcher_core::test_env::state_dir_guard();
+            let pid_file = env.path().join("hub.pid");
+            std::fs::write(&pid_file, format!("{}\n", provably_dead_pid())).unwrap();
+            assert!(pid_file.exists(), "fixture: the stale hub.pid must exist");
+
+            let renames = stop_hub_then_hard_reset(&local, "vco_upstream/main")
+                .await
+                .expect("the resync reset must land on a diverged clone");
+
+            assert!(
+                !pid_file.exists(),
+                "the hub must be STOPPED before `git reset --hard` writes the \
+                 tree: `launcher/dist/<arch>/vct-hub` is a TRACKED file, so \
+                 the reset overwrites it under a running hub (Windows: the \
+                 whole reset aborts; POSIX: the hub serves old code from a \
+                 deleted inode for the rest of the session). The stale hub.pid \
+                 is still here, so the stop never ran."
+            );
+            assert_ne!(head_of(&local), head_before, "the reset must have moved HEAD");
+            assert!(
+                local.join("upstream_only.txt").is_file(),
+                "the tree must now carry upstream's content"
+            );
+            assert!(
+                !local.join("local_only.txt").exists(),
+                "a hard reset discards the local divergence — that is the point \
+                 of this surface"
+            );
+            // POSIX: nothing is renamed (git replaces the inode safely).
+            #[cfg(not(windows))]
+            assert_eq!(
+                renames,
+                crate::commands::update_pipeline::PrePullRenames::default(),
+                "the pre-pull renames are Windows-only"
+            );
+            #[cfg(windows)]
+            let _ = renames;
+        }
+
+        /// FAILURE ARM — and the ORDERING claim.
+        ///
+        /// The reset cannot run (its target ref does not exist). Two things
+        /// must hold: the tree is UNTOUCHED, and the hub was stopped anyway —
+        /// because the stop happens BEFORE the write is attempted. Move the
+        /// stop after the reset and this test goes red while the act-arm test
+        /// above stays green.
+        ///
+        /// It also drives the recovery leg: `stop_hub_then_hard_reset` must
+        /// route a failed reset through `abort_update_restore_binaries_and_hub`
+        /// so the hub it stopped comes back. Without that, a failed resync
+        /// leaves a perma-stopped hub — the failure `07101d30` added the
+        /// revert-on-every-early-return for on the installer surface.
+        #[tokio::test]
+        async fn a_resync_whose_reset_fails_leaves_the_tree_alone_but_still_stopped_the_hub_first() {
+            skip_if_no_git!();
+            let (_tmp, local, head_before) = diverged_clone();
+
+            let env = vct_launcher_core::test_env::state_dir_guard();
+            let pid_file = env.path().join("hub.pid");
+            std::fs::write(&pid_file, format!("{}\n", provably_dead_pid())).unwrap();
+
+            let err = stop_hub_then_hard_reset(&local, "vco_upstream/no-such-branch")
+                .await
+                .expect_err("a reset to a ref that does not exist must fail");
+            assert!(!err.is_empty(), "the git error must reach the caller: {err}");
+
+            assert!(
+                !pid_file.exists(),
+                "ORDER: the hub stop must precede the tree write, so its stale \
+                 hub.pid is gone even when the write never happened. Finding it \
+                 here means the stop was moved after the reset, where it \
+                 protects nothing."
+            );
+            assert_eq!(
+                head_of(&local),
+                head_before,
+                "a failed reset must leave the tree exactly as it was"
+            );
+            assert!(
+                local.join("local_only.txt").is_file(),
+                "the local divergence must survive a reset that never ran"
+            );
         }
     }
 }

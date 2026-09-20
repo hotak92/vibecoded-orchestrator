@@ -299,11 +299,20 @@ def test_post_file_edit_no_longer_emits_per_edit_reminder() -> None:
     """The per-Edit '[Code edit reminder] ... was just edited' _add_nudge must
     be GONE from post-file-edit.sh (replaced by accumulator append)."""
     body = POST_EDIT_SH.read_text(encoding="utf-8")
-    assert "_add_nudge \"[Code edit reminder]" not in body, (
-        "per-Edit reminder nudge must be removed (aggregation moved to Stop)"
+    route_lib = (HOOKS / "_lib" / "route-touched-path.sh").read_text(encoding="utf-8")
+    for name, text in (("post-file-edit.sh", body), ("route-touched-path.sh", route_lib)):
+        assert "_add_nudge \"[Code edit reminder]" not in text, (
+            f"per-Edit reminder nudge must be removed from {name} "
+            "(aggregation moved to Stop)"
+        )
+    # v0.2.95 (lane F10): the accumulator append moved into the ONE routing
+    # home shared with post-bash-file-sync.sh, and the session id arrives as a
+    # parameter rather than the hook-local SESSION_ID_FROM_STDIN.
+    assert "edit_reminder_${session_id}.txt" in route_lib, (
+        "the routing home must append touched paths to the per-turn accumulator"
     )
-    assert "edit_reminder_${SESSION_ID_FROM_STDIN}.txt" in body, (
-        "post-file-edit.sh must append edited paths to the per-turn accumulator"
+    assert "vco_route_touched_path" in body, (
+        "post-file-edit.sh must delegate routing to _lib/route-touched-path.sh"
     )
 
 

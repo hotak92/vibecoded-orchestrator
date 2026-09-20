@@ -264,7 +264,8 @@ if _have_scanner and transcript_path and os.path.exists(transcript_path):
                 break
     scan_result = TranscriptScanner().scan(transcript_path, on_assistant_message=_on_msg)
     # v10.1 (B1 fix): use work_units_total (production+intake) instead of
-    # cache_creation_total (cost-only). cache_creation grew with hook-injected
+    # cache_creation_total (a cache-size signal, not a work signal).
+    # cache_creation grew with hook-injected
     # context per turn, not with what the model actually produced or
     # processed — wrong signal for "work done since last KG save".
     session_total = scan_result.work_units_total

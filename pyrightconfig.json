@@ -17,11 +17,31 @@
     // debt — which is the ONLY moment adding a surface is free. A package
     // that ships without being in `include` is a package whose first type
     // error arrives in the field.
+    //
+    // v0.2.95 (review MINOR-5 — "the scope is an accretion, not a decision"):
+    // two omissions are now DECISIONS, recorded here rather than left to be
+    // re-derived.
+    //   * `.github/scripts` JOINS: it is gate code — the hook-parity gate
+    //     runs from there — and it measured 0 errors / 0 warnings on
+    //     2026-09-16, so it lands free. Gate code that is itself ungated is
+    //     how an F841 sat in it unnoticed until the v0.2.95 ruff sweep.
+    //   * `VCThelpers` STAYS OUT, with the cost measured: 5 errors on
+    //     2026-09-16, ALL of them `reportAttributeAccessIssue` on `winreg`
+    //     attributes in `license/validator.py::_read_windows_machine_guid`
+    //     (lines 238-244). They are an artefact of running pyright on Linux,
+    //     where the `winreg` stub is attribute-less; the code itself is
+    //     correctly guarded by `try: import winreg / except ImportError`.
+    //     The honest fixes are a per-line `# pyright: ignore` litter across
+    //     shipped license code or a platform-scoped config, and neither is
+    //     worth doing blind — so it is BACKLOGGED (CHANGELOG, v0.2.95) with
+    //     the count above, per this file's own exclusion contract. ruff DOES
+    //     gate it (ci.yml `python-lint`), so it is not unlinted.
     "include": [
         "vco_lib",
         "claude_mcp_servers/weaviate_mcp",
         "claude_mcp_servers/search_mcp",
-        "claude_mcp_servers/model_router"
+        "claude_mcp_servers/model_router",
+        ".github/scripts"
     ],
     "exclude": [
         "**/.venv",

@@ -92,13 +92,15 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import vct_root_dir
 
 __all__ = [
     "DEFAULT_HUB_PORT",
+    "binary_names",
+    "find_dist_binary",
     "HUB_PID_FILE",
     "HUB_PORT_FILE",
     "HUB_TOKEN_FILE",
@@ -237,16 +239,27 @@ def is_running() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def hub_binary_names() -> tuple[str, ...]:
-    """Candidate filenames, most-likely first.
+def binary_names(stem: str) -> tuple[str, ...]:
+    """Candidate filenames for ``stem``, most-likely first.
 
-    Windows probes ``vct-hub.exe`` then the bare name; POSIX the reverse —
+    Windows probes ``<stem>.exe`` then the bare name; POSIX the reverse —
     matching ``Get-HubExeNames`` in the ``.ps1`` hook and
     ``hub_binary_name()`` in ``hub_launcher.rs``.
+
+    v0.2.95: parameterised over the stem so the LAUNCHER binary
+    (:mod:`vco_lib.launcher_ensure`) reads the same two-name rule instead of
+    carrying a second copy of it. ``vct-hub`` stays the only caller that has
+    a named wrapper, because it is the only one with three callers to keep
+    honest.
     """
     if os.name == "nt":
-        return ("vct-hub.exe", "vct-hub")
-    return ("vct-hub", "vct-hub.exe")
+        return (f"{stem}.exe", stem)
+    return (stem, f"{stem}.exe")
+
+
+def hub_binary_names() -> tuple[str, ...]:
+    """Candidate ``vct-hub`` filenames — :func:`binary_names` for the hub."""
+    return binary_names("vct-hub")
 
 
 def dist_arch_dir() -> Optional[str]:
@@ -299,11 +312,87 @@ def _is_executable(path: Path) -> bool:
     return os.access(path, os.X_OK)
 
 
-def _first_executable_in(directory: Path) -> Optional[Path]:
-    for name in hub_binary_names():
+def _first_executable_in(
+    directory: Path, names: Sequence[str] = ()
+) -> Optional[Path]:
+    for name in (names or hub_binary_names()):
         candidate = directory / name
         if _is_executable(candidate):
             return candidate
+    return None
+
+
+def find_dist_binary(
+    stem: str,
+    *,
+    env_override: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+    extra_dirs: Sequence[Path] = (),
+    probe_repo_dist: bool = True,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[Path]:
+    """Resolve a VCO ``launcher/dist/`` binary by stem, or ``None``.
+
+    The four-step chain documented at module level, with the binary stem and
+    its override env var as parameters. v0.2.95 extracted it from
+    :func:`find_hub_binary` when :mod:`vco_lib.launcher_ensure` needed the
+    SAME chain for ``vct-launcher``: the alternative was a fifth hand-written
+    copy of a walk that had already drifted once across its first three.
+
+    Never raises and never spawns anything.
+
+    :param stem: binary stem, e.g. ``"vct-hub"`` / ``"vct-launcher"``.
+    :param env_override: name of the env var that pins an explicit path
+        (step 1). ``None`` skips step 1 entirely.
+    :param env: environment to read steps 1 and 4 from. Defaults to the real
+        one; a caller that already resolved an environment (the launcher
+        ensure threads one through every gate) passes it so the whole
+        resolution answers ONE environment rather than two.
+    """
+    names = binary_names(stem)
+    environ: Mapping[str, str] = os.environ if env is None else env
+
+    # 1. Explicit override.
+    override = environ.get(env_override, "").strip() if env_override else ""
+    if override:
+        candidate = Path(override)
+        if _is_executable(candidate):
+            return candidate
+        # Falls through deliberately, matching all three prior copies.
+
+    # 2. Install-folder copy — caller anchors first, then the checkout's
+    #    arch-qualified dist slot, then the arch-less fallback.
+    for directory in extra_dirs:
+        found = _first_executable_in(Path(directory), names)
+        if found is not None:
+            return found
+
+    root = Path(repo_root) if repo_root is not None else _default_repo_root()
+    if probe_repo_dist and root is not None:
+        dist = root / "launcher" / "dist"
+        arch = dist_arch_dir()
+        if arch:
+            found = _first_executable_in(dist / arch, names)
+            if found is not None:
+                return found
+        found = _first_executable_in(dist, names)
+        if found is not None:
+            return found
+
+    # 3. PATH.
+    for name in names:
+        on_path = shutil.which(name)
+        if on_path and _is_executable(Path(on_path)):
+            return Path(on_path)
+
+    # 4. Known user-install location.
+    home = environ.get("USERPROFILE") if os.name == "nt" else None
+    home = home or environ.get("HOME") or ""
+    if home:
+        found = _first_executable_in(Path(home) / ".vct" / "bin", names)
+        if found is not None:
+            return found
+
     return None
 
 
@@ -340,48 +429,13 @@ def find_hub_binary(
           fall back to the checkout's ``dist/`` would hand a `cargo run`
           launcher a hub it never used to find. So it passes ``False``.
     """
-    # 1. Explicit override.
-    override = os.environ.get("VCT_HUB_BIN", "").strip()
-    if override:
-        candidate = Path(override)
-        if _is_executable(candidate):
-            return candidate
-        # Falls through deliberately, matching all three prior copies.
-
-    # 2. Install-folder copy — caller anchors first, then the checkout's
-    #    arch-qualified dist slot, then the arch-less fallback.
-    for directory in extra_dirs:
-        found = _first_executable_in(Path(directory))
-        if found is not None:
-            return found
-
-    root = Path(repo_root) if repo_root is not None else _default_repo_root()
-    if probe_repo_dist and root is not None:
-        dist = root / "launcher" / "dist"
-        arch = dist_arch_dir()
-        if arch:
-            found = _first_executable_in(dist / arch)
-            if found is not None:
-                return found
-        found = _first_executable_in(dist)
-        if found is not None:
-            return found
-
-    # 3. PATH.
-    for name in hub_binary_names():
-        on_path = shutil.which(name)
-        if on_path and _is_executable(Path(on_path)):
-            return Path(on_path)
-
-    # 4. Known user-install location.
-    home = os.environ.get("USERPROFILE") if os.name == "nt" else None
-    home = home or os.environ.get("HOME") or ""
-    if home:
-        found = _first_executable_in(Path(home) / ".vct" / "bin")
-        if found is not None:
-            return found
-
-    return None
+    return find_dist_binary(
+        "vct-hub",
+        env_override="VCT_HUB_BIN",
+        repo_root=repo_root,
+        extra_dirs=extra_dirs,
+        probe_repo_dist=probe_repo_dist,
+    )
 
 
 def _default_repo_root() -> Optional[Path]:

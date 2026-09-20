@@ -62,6 +62,9 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
 )
 import install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
+from tests.common.scratch_dirs import (  # noqa: E402
+    scratch_state_dir as _scratch_state_dir,
+)
 
 
 # ─── Stub Weaviate HTTP server (schema + aggregate) ──────────────────────
@@ -221,11 +224,7 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
     """v0.2.40 W40-A — second-pass cross-prefix adoption."""
 
     def setUp(self):
-        self._tmp = (
-            Path(__file__).resolve().parent
-            / f"_tmp_cross_prefix_{os.getpid()}_{id(self)}"
-        )
-        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._tmp = _scratch_state_dir("cross_prefix")
         self._db_path = self._tmp / "launcher.db"
         self._env_patch = mock.patch.dict(
             os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
@@ -621,6 +620,64 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
         ids = [e.condition_id for e in report.entries]
         self.assertNotIn("kg_binding_self_healed", ids)
         self.assertNotIn("multi_candidate_prefix_adopt", ids)
+
+    # ── T9b (v0.2.95 F3, adjacent site) ──────────────────────────────
+    def test_t9b_a_fixture_shaped_candidate_is_never_adopted(self):
+        """A populated sibling whose project stem is one of VCO's test-fixture
+        names is NOT an adoption target.
+
+        `fixture_class_guard` refuses every write to such a class, so adopting
+        it would point the binding at a collection each later write bounces off
+        — the same defect `kg_binding_doctor._unbindable_fixture_class` closes
+        on the evidence surface. Without the guard this class is the lone
+        populated candidate and the pass adopts it.
+        """
+        _build_launcher_db(
+            self._db_path,
+            rows=[
+                ("p1", "shared",
+                 "VibeCodedOrchestrator_KnowledgeGraph", "{}"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["Alpha_KnowledgeGraph"],
+            counts={"Alpha_KnowledgeGraph": 70},
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings[0][2], "VibeCodedOrchestrator_KnowledgeGraph",
+            "must not adopt a class VCO's own write guard refuses",
+        )
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_t9c_an_ordinary_candidate_is_still_adopted(self):
+        """The leave-alone leg's twin: the guard must not have turned the
+        whole pass off."""
+        _build_launcher_db(
+            self._db_path,
+            rows=[
+                ("p1", "shared",
+                 "VibeCodedOrchestrator_KnowledgeGraph", "{}"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VCODev_KnowledgeGraph"],
+            counts={"VCODev_KnowledgeGraph": 70},
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        self.assertEqual(
+            _read_bindings(self._db_path)[0][2], "VCODev_KnowledgeGraph",
+        )
 
     # ── T10 (v0.2.92 D18) ────────────────────────────────────────────
     def test_t10_primary_role_ghost_binding_is_adopted(self):

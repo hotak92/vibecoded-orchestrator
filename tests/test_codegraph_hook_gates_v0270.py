@@ -213,9 +213,17 @@ def test_post_file_edit_resync_fires_on_code_edit() -> None:
     code_graph_collection_prefix per canonical root and runs the analyzer batch.
     """
     pfe = (HOOKS / "post-file-edit.sh").read_text(encoding="utf-8")
-    # post-file-edit appends code edits to the drain queue (the new resync feed).
-    assert "codegraph_drain_" in pfe, (
-        "post-file-edit.sh must append code edits to the codegraph drain queue"
+    # v0.2.95 (lane F10): the append moved into the ONE routing home that
+    # post-file-edit.sh and post-bash-file-sh both call, so a CLI write reaches
+    # the drain queue too. The hook must still delegate; the lib must still
+    # append. (The behavioural end-to-end proof lives in
+    # tests/test_v0295_bash_write_sync.py.)
+    assert "vco_route_touched_path" in pfe, (
+        "post-file-edit.sh must delegate routing to _lib/route-touched-path.sh"
+    )
+    route_lib = (HOOKS / "_lib" / "route-touched-path.sh").read_text(encoding="utf-8")
+    assert "codegraph_drain_" in route_lib, (
+        "the routing home must append code edits to the codegraph drain queue"
     )
     # The DRAIN now owns the prefix resolution for the code-graph write target.
     drain = (HOOKS / "stop-codegraph-drain.sh").read_text(encoding="utf-8")

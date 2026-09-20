@@ -496,12 +496,23 @@ class ComposeArgvTests(unittest.TestCase):
 # doctor — the reported, deferred, and self-clearing halves
 # ---------------------------------------------------------------------------
 class DoctorProbeTests(unittest.TestCase):
-    def _report(self, state):
-        res = doctor.DoctorResolvers(code_embed_state=lambda root: state)
+    def _report(self, state, context=None):
+        # The rebuild context is INJECTED for the same reason the image state
+        # is: its default reads the machine (runtime resolution + two
+        # container probes). The described default here is "nothing foreign
+        # owns the container", i.e. the plain-install shape.
+        res = doctor.DoctorResolvers(
+            code_embed_state=lambda root: state,
+            code_embed_rebuild_context=lambda: (
+                context
+                if context is not None
+                else code_embed_image.RebuildContext(compose_cmd="podman compose")
+            ),
+        )
         return doctor.run_doctor(REPO_ROOT, scope=doctor.SCOPE_FULL, resolvers=res)
 
-    def _finding(self, state):
-        report = self._report(state)
+    def _finding(self, state, context=None):
+        report = self._report(state, context)
         return next(f for f in report.findings if f.probe == "code_embed_image")
 
     def test_stale_is_a_problem_naming_the_registered_condition(self):
@@ -552,6 +563,185 @@ class DoctorProbeTests(unittest.TestCase):
             deferral_probes.registry_probe_name("code_embed_image_stale"),
             "code_embed_image_still_stale",
         )
+
+
+class TheRemediationCanActuallyRebuildTests(unittest.TestCase):
+    """v0.2.95 F2 — the printed command must not be the one that refused.
+
+    The loop: ``install.py --update`` rebuilds the image only where its own
+    compose project owns the container. Where it does not, step 5's
+    :func:`vco_lib.install_services_guard.apply_recreate_guard` strips
+    ``code_embed`` out of ``build_services`` (correctly — compose derives the
+    IMAGE NAME from the project, so a build under a different project makes an
+    image the running container never loads) and prints ``[skip-recreate]
+    code_embed``. The doctor then re-probed, found the image still stale, and
+    emitted an entry whose remediation was ``python install.py --update`` — the
+    run that had just refused. On a data-integrity condition (the pre-v0.2.92
+    image truncates over-window code at HTTP 200 into the code graph), on the
+    whole population of long-standing installs.
+
+    A printed command is shipped code: it must exist and it must help.
+    """
+
+    FOREIGN = containers.ComposeIdentity(
+        project="vibecoded",
+        working_dir="/home/u/PROJ/claude_mcp_servers",
+        config_files="/home/u/PROJ/claude_mcp_servers/compose.yaml,"
+                     "/home/u/PROJ/claude_mcp_servers/compose.override.yaml",
+    )
+
+    #: The label podman-compose ACTUALLY writes (review MAJOR-1). It records
+    #: `-f` exactly as typed (`podman_compose.py`: `relative_files = files`),
+    #: so a stack started from its own compose directory labels the container
+    #: with bare filenames. The absolute fixture above is the docker-compose
+    #: shape; testing only it is how "the test describes the wrong machine".
+    FOREIGN_RELATIVE = containers.ComposeIdentity(
+        project="vibecoded",
+        working_dir="/home/u/PROJ/claude_mcp_servers",
+        config_files="compose.yaml,compose.override.yaml",
+    )
+
+    def _command(self, context):
+        res = doctor.DoctorResolvers(
+            code_embed_state=lambda root: code_embed_image.ImageState(
+                code_embed_image.STALE, "old image"),
+            code_embed_rebuild_context=lambda: context,
+        )
+        report = doctor.run_doctor(REPO_ROOT, scope=doctor.SCOPE_FULL, resolvers=res)
+        finding = next(
+            f for f in report.findings if f.probe == "code_embed_image"
+        )
+        return finding.command
+
+    def test_the_remediation_is_not_only_the_update_that_refuses(self):
+        """The loop, closed. RED before the fix: the whole command was
+        ``cd <root>`` + ``python install.py --update`` and nothing else."""
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman compose", identity=self.FOREIGN))
+        self.assertIn("install.py --update", cmd)
+        self.assertIn("--build", cmd)
+        self.assertIn("--force-recreate", cmd)
+        self.assertIn(code_embed_image.COMPOSE_SERVICE, cmd)
+
+    def test_a_foreign_owner_gets_ITS_project_not_the_installers(self):
+        """The leg that makes the second step TRUE rather than merely present:
+        run in `infrastructure/` the build would produce
+        `infrastructure_code_embed`, an image the running container never
+        loads — which is exactly why the installer refused."""
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman compose", identity=self.FOREIGN))
+        self.assertIn("-f /home/u/PROJ/claude_mcp_servers/compose.yaml", cmd)
+        self.assertIn(
+            "-f /home/u/PROJ/claude_mcp_servers/compose.override.yaml", cmd)
+        self.assertIn("-p vibecoded", cmd)
+        self.assertIn("podman compose", cmd)
+
+    def test_a_RELATIVE_config_files_label_is_absolutised(self):
+        """Review MAJOR-1. podman-compose labels the container with the `-f`
+        values verbatim, so they are usually bare filenames. Both providers
+        resolve `-f` against the CURRENT directory and the remedy's step 1
+        leaves the user in the orchestrator root — so a verbatim `-f
+        compose.yaml` resolves to a file that is not there, and the command
+        the lane added to close the loop could not run."""
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman-compose", identity=self.FOREIGN_RELATIVE))
+        for flag in re.findall(r"-f (\S+)", cmd):
+            self.assertTrue(
+                os.path.isabs(flag), f"`-f {flag}` resolves against the cwd",
+            )
+        self.assertIn("-f /home/u/PROJ/claude_mcp_servers/compose.yaml", cmd)
+        self.assertIn(
+            "-f /home/u/PROJ/claude_mcp_servers/compose.override.yaml", cmd)
+
+    def test_no_project_directory_flag_podman_compose_rejects(self):
+        """podman-compose 1.5.0's parser has no `--project-directory`, so
+        emitting it is an argparse error rather than a rebuild. It is also
+        redundant: both providers take the project directory from the first
+        `-f`, which is now absolute."""
+        for identity in (self.FOREIGN, self.FOREIGN_RELATIVE):
+            with self.subTest(config_files=identity.config_files):
+                cmd = self._command(code_embed_image.RebuildContext(
+                    compose_cmd="podman-compose", identity=identity))
+                self.assertNotIn("--project-directory", cmd)
+
+    def test_a_label_with_no_config_files_still_pins_the_directory(self):
+        """Nothing to absolutise, so the invocation would resolve against the
+        caller's cwd — the `cd` pins the same directory the other way."""
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman compose",
+            identity=containers.ComposeIdentity(
+                project="vibecoded",
+                working_dir="/home/u/PROJ/claude_mcp_servers",
+            )))
+        self.assertIn("cd /home/u/PROJ/claude_mcp_servers &&", cmd)
+        self.assertIn("-p vibecoded", cmd)
+
+    def test_the_owner_is_named_so_the_user_can_check_it(self):
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman compose", identity=self.FOREIGN))
+        self.assertIn("project 'vibecoded'", cmd)
+
+    def test_no_foreign_owner_falls_back_to_the_installers_own_project(self):
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman compose"))
+        self.assertIn(str(Path(REPO_ROOT) / "infrastructure"), cmd)
+        self.assertIn("--build", cmd)
+        self.assertNotIn("--project-directory", cmd)
+
+    def test_the_command_survives_a_context_that_could_not_be_read(self):
+        """Soft-fail must not delete the step OR the finding.
+
+        The reading that produces the finding is the image state; the context
+        only decides how the remedy is PHRASED. Review MINOR: a raising seam
+        used to take the whole `code_embed_image` probe down to UNKNOWN, i.e.
+        a data-integrity verdict lost to an unreadable container label — while
+        this test's own name claimed the command survived.
+        """
+        res = doctor.DoctorResolvers(
+            code_embed_state=lambda root: code_embed_image.ImageState(
+                code_embed_image.STALE, "old image"),
+            code_embed_rebuild_context=lambda: (_ for _ in ()).throw(
+                RuntimeError("no runtime")),
+        )
+        report = doctor.run_doctor(REPO_ROOT, scope=doctor.SCOPE_FULL, resolvers=res)
+        finding = next(f for f in report.findings if f.probe == "code_embed_image")
+        self.assertEqual(finding.status, doctor.STATUS_PROBLEM)
+        self.assertEqual(finding.condition_id, doctor.CID_CODE_EMBED_IMAGE_STALE)
+        self.assertIn("--build", finding.command)
+        self.assertIn(str(Path(REPO_ROOT) / "infrastructure"), finding.command)
+
+    def test_rebuild_command_has_a_caller(self):
+        """It shipped in v0.2.92 with ZERO callers while the doctor's own
+        docstring promised the entry carries "the explicit compose command"."""
+        cmd = self._command(code_embed_image.RebuildContext(
+            compose_cmd="podman compose"))
+        self.assertIn(
+            code_embed_image.rebuild_command(REPO_ROOT, "podman compose"), cmd,
+        )
+
+    def test_the_guard_that_strips_code_embed_is_the_reason_for_step_two(self):
+        """The two halves of the loop, in one place: the guard removes
+        ``code_embed`` from the build list on exactly the machines whose
+        container is foreign, so the update cannot be the whole remedy."""
+        from vco_lib import install_services_guard as guard
+
+        with mock.patch.object(
+            guard, "foreign_owned_services",
+            return_value={"code_embed": "container 'x' was created by compose "
+                                        "project 'vibecoded'"},
+        ):
+            outcome = guard.apply_recreate_guard(
+                services_to_recreate=["code_embed"],
+                recreate_for_rebuild=["code_embed"],
+                build_services=["code_embed"],
+                runtime="podman",
+                infra_dir=Path("/tmp/infra"),
+                compose_file=Path("/tmp/infra/docker-compose.yml"),
+                deferral_report=None,
+                log_event=lambda *a, **k: None,
+            )
+        self.assertEqual(outcome.build_services, [])
+        self.assertIn("code_embed", outcome.foreign)
 
 
 class ClearProbeTests(unittest.TestCase):

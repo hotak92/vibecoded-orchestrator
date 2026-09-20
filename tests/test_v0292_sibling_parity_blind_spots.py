@@ -27,12 +27,11 @@ HOOKS_LIB = REPO / "templates" / "hooks" / "_lib"
 SCRIPTS = REPO / "templates" / "scripts"
 
 #: Extension-less bash wrappers shipped WITHOUT a PowerShell sibling.
-#: v0.2.92 delivery audit m3 landed ``kg-duplicates.ps1`` (the audit's own
-#: R42 fix), leaving ``cost-summary`` the only gap — Windows users reach the
-#: same code via the documented portable entry point
-#: ``python .claude/scripts/cost-summary.py``. Remove an entry when its
-#: ``.ps1`` lands.
-KNOWN_MISSING: frozenset[str] = frozenset({"cost-summary"})
+#: EMPTY — every shipped extension-less wrapper has a ``.ps1`` sibling. An
+#: entry here is a registered gap: adding one fails the ratchet below, and
+#: writing the ``.ps1`` for it fails too until the entry is removed, so the
+#: register cannot go stale in either direction.
+KNOWN_MISSING: frozenset[str] = frozenset()
 
 #: ``.ps1``-only helpers with no POSIX counterpart by design (a Windows
 #: mechanism with nothing to mirror).

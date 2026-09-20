@@ -7153,9 +7153,9 @@ def main():
         # successful run end (WP-3's launcher parser reads the last occurrence).
         _print_codegraph_provenance(embedding_service, repo_path)
         # v0.2.91 wave-3 fix (MAJOR-1): the NARROW paired clear, at the only
-        # point that proves the walk actually happened. Mirrors
-        # `sync_knowledge_graph.py::_clear_sync_deferral_no_backend`.
-        _deferral_op("clear_backend_deferrals", deferral_root)
+        # point that proves the walk actually happened. v0.2.95 F1 adds the
+        # chunker re-sync's code-graph half here (force-recreate walks only).
+        _deferral_op("record_successful_walk", deferral_root, args.force_recreate)
         return 0
 
     finally:
@@ -7185,10 +7185,10 @@ def _print_codegraph_provenance(
 
 # ── Deferral tenancy ───────────────────────────────────────────────────────
 #
-# The three ledger operations this script owns (both emitters + the paired
-# clear) live in ONE vco_lib module, `vco_lib.codegraph_deferrals`, and reach
-# it through the ONE guarded wrapper below — per the modularity rule the
-# analyzer ratchet enforces, and so the soft-fail guard has a single home.
+# The three ledger operations this script owns (two emitters + the completed-
+# walk record, which performs the paired clear AND stamps the chunker re-sync's
+# code-graph half) live in ONE vco_lib module, `vco_lib.codegraph_deferrals`,
+# reached through the ONE guarded wrapper below — the analyzer keeps no logic.
 
 
 def _resolve_deferral_root(cli_root: Optional[Path], default_root: Path) -> Path:

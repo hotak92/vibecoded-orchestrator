@@ -487,6 +487,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 
 **PostToolUse**:
 - `post-file-edit.sh` — auto-sync on file edits: `knowledge/` → KG, `docs/` → development collection, code files → code-graph queue; duplicate detection every 10 edits (matcher: `Edit(*)|Write(*)`).
+- `post-bash-file-sync.sh` — the same routing for a file written from the CLI (`cat > knowledge/x.md`, a heredoc, `sed -i` on a docs page): the command is parsed for the paths it wrote and each one goes through the one routing home (matcher: `Bash`).
 - `py-compile-check.sh` — syntax check on Python writes (matcher: `Write(*.py)`).
 - `post-tool-security.sh` — credential scan on written files (matcher: `Edit(*)|Write(*)`).
 
@@ -494,7 +495,6 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `config-change-audit.sh` — log `settings.json` changes to JSONL (background).
 
 **Stop**:
-- `cost-tracker.sh` — append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`. Summary: `python .claude/scripts/cost-summary.py [--days N]` (portable, all OSes; the bash `cost-summary` shim still works on POSIX).
 - `notify-stop.sh` — desktop notification (`notify-send`).
 
 **StopFailure**:

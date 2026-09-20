@@ -57,9 +57,15 @@ makes leaving the slots unset the honest choice.
 
 A vendor model is never the Default (USER RULING 2026-09-08)
 ------------------------------------------------------------
-``ANTHROPIC_MODEL`` is not "the model I picked". It is the model the client
-falls back to, and a Claude Code panel PROCESS RESTART resumes the session on
-it — the picker choice does not survive. On 2026-09-08 the Default held
+``ANTHROPIC_MODEL`` is not "the model I picked". It is an ENV PIN, and
+"fallback" understates it: the documented resolution order is ``/model``
+(this session) > ``--model`` > ``ANTHROPIC_MODEL`` > the ``model`` key in
+``~/.claude/settings.json`` > ``ANTHROPIC_DEFAULT_MODEL``, so this key
+OUTRANKS the choice ``/model`` saves and the NEXT launch returns to it
+whatever the user saved (code.claude.com/docs, model configuration;
+re-verified 2026-09-16). A Claude Code panel PROCESS RESTART therefore
+resumes the session on it — the picker choice does not survive. On
+2026-09-08 the Default held
 ``claude-gw/glm-5.3[1m]`` (written by the prototype
 ``claude-or-vscode-sync``, and pre-selected by 0.2.93's own "Also set the
 picker's Default entry"), the panel restarted at 00:38Z, and 204 turns of a
@@ -83,7 +89,36 @@ Two deliberate asymmetries:
   (``default_model_is_vendor``) so the GUI can say so out loud, and
   :func:`clear_default_model` removes it — that one key, on a click, with a
   backup. Silently deleting a value the user may have chosen on purpose
-  would be the same class of surprise this rule exists to end.
+  would be the same class of surprise this rule exists to end. The ONE
+  exception is the one-time migration below, which removes the pin VCO
+  itself could have written, once, and says which value it took.
+
+VCO does not pin the Default at all (USER RULING 2026-09-17)
+--------------------------------------------------------------
+"stop writing the pin, also because we have the multimodel/remotecontrol
+switch that may conflict with it, model selection is the one made by the
+user in Claude Code's GUI remembered across sessions." So:
+
+* nothing here writes ``ANTHROPIC_MODEL`` unless a caller passes an explicit
+  ``model=`` (``point --model <id>``, or the launcher's opt-in "Also set the
+  picker's Default entry" checkbox, which is OFF by default). That is the
+  opt-in pin for anyone who wants one, and it is still first-party-only;
+* what governs otherwise is the ``model`` key in ``~/.claude/settings.json``
+  — what ``/model`` saves, ``[1m]`` included when the 1M row is picked. VCO
+  never writes THAT file: the choice is the user's, made in their picker, and
+  remembered by their client. Removing the env pin is what lets it be
+  obeyed, because the pin outranks it on every launch;
+* a machine that ALREADY carries a pin is migrated once —
+  :func:`migrate_default_pins`, run by ``install.py`` on every install/update
+  through :mod:`vco_lib.machine_migrations`. A fix only new installs receive
+  would be a fix delivered nowhere. :func:`migrate_default_pin` documents how
+  "ours" is told from "theirs" and what the residual risk is;
+* the mode switch is unaffected: it still stashes only what it DROPS and
+  restores it verbatim, so neither leg can introduce a pin that was not
+  there. A stashed ``ANTHROPIC_MODEL`` is by construction a gateway-only id
+  (that is the only kind the ``remote-control`` leg takes out) and the
+  restore refuses exactly those, so the ``multimodel`` leg cannot put one
+  back either.
 
 The ONE permitted touch on those values — the ``[1m]`` decoration (R41)
 -----------------------------------------------------------------------
@@ -141,6 +176,40 @@ cannot inject a routing key or any other name into the env block.
 Both legs are idempotent: re-applying the current mode changes nothing and
 leaves the stash exactly as it was, so a second click cannot destroy the
 choices the first one saved.
+
+What ``remote-control`` guarantees: the stock client, in charge of everything
+------------------------------------------------------------------------------
+OWNER REQUIREMENT (2026-09-16): "when set to remotecontrol it just uses
+Claude Code's native everything including tokens counting". Three properties
+carry that, and ``tests/test_v0295_mode_switch_native_invariants.py`` pins
+each of them behaviourally:
+
+* No VCO routing survives the leg. Every :data:`ROUTING_KEYS` entry and
+  :data:`LOGIN_PROMPT_KEY` is removed, so ``ANTHROPIC_BASE_URL`` is unset
+  and the endpoint gate above is satisfied — Remote Control can start.
+* No value the stock client cannot resolve survives it
+  (:func:`is_gateway_only_model`), so the ``/model`` picker is the client's
+  own list from api.anthropic.com and nothing in the file names a model
+  only the gateway could answer.
+* This module writes NO client-side context knob, in EITHER mode.
+  ``CLAUDE_CODE_MAX_CONTEXT_TOKENS``, ``CLAUDE_CODE_DISABLE_1M_CONTEXT``
+  and ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` are not written here, and the set
+  of keys either leg can ADD to the env block is exactly
+  ``ROUTING_KEYS | {MODEL_KEY} | SLOT_OVERRIDE_KEYS`` — so the client sizes
+  its window from the model ID (``[1m]`` => 1M, per R41 above) and counts
+  tokens itself from each response's ``usage``, which is what makes the
+  accounting native rather than something VCO half-configures. A knob the
+  USER put in the env block is their key and rides through both legs
+  untouched, like every other key this module does not own.
+
+What the leg deliberately does NOT remove is a FIRST-PARTY ``ANTHROPIC_MODEL``
+(or first-party slot value): ``claude-opus-5[1m]`` resolves against
+api.anthropic.com, so it is not gateway-only, and this leg stashes only what
+it drops — dropping it would destroy a choice nothing had saved. It stays an
+env pin with the precedence stated above, i.e. it still outranks ``/model``
+on the next launch. Whether ``point`` should write that pin at all is the
+owner's open question (plan v0.2.95 Q1); behaviour here is unchanged pending
+it, and the test that pins today's answer says so by name.
 
 Merge, never replace
 --------------------
@@ -368,6 +437,14 @@ GATEWAY_PROBE_TIMEOUT = 1.0
 STASH_SUBDIR = "model-gateway"
 STASH_BASENAME = "vscode-mode-stash.json"
 _STASH_SCHEMA_VERSION = 1
+
+#: Ledger recording that the one-time Default-pin migration has run on this
+#: machine (Q1, owner ruling 2026-09-17 — see the module docstring). Its mere
+#: EXISTENCE is the guard: a pin the user sets after it was written is theirs,
+#: and is never removed again. Same directory as the stash, for the same
+#: reason.
+PIN_MIGRATION_BASENAME = "vscode-default-pin-migration.json"
+_PIN_MIGRATION_SCHEMA_VERSION = 1
 
 #: Routing keys whose VALUE is a credential (or its deliberate blank). Their
 #: names are stashed; their values never are — the token is re-read from the
@@ -965,6 +1042,22 @@ DOGFOOD_OAUTH_BETA = "oauth-2025-04-20"
 DOGFOOD_ASCII_BYTES = 1536 * 1024
 DOGFOOD_ACCENTED_BYTES = 1024 * 1024
 
+#: Budget for ONE paid-leg subprocess — the Claude Code CLI running a
+#: one-prompt completion through the gateway (see :func:`_dogfood_cli_leg`).
+#: A full client startup, a streamed completion and a JSON result need far
+#: more headroom than one raw HTTP call, hence this and not
+#: :data:`DOGFOOD_CALL_TIMEOUT_S`. It does NOT change what a caller of the
+#: cost-free proof must allow: the launcher's ``DOGFOOD_TIMEOUT`` covers a
+#: run that never passes ``--paid``, so only a caller that opts into the
+#: paid legs must budget ``DOGFOOD_TOTAL_BUDGET_S`` plus one of these per
+#: advertised model id.
+DOGFOOD_CLIENT_TIMEOUT_S = 60.0
+
+#: The prompt the paid leg sends. One word: the leg proves a streamed
+#: completion can be driven and parsed through the gateway, and every token
+#: beyond the minimum is money spent proving nothing additional.
+DOGFOOD_CLI_PROMPT = "hi"
+
 
 def _native_connection(timeout: float) -> Any:
     """The connection the NATIVE half of the proof uses.
@@ -1039,25 +1132,39 @@ def dogfood_gateway(
        budget. ``count_tokens`` costs nothing.
     2. ``/v1/models`` lists at least one first-party model, so the picker the
        user is about to open is not empty.
-    3. Non-free, opt-in (``cost_free_only=False``): a ``max_tokens: 1``
-       streamed completion both ways, which must both end in ``message_stop``
-       with the same ``stop_reason``. It is the only case that proves the
-       STREAMING path end to end, and it is the only one that spends money —
-       hence the flag, and hence the default.
+    3. Non-free, opt-in (``cost_free_only=False``): a one-prompt completion
+       through the gateway driven by the Claude Code CLI itself (``claude
+       -p hi --model <id> --output-format json`` with ``ANTHROPIC_BASE_URL``
+       pointed at the gateway), once for the first-party Default id and once
+       more for a vendor id when ``/v1/models`` advertises one. The CLI is
+       the transport because raw HTTP cannot be: Anthropic honours a
+       subscription OAuth token only when a first-party client presents it,
+       and every raw ``/v1/messages`` request carrying one is answered
+       ``429 rate_limit_error`` — direct or through the gateway, in every
+       header shape tried — so the raw comparison this replaced could never
+       pass for a subscription user, and its failure text blamed the proxy
+       for an upstream refusal (found 2026-09-10). The CLI leg is still the
+       only case that proves the STREAMING path end to end, and the only one
+       that spends money — hence the flag, and hence the default. Without
+       the CLI on PATH the leg is ``skipped`` (``dogfood:no_client``), never
+       refused: the cost-free checks above still ran.
     4. ``/health`` reports a version not older than this package's, so a
        stale daemon left running from a previous install is not what the
        panel gets pointed at.
 
     Returns a result dict: ``ok``, ``status`` (``ok`` / ``refused`` /
-    ``skipped``), ``reason`` (``dogfood:<case>`` on a refusal), ``cases`` and
-    ``elapsed_s``. ``skipped`` means the proof could not RUN — no Claude
-    login to compare against, or the native endpoint unreachable — which is
-    deliberately not a refusal: a machine with no first-party login still has
-    a working vendor gateway, and blocking it would be the gateway deciding
-    something it cannot know.
+    ``skipped``), ``reason`` (``dogfood:<case>`` or
+    ``upstream_refused:<status>`` on a refusal; ``dogfood:no_client`` on the
+    CLI-less skip), ``cases`` and ``elapsed_s``. ``skipped`` means the proof
+    could not RUN — no Claude login to compare against, the native endpoint
+    unreachable, or no CLI to drive the paid leg — which is deliberately not
+    a refusal: a machine with no first-party login still has a working
+    vendor gateway, and blocking it would be the gateway deciding something
+    it cannot know.
     """
     import http.client
     import time as _time
+    from tempfile import TemporaryDirectory
 
     started = _time.monotonic()
     cases: list[dict] = []
@@ -1192,12 +1299,28 @@ def dogfood_gateway(
     if not cost_free_only and (
         _time.monotonic() - started <= DOGFOOD_TOTAL_BUDGET_S
     ):
-        stream_ok, stream_detail = _dogfood_stream(
-            port, token, native_headers, timeout,
-        )
-        record("stream", stream_ok, stream_detail)
-        if not stream_ok:
-            return finish("refused", "dogfood:stream", stream_detail)
+        client = _dogfood_claude_cli()
+        if client is None:
+            record("stream", False, "the Claude Code CLI was not found on PATH")
+            return finish(
+                "skipped", "dogfood:no_client",
+                "the paid leg needs the Claude Code CLI (`claude` on PATH) "
+                "to drive a streamed completion as a first-party client; "
+                "none was found, so that leg could not run. The cost-free "
+                "checks above are unaffected.",
+            )
+        legs: list = [("stream", DOGFOOD_MODEL)]
+        vendor_id = _dogfood_vendor_model_id(port, token, timeout)
+        if vendor_id:
+            legs.append(("stream_vendor", vendor_id))
+        with TemporaryDirectory(prefix="dogfood-paid-") as paid_tmp:
+            for case_name, model_id in legs:
+                verdict, reason, detail = _dogfood_cli_leg(
+                    client, port, token, model_id, Path(paid_tmp),
+                )
+                record(case_name, verdict == "ok", detail)
+                if verdict != "ok":
+                    return finish("refused", reason, detail)
 
     return finish(
         "ok", None, f"the gateway answered like Anthropic on {len(cases)} checks.",
@@ -1239,8 +1362,15 @@ def _default_credentials_path() -> Path:
     return Path(override) if override else claude_user_dir() / ".credentials.json"
 
 
-def _dogfood_models(port: int, token: str, timeout: float) -> "tuple[bool, str]":
-    """At least one first-party entry, or the picker the user opens is empty."""
+def _dogfood_models_entries(
+    port: int, token: str, timeout: float,
+) -> "tuple[Optional[list], str]":
+    """The ``/v1/models`` entry list, or ``(None, why-not)``.
+
+    A function of its own because two legs need the same list: the
+    first-party check in :func:`_dogfood_models`, and the paid leg's choice
+    of a vendor id in :func:`_dogfood_vendor_model_id`.
+    """
     import http.client
 
     conn = None
@@ -1252,13 +1382,21 @@ def _dogfood_models(port: int, token: str, timeout: float) -> "tuple[bool, str]"
         resp = conn.getresponse()
         payload = json.loads(resp.read().decode("utf-8", "replace"))
     except (OSError, ValueError) as exc:
-        return False, f"/v1/models did not answer ({exc})"
+        return None, f"/v1/models did not answer ({exc})"
     finally:
         if conn is not None:
             conn.close()
     entries = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
-        return False, "/v1/models did not return a data list"
+        return None, "/v1/models did not return a data list"
+    return entries, f"{len(entries)} models"
+
+
+def _dogfood_models(port: int, token: str, timeout: float) -> "tuple[bool, str]":
+    """At least one first-party entry, or the picker the user opens is empty."""
+    entries, detail = _dogfood_models_entries(port, token, timeout)
+    if entries is None:
+        return False, detail
     first_party = [
         e for e in entries
         if isinstance(e, dict) and is_first_party_model_id(str(e.get("id", "")))
@@ -1266,6 +1404,26 @@ def _dogfood_models(port: int, token: str, timeout: float) -> "tuple[bool, str]"
     if not first_party:
         return False, f"/v1/models listed {len(entries)} models, none first-party"
     return True, f"{len(first_party)} first-party of {len(entries)} models"
+
+
+def _dogfood_vendor_model_id(
+    port: int, token: str, timeout: float,
+) -> Optional[str]:
+    """The first advertised id only the gateway can serve, or ``None``.
+
+    The paid leg runs both kinds of model — the first-party Default and one
+    vendor id — because routing a vendor id exercises the gateway's own
+    upstream selection, which a first-party id never touches. Nothing
+    advertised simply means there is nothing of that kind to prove.
+    """
+    entries, _detail = _dogfood_models_entries(port, token, timeout)
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        model_id = str(entry.get("id", ""))
+        if model_id and not is_first_party_model_id(model_id):
+            return model_id
+    return None
 
 
 def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
@@ -1318,74 +1476,128 @@ def _this_package_version() -> str:
         return ""
 
 
-def _dogfood_stream(
-    port: int, token: str, native_headers: Mapping[str, str], timeout: float,
-) -> "tuple[bool, str]":
-    """A one-token streamed completion, both ways. COSTS MONEY (opt-in)."""
-    import http.client
+#: How an upstream refusal's HTTP status is recognised in CLI output: the
+#: CLI's own rendering (``API Error: 429 {...}``), or a JSON ``"status"``
+#: field in an SDK error payload. A bare number is deliberately NOT
+#: matched — durations and token counts would masquerade as refusals.
+_API_ERROR_STATUS_RES = (
+    re.compile(r"api error[^0-9\n]{0,40}?([1-5]\d{2})", re.IGNORECASE),
+    re.compile(r"['\"]status['\"]\s*:\s*([1-5]\d{2])"),
+)
 
-    body = json.dumps(
-        {
-            "model": DOGFOOD_MODEL,
-            "max_tokens": 1,
-            "stream": True,
-            "messages": [{"role": "user", "content": "hi"}],
-        }
-    ).encode("utf-8")
 
-    def read_stream(conn: Any, headers: Mapping[str, str]) -> "tuple[int, bytes]":
-        conn.request("POST", "/v1/messages", body=body, headers=dict(headers))
-        resp = conn.getresponse()
-        return resp.status, resp.read()
+def _dogfood_claude_cli() -> Optional[str]:
+    """The Claude Code CLI's path, or ``None``. PATH is the only channel.
 
-    gw_conn = nat_conn = None
+    The paid leg needs a FIRST-PARTY client (see :func:`dogfood_gateway`
+    case 3 for why nothing shorter can stand in), and the CLI is discovered
+    the way any user invokes it — not through an install-relative path an
+    install could pin to a stale copy.
+    """
+    import shutil
+
+    return shutil.which("claude")
+
+
+def _dogfood_cli_leg(
+    client: str,
+    port: int,
+    token: str,
+    model_id: str,
+    workdir: Path,
+) -> "tuple[str, Optional[str], str]":
+    """One paid leg: a one-prompt completion through the Claude Code CLI.
+
+    The CLI — not raw HTTP — is the transport because raw HTTP cannot work
+    here: Anthropic honours a subscription OAuth token only when a
+    first-party client presents it, and every raw ``/v1/messages`` request
+    carrying one is answered ``429 rate_limit_error`` (2026-09-10, in every
+    configuration tried), so the raw leg this replaced could never pass for
+    a subscription user and its failure text blamed the gateway for an
+    upstream refusal. The CLI, pointed at the gateway with the HOST token,
+    is the client the panel itself will be.
+
+    Returns ``(verdict, reason, detail)``: ``("ok", None, ...)`` when the
+    CLI exited 0 with a parseable answer; ``("refused",
+    "upstream_refused:<status>", ...)`` when the output carries an API
+    error with an HTTP status — the gateway forwarded the upstream's
+    refusal faithfully, and the detail says so rather than blaming the
+    proxy; ``("refused", "dogfood:client", ...)`` for anything else
+    (timeout, unparseable output), with the captured output tail.
+    """
+    import subprocess
+
+    env = dict(os.environ)
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+    env["ANTHROPIC_AUTH_TOKEN"] = token
+    # The host token is the credential this leg authenticates with; a stale
+    # ANTHROPIC_API_KEY from the caller's shell would outrank it and send
+    # the wrong credential to the gateway.
+    env.pop("ANTHROPIC_API_KEY", None)
     try:
-        gw_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
-        gw_status, gw_raw = read_stream(
-            gw_conn,
-            {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "anthropic-version": DOGFOOD_ANTHROPIC_VERSION,
-            },
+        proc = subprocess.run(
+            [
+                client, "-p", DOGFOOD_CLI_PROMPT,
+                "--model", model_id, "--output-format", "json",
+            ],
+            env=env, cwd=str(workdir), capture_output=True,
+            timeout=DOGFOOD_CLIENT_TIMEOUT_S,
         )
-        nat_conn = _native_connection(timeout)
-        nat_status, nat_raw = read_stream(nat_conn, native_headers)
-    except OSError as exc:
-        return False, f"streamed comparison failed ({exc})"
-    finally:
-        for conn in (gw_conn, nat_conn):
-            if conn is not None:
-                conn.close()
-    for label, raw in (("gateway", gw_raw), ("native", nat_raw)):
-        if b"message_stop" not in raw:
-            return False, f"the {label} stream did not end with message_stop"
-    if gw_status != nat_status:
-        return False, f"gateway {gw_status} vs native {nat_status}"
-    if _stop_reason(gw_raw) != _stop_reason(nat_raw):
-        return False, (
-            f"stop_reason {_stop_reason(gw_raw)!r} through the gateway vs "
-            f"{_stop_reason(nat_raw)!r} natively"
+    except subprocess.TimeoutExpired:
+        return (
+            "refused", "dogfood:client",
+            f"the claude CLI leg for {model_id} did not answer within "
+            f"{DOGFOOD_CLIENT_TIMEOUT_S:.0f}s",
         )
-    return True, f"both streams ended with stop_reason={_stop_reason(gw_raw)!r}"
+    stdout = proc.stdout.decode("utf-8", "replace").strip()
+    stderr = proc.stderr.decode("utf-8", "replace").strip()
+    if proc.returncode == 0 and _cli_json_answer(stdout) is not None:
+        return (
+            "ok", None,
+            f"{model_id} answered a one-prompt completion through the "
+            "gateway via the Claude Code CLI",
+        )
+    status = _api_error_status(stdout, stderr)
+    if status is not None:
+        return (
+            "refused", f"upstream_refused:{status}",
+            f"the one-prompt completion for {model_id} came back "
+            f"HTTP {status}: the gateway forwarded the upstream's refusal "
+            "faithfully, so this is the upstream's answer and not a gateway "
+            "defect. Retry later, or check the account's limits.",
+        )
+    tail = (stderr or stdout)[-300:]
+    return (
+        "refused", "dogfood:client",
+        f"the claude CLI leg for {model_id} did not produce a usable answer "
+        f"(exit {proc.returncode}); output tail: {tail!r}",
+    )
 
 
-def _stop_reason(raw: bytes) -> Optional[str]:
-    """The ``stop_reason`` an SSE answer carries, or ``None``."""
-    for line in raw.splitlines():
-        if not line.startswith(b"data:"):
-            continue
-        try:
-            event = json.loads(line[5:].strip() or b"{}")
-        except ValueError:
-            continue
-        if isinstance(event, dict):
-            reason = event.get("delta", {}).get("stop_reason") if isinstance(
-                event.get("delta"), dict
-            ) else None
-            reason = reason or event.get("stop_reason")
-            if reason:
-                return str(reason)
+def _cli_json_answer(stdout: str) -> Optional[str]:
+    """The answer inside a ``--output-format json`` result, or ``None``.
+
+    ``claude -p --output-format json`` prints one JSON object whose
+    ``result`` is the answer; ``is_error: true`` marks an error result,
+    which is not an answer even on exit 0.
+    """
+    try:
+        payload = json.loads(stdout)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or payload.get("is_error"):
+        return None
+    answer = payload.get("result")
+    return answer if isinstance(answer, str) and answer.strip() else None
+
+
+def _api_error_status(*outputs: str) -> Optional[int]:
+    """The HTTP status of an API error in the given text, or ``None``."""
+    for pattern in _API_ERROR_STATUS_RES:
+        for output in outputs:
+            m = pattern.search(output)
+            if m:
+                return int(m.group(1))
     return None
 
 
@@ -1768,13 +1980,14 @@ def decorate_1m(value: Any, table: Optional[Any]) -> Any:
 def is_first_party_model_id(model_id: Any) -> bool:
     """Pure: does this id name a model ANTHROPIC serves, under its own name?
 
-    ``ANTHROPIC_MODEL`` is not "the model I picked" — it is the model the
-    client falls back to. A Claude Code panel process that RESTARTS resumes
-    the session on this value, silently discarding the picker choice; on
-    2026-09-08 that turned a Fable session into a GLM one at 00:42Z and 204
-    turns ran on a vendor model before anyone noticed. So a vendor model may
-    be PICKED (that is what the gateway's catalogue is for) and may never be
-    the Default. First-party is the whole rule:
+    ``ANTHROPIC_MODEL`` is not "the model I picked" — it is an env pin that
+    OUTRANKS the choice ``/model`` saves, on every launch (the full
+    precedence is in the module docstring). A panel process that RESTARTS
+    resumes the session on this value, silently discarding the picker
+    choice; on 2026-09-08 that turned a Fable session into a GLM one at
+    00:42Z and 204 turns ran on a vendor model before anyone noticed. So a
+    vendor model may be PICKED (that is what the gateway's catalogue is for)
+    and may never be the Default. First-party is the whole rule:
 
     * ``claude-opus-5`` / ``claude-fable-5-1`` -> True. Anthropic's own ids
       all begin ``claude-``; the gateway routes exactly that prefix to
@@ -2124,6 +2337,213 @@ def clear_default_model(path: Path) -> dict:
         return result
 
 
+# ---------------------------------------------------------------------------
+# Q1 — the Default pin, removed ONCE (USER RULING 2026-09-17)
+# ---------------------------------------------------------------------------
+
+
+def pin_migration_ledger_path() -> Path:
+    """Where the one-time Default-pin migration records that it ran."""
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / STASH_SUBDIR / PIN_MIGRATION_BASENAME
+
+
+def migrate_default_pin(path: Path) -> dict:
+    """Remove a PRE-RULING ``ANTHROPIC_MODEL`` from ONE settings file.
+
+    The ruling (2026-09-17, verbatim): "stop writing the pin, also because we
+    have the multimodel/remotecontrol switch that may conflict with it, model
+    selection is the one made by the user in Claude Code's GUI remembered
+    across sessions". The pin OUTRANKS that choice on every launch, so a
+    machine that already carries one does not reach the ruled state by VCO
+    merely declining to write new ones — the existing one has to go, once.
+
+    **How "ours" is told from "theirs", and what the residual risk is.**
+    VCO could only ever have written a FIRST-PARTY id here: both write sites
+    refuse a vendor id (:func:`is_first_party_model_id`, the 2026-09-08
+    ruling, enforced since v0.2.92 and pinned by tests). So:
+
+    * a vendor / gateway-namespaced / unresolvable id is PROVABLY not ours —
+      it came from the ``claude-or-vscode-sync`` prototype or from a hand
+      edit — and is left exactly where it is, reported (:func:`panel_mode`'s
+      ``default_model_is_vendor``) with :func:`clear_default_model` beside it
+      as the user's one-click choice. Deleting it here would be the
+      behind-their-back deletion this module has always refused;
+    * a first-party id is one VCO could have written, and is removed — with
+      the usual backup, and NAMED in the result so the caller can say which
+      value went and how to put it back (``--model <id>``).
+
+    The residual risk is stated rather than hidden: a user who hand-set a
+    first-party pin BEFORE this ran loses it once. Three things bound it —
+    it happens ONCE per machine (:func:`migrate_default_pins` holds the
+    ledger), the previous file is in the backup beside it, and the exact
+    value is reported — and the value's only effect is to override the choice
+    the owner ruled must govern.
+
+    Never writes when there is nothing to remove: a missing file, a missing
+    key and an unparseable file all leave the bytes untouched.
+    """
+    path = Path(path)
+    result: dict[str, Any] = {
+        "action": "migrate_default_pin",
+        "path": str(path),
+        "ok": True,
+        "status": "absent",
+        "reason": None,
+        "value": None,
+        "backup_path": None,
+        "message": "",
+    }
+    if not path.is_file():
+        result["message"] = f"{path} does not exist; nothing to migrate."
+        return result
+    try:
+        settings, _original = _load_settings(path)
+        block = _existing_env_block(settings, path)
+    except SettingsRefused as exc:
+        result.update(
+            ok=False, status="refused", reason=exc.reason, message=exc.message,
+        )
+        return result
+
+    pinned = block.get(MODEL_KEY)
+    if not isinstance(pinned, str) or not pinned.strip():
+        result["message"] = f"No {MODEL_KEY} in {path}; nothing to migrate."
+        return result
+    result["value"] = pinned
+    if not is_first_party_model_id(pinned):
+        result.update(
+            status="kept",
+            reason="not_first_party",
+            message=(
+                f"Kept {MODEL_KEY}={pinned} in {path}: VCO never writes a "
+                "vendor id there, so this one is not VCO's to remove. It is "
+                "still what a restarted panel resumes on: the launcher's "
+                "“Clear default” (or `clear-default`) is how to drop it."
+            ),
+        )
+        return result
+
+    cleared = clear_default_model(path)
+    if not cleared["ok"]:
+        result.update(
+            ok=False,
+            status="refused",
+            reason=cleared["reason"],
+            message=cleared["message"],
+        )
+        return result
+    result.update(
+        status="removed",
+        backup_path=cleared["backup_path"],
+        message=(
+            f"Removed {MODEL_KEY}={pinned} from {path}. The model you pick in "
+            "Claude Code's /model picker now governs, and is remembered "
+            "across sessions. To pin one again on purpose: "
+            f"`python -m vco_lib.vscode_settings point --path {path} "
+            f"--model {pinned}`."
+        ),
+    )
+    return result
+
+
+def migrate_default_pins(
+    *,
+    ledger: Optional[Path] = None,
+    targets: Optional[Sequence[str]] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> dict:
+    """Run :func:`migrate_default_pin` over every detected panel — ONCE.
+
+    ONCE PER MACHINE, not once per file and not on every run, and the ledger's
+    existence is the whole guard. That is what makes this a migration rather
+    than a policy: a pin the user sets AFTER the update is a deliberate
+    post-ruling act and must survive forever, and a rule that re-ran would eat
+    it every update. Per-machine rather than per-file also covers what a
+    per-file record would miss — a machine with no VS Code at update time, and
+    a hand-set pin in a panel installed afterwards.
+
+    Idempotent and cheap on the hot path: an existing ledger short-circuits
+    before any file is opened. A ledger that cannot be WRITTEN is reported and
+    not raised — the removal already happened, and the worst consequence of
+    losing the record is that a later update re-runs a no-op.
+    """
+    ledger_path = Path(ledger) if ledger is not None else pin_migration_ledger_path()
+    result: dict[str, Any] = {
+        "action": "migrate_default_pins",
+        "ok": True,
+        "status": "already-migrated",
+        "ledger_path": str(ledger_path),
+        "ledger_written": False,
+        "targets": [],
+        "removed": [],
+        "kept": [],
+        "message": "",
+    }
+    if ledger_path.is_file():
+        result["message"] = (
+            f"The Default-pin migration already ran (see {ledger_path}); a "
+            f"{MODEL_KEY} set since then is yours and is left alone."
+        )
+        return result
+
+    if targets is None:
+        paths = [t.path for t in detect_targets(env=env)]
+    else:
+        paths = [str(t) for t in targets]
+
+    for target in paths:
+        one = migrate_default_pin(Path(target))
+        result["targets"].append(one)
+        if one["status"] == "removed":
+            result["removed"].append({"path": one["path"], "value": one["value"]})
+        elif one["status"] == "kept":
+            result["kept"].append({"path": one["path"], "value": one["value"]})
+
+    doc = {
+        "schema_version": _PIN_MIGRATION_SCHEMA_VERSION,
+        "migrated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "targets": [
+            {
+                "path": one["path"],
+                "status": one["status"],
+                "value": one["value"],
+                "backup_path": one["backup_path"],
+            }
+            for one in result["targets"]
+        ],
+    }
+    try:
+        _write_owner_only_json(
+            ledger_path,
+            doc,
+            label="Default-pin migration ledger",
+            reason="pin_ledger_not_lockable",
+        )
+        result["ledger_written"] = True
+    except (SettingsRefused, OSError) as exc:
+        result["message"] = (
+            f"The Default-pin migration ran but could not be recorded in "
+            f"{ledger_path} ({exc}); it will re-run on the next update, which "
+            "is a no-op once the pin is gone."
+        )
+
+    result["status"] = "migrated"
+    removed = result["removed"]
+    if removed and not result["message"]:
+        result["message"] = "; ".join(
+            f"removed {MODEL_KEY}={item['value']} from {item['path']}"
+            for item in removed
+        )
+    elif not result["message"]:
+        result["message"] = (
+            f"No VCO-written {MODEL_KEY} to remove"
+            f"{'' if paths else ' (no VS Code settings file found)'}."
+        )
+    return result
+
+
 def reset_native(path: Path) -> dict:
     """Remove BOTH managed keys, restoring the stock Claude Code panel.
 
@@ -2330,13 +2750,15 @@ def _read_stash(path: Path) -> tuple[Optional[dict], Optional[str]]:
     return doc, None
 
 
-def _write_stash(path: Path, doc: Mapping[str, Any]) -> None:
-    """Write the stash owner-only. Loud when it cannot be locked down.
+def _write_owner_only_json(
+    path: Path, doc: Mapping[str, Any], *, label: str, reason: str,
+) -> None:
+    """Write one of this module's own state files, restricted to the owner.
 
-    The stash never holds the token, so a permission failure here is not a
-    credential exposure — but it IS a file that names the user's model
-    choices, and the module's contract is "restricted to the owner" for
-    everything it writes.
+    Two callers (the mode stash and the pin-migration ledger) and one rule:
+    everything this module writes is owner-only, and a file that could not be
+    locked down is REMOVED rather than left behind — the same contract
+    :func:`_write_settings` applies to the settings file itself.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, json.dumps(doc, indent=2) + "\n", mode=0o600)
@@ -2348,10 +2770,23 @@ def _write_stash(path: Path, doc: Mapping[str, Any]) -> None:
         except OSError:
             pass
         raise SettingsRefused(
-            "stash_not_lockable",
-            f"the mode stash {path} could not be restricted to your user "
+            reason,
+            f"the {label} {path} could not be restricted to your user "
             f"account ({exc}). Nothing was changed.",
         ) from exc
+
+
+def _write_stash(path: Path, doc: Mapping[str, Any]) -> None:
+    """Write the stash owner-only. Loud when it cannot be locked down.
+
+    The stash never holds the token, so a permission failure here is not a
+    credential exposure — but it IS a file that names the user's model
+    choices, and the module's contract is "restricted to the owner" for
+    everything it writes.
+    """
+    _write_owner_only_json(
+        path, doc, label="mode stash", reason="stash_not_lockable",
+    )
 
 
 def _clear_stash(path: Path) -> bool:
@@ -2828,7 +3263,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_dogfood.add_argument(
         "--paid",
         action="store_true",
-        help="also compare a 1-token streamed completion (costs money)",
+        help=(
+            "also run a one-prompt completion through the gateway with the "
+            "Claude Code CLI (costs money; needs `claude` on PATH)"
+        ),
     )
 
     p_point = sub.add_parser(
@@ -2883,6 +3321,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_clear.add_argument("--path", required=True)
 
+    sub.add_parser(
+        "migrate-default-pin",
+        help=(
+            "ONCE per machine: remove the pre-2026-09-17 ANTHROPIC_MODEL pin "
+            "from every detected panel, so the model you pick in Claude "
+            "Code's GUI governs again. A vendor id is never touched (VCO did "
+            "not write it); a pin set after this ran is yours and is left "
+            "alone. Idempotent: a second run reports and changes nothing."
+        ),
+    )
+
     p_reset = sub.add_parser("reset", help="remove both managed keys")
     p_reset.add_argument("--path", required=True)
 
@@ -2929,6 +3378,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if args.command == "clear-default":
         result = clear_default_model(Path(args.path))
+        _emit(result)
+        return 0 if result["ok"] else 1
+    if args.command == "migrate-default-pin":
+        result = migrate_default_pins()
         _emit(result)
         return 0 if result["ok"] else 1
     if args.command == "reset":
@@ -3083,6 +3536,7 @@ __all__ = [
     "MODE_UNMANAGED",
     "MODE_UNPARSEABLE",
     "PORT_BASENAME",
+    "PIN_MIGRATION_BASENAME",
     "PORT_ENV",
     "ROUTING_KEYS",
     "SLOT_OVERRIDE_KEYS",
@@ -3101,11 +3555,14 @@ __all__ = [
     "is_gateway_only_model",
     "is_loopback_host",
     "is_prototype_endpoint",
+    "migrate_default_pin",
+    "migrate_default_pins",
     "is_vco_gateway_base_url",
     "last_port_path",
     "main",
     "panel_endpoint_port",
     "panel_mode",
+    "pin_migration_ledger_path",
     "port_file_path",
     "paste_block",
     "point_at_gateway",

@@ -69,12 +69,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from vco_lib import manifest_paths as _manifest_paths
 from vco_lib.deferral_registry import dismiss_key_fields
 
-#: Manifest path relative to a managed project folder. MUST match
-#: ``vco_lib.project_init._MANIFEST_REL`` — asserted by
-#: ``tests/test_deferral_dismissal_memory_v0291.py``.
-MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
+#: Manifest path relative to a managed project folder. RE-EXPORTED from
+#: :mod:`vco_lib.manifest_paths`, which is the one home for that spelling
+#: (v0.2.95) — the name stays here because external callers import it from
+#: this module (``claude_mcp_servers/weaviate_mcp/server.py``), and because
+#: ``tests/test_deferral_dismissal_memory_v0291.py`` pins it against
+#: ``project_init``'s alias. Both now resolve to the SAME object, so the pin
+#: is structural rather than a promise two authors have to keep.
+MANIFEST_REL = _manifest_paths.MANIFEST_REL
 
 #: Top-level manifest key holding every dismissal.
 DISMISSALS_KEY = "dismissals"

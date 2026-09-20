@@ -180,13 +180,27 @@ def test_from_db_minimal_project(tmp_path: Path) -> None:
     assert env["OLLAMA_PORT"] == "11435"
     assert env["CODE_EMBED_URL"] == "http://localhost:11440"
     assert env["CODE_EMBED_PORT"] == "11440"
-    # Conditional keys are absent (no peers granted, no orchestrator root).
+    # Conditional keys are absent (no peers granted).
     assert "VCT_KG_ACCESS_LIST" not in env
     assert "VCT_CODE_GRAPH_ACCESS_LIST" not in env
     # v0.2.34 A7 — diagrams access is independent; no peers ⇒ no key.
     assert "VCT_DIAGRAMS_ACCESS_LIST" not in env
-    assert "VCT_ORCHESTRATOR_ROOT" not in env
-    assert "VCT_INFRASTRUCTURE_DIR" not in env
+    # v0.2.95: the three portability keys are NO LONGER conditional on the
+    # caller. When no root is passed the projection resolves the clone from
+    # its own module location, because omitting them does not merely skip
+    # them — an apply rebuilds the managed block, so it REMOVES the ones an
+    # earlier bundle update wrote (the field state of 2026-09-14: a
+    # `.claude/env` advertising the keys in its header and carrying none).
+    # Running from the checkout, that resolution succeeds; the "cannot be
+    # confirmed → still omitted" arm is pinned in
+    # tests/test_v0295_project_env_root_keys.py.
+    from vco_lib.config_projection import _orchestrator_root_from_module
+
+    resolved_root = _orchestrator_root_from_module()
+    assert resolved_root is not None
+    assert env["VCT_ORCHESTRATOR_ROOT"] == str(resolved_root)
+    assert env["VCT_INFRASTRUCTURE_DIR"] == str(Path(str(resolved_root)) / "infrastructure")
+    assert env["VCT_INSTALL_ROOT"] == str(resolved_root)
     # GITHUB_TOKEN never resolved by this contract.
     assert "GITHUB_TOKEN" not in env
 

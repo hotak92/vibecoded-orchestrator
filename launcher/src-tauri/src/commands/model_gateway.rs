@@ -67,7 +67,7 @@ use vct_launcher_core::python_resolve::resolve_python_for_vco_lib;
 // MUST MATCH `claude_mcp_servers/model_router/config.py`: `DEFAULT_PORT`,
 // `_PID_BASENAME`, `_PORT_BASENAME`, `_TOKEN_BASENAME`, and the
 // `VCT_MODEL_GATEWAY_PORT` env name. Held in lockstep by
-// `tests/test_v0292_model_gateway_gui_contract.py`, which reads both source
+// `tests/test_v0292_model_gateway_gui_contract.py`, which reads the source
 // files and compares the literals.
 //
 // This is a deliberate (C)-tier mirror under the repo's A>B>C rule, for the
@@ -76,9 +76,19 @@ use vct_launcher_core::python_resolve::resolve_python_for_vco_lib;
 // which would make the launcher's status card depend on the gateway package
 // being importable — backwards, since the card's whole job includes
 // reporting that the gateway is NOT installed.
-
-/// The gateway's documented default port.
-pub const DEFAULT_GATEWAY_PORT: u16 = 11436;
+//
+// v0.2.95: the PORT half of that mirror moved to
+// `vct_launcher_core::services::model_gateway_port`, which the hub's gateway
+// supervisor and `/services/status` skeleton also use — three Rust copies
+// became one, and the parity test against `model_router/config.py` moved with
+// them. What stays local below is what only this file needs: the pid/token
+// basenames and the start-time fallback range. Re-exported so the many
+// call-sites in this module (and `pub` consumers elsewhere in the crate) read
+// unchanged.
+pub use vct_launcher_core::services::model_gateway_port::{
+    base_url, last_port_path, resolve_port, DEFAULT_GATEWAY_PORT,
+    GATEWAY_SERVICE, LAST_PORT_BASENAME, PORT_BASENAME, PORT_ENV,
+};
 
 /// Ports the starter falls back to when the resolved one is taken by
 /// something that is not a gateway.
@@ -114,26 +124,8 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 11436;
 /// then. Moving the range means moving BOTH sides in the same change.
 pub const FALLBACK_PORT_RANGE: std::ops::RangeInclusive<u16> = 11460..=11468;
 
-/// `/health`'s `service` value. MUST MATCH `model_router/server.py`. A port
-/// answering with anything else is NOT a gateway, however plausible.
-const GATEWAY_SERVICE: &str = "vct-model-gateway";
 const PID_BASENAME: &str = "model-gateway.pid";
-const PORT_BASENAME: &str = "model-gateway.port";
-/// The launcher's record of the port it last STARTED a gateway on.
-///
-/// Review R2-2: the daemon unlinks its own port file on a clean exit, so a
-/// gateway that had moved off the default (because something else held it)
-/// was forgotten the moment it stopped — and the next resolution answered
-/// with the shipped default, which on the reporter's machine is a legacy
-/// container. Not cosmetic: the uninstall reset then walks past the panel it
-/// should clean up, and a Services "point" writes our host token into a base
-/// URL naming somebody else's service. This file is written on every start
-/// and never deleted; it remembers INTENT, which is exactly what a stopped
-/// gateway needs to stay recognisable. MUST MATCH
-/// `vco_lib/vscode_settings.py::LAST_PORT_BASENAME`.
-const LAST_PORT_BASENAME: &str = "model-gateway.last-port";
 const TOKEN_BASENAME: &str = "model-gateway.token";
-const PORT_ENV: &str = "VCT_MODEL_GATEWAY_PORT";
 
 /// Env prefix whose keys are forwarded into a gateway we spawn. The daemon's
 /// documented knobs (`VCT_MODEL_GATEWAY_CREDENTIALS`,
@@ -347,22 +339,14 @@ fn pid_path() -> PathBuf {
     vct_root_dir().join(PID_BASENAME)
 }
 
-fn port_path() -> PathBuf {
-    vct_root_dir().join(PORT_BASENAME)
-}
-
-fn last_port_path() -> PathBuf {
-    vct_root_dir().join(LAST_PORT_BASENAME)
-}
-
-/// Read a one-line port file. `None` for absent, unreadable, unparseable or
-/// out-of-range — a corrupt file must degrade to the next source, never
-/// blank the card or resolve to something nonsensical.
-fn read_port_file(path: &Path) -> Option<u16> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let port = text.trim().parse::<u16>().ok()?;
-    (port > 0).then_some(port)
-}
+// `port_path`, `last_port_path` and `read_port_file` now live in
+// `vct_launcher_core::services::model_gateway_port` (v0.2.95); `last_port_path`
+// is re-exported at the top of this file for `remember_last_port`, and the
+// other two are reached through `resolve_port`, their only remaining caller
+// here. They used to be declared here AND, near-identically, in the hub's
+// gateway supervisor; the third consumer — `/services/status` — had no copy at
+// all and hard-coded the default port instead, which is how a machine whose
+// gateway fell back got a health URL nothing served.
 
 /// Record the port we just started a gateway on. Soft-fail by design: a
 /// gateway that started must not be reported as failed because a memo could
@@ -399,35 +383,12 @@ fn token_path() -> PathBuf {
     vct_root_dir().join(TOKEN_BASENAME)
 }
 
-/// `$VCT_MODEL_GATEWAY_PORT` -> the daemon's port file -> the launcher's
-/// last-chosen-port record -> the documented default.
-///
-/// The first two steps are `model_router.config.resolve_port`'s order; the
-/// third is this launcher's own memory (review R2-2), and it is what keeps a
-/// gateway that ran on a fallback port recognisable after the daemon has
-/// exited and deleted its port file. Each step is EVIDENCE; the default is
-/// the answer only when there is none. MUST MATCH the chain in
-/// `vco_lib/vscode_settings.py::resolve_gateway_ports`.
-///
-/// An out-of-range or unparseable value falls through rather than erroring:
-/// these files are read on every status poll, so a corrupt one must degrade
-/// to the next source instead of blanking the card.
-pub fn resolve_port() -> u16 {
-    if let Ok(raw) = std::env::var(PORT_ENV) {
-        if let Ok(v) = raw.trim().parse::<u16>() {
-            if v > 0 {
-                return v;
-            }
-        }
-    }
-    read_port_file(&port_path())
-        .or_else(|| read_port_file(&last_port_path()))
-        .unwrap_or(DEFAULT_GATEWAY_PORT)
-}
-
-fn base_url(port: u16) -> String {
-    format!("http://127.0.0.1:{}", port)
-}
+// `resolve_port` (env pin -> the daemon's port file -> the launcher's
+// last-chosen-port record -> the documented default) and `base_url` are
+// re-exported from `vct_launcher_core::services::model_gateway_port`; see
+// there for the order's rationale and for the parity pin against
+// `model_router.config.resolve_port` / `vco_lib.vscode_settings.
+// resolve_gateway_ports`.
 
 /// The base URL a panel write must carry: the caller's KNOWN port when it has
 /// one, the resolved port otherwise.
@@ -519,14 +480,104 @@ pub struct GatewayHealth {
     pub oauth_present: bool,
     #[serde(default)]
     pub oauth_state: String,
+    /// Seconds until the Claude login expires; negative once it has, `None`
+    /// when the credentials file states no expiry.
+    ///
+    /// v0.2.95: the gateway has emitted this since v0.2.94 and the GUI has
+    /// read it since v0.2.94 (`describeOAuthExpiry`, `OAUTH_WARN_SECONDS`),
+    /// but this struct never carried it — so the field was dropped on the way
+    /// through, `undefined` reached the card, and the "re-login within N
+    /// minutes" warning could not fire on any machine. A promise with the
+    /// consumer already written; the missing half was here.
+    #[serde(default)]
+    pub oauth_expires_in_s: Option<i64>,
     #[serde(default)]
     pub vendors: Vec<String>,
     #[serde(default)]
     pub vendor_keys_cached: Vec<String>,
+    /// Which scope the gateway's vendor keys resolve in, and whether that
+    /// scope resolves at all (v0.2.95, R5b).
+    ///
+    /// `vendors` beside an empty `vendor_keys_cached` reads like "no key
+    /// configured yet". On 2026-09-10 the truth was "this daemon's working
+    /// directory is not a registered project, so it cannot see ANY key you
+    /// configure" — eight hours of 503s with the key present the whole time.
+    /// Rendered verbatim rather than interpreted here: `resolvable` is
+    /// TRI-state (`null` = nothing has probed it, which is a different claim
+    /// from `false`).
+    #[serde(default)]
+    pub secret_scope: Option<serde_json::Value>,
+    /// Where per-chat token rows land, and how many this gateway process has
+    /// written (v0.2.95, the usage ledger). Counters and a path, never rows —
+    /// `/health` is unauthenticated.
+    #[serde(default)]
+    pub usage_ledger: Option<serde_json::Value>,
     /// `owner_only` / `broader` / `unknown` for the gateway's token file.
     #[serde(default)]
     pub token_file_permissions: String,
 }
+
+// ─── Login registration: the THIRD state ──────────────────────────────────
+
+/// What the gateway's login registration is, right now — read from the ONE
+/// home, `python -m vco_lib.gateway_ensure status --json`.
+///
+/// The toggle used to have two positions, "enabled" and "disabled", derived
+/// from the daemon's `--boot-status` exit code. That is one state short, and
+/// the missing one is the state this machine sat in for eight hours on
+/// 2026-09-10: REGISTERED, `enabled`, and unable to run — a unit whose
+/// `ExecStart` named an interpreter that cannot import `model_router`.
+/// Collapsing it into either neighbour is a lie in both directions:
+/// "registered" hides that nothing can start, and "not registered" hides that
+/// there IS a registration to repair.
+///
+/// Nothing here is re-derived from a unit file in Rust. The unit/plist/task
+/// is read, and its entry point VERIFIED by running it with `--version`, in
+/// `vco_lib.gateway_ensure`; this struct is a reader of that answer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GatewayRegistration {
+    /// `running` / `registered_not_running` / `registered_but_unrunnable` /
+    /// `not_registered` / `start_failed` / `disabled_by_env`.
+    #[serde(default)]
+    pub state: String,
+    /// The sentence to show. Always populated — every state is named,
+    /// including the silent ones.
+    #[serde(default)]
+    pub reason: String,
+    /// `true` / `false` / `null` (not probed). Tri-state on purpose: "I did
+    /// not check" is not "it cannot run".
+    #[serde(default)]
+    pub runnable: Option<bool>,
+    /// The artefact's path, for a card that has to say WHERE.
+    #[serde(default)]
+    pub unit_path: Option<String>,
+}
+
+/// What the hub's gateway supervisor last concluded, when it gave up.
+///
+/// Written by `vct_hub::gateway_watchdog` into launcher.db `app_state` under
+/// [`HUB_GATEWAY_CONDITION_KEY`] and deleted by it the moment the gateway
+/// serves again. The hub is detached and its stderr goes nowhere a user
+/// looks, so without this the only evidence of "I tried three times and
+/// stopped" would be a log file nobody opens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HubGatewayCondition {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub observed_at_ms: i64,
+}
+
+/// MUST MATCH `vct_hub::gateway_watchdog::APP_STATE_KEY_CONDITION` — pinned
+/// from that side by `the_condition_key_is_the_one_the_launcher_reads`, which
+/// reads THIS file.
+pub const HUB_GATEWAY_CONDITION_KEY: &str = "hub.model_gateway.condition";
 
 // ─── Status payload ───────────────────────────────────────────────────────
 
@@ -551,6 +602,20 @@ pub struct ModelGatewayStatus {
     /// `enabled` / `disabled` / `unsupported` — the daemon's own
     /// `--boot-status` contract words.
     pub boot: String,
+    /// The login registration in full, including the third state
+    /// ("registered but unrunnable"). `None` means NOT ASKED, which is the
+    /// case while the gateway is answering: a serving gateway is proof enough
+    /// that its registration runs, and the answer costs a subprocess plus a
+    /// `--version` run of the registered argv, which does not belong on a
+    /// five-second poll. `None` therefore never means "not registered" —
+    /// that is `Some(state = "not_registered")`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration: Option<GatewayRegistration>,
+    /// The hub supervisor's last verdict, when it gave up on restarting the
+    /// gateway. `None` when there is nothing recorded — which is the normal
+    /// state, because the row is deleted as soon as the gateway serves again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub_condition: Option<HubGatewayCondition>,
     /// The host token exists on disk, i.e. the gateway has run at least
     /// once. Presence only; the value is never read here.
     pub token_present: bool,
@@ -1020,8 +1085,12 @@ pub(crate) fn env_pin_conflict(
 #[command]
 pub async fn model_gateway_status(
     supervisor: State<'_, GatewaySupervisor>,
+    db: State<'_, crate::db::Db>,
 ) -> Result<ModelGatewayStatus, String> {
-    status_on_port(&supervisor, resolve_port()).await
+    // `db` is injected by Tauri, not passed from the frontend: the JS call is
+    // still `invoke('model_gateway_status')` with no arguments. It is here so
+    // the card can show what the DETACHED hub supervisor concluded.
+    status_on_port(&supervisor, &db, resolve_port()).await
 }
 
 /// The status payload for ONE known port.
@@ -1034,6 +1103,7 @@ pub async fn model_gateway_status(
 /// the launcher's last-started-port record, then the default).
 async fn status_on_port(
     supervisor: &GatewaySupervisor,
+    db: &crate::db::Db,
     port: u16,
 ) -> Result<ModelGatewayStatus, String> {
     // `supervise`, not `poll`: a child of ours that died is restarted once
@@ -1045,6 +1115,17 @@ async fn status_on_port(
     let boot = tauri::async_runtime::spawn_blocking(boot_status_word)
         .await
         .unwrap_or_else(|_| "unsupported".to_string());
+    // Asked ONLY when nothing is serving — see the field's doc for why a
+    // serving gateway needs no registration probe, and why `None` here is
+    // "not asked" rather than "not registered".
+    let registration = if reachable == Some(true) {
+        None
+    } else {
+        tauri::async_runtime::spawn_blocking(read_registration)
+            .await
+            .unwrap_or(None)
+    };
+    let hub_condition = hub_gateway_condition(db);
     let supervised = supervised_pid.is_some() && supervised_pid == pid;
     let supervision = {
         let running = state == ProcessState::Running;
@@ -1067,6 +1148,8 @@ async fn status_on_port(
         health,
         health_error,
         boot,
+        registration,
+        hub_condition,
         token_present: token_path().is_file(),
         python: resolve_python_for_vco_lib().map(|p| p.to_string_lossy().to_string()),
         dogfood: None,
@@ -1076,6 +1159,11 @@ async fn status_on_port(
 /// `--boot-status` prints one contract word and exits 0/1/2/3. Anything the
 /// launcher cannot classify becomes `unsupported`, which the GUI renders as
 /// a disabled toggle with a reason — never as a confident "off".
+///
+/// It answers the TOGGLE's question ("is a registration present?"), which is
+/// binary. The third state — present but unable to run — is a different
+/// question and is answered by [`read_registration`]; the two are kept apart
+/// so the toggle keeps reflecting exactly what turning it on and off does.
 fn boot_status_word() -> String {
     match run_gateway_cli(&["--boot-status"]) {
         Ok((0, _, _)) => "enabled".to_string(),
@@ -1084,9 +1172,44 @@ fn boot_status_word() -> String {
     }
 }
 
+/// Read the login registration from the ONE home:
+/// `python -m vco_lib.gateway_ensure status --json`.
+///
+/// `status` STARTS NOTHING and WRITES NOTHING — that is its contract, and it
+/// is what makes it safe on a GUI poll. `ensure` is the other subcommand and
+/// is never called from here: the launcher's Start button is an explicit user
+/// action with its own path, and the always-on restarting belongs to the hub
+/// (`vct_hub::gateway_watchdog`), not to whichever GUI happens to be open.
+///
+/// `None` when the call could not be made or did not answer in JSON — which
+/// the card renders as "could not ask", never as "not registered".
+fn read_registration() -> Option<GatewayRegistration> {
+    let python = resolve_python_for_vco_lib()?;
+    let root = crate::commands::installer::find_local_repo_root().ok();
+    let mut cmd = python_module_command(&python, "vco_lib.gateway_ensure", root.as_deref());
+    cmd.arg("status").arg("--json");
+    // Exit 3 (`registered_but_unrunnable`) and 4 (`start_failed`) are
+    // ANSWERS, not failures: the payload is on stdout either way, so the
+    // exit code is deliberately not consulted here.
+    let (_code, stdout, _stderr) = run_to_completion(cmd, "vco_lib.gateway_ensure").ok()?;
+    serde_json::from_str::<GatewayRegistration>(stdout.trim()).ok()
+}
+
+/// The hub supervisor's recorded verdict, or `None`.
+///
+/// Read-only and soft: a missing row, a damaged row, or a DB that cannot be
+/// read all mean "nothing recorded", because the alternative — failing the
+/// whole status poll over a diagnostic field — would take the card down for
+/// the one condition it exists to explain.
+fn hub_gateway_condition(db: &crate::db::Db) -> Option<HubGatewayCondition> {
+    let raw = db.app_state_get(HUB_GATEWAY_CONDITION_KEY).ok()??;
+    serde_json::from_str::<HubGatewayCondition>(&raw).ok()
+}
+
 #[command]
 pub async fn model_gateway_start(
     supervisor: State<'_, GatewaySupervisor>,
+    db: State<'_, crate::db::Db>,
     port: Option<u16>,
 ) -> Result<ModelGatewayStatus, String> {
     if supervisor.poll().is_some() {
@@ -1206,7 +1329,7 @@ pub async fn model_gateway_start(
     // would tell the user the start failed. When the poll timed out the
     // status carries that honestly (`reachable`/`health` from a real probe),
     // and the GUI gates its "started on port N" line on it.
-    let mut status = status_on_port(&supervisor, chosen).await?;
+    let mut status = status_on_port(&supervisor, &db, chosen).await?;
     status.dogfood = dogfood;
     Ok(status)
 }

@@ -68,9 +68,15 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 from vco_lib.paths import to_posix_rel
 from vco_lib import codegraph_orphan_snapshot as _cos
 from vco_lib import codegraph_prefix_record as _cpr
+# v0.2.95 WP-9: "which plan actions may be applied without consent" is a policy,
+# not plumbing, and it had a second implementation in Rust. One home now; this
+# module publishes its verdict on the `migrate-collections --json` envelope and
+# the launcher reads it. See `vco_lib/migration_plan_classify.py`.
+from vco_lib import migration_plan_classify as _mpc
 # v0.2.92 W3 (§3 item 11): `.git/info/exclude` computation + append moved to
 # their own module when the project-move engine became a third caller.
 from vco_lib import git_exclude as _git_exclude
+from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
 from vco_lib import weaviate_helpers as _wh
@@ -85,16 +91,39 @@ from vco_lib.weaviate_vectors import clean_named_vector
 # launcher's settings.json hook editor needs the identical "which token is the
 # script actually being RUN" logic to find the script a newly-registered hook
 # command points at (starter-file seeding). Two copies of a walk this subtle
-# would drift, and the conservative guard in ``_merge_hooks_for_bundle`` (never
-# rewrite a user's OWN hook) depends on it being exactly right. LOUD-FAIL
-# import, same rule as the sibling above.
+# would drift, and the conservative guard in
+# ``vco_lib.settings_merge.merge_hooks_block`` (never rewrite a user's OWN
+# hook) depends on it being exactly right. LOUD-FAIL import, same rule as the
+# sibling above.
 from vco_lib.hooks_settings import (
     # The three *_TOKENS aliases below are re-exports: tests read them via
     # module attribute and assert identity with hooks_settings' originals.
     CMD_SEPARATOR_TOKENS as _HOOK_CMD_SEPARATOR_TOKENS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
     INTERPRETER_TOKENS as _HOOK_INTERPRETER_TOKENS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
     SCRIPT_FLAG_TOKENS as _HOOK_SCRIPT_FLAG_TOKENS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
-    invoked_script_tokens as _invoked_script_tokens,
+)
+# v0.2.95: the retired-hook machinery — the identity walk (built on the
+# anchor-walk imported above), the scrub, the audit-row emitters — lives in
+# ``vco_lib.hook_retirements`` with the retirement table. The walk keeps its
+# historical alias here: the supersede logic that used to call it moved on to
+# ``vco_lib.settings_merge`` (imported just below), but this module's tests
+# still reach the walk through this name, and an alias is object identity —
+# there is no second copy to drift.
+from vco_lib.hook_retirements import (
+    emit_removal_audit_rows, removal_envelope_rows,
+    vco_hook_script_identity as _vco_hook_script_identity,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
+)
+# v0.2.95: the settings.json merge ALGORITHM — the user-wins recursive merge
+# and the per-event hooks merge it delegates to — lives in
+# ``vco_lib.settings_merge``. What stays in THIS module is the I/O around it:
+# ``_merge_settings_template_for_bundle`` reads the template, reads the target
+# and writes atomically, and is the thin orchestration shim over the pure
+# decision. Both private names survive as ALIASES (same object-identity rule
+# as the import above) because this module and the merge's test suite reach
+# them here.
+from vco_lib.settings_merge import (
+    merge_hooks_block as _merge_hooks_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
+    smart_merge_settings as _smart_merge_for_bundle,
 )
 
 # Default Weaviate port. Canonical value lives in
@@ -3258,7 +3287,12 @@ def _write_bootstrap_deferral(
 # ---------------------------------------------------------------------------
 
 
-_MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
+# Alias, not a definition: `vco_lib.manifest_paths` is the one home for this
+# spelling (v0.2.95). The private name stays because this module's call sites
+# and its tests use it, and because `deferral_dismissal.MANIFEST_REL` is pinned
+# against it — a pin that is now object identity rather than two authors
+# agreeing.
+_MANIFEST_REL = _manifest_paths.MANIFEST_REL
 _MANIFEST_SCHEMA_VERSION = 2
 
 # v0.2.85 PLAN-v0285 D2 (one-concern-one-home): the install-bundle result
@@ -4582,7 +4616,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     callers (``install_project_bundle``'s adopt branch and its
     create/overwrite branch) pass **0o700** — owner-only rwx — for ``*.sh`` and
     for everything under ``.claude/scripts/`` (many shims are extension-less:
-    ``kg-search``, ``code-graph-query``, ``cost-summary``). It is 0o700 rather
+    ``kg-search``, ``code-graph-query``, ``kg-sync``). It is 0o700 rather
     than 0o755 because CodeQL's ``py/overly-permissive-file`` flags both 0o755
     (world) and 0o750 (group), and the project folder belongs to one user.
     This docstring said 0o755 until v0.2.92; the code has shipped 0o700 since
@@ -5948,8 +5982,17 @@ def _run_rl_client_setup(folder: Path) -> dict:
 # this ratchet-capped file. Re-exported so `project_init._emit_...` keeps
 # resolving for its existing callers and tests.
 from vco_lib.migrate_deferral import (  # noqa: E402,F401
-    _emit_migrate_required_deferral,
+    # A deliberate RE-EXPORT, not a live call site: v0.2.95 (WP-9) moved this
+    # module's last caller into `migrate_deferral` itself, but four test
+    # modules and any out-of-tree caller still reach the emitter as
+    # `project_init._emit_migrate_required_deferral`, and the v0.2.92 move
+    # promised that name would keep resolving. Kept per pyrightconfig.json's
+    # own rule for deliberate re-exports (per-line ignore + reason).
+    _emit_migrate_required_deferral,  # pyright: ignore[reportUnusedImport]
 )
+# v0.2.95 WP-9: the module itself, for `reconcile_schema_migration_deferral`
+# (the emit-or-clear gate, moved there out of `_cmd_migrate_collections`).
+from vco_lib import migrate_deferral as _migrate_deferral  # noqa: E402
 
 
 def _cleanup_legacy_bash_env_in_project(
@@ -10367,7 +10410,7 @@ def install_project_bundle(
                     # Preserve executable bit for shell scripts on POSIX.
                     if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
                         # Many launcher scripts have no extension (kg-search,
-                        # code-graph-query, cost-summary). Mark all of
+                        # code-graph-query, kg-sync). Mark all of
                         # .claude/scripts/ + *.sh as executable. 0o700
                         # (owner-only rwx) — CodeQL py/overly-permissive-file
                         # flagged both 0o755 (world) and 0o750 (group) as
@@ -10698,11 +10741,22 @@ def install_project_bundle(
     if "settings" not in skip_kinds and settings_template.exists():
         try:
             settings_target = folder / ".claude" / "settings.json"
+            # v0.2.95: one record per RETIRED hook registration the merge
+            # removed (`vco_lib.hook_retirements`); collected at this level
+            # because the audit row needs the FOLDER, not just the hooks.
+            retired_removed: list = []
             settings_action, settings_redirect = _merge_settings_template_for_bundle(
                 settings_template, settings_target,
-                dry_run=dry_run,
+                dry_run=dry_run, retired_removed=retired_removed,
             )
             result["settings_action"] = settings_action
+            if retired_removed:
+                # Envelope on BOTH paths (dry-run reports what it WOULD
+                # remove); audit rows only after a real write.
+                result["retired_hook_registrations"] = removal_envelope_rows(retired_removed)
+                if not dry_run and settings_action == "merged":
+                    emit_removal_audit_rows(
+                        folder, retired_removed, log_auto=_log_auto, log=_log)
             # v0.2.70 (Bug B / W-F1): when `.claude` itself is a symlink VCO
             # refused to write through, the settings.json write redirected to a
             # `.vco-new` sibling. Thread that into the SAME accumulator as the
@@ -12080,12 +12134,21 @@ def _find_orchestrator_root_from_module() -> Path:
 
 def _merge_settings_template_for_bundle(
     template_path: Path, target_path: Path, *, dry_run: bool,
+    retired_removed: Optional[list] = None,
 ) -> tuple[str, Optional[Path]]:
-    """Mirror of install.py:_merge_settings_template + _smart_merge_settings.
+    """The I/O half of the settings.json merge: read the template, read the
+    target, hand both to :func:`vco_lib.settings_merge.smart_merge_settings`,
+    write the answer atomically.
 
-    Inlined here (rather than importing from install.py) so vco_lib stays
-    import-free of install.py — install.py imports vco_lib, not the other
-    way around.
+    The DECISION half — what a merge may change, and the per-event hooks
+    merge underneath it — lives in ``vco_lib.settings_merge`` (v0.2.95). The
+    split is deliberate: that half is pure and heavily tested on its own,
+    this half owns the filesystem. The docstring here used to call the pair a
+    "mirror of install.py:_merge_settings_template + _smart_merge_settings",
+    inlined so ``vco_lib`` need not import ``install.py``. Neither name exists
+    in ``install.py`` any more — v0.2.85 (D2) deleted its bespoke Steps 5b/9b
+    and routed the root install through this one engine — so there is no
+    mirror, and the claim is retired rather than carried forward.
 
     Returns ``(status, redirect_target)``:
       * ``status`` — one of ``would-create`` / ``created`` / ``would-merge`` /
@@ -12097,6 +12160,13 @@ def _merge_settings_template_for_bundle(
         the SAME ``symlink_redirect_events`` accumulator as the main file
         loop so the consolidated symlink deferral also lists settings.json
         (the symlinked-``.claude`` case would otherwise under-report).
+
+    ``retired_removed`` — v0.2.95: optional accumulator handed to the hooks
+    merge, which appends one record per RETIRED registration it removed (see
+    ``hook_retirements.scrub_retired_registrations``). The caller writes the
+    audit rows; this function only reports. On the fresh-create path (no
+    target file) and on the unparseable-file path nothing is appended,
+    because neither path merges anything.
     """
     template_data = json.loads(template_path.read_text(encoding="utf-8"))
 
@@ -12115,7 +12185,9 @@ def _merge_settings_template_for_bundle(
     except json.JSONDecodeError:
         return "unchanged (user file unparseable)", None
 
-    merged = _smart_merge_for_bundle(existing, template_data)
+    merged = _smart_merge_for_bundle(
+        existing, template_data, retired_removed=retired_removed,
+    )
     if merged == existing:
         return "unchanged", None
 
@@ -12127,23 +12199,6 @@ def _merge_settings_template_for_bundle(
         (json.dumps(merged, indent=2) + "\n").encode("utf-8"),
     )
     return "merged", redirect
-
-
-def _smart_merge_for_bundle(user: dict, template: dict) -> dict:
-    """Recursive dict merge with hooks-block special-case (mirror of
-    install.py:_smart_merge_settings)."""
-    out = dict(user)
-    for key, tval in template.items():
-        if key not in out:
-            out[key] = tval
-            continue
-        uval = out[key]
-        if key == "hooks" and isinstance(uval, dict) and isinstance(tval, dict):
-            out[key] = _merge_hooks_for_bundle(uval, tval)
-        elif isinstance(uval, dict) and isinstance(tval, dict):
-            out[key] = _smart_merge_for_bundle(uval, tval)
-        # else: user wins.
-    return out
 
 
 def _apply_canonical_env_via_config_projection(
@@ -13150,213 +13205,6 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     return result
 
 
-# The interpreter / script-flag / separator token sets that anchor the
-# invoked-script walk now live in `vco_lib.hooks_settings` (imported at module
-# top as `_HOOK_INTERPRETER_TOKENS` / `_HOOK_SCRIPT_FLAG_TOKENS` /
-# `_HOOK_CMD_SEPARATOR_TOKENS`), shared with the launcher's settings.json hook
-# editor. Only the VCO-hook PATH pattern below is specific to this module.
-
-# A bare `.claude/hooks/<name>.{sh,ps1}` token (with optional `${VAR}/` /
-# `%VAR%/` / path prefix ahead of `.claude/`, no embedded whitespace), with the
-# capture group on the basename. Anchored to the FULL token (the token has
-# already been split on whitespace + de-quoted by the caller).
-_HOOK_TOKEN_RE = re.compile(
-    r"^(?:[^\s]*/)?\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))$"
-)
-
-
-def _vco_hook_script_identity(command: str) -> Optional[str]:
-    """Extract the canonical IDENTITY of a VCO-shipped hook command: the hook
-    SCRIPT basename under `.claude/hooks/` (e.g. `ensure-containers.ps1`,
-    `pre-tool-use.sh`), normalized across path-separator (`\\` vs `/`),
-    `${...}` / `%...%` variable expansion, and quoting. Returns `None` when the
-    command does NOT *invoke* a script under `.claude/hooks/` — i.e. it is a
-    user's OWN custom hook, which must never be rewritten/dropped.
-
-    v0.2.70 (Stream G): two commands with the SAME identity are the SAME VCO
-    hook (one may be a stale form of the other, e.g. a backslash path
-    pre-v0.2.70 vs the forward-slash form shipped now). This is the conservative
-    matcher behind the supersede-not-stack merge.
-
-    BLOCKER G-1 fix: the identity is resolved ONLY when `.claude/hooks/<name>`
-    is the *invoked script*, NOT when it appears anywhere in the command string.
-    A user command that merely *references* a VCO hook path as an ARGUMENT or a
-    pipe/cat operand (e.g. `bash my-wrapper.sh --target .claude/hooks/x.sh` or
-    `cat .claude/hooks/x.sh | grep foo`) is a CUSTOM user hook and returns
-    `None` (never superseded/destroyed). A token is the invoked script iff it is
-    (a) the first command-start token, (b) immediately follows a shell
-    interpreter token (`bash`/`pwsh`/...), or (c) immediately follows a
-    PowerShell `-File`/`-Command` flag. Tokens appearing later as arguments or
-    after a pipe (without one of those anchors) are NOT invocations.
-    """
-    # The anchor-walk itself (which token is the script actually being RUN,
-    # normalized across `\`/`/`, quoting and var-expansion) lives in
-    # `vco_lib.hooks_settings.invoked_script_tokens` — see the import note
-    # above. Identity = the FIRST invocation-anchored token that is a
-    # `.claude/hooks/<name>.{sh,ps1}` path; a command whose only such path sits
-    # at an ARGUMENT position yields no anchored match and returns None, which
-    # is the conservative "this is the user's own hook, never touch it" answer.
-    for tok in _invoked_script_tokens(command):
-        m = _HOOK_TOKEN_RE.match(tok)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
-    """Per-event hook array merge.
-
-    v0.2.70 (Stream G — supersede-not-stack): historically this was APPEND-ONLY
-    by exact command-STRING identity, so when a VCO-shipped hook's command form
-    changed (e.g. a path-separator fix `...\\hooks\\x.ps1` -> `.../hooks/x.ps1`,
-    a flag change, or an interpreter change) bundle-update did NOT heal existing
-    projects — it STACKED the new command next to the stale one, leaving the
-    BROKEN command actively firing (and failing) at every event alongside the
-    working one. That is worse than dead code: the stale invocation keeps
-    running.
-
-    Now: a template entry whose hook-script IDENTITY (the `.claude/hooks/<name>`
-    basename, normalized across `\\`/`/`, var-expansion, quoting) matches an
-    EXISTING user entry's identity but whose command STRING differs SUPERSEDES
-    the stale one — the stale command is dropped and the template's current
-    command installed, leaving exactly ONE invocation per VCO hook. Identity +
-    string both match → left as-is (idempotent). Identity absent from the user's
-    set → appended (genuinely new VCO hook; today's behavior).
-
-    CONSERVATIVE GUARD (critical): a command is only treated as a VCO hook when
-    `_vco_hook_script_identity` resolves it to a `.claude/hooks/<name>` script
-    VCO actually ships (i.e. the same identity appears in the TEMPLATE). A
-    user's OWN custom hook (a script not under `.claude/hooks/`, or one VCO
-    doesn't ship) returns `None` / has no template match and is PRESERVED
-    byte-for-byte — never rewritten or dropped. When in doubt, fall back to the
-    pre-v0.2.70 append behavior (a wrong replace that clobbers a user hook is
-    worse than a missed supersede).
-    """
-    out = dict(user_hooks)
-
-    def _entry_cmds(entry: dict) -> list[str]:
-        if not isinstance(entry, dict):
-            return []
-        cmds: list[str] = []
-        for h in entry.get("hooks", []):
-            if not isinstance(h, dict):
-                continue
-            cmd = h.get("command")
-            # Keep only non-empty string commands (drops None + falsy) — this
-            # also narrows the element type to `str` for the return contract.
-            if isinstance(cmd, str) and cmd:
-                cmds.append(cmd)
-        return cmds
-
-    for event, t_entries in template_hooks.items():
-        if event not in out:
-            out[event] = list(t_entries)
-            continue
-        u_entries = out[event] if isinstance(out[event], list) else []
-
-        # Exact command strings already present (idempotent skip).
-        existing_cmds: set[str] = set()
-        for entry in u_entries:
-            for c in _entry_cmds(entry):
-                existing_cmds.add(c)
-
-        # Build the merged entry list. First pass: SUPERSEDE stale VCO hook
-        # commands in the USER entries whose identity matches a template
-        # identity but whose string differs from the current template command.
-        # Map identity -> current template command (first occurrence wins;
-        # the template ships at most one command per identity per event). The
-        # KEYS of this map ARE the set of VCO-shipped identities eligible to
-        # supersede — a user command whose identity is absent here (e.g. a
-        # user's own hook, or a hook this template doesn't ship) is never
-        # rewritten. This is the eligibility guard (no separate set needed).
-        template_cmd_for_identity: dict[str, str] = {}
-        for t_entry in t_entries:
-            for c in _entry_cmds(t_entry):
-                ident = _vco_hook_script_identity(c)
-                if ident and ident not in template_cmd_for_identity:
-                    template_cmd_for_identity[ident] = c
-
-        merged_entries: list = []
-        superseded_identities: set[str] = set()
-        for entry in u_entries:
-            if not isinstance(entry, dict):
-                merged_entries.append(entry)
-                continue
-            new_entry = dict(entry)
-            new_hooks: list = []
-            for h in entry.get("hooks", []):
-                if not isinstance(h, dict) or not h.get("command"):
-                    new_hooks.append(h)
-                    continue
-                cmd = h["command"]
-                ident = _vco_hook_script_identity(cmd)
-                # CONSERVATIVE: only supersede when the identity is a VCO hook
-                # the template ships AND the string actually differs (stale
-                # form). A user's own hook (ident None, or ident not in the
-                # template) is preserved verbatim.
-                if (
-                    ident
-                    and ident in template_cmd_for_identity
-                    and cmd != template_cmd_for_identity[ident]
-                ):
-                    new_h = dict(h)
-                    new_h["command"] = template_cmd_for_identity[ident]
-                    new_hooks.append(new_h)
-                    superseded_identities.add(ident)
-                else:
-                    new_hooks.append(h)
-                    if ident and cmd == template_cmd_for_identity.get(ident):
-                        # Already current — record so the append pass skips it.
-                        superseded_identities.add(ident)
-            new_entry["hooks"] = new_hooks
-            merged_entries.append(new_entry)
-
-        # Second pass: APPEND genuinely-new template hooks at PER-COMMAND
-        # (inner-hook) granularity. A template command is "handled" (so it
-        # must NOT be re-appended) when EITHER its exact string is already
-        # present verbatim OR its VCO-hook identity was just superseded/
-        # confirmed-current in a user entry above.
-        #
-        # WHY per-command, not per-entry (pre-existing bug, A3): the template
-        # ships several inner-hooks in ONE event group (e.g. the `Stop` group
-        # carries cost-tracker + notify-stop + stop-drain-citations together).
-        # Appending the WHOLE group whenever ANY one inner-hook is new would
-        # re-introduce the already-present cost-tracker/notify-stop commands as
-        # a second entry → a duplicate cost row in costs.jsonl and a double
-        # desktop notification at every turn-end. Adding the new
-        # stop-drain-citations hook makes this fire on every existing project's
-        # next bundle update. So append only the inner-hooks that are NOT
-        # already handled, preserving their per-hook config (timeout/async).
-        def _cmd_handled(c: str) -> bool:
-            if c in existing_cmds:
-                return True
-            ident = _vco_hook_script_identity(c)
-            return ident is not None and ident in superseded_identities
-
-        for t_entry in t_entries:
-            if not isinstance(t_entry, dict):
-                continue
-            # Carry forward only the template inner-hooks whose command is not
-            # already present (a command-less hook item, if any, is dropped on
-            # the append path — it has no identity to dedup and the user's
-            # existing group already covers any structural hooks).
-            new_inner = [
-                h
-                for h in t_entry.get("hooks", [])
-                if isinstance(h, dict)
-                and h.get("command")
-                and not _cmd_handled(h["command"])
-            ]
-            if not new_inner:
-                continue
-            appended = dict(t_entry)
-            appended["hooks"] = new_inner
-            merged_entries.append(appended)
-
-        out[event] = merged_entries
-    return out
-
-
 # ---------------------------------------------------------------------------
 # CLI entry point (Rust subprocess interface)
 # ---------------------------------------------------------------------------
@@ -13713,96 +13561,32 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
 
-        # PR 5: drift-detection deferral (pre-update path).
-        if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
-            # v0.2.70: `copy` is ALWAYS lossless — the staging double-copy
-            # round-trips every EXISTING UUID + named vector + property byte-for-byte
-            # via `_copy_collection_with_vectors` (no re-embedding; the live
-            # collection is not dropped until the staging swap's count-match
-            # assertion passes). So `copy` must AUTO-APPLY without consent — only
-            # genuinely data-losing actions defer, and `action == "rebuild"` is the
-            # exact lossy set here. `legacy_single_vector` classifies `rebuild`
-            # (never `copy`). A same-name/different-dim slot is INVISIBLE to
-            # `_schema_delta` (name-only comparison): on its own it yields `noop`;
-            # when it COEXISTS with a genuinely-missing slot, `_classify_action`
-            # returns `copy` (driven by the missing slot) and the mismatch slot
-            # rides along — but copy still only round-trips the EXISTING vectors
-            # verbatim (it neither fixes nor worsens the dim-mismatch, and never
-            # re-embeds/drops), so it remains lossless + data-safe. Genuine
-            # dim-mismatch remediation is owned by the schema_migration_runner
-            # subsystem (it defers). The dry-run plan strips `delta`, leaving
-            # `action` as the only signal here — sufficient given that proof.
-            #
-            # NOTE: this auto-apply is NEW behavior, NOT a mirror of
-            # `install.py --update` (whose drift detector EXCLUDES the additive
-            # v0.2.18 slots and never reaches the apply for an additive 3->5 drift).
-            # It is justified purely by losslessness. The launcher's WET follow-up
-            # that actually applies the additive subset lives in
-            # `projects_v2.rs::run_migrate_dry_run` (the dry-run probe here only
-            # stops deferring — it never mutates).
-            destructive = [
-                e for e in result.get("plan", [])
-                if e.get("action") == "rebuild"
-            ]
-            resolved_folder = Path(project_folder).resolve()
-            if destructive:
-                try:
-                    _emit_migrate_required_deferral(
-                        resolved_folder,
-                        project_name=args.name,
-                        weaviate_url=args.weaviate_url or _weaviate_url_default(),
-                        plan_entries=destructive,
-                    )
-                    result["deferral_emitted"] = True
-                except Exception as e:
-                    # Soft-fail: a deferral write failure must not abort the
-                    # whole update flow. Report via errors[] so the Rust caller
-                    # surfaces it as a warning toast.
-                    result["errors"].append({
-                        "collection": None,
-                        "action": "deferral",
-                        "error": f"migrate-required deferral write failed: "
-                                 f"{type(e).__name__}: {e}",
-                    })
-            else:
-                # v0.2.55 (stale-migration-deferral fix): the dry-run is CLEAN (no
-                # copy/rebuild needed). PRE-v0.2.55 this branch did nothing, so
-                # a `schema_migration_required` entry written by an EARLIER
-                # update (when a migration WAS pending) survived forever even
-                # after the migration was applied or the schema healed —
-                # exactly the stale-deferral carry-forward bug (the entry was re-read by
-                # `DeferralReport.read()` on every subsequent bundle update and
-                # never cleared because the emitter is gated on `destructive`).
-                # Re-probe-clears-stale, matching the Track D `--apply-deferred`
-                # discipline: a clean dry-run IS the re-probe; clear the stale
-                # entry. Soft-fail — never abort the update over a deferral
-                # housekeeping write.
-                try:
-                    # v0.2.83 PLAN-v0283 WP-B2: resolve via the ONE locked emitter
-                    # home (read-modify-write under the exclusive lock; foreign
-                    # entries preserved). resolve_conditions returns the count it
-                    # actually cleared, so the flag is set only when it fired.
-                    from vco_lib import deferral_emit as _de
-                    cleared = _de.resolve_conditions(
-                        resolved_folder, ["schema_migration_required"],
-                    )
-                    if cleared:
-                        result["stale_migrate_deferral_cleared"] = True
-                        # stderr (not stdout) so `--json` output stays parseable.
-                        print(
-                            "  [ok] schema_migration_required: dry-run clean — "
-                            "cleared stale migration deferral (no copy/rebuild "
-                            "needed).",
-                            file=sys.stderr,
-                        )
-                except Exception as e:
-                    # Housekeeping only — report but don't fail.
-                    result["errors"].append({
-                        "collection": None,
-                        "action": "deferral-clear",
-                        "error": f"stale migrate-deferral clear failed: "
-                                 f"{type(e).__name__}: {e}",
-                    })
+        # PR 5: drift-detection deferral (pre-update path). v0.2.95 WP-9: the
+        # policy — when a dry-run may write `schema_migration_required`, which
+        # plan entries force it, and when a clean re-probe clears a stale one —
+        # now lives beside the emitter it drives, in
+        # `vco_lib/migrate_deferral.py`. It arrived here as ~95 inline lines in
+        # a CLI handler; the gate moved with it because the gate IS part of the
+        # policy. `result` is mutated in place exactly as before.
+        _migrate_deferral.reconcile_schema_migration_deferral(
+            result,
+            project_folder=project_folder,
+            project_name=args.name,
+            weaviate_url=args.weaviate_url or _weaviate_url_default(),
+            dry_run=bool(args.dry_run),
+            all_projects=all_projects,
+        )
+
+        # v0.2.95 WP-9 (surface-map D4): publish the auto-apply classification
+        # so the launcher READS it instead of re-deriving the policy in Rust.
+        # Computed here, after every step that can append to `errors[]`, so the
+        # verdict describes the run as it finished rather than as it started —
+        # a probe that hit a deferral-write error saw the drift only partly.
+        # The caller still ANDs its own evidence that the PROCESS exited 0,
+        # which no payload can vouch for about itself.
+        _verdict = _mpc.classify_migration_plan(result)
+        result[_mpc.AUTO_APPLY_KEY] = _verdict["auto_apply_additive"]
+        result[_mpc.ADDITIVE_COLLECTIONS_KEY] = _mpc.additive_collections(result)
 
         if args.json:
             print(json.dumps(result))

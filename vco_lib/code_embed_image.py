@@ -442,8 +442,152 @@ def build_rejected_lines(compose_cmd: str, infra_dir) -> tuple:
     )
 
 
-def rebuild_command(install_root, compose_cmd: str = "docker compose") -> str:
-    """The explicit command a user can run to refresh the image themselves."""
+@dataclass(frozen=True)
+class RebuildContext:
+    """Everything :func:`rebuild_command` needs to know about THIS machine.
+
+    ``compose_cmd`` is the invocation this host actually has (``podman
+    compose`` / ``podman-compose`` / ``docker compose``); ``identity`` is the
+    compose project that created the running container, or ``None`` when
+    there is none, it carries no labels, or nothing could be asked. Both
+    default to the shape a plain install has, so a failed probe degrades to
+    the command that is right for the common machine rather than to silence.
+    """
+
+    compose_cmd: str = "docker compose"
+    identity: Optional[object] = None
+
+
+def rebuild_context() -> RebuildContext:
+    """Read the machine once for the two facts the printed command needs.
+
+    Soft-fail throughout and READ-ONLY: a runtime resolution (the ONE home in
+    :mod:`vco_lib.containers`, so the doctor cannot disagree with the
+    installer about which compose exists) plus two container probes. Called
+    only from the STALE branch of the doctor's probe — the branch that is
+    about to print a command — so a healthy machine pays nothing.
+    """
+    from vco_lib import containers as _containers
+
+    compose_cmd = "docker compose"
+    runtime = "podman"
+    try:
+        resolution = _containers.resolve()
+    except Exception:  # noqa: BLE001 — a probe never fails the doctor
+        resolution = None
+    if resolution is not None:
+        resolved = getattr(resolution, "runtime", None)
+        if resolved:
+            runtime = str(resolved)
+        argv = getattr(resolution, "compose", None)
+        if argv:
+            compose_cmd = " ".join(str(part) for part in argv)
+    return RebuildContext(
+        compose_cmd=compose_cmd, identity=owning_compose_identity(runtime),
+    )
+
+
+def owning_compose_identity(runtime: str = "podman"):
+    """The compose identity that CREATED the running ``code_embed`` container.
+
+    ``None`` when there is no such container, when it carries no compose
+    labels, or when the runtime cannot be asked. Read-only: two probes
+    (``container exists`` and ``inspect``) through
+    :mod:`vco_lib.containers`, the one home for both.
+
+    Why the doctor needs this at all (v0.2.95 F2): the rebuild command is only
+    true if it is run in the project that owns the container. Compose derives
+    the image NAME from the project, so ``--build`` under a different project
+    produces a different image that the running container never loads — which
+    is exactly why ``install_services_guard.apply_recreate_guard`` strips
+    ``code_embed`` from the build list on those machines rather than building
+    the wrong thing.
+    """
+    from vco_lib import containers as _containers
+
+    try:
+        ref = _containers.find_existing_container(COMPOSE_SERVICE, runtime)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if not ref:
+        return None
+    try:
+        return _containers.compose_identity_of(ref, runtime)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+
+
+def rebuild_command(
+    install_root, compose_cmd: str = "docker compose", identity=None,
+) -> str:
+    """The explicit command a user can run to refresh the image themselves.
+
+    Two shapes, because "the installer's compose project" and "the project
+    that owns the running container" are not always the same machine fact:
+
+    * ``identity is None`` (or it names no working directory) → the
+      installer's own ``infrastructure/`` project. The shape every plain
+      install can run.
+    * ``identity`` names a FOREIGN compose project → that project's
+      invocation, built from the container's own labels (its config files and
+      working directory), because a build under any other project name
+      produces an image the running container will never load.
+
+    v0.2.95 F2 — this function shipped in v0.2.92 with ZERO callers while
+    ``doctor.py`` promised, in prose, that the ``code_embed_image_stale``
+    entry carries "the explicit compose command" and printed
+    ``install.py --update`` instead. On the machines that also carry
+    ``services_foreign_compose_identity`` that update is the run which just
+    refused to rebuild, so the remediation could not fix the condition that
+    produced it. Making this live is the fix; the identity arm is what makes
+    it TRUE rather than merely present.
+
+    Three details in the identity arm, each of which alone made the printed
+    command UNRUNNABLE on the population it targets (review MAJOR-1):
+
+    * **The label's paths are absolutised against ``working_dir``.**
+      podman-compose records ``config_files`` exactly as the user typed it on
+      the command line (``podman_compose.py`` ``relative_files = files`` →
+      the project label), so the live value on a machine started from its own
+      compose directory is ``compose.yaml,compose.override.yaml``. Both
+      providers resolve ``-f`` against the CURRENT directory, and the remedy's
+      first step leaves the user in the orchestrator root — where neither file
+      exists.
+    * **The project name is passed explicitly** (``-p``, accepted by
+      docker-compose v2 and podman-compose alike). Without it the name comes
+      from a ``name:`` key or the directory, i.e. from whichever file happened
+      to resolve — and the project name is precisely what decides the image
+      name this rebuild has to overwrite.
+    * **No ``--project-directory``.** podman-compose 1.5.0's parser does not
+      have the flag at all (argparse error, not a warning), and it is redundant
+      once the files are absolute: both providers derive the project directory
+      from the first ``-f``.
+
+    With no usable file list the arm falls back to ``cd <working_dir>``, which
+    pins the same directory by the other means rather than emitting a bare
+    invocation that would resolve against the caller's cwd.
+    """
+    working_dir = (getattr(identity, "working_dir", "") or "").strip()
+    config_files = (getattr(identity, "config_files", "") or "").strip()
+    if identity is not None and working_dir:
+        files = [
+            str(candidate if candidate.is_absolute()
+                else Path(working_dir) / candidate)
+            for candidate in (
+                Path(part.strip())
+                for part in config_files.split(",") if part.strip()
+            )
+        ]
+        project = (getattr(identity, "project", "") or "").strip()
+        command = " ".join(
+            fragment for fragment in (
+                compose_cmd,
+                " ".join(f"-f {path}" for path in files),
+                f"-p {project}" if project else "",
+                f"--profile gpu up -d --build --force-recreate {COMPOSE_SERVICE}",
+            ) if fragment
+        )
+        return command if files else f"cd {working_dir} && {command}"
     infra = Path(install_root) / "infrastructure"
     return (
         f"cd {infra} && {compose_cmd} --profile gpu up -d --build "

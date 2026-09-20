@@ -125,7 +125,9 @@ def default_rl_data_dir() -> Path:
     this maintainer's box that is 2.6 GB under ``~/.claude/retrieval_rl_data/``.
     Nothing here copies, moves, reads or deletes it — deliberately, and unlike
     :mod:`vco_lib.metrics_migration`, which DID copy. The difference is that the
-    metrics streams have live readers (``cost-summary.py``) that must see one
+    metrics streams have live readers (e.g. ``kg-update-nudge.sh``, whose
+    history reads go through ``_lib/metrics-dir.sh``'s
+    ``vco_metrics_read_file``) that must see one
     continuous history at the new home, whereas this corpus is frozen (v0.2.47
     replaced the JSONL sink with the vct-hub ``rl_events`` table) and its only
     remaining consumers all address the old location by name: the paid RL

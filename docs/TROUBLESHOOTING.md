@@ -773,7 +773,9 @@ python -m vco_lib.project_init dismiss-deferral \
 
 Since v0.2.91 a dismissal has a MEMORY: for conditions that declare one, it holds until the underlying state genuinely changes (the Ollama port pair, the shipped reference templates, the parked upstream sidecars) — rewording the message does not re-fire it.
 
-You never need to delete the file by hand. Entries whose condition is provably over are removed by the read-only re-probe pass that now runs on **every** `install.py --update` and every bundle update — not only under `--apply-deferred`, which is what it required before v0.2.91 and which the launcher's own update path never passed.
+You never need to delete the file by hand. Entries whose condition is provably over are removed by the read-only re-probe pass that now runs on **every** `install.py --update` and every bundle update — not only under `--apply-deferred`, which is what it required before v0.2.91 and which the launcher's own update path never passed. Since v0.2.95 that update pass runs *after* the hub-restart step (so an entry like `hub_restart_failed_after_abort` — an abort-path hub restart whose health poll failed — clears in the very run that brings the hub back), and `vco doctor` runs the same reconcile at the start of every standalone pass: a row whose condition is provably over (the hub answering `/api/v1/health` on the resolved port) is removed from the ledger, leaving an audit line in `.claude/logs/auto-resolutions.jsonl` naming the probe that decided it. Only positive evidence clears — a hub that is still down keeps its row.
+
+**Reading `vco doctor` when it cannot check something.** A standalone `vco doctor` obtains its install-time facts (the `--bootstrap` prerequisite envelope, the launcher dist-binary mapping) itself, from the install root — you do not need to run anything first. When even that cannot be produced, the affected probe prints `unknown` together with the exact command that would produce the facts (`python install.py --bootstrap --json`). `unknown` means *not answered* — never *fine*, and never *absent*.
 
 ## Scripts in `.claude/scripts/` don't run
 
@@ -948,7 +950,7 @@ For a deeper failure, also attach `state/logs/install.jsonl` (the structured per
 ## Getting more help
 
 - GitHub Issues: <https://github.com/hotak92/vibecoded-orchestrator/issues>
-- Community channel: (TBD — linked from vibecodedtools.it at launch)
+- Community channel: (TBD — linked from vibecodedtools.com at launch)
 - Commercial support: Pro tier includes email support.
 
 ### "API Error: 400 messages.N.content.1.server_tool_use.id: String should match pattern '^srvtoolu_…'"

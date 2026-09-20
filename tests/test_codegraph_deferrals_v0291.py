@@ -134,7 +134,11 @@ class AnalyzerWiringTests(unittest.TestCase):
     def test_the_success_path_clears(self) -> None:
         body = self.src[self.src.index("_print_codegraph_provenance(embedding_service"):]
         body = body[: body.index("return 0") + len("return 0")]
-        self.assertIn('_deferral_op("clear_backend_deferrals", deferral_root)', body)
+        self.assertIn(
+            '_deferral_op("record_successful_walk", deferral_root, '
+            'args.force_recreate)',
+            body,
+        )
 
     def test_both_skip_paths_still_exit_zero_and_re_emit(self) -> None:
         """The premise of the whole design: an exit code is not evidence."""
@@ -157,7 +161,7 @@ class AnalyzerWiringTests(unittest.TestCase):
         names = set(re.findall(r'_deferral_op\(\s*"([a-z_]+)"', self.src))
         self.assertEqual(
             names,
-            {"emit_no_backend", "emit_code_backend_down", "clear_backend_deferrals"},
+            {"emit_no_backend", "emit_code_backend_down", "record_successful_walk"},
         )
         for name in names:
             with self.subTest(op=name):
@@ -223,7 +227,7 @@ class LedgerRootSeamTests(unittest.TestCase):
         )
         for site in ('_deferral_op("emit_no_backend", deferral_root',
                      '_deferral_op("emit_code_backend_down", deferral_root',
-                     '_deferral_op("clear_backend_deferrals", deferral_root)'):
+                     '_deferral_op("record_successful_walk", deferral_root'):
             with self.subTest(site=site):
                 self.assertIn(site, src)
         self.assertNotIn("_deferral_op(\"emit_no_backend\", install_root", src)

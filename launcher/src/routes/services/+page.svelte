@@ -40,8 +40,12 @@
     pointPanelPort,
     describeWriteResult,
     describeDogfood,
+    describeHubCondition,
     describeOAuthExpiry,
+    describeRegistration,
+    describeSecretScope,
     describeSupervision,
+    describeUsageLedger,
     gatewayIsConfigured,
     getModelGatewayStatus,
     inspectVSCodeTarget,
@@ -191,6 +195,16 @@
   // left. Both are `null` when there is nothing worth saying.
   const gwSupervision = $derived(describeSupervision(gw));
   const gwOAuth = $derived(describeOAuthExpiry(gw));
+  // v0.2.95 (R5c): the login registration's THIRD state — present but unable
+  // to run — and what the detached hub supervisor concluded when it stopped
+  // retrying. Both `null` when there is nothing to say; neither is ever
+  // folded into the "Start at login" checkbox, which answers a different
+  // (binary) question.
+  const gwRegistration = $derived(describeRegistration(gw));
+  const gwHubCondition = $derived(describeHubCondition(gw));
+  // Why a gateway that is UP may still serve nothing: its secret scope.
+  const gwSecretScope = $derived(describeSecretScope(gw));
+  const gwUsageLedger = $derived(describeUsageLedger(gw));
   // Only ever set by a START, and only shown when the proof REFUSED.
   const gwDogfood = $derived(describeDogfood(gw));
   const gwWarnings = $derived(pointPanelWarnings(vsInspection));
@@ -738,6 +752,29 @@
         {gwOAuth.detail}
       </p>
     {/if}
+    {#if gwRegistration}
+      <p class="gw-detail {gwRegistration.tone}">
+        <strong>{gwRegistration.label}.</strong>
+        {gwRegistration.detail}
+        {#if gwRegistration.tone === 'down'}
+          Re-run <code>python install.py --update</code> from the orchestrator
+          root — it re-renders this registration from the install venv and
+          verifies it before writing.
+        {/if}
+      </p>
+    {/if}
+    {#if gwHubCondition}
+      <div class="banner error">
+        <strong>{gwHubCondition.label}.</strong>
+        {gwHubCondition.detail}
+      </div>
+    {/if}
+    {#if gwSecretScope}
+      <p class="gw-detail {gwSecretScope.tone}">
+        <strong>{gwSecretScope.label}.</strong>
+        {gwSecretScope.detail}
+      </p>
+    {/if}
     {#if gwDogfood}
       <div class="banner error">
         <strong>{gwDogfood.label}.</strong>
@@ -861,6 +898,21 @@
             >
           {/if}
         </dd>
+        {#if gw.health.secret_scope}
+          <dt>vendor key scope</dt>
+          <dd>
+            <code>{gw.health.secret_scope.project}</code>
+            {gw.health.secret_scope.resolvable === true
+              ? '— resolves'
+              : gw.health.secret_scope.resolvable === false
+                ? '— does NOT resolve'
+                : '— not probed yet'}
+          </dd>
+        {/if}
+        {#if gwUsageLedger}
+          <dt>usage ledger</dt>
+          <dd>{gwUsageLedger}</dd>
+        {/if}
         <dt>token file</dt>
         <dd>
           {gw.health.token_file_permissions}

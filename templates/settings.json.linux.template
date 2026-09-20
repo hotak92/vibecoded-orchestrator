@@ -302,12 +302,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/cost-tracker.sh",
-            "timeout": 5,
-            "async": true
-          },
-          {
-            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/notify-stop.sh",
             "timeout": 5,
             "async": true
@@ -375,6 +369,16 @@
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-bash-context-record.sh",
             "timeout": 5,
             "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-bash-file-sync.sh",
+            "timeout": 10
           }
         ]
       },

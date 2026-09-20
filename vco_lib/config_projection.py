@@ -1804,6 +1804,51 @@ class DbUnreachable(ConfigProjectionError):
     """Could not open the launcher DB (missing, perms, corrupt)."""
 
 
+# ─── orchestrator-root fallback ─────────────────────────────────────────
+
+
+def _orchestrator_root_from_module() -> Path | None:
+    """Resolve the orchestrator clone from THIS module's own location, or
+    ``None`` when it cannot be CONFIRMED.
+
+    ``vco_lib`` ships inside the orchestrator clone and ``install.py``
+    installs it editable (``pip install -e .``), so the interpreter running
+    this projection is loading a module file that sits inside the clone —
+    which is exactly the fact a caller that could not resolve the root is
+    missing.
+
+    Confirmation is positive and two-part: an ancestor directory must carry
+    BOTH the ``vct-module.json`` manifest (the orchestrator-clone marker
+    ``project_init._find_orchestrator_root_from_module`` and
+    ``vct_launcher_core::orchestrator_manifest`` already walk for) and a
+    ``vco_lib/`` directory (so a manifest belonging to some OTHER VCT module
+    cannot be mistaken for the clone). Nothing is guessed: a non-editable copy
+    of ``vco_lib`` in a venv's ``site-packages`` has no manifest above it and
+    yields ``None`` — the conservative answer, which leaves the three
+    portability keys omitted exactly as before this fallback existed.
+
+    Unlike ``project_init._find_orchestrator_root_from_module``, this returns
+    ``None`` rather than a best-effort parent directory: this value is WRITTEN
+    into every project's ``.claude/env`` as an absolute pointer, and a wrong
+    pointer is worse than an absent one (the venv ladder validates the env
+    tier and would reject it, but the launcher, the hooks and the user reading
+    the file would not).
+
+    Never raises.
+    """
+    try:
+        here = Path(__file__).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for parent in here.parents:
+        try:
+            if (parent / "vct-module.json").is_file() and (parent / "vco_lib").is_dir():
+                return parent
+        except OSError:
+            continue
+    return None
+
+
 # ─── project_env_from_db ────────────────────────────────────────────────
 
 
@@ -1887,10 +1932,15 @@ def project_env_from_db(
             11435.
         code_embed_port_default: Port for CODE_EMBED_URL / CODE_EMBED_PORT.
             Default 11440.
-        orchestrator_root: When set, emit ``VCT_ORCHESTRATOR_ROOT`` and
-            ``VCT_INFRASTRUCTURE_DIR``. When ``None`` (default), those
-            two keys are OMITTED — matching the Rust resolver's
-            "launcher running outside a git checkout" semantics.
+        orchestrator_root: The orchestrator clone to emit
+            ``VCT_ORCHESTRATOR_ROOT`` / ``VCT_INFRASTRUCTURE_DIR`` /
+            ``VCT_INSTALL_ROOT`` for. When ``None`` (default, and what the
+            launcher passes whenever its own root resolver fails), the root is
+            resolved from THIS module's location via
+            :func:`_orchestrator_root_from_module` — see the comment at that
+            emit site for why an apply that omits them REMOVES them. The three
+            keys are omitted only when that confirmation also fails (a
+            non-editable ``vco_lib`` copy with no manifest above it).
 
     Returns:
         A :class:`ProjectEnvBundle` ready to feed into
@@ -2261,6 +2311,31 @@ def project_env_from_db(
     # the wrong precedence for a per-project value. The G6 reconcile therefore
     # fixes the module_ports ROW (record reality); the hub then serves the
     # correct port automatically — no env projection needed.
+
+    # v0.2.95: when the CALLER could not resolve the orchestrator root, resolve
+    # it from THIS MODULE's own location before giving up.
+    #
+    # The three portability keys were emitted only when a caller handed them
+    # down, and the launcher's `ProjectEnvSettings::populate` hands down
+    # `None` whenever `resolve_orchestrator_root` fails (a PATH-installed
+    # launcher binary far from the clone — the case `install.py::
+    # _seed_launcher_install_path` documents). Because an apply REBUILDS the
+    # managed block from scratch and drops keys absent from the bundle, such a
+    # run does not merely skip the keys — it REMOVES the ones a previous
+    # bundle update wrote. Field evidence (field report 2026-09-14): a `.claude/env`
+    # whose header advertises the portability keys and carries none of them,
+    # which is what made a correctly-installed orchestrator undiscoverable —
+    # the venv ladder's DURABLE tier is exactly this file-backed key.
+    #
+    # `vco_lib` ships INSIDE the orchestrator clone and `install.py` installs
+    # it editable, so the module file's own path names the clone. Confirmed
+    # positively (the `vct-module.json` manifest + a sibling `vco_lib/`), never
+    # guessed: a non-editable copy of vco_lib in some venv's site-packages has
+    # no manifest above it, so it resolves to None and the keys stay omitted —
+    # today's behaviour, unchanged, rather than a wrong absolute path written
+    # into every project.
+    if orchestrator_root is None:
+        orchestrator_root = _orchestrator_root_from_module()
 
     if orchestrator_root is not None:
         # Use forward slashes on POSIX, backslashes on Windows — matches

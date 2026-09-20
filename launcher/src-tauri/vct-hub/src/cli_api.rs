@@ -2983,7 +2983,7 @@ mod hub_access_matrix_wiring_tests {
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/cost-tracker.sh",
+            "command": "bash .claude/hooks/notify-stop.sh",
             "timeout": 5
           }
         ]
@@ -3027,7 +3027,7 @@ mod hub_access_matrix_wiring_tests {
                 &pid,
                 "Stop",
                 "",
-                "bash .claude/hooks/cost-tracker.sh",
+                "bash .claude/hooks/notify-stop.sh",
                 "project",
                 None,
                 None,
@@ -3056,7 +3056,7 @@ mod hub_access_matrix_wiring_tests {
 
         let after = std::fs::read_to_string(&settings_path).unwrap();
         assert_ne!(after, before, "the CLI's disable must edit settings.json, not just the DB");
-        assert!(!after.contains("cost-tracker.sh"), "entry must be gone: {}", after);
+        assert!(!after.contains("notify-stop.sh"), "entry must be gone: {}", after);
     }
 
     #[tokio::test]

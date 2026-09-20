@@ -167,8 +167,18 @@ class TestTrimBGitBypass:
 
 
 def test_sh_source_mentions_must_match_ps1():
-    """Regression pin: both siblings carry the D-11 candidate order + the
-    TRIM-b git step-aside (must-match discipline)."""
+    """Marker pin only — NOT the candidate-order parity guarantee.
+
+    This asserts that the D-11 / TRIM-b *markers* survive an edit of either
+    hook. It is a source scan, so a name inside a comment satisfies it: it
+    stayed green under a deliberate ``/usr/bin/lean-ctx`` drift during the
+    v0.2.95 WP-7 red-proof. The real, extraction-based parity assertion over
+    install.py / lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1 lives in
+    ``tests/test_v0295_wp7_bootstrap_cascade_parity.py``
+    (``test_lean_ctx_cascade_agrees_across_install_py_and_both_hooks``) —
+    that one went red under the same mutation. Keep both; they check
+    different things.
+    """
     sh = SH_HOOK.read_text(encoding="utf-8")
     ps1 = PS1_HOOK.read_text(encoding="utf-8")
     for src in (sh, ps1):
