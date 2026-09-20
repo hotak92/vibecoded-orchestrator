@@ -1840,6 +1840,11 @@ pub(crate) fn parse_drift_output(stdout: &str) -> DriftVerdict {
         }
     };
     let field = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    // v0.2.95: the second question the sentinel answers. Absent or non-bool
+    // ⇒ false — an older wrapper (a project whose bundle still lags) simply
+    // does not emit it, and that must read as "nothing extra owed", never as
+    // owed-on-every-update.
+    let repair_owed = v.get("repair_owed").and_then(|x| x.as_bool()).unwrap_or(false);
     let status = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
     let binding = v.get("binding").and_then(|x| x.as_str()).unwrap_or("");
     let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
@@ -1857,6 +1862,11 @@ pub(crate) fn parse_drift_output(stdout: &str) -> DriftVerdict {
             stale: field("stale"),
             scanned: field("scanned"),
         },
+        // Drift above wins when both are true: the `--all` it spawns visits
+        // every node anyway, repairing and stamping on the way past.
+        "ok" if repair_owed => {
+            DriftVerdict::MetadataRepairOwed { scanned: field("scanned") }
+        }
         "ok" => DriftVerdict::Ok { scanned: field("scanned") },
         other => DriftVerdict::Unavailable {
             detail: format!(
@@ -2000,6 +2010,70 @@ mod v0294_drift_probe_tests {
             parse_drift_output("no sentinel anywhere\n"),
             DriftVerdict::Unavailable { .. }
         ));
+    }
+
+    /// v0.2.95 ship-gate MAJOR, RED-PROOF (a), consumer half: a clean store
+    /// PLUS an unrun metadata repair is a SPAWN, not a confirmed skip.
+    ///
+    /// Pre-fix this line parsed to `Ok`, the gate returned `SkipConfirmed`,
+    /// and a project carrying 0.2.94-dialect rows kept its prose-scraped
+    /// `tags` forever — every count in the verdict honestly zero.
+    #[test]
+    fn a_clean_store_that_still_owes_the_metadata_repair_is_not_ok() {
+        let out = sentinel(
+            r#"{"binding":"bound","status":"ok","scanned":78,"repair_owed":true}"#,
+        );
+        assert_eq!(
+            parse_drift_output(&out),
+            DriftVerdict::MetadataRepairOwed { scanned: 78 }
+        );
+    }
+
+    /// RED-PROOF (b), consumer half: once, then silence.
+    #[test]
+    fn a_stamped_project_parses_as_plain_ok() {
+        let out = sentinel(
+            r#"{"binding":"bound","status":"ok","scanned":78,"repair_owed":false}"#,
+        );
+        assert_eq!(parse_drift_output(&out), DriftVerdict::Ok { scanned: 78 });
+    }
+
+    /// An older wrapper (a project whose bundle still lags) omits the field
+    /// entirely. Absent must read as "nothing extra owed" — never as owed on
+    /// every single update.
+    #[test]
+    fn an_absent_repair_owed_field_is_plain_ok() {
+        let out = sentinel(r#"{"binding":"bound","status":"ok","scanned":3}"#);
+        assert_eq!(parse_drift_output(&out), DriftVerdict::Ok { scanned: 3 });
+    }
+
+    /// Drift WINS: the `--all` it already spawns visits every node, repairing
+    /// and stamping on the way past. Two signals would queue two runs.
+    #[test]
+    fn real_drift_outranks_the_repair_signal() {
+        let out = sentinel(
+            r#"{"binding":"bound","status":"drift","missing":2,"stale":1,"scanned":9,"repair_owed":true}"#,
+        );
+        assert_eq!(
+            parse_drift_output(&out),
+            DriftVerdict::Drift { missing: 2, stale: 1, scanned: 9 }
+        );
+    }
+
+    /// A verdict we could not trust must NOT be upgraded by a stamp file:
+    /// spawning `--all` at an unreachable Weaviate repairs nothing.
+    #[test]
+    fn repair_owed_never_rescues_an_unusable_verdict() {
+        for body in [
+            r#"{"binding":"unbound","status":"unknown","detail":"no KG binding","repair_owed":true}"#,
+            r#"{"binding":"bound","status":"unknown","detail":"weaviate unreachable","repair_owed":true}"#,
+        ] {
+            assert!(
+                matches!(parse_drift_output(&sentinel(body)), DriftVerdict::Unavailable { .. }),
+                "must stay Unavailable: {}",
+                body
+            );
+        }
     }
 
     /// The wrapper prints human chatter too; the LAST sentinel wins so a

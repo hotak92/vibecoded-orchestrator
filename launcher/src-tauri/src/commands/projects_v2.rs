@@ -1197,6 +1197,14 @@ pub(crate) async fn apply_post_bundle_steps(
             KgSyncSpawnReason::InitialCreate => tracing::info!(
                 "[vct] kg-sync spawned for {} — first install", project_id
             ),
+            KgSyncSpawnReason::MetadataRepairOwed { scanned } => tracing::info!(
+                "[vct] kg-sync spawned for {} — Weaviate holds every one of \
+                 {} node(s), but this project has never run the v0.2.95 KG \
+                 metadata repair. The pass patches stored title/type/tags on \
+                 rows whose text is unchanged: property writes only, ZERO \
+                 re-embeds, and it runs once (the run stamps itself).",
+                project_id, scanned
+            ),
         }
     }
     if matches!(kg_decision, KgSyncDecision::Spawn(_)) {

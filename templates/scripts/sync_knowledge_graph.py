@@ -4604,6 +4604,39 @@ def _record_chunker_resync_kg_half(project_root: Path) -> None:
         print(f"   (chunker re-sync stamp failed: {inner})", file=sys.stderr)
 
 
+def _record_metadata_repair_pass(project_root: Path) -> None:
+    """Record that this project's tree has been walked under the current
+    metadata-repair generation (v0.2.95).
+
+    The PROJECT half of the one-time repair trigger. ``install.py``'s leg (d)
+    keys the same decision off a GLOBAL ``app_state`` row, which can only ever
+    speak for the install root's own tree; a registered project is synced by
+    the launcher's bundle update, whose gate asks ``--check-drift`` — and drift
+    is *recomputed signature ≠ stored hash*, EQUAL for exactly the rows this
+    release repairs. So no project ever spawned the pass. This stamp is what
+    ``--check-drift`` reads to answer "repair owed", and writing it here is
+    what retires that answer.
+
+    NARROW, exactly like the three clears beside this call. The caller must
+    establish ALL THREE before calling: zero sync failures, the knowledge tree
+    actually walked, and zero INCOMPLETE metadata repairs. The third is this
+    stamp's own version of the rule — a node whose repair could not complete
+    keeps stale properties AND a content hash that still MATCHES, so no later
+    diff, drift scan or edit can ever see that it is owed. Stamping over that
+    would retire the pass permanently with the work undone, which is the exact
+    failure the whole mechanism exists to end. Withholding the stamp costs one
+    further zero-embed ``--all``, and that is the retry.
+
+    Soft-fail: a sync's exit code never depends on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.kg_metadata_repair_state import write_stamp
+
+        write_stamp(project_root)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (metadata-repair stamp failed: {inner})", file=sys.stderr)
+
+
 def _clear_node_formats_deferral(project_root: Path) -> None:
     """Resolve :data:`_NODE_FORMATS_CID` after a refresh that exited 0.
 
@@ -4669,12 +4702,23 @@ def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
 DRIFT_SENTINEL_PREFIX = "KG_DRIFT_JSON "
 
 
-def _print_drift_sentinel(binding, report) -> None:
+def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
     """Emit the machine-readable drift verdict. Best-effort; never raises.
 
     Always printed — including on the ``unbound`` early exit, where ``report``
     is ``None`` — so a caller can distinguish "checked, nothing owed" from
     "never got a verdict". Silence must never read as "every node is present".
+
+    ``repair_owed`` (v0.2.95) is the SECOND question this line answers, and it
+    is deliberately NOT folded into ``status``/``missing``/``stale``: those
+    describe nodes the STORE is missing or holds at a stale content hash, and
+    a node owing the metadata repair is missing from nothing — its text, and
+    therefore its hash, match exactly. Reporting it as drift would make the
+    counts lie, and the Rust consumer treats a ``drift`` verdict carrying zero
+    drifted nodes as a contradiction anyway. Only a POSITIVE True reaches the
+    wire as true: ``None`` means the stamp could not be read, and "could not
+    look" must leave the launcher on its prior behaviour rather than spawn a
+    pass on every update forever.
     """
     import json  # local import — this script imports json per-function
 
@@ -4690,6 +4734,7 @@ def _print_drift_sentinel(binding, report) -> None:
                 getattr(report, "detail", "") if report is not None
                 else (getattr(binding, "detail", "") or "no KG binding")
             ),
+            "repair_owed": repair_owed is True,
         }
         print(DRIFT_SENTINEL_PREFIX + json.dumps(payload), flush=True)
     except Exception as exc:  # noqa: BLE001 — a report line never breaks a scan
@@ -4722,6 +4767,7 @@ def _run_check_drift() -> None:
     the scenario `vco_lib.kg_sync_drift`'s own `python -m` CLI exists to
     cover instead (see that module's docstring).
     """
+    from vco_lib.kg_metadata_repair_state import repair_owed as metadata_repair_owed
     from vco_lib.kg_sync_drift import check_kg_binding, scan_drift, surface_binding_gap, surface_drift
 
     # Pass the RAW env var (not COLLECTION_NAME, which _resolve_collections()
@@ -4772,8 +4818,38 @@ def _run_check_drift() -> None:
             "(content-hash gated: unaffected nodes are skipped, nothing "
             "is deleted)."
         )
+    # v0.2.95: the SECOND question this probe answers for the bundle-update
+    # gate. `scan_drift` above compares CONTENT HASHES, and the rows this
+    # release repairs match theirs by definition — the file text never
+    # changed, which is the defect's whole premise — so the scan is silent
+    # about them and the gate spawned nothing for a registered project. The
+    # per-project stamp is the evidence instead: absent (the state every
+    # project upgrading from 0.2.94 is in) or below the newest bump ⇒ owed.
+    # Unreadable ⇒ None, which the sentinel reports as not-owed, so a corrupt
+    # stamp degrades to prior behaviour instead of spawning a pass forever.
+    #
+    # Gated on a REAL binding, and that is not belt-and-braces: `binding` is
+    # `"ok"` (never `"bound"`) for a tree with no non-archived content, and
+    # such a tree has no row the pass could patch AND no run that could
+    # record one — the launcher short-circuits a project with no markdown
+    # before the subprocess (`kg_sync.rs::run_sync_task`), and an `--all`
+    # over an empty tree stamps nothing. Reporting `owed` there would print
+    # a remedy that cannot retire itself, every time the probe is run by
+    # hand. The Rust consumer already discards a non-`bound` verdict, so
+    # this costs it nothing; the field is made honest AT THE SOURCE so a
+    # later consumer reading `repair_owed` alone cannot be misled by it.
+    repair_owed = (
+        metadata_repair_owed(PROJECT_ROOT) if binding.status == "bound" else False
+    )
+    if repair_owed:
+        print(
+            "🔧 KG metadata repair: owed — stored properties on this "
+            "project's rows predate the current frontmatter parse. A "
+            "whole-tree `--all` patches them (property writes only; a node "
+            "whose content hash matches is never re-embedded to do it)."
+        )
     surface_drift(PROJECT_ROOT, report)
-    _print_drift_sentinel(binding, report)
+    _print_drift_sentinel(binding, report, repair_owed)
     sys.exit(0)
 
 
@@ -5097,6 +5173,15 @@ def main():
                     # this reads the value that was in force DURING the walk.
                     if _chunker_resync_pending():
                         _record_chunker_resync_kg_half(PROJECT_ROOT)
+                    # v0.2.95: the SAME run is the one-time metadata-repair
+                    # pass — it visited every node, so every embed-skip gate
+                    # got its chance to patch stale stored properties. The
+                    # extra guard is this stamp's own (see the helper): a
+                    # repair that could not COMPLETE leaves a node stale
+                    # behind a matching content hash, where nothing would ever
+                    # look again, so it must not be recorded as done.
+                    if _METADATA_REPAIR_FAILED_COUNT == 0:
+                        _record_metadata_repair_pass(PROJECT_ROOT)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted

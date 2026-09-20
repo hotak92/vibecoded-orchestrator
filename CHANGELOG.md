@@ -502,14 +502,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **And something actually runs it.** The repair sits on the sync's SKIP path, and
     no upgrade reached that path: `install.py --update` passes only the
     content-hash diff, and for these rows the hash MATCHES — which is the whole
-    defect. The first install-or-update with no `last_kg_metadata_repair_version`
-    stamp in `app_state` (i.e. every install coming from 0.2.94 or earlier) now runs
-    the knowledge sync as `--all` once, so every node is visited and its stored
-    `title`/`node_type`/`tags` brought up to this release's parse. It records itself
-    **only after exiting 0**, so a run that dies part-way is retried on the next
-    update instead of being marked done — the version-crossing gate used elsewhere
-    could not be used here, because the manifest version is advanced by a later step
-    that does not know whether the seed succeeded, and a crossing cannot be withheld.
+    defect. Two triggers now reach it, one per level:
+    - **The orchestrator root**: the first `install.py` install-or-update with no
+      `last_kg_metadata_repair_version` stamp in `app_state` runs the root's knowledge
+      sync as `--all` once. It records itself **only after exiting 0**, so a run that
+      dies part-way is retried on the next update instead of being marked done — the
+      version-crossing gate used elsewhere could not be used here, because the
+      manifest version is advanced by a later step that does not know whether the
+      seed succeeded, and a crossing cannot be withheld.
+    - **Every registered project**: the launcher's bundle update already runs
+      `kg-sync --check-drift`, and that probe now reports `repair_owed` whenever the
+      project has a real KG binding and its `.claude/state/kg-metadata-repair.json`
+      stamp is absent or older than the newest entry of `KG_METADATA_REPAIR_BUMPS`.
+      The existing drift gate then spawns the ordinary zero-embed `kg-sync --all`,
+      whose clean completion writes the stamp — once per project, then it retires
+      itself. The same stamp is what the launcher's Sync-KG button leaves behind, so
+      clicking it first costs nothing extra. A project with no real binding (empty,
+      docs-only, archived-only) is never told it owes a repair it cannot retire.
   - What the pass costs: one fetch per node, one property patch per stale node,
     **zero embeds**, no `content_hash` changed. It covers the nested `metadata:`
     dialect, `name:`-titled nodes, string `tags:`, **and** nodes whose frontmatter

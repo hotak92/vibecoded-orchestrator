@@ -1954,6 +1954,27 @@ def emit_context_change_incomplete_deferral(
 #: reads as OWED.
 KG_METADATA_REPAIR_STATE_KEY = "last_kg_metadata_repair_version"
 
+# ── The PROJECT half of the same decision (v0.2.95 ship-gate MAJOR) ──
+#
+# Everything above answers for the install ROOT, and can only ever answer for
+# it: `app_state` is a GLOBAL table, and install.py is the only thing that
+# reads it here. A REGISTERED PROJECT is never seeded by install.py — its tree
+# is synced by the launcher's bundle update, whose gate asks
+# `kg-sync --check-drift`, and drift is *recomputed signature ≠ stored hash*,
+# which is EQUAL for exactly the rows this pass repairs. So the leg above left
+# every project unrepaired.
+#
+# `vco_lib.kg_metadata_repair_state` closes that with a per-project stamp in
+# the project's own `.claude/state/`, written by the sync script at the end of
+# a clean `--all` and read by `--check-drift`, which reports `repair_owed` on
+# its machine-readable verdict so the EXISTING drift machinery spawns the
+# ordinary zero-embed pass. That module CALLS `kg_metadata_repair_due` and
+# `KG_METADATA_REPAIR_STAMP` below rather than re-deriving them, so the ladder
+# has one home and the two answers cannot disagree about what "at least this
+# generation" means. The root keeps the `app_state` leg: nothing runs
+# `--check-drift` for it (install.py never invokes the probe), so the
+# per-project mechanism does not reach it.
+
 #: The releases whose stored-metadata parse differs from the one before them.
 #: APPEND to this when a future release teaches
 #: `sync_knowledge_graph.py::_normalise_frontmatter` another dialect — a stamp
@@ -2005,6 +2026,16 @@ def kg_metadata_repair_certified(sync_all: bool, sync_exit_zero: bool) -> bool:
     fires per node on the embed-skip path, so a run handed an explicit file
     list judged only those files, and a run that exited non-zero may have
     died before reaching the rest.
+
+    A THIRD precondition is the CALLER's to establish, because only it can:
+    the run must have targeted the project's CONFIGURED KG collection.
+    install.py has an arm that sets ``_sync_all`` precisely BECAUSE no
+    ``KG_COLLECTION`` resolved, and the sync script then falls back to the
+    literal ``"KnowledgeGraph"`` default — so a clean exit there proves a pass
+    over a collection the user does not read, and stamping it would retire the
+    repair for the collection they do (ship-gate MINOR, v0.2.95). The call
+    site passes ``_sync_all and bool(current_kg_collection)`` for that reason;
+    keep the conjunction if this gate acquires another caller.
 
     That second half is v0.2.95 WP-4's rule, for WP-4's reason. A node this
     pass never reached keeps a `content_hash` that still MATCHES — it is
