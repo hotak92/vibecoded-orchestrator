@@ -2019,13 +2019,19 @@ def kg_metadata_repair_due(
     return not generation_is_current(stamped_version, tuple(bumps))
 
 
-def kg_metadata_repair_certified(sync_all: bool, sync_exit_zero: bool) -> bool:
+def kg_metadata_repair_certified(
+    sync_all: bool,
+    sync_exit_zero: bool,
+    *,
+    project_root: "Optional[Path]" = None,
+) -> bool:
     """May this seed run record the metadata-repair pass as done?
 
-    PURE. Only a WHOLE-TREE run (``--all``) that exited 0 may. The repair
-    fires per node on the embed-skip path, so a run handed an explicit file
-    list judged only those files, and a run that exited non-zero may have
-    died before reaching the rest.
+    PURE except for the one stat behind *project_root* (below). Only a
+    WHOLE-TREE run (``--all``) that exited 0 may. The repair fires per node
+    on the embed-skip path, so a run handed an explicit file list judged only
+    those files, and a run that exited non-zero may have died before reaching
+    the rest.
 
     A THIRD precondition is the CALLER's to establish, because only it can:
     the run must have targeted the project's CONFIGURED KG collection.
@@ -2047,8 +2053,37 @@ def kg_metadata_repair_certified(sync_all: bool, sync_exit_zero: bool) -> bool:
 
     Withholding the stamp costs at most one further zero-embed `--all` on a
     later update. That is the cheap direction, and it is the retry.
+
+    *project_root* — the FOURTH precondition, and the one that makes this
+    record a PROJECTION of the sync's own rather than a second opinion
+    (round-6 ship-gate MAJOR). An exit code cannot see an INCOMPLETE metadata
+    repair: a repair that aborts part-way is counted
+    (``_METADATA_REPAIR_FAILED_COUNT``) and still returns ``embed-skipped``,
+    which is not a FAILED outcome, so the run exits 0 with a node left stale
+    behind a matching content hash. The sync withholds its FILE stamp on that
+    counter; install.py, which sees only the exit code, used to stamp
+    ``app_state`` anyway — and then ``kg_metadata_repair_due_now`` answers
+    not-due forever while the file stamp still says owed. Reading the stamp
+    the SAME subprocess just wrote ends that disagreement: the two records
+    cannot differ because one is derived from the other.
+
+    ``repair_owed(...) is False`` — strictly. ``None`` means the stamp file
+    exists and could not be read: "cannot look" is not "provably done", and
+    the safe direction here is the cheap one (one more zero-embed pass, which
+    also REWRITES the unreadable stamp, so it cannot loop). ``None`` for
+    *project_root* means no root was offered — the pure two-fact question the
+    ladder's own unit tests ask. install.py always passes one; what proves it
+    still does is behavioural, not a source scan:
+    ``test_a_clean_exit_without_the_file_stamp_records_nothing`` drives the
+    real seed with a sync that exits 0 and writes no stamp.
     """
-    return bool(sync_all) and bool(sync_exit_zero)
+    if not (bool(sync_all) and bool(sync_exit_zero)):
+        return False
+    if project_root is None:
+        return True
+    from vco_lib.kg_metadata_repair_state import repair_owed
+
+    return repair_owed(Path(project_root)) is False
 
 
 def kg_metadata_repair_due_now(
@@ -2070,19 +2105,29 @@ def stamp_kg_metadata_repair(
     sync_all: bool,
     sync_exit_zero: bool,
     write_app_state_key: "Callable[[str, str], None]",
+    *,
+    project_root: "Optional[Path]" = None,
 ) -> bool:
     """Record the metadata-repair pass as done, if this run earned it.
 
     I/O seam over :func:`kg_metadata_repair_certified`; returns whether the
     stamp was written, so a caller (and a test) can assert the DECISION and
-    not merely the absence of an error.
+    not merely the absence of an error. *project_root* is threaded through
+    unchanged — this seam adds the ``app_state`` WRITE, never a fact.
 
     Soft-fail on the write is inherited from install.py's
     ``_write_app_state_key``, and it fails in the safe direction: a stamp
-    that does not land leaves the pass owed, which costs one more zero-embed
-    `--all` — never a silently-skipped repair.
+    that does not land leaves the pass owed — never a silently-skipped
+    repair. Same honest price as ``kg_metadata_repair_state.write_stamp``,
+    though: a cause that survives the run (no ``launcher.db`` at all, an
+    unwritable one) costs a zero-embed `--all` PER UPDATE until it clears,
+    not one in total. The launcher-less install never reaches this gate —
+    leg (b) already walks `--all` for it — which is what keeps that bound
+    theoretical rather than the ordinary case.
     """
-    if not kg_metadata_repair_certified(sync_all, sync_exit_zero):
+    if not kg_metadata_repair_certified(
+        sync_all, sync_exit_zero, project_root=project_root,
+    ):
         return False
     write_app_state_key(KG_METADATA_REPAIR_STATE_KEY, KG_METADATA_REPAIR_STAMP)
     return True

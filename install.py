@@ -15807,9 +15807,9 @@ def _seed_weaviate_impl(
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
         )
     # v0.2.95 WP-7: only a WHOLE-TREE run that exited 0 AGAINST THE CONFIGURED
-    # collection visited and judged the nodes the user actually reads, so only it
-    # may retire the metadata-repair pass — leg-(b)'s carve-out rule, three ways.
-    _install_weaviate.stamp_kg_metadata_repair(_sync_all and bool(current_kg_collection), sync_exit_zero, _write_app_state_key)
+    # collection may retire the metadata-repair pass — and `project_root` makes
+    # this record a PROJECTION of the file stamp that run wrote, not a 2nd one.
+    _install_weaviate.stamp_kg_metadata_repair(_sync_all and bool(current_kg_collection), sync_exit_zero, _write_app_state_key, project_root=PROJECT_ROOT)
     if _context_change_incomplete:
         _install_weaviate.emit_context_change_incomplete_deferral(
             deferral_report, _context_change_reason,

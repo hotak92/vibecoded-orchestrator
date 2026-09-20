@@ -23,10 +23,10 @@ excluding those nodes.
 What is under test here is the TRIGGER: leg (d) in
 ``install.py::_seed_weaviate_impl``, gated by
 ``vco_lib.install_weaviate.kg_metadata_repair_due_now`` and retired by
-``stamp_kg_metadata_repair``. Four properties, each asserted on an
-OBSERVABLE effect (the spawned argv, the stored ``app_state`` row) and never
-on a source scan — six source-scanning tests in this release broke on
-legitimate changes:
+``stamp_kg_metadata_repair``. Five properties, each asserted on an
+OBSERVABLE effect (the spawned argv, the stored ``app_state`` row, the
+written stamp file) and never on a source scan — six source-scanning tests in
+this release broke on legitimate changes:
 
   a. an install that has not paid the pass spawns ``--all``;
   b. an install that HAS paid it does not spawn it again;
@@ -34,7 +34,12 @@ legitimate changes:
      retries it;
   d. the pass costs ZERO embeds — asserted on the embed CALL COUNT, with one
      fetch per node and one patch per stale row, not on the absence of an
-     error.
+     error;
+  e. the ``app_state`` row is a PROJECTION of the per-project stamp file the
+     same run wrote, never a second opinion about it (round-6 ship-gate
+     MAJOR): a repair that aborts part-way is counted rather than FAILED, so
+     the run still exits 0, and only the withheld file stamp records that the
+     work is still owed.
 
 No live Weaviate anywhere: the install-level tests replace
 ``subprocess.run`` outright, and the cost test reuses the in-memory counting
@@ -49,6 +54,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +68,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.common.launcher_db_fixture import connect, make_launcher_db  # noqa: E402
 from vco_lib import install_weaviate as iw  # noqa: E402
+from vco_lib import kg_metadata_repair_state as state  # noqa: E402
 import install  # noqa: E402
 
 # The fake-Weaviate family + the counting server live in the repair's own
@@ -155,6 +162,50 @@ class RepairGateDecisionTests(unittest.TestCase):
         )
         self.assertFalse(iw.kg_metadata_repair_certified(False, False))
 
+    def test_exit_zero_is_not_proof_the_repair_completed(self):
+        """Round-6 MAJOR: the fourth precondition, on the pure seam.
+
+        An INCOMPLETE repair is counted, not FAILED — the node's outcome is
+        ``embed-skipped``, so the run exits 0 with that node still stale
+        behind a matching content hash. The sync withholds its FILE stamp on
+        that counter; this gate used to see only the exit code and certify
+        anyway, leaving ``app_state`` claiming a pass the sync says is still
+        owed. With the root in hand the two records cannot disagree.
+        """
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+
+        self.assertIs(state.repair_owed(root), True, "fixture sanity")
+        self.assertFalse(
+            iw.kg_metadata_repair_certified(True, True, project_root=root),
+            "exit 0 with NO file stamp is the incomplete-repair shape — the "
+            "one the whole mechanism exists to end",
+        )
+
+        state.write_stamp(root)
+        self.assertTrue(
+            iw.kg_metadata_repair_certified(True, True, project_root=root),
+            "and the run that DID complete certifies — otherwise leg (d) "
+            "would walk the whole tree on every update forever",
+        )
+
+    def test_an_unreadable_stamp_does_not_certify(self):
+        """A stamp that cannot be READ is not a stamp that says done.
+
+        It costs one more zero-embed pass, and that pass REWRITES the stamp
+        (``write_stamp`` overwrites unconditionally), so it cannot loop.
+        """
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        path = state.state_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not json", encoding="utf-8")
+
+        self.assertIsNone(state.repair_owed(root), "fixture sanity")
+        self.assertFalse(
+            iw.kg_metadata_repair_certified(True, True, project_root=root)
+        )
+
     def test_stamp_seam_writes_only_when_certified(self):
         written: "list[tuple]" = []
         self.assertTrue(
@@ -173,6 +224,31 @@ class RepairGateDecisionTests(unittest.TestCase):
                     )
                 )
         self.assertEqual(written, [], "an uncertified run writes nothing")
+
+        # The third leg (round-6 MAJOR): a root in hand, and no file stamp.
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertFalse(
+            iw.stamp_kg_metadata_repair(
+                True, True, lambda k, v: written.append((k, v)),
+                project_root=root,
+            ),
+            "exit 0 does not mean the repair completed — the file stamp the "
+            "same run would have written is what says it did",
+        )
+        self.assertEqual(written, [], "and nothing reached app_state")
+
+        state.write_stamp(root)
+        self.assertTrue(
+            iw.stamp_kg_metadata_repair(
+                True, True, lambda k, v: written.append((k, v)),
+                project_root=root,
+            )
+        )
+        self.assertEqual(
+            written,
+            [(iw.KG_METADATA_REPAIR_STATE_KEY, iw.KG_METADATA_REPAIR_STAMP)],
+        )
 
     def test_read_seam_asks_for_the_one_key(self):
         asked: "list[str]" = []
@@ -243,8 +319,18 @@ class RepairTriggerTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def _run_seed(self, *, hashes, sync_returncode=0, update=True) -> "list[tuple]":
-        """Run the seed step; return every argv it spawned."""
+    def _run_seed(
+        self, *, hashes, sync_returncode=0, update=True, sync_stamps=True,
+    ) -> "list[tuple]":
+        """Run the seed step; return every argv it spawned.
+
+        ``sync_stamps`` mirrors what the REAL subprocess does at the end of a
+        clean ``--all``: it writes the per-project stamp file
+        (``_record_metadata_repair_pass`` → ``kg_metadata_repair_state``).
+        Set it False for the shape an exit code cannot show — a repair that
+        aborted part-way, which is COUNTED rather than FAILED, so the run
+        still exits 0 and only the withheld file stamp records the truth.
+        """
         spawned: "list[tuple]" = []
 
         def _fake_run(cmd, **kwargs):
@@ -261,8 +347,11 @@ class RepairTriggerTests(unittest.TestCase):
                      "failures": []}
                 )
                 return _Ret()
-            if "sync_knowledge_graph.py" in str(cmd) and sync_returncode:
-                raise subprocess.CalledProcessError(sync_returncode, cmd)
+            if "sync_knowledge_graph.py" in str(cmd):
+                if sync_returncode:
+                    raise subprocess.CalledProcessError(sync_returncode, cmd)
+                if sync_stamps and "--all" in [str(a) for a in cmd]:
+                    state.write_stamp(self.tmp)
             return _Ret()
 
         buf = io.StringIO()
@@ -312,11 +401,17 @@ class RepairTriggerTests(unittest.TestCase):
         )
 
     def test_a_clean_pass_records_itself(self):
+        """The positive half of (e): exit 0 AND the file stamp present."""
         self._build_db()
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
         self._run_seed(hashes={node: "samehash"})
 
+        self.assertTrue(
+            state.state_path(self.tmp).exists(),
+            "fixture sanity: a clean `--all` writes the per-project stamp, "
+            "and app_state is derived from it",
+        )
         self.assertEqual(
             self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
             iw.KG_METADATA_REPAIR_STAMP,
@@ -386,6 +481,50 @@ class RepairTriggerTests(unittest.TestCase):
             self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
             iw.KG_METADATA_REPAIR_STAMP,
             "and the clean retry finally retires it",
+        )
+
+    def test_a_clean_exit_without_the_file_stamp_records_nothing(self):
+        """RED-PROOF, round-6 MAJOR. Exit 0 is not proof the repair completed.
+
+        The constructed failure: a repair that fails after row 1 of 3 on a
+        transient 5xx is COUNTED (`_METADATA_REPAIR_FAILED_COUNT`) and its
+        node still returns ``embed-skipped`` — not a FAILED outcome — so
+        ``total_fail`` is 0 and the run exits 0. The sync correctly withholds
+        its file stamp. install.py sees only the exit code; before this fix
+        it stamped ``app_state`` anyway, and from then on leg (d) answered
+        not-due while leg (c)'s diff stayed empty for that node — its
+        remaining rows keep prose-scraped tags permanently, with the run
+        report's "the next sync retries the rest" naming a run that never
+        comes.
+
+        Asserted on the stored ``app_state`` row and on the argv of the NEXT
+        update, never on a source scan.
+        """
+        self._build_db()
+        node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
+
+        self._run_seed(hashes={node: "samehash"}, sync_stamps=False)
+
+        self.assertFalse(
+            state.state_path(self.tmp).exists(),
+            "fixture sanity: this is the shape where the sync withheld its "
+            "own stamp",
+        )
+        self.assertIsNone(
+            self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
+            "app_state must be a PROJECTION of the file stamp the same run "
+            "wrote — two records of one fact that can disagree is the defect",
+        )
+
+        retry = self._run_seed(hashes={node: "samehash"})
+        self.assertEqual(
+            [c[-1] for c in self._kg_sync_argvs(retry)], ["--all"],
+            "withholding the app_state row IS the retry",
+        )
+        self.assertEqual(
+            self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
+            iw.KG_METADATA_REPAIR_STAMP,
+            "and the run that DID complete — file stamp present — records it",
         )
 
     def test_a_fresh_install_records_the_pass_and_never_pays_it_twice(self):

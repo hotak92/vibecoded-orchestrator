@@ -1756,8 +1756,9 @@ fn extract_number_before(s: &str, marker: &str) -> Option<u32> {
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // See `projects_v2::change_detect`'s v0.2.94 block for the field evidence. This
-// half runs the probe; that half owns the decision (and is pure, so all four
-// legs are unit-tested without a subprocess).
+// half runs the probe; that half owns the decision (and is pure, so all five
+// legs — create / content-changed / never-succeeded / drift, plus v0.2.95's
+// metadata-repair-owed — are unit-tested without a subprocess).
 //
 // It reuses the SAME wrapper the sync itself runs (`kg-sync`, resolved by
 // `resolve_kg_sync_script`, invoked via `invocation_for`) and the SAME env

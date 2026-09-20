@@ -56,6 +56,7 @@ unroutable sentinel. Every path written is under ``tmp``.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -351,8 +352,28 @@ class ACleanWholeTreeRunStampsTheProject(_SyncTestBase):
         self.assertFalse(self._stamp().exists())
         self.assertIs(state.repair_owed(self.root), True)
 
-    def test_a_run_that_walked_no_knowledge_nodes_does_not_stamp(self):
-        """The guard its three neighbours already use, for the same reason."""
+    def test_a_run_that_walked_an_empty_tree_stamps_it(self):
+        """RETARGETED at round 6 (MINOR-6). An empty walk IS a complete walk.
+
+        It used to assert the opposite — the stamp sat inside the
+        ``kg_tally.total > 0 or not KNOWLEDGE_ROOT.exists()`` guard its three
+        neighbours share. That guard is right for THEM: a drift entry names
+        nodes and a re-chunk names entries, so both can still be true about a
+        tree the run never looked at, and a clear must not fire on one that
+        did not look. The repair stamp names neither — it records WHICH
+        GENERATION this project's tree has been walked under, and a tree with
+        nothing in it has no node left holding a stale property.
+
+        Worse, the shared guard split the two EMPTY shapes: ``knowledge/``
+        absent stamped (its ``or not KNOWLEDGE_ROOT.exists()`` exception)
+        while ``knowledge/`` present-but-empty did not. Harmless while
+        ``app_state`` was an independent record; once it became a projection
+        of this stamp (round-6 MAJOR), the second shape re-fired an empty
+        ``--all`` on every single update, forever.
+
+        Both shapes are asserted here, in one place, so they cannot drift
+        apart again.
+        """
         docs = self.root / "docs"
         docs.mkdir()
         (docs / "guide.md").write_text("# Guide\n\nbody\n", encoding="utf-8")
@@ -363,13 +384,107 @@ class ACleanWholeTreeRunStampsTheProject(_SyncTestBase):
 
         self.assertEqual(code, 0, f"stderr:\n{err}")
         self.assertIn("📊 KG:   0 succeeded, 0 failed, 0 skipped", out)
-        self.assertFalse(self._stamp().exists(),
-                         "a run that considered ZERO knowledge nodes repaired "
-                         "nothing and must not be recorded as the pass")
+        self.assertTrue(
+            (self.root / "knowledge").is_dir(),
+            "fixture sanity: this is the PRESENT-but-empty shape",
+        )
+        self.assertTrue(self._stamp().exists(),
+                        "an empty walk under this generation is a complete "
+                        "walk under it — withholding the stamp charges every "
+                        "future update a pass with nothing to repair")
+        self.assertIs(state.repair_owed(self.root), False)
+
+        # The other empty shape: no `knowledge/` at all. Same answer.
+        self._stamp().unlink()
+        (self.root / "knowledge").rmdir()
+        mod2 = self.load(dev="TestDev")
+        self.install_working_backends(mod2)
+
+        code2, _out2, err2 = self.run_main(mod2, ["kg-sync", "--all"])
+
+        self.assertEqual(code2, 0, f"stderr:\n{err2}")
+        self.assertTrue(self._stamp().exists(),
+                        "the two empty-tree shapes must agree")
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 4. The signal is only ever raised where it can also be RETIRED
+# 4. A pass over a collection the user does not read is not a pass
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class OnlyAConfiguredRunStamps(_SyncTestBase):
+    """Round-6 ship-gate MINOR-1 — the project half of the root's own rule.
+
+    ``_resolve_collections`` falls back to the literal ``"KnowledgeGraph"``
+    when the hub is unreachable AND ``KG_COLLECTION`` is unset. A by-hand
+    ``--all`` in that state walks every node into a collection nobody reads;
+    stamping it retires the repair for the collection they DO read, and the
+    self-heal that covers the ordinary case does not reach here — a later
+    configured ``--check-drift`` finds the real rows present at a matching
+    hash, answers ``ok``, and looks no further.
+
+    install.py closes the same hole at the root by passing
+    ``bool(current_kg_collection)``; this is that rule where the sync script
+    is the one that knows.
+    """
+
+    def test_the_resolver_reports_whether_the_kg_name_was_resolved(self):
+        """The verdict itself — the one thing only the resolver can tell."""
+        mod = self.load()
+
+        # The harness's own fixture collection, not a fresh literal: a new
+        # `<Stem>_KnowledgeGraph` name in tests/ is a classification the
+        # fixture-class guard requires someone to make (v0.2.94), and this
+        # assertion needs no name of its own to be true.
+        os.environ["KG_COLLECTION"] = PROJECT_KG
+        name, _dev, _shared, resolved = mod._resolve_collections()
+        self.assertEqual(name, PROJECT_KG)
+        self.assertTrue(resolved)
+
+        os.environ.pop("KG_COLLECTION", None)
+        name, _dev, _shared, resolved = mod._resolve_collections()
+        self.assertEqual(name, "KnowledgeGraph", "the literal fallback")
+        self.assertFalse(
+            resolved,
+            "downstream every caller sees one string, and a REAL collection "
+            "can genuinely be called KnowledgeGraph — only this function can "
+            "tell a configured name from the default it invented",
+        )
+
+    def test_a_run_against_the_fallback_collection_does_not_stamp(self):
+        """RED-PROOF: the whole run, loaded with nothing configured."""
+        _write_node(self.root / "knowledge" / "concepts" / "n.md", "N")
+        mod = self.load()
+        fake_filter = mod.Filter  # the loader's; a re-exec drops it
+        # Re-enter the module the way an unconfigured shell would: the
+        # collection is resolved ONCE at import, so the env must be gone
+        # BEFORE the module body runs again. The module's OWN loader re-runs
+        # it — a second copy of `_load_sync_module` is the duplication the
+        # file's header refuses, and `importlib.reload` cannot find a spec
+        # for a synthetic module name.
+        os.environ.pop("KG_COLLECTION", None)
+        mod.__spec__.loader.exec_module(mod)  # same module, body re-run
+        mod.Filter = fake_filter
+        self.install_working_backends(mod)
+
+        self.assertEqual(mod.COLLECTION_NAME, "KnowledgeGraph", "fixture sanity")
+
+        code, out, err = self.run_main(mod, ["kg-sync", "--all"])
+
+        self.assertEqual(code, 0, f"the run itself succeeds. stderr:\n{err}")
+        self.assertFalse(
+            state.state_path(self.root).exists(),
+            "a whole-tree pass over the fallback collection proves nothing "
+            "about the collection the user reads",
+        )
+        self.assertIs(state.repair_owed(self.root), True)
+        self.assertIn("metadata-repair stamp withheld", out,
+                      "and it says so — a silent withhold is unexplainable "
+                      "when the pass runs again next update")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 5. The signal is only ever raised where it can also be RETIRED
 # ═════════════════════════════════════════════════════════════════════════
 
 
@@ -391,11 +506,14 @@ class TheSignalConverges(_SyncTestBase):
 
         `check_kg_binding` answers `ok` — NOT `bound` — for a tree with no
         non-archived content, and there is nothing there for the pass to
-        patch. Worse, nothing could record it if there were: the launcher
-        returns `skipped` for a project with no markdown WITHOUT running the
-        script (`kg_sync.rs::run_sync_task`), and an `--all` over an empty
-        tree writes no stamp. So `owed` here is an instruction that repeats
-        forever. Asserted on the WIRE field and on the human line.
+        patch. Worse, nothing AUTOMATIC could act on it if there were: the
+        launcher returns `skipped` for a project with no markdown WITHOUT
+        running the script (`kg_sync.rs::run_sync_task`), so the spawn this
+        signal asks for never happens and `owed` becomes an instruction that
+        repeats forever. (Since round-6 MINOR-6 a by-hand `--all` over an
+        empty tree DOES stamp, so the gate rests on the launcher's
+        short-circuit, not on the stamp rule.) Asserted on the WIRE field and
+        on the human line.
         """
         docs = self.root / "docs"
         docs.mkdir()

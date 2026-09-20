@@ -374,9 +374,9 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # is unreachable (launcher not running, project not registered). The
 # resolver emits its own rate-limited warning so callers don't need to
 # log anything extra. See `.claude/context/plans/v0.2.21-resolver-design.md`.
-def _resolve_collections() -> tuple[str, str, str]:
-    """Return (kg_collection, development_collection, shared_kg_collection)
-    via hub, env-fallback.
+def _resolve_collections() -> tuple[str, str, str, bool]:
+    """Return (kg_collection, development_collection, shared_kg_collection,
+    kg_positively_resolved) via hub, env-fallback.
 
     The hub resolver is authoritative when reachable (v0.2.21 contract: the
     launcher's per-project resolution wins over ambient env, so a stale env
@@ -406,12 +406,24 @@ def _resolve_collections() -> tuple[str, str, str]:
     VCT_DISABLE_HUB_RESOLVER short-circuit for the test session. See
     ``server.py::_try_resolve_project_config`` for the matching guard +
     ``tests/conftest.py`` for the autouse fixture.
+
+    The FOURTH element (v0.2.95 round-6 ship-gate MINOR-1) is whether the KG
+    name came from somewhere that POSITIVELY named it — the hub, or a
+    non-empty ``KG_COLLECTION`` — as opposed to the literal ``"KnowledgeGraph"``
+    default this function falls back to when nothing is configured. Only this
+    function can tell those apart: every caller downstream sees one string and
+    a real collection genuinely CAN be called ``KnowledgeGraph``. The one
+    consumer is :func:`_record_metadata_repair_pass`, which must not record a
+    whole-tree pass performed against a collection the user does not read;
+    `--check-drift` answers the same question its own way (it passes the RAW
+    env var to ``check_kg_binding``) and is deliberately left alone.
     """
     if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
         return (
             os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             os.getenv("DEVELOPMENT_COLLECTION", ""),
             os.getenv("SHARED_KG_COLLECTION", ""),
+            bool(os.getenv("KG_COLLECTION", "").strip()),
         )
     try:
         from vco_lib.project_config import resolve  # type: ignore[import-not-found]
@@ -422,18 +434,28 @@ def _resolve_collections() -> tuple[str, str, str]:
             cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             cfg.development_collection or os.getenv("DEVELOPMENT_COLLECTION", ""),
             cfg.shared_kg_collection or os.getenv("SHARED_KG_COLLECTION", ""),
+            bool(
+                (cfg.kg_collection or os.getenv("KG_COLLECTION", "") or "").strip()
+            ),
         )
     except Exception:
         return (
             os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             os.getenv("DEVELOPMENT_COLLECTION", ""),
             os.getenv("SHARED_KG_COLLECTION", ""),
+            bool(os.getenv("KG_COLLECTION", "").strip()),
         )
 
 
-COLLECTION_NAME, _RESOLVED_DEV_COLLECTION, SHARED_COLLECTION_NAME = (
-    _resolve_collections()
-)
+#: ``_KG_COLLECTION_RESOLVED`` is False exactly when ``COLLECTION_NAME`` is the
+#: literal fallback default rather than a name anything configured — see the
+#: resolver's docstring for why only it can tell those apart.
+(
+    COLLECTION_NAME,
+    _RESOLVED_DEV_COLLECTION,
+    SHARED_COLLECTION_NAME,
+    _KG_COLLECTION_RESOLVED,
+) = _resolve_collections()
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Chunking configuration for embedding limits.
@@ -4617,18 +4639,40 @@ def _record_metadata_repair_pass(project_root: Path) -> None:
     ``--check-drift`` reads to answer "repair owed", and writing it here is
     what retires that answer.
 
-    NARROW, exactly like the three clears beside this call. The caller must
-    establish ALL THREE before calling: zero sync failures, the knowledge tree
-    actually walked, and zero INCOMPLETE metadata repairs. The third is this
-    stamp's own version of the rule — a node whose repair could not complete
-    keeps stale properties AND a content hash that still MATCHES, so no later
-    diff, drift scan or edit can ever see that it is owed. Stamping over that
-    would retire the pass permanently with the work undone, which is the exact
-    failure the whole mechanism exists to end. Withholding the stamp costs one
-    further zero-embed ``--all``, and that is the retry.
+    NARROW, like the three clears beside this call, but NOT on the same three
+    facts. The caller establishes two: zero sync failures, and zero INCOMPLETE
+    metadata repairs — a node whose repair could not complete keeps stale
+    properties AND a content hash that still MATCHES, so no later diff, drift
+    scan or edit can ever see that it is owed; stamping over that would retire
+    the pass permanently with the work undone, which is the exact failure the
+    whole mechanism exists to end. It deliberately does NOT establish "the
+    knowledge tree was actually walked": an empty walk under generation G is a
+    complete walk under generation G (round-6 ship-gate MINOR-6; the reasoning
+    is at the call site, beside the guard it is exempt from).
+
+    The THIRD fact is this function's own, because only the module can state
+    it: the run must have resolved a REAL KG collection. ``_resolve_collections``
+    falls back to the literal ``"KnowledgeGraph"`` when the hub is unreachable
+    AND ``KG_COLLECTION`` is unset, so a by-hand ``--all`` in that state walks
+    the tree into a collection nobody reads — and a later configured
+    ``--check-drift`` finds the REAL rows present at a matching hash, answers
+    ``ok``, and the stamp keeps the repair retired for the collection the user
+    actually has (round-6 ship-gate MINOR-1). Mirrors the root's third
+    precondition (``install.py`` passes ``bool(current_kg_collection)`` into
+    ``install_weaviate.kg_metadata_repair_certified``) and sits HERE rather
+    than at the call site for the reason the root's sits there: whoever CAN
+    establish the fact, owns it — and here that is the module, for every
+    caller this helper ever acquires.
 
     Soft-fail: a sync's exit code never depends on ledger bookkeeping.
     """
+    if not _KG_COLLECTION_RESOLVED:
+        print(
+            "   (metadata-repair stamp withheld: no KG collection resolved — "
+            "this run wrote to the fallback default, not the project's "
+            "collection; a configured run will repair and stamp)"
+        )
+        return
     try:
         from vco_lib.kg_metadata_repair_state import write_stamp
 
@@ -4830,14 +4874,17 @@ def _run_check_drift() -> None:
     #
     # Gated on a REAL binding, and that is not belt-and-braces: `binding` is
     # `"ok"` (never `"bound"`) for a tree with no non-archived content, and
-    # such a tree has no row the pass could patch AND no run that could
-    # record one — the launcher short-circuits a project with no markdown
-    # before the subprocess (`kg_sync.rs::run_sync_task`), and an `--all`
-    # over an empty tree stamps nothing. Reporting `owed` there would print
-    # a remedy that cannot retire itself, every time the probe is run by
-    # hand. The Rust consumer already discards a non-`bound` verdict, so
-    # this costs it nothing; the field is made honest AT THE SOURCE so a
-    # later consumer reading `repair_owed` alone cannot be misled by it.
+    # such a tree has no row the pass could patch AND no run the LAUNCHER
+    # would let record one — it short-circuits a project with no markdown
+    # before the subprocess (`kg_sync.rs::run_sync_task`), so the spawn the
+    # signal asks for never happens. Reporting `owed` there would print
+    # a remedy that nothing automatic can retire, every time the probe is run
+    # by hand. (A by-hand `--all` CAN retire it — an empty walk stamps, since
+    # round-6 MINOR-6 — which is why the gate rests on the launcher's
+    # short-circuit and not on the stamp rule.) The Rust consumer already
+    # discards a non-`bound` verdict, so this costs it nothing; the field is
+    # made honest AT THE SOURCE so a later consumer reading `repair_owed`
+    # alone cannot be misled by it.
     repair_owed = (
         metadata_repair_owed(PROJECT_ROOT) if binding.status == "bound" else False
     )
@@ -5173,15 +5220,35 @@ def main():
                     # this reads the value that was in force DURING the walk.
                     if _chunker_resync_pending():
                         _record_chunker_resync_kg_half(PROJECT_ROOT)
-                    # v0.2.95: the SAME run is the one-time metadata-repair
-                    # pass — it visited every node, so every embed-skip gate
-                    # got its chance to patch stale stored properties. The
-                    # extra guard is this stamp's own (see the helper): a
-                    # repair that could not COMPLETE leaves a node stale
-                    # behind a matching content hash, where nothing would ever
-                    # look again, so it must not be recorded as done.
-                    if _METADATA_REPAIR_FAILED_COUNT == 0:
-                        _record_metadata_repair_pass(PROJECT_ROOT)
+                # v0.2.95: the SAME run is the one-time metadata-repair pass —
+                # it visited every node, so every embed-skip gate got its
+                # chance to patch stale stored properties.
+                #
+                # OUTSIDE the walk guard above, deliberately, and this is the
+                # one clear here that must be (round-6 ship-gate MINOR-6). The
+                # guard exists because a clear predicated on "the tree was
+                # walked and found clean" must not fire on a run that walked NO
+                # knowledge tree — a drift entry names nodes, and a re-chunk
+                # names entries, so both can still be TRUE about a tree this
+                # run never looked at. A metadata-repair stamp names neither:
+                # it records WHICH GENERATION this project's tree has been
+                # walked under, and an empty walk under generation G is a
+                # complete walk under generation G — there is no node left
+                # holding a stale property, because there is no node. Leaving
+                # it inside also split the two empty-tree shapes for no reason
+                # anyone could state: `knowledge/` ABSENT stamped (the guard's
+                # own `or not KNOWLEDGE_ROOT.exists()` exception) while
+                # `knowledge/` PRESENT-but-EMPTY did not, so the second re-ran
+                # an empty `--all` on every update once install.py's app_state
+                # record became a projection of this stamp.
+                #
+                # The one guard this stamp does keep is its own: a repair that
+                # could not COMPLETE leaves a node stale behind a matching
+                # content hash, where nothing would ever look again, so it must
+                # not be recorded as done. (The third precondition — that this
+                # run resolved a REAL collection — is the helper's; see it.)
+                if _METADATA_REPAIR_FAILED_COUNT == 0:
+                    _record_metadata_repair_pass(PROJECT_ROOT)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted

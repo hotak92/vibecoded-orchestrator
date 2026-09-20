@@ -505,20 +505,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     defect. Two triggers now reach it, one per level:
     - **The orchestrator root**: the first `install.py` install-or-update with no
       `last_kg_metadata_repair_version` stamp in `app_state` runs the root's knowledge
-      sync as `--all` once. It records itself **only after exiting 0**, so a run that
-      dies part-way is retried on the next update instead of being marked done — the
-      version-crossing gate used elsewhere could not be used here, because the
-      manifest version is advanced by a later step that does not know whether the
-      seed succeeded, and a crossing cannot be withheld.
-    - **Every registered project**: the launcher's bundle update already runs
-      `kg-sync --check-drift`, and that probe now reports `repair_owed` whenever the
+      sync as `--all` once. It records itself as done **only when the sync it just
+      ran left its own per-tree stamp behind** — not merely on exit 0, because a
+      repair that aborts part-way exits 0 (a skipped node is not a failed one) and
+      would otherwise retire the pass with the work undone. The root's record is a
+      projection of the sync's, so the two cannot disagree; a part-way run is retried
+      on the next update. The version-crossing gate used elsewhere could not be used
+      here: the manifest version is advanced by a later step that does not know
+      whether the seed succeeded, and a crossing cannot be withheld.
+    - **Every registered project**: when the launcher's bundle update finds no cheaper
+      reason to sync (nothing on disk changed, no sync in flight, a prior sync succeeded)
+      it runs `kg-sync --check-drift`, and that probe now reports `repair_owed` whenever the
       project has a real KG binding and its `.claude/state/kg-metadata-repair.json`
       stamp is absent or older than the newest entry of `KG_METADATA_REPAIR_BUMPS`.
-      The existing drift gate then spawns the ordinary zero-embed `kg-sync --all`,
+      The launcher's drift gate gained a verdict for it and spawns the ordinary
+      zero-embed `kg-sync --all` (a launcher binary older than 0.2.95 does not know the
+      verdict and reads the probe as "ok" — so the launcher must be updated too, which
+      the orchestrator update does),
       whose clean completion writes the stamp — once per project, then it retires
       itself. The same stamp is what the launcher's Sync-KG button leaves behind, so
       clicking it first costs nothing extra. A project with no real binding (empty,
-      docs-only, archived-only) is never told it owes a repair it cannot retire.
+      docs-only, archived-only) is never told it owes a repair, because the launcher
+      would never spawn a sync for it and the signal would stand forever. A by-hand
+      `--all` that could not positively resolve the project's KG collection (hub down,
+      `KG_COLLECTION` unset) leaves no stamp either, so a walk of the fallback
+      collection never certifies the real one.
   - What the pass costs: one fetch per node, one property patch per stale node,
     **zero embeds**, no `content_hash` changed. It covers the nested `metadata:`
     dialect, `name:`-titled nodes, string `tags:`, **and** nodes whose frontmatter

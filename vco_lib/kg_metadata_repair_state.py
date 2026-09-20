@@ -35,11 +35,19 @@ Same reasoning ``vco_lib.chunker_revision`` records for its own sentinel,
 and this module deliberately mirrors that file's shape: the sync engine runs
 for CLI-only and never-booted-the-GUI installs too (no ``launcher.db`` to
 write), and per-project state must stay genuinely per-project — ``app_state``
-is GLOBAL, so it can only ever speak for the install root's own tree. The
-root keeps its ``app_state`` leg unchanged; both are written by the same
-clean ``--all``, so they agree whenever install.py drove it, and a divergence
-(an ``--all`` run from the launcher button or by hand, which stamps here but
-not there) costs at most ONE further zero-embed pass at the root, once.
+is GLOBAL, so it can only ever speak for the install root's own tree.
+
+The root keeps its ``app_state`` leg, and since the round-6 ship-gate MAJOR
+that row is a PROJECTION of this file rather than a second opinion about the
+same fact: ``install.py`` passes its ``PROJECT_ROOT`` to
+``install_weaviate.stamp_kg_metadata_repair``, which stamps ``app_state``
+only when :func:`repair_owed` answers ``False`` for the tree the run just
+walked. Before that, the two could disagree — a repair that aborted part-way
+is COUNTED rather than FAILED, so the run still exits 0, this file's stamp is
+withheld and the exit code alone said "done". They cannot disagree now. The
+remaining divergence is one-directional and harmless: an ``--all`` from the
+launcher button or by hand stamps here and not there, which costs the root at
+most ONE further zero-embed pass, once.
 
 The GENERATION LADDER is not forked: :data:`KG_METADATA_REPAIR_BUMPS` and the
 ``generation_is_current`` comparison both live in ``vco_lib.install_weaviate``
@@ -120,8 +128,11 @@ def write_stamp(folder: Path, generation: Optional[str] = None) -> bool:
     Best-effort and atomic (tmp + replace), exactly like
     ``chunker_revision.write_last_revision``. Never raises; returns whether
     the stamp landed so a caller can LOG it — never gate on it. A stamp that
-    does not land leaves the pass owed, which costs one more zero-embed
-    ``--all`` on a later update and never a silently-skipped repair.
+    does not land leaves the pass owed, and that is the safe direction: never
+    a silently-skipped repair. Name the price honestly, though — it is not
+    "one more pass" but ONE PER UPDATE until the stamp can land, because a
+    cause that survives the run (a read-only ``.claude/state/``, a full disk)
+    also survives the next one. Same class as ``chunker_revision``'s.
     """
     if generation is None:
         from vco_lib.install_weaviate import KG_METADATA_REPAIR_STAMP

@@ -1208,9 +1208,10 @@ pub(crate) async fn apply_post_bundle_steps(
         }
     }
     if matches!(kg_decision, KgSyncDecision::Spawn(_)) {
-        // ONE spawn path for all four legs (create / content-changed /
-        // never-succeeded / drift) — a drift repair is the SAME hash-gated
-        // `kg-sync --all` a content change gets, never a forced re-embed.
+        // ONE spawn path for all five legs (create / content-changed /
+        // never-succeeded / drift / metadata-repair-owed) — a drift or repair
+        // spawn is the SAME hash-gated `kg-sync --all` a content change gets,
+        // never a forced re-embed.
         if let Err(e) = db.upsert_kg_sync(
             project_id,
             kg_sync_status::PENDING,
