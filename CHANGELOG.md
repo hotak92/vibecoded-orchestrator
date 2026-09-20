@@ -505,8 +505,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     defect. Two triggers now reach it, one per level:
     - **The orchestrator root**: the first `install.py` install-or-update with no
       `last_kg_metadata_repair_version` stamp in `app_state` runs the root's knowledge
-      sync as `--all` once. It records itself as done **only when the sync it just
-      ran left its own per-tree stamp behind** — not merely on exit 0, because a
+      sync as `--all` once. It records itself as done **only when the tree carries
+      the sync's own current per-tree stamp** — not merely on exit 0, because a
       repair that aborts part-way exits 0 (a skipped node is not a failed one) and
       would otherwise retire the pass with the work undone. The root's record is a
       projection of the sync's, so the two cannot disagree; a part-way run is retried
