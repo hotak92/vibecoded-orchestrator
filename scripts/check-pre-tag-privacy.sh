@@ -36,15 +36,32 @@ set -uo pipefail
 
 FAIL=0
 
+# `git grep -I` on every pattern query below — do NOT match inside BINARY
+# files. These patterns are short name tokens ("SD15", "ARTup", a username),
+# and a compiled artefact is tens of megabytes of bytes that can spell one by
+# coincidence; a hit there says nothing about a leak in code or comments,
+# which is what this gate is for (its own messages say "in code/comments").
+#
+# It also removes a real local-vs-CI divergence: git decides per-file whether
+# content is text, and that decision differed between a developer checkout and
+# the runner — so the SAME tree passed here and failed there, naming a binary
+# that neither copy actually contained the token in.
+#
+# Binaries are NOT left unscanned. The thing that genuinely leaks from
+# compiled output is an absolute DEVELOPER PATH, and that has a purpose-built
+# scanner: `strings <binary>` piped through the dev-path regexes mirrored in
+# tests/test_launcher_leak_grep.py (Linux/macOS/Windows home directories, each
+# with its own allowlist). Token matching here was never that scanner, and
+# skipping binaries here takes nothing away from it.
 check_pattern() {
     local description="$1"
     local pattern="$2"
     local exclude_pattern="${3:-}"
     local hits
     if [ -n "$exclude_pattern" ]; then
-        hits=$(git grep -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/pre-ship-check.sh' ':!:CHANGELOG.md' 2>/dev/null | grep -Ev "$exclude_pattern" || true)
+        hits=$(git grep -I -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/pre-ship-check.sh' ':!:CHANGELOG.md' 2>/dev/null | grep -Ev "$exclude_pattern" || true)
     else
-        hits=$(git grep -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/pre-ship-check.sh' ':!:CHANGELOG.md' 2>/dev/null || true)
+        hits=$(git grep -I -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/pre-ship-check.sh' ':!:CHANGELOG.md' 2>/dev/null || true)
     fi
     if [ -n "$hits" ]; then
         echo "::error::pre-tag privacy gate: $description"
@@ -116,7 +133,7 @@ done
 
 if [ -n "$known_names_re" ]; then
     # First pass: blocklist names — always fail.
-    name_leak_hits=$(git grep -l -E "$known_names_re" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/check-no-secrets.sh' ':!:launcher/src-tauri/.cargo/config.toml' ':!:launcher/src-tauri/Cargo.toml' ':!:CHANGELOG.md' 2>/dev/null || true)
+    name_leak_hits=$(git grep -I -l -E "$known_names_re" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/check-no-secrets.sh' ':!:launcher/src-tauri/.cargo/config.toml' ':!:launcher/src-tauri/Cargo.toml' ':!:CHANGELOG.md' 2>/dev/null || true)
     if [ -n "$name_leak_hits" ]; then
         echo "::error::pre-tag privacy gate: known-name home-dir references found in tracked files"
         echo "         (blocklist: ${known_names_blocklist[*]})"
