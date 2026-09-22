@@ -302,11 +302,13 @@ class TestSoftFailWhenLauncherDbUnreachable(IsolatedEnvMixin, unittest.TestCase)
 
 
 class TestModelIdForActiveMapping(unittest.TestCase):
-    """Both install.py and embedding_service.py ship a copy of this
-    mapping (install.py needs it before vco_lib is importable in some
-    bootstrap edge-cases). They MUST agree byte-for-byte — drift between
-    the two would mean install.py threads ``arctic`` but the subprocess
-    picks a different model id, defeating the whole fix.
+    """install.py's ``_model_id_for_active`` is a thin delegate to
+    ``vco_lib.embedding_service._model_id_for_active`` (v0.2.96 F-2 — the
+    former inline mirror's "bootstrap self-containment" premise was false:
+    install.py hard-imports vco_lib at module top level, so the mirror
+    could only drift). These tests pin the mapping's VALUES at the
+    call-site surface install.py exposes, so a drift introduced on either
+    side of the delegation shows up here.
     """
 
     def test_arctic(self) -> None:

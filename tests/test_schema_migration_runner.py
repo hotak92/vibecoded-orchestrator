@@ -1370,3 +1370,87 @@ def test_b2_read_launcher_db_max_missing_table_is_none(tmp_path):
     conn.commit()
     conn.close()
     assert smr._read_launcher_db_max_migration(db_path) is None
+
+
+# ---------------------------------------------------------------------------
+# v0.2.96 — the `weaviate_url=""` default is BEHAVIOURAL, not just a shape
+# ---------------------------------------------------------------------------
+#
+# `tests/test_v0296_weaviate_url_port_precedence.py::
+# test_no_signature_default_still_hardcodes_the_url` pins the default with
+# `inspect.signature` — a source-shape check. It proves the bound default is
+# `""`; it cannot prove the BODY then resolves that sentinel through the
+# shared Weaviate-URL home at call time, nor that the resolved value is what
+# the edge scripts and the live probe actually address. A body that dropped
+# the `if not weaviate_url:` block, or resolved it from a stale module-level
+# constant, would keep that test green while every migration on a relocated
+# Weaviate addressed the wrong instance.
+#
+# So: call it with `weaviate_url` OMITTED, under `WEAVIATE_PORT=19731` and no
+# `WEAVIATE_URL`, and assert on the URL the runner HANDS OUT.
+
+
+def test_omitted_weaviate_url_resolves_through_the_shared_home_at_call_time(
+    db_with_v033, tmp_path, monkeypatch
+):
+    """The signature default, proven by behaviour.
+
+    Red-proof (both halves independently):
+      * change the signature default to ``"http://localhost:8081"`` → the
+        body's ``if not weaviate_url`` never fires and both assertions fail;
+      * delete the ``if not weaviate_url:`` resolution block → the runner
+        hands ``""`` to the probe and the edge, and both assertions fail.
+    """
+    monkeypatch.delenv("WEAVIATE_URL", raising=False)
+    monkeypatch.setenv("WEAVIATE_PORT", "19731")
+
+    # Two artifacts, because the two consumers of the resolved URL sit on
+    # DIFFERENT paths: an out-of-date artifact runs an EDGE, an up-to-date
+    # one is handed to the LIVE-DRIFT PROBE. Both must address the same
+    # env-resolved instance.
+    atype = "development_collection"  # per-project derived — runs the edge
+    name = "P1_Development"
+    base = sv.canonical_version(atype)
+    _insert_row(db_with_v033, "p1", atype, name, base)
+    monkeypatch.setitem(sv.CANONICAL_VERSIONS, atype, base + 1)
+
+    _insert_row(
+        db_with_v033, "p1", "kg_collection", "P1_KnowledgeGraph",
+        sv.canonical_version("kg_collection"),
+    )  # UP_TO_DATE ⇒ the live-drift probe decides
+
+    migrations = tmp_path / "migrations"
+    _write_edge(migrations, atype, f"{base}_to_{base + 1}.sh", classification="derived")
+
+    probed: "list[str]" = []
+    edge_urls: "list[str]" = []
+
+    def _recording_probe(weaviate_url, artifact_name):
+        probed.append(weaviate_url)
+        return (False, [])
+
+    def _recording_apply(edge, *, project_root, launcher_db, weaviate_url, env):
+        edge_urls.append(weaviate_url)
+        return True
+
+    monkeypatch.setattr(smr, "_apply_edge", _recording_apply)
+    smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=migrations,
+        env=_env_with_collections(), live_drift_probe=_recording_probe,
+        now_ms=1,
+        # weaviate_url deliberately OMITTED — the default is what is under test.
+    )
+
+    from vco_lib.weaviate_helpers import weaviate_url_default
+
+    expected = weaviate_url_default()
+    assert expected == "http://localhost:19731", (
+        "precondition: the shared home must honour WEAVIATE_PORT"
+    )
+    assert edge_urls == [expected], (
+        "the migration edge must run against the env-resolved instance, "
+        f"got {edge_urls!r}"
+    )
+    assert probed and set(probed) == {expected}, (
+        f"the live-drift probe addressed {set(probed)!r}, not {expected!r}"
+    )

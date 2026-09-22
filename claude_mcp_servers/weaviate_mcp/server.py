@@ -1458,7 +1458,29 @@ mcp = FastMCP(
 
 # Global state
 weaviate_client = None
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+# ── MIRROR (category C) — must match `vco_lib/weaviate_helpers.py::
+#    weaviate_url_default`, which is the SHARED HOME for this resolution.
+#
+# Why a mirror and not a call: this MCP deliberately does NOT import vco_lib.
+# It boots on half-installed environments where vco_lib is not importable,
+# and adding a boot-critical import here would trade a real failure mode for
+# a cosmetic convergence (same reasoning as `get_weaviate_client`, recorded
+# in knowledge/concepts/weaviate-helper-convergence-mock-surface-pattern.md).
+#
+# The precedence below is therefore copied, and must stay byte-equivalent in
+# BEHAVIOUR to the shared home:
+#   1. WEAVIATE_URL  — a full URL the user stated (scheme+host+port); wins
+#                      even when WEAVIATE_PORT disagrees.
+#   2. WEAVIATE_PORT — a port for the canonical localhost host. Honouring it
+#                      here is what lets a user who moved Weaviate off 8081
+#                      still get search results; before v0.2.96 this line
+#                      ignored the knob and every hybrid_search on a
+#                      relocated instance silently addressed 8081.
+#   3. 8081          — the canonical default.
+# Empty / whitespace-only values are treated as UNSET at both levels.
+_WEAVIATE_URL_ENV = (os.getenv("WEAVIATE_URL") or "").strip()
+_WEAVIATE_PORT_ENV = (os.getenv("WEAVIATE_PORT") or "").strip()
+WEAVIATE_URL = _WEAVIATE_URL_ENV or f"http://localhost:{_WEAVIATE_PORT_ENV or 8081}"
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 
 # RL training integration (transparent, best-effort).

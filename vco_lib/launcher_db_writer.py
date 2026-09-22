@@ -51,7 +51,11 @@ def read_app_state_key(db_path: Path, key: str) -> Optional[str]:
     if not db_path.is_file():
         return None
     try:
-        uri = f"file:{db_path}?mode=ro&immutable=1"
+        # v0.2.96 L-11: built by `launcher_db_reader.sqlite_ro_uri`, the ONE
+        # home — a hand-interpolated path containing ?/#/% truncates at the
+        # first ? and the open fails shut.
+        from vco_lib.launcher_db_reader import sqlite_ro_uri
+        uri = sqlite_ro_uri(db_path, immutable=True)
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         try:
             row = conn.execute(

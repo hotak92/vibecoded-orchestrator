@@ -21,6 +21,18 @@ A structural rule cannot go stale that way: it is wrong only for an id shaped
 unlike every id either upstream has ever returned, and that case resolves to
 ``unknown``, which is the honest answer rather than a wrong one.
 
+**One shape breaks that claim today, and the owner has deferred the fix to
+0.2.97.** A FOUR-digit tail is read as a version, not a date (only an
+eight-digit segment is a date — see the date rule below), so a vendor's dated
+build ``<family>-0731`` parses as version ``(731,)`` and outranks the newer
+``<family>.1`` at ``(1,)`` under the latest-only filter: the snapshot is
+published and the current model hidden. The shipped data hit this once
+(``deepseek-v4-flash-0731``) and it is shielded for that ONE family by the
+qwen row's ``catalog_exclude_prefixes``; any future vendor snapshot reproduces
+it until the parser learns to read a valid ``MMDD`` tail as a date. So for
+dated four-digit ids the rule above IS stale-able, and per-vendor exclusion is
+the only mechanism holding.
+
 The rule, in full
 -----------------
 Strip Claude Code's ``[1m]`` suffix and the vendor namespace, then split what

@@ -135,7 +135,12 @@ class PruneRunsOnPartialSyncTest(unittest.TestCase):
              mock.patch.object(install, "_compute_on_disk_content_hashes", return_value=on_disk_hashes), \
              mock.patch.object(install, "_batch_query_weaviate_content_hashes", return_value=stored_hashes), \
              mock.patch.object(install, "_prune_stale_kg_rows", side_effect=_capture_prune) as prune_mock, \
-             mock.patch("subprocess.run", side_effect=_fake_run):
+             mock.patch("subprocess.run", side_effect=_fake_run), \
+             mock.patch.object(
+                 # v0.2.96 WP-1: the sync child now spawns via
+                 # run_child_logged; keep it faked so no real child runs.
+                 install, "run_child_logged", side_effect=_fake_run,
+             ):
             install._seed_weaviate(_make_args(update=True))
 
         # The prune must have been invoked exactly once.

@@ -597,7 +597,7 @@ def _probe_secret_scope_at_startup(app) -> None:
 def _serve(port_override: Optional[int]) -> int:
     from aiohttp import web
 
-    from .auth import ensure_host_token
+    from .auth import ensure_host_token, host_token_stamp
     from .config import (
         FALLBACK_PORT_RANGE,
         GatewayConfig,
@@ -746,7 +746,17 @@ def _serve(port_override: Optional[int]) -> int:
     # was on its way out, which is precisely the stale claim that blocks the
     # next start.
     try:
-        app = create_app(config, token_permissions=owner_only_state(token_path()))
+        # ``token_file_stamp`` samples the (path, mtime_ns, size) of the file
+        # this daemon just loaded — issue 10's diagnostic, shown by /health
+        # beside a fresh stat so a client-side 401 can be told apart from a
+        # regenerated file or a divergent VCT_STATE_DIR without restarting
+        # anything. Sampled HERE rather than in create_app: the factory stays
+        # pure, exactly like token_permissions.
+        app = create_app(
+            config,
+            token_permissions=owner_only_state(token_path()),
+            token_file_stamp=host_token_stamp(token_path()),
+        )
         _probe_secret_scope_at_startup(app)
         # AFTER the bind, never before: a port file naming a port we did not
         # get is what sends every reader at somebody else's service.

@@ -39,6 +39,38 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
+from urllib.parse import quote
+
+
+def sqlite_ro_uri(db_path: "str | Path", *, immutable: bool = False) -> str:
+    """Build the read-only SQLite ``file:`` URI for ``db_path``.
+
+    THE one home for this string (v0.2.96, ship-gate L-11). Eleven sites
+    across ``vco_lib``, ``install.py`` and the shipped sync script each built
+    ``f"file:{db_path}?mode=ro"`` by hand, and every one of them fails shut on
+    a launcher.db whose path contains ``?``, ``#`` or ``%``: SQLite reads
+    everything after the first ``?`` as the query string, so the path
+    silently truncates and the open raises. The failure is conservative — the
+    caller's soft-fail returns "unknown" — but the gate that depends on it
+    never fires for that user and nothing says why.
+
+    ``urllib.parse.quote`` with ``safe="/"`` percent-encodes exactly the
+    reserved characters while leaving the separators SQLite needs. A Windows
+    path is normalised to forward slashes first, which is the spelling the
+    URI form requires (``file:C:/Users/...``); the drive colon is left as-is
+    because SQLite accepts it and quoting it breaks the form.
+
+    :param immutable: append ``immutable=1`` — the "this file will not change
+        under us" promise used by the writer module's pre-flight read. Off by
+        default: it disables SQLite's change detection and must be opted into.
+    """
+    raw = str(db_path).replace("\\", "/")
+    # `safe` keeps the path separators and the Windows drive colon literal;
+    # everything else that SQLite's URI parser would treat as syntax (?, #, %)
+    # is percent-encoded.
+    encoded = quote(raw, safe="/:")
+    params = "mode=ro" + ("&immutable=1" if immutable else "")
+    return f"file:{encoded}?{params}"
 
 
 def _discover_db_path() -> Optional[Path]:
@@ -94,8 +126,7 @@ def _open_db_readonly(
     if p is None:
         return None
     try:
-        uri = f"file:{p}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn = sqlite3.connect(sqlite_ro_uri(p), uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
         return conn
     except Exception:
@@ -678,7 +709,9 @@ def profile_for_text_model(model_id: str | None) -> Optional[str]:
     return _TEXT_MODEL_ACTIVE_EMBEDDING.get(model_id.strip())
 
 
-def read_app_state_default_text_embedding() -> Optional[str]:
+def read_app_state_default_text_embedding(
+    db_path: Optional[Path] = None,
+) -> Optional[str]:
     """Return the hardware-selected default TEXT model id, or ``None``.
 
     Reads ``app_state[default_text_embedding]`` (raw string, not JSON —
@@ -688,15 +721,24 @@ def read_app_state_default_text_embedding() -> Optional[str]:
     when the canonical ``embedding.active_profile`` key is unset.
 
     Soft-fail: ``None`` when launcher.db is absent / key unset / empty.
+
+    Differs from :func:`read_app_state_active_embedding` ONLY in the key
+    read — and the two keys are NOT interchangeable (a PROFILE vs a MODEL
+    ID; see the v0.2.68 embedding-drop post-mortem), so both named readers
+    stay. The strip/empty normalisation is shared via
+    :func:`_read_app_state_key_normalized`.
+
+    :param db_path: optional explicit launcher.db path (see
+        :func:`read_app_state_value`).
     """
-    raw = read_app_state_value(APP_STATE_KEY_DEFAULT_TEXT_EMBED)
-    if raw is None:
-        return None
-    stripped = raw.strip()
-    return stripped if stripped else None
+    return _read_app_state_key_normalized(
+        APP_STATE_KEY_DEFAULT_TEXT_EMBED, db_path=db_path
+    )
 
 
-def read_app_state_value(key: str) -> Optional[str]:
+def read_app_state_value(
+    key: str, db_path: Optional[Path] = None
+) -> Optional[str]:
     """Read a single ``app_state`` key from launcher.db (read-only).
 
     Returns the stored string value, or ``None`` when the DB is unavailable,
@@ -707,10 +749,16 @@ def read_app_state_value(key: str) -> Optional[str]:
     "unknown / use fallback".
 
     :param key: the ``app_state.key`` to look up.
+    :param db_path: optional explicit launcher.db path, used VERBATIM when
+        the file exists (the explicit-path form of ``_open_db_readonly``,
+        for callers that already resolved the DB — e.g. install.py
+        threading its ``_discover_app_state_db_path`` seam — so they read
+        the SAME db they operate on). ``None`` runs the module's default
+        discovery (``VCT_LAUNCHER_DB_PATH`` env → ``~/.vct/launcher.db``).
     """
     if not key:
         return None
-    conn = _open_db_readonly()
+    conn = _open_db_readonly(db_path)
     if conn is None:
         return None
     try:
@@ -727,7 +775,28 @@ def read_app_state_value(key: str) -> Optional[str]:
             pass
 
 
-def read_app_state_active_embedding() -> Optional[str]:
+def _read_app_state_key_normalized(
+    key: str, db_path: Optional[Path] = None
+) -> Optional[str]:
+    """Read one ``app_state`` key and normalise: stripped value or ``None``.
+
+    The shared mechanics of the two named ``app_state`` readers
+    (:func:`read_app_state_default_text_embedding` /
+    :func:`read_app_state_active_embedding`): raw ``None`` stays ``None``,
+    the value is ``.strip()``-ped, and empty-after-strip becomes ``None``.
+    Soft-fail throughout — the read beneath never raises, and neither
+    does this.
+    """
+    raw = read_app_state_value(key, db_path=db_path)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
+
+
+def read_app_state_active_embedding(
+    db_path: Optional[Path] = None,
+) -> Optional[str]:
     """Return the active embedding profile from launcher.db, or ``None``.
 
     Reads ``app_state[embedding.active_profile]``. The value, when set,
@@ -750,9 +819,12 @@ def read_app_state_active_embedding() -> Optional[str]:
     seeding) and any subprocess (``install.py``'s ``sync_knowledge_graph.py``
     spawn, the MCP server's ``EmbeddingService.for_project()``) that
     needs to know which embedding to use when no env override is set.
+
+    :param db_path: optional explicit launcher.db path (see
+        :func:`read_app_state_value`) — install.py passes its own
+        ``_discover_app_state_db_path()`` so the read targets the same
+        DB install.py operates on.
     """
-    raw = read_app_state_value(APP_STATE_KEY_ACTIVE_EMBEDDING)
-    if raw is None:
-        return None
-    stripped = raw.strip()
-    return stripped if stripped else None
+    return _read_app_state_key_normalized(
+        APP_STATE_KEY_ACTIVE_EMBEDDING, db_path=db_path
+    )

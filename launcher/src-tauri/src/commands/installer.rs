@@ -13453,22 +13453,32 @@ MemAvailable:   23456789 kB
             body.contains("claude_json.exists()"),
             "~/.claude.json scrub must be guarded by .exists()"
         );
-        // Container ops are gated by a RESOLVED compose command plus the
-        // compose directory existing. v0.2.92 (MAJOR-3): the uninstaller no
-        // longer detects the runtime itself — it was a fourth independent copy
-        // that ignored VCT_CONTAINER_RUNTIME and could print `volume rm`
-        // commands naming the wrong runtime. It now resolves through
-        // vco_lib.containers, so the guard is the resolved compose argv.
-        // Both the definition and the use are pinned: a guard that is computed
-        // but never consulted would satisfy either one alone.
-        assert!(
-            body.contains("will_stop_containers = compose_argv is not None"),
-            "container ops must be guarded by a RESOLVED compose command"
-        );
-        assert!(
-            body.contains("if will_stop_containers:"),
-            "the resolved-compose guard must actually gate the container op"
-        );
+        // NOT CHECKED HERE ANY MORE — SUPERSEDED, not dropped (v0.2.96).
+        //
+        // The guarantee still stands and still matters: container ops in
+        // `_run_uninstall` must be gated on a RESOLVED compose argv, because
+        // v0.2.92 (MAJOR-3) found the uninstaller detecting the runtime
+        // itself — a fourth independent copy that ignored
+        // VCT_CONTAINER_RUNTIME and could print `volume rm` commands naming
+        // the wrong runtime. It resolves through `vco_lib.containers` now.
+        //
+        // What is gone is the way that guarantee was pinned from here: two
+        // `body.contains(...)` scans for a Python VARIABLE NAME
+        // (`will_stop_containers`). That shape fails in both directions.
+        // It died on the first legitimate refactor of its subject — the name
+        // became `stop_argv: Optional[list[str]]`, bound from the resolved
+        // argv so each use-site reads one narrowed value instead of
+        // re-deriving the precondition — while the guarantee was untouched.
+        // And it would have passed on prose: install.py carries the literal
+        // text `compose_argv is not None` inside a COMMENT, so a slightly
+        // looser scan reports agreement with the real guard removed. A
+        // source-text scan cannot tell code from commentary.
+        //
+        // The home for this check is now `tests/test_container_runtime_ssot.py`
+        // (repo root), which pins it STRUCTURALLY, by AST, on the Python side
+        // where the code lives — one language instead of two, which is also
+        // what this repo's cross-language rule asks for. Look there before
+        // concluding the check was abandoned.
     }
 
     // ─── Install log reader (read_install_log_from + derive_install_state) ─────

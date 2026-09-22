@@ -183,7 +183,14 @@ class SeedDiffGateTest(unittest.TestCase):
             install, "_compute_on_disk_content_hashes", return_value=on_disk_hashes,
         ), mock.patch.object(
             install, "_batch_query_weaviate_content_hashes", return_value=stored_hashes,
-        ), mock.patch("subprocess.run", side_effect=_fake_subprocess_run):
+        ), mock.patch("subprocess.run", side_effect=_fake_subprocess_run), \
+           mock.patch.object(
+               # v0.2.96 WP-1: the sync child now spawns via the log-routing
+               # helper; route it through the same fake so no real child
+               # runs and the captures keep recording the seed argvs.
+               install, "run_child_logged",
+               side_effect=_fake_subprocess_run,
+           ):
             install._seed_weaviate(args)
 
         return captured_calls
@@ -542,6 +549,10 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             install, "_batch_query_weaviate_content_hashes", return_value={},
         ), mock.patch(
             "subprocess.run", side_effect=subprocess_side_effect,
+        ), mock.patch.object(
+            # v0.2.96 WP-1: see _run_seed_with_mocks — the sync child now
+            # spawns via run_child_logged.
+            install, "run_child_logged", side_effect=subprocess_side_effect,
         ):
             install._seed_weaviate(
                 _make_args(), deferral_report=deferral_report,

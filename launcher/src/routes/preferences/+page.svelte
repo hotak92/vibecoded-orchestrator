@@ -1147,6 +1147,26 @@
   const KG_SUMMARY_DEFAULT_MODEL = 'gpt-4o-mini';
 
   type KgSummaryOverride = '' | 'cli' | 'ollama' | 'openai' | 'skip';
+
+  // Result of the `recheck_summary_backend` Tauri command. Count fields are
+  // null when the CLI's summary line did not parse.
+  //
+  // MUST MATCH the `SummaryRecheckView` struct in
+  // launcher/src-tauri/src/commands/kg_summary.rs. There is no Rust→TS
+  // codegen here, so this is a hand mirror — locked by the cargo test
+  // `the_recheck_dto_field_set_matches_its_typescript_mirror`, which reads
+  // THIS block and diffs its field names against the serialised struct.
+  // Edit one side only and that test reds (v0.2.96 D-6).
+  type SummaryRecheckView = {
+    project_root: string;
+    exit_code: number;
+    pending_before: number | null;
+    pending_after: number | null;
+    spawned: number | null;
+    failures: number | null;
+    code_leg_skipped: boolean;
+    summary_line: string;
+  };
   let kgSummaryConsent = $state(false);
   let kgSummaryModel = $state<string>(KG_SUMMARY_DEFAULT_MODEL);
   let kgSummaryOverride = $state<KgSummaryOverride>('');
@@ -1305,6 +1325,51 @@
       kgSummaryError = String(e);
     } finally {
       kgSummarySaving = false;
+    }
+  }
+
+  // ── "Recheck summary backend now" (v0.2.96 WP-7b) ────────────────────
+  // After a quota/trust breaker demotes summaries to a fallback tier, the
+  // hash-frozen fallback rows regenerate ONLY via this action (new and
+  // changed nodes resume on the preferred tier by themselves at the 5 h
+  // cooldown). It clears the breaker latch and regenerates exactly the
+  // pending set for the selected project — or the orchestrator root when
+  // none is selected — then resolves the `kg_summaries_degraded`
+  // deferral when nothing is left pending.
+  let summaryRechecking = $state(false);
+
+  async function recheckSummaryBackend() {
+    if (summaryRechecking) return;
+    summaryRechecking = true;
+    try {
+      const view = await invoke<SummaryRecheckView>(
+        'recheck_summary_backend',
+        { projectId: $selectedProject?.id ?? null },
+      );
+      const target = $selectedProject?.name ?? 'orchestrator root';
+      if (view.pending_before !== null && view.pending_after !== null) {
+        const regenerated = Math.max(
+          view.pending_before - view.pending_after,
+          0,
+        );
+        let msg = `Summary recheck (${target}): ${regenerated} regenerated, ` +
+          `${view.pending_after} still pending`;
+        if (view.failures) msg += `, ${view.failures} failure(s)`;
+        if (view.code_leg_skipped) {
+          msg += '; code leg skipped (unresolved project name)';
+        }
+        toast.success(`${msg}.`);
+      } else {
+        // Counts did not parse — surface the CLI's own line verbatim
+        // rather than inventing numbers.
+        toast.success(
+          `Summary recheck (${target}): ${view.summary_line || 'done'}.`,
+        );
+      }
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      summaryRechecking = false;
     }
   }
 
@@ -2408,6 +2473,34 @@
               {/each}
             </select>
           {/if}
+        </div>
+
+        <!-- v0.2.96 WP-7b: manual recheck. Hash-frozen fallback rows (from a
+             quota/trust breaker demotion) regenerate only via this action;
+             new/changed nodes resume on the preferred tier at the 5 h
+             cooldown. Targets the selected project, or the orchestrator
+             root when none is selected. -->
+        <div class="pr-kgsum-block">
+          <p class="pr-kgsum-block-label">Diagnostics</p>
+          <button
+            class="pr-btn"
+            onclick={() => void recheckSummaryBackend()}
+            disabled={summaryRechecking}
+          >
+            {summaryRechecking ? 'Rechecking…' : 'Recheck summary backend now'}
+          </button>
+          <p class="pr-hint" style="margin-top: 6px;">
+            Clears the summary-backend breaker and regenerates the
+            hash-frozen fallback rows for
+            {#if $selectedProject}
+              <code>{$selectedProject.name}</code>
+            {:else}
+              the orchestrator root
+            {/if}
+            (new and changed nodes resume on the preferred tier by
+            themselves at the 5&nbsp;h breaker cooldown). Runs in the
+            background — this can take a while on large knowledge trees.
+          </p>
         </div>
 
         {#if kgSummarySaving}

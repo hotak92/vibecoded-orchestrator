@@ -107,6 +107,15 @@ pub struct DuplicateScanResult {
     /// silently drop the value).
     pub threshold: f64,
     pub pairs: Vec<DuplicatePair>,
+    /// Nodes the scan never COMPARED because they were re-synced under it
+    /// (v0.2.96). Non-zero means `pairs` is a FLOOR, not a verdict: a
+    /// duplicate involving a skipped node is simply absent from it. The
+    /// exit-status check above already separates a FAILED scan from a clean
+    /// one; this separates a clean one from a PARTIAL one, which otherwise
+    /// renders identically. `#[serde(default)]` on the payload keeps a
+    /// project still carrying a pre-v0.2.96 `detect_duplicates.py` working
+    /// (it reports 0, which is what those scans implicitly claimed).
+    pub nodes_skipped: u64,
 }
 
 /// Result of `code_graph_reanalyze_current` / `code_graph_prune_stale`.
@@ -384,6 +393,8 @@ pub async fn kg_check_duplicates(
         threshold: f64,
         #[serde(default)]
         pairs: Vec<DuplicatePair>,
+        #[serde(default)]
+        nodes_skipped: u64,
     }
     let payload: Payload = serde_json::from_str(json_doc).map_err(|e| {
         format!(
@@ -402,12 +413,14 @@ pub async fn kg_check_duplicates(
         &serde_json::json!({
             "threshold": payload.threshold,
             "pair_count": payload.pairs.len(),
+            "nodes_skipped": payload.nodes_skipped,
         }),
     )?;
 
     Ok(DuplicateScanResult {
         threshold: payload.threshold,
         pairs: payload.pairs,
+        nodes_skipped: payload.nodes_skipped,
     })
 }
 

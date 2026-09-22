@@ -81,28 +81,95 @@ class _ConfigHandle:
         return _Config(self._vector_config)
 
 
+# The message Weaviate really returns for `near_object` against a uuid that no
+# longer exists — captured verbatim from the live instance on 2026-09-22.
+# NOTE the absent `for target: <slot>` tail: the SAME sentence with that tail
+# means "this object has no vector in the slot you named". The scanner must
+# not tell them apart by text (it asks whether the object still exists), and
+# these doubles exercise both.
+VANISHED_MSG = (
+    "Query call with protocol GRPC search failed with message explorer: get "
+    "class: concurrentTargetVectorSearch): explorer: get class: vectorize "
+    "search vector: nearObject params: vector not found."
+)
+EMPTY_SLOT_MSG = VANISHED_MSG[:-1] + " for target: ollama_embed."
+
+
 class _Query:
-    def __init__(self, node: _Obj, recorder: list) -> None:
+    def __init__(
+        self,
+        node: _Obj,
+        recorder: list,
+        *,
+        nodes: "list[_Obj] | None" = None,
+        vanished: "frozenset[str] | set[str]" = frozenset(),
+        still_present_failures: "frozenset[str] | set[str]" = frozenset(),
+        exists_probe_raises: bool = False,
+    ) -> None:
         self._node = node
         self._recorder = recorder
+        self._nodes = [node] if nodes is None else list(nodes)
+        #: uuids DELETED between the snapshot and their comparison — the
+        #: v0.2.96 race (kg-sync upserts delete-then-insert with a new uuid).
+        self._vanished = set(vanished)
+        #: uuids whose `near_object` fails while the object is STILL THERE —
+        #: the structural failures (wrong slot, dead transport) that must keep
+        #: aborting the scan.
+        self._still_present_failures = set(still_present_failures)
+        self._exists_probe_raises = exists_probe_raises
 
     def fetch_objects(self, **_kw):
-        return _Page([self._node])
+        return _Page(list(self._nodes))
+
+    def fetch_object_by_id(self, uid, **_kw):
+        if self._exists_probe_raises:
+            raise RuntimeError("schema/transport error during existence probe")
+        key = str(uid)
+        if key in self._vanished:
+            return None
+        for node in self._nodes:
+            if str(node.uuid) == key:
+                return node
+        return None
 
     def near_object(self, **kwargs):
         self._recorder.append(kwargs)
+        key = str(kwargs.get("near_object"))
+        if key in self._vanished:
+            raise RuntimeError(VANISHED_MSG)
+        if key in self._still_present_failures:
+            raise RuntimeError(EMPTY_SLOT_MSG)
         # The node itself — the scanner skips self, so the scan completes
         # with zero pairs and we get a clean look at the kwargs.
+        for node in self._nodes:
+            if str(node.uuid) == key:
+                return _Page([node])
         return _Page([self._node])
 
 
 class _Collection:
     """A collection whose SCHEMA shape is the variable under test."""
 
-    def __init__(self, vector_config, *, with_config: bool = True) -> None:
+    def __init__(
+        self,
+        vector_config,
+        *,
+        with_config: bool = True,
+        nodes: "list[_Obj] | None" = None,
+        vanished: "frozenset[str] | set[str]" = frozenset(),
+        still_present_failures: "frozenset[str] | set[str]" = frozenset(),
+        exists_probe_raises: bool = False,
+    ) -> None:
         self.node = _Obj(str(uuid.uuid4()), "A Node", "knowledge/a.md")
         self.recorded: list = []
-        self.query = _Query(self.node, self.recorded)
+        self.query = _Query(
+            self.node,
+            self.recorded,
+            nodes=nodes,
+            vanished=vanished,
+            still_present_failures=still_present_failures,
+            exists_probe_raises=exists_probe_raises,
+        )
         if with_config:
             self.config = _ConfigHandle(vector_config)
 
@@ -425,3 +492,308 @@ def test_shared_resolver_reports_the_legacy_shape_as_no_named_vectors() -> None:
         config = _ConfigWithoutVectorConfig()
 
     assert collection_vector_slots(_Coll()) is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.2.96 — the SECOND field defect on this same mechanism (2026-09-22)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Observed live, via the hook path, on a maintainer machine::
+#
+#     📊 Found 761 nodes to analyze
+#     ❌ Error during duplicate detection: Query call with protocol GRPC search
+#        failed with message explorer: get class: concurrentTargetVectorSearch):
+#        explorer: get class: vectorize search vector: nearObject params:
+#        vector not found.
+#     ⚠️  Scan did NOT complete — no verdict.
+#
+# …and the SAME scanner, run directly seconds later, completed: 761 nodes,
+# 8 duplicates, report written. The scanner was not broken; one invocation
+# PATH was.
+#
+# Root cause: the scan snapshots every node's uuid up front and then issues
+# one `near_object(<that uuid>)` per node. `route-touched-path.sh` fires it
+# from the knowledge-edit hook itself — into the kg-sync burst the same fire
+# just scheduled — and `sync_knowledge_graph` upserts by DELETE + INSERT with
+# no fixed uuid, so a node re-synced mid-scan loses the snapshotted uuid
+# forever. Weaviate answers that with `nearObject params: vector not found`
+# and the single outer `except` aborted the entire run.
+#
+# These tests drive the REAL `find_duplicates`. The property they protect is
+# not "tolerate errors" — it is the pair: a vanished node is survivable AND
+# says so; anything else still fails loudly.
+
+
+def _nodes(count: int) -> list:
+    return [
+        _Obj(str(uuid.uuid4()), f"Node {i}", f"knowledge/n{i}.md")
+        for i in range(count)
+    ]
+
+
+def test_a_node_resynced_mid_scan_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The field defect, pinned: one vanished node must not kill the scan.
+
+    Red-proof: delete the ``try/except`` around ``near_object`` in
+    ``find_duplicates`` (or its ``continue``) and this fails — ``scan_error``
+    is set and the 3-node scan produces no verdict, exactly as the live run
+    did over 761 nodes.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(3)
+    coll = _Collection(MULTI_VECTOR, nodes=nodes, vanished={str(nodes[1].uuid)})
+
+    duplicates, det = _scan(mod, coll)
+
+    assert det.scan_error is None, (
+        "a node re-synced under the scan is an expected condition on a live "
+        f"collection, not a scan failure: {det.scan_error}"
+    )
+    assert det.nodes_skipped == 1
+    assert duplicates == []
+    # All three were attempted; the survivors were really compared.
+    assert len(coll.recorded) == 3
+
+
+def test_a_partial_scan_is_announced_not_silently_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tolerance must not become silence.
+
+    The 2026-09-09 fix on this same scanner exists because "no verdict" read
+    as "nothing found". A partial verdict must be as visible: the count is on
+    the detector, and the terminal line carries ⚠️ — the marker the hook's
+    report grep (``route-touched-path.sh``: ``✅|⚠️|📊|❌``) keys on, so it
+    reaches the reader rather than dying in dropped stdout.
+
+    Red-proof: drop the ``if self.nodes_skipped:`` progress block and this
+    fails on the missing ⚠️ line.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(4)
+    gone = {str(nodes[0].uuid), str(nodes[2].uuid)}
+    coll = _Collection(MULTI_VECTOR, nodes=nodes, vanished=gone)
+
+    det = mod.DuplicateDetector.__new__(mod.DuplicateDetector)
+    det.threshold = 0.95
+    det.scan_error = None
+    det.collection = coll
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        det.find_duplicates()
+
+    assert det.nodes_skipped == 2
+    printed = out.getvalue()
+    assert "⚠️" in printed, f"a partial scan must announce itself: {printed!r}"
+    assert "2 of 4" in printed
+
+
+def test_a_failure_with_the_object_still_present_still_fails_the_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dangerous direction stays closed.
+
+    An EMPTY-SLOT failure carries nearly the same sentence as a vanished
+    object (they differ only by ``for target: <slot>``), and it means the scan
+    is querying a vector nothing ever wrote. If the tolerance swallowed that,
+    the scanner would report "0 duplicates" for a graph it never searched —
+    the precise lie v0.2.92 and v0.2.94 each closed once.
+
+    Red-proof: replace the ``if not self._node_is_gone(node_uuid): raise``
+    guard with an unconditional ``continue`` and this fails: the scan reports
+    a clean graph with ``scan_error is None``.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(3)
+    coll = _Collection(
+        MULTI_VECTOR, nodes=nodes, still_present_failures={str(nodes[1].uuid)}
+    )
+
+    duplicates, det = _scan(mod, coll)
+
+    assert duplicates == []
+    assert det.scan_error, "a failure on an object that is STILL THERE is fatal"
+    assert "vector not found" in det.scan_error
+
+
+def test_an_existence_probe_that_itself_fails_is_not_a_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cannot confirm ⇒ do nothing (the standing conservative-default rule).
+
+    If the probe that would establish "this object is gone" raises, absence is
+    NOT established. Guessing it is would turn a broken transport into a
+    partial-but-plausible verdict.
+
+    Red-proof: make ``_node_is_gone`` return True in its ``except`` arm and
+    this fails — the scan completes with ``scan_error is None``.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(2)
+    coll = _Collection(
+        MULTI_VECTOR,
+        nodes=nodes,
+        vanished={str(nodes[0].uuid)},
+        exists_probe_raises=True,
+    )
+
+    _duplicates, det = _scan(mod, coll)
+
+    assert det.scan_error, "an unconfirmable absence must not be read as absence"
+
+
+def test_every_node_vanishing_is_no_verdict_not_a_clean_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing compared is the ABSENCE of a verdict, not a partial one.
+
+    A full re-embed or a wholesale kg-sync invalidates every snapshotted uuid.
+    Reporting "0 duplicates, 100% skipped" would be a verdict shaped like a
+    clean bill of health.
+
+    Red-proof: delete the ``nodes_skipped == len(nodes)`` raise and this fails
+    — ``scan_error`` is None and ``main`` would exit 0.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(3)
+    coll = _Collection(
+        MULTI_VECTOR, nodes=nodes, vanished={str(n.uuid) for n in nodes}
+    )
+
+    duplicates, det = _scan(mod, coll)
+
+    assert duplicates == []
+    assert det.scan_error, "zero nodes compared is no verdict"
+    assert "disappeared" in det.scan_error
+
+
+# ─── the verdict surfaces: a partial scan is never printed as "clean" ───────
+
+
+class _StubDetector:
+    """Stands in for the real detector so ``main`` can be driven end to end."""
+
+    instances: list = []
+
+    def __init__(self, similarity_threshold: float = 0.95) -> None:
+        self.threshold = similarity_threshold
+        self.scan_error = None
+        self.nodes_skipped = 2
+        _StubDetector.instances.append(self)
+
+    def find_duplicates(self):
+        return []
+
+    def close(self):
+        return None
+
+
+def _run_main(mod, monkeypatch: pytest.MonkeyPatch, argv: list):
+    monkeypatch.setattr(mod, "DuplicateDetector", _StubDetector)
+    monkeypatch.setattr(sys, "argv", ["detect_duplicates.py", *argv])
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = mod.main()
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_main_never_prints_clean_after_a_partial_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The human verdict.
+
+    Red-proof: delete the ``elif detector.nodes_skipped:`` arm in ``main`` and
+    this fails — the run prints "knowledge graph is clean!" for a graph two of
+    whose nodes were never looked at.
+    """
+    mod = _load(SCANNER)
+    _StubDetector.instances = []
+
+    code, out, _err = _run_main(mod, monkeypatch, [])
+
+    assert code == 0, "a PARTIAL scan completed — it is not a failure"
+    assert "clean" not in out.lower(), f"partial must not read as clean: {out!r}"
+    assert "⚠️" in out and "PARTIAL" in out
+
+
+def test_json_payload_carries_the_skip_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The machine verdict — the launcher modal needs the same distinction.
+
+    Red-proof: drop ``"nodes_skipped"`` from the payload and this fails; the
+    launcher would render "0 duplicates" for a partial scan.
+    """
+    import json as _json
+
+    mod = _load(SCANNER)
+    _StubDetector.instances = []
+
+    code, out, _err = _run_main(mod, monkeypatch, ["--json"])
+
+    payload = _json.loads(out)
+    assert payload["nodes_skipped"] == 2
+    assert payload["count"] == 0
+    assert code == 0
+
+
+# ─── the scanner addresses the ENV-RESOLVED Weaviate, not a hardcoded one ───
+
+
+def test_the_scanner_connects_to_the_env_resolved_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``WEAVIATE_PORT`` must steer the scan (v0.2.96).
+
+    ``detect_duplicates.py`` computed ``WEAVIATE_URL`` at module level — and a
+    parity test pins that computation against the shared home — while its
+    ``connect_to_custom`` hardcoded ``localhost:8081``. The constant was
+    credited and inert: on a relocated Weaviate the scan addressed a DIFFERENT
+    instance (or nothing), and reported no verdict for a collection it never
+    reached.
+
+    Red-proof: restore ``http_host='localhost', http_port=8081`` and this
+    fails on the recorded URL.
+    """
+    monkeypatch.delenv("WEAVIATE_URL", raising=False)
+    monkeypatch.setenv("WEAVIATE_PORT", "19731")
+    monkeypatch.setenv("GRPC_PORT", "50052")
+
+    import vco_lib.weaviate_helpers as wh
+
+    recorded: dict = {}
+
+    class _FakeCollections:
+        def get(self, name):
+            return _Collection(MULTI_VECTOR)
+
+    class _FakeClient:
+        collections = _FakeCollections()
+
+    def _fake_connect(url=None, **kwargs):
+        recorded["url"] = url
+        recorded.update(kwargs)
+        return _FakeClient()
+
+    monkeypatch.setattr(wh, "connect_v4", _fake_connect)
+
+    mod = _load(SCANNER)
+    assert mod.WEAVIATE_URL == "http://localhost:19731"
+
+    det = mod.DuplicateDetector(similarity_threshold=0.95)
+    try:
+        assert recorded["url"] == "http://localhost:19731", (
+            "the scan must address the env-resolved instance, not localhost:8081"
+        )
+        assert recorded["skip_init_checks"] is False, (
+            "an unreachable Weaviate must still fail at connect, loudly"
+        )
+    finally:
+        det.close()

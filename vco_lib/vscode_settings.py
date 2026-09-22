@@ -1459,11 +1459,19 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
 
 
 def _version_tuple(text: str) -> tuple:
-    parts = []
-    for chunk in text.split("."):
-        digits = "".join(c for c in chunk if c.isdigit())
-        parts.append(int(digits) if digits else 0)
-    return tuple(parts)
+    """Comparable version key — see :mod:`vco_lib.version_compare`.
+
+    This used to FILTER digits out of each dotted chunk, so ``0.2.95rc1``
+    became ``(0, 2, 951)`` and ranked above ``0.2.100``. The freshness proof
+    below reports whether the RUNNING gateway is the INSTALLED code, and an
+    editable install's metadata version carries a suffix routinely — so the
+    one comparison a user relies on to answer "is my restart needed" could
+    answer backwards. Now the leading-digit rule the rest of the codebase
+    already used.
+    """
+    from vco_lib.version_compare import version_parts
+
+    return tuple(version_parts(text))
 
 
 def _this_package_version() -> str:

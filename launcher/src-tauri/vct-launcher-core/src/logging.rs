@@ -471,20 +471,30 @@ pub fn init_tracing_named(level: Level, name: &str) {
         // some other subscriber won the race, ours is inert and reloading
         // it would silently do nothing while looking like it worked.
         let _ = RELOAD_HANDLE.set(handle);
-        // The banner is at ERROR level ON PURPOSE. It is not an error; it is
-        // the one line that must appear even when the user has set
-        // `VCO_LOG_LEVEL=error` to quieten a noisy session — otherwise the
-        // "does this file exist and does it have content?" invariant holds
-        // only at INFO and above, and the quietest setting produces the
-        // emptiest evidence exactly when someone is debugging.
-        tracing::error!(
-            "[vct] {} {} started — diagnostics: {} (keeping the newest {} daily files)",
-            name,
-            env!("CARGO_PKG_VERSION"),
-            log_path.display(),
-            LOG_RETENTION_FILES,
-        );
+        emit_startup_banner(name, &log_path);
     }
+}
+
+/// The one startup line every process writes once its subscriber is in.
+///
+/// v0.2.96 WP-8 (register issue 7): INFO, not ERROR. It was ERROR "on
+/// purpose" so the banner would survive `VCO_LOG_LEVEL=error`, but that
+/// reasoning is outweighed by what the field showed: a watcher scanning
+/// launcher logs for ERROR lines (a completely reasonable way to triage a
+/// support dump) false-alarms on every single healthy start — the banner
+/// is by definition the most common ERROR in the file. The visibility
+/// argument is preserved by construction instead: the file is created
+/// EAGERLY above, so "does this file exist" stays true at every level,
+/// and a quietened session still gets its banner the moment it emits a
+/// real diagnostic.
+fn emit_startup_banner(name: &str, log_path: &Path) {
+    tracing::info!(
+        "[vct] {} {} started — diagnostics: {} (keeping the newest {} daily files)",
+        name,
+        env!("CARGO_PKG_VERSION"),
+        log_path.display(),
+        LOG_RETENTION_FILES,
+    );
 }
 
 /// Backwards-compatible entry point: `init_tracing_named(level, "launcher")`.
@@ -748,6 +758,34 @@ mod tests {
                     .with_writer(DailyFileMakeWriter(sink)),
             );
         tracing::subscriber::with_default(subscriber, f);
+    }
+
+    #[test]
+    fn startup_banner_is_info_not_error() {
+        // v0.2.96 WP-8 (register issue 7): an ERROR-scanning watcher
+        // triaged every healthy start as a failure because the banner was
+        // by definition the most common ERROR line in the file. The
+        // compact format renders the level as text, so severity is
+        // assertable from the file body itself.
+        crate::test_env::with_state_dir(|_root| {
+            let dir = log_dir();
+            with_file_subscriber(&dir, "launcher", || {
+                emit_startup_banner("launcher", &dir.join("launcher.log"));
+            });
+            let body = std::fs::read_to_string(
+                dir.join(DailyFile::file_name("launcher", &DailyFile::today())),
+            )
+            .expect("read log");
+            let banner = body
+                .lines()
+                .find(|l| l.contains("started — diagnostics:"))
+                .unwrap_or_else(|| panic!("no banner in log:\n{body}"));
+            assert!(banner.contains("INFO"), "banner must be INFO; got:\n{banner}");
+            assert!(
+                !banner.contains("ERROR"),
+                "banner must not be ERROR; got:\n{banner}"
+            );
+        });
     }
 
     #[test]

@@ -59,6 +59,21 @@ logger = logging.getLogger(__name__)
 #: the user adds in the GUI is still picked up within seconds.
 NEGATIVE_TTL_CAP_S = 30
 
+#: How long a key that PREVIOUSLY resolved keeps being served once resolution
+#: starts failing (issue 12, the 2026-09-20 update). The update stops vct-hub
+#: by design; the hub's per-project route is the only way to an OS-keychain
+#: key; and nine 503 ``vendor_key_unavailable`` answers followed during the
+#: ~80-minute hub-stop window for a key that was fine the whole time. The
+#: resolver's single cache slot holds last-ATTEMPT, so the first failed
+#: re-resolution erased the good key — the fix is a SECOND, success-only
+#: ``_last_good`` store, and this is the bound it serves within. 6 h covers an
+#: update's hub-stop window with room to spare while still expiring a key
+#: REVOKED this morning within the evening. The env knob
+#: (``VCT_MODEL_GATEWAY_KEY_STALE_MAX_S``) is read by
+#: :mod:`model_router.config`, never here: this module deliberately imports
+#: neither ``os`` nor ``subprocess``.
+DEFAULT_SERVE_STALE_MAX_AGE_S = 6 * 3600
+
 SecretGetter = Callable[..., str]
 
 #: Maps a project PATH (or id) to the hub's project id. Raises on every
@@ -86,7 +101,9 @@ class KeyResult:
 
     key: Optional[str] = None
     problem: Optional[str] = None
-    #: ``resolved`` / ``cached`` / ``missing``.
+    #: ``resolved`` / ``cached`` / ``stale`` / ``missing``. ``stale`` is the
+    #: last-known-good key served through a FAILED resolution (issue 12) —
+    #: still the same key value, only its provenance changed.
     state: str = "missing"
     #: Which declared key name answered. Names are not secrets.
     resolved_from: Optional[str] = None
@@ -228,12 +245,36 @@ class VendorKeyResolver:
         scope_prober: Optional[ScopeProber] = None,
         probe_scope_on_miss: bool = False,
         install_root: Optional[InstallRootResolver] = None,
+        serve_stale_max_age_s: int = DEFAULT_SERVE_STALE_MAX_AGE_S,
     ) -> None:
         self._project = project
         self._ttl_s = max(1, int(ttl_s))
         self._getter = getter
         self._clock = clock
         self._cache: dict[str, _CacheEntry] = {}
+        #: Success-only store (issue 12). ``_cache`` above holds the last
+        #: ATTEMPT — a failed re-resolution overwrites it — so the
+        #: last-known-good key needs its own home that only a success writes.
+        self._last_good: dict[str, _CacheEntry] = {}
+        #: Vendors currently served from ``_last_good``; drives the
+        #: EDGE-TRIGGERED WARN pair (enter stale once, leave stale once) and
+        #: ``serving_stale_ids`` for ``/health``.
+        self._serving_stale: set[str] = set()
+        #: Vendors whose last-known-good key aged PAST the serve-stale bound.
+        #: A third state, tracked separately because leaving stale service
+        #: through the bound is not recovery — the vendor is answering
+        #: failures again, and the operator who read that line is still owed
+        #: the one that says it resolves again (it was never emitted: the
+        #: bound path discarded the vendor from ``_serving_stale``, so
+        #: :meth:`_leave_stale` had nothing to react to).
+        self._past_stale_bound: set[str] = set()
+        #: Vendors already named in a "no key" WARN. Edge-triggered for the
+        #: same reason as the pair above: this line fired once per ATTEMPT,
+        #: so an 80-minute hub stop wrote ~160 identical warnings — the 503
+        #: storm rebuilt as a WARN storm, which is what issue 12 set out to
+        #: stop.
+        self._no_key_logged: set[str] = set()
+        self._serve_stale_max_age_s = max(1, int(serve_stale_max_age_s))
         self._scope_prober = scope_prober
         #: Resolves the DEFAULT scope when nothing is pinned. Memoized on
         #: first use rather than called here, because ``create_app`` promises
@@ -473,11 +514,117 @@ class VendorKeyResolver:
             )
         )
 
+    def serving_stale_ids(self) -> tuple[str, ...]:
+        """Vendor ids currently answered from the last-known-good store.
+
+        ``/health`` reads this beside :meth:`cached_vendor_ids`. A
+        stale-served vendor is deliberately NOT listed as cached — its
+        ordinary cache slot holds a failure — so this is the only surface
+        where the issue-12 state is visible.
+        """
+        return tuple(sorted(self._serving_stale))
+
     def invalidate(self, vendor_id: Optional[str] = None) -> None:
+        """Drop cached state — INCLUDING the last-known-good store.
+
+        An explicit invalidation (a key was rotated or revoked on purpose)
+        must not be undone by serve-stale, so it clears ``_last_good`` too.
+        """
         if vendor_id is None:
             self._cache.clear()
+            self._last_good.clear()
+            self._serving_stale.clear()
+            self._past_stale_bound.clear()
+            self._no_key_logged.clear()
         else:
             self._cache.pop(vendor_id, None)
+            self._last_good.pop(vendor_id, None)
+            self._serving_stale.discard(vendor_id)
+            self._past_stale_bound.discard(vendor_id)
+            self._no_key_logged.discard(vendor_id)
+
+    def _serve_stale(
+        self, vendor: Vendor, now: float, *, fresh: KeyResult
+    ) -> Optional[KeyResult]:
+        """Answer a FAILED resolution with the last-known-good key (issue 12).
+
+        Field evidence: the 2026-09-20 update stopped vct-hub by design, the
+        hub's per-project route is the only way to an OS-keychain key, and
+        nine 503 ``vendor_key_unavailable`` answers followed during the
+        ~80-minute hub-stop window for a key that was fine the whole time.
+        Only a SUCCESS ever writes ``_last_good``, so the failed
+        re-resolution that overwrote the ordinary cache slot cannot erase
+        it here.
+
+        The serve is bounded — past ``_serve_stale_max_age_s`` the resolver
+        answers failures again, so a key REVOKED this morning stops being
+        served the same day. Both WARNs are EDGE-TRIGGERED per vendor: one
+        line entering stale service, one line leaving it. Per-request
+        warnings would rebuild the 503 storm as a WARN storm.
+        """
+        entry = self._last_good.get(vendor.vendor_id)
+        if entry is not None and entry.result.key:
+            age = now - entry.fetched_at
+            # Inclusive on purpose, and the only inclusive bound in this
+            # module: this asks "is the key WITHIN the serve-stale bound",
+            # while the TTL checks elsewhere ask "is the entry YOUNGER than
+            # its TTL" and are therefore exclusive. Two questions, two
+            # comparisons — not a drift to normalise away.
+            if age <= self._serve_stale_max_age_s:
+                if vendor.vendor_id not in self._serving_stale:
+                    self._serving_stale.add(vendor.vendor_id)
+                    logger.warning(
+                        "model-gateway: vendor %s key resolution failed; "
+                        "serving the last-known-good key (resolved %ds ago, "
+                        "serve-stale bound %ds). Fresh resolution said: %s. "
+                        "Expected while the hub is stopped — an update stops "
+                        "it by design — and self-heals on the next success.",
+                        vendor.vendor_id,
+                        int(age),
+                        self._serve_stale_max_age_s,
+                        fresh.problem or "no key found",
+                    )
+                return KeyResult(
+                    key=entry.result.key,
+                    state="stale",
+                    resolved_from=entry.result.resolved_from,
+                )
+        if vendor.vendor_id in self._serving_stale:
+            self._serving_stale.discard(vendor.vendor_id)
+            self._past_stale_bound.add(vendor.vendor_id)
+            logger.warning(
+                "model-gateway: vendor %s has no fresh key and its "
+                "last-known-good one is past the serve-stale bound (%ds); "
+                "answering failures again",
+                vendor.vendor_id,
+                self._serve_stale_max_age_s,
+            )
+        return None
+
+    def _leave_stale(self, vendor_id: str) -> None:
+        """State a RECOVERY once, whichever failure state it ends.
+
+        Two states end here, and until 2026-09-22 only the first did: a
+        vendor served from ``_last_good``, and a vendor whose last-good key
+        aged past the bound and was answering failures again. The second was
+        the louder one to be left in — the operator read "answering failures
+        again" and was never told it stopped.
+        """
+        recovered = (
+            vendor_id in self._serving_stale
+            or vendor_id in self._past_stale_bound
+        )
+        was_stale = vendor_id in self._serving_stale
+        self._serving_stale.discard(vendor_id)
+        self._past_stale_bound.discard(vendor_id)
+        self._no_key_logged.discard(vendor_id)
+        if recovered:
+            logger.info(
+                "model-gateway: vendor %s key resolves again%s",
+                vendor_id,
+                "; no longer serving the last-known-good one" if was_stale
+                else " after answering failures",
+            )
 
     def resolve(self, vendor: Vendor) -> KeyResult:
         """Blocking resolution. Callers on the event loop use :meth:`aresolve`."""
@@ -492,10 +639,23 @@ class VendorKeyResolver:
                         state="cached",
                         resolved_from=entry.result.resolved_from,
                     )
+                # A cached failure still serves the last-known-good key while
+                # within the bound (issue 12): the negative cache exists to
+                # stop resolver storms, not to 503 requests through them.
+                stale = self._serve_stale(vendor, now, fresh=entry.result)
+                if stale is not None:
+                    return stale
                 return entry.result
 
         result = self._resolve_uncached(vendor)
         self._cache[vendor.vendor_id] = _CacheEntry(result=result, fetched_at=now)
+        if result.key:
+            self._last_good[vendor.vendor_id] = _CacheEntry(result=result, fetched_at=now)
+            self._leave_stale(vendor.vendor_id)
+            return result
+        stale = self._serve_stale(vendor, now, fresh=result)
+        if stale is not None:
+            return stale
         return result
 
     async def aresolve(self, vendor: Vendor) -> KeyResult:
@@ -605,15 +765,19 @@ class VendorKeyResolver:
             f"Resolver detail: {'; '.join(failures) if failures else 'no attempt made'}"
             f"{scope_note}"
         )
-        logger.warning(
-            "model-gateway: no key for vendor %s (tried %s)",
-            vendor.vendor_id,
-            ", ".join(vendor.secret_keys),
-        )
+        if vendor.vendor_id not in self._no_key_logged:
+            self._no_key_logged.add(vendor.vendor_id)
+            logger.warning(
+                "model-gateway: no key for vendor %s (tried %s). Said once "
+                "per vendor until it resolves again, not once per attempt.",
+                vendor.vendor_id,
+                ", ".join(vendor.secret_keys),
+            )
         return KeyResult(problem=problem)
 
 
 __all__ = [
+    "DEFAULT_SERVE_STALE_MAX_AGE_S",
     "InstallRootResolver",
     "KeyResult",
     "NEGATIVE_TTL_CAP_S",

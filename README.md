@@ -237,7 +237,7 @@ vibecoded-orchestrator/
 │   # per project — opt in via the launcher's Diagrams tab
 ├── templates/
 │   ├── agents/free/           # 44 bundled agents
-│   ├── skills/                # 53 bundled skills
+│   ├── skills/                # 54 bundled skills
 │   └── hooks/                 # Hook sources rendered into .claude/hooks/ at install
 ├── infrastructure/
 │   ├── docker-compose.yml     # Weaviate + Ollama

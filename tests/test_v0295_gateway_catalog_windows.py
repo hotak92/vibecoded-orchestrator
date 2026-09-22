@@ -308,8 +308,8 @@ class FamilyFloorTests(unittest.TestCase):
 
     def test_inheritance_is_logged_once_per_process_not_per_request(self) -> None:
         """A picker refresh every few hours must not reprint the sentence."""
-        cat._INHERITED_LOGGED.clear()
-        self.addCleanup(cat._INHERITED_LOGGED.clear)
+        cat.reset_log_once(cat.LOG_ONCE_INHERITED)
+        self.addCleanup(cat.reset_log_once, cat.LOG_ONCE_INHERITED)
         rows = [entry("acme-91", window=cat.ONE_M_WINDOW), entry("acme-92")]
         with self.assertLogs(cat.logger, level=logging.INFO) as captured:
             resolve_all(rows, table_of())
@@ -330,9 +330,13 @@ class OneMFollowsTheWindowTests(unittest.IsolatedAsyncioTestCase):
                 ]
             },
         )
-        ids = [e.id for e in (await service.union(table=table_of())).entries]
-        self.assertIn("claude-newmodel-9", ids)
+        union = await service.union(table=table_of())
+        ids = [e.id for e in union.entries]
+        # The advert auto-updates from upstream's own window with nobody
+        # editing the table; the published spelling is the ``[1m]`` one, and
+        # the plain id is withheld by the window-rows default.
         self.assertIn(f"claude-newmodel-9{ONE_M_SUFFIX}", ids)
+        self.assertIn("claude-newmodel-9", union.hidden)
 
     async def test_an_upstream_200k_model_gets_no_companion(self) -> None:
         """The leave-alone half of the same gate."""
@@ -388,8 +392,8 @@ class TableDisagreementWarningTests(unittest.TestCase):
         )
 
     def setUp(self) -> None:
-        cat._WINDOW_DISAGREEMENT_LOGGED.clear()
-        self.addCleanup(cat._WINDOW_DISAGREEMENT_LOGGED.clear)
+        cat.reset_log_once(cat.LOG_ONCE_WINDOW_DISAGREEMENT)
+        self.addCleanup(cat.reset_log_once, cat.LOG_ONCE_WINDOW_DISAGREEMENT)
 
     def test_a_contradicting_row_is_reported_not_resolved_silently(self) -> None:
         with self.assertLogs(cat.logger, level=logging.WARNING) as captured:
@@ -509,9 +513,12 @@ class LatestOnlyFilterTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         ids = [e.id for e in (await service.union(table=table_of())).entries]
-        self.assertEqual(
-            ids, ["claude-fable-5-1", f"claude-fable-5-1{ONE_M_SUFFIX}"],
-        )
+        # The superseded model contributes NEITHER spelling: a companion for
+        # a model the latest filter removed would be selectable and orphaned.
+        # (The surviving model shows only its ``[1m]`` row under the
+        # window-rows default — a different knob, asserted here so the two
+        # cannot be confused when this list next changes.)
+        self.assertEqual(ids, [f"claude-fable-5-1{ONE_M_SUFFIX}"])
 
 
 class DescriptionTests(unittest.TestCase):
@@ -773,29 +780,57 @@ class ShippedDataInvariantTests(unittest.TestCase):
 
     def test_the_latest_only_picker_is_the_list_a_user_would_choose_from(self) -> None:
         """The shipped result of requirement (a), spelled out so a regression
-        in the grouping is a named diff rather than a count."""
+        in the grouping is a named diff rather than a count.
+
+        Every 1M first-party model appears ONCE, as its ``[1m]`` row: the
+        ``window_rows`` default withholds the plain spelling (which is listed
+        among the hidden ids below, not dropped). The 200K haiku row, having
+        no second spelling to choose between, is untouched by that knob.
+
+        The Token-Plan rows come from the declared fallback in this fixture
+        (the injected fetch answers nothing, so the row's nine declared
+        ids serve). Three of the nine hide as older same-family siblings
+        and two more as curated-hidden (qwen3.7-plus, deepseek-v4-pro).
+        The dated ``deepseek-v4-flash-0731`` snapshot is curated out of the
+        row entirely (owner ruling 2026-09-22 — its four-digit tail parses
+        as VERSION 731 and would outrank ``deepseek-v4.1-flash`` under the
+        latest filter), so the versioned line is the published flash."""
         latest = asyncio.run(self.service.union(table=load_seed()))
         self.assertEqual(
             [row.id for row in latest.entries],
             [
-                "claude-fable-5-1", f"claude-fable-5-1{ONE_M_SUFFIX}",
+                f"claude-fable-5-1{ONE_M_SUFFIX}",
                 "claude-haiku-4-5-20251001",
-                "claude-opus-5", f"claude-opus-5{ONE_M_SUFFIX}",
-                "claude-sonnet-5", f"claude-sonnet-5{ONE_M_SUFFIX}",
+                f"claude-opus-5{ONE_M_SUFFIX}",
+                f"claude-sonnet-5{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3-flash{ONE_M_SUFFIX}",
-                "claude-gw/glm-5-turbo",
-                "claude-gw/glm-4.5-air",
+                "claude-gw/qwen/qwen3.8-max",
+                "claude-gw/qwen/qwen3.8-flash",
+                f"claude-gw/qwen/glm-5.3{ONE_M_SUFFIX}",
+                "claude-gw/qwen/deepseek-v4.1-flash",
             ],
         )
         self.assertEqual(
             sorted(latest.hidden),
             [
+                # ``claude-fable-5-1``, ``claude-opus-5`` and
+                # ``claude-sonnet-5`` are here as the PLAIN spelling of a 1M
+                # model, withheld by the ``window_rows`` default (one model,
+                # one row) rather than by the latest filter — reported, and
+                # still routable by name.
                 "claude-fable-5",
-                "claude-gw/glm-4.5", "claude-gw/glm-4.6", "claude-gw/glm-4.7",
-                "claude-gw/glm-5", "claude-gw/glm-5.1",
-                f"claude-gw/glm-5.2{ONE_M_SUFFIX}",
-                "claude-opus-4-8", "claude-sonnet-4-6",
+                "claude-fable-5-1",
+                "claude-gw/glm-4.5", "claude-gw/glm-4.5-air",
+                "claude-gw/glm-4.6", "claude-gw/glm-4.7",
+                "claude-gw/glm-5", "claude-gw/glm-5-turbo",
+                "claude-gw/glm-5.1", "claude-gw/glm-5.2",
+                "claude-gw/qwen/deepseek-v4-pro",
+                f"claude-gw/qwen/glm-5.2{ONE_M_SUFFIX}",
+                "claude-gw/qwen/qwen3.6-flash", "claude-gw/qwen/qwen3.7-max",
+                "claude-gw/qwen/qwen3.7-plus",
+                "claude-opus-4-8", "claude-opus-5",
+                "claude-sonnet-4-6", "claude-sonnet-5",
             ],
         )
 
@@ -840,6 +875,10 @@ class GatewaySurfaceTests(GatewayTestBase):
         # per request — so the knob is exercised through the real handler
         # rather than through a second construction path.
         self.config.catalog_filter = cat.CATALOG_FILTER_ALL
+        # ``both`` so the hidden list isolates the CATALOG knob under test:
+        # the window-rows default would otherwise withhold each plain row and
+        # this assertion would be reading the wrong knob's work.
+        self.config.window_rows = cat.WINDOW_ROWS_BOTH
         body = await (await self.client.get("/v1/models", headers=self.auth())).json()
         ids = [row["id"] for row in body["data"]]
         self.assertIn("claude-fable-5", ids)
@@ -902,6 +941,55 @@ def _service_with(
         static_ttl_s=60,
         clock=_Clock(),
     )
+
+
+class WindowRowsKnobTests(unittest.TestCase):
+    """``VCT_MODEL_GATEWAY_WINDOW_ROWS`` — the same contract as the catalog
+    knob beside it, for the same reason: a typo must refuse to start rather
+    than run as the default."""
+
+    def test_unset_is_one_m_only(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VCT_MODEL_GATEWAY_WINDOW_ROWS", None)
+            self.assertEqual(
+                cfg.resolve_window_rows(), cfg.WINDOW_ROWS_ONE_M_ONLY,
+            )
+
+    def test_each_accepted_value_resolves_to_itself(self) -> None:
+        for value in cfg.WINDOW_ROW_MODES:
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ, {"VCT_MODEL_GATEWAY_WINDOW_ROWS": value},
+                ):
+                    self.assertEqual(cfg.resolve_window_rows(), value)
+
+    def test_case_and_padding_are_forgiven(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"VCT_MODEL_GATEWAY_WINDOW_ROWS": "  BOTH "},
+        ):
+            self.assertEqual(cfg.resolve_window_rows(), cfg.WINDOW_ROWS_BOTH)
+
+    def test_a_typo_is_refused_and_the_error_names_the_real_values(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"VCT_MODEL_GATEWAY_WINDOW_ROWS": "one"},
+        ):
+            with self.assertRaises(cfg.WindowRowsError) as raised:
+                cfg.resolve_window_rows()
+        for value in cfg.WINDOW_ROW_MODES:
+            self.assertIn(value, str(raised.exception))
+
+    def test_the_config_carries_the_resolved_value(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"VCT_MODEL_GATEWAY_WINDOW_ROWS": "both"},
+        ):
+            self.assertEqual(
+                cfg.GatewayConfig.from_env().window_rows, cfg.WINDOW_ROWS_BOTH,
+            )
+
+    def test_the_default_config_publishes_one_row(self) -> None:
+        self.assertEqual(
+            cfg.GatewayConfig().window_rows, cfg.WINDOW_ROWS_ONE_M_ONLY,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

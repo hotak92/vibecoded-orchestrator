@@ -335,28 +335,12 @@
     "content_hash": "05671c80b1630d3c",
     "total_chunks": 1
   },
-  "knowledge/concepts/orchestrator-code-graph.md": {
-    "title": "Orchestrator Code Graph",
-    "description": "It is a semantic index of source code that extracts structural entities and stores them in Weaviate for both semantic and structural queries.\nKey features include finding code by purpose rather than exact strings, answering structural questions without reading files, and supporting incremental analysis of changed files.\nUse cases involve locating authentication middleware or database retry logic by their function and identifying callers of specific functions or module imports.\nIt matters because it enables developers to navigate complex codebases efficiently by understanding code relationships and intent instead of relying on traditional grep searches.",
-    "summary": "The Orchestrator Code Graph is a semantic index of source code that extracts structural entities (modules, classes, functions, APIs, interactions), embeds them using specialized models (CodeSage-Large-v2 on GPU or Jina on CPU), and stores them in Weaviate for both semantic and structural queries. It enables purpose-based code discovery and answers structural questions like identifying callers or dependencies without reading files. The analysis pipeline supports language detection, AST parsing for Python, regex extraction for others, and incremental updates via `git diff` to re-analyze only changed files. Entities are stored in per-project Weaviate collections with named vectors to support backend switching. The system integrates via an MCP server for search and structure queries, a hook system that queues analysis after file edits, and a pre-edit hook that injects relevant code context.",
-    "generated_at": "2026-07-20T18:52:19.131189+00:00",
-    "content_hash": "e9a2c19607df335f",
-    "total_chunks": 1
-  },
   "knowledge/concepts/orchestrator-context-management.md": {
     "title": "Orchestrator Context Management",
     "description": "Orchestrator Context Management preserves Claude's working state across compaction events using a two-layer memory architecture.\nIt maintains stable project facts in a local MEMORY.md file and active task details in a git-tracked CONTEXT_STATE.md file.\nThis system prevents loss of active task states, modified files, and plans when conversations are automatically summarized.\nIt utilizes RL-scored tiered injection and Lost-In-The-Middle ordering to reinject critical information at optimal positions.",
     "summary": "Orchestrator Context Management preserves Claude's working state across compaction events using a two-layer memory architecture and a save/restore pipeline. Layer 1 (`MEMORY.md`) stores stable, auto-loaded project facts (first 200 lines) locally, while Layer 2 (`CONTEXT_STATE.md`) holds active task state, blockers, and next steps in git (target 250-350 lines). The system employs a Pre-Compact Save Cycle to snapshot state before auto-compaction and a Post-Compact Reinject process using Lost-In-The-Middle (LITM) ordering to place critical information at the start and end of the reinjected payload. Session-level deduplication prevents context bloat by tracking injected nodes, and diff-based injection reduces token overhead by transmitting only changed sections after the initial prompt. Additional efficiency strategies include parallel tool calls, targeted file reads, agent delegation for multi-file tasks, and local analysis without external MCPs.",
     "generated_at": "2026-07-20T18:52:23.149010+00:00",
     "content_hash": "eaad8bc84653c5a9",
-    "total_chunks": 1
-  },
-  "knowledge/concepts/orchestrator-hook-system.md": {
-    "title": "Orchestrator Hook System",
-    "description": "The Orchestrator Hook System allows programmatic interception of Claude Code's lifecycle events, functioning as the system's automated workflow engine. Hooks, implemented as shell scripts registered in `.claude/settings.json`, bind to events like `PreToolUse`, `PostToolUse`, and `SessionStart` to execute custom logic. These hooks enable critical functions such as security enforcement, automatic knowledge-graph synchronization, and context state preservation across operations. Use this system to build complex, resilient agentic workflows requiring pre- and post-execution validation or state management.",
-    "summary": "Hooks intercept Claude Code lifecycle events (e.g., `PreToolUse`, `PreCompact`) via shell scripts registered in `.claude/settings.json` to implement automated workflows, enabling security enforcement, knowledge-graph synchronization, and context preservation. The single most important fact is that hooks provide programmatic control points to intercept and modify the execution flow between user actions and tool utilization.",
-    "generated_at": "2026-09-17T03:58:35.820667+00:00",
-    "content_hash": "4c52fff9b26e53b1",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {

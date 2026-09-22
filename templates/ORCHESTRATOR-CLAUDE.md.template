@@ -460,7 +460,7 @@ A fifth MCP — **playwright** (browser automation) — is enabled by default an
 **Free-tier RL gate** — retrieval reranking skips RL when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL; free-tier users get plain Weaviate cosine ordering. Nothing breaks when the gate is closed — retrieval just falls back to base scores.
 
 ### Hook System
-Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically (the `.ps1` siblings are the native-Windows code path). The list below is a representative subset by event; `ls .claude/hooks/*.sh` enumerates the full set and `.claude/settings.json` shows the event each is registered on (two — `kg-sync-on-edit.sh` and `code-graph-incremental.sh` — are invoked by sibling hooks rather than registered directly).
+Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically (the `.ps1` siblings are the native-Windows code path). The list below is a representative subset by event; `ls .claude/hooks/*.sh` enumerates the full set and `.claude/settings.json` shows the event each is registered on. Two ship **unregistered and uninvoked**, kept for users who want to wire them themselves: `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh` (which mirrors its resolution logic and calls the analyzer itself rather than calling the hook). Neither is dead code; both run standalone.
 
 **SessionStart (startup)**:
 - `ensure-containers.sh` — auto-start Podman/Docker containers (Weaviate, Ollama, code-embed) if not running (background).
@@ -498,7 +498,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `notify-stop.sh` — desktop notification (`notify-send`).
 
 **StopFailure**:
-- `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`.
+- `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`. The notification is coalesced to at most one per 5 minutes per (project, error class), with the suppressed count carried on the next one; the ledger line is written for **every** event regardless. `VCO_STOP_FAILURE_NOTIFY=0` silences the pop-up only — never the ledger, which is the diagnostic worth keeping.
 
 **All available hook events**:
 
@@ -721,7 +721,7 @@ Output: Where to save
 - `tools` / `disallowedTools` — allow/deny tool lists.
 - `permissionMode` — `default` | `acceptEdits` | `dontAsk` | `bypassPermissions` | `plan`.
 - `maxTurns` — max agentic turns before stopping.
-- `effort` — `low` | `medium` | `high` | `xhigh` | `max` — caps per-agent reasoning cost. Frontmatter wins over session level. Cannot be set as Agent-tool parameter — must be in `.md` frontmatter. The env var `CLAUDE_CODE_EFFORT_LEVEL` overrides frontmatter globally. When spawning ad-hoc agents (Agent tool with a description but no pre-existing definition file), tell them in the prompt to operate at `high` effort by default for substantive work — implementation, refactors, multi-file changes, design + code. Reserve `xhigh` / `max` for genuinely deep-reasoning tasks where `high` has empirically fallen short: gnarly architecture spec across many subsystems, security review of unfamiliar code, hard debugging that already proved resistant to standard effort. Trivial sweeps stay at default.
+- `effort` — `low` | `medium` | `high` | `xhigh` | `max` — caps per-agent reasoning cost. Frontmatter wins over session level. Cannot be set as Agent-tool parameter — must be in `.md` frontmatter. The env var `CLAUDE_CODE_EFFORT_LEVEL` overrides frontmatter globally. When spawning ad-hoc agents (Agent tool with a description but no pre-existing definition file), tell them in the prompt to operate at `high` effort by default for substantive work — implementation, refactors, multi-file changes, design + code. **Every bundled agent ships at `high`** (v0.2.96; ten of them pinned `xhigh` before). Reserve `xhigh` / `max` for genuinely deep-reasoning tasks where `high` has empirically fallen short: gnarly architecture spec across many subsystems, security review of unfamiliar code, hard debugging that already proved resistant to standard effort — and check the agent's model first, because **`xhigh` is rejected outright by models that do not expose extended thinking**, so pinning it there makes the agent fail to start rather than reason harder. Trivial sweeps stay at default.
 - `isolation: worktree` — runs in a temporary git worktree (auto-cleaned if no changes).
 - `background: true` — always run as background task.
 - `memory` — `user` | `project` | `local` — enables persistent agent memory directory.
@@ -814,7 +814,7 @@ Two distinct "update" actions live in the launcher:
 The "Update bundle" path is manifest-driven via `<project>/.claude/.vco-manifest.json`:
 - New shipped file → created in the project.
 - Installed file matches the manifest's prior-shipped hash (= untouched since install) → overwritten with the new shipped version.
-- Installed file differs from the manifest's prior-shipped hash (= locally modified) → **adopted**: the current bytes are backed up to `<project>/.claude/backups/bundle-adoptions/<timestamp>/<path>`, then the shipped version is written. Only if that backup cannot be written is the file left alone and a `bundle_user_modified_preserved` deferral entry written to `<project>/.claude/context/UPDATE_DEFERRED.md` with the explicit `--force` command (`--force` writes the shipped version with NO backup — it means "discard my local edits").
+- Installed file differs from the manifest's prior-shipped hash (= locally modified) → **adopted**: the current bytes are backed up to `<project>/.claude/backups/bundle-adoptions/<timestamp>/<path>`, then the shipped version is written. Only if that backup cannot be written is the file left alone and a `bundle_user_modified_preserved` deferral entry written to `<project>/.claude/context/UPDATE_DEFERRED.md`. That entry names the failed backup write and quotes its error per file, and its remedies are ordered: fix the backup destination (free space, write permission, no symlink under `.claude/backups/`) and re-run the ORDINARY update — which adopts the files, captures the backups and clears the entry by itself — then dismiss, then diff per file, and only last `--force`, which writes the shipped version with NO backup on the very machine whose backup writes just failed.
 - `knowledge/**` is the exception: a modified KG node is the user's data and is **always preserved** — on the normal path and under `--force` alike.
 - Schema drift detected (Weaviate target schema differs from on-disk) → `schema_migration_required` deferral entry; the destructive migration is NOT auto-applied. Requires explicit consent via `python -m vco_lib.project_init migrate-collections --name <project>`.
 

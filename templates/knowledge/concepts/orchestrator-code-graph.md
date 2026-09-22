@@ -192,7 +192,7 @@ The `--incremental` flag makes analysis fast enough to run on every commit:
 3. Re-analyze only those files.
 4. Upsert new/updated entities, delete removed ones.
 
-The PostToolUse file-edit hook (`post-file-edit.sh`) routes edited code files to `code-graph-incremental.sh`, which queues them for incremental analysis after every edit.
+The PostToolUse file-edit hook (`post-file-edit.sh`) appends edited code files to a per-session queue in `.claude/state/`, and the `Stop` hook `stop-codegraph-drain.sh` drains that queue at end-of-turn: ONE analyzer pass per canonical root over the turn's files, rate-limited to once per 120 s. `code-graph-incremental.sh` ships **unregistered and uninvoked** — it re-analyzes a single file and is kept for users who want to wire it themselves; its scheduling moved into the drain hook, which mirrors its resolution logic and calls the analyzer directly.
 
 ## Integration Points
 

@@ -175,6 +175,11 @@ from vco_lib.embedding_service import (  # noqa: E402 - must follow the sys.path
     EmbeddingService,
     NoEmbeddingBackendError,
 )
+# v0.2.96: the Weaviate base-URL precedence (WEAVIATE_URL > WEAVIATE_PORT >
+# the canonical port) has ONE home. This is a CALL, not a mirror: the
+# `vco_lib.embedding_service` import directly above is unguarded and runs
+# first, so vco_lib is importable wherever this script runs at all.
+from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 from weaviate_mcp.chunking import chunk_text  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 from weaviate.classes.query import Filter  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 from weaviate.classes.config import Configure, Property, DataType  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
@@ -187,7 +192,7 @@ from weaviate.classes.config import Configure, Property, DataType  # noqa: E402 
 # vector regardless of DUAL_EMBEDDING_ENABLED — the DocumentChunks
 # schema uses `Configure.Vectorizer.none()` (see
 # `ensure_document_chunks_collection`).
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+WEAVIATE_URL = weaviate_url_default()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 

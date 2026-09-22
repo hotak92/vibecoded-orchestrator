@@ -379,12 +379,32 @@ def _collection_prefix(project_name: str) -> "str | None":
 
 
 def _connect_weaviate():
-    """Weaviate client from env (WEAVIATE_URL / GRPC_PORT); None on failure."""
+    """Weaviate client from env (WEAVIATE_URL / WEAVIATE_PORT / GRPC_PORT).
+
+    Returns ``None`` on failure (soft-fail; the call site exits 0).
+
+    v0.2.96: the base URL is resolved by the ONE home,
+    :func:`vco_lib.weaviate_helpers.weaviate_url_default`, rather than by a
+    local ``os.getenv`` of ``WEAVIATE_URL`` alone with the canonical port as
+    its literal fallback — a shape that ignored ``WEAVIATE_PORT`` entirely
+    (and which a test now bans repo-wide, so do not restore it even in
+    prose). This is a CALL rather than a category-C mirror because
+    ``vco_lib`` is already proven importable by the time this runs: ``run()``
+    calls :func:`_collection_prefix` FIRST and returns early when that cannot
+    import ``vco_lib``, and ``_collection_prefix`` puts the same ladder
+    (``VCT_ORCHESTRATOR_ROOT`` → the clone root) on ``sys.path``.
+
+    The import sits OUTSIDE the ``try`` on purpose: a failed ``vco_lib``
+    import is a BROKEN install, and reporting it as "Weaviate unreachable"
+    would be the silent-fallback this repo forbids.
+    """
+    from vco_lib.weaviate_helpers import weaviate_url_default
+
     try:
         import weaviate
         from urllib.parse import urlparse
 
-        url = urlparse(os.getenv("WEAVIATE_URL", "http://localhost:8081"))
+        url = urlparse(weaviate_url_default())
         return weaviate.connect_to_local(
             host=url.hostname or "localhost",
             port=url.port or 8081,

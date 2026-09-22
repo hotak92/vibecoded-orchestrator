@@ -529,7 +529,7 @@ mod tests {
     /// Pinning this through `app_state` is the only way to make "the seed is
     /// unreachable" deterministic: the resolver's fallback walks up from
     /// `current_exe()`, so a test binary inside this checkout otherwise finds
-    /// the real repo root and its real ten-row seed.
+    /// the real repo root and its real shipped seed.
     fn clone_without_seed(dir: &Path) -> PathBuf {
         let clone = dir.join("clone-without-seed");
         std::fs::create_dir_all(clone.join("state")).unwrap();
@@ -895,7 +895,10 @@ mod tests {
     /// The REAL shipped seed loads under the launcher's parser, with the ten
     /// cited GLM rows, the four first-party Claude 5 rows (read only by
     /// `vco_lib.vscode_settings.decorate_1m`; the gateway publishes
-    /// first-party ids verbatim) and the version-key evidence intact.
+    /// first-party ids verbatim), the eight v0.2.96 qwen Token-Plan rows
+    /// (whose `max_output` is 0 = UNSTATED — the vendor page publishes no
+    /// per-model figure and inventing one is forbidden) and the version-key
+    /// evidence intact.
     ///
     /// This reads the repo file directly via `CARGO_MANIFEST_DIR`, which is
     /// compile-time-only path resolution INSIDE `#[cfg(test)]` (the same
@@ -918,8 +921,9 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            14,
-            "the ten cited GLM rows of handoff §7 plus the four Claude 5 rows"
+            22,
+            "the ten cited GLM rows of handoff §7, the four Claude 5 rows, \
+             and the eight v0.2.96 qwen Token-Plan rows"
         );
         assert!(
             rows.iter().all(|r| !r.source.trim().is_empty()),
@@ -937,6 +941,39 @@ mod tests {
             assert!(row.window_1m && row.context_window == 1_000_000, "{}", id);
             assert!(row.source.starts_with("https://docs.anthropic.com"), "{}", id);
         }
+        // The v0.2.96 qwen Token-Plan rows: vendor `qwen`, the DOCUMENTED
+        // 200K default window, NOT 1M (per-model 1M support is UNVERIFIED —
+        // each row's source_note says so), and max_output 0 = UNSTATED: the
+        // cited page publishes no per-model figure and inventing one is
+        // forbidden. These rows are why migration 046 relaxed the CHECK.
+        let qwen: Vec<&ChatModelContextInput> =
+            rows.iter().filter(|r| r.vendor == "qwen").collect();
+        assert_eq!(qwen.len(), 8, "the eight Token-Plan rows; no PAYG row exists");
+        for row in &qwen {
+            assert_eq!(
+                row.max_output, 0,
+                "{}: unstated, never an invented figure",
+                row.model_id
+            );
+            assert_eq!(row.context_window, 200_000, "{}", row.model_id);
+            assert!(
+                !row.window_1m,
+                "{}: per-model 1M support is UNVERIFIED",
+                row.model_id
+            );
+            assert!(
+                row.source.starts_with("https://docs.qwencloud.com/"),
+                "{}: cited to the vendor docs, got {}",
+                row.model_id,
+                row.source
+            );
+            assert!(
+                row.source_note.contains("UNVERIFIED") || row.source_note.contains("unstated"),
+                "{}: the honest caveat must travel with the row, got {:?}",
+                row.model_id,
+                row.source_note
+            );
+        }
         // The version-key evidence: same family, 5x apart. If a future edit
         // ever collapses these into a `glm-5*` rule, this reds.
         assert!(by_id("glm-5.2").window_1m && by_id("glm-5.2").context_window == 1_000_000);
@@ -950,6 +987,81 @@ mod tests {
             air.source_note
         );
         assert!(!air.window_1m, "no unofficial 1M glm-4.5-air");
+    }
+
+    /// CONSUMER-LEVEL CONTRACT (v0.2.96): an UNSTATED row never surfaces a
+    /// max-output figure anywhere along the launcher's own pipeline. The REAL
+    /// shipped seed — eight qwen rows with `max_output: 0` — goes through
+    /// parse → table → exported file, and the file the gateway reads carries
+    /// the 0 marker verbatim: never an invented count, never an absent key
+    /// (the reader's `or 0` coalescing means absent and 0 must not diverge).
+    /// The leave-alone half pins that a row WITH a published figure keeps it.
+    #[test]
+    #[serial_test::serial]
+    fn unstated_rows_flow_from_the_shipped_seed_into_the_export_as_zero() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let mut seed = repo_root;
+        for seg in SEED_RELATIVE_PATH {
+            seed = seed.join(seg);
+        }
+        let raw = std::fs::read_to_string(&seed)
+            .unwrap_or_else(|e| panic!("shipped seed {} unreadable: {}", seed.display(), e));
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("seed is valid JSON");
+        let rows = parse_document(&value).expect("seed parses under the writer's rules");
+
+        let db = make_db();
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&rows).unwrap(),
+            22,
+            "every shipped row — the unstated ones included — stores through \
+             the relaxed CHECK (migration 046)"
+        );
+
+        let dir = tmp_dir("unstated");
+        let target = dir.join("chat_model_context.json");
+        std::env::set_var(EXPORT_PATH_ENV, &target);
+        let report = export_now(&db);
+        std::env::remove_var(EXPORT_PATH_ENV);
+        assert!(report.ok, "export failed: {:?}", report.error);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let models = written["models"].as_object().unwrap();
+        for id in [
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.6-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash-0731",
+            "deepseek-v4.1-flash",
+        ] {
+            let entry = models
+                .get(id)
+                .unwrap_or_else(|| panic!("the export is missing {}", id));
+            assert_eq!(
+                entry["max_output"],
+                serde_json::json!(0),
+                "{}: the export carries the unstated marker, never a figure",
+                id
+            );
+            assert!(
+                entry.as_object().unwrap().contains_key("max_output"),
+                "{}: the key is present — absent and 0 must mean the same \
+                 thing to the reader, and the file says which one it wrote",
+                id
+            );
+        }
+        // Leave-alone: a row WITH a published figure keeps it exactly.
+        assert_eq!(
+            models["glm-5.2"]["max_output"],
+            serde_json::json!(128_000),
+            "a stated figure is untouched by the unstated-marker contract"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// End-to-end on a synthetic clone: seed → table → export, with the

@@ -155,6 +155,25 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "by the 2026-09-09 defect still get their owed walk: decide() rule 4 "
         "fires on crosses_version_boundary(prev, 0.2.95, 0.2.94)."
     ),
+    "0.2.96": (
+        "No extraction-semantics change. `git diff v0.2.95..HEAD` across the "
+        "same extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) "
+        "touches ONE file: schema_versions.py, +10/-1, and the change is the "
+        "launcher.db migration-046 ledger entry (chat_model_context.max_output "
+        "CHECK widened > 0 -> >= 0). That is a launcher DB constraint, not an "
+        "extraction rule — nothing about how an entity is found, named, "
+        "hashed, chunked or truncated moved. _CHUNKER_REVISION unchanged at "
+        "v0.2.92.1; CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7. "
+        "The cycle's code-graph work was the M-2 EXPOSURE repair, which "
+        "re-EMBEDS rows whose vectors came from a silently-truncating "
+        "code-embed image; it demotes those rows to a vectorless sentinel so "
+        "the existing embed_revision gate re-embeds them. That is an embedding "
+        "concern gated on its own mechanism, and appending here instead would "
+        "charge EVERY project with a graph one forced re-extraction to fix a "
+        "population identified by evidence."
+    ),
 }
 
 #: The newest generation a freshly-built graph satisfies.

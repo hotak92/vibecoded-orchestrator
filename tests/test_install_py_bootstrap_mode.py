@@ -103,14 +103,19 @@ def test_bootstrap_weaviate_health_endpoint_is_canonical():
     """NEW-4: bootstrap must report `/v1/.well-known/ready` as the canonical health endpoint."""
     cp = _run_install(["--bootstrap", "--json"])
     env = json.loads(cp.stdout)
-    assert env["weaviate_endpoints"]["health"] == (
-        "http://localhost:8081/v1/.well-known/ready"
-    ), (
+    # The PATH is what NEW-4 pins; the host:port is resolved (v0.2.96 —
+    # these endpoints honour WEAVIATE_URL/WEAVIATE_PORT instead of hardcoding
+    # the default, so a relocated Weaviate is advertised correctly). Asserting
+    # the whole literal would re-pin the very hardcode that fix removed, and
+    # under this suite it reads the unroutable sentinel by design.
+    health = env["weaviate_endpoints"]["health"]
+    assert health.endswith("/v1/.well-known/ready"), (
         "NEW-4 SSOT violation: bootstrap envelope must publish "
         "`/v1/.well-known/ready` as the Weaviate health endpoint, NOT "
         "`/v1/meta`. installer.rs:627 comment is wrong; Python side is "
-        "canonical and Rust consumers must read this value from here."
+        f"canonical and Rust consumers must read this value from here. Got: {health}"
     )
+    assert "/v1/meta" not in health, f"the retired endpoint is back: {health}"
 
 
 def test_bootstrap_launcher_dist_subdir_no_experimental_macos():

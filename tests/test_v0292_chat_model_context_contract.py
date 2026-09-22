@@ -266,9 +266,10 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
             )
             self.assertEqual(table.path, path)
             self.assertEqual(table.uncited, ())
-            # Ten cited vendor rows + the four first-party Claude 5 rows
-            # (pinned in tests/test_model_router_context_table.py).
-            self.assertEqual(len(table.rows), 14)
+            # Ten cited zai rows + the four first-party Claude 5 rows + the
+            # eight QwenCloud Token-Plan rows (v0.2.96) — the id sets are
+            # pinned in tests/test_model_router_context_table.py.
+            self.assertEqual(len(table.rows), 22)
 
     def test_the_one_m_decisions_survive_the_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

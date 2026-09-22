@@ -690,9 +690,34 @@ cd <orchestrator-root>/infrastructure
 docker compose --profile gpu up -d --build --force-recreate code_embed
 ```
 
-**Order matters.** Refresh the image **before** re-running any code-graph
-re-sync. Rebuilding the graph first re-walks every entity through the old,
-truncating service and then reports success — you would have to do it twice.
+**Order matters — and since v0.2.96 it is enforced, not just advised.** The
+freshness verdict is taken inside the code-graph re-sync driver itself, so
+every path through it passes the check: the install trigger, the deferral
+auto-retry, and a manual `--run-resync`. A stale verdict records the deferral
+(rebuild first, then re-run) instead of embedding, rather than re-walking
+every entity through the truncating service and reporting success. A verdict
+that cannot be established positively never gates. A persistently stale image
+also no longer quietly burns the auto-retry budget: the dispatcher blocks
+before it counts an attempt, so the retry fires on the first pass after your
+rebuild instead of having been retired three passes earlier.
+
+**Vectors already written through such an image do not fix themselves, and
+before v0.2.96 the printed remedy wrongly implied they would.** They carry
+*correct* content hashes, so every skip gate passes over them forever — a
+plain re-sync after the rebuild re-embeds nothing, because as far as the
+hashes are concerned nothing changed. From v0.2.96 an update that finds BOTH
+completion evidence (rows stored at the current embed revision) AND evidence
+of the truncating image (a live probe, an observation recorded at rebuild
+time, or a surviving `code_embed_image_stale` ledger entry) queues a one-time
+re-embed; the next re-sync under a current image demotes exactly those rows,
+re-embeds them, and records that project as healed. The record is per project,
+so a machine running several heals each of them once. **An install with no
+such evidence is unchanged and re-embeds nothing.**
+
+The unconditional manual escape is still the analyzer's `--force-recreate`,
+which DROPS the five code-graph collections and rebuilds them from scratch
+(see [`INSTALL_ARCHITECTURE_v2.md`](INSTALL_ARCHITECTURE_v2.md)) — reach for
+it only when the evidence-gated path does not apply to your install.
 
 CPU-tier installs are unaffected: they route code embeddings through Ollama
 and do not run this container at all.
@@ -745,7 +770,9 @@ When you click "Update bundle" in the per-project Settings page (or run `python 
 
 The two deferral types you'll encounter most often:
 
-**`bundle_user_modified_preserved`** — Update Bundle detected that one of your project files differs from the orchestrator's prior-shipped hash recorded in `.claude/.vco-manifest.json`. The orchestrator interpreted this as "user edits present" and preserved your version on disk rather than overwriting. Each preserved file appears in the deferral with the explicit force command (typically `python -m vco_lib.project_init install-bundle --update --force --file <path>`) that accepts the orchestrator's default for that file. Inspect your edits first; run the force command only if you want to discard them.
+**`bundle_user_modified_preserved`** — Update Bundle found one of your project files differing from the orchestrator's prior-shipped hash in `.claude/.vco-manifest.json`, **and could not write the backup it takes before adopting it**. Since v0.2.84 a divergent shipped file is normally *adopted*: your current bytes are copied to `.claude/backups/bundle-adoptions/<timestamp>/` and the new shipped version is written, with a one-time NOTICE rather than a deferral. A file only reaches this entry when that backup write fails — no free space, no write permission on the backup path, or a symlink under it. From v0.2.96 the entry names the failed write and quotes the per-file error instead of describing a "preserve" policy that has not been the behaviour for many releases.
+
+The remedies are ordered, and the order matters: **(1)** fix the backup destination (`df -h`, check the write permission and that no ancestor of `.claude/backups/` is a symlink) and re-run the ordinary update — the files are then adopted with their backups captured and the entry clears itself; **(2)** dismiss the deferral to keep your customizations (`python -m vco_lib.project_init dismiss-deferral --folder <project> --condition-id bundle_user_modified_preserved`); **(3)** `diff -u` each file before deciding; **(4)** last resort, `--force`, which takes the shipped versions **with no backup at all** — on the machine that just proved it cannot take one. Copy the files aside yourself before reaching for (4). `knowledge/**` is never overwritten on any of these paths, `--force` included.
 
 **`schema_migration_required`** — Update Bundle detected drift between the Weaviate target schema and the schema currently on disk for one of your project's collections. Because schema migration is destructive (it can re-embed or recreate collection objects), the bundle path never auto-applies it. The deferral entry shows the explicit consent command: `cd "$VCT_ORCHESTRATOR_ROOT" && .venv/bin/python -m vco_lib.project_init migrate-collections --name '<project>'` (the v0.2.19 fix made this work correctly from project venvs — previously it produced `ModuleNotFoundError`). Run it once you have a Weaviate backup or are comfortable with the migration's destructive scope. Two env knobs tune that run: `VCT_CODEGRAPH_INDEX_TYPE=hfresh` opts the project's five code-graph collections into the vector-preserving index-type migration (default `hnsw` keeps them out of the plan; the CLI `--index-type` flag takes precedence when given), and `VCT_EDGE_TIMEOUT_SECS` (default `3600`; `0` disables the cap) bounds each migration edge subprocess — raise it on I/O-degraded machines rather than letting a long purge be killed mid-run.
 

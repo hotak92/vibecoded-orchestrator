@@ -5,7 +5,7 @@ short_desc: Opus for gnarly code, security, multi-layer debugging
 keywords: ["complex refactor", "architectural reasoning", "multi-layer", "N+1 query", "hard problem", "complex implementation", "deep refactor", "gnarly code", "security review"]
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: opus
-effort: xhigh
+effort: high
 isolation: worktree
 mcpServers:
   orchestrator-tools:

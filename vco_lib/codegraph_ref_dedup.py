@@ -556,11 +556,13 @@ def list_code_collections(base_url: str, *,
     classes = payload.get("classes") if isinstance(payload, dict) else None
     if not isinstance(classes, list):
         raise RefDedupError("schema fetch: no 'classes' array in response")
-    names = [
-        c.get("class") for c in classes
-        if isinstance(c, dict) and isinstance(c.get("class"), str)
-    ]
-    return sorted(n for n in names if n and reference_props_for(n))
+    # v0.2.96: name extraction through the ONE home (`weaviate_helpers`);
+    # the `raise` above stays here because THIS caller's contract is
+    # "a schema response without a classes array is an error", which the
+    # shared reader deliberately does not impose on its other callers.
+    from vco_lib.weaviate_helpers import schema_class_names
+    names = schema_class_names({"classes": classes})
+    return sorted(n for n in names if reference_props_for(n))
 
 
 def fetch_page(base_url: str, collection: str, *, after: Optional[str],
@@ -1252,7 +1254,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help="actually write (default: dry run)")
     parser.add_argument("--weaviate-url", default=None,
-                        help="default: $WEAVIATE_URL or http://localhost:8081")
+                        help="default: $WEAVIATE_URL, else "
+                             "http://localhost:$WEAVIATE_PORT, else "
+                             "http://localhost:8081")
     parser.add_argument("--props", default=None,
                         help="comma-separated reference properties to consider "
                              "(default: every reference property the "

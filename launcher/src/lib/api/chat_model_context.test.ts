@@ -199,8 +199,10 @@ describe('validateDraft — the client half of the citation gate', () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
+    // A blank max_output is NOT a problem: since v0.2.96 it means UNSTATED
+    // (the vendor publishes no figure) and stores as the 0 marker.
     expect(result.errors.map((e) => e.field).sort()).toEqual(
-      ['context_window', 'max_output', 'model_id', 'source', 'vendor'].sort(),
+      ['context_window', 'model_id', 'source', 'vendor'].sort(),
     );
   });
 
@@ -227,6 +229,69 @@ describe('validateDraft — the client half of the citation gate', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.input.source_note).toBe('');
+  });
+});
+
+describe('the UNSTATED max_output contract (v0.2.96, cross-language)', () => {
+  // 0 = the vendor publishes no per-model figure (the shipped qwen
+  // Token-Plan rows store it); inventing a number is forbidden. Mirrors the
+  // Rust gate (validated() accepts 0, refuses negatives — SQL CHECK from
+  // migration 046) and the Python reader (catalog::_positive folds 0 to
+  // None, so nothing publishes it as a count).
+  it('accepts a blank field as UNSTATED and stores the 0 marker', () => {
+    const result = validateDraft(goodDraft({ max_output: '' }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.input.max_output).toBe(0);
+  });
+
+  it('accepts an explicit 0 (even padded) as the same UNSTATED marker', () => {
+    for (const zero of ['0', ' 0 ']) {
+      const result = validateDraft(goodDraft({ max_output: zero }));
+      expect(result.ok, `"${zero}" means unstated`).toBe(true);
+      if (!result.ok) return;
+      expect(result.input.max_output).toBe(0);
+    }
+  });
+
+  it('still refuses negative, fractional and malformed max_output', () => {
+    for (const bad of ['-1', '-0', '1e6', '1.5', '1 000', 'lots']) {
+      const result = validateDraft(goodDraft({ max_output: bad }));
+      expect(result.ok, `"${bad}" must be refused`).toBe(false);
+    }
+  });
+
+  it('keeps context_window strictly positive — UNSTATED applies to max_output only', () => {
+    for (const bad of ['0', '-1', '']) {
+      const result = validateDraft(goodDraft({ context_window: bad }));
+      expect(result.ok, `context_window "${bad}" must be refused`).toBe(false);
+      if (!result.ok) {
+        expect(result.errors.map((e) => e.field)).toContain('context_window');
+      }
+    }
+  });
+
+  it('an unstated row NEVER surfaces a token count in the editor', () => {
+    // Consumer-level half: the draft for a stored-0 row is BLANK — an editor
+    // showing "0" would render the marker as if it were a number — and
+    // re-saving it round-trips the unstated marker without the user having
+    // to invent a figure.
+    const draft = draftFromRow(makeRow({ max_output: 0 }));
+    expect(draft.max_output).toBe('');
+
+    const result = validateDraft(draft);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.input.max_output).toBe(0);
+  });
+
+  it('a stated row still round-trips its figure', () => {
+    const draft = draftFromRow(makeRow({ max_output: 96_000 }));
+    expect(draft.max_output).toBe('96000');
+    const result = validateDraft(draft);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.input.max_output).toBe(96_000);
   });
 });
 

@@ -291,6 +291,41 @@ class FilePermissionTests(_TmpCase):
             fileperms._windows_grant_identity()
 
 
+class HostTokenStampTests(_TmpCase):
+    """Issue 10: the (path, mtime_ns, size) stamp of the loaded token file."""
+
+    def test_the_stamp_matches_a_fresh_stat(self) -> None:
+        path = self.dir / "model-gateway.token"
+        path.write_text("tok\n", encoding="utf-8")
+        stamp = auth.host_token_stamp(path)
+        st = path.stat()
+        self.assertEqual(stamp["path"], str(path))
+        self.assertEqual(stamp["mtime_ns"], st.st_mtime_ns)
+        self.assertEqual(stamp["size"], st.st_size)
+
+    def test_a_rewritten_file_carries_a_different_stamp(self) -> None:
+        """The pair is what tells a regenerated token file from the one the
+        daemon loaded — the shape 2 diagnostic. Size alone suffices here;
+        mtime_ns equality between two writes is possible on coarse clocks."""
+        path = self.dir / "model-gateway.token"
+        path.write_text("short", encoding="utf-8")
+        first = auth.host_token_stamp(path)
+        path.write_text("a-much-longer-token-value", encoding="utf-8")
+        second = auth.host_token_stamp(path)
+        self.assertNotEqual(first["size"], second["size"])
+
+    def test_a_missing_file_stamps_none(self) -> None:
+        self.assertIsNone(auth.host_token_stamp(self.dir / "absent"))
+
+    def test_the_stamp_carries_no_token_content(self) -> None:
+        path = self.dir / "model-gateway.token"
+        token = "wp9-stamp-synthetic-not-a-real-token"
+        path.write_text(token, encoding="utf-8")
+        stamp = auth.host_token_stamp(path)
+        self.assertNotIn(token, repr(stamp))
+        self.assertEqual(sorted(stamp), ["mtime_ns", "path", "size"])
+
+
 class ConfigResolutionTests(_TmpCase):
     def setUp(self) -> None:
         super().setUp()
@@ -299,6 +334,7 @@ class ConfigResolutionTests(_TmpCase):
             "VCT_MODEL_GATEWAY_CREDENTIALS", "VCT_MODEL_GATEWAY_CONTEXT_TABLE",
             "VCT_MODEL_GATEWAY_SECRET_PROJECT", "VCT_MODEL_GATEWAY_CATALOG_TTL",
             "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", "VCT_MODEL_GATEWAY_KEY_TTL",
+            "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S",
         ):
             self.set_env(key, None)
         self.set_env("VCT_STATE_DIR", str(self.dir))
@@ -363,6 +399,33 @@ class ConfigResolutionTests(_TmpCase):
         os.environ["VCT_MODEL_GATEWAY_SECRET_PROJECT"] = "Acme"
         self.assertEqual(config.GatewayConfig.from_env().secret_project, "Acme")
 
+    def test_key_stale_max_age_defaults_to_six_hours(self) -> None:
+        """Issue 12's bound: 6 h covers an update's hub-stop window with room
+        to spare while a revoked key stops being served the same day."""
+        self.assertEqual(
+            config.GatewayConfig.from_env().key_stale_max_age_s, 6 * 3600,
+        )
+        self.assertEqual(
+            config.DEFAULT_SERVE_STALE_MAX_AGE_S, 6 * 3600,
+        )
+
+    def test_key_stale_max_age_is_read_from_the_documented_env_key(self) -> None:
+        os.environ["VCT_MODEL_GATEWAY_KEY_STALE_MAX_S"] = "120"
+        self.assertEqual(
+            config.GatewayConfig.from_env().key_stale_max_age_s, 120,
+        )
+
+    def test_a_nonsense_key_stale_bound_falls_back_to_the_default(self) -> None:
+        """A non-positive or non-numeric bound must not reach the resolver:
+        an unbounded stale serve is not a state a typo should reach."""
+        for value in ("banana", "0", "-5", ""):
+            with self.subTest(value=value):
+                os.environ["VCT_MODEL_GATEWAY_KEY_STALE_MAX_S"] = value
+                self.assertEqual(
+                    config.GatewayConfig.from_env().key_stale_max_age_s,
+                    6 * 3600,
+                )
+
     def test_every_documented_env_key_is_actually_read(self) -> None:
         """A knob nobody reads is a promise, not a feature."""
         documented = {
@@ -370,6 +433,7 @@ class ConfigResolutionTests(_TmpCase):
             "VCT_MODEL_GATEWAY_CREDENTIALS", "VCT_MODEL_GATEWAY_CONTEXT_TABLE",
             "VCT_MODEL_GATEWAY_SECRET_PROJECT", "VCT_MODEL_GATEWAY_CATALOG_TTL",
             "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", "VCT_MODEL_GATEWAY_KEY_TTL",
+            "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S",
         }
         source = Path(config.__file__).read_text(encoding="utf-8")
         docstring = source.split('"""')[1]

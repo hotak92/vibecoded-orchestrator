@@ -459,11 +459,18 @@ def test_spawn_leaves_alone_when_cleanup_owed_undeterminable(monkeypatch, tmp_pa
 
 
 def test_install_shim_resolves_ledger_on_not_owed():
-    """Source-level guard: install.py's shim handles not_owed by resolving
-    the (deliberately foreign) resync ledger entry."""
-    src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+    """Source-level guard: not_owed resolves the (deliberately foreign)
+    resync ledger entry.  v0.2.96 (M-2): the handling chain moved VERBATIM
+    out of install.py into ``codegraph_resync.report_trigger_result`` (the
+    install line ratchet answered by EXTRACTION, per its own rule), so the
+    guard pins BOTH halves — the vco_lib home owns the branch (via the
+    module's ONE condition-id constant), and install.py delegates to it."""
+    src = (REPO_ROOT / "vco_lib" / "codegraph_resync.py").read_text(encoding="utf-8")
     assert 'result.status == "not_owed"' in src
-    assert 'mark_resolved("codegraph_embed_resync_pending")' in src
+    assert 'mark_resolved(_CONDITION_ID)' in src
+    assert '_CONDITION_ID = "codegraph_embed_resync_pending"' in src
+    install_src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+    assert "report_trigger_result(result, project_name, deferral_report" in install_src
 
 
 # ─────────── R-7: driver runs analyzer, verifies, defers one-time ───────────

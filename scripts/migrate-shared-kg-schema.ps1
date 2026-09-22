@@ -27,7 +27,9 @@
 # path and as ok=false + stderr in the launcher's consent modal.
 #
 # Env vars:
-#   $env:WEAVIATE_URL          — defaults to http://localhost:8081
+#   $env:WEAVIATE_URL          — defaults to http://localhost:$env:WEAVIATE_PORT
+#                                (or 8081 when neither is set); WEAVIATE_URL
+#                                wins outright
 #   $env:SHARED_KG_COLLECTION  — defaults to VibeCodedOrchestrator_KnowledgeGraph
 #                                (capital-C casing since v0.2.23 B1; was
 #                                lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
@@ -46,7 +48,7 @@ param()
 
 $ErrorActionPreference = "Continue"
 
-$WeaviateUrl = if ($env:WEAVIATE_URL) { $env:WEAVIATE_URL } else { "http://localhost:8081" }
+$WeaviateUrl = if ($env:WEAVIATE_URL) { $env:WEAVIATE_URL } elseif ($env:WEAVIATE_PORT) { "http://localhost:$($env:WEAVIATE_PORT)" } else { "http://localhost:8081" }
 $SharedKg    = if ($env:SHARED_KG_COLLECTION) { $env:SHARED_KG_COLLECTION } else { "VibeCodedOrchestrator_KnowledgeGraph" }
 $Consent     = ($env:VCO_SHARED_KG_MIGRATE_CONSENT -eq "1")
 

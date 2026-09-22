@@ -46,6 +46,9 @@ subsystem) —
                                 read-only three-value comparison) over
                                 ``project_identity``'s one DB read and
                                 ``weaviate_helpers``' listing/count/sample
+    summary_pending             ``vco_lib.summary_health``'s sidecar scan
+                                (the ``kg_summaries_degraded`` pending set;
+                                REPORTED — the module owns the lifecycle)
 
 v0.2.92 WP-14/WP-7 — what the last five close
 ---------------------------------------------
@@ -401,6 +404,11 @@ class DoctorResolvers:
     #: the gateway probe is driven from a described machine: no systemd, no
     #: launchd, no schtasks, and no spawn of a registered entry point.
     gateway_state: Optional[Callable[[], Any]] = None
+    #: (project_root) -> :class:`vco_lib.summary_health.PendingSet`, or None
+    #: when the sidecars could not be read. Defaults to the scan itself;
+    #: injected so the summary-pending probe's tests describe a machine's
+    #: sidecars with dataclasses, no filesystem.
+    summary_pending: Optional[Callable[[Path], Optional[Any]]] = None
 
     def resolve_gateway_state(self):
         """The model gateway's registration verdict, from its ONE home.
@@ -576,6 +584,26 @@ class DoctorResolvers:
 
             return DeferralReport.read(folder)
         except Exception:  # noqa: BLE001 — an unreadable ledger is "unknown"
+            return None
+
+    def resolve_summary_pending(self, project_root: Path) -> Optional[Any]:
+        """The summary-degradation pending set, or ``None`` when unscannable.
+
+        Composes :func:`vco_lib.summary_health.scan_pending` — the ONE home
+        for "which summary rows are degraded", already derived (not a second
+        ledger) from the sidecars' recorded backends — so the doctor's count,
+        the ``kg_summaries_degraded`` entry's own ``detected`` text and the
+        recheck's backfill list can never disagree about what is pending.
+        Soft-fail: an unreadable sidecar tree is ``None`` (the probe renders
+        ``unknown``), never "nothing pending".
+        """
+        if self.summary_pending is not None:
+            return self.summary_pending(Path(project_root))
+        from vco_lib import summary_health  # noqa: PLC0415
+
+        try:
+            return summary_health.scan_pending(Path(project_root))
+        except Exception:  # noqa: BLE001 — could not look is not a verdict
             return None
 
 
@@ -984,6 +1012,104 @@ def probe_deferral_ledger(folder: Path, res: DoctorResolvers, ctx: dict) -> list
             )
         )
     return findings
+
+
+def probe_summary_pending(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """How many KG/code summary rows are degraded, and the way out.
+
+    v0.2.96 WP-7b (WP-7a review MINOR-3): the ``kg_summaries_degraded``
+    entry carries the pending counts in its ``detected`` text, but the
+    DOCTOR — the authoritative end-of-update report — never read them, so
+    ``vco doctor`` could say "1 actionable entry" without saying WHAT was
+    owed. This probe surfaces the count from the same scan the entry and
+    the recheck use (:func:`vco_lib.summary_health.scan_pending`), plus the
+    one-line recovery.
+
+    REPORTED, not owned: the condition is emitted and paired-resolved by
+    :mod:`vco_lib.summary_health` (only ``summary_recheck``'s post-scan
+    settles it), so the finding carries the cid for routing but is
+    deliberately outside :data:`DOCTOR_OWNED_CIDS` — the doctor never
+    re-emits or resolves it. An OK reading therefore does NOT clear a live
+    entry either (that is the paired-resolution contract, not an omission):
+    a live entry over an empty pending set stays a PROBLEM here naming the
+    recheck, because that entry needs its resolver's audit row to go away.
+
+    Trigger: the condition is live in this folder's ledger OR the pending
+    set is non-empty — either alone is real degradation (a pending set with
+    no entry is the freshly-upgraded machine whose legacy sidecar rows
+    predate the ``backend`` field; they regenerate only via the recheck).
+
+    ``full`` scope only: the scan is local file reads plus one sha256 per
+    knowledge node — cheap per node, but the orchestrator root's tree is
+    walked in full, and the answer changes when summaries generate, not at
+    boot. The probe's readers are install/update's end-of-run report and
+    ``vco doctor`` (the ``install_completeness`` cost precedent).
+    """
+    from vco_lib import summary_health  # noqa: PLC0415
+
+    pending = res.resolve_summary_pending(folder)
+    total = getattr(pending, "total", None)
+    if not isinstance(total, int):
+        # Positive evidence only: sidecars that cannot be read are not
+        # "nothing pending" (the `mcp_commands_spawnable` precedent).
+        return [
+            Finding(
+                probe="summary_pending",
+                status=STATUS_UNKNOWN,
+                summary="KG/code summary sidecars could not be scanned",
+            )
+        ]
+    report = res.resolve_deferral_report(folder)
+    live = report is not None and any(
+        getattr(e, "condition_id", "") == summary_health.CONDITION_ID
+        for e in getattr(report, "entries", []) or []
+    )
+    if not live and total == 0:
+        return [
+            Finding(
+                probe="summary_pending",
+                status=STATUS_OK,
+                summary="no summary rows pending regeneration",
+                detail={"pending_total": 0},
+            )
+        ]
+    kg_stale = len(getattr(pending, "kg_stale", []) or [])
+    kg_missing = len(getattr(pending, "kg_missing", []) or [])
+    code_stale = len(getattr(pending, "code_stale", []) or [])
+    root = Path(folder).resolve()
+    return [
+        Finding(
+            probe="summary_pending",
+            status=STATUS_PROBLEM,
+            summary=(
+                f"{total} summary row(s) degraded ({kg_stale} KG on a "
+                f"fallback backend, {kg_missing} KG with no summary, "
+                f"{code_stale} code on a fallback backend)"
+                + (
+                    f" — the {summary_health.CONDITION_ID} entry is live"
+                    if live else ""
+                )
+            ),
+            fix=FIX_DEFER,
+            condition_id=summary_health.CONDITION_ID,
+            command=remedy_shell.steps(
+                "# New/changed nodes resume on the preferred tier at the "
+                "5 h breaker cooldown;",
+                "# hash-frozen fallback rows regenerate only via the "
+                "recheck:",
+                f"cd {remedy_shell.quote(root)}",
+                "python -m vco_lib.summary_health summary-recheck "
+                f"--project-root {remedy_shell.quote(root)}",
+            ),
+            detail={
+                "pending_total": total,
+                "kg_stale": kg_stale,
+                "kg_missing": kg_missing,
+                "code_stale": code_stale,
+                "condition_live": live,
+            },
+        )
+    ]
 
 
 def probe_prereqs(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
@@ -3830,6 +3956,68 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
 #: point users at a panel that cannot show them. That is the same class of
 #: defect as ``update.log``: a diagnostic that names something absent. They run
 #: where they are read: install/update's end-of-run report and ``vco doctor``.
+def probe_claude_code_trust(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Is this folder's Claude Code trust flag intact? (register 14(b))
+
+    The 2026-09-20 notification storm's engine: the Claude Code CLI owns
+    and rewrites ``~/.claude.json`` wholesale, and a rewrite cycle can
+    leave ``projects["<folder>"].hasTrustDialogAccepted`` False. Every
+    headless ``claude -p`` in the folder then fails with "this workspace
+    has not been trusted" — which VCO's own shipped generators invoke per
+    node. The doctor names the state so the next occurrence reads as one
+    actionable line instead of a 300-toast mystery.
+
+    Read-only on ``~/.claude.json`` (the CLI's file; nothing here writes
+    it — re-accepting the dialog is the user's act, once, interactively).
+    Routed through :func:`vco_lib.paths.user_home` so the suite's
+    hermeticity redirect steers it (a probe reading the REAL
+    ``~/.claude.json`` under pytest is exactly what conftest's guard
+    exists to catch). Positive evidence only: an unreadable file or a
+    missing entry is NOT a verdict (the folder may simply never have
+    been prompted).
+    """
+    import json  # noqa: PLC0415
+
+    from vco_lib.paths import user_home  # noqa: PLC0415
+
+    cc_json = user_home() / ".claude.json"
+    try:
+        data = json.loads(cc_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [Finding(
+            probe="claude_code_trust",
+            status=STATUS_UNKNOWN,
+            summary="could not read ~/.claude.json — trust state unknown",
+        )]
+    entry = (data.get("projects") or {}).get(str(folder))
+    if not isinstance(entry, dict):
+        return [Finding(
+            probe="claude_code_trust",
+            status=STATUS_OK,
+            summary="no Claude Code trust entry for this folder yet",
+        )]
+    if entry.get("hasTrustDialogAccepted") is False:
+        return [Finding(
+            probe="claude_code_trust",
+            status=STATUS_PROBLEM,
+            summary=(
+                "this workspace's Claude Code trust flag is False — every "
+                "headless claude invocation (KG/code summaries) fails with "
+                "'not been trusted'"
+            ),
+            command="",
+            detail={"recovery": (
+                "run claude interactively once in this folder and accept "
+                "the trust dialog"
+            )},
+        )]
+    return [Finding(
+        probe="claude_code_trust",
+        status=STATUS_OK,
+        summary="Claude Code trust flag intact for this folder",
+    )]
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -3879,6 +4067,14 @@ PROBES: dict = {
     # (`--version`), and it reports nothing at all on the majority of machines,
     # where the gateway's login-time autostart was never opted into.
     "model_gateway_runnable": (probe_model_gateway_runnable, (SCOPE_FULL,)),
+    # v0.2.96 WP-7b: full-only — local file reads + one sha256 per knowledge
+    # node (the whole tree at the orchestrator root). REPORTED-not-owned cid:
+    # `kg_summaries_degraded` belongs to `vco_lib.summary_health` (paired
+    # resolution), so this probe never emits or resolves it — the boot-ledger
+    # promise is preserved trivially (it never runs at boot) and the
+    # end-of-update report names the count, not just the cid.
+    "summary_pending": (probe_summary_pending, (SCOPE_FULL,)),
+    "claude_code_trust": (probe_claude_code_trust, (SCOPE_FULL,)),
 }
 
 

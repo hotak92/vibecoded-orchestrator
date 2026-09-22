@@ -741,7 +741,12 @@ class CatalogTests(ChaosBase):
         self.assertLess(elapsed, 12, "the picker waited on a dead vendor")
         body = await resp.json()
         ids = [entry["id"] for entry in body["data"]]
-        self.assertIn("claude-opus-5", ids, "the healthy family must still list")
+        # Spelled as the picker advertises a 1M first-party model (its
+        # ``[1m]`` row); what this test is about is that the healthy family
+        # lists AT ALL while the other one hangs.
+        self.assertIn(
+            "claude-opus-5[1m]", ids, "the healthy family must still list",
+        )
 
 
 # ── 15 — the gateway never answers in a shape the SDK cannot parse ───────

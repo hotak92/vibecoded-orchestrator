@@ -31,10 +31,22 @@ from pathlib import Path
 
 from model_router import context_table as ct
 
-#: The ten vendor rows the shipped seed must carry.
+#: The ten subscription-vendor rows the shipped seed must carry.
 EXPECTED_VENDOR_SEED_IDS = {
     "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5",
     "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
+}
+
+#: The eight Token-Plan rows (owner order 2026-09-21, expanded 2026-09-22
+#: with the live compatible-mode probe's deepseek-v4.1-flash). ``glm-5.2``
+#: and ``glm-5.3`` are NOT duplicated here although that endpoint serves
+#: them too: lookup keys are bare ids and vendor-agnostic, and the rows
+#: above already carry the verified windows — a second row under another
+#: vendor could only disagree with them.
+EXPECTED_QWEN_SEED_IDS = {
+    "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
+    "qwen3.6-flash", "deepseek-v4-pro", "deepseek-v4-flash-0731",
+    "deepseek-v4.1-flash",
 }
 
 #: The first-party rows, read by TWO consumers.
@@ -51,7 +63,9 @@ EXPECTED_CLAUDE_SEED_IDS = {
 }
 
 #: The seed, and nothing else.
-EXPECTED_SEED_IDS = EXPECTED_VENDOR_SEED_IDS | EXPECTED_CLAUDE_SEED_IDS
+EXPECTED_SEED_IDS = (
+    EXPECTED_VENDOR_SEED_IDS | EXPECTED_QWEN_SEED_IDS | EXPECTED_CLAUDE_SEED_IDS
+)
 
 #: Exactly the models whose official page states a 1M window.
 EXPECTED_1M_IDS = {"glm-5.3", "glm-5.3-flash", "glm-5.2"} | EXPECTED_CLAUDE_SEED_IDS
@@ -60,6 +74,7 @@ EXPECTED_1M_IDS = {"glm-5.3", "glm-5.3-flash", "glm-5.2"} | EXPECTED_CLAUDE_SEED
 #: not a vendor page.
 OFFICIAL_DOC_PREFIX = {
     "zai": "https://docs.z.ai/",
+    "qwen": "https://docs.qwencloud.com/",
     "anthropic": "https://docs.anthropic.com",
 }
 
@@ -116,6 +131,44 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(self.seed.rows["glm-5.2"].context_window, 1_000_000)
         self.assertEqual(self.seed.rows["glm-5.1"].context_window, 200_000)
 
+    def test_the_shared_ids_answer_from_the_one_row_that_exists(self) -> None:
+        """``glm-5.2`` AND ``glm-5.3`` are served by BOTH shipped vendor
+        endpoints, but the table keys on the bare id — so each has exactly
+        ONE row (the one whose window is vendor-verified) and every consumer
+        of the shared id reads it, whatever endpoint serves it. A second,
+        vendor-duplicated row here could only disagree with the first and
+        make the lookup order-dependent."""
+        for model_id in ("glm-5.2", "glm-5.3"):
+            with self.subTest(model=model_id):
+                row = self.seed.rows[model_id]
+                self.assertEqual(row.vendor, "zai", "the ONE cited row")
+                self.assertEqual(row.context_window, 1_000_000)
+                self.assertTrue(row.window_1m)
+                self.assertIsNotNone(self.seed.lookup(model_id))
+        # The Token-Plan endpoint's own 1M support for them is unverified,
+        # but that is a property of the OTHER endpoint's docs, not of these
+        # ids' verified window: the rows must not be narrowed to match the
+        # weaker citation.
+
+    def test_token_plan_rows_claim_only_the_documented_default(self) -> None:
+        """The Token-Plan page documents a 200K default and "1M where the
+        model supports it" WITHOUT naming models — so every one of these
+        rows claims 200K, flags no 1M, states no max_output, and SAYS SO in
+        its note. The day the vendor publishes per-model windows, these rows
+        are the ones to update and this test with them."""
+        for model_id in EXPECTED_QWEN_SEED_IDS:
+            with self.subTest(model=model_id):
+                row = self.seed.rows[model_id]
+                self.assertEqual(row.vendor, "qwen")
+                self.assertEqual(row.context_window, 200_000)
+                self.assertFalse(row.window_1m)
+                self.assertEqual(row.max_output, 0)
+                self.assertIn(
+                    "UNVERIFIED", row.source_note,
+                    f"{model_id}: the note must state that per-model 1M "
+                    "support is unverified",
+                )
+
     def test_claude_rows_are_first_party_and_1m(self) -> None:
         """The Claude 5 rows exist so ``vco_lib.vscode_settings.decorate_1m``
         can append the client's own ``[1m]`` hint to a slot/default naming
@@ -135,18 +188,23 @@ class SeedTests(unittest.TestCase):
                 self.assertEqual(row.context_window, 1_000_000)
 
     def test_claude_rows_add_a_1m_companion_to_the_gateway_catalog(self) -> None:
-        """A first-party 1M row publishes the plain id AND an ``[1m]`` twin.
+        """A first-party 1M row publishes its ``[1m]`` spelling, and under
+        ``both`` the plain id beside it.
 
-        This assertion is inverted from the one v0.2.93 shipped, which pinned
-        "a Claude row must NOT change what /v1/models advertises" on the
-        theory that the client knows first-party windows natively. It does not
-        when it is pointed at a custom base URL: it budgeted 200K for a 1M
-        model, so a session compacted at a fifth of the window the user was
-        paying for. Both entries are published — the plain id is still the
-        200K behaviour, and nobody loses the ability to ask for it. Driven
-        through the real ``CatalogService.union`` with the real SEED as its
-        table, so the wiring is what is pinned, not a helper. (Since v0.2.95
-        the union reads the table itself rather than being handed an
+        Two inversions are folded into this one test, in order. v0.2.93
+        pinned "a Claude row must NOT change what /v1/models advertises", on
+        the theory that the client knows first-party windows natively; it
+        does not when pointed at a custom base URL, where it budgeted 200K
+        for a 1M model and compacted a session at a fifth of the window the
+        user was paying for — hence the ``[1m]`` row. v0.2.96 then made that
+        row the ONLY one published by default (one model, one row), which is
+        why the plain id is asserted ABSENT here and present only under
+        :data:`WINDOW_ROWS_BOTH`. The capability was not lost, it moved
+        behind a knob, and both halves are pinned so neither can rot.
+
+        Driven through the real ``CatalogService.union`` with the real SEED
+        as its table, so the wiring is what is pinned, not a helper. (Since
+        v0.2.95 the union reads the table itself rather than being handed an
         ``advertise_1m`` callable: the advert follows the resolved window,
         and a cited seed row is the first thing that resolution consults.)"""
         import asyncio
@@ -177,14 +235,32 @@ class SeedTests(unittest.TestCase):
         )
         catalog = asyncio.run(service.union(table=seed))
         ids = {e.id for e in catalog.entries}
-        self.assertIn("claude-opus-5", ids, "first-party id still published verbatim")
-        self.assertIn("claude-opus-5[1m]", ids, "the seed row decorates it too")
+        self.assertIn("claude-opus-5[1m]", ids, "the seed row decorates it")
+        self.assertNotIn(
+            "claude-opus-5", ids,
+            "the plain row is withheld by default — one model, one row",
+        )
+        self.assertIn(
+            "claude-opus-5", catalog.hidden,
+            "withheld, not vanished: the picker's absence is reported",
+        )
         self.assertIn("claude-gw/glm-5.3[1m]", ids, "the vendor row still does")
         companion = next(
             e for e in catalog.entries if e.id == "claude-opus-5[1m]"
         )
         self.assertIn("1M context", companion.display_name)
         self.assertTrue(companion.display_name.startswith("Opus 5"))
+
+        both = asyncio.run(
+            service.union(table=seed, window_rows=cat.WINDOW_ROWS_BOTH),
+        )
+        both_ids = {e.id for e in both.entries}
+        self.assertIn(
+            "claude-opus-5", both_ids,
+            "the escape hatch restores the 200K row",
+        )
+        self.assertIn("claude-opus-5[1m]", both_ids, "without costing the 1M one")
+        self.assertNotIn("claude-opus-5", both.hidden)
 
     def test_every_row_names_a_vendor_that_exists(self) -> None:
         from model_router.vendors import ANTHROPIC_FAMILY, VENDORS

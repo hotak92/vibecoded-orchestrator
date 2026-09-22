@@ -156,10 +156,16 @@ COUNT_SOURCE_FIELD = "_vct_count_source"
 COUNT_SOURCE_VENDOR = "vendor"
 COUNT_SOURCE_ESTIMATE = f"estimate:bytes/{ESTIMATE_BYTES_PER_TOKEN}"
 
-#: ``(vendor_id, model)`` pairs already named in a substitution warning. One
-#: line per process per pair: the substitution fires on EVERY count_tokens
+#: Topic for the substitution warning in the ONE say-it-once registry
+#: (:func:`model_router.catalog._log_once`). One line per process per
+#: ``(vendor_id, model)`` pair: the substitution fires on EVERY count_tokens
 #: call for an affected model, and Claude Code calls it constantly.
-_COUNT_SUBSTITUTION_LOGGED: set[tuple[str, str]] = set()
+#:
+#: This was a fourth parallel set until 2026-09-22. The other three were
+#: consolidated that day and this one was missed, which is the exact shape
+#: the consolidation exists to stop — the registry pattern was being copied
+#: faster than it was being shared.
+LOG_ONCE_COUNT_SUBSTITUTION = "count_substitution"
 
 #: Set once, when the metrics home could not be resolved. See :func:`_metrics_dir`.
 _METRICS_DIR_WARNED = False
@@ -220,6 +226,29 @@ def usage_block(payload: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     return None
 
 
+def reported_model_id(payload: Mapping[str, Any]) -> Optional[str]:
+    """The ``model`` id one event or one non-streamed body reports, or ``None``.
+
+    Mirrors :func:`usage_block`'s walk on purpose: a stream puts the id inside
+    ``message_start``'s nested message, a non-streamed body puts it at the
+    top, and the two must not drift apart — issue 9's echo assertion reads
+    this, and its whole value is comparing the SAME shapes the vendor writes.
+
+    Empty string counts as absent: a vendor that echoes ``""`` said nothing,
+    and silence must not read as a mismatch (the module's zero-versus-silence
+    discipline, applied to an id).
+    """
+    direct = payload.get("model")
+    if isinstance(direct, str) and direct:
+        return direct
+    message = payload.get("message")
+    if isinstance(message, Mapping):
+        nested = message.get("model")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
 def _as_count(value: Any) -> Optional[int]:
     """A non-negative token count, or ``None`` for anything that is not one.
 
@@ -257,6 +286,10 @@ class UsageAccumulator:
         self._seen: set[str] = set()
         #: Did the response state its FINAL usage? See :attr:`complete`.
         self._final_seen = False
+        #: The ``model`` id the response reports, last non-empty one wins
+        #: (issue 9). ``None`` until an event or body carries one — absence
+        #: is silence, never a mismatch.
+        self._reported_model: Optional[str] = None
 
     # ── input ────────────────────────────────────────────────────────────
     def feed(self, chunk: bytes) -> None:
@@ -323,6 +356,9 @@ class UsageAccumulator:
         if isinstance(payload, dict):
             # A non-streamed body IS the final word by construction: there is
             # no later event that could revise it.
+            model = reported_model_id(payload)
+            if model is not None:
+                self._reported_model = model
             if self._merge(usage_block(payload)):
                 self._final_seen = True
 
@@ -331,6 +367,12 @@ class UsageAccumulator:
         payload = event_payload(raw)
         if payload is None:
             return
+        # Issue 9: capture the reported model wherever the event carries it —
+        # ``message_start`` nests it in ``message``, some vendors repeat it at
+        # the top of the delta. Last non-empty one wins.
+        model = reported_model_id(payload)
+        if model is not None:
+            self._reported_model = model
         if self._merge(usage_block(payload)):
             # ``message_delta`` is where BOTH upstreams state the final
             # figures — Anthropic's final ``output_tokens``, the vendor's
@@ -392,6 +434,17 @@ class UsageAccumulator:
     @property
     def saw_anything(self) -> bool:
         return bool(self._seen)
+
+    @property
+    def reported_model(self) -> Optional[str]:
+        """The ``model`` id this response reported, or ``None`` for silence.
+
+        Issue 9's echo assertion compares this against the forwarded id at
+        the terminal ``access`` point in :mod:`model_router.server`. ``None``
+        means no event or body carried the field — which is NOT a mismatch,
+        for the same reason an unreported token count is not zero.
+        """
+        return self._reported_model
 
 
 @dataclass(frozen=True)
@@ -624,18 +677,19 @@ def note_count_substitution(vendor_id: str, model: str) -> bool:
     warning would be one log line per keystroke-scale interaction for as long
     as the model is selected.
     """
-    key = (vendor_id, model)
-    if key in _COUNT_SUBSTITUTION_LOGGED:
-        return False
-    _COUNT_SUBSTITUTION_LOGGED.add(key)
-    logger.warning(
+    from .catalog import _log_once
+
+    return _log_once(
+        LOG_ONCE_COUNT_SUBSTITUTION,
+        (vendor_id, model),
+        logging.WARNING,
         "model-gateway: %s answered count_tokens with 0 input tokens for %s on "
         "a non-empty body; substituting the gateway's own bytes/%d estimate so "
         "the client is not told its conversation is empty. Further "
         "substitutions for this model are not logged.",
         vendor_id, model, ESTIMATE_BYTES_PER_TOKEN,
+        logger_=logger,
     )
-    return True
 
 
 # ── the ledger ───────────────────────────────────────────────────────────
@@ -964,6 +1018,7 @@ __all__ = [
     "guard_count_tokens",
     "note_count_substitution",
     "read_identity",
+    "reported_model_id",
     "split_sse_events",
     "usage_block",
 ]

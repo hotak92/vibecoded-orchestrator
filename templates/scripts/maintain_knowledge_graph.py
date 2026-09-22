@@ -107,13 +107,18 @@ from vco_lib.embedding_service import (  # noqa: E402 - must follow the sys.path
     EmbeddingService,
     NoEmbeddingBackendError,
 )
+# v0.2.96: the Weaviate base-URL precedence (WEAVIATE_URL > WEAVIATE_PORT >
+# the canonical port) has ONE home. This is a CALL, not a mirror: the
+# `vco_lib.embedding_service` import directly above is unguarded and runs
+# first, so vco_lib is importable wherever this script runs at all.
+from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 
 # Configuration
 # v0.2.18: EMBEDDING_MODEL is no longer read here. This script delegates
 # embed calls to sync_knowledge_graph.sync_node, which constructs its own
 # EmbeddingService. Keeping WEAVIATE_URL / OLLAMA_URL / GRPC_PORT for the
 # Weaviate client only.
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+WEAVIATE_URL = weaviate_url_default()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 

@@ -126,13 +126,14 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Mapping, NamedTuple, Optional
 
 import aiohttp
 from aiohttp import web
 
 from . import __version__
-from .auth import OAuthReader, token_matches
+from .auth import OAuthReader, host_token_stamp, token_matches
 from .catalog import CatalogEntry, CatalogService, resolve_window, to_models_response
 from .config import SERVICE_NAME, UPSTREAM_CONNECT_TIMEOUT_S, GatewayConfig
 from .context_table import ContextTableLoader
@@ -273,6 +274,12 @@ HEAD_SCAN_BYTES = 64 * 1024
 #: are going to discard is a denial-of-service surface for free.
 _QUOTA_BODY_PEEK_BYTES = 64 * 1024
 
+#: How much of a vendor 401/403 body is HELD while classifying it (the body
+#: IS relayed — :func:`_auth_rejection_response` — so an overflow is not
+#: discarded but streamed verbatim past the bound; the limit bounds memory,
+#: not the relay).
+_AUTH_BODY_LIMIT_BYTES = 64 * 1024
+
 
 #: What a GATEWAY-side 502 carries. Anthropic's SDKs read ``x-should-retry``
 #: to decide whether a status is worth another attempt, and every 502 this
@@ -282,6 +289,13 @@ _QUOTA_BODY_PEEK_BYTES = 64 * 1024
 #: hard failure, which is the invariant ("never worse than native") breaking
 #: on the most ordinary flake there is.
 RETRYABLE_HEADERS = {"x-should-retry": "true"}
+
+#: WP-6 review MAJOR-1/MINOR-1 caps. Auth strikes: one 401 is a blip,
+#: three consecutive is a dead key (rotated/revoked) that must not keep
+#: serving from the last-good store. Echo-log cap: ``forwarded`` is
+#: client-controlled, so the triple edge-set is bounded like ``_id_maps``.
+VENDOR_AUTH_STRIKE_LIMIT = 3
+_ECHO_LOG_CAP = 256
 
 
 def _error_body(kind: str, message: str) -> dict:
@@ -397,6 +411,7 @@ class Gateway:
         oauth_reader: Optional[OAuthReader] = None,
         key_resolver: Optional[VendorKeyResolver] = None,
         token_permissions: OwnerOnlyState = "unknown",
+        token_file_stamp: Optional[Mapping[str, object]] = None,
     ) -> None:
         validate_registry(vendors)
         self.config = config
@@ -411,9 +426,19 @@ class Gateway:
             # so nothing a test or an embedder builds reaches the hub on its
             # own. See `VendorKeyResolver.probe_scope`.
             probe_scope_on_miss=True,
+            # Issue 12: keep answering with the last-known-good key while a
+            # failed resolution is within this bound — the 2026-09-20 update
+            # stopped the hub (by design) and nine 503s followed for a key
+            # that was fine. An injected resolver keeps its own default.
+            serve_stale_max_age_s=config.key_stale_max_age_s,
         )
         self.context = ContextTableLoader(config.context_table_file)
         self.token_permissions = token_permissions
+        #: The token file stamp sampled by the DAEMON at startup (issue 10).
+        #: ``create_app`` stays pure — binds nothing, stats nothing — so the
+        #: caller that has already read the token takes this one extra
+        #: observation, exactly like ``token_permissions``.
+        self._token_file_stamp: Optional[Mapping[str, object]] = token_file_stamp
         self._session: Optional[aiohttp.ClientSession] = None
         #: Per-vendor rewritten-id -> vendor-id maps. Per PROCESS and bounded:
         #: the client echoes an id back one turn later, so the map only has to
@@ -421,6 +446,20 @@ class Gateway:
         self._id_maps: dict[str, BoundedIdMap] = {}
         #: peer -> (when its last 401 line was written, how many since).
         self._unauthorised_seen: dict[str, tuple[float, int]] = {}
+        #: Issue 9: vendor responses whose reported ``model`` was not the id
+        #: this daemon forwarded. Bounded WARN edge-state beside it.
+        self._model_echo_mismatches = 0
+        # WP-6 review MINOR-1: ``forwarded`` is client-controlled, so the
+        # triple set is unbounded across uptime. Dict-as-ordered-set with a
+        # FIFO cap mirrors the ``_id_maps`` bounding rationale one field up.
+        self._echo_logged: dict[tuple[str, str, str], None] = {}
+        # WP-6 review MAJOR-1: consecutive per-vendor auth rejections. At
+        # VENDOR_AUTH_STRIKE_LIMIT the last-good key is invalidated —
+        # serve-stale must not outlive a key the vendor itself rejects. A
+        # single 401 does NOT invalidate (an auth blip would become an
+        # outage); VENDOR_AUTH_STRIKE_LIMIT consecutive do, and any 2xx
+        # resets the count.
+        self._vendor_auth_strikes: dict[str, int] = {}
         #: Per-chat token accounting. Built here rather than in ``create_app``
         #: so a handler reaches it the same way it reaches every other piece
         #: of shared state, and so a test can swap it on the gateway object.
@@ -485,6 +524,125 @@ class Gateway:
     async def _catalog_vendor_key(self, vendor: Vendor) -> Optional[str]:
         result = await self.keys.aresolve(vendor)
         return result.key
+
+    # ── issue 9: model echo assertion ────────────────────────────────────
+    def note_model_echo_mismatch(
+        self, vendor_id: str, forwarded: str, reported: str,
+    ) -> None:
+        """Count one vendor answer whose reported ``model`` is not the id
+        this daemon forwarded (issue 9).
+
+        The shape is the alias trap (see the zai row in
+        :mod:`model_router.vendors`): a vendor that maps a requested name
+        onto a different model server-side still answers 200, so routing
+        alone cannot see it — only comparing the echoed id can. The
+        comparison is made in the terminal ``access`` closure of
+        :func:`_proxy`, so it covers both the streamed and the buffered
+        vendor shapes, and it deliberately does NOT fire when the response
+        carries no ``model`` at all: absence is silence, not a mismatch
+        (same discipline as usage).
+
+        The COUNTER increments on every occurrence — a rate over time is
+        the whole point — while the WARN is EDGE-TRIGGERED per
+        ``(vendor, forwarded, reported)``: a vendor that aliases does so on
+        every request, and a per-request WARN is a storm wearing a warning
+        label. The mismatch is never repaired; the answer already went out.
+        """
+        self._model_echo_mismatches += 1
+        triple = (vendor_id, forwarded, reported)
+        if triple in self._echo_logged:
+            return
+        if len(self._echo_logged) >= _ECHO_LOG_CAP:
+            self._echo_logged.pop(next(iter(self._echo_logged)), None)
+        self._echo_logged[triple] = None
+        logger.warning(
+            "model-gateway: vendor %s was forwarded %s and its response "
+            "reports model %s — the alias-trap shape (see the zai row in "
+            "model_router.vendors). The answer was already relayed; "
+            "counting it as model_echo_mismatches in /health.",
+            vendor_id,
+            _log_safe(forwarded),
+            _log_safe(reported),
+        )
+
+    @property
+    def model_echo_mismatches(self) -> int:
+        """How many vendor answers echoed a model this daemon did not send.
+
+        Zero on a healthy daemon; surfaced in ``/health`` beside the ledger
+        counters.
+        """
+        return self._model_echo_mismatches
+
+    # ── WP-6 review MAJOR-1: vendor auth rejections vs the last-good key ──
+    def note_vendor_auth_rejection(self, vendor_id: str) -> None:
+        """Count one KEY-level vendor auth rejection; at the strike limit,
+        invalidate the last-good key.
+
+        Serve-stale exists for the hub-down window (issue 12), where the
+        key is FINE and resolution is what failed. The mirror-image case
+        is a key the VENDOR is rejecting while resolution also fails
+        (rotated or revoked): without this, the stale key serves until the
+        6 h bound — ``invalidate()`` was a credited mechanism with no
+        production caller. One 401 does not invalidate (an auth blip would
+        become a hard outage); ``VENDOR_AUTH_STRIKE_LIMIT`` consecutive
+        do, with one WARN per invalidation. After invalidation the strikes
+        reset, so a persistently-rejected key re-fires every
+        ``VENDOR_AUTH_STRIKE_LIMIT`` requests — visible, not silent.
+
+        The caller classifies first: only KEY-level rejections
+        (:func:`_auth_rejection_is_key_level`) reach this method. A 403
+        whose body says the MODEL is access-denied is not evidence about
+        the key and must not feed this counter — three requests for
+        deprecated-but-listed models would otherwise invalidate a healthy
+        key.
+        """
+        n = self._vendor_auth_strikes.get(vendor_id, 0) + 1
+        if n < VENDOR_AUTH_STRIKE_LIMIT:
+            self._vendor_auth_strikes[vendor_id] = n
+            return
+        self.keys.invalidate(vendor_id)
+        self._vendor_auth_strikes.pop(vendor_id, None)
+        logger.warning(
+            "model-gateway: vendor %s rejected the key %d consecutive "
+            "times — last-good store invalidated (serve-stale cannot "
+            "outlive a key the vendor rejects)",
+            _log_safe(vendor_id), n,
+        )
+
+    def note_vendor_success(self, vendor_id: str) -> None:
+        """A 2xx from the vendor clears its auth-strike count (a blip
+        never accumulates across an interleaved success)."""
+        self._vendor_auth_strikes.pop(vendor_id, None)
+
+    # ── issue 10: host-token file diagnostic ─────────────────────────────
+    def host_token_file_report(self) -> Optional[dict]:
+        """The token file stamp THIS process loaded, beside the current one.
+
+        Decides among the three 401 shapes of issue 10 without restarting
+        anything:
+
+        * ``path`` differs from the file the failing client read → the
+          starter and the client resolved different ``VCT_STATE_DIR``s
+          (shape 1); reconcile the env, restart.
+        * same ``path``, loaded stamp differs from ``current_mtime_ns``/
+          ``current_size`` → the file was deleted and regenerated AFTER this
+          daemon started (shape 2; the single-instance guard never fires for
+          it because the port never left). Remedy: restart the gateway —
+          honest message, deliberately no auto-heal.
+        * same stamp → the client presented wrong content (shape 3).
+
+        ``None`` for an app built without a sampled stamp (every test, any
+        embedder): the diagnostic is the daemon's to give.
+        """
+        loaded = self._token_file_stamp
+        if not loaded:
+            return None
+        report: dict[str, object] = dict(loaded)
+        current = host_token_stamp(Path(str(loaded.get("path", ""))))
+        report["current_mtime_ns"] = current["mtime_ns"] if current else None
+        report["current_size"] = current["size"] if current else None
+        return report
 
     # ── request plumbing ─────────────────────────────────────────────────
     def authorised(self, request: web.Request) -> bool:
@@ -597,10 +755,12 @@ async def health_handler(request: web.Request) -> web.Response:
     ``test_health_reports_exactly_the_documented_fields``:
 
     ``ok`` (bool), ``service``, ``version``, ``port``, ``host``,
-    ``catalog_source`` (family -> ``live``/``static``/``unfetched``/
-    ``unavailable``),
+    ``catalog_source`` (family -> ``live``/``static``/``declared``/
+    ``unfetched``/``unavailable``),
     ``catalog_filter`` (``latest``/``all`` — which versions of a family reach
-    the picker), ``catalog_hidden`` (int, how many rows the last catalog build
+    the picker), ``window_rows`` (``one_m_only``/``both`` — whether a 1M
+    first-party model shows its plain row beside its ``[1m]`` one),
+    ``catalog_hidden`` (int, how many rows the last catalog build
     withheld under that filter; ``0`` before the picker has ever opened, which
     reads the same as "nothing hidden" and correctly so),
     ``context_table_source``, ``context_table_path``, ``oauth_present``
@@ -608,6 +768,10 @@ async def health_handler(request: web.Request) -> web.Response:
     ``unreadable``), ``oauth_expires_in_s`` (int seconds, negative once past,
     ``null`` when the file states no expiry), ``vendors``,
     ``vendor_keys_cached``,
+    ``vendor_keys_stale`` (vendor ids currently answered from the
+    last-known-good store — issue 12's serve-stale state; empty on a healthy
+    daemon, non-empty exactly while resolution fails for a vendor whose key
+    resolved recently enough to keep serving),
     ``secret_scope`` (``project`` — the scope vendor keys resolve in, which is
     the pin when there is one and this process's working directory when there
     is not, because that is what the resolver itself falls back to;
@@ -620,8 +784,20 @@ async def health_handler(request: web.Request) -> web.Response:
     ``vendor_keys_cached`` reads like "no key configured yet", while the actual
     2026-09-10 state was "this daemon's scope cannot see any key you
     configure"),
+    ``model_echo_mismatches`` (int, how many vendor answers reported a
+    ``model`` that is not the id this daemon forwarded — issue 9's
+    alias-trap counter. Zero on a healthy daemon; each distinct
+    ``(vendor, forwarded, reported)`` also WARNs once),
     ``token_file_permissions`` (``owner_only``/``broader``/``unknown``,
     sampled at startup — probing it here would shell out on Windows),
+    ``host_token_file`` (the token file THIS process loaded — ``path``,
+    ``mtime_ns``, ``size`` sampled at startup, beside ``current_mtime_ns`` /
+    ``current_size`` from one fresh ``stat``. The pair distinguishes the three
+    401 shapes of issue 10: a ``path`` the failing client does not recognise
+    means starter and client resolved different ``VCT_STATE_DIR``s; the same
+    path with a different stamp means the file was deleted and regenerated
+    after this daemon started (restart to fix); the same stamp means the client
+    presented wrong content. ``null`` when no stamp was sampled at startup),
     ``usage_ledger`` (``path`` — where per-chat token rows land, ``null`` on
     an install where the metrics home could not be resolved; ``rows_written``,
     how many rows THIS process has appended; ``last_write_ts``, the ``ts`` of
@@ -647,6 +823,7 @@ async def health_handler(request: web.Request) -> web.Response:
             # liveness probe that could block on two upstream fetches is the
             # thing /health exists not to be.
             "catalog_filter": gateway.config.catalog_filter,
+            "window_rows": gateway.config.window_rows,
             "catalog_hidden": gateway.catalog.hidden_count(),
             "context_table_source": table.source,
             "context_table_path": str(table.path) if table.path else None,
@@ -662,11 +839,22 @@ async def health_handler(request: web.Request) -> web.Response:
             "oauth_expires_in_s": _expires_in_s(oauth.expires_at_ms),
             "vendors": sorted(gateway.vendors.keys()),
             "vendor_keys_cached": list(gateway.keys.cached_vendor_ids()),
+            # Issue 12: the vendors currently served from the last-known-good
+            # store. One cached set read — no store is touched, and the
+            # negative-cache / serve-stale state stays visible through a hub
+            # blip instead of reading as "no key".
+            "vendor_keys_stale": list(gateway.keys.serving_stale_ids()),
             # Cached verdict only — `scope_status` touches no store. The two
             # fields above say WHICH vendors exist and which have a live key;
             # this one says whether a key could be found at all.
             "secret_scope": gateway.keys.scope_status().to_dict(),
+            # In-memory counter — the alias-tripwire of issue 9.
+            "model_echo_mismatches": gateway.model_echo_mismatches,
             "token_file_permissions": gateway.token_permissions,
+            # One fresh `stat` beside the startup-sampled stamp: the pair is
+            # the issue-10 diagnostic (loaded vs current), and a stat is the
+            # only filesystem work /health does besides the credentials one.
+            "host_token_file": gateway.host_token_file_report(),
             # Cached counters and a resolved path — no directory is created
             # and no file is opened, so /health's "never blocks" holds.
             "usage_ledger": gateway.usage.health(),
@@ -730,6 +918,7 @@ async def models_handler(request: web.Request) -> web.Response:
     catalog = await gateway.catalog.union(
         table=table,
         catalog_filter=gateway.config.catalog_filter,
+        window_rows=gateway.config.window_rows,
     )
     logger.info(
         "model-gateway: /v1/models -> %d entries (%s)%s",
@@ -741,6 +930,7 @@ async def models_handler(request: web.Request) -> web.Response:
         (
             f", {len(catalog.hidden)} hidden by "
             f"catalog={gateway.config.catalog_filter}"
+            f"/rows={gateway.config.window_rows}"
             if catalog.hidden else ""
         ),
     )
@@ -1684,6 +1874,28 @@ async def _proxy(
                 ),
                 what="usage ledger",
             )
+        # Issue 9 — model echo assertion, at the ONE terminal point every
+        # response ends at, so both the streamed and the buffered vendor
+        # shapes are covered. Compared here rather than in ``_submit_usage``
+        # because that fires only under ``seen`` (a usage-less 2xx would
+        # escape the assertion) and only after the decline gates. Absence of
+        # the field is silence, not mismatch — the same discipline the usage
+        # block uses — so a vendor that does not echo a model never counts.
+        # First-party answers are exempt: the alias trap is a vendor
+        # property (``vendors.py``), and native is the definition of correct.
+        if (
+            accumulator is not None
+            and 200 <= status < 300
+            and decision.vendor is not None
+            and decision.forward_model
+        ):
+            reported = accumulator.reported_model
+            if reported is not None and reported != decision.forward_model:
+                gateway.note_model_echo_mismatch(
+                    decision.vendor.vendor_id,
+                    decision.forward_model,
+                    reported,
+                )
 
     try:
         upstream_ctx = gateway.session.post(
@@ -1736,6 +1948,21 @@ async def _proxy(
                         allow_oauth_retry=False,
                     )
             vendor = decision.vendor
+            # WP-6 review MAJOR-1, refined by the no-discovery-vendor
+            # addendum: a vendor 401/403 must be CLASSIFIED before it can
+            # touch the strike counter, and classifying means reading the
+            # body — which consumes it. So this branch owns the whole
+            # response: it counts key-level rejections (three consecutive
+            # invalidate the last-good key; any 2xx resets via the elif
+            # below), exempts the documented model-level access-denial
+            # shape, and relays the vendor's own answer verbatim either
+            # way. Status sets here are disjoint from the quota branch's.
+            if vendor is not None and upstream.status in (401, 403):
+                return await _auth_rejection_response(
+                    request, gateway, vendor, upstream, access,
+                )
+            if vendor is not None and 200 <= upstream.status < 300:
+                gateway.note_vendor_success(vendor.vendor_id)
             if vendor is not None and upstream.status in QUOTA_STATUSES:
                 return await _quota_response(
                     upstream, vendor, stream_requested, access,
@@ -1998,6 +2225,108 @@ def _log_repair(family_id: str, stats: RepairStats, suppressed: int = 0) -> None
     )
 
 
+def _auth_rejection_is_key_level(status: int, raw: bytes) -> bool:
+    """Is a vendor 401/403 about the KEY, or about the MODEL?
+
+    The two feed different machinery and must not be conflated:
+
+    * KEY-level (401, or a 403 about the credential) increments the
+      auth-strike counter — three consecutive and the last-good key store is
+      invalidated, because a key the VENDOR rejects must not keep serving
+      stale.
+    * MODEL-level (HTTP 403 ``AccessDenied``, error code ``access_denied``)
+      means the model is gated or deprecated while the key is perfectly
+      good. Feeding those to the strike counter would invalidate a healthy
+      key after three requests for models the vendor itself still lists —
+      the exact trap this classifier exists to defuse.
+
+    Only the DOCUMENTED model-level shape is exempted: the vendor's own
+    client docs describe deprecated models answering 403 with that code, and
+    :mod:`model_router.quota` established the house rule that a claim of
+    this size needs positive evidence in the body. An unparseable body, or a
+    403 whose error shape is unrecognised, counts as key-level — which is
+    the pre-addendum behaviour, no worse — because the strike counter's
+    purpose (protecting the last-good store) must not silently switch off on
+    a body the gateway could not read.
+    """
+    if status == 401:
+        return True
+    try:
+        payload = json.loads(raw) if raw else None
+    except ValueError:
+        return True
+    if not isinstance(payload, dict):
+        return True
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return True
+    code = str(error.get("code") or "").strip().lower()
+    error_type = str(error.get("type") or "").strip().lower()
+    return "access_denied" not in (code, error_type)
+
+
+async def _auth_rejection_response(
+    request: web.Request,
+    gateway: "Gateway",
+    vendor: Vendor,
+    upstream: aiohttp.ClientResponse,
+    access: Callable[..., None],
+) -> web.StreamResponse:
+    """Classify a vendor 401/403, then relay the vendor's own answer verbatim.
+
+    The body has to be read to classify it (see
+    :func:`_auth_rejection_is_key_level`), and an aiohttp ``StreamReader``
+    cannot be un-read — so this branch OWNS the response end to end, exactly
+    like :func:`_quota_response` owns the quota statuses. Past the hold bound
+    the held bytes are written and the remainder streamed, verbatim, the
+    relay shape :func:`_relay_vendor_json` uses for oversized bodies: the
+    classification is ours, the answer is the vendor's, and neither editing
+    the other is the bug this whole function avoids.
+    """
+    relay = gateway.relay_headers(upstream)
+    raw, overflowed = await _buffer_bounded(
+        upstream.content, _AUTH_BODY_LIMIT_BYTES,
+    )
+    key_level = _auth_rejection_is_key_level(upstream.status, raw)
+    if key_level:
+        gateway.note_vendor_auth_rejection(vendor.vendor_id)
+        auth_class = "key"
+    else:
+        logger.info(
+            "model-gateway: vendor %s refused the MODEL, not the key "
+            "(access_denied 403; likely a deprecated id the vendor still "
+            "lists) — relayed without an auth strike",
+            _log_safe(vendor.vendor_id),
+        )
+        auth_class = "model_access_denied"
+    if overflowed:
+        logger.warning(
+            "model-gateway: %s auth rejection exceeds %d bytes; classified "
+            "from the held prefix and relayed verbatim",
+            vendor.vendor_id, _AUTH_BODY_LIMIT_BYTES,
+        )
+        response = web.StreamResponse(status=upstream.status, headers=relay)
+        response.enable_chunked_encoding()
+        await response.prepare(request)
+        total = len(raw)
+        await response.write(raw)
+        async for chunk in upstream.content.iter_any():
+            await response.write(chunk)
+            total += len(chunk)
+        await response.write_eof()
+        access(
+            upstream.status, stream=False,
+            extra=f"note=vendor_auth auth_class={auth_class}",
+        )
+        return response
+    access(
+        upstream.status,
+        stream=False,
+        extra=f"bytes={len(raw)} note=vendor_auth auth_class={auth_class}",
+    )
+    return web.Response(status=upstream.status, headers=relay, body=raw)
+
+
 async def _quota_response(
     upstream: aiohttp.ClientResponse,
     vendor: Vendor,
@@ -2248,6 +2577,7 @@ def create_app(
     oauth_reader: Optional[OAuthReader] = None,
     key_resolver: Optional[VendorKeyResolver] = None,
     token_permissions: OwnerOnlyState = "unknown",
+    token_file_stamp: Optional[Mapping[str, object]] = None,
 ) -> web.Application:
     """Build the application. Pure: binds nothing, starts no I/O."""
     gateway = Gateway(
@@ -2257,6 +2587,7 @@ def create_app(
         oauth_reader=oauth_reader,
         key_resolver=key_resolver,
         token_permissions=token_permissions,
+        token_file_stamp=token_file_stamp,
     )
     app = web.Application(
         middlewares=[loopback_only_middleware],

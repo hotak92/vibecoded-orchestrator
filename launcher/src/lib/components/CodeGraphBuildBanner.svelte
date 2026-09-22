@@ -29,6 +29,7 @@
   import {
     isPruneFailurePartial as computeIsPruneFailurePartial,
     buildDropRecreateCommand,
+    buildDetailLine as detailLine,
   } from './codegraph-build-banner-logic';
   import StatusBannerShell from './StatusBannerShell.svelte';
   import { toneForCodeGraphBuildStatus } from './status-banner-tone';
@@ -193,18 +194,10 @@
     }
   }
 
-  function detailLine(v: CodeGraphBuildView): string {
-    const parts: string[] = [];
-    // Partial: lead with the stale-row warning (error_message carries the
-    // "N stale row(s) could not be pruned" text set by the reader). It's
-    // informational, not a failure — inserts all succeeded.
-    if (v.status === 'partial' && v.error_message) parts.push(v.error_message);
-    if (v.languages.length > 0) parts.push(`Languages: ${v.languages.join(', ')}`);
-    if (v.duration_ms != null) parts.push(`Took ${(v.duration_ms / 1000).toFixed(1)}s`);
-    // v0.2.73 (CG-3): Joern CFG/PDG removed (zero readers) — joern_used is now
-    // always false; the "Joern: enabled" line is dead and removed.
-    return parts.join(' · ');
-  }
+  // `detailLine` is `buildDetailLine` from ./codegraph-build-banner-logic —
+  // one home, unit-tested there. v0.2.96 (L-4): it now surfaces
+  // `error_message` on `failed` as well as on `partial`, so the state that
+  // never auto-hides says WHY without a "Show details" click.
 
   // Reactive: should the banner be visible at all? Terminal states fade
   // out after `hideTerminalAfterMs`; failed never auto-hides; dismissed

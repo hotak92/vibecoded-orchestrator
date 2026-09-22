@@ -147,10 +147,47 @@ if [ ! -f "$ANALYZER" ]; then
 fi
 # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
-ANALYZER_PY="$PY"
-if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+# Interpreter for the analyzer. Precedence — MUST MATCH
+# stop-codegraph-drain.ps1 (`$env:VCT_PYTHON` → resolver → PATH loop):
+#   1. $VCT_PYTHON      explicit operator override (a user statement)
+#   2. shared venv resolver (VCT_INSTALL_ROOT/.venv, clone-relative, …)
+#   3. $PY              bare PATH — python3 / python / py
+# v0.2.96: this file read NEITHER $VCT_PYTHON (its .ps1 sibling and
+# code-graph-incremental.sh both do — a silent cross-OS divergence) nor any
+# record of WHICH tier answered, which is what the probe below needs.
+ANALYZER_PY="${VCT_PYTHON:-}"
+_CG_PY_FROM_BARE_PATH=0
+if [ -z "$ANALYZER_PY" ] && command -v resolve_vco_venv_python >/dev/null 2>&1; then
     resolve_vco_venv_python "$SCRIPT_DIR"
-    [ -n "${VCO_VENV_PYTHON:-}" ] && ANALYZER_PY="$VCO_VENV_PYTHON"
+    ANALYZER_PY="${VCO_VENV_PYTHON:-}"
+fi
+if [ -z "$ANALYZER_PY" ]; then
+    ANALYZER_PY="$PY"
+    _CG_PY_FROM_BARE_PATH=1
+fi
+
+# v0.2.96 (WP-5 S2): when every venv tier missed, ANALYZER_PY is whatever
+# `python3`/`python`/`py` happens to be on PATH — an interpreter that in a
+# user project routinely has neither `weaviate` nor `vco_lib`. The analyzer
+# then prints "Error: weaviate-client not installed" into the detached run's
+# `>/dev/null 2>&1`, while the code below has ALREADY consumed $QUEUE and
+# deletes $CONSUMED at the end: the batch of edited paths is lost with no
+# trace, and those files' code-graph rows stay stale forever.
+#
+# This is not a new policy — it is the policy this hook already applies two
+# blocks up ("No analyzer → put the queue back (append, so nothing is lost)").
+# An interpreter that cannot import the analyzer's dependencies is the same
+# condition: the analyzer cannot run. Probe the SAME import string the
+# shipped wrappers gate on (`kg-duplicates`, `vct_venv_ladder.sh`), and only
+# when we actually fell back — a healthy install resolves a venv and pays
+# nothing. One line to stderr, exit 0: a Stop hook still never blocks.
+if [ "$_CG_PY_FROM_BARE_PATH" = "1" ]; then
+    if ! "$ANALYZER_PY" -c 'import weaviate, vco_lib' >/dev/null 2>&1; then
+        cat "$CONSUMED" >> "$QUEUE" 2>/dev/null || true
+        rm -f "$CONSUMED" 2>/dev/null || true
+        echo "ℹ️  code-graph drain: no interpreter with weaviate+vco_lib (tried '$ANALYZER_PY'); queue kept for a later turn." >&2
+        exit 0
+    fi
 fi
 
 # Resolve the code-graph collection prefix for a canonical root (hub resolver

@@ -162,6 +162,12 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     # would protect nothing while making two adjacent, identical fixtures
     # behave differently.
     "V0295R", "V0295R_Shared",
+    # v0.2.96 WP-2 schema-trim suite — same classification as V0295T/V0295R
+    # above (release-stemmed collection literal confined to one test module,
+    # in-memory fakes only; nothing outside the module can name it).
+    # `StaleDefault` is the suite's deliberately-wrong env-default name the
+    # DB middle tier must NOT resolve to — tabled for the same reason.
+    "V0296T", "V0296T_Shared", "StaleDefault",
     "Vco_v0243_A_install",
     "Vco_v0243_B_rust", "Vco_v0243_C_cleanup", "VcoD2Scratch", "VCODev",
     "Vcodev", "vcodev", "VcoDev", "vct", "Vct_coordination",

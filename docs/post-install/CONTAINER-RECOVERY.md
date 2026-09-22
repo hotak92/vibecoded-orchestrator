@@ -130,9 +130,53 @@ Common offenders:
 
 Resolution: stop the offender, OR change the orchestrator's port via
 env vars, THEN restart the relevant container. `WEAVIATE_PORT`,
-`OLLAMA_PORT`, and `VCT_HUB_PORT` are documented in
-`docs/CONFIGURATION.md`; `CODE_EMBED_PORT` is read directly by
-`infrastructure/docker-compose.yml` (host-side default `11440`).
+`OLLAMA_PORT`, `CODE_EMBED_PORT` and `VCT_HUB_PORT` are documented in
+[`../CONFIGURATION.md`](../CONFIGURATION.md) — Weaviate's under
+"Which Weaviate, vs which collection", which also gives the
+`WEAVIATE_URL` > `WEAVIATE_PORT` > `localhost:8081` precedence and the
+one caveat that matters here: the launcher's own resolver reads
+`WEAVIATE_URL`, not `WEAVIATE_PORT`, so set the URL if you want every
+surface to follow the move.
+
+---
+
+## A service on our port belongs to a different compose project
+
+Distinct from a port conflict: the container is *there* and answering,
+but another compose project created it (VCO checks the compose labels).
+Since v0.2.93 an install refuses to `--force-recreate` or `--build` such
+a service — recreating a container you do not own can orphan its volumes
+— and leaves a `services_foreign_compose_identity` entry in the
+install's `UPDATE_DEFERRED.md` ledger. Until v0.2.96 the entry described
+the refusal and stopped there, so the only way forward was manual
+compose surgery.
+
+That entry now leads with the command that does it:
+
+```bash
+python -m vco_lib.service_adoption adopt-services --root <install root>
+python -m vco_lib.service_adoption adopt-services --root <install root> --dry-run   # plan only, changes nothing
+```
+
+`--root` defaults to the checkout the module is imported from; add
+`--runtime docker` on a Docker install (the default is `podman`).
+
+It reconciles rather than replaces. The live containers are read, an
+`infrastructure/compose.override.yaml` is generated carrying their bind
+mounts **byte for byte** plus the behaviour-critical environment and
+healthchecks, the merged configuration is re-rendered and verified
+*before* anything is stopped, and then services move one at a time. It
+never removes or prunes a volume, never `down`s the other project, and
+never writes that project's files. Any service whose live state cannot
+be read positively is refused — substituting a named volume for a bind
+mount is refused outright, because that is how a 110 GB model directory
+gets silently orphaned. A service that fails to come up is re-created
+under its original invocation and the services after it are left alone.
+An override file you wrote yourself is never overwritten.
+
+Where adoption is not what you want, the deferral's printed rebuild
+command tags the **owning** project's image name, so a manual rebuild
+reaches the image actually in use instead of building one nothing runs.
 
 ---
 

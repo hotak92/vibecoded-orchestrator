@@ -5,7 +5,7 @@ short_desc: comprehensive web research with sub-agent spawning
 keywords: [deep research, recursive research, comprehensive investigation, multi-step research, authoritative sources, "research report", "research this topic", "deep dive into", "thorough research", "comprehensive research", "investigate deeply"]
 tools: WebSearch, WebFetch, Task, Read, Write
 model: sonnet
-effort: xhigh
+effort: high
 ---
 
 # Deep Researcher Agent

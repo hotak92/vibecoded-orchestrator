@@ -11,7 +11,9 @@ the only guard lives at chunk granularity inside the Python embed path
 (``VCT_EMBED_REQUEST_TIMEOUT_SECS`` in ``EmbeddingService``).
 
 This is a source-structure guard: it walks install.py's AST and asserts that
-EVERY ``subprocess.run(...)`` whose first arg invokes ``sync_knowledge_graph.py``
+EVERY seed spawn — ``subprocess.run(...)`` OR ``run_child_logged(...)``
+(v0.2.96 WP-1 moved both seed sites to the log-routing helper; it carries no
+timeout parameter at all) — whose first arg invokes ``sync_knowledge_graph.py``
 (via the ``sync_kg`` variable) does NOT pass a ``timeout=`` keyword. It would
 fail if a future edit re-introduced a per-process cap on the seed.
 """
@@ -30,15 +32,19 @@ if str(REPO_ROOT) not in sys.path:
 INSTALL_PY = REPO_ROOT / "install.py"
 
 
-def _is_subprocess_run(call: ast.Call) -> bool:
-    """True if ``call`` is ``subprocess.run(...)``."""
+def _is_seed_spawn_call(call: ast.Call) -> bool:
+    """True if ``call`` is ``subprocess.run(...)`` or a bare
+    ``run_child_logged(...)`` (v0.2.96 WP-1's log-routing helper, imported
+    into install.py's namespace)."""
     func = call.func
-    return (
+    if (
         isinstance(func, ast.Attribute)
         and func.attr == "run"
         and isinstance(func.value, ast.Name)
         and func.value.id == "subprocess"
-    )
+    ):
+        return True
+    return isinstance(func, ast.Name) and func.id == "run_child_logged"
 
 
 def _first_arg_references_sync_kg(call: ast.Call) -> bool:
@@ -70,7 +76,7 @@ class SeedSubprocessNoProcessTimeoutTests(unittest.TestCase):
         for node in ast.walk(self.tree):
             if (
                 isinstance(node, ast.Call)
-                and _is_subprocess_run(node)
+                and _is_seed_spawn_call(node)
                 and _first_arg_references_sync_kg(node)
             ):
                 calls.append(node)
@@ -87,7 +93,7 @@ class SeedSubprocessNoProcessTimeoutTests(unittest.TestCase):
             len(calls),
             2,
             "expected at least the two sync_knowledge_graph.py seed "
-            "subprocess.run call sites in install.py",
+            "spawn call sites in install.py",
         )
 
     def test_no_seed_call_passes_timeout(self):
@@ -97,7 +103,7 @@ class SeedSubprocessNoProcessTimeoutTests(unittest.TestCase):
                 "timeout",
                 kwarg_names,
                 f"install.py line {call.lineno}: a sync_knowledge_graph.py "
-                "seed subprocess.run must NOT pass timeout= (v0.2.69 FIX 3 — "
+                "seed spawn must NOT pass timeout= (v0.2.69 FIX 3 — "
                 "no per-process cap on the seed path; the guard is per-embed-"
                 "request in EmbeddingService).",
             )
@@ -106,7 +112,7 @@ class SeedSubprocessNoProcessTimeoutTests(unittest.TestCase):
             self.assertIn(
                 "check",
                 kwarg_names,
-                f"install.py line {call.lineno}: seed subprocess.run should "
+                f"install.py line {call.lineno}: seed spawn should "
                 "keep check=True so real non-zero exits still raise.",
             )
 

@@ -38,6 +38,7 @@ The test exercises THREE failure modes:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import textwrap
@@ -45,6 +46,38 @@ import unittest
 from pathlib import Path
 
 from tests.common.child_env import child_env
+
+
+def _assert_filter_precedes_weaviate_import(case: unittest.TestCase, script: Path) -> None:
+    """ONE home for the four identical order checks below.
+
+    Order matters because authlib forces
+    ``simplefilter('always', AuthlibDeprecationWarning)`` at
+    ``authlib.deprecate`` import time; a filter installed AFTER weaviate has
+    imported authlib does nothing.
+
+    The weaviate import is matched by REGEX, not by the literal
+    ``"\nimport weaviate"``: it is the PACKAGE import that pulls authlib, and
+    a module that connects through ``vco_lib.weaviate_helpers`` legitimately
+    has only ``from weaviate.classes... import ...``. Pinning the spelling
+    made this test fail for a file whose ordering property was intact
+    (v0.2.96: ``detect_duplicates.py``, after its connect moved to the shared
+    home and the now-unused bare import was dropped) — a pin on an incidental
+    string, which is exactly the shape this codebase has been bitten by
+    before. `analyze_code_graph.py` had already been given the regex; the
+    other three had not, because the check was copied four times.
+    """
+    text = script.read_text()
+    case.assertIn("AuthlibDeprecationWarning", text, msg="filter block missing entirely")
+    filter_idx = text.index("AuthlibDeprecationWarning")
+    m = re.search(r"^\s*(import weaviate\b|from weaviate[.\s])", text, re.M)
+    case.assertIsNotNone(m, f"{script.name} no longer imports weaviate?")
+    assert m is not None  # for type checkers
+    case.assertLess(
+        filter_idx, m.start(),
+        msg=f"the filter must precede the weaviate import in {script.name}",
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -158,35 +191,17 @@ class AuthlibDeprecationFilterTests(unittest.TestCase):
         ``authlib.deprecate`` import time; if our filter runs AFTER
         weaviate has imported authlib, the warning still escapes.
         """
-        script = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
-        text = script.read_text()
-        filter_marker = "AuthlibDeprecationWarning"
-        weaviate_import = "\nimport weaviate"
-        self.assertIn(filter_marker, text, msg="filter block missing entirely")
-        self.assertIn(weaviate_import, text)
-        self.assertLess(
-            text.index(filter_marker),
-            text.index(weaviate_import),
-            msg="filter must precede `import weaviate`",
+        _assert_filter_precedes_weaviate_import(
+            self, REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
         )
 
     def test_analyze_code_graph_filter_block_present(self) -> None:
         """Same order check for templates/scripts/analyze_code_graph.py."""
-        script = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
-        text = script.read_text()
-        self.assertIn("AuthlibDeprecationWarning", text)
-        # analyze_code_graph.py wraps the import in try/except, but the
-        # filter block must still come before the try statement.
-        filter_idx = text.index("AuthlibDeprecationWarning")
-        # The weaviate import is inside a try block. v0.2.94: the analyzer
-        # connects through `vco_lib.weaviate_helpers`, so the bare
-        # `import weaviate` is gone and the FIRST import of the package is
-        # `from weaviate.classes...` — locate whichever form comes first;
-        # it is the package import that triggers authlib, not the spelling.
-        import re
-        m = re.search(r"^\s*(import weaviate\b|from weaviate[.\s])", text, re.M)
-        self.assertIsNotNone(m, "analyze_code_graph.py no longer imports weaviate?")
-        self.assertLess(filter_idx, m.start())
+        # The import is inside a try/except here; the filter block must
+        # still precede the try statement.
+        _assert_filter_precedes_weaviate_import(
+            self, REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+        )
 
     def test_detect_duplicates_filter_block_present(self) -> None:
         """Same order check for templates/scripts/detect_duplicates.py.
@@ -195,21 +210,15 @@ class AuthlibDeprecationFilterTests(unittest.TestCase):
         post-edit hook, so any warning that escapes here would surface
         repeatedly during normal use, not just during install.
         """
-        script = REPO_ROOT / "templates" / "scripts" / "detect_duplicates.py"
-        text = script.read_text()
-        self.assertIn("AuthlibDeprecationWarning", text)
-        filter_idx = text.index("AuthlibDeprecationWarning")
-        weaviate_import_idx = text.index("\nimport weaviate")
-        self.assertLess(filter_idx, weaviate_import_idx)
+        _assert_filter_precedes_weaviate_import(
+            self, REPO_ROOT / "templates" / "scripts" / "detect_duplicates.py"
+        )
 
     def test_weaviate_mcp_server_filter_block_present(self) -> None:
         """Same order check for claude_mcp_servers/weaviate_mcp/server.py."""
-        script = REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
-        text = script.read_text()
-        self.assertIn("AuthlibDeprecationWarning", text)
-        filter_idx = text.index("AuthlibDeprecationWarning")
-        weaviate_import_idx = text.index("\nimport weaviate")
-        self.assertLess(filter_idx, weaviate_import_idx)
+        _assert_filter_precedes_weaviate_import(
+            self, REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
+        )
 
 
 if __name__ == "__main__":

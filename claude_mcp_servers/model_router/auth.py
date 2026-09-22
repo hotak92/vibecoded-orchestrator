@@ -233,10 +233,46 @@ def token_matches(presented: str, expected: str) -> bool:
     return hmac.compare_digest(presented, expected)
 
 
+def host_token_stamp(path: Path) -> "dict[str, object] | None":
+    """The identifying stamp of a host-token file: path, ``mtime_ns``, size.
+
+    Issue 10's diagnostic. The daemon samples this ONCE at startup, right
+    after ``ensure_host_token`` (see ``model_router.__main__._serve``), and
+    ``/health`` later shows it beside a fresh stamp of the same path. The
+    pair distinguishes the three ways a client with a valid-looking token
+    can still 401 against a live daemon:
+
+    * the LOADED path differs from the file the client read — starter and
+      client resolved different ``VCT_STATE_DIR``s;
+    * same path, different ``(mtime_ns, size)`` — the file was deleted and
+      regenerated AFTER this daemon started, so the daemon authorises with
+      a token no file on disk holds any more (remedy: restart the gateway);
+    * same stamp — the client presented wrong content.
+
+    ``None`` when the file cannot be stated (deleted, unreadable): the
+    caller reports that as its own answer rather than guessing.
+
+    The stamp is the ``(mtime_ns, size)`` pair the in-module precedent
+    (:class:`OAuthReader`) already trusts to detect a rewritten file, and it
+    deliberately contains NO content — a stamp that hashed the token would
+    put a credential-adjacent value into ``/health``.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return {
+        "path": str(path),
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+    }
+
+
 __all__ = [
     "OAuthReader",
     "OAuthState",
     "ensure_host_token",
+    "host_token_stamp",
     "read_host_token",
     "token_matches",
 ]

@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.common.child_env import child_env  # noqa: E402
+from tests.common.module_gateway import MODULE_GATEWAY_AGENT_FILES  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
@@ -424,6 +425,114 @@ class InstallBundleFreshTests(unittest.TestCase):
         self.assertEqual(result["actions"]["create"], [])
         # Settings is "unchanged" on identical re-merge.
         self.assertIn(result["settings_action"], ("unchanged", ""))
+
+
+class ModuleGatewayAgentDeliveryTests(unittest.TestCase):
+    """v0.2.96 WP-10 — `templates/agents/module-gateway/` delivery legs.
+
+    The gated set (tests/common/module_gateway.py is the ONE home for its
+    file list) carries hardcoded `claude-gw/*` frontmatter model ids, so it
+    must reach a project ONLY when that project's `model_gateway` module row
+    says active. The gate resolves folder→UUID before the active-check
+    (survey §2 key-divergence; the resolver itself is pinned in
+    test_conditional_template.py::ModuleGatewayDeliveryKeyTests). These are
+    the DELIVERY legs: enumerate → install → on-disk bytes.
+    """
+
+    UUID = "0f1e2d3c-4b5a-6978-8976-a5b4c3d2e1f0"
+    GATED = MODULE_GATEWAY_AGENT_FILES
+
+    def setUp(self):
+        import shutil
+
+        self._saved_db_override = os.environ.get("VCT_LAUNCHER_DB_PATH")
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-bundle-gw-"))
+        self.orch = self.tmp / "orchestrator"
+        self.proj = self.tmp / "project"
+        self.orch.mkdir()
+        self.proj.mkdir()
+        _make_fake_orchestrator(self.orch)
+        # Ship the REAL gated definitions (byte-fidelity is part of the
+        # delivery contract: the frontmatter model ids are the payload).
+        gated_src = REPO_ROOT / "templates" / "agents" / "module-gateway"
+        gated_dst = self.orch / "templates" / "agents" / "module-gateway"
+        gated_dst.mkdir(parents=True)
+        for name in self.GATED:
+            shutil.copyfile(gated_src / name, gated_dst / name)
+
+    def tearDown(self):
+        import shutil
+
+        if self._saved_db_override is None:
+            os.environ.pop("VCT_LAUNCHER_DB_PATH", None)
+        else:
+            os.environ["VCT_LAUNCHER_DB_PATH"] = self._saved_db_override
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def _fixture_db(self, *, enabled: int, register: bool) -> None:
+        """Real-schema launcher.db (tests/common/launcher_db_fixture — no
+        hand-rolled DDL) with the project registered + module row set."""
+        from tests.common.launcher_db_fixture import insert_rows, make_launcher_db
+
+        projects = [{
+            "project_id": self.UUID,
+            "name": "Project",
+            "folder_path": self.proj,
+        }] if register else []
+        db = make_launcher_db(self.tmp / "db", projects=projects)
+        insert_rows(db, "project_modules", [{
+            "project_id": self.UUID,
+            "module_name": "model_gateway",
+            "enabled": enabled,
+        }])
+        os.environ["VCT_LAUNCHER_DB_PATH"] = str(db)
+
+    def _dest(self, name: str) -> str:
+        return str(Path(".claude") / "agents" / name)
+
+    def test_module_active_delivers_all_definitions_byte_identical(self):
+        self._fixture_db(enabled=1, register=True)
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        for name in self.GATED:
+            self.assertIn(self._dest(name), result["actions"]["create"])
+            delivered = self.proj / ".claude" / "agents" / name
+            self.assertTrue(delivered.exists(), f"{name} not delivered")
+            source = (
+                REPO_ROOT / "templates" / "agents" / "module-gateway" / name
+            )
+            self.assertEqual(
+                delivered.read_bytes(), source.read_bytes(),
+                f"{name} must land byte-identical (no placeholders to expand)",
+            )
+
+    def test_module_inactive_does_not_deliver(self):
+        """enabled=0 is an explicit opt-out; the set stays out of the
+        enumeration entirely (never created, never on disk)."""
+        self._fixture_db(enabled=0, register=True)
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        for name in self.GATED:
+            self.assertNotIn(self._dest(name), result["actions"]["create"])
+            self.assertFalse((self.proj / ".claude" / "agents" / name).exists())
+        # The free bucket is untouched by the gate either way.
+        self.assertIn(
+            str(Path(".claude") / "agents" / "coder.md"),
+            result["actions"]["create"],
+        )
+
+    def test_unregistered_folder_does_not_deliver(self):
+        """Module row for another project's UUID + this folder unregistered
+        → conservative NOT-active (fails toward less materialization)."""
+        self._fixture_db(enabled=1, register=False)
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        for name in self.GATED:
+            self.assertNotIn(self._dest(name), result["actions"]["create"])
+            self.assertFalse((self.proj / ".claude" / "agents" / name).exists())
 
 
 class InstallBundleUpdateModeTests(unittest.TestCase):

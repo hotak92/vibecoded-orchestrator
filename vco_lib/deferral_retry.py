@@ -88,6 +88,12 @@ from typing import Callable, Iterable, Optional, Sequence
 
 from vco_lib.intfile import read_int_line
 
+# v0.2.96 (WP-3): the image-freshness verdict token the dispatch-side image
+# gate branches on. Hard import — `vco_lib` importing `vco_lib` is the
+# definition of a healthy install; the token itself comes from the ONE home
+# (``vco_lib.code_embed_image``, via ``codegraph_resync``'s shared helper).
+from vco_lib.code_embed_image import STALE as _IMAGE_STALE
+
 #: Per (folder, condition) attempt ceiling. Beyond it the entry stays for the
 #: user — a retry that failed three times is not transient.
 MAX_ATTEMPTS = 3
@@ -142,6 +148,66 @@ BLOCKED = "blocked"
 #: plausibly transient and the generic disposition is fair; at it, the reader
 #: is owed the specific history instead.
 BLOCKED_NOTE_THRESHOLD = 3
+
+#: WHY a pass was blocked. The two gates below can both block the SAME
+#: condition, and the honest note depends on which one did — so the gate that
+#: blocks writes a detail from here and :func:`classify_block_detail` reads it
+#: back. ONE home for the vocabulary: a detail edited on the writing side only
+#: would silently revert the note to the wrong cause, which is the v0.2.96
+#: ship-gate's MINOR-3 (the cause used to come from the HANDLER's static
+#: image-gate FLAG, so a service that was simply DOWN told the user to rebuild
+#: an image for a service that was not running).
+BLOCK_CAUSE_BACKEND = "backend"
+BLOCK_CAUSE_IMAGE = "image"
+#: Neither — an old trail whose rows predate this vocabulary, or a future gate
+#: that has not declared itself. The note then reports the streak WITHOUT
+#: naming a cause, which is the honest answer (never a guessed one).
+BLOCK_CAUSE_UNKNOWN = ""
+
+#: The blocked-by-image detail, verbatim. A constant because two places must
+#: agree on it: the gate that writes the row and the classifier that reads it.
+BLOCKED_BY_IMAGE_DETAIL = (
+    "code-embed image is STALE (older than its source) — embedding through "
+    "it would silently truncate; the retry resumes by itself once the image "
+    "is rebuilt"
+)
+
+
+def backend_block_detail(kind: str, reachable: Optional[bool]) -> str:
+    """The blocked-by-backend detail for ``kind``, verbatim.
+
+    Same ONE-home reason as :data:`BLOCKED_BY_IMAGE_DETAIL`; a function
+    because the sentence names the backend and distinguishes "provably down"
+    from "could not tell", both of which are reachability, not freshness.
+    """
+    return (
+        f"no {kind} embedding backend reachable"
+        if reachable is False
+        else f"{kind} backend reachability unknown"
+    )
+
+
+def classify_block_detail(detail: str) -> str:
+    """Which gate wrote this BLOCKED row's detail — one of the
+    ``BLOCK_CAUSE_*`` tokens.
+
+    Reads the detail rather than the handler's declared preconditions
+    because a handler can have BOTH (``codegraph_resync`` needs a reachable
+    code backend AND a current image), and only the row records which one
+    actually blocked. Unrecognised text is :data:`BLOCK_CAUSE_UNKNOWN` — a
+    row written by an older version says nothing about its cause, and
+    inventing one for it is the defect this replaces.
+    """
+    text = str(detail or "")
+    if BLOCKED_BY_IMAGE_DETAIL in text:
+        return BLOCK_CAUSE_IMAGE
+    for kind in (TEXT_BACKEND, CODE_BACKEND):
+        if (
+            backend_block_detail(kind, False) in text
+            or backend_block_detail(kind, None) in text
+        ):
+            return BLOCK_CAUSE_BACKEND
+    return BLOCK_CAUSE_UNKNOWN
 
 #: Which backend a handler's owed work actually needs. The gate asks THIS
 #: question — "is any backend up" was the wrong one: on a machine whose text
@@ -303,6 +369,25 @@ def default_runner(argv: Sequence[str], cwd: Path) -> int:
         list(argv), cwd=str(cwd), check=False,
     )
     return proc.returncode
+
+
+def _code_embed_image_verdict(folder: Path) -> str:
+    """v0.2.96 (WP-3): the code-embed image verdict for ``folder``.
+
+    ONE home — ``vco_lib.codegraph_resync.code_embed_image_verdict`` — so the
+    dispatcher's gate and the gate inside the driver it spawns consult the
+    same verdict and can never disagree (review M-1: a gate only install.py
+    consults is bypassed by this very dispatcher). ``unknown`` on any failure,
+    including a broken import: could-not-look must not read as a block.
+    """
+    try:
+        from vco_lib.codegraph_resync import code_embed_image_verdict
+    except Exception:  # noqa: BLE001 — broken install ⇒ unknown, never a crash
+        return "unknown"
+    try:
+        return code_embed_image_verdict(folder)
+    except Exception:  # noqa: BLE001 — a failed probe is unknown
+        return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +569,19 @@ class Handler:
     Pairing the two in one row is what stops the gate and the handler drifting
     apart: a handler cannot be added without declaring which backend has to be
     up for its work to be possible.
+
+    v0.2.96 (WP-3) adds the second declared precondition:
+    ``needs_current_code_embed_image`` — True when the handler's work embeds
+    through the code-embed SERVICE, because a service that is reachable but
+    built from stale source silently truncates over-window input at HTTP 200
+    (register issue 8; the 2026-09-20 update pushed 3 156 embed requests
+    through one). Reachability (``backend``) cannot see that; only the image
+    verdict can, so the two gates are separate questions with the same shape.
     """
 
     run: Callable[[RetryContext], RetryResult]
     backend: str
+    needs_current_code_embed_image: bool = False
 
 
 #: handler name → handler. The registry references these as
@@ -495,8 +589,19 @@ class Handler:
 #: here fails ``tests/test_v0291_retry_dispatch.py``.
 HANDLERS: dict[str, Handler] = {
     "kg_seed": Handler(retry_kg_seed, TEXT_BACKEND),
-    "code_graph_walk": Handler(retry_code_graph_walk, CODE_BACKEND),
-    "codegraph_resync": Handler(retry_codegraph_resync, CODE_BACKEND),
+    # WP-3 review MAJOR-1: `code_graph_walk`'s handler does a BARE analyzer
+    # walk that never enters the resync driver, so the driver-side verdict
+    # gate cannot see it — without this flag, a stale-but-UP service passes
+    # the reachability-only backend gate and this retry embeds straight
+    # through the stale image (the exact defect WP-3 exists to close).
+    "code_graph_walk": Handler(
+        retry_code_graph_walk, CODE_BACKEND,
+        needs_current_code_embed_image=True,
+    ),
+    "codegraph_resync": Handler(
+        retry_codegraph_resync, CODE_BACKEND,
+        needs_current_code_embed_image=True,
+    ),
 }
 
 
@@ -577,6 +682,12 @@ class RetryHistory:
     #: ISO timestamps bounding that streak (``""`` when there is none).
     streak_first_ts: str = ""
     streak_last_ts: str = ""
+    #: The NEWEST blocked row's own ``detail`` — what actually blocked, as the
+    #: gate recorded it. :func:`classify_block_detail` turns it into a cause;
+    #: without it a reader can only guess from the handler's declared
+    #: preconditions, and a handler with two of them guesses wrong half the
+    #: time (v0.2.96 ship-gate MINOR-3).
+    streak_last_detail: str = ""
     #: Status of the newest row of any kind (``""`` when the trail is empty).
     last_status: str = ""
 
@@ -599,7 +710,7 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
     except OSError:
         return RetryHistory(condition_id=condition_id)
     attempts = blocked = streak = 0
-    streak_first = streak_last = ""
+    streak_first = streak_last = streak_detail = ""
     last_status = ""
     for line in text.splitlines():
         line = line.strip()
@@ -621,11 +732,12 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
             streak = streak + 1 if streak else 1
             streak_first = streak_first or ts
             streak_last = ts
+            streak_detail = str(row.get("detail") or "")
         elif status:
             # Any non-blocked row ENDS the streak: something did run, so
             # "down each time" would no longer be true of what follows.
             streak = 0
-            streak_first = streak_last = ""
+            streak_first = streak_last = streak_detail = ""
     return RetryHistory(
         condition_id=condition_id,
         attempts=attempts,
@@ -633,6 +745,7 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         blocked_streak=streak,
         streak_first_ts=streak_first,
         streak_last_ts=streak_last,
+        streak_last_detail=streak_detail,
         last_status=last_status,
     )
 
@@ -672,12 +785,39 @@ def retry_disposition_note(folder: Path, condition_id: str) -> str:
         window = (
             f" since {history.streak_first_ts}" if history.streak_first_ts else ""
         )
+        # WP-3 review MINOR: the streak's CAUSE is not always reachability —
+        # the image-freshness gate blocks while the service answers /health
+        # perfectly. Say which it was; "backend was unreachable" is false for
+        # image-gate blocks and sent the user to restart a service that was
+        # never down.
+        #
+        # v0.2.96 ship-gate MINOR-3: read that from the BLOCKED row the gate
+        # actually wrote, never from the handler's declared preconditions.
+        # `codegraph_resync` and `code_graph_walk` have BOTH (a code backend
+        # AND a current image), so deriving the cause from the image FLAG
+        # rendered "the service is up but predates the running source —
+        # rebuild it" for a service that was simply DOWN: a false,
+        # actionable-sounding instruction, and the mirror image of the defect
+        # this note exists to correct.
+        cause = {
+            BLOCK_CAUSE_IMAGE: (
+                "the code-embedding image it needs is stale (the service is "
+                "up but predates the running source — rebuild it before "
+                "expecting this to resume)"
+            ),
+            BLOCK_CAUSE_BACKEND: "the backend it needs was unreachable every time",
+        }.get(
+            classify_block_detail(history.streak_last_detail),
+            # An old trail (rows predating the recorded detail) cannot say
+            # which gate blocked, and guessing is what this replaced.
+            "VCO did not record which precondition was missing on those "
+            "passes (a trail written by an older version)",
+        )
         return (
             f"VCO has been unable to retry this on the last "
-            f"{history.blocked_streak} pass(es){window}: the backend it needs "
-            "was unreachable every time. It will retry by itself the moment "
-            "that backend answers, and not before — so nothing changes here "
-            "until the service is back."
+            f"{history.blocked_streak} pass(es){window}: {cause}. It will "
+            "retry by itself the moment that changes, and not before — "
+            "so nothing changes here until then."
         )
     return ""
 
@@ -874,8 +1014,12 @@ def dispatch(
     3. attempts so far < :data:`MAX_ATTEMPTS`;
     4. the probe for the backend THAT handler needs returns **True** (False and
        None both skip);
-    5. the attempt is recorded, THEN the handler runs;
-    6. the condition is resolved only when the child's own paired clear removed
+    5. v0.2.96 (WP-3): for handlers declaring
+       ``needs_current_code_embed_image``, the code-embed image verdict must
+       not be ``stale`` — a stale verdict BLOCKS without consuming an attempt
+       (same convention as gate 4's BLOCKED rows);
+    6. the attempt is recorded, THEN the handler runs;
+    7. the condition is resolved only when the child's own paired clear removed
        it from the ledger — never on the exit code alone.
 
     ``single_instance=False`` is for tests that drive the dispatcher many times
@@ -965,11 +1109,12 @@ def _dispatch_locked(
             + {True: "reachable", False: "provably down", None: "unknown"}[backend]
         )
         if backend is not True:
+            # The detail is the ONE home's sentence (`backend_block_detail`),
+            # because `retry_disposition_note` classifies the row back into a
+            # cause from it — a second copy here would drift and silently
+            # revert the note to the wrong cause.
             skipped = RetryResult(
-                cid, SKIPPED,
-                f"no {handler.backend} embedding backend reachable"
-                if backend is False
-                else f"{handler.backend} backend reachability unknown",
+                cid, SKIPPED, backend_block_detail(handler.backend, backend),
             )
             # v0.2.92 (WFT C7): record the BLOCK durably. Until now this arm
             # returned and left nothing behind but a per-run detached log, so
@@ -980,6 +1125,31 @@ def _dispatch_locked(
             record_attempt(folder, RetryResult(cid, BLOCKED, skipped.detail))
             results.append(skipped)
             continue
+        # v0.2.96 (WP-3, register issue 8): IMAGE-freshness gate for handlers
+        # whose work embeds through the code-embed service. The backend gate
+        # above asks reachability; a service built from stale source answers
+        # it fine and then silently truncates over-window embed input at HTTP
+        # 200 — so a retry dispatched into a stale-image machine would run
+        # the driver into its own refusal (the driver gates too, M-1) and
+        # come back INCONCLUSIVE with the attempt already consumed. Three
+        # such passes and the durable cap stops the retries FOREVER —
+        # including on the day the image is finally rebuilt and current. So
+        # the stale verdict BLOCKS here, BEFORE the STARTED row is written:
+        # same convention as the backend gate above (being blocked is not an
+        # attempt; `retry_disposition_note` renders the streak), and the
+        # retry resumes by itself the moment the verdict turns current.
+        # ``unknown``/``current`` proceed — unknown is could-not-look, and
+        # this gate must never be the thing that skips owed work.
+        if handler.needs_current_code_embed_image:
+            verdict = _code_embed_image_verdict(folder)
+            trail(f"{cid}: code-embed image gate → {verdict}")
+            if verdict == _IMAGE_STALE:
+                # Same ONE home as the backend arm above: the note reads this
+                # row's detail back to decide which cause to name.
+                blocked = RetryResult(cid, SKIPPED, BLOCKED_BY_IMAGE_DETAIL)
+                record_attempt(folder, RetryResult(cid, BLOCKED, blocked.detail))
+                results.append(blocked)
+                continue
         # Recorded BEFORE the handler runs: a crash must still consume its
         # attempt, or the cap can never engage on a handler that always dies.
         record_attempt(folder, RetryResult(cid, STARTED, f"handler {name}"))
@@ -1207,7 +1377,11 @@ def _dispatch_quiet(folder: Path) -> list[RetryResult]:
 __all__ = [
     "ATTEMPTS_FILENAME",
     "BLOCKED",
+    "BLOCKED_BY_IMAGE_DETAIL",
     "BLOCKED_NOTE_THRESHOLD",
+    "BLOCK_CAUSE_BACKEND",
+    "BLOCK_CAUSE_IMAGE",
+    "BLOCK_CAUSE_UNKNOWN",
     "CODE_BACKEND",
     "FAILED",
     "HANDLERS",
@@ -1225,6 +1399,8 @@ __all__ = [
     "RetryResult",
     "attempt_count",
     "attempts_path",
+    "backend_block_detail",
+    "classify_block_detail",
     "condition_cleared",
     "default_backend_probe",
     "default_runner",

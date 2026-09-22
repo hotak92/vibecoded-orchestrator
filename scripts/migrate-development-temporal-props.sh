@@ -18,7 +18,8 @@
 # partial migration.
 #
 # Env vars:
-#   WEAVIATE_URL  — defaults to http://localhost:8081
+#   WEAVIATE_URL  — defaults to http://localhost:${WEAVIATE_PORT:-8081};
+#                   WEAVIATE_URL wins outright when set
 #
 # Requires: bash, curl, jq (skipped with a clear message if jq is missing).
 #
@@ -34,7 +35,7 @@
 
 set -uo pipefail
 
-WEAVIATE_URL="${WEAVIATE_URL:-http://localhost:8081}"
+WEAVIATE_URL="${WEAVIATE_URL:-http://localhost:${WEAVIATE_PORT:-8081}}"
 
 if ! command -v curl >/dev/null 2>&1; then
     echo "[migrate-dev-props] curl not found on PATH; skipping migration." >&2

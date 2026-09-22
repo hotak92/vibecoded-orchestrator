@@ -94,7 +94,9 @@ export function draftFromRow(row: ChatModelContextRow): ChatModelContextDraft {
     model_id: row.model_id,
     vendor: row.vendor,
     context_window: String(row.context_window),
-    max_output: String(row.max_output),
+    // 0 = UNSTATED (the vendor publishes no figure) — the editor shows that
+    // as a BLANK field, never as a "0" that reads like a real token count.
+    max_output: row.max_output > 0 ? String(row.max_output) : '',
     window_1m: row.window_1m,
     source: row.source,
     source_note: row.source_note,
@@ -113,14 +115,61 @@ export function emptyDraft(): ChatModelContextDraft {
   };
 }
 
-/** Parse a token count. Rejects blanks, non-integers and non-positives —
- *  each of which the DB would refuse anyway, later and less helpfully. */
-function parseTokens(raw: string): number | null {
+/** Parse a token-count field. ONE home for both numeric fields of this pane
+ *  (v0.2.96 D-10: they had drifted into two near-identical parsers differing
+ *  only in the zero rule, which is the one thing a reader must not have to
+ *  diff two functions to learn).
+ *
+ *  Shared in every case: trimmed, digits-only (`\d+` never matches a minus
+ *  sign or a decimal point, so negatives and fractions are rejected without
+ *  a second rule), and safe-integer.
+ *
+ *  `allowZero` is the ONLY axis:
+ *   * `false` — CONTEXT WINDOW. Blank and 0 are refused; the DB's
+ *     `context_window > 0` CHECK would refuse them anyway, later and less
+ *     helpfully.
+ *   * `true` — MAX OUTPUT, where blank or `0` means UNSTATED (blank
+ *     normalises to the 0 marker). See `parseMaxOutputTokens` below for the
+ *     cross-language contract that makes 0 the honest value. */
+function parseTokenField(raw: string, opts: { allowZero: boolean }): number | null {
   const trimmed = raw.trim();
-  if (trimmed === '') return null;
+  if (trimmed === '') return opts.allowZero ? 0 : null;
   if (!/^\d+$/.test(trimmed)) return null;
   const n = Number(trimmed);
-  return Number.isSafeInteger(n) && n > 0 ? n : null;
+  if (!Number.isSafeInteger(n)) return null;
+  return opts.allowZero || n > 0 ? n : null;
+}
+
+/** Parse the CONTEXT-WINDOW field: strictly positive, never unstated. An
+ *  uncited-or-absent window is exactly what this table exists to prevent a
+ *  client from acting on, so there is no marker value for "don't know". */
+function parseTokens(raw: string): number | null {
+  return parseTokenField(raw, { allowZero: false });
+}
+
+/** Parse the MAX-OUTPUT field, where blank or `0` means UNSTATED.
+ *
+ *  v0.2.96 cross-language contract: the vendor's docs may publish no
+ *  per-model max-output figure (the shipped qwen Token-Plan rows store 0),
+ *  and inventing a plausible number is forbidden by the same no-guessed-
+ *  numbers rule that makes the citation mandatory. This mirrors the Rust
+ *  gate (`ChatModelContextInput::validated` accepts 0, refuses negatives —
+ *  backed by the SQL CHECK from migration 046) and the Python gateway's
+ *  reader (`catalog::_positive` folds 0 to None, so an unstated row never
+ *  publishes a token count). Negative and malformed stay rejected: `\d+`
+ *  never matches a minus sign.
+ *
+ *  MUST MATCH — the `0 = UNSTATED` rule has FOUR homes with no shared
+ *  runtime, so each names the other three (v0.2.96 D-3):
+ *    1. SQL    — `CHECK (max_output >= 0)`, launcher/src-tauri/
+ *                vct-launcher-core/src/db/migrations/046_chat_model_context_max_output_unstated.sql
+ *    2. Rust   — `ChatModelContextInput::validated`, launcher/src-tauri/
+ *                vct-launcher-core/src/db/chat_model_context.rs
+ *    3. TS     — here.
+ *    4. Python — `catalog.py::_positive`,
+ *                claude_mcp_servers/model_router/catalog.py */
+function parseMaxOutputTokens(raw: string): number | null {
+  return parseTokenField(raw, { allowZero: true });
 }
 
 /**
@@ -169,11 +218,13 @@ export function validateDraft(
     });
   }
 
-  const maxOutput = parseTokens(draft.max_output);
+  const maxOutput = parseMaxOutputTokens(draft.max_output);
   if (maxOutput === null) {
     errors.push({
       field: 'max_output',
-      message: 'Enter the max output as a whole number of tokens, e.g. 128000.',
+      message:
+        'Enter the max output as a whole number of tokens, e.g. 128000 — ' +
+        'or leave it blank when the vendor does not publish a figure.',
     });
   }
 

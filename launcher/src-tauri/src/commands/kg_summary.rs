@@ -170,6 +170,481 @@ pub async fn retry_kg_summary(
     Ok(())
 }
 
+// ─── v0.2.96 WP-7b: the GUI "Recheck summary backend now" action ────────
+//
+// WP-7a landed `python -m vco_lib.summary_health summary-recheck` (clears
+// the breaker latch, re-derives the pending set from the sidecars,
+// regenerates exactly it, resolves the `kg_summaries_degraded` ledger
+// entry when the post-scan finds nothing pending) and the WP-7a review's
+// MINOR-2 confirmed the GUI action that names it was not wired. This is
+// that action: Preferences → KG Summaries invokes it through the ONE
+// `python -m vco_lib.<module>` seam (env sandbox via
+// `services::vco_lib_bridge`, clone PYTHONPATH via the model-gateway
+// helper), awaits it off the UI thread, and returns the CLI's counts so
+// the toast can say how many rows were regenerated or remain pending.
+
+/// Deadline for the recheck subprocess. The recheck spawns one generator
+/// child per pending row (each an LLM call), so the honest budget is the
+/// enrichment precedent (`embedding_enrichment::ENRICHMENT_TIMEOUT_SECS`
+/// = 30 min), not the 30 s gateway-CLI one. A kill at the deadline is
+/// safe: the operation is idempotent and soft-fail per row — anything not
+/// regenerated stays pending for the next recheck.
+const RECHECK_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Prefix of the ONE summary line the recheck CLI prints.
+///
+/// MUST MATCH `vco_lib/summary_health.py` — `RECHECK_LINE_PREFIX` and
+/// `format_recheck_summary_line()`, which is the ONE home that renders the
+/// line. The shape is "N pending before, M after; X generator run(s),
+/// Y failure(s)" plus an optional "; code leg SKIPPED (…)" suffix.
+///
+/// v0.2.96 (duplication register D-2): before this release the Rust tests
+/// HAND-WROTE the line they parse, so the parser and the producer could
+/// drift with every test staying green — an unparsed run degrades silently
+/// to "raw stdout tail" with no counts. Parity is now enforced by
+/// `tests/test_v0296_lane_python_core.py::SummaryRecheckLineGrammarParity`,
+/// which reads THIS file and compares it against the Python constants —
+/// not a marker-string scan, which a name in a comment satisfies.
+///
+/// The last matching line wins — same rationale as
+/// `parse_backend_from_stdout`: a later line is a strictly later statement
+/// of the same run.
+const RECHECK_LINE_PREFIX: &str = "[summary-health] recheck:";
+
+/// Counts parsed from the recheck CLI's summary line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecheckCounts {
+    pending_before: u32,
+    pending_after: u32,
+    spawned: u32,
+    failures: u32,
+    code_leg_skipped: bool,
+}
+
+/// Leading unsigned integer of a trimmed segment, e.g. `"3 pending
+/// before"` → `Some(3)`. `None` when the segment does not start with a
+/// number.
+fn leading_u32(segment: &str) -> Option<u32> {
+    let digits: String = segment
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Parse the CLI's fixed-format summary line out of captured stdout.
+///
+/// `None` when no line carries the prefix or the numbers do not parse —
+/// the caller still surfaces the raw stdout tail, so an unparsed run is
+/// visible, never silently blank.
+fn parse_recheck_summary_line(stdout: &str) -> Option<RecheckCounts> {
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.contains(RECHECK_LINE_PREFIX))?;
+    let rest = line.split(RECHECK_LINE_PREFIX).nth(1)?.trim();
+    let code_leg_skipped = rest.contains("code leg SKIPPED");
+    // Drop the optional trailing "; code leg SKIPPED (…)" segment before
+    // splitting the two count segments on ';'.
+    let counts_part = rest.split("; code leg").next()?.trim();
+    let mut segments = counts_part.split(';');
+    let pendings = segments.next()?.trim();
+    let runs = segments.next()?.trim();
+    let mut pending_parts = pendings.split(',');
+    let pending_before = leading_u32(pending_parts.next()?)?;
+    let pending_after = leading_u32(pending_parts.next()?)?;
+    let mut run_parts = runs.split(',');
+    let spawned = leading_u32(run_parts.next()?)?;
+    let failures = leading_u32(run_parts.next()?)?;
+    Some(RecheckCounts {
+        pending_before,
+        pending_after,
+        spawned,
+        failures,
+        code_leg_skipped,
+    })
+}
+
+/// The recheck subcommand + its flags for one target root, as a pure argv
+/// (kept separate from the `Command` build so the wiring is testable —
+/// `std::process::Command` does not expose its args).
+fn recheck_argv(project_root: &std::path::Path) -> Vec<String> {
+    vec![
+        "summary-recheck".to_string(),
+        "--project-root".to_string(),
+        project_root.display().to_string(),
+    ]
+}
+
+/// `python -m vco_lib.summary_health summary-recheck --project-root <root>`
+/// with the launcher's env sandbox and the clone's `PYTHONPATH` — the
+/// established `vco_lib` spawn seam (`services::vco_lib_bridge` +
+/// model_gateway's PYTHONPATH helper), so this spawn cannot drift from
+/// every other `-m vco_lib.<module>` site.
+///
+/// Built as a `std::process::Command` because the sandbox kernel takes
+/// `&mut std::process::Command`, then converted (tokio's `From` impl
+/// preserves argv/env/stdio) for the awaited, deadline-capped `output()`.
+/// `.silent()` carries the Windows CREATE_NO_WINDOW flag, matching the
+/// sibling `invoke_summariser_once` pattern.
+fn summary_health_command(
+    python: &std::path::Path,
+    orchestrator_root: Option<&std::path::Path>,
+    project_root: &std::path::Path,
+) -> tokio::process::Command {
+    let mut cmd = std::process::Command::new(python).silent();
+    cmd.arg("-m").arg("vco_lib.summary_health");
+    for arg in recheck_argv(project_root) {
+        cmd.arg(arg);
+    }
+    crate::services::vco_lib_bridge::reinject_minimal_env(&mut cmd);
+    if let Some(root) = orchestrator_root {
+        cmd.env(
+            "PYTHONPATH",
+            crate::commands::model_gateway::orchestrator_pythonpath(root),
+        );
+        // cwd at the clone root so the in-tree `vco_lib` namespace
+        // package resolves even where PYTHONPATH is not honoured.
+        cmd.current_dir(root);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    tokio::process::Command::from(cmd)
+}
+
+/// Result payload for `recheck_summary_backend` — the CLI's counts plus
+/// the raw summary line, so the GUI toast can name what was regenerated
+/// (and fall back to the verbatim line when parsing fails).
+///
+/// MUST MATCH the `SummaryRecheckView` type in
+/// `launcher/src/routes/preferences/+page.svelte`. This repo has no
+/// Rust→TS codegen surface, so the mirror is a C-tier duplication and the
+/// LOCK is the minimum the repo rule requires: the parity test
+/// `the_recheck_dto_field_set_matches_its_typescript_mirror` below
+/// serialises this struct and diffs the wire field names against the
+/// `.svelte` declaration. Add, rename or `#[serde(rename)]` a field here
+/// and that test reds until the TS side is updated too (v0.2.96 D-6;
+/// pre-fix the pair was hand-mirrored with nothing holding it).
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryRecheckView {
+    pub project_root: String,
+    pub exit_code: i64,
+    /// Parsed from the CLI's summary line; `None` when it did not parse
+    /// (see `summary_line`).
+    pub pending_before: Option<u32>,
+    pub pending_after: Option<u32>,
+    pub spawned: Option<u32>,
+    pub failures: Option<u32>,
+    pub code_leg_skipped: bool,
+    /// The verbatim `[summary-health] recheck: …` line ("" when absent).
+    pub summary_line: String,
+}
+
+/// The "Recheck summary backend now" action (v0.2.96 WP-7b).
+///
+/// Runs `python -m vco_lib.summary_health summary-recheck --project-root
+/// <root>` for the SELECTED project when `project_id` names one, else for
+/// the orchestrator root (the CLI's own default target — its knowledge
+/// tree is the shared-KG home). Async and off the UI thread; the frontend
+/// holds the button in a working state and toasts the counts on
+/// completion. A non-zero exit is NOT swallowed: the view carries the
+/// exit code and the raw line so the error surfaces honestly.
+#[command]
+pub async fn recheck_summary_backend(
+    project_id: Option<String>,
+    db: State<'_, Db>,
+) -> Result<SummaryRecheckView, String> {
+    // Target resolution first — everything after this point needs no DB.
+    let orch_root =
+        crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+    let (root, audit_project_id) = match project_id.as_deref() {
+        Some(pid) => {
+            let project = db
+                .get_project(pid)?
+                .ok_or_else(|| format!("project {} not found", pid))?;
+            (
+                std::path::PathBuf::from(&project.folder_path),
+                Some(project.id),
+            )
+        }
+        None => (
+            orch_root.clone().ok_or_else(|| {
+                "orchestrator root unresolvable (no DB-cached install \
+                 path and no clone discoverable from the launcher \
+                 binary) — select a project and retry, or run the \
+                 recheck from a project folder"
+                    .to_string()
+            })?,
+            None,
+        ),
+    };
+    let python =
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+            .ok_or_else(|| {
+                "no python interpreter found for vco_lib (checked $VCT_VENV, \
+                 <VCT_INSTALL_ROOT>/.venv, then PATH). Re-run install.py to \
+                 rebuild the orchestrator venv."
+                    .to_string()
+            })?;
+
+    let mut cmd = summary_health_command(&python, orch_root.as_deref(), &root);
+    // A dropped wait future does not kill the child by default; opt in so the
+    // deadline really ends the python process rather than only ending our
+    // wait for it. `kill_on_drop` reaches exactly ONE process, so the
+    // generators that child spawned are handled separately — see the timeout
+    // arm of `run_recheck_and_audit` (v0.2.96 L-7).
+    cmd.kill_on_drop(true);
+
+    run_recheck_and_audit(
+        &db,
+        audit_project_id.as_deref(),
+        &root,
+        cmd,
+        std::time::Duration::from_secs(RECHECK_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// What one recheck attempt turned out to be. Every terminal state past the
+/// spawn maps to exactly one variant, and `recheck_audit_detail` turns it
+/// into the audit row.
+///
+/// v0.2.96 (L-6): pre-fix, `db.audit` sat AFTER the `?` on the timeout and
+/// after the non-zero-exit `return`, so the two outcomes a reader most needs
+/// in the trail — the deadline firing, and the CLI failing — were the two
+/// that recorded nothing, while the child had already cleared the quota
+/// breaker. An audit trail with invisible failure states does not just lose
+/// detail; it misreports the successes it does hold as the whole story.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecheckOutcome {
+    /// Exit 0. Counts as parsed (any of them may be `None`).
+    Completed {
+        pending_before: Option<u32>,
+        pending_after: Option<u32>,
+        failures: Option<u32>,
+    },
+    /// The CLI ran to completion and refused.
+    ExitNonZero { exit_code: i64 },
+    /// `RECHECK_TIMEOUT_SECS` elapsed. The child was killed on drop and its
+    /// generator descendants signalled first (`descendants_killed` counts
+    /// them — 0 is the normal case, meaning the child had none in flight).
+    TimedOut {
+        after_secs: u64,
+        descendants_killed: usize,
+    },
+    /// The process could not be started at all.
+    SpawnFailed { error: String },
+}
+
+impl RecheckOutcome {
+    /// The stable string the audit row carries. Kept as a method so the
+    /// vocabulary lives beside the enum and a new variant cannot be added
+    /// without choosing one.
+    fn as_str(&self) -> &'static str {
+        match self {
+            RecheckOutcome::Completed { .. } => "completed",
+            RecheckOutcome::ExitNonZero { .. } => "exit_nonzero",
+            RecheckOutcome::TimedOut { .. } => "timed_out",
+            RecheckOutcome::SpawnFailed { .. } => "spawn_failed",
+        }
+    }
+}
+
+/// The `detail` JSON for one audited recheck. `project_root` and `outcome`
+/// are present on EVERY row so the trail can be read without knowing which
+/// variant produced it; the rest are the fields that variant actually has
+/// (a timed-out run has no counts, and inventing zeros for it would make the
+/// trail claim the run found nothing pending).
+fn recheck_audit_detail(project_root: &str, outcome: &RecheckOutcome) -> serde_json::Value {
+    let mut detail = serde_json::json!({
+        "project_root": project_root,
+        "outcome": outcome.as_str(),
+    });
+    let map = detail
+        .as_object_mut()
+        .expect("json! literal above is an object");
+    match outcome {
+        RecheckOutcome::Completed {
+            pending_before,
+            pending_after,
+            failures,
+        } => {
+            map.insert("pending_before".into(), serde_json::json!(pending_before));
+            map.insert("pending_after".into(), serde_json::json!(pending_after));
+            map.insert("failures".into(), serde_json::json!(failures));
+        }
+        RecheckOutcome::ExitNonZero { exit_code } => {
+            map.insert("exit_code".into(), serde_json::json!(exit_code));
+        }
+        RecheckOutcome::TimedOut {
+            after_secs,
+            descendants_killed,
+        } => {
+            map.insert("timeout_secs".into(), serde_json::json!(after_secs));
+            map.insert(
+                "descendants_killed".into(),
+                serde_json::json!(descendants_killed),
+            );
+        }
+        RecheckOutcome::SpawnFailed { error } => {
+            map.insert("error".into(), serde_json::json!(error));
+        }
+    }
+    detail
+}
+
+/// Run one recheck under `timeout`, then audit it — on EVERY path.
+///
+/// The shape is the point: the attempt is classified first, the audit is
+/// written second, and the function has ONE exit. There is no place left for
+/// a future edit to `return` a failure without a row, which is exactly how
+/// L-6 happened. Takes `&Db` (not `State<Db>`) and the already-built command
+/// so the timeout path is reachable from a unit test.
+async fn run_recheck_and_audit(
+    db: &Db,
+    audit_project_id: Option<&str>,
+    root: &std::path::Path,
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Result<SummaryRecheckView, String> {
+    let project_root = root.display().to_string();
+
+    // Spawned explicitly (rather than through `Command::output()`) for two
+    // reasons the timeout arm below needs: the child's PID, and a wait
+    // future we still OWN when the deadline fires — `tokio::time::timeout`
+    // drops the inner future before handing us the `Err`, and by then the
+    // generators have been reparented to init and can no longer be proven
+    // ours (v0.2.96 L-7).
+    let spawned_at = vct_launcher_core::process::epoch_secs_now();
+
+    let (result, outcome) = match cmd.spawn() {
+        Err(e) => {
+            let error = format!("summary recheck spawn failed: {}", e);
+            let outcome = RecheckOutcome::SpawnFailed {
+                error: error.clone(),
+            };
+            (Err(error), outcome)
+        }
+        Ok(child) => {
+            let child_pid = child.id();
+            let wait = child.wait_with_output();
+            tokio::pin!(wait);
+            let finished = tokio::select! {
+                r = &mut wait => Some(r),
+                _ = tokio::time::sleep(timeout) => None,
+            };
+            match finished {
+                None => {
+                    // The deadline fired and `wait` is STILL ALIVE, so the
+                    // python child is too and its generators are still ITS
+                    // children. Reap them now, while that parent link is the
+                    // proof of ownership; the child itself dies with `wait`
+                    // when this scope ends (`kill_on_drop`).
+                    let descendants_killed = match child_pid {
+                        Some(pid) => {
+                            vct_launcher_core::process::kill_descendants(pid, spawned_at)
+                        }
+                        // `id()` is `None` only once the child has been
+                        // reaped, which cannot be true on this arm — and
+                        // guessing a PID would be worse than doing nothing.
+                        None => 0,
+                    };
+                    if descendants_killed > 0 {
+                        tracing::warn!(
+                            "[kg_summary] summary recheck timed out after {} s; \
+                             signalled {} generator process(es) the child had \
+                             spawned",
+                            timeout.as_secs(),
+                            descendants_killed
+                        );
+                    }
+                    (
+                        Err(format!(
+                            "summary recheck timed out after {} s — safe to \
+                             re-run; anything not regenerated stayed pending",
+                            timeout.as_secs()
+                        )),
+                        RecheckOutcome::TimedOut {
+                            after_secs: timeout.as_secs(),
+                            descendants_killed,
+                        },
+                    )
+                }
+                Some(Err(e)) => {
+                    // An io error from the wait/pipe-drain, not from the
+                    // spawn itself — same class for the caller (the process
+                    // could not be run to completion) and same vocabulary.
+                    let error = format!("summary recheck spawn failed: {}", e);
+                    let outcome = RecheckOutcome::SpawnFailed {
+                        error: error.clone(),
+                    };
+                    (Err(error), outcome)
+                }
+                Some(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let counts = parse_recheck_summary_line(&stdout);
+                    let summary_line = stdout
+                        .lines()
+                        .rev()
+                        .find(|l| l.contains(RECHECK_LINE_PREFIX))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let view = SummaryRecheckView {
+                        project_root: project_root.clone(),
+                        exit_code: output.status.code().unwrap_or(-1).into(),
+                        pending_before: counts.as_ref().map(|c| c.pending_before),
+                        pending_after: counts.as_ref().map(|c| c.pending_after),
+                        spawned: counts.as_ref().map(|c| c.spawned),
+                        failures: counts.as_ref().map(|c| c.failures),
+                        code_leg_skipped: counts
+                            .as_ref()
+                            .map_or(false, |c| c.code_leg_skipped),
+                        summary_line,
+                    };
+                    if output.status.success() {
+                        let outcome = RecheckOutcome::Completed {
+                            pending_before: view.pending_before,
+                            pending_after: view.pending_after,
+                            failures: view.failures,
+                        };
+                        (Ok(view), outcome)
+                    } else {
+                        let tail = if stderr.trim().is_empty() {
+                            stdout.trim().to_string()
+                        } else {
+                            stderr.trim().to_string()
+                        };
+                        let outcome = RecheckOutcome::ExitNonZero {
+                            exit_code: view.exit_code,
+                        };
+                        (
+                            Err(format!(
+                                "summary recheck exited {} — {}",
+                                view.exit_code, tail
+                            )),
+                            outcome,
+                        )
+                    }
+                }
+            }
+        }
+    };
+
+    // Soft-fail, as every audit call in this crate is: a DB that will not
+    // take the row must not turn a completed recheck into an error.
+    let _ = db.audit(
+        "summary_recheck",
+        audit_project_id,
+        None,
+        &recheck_audit_detail(&project_root, &outcome),
+    );
+    result
+}
+
 /// Public entry point used by `create_project_v2` (and the retry command).
 /// Spawns a background task; never blocks. The caller has already inserted
 /// a `pending` row into `kg_summaries`.
@@ -1455,6 +1930,75 @@ mod tests {
     }
 
     #[test]
+    fn parse_recheck_line_parses_the_canonical_shape() {
+        // Byte-for-byte the line `summary_health.py` prints (its shape is
+        // pinned Python-side by tests/test_v0296_summary_quota_breaker.py;
+        // this keeps the Rust parser honest against a rename).
+        let line = "[summary-health] recheck: 3 pending before, 0 after; \
+                    5 generator run(s), 0 failure(s)";
+        let c = parse_recheck_summary_line(line).expect("must parse");
+        assert_eq!(
+            c,
+            RecheckCounts {
+                pending_before: 3,
+                pending_after: 0,
+                spawned: 5,
+                failures: 0,
+                code_leg_skipped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_recheck_line_flags_the_code_leg_skip_suffix() {
+        let line = "[summary-health] recheck: 2 pending before, 1 after; \
+                    2 generator run(s), 1 failure(s); code leg SKIPPED \
+                    (unresolved project name)";
+        let c = parse_recheck_summary_line(line).expect("must parse");
+        assert!(c.code_leg_skipped);
+        assert_eq!((c.pending_before, c.pending_after, c.failures), (2, 1, 1));
+    }
+
+    #[test]
+    fn parse_recheck_line_takes_the_last_matching_line() {
+        // Last-wins, matching `parse_backend_from_stdout`: a later line is
+        // a strictly later statement of the same run.
+        let noisy = "node a: ok\n\
+                     [summary-health] recheck: 9 pending before, 9 after; \
+                     0 generator run(s), 0 failure(s)\n\
+                     node b: ok\n\
+                     [summary-health] recheck: 1 pending before, 0 after; \
+                     1 generator run(s), 0 failure(s)\n";
+        let c = parse_recheck_summary_line(noisy).expect("must parse");
+        assert_eq!(c.pending_before, 1);
+        assert_eq!(c.pending_after, 0);
+    }
+
+    #[test]
+    fn parse_recheck_line_returns_none_when_absent_or_malformed() {
+        assert!(parse_recheck_summary_line("no marker here").is_none());
+        assert!(parse_recheck_summary_line("").is_none());
+        // Prefix present but numbers garbled — the caller surfaces the raw
+        // line rather than trusting a partial parse.
+        assert!(parse_recheck_summary_line(
+            "[summary-health] recheck: ??? pending before, x after"
+        )
+        .is_none());
+        assert!(parse_recheck_summary_line(
+            "[summary-health] recheck: 3 pending before"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn recheck_argv_carries_the_verb_and_the_target_root() {
+        let argv = recheck_argv(std::path::Path::new("/tmp/proj"));
+        assert_eq!(argv[0], "summary-recheck");
+        assert_eq!(argv[1], "--project-root");
+        assert_eq!(argv[2], "/tmp/proj");
+    }
+
+    #[test]
     fn tail_log_truncates_long_output() {
         let big = "a".repeat(10_000);
         let tail = tail_log(&big);
@@ -1500,4 +2044,384 @@ mod tests {
         let canonical = "  Foo Title: unchanged (hash match), skipping";
         assert!(canonical.contains(UNCHANGED_MARKER));
     }
+
+    // ─── v0.2.96 (L-6): every recheck outcome reaches the audit trail ────
+
+    #[test]
+    fn audit_detail_names_the_timeout_as_the_outcome() {
+        // The row that did not exist before: a deadline that fired is a
+        // FACT about that project, and the child had already cleared the
+        // quota breaker by the time it fired.
+        let d = recheck_audit_detail(
+            "/tmp/proj",
+            &RecheckOutcome::TimedOut {
+                after_secs: 1800,
+                descendants_killed: 2,
+            },
+        );
+        assert_eq!(d["outcome"], "timed_out");
+        assert_eq!(d["timeout_secs"], 1800);
+        // L-7: how many generator processes the deadline had to reap is
+        // part of the record — a run that left work half-done looks
+        // different from one that timed out with nothing in flight.
+        assert_eq!(d["descendants_killed"], 2);
+        assert_eq!(d["project_root"], "/tmp/proj");
+        // No invented counts: a timed-out run did not observe "0 pending".
+        assert!(d.get("pending_before").is_none());
+        assert!(d.get("pending_after").is_none());
+    }
+
+    #[test]
+    fn audit_detail_names_the_other_three_outcomes_too() {
+        let ok = recheck_audit_detail(
+            "/tmp/p",
+            &RecheckOutcome::Completed {
+                pending_before: Some(3),
+                pending_after: Some(0),
+                failures: Some(1),
+            },
+        );
+        assert_eq!(ok["outcome"], "completed");
+        assert_eq!(ok["pending_before"], 3);
+        assert_eq!(ok["pending_after"], 0);
+        assert_eq!(ok["failures"], 1);
+
+        let bad = recheck_audit_detail("/tmp/p", &RecheckOutcome::ExitNonZero { exit_code: 2 });
+        assert_eq!(bad["outcome"], "exit_nonzero");
+        assert_eq!(bad["exit_code"], 2);
+
+        let spawn = recheck_audit_detail(
+            "/tmp/p",
+            &RecheckOutcome::SpawnFailed { error: "no such file".into() },
+        );
+        assert_eq!(spawn["outcome"], "spawn_failed");
+        assert_eq!(spawn["error"], "no such file");
+    }
+
+    #[test]
+    fn a_completed_run_that_parsed_nothing_records_nulls_not_zeros() {
+        // The counts are Option because the summary line may not parse. A
+        // missing count must stay missing in the trail — a 0 there would
+        // read as "nothing was pending", which is a different claim.
+        let d = recheck_audit_detail(
+            "/tmp/p",
+            &RecheckOutcome::Completed {
+                pending_before: None,
+                pending_after: None,
+                failures: None,
+            },
+        );
+        assert_eq!(d["outcome"], "completed");
+        assert!(d["pending_before"].is_null());
+        assert!(d["failures"].is_null());
+    }
+
+    /// WIRING, not just the helper: drive the REAL `run_recheck_and_audit`
+    /// into its timeout branch with a child that outlives a 50 ms deadline,
+    /// and assert the audit row is actually there afterwards. Pre-fix this
+    /// path returned through `?` before `db.audit` was ever reached, so the
+    /// table stayed empty.
+    ///
+    /// unix-only because it needs a portable "sleep for a while" binary;
+    /// the branch it exercises is platform-independent (`tokio::time::
+    /// timeout` + the single-exit audit below it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_recheck_still_writes_its_audit_row() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        let res = run_recheck_and_audit(
+            &db,
+            None,
+            std::path::Path::new("/tmp/some-project"),
+            cmd,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        let err = res.expect_err("the 50 ms deadline must fire");
+        assert!(err.contains("timed out"), "{err}");
+
+        let rows = db
+            .audit_list(None, None, None, None, Some("summary_recheck"), 10)
+            .expect("audit_list");
+        assert_eq!(rows.len(), 1, "exactly one row for one attempt");
+        assert_eq!(rows[0].operation, "summary_recheck");
+        let detail: serde_json::Value =
+            serde_json::from_str(&rows[0].detail).expect("detail is json");
+        assert_eq!(detail["outcome"], "timed_out");
+        assert_eq!(detail["project_root"], "/tmp/some-project");
+    }
+
+    /// The leave-alone half: a child that exits 0 still records `completed`
+    /// (the behaviour that DID exist before), so the restructure did not buy
+    /// the failure rows by losing the success one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_completed_recheck_still_writes_its_audit_row() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(
+            "echo '[summary-health] recheck: 4 pending before, 1 after; \
+             3 generator run(s), 0 failure(s)'",
+        );
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let view = run_recheck_and_audit(
+            &db,
+            None,
+            std::path::Path::new("/tmp/done-project"),
+            cmd,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("exit 0");
+        assert_eq!(view.pending_before, Some(4));
+        assert_eq!(view.pending_after, Some(1));
+
+        let rows = db
+            .audit_list(None, None, None, None, Some("summary_recheck"), 10)
+            .expect("audit_list");
+        assert_eq!(rows.len(), 1);
+        let detail: serde_json::Value =
+            serde_json::from_str(&rows[0].detail).expect("detail is json");
+        assert_eq!(detail["outcome"], "completed");
+        assert_eq!(detail["pending_before"], 4);
+    }
+
+    /// A non-zero exit is the other path that recorded nothing pre-fix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_recheck_still_writes_its_audit_row() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo boom >&2; exit 3");
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let err = run_recheck_and_audit(
+            &db,
+            None,
+            std::path::Path::new("/tmp/broken-project"),
+            cmd,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect_err("exit 3");
+        assert!(err.contains("exited 3"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+
+        let rows = db
+            .audit_list(None, None, None, None, Some("summary_recheck"), 10)
+            .expect("audit_list");
+        assert_eq!(rows.len(), 1);
+        let detail: serde_json::Value =
+            serde_json::from_str(&rows[0].detail).expect("detail is json");
+        assert_eq!(detail["outcome"], "exit_nonzero");
+        assert_eq!(detail["exit_code"], 3);
+    }
+
+
+    /// C-TIER PARITY LOCK for the `SummaryRecheckView` DTO (v0.2.96 D-6).
+    ///
+    /// The struct in this file and the `type SummaryRecheckView` in
+    /// `launcher/src/routes/preferences/+page.svelte` are a hand mirror —
+    /// this repo has no Rust→TS codegen surface, so the repo's duplication
+    /// rule puts the pair at tier C and requires a parity test plus "must
+    /// match" comments on both homes. This is that test.
+    ///
+    /// The Rust side is read by SERIALISING the struct, not by scanning the
+    /// source: that way a `#[serde(rename)]` — which changes the wire name
+    /// while leaving the field name alone — is caught too. The TS side is
+    /// read from the `.svelte` file via `CARGO_MANIFEST_DIR`
+    /// (compile-time-only, inside `#[cfg(test)]`; the same sanctioned use
+    /// as `commands::chat_model_context`'s shipped-seed test).
+    ///
+    /// The scan FAILS LOUD rather than falling through green: a missing
+    /// file, a missing/unterminated type block, or an empty field set each
+    /// panic with what was looked for. A source-text gate that cannot find
+    /// its subject must not report agreement.
+    #[test]
+    fn the_recheck_dto_field_set_matches_its_typescript_mirror() {
+        // ── Rust side: the actual wire names, from serde ────────────────
+        let sample = SummaryRecheckView {
+            project_root: "/tmp/p".into(),
+            exit_code: 0,
+            pending_before: Some(1),
+            pending_after: Some(0),
+            spawned: Some(1),
+            failures: Some(0),
+            code_leg_skipped: false,
+            summary_line: "line".into(),
+        };
+        let value = serde_json::to_value(&sample).expect("DTO serialises");
+        let mut rust_fields: Vec<String> = value
+            .as_object()
+            .expect("DTO serialises to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        rust_fields.sort();
+        assert!(!rust_fields.is_empty(), "serde produced no fields");
+
+        // ── TS side: the declaration in the preferences page ────────────
+        const MIRROR_REL: &[&str] =
+            &["src", "routes", "preferences", "+page.svelte"];
+        let mut mirror = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR (launcher/src-tauri) has a parent")
+            .to_path_buf();
+        for seg in MIRROR_REL {
+            mirror = mirror.join(seg);
+        }
+        let src = std::fs::read_to_string(&mirror).unwrap_or_else(|e| {
+            panic!(
+                "the TS mirror {} is unreadable: {} — if the pane moved, \
+                 move this lock with it rather than deleting it",
+                mirror.display(),
+                e
+            )
+        });
+        const DECL: &str = "type SummaryRecheckView = {";
+        let start = src.find(DECL).unwrap_or_else(|| {
+            panic!(
+                "{} no longer declares `{}` — the Rust DTO's mirror must \
+                 stay findable or this lock silently stops locking",
+                mirror.display(),
+                DECL
+            )
+        }) + DECL.len();
+        let len = src[start..].find("\n  };").unwrap_or_else(|| {
+            panic!("the `{}` block in {} is unterminated", DECL, mirror.display())
+        });
+        let body = &src[start..start + len];
+
+        let mut ts_fields: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") || line.starts_with("*") {
+                continue;
+            }
+            let Some((name, _)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().trim_end_matches('?');
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                ts_fields.push(name.to_string());
+            }
+        }
+        ts_fields.sort();
+        assert!(
+            !ts_fields.is_empty(),
+            "parsed zero fields out of the `{}` block in {} — the scan \
+             broke, which is a failure, not agreement",
+            DECL,
+            mirror.display()
+        );
+
+        assert_eq!(
+            rust_fields,
+            ts_fields,
+            "SummaryRecheckView has drifted. Rust (serde wire names) vs \
+             {}. Update BOTH homes — the GUI reads these keys by name and \
+             a missing one is `undefined` at runtime, not a build error.",
+            mirror.display()
+        );
+    }
+
+
+    /// v0.2.96 (L-7) WIRING: a timed-out recheck reaps the GRANDCHILDREN
+    /// its child left running, not just the child.
+    ///
+    /// The shape mirrors the real one: `sh` (our child) spawns a long
+    /// `sleep` (the "generator"), records its pid, then waits.
+    /// `kill_on_drop` reaches the `sh` only — pre-fix the `sleep` survived
+    /// the deadline, was reparented to init, and ran on with nobody waiting
+    /// on it. The assertion is on actual OS state afterwards
+    /// (`pid_is_alive`), not on a returned count that could be reported
+    /// without anything having happened.
+    ///
+    /// unix-only for the portable `sh`/`sleep` pair. The code under test has
+    /// no per-OS branch: `kill_descendants` is ONE implementation over
+    /// `sysinfo` for Linux, macOS and Windows alike.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_recheck_reaps_the_generator_its_child_spawned() {
+        use vct_launcher_core::process::pid_is_alive;
+
+        let dir = tmpdir("l7-grandchild");
+        let pidfile = dir.join("generator.pid");
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 45 & echo $! > '{}'; wait",
+            pidfile.display()
+        ));
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        // 2 s deadline: generous enough that the shell has certainly written
+        // the pid file (it does so in the first milliseconds), short enough
+        // to keep the test fast.
+        let err = run_recheck_and_audit(
+            &db,
+            None,
+            std::path::Path::new("/tmp/grandchild-project"),
+            cmd,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("the 2 s deadline must fire");
+        assert!(err.contains("timed out"), "{err}");
+
+        let raw = fs::read_to_string(&pidfile).unwrap_or_else(|e| {
+            panic!(
+                "the child never recorded its generator's pid at {} ({e}) — \
+                 the fixture, not the fix, is broken",
+                pidfile.display()
+            )
+        });
+        let generator_pid: u32 = raw.trim().parse().expect("a pid");
+
+        // The generator is gone. Poll briefly: SIGTERM delivery + reaping is
+        // not instantaneous, and a fixed sleep would be either flaky or slow.
+        for _ in 0..40 {
+            if !pid_is_alive(generator_pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !pid_is_alive(generator_pid),
+            "the generator (pid {generator_pid}) outlived the deadline — \
+             `kill_on_drop` reached the child only, which is L-7 exactly"
+        );
+
+        let rows = db
+            .audit_list(None, None, None, None, Some("summary_recheck"), 10)
+            .expect("audit_list");
+        assert_eq!(rows.len(), 1);
+        let detail: serde_json::Value =
+            serde_json::from_str(&rows[0].detail).expect("detail is json");
+        assert_eq!(detail["outcome"], "timed_out");
+        assert_eq!(
+            detail["descendants_killed"], 1,
+            "the one generator the child had in flight, recorded: {detail}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

@@ -242,6 +242,7 @@ from vco_lib.launcher_db_reader import (
     APP_STATE_KEY_DEFAULT_TEXT_EMBED,
     ORCHESTRATOR_CORE_MODULE_ID,
     profile_for_text_model,
+    sqlite_ro_uri as _sqlite_ro_uri,
 )
 
 
@@ -581,8 +582,11 @@ def _open_db_read_only(db_path: Path) -> sqlite3.Connection:
             f"and has any project been registered?"
         )
     # SQLite's URI form lets us pass mode=ro reliably across platforms.
+    # v0.2.96 L-11: built by `launcher_db_reader.sqlite_ro_uri`, the ONE
+    # home — a hand-interpolated path containing ?/#/% truncates at the
+    # first ? and the open fails shut.
     conn = sqlite3.connect(
-        f"file:{db_path}?mode=ro", uri=True, timeout=5.0
+        _sqlite_ro_uri(db_path), uri=True, timeout=5.0
     )
     conn.row_factory = sqlite3.Row
     return conn
@@ -1357,8 +1361,9 @@ def _resolve_shared_kg_default_from_launcher_db(
     try:
         if not db_path.is_file():
             return _LAST_RESORT_SHARED_KG_NAME
+        # v0.2.96 L-11: the shared RO-URI builder (see `_connect_ro`).
         conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=5.0
+            _sqlite_ro_uri(db_path), uri=True, timeout=5.0
         )
         try:
             conn.row_factory = sqlite3.Row

@@ -67,7 +67,14 @@ from typing import List, Optional, Sequence, Tuple
 
 from vco_lib.atomic import atomic_write_text
 
-# Mirror install.py::_SECRET_SHAPED_SUBSTRINGS. Substring matches inside
+# Secret-shaped needle set. The canonical home is
+# ``vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS``, which reads the
+# data from the committed rule table ``vco_lib/mcp_scan_rules.toml``
+# ([env].secret_shaped_needles) — the SAME table the Rust registrar reads.
+# This module keeps a DELIBERATE literal mirror (the secrets-audit
+# subsystem stays separate from the MCP-registration import chain;
+# install.py only re-exports the home) and is locked to the table by
+# ``tests/test_secret_shaped_needles_parity.py``. Substring matches inside
 # ``[_\\-]``-delimited segments — avoids false positives like ``PYTHONPATH``
 # matching ``PAT`` or ``COMPASS`` matching ``PASS``.
 _SECRET_SHAPED_SUBSTRINGS: Tuple[str, ...] = (
@@ -110,11 +117,13 @@ _PLACEHOLDER_VALUES: frozenset[str] = frozenset({
 def is_secret_shaped_env_key(key: str) -> bool:
     """Return True iff ``key`` looks like a credential.
 
-    Mirrors ``install.py::_is_secret_shaped_env_key`` exactly. Kept in
-    sync as a pure copy because (a) install.py owns the canonical
-    implementation, (b) this module is imported by audit/test paths
-    that should not transitively import the install.py module-level
-    state (~18 kLOC + an argparse parser).
+    Mirrors ``vco_lib/install_mcp.py::_is_secret_shaped_env_key`` (the
+    canonical home; install.py re-exports it). The needle DATA both use
+    comes from the committed rule table ``vco_lib/mcp_scan_rules.toml``
+    ([env].secret_shaped_needles); this module keeps its own literal of
+    that set (secrets-audit is a separate subsystem) and
+    ``tests/test_secret_shaped_needles_parity.py`` locks every
+    implementation to the table.
 
     Matches secret substrings as TOKENS within ``[_\\-]``-delimited
     env-key parts. Avoids false positives like ``PYTHONPATH`` matching

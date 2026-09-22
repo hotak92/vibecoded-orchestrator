@@ -217,7 +217,9 @@ def _open_db_ro(db_path: Path) -> sqlite3.Connection:
     """
     if not db_path.is_file():
         raise FileNotFoundError(f"launcher.db not found at {db_path}")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    # v0.2.96 L-11: the shared RO-URI builder (quotes ?/#/% in the path).
+    from vco_lib.launcher_db_reader import sqlite_ro_uri
+    conn = sqlite3.connect(sqlite_ro_uri(db_path), uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -944,7 +946,15 @@ def _check_weaviate_class(
             STATUS_FAIL,
             f"cannot derive expected class name: {exc}",
         )
-    weaviate_url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
+    # v0.2.96: resolved through the ONE home
+    # (``vco_lib/weaviate_helpers.py::weaviate_url_default``) rather than from
+    # ``WEAVIATE_URL`` alone. The old spelling ignored ``WEAVIATE_PORT``, so on
+    # an install relocated by that knob this check reported the Diagrams class
+    # missing — a FAIL against a healthy install, because it probed whatever
+    # answered on the canonical port.
+    from vco_lib.weaviate_helpers import weaviate_url_default
+
+    weaviate_url = weaviate_url_default()
     try:
         import weaviate  # type: ignore
     except ImportError:

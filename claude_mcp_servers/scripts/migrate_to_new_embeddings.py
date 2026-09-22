@@ -55,11 +55,16 @@ from weaviate.classes.config import Configure, Property
 # pre-existing (pre-v0.2.91) accommodation specific to this script's
 # half-installed-venv case, not something to extend to a brand-new import.
 from vco_lib.log_setup import configure_logging
+# v0.2.96: the Weaviate base-URL precedence (WEAVIATE_URL > WEAVIATE_PORT >
+# the canonical port) has ONE home. A CALL, not a mirror: the
+# `vco_lib.log_setup` import above is bare for the reason stated there, so
+# vco_lib is already a hard requirement of this script.
+from vco_lib.weaviate_helpers import weaviate_url_default
 
 configure_logging(format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migrate_embeddings")
 
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+WEAVIATE_URL = weaviate_url_default()
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")

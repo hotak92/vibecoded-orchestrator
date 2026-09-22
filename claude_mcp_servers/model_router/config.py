@@ -49,16 +49,42 @@ Environment knobs (all optional; every one is read by code in this package)
     :data:`CATALOG_FILTER_LATEST` (the default — only the newest version of
     each family, so the picker is the list of models a user would actually
     choose from) or :data:`CATALOG_FILTER_ALL` (every version the upstreams
-    return). Withheld ids are reported in ``_vct_catalog_hidden`` and counted
-    in ``/health``, never silently dropped. An unrecognised value is an
+    return, except ids withheld on grounds this knob does not govern:
+    ``verified_ids`` truth-withholding and ``catalog_hide_ids`` curation
+    survive ``all``, and ``catalog_exclude_prefixes`` drops ids from the
+    catalog entirely). Ids withheld BY THIS KNOB are reported in
+    ``_vct_catalog_hidden`` and counted in ``/health``, never silently
+    dropped. An unrecognised value is an
     error at startup (:func:`resolve_catalog_filter`) rather than a silent
     fall back to the default: a knob whose typo does nothing is the failure
     mode this project has paid for before.
+``VCT_MODEL_GATEWAY_WINDOW_ROWS``
+    Which spellings of a 1M FIRST-PARTY model reach the ``/model`` picker:
+    :data:`WINDOW_ROWS_ONE_M_ONLY` (the default — the ``[1m]`` row alone, so
+    one model is one row) or :data:`WINDOW_ROWS_BOTH` (also the plain id,
+    which the client budgets at its smaller default window — the way to hold
+    a 1M model to that budget deliberately). The withheld plain id is
+    reported in ``_vct_catalog_hidden`` and stays routable by name: this
+    knob decides what is ADVERTISED, never what the gateway will answer to.
+    An unrecognised value is an error at startup
+    (:func:`resolve_window_rows`), for the reason given just above.
 ``VCT_MODEL_GATEWAY_CATALOG_TTL`` / ``VCT_MODEL_GATEWAY_STATIC_RETRY_TTL`` /
 ``VCT_MODEL_GATEWAY_KEY_TTL``
     Cache lifetimes in seconds. Present so the smoke tests can drive the
     cache without sleeping; documented because a knob nobody can find is a
     knob that gets re-invented.
+``VCT_MODEL_GATEWAY_KEY_STALE_MAX_S``
+    How long the vendor-key resolver keeps serving the last-known-good key
+    once resolution starts FAILING (issue 12, the 2026-09-20 update: the hub
+    stop made the only route to an OS-keychain key unreachable for ~80
+    minutes and nine 503 ``vendor_key_unavailable`` answers followed for a
+    key that was fine). Default
+    :data:`model_router.secrets.DEFAULT_SERVE_STALE_MAX_AGE_S` (6 h) — covers
+    an update's hub-stop window with room to spare while a revoked key stops
+    being served the same day. Not read in ``secrets.py`` itself: that module
+    deliberately imports neither ``os`` nor ``subprocess`` (pinned by test),
+    so the knob travels ``config`` → ``GatewayConfig`` → resolver
+    constructor, exactly like ``VCT_MODEL_GATEWAY_KEY_TTL``.
 ``VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES``
     How much of a request body the daemon will HOLD in order to rewrite ids
     in it, in bytes. Defaults to :data:`REWRITE_BUFFER_LIMIT_BYTES`. It is
@@ -91,7 +117,16 @@ from .catalog import (
     CATALOG_FILTER_LATEST,
     CATALOG_FILTERS,
     DEFAULT_CATALOG_FILTER,
+    DEFAULT_WINDOW_ROWS,
+    WINDOW_ROW_MODES,
+    WINDOW_ROWS_BOTH,
+    WINDOW_ROWS_ONE_M_ONLY,
 )
+# No import cycle: ``secrets`` depends only on ``vendors``. The default is
+# declared beside the resolver state it bounds, and this module — the one
+# that owns every ``VCT_MODEL_GATEWAY_*`` env read — re-exports it so the
+# knob's default and its reader cannot drift apart.
+from .secrets import DEFAULT_SERVE_STALE_MAX_AGE_S
 
 #: Documented in CLAUDE.md as the model-router port. The field prototype ran
 #: on 8787; the shipped daemon uses the documented port and the collision with
@@ -383,6 +418,33 @@ def resolve_catalog_filter() -> str:
     return raw
 
 
+class WindowRowsError(ValueError):
+    """``VCT_MODEL_GATEWAY_WINDOW_ROWS`` names a mode that does not exist."""
+
+
+def resolve_window_rows() -> str:
+    """Which spellings of a 1M first-party model reach the picker.
+
+    Same judgement as :func:`resolve_catalog_filter`, for the same reason: a
+    typo REFUSES to start rather than running as the default and leaving the
+    user to discover, some hours later, that the setting they made never
+    took. A bad ENUM has no safe value to fall back to.
+    """
+    raw = (os.environ.get("VCT_MODEL_GATEWAY_WINDOW_ROWS") or "").strip().lower()
+    if not raw:
+        return DEFAULT_WINDOW_ROWS
+    if raw not in WINDOW_ROW_MODES:
+        raise WindowRowsError(
+            f"VCT_MODEL_GATEWAY_WINDOW_ROWS={raw!r} is not a window-rows "
+            f"mode. Use one of: {', '.join(WINDOW_ROW_MODES)}. "
+            f"{WINDOW_ROWS_ONE_M_ONLY!r} (the default) publishes only the "
+            f"'[1m]' row of a 1M first-party model; {WINDOW_ROWS_BOTH!r} "
+            "also publishes its plain row, which the client budgets at the "
+            "smaller default window.",
+        )
+    return raw
+
+
 class HostNotLoopbackError(ValueError):
     """A non-loopback bind address was requested."""
 
@@ -443,6 +505,11 @@ class GatewayConfig:
     catalog_ttl_s: int = DEFAULT_CATALOG_TTL_S
     static_retry_ttl_s: int = DEFAULT_STATIC_RETRY_TTL_S
     key_ttl_s: int = DEFAULT_KEY_TTL_S
+    #: Bound on serving the last-known-good vendor key through FAILED
+    #: resolutions (issue 12). Threaded into ``VendorKeyResolver`` by
+    #: ``Gateway.__init__`` — see the ``VCT_MODEL_GATEWAY_KEY_STALE_MAX_S``
+    #: paragraph in the module docstring for why the read lives here.
+    key_stale_max_age_s: int = DEFAULT_SERVE_STALE_MAX_AGE_S
     secret_project: str | None = None
     #: Seconds of SILENCE from the upstream before the relay gives up — an
     #: IDLE timeout, never a total one. The distinction is the 2026-09-09
@@ -475,6 +542,11 @@ class GatewayConfig:
     #: ``CatalogService.union``; reported in ``/health`` so the answer to "why
     #: is my picker short?" does not require knowing the knob exists.
     catalog_filter: str = DEFAULT_CATALOG_FILTER
+    #: Which spellings of a 1M first-party model reach the picker. Handed to
+    #: ``CatalogService.union`` alongside :attr:`catalog_filter`; reported in
+    #: ``/health`` for the same reason — "why is there only one Opus row?"
+    #: should be answerable without knowing the knob exists.
+    window_rows: str = DEFAULT_WINDOW_ROWS
 
     @classmethod
     def from_env(cls, *, token: str = "") -> "GatewayConfig":
@@ -491,6 +563,9 @@ class GatewayConfig:
                 "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", DEFAULT_STATIC_RETRY_TTL_S,
             ),
             key_ttl_s=_env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S),
+            key_stale_max_age_s=_env_int(
+                "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S,
+            ),
             rewrite_buffer_bytes=_env_int(
                 "VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES",
                 REWRITE_BUFFER_LIMIT_BYTES,
@@ -500,6 +575,7 @@ class GatewayConfig:
                 or None
             ),
             catalog_filter=resolve_catalog_filter(),
+            window_rows=resolve_window_rows(),
         )
 
 
@@ -510,10 +586,17 @@ __all__ = [
     "DEFAULT_CATALOG_FILTER",
     "CatalogFilterError",
     "resolve_catalog_filter",
+    "DEFAULT_WINDOW_ROWS",
+    "WINDOW_ROW_MODES",
+    "WINDOW_ROWS_BOTH",
+    "WINDOW_ROWS_ONE_M_ONLY",
+    "WindowRowsError",
+    "resolve_window_rows",
     "DEFAULT_CATALOG_TTL_S",
     "DEFAULT_HOST",
     "DEFAULT_KEY_TTL_S",
     "DEFAULT_PORT",
+    "DEFAULT_SERVE_STALE_MAX_AGE_S",
     "DEFAULT_STATIC_RETRY_TTL_S",
     "FALLBACK_PORT_RANGE",
     "DEFAULT_UPSTREAM_IDLE_TIMEOUT_S",

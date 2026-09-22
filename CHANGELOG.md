@@ -7,6 +7,412 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.96] - 2026-09-22
+
+### Fixed — the "your files were preserved" update notice names the real cause (v0.2.96)
+
+- When an update could not update a file under `.claude/`, the ledger entry
+  it wrote said the file had been "preserved (not overwritten)" by a
+  default-to-safety policy, and its headline remedy was
+  `--update --force`. Both were wrong. VCO has adopted divergent shipped
+  files since v0.2.84 — backing your current bytes up first — so the only
+  way a file still reaches this entry is that **the backup could not be
+  written** (no free space, no write permission, or a symlink under
+  `.claude/backups/`). The cause appeared only in a warning nobody was
+  pointed at, while the entry recommended the one command that overwrites
+  with *no* backup, on the very machine whose backup writes had just failed.
+- The entry now names the failed backup write and quotes the error per file,
+  and its remedies are ordered: fix the backup destination and re-run the
+  ordinary update (which adopts the files, captures the backups and clears
+  the entry by itself), dismiss, diff per file, and only last `--force`,
+  labelled as destroying local edits.
+
+### Fixed — a project's `docs/` stopped re-embedding on every sync (v0.2.96)
+
+- On a project whose `<Name>_Development` collection predates v0.2.74, every
+  `docs/` sync re-embedded every unchanged file. The lookup asked for two
+  properties that collection does not declare, both attempts failed, and the
+  code fell through to a full re-embed. The KG collection had this fixed
+  earlier in this release; the development collection had not. It now
+  narrows its request to the properties the collection actually declares and
+  skips only the one check those properties feed, so unchanged docs are
+  skipped as they always should have been. One line per run says when the
+  narrowing applies.
+
+### Fixed — a launcher.db under a path containing `?`, `#` or `%` (v0.2.96)
+
+- Eleven places opened the launcher database by pasting its path into a
+  `file:` URI. SQLite reads everything after the first `?` as options, so
+  such a path was truncated — and the truncation also swallowed the
+  read-only flag that was meant to follow. The result was a **writable**
+  handle on a *different* file, which SQLite then created: every read
+  reported the tables missing and every caller concluded the project was not
+  registered. All eleven now build the URI through one percent-quoting
+  helper.
+
+### Changed — `install.py` joined the type-check gate (v0.2.96)
+
+- `install.py` had been outside the CI `pyright` gate since v0.2.55 with a
+  standing backlog note. Its 26 type errors are fixed and the file is now
+  gated at zero. Two were real defects rather than annotation friction: the
+  launcher-binary staleness check compared a timestamp against `None`
+  whenever an existing binary could not be `stat()`-ed (an uncaught
+  `TypeError`), and two exception classes were imported inside the `try`
+  whose `except` clauses name them, so a broken install reported a confusing
+  `NameError` instead of the import error that says what is wrong.
+
+### Changed — bundled agents no longer pin the highest reasoning effort (v0.2.96)
+
+- Ten bundled agent definitions declared `effort: xhigh` in their
+  frontmatter, which overrides the session's effort level and cannot be
+  overridden from the Agent tool. They now declare `effort: high`. Beyond
+  the cost, `xhigh` is rejected outright by models that do not expose
+  extended thinking, so an agent pinning it could fail to start rather than
+  run more carefully. Raise it per-agent if you want it: frontmatter still
+  accepts `xhigh` and `max`.
+
+### Fixed — quieter and more honest gateway key diagnostics (v0.2.96)
+
+- A vendor whose key could not be resolved logged one warning per ATTEMPT,
+  so a period with the hub stopped produced a warning every few seconds for
+  a key that was fine. The line is now stated once per vendor and again only
+  after the key resolves and fails afresh.
+- When a last-known-good key aged past the serve-stale bound, the gateway
+  said it was "answering failures again" and then never said when the key
+  started resolving again. That recovery is now stated.
+- A vendor row's `catalog_hide_ids` entries are validated at startup: a
+  blank entry, one with surrounding whitespace, or one naming no declared id
+  is refused rather than silently hiding nothing.
+
+### Fixed — the duplicate scan no longer aborts on a node that was just re-synced (v0.2.96)
+
+- The knowledge-graph duplicate scan takes a snapshot of every node, then
+  examines each one. The hook that runs it also schedules a sync in the same
+  pass, and a node re-written by that sync changes identity — so the scan
+  reached it, failed, and **abandoned the whole run**, reporting no verdict
+  at all. A single edited node could silence a scan of hundreds.
+- A node that vanishes mid-scan is now skipped and counted. Anything else —
+  a genuinely unreachable store, a misconfigured vector — still stops the
+  scan loudly, because "found nothing" and "could not look" must not be the
+  same outcome. A partial scan now says so in the terminal, the report file,
+  the JSON output (`nodes_skipped`) and the launcher.
+
+### Fixed — the code-graph drain no longer discards a turn's edits (v0.2.96)
+
+- The hook that drains the pending code-graph queue at the end of a turn
+  consumed the queue and then ran the analyzer under whatever `python` was
+  on `PATH`, with all output discarded. Where that interpreter was wrong,
+  the work failed silently and the queued paths were already gone — so the
+  edits from that turn were never indexed, with nothing said. It now checks
+  the interpreter BEFORE consuming the queue, uses the resolved one and
+  honours `VCT_PYTHON` (its PowerShell sibling already did); when that check
+  fails the queued paths are put back rather than lost, and the reason is
+  reported. The analyzer itself still runs detached, as it has since
+  2026-07-03 — this fixes the paths being discarded, not the analyzer's own
+  output being quiet.
+
+### Fixed — a relocated Weaviate is now found by every caller (v0.2.96)
+
+- `WEAVIATE_PORT` was documented and read by only some callers. The shared
+  URL resolver ignored it and fell back to the default port, so moving
+  Weaviate off `8081` (without also setting `WEAVIATE_URL`) gave the right
+  address from the installer and the wrong one from everything else — most
+  damagingly the retrieval path, where the symptom is **no knowledge-graph
+  results at all** rather than an error. Resolution order is now
+  `WEAVIATE_URL`, then `WEAVIATE_PORT`, then the default, applied through a
+  single shared helper that 40+ call-sites now use.
+- The Weaviate **instance** is machine-global; only the **collection** is
+  per-project. Both are documented in `docs/CONFIGURATION.md`, because the
+  two being different is the thing that is easy to get wrong when running
+  more than one Weaviate.
+- `vco doctor`'s diagram verification reported FAIL against a healthy
+  install for the same reason, and no longer does.
+
+### Fixed — version comparison agreed with itself (v0.2.96)
+
+- Three copies of "compare two version strings" gave two different answers:
+  one read `0.2.95rc1` as patch **951** and therefore ranked it above
+  `0.2.100`. That comparison backs the gateway's freshness check — the one
+  that tells you whether the running code is the installed code — so it
+  could answer backwards for any version carrying a suffix, which an
+  editable install's version does routinely. One implementation now.
+  A pre-release suffix compares equal to its release (ordering it below is
+  a separate change, deliberately not made here).
+
+### Changed — one row per model in the gateway picker (v0.2.96)
+
+- A **first-party** model with a 1M context window now occupies a
+  **single** picker row — its `[1m]` one — where it previously occupied
+  two. The gateway sizes a client's context budget from the id string
+  (`[1m]` means 1M, anything else behind a custom base URL means the
+  smaller default), so the pair existed to make both budgets reachable;
+  the cost was two rows per model in a list meant to be chosen from at a
+  glance. Only first-party rows are ever paired: a vendor model is
+  published as the single id its resolved window earns, already carrying
+  `[1m]` when that window is 1M, so nothing about the vendor catalog
+  changes here. The plain id is now
+  reported in `_vct_catalog_hidden` and **remains routable by name**, so a
+  session already pinned to it keeps working.
+- `VCT_MODEL_GATEWAY_WINDOW_ROWS=both` restores the plain row. Use it to
+  hold a 1M model to the smaller budget deliberately — which is what keeps
+  a long session under the upstream's long-context pricing tier. An
+  unrecognised value refuses to start rather than silently running as the
+  default, matching `VCT_MODEL_GATEWAY_CATALOG`. `/health` reports the
+  resolved mode as `window_rows`.
+
+### Added — QwenCloud Token-Plan vendor route, catalog truth filter, and the unstated-max_output contract (v0.2.96)
+
+- **Qwen vendor row** in `claude_mcp_servers/model_router/vendors.py`: the
+  Token-Plan endpoint (`…/apps/anthropic`) publishes under the nested
+  namespace `claude-gw/qwen/…` (every panel rule keyed on `claude-gw/` keeps
+  working) while its bare ids (`qwen…`, `deepseek…`) route without the
+  prefix; the key resolves as `qwen_api_key` or `QWEN_API_KEY` through the
+  same shared-keychain path as the other vendor keys. The anthropic app
+  endpoint has no model-list route, but the subscription's OpenAI-compatible
+  base serves one (live-verified 2026-09-22): the row rides the live catalog
+  machinery through the new `catalog_url` registry field (an absolute-URL
+  override used instead of `upstream + catalog_path`), drops the non-chat
+  modalities that list carries (voice, image, the `auto` router alias) via
+  the new `catalog_exclude_prefixes` field, and keeps its nine declared chat
+  ids as the keyless/fetch-failed fallback — `/health` reports the family
+  source as `live` or `declared`, whichever answered. The owner's final
+  advertised qwen list (ruling 2026-09-22) is four ids — glm-5.3,
+  deepseek-v4.1-flash, qwen3.8-max, qwen3.8-flash — via the new
+  `catalog_hide_ids` curation field: curated-hidden ids stay reported in
+  `_vct_catalog_hidden` and routable by name but never publish under either
+  catalog filter. The pay-as-you-go
+  endpoint is deliberately absent until its model list is proven.
+- **z.ai `verified_ids` truth filter**: ids the endpoint reroutes
+  server-side to other models are withheld from the picker (listed in
+  `_vct_catalog_hidden`, namespaced, one INFO log per changed withheld set);
+  `VCT_MODEL_GATEWAY_CATALOG=all` does not bring them back — an id that
+  answers as a different model is not a capability to unlock.
+- **Auth-rejection discrimination**: only 401s and 403s carrying
+  `access_denied` count against a vendor key's strike counter; model-level
+  rejections (e.g. a deprecated model) no longer invalidate a healthy key,
+  and unreadable rejection bodies fail toward the pre-existing protective
+  behaviour.
+- **Migration 046 + schema set 46**: `chat_model_context.max_output` now
+  admits 0 = "the vendor publishes no figure" (SQLite CHECK widened via the
+  table-rebuild pattern; zero rows can be lost), matching the Python
+  context table's fold; the GUI renders unstated as — / a blank editor
+  field so re-saving a row can never force an invented number.
+- **GLM-trio agent roles** (module-gateway): `glm-reviewer` + `glm-planner`
+  on `claude-gw/glm-5.3`, `glm-flash-researcher` on `claude-gw/glm-5.3-flash`
+  (investigation only); `glm-flash-reviewer` retired (byte-copy archived in
+  the release tooling docs).
+
+### Changed — the module-gateway agent set is now four roles (v0.2.96)
+
+- agents: module-gateway set is now four — glm-reviewer (GLM 5.3, the review
+  lane), glm-planner (GLM 5.3), glm-flash-researcher (flash;
+  research/investigation only, never review); glm-flash-reviewer retired
+  (owner ruling 2026-09-21). Already-delivered copies of the retired
+  definition are orphan-cleaned on the next bundle update (unmodified
+  deleted; user-modified preserved with a deferral).
+
+### Added — module-scoped agent delivery (v0.2.96)
+
+- Bundled agents used to ship to every project unconditionally. A project
+  with the **model gateway** module active now additionally receives the
+  four gateway agent definitions (`templates/agents/module-gateway/`) on
+  its next bundle update — the first shipped artefact delivered on a
+  per-module condition. A project without the module active receives none
+  of them, and a launcher-less CLI install receives none either (the module
+  state lives in `launcher.db`). The project's own `CLAUDE.md` gains one
+  line inside its existing gateway section: these agents are spawned by
+  definition NAME with no model override, because the Agent tool's model
+  list cannot carry `claude-gw/*` ids while an agent's frontmatter can.
+
+### Fixed — a GUI update could wedge at "Seeding Weaviate KG" and stay there (v0.2.96)
+
+- **`install.py` spawned the knowledge-seed child with its own stdout and
+  stderr inherited.** On a launcher that reads one pipe to EOF before
+  draining the other, a child writing more than the ~64 KiB pipe buffer to
+  stderr deadlocked all three processes: the progress bar sat at "Seeding
+  Weaviate KG" with nothing to act on. Both seed spawns now go through one
+  helper that drains a single merged stream and appends it to a per-run log
+  under `~/.vct/logs/` (`kg-sync-<UTC>.log`, `shared-kg-seed-<UTC>.log`), so
+  a seed that stalls or fails leaves a readable record where it used to
+  leave nothing. A terminal parent still sees every line as before.
+- **A slow but healthy re-embed looked exactly like a hang**: `install.py`
+  prints nothing for the whole time it blocks on that child. The sync child
+  now emits a progress tick at most every 15 s — one on start, throttled
+  per-node ticks, one on completion, and one before the summary
+  regeneration that can run for minutes with no output of its own — and
+  those ticks are relayed onto `install.py`'s stdout for the launcher to
+  render. A fast hash-skip sync emits only its two bracketing beats, so
+  small syncs are not turned into noise.
+- **New stall notice.** After 10 minutes of complete silence during an
+  update the launcher says the update may be stalled, once per silent
+  window, and repeats only if the silence continues. It never aborts, kills
+  or times anything out. `VCO_UPDATE_STALL_WARN_SECS` sets the window (`0`
+  disables it; values below 30 s clamp up; garbage falls back to 600).
+- `docs/post-install/UPDATE-RECOVERY.md` gains the row for an update already
+  stuck this way on an older launcher: what to kill, how to finish through
+  the resume flow, and that the CLI path cannot hang in this shape.
+
+### Fixed — a knowledge sync against a pre-chunking collection failed every node instead of skipping it (v0.2.96)
+
+- A collection created before the chunk-metadata properties existed has no
+  `chunk_num` / `total_chunks` to return, but the existing-row lookup asked
+  for them unconditionally — so every node raised `no such prop with name
+  'chunk_num' found` on all three lookup attempts and the run produced one
+  stack trace per node while storing nothing. The lookup now probes the
+  class schema once per run and asks only for the properties that class
+  declares, skipping the chunk-count comparison that has no stored counts
+  to compare against. **The hash-based embed-skip stays live**, so an
+  unchanged tree on an old-schema class re-embeds nothing, exactly as on a
+  current one. A class whose schema cannot be read positively keeps the
+  previous behaviour rather than guessing at a trim.
+- **The seed child could not find the shared KG collection while vct-hub was
+  stopped** — and an orchestrator update stops it by design. Between the hub
+  and the environment default it now reads the binding the launcher recorded
+  in `launcher.db` (read-only; a busy, locked or absent database falls
+  through to the environment silently), so an update-time seed writes to the
+  same shared collection the rest of the install resolves.
+
+### Fixed — code-graph vectors embedded through an out-of-date code-embed image (v0.2.96)
+
+- **A re-sync no longer walks while the code-embed service image is out of
+  date.** An image predating v0.2.92 silently truncated over-window input
+  and answered 200, so the walk stored corrupted vectors and stamped them as
+  current. The freshness verdict is now taken inside the re-sync driver, so
+  every path passes it — the install trigger, the deferral auto-retry, and a
+  manual `--run-resync` — and a stale verdict records the deferral (rebuild
+  the image FIRST, then re-run) instead of embedding. A verdict that cannot
+  be established never gates. A persistently stale image also stops burning
+  the retry budget: the dispatcher blocks before it counts an attempt, so
+  the retry fires on the first pass after the rebuild instead of having been
+  retired three passes earlier.
+- **Vectors already written through such an image are repaired, once.** They
+  carry correct content hashes, so every skip gate passed over them forever
+  and the remedy the CLI used to print ("rebuild, then re-run the re-sync")
+  could not reach them. When an update finds BOTH completion evidence (rows
+  stored at the current embed revision) AND evidence of the truncating image
+  (a live probe, an observation recorded at rebuild time, or a surviving
+  `code_embed_image_stale` ledger entry), it queues a one-time re-embed; the
+  next re-sync under a current image demotes exactly those rows and
+  re-embeds them, then records that project as healed. The record is
+  per project, so a machine running several projects heals each of them
+  once rather than only the first. **An install with no such evidence is
+  unchanged and re-embeds nothing.** `--force-recreate` remains the
+  unconditional manual escape, and the printed remedy now says all of this
+  instead of promising that a plain re-sync would fix it.
+
+### Added — `adopt-services`: bring containers another project owns under this install (v0.2.96)
+
+- When Weaviate, Ollama or the code-embed service on this machine belong to
+  a different compose project, VCO has refused to recreate them since
+  v0.2.93 and left a deferral saying so, with no way forward short of manual
+  compose surgery. That deferral now leads with a command that does it:
+  `python -m vco_lib.service_adoption adopt-services --root <install root>`
+  (`--dry-run` prints the plan and changes nothing).
+- The adoption reconciles rather than replaces. It reads the live
+  containers, generates an `infrastructure/compose.override.yaml` carrying
+  their bind mounts **byte for byte** plus the behaviour-critical
+  environment and healthchecks, re-renders the merged configuration and
+  verifies it BEFORE stopping anything, then moves one service at a time. It
+  never removes or prunes a volume, never `down`s the other project, never
+  writes that project's files, and refuses any service whose live state it
+  cannot read positively — substituting a named volume for a bind mount is
+  refused outright, so a 110 GB model directory cannot be silently orphaned.
+  A service that fails to come up is re-created under its original
+  invocation and the services after it are left untouched. An override you
+  wrote yourself is never overwritten.
+- Where adoption is not wanted or not possible, the printed rebuild command
+  now tags the OWNING project's image name, so a manual rebuild reaches the
+  image actually in use instead of building one nothing runs.
+
+### Changed — the model gateway keeps serving while vct-hub is stopped (v0.2.96)
+
+- An orchestrator update stops the hub, and the gateway resolves its vendor
+  keys through it; the 5-minute key cache then expired mid-update and every
+  request failed for the rest of the window (observed: ~80 minutes). The
+  gateway now keeps answering with the last key that resolved successfully,
+  for at most 6 h since that success —
+  `VCT_MODEL_GATEWAY_KEY_STALE_MAX_S`, and a non-numeric or non-positive
+  value falls back to the default rather than serving unbounded. It logs
+  once when it starts serving stale, once if it passes the bound, once when
+  it recovers — never per request — and `/health` lists which vendors are
+  being served this way. A key the vendor itself rejects is invalidated
+  immediately, so the stale window never outlives a revoked key.
+- **The gateway now checks that the model in the answer is the model it
+  forwarded.** A vendor that reroutes a request to a different model
+  server-side is counted in `/health` (`model_echo_mismatches`) and warned
+  about once per distinct mismatch. Nothing is repaired or refused — this is
+  the standing tripwire for the aliasing the vendor registry documents.
+- `/health` also reports which host-token file the running daemon loaded and
+  whether that file still matches it, which separates the three causes of a
+  token mismatch that previously looked identical: a second daemon instance,
+  a divergent `VCT_STATE_DIR`, or a token regenerated after start.
+
+### Fixed — summary generation kept calling a tier that had nothing left to give (v0.2.96)
+
+- The circuit breaker treated **running out of quota** as a transient
+  rate-limit (15 min), and had no class at all for a headless `claude -p`
+  refused because the workspace is not trusted. Both now demote the tier for
+  5 h by default (`VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN`); a trust refusal is
+  terminal for that tier, since only a human re-accepting the dialog fixes
+  it. **Unclassified failures are strike-gated too**: one stray error still
+  never demotes, three consecutive ones do
+  (`VCO_SUMMARY_BREAKER_OTHER_STRIKES`, `VCO_SUMMARY_BREAKER_OTHER_COOLDOWN`).
+  Before this, an unclassified failure never tripped the breaker at all — a
+  field night ran 304 of them in a row with the breaker never moving.
+- **A degraded run now says so, once per event.** When the preferred tier
+  opens on quota or trust, a `kg_summaries_degraded` deferral entry names how
+  many rows are affected. The set is derived by scanning the summary
+  sidecars themselves — rows whose recorded backend is not the preferred
+  tier while their content hash is current, plus nodes with no summary at
+  all — so there is no second ledger to keep in step.
+- **Those rows cannot recover on their own**: their hashes are current, so an
+  ordinary run correctly skips them, and only new or changed nodes come back
+  when the cooldown expires. `python -m vco_lib.summary_health
+  summary-recheck --project-root <root>` clears the breaker and regenerates
+  exactly that set. The launcher's **Preferences → KG Summaries →
+  Diagnostics** gains a "Recheck summary backend now" button that runs it
+  against the selected project (the orchestrator root when none is selected)
+  and reports how many were regenerated and how many remain. `vco doctor`
+  counts the pending rows in its full scan and prints the same command; it
+  reports the count, and never clears the entry itself. Both the knowledge
+  and the code summary generators are covered — they share one backend
+  ladder.
+
+### Fixed — one repeating background failure could produce hundreds of desktop notifications (v0.2.96)
+
+- The StopFailure hook notified on every event and parsed the payload with
+  the wrong shape, so a single repeating failure produced 304 identical
+  "unknown: No details" pop-ups in one night. It now notifies at most once
+  per 5 minutes per project and error class, and the next notification
+  carries the count it suppressed. A payload whose shape it does not
+  recognise is reported as a truncated copy of the payload itself rather
+  than "no details", and **every** event — suppressed or not — is still
+  written to the failures ledger, which is what made that night
+  diagnosable. `VCO_STOP_FAILURE_NOTIFY=0` silences only the notification
+  and keeps the ledger (distinct from `VCT_DISABLE_HOOKS`, which disables
+  every hook). The PowerShell sibling was rewritten in lockstep.
+- **`vco doctor` now reads the Claude Code trust flag for the folder.** The
+  storm above was driven by `hasTrustDialogAccepted` turning false in
+  `~/.claude.json`: every headless `claude -p` then failed "this workspace
+  has not been trusted", including the ones VCO's own summary generators
+  make. The probe names that state and its one-step recovery — run `claude`
+  in the folder and accept the dialog. It never writes the flag: that is the
+  CLI's own decision to record. An unreadable file, or a folder with no
+  entry yet, is reported as unknown rather than as a verdict.
+
+### Changed — the launcher stops logging normal events as failures (v0.2.96)
+
+- The startup banner was emitted at ERROR severity, so any log watcher keyed
+  on ERROR raised an alarm on every single launch. It is INFO now; the log
+  file is still created eagerly.
+- During an orchestrator update the launcher closes `launcher.db` so the
+  installer can write it. The background heartbeat sweep and the
+  settings-file watcher kept polling across that window and logged "no such
+  table" warnings for as long as it lasted. Both now stand down while the
+  swap is in progress and resume after it — and both still warn on a
+  database that is genuinely broken, which is the case those warnings exist
+  for.
+
 ## [0.2.95] - 2026-09-19
 
 ### Fixed — the launcher self-update could leave your install half-updated, and then report it complete (v0.2.95)

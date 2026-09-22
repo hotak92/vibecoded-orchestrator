@@ -212,6 +212,15 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 46 = migration 046_chat_model_context_max_output_unstated.sql (v0.2.96 —
+#: chat_model_context.max_output CHECK widened from > 0 to >= 0 so the seed
+#: can carry 0 = "vendor does not publish a figure" for the qwen rows; an
+#: invented positive number would be a lie the client acts on. SQLite CHECKs
+#: are immutable, so this is the repo's table-rebuild pattern (mirror of
+#: 021/038): every existing row satisfies > 0 and therefore >= 0, so the
+#: rebuild cannot lose one. Python's context_table already folded 0 to
+#: unstated; this migration makes the DB backstop agree. Bumped ATOMICALLY
+#: with mig 046's Rust registration.
 #: 45 = migration 045_chat_model_context_tombstone.sql (v0.2.94 — the other
 #: half of the per-row chat-model-context boot seed). The seed used to write
 #: only into an EMPTY table, which doubled as the "never reinstate a row the
@@ -265,7 +274,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 45
+LAUNCHER_DB_TABLE_SET_VERSION = 46
 
 
 # ===========================================================================

@@ -274,9 +274,24 @@ class ContextTable:
         namespace) that restriction is unavailable, and the family stem is all
         there is; the failure case is therefore narrow and named: a bare query
         whose family stem is also published by a SECOND vendor in the same
-        table would pool both vendors' rows and take the larger window. No
-        shipped table has such a pair (``claude-*`` vs ``glm*``), and a row's
-        ``vendor`` field is what a future refinement would key on.
+        table would pool both vendors' rows and take the larger window.
+
+        **The shipped table DOES have such a pair, deliberately** (owner
+        ruling, 2026-09-22): ``glm-5.3`` and ``glm-5.2`` are listed by both
+        the z.ai row and the QwenCloud row, and the cited z.ai window
+        answers for both. The ruling is that a context window is a property
+        of the MODEL, not of the endpoint serving it — glm-5.3 is glm-5.3
+        wherever it is served — so the rows are NOT narrowed to match the
+        weaker citation, and ``lookup`` stays vendor-blind on purpose. Pinned
+        by ``tests/test_model_router_context_table.py::
+        test_the_shared_ids_answer_from_the_one_row_that_exists``.
+
+        The cost of that ruling, stated so nobody has to rediscover it: if an
+        endpoint serves a shared model at a SMALLER window than the citation,
+        the picker over-advertises and the client budgets more context than
+        the upstream will accept. Keying ``lookup`` on ``(vendor, id)`` — the
+        row's ``vendor`` field exists for exactly that — is the refinement to
+        reach for if that ever bites.
         """
         parts = parse_model_id(model_id)
         if parts.bare_id in self.tombstones:

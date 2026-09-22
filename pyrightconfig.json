@@ -36,8 +36,26 @@
     //     worth doing blind — so it is BACKLOGGED (CHANGELOG, v0.2.95) with
     //     the count above, per this file's own exclusion contract. ruff DOES
     //     gate it (ci.yml `python-lint`), so it is not unlinted.
+    //
+    // v0.2.96: `install.py` JOINS the gate — the v0.2.55 backlog entry this
+    // file carried for four releases ("34 pre-existing errors, 26k lines …
+    // add it to `include` once the backlog clears") is now closed. All 26
+    // errors measured on 2026-09-22 were fixed, not suppressed: five
+    // re-exports and one importability probe took the per-line
+    // `# pyright: ignore[reportUnusedImport]` + rationale this file
+    // sanctions, and the rest were real typing fixes. Two of those were
+    // latent BUGS the gate surfaced, not friction:
+    //   * `float > None` in the launcher-binary staleness check, reachable
+    //     whenever `stat()` on an existing dist binary raised OSError
+    //     (TypeError, uncaught — the `except OSError` does not cover it);
+    //   * `DbUnreachable` / `ProjectNotFound` imported INSIDE the `try`
+    //     whose `except` clauses name them, so a broken `vco_lib` produced
+    //     a NameError in place of the ImportError that says what is wrong.
+    // Which is the argument for the gate: a file that ships and is ungated
+    // is a file whose first type error arrives in the field.
     "include": [
         "vco_lib",
+        "install.py",
         "claude_mcp_servers/weaviate_mcp",
         "claude_mcp_servers/search_mcp",
         "claude_mcp_servers/model_router",
@@ -53,10 +71,6 @@
         // dominated by reportArgumentType friction against
         // weaviate-client v4 stubs. Gate it after that cleanup.
         "claude_mcp_servers/weaviate_mcp/server.py"
-        // NOTE: install.py (34 pre-existing errors, 26k lines) is a
-        // second backlog item — it is simply NOT in `include` above,
-        // so it needs no exclude entry. Add it to `include` once the
-        // v0.2.55 backlog clears it.
     ],
     "pythonVersion": "3.12",
     // v0.2.92: unused-import ratchet ON. The 21-violation backlog this

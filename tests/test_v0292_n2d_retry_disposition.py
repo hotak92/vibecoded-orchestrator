@@ -261,9 +261,16 @@ class DispositionNoteTests(unittest.TestCase):
             self._trail_blocked(folder, 12)
             note = deferral_retry.retry_disposition_note(folder, CID)
         self.assertIn("12", note)
-        self.assertIn("unreachable every time", note)
+        # SHIP-GATE MINOR-3 (2026-09-22): these rows say the BACKEND was
+        # unreachable (`_trail_blocked` writes that detail), so the note must
+        # say so — even though this CID's handler is ALSO image-gated. The
+        # cause comes from what actually blocked, never from a static flag:
+        # telling a user to rebuild an image for a service that is not even
+        # running is a false, actionable-sounding instruction.
+        self.assertIn("the backend it needs was unreachable every time", note)
+        self.assertNotIn("code-embedding image", note)
         self.assertIn("2026-08-01", note, "the note dates the run it describes")
-        self.assertIn("nothing changes here until the service is back", note)
+        self.assertIn("nothing changes here until then", note)
 
     def test_a_spent_cap_says_VCO_has_STOPPED(self):
         """The strongest correction: past the cap the dispatcher would SKIP
@@ -285,7 +292,7 @@ class DispositionNoteTests(unittest.TestCase):
             self._trail_blocked(folder, 9)
             note = deferral_retry.retry_disposition_note(folder, CID)
         self.assertNotIn("VCO retries this itself", note)
-        self.assertIn("will retry by itself the moment that backend answers", note)
+        self.assertIn("will retry by itself the moment that changes", note)
 
     def test_the_reader_never_writes_to_the_ledger(self):
         """It must not: `vco_lib.codegraph_resync` owns this entry and
@@ -358,7 +365,11 @@ class DoctorRendersTheNoteTests(unittest.TestCase):
             findings = self._findings(folder)
         owed = next(f for f in findings if f.probe == "owed_retryable_work")
         self.assertIn("VCO can retry itself", owed.summary)
-        self.assertIn("unreachable every time", owed.summary,
+        # The seeded rows are the BACKEND gate's own detail, so the rendered
+        # note names unreachability (ship-gate MINOR-3: the cause follows the
+        # row, not the handler's static image-gate flag).
+        self.assertIn("the backend it needs was unreachable every time",
+                      owed.summary,
                       "the tier and the history must appear together")
         self.assertIn(CID, owed.detail["retry_notes"])
 
@@ -372,3 +383,112 @@ class DoctorRendersTheNoteTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class BlockCauseBranchPins(unittest.TestCase):
+    """Which cause the note names, for each way a pass can be BLOCKED.
+
+    Ship-gate-fix re-review (2026-09-21) pinned both halves of the
+    disjunction — but against the HANDLER's static
+    ``needs_current_code_embed_image`` flag, which is not what blocked. The
+    v0.2.96 ship-gate's MINOR-3 caught the consequence: `codegraph_resync` is
+    image-gated AND code-backend-gated, so a service that is simply DOWN
+    produced "the service is up but predates the running source — rebuild
+    it", sending the user to rebuild an image for a service that is not
+    running. The cause is now read from the trailing BLOCKED row's own
+    detail, which the two gates write distinctly, so every combination is
+    pinned here by the ROW, not by the registry.
+    """
+
+    def _trail(self, folder, cid, n, detail):
+        for _ in range(n):
+            deferral_retry.record_attempt(
+                folder, deferral_retry.RetryResult(cid, deferral_retry.BLOCKED,
+                                                   detail))
+
+    def test_a_down_backend_says_unreachable_for_a_NON_gated_handler(self):
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            self._trail(folder, KG_CID, 12,
+                        "no text embedding backend reachable")
+            note = deferral_retry.retry_disposition_note(folder, KG_CID)
+        self.assertIn("the backend it needs was unreachable every time", note)
+        self.assertNotIn("code-embedding image", note,
+                         "kg_seed is text-backend: the stale-image cause "
+                         "would be a lie about a service that was never probed")
+
+    def test_a_down_backend_says_unreachable_for_an_IMAGE_GATED_handler(self):
+        """THE MINOR-3 pin. Same handler as the stale-image case below; only
+        the row differs, and the row is what happened."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            self._trail(folder, CID, 12,
+                        "no code embedding backend reachable")
+            note = deferral_retry.retry_disposition_note(folder, CID)
+        self.assertIn("the backend it needs was unreachable every time", note)
+        self.assertNotIn("code-embedding image", note,
+                         "the service was DOWN: 'rebuild the image' is a "
+                         "false instruction about a service that is not up")
+
+    def test_a_stale_image_says_stale_image(self):
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            self._trail(folder, CID, 12, deferral_retry.BLOCKED_BY_IMAGE_DETAIL)
+            note = deferral_retry.retry_disposition_note(folder, CID)
+        self.assertIn("the code-embedding image it needs is stale", note)
+        self.assertNotIn("was unreachable every time", note,
+                         "the image-gated branch's service answers /health; "
+                         "'unreachable' sends the user to restart what is up")
+
+    def test_an_unclassifiable_row_names_neither_cause(self):
+        """An old trail (rows written before the gates recorded a detail) must
+        not be dressed up as either cause: the note still reports the streak,
+        and says plainly that the reason was not recorded."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            self._trail(folder, CID, 12, "")
+            note = deferral_retry.retry_disposition_note(folder, CID)
+        self.assertIn("12", note)
+        self.assertNotIn("was unreachable every time", note)
+        self.assertNotIn("the code-embedding image it needs is stale", note)
+        self.assertIn("did not record", note)
+
+    def test_the_gates_write_the_details_this_reader_classifies(self):
+        """The writer and the reader share ONE home, proven by driving the
+        real dispatcher: whatever `dispatch` records for each blocking gate
+        must classify back to that gate. A detail string edited on one side
+        only would fail here rather than silently reverting the note to a
+        wrong cause."""
+        runner = _runner(0)
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            with mock.patch.object(deferral_retry, "trail"):
+                deferral_retry.dispatch(
+                    folder, condition_ids=[CID],
+                    backend_probe=lambda f, k: False, runner=runner,
+                    single_instance=False,
+                )
+            backend_row = deferral_retry.retry_history(folder, CID)
+            self.assertEqual(
+                deferral_retry.classify_block_detail(
+                    backend_row.streak_last_detail),
+                deferral_retry.BLOCK_CAUSE_BACKEND,
+            )
+
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            with mock.patch.object(deferral_retry, "trail"), \
+                    mock.patch.object(deferral_retry,
+                                      "_code_embed_image_verdict",
+                                      lambda folder: "stale"):
+                deferral_retry.dispatch(
+                    folder, condition_ids=[CID],
+                    backend_probe=lambda f, k: True, runner=runner,
+                    single_instance=False,
+                )
+            image_row = deferral_retry.retry_history(folder, CID)
+            self.assertEqual(
+                deferral_retry.classify_block_detail(
+                    image_row.streak_last_detail),
+                deferral_retry.BLOCK_CAUSE_IMAGE,
+            )

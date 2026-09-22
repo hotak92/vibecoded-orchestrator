@@ -35,6 +35,24 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 
+def _weaviate_url_default() -> str:
+    """Default Weaviate URL — an ALIAS, not a second implementation.
+
+    Delegates to :func:`vco_lib.weaviate_helpers.weaviate_url_default`, the
+    ONE home for the precedence ``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > the
+    canonical port. The import is deferred to call time to match this
+    module's established style (it is imported BY ``install.py`` and keeps
+    its own import surface minimal; see the module docstring).
+
+    Both of this module's former inline copies spelled the fallback port as
+    a literal ``'8081'`` rather than reading the shared constant, so they
+    could drift from it independently — that is the second reason this is a
+    delegate and not a local body.
+    """
+    from vco_lib.weaviate_helpers import weaviate_url_default
+    return weaviate_url_default()
+
+
 def _install_log(log_event: Optional[Callable]) -> Callable:
     """Adapt an optional install-time logger to a never-raising callable.
 
@@ -341,7 +359,7 @@ def _prune_stale_kg_rows(
     # Fetch all stored (uuid, file_path) pairs from Weaviate.
     stored: list[tuple[str, str]] = []  # (uuid, file_path)
     try:
-        base = (weaviate_url or "http://localhost:8081").rstrip("/")
+        base = (weaviate_url or _weaviate_url_default()).rstrip("/")
         # v0.2.46 V46-A: dropped the broken `where: Like "%"` filter (same
         # bug as CI-10 in _batch_query_weaviate_content_hashes — Weaviate's
         # BM25 tokenizer rejects `%` as "only stopwords provided" and the
@@ -463,7 +481,7 @@ def _prune_stale_kg_rows(
     # ALSO why the prune logic appeared to "no-op silently" — same
     # silent-zero-fallback antipattern as the diff-gate fetch).
     try:
-        base = (weaviate_url or "http://localhost:8081").rstrip("/")
+        base = (weaviate_url or _weaviate_url_default()).rstrip("/")
         import json as _json
         import urllib.request as _ur
         delete_body = _json.dumps({
@@ -1581,10 +1599,7 @@ def migrate_kg_named_vector_slots(deferral_report, *, log_event=None) -> None:
 
     _log = _install_log(log_event)
 
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _weaviate_url_default()
     kg_coll = os.environ.get("KG_COLLECTION", "")
     dev_coll = os.environ.get("DEVELOPMENT_COLLECTION", "")
 
@@ -1713,18 +1728,15 @@ def detect_legacy_shared_kg_class(deferral_report, *, log_event=None) -> None:
     ``log_event`` is install.py's ``_log_install_event`` (optional).
     """
     import json
-    import os
     import urllib.request
 
     from vco_lib.deferral_report import DeferralEntry
 
     _log = _install_log(log_event)
 
-    # Resolve Weaviate URL: prefer env, fall back to canonical default.
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    # WEAVIATE_URL > WEAVIATE_PORT > the canonical port — resolved in ONE
+    # home (`weaviate_helpers.weaviate_url_default`), never re-spelled here.
+    weaviate_url = _weaviate_url_default()
     try:
         resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
             f"{weaviate_url}/v1/schema", timeout=5,
@@ -1735,7 +1747,12 @@ def detect_legacy_shared_kg_class(deferral_report, *, log_event=None) -> None:
         # on Weaviate unreachability.
         return
 
-    classes = {c.get("class", "") for c in schema.get("classes", [])}
+    # v0.2.96: the ONE home for this question (`weaviate_helpers`), not a
+    # sixth hand-written comprehension. Behaviour-identical here — the old
+    # form admitted "" for an entry with no `class`, which never matched any
+    # of the names compared below.
+    from vco_lib.weaviate_helpers import schema_class_names
+    classes = schema_class_names(schema)
     legacy_name = "VibeCodedTools_KnowledgeGraph"
     canonical_name = "VibeCodedOrchestrator_KnowledgeGraph"
     # v0.2.23 B1: also recognise the lowercase-c v0.2.12–v0.2.22 default

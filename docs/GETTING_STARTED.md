@@ -154,6 +154,8 @@ python install.py --on-conflict abort      # bail if any conflict is detected
 
 The chosen action per service is recorded in `~/.vct/services.toml` and re-read by both install.py and the launcher, so subsequent runs do not re-prompt.
 
+A related but distinct case: the service on our port is one VCO would manage, but the *container* was created by a different compose project. An install refuses to recreate it and says so in the deferral ledger; from v0.2.96 that entry carries a `python -m vco_lib.service_adoption adopt-services` command that brings it under this install without touching its volumes. See [`post-install/CONTAINER-RECOVERY.md`](post-install/CONTAINER-RECOVERY.md).
+
 #### Collection naming in adopt mode
 
 When install adopts an existing Weaviate, it must not pollute the host with bare top-level `KnowledgeGraph` / `Development` collections — many users run Weaviate with per-project namespacing (`MyProject_KnowledgeGraph`, etc.). Adopt mode therefore:

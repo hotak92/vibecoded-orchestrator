@@ -1080,7 +1080,14 @@ def _weaviate_class_object_count(
     import json
     import urllib.request
 
-    base = (weaviate_url or "http://localhost:8081").rstrip("/")
+    from vco_lib.weaviate_helpers import weaviate_url_default
+
+    # A falsy ``weaviate_url`` resolves through the ONE home rather than a
+    # bare literal: the literal read NEITHER ``WEAVIATE_URL`` nor
+    # ``WEAVIATE_PORT``, so on a relocated Weaviate this counted objects in
+    # whatever answered on the canonical port. See
+    # ``vco_lib/weaviate_helpers.py::weaviate_url_default``.
+    base = (weaviate_url or weaviate_url_default()).rstrip("/")
     # class_name is a derived Weaviate class name (prefix + fixed suffix) — shape
     # -validate anyway to fail-closed against a future untrusted caller.
     if not class_name or not class_name.replace("_", "").isalnum():
@@ -1176,7 +1183,7 @@ def run_schema_migrations(
     project_id: Optional[str],
     migrations_dir: Path,
     deferral_report: object = None,  # DeferralReport-like; runner doesn't write
-    weaviate_url: str = "http://localhost:8081",
+    weaviate_url: str = "",  # "" = resolve from env at CALL time; see body
     env: Mapping[str, str],
     check: bool = False,
     artifact_names: Optional[Mapping[str, list[str]]] = None,
@@ -1215,6 +1222,8 @@ def run_schema_migrations(
         project_id: the project whose per-project artifacts are migrated.
         migrations_dir: ``<root>/migrations`` (empty today → no-op).
         weaviate_url: target Weaviate for edge scripts + the live probe.
+            Empty (the default) resolves from the environment at CALL time
+            via ``weaviate_helpers.weaviate_url_default`` — see the body.
         env: resolved env (KG_COLLECTION, SHARED_KG_COLLECTION, CODE_GRAPH_
             PROJECT, ...).
         check: dry-run — plan only, NO registry write, NO edge apply.
@@ -1232,6 +1241,18 @@ def run_schema_migrations(
     Returns:
         :class:`MigrationRunReport` summarizing every artifact's outcome.
     """
+    # Resolve the Weaviate URL at CALL time for the same reason the probes
+    # below are resolved at call time: a bound default-arg value is frozen at
+    # import. A string literal in the signature was worse than frozen — it
+    # consulted the environment NOT AT ALL, so a caller that omitted the
+    # argument addressed ``localhost:8081`` even when ``WEAVIATE_URL`` /
+    # ``WEAVIATE_PORT`` named a different instance, and then ran EDGE SCRIPTS
+    # against it. ONE home for the precedence:
+    # ``vco_lib/weaviate_helpers.py::weaviate_url_default``.
+    if not weaviate_url:
+        from vco_lib.weaviate_helpers import weaviate_url_default
+
+        weaviate_url = weaviate_url_default()
     report = MigrationRunReport()
     when = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     root = project_root or migrations_dir.parent

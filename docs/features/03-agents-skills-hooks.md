@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 44 bundled agents, 54 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 invoked by sibling hooks rather than registered). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 44 bundled agents, 54 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. Neither is dead code; both run standalone). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -8,7 +8,11 @@ For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-
 
 ## Bundled Agents (`templates/agents/free/`)
 
-Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 44 agents below split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / bootstrap-refinement). The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
+Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 44 agents split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / bootstrap-refinement); the list below describes the most-used of them, not all 44 — `ls templates/agents/free/` is the complete set. The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
+
+**Every bundled agent declares `effort: high`** (v0.2.96 — ten of them previously declared `xhigh`). Frontmatter effort *overrides* the session's level and cannot be overridden from the Agent tool, so the value a shipped agent pins is the value you get. `high` rather than `xhigh` for two reasons: the cost, and the fact that `xhigh` is rejected outright by models that do not expose extended thinking — an agent pinning it can fail to start rather than run more carefully. Raise it per-agent if you want it; the frontmatter still accepts `xhigh` and `max`, on a model you know supports them.
+
+**Module-scoped agents.** Bundled agents used to ship to every project unconditionally. Since v0.2.96 a project with the **model gateway** module active additionally receives `templates/agents/module-gateway/` — `glm-implementer`, `glm-reviewer`, `glm-planner` and `glm-flash-researcher` — on its next bundle update. These are the first shipped artefacts delivered on a per-module condition: a project without the module active receives none of them, and neither does a launcher-less CLI install, because the module state lives in `launcher.db`. They are deliberately outside the 44 free-agent count, which measures `templates/agents/free/` alone. Spawn them by definition **name** with no model override — the Agent tool's model list cannot carry `claude-gw/*` ids, while an agent's own frontmatter can. (`glm-flash-reviewer` was retired in the same release: flash is kept for research and investigation, review moved to `glm-5.3`. An already-delivered copy is orphan-cleaned on the next bundle update if unmodified, and preserved with a deferral entry if you edited it.)
 
 ### `coder` (Sonnet, `isolation: worktree`)
 Writes code from a spec, following patterns from the KG. Runs in git worktree isolation by default.
@@ -26,7 +30,7 @@ Requirements analysis, architectural design, and task breakdown. Injects `task-b
 ### `tester` (Sonnet)
 Test creation, verification, and bug investigation. Injects `code-review-expert` skill. MCP: `orchestrator-tools`.
 
-### `code-explorer` (Haiku, `effort: low`)
+### `code-explorer` (Haiku)
 Read-heavy research agent that can also write findings reports.
 
 <details>
@@ -51,16 +55,16 @@ Keeps documentation current and prunes stale material — but always extracts to
 ### `doc-organizer` (Sonnet)
 Detects/merges duplicates, moves loose files, archives old docs, maintains the doc tree. Does not write new documentation — only organizes what exists.
 
-### `graph-health-checker` (Haiku, `effort: low`)
+### `graph-health-checker` (Haiku)
 Validates KG and code-graph integrity: orphaned nodes, broken links, missing metadata. Background maintenance trigger.
 
-### `knowledge-curator` (Haiku, `effort: low`)
+### `knowledge-curator` (Haiku)
 Extracts WikiLink relationships from KG nodes and updates Weaviate cross-references. Background maintenance.
 
 ### `kg-navigator` (Sonnet)
 Searches and explores the KG, surfaces relevant patterns before implementation, flags gaps. Read-only (Read, Grep, Bash only).
 
-### `code-graph-updater` (Haiku, `effort: low`)
+### `code-graph-updater` (Haiku)
 Incremental code-graph updates when files change. Background maintenance trigger.
 
 ### `gui-tester` (Sonnet, explicit model: `claude-sonnet-4-6`)
@@ -73,10 +77,10 @@ Tools: restricted to Playwright MCP tools only (`mcp__playwright__browser_*`). R
 
 </details>
 
-### `web-explorer` (Haiku, `effort: low`)
+### `web-explorer` (Haiku)
 The web counterpart to `code-explorer`: searches, reads pages, cross-references with local files, writes a single markdown report.
 
-### `prompt-engineer` (Sonnet, `effort: low`)
+### `prompt-engineer` (Sonnet)
 Reviews and rewrites agent prompts using current Claude 4.x patterns.
 
 ### `orchestrator-installer` (Opus)
@@ -96,25 +100,25 @@ End-to-end project design: requirements, architecture, implementation plan. Inje
 ### `ai-agentic-architect` (Sonnet)
 Designs multi-agent systems and agentic workflows with coordination strategies. Injects `architect` + `task-breakdown` skills.
 
-### `project-coordinator` (Sonnet, `effort: low`)
+### `project-coordinator` (Sonnet)
 Coordinates multi-agent workflows, tracks progress, manages blackboard task assignment.
 
-### `project-organizer` (Sonnet, `effort: low`)
+### `project-organizer` (Sonnet)
 Keeps the project tidy over time and captures cross-project patterns for reuse.
 
-### `backend-specialist` (Sonnet, `isolation: worktree`, `effort: low`)
+### `backend-specialist` (Sonnet, `isolation: worktree`)
 APIs, services, databases, business logic. Injects `api-designer` + `database-advisor` skills.
 
-### `frontend-specialist` (Sonnet, `isolation: worktree`, `effort: low`)
+### `frontend-specialist` (Sonnet, `isolation: worktree`)
 React/Vue/Svelte components, forms, routing. Injects `react-patterns` + `accessibility-checker` skills.
 
-### `gui-expert` (Sonnet, `effort: low`)
+### `gui-expert` (Sonnet)
 Designs and implements Gradio web applications with WCAG 2.1 AA compliance.
 
-### `ai-llm-expert` (Sonnet, `effort: low`)
+### `ai-llm-expert` (Sonnet)
 LLM integration work: prompt engineering, context management, multi-model routing, cost optimization. Injects `ai-prompting` + `ai-model-selector` skills.
 
-### `deep-researcher` (Sonnet, `effort: low`)
+### `deep-researcher` (Sonnet)
 Multi-level web research: spawns recursive sub-agents to chase down branches without losing the parent thread.
 
 ---
@@ -204,7 +208,7 @@ Skills are smaller and lighter than agents — they're injected into context as 
 
 ## Hooks (`.claude/hooks/`)
 
-46 shell scripts (with `.ps1` Windows siblings) that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). 44 are wired in the default `.claude/settings.json`; two ship unwired — `code-graph-incremental.sh`, invoked by `post-file-edit.sh` rather than registered, and `kg-sync-on-edit.sh`, an opt-in single-purpose hook superseded by that same auto-sync (see the note at the end of this section). Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
+46 shell scripts (with `.ps1` Windows siblings) that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). 44 are wired in the default `.claude/settings.json`; two ship unwired and are invoked by nothing — `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh` (that hook mirrors its analyzer/venv resolution and calls the analyzer itself rather than calling the hook), and `kg-sync-on-edit.sh`, an opt-in single-purpose hook superseded by `post-file-edit.sh`'s auto-sync (see the note at the end of this section). Both run standalone, for users who want to wire them in their own settings. Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
 
 Hook input contract (PR #176, 2026-05): hooks receive their event payload as JSON on stdin per Claude Code v2.1.x spec. `session_id`, `tool_name`, and other fields are read from stdin via `python -c 'import json,sys; d=json.loads(sys.stdin.read()); ...'`. Positional args (`$1`, `$2`) are present for backward compatibility but are empty when invoked by Claude Code v2.1.x.
 
@@ -336,6 +340,10 @@ Send a desktop notification (`notify-send`) when Claude finishes a response. Not
 
 ### `stop-failure-notify.sh` — StopFailure (background)
 Send an urgent desktop notification when a turn fails (rate limit, auth error, etc.) and log to `~/.claude/metrics/failures.jsonl`.
+
+Notifications are **coalesced** (v0.2.96): at most one per 5 minutes per `(project, error class)`, and the next one through carries the count it suppressed. Before that the hook notified on every event and parsed the payload with the wrong shape, so one repeating background failure produced 304 identical "unknown: No details" pop-ups in a single night. A payload whose shape it does not recognise is now reported as a truncated copy of the payload itself rather than as "no details". **Every** event — suppressed or not — is still written to the ledger; that ledger is what made the storm diagnosable, so `VCO_STOP_FAILURE_NOTIFY=0` silences only the pop-up and never the record. The `.ps1` sibling behaves identically.
+
+If you are seeing that storm, `vco doctor` now reads Claude Code's `hasTrustDialogAccepted` flag for the folder: when it is false every headless `claude -p` fails "this workspace has not been trusted", including the ones VCO's own summary generators make. The probe names the state and the one-step recovery (run `claude` in the folder and accept the dialog); it never writes the flag, because that is the CLI's own decision to record.
 
 ### `kg-update-nudge.sh` — UserPromptSubmit + Stop (background)
 Counts substantive work tokens since the last KG node write; nudges to write a KG node when the threshold (~150k tokens) is exceeded. Bypass with `KG_NUDGE_OFF=1`.

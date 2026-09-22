@@ -303,5 +303,97 @@ class CliTests(PruneBase):
         self.assertEqual(rc, 2)
 
 
+class ResolutionReasonTests(PruneBase):
+    """v0.2.96 — the hub-failure reason must survive the soft-fail.
+
+    `_resolve_project_context` swallowed the exception with `except
+    Exception: pass`, so `resolution_source` could say WHICH resolver
+    answered and never WHY the preferred one did not. A prune that addresses
+    an unexpected collection is then unreportable: its own JSON says
+    "settings/binding-first" with no way to tell a hub that was DOWN from a
+    project that is simply unregistered.
+
+    Red-proof for all three: restore `except Exception: pass` (and drop the
+    two `fallback_reason` keys) — every test in this class fails.
+    """
+
+    def test_hub_failure_reason_is_carried_not_swallowed(self):
+        import vco_lib.project_config as pc
+
+        def _boom(_folder):
+            raise RuntimeError("hub refused: HTTP 503 from 127.0.0.1:7700")
+
+        with mock.patch.object(pc, "resolve", _boom):
+            ctx = crep._resolve_project_context(self.project)
+
+        self.assertEqual(ctx["source"], "settings/binding-first")
+        self.assertIsNotNone(
+            ctx["fallback_reason"],
+            "the reason the hub path was abandoned must be reportable",
+        )
+        self.assertIn("HTTP 503", ctx["fallback_reason"])
+        self.assertIn("RuntimeError", ctx["fallback_reason"])
+
+    def test_hub_success_carries_no_reason(self):
+        """No failure ⇒ no reason. The key is the evidence, not decoration."""
+        import vco_lib.project_config as pc
+
+        class _Cfg:
+            weaviate_url = _URL
+            kg_collection = "Proj_KnowledgeGraph"
+            development_collection = "Proj_Development"
+            shared_kg_collection = "Shared_KG"
+
+        with mock.patch.object(pc, "resolve", lambda _f: _Cfg()):
+            ctx = crep._resolve_project_context(self.project)
+
+        self.assertEqual(ctx["source"], "hub")
+        self.assertIsNone(ctx["fallback_reason"])
+
+    def test_cli_surfaces_the_reason_on_both_output_surfaces(self):
+        """JSON consumers never read stderr; humans never read the JSON."""
+        import contextlib
+        import io
+
+        fake = _FakeWeaviateHTTP(
+            {"Proj_KnowledgeGraph": [], "Proj_Development": []},
+        )
+        ctx = {
+            "weaviate_url": _URL,
+            "kg_collection": "Proj_KnowledgeGraph",
+            "development_collection": "Proj_Development",
+            "shared_kg_collection": "Shared_KG",
+            "source": "settings/binding-first",
+            "fallback_reason": "ConnectionRefusedError: hub not running",
+        }
+        patches = (
+            mock.patch.object(crep, "_http_request", fake),
+            mock.patch.object(crep, "weaviate_reachable", lambda *_a, **_k: True),
+            mock.patch.object(crep, "_resolve_project_context", lambda _f: dict(ctx)),
+        )
+
+        out, err = io.StringIO(), io.StringIO()
+        with patches[0], patches[1], patches[2], \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = crep.main(["--project", str(self.project), "--dry-run", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(
+            payload["resolution_fallback_reason"],
+            "ConnectionRefusedError: hub not running",
+        )
+
+        out, err = io.StringIO(), io.StringIO()
+        with patches[0], patches[1], patches[2], \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = crep.main(["--project", str(self.project), "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hub not running", err.getvalue())
+        self.assertNotIn(
+            "hub not running", out.getvalue(),
+            "the caveat belongs on stderr, not inside the counts",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

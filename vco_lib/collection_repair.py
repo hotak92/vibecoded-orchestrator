@@ -454,6 +454,20 @@ def _resolve_project_context(folder: Path) -> dict:
     Hub-first (:func:`vco_lib.project_config.resolve`); falls back to the
     project's ``.claude/settings.json`` env + the binding-first name
     resolver when the hub is unreachable / the project unregistered.
+
+    Returns ``source`` ("hub" | "settings/binding-first") AND
+    ``fallback_reason`` — ``None`` on the hub path, otherwise the exception
+    that pushed us off it.
+
+    v0.2.96: the ``except`` arm was ``pass``, so this function could say WHICH
+    resolver answered but never WHY the preferred one did not. A prune that
+    addresses the wrong collection because the hub was down is then
+    indistinguishable, in its own report, from one that addresses the wrong
+    collection because the hub answered wrongly — and the operator is left
+    re-deriving it. The reason travels IN THE RESULT rather than only through
+    a log line: ``main --json`` is a machine surface whose consumer never
+    reads stderr, and `resolution_source` is already in that document, so the
+    "why" belongs beside the "which". `main` also prints it for humans.
     """
     try:
         from vco_lib.project_config import resolve as _hub_resolve
@@ -464,9 +478,10 @@ def _resolve_project_context(folder: Path) -> dict:
             "development_collection": cfg.development_collection,
             "shared_kg_collection": cfg.shared_kg_collection,
             "source": "hub",
+            "fallback_reason": None,
         }
-    except Exception:  # noqa: BLE001 — hub-down / unregistered ⇒ fallback
-        pass
+    except Exception as exc:  # noqa: BLE001 — hub-down / unregistered ⇒ fallback
+        fallback_reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
     from vco_lib.project_init import (
         _SHARED_KG_NAME,
@@ -487,6 +502,7 @@ def _resolve_project_context(folder: Path) -> dict:
         "development_collection": names.get("development_collection", ""),
         "shared_kg_collection": shared,
         "source": "settings/binding-first",
+        "fallback_reason": fallback_reason,
     }
 
 
@@ -540,10 +556,23 @@ def main(argv: Optional[list] = None) -> int:
         dry_run=args.dry_run,
     )
     result["resolution_source"] = ctx["source"]
+    # v0.2.96: a soft-fail that discards its own diagnosis makes a resolution
+    # bug unreportable. `None` when the hub answered.
+    result["resolution_fallback_reason"] = ctx.get("fallback_reason")
 
     if args.json:
         print(json.dumps(result, indent=2))
     else:
+        if result.get("resolution_fallback_reason"):
+            # stderr: this is a caveat on the numbers below, not one of them.
+            print(
+                "note: the hub did not resolve this project "
+                f"({result['resolution_fallback_reason']}); collections were "
+                f"resolved from {result['resolution_source']}. If the counts "
+                "below name a collection you did not expect, that is where "
+                "the name came from.",
+                file=sys.stderr,
+            )
         if result.get("skipped"):
             print(f"skipped: {result['skipped']}")
         for leg in result.get("legs", []):

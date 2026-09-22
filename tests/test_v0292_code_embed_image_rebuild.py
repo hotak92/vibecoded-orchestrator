@@ -161,11 +161,44 @@ class ServedStateTests(unittest.TestCase):
         )
 
     def test_no_source_in_tree_is_unknown(self):
-        """A per-project install has no service source; that is not a problem."""
+        """A per-project install has no service source; that is not a problem.
+
+        The image REPORTS a digest here, so it carries v0.2.92's server and
+        refuses over-window input loudly — with nothing to compare against,
+        "cannot say" is the honest answer.
+        """
         self.assertEqual(
             code_embed_image.served_state(
                 None, {"status": "ok", "source_sha": self.SHA}
             ).verdict,
+            code_embed_image.UNKNOWN,
+        )
+
+    def test_field_absent_is_stale_even_with_NO_expected_digest(self):
+        """WP-3 judgment call 3, resolved 2026-09-22 (owner directive).
+
+        The missing ``source_sha`` KEY is a POSITIVE fact about the RUNNING
+        image — every image carrying v0.2.92's server.py reports the field
+        unconditionally — and answering it needs no digest to compare. While
+        the "nothing to compare" arm ran FIRST, that evidence was discarded
+        on any tree without the build context: a machine whose vco_lib does
+        not sit inside a clone (the site-packages-shadow shape) could not
+        reach a verdict at all, so the WP-3 gate stayed inert there and the
+        walk embedded through a silently-truncating service.
+        """
+        state = code_embed_image.served_state(None, {"status": "ok", "dim": 2048})
+        self.assertEqual(state.verdict, code_embed_image.STALE)
+        self.assertIn("predates", state.summary)
+
+    def test_no_digest_and_no_service_is_still_unknown(self):
+        """The leave-alone half: with no payload there is no positive
+        evidence of anything, whatever the tree looks like."""
+        self.assertEqual(
+            code_embed_image.served_state(None, None).verdict,
+            code_embed_image.UNKNOWN,
+        )
+        self.assertEqual(
+            code_embed_image.served_state(None, {"status": "error"}).verdict,
             code_embed_image.UNKNOWN,
         )
 

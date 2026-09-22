@@ -76,14 +76,17 @@ class VendorNeutralityTests(unittest.TestCase):
     def test_registry_is_valid(self) -> None:
         vendors.validate_registry()
 
-    def test_shipped_scope_is_exactly_one_vendor(self) -> None:
+    def test_shipped_scope_is_exactly_two_vendors(self) -> None:
         """Narrow on purpose: only routes proven end-to-end ship.
 
         A disabled row would be untested code shipped as configuration, so
         vendors that have never made a live call are absent entirely rather
-        than present-and-off.
+        than present-and-off. The subscription route and the Token-Plan route
+        are both owner-ordered (2026-09-21) and both proven; the Token-Plan
+        vendor's pay-as-you-go sibling is deliberately absent until its model
+        list is extracted and proven.
         """
-        self.assertEqual(sorted(vendors.VENDORS), ["zai"])
+        self.assertEqual(sorted(vendors.VENDORS), ["qwen", "zai"])
 
     def test_vendor_neutral_modules_carry_no_vendor_literal(self) -> None:
         for name in VENDOR_NEUTRAL_MODULES:
@@ -216,17 +219,127 @@ class RegistryValidationTests(unittest.TestCase):
         """The guard rejects the trap, not the feature."""
         vendors.validate_registry(self._acme(static_ids=("acme-1", "acme-2")))
 
-    def test_shipped_rows_declare_no_static_ids(self) -> None:
-        """Today's fallback is snapshot-driven, deliberately.
+    def test_shipped_rows_declare_static_ids_exactly_where_the_fallback_is_their_own(self) -> None:
+        """A row on the STANDARD discovery path keeps the shipped snapshot as
+        its fallback and declares nothing.
 
         `static_ids` exists so a NEW vendor can be added as a config row with
-        its own fallback. If a shipped row ever sets it, that row stops
-        tracking `static_catalog.json`, and the snapshot-vs-seed consistency
-        checks in test_model_router_catalog.py would need to cover the row's
-        list too. This test is the tripwire for that.
+        its own fallback — and for the two shapes whose fallback MUST be the
+        row's own list: a vendor with no model-list endpoint at all (whose
+        `static_ids` ARE the catalog), and a vendor whose list endpoint lives
+        on another base (`catalog_url`), where the declared list is what the
+        keyless and fetch-failed moments serve. `validate_registry` enforces
+        non-empty in both directions. A standard-path row that set
+        `static_ids` would stop tracking `static_catalog.json`, and the
+        snapshot-vs-seed consistency checks in test_model_router_catalog.py
+        would need to cover the row's list too; this test is the tripwire
+        for that.
         """
         for vendor_id, row in vendors.VENDORS.items():
-            self.assertEqual(row.static_ids, (), vendor_id)
+            if row.catalog_path is None or row.catalog_url is not None:
+                self.assertTrue(row.static_ids, vendor_id)
+            else:
+                self.assertEqual(row.static_ids, (), vendor_id)
+
+    def test_a_no_discovery_row_with_no_static_ids_is_rejected(self) -> None:
+        """A `catalog_path is None` row with no declared ids would show an
+        empty picker for that vendor, forever — there is nothing to fetch and
+        nothing to fall back to."""
+        with self.assertRaises(vendors.RegistryError) as ctx:
+            vendors.validate_registry(self._acme(catalog_path=None))
+        self.assertIn("static_ids", str(ctx.exception))
+
+    def test_a_catalog_url_row_without_a_declared_fallback_is_rejected(self) -> None:
+        """The override rides the live path, but the keyless moment and the
+        failed fetch have nothing to serve unless the row declares its own
+        list — the same empty-picker failure as the no-discovery case, one
+        retry window later."""
+        with self.assertRaises(vendors.RegistryError) as ctx:
+            vendors.validate_registry(
+                self._acme(catalog_url="https://lists.acme.example/v1/models"),
+            )
+        self.assertIn("static_ids", str(ctx.exception))
+
+    def test_a_catalog_url_must_be_an_absolute_http_url(self) -> None:
+        """It REPLACES `upstream + catalog_path`; a relative path here would
+        be fetched as a malformed URL and read as a vendor outage."""
+        with self.assertRaises(vendors.RegistryError) as ctx:
+            vendors.validate_registry(
+                self._acme(
+                    catalog_url="/compatible/v1/models",
+                    static_ids=("acme-1",),
+                ),
+            )
+        self.assertIn("catalog_url", str(ctx.exception))
+
+    def test_a_catalog_url_row_with_a_declared_fallback_passes(self) -> None:
+        """The guard rejects the trap, not the feature — the shipped
+        Token-Plan row is this shape."""
+        vendors.validate_registry(
+            self._acme(
+                catalog_url="https://lists.acme.example/v1/models",
+                static_ids=("acme-1",),
+            ),
+        )
+
+    def test_a_blank_exclude_prefix_is_rejected(self) -> None:
+        """Every id starts with the empty string, so a blank entry would
+        exclude the ENTIRE live list and leave the family on its fallback
+        forever — with a `live`-looking fetch succeeding each retry."""
+        with self.assertRaises(vendors.RegistryError) as ctx:
+            vendors.validate_registry(
+                self._acme(catalog_exclude_prefixes=("  ",)),
+            )
+        self.assertIn("catalog_exclude_prefixes", str(ctx.exception))
+
+    def test_rows_that_do_not_override_discovery_exclude_nothing(self) -> None:
+        """The defaults are inert: the shipped standard-path row neither
+        overrides its list URL nor filters a single id its endpoint sends
+        (its list honesty is the truth filter's business, not a prefix
+        filter's)."""
+        zai = vendors.VENDORS["zai"]
+        self.assertIsNone(zai.catalog_url)
+        self.assertEqual(zai.catalog_exclude_prefixes, ())
+
+    def test_two_vendors_may_not_share_a_bare_prefix(self) -> None:
+        """Bare prefixes resolve longest-first, so nesting is fine but an
+        EXACT collision is not: whichever row the mapping happens to iterate
+        wins the other's ids, silently. The two shipped rows prove the shape
+        is real, not synthetic — one serves the other's family name among
+        its model ids."""
+        zai = vendors.VENDORS["zai"]
+        other = self._acme(bare_id_prefixes=("GLM",))["acme"]
+        with self.assertRaises(vendors.RegistryError) as ctx:
+            vendors.validate_registry({"zai": zai, "acme": other})
+        self.assertIn("bare_id_prefix", str(ctx.exception))
+
+    def test_a_nested_bare_prefix_is_not_a_collision(self) -> None:
+        """The legitimate sibling of the collision rule: a strictly longer
+        prefix from another vendor wins only its own ids and defers the
+        rest."""
+        zai = vendors.VENDORS["zai"]
+        other = self._acme(bare_id_prefixes=("glm-5.3",))["acme"]
+        vendors.validate_registry({"zai": zai, "acme": other})
+        claimed = routing.route("glm-5.3", {"zai": zai, "acme": other})
+        assert isinstance(claimed, Route)
+        self.assertEqual(claimed.family_id, "acme")
+        deferred = routing.route("glm-4.6", {"zai": zai, "acme": other})
+        assert isinstance(deferred, Route)
+        self.assertEqual(deferred.family_id, "zai")
+
+    def test_a_claude_marked_verified_id_is_rejected(self) -> None:
+        """The truth filter KEEPS only listed ids, so a Claude-marked entry
+        would be the one id of its family kept — a picker row the
+        honest-naming guard then refuses. The filter would actively select
+        for the un-routable id."""
+        bad = self._acme(verified_ids=("claude-3-opus",))
+        with self.assertRaises(vendors.RegistryError) as ctx:
+            vendors.validate_registry(bad)
+        self.assertIn("verified_id", str(ctx.exception))
+
+    def test_a_blank_verified_id_is_rejected(self) -> None:
+        with self.assertRaises(vendors.RegistryError):
+            vendors.validate_registry(self._acme(verified_ids=(" ",)))
 
 
 class RouteTests(unittest.TestCase):
@@ -266,6 +379,61 @@ class RouteTests(unittest.TestCase):
         assert isinstance(decision, Route)
         self.assertEqual(decision.family_id, "zai")
         self.assertEqual(decision.forward_model, "glm-4.6")
+
+    def test_the_nested_namespace_routes_and_strips(self) -> None:
+        """The Token-Plan vendor EXTENDS the shared namespace rather than
+        minting a parallel one, and the longest-match rule resolves it — a
+        picker row, a CLI spelling, and the panel's ``claude-gw/`` prefix
+        rule all keep working."""
+        decision = routing.route("claude-gw/qwen/qwen3.8-max")
+        assert isinstance(decision, Route)
+        self.assertEqual(decision.family_id, "qwen")
+        self.assertEqual(decision.forward_model, "qwen3.8-max")
+        self.assertFalse(decision.is_anthropic)
+        self.assertEqual(
+            decision.upstream, vendors.VENDORS["qwen"].upstream,
+        )
+
+    def test_the_shared_namespace_does_not_shadow_the_nested_one(self) -> None:
+        """Both spellings of the shared family id work and land on the row
+        the spelling names — the whole point of longest-match resolution."""
+        nested = routing.route("claude-gw/qwen/glm-5.2")
+        assert isinstance(nested, Route)
+        self.assertEqual(nested.family_id, "qwen")
+        flat = routing.route("claude-gw/glm-5.2")
+        assert isinstance(flat, Route)
+        self.assertEqual(flat.family_id, "zai")
+
+    def test_the_second_vendor_bare_prefixes_route_to_it(self) -> None:
+        """A user who types the vendor's real id on the CLI is not forced to
+        spell the namespace — and the OTHER upstream's model ids route to
+        this row too, because that endpoint serves them."""
+        for model_id in ("qwen3.8-max", "deepseek-v4-pro"):
+            with self.subTest(model=model_id):
+                decision = routing.route(model_id)
+                assert isinstance(decision, Route), model_id
+                self.assertEqual(decision.family_id, "qwen")
+                self.assertEqual(decision.forward_model, model_id)
+        # The subscription vendor keeps its own prefix...
+        decision = routing.route("glm-5.3")
+        assert isinstance(decision, Route)
+        self.assertEqual(decision.family_id, "zai")
+        # ...and a date-suffixed id of the other upstream still resolves
+        # through this row's prefix.
+        long = routing.route("deepseek-v4-flash-0731")
+        assert isinstance(long, Route)
+        self.assertEqual(long.family_id, "qwen")
+
+    def test_one_m_suffix_is_stripped_on_the_nested_route_too(self) -> None:
+        decision = routing.route("claude-gw/qwen/qwen3.7-plus[1m]")
+        assert isinstance(decision, Route)
+        self.assertEqual(decision.forward_model, "qwen3.7-plus")
+        self.assertTrue(decision.one_m_requested)
+
+    def test_a_claude_id_under_the_nested_namespace_is_refused(self) -> None:
+        decision = routing.route("claude-gw/qwen/claude-sonnet-5")
+        assert isinstance(decision, RouteError)
+        self.assertEqual(decision.reason, "claude_id_to_vendor")
 
     def test_claude_id_goes_to_the_first_party_route(self) -> None:
         decision = routing.route("claude-opus-5")

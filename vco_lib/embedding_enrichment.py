@@ -307,10 +307,19 @@ class EnrichmentReport:
 
 
 def _weaviate_url() -> str:
-    """Default Weaviate URL. Cross-OS: reads ``WEAVIATE_URL`` env, falls
-    back to the canonical localhost port.
+    """Default Weaviate URL, trailing slash trimmed for ``f"{url}/v1/..."``.
+
+    The RESOLUTION is not implemented here — it delegates to
+    :func:`vco_lib.weaviate_helpers.weaviate_url_default`, which owns the
+    precedence ``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > the canonical port.
+    Until v0.2.96 this was a hand-written copy that read ``WEAVIATE_URL``
+    alone AND re-spelled the port as a literal ``8081``, so it could drift
+    from the constant on both axes. Only the ``rstrip`` is local: the shared
+    helper deliberately returns the URL unnormalized so a caller that wants
+    it verbatim gets it verbatim.
     """
-    return os.environ.get("WEAVIATE_URL", "http://localhost:8081").rstrip("/")
+    from vco_lib.weaviate_helpers import weaviate_url_default
+    return weaviate_url_default().rstrip("/")
 
 
 def _grpc_port() -> int:
