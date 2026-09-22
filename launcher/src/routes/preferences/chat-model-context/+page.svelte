@@ -353,7 +353,16 @@
                   </td>
                   <td class="dim">{row.vendor}</td>
                   <td class="num mono">{row.context_window.toLocaleString()}</td>
-                  <td class="num mono">{row.max_output.toLocaleString()}</td>
+                  <td class="num mono">
+                    <!-- 0 = UNSTATED: the vendor publishes no figure, so the
+                         pane shows "no information" — never a "0" that reads
+                         like a real token count (v0.2.96 contract). -->
+                    {#if row.max_output > 0}
+                      {row.max_output.toLocaleString()}
+                    {:else}
+                      <span class="dim" title="The vendor does not publish a max-output figure for this model">—</span>
+                    {/if}
+                  </td>
                   <td>
                     {#if row.window_1m}
                       <span class="badge badge-teal">[1m]</span>
@@ -436,7 +445,13 @@
 
     <label class="field">
       <span>Max output (tokens)</span>
-      <input type="text" inputmode="numeric" bind:value={draft.max_output} placeholder="128000" />
+      <input type="text" inputmode="numeric" bind:value={draft.max_output} placeholder="128000 or blank" />
+      <small class="field-hint">
+        Leave blank when the vendor does not publish a figure — the row is
+        stored as “unstated” and the table shows — instead of a number.
+        Never type a guess: an uncited number is what this table exists to
+        prevent.
+      </small>
       {#if errorFor('max_output')}<small class="field-err">{errorFor('max_output')}</small>{/if}
     </label>
 

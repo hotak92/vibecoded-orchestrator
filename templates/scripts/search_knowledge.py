@@ -19,7 +19,24 @@ from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 from weaviate.classes.query import Filter
 
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+# ── MIRROR (category C) — must match `vco_lib/weaviate_helpers.py::
+#    weaviate_url_default`, which is the SHARED HOME for this resolution.
+#    Precedence: WEAVIATE_URL > WEAVIATE_PORT > the canonical port; an
+#    empty/whitespace-only value at either level is UNSET, not a literal.
+#
+# Why a mirror and not a call: this is a MODULE-LEVEL constant evaluated
+# BEFORE this file's `vco_lib` bootstrap (the sys.path insert + import live
+# in `_get_embedding_service` far below), and every `vco_lib` use in this
+# file is function-local and soft — see the guarded import in
+# `_resolve_kg_collections` below, which exists so the module stays
+# importable where vco_lib is not on the path.
+#
+# `tests/test_v0296_weaviate_url_port_precedence.py::TestShippedMirrorParity`
+# EXECUTES these lines against the shared home on every case, so the two
+# cannot drift.
+_WEAVIATE_URL_ENV = (os.getenv("WEAVIATE_URL") or "").strip()
+_WEAVIATE_PORT_ENV = (os.getenv("WEAVIATE_PORT") or "").strip()
+WEAVIATE_URL = _WEAVIATE_URL_ENV or f"http://localhost:{_WEAVIATE_PORT_ENV or 8081}"
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 # v0.2.18: EMBEDDING_MODEL is resolved by EmbeddingService at search
 # time (see `_get_embedding_service` below). Kept the OLLAMA_URL env

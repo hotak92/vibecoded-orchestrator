@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Sequence
 
 from vco_lib import containers as _containers
+from vco_lib import code_embed_image as _code_embed_image
 from vco_lib import deferral_emit as _deferral_emit
 from vco_lib.deferral_report import DeferralEntry
 
@@ -45,6 +46,7 @@ __all__ = [
     "emit_compose_up_failed_deferral",
     "print_compose_failure_hints",
     "compose_failure_followup",
+    "override_f_chain",
 ]
 
 LogEvent = Callable[..., None]
@@ -52,13 +54,42 @@ LogEvent = Callable[..., None]
 CID_FOREIGN_IDENTITY = "services_foreign_compose_identity"
 CID_COMPOSE_UP_FAILED = "services_compose_up_failed"
 
+#: The two auto-load override names the storage-UX generator writes
+#: (storage_ux.rs; the C-RT-5 two-name convention). An explicit ``-f`` chain
+#: disables compose's auto-load, so install.py's step-5 compose invocation
+#: appends :func:`override_f_chain` to actually consume a generated
+#: override.
+_OVERRIDE_FILE_NAMES: tuple[str, ...] = (
+    "compose.override.yaml",
+    "docker-compose.override.yml",
+)
+
+
+def override_f_chain(infra_dir: Path) -> list[str]:
+    """``-f <file>`` argv fragments for every override present in
+    ``infra_dir`` (v0.2.96 WP-4).  Empty on a stock install — the caller's
+    argv is unchanged, so nothing outside the adoption flow can observe
+    this."""
+    out: list[str] = []
+    for name in _OVERRIDE_FILE_NAMES:
+        if (infra_dir / name).is_file():
+            out.extend(["-f", str(infra_dir / name)])
+    return out
+
 
 def foreign_owned_services(
     services: list[str], runtime: str, infra_dir: Path, compose_file: Path,
+    identities: Optional[dict] = None,
 ) -> dict[str, str]:
     """Which of ``services`` have an existing container ANOTHER compose
     identity created (svc → reason). Read-only; any probe that cannot
-    positively read the container as ours counts it as NOT ours."""
+    positively read the container as ours counts it as NOT ours.
+
+    ``identities``, when passed, is filled with the per-service
+    :class:`vco_lib.containers.ComposeIdentity` that produced the verdict
+    (``None`` when unreadable) — the v0.2.96 deferral remedy derives the
+    owning-name rebuild command from it.  Optional out-param: existing
+    callers and mocks that pass nothing behave exactly as before."""
     if not services:
         return {}
     try:
@@ -74,20 +105,58 @@ def foreign_owned_services(
             ref = None
         if not ref:
             continue  # no container exists — compose creates it fresh
-        why = _containers.foreign_compose_identity(
-            _containers.compose_identity_of(ref, runtime), own,
-        )
+        identity = _containers.compose_identity_of(ref, runtime)
+        why = _containers.foreign_compose_identity(identity, own)
         if why:
             out[svc] = f"container '{ref}' {why}"
+            if identities is not None:
+                identities[svc] = identity
     return out
 
 
 def build_foreign_compose_identity_entry(
     foreign: dict[str, str], runtime: str, infra_dir: Path,
+    identities: Optional[dict] = None,
 ) -> DeferralEntry:
-    """The ledger row for the services step 5 refused to recreate."""
+    """The ledger row for the services step 5 refused to recreate.
+
+    v0.2.96: the remedy now leads with the guarded, mount-reconciling
+    adoption command (``vco_lib.service_adoption``); Option A derives the
+    OWNING-name rebuild through
+    :func:`vco_lib.code_embed_image.rebuild_command` (Task 3a — a build
+    under the installer's project name produces an image the running
+    container never loads); the manual Option B text stays as the
+    documented fallback.  ``identities`` (from
+    :func:`foreign_owned_services`) enables the derived Option A; without
+    it the generic placeholder shape from v0.2.93 is kept, so existing
+    callers behave exactly as before.
+    """
     names = " ".join(sorted(foreign))
+    root = infra_dir.parent
     detail = "\n".join(f"  - {svc}: {why}" for svc, why in sorted(foreign.items()))
+    identity = None
+    if identities:
+        identity = next(
+            (v for v in identities.values()
+             if v is not None and (getattr(v, "working_dir", "") or "").strip()),
+            None,
+        )
+    if identity is not None:
+        option_a_cmd = _code_embed_image.rebuild_command(
+            root, f"{runtime} compose", identity, services=sorted(foreign),
+        )
+        option_a = (
+            "# Option A — keep the current ownership and rebuild the image right\n"
+            "# there, under the OWNING project's name (the only name the running\n"
+            "# container loads):\n"
+            f"#   {option_a_cmd}"
+        )
+    else:
+        option_a = (
+            "# Option A — keep the current ownership and apply the change there:\n"
+            "#   cd <working dir shown above>\n"
+            f"#   {runtime} compose -f <config files shown above> up -d --force-recreate {names}"
+        )
     return DeferralEntry(
             condition_id=CID_FOREIGN_IDENTITY,
             title=(
@@ -111,12 +180,14 @@ def build_foreign_compose_identity_entry(
                 "image rebuild did NOT reach them."
             ),
             command_to_apply=(
-                "# Option A — keep the current ownership and apply the change there:\n"
-                "#   cd <working dir shown above>\n"
-                f"#   {runtime} compose -f <config files shown above> up -d --force-recreate {names}\n"
-                "# Option B — hand these services to the installer's compose (so future\n"
-                "# updates apply cleanly). FIRST confirm every data volume / bind mount\n"
-                "# is identical in both compose files:\n"
+                "# RECOMMENDED — the guarded, mount-reconciling adoption (v0.2.96):\n"
+                "# verifies every mount/env difference against the RUNNING container,\n"
+                "# generates the reconciling infrastructure/compose.override.yaml,\n"
+                "# then moves one service at a time with per-service rollback:\n"
+                f"#   python -m vco_lib.service_adoption adopt-services --root {root}\n"
+                f"{option_a}\n"
+                "# Option B — the manual path (fallback): FIRST confirm every data\n"
+                "# volume / bind mount is identical in both compose files:\n"
                 f"#   {runtime} inspect <container> --format '{{{{json .Mounts}}}}'   # vs infrastructure/docker-compose.yml\n"
                 "# then stop and remove ONLY those containers (never the volumes) and re-run:\n"
                 "#   python install.py --update\n"
@@ -131,13 +202,15 @@ def build_foreign_compose_identity_entry(
 
 def emit_foreign_compose_identity_deferral(
     deferral_report, foreign: dict[str, str], runtime: str, infra_dir: Path,
+    identities: Optional[dict] = None,
 ) -> Optional[DeferralEntry]:
     """Add the row to the RUN-scoped report; returns it so a hard stop can
     still persist it (the run report is only written by ``finalize()`` at the
     end of a COMPLETED run — review R1 finding 4)."""
     if deferral_report is None or not foreign:
         return None
-    entry = build_foreign_compose_identity_entry(foreign, runtime, infra_dir)
+    entry = build_foreign_compose_identity_entry(foreign, runtime, infra_dir,
+                                                 identities=identities)
     deferral_report.add_entry(entry)
     return entry
 
@@ -170,8 +243,10 @@ def apply_recreate_guard(
     the install event. Returns the filtered lists plus the foreign map (empty
     when nothing was foreign — the lists come back unchanged).
     """
+    identities: dict = {}
     foreign = foreign_owned_services(
         services_to_recreate, runtime, infra_dir, compose_file,
+        identities=identities,
     )
     if not foreign:
         return GuardOutcome(
@@ -184,7 +259,7 @@ def apply_recreate_guard(
         f"reach it. See UPDATE_DEFERRED.md ({CID_FOREIGN_IDENTITY})."
     )
     entry = emit_foreign_compose_identity_deferral(
-        deferral_report, foreign, runtime, infra_dir,
+        deferral_report, foreign, runtime, infra_dir, identities=identities,
     )
     log_event(
         "5/10", "skip-recreate",

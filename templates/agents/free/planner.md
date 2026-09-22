@@ -13,7 +13,7 @@ tools:
   - WebFetch
   - mcp__weaviate-kg__*
 model: sonnet
-effort: xhigh
+effort: high
 mcpServers:
   orchestrator-tools:
     command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python

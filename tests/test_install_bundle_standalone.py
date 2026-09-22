@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.module_gateway import MODULE_GATEWAY_AGENT_FILES  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 from vco_lib.project_init import sanitize_for_weaviate_class  # noqa: E402
 
@@ -298,6 +299,28 @@ class TestInstallBundleStandaloneWriteEnv(unittest.TestCase):
             sanitized[0].isupper(),
             f"sanitized prefix {sanitized!r} does not start with uppercase",
         )
+
+
+    def test_module_gateway_agents_not_delivered_launcherless(self) -> None:
+        """v0.2.96 WP-10: standalone (CLI-only, no launcher.db) never
+        delivers the gated set — the row-gated delivery silently never
+        fires here BY DESIGN (survey §3), so no `claude-gw/*` frontmatter
+        reaches an install that never opted in through the launcher."""
+        import shutil
+
+        gated_src = REPO_ROOT / "templates" / "agents" / "module-gateway"
+        gated_dst = self.orch / "templates" / "agents" / "module-gateway"
+        gated_dst.mkdir(parents=True)
+        for name in MODULE_GATEWAY_AGENT_FILES:
+            shutil.copyfile(gated_src / name, gated_dst / name)
+
+        # No VCT_LAUNCHER_DB_PATH and no reachable launcher.db: the
+        # conftest state-redirect leaves the resolver with no DB.
+        result = self._run()
+        for name in MODULE_GATEWAY_AGENT_FILES:
+            dest = str(Path(".claude") / "agents" / name)
+            self.assertNotIn(dest, result["actions"]["create"])
+            self.assertFalse((self.project / ".claude" / "agents" / name).exists())
 
 
 class TestInstallBundleStandaloneCLI(unittest.TestCase):

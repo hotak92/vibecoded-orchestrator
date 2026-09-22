@@ -332,6 +332,17 @@ from vco_lib.kg_metadata_repair import (  # noqa: E402 — same import-order con
     apply_metadata_repair,
     plan_metadata_repair,
 )
+# v0.2.96 (D-1): the `[VCO-EVENT]` line GRAMMAR + env gate + soft-fail. One
+# Python home, shared with install.py's mirror and locked against the Rust
+# consumer (`update_pipeline.rs`) by a parity test — this script used to
+# format the line itself.
+from vco_lib import progress_event as _progress_event  # noqa: E402 — same import-order constraint as the group above
+# v0.2.96: the Weaviate base-URL precedence (WEAVIATE_URL > WEAVIATE_PORT >
+# the canonical port) has ONE home. A CALL, not a mirror — every import in
+# this group is unguarded, so vco_lib is importable wherever this script runs
+# at all; `WeaviateWrapper.__init__` already reaches this same module lazily
+# for `connect_v4`.
+from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — same import-order constraint as the group above
 
 # Try to import query logger.
 #
@@ -364,9 +375,87 @@ except Exception:
 # stuck-at-40-with-qwen3 install bug (v0.2.52 V52-AJ, 2026-06-09).
 # Keeping the env names in `_redacted_env_snapshot()` failure log helps
 # diagnose drift.
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+WEAVIATE_URL = weaviate_url_default()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
+
+
+def _shared_kg_from_launcher_db(project_root: Path) -> str:
+    """The hub-less middle tier for the SHARED collection name (v0.2.96 WP-2(b)).
+
+    Completes the chain hub (authoritative, v0.2.21 contract) → launcher.db
+    READ-ONLY (this tier) → env default. Called ONLY from the hub-failure
+    branch of :func:`_resolve_collections` — when the hub can answer it
+    stays the single source of truth and this tier never runs.
+
+    Implementation discipline (review m-2): this CALLS ``vco_lib`` and
+    contains no DB-reading code of its own — the read-only surface
+    (``get_kg_binding`` / ``get_orchestrator_root_bindings``) plus, since
+    v0.2.96, ``module_gated_delivery.resolve_project_id_for_folder`` for the
+    folder→project-id step.
+
+    v0.2.96 (ship-gate D-4): that last delegation is the fix for a second
+    implementation this function shipped with. It used to walk
+    ``list_registered_projects()`` and compare
+    ``str(Path(folder).resolve())`` itself, while the folder→UUID resolver
+    extracted THIS SAME CYCLE (``resolve_project_id_for_folder``, WP-10,
+    which its own module header calls "ONE home for the pattern") compares
+    through ``_canonical_path_eq``. The two are not equivalent: the shared
+    one is case-INSENSITIVE on Windows, because NTFS is, so a launcher.db
+    row spelled ``C:\\Users\\Foo\\Proj`` against a resolved root
+    ``C:\\users\\foo\\proj`` matched there and MISSED here — and a miss here
+    silently drops to the env tier, i.e. back to the stale default class
+    this whole tier exists to displace.
+
+    Relationship to install.py's V44-G1 hybrid chain
+    (install.py:15100-15480, which reads ``get_orchestrator_root_bindings``
+    at install.py:15414): that chain resolves the canonical root name from
+    env-vs-DB with Weaviate existence checks, then REBINDS the DB binding
+    rows and threads ``KG_COLLECTION`` — its explicit overlay (install.py's
+    step-5 env threading) never sets ``SHARED_KG_COLLECTION``; the child still sees one
+    only because `_subprocess_env_with_embedding` (~:14253) copies
+    os.environ wholesale — into this child. This tier reads the SAME rows,
+    read-only, AFTER that decision, so it can only ever surface a name
+    V44-G1 has already recorded as canonical; neither side writes here and
+    both read one row source, so the two middle tiers cannot diverge.
+    Where env and DB disagree on a subsequent update V44-G1 lets the DB
+    win — this tier mirrors that by preferring the DB row over the env
+    default (the 2026-09-20 update hang, register issue 2: the env default
+    named a stale pre-0.2.74 old-schema class while the DB held canonical).
+
+    Lookup order:
+
+    1. The registered project whose ``folder_path`` IS this sync's root —
+       the same by-folder answer the hub's ``/projects/by-path`` route
+       gives when it is up — via ``resolve_project_id_for_folder`` then
+       ``get_kg_binding(pid, "shared")``.
+    2. The orchestrator-root row (host-keyed, so a moved-not-yet-
+       re-registered root still resolves) via
+       ``get_orchestrator_root_bindings()`` — also the machine's canonical
+       shared class, which is what the DEFAULT env value names on a
+       default install.
+
+    Soft-fail by construction on absent / busy / locked / foreign-schema
+    launcher.db (every reader helper returns ``None``; the outer
+    ``except`` covers import failures too): the env tier answers next and
+    nothing is printed. The update window's real DB state is "launcher
+    closed, file on disk" — the normal case, not an error.
+    """
+    try:
+        from vco_lib.launcher_db_reader import (
+            get_kg_binding,
+            get_orchestrator_root_bindings,
+        )
+        from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+
+        pid = resolve_project_id_for_folder(Path(project_root))
+        if pid:
+            name = get_kg_binding(pid, "shared")
+            return (name or "").strip()
+        _db_primary, db_shared = get_orchestrator_root_bindings()
+        return (db_shared or "").strip()
+    except Exception:  # noqa: BLE001 — the tier must never raise
+        return ""
 
 
 # v0.2.21 Step 18 (caller migration): resolve project-scoped collection
@@ -374,9 +463,11 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # is unreachable (launcher not running, project not registered). The
 # resolver emits its own rate-limited warning so callers don't need to
 # log anything extra. See `.claude/context/plans/v0.2.21-resolver-design.md`.
+# v0.2.96 WP-2(b): the fallback is now a CHAIN — hub → launcher.db
+# (read-only, `_shared_kg_from_launcher_db`) → env — for the SHARED name.
 def _resolve_collections() -> tuple[str, str, str, bool]:
     """Return (kg_collection, development_collection, shared_kg_collection,
-    kg_positively_resolved) via hub, env-fallback.
+    kg_positively_resolved) via hub, launcher.db, env-fallback.
 
     The hub resolver is authoritative when reachable (v0.2.21 contract: the
     launcher's per-project resolution wins over ambient env, so a stale env
@@ -439,6 +530,37 @@ def _resolve_collections() -> tuple[str, str, str, bool]:
             ),
         )
     except Exception:
+        # v0.2.96 WP-2(b): the hub-less middle tier (review m-2). Before
+        # falling to env, ask launcher.db READ-ONLY for the shared binding.
+        # install.py's EXPLICIT overlay threads KG_COLLECTION into the sync
+        # children but never SHARED_KG_COLLECTION (the overlay is part of
+        # install.py's step-5 env threading; the later `_subprocess_env_with_embedding`
+        # around :14253 copies os.environ wholesale, which is why a
+        # SHARED_KG_COLLECTION inherited from the spawning shell still
+        # reaches the child — review MINOR-3 wording), so on a hub-down
+        # update window the env tier for the SHARED name is whatever
+        # default the spawning process carried — on machines with a
+        # pre-0.2.74 history that default names a stale old-schema class
+        # (register issue 2, the 2026-09-20 update hang). See
+        # `_shared_kg_from_launcher_db` for the V44-G1 reconciliation and
+        # the soft-fail contract.
+        _db_shared = _shared_kg_from_launcher_db(PROJECT_ROOT)
+        if _db_shared:
+            # WP-2 review MINOR-1: one stderr line so the tier's engagement
+            # is observable — a silent middle tier that fixes the 2026-09-20
+            # hang is indistinguishable from one that never ran. stderr,
+            # never stdout (the JSON-contract rule).
+            print(
+                f"[kg-sync] hub unreachable; shared collection resolved "
+                f"from launcher.db (read-only): {_db_shared}",
+                file=sys.stderr,
+            )
+            return (
+                os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+                os.getenv("DEVELOPMENT_COLLECTION", ""),
+                _db_shared,
+                bool(os.getenv("KG_COLLECTION", "").strip()),
+            )
         return (
             os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             os.getenv("DEVELOPMENT_COLLECTION", ""),
@@ -2343,6 +2465,112 @@ class SyncTally:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# v0.2.96 (ship-gate MAJOR-1): the seed child's `[VCO-EVENT]` heartbeat.
+#
+# The launcher's update stall watchdog (update_pipeline.rs) treats ANY
+# line on install.py's stdout as progress and warns after N minutes of
+# total silence. While install.py blocks inside run_child_logged() on
+# THIS script, install.py itself prints nothing, and the WP-1 relay
+# forwards only `[VCO-EVENT]`-prefixed child lines — so before this
+# emitter existed, a healthy seed longer than the stall window
+# (default 600 s) triggered a false "update may be stalled" notice on
+# every GUI update. These throttled ticks are the producer that
+# premise always assumed (the 2026-09-21 ship-gate finding).
+#
+# The GRAMMAR, the env gate and the soft-fail are NOT restated here: they
+# live in `vco_lib.progress_event`, the ONE Python home (v0.2.96, D-1),
+# which also carries the must-match relationship to the Rust consumer and
+# the relay filter. A second prose copy of a contract drifts from the first,
+# and this block's copy of the parse rule was already the only remaining
+# hand-written instance of the line prefix in this file.
+#
+# What is THIS producer's own policy, and therefore stays: the step token
+# and detail cap below, and the throttle clock.
+#   * `installer_step_to_user_label` maps the step; `kg-sync` is
+#     DELIBERATELY unknown to that table so the short detail surfaces
+#     verbatim (progress.rs unknown-step fallback, detail < 200 chars).
+#   * the launcher is the ONLY setter of the env gate (update_pipeline.rs),
+#     and it reaches this child through seed_env's `os.environ.copy()` —
+#     so CLI runs stay quiet.
+# ──────────────────────────────────────────────────────────────────────
+
+#: Step token for this script's events — unknown to
+#: ``installer_step_to_user_label`` ON PURPOSE: a known token (e.g.
+#: ``7c/10``) would collapse every tick onto one static label and hide
+#: the node counts; the unknown-step fallback surfaces the detail.
+_SYNC_EVENT_STEP = "kg-sync"
+
+#: One tick per this many seconds, MAX. Time-based rather than per-node
+#: on purpose: a fast hash-skip sync (hundreds of nodes in seconds)
+#: must emit only its two bracketing beats, not a per-node burst, while
+#: a slow re-embed must never be silent longer than this. 15 s keeps
+#: nominal silence under the watchdog's configured floor
+#: (MIN_STALL_WARN_SECS = 30 in update_pipeline.rs) and 40× under its
+#: 600 s default window.
+_HEARTBEAT_MIN_INTERVAL_S = 15.0
+
+#: ``None`` until a tree walk emits its first line (the per-chunk hook
+#: below must stay silent on single-file CLI runs); set on every emit.
+#: Module-level because ``sync_node``/``sync_doc`` hook the chunk beats
+#: without a signature change.
+_heartbeat_last_emit: "Optional[float]" = None
+
+
+def _emit_sync_event(phase: str, detail: str) -> None:
+    """This script's ``[VCO-EVENT]`` tick: producer POLICY over the shared
+    grammar.
+
+    v0.2.96 (duplication register D-1): the LINE GRAMMAR, the
+    ``VCO_PROGRESS_STREAM`` gate and the soft-fail belong to
+    ``vco_lib.progress_event`` — the ONE Python home, locked against the
+    Rust consumer by a parity test. Both producers used to format the line
+    themselves and nothing on either side of the language boundary said they
+    had to agree.
+
+    What stays HERE is this producer's own policy, which the other producer
+    deliberately does not share: the 180-char detail cap (a KG tick's detail
+    is generated text, not a fixed stage label) and the throttle clock, which
+    is only advanced on an emission that was actually gated through.
+    """
+    global _heartbeat_last_emit
+    if os.environ.get(_progress_event.STREAM_ENV) != "1":
+        return
+    safe = " ".join(str(detail or "").split())
+    if len(safe) > 180:
+        safe = safe[:177] + "..."
+    _progress_event.emit(_SYNC_EVENT_STEP, phase, safe)
+    _heartbeat_last_emit = time.monotonic()
+
+
+def _heartbeat_due() -> bool:
+    last = _heartbeat_last_emit
+    return last is None or (time.monotonic() - last) >= _HEARTBEAT_MIN_INTERVAL_S
+
+
+def _heartbeat_note_node(idx: int, total: int, label: str,
+                         tally: "SyncTally") -> None:
+    """Throttled mid-walk tick (one per :data:`_HEARTBEAT_MIN_INTERVAL_S`
+    at most). The last node is skipped — the closing beat follows it."""
+    if idx >= total or not _heartbeat_due():
+        return
+    _emit_sync_event(
+        "ok",
+        f"{label}: {idx}/{total} nodes "
+        f"({tally.succeeded} ok, {tally.failed} failed, "
+        f"{tally.skipped} skipped)",
+    )
+
+
+def _heartbeat_note_chunk() -> None:
+    """Per-chunk beat for a single node whose embed outlives the throttle
+    window. Only while a walk is armed — a single-file CLI run never
+    started one."""
+    if _heartbeat_last_emit is None or not _heartbeat_due():
+        return
+    _emit_sync_event("ok", "embedding a large node — chunk-level progress")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # v0.2.95 WP-5 — the ACTIVE named-vector slot gate for the embed-skip.
 #
 # ONE home for "may this row set be skipped, given the slot the running
@@ -2411,6 +2639,99 @@ def _collection_declares_slot(
     if slots is None:
         return None
     return slot in slots
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.96 WP-2(a) — OLD-SCHEMA TOLERANCE for the existing-row lookup.
+#
+# The 2026-09-20 update hang (register issue 2): a machine whose canonical
+# shared class predates `chunk_num`/`total_chunks` (pre-0.2.74) errors
+# EVERY read that NAMES those props, so all three rungs of `sync_node`'s
+# lookup ladder failed and the raised third became a per-node traceback
+# storm that filled the 64 KiB launcher pipe. The fix is TRIM, never skip
+# (review M-4): probe the class schema once per run, ask only for the
+# DECLARED properties, and skip the chunk-count-match gate the missing
+# props feed — so the hash-gated embed-skip fast path stays LIVE on
+# old-schema classes (the zero-re-embed pin). Skipping the lookup leg
+# instead would re-embed every node on every sync, which is exactly what
+# "never re-embed unchanged content" forbids.
+# ──────────────────────────────────────────────────────────────────────
+
+#: The chunk-bookkeeping props the embed-skip count gate feeds on. A class
+#: that predates them is the "old schema" this block tolerates.
+_CHUNK_PROPS: "frozenset[str]" = frozenset({"chunk_num", "total_chunks"})
+
+#: Declared-PROPERTY schema probe cache, keyed by collection name — the
+#: same once-per-collection-per-process discipline as `_SLOT_SCHEMA_CACHE`
+#: above (a schema does not change under a running sync; a migration is a
+#: separate, consented operation), so a full-tree sync over a legacy class
+#: pays one probe, not one per node.
+_PROP_SCHEMA_CACHE: "Dict[str, Optional[frozenset[str]]]" = {}
+
+#: Collections already warned for the old-schema trim THIS RUN — the
+#: warning is per (run, collection), never per node.
+_OLD_SCHEMA_TRIM_WARNED: "set[str]" = set()
+
+
+def _collection_declared_props(
+    collection: object, collection_name: str
+) -> "Optional[frozenset[str]]":
+    """Property names *collection*'s live schema declares, or ``None``.
+
+    One ``collection.config.get()`` per collection per process, through
+    the client the script already holds — the same read
+    :func:`vco_lib.kg_vector_slot.collection_vector_slots` makes for the
+    named-vector slots.
+
+    ``None`` is UNDETERMINABLE (the schema call raised, or the client
+    exposed ``properties`` in a shape this function cannot read): callers
+    must then keep today's untrimmed ask exactly — a probe that cannot
+    CONFIRM an old schema must not degrade into a guess that trims one.
+    """
+    if collection_name in _PROP_SCHEMA_CACHE:
+        return _PROP_SCHEMA_CACHE[collection_name]
+    try:
+        # getattr, not attribute access: `collection` is the untyped seam
+        # object (same discipline as `collection_vector_slots`), and an
+        # old client / test double without `.config` is simply
+        # UNDETERMINABLE, not an error.
+        config = getattr(collection, "config", None)
+        config_get = getattr(config, "get", None) if config is not None else None
+        payload = config_get() if callable(config_get) else None
+        raw = getattr(payload, "properties", None)
+        names = (
+            frozenset(
+                str(prop.name)
+                for prop in raw
+                if getattr(prop, "name", None)
+            )
+            if raw
+            else None
+        )
+    except Exception:  # noqa: BLE001 — old client / double / transport error
+        names = None
+    if names is not None and not names:
+        # Every real class declares at least `file_path`; "no readable
+        # names at all" means the shape was unreadable, not that the
+        # class is empty.
+        names = None
+    _PROP_SCHEMA_CACHE[collection_name] = names
+    return names
+
+
+def _warn_old_schema_trimmed_once(
+    collection_name: str, missing: "frozenset[str]"
+) -> None:
+    """Exactly ONE warning line per (run, collection) when the trim fires."""
+    if collection_name in _OLD_SCHEMA_TRIM_WARNED:
+        return
+    _OLD_SCHEMA_TRIM_WARNED.add(collection_name)
+    print(
+        f"⚠️  Old schema on '{collection_name}': "
+        f"{', '.join(sorted(missing))} not declared — existing-row lookups "
+        f"ask declared properties only and the chunk-count gate is skipped "
+        f"(hash-gated embed-skip stays live)"
+    )
 
 
 def _active_slot_gate_ok(
@@ -2616,6 +2937,13 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     This handles the warm-up case where an existing v0.2.17 Dev collection
     just gained the `content_hash` property via additive patch_props but
     none of its rows have a value yet.
+
+    v0.2.96 (ship-gate F-L5): the lookup is OLD-SCHEMA TOLERANT, the same
+    TRIM-never-SKIP rule WP-2(a) gave `sync_node`. A `<X>_Development` class
+    predating `chunk_num`/`total_chunks` used to error BOTH fetch rungs, and
+    the ladder's `existing = None` then re-embedded every unchanged doc on
+    every sync — the zero-re-embed anti-promise WP-2 fixed on the KG
+    collection and left standing on this one.
     """
     if not DEV_COLLECTION_NAME:
         print(f"⊘ DEVELOPMENT_COLLECTION not set — skipping {file_path}")
@@ -2680,6 +3008,33 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         except Exception:  # noqa: BLE001 — soft-fail on degenerate wrapper
             active_slot = ""
 
+        # v0.2.96 (ship-gate F-L5) — OLD-SCHEMA TOLERANCE, the same TRIM-never-
+        # SKIP rule WP-2(a) gave `sync_node`, now on THIS collection too. A
+        # `<X>_Development` class that predates `chunk_num`/`total_chunks`
+        # (pre-0.2.74) ERRORS every read that names them, so both rungs below
+        # failed and the ladder ended at `existing = None  # forces fall-
+        # through to re-embed` — silently re-embedding every unchanged doc on
+        # every sync. That is the zero-re-embed anti-promise WP-2 fixed for the
+        # KG collection, left standing on the other one. Same ONE probe
+        # (`_collection_declared_props`, cached per collection per process),
+        # same one-line-per-(run, collection) warning, same consequence: the
+        # count gate the missing props feed is skipped (with no stored counts
+        # there is nothing to match, and `0 == N` would veto every skip),
+        # while the hash + shape + active-slot gates stay live.
+        _base_return_props = [
+            "file_path", "content_hash", "chunk_num", "total_chunks",
+        ]
+        _chunk_count_gate_live = True
+        _declared_props = _collection_declared_props(coll, DEV_COLLECTION_NAME)
+        if _declared_props is not None and not _CHUNK_PROPS <= _declared_props:
+            _base_return_props = [
+                p for p in _base_return_props if p in _declared_props
+            ]
+            _chunk_count_gate_live = False
+            _warn_old_schema_trimmed_once(
+                DEV_COLLECTION_NAME, _CHUNK_PROPS - _declared_props
+            )
+
         # Pull existing objects WITH vectors so we can verify the active
         # slot is populated. `include_vector=True` returns `obj.vector` as
         # a dict keyed by slot name for named-vector collections.
@@ -2688,9 +3043,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             existing = coll.query.fetch_objects(
                 filters=_file_path_filter(doc_data["file_path"]),
                 limit=100,
-                return_properties=[
-                    "file_path", "content_hash", "chunk_num", "total_chunks",
-                ],
+                return_properties=_base_return_props,
                 include_vector=True,
             )
         except Exception as fetch_err:  # noqa: BLE001
@@ -2712,11 +3065,13 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 existing = coll.query.fetch_objects(
                     filters=_file_path_filter(doc_data["file_path"]),
                     limit=100,
-                    return_properties=[
-                        "file_path", "content_hash", "chunk_num", "total_chunks",
-                    ],
+                    return_properties=_base_return_props,
                 )
             except Exception:
+                # Both rungs failed for a reason the trim cannot explain
+                # (transport down, filter rejected). Nothing is known about
+                # the stored rows, so the conservative answer is the one that
+                # produces correct data: re-embed.
                 existing = None  # forces fall-through to re-embed
 
         # EMBED-SKIP fast path. Mirrors sync_node's v0.2.17 implementation
@@ -2756,13 +3111,20 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                         existing_total_chunks.append(0)
                     existing_file_paths.append(props.get("file_path", "") or "")
 
-                chunk_count_ok = (
-                    len(existing_total_chunks) > 0
-                    and all(
-                        tc == len(existing_total_chunks)
-                        for tc in existing_total_chunks
+                if _chunk_count_gate_live:
+                    chunk_count_ok = (
+                        len(existing_total_chunks) > 0
+                        and all(
+                            tc == len(existing_total_chunks)
+                            for tc in existing_total_chunks
+                        )
                     )
-                )
+                else:
+                    # v0.2.96 F-L5: this class declares no chunk props, so the
+                    # count-match gate has no data to judge on — skip the GATE,
+                    # never the lookup (the WP-2(a) M-4 rule). The hash, shape
+                    # and vector-slot gates still apply.
+                    chunk_count_ok = True
                 hashes_ok = (
                     len(existing_hashes) > 0
                     and all(h == current_content_hash for h in existing_hashes)
@@ -2800,7 +3162,16 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     chunk_count_ok and hashes_ok and slots_ok and shapes_ok
                 )
                 _plan_ok = True
-                if _self_consistent and _chunker_resync_pending():
+                # v0.2.96 F-L5: the plan check hard-asks chunk props, so on an
+                # old-schema class it can only ever answer False — a needless
+                # re-embed window whenever the chunker-resync deferral is set.
+                # Skip it exactly when the count gate already told us the props
+                # are absent (the same carve-out `sync_node` carries).
+                if (
+                    _self_consistent
+                    and _chunker_resync_pending()
+                    and _chunk_count_gate_live
+                ):
                     _plan_ok = _stored_plan_matches_current(
                         server, coll, doc_data["file_path"], content,
                         len(existing_hashes),
@@ -2933,6 +3304,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 f"   ✓ Stored chunk {i + 1}/{len(chunks)}",
                 flush=True,
             )
+            _heartbeat_note_chunk()
         print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})", flush=True)
         return SyncOutcome(OUTCOME_SYNCED, doc_data["file_path"])
     except Exception as e:
@@ -2980,14 +3352,20 @@ def sync_all_docs(server: WeaviateMCPServer) -> "SyncTally":
     md_files = list(DOCS_ROOT.rglob("*.md"))
     total = len(md_files)
     print(f"📚 Found {total} markdown files in docs/")
+    _emit_sync_event("start", f"syncing docs: {total} nodes")
     # v0.2.70 FIX C: running "doc M/N" counter (flush=True), same rationale as
     # sync_all_nodes — visibility for a long re-embed, no watchdog/timeout.
     for idx, md in enumerate(sorted(md_files), start=1):
         print(f"[{idx}/{total}] {md.name}", flush=True)
         tally.add(sync_doc(server, md))
+        _heartbeat_note_node(idx, total, "docs", tally)
         print(f"  → progress: {idx}/{total} docs processed "
               f"({tally.succeeded} ok, {tally.failed} failed, "
               f"{tally.skipped} skipped)", flush=True)
+    _emit_sync_event(
+        "ok",
+        f"synced docs: {total} nodes ({tally.succeeded} ok, "
+        f"{tally.failed} failed, {tally.skipped} skipped)")
     return tally
 
 
@@ -3752,13 +4130,40 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         _base_return_props = [
             "file_path", "content_hash", "chunk_num", "total_chunks",
         ]
+        # v0.2.96 WP-2(a) — OLD-SCHEMA TOLERANCE: trim, never skip (review
+        # M-4; see the `_CHUNK_PROPS` block above for the full why). The
+        # once-per-run probe narrows EVERY rung's ask below to the DECLARED
+        # intersection — `file_path` + `content_hash` survive on every
+        # field-verified stale class (register issue 2) — so the fetch
+        # SUCCEEDS where the pre-fix ladder errored on all three rungs, and
+        # the chunk-count gate those props feed is skipped: with no stored
+        # counts there is nothing to match, and `0 == N` would otherwise
+        # veto every skip and re-embed the whole class. The embed-skip fast
+        # path below stays live on old-schema classes (the zero-re-embed
+        # pin, field-verified load-bearing by the owner 2026-09-20).
+        _chunk_count_gate_live = True
+        _repairable_ask = list(REPAIRABLE_PROPERTIES)
+        _declared_props = _collection_declared_props(
+            collection, target_collection_name
+        )
+        if _declared_props is not None and not _CHUNK_PROPS <= _declared_props:
+            _base_return_props = [
+                p for p in _base_return_props if p in _declared_props
+            ]
+            _repairable_ask = [
+                p for p in _repairable_ask if p in _declared_props
+            ]
+            _chunk_count_gate_live = False
+            _warn_old_schema_trimmed_once(
+                target_collection_name, _CHUNK_PROPS - _declared_props
+            )
         _vectors_requested = True
         _metadata_props_available = True
         try:
             existing = collection.query.fetch_objects(
                 filters=where_filter,
                 limit=100,
-                return_properties=_base_return_props + list(REPAIRABLE_PROPERTIES),
+                return_properties=_base_return_props + _repairable_ask,
                 include_vector=True,
             )
         except Exception as _meta_fetch_err:  # noqa: BLE001 — older client / legacy schema
@@ -3813,10 +4218,20 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     existing_total_chunks.append(0)
                 existing_file_paths.append(props.get("file_path", "") or "")
 
-            chunk_count_ok = (
-                len(existing_total_chunks) > 0
-                and all(tc == len(existing_total_chunks) for tc in existing_total_chunks)
-            )
+            if _chunk_count_gate_live:
+                chunk_count_ok = (
+                    len(existing_total_chunks) > 0
+                    and all(
+                        tc == len(existing_total_chunks)
+                        for tc in existing_total_chunks
+                    )
+                )
+            else:
+                # v0.2.96 WP-2(a): this class declares no chunk props, so
+                # the count-match gate has no data to judge on — skip the
+                # GATE, never the lookup (review M-4). The hash, shape and
+                # vector-slot gates still apply.
+                chunk_count_ok = True
             # v0.2.92 WP-B1 (D13): the skip may only fire when no found
             # row reports a NON-canonical (legacy backslash) spelling — a
             # legacy-shaped row reached through the dual-shape filter must
@@ -3877,7 +4292,12 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     )
             _self_consistent = _hashes_and_shape_ok and _slots_ok
             _plan_ok = True
-            if _self_consistent and _chunker_resync_pending():
+            # WP-2 review MINOR-2: the plan check hard-asks chunk props, so
+            # on an old-schema class (chunk props undeclared) it can only
+            # answer False — a self-terminating but needless re-embed window
+            # whenever the chunker-resync deferral is set. Skip it exactly
+            # when the count gate already told us chunk props are absent.
+            if _self_consistent and _chunker_resync_pending() and _chunk_count_gate_live:
                 _plan_ok = _stored_plan_matches_current(
                     server, collection, node_data["file_path"], content,
                     len(existing_hashes),
@@ -4213,6 +4633,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     f"   ✓ Stored chunk {chunk.chunk_number + 1}/{chunk.total_chunks} ({chunk.token_count} tokens)",
                     flush=True,
                 )
+                _heartbeat_note_chunk()
 
             if last_slots:
                 print(f"   ✓ All chunks written to vectors={sorted(last_slots)}")
@@ -4299,6 +4720,7 @@ def sync_all_nodes(server: WeaviateMCPServer) -> "SyncTally":
     total = len(md_files)
     print(f"📚 Found {total} markdown files in knowledge/")
     print()
+    _emit_sync_event("start", f"syncing knowledge: {total} nodes")
 
     # v0.2.70 FIX C: emit a running "node M/N" counter (flush=True) so a long
     # full re-embed (e.g. an arctic model-swap over thousands of shared-KG
@@ -4309,11 +4731,16 @@ def sync_all_nodes(server: WeaviateMCPServer) -> "SyncTally":
     for idx, md_file in enumerate(sorted(md_files), start=1):
         print(f"[{idx}/{total}] {md_file.name}", flush=True)
         tally.add(sync_node(server, md_file))
+        _heartbeat_note_node(idx, total, "knowledge", tally)
         print(f"  → progress: {idx}/{total} nodes processed "
               f"({tally.succeeded} ok, {tally.failed} failed, "
               f"{tally.skipped} skipped)", flush=True)
         print()  # Blank line between nodes
 
+    _emit_sync_event(
+        "ok",
+        f"synced knowledge: {total} nodes ({tally.succeeded} ok, "
+        f"{tally.failed} failed, {tally.skipped} skipped)")
     return tally
 
 
@@ -4525,6 +4952,13 @@ def _regen_node_formats_after_full_sync() -> None:
         # including on direct-CLI runs without PYTHONUNBUFFERED.
         print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...",
               flush=True)
+        # The same silence hazard on the UPDATE watchdog's surface: the regen
+        # runs capture_output=True, so this script produces nothing for up to
+        # its full 600 s cap. One event restarts that clock AND tells the
+        # modal what the wait is (a run that exhausts the cap is the one
+        # honest case where the stall notice may still fire).
+        _emit_sync_event(
+            "start", "refreshing KG summaries (this can take several minutes)")
         # NO `--force`: the generator skips nodes whose formats already exist,
         # so a re-run over an already-summarised project regenerates nothing.
         # (Standing rule: never re-embed / re-generate hash-unchanged content.)

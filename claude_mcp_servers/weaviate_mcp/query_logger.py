@@ -30,10 +30,15 @@ def _resolve_log_dir() -> Path:
     if override:
         return Path(override)
     # State-root resolution goes through the MCP-isolation mirror
-    # `_lib.update_gate._vct_root_dir` (the documented in-package mirror
-    # of vco_lib.paths.vct_root_dir — MCP servers run from
-    # claude_mcp_servers/.venv which doesn't carry vco_lib). The
-    # consolidation gate in tests/test_vct_root_dir_consolidation.py
+    # `_lib.update_gate._vct_root_dir` (the documented in-package mirror of
+    # vco_lib.paths.vct_root_dir). WHY that mirror exists is stated once, in
+    # `_lib/update_gate.py`'s module docstring — deliberately not restated
+    # here: this comment used to carry its own copy of the reason ("MCP
+    # servers run from claude_mcp_servers/.venv which doesn't carry
+    # vco_lib"), that copy went stale when the launch path moved to the
+    # install-root venv, and a stale reason is worse than none because the
+    # next reader trusts it. The real constraint is packaging, not the venv.
+    # The consolidation gate in tests/test_vct_root_dir_consolidation.py
     # forbids inline ~/.vct reconstruction outside that mirror.
     try:
         import sys

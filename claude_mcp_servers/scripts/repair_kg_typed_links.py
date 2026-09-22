@@ -51,11 +51,16 @@ import weaviate
 # so a failed import here already fails loudly (ImportError), matching the
 # "no silent-fallback on vco_lib imports" discipline used elsewhere.
 from vco_lib.log_setup import configure_logging
+# v0.2.96: the Weaviate base-URL precedence (WEAVIATE_URL > WEAVIATE_PORT >
+# the canonical port) has ONE home. A CALL, not a mirror: the
+# `vco_lib.log_setup` import above is bare for the reason stated there, so
+# vco_lib is already a hard requirement of this script.
+from vco_lib.weaviate_helpers import weaviate_url_default
 
 configure_logging(format="%(levelname)s %(message)s")
 logger = logging.getLogger("repair_typed_links")
 
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+WEAVIATE_URL = weaviate_url_default()
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 # Properties fetched per object via REST GraphQL.

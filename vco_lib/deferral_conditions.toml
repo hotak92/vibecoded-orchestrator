@@ -922,7 +922,14 @@ DRIVER (`vco_lib.codegraph_resync --run-resync`), never a bare analyzer walk: \
 the driver re-probes the stale count and performs THIS cid's paired clear on a \
 positive zero, so the dispatcher's ledger-re-read has something to observe. A \
 bare walk performs no clear and would have been INCONCLUSIVE every attempt \
-until the durable cap burned."""
+until the durable cap burned. v0.2.96 (WP-3, register issue 8): the entry has \
+TWO flavours — service-down ("bring the service up") and stale-image ("rebuild \
+the image FIRST"; emitting through a stale image silently truncates over-window \
+input at HTTP 200). The verdict is enforced INSIDE the driver \
+(``run_resync_and_verify``) so install, auto-retry and manual ``--run-resync`` \
+all pass it, and the dispatcher BLOCKS a stale verdict BEFORE writing the \
+STARTED row — a persistently stale image therefore burns NO retry budget and \
+the retry resumes by itself once the image is rebuilt and current."""
 
 [conditions.residue_cleanup_pending]
 class = "action_required"
@@ -992,6 +999,39 @@ Distinct from `kg_sync_drift_detected`: this fires when there is no \
 collection to compare against AT ALL, not when some nodes within an \
 existing binding are unsynced — no per-node hash comparison could ever \
 detect it. Cleared by `surface_binding_gap` once a binding resolves."""
+
+[conditions.kg_summaries_degraded]
+class = "action_required"
+owner = "vco_lib.summary_health"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.96 WP-7 (register issues 13 + 14). The summary backend ladder's \
+preferred tier opened its circuit breaker on a QUOTA (token/budget \
+exhaustion — 5 h cooldown, `VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN`) or TRUST \
+(headless `claude -p` refused: workspace not trusted — terminal for the \
+tier) failure. Until the tier returns, summaries generate on a FALLBACK \
+tier or not at all, and because the sidecars record the backend that \
+actually answered, the degraded rows are exactly the ones a sidecar names \
+a non-preferred backend for with a CURRENT content hash (hash-frozen: \
+ordinary runs correctly skip them) plus nodes with no summary at all. \
+The pending set is derived by SCANNING the sidecars \
+(`vco_lib.summary_health.scan_pending`) — no second ledger to maintain. \
+New and changed nodes resume on the preferred tier when the cooldown \
+expires; the frozen rows regenerate only via the recheck command, which \
+clears the breaker and regenerates exactly the pending set (also the \
+launcher's "Recheck summary backend now" action). ONE entry per event, \
+not per attempt: the breaker trip seam spawns `python -m vco_lib.\
+summary_health note-degradation` detached (best-effort, stdlib \
+constraint — `templates/scripts/summary_backends.py` cannot import \
+vco_lib from user projects), and the ledger's per-cid last-write-wins \
+makes a re-notify a REPLACE. action_required, NOT auto_retryable, on the \
+`kg_sync_drift_detected` precedent: no dispatcher handler is wired for \
+this cid (deferral_retry.py is outside this work package's file set) and \
+the 5 h clock only restores the TIER — the frozen rows need the command, \
+and the trust flavour needs a human to re-accept the workspace dialog. \
+Paired site: `vco_lib.summary_health.summary_recheck` resolves this cid \
+when a post-backfill scan finds ZERO pending rows — after a converged \
+recheck, or when ordinary runs have already regenerated everything."""
 
 [conditions.compose_override_renamed]
 class = "informational_record"

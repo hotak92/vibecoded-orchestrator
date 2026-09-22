@@ -224,6 +224,19 @@ def venv_in(root: "str | Path") -> Optional[Path]:
     return None
 
 
+def resolve_root_venv_python(root: "str | Path") -> Optional[Path]:
+    """The interpreter of ``root``'s PRIMARY ``.venv``, or ``None``.
+
+    Unlike :func:`venv_in` this probes only the first (current) layout —
+    NOT the legacy ``claude_mcp_servers/.venv`` rung.  It replaces the
+    inline probe install.py's resync shim used to carry (v0.2.96 M-2,
+    install.py line ratchet): "prefer the orchestrator venv python; ``None``
+    falls back to the caller's resolver ladder".  Never raises: every probe
+    is an ``is_file()`` behind :func:`_first_existing`'s OSError guard.
+    """
+    return _first_existing(venv_interpreters(Path(root) / VENV_LAYOUTS[0]))
+
+
 def resolve_install_root(explicit: "str | Path | None" = None) -> Optional[Path]:
     """The orchestrator clone this process belongs to, or ``None``.
 

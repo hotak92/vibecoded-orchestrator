@@ -330,28 +330,130 @@ def probe_class_listing(
             f"GET {url} -> response carries no 'classes' array",
             what=WHAT_CLASS_LISTING,
         )
-    names = [
-        str(c.get("class"))
-        for c in classes
-        if isinstance(c, dict)
-        and isinstance(c.get("class"), str)
-        and c.get("class")
-    ]
+    names = schema_class_names_ordered({"classes": classes})
     if not names:
         return ProbeResult.absent(what=WHAT_CLASS_LISTING, value=[])
     return ProbeResult.present(names, what=WHAT_CLASS_LISTING)
 
 
-def weaviate_url_default() -> str:
-    """Return the WEAVIATE_URL env value, or the canonical localhost default.
+def schema_class_names_ordered(schema: object) -> "list[str]":
+    """Class names in a Weaviate ``/v1/schema`` payload, in PAYLOAD ORDER.
 
-    Read from the environment on each call (never cached at import) so tests
-    and hooks that mutate ``os.environ["WEAVIATE_URL"]`` between calls see the
-    live value.
+    The order-preserving shape of :func:`schema_class_names` — same rule, one
+    implementation. :func:`probe_class_listing` needs it because its result is
+    shown to a human and Weaviate's own ordering is the least surprising one;
+    every other caller compares membership and takes the set.
     """
-    return os.environ.get(
-        "WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}"
-    )
+    if not isinstance(schema, dict):
+        return []
+    entries = schema.get("classes")
+    if not isinstance(entries, list):
+        return []
+    out: "list[str]" = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("class")
+        if isinstance(name, str) and name:
+            out.append(name)
+    return out
+
+
+def schema_class_names(schema: object) -> "set[str]":
+    """Every class NAME in a Weaviate ``/v1/schema`` payload, as ``set[str]``.
+
+    ONE home for "read the class names out of a schema response" (v0.2.96).
+    The comprehension had grown to five hand-written copies in ``install.py``
+    alone plus this module, ``codegraph_ref_dedup``, ``install_weaviate`` and
+    ``doctor`` — each with a slightly different filter, and three of them
+    yielding ``str | None`` because ``c.get("class")`` is untyped. That is not
+    a cosmetic difference: a ``None`` in the set flows into ``sorted()`` and
+    into class-name comparisons, which is where three of the ``install.py``
+    type errors came from when that file joined the pyright gate.
+
+    Every non-conforming entry is dropped rather than represented: a schema
+    entry that is not a dict, or whose ``class`` is missing / not a string /
+    empty, is not a class name. Returns an empty set for any payload shape
+    this cannot read (no ``classes`` array, not a dict) — callers already
+    treat "no classes" as "nothing of ours is here", and inventing a
+    distinction they do not consume would be the wrong kind of precision.
+    """
+    return set(schema_class_names_ordered(schema))
+
+
+def weaviate_url_default() -> str:
+    """Resolve the base Weaviate HTTP URL from the environment.
+
+    **This function is the FLOOR of the resolution chain, not a competitor to
+    it.** Every call-site spells ``weaviate_url or weaviate_url_default()``,
+    so an explicitly-resolved URL always wins and this is reached only when
+    the layers above are silent. Those layers are, and must stay, above it:
+
+    * The Weaviate **instance** is machine-global, not per-project. The hub
+      serves ``LocalConfig::load().weaviate_url``. ``launcher.db`` does carry
+      a per-row ``project_kg_bindings.weaviate_url`` ("override; NULL = use
+      launcher default"), but **no resolver reads it** — it is only ever
+      PRESERVED across rewrites. That is stated in
+      ``launcher/src-tauri/src/commands/binding_reconcile.rs``, which also
+      records what must change on the day it becomes a real resolver leg.
+    * The launcher does not *compete* with the env — it **writes** the env.
+      ``vco_lib/config_projection.py`` projects the DB-resolved port into
+      ``.claude/settings.json`` and ``.claude/env`` as ``WEAVIATE_URL`` AND
+      ``WEAVIATE_PORT`` together, and ``install.py``'s two env writers emit
+      the same pair from one port. So these variables are the *transport* of
+      the DB value, which is why reading them here cannot invert it.
+    * Every peer resolver already ranks env above config-file:
+      ``vct-launcher-core/src/config.rs`` resolves default → ``vct-config.toml``
+      → ``VCT_WEAVIATE_URL`` → ``WEAVIATE_URL``.
+
+    Do NOT make this function reach into ``launcher.db`` or the hub. It is
+    ``vco_lib``'s stdlib-only leaf and is called from hooks and shipped
+    templates; the DB is consulted by the resolver layer above (see
+    ``vco_lib/collection_repair.py::_resolve_project_context``, which is
+    hub-first and reports which source answered).
+
+    **Precedence — highest first. Both knobs may be set at once; the more
+    specific statement wins:**
+
+    1. ``WEAVIATE_URL`` — a complete URL the user stated. It names the scheme,
+       the host AND the port, so it outranks a bare port. Used verbatim.
+    2. ``WEAVIATE_PORT`` — a port for the canonical localhost host, i.e.
+       ``http://localhost:<port>``. This is the knob a user reaches for when
+       Weaviate is merely on a different port of the same machine (the
+       ``.env`` / compose surface documents it that way), and it is the level
+       that was BROKEN until v0.2.96: the fallback jumped straight to (3), so
+       every caller but ``install.py`` addressed the wrong port — at best a
+       connection refused, at worst a DIFFERENT install's Weaviate listening
+       on 8081.
+    3. :data:`DEFAULT_WEAVIATE_PORT` — ``http://localhost:8081``.
+
+    So ``WEAVIATE_URL`` set ⇒ (2) and (3) are never consulted, *including*
+    when ``WEAVIATE_PORT`` disagrees with the port inside the URL. That case
+    is not a conflict to reconcile: a full URL is the stronger statement, and
+    silently rewriting its port would make ``WEAVIATE_URL`` unable to mean
+    what it says.
+
+    An **empty or whitespace-only** value at either level is treated as
+    UNSET, not as a literal. ``WEAVIATE_URL=""`` in a ``.env`` is a
+    mis-populated variable, never a request for the empty URL — the same
+    coercion ``KG_COLLECTION`` already gets. Surrounding whitespace is
+    stripped (a ``.env`` written on Windows and sourced on Linux carries a
+    trailing ``\\r``, which would otherwise be pasted into the URL).
+
+    A ``WEAVIATE_PORT`` that is not a number is interpolated ANYWAY rather
+    than being discarded back to (3). A typo'd port must fail loudly at
+    connect time; quietly resolving it to 8081 would send the caller to
+    whatever else is on the canonical port, which is the exact harm this
+    function's level (2) exists to prevent.
+
+    Read from the environment on EACH call (never cached at import) so tests
+    and hooks that mutate ``os.environ`` between calls see the live value.
+    """
+    url = (os.environ.get("WEAVIATE_URL") or "").strip()
+    if url:
+        return url
+    port = (os.environ.get("WEAVIATE_PORT") or "").strip()
+    return f"http://localhost:{port or DEFAULT_WEAVIATE_PORT}"
 
 
 def http_request(

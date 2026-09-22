@@ -263,16 +263,34 @@ except Exception:
 # `vco_lib.codegraph_references` import above is: this script already requires
 # `weaviate_mcp.server`, which imports vco_lib at module scope.
 from vco_lib.paths import claude_user_dir  # noqa: E402 — see import discipline above
+# v0.2.96: the no-config branch below used to HARDCODE `http://localhost:8081`,
+# reading neither `WEAVIATE_URL` nor `WEAVIATE_PORT`. Every other shipped
+# script read at least the former, so on an install whose Weaviate is not on
+# the canonical port this CLI was the one that silently queried the wrong
+# instance — and `mcp-config.json` does not exist on a stock install, so the
+# broken branch was the DEFAULT one. Resolution now goes through the ONE home.
+# v0.2.96 (6b): the ENVIRONMENT outranks the config FILE, matching every peer
+# resolver (vct-launcher-core/src/config.rs resolves default -> vct-config.toml
+# -> VCT_WEAVIATE_URL -> WEAVIATE_URL). The block below used to let
+# `mcp-config.json` win over both knobs, inverted relative to all of them. Any
+# env statement (WEAVIATE_URL or WEAVIATE_PORT) now wins outright through the
+# ONE home; the file is consulted only when the env is silent.
+from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — see import discipline above
 
 CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
 
-if CONFIG_PATH.exists():
+if (os.environ.get("WEAVIATE_URL") or "").strip() or (
+    os.environ.get("WEAVIATE_PORT") or "").strip():
+    WEAVIATE_URL = weaviate_url_default()
+    GRPC_PORT = 50052
+    OLLAMA_URL = "http://localhost:11435"
+elif CONFIG_PATH.exists():
     config = json.loads(CONFIG_PATH.read_text())
     WEAVIATE_URL = config["weaviate"]["url"]
     GRPC_PORT = config["weaviate"]["grpc_port"]
     OLLAMA_URL = config.get("ollama", {}).get("url", "http://localhost:11435")
 else:
-    WEAVIATE_URL = "http://localhost:8081"
+    WEAVIATE_URL = weaviate_url_default()
     GRPC_PORT = 50052
     OLLAMA_URL = "http://localhost:11435"
 

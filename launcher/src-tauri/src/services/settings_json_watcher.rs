@@ -486,6 +486,21 @@ async fn sync_watches<R: Runtime + 'static>(
     let db = app
         .try_state::<Db>()
         .ok_or_else(|| "launcher.db not available".to_string())?;
+    // v0.2.96 WP-8 (register issue 5): during the update's DB swap window
+    // the managed connection is the schema-less in-memory stand-in;
+    // `list_projects()` then fails with `no such table: projects` and the
+    // 30 s re-poll logs that warning for the whole binary-refresh window
+    // (the 2026-09-20 log storm). Stand down instead — the re-poll
+    // catches up on its next tick after `reopen_after_update`. Only the
+    // stand-in is silenced: a genuinely broken file-backed DB still
+    // reports errors.
+    if db.is_update_standby() {
+        tracing::debug!(
+            "[settings_json_watcher] re-sync stood down: launcher.db is the \
+             update-window stand-in"
+        );
+        return Ok(());
+    }
     let projects = db.list_projects().map_err(|e| format!("list_projects: {}", e))?;
 
     let desired: HashSet<PathBuf> = projects

@@ -247,7 +247,9 @@ def _connect_weaviate():  # noqa: ANN202 — return type bound to weaviate modul
             "`pip install weaviate-client` and retry."
         ) from exc
 
-    url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
+    # WEAVIATE_URL > WEAVIATE_PORT > the canonical port, resolved in ONE home.
+    from vco_lib.weaviate_helpers import weaviate_url_default
+    url = weaviate_url_default()
     parsed = urlparse(url)
     host = parsed.hostname or "localhost"
     http_port = parsed.port or 8081

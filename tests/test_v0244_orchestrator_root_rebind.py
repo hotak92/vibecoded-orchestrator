@@ -178,6 +178,11 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             install, "_discover_app_state_db_path", return_value=db_path
         ), self._patch_count(), mock.patch(
             "subprocess.run", side_effect=self._fake_run
+        ), mock.patch.object(
+            # v0.2.96 WP-1: the seed child now spawns via run_child_logged;
+            # the capture must keep seeing it or the no-sync assertions
+            # would pass vacuously.
+            install, "run_child_logged", side_effect=self._fake_run
         ):
             errors = install._seed_weaviate_shared_kg_only(
                 args=_make_args(),
@@ -253,6 +258,11 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             install, "_discover_app_state_db_path", return_value=db_path
         ), self._patch_count(), mock.patch(
             "subprocess.run", side_effect=self._fake_run
+        ), mock.patch.object(
+            # v0.2.96 WP-1: the seed child now spawns via run_child_logged;
+            # the capture must keep seeing it or the no-sync assertions
+            # would pass vacuously.
+            install, "run_child_logged", side_effect=self._fake_run
         ):
             errors = install._seed_weaviate_shared_kg_only(
                 args=_make_args(),
@@ -314,6 +324,11 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             install, "PROJECT_ROOT", self.tmp
         ), mock.patch(
             "subprocess.run", side_effect=self._fake_run
+        ), mock.patch.object(
+            # v0.2.96 WP-1: the seed child now spawns via run_child_logged;
+            # the capture must keep seeing it or the no-sync assertions
+            # would pass vacuously.
+            install, "run_child_logged", side_effect=self._fake_run
         ):
             errors = install._seed_weaviate_shared_kg_only(
                 args=_make_args(),
@@ -407,6 +422,11 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             _cp, "apply_project_env", wraps=_cp.apply_project_env
         ) as apply_spy, self._patch_count(), mock.patch(
             "subprocess.run", side_effect=self._fake_run
+        ), mock.patch.object(
+            # v0.2.96 WP-1: the seed child now spawns via run_child_logged;
+            # the capture must keep seeing it or the no-sync assertions
+            # would pass vacuously.
+            install, "run_child_logged", side_effect=self._fake_run
         ):
             errors = install._seed_weaviate_shared_kg_only(
                 args=_make_args(),

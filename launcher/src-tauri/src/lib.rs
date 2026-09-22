@@ -3486,6 +3486,12 @@ pub fn run() {
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
             commands::kg_summary::retry_kg_summary,
+            // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
+            // (Preferences → KG Summaries) — shells to
+            // `python -m vco_lib.summary_health summary-recheck` for the
+            // selected project (orchestrator root when none) and returns
+            // the CLI's pending/regenerated counts for the toast.
+            commands::kg_summary::recheck_summary_backend,
             // Defect B (v0.2.68): async project-setup status read (banner
             // mount / reload) + retry (banner Retry button). The heavy
             // create phase (bootstrap + bundle + post-bundle) now runs

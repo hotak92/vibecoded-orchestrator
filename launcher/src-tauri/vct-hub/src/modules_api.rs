@@ -1306,17 +1306,17 @@ mod tests {
     use super::*;
     use vct_launcher_core::db::Db;
 
-    /// Probe whether the OS keychain backend is available in this test
-    /// environment. CI containers and headless build hosts typically
-    /// have no Secret Service / Keychain / Credential Manager running,
-    /// so any test that exercises the actual keychain has to short-circuit.
-    fn keyring_available() -> bool {
-        // v0.2.76 (A4): delegate to the ONE shared probe in vct-launcher-core
-        // (bounded-timeout worker — a wedged Secret Service returns false,
-        // never hangs). Replaces the raw `Entry::new(..).set_password("canary")`
-        // copy this hub crate used to carry.
-        vct_launcher_core::secrets::keyring_probe_available()
-    }
+    // v0.2.96 (L-15): `keyring_available()` lived here — a one-line
+    // delegation to `vct_launcher_core::secrets::keyring_probe_available()`
+    // that nothing in this module ever called. Every keychain-touching test
+    // below carries `#[ignore = "requires OS keychain backend (keyring);
+    // skipped in CI headless env"]`, which is the SUPERSEDING mechanism:
+    // it declares the requirement instead of silently turning an explicit
+    // `--ignored` run on a headless host into a green no-op. The capability
+    // itself is not lost — the shared probe still lives in
+    // `vct_launcher_core::secrets` and production code calls it
+    // (`commands/installer.rs`). Deleted rather than `#[allow(dead_code)]`d,
+    // so `cargo check --all-targets` is clean rather than muted.
 
     /// PR-3 Commit 3 canary: the hub's per-subprocess secret resolver MUST
     /// honour `is_secret_active`. A paused secret (Lifecycle B Unset)

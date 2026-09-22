@@ -375,6 +375,23 @@ class DeliveryAuditTests(unittest.TestCase):
         v0.2.92 move made to its callers. Written down rather than shaved off
         to hit a rounder number, per THE RULE below.)
 
+        Lowered 15_661 -> 15_658 (2026-09-21, WP-10 lane): the model-gateway
+        agent delivery gate (+130 lines) landed here first and tripped this
+        gate, which is the gate working. The extraction took the gate, its
+        folder→UUID resolver and the module-name/dir constants into
+        ``vco_lib/module_gated_delivery.py`` (~125 lines, self-contained, no
+        project_init state) — and then paid the enumeration block's cost too:
+        the resolver is the THIRD copy of a pattern that
+        ``_apply_canonical_env_via_config_projection`` and
+        ``_read_codegraph_binding_override`` already inlined, so both
+        call-sites now use the shared one (one home for the pattern). Net
+        15_791 -> 15_658, i.e. smaller than before the lane's work despite
+        gaining the behaviour. One disclosed drift: an unreadable-but-present
+        launcher.db now reports ``not_registered`` instead of
+        ``db_unreachable`` from the config-projection resolve half (every
+        other soft-fail branch keeps its action; no test pinned that branch,
+        and both actions leave the file untouched).
+
         THE RULE, so no future re-pin has to re-derive it (identical to
         ``test_install_main_ratchet``'s, and stated here because this gate
         broke it): the ceiling is the measured ``wc -l`` EXACTLY. Not
@@ -392,11 +409,52 @@ class DeliveryAuditTests(unittest.TestCase):
         equivalents to POSIX-only printed remedies tripped it and the first
         instinct was to cut prose). A small addition that owes an extraction
         owes it; that is the gate working, not a reason for slack.
+
+        v0.2.96 python-core fix lane — re-pinned DOWN to the measured 15_634.
+
+        NOTE FOR THE AUDIT TRAIL: this gate was ALREADY RED at `95865ab0`.
+        The file measured 15_661 against the 15_658 pin with no lane changes
+        applied — a committed red on the release branch, found by this lane
+        and recorded in `LANE-FIX-PYTHON-CORE-2026-09-22.md`. The lane's own
+        additions (the F-B1 deferral rewrite, the D-5 `_record_preserve`
+        extraction, two corrected docstrings) were paid for the ratchet's own
+        way rather than by raising the pin: `record_preserve` and
+        `emit_user_modified_deferral` moved to `vco_lib/bundle_preserve.py`
+        (the `vco_lib/bundle_skip_deferral.py` precedent — a deferral emitter
+        is a self-contained unit of prose + one command), leaving thin
+        same-signature wrappers because the bundle tests use the names.
+
+        Reconciled 15_634 -> 15_635 by the COORDINATOR (2026-09-22, at
+        integration). Two lanes landed in this file in the same window: the
+        python-core lane measured 15_634 after its extractions, then the
+        Weaviate lane replaced an inline URL fallback with a three-line
+        delegate to `vco_lib.weaviate_helpers.weaviate_url_default`, taking
+        the file to 15_635.
+
+        This is a LOWERING, not a raise, and the distinction is the one that
+        matters here: the pin committed at HEAD is 15_661, and the file is
+        now 15_635 — twenty-six lines smaller than the gate's committed
+        value. 15_634 was a mid-cycle measurement that a later, correct fix
+        invalidated by one line; it was never a committed ceiling. The
+        forbidden move is raising this above a committed value to admit
+        growth, and that has not happened.
+
+        Nor is the +1 growth in the sense this gate polices: the LOGIC left
+        the file (it now lives in the shared helper) and what remains is a
+        delegate. Extracting one more line to get back under 15_634 would be
+        gaming the number rather than serving what it protects.
+
+        Correction for the record: one lane's report described this ratchet
+        as "a shape constraint, not a line pin, and unaffected". That is
+        wrong — this is a line pin, as the assertion below shows. That lane
+        checked `test_install_main_ratchet.py` and did not find this second,
+        differently-named gate. Two ratchets guard two files; a change that
+        touches both must re-measure both.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_661,
+            n, 15_635,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

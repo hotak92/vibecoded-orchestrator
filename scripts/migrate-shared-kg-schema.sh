@@ -41,7 +41,8 @@
 # step will create it with the correct schema).
 #
 # Env vars:
-#   WEAVIATE_URL          — defaults to http://localhost:8081
+#   WEAVIATE_URL          — defaults to http://localhost:${WEAVIATE_PORT:-8081};
+#                          WEAVIATE_URL wins outright when set
 #   SHARED_KG_COLLECTION  — defaults to VibeCodedOrchestrator_KnowledgeGraph
 #                           (capital-C casing since v0.2.23 B1; was
 #                           lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
@@ -65,7 +66,7 @@
 
 set -uo pipefail
 
-WEAVIATE_URL="${WEAVIATE_URL:-http://localhost:8081}"
+WEAVIATE_URL="${WEAVIATE_URL:-http://localhost:${WEAVIATE_PORT:-8081}}"
 SHARED_KG="${SHARED_KG_COLLECTION:-VibeCodedOrchestrator_KnowledgeGraph}"
 CONSENT="${VCO_SHARED_KG_MIGRATE_CONSENT:-0}"
 

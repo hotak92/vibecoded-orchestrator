@@ -367,6 +367,11 @@ class RepairTriggerTests(unittest.TestCase):
             install, "_prune_stale_kg_rows", lambda *a, **k: None
         ), mock.patch(
             "subprocess.run", side_effect=_fake_run
+        ), mock.patch.object(
+            # v0.2.96 WP-1: the sync child now spawns via run_child_logged;
+            # route it through the same fake (check-semantics preserved —
+            # the fake raises CalledProcessError exactly as the helper does).
+            install, "run_child_logged", side_effect=_fake_run
         ), contextlib.redirect_stdout(buf):
             ns = argparse.Namespace()
             ns.update = update

@@ -1239,7 +1239,8 @@ def _build_client(
     try:
         import weaviate
 
-        url = weaviate_url or os.environ.get("WEAVIATE_URL") or "http://localhost:8081"
+        from vco_lib.weaviate_helpers import weaviate_url_default
+        url = weaviate_url or weaviate_url_default()
         m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
         host = m.group(1) if m else "localhost"
         http_port = int(m.group(2)) if (m and m.group(2)) else 8081

@@ -180,6 +180,58 @@ pub(crate) fn spawn_heartbeat_ticker(
 static HEARTBEAT_SWEEPER_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// One pass of the periodic staleness sweeper (both twin tables), gated on
+/// the update standby probe.
+///
+/// v0.2.96 WP-8 (register issue 5): during the launcher's DB swap window
+/// (`close_for_update` → binary refresh → `reopen_after_update`) the
+/// managed `Db` is a schema-less in-memory stand-in, and every 5-minute
+/// tick used to log
+/// `warning: kg-sync heartbeat sweep failed: no such table: kg_syncs` (and
+/// the code-graph twin) for the whole window. The sweeper now STANDS DOWN
+/// while the probe says standby — and only then: a genuinely broken
+/// file-backed DB still gets the full sweep with its warnings.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeartbeatSweepOutcome {
+    /// The managed Db is the swap-window stand-in; nothing was attempted.
+    StoodDown,
+    /// The sweep ran its queries (any per-query failure is logged inside,
+    /// exactly as before the gate).
+    Ran,
+}
+
+pub(crate) fn heartbeat_sweep_once(db: &Db) -> HeartbeatSweepOutcome {
+    if db.is_update_standby() {
+        tracing::debug!(
+            "[vct] kg-sync heartbeat sweep stood down: launcher.db is the \
+             update-window stand-in (no such table warnings suppressed)"
+        );
+        return HeartbeatSweepOutcome::StoodDown;
+    }
+    let stale_secs = heartbeat_stale_secs();
+    match db.mark_stale_running_kg_syncs_failed(stale_secs, KG_SYNC_STALE_ERROR, None) {
+        Ok(n) if n > 0 => tracing::error!(
+            "[vct] kg-sync heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
+            n, stale_secs
+        ),
+        Err(e) => tracing::warn!("[vct] warning: kg-sync heartbeat sweep failed: {}", e),
+        _ => {}
+    }
+    match db.mark_stale_running_code_graph_builds_failed(
+        stale_secs,
+        CODE_GRAPH_STALE_ERROR,
+        None,
+    ) {
+        Ok(n) if n > 0 => tracing::error!(
+            "[vct] code-graph heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
+            n, stale_secs
+        ),
+        Err(e) => tracing::warn!("[vct] warning: code-graph heartbeat sweep failed: {}", e),
+        _ => {}
+    }
+    HeartbeatSweepOutcome::Ran
+}
+
 /// Spawn the periodic staleness sweeper (both twin tables, one pass).
 /// Spawned from INSIDE `resume_pending_syncs` — deliberately not lib.rs,
 /// which already calls that function at setup. Soft-fail: DB errors are
@@ -200,28 +252,8 @@ fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
                 HEARTBEAT_SWEEP_INTERVAL_SECS,
             ))
             .await;
-            let stale_secs = heartbeat_stale_secs();
             let db = app.state::<Db>();
-            match db.mark_stale_running_kg_syncs_failed(stale_secs, KG_SYNC_STALE_ERROR, None) {
-                Ok(n) if n > 0 => tracing::error!(
-                    "[vct] kg-sync heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
-                    n, stale_secs
-                ),
-                Err(e) => tracing::warn!("[vct] warning: kg-sync heartbeat sweep failed: {}", e),
-                _ => {}
-            }
-            match db.mark_stale_running_code_graph_builds_failed(
-                stale_secs,
-                CODE_GRAPH_STALE_ERROR,
-                None,
-            ) {
-                Ok(n) if n > 0 => tracing::error!(
-                    "[vct] code-graph heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
-                    n, stale_secs
-                ),
-                Err(e) => tracing::warn!("[vct] warning: code-graph heartbeat sweep failed: {}", e),
-                _ => {}
-            }
+            heartbeat_sweep_once(&db);
         }
     });
 }
@@ -2219,6 +2251,52 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
             42
         );
+    }
+
+    // ─── v0.2.96 WP-8 (register issue 5): sweep stands down in the swap
+    // window, and ONLY there — the 2026-09-20 log storm was
+    // `no such table: kg_syncs` / `code_graph_builds` warnings from this
+    // sweeper retrying every tick while the managed Db was the stand-in.
+
+    #[test]
+    fn heartbeat_sweep_stands_down_during_the_update_swap_window() {
+        vct_launcher_core::test_env::with_state_dir(|_root| {
+            let db = Db::open().expect("open managed launcher.db");
+            db.close_for_update().expect("enter swap window");
+            assert_eq!(
+                heartbeat_sweep_once(&db),
+                HeartbeatSweepOutcome::StoodDown,
+                "no queries (and no warnings) while the stand-in is installed"
+            );
+            db.reopen_after_update().expect("leave swap window");
+            assert_eq!(
+                heartbeat_sweep_once(&db),
+                HeartbeatSweepOutcome::Ran,
+                "the sweep resumes the moment the real file connection is back"
+            );
+        });
+    }
+
+    #[test]
+    fn heartbeat_sweep_runs_and_warns_on_a_genuinely_broken_db() {
+        // The OFF arm: file-backed DB whose twin tables are gone must NOT
+        // be silenced — the sweep attempts its queries (logging the
+        // warnings that surface real breakage) instead of standing down.
+        vct_launcher_core::test_env::with_state_dir(|_root| {
+            let db = Db::open().expect("open managed launcher.db");
+            db.lock()
+                .execute_batch(
+                    "DROP TABLE IF EXISTS kg_syncs;
+                     DROP TABLE IF EXISTS code_graph_builds;",
+                )
+                .expect("drop twin tables");
+            assert_eq!(
+                heartbeat_sweep_once(&db),
+                HeartbeatSweepOutcome::Ran,
+                "a broken file-backed DB is not the swap window; the sweep \
+                 must still fire (and warn)"
+            );
+        });
     }
 
     fn tmpdir(label: &str) -> std::path::PathBuf {

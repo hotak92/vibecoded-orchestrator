@@ -157,7 +157,7 @@ def hard_cut(
     upstream_remote: str = "vco_upstream",
     db_path: Optional[Path] = None,
     env: Optional[Mapping[str, str]] = None,
-    weaviate_url: str = "http://localhost:8081",
+    weaviate_url: str = "",  # "" = resolve from env at CALL time; see body
     runner: Optional[Callable[..., subprocess.CompletedProcess]] = None,
     deferral_writer: Optional[Callable[..., bool]] = None,
     migration_runner: Optional[Callable[..., object]] = None,
@@ -183,7 +183,11 @@ def hard_cut(
         upstream_remote: pinned public remote (caller ran ensure_upstream_remote).
         db_path: launcher.db for the migration runner (defaults under vct_root).
         env: resolved env for subprocesses.
-        weaviate_url: target Weaviate for the migration runner.
+        weaviate_url: target Weaviate for the migration runner. Empty (the
+            default) resolves from the environment at CALL time via
+            ``weaviate_helpers.weaviate_url_default``. It is threaded into
+            ``sub_env`` with ``setdefault``, so an explicit ``WEAVIATE_URL``
+            already present in ``env`` still wins over both.
         runner: subprocess runner (injectable for tests).
         deferral_writer: callable ``(clone_root, bundle_path, from, to,
             restore_cmd) -> bool`` writing the ``hard_cut_performed`` deferral
@@ -198,6 +202,18 @@ def hard_cut(
     run = runner or _default_runner
     write_deferral = deferral_writer or _default_deferral_writer
     res = HardCutResult(from_version=from_version, to_version=to_version)
+    # Resolved at CALL time, never as a bound default-arg value, and BEFORE
+    # the setdefault below — an empty sentinel must never be threaded into a
+    # subprocess as ``WEAVIATE_URL=""``. The former string literal consulted
+    # the environment NOT AT ALL, so a hard cut whose caller omitted the
+    # argument ran ``install.py --update`` AND the migration runner against
+    # ``localhost:8081`` even when ``WEAVIATE_URL`` / ``WEAVIATE_PORT`` named
+    # a different instance. ONE home for the precedence:
+    # ``vco_lib/weaviate_helpers.py::weaviate_url_default``.
+    if not weaviate_url:
+        from .weaviate_helpers import weaviate_url_default
+
+        weaviate_url = weaviate_url_default()
     sub_env = dict(env or {})
     sub_env.setdefault("WEAVIATE_URL", weaviate_url)
     tag = to_version if to_version.startswith("v") else f"v{to_version}"

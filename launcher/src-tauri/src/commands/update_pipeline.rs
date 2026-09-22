@@ -1514,6 +1514,31 @@ pub(crate) async fn run_install_py_update(
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
+    // v0.2.96 WP-8 (register issue 4, GUI half): the stall watchdog. Only
+    // meaningful when there IS a progress surface to inform, and only
+    // spawned when not disabled (`VCO_UPDATE_STALL_WARN_SECS=0`). State and
+    // done-flag live OUTSIDE the futures: read_stdout feeds one, the
+    // watchdog loop reads both, `tokio::join!` shares the `&` borrows.
+    let stall_warn_secs = resolve_stall_warn_secs(
+        std::env::var("VCO_UPDATE_STALL_WARN_SECS").ok().as_deref(),
+    );
+    let watchdog_state = match (stream_to, stall_warn_secs) {
+        (Some(_), 0) => {
+            tracing::debug!(
+                "[vct] {}: stall watchdog disabled via VCO_UPDATE_STALL_WARN_SECS=0",
+                surface
+            );
+            None
+        }
+        (Some(_), secs) => Some(std::sync::Arc::new(std::sync::Mutex::new(
+            StallWatchdogState::new(std::time::Duration::from_secs(secs)),
+        ))),
+        (None, _) => None,
+    };
+    let watchdog_done = watchdog_state
+        .as_ref()
+        .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
     let read_stdout = async {
         let mut buf = Vec::<u8>::new();
         let Some(stdout) = stdout_pipe else { return buf };
@@ -1524,7 +1549,35 @@ pub(crate) async fn run_install_py_update(
                 Ok(Some(line)) => {
                     buf.extend_from_slice(line.as_bytes());
                     buf.push(b'\n');
+                    // ANY stdout line is heartbeat. install.py itself is
+                    // silent while it blocks on the seed child — the
+                    // producer there is the CHILD's own throttled
+                    // `[VCO-EVENT] kg-sync …` ticks (emitted by
+                    // sync_knowledge_graph.py under VCO_PROGRESS_STREAM,
+                    // relayed onto install.py's stdout by
+                    // vco_lib/child_process.py), which is what keeps a
+                    // slow but healthy re-embed from looking stalled.
+                    if let Some(state) = watchdog_state.as_ref() {
+                        state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .note_progress();
+                    }
                     let Some(window) = stream_to else { continue };
+                    // MUST MATCH `vco_lib/progress_event.py` — `EVENT_PREFIX`
+                    // (this literal, trailing space included) and
+                    // `EVENT_FIELD_COUNT` (the `splitn` below). That module is
+                    // the ONE Python home for the grammar; both producers
+                    // (`install.py::_log_install_event`,
+                    // `templates/scripts/sync_knowledge_graph.py::_emit_sync_event`)
+                    // and the relay filter
+                    // (`vco_lib/child_process.py::_EVENT_LINE_RE`) build their
+                    // lines from it. Parity is enforced by
+                    // `tests/test_v0296_lane_python_core.py::VcoEventLineGrammarParity`,
+                    // which reads THIS file and compares — not a marker scan.
+                    // Change either side alone and every progress tick stops
+                    // reaching the modal, which looks identical to a stalled
+                    // update.
                     let Some(rest) = line.strip_prefix("[VCO-EVENT] ") else {
                         continue;
                     };
@@ -1556,6 +1609,12 @@ pub(crate) async fn run_install_py_update(
                 }
             }
         }
+        // stdout is at EOF — the update has finished producing output, so
+        // the watchdog must stand down within one tick rather than fire a
+        // bogus stall notice on a process that already exited.
+        if let Some(done) = watchdog_done.as_ref() {
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         buf
     };
 
@@ -1568,7 +1627,31 @@ pub(crate) async fn run_install_py_update(
         buf
     };
 
-    let (stdout_buf, stderr_buf) = tokio::join!(read_stdout, read_stderr);
+    let run_watchdog = async {
+        if let (Some(state), Some(done), Some(window)) = (
+            watchdog_state.as_ref(),
+            watchdog_done.as_ref(),
+            stream_to,
+        ) {
+            stall_watchdog_loop(
+                std::time::Duration::from_secs(stall_warn_secs),
+                std::time::Duration::from_millis(250),
+                std::sync::Arc::clone(state),
+                std::sync::Arc::clone(done),
+                |msg: String| {
+                    // Same install-progress channel the [VCO-EVENT] parser
+                    // feeds (see `read_stdout` above); the message is short
+                    // by construction to honour the GUI's <200-char detail
+                    // contract (progress.rs unknown-step fallback).
+                    emit_progress(window, "install", &msg, 50.0);
+                    tracing::warn!("[vct] {}: {}", surface, msg);
+                },
+            )
+            .await;
+        }
+    };
+
+    let (stdout_buf, stderr_buf, ()) = tokio::join!(read_stdout, read_stderr, run_watchdog);
 
     // Both pipes are at EOF, so the child has closed them — `wait()` reaps a
     // process that is already finishing rather than one we are still starving.
@@ -1596,6 +1679,119 @@ pub(crate) async fn run_install_py_update(
         success: status.success(),
         stderr,
     })
+}
+
+// ─── v0.2.96 WP-8 (register issue 4, GUI half): the update stall watchdog ──
+//
+// Watches install.py's stdout for progress. install.py emits its own
+// `[VCO-EVENT]` lines only BETWEEN phases — while it blocks on the seed
+// child it prints nothing, and the producer there is the CHILD:
+// sync_knowledge_graph.py emits throttled `[VCO-EVENT] kg-sync …` ticks
+// (gated on VCO_PROGRESS_STREAM, which this pipeline threads through
+// install.py's env into the seed child) and the WP-1 relay
+// (`vco_lib/child_process.py`) forwards them onto install.py's stdout.
+// With that producer in place a healthy update produces stdout lines
+// even mid-seed, so N minutes of total silence means the user is looking
+// at a modal that may never move again (the 2026-09-20 "stuck at
+// Seeding" class, now deadlock-free but still potentially slow).
+//
+// The watchdog only ever SURFACES a state ("update may be stalled") on the
+// same install-progress channel the [VCO-EVENT] parser feeds. It never
+// aborts, kills, or times anything out — the no-global-timeout ruling
+// (v0.2.69 FIX 3) stands; a genuinely slow re-embed must complete.
+
+/// Default silence before the "may be stalled" notice: 10 minutes.
+const DEFAULT_STALL_WARN_SECS: u64 = 600;
+/// Floor: a configured stall window below this is treated as misconfigured
+/// noise (a sub-minute stall notice would fire during normal pip resolves).
+const MIN_STALL_WARN_SECS: u64 = 30;
+
+/// Pure env resolution: `VCO_UPDATE_STALL_WARN_SECS` — default 600, `0`
+/// disables the watchdog entirely, garbage falls back to the default
+/// (never disables on a typo), anything below the floor is clamped up.
+pub(crate) fn resolve_stall_warn_secs(env_val: Option<&str>) -> u64 {
+    let Some(raw) = env_val else { return DEFAULT_STALL_WARN_SECS };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => 0,
+        Ok(n) => n.max(MIN_STALL_WARN_SECS),
+        Err(_) => DEFAULT_STALL_WARN_SECS,
+    }
+}
+
+/// The stall decision state, pure and unit-tested.
+#[derive(Debug)]
+struct StallWatchdogState {
+    stall: std::time::Duration,
+    last_progress: std::time::Instant,
+    last_notice: Option<std::time::Instant>,
+}
+
+impl StallWatchdogState {
+    fn new(stall: std::time::Duration) -> Self {
+        Self {
+            stall,
+            last_progress: std::time::Instant::now(),
+            last_notice: None,
+        }
+    }
+
+    /// Any stdout line counts as progress — the heartbeat contract.
+    fn note_progress(&mut self) {
+        self.last_progress = std::time::Instant::now();
+    }
+
+    /// Should a stall notice fire at `now`? At most one notice per stall
+    /// window of CONTINUED silence (the state stays surfaced; it is not a
+    /// toast storm).
+    fn notice_due(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.last_progress) < self.stall {
+            return false;
+        }
+        match self.last_notice {
+            Some(t) if now.duration_since(t) < self.stall => false,
+            _ => {
+                self.last_notice = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// The watchdog loop, parameterised on the emit closure so tests can
+/// observe notices without a tauri `Window` (none is constructible in
+/// tests). Exits within one `tick` of `done` being set — it never cancels
+/// or interferes with the reader it watches.
+async fn stall_watchdog_loop<F>(
+    stall: std::time::Duration,
+    tick: std::time::Duration,
+    shared: std::sync::Arc<std::sync::Mutex<StallWatchdogState>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut emit: F,
+) where
+    F: FnMut(String),
+{
+    loop {
+        tokio::time::sleep(tick).await;
+        if done.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let notice = {
+            let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+            state.notice_due(std::time::Instant::now())
+        };
+        if notice {
+            let mins = stall.as_secs() / 60;
+            let label = if mins > 0 {
+                format!("{} min", mins)
+            } else {
+                format!("{} s", stall.as_secs())
+            };
+            emit(format!(
+                "update may be stalled — no progress for {label} (still running; \
+                 nothing was cancelled; you can keep waiting or abort from the UI)"
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,6 +2464,209 @@ mod tests {
                 && detail.get("binary_stale").and_then(|b| b.as_bool()) == Some(true)),
             "and the staleness reaches the audit row the caller writes; rows: {:?}",
             outcome.db_audit
+        );
+    }
+
+    // ─── v0.2.96 WP-8 (register issue 4): the stall watchdog ──────────────
+    //
+    // The GUI surface itself (`emit_progress` into a tauri `Window`) is not
+    // constructible in unit tests, so the loop is tested through an injected
+    // emit collector; the production closure is 4 lines over the SAME
+    // `emit_progress(window, "install", …, 50.0)` channel the [VCO-EVENT]
+    // parser uses.
+
+    #[test]
+    fn stall_window_env_resolution_default_zero_garbage_and_floor() {
+        assert_eq!(resolve_stall_warn_secs(None), 600, "documented default");
+        assert_eq!(resolve_stall_warn_secs(Some("0")), 0, "0 disables");
+        assert_eq!(
+            resolve_stall_warn_secs(Some("garbage")),
+            600,
+            "a typo must fall back to the default, never disable the watchdog"
+        );
+        assert_eq!(
+            resolve_stall_warn_secs(Some("  120  ")),
+            120,
+            "surrounding whitespace is tolerated"
+        );
+        assert_eq!(
+            resolve_stall_warn_secs(Some("5")),
+            30,
+            "below the floor is clamped up, not taken literally"
+        );
+        assert_eq!(
+            resolve_stall_warn_secs(Some("-1")),
+            600,
+            "negative is garbage, not a disable"
+        );
+    }
+
+    #[test]
+    fn stall_state_notices_once_per_window_and_resets_on_progress() {
+        let stall = std::time::Duration::from_millis(100);
+        let mut st = StallWatchdogState::new(stall);
+        let t0 = std::time::Instant::now();
+        assert!(!st.notice_due(t0), "fresh state is not stalled");
+        assert!(
+            !st.notice_due(t0 + std::time::Duration::from_millis(99)),
+            "one tick before the window"
+        );
+        assert!(
+            st.notice_due(t0 + std::time::Duration::from_millis(101)),
+            "silence past the window fires"
+        );
+        assert!(
+            !st.notice_due(t0 + std::time::Duration::from_millis(150)),
+            "no second notice inside the SAME stall window"
+        );
+        assert!(
+            st.notice_due(t0 + std::time::Duration::from_millis(210)),
+            "continued silence re-notifies after a further window"
+        );
+        // Progress resets the silence clock…
+        st.note_progress();
+        assert!(
+            !st.notice_due(t0 + std::time::Duration::from_millis(215)),
+            "just after a heartbeat"
+        );
+        assert!(
+            st.notice_due(t0 + std::time::Duration::from_millis(330)),
+            "and the window restarts from the heartbeat, not from the notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_loop_fires_on_silence_and_is_paced() {
+        let stall = std::time::Duration::from_millis(80);
+        let tick = std::time::Duration::from_millis(10);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(StallWatchdogState::new(stall)));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let watcher = {
+            let state = std::sync::Arc::clone(&state);
+            let done = std::sync::Arc::clone(&done);
+            let sink = std::sync::Arc::clone(&notices);
+            tokio::spawn(async move {
+                stall_watchdog_loop(stall, tick, state, done, move |msg| {
+                    sink.lock().unwrap_or_else(|p| p.into_inner()).push(msg);
+                })
+                .await;
+            })
+        };
+
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("the watchdog must exit within one tick of done")
+            .expect("watchdog join failed");
+
+        let elapsed = started.elapsed();
+        let got = notices.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            !got.is_empty(),
+            "total silence must surface at least one notice"
+        );
+        let max_notices =
+            (elapsed.as_millis() as f64 / stall.as_millis() as f64).floor() + 1.0;
+        assert!(
+            got.len() as f64 <= max_notices,
+            "at most one notice per stall window of continued silence: {} notices \
+             in {:?} (bound {})",
+            got.len(),
+            elapsed,
+            max_notices
+        );
+        assert!(
+            got[0].contains("update may be stalled"),
+            "message names the state: {}",
+            got[0]
+        );
+        assert!(
+            got[0].contains("nothing was cancelled"),
+            "message must not read as an abort: {}",
+            got[0]
+        );
+        assert!(
+            got[0].len() < 200,
+            "message must honour the GUI detail-length contract (progress.rs): {}",
+            got[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_is_silent_while_progress_keeps_flowing() {
+        let stall = std::time::Duration::from_millis(80);
+        let tick = std::time::Duration::from_millis(10);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(StallWatchdogState::new(stall)));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        // A heartbeat every 30 ms — always inside the 80 ms stall window.
+        let feeder = {
+            let state = std::sync::Arc::clone(&state);
+            let done = std::sync::Arc::clone(&done);
+            tokio::spawn(async move {
+                for _ in 0..8 {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .note_progress();
+                }
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let watcher = {
+            let sink = std::sync::Arc::clone(&notices);
+            let state = std::sync::Arc::clone(&state);
+            let done = std::sync::Arc::clone(&done);
+            tokio::spawn(async move {
+                stall_watchdog_loop(stall, tick, state, done, move |msg| {
+                    sink.lock().unwrap_or_else(|p| p.into_inner()).push(msg);
+                })
+                .await;
+            })
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), feeder).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("watchdog must exit once the feeder sets done")
+            .expect("watchdog join failed");
+
+        let got = notices.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            got.is_empty(),
+            "a stdout heartbeat well inside the stall window must never fire a \
+             stall notice; got {:?}",
+            got
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_watchdog_exits_promptly_once_done() {
+        let stall = std::time::Duration::from_secs(600);
+        let tick = std::time::Duration::from_millis(10);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(StallWatchdogState::new(stall)));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let notices = std::sync::Arc::clone(&sink);
+
+        // `done` pre-set: the very first post-tick check must return — the
+        // loop may never outlive the reader it watches by more than a tick.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stall_watchdog_loop(stall, tick, state, done, move |msg| {
+                notices.lock().unwrap_or_else(|p| p.into_inner()).push(msg);
+            }),
+        )
+        .await
+        .expect("pre-set done must terminate the loop within one tick");
+        assert!(
+            sink.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+            "a done watchdog must not fire on its way out"
         );
     }
 }

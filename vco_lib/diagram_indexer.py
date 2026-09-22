@@ -50,6 +50,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 from vco_lib.atomic import atomic_write_json
+from vco_lib.weaviate_helpers import weaviate_url_default
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -571,11 +572,15 @@ def _weaviate_delete_by_file_path(
     """Delete Weaviate objects in the diagrams collection matching file_path.
 
     Returns True if at least one object was deleted, False if skipped
-    (no URL / no collection / client unavailable) or no match found.
+    (no collection / client unavailable) or no match found.
     Raises on Weaviate errors so the caller logs + the audit report
     can flag the failure.
     """
-    url = weaviate_url or os.environ.get("WEAVIATE_URL")
+    # v0.2.96 (6e): resolve through the ONE home (WEAVIATE_URL >
+    # WEAVIATE_PORT > 8081). The old `or os.environ.get("WEAVIATE_URL")`
+    # yielded None when neither was set — a silent "skipped" that read as
+    # success — and ignored WEAVIATE_PORT entirely.
+    url = weaviate_url or weaviate_url_default()
     if not url or not collection_name:
         logger.debug(
             "Weaviate delete skipped (url=%s, collection=%s)",
@@ -865,13 +870,13 @@ def _weaviate_upsert(
 ) -> bool:
     """Upsert the row into `<Project>_Diagrams` Weaviate collection.
 
-    Returns True if the upsert actually wrote, False if skipped (no URL,
-    no collection name, weaviate-client not installed). Raises on
+    Returns True if the upsert actually wrote, False if skipped (no
+    collection name, weaviate-client not installed). Raises on
     Weaviate errors so the caller enqueues a retry.
 
     Raises on any Weaviate error so the caller can decide whether to
-    enqueue a retry. Skipped silently when:
-      - `weaviate_url` is None and no `WEAVIATE_URL` env is set, OR
+    enqueue a retry. The URL always resolves (explicit argument or the
+    ONE home — v0.2.96 6e); skipped silently only when:
       - `collection_name` is None (no per-project diagrams collection
         configured — common during early-stage installs).
 
@@ -887,7 +892,11 @@ def _weaviate_upsert(
     sources are small) so the indexer can run from the hook without
     pulling in the full MCP machinery.
     """
-    url = weaviate_url or os.environ.get("WEAVIATE_URL")
+    # v0.2.96 (6e): resolve through the ONE home (WEAVIATE_URL >
+    # WEAVIATE_PORT > 8081). The old `or os.environ.get("WEAVIATE_URL")`
+    # yielded None when neither was set — a silent "skipped" that read as
+    # success — and ignored WEAVIATE_PORT entirely.
+    url = weaviate_url or weaviate_url_default()
     if not url or not collection_name:
         logger.debug(
             "Weaviate upsert skipped (url=%s, collection=%s)",
@@ -1023,8 +1032,10 @@ def index_diagram(
             `vco rebuild-diagram-index`).
         db_path: Path to the launcher's SQLite DB. Defaults to
             `${VCT_STATE_DIR:-$HOME/.vct}/launcher.db`.
-        weaviate_url: Override for WEAVIATE_URL env var. None falls back
-            to env, then skips Weaviate write if neither is set.
+        weaviate_url: Explicit Weaviate base URL. None falls back to the
+            ONE home (WEAVIATE_URL > WEAVIATE_PORT > 8081), so the URL
+            always resolves; the write is skipped only when the collection
+            is unset or the client is unavailable.
         diagrams_collection: Per-project Weaviate collection name (e.g.
             `MyProj_Diagrams`). Required for Weaviate upsert; if None,
             Weaviate write is skipped (DB + sidecar still happen).

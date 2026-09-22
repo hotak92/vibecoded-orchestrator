@@ -301,6 +301,35 @@ impl Db {
         Ok(())
     }
 
+    /// v0.2.96 WP-8 (register issue 5): is the managed connection currently
+    /// the schema-less in-memory stand-in installed by [`close_for_update`]?
+    ///
+    /// Pollers that open their OWN connections are already gated by
+    /// `update_gate::skip_if_update_in_progress`; the ones that share THIS
+    /// managed `Db` (the settings-watcher's project re-poll, the heartbeat
+    /// sweeper) used to keep firing into the stand-in for the whole
+    /// binary-refresh window, logging `no such table: projects` /
+    /// `kg_syncs` / `code_graph_builds` warnings every 30 s. They now stand
+    /// down on this probe instead — and ONLY on it: a genuinely broken
+    /// file-backed DB (tables dropped, file corrupted) still reports
+    /// `false`, so the poller warnings that surface real breakage keep
+    /// firing.
+    ///
+    /// Detection: `PRAGMA database_list` reports each attached database's
+    /// backing file; the in-memory stand-in — and only it — has an empty
+    /// one for `main`. A probe failure also reports `false` (fail toward
+    /// the loud side).
+    pub fn is_update_standby(&self) -> bool {
+        let guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .query_row("PRAGMA database_list", [], |row| {
+                let name: String = row.get(1)?;
+                let file: String = row.get(2)?;
+                Ok(name == "main" && file.is_empty())
+            })
+            .unwrap_or(false)
+    }
+
     /// Open an in-memory DB for tests. Runs all migrations + ensures the
     /// change_log table is present, mirroring the production `open()`
     /// path. Each call returns a fresh isolated DB.
@@ -413,6 +442,65 @@ mod close_reopen_tests {
                 })
                 .expect("row survives close/reopen cycles");
             assert_eq!(v, "1");
+        });
+    }
+
+    // ─── v0.2.96 WP-8 (register issue 5): the standby probe ──────────
+    //
+    // The managed-Db pollers (settings watcher, heartbeat sweeper) stand
+    // down on `is_update_standby`; these pin BOTH arms — the on-arm inside
+    // the swap window and the off-arm for a genuinely broken file DB,
+    // because silencing the latter would hide real breakage.
+
+    #[test]
+    fn standby_probe_is_false_for_a_healthy_file_backed_db() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            assert!(
+                !db.is_update_standby(),
+                "a healthy file-backed managed Db must not read as standby"
+            );
+        });
+    }
+
+    #[test]
+    fn standby_probe_is_true_inside_the_swap_window_and_false_after_reopen() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            assert!(!db.is_update_standby());
+            db.close_for_update().expect("close_for_update");
+            assert!(
+                db.is_update_standby(),
+                "the in-memory stand-in must be detected (this is the swap window)"
+            );
+            db.reopen_after_update().expect("reopen_after_update");
+            assert!(
+                !db.is_update_standby(),
+                "the restored file connection must read as real again"
+            );
+        });
+    }
+
+    #[test]
+    fn standby_probe_stays_false_for_a_genuinely_broken_file_backed_db() {
+        // The OFF arm. A file-backed DB with its tables dropped is exactly
+        // what the poller warnings exist to surface; the probe must not
+        // mistake "broken" for "standby".
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            db.close_for_update().expect("close for a clean file");
+            db.reopen_after_update().expect("reopen");
+            db.lock()
+                .execute_batch(
+                    "DROP TABLE IF EXISTS projects;
+                     DROP TABLE IF EXISTS kg_syncs;
+                     DROP TABLE IF EXISTS code_graph_builds;",
+                )
+                .expect("drop tables");
+            assert!(
+                !db.is_update_standby(),
+                "a broken file-backed DB must NOT be silenced as standby"
+            );
         });
     }
 

@@ -290,25 +290,25 @@ def _on_disk_launcher_version(install_root: Path, dist_rel_dir: str, binary_name
 
 
 def _version_parts(v: str) -> list[int]:
-    out: list[int] = []
-    for part in v.split("."):
-        digits = ""
-        for ch in part:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        out.append(int(digits) if digits else 0)
-    return out
+    """Thin delegate to the ONE home — see :mod:`vco_lib.version_compare`.
+
+    Kept as a module-local name because this module's tests patch it.
+    """
+    from vco_lib.version_compare import version_parts
+
+    return version_parts(v)
 
 
 def _version_ge(a: str, b: str) -> bool:
-    """``a >= b`` on the leading numeric components (mirrors install.py's ``_ge``)."""
-    pa, pb = _version_parts(a), _version_parts(b)
-    n = max(len(pa), len(pb))
-    pa += [0] * (n - len(pa))
-    pb += [0] * (n - len(pb))
-    return pa >= pb
+    """``a >= b`` on the leading numeric components.
+
+    Was a hand-written copy of install.py's ``_ge`` — its own docstring said
+    "mirrors install.py's ``_ge``", which is a request for extraction rather
+    than a design. Both now delegate to :mod:`vco_lib.version_compare`.
+    """
+    from vco_lib.version_compare import version_ge
+
+    return version_ge(a, b)
 
 
 def _staged_new_siblings(install_root: Path, dist_rel_dir: str) -> list[str]:
@@ -661,9 +661,15 @@ def code_embed_image_still_stale(ctx: ProbeContext) -> Optional[bool]:
                 (or reports none at all, which identifies a pre-v0.2.92 image).
         False — the digests match: the image has been rebuilt and the entry
                 describes a condition that is over.
-        None  — could not look (service down, no service source in this tree,
-                the service could not hash itself). Positive evidence only:
-                a silent service is never read as "fixed".
+        None  — could not look (service down, the service could not hash
+                itself). Positive evidence only: a silent service is never
+                read as "fixed".
+
+    A tree with no code-embed service source of its own is NOT a ``None``
+    case, though it was until 2026-09-22: there is one service per machine,
+    so the verdict resolves the INSTALL ROOT and answers from there. A
+    per-project probe that returned ``None`` for every project left the
+    entry standing on exactly the machines it was meant to clear.
     """
     from vco_lib import code_embed_image
 

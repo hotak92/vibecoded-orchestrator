@@ -860,7 +860,7 @@ echo ""
 LIVE_GATE_TEST="tests/test_v0246_v46b_live_ci10_diff_gate.py"
 if [ -f "$LIVE_GATE_TEST" ]; then
     echo "--- Live re-embed regression protection (V46-C) ---"
-    _WEAVIATE_PROBE_URL="${WEAVIATE_URL:-http://localhost:8081}"
+    _WEAVIATE_PROBE_URL="${WEAVIATE_URL:-http://localhost:${WEAVIATE_PORT:-8081}}"
     if ! curl -sf "${_WEAVIATE_PROBE_URL}/v1/.well-known/ready" >/dev/null 2>&1; then
         gate_warn "Live re-embed regression protection (V46-C)" \
             "SKIP — Weaviate not reachable at ${_WEAVIATE_PROBE_URL}; only enforced when Weaviate is up. This gate MUST pass on the release machine before tagging."

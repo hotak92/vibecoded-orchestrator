@@ -331,6 +331,44 @@ if not _ALLOW_REAL_STATE:
     os.environ["WEAVIATE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
 
+
+# ─── W-CODE-EMBED (v0.2.96): no test reaches the LIVE code-embed service ─────
+#
+# Same containment as W-WEAVIATE above, for the OTHER backend a shipped
+# resolver defaults to localhost on: `vco_lib.code_embed_image.service_base_url`
+# resolves `CODE_EMBED_SERVICE_URL` → `http://localhost:<CODE_EMBED_PORT|11440>`,
+# and `probe_health` / `code_embed_service_healthy` open it for real.
+#
+# It became load-bearing with the v0.2.96 ship-gate MAJOR-2 fix. Before it, a
+# sourceless (per-project) tree short-circuited `code_embed_image_verdict` to
+# `unknown` with no HTTP, and that accident was the only thing keeping the
+# resync gates hermetic — the docstring of `test_v0296_code_embed_image_gate.py`
+# says it outright: "no test contacts any real service — doubly important on
+# THIS machine, whose real code-embed service IS the stale one". Now that a
+# project tree is correctly judged against the INSTALL root (the machine has
+# ONE service), every unpinned gate call would ask the developer's own service
+# and branch on its answer: measured on the maintainer's box, 17 tests across
+# 6 files flipped to "walk refused" purely because a real pre-v0.2.92 image was
+# listening on :11440. A suite whose verdict depends on what happens to be
+# running is not a suite.
+#
+# `http://127.0.0.1:9` (IANA discard) makes `probe_health` fail FAST, so
+# `served_state` returns `unknown` deterministically — today's behaviour, on
+# every machine, with or without a service. A test that needs another value
+# sets it itself (`monkeypatch.setenv`/`delenv` restores afterwards), which is
+# what `test_v0292_resolver_and_shared_url.py`'s `moved_port` fixture already
+# does. No opt-out list: nothing in the suite is supposed to embed through a
+# real code-embed service, and `VCO_TEST_ALLOW_REAL_STATE=1` remains the one
+# hatch for "run against my real install".
+#
+# Set at IMPORT time (module-scope readers resolve it during COLLECTION —
+# `weaviate_mcp/embeddings.py` and `templates/scripts/query_code_graph.py` both
+# read it into a module constant) and RE-ESTABLISHED per test below.
+_AMBIENT_CODE_EMBED_URL = os.environ.get("CODE_EMBED_SERVICE_URL")
+
+if not _ALLOW_REAL_STATE:
+    os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+
 # ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
 #
 # `weaviate_mcp.server._resolution_context()` answers "whose project is this?"
@@ -1420,6 +1458,29 @@ def _pin_claude_project_dir(request):
             os.environ.pop("CLAUDE_PROJECT_DIR", None)
         else:
             os.environ["CLAUDE_PROJECT_DIR"] = prev
+
+
+@pytest.fixture(autouse=True)
+def _pin_code_embed_url():
+    """W-CODE-EMBED: re-establish the code-embed pin for EVERY test.
+
+    Per-test re-establishment for the same reason the Weaviate pin has it: a
+    test that sets `CODE_EMBED_SERVICE_URL` itself and restores by
+    `os.environ.update(backup)` cannot REMOVE a key the backup lacked, so one
+    such test would un-pin everything after it.
+    """
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    prev = os.environ.get("CODE_EMBED_SERVICE_URL")
+    os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("CODE_EMBED_SERVICE_URL", None)
+        else:
+            os.environ["CODE_EMBED_SERVICE_URL"] = prev
 
 
 @pytest.fixture(autouse=True)

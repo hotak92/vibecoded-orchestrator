@@ -150,7 +150,7 @@ def reconcile_codegraph_registry(
     deferral_report: object = None,
     *,
     db_path: Path,
-    weaviate_url: str = "http://localhost:8081",
+    weaviate_url: str = "",  # "" = resolve from env at CALL time; see body
     migrations_dir: Path,
     project_root: Optional[Path] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -169,6 +169,8 @@ def reconcile_codegraph_registry(
             deferral write (tests).
         db_path: launcher.db (the registry + bindings SSOT live here).
         weaviate_url: target Weaviate for the existence probe + edge scripts.
+            Empty (the default) resolves from the environment at CALL time
+            via ``weaviate_helpers.weaviate_url_default`` — see the body.
         migrations_dir: ``<root>/migrations`` — the edge ladder lives under
             ``migrations/codegraph_collection/``.
         project_root: cwd for edge subprocesses (defaults to migrations_dir's
@@ -188,6 +190,17 @@ def reconcile_codegraph_registry(
     from . import artifact_version_registry as avr
     from . import schema_migration_runner as smr
     from . import schema_versions as sv
+
+    # Resolved at CALL time, never as a bound default-arg value. The former
+    # string literal consulted the environment NOT AT ALL, so a caller that
+    # omitted the argument probed — and ran EDGE SCRIPTS against —
+    # ``localhost:8081`` even when ``WEAVIATE_URL`` / ``WEAVIATE_PORT`` named
+    # a different instance. ONE home for the precedence:
+    # ``vco_lib/weaviate_helpers.py::weaviate_url_default``.
+    if not weaviate_url:
+        from .weaviate_helpers import weaviate_url_default
+
+        weaviate_url = weaviate_url_default()
 
     outcome = ReconcileOutcome()
 

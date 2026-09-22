@@ -96,6 +96,43 @@ class ResolutionChainTests(unittest.TestCase):
         self.assertIn("Secrets panel", message)
         self.assertIn("vct set", message)
 
+    def test_the_qwen_row_resolves_from_its_first_key_without_trying_more(self) -> None:
+        """The row's key names must be the ones the resolver actually asks
+        for, in order, or the vendor ships unreachable. Driven against the
+        REAL shipped row, not a fixture."""
+        row = VENDORS["qwen"]
+        self.assertEqual(row.secret_keys, ("qwen_api_key", "QWEN_API_KEY"))
+
+        seen: list[str] = []
+
+        def getter(key, project=None):
+            seen.append(key)
+            return FAKE_KEY
+
+        result = VendorKeyResolver(getter=getter).resolve(row)
+        self.assertEqual(result.state, "resolved")
+        self.assertEqual(result.resolved_from, "qwen_api_key")
+        self.assertEqual(seen, ["qwen_api_key"], "first hit short-circuits")
+
+    def test_the_qwen_row_falls_through_to_the_uppercase_spelling(self) -> None:
+        """The field shape this second name exists for: the launcher
+        keychain holds QWEN_API_KEY (the vendor docs' own env spelling)
+        and nothing under the canonical lowercase name."""
+
+        def getter(key, project=None):
+            return FAKE_KEY if key == "QWEN_API_KEY" else None
+
+        result = VendorKeyResolver(getter=getter).resolve(VENDORS["qwen"])
+        self.assertEqual(result.state, "resolved")
+        self.assertEqual(result.resolved_from, "QWEN_API_KEY")
+
+    def test_the_second_shipped_rows_miss_names_its_keys(self) -> None:
+        """The miss message must name the keys the user has to create."""
+        result = VendorKeyResolver(getter=_absent).resolve(VENDORS["qwen"])
+        self.assertEqual(result.state, "missing")
+        self.assertIn("qwen_api_key", result.problem or "")
+        self.assertIn("QWEN_API_KEY", result.problem or "")
+
     def test_project_scope_is_passed_through(self) -> None:
         seen: list[object] = []
 
@@ -186,6 +223,278 @@ class CacheTests(unittest.TestCase):
 
         resolver = VendorKeyResolver(getter=exploding)
         self.assertEqual(resolver.cached_vendor_ids(), ())
+
+
+class ServeStaleTests(unittest.TestCase):
+    """Issue 12: a failed re-resolution must not erase a good key.
+
+    The 2026-09-20 update stopped vct-hub by design; the hub's per-project
+    route is the only way to an OS-keychain key; nine 503
+    ``vendor_key_unavailable`` answers followed during the ~80-minute
+    hub-stop window for a key that was fine the whole time. The ordinary
+    cache slot holds the last ATTEMPT, so the first failed re-resolution
+    overwrote the good key — the fix is a second, success-only store with a
+    bounded serve window.
+    """
+
+    def _flaky(self):
+        """A getter that answers once, then fails every time after."""
+        state = {"ok": True}
+
+        def getter(key, project=None):
+            if state["ok"]:
+                return FAKE_KEY
+            raise LookupError("hub stopped")
+
+        return getter, state
+
+    def test_a_failed_resolution_serves_the_last_known_good_key(self) -> None:
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+
+        good = resolver.resolve(ACME)
+        self.assertEqual(good.state, "resolved")
+
+        state["ok"] = False
+        clock.now += 301  # past the key TTL: a fresh resolution happens and fails
+        stale = resolver.resolve(ACME)
+        self.assertEqual(stale.key, FAKE_KEY, "the good key was lost to a failure")
+        self.assertEqual(stale.state, "stale")
+        self.assertEqual(stale.resolved_from, "acme_primary_key")
+        self.assertEqual(resolver.serving_stale_ids(), ("acme",))
+
+    def test_a_cached_failure_serves_stale_without_re_resolving(self) -> None:
+        """The negative cache must stop resolver storms, not serve 503s: a
+        request landing inside the 30 s miss window still gets the good key."""
+        getter, state = self._flaky()
+        clock = _Clock()
+        calls: list[str] = []
+
+        def counting(key, project=None):
+            calls.append(key)
+            return getter(key, project)
+
+        resolver = VendorKeyResolver(getter=counting, ttl_s=300, clock=clock)
+        resolver.resolve(ACME)  # success: one getter call (first name wins)
+        state["ok"] = False
+        clock.now += 301  # past the key TTL: a fresh resolution runs and fails
+        self.assertEqual(resolver.resolve(ACME).state, "stale")
+        clock.now += NEGATIVE_TTL_CAP_S - 1  # still inside the negative TTL
+        self.assertEqual(resolver.resolve(ACME).state, "stale")
+        # 1 success call + 2 calls for the one failed attempt (both declared
+        # names tried, both miss): the third request resolved NOTHING.
+        self.assertEqual(len(calls), 3)
+
+    def test_the_serve_is_bounded_and_configurable(self) -> None:
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(
+            getter=getter, ttl_s=300, clock=clock, serve_stale_max_age_s=400,
+        )
+        resolver.resolve(ACME)
+        state["ok"] = False
+        clock.now += 301
+        self.assertEqual(resolver.resolve(ACME).state, "stale")
+        clock.now += 100  # the last-known-good key is now 401 s old: past 400
+        result = resolver.resolve(ACME)
+        self.assertIsNone(result.key, "a key past the bound was still served")
+        self.assertEqual(result.state, "missing")
+        self.assertEqual(resolver.serving_stale_ids(), ())
+
+    def test_invalidate_forbids_serving_stale(self) -> None:
+        """An explicit invalidation (rotation, revocation) must win."""
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+        resolver.resolve(ACME)
+        resolver.invalidate(ACME.vendor_id)
+        state["ok"] = False
+        result = resolver.resolve(ACME)
+        self.assertIsNone(result.key)
+        self.assertEqual(result.state, "missing")
+
+    def test_entering_stale_service_warns_once_not_per_request(self) -> None:
+        """A per-request WARN would rebuild the 503 storm as a WARN storm."""
+        import model_router.secrets as mod
+
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+        resolver.resolve(ACME)
+        state["ok"] = False
+        with self.assertLogs(mod.logger, level=logging.WARNING) as captured:
+            for _ in range(4):
+                clock.now += 301  # each past the TTL: a fresh failed attempt
+                resolver.resolve(ACME)
+        stale_warnings = [
+            line for line in captured.output if "last-known-good" in line
+        ]
+        self.assertEqual(len(stale_warnings), 1, captured.output)
+
+    def test_passing_the_bound_warns_once_and_answers_failures_again(self) -> None:
+        import model_router.secrets as mod
+
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(
+            getter=getter, ttl_s=300, clock=clock, serve_stale_max_age_s=400,
+        )
+        resolver.resolve(ACME)
+        state["ok"] = False
+        clock.now += 301
+        with self.assertLogs(mod.logger, level=logging.WARNING):
+            resolver.resolve(ACME)  # enters stale service (age 301 <= 400)
+        with self.assertLogs(mod.logger, level=logging.WARNING) as captured:
+            clock.now += 100  # past the bound
+            resolver.resolve(ACME)
+            clock.now += NEGATIVE_TTL_CAP_S + 1  # repeat past the bound
+            resolver.resolve(ACME)
+        exit_warnings = [
+            line for line in captured.output if "past the serve-stale bound" in line
+        ]
+        self.assertEqual(len(exit_warnings), 1, captured.output)
+
+    def test_recovery_is_stated_once_and_ends_the_state(self) -> None:
+        import model_router.secrets as mod
+
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+        resolver.resolve(ACME)
+        state["ok"] = False
+        clock.now += 301
+        resolver.resolve(ACME)
+        self.assertEqual(resolver.serving_stale_ids(), ("acme",))
+
+        state["ok"] = True  # the hub came back
+        clock.now += NEGATIVE_TTL_CAP_S + 1
+        with self.assertLogs(mod.logger, level=logging.INFO) as captured:
+            result = resolver.resolve(ACME)
+        self.assertEqual(result.state, "resolved")
+        self.assertEqual(resolver.serving_stale_ids(), ())
+        self.assertTrue(
+            any("resolves again" in line for line in captured.output),
+            captured.output,
+        )
+
+    def test_a_stale_vendor_is_not_listed_as_cached(self) -> None:
+        """``/health`` keeps the two claims apart: a stale-served vendor's
+        cache slot holds a FAILURE, so "cached" would overstate it."""
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+        resolver.resolve(ACME)
+        state["ok"] = False
+        clock.now += 301
+        resolver.resolve(ACME)
+        self.assertNotIn("acme", resolver.cached_vendor_ids())
+        self.assertIn("acme", resolver.serving_stale_ids())
+
+    def test_recovery_past_the_bound_is_stated_too(self) -> None:
+        """The third state, which used to end in silence.
+
+        Leaving stale service THROUGH the bound is not recovery — the
+        resolver is answering failures again — so the vendor is dropped from
+        ``_serving_stale`` at that moment. The recovery line keyed on that
+        set, so the operator who read "answering failures again" was never
+        told it stopped. Both exits must speak.
+        """
+        import model_router.secrets as mod
+
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(
+            getter=getter, ttl_s=300, clock=clock, serve_stale_max_age_s=600,
+        )
+        resolver.resolve(ACME)
+        state["ok"] = False
+        clock.now += 301
+        resolver.resolve(ACME)
+        self.assertEqual(resolver.serving_stale_ids(), ("acme",))
+
+        # Past the bound: stale service ends, failures resume.
+        with self.assertLogs(mod.logger, level=logging.WARNING) as captured:
+            clock.now += 601
+            self.assertIsNone(resolver.resolve(ACME).key)
+        self.assertIn("answering failures again", "\n".join(captured.output))
+        self.assertEqual(resolver.serving_stale_ids(), ())
+
+        # Recovery must still be stated.
+        state["ok"] = True
+        with self.assertLogs(mod.logger, level=logging.INFO) as captured:
+            clock.now += 301
+            self.assertEqual(resolver.resolve(ACME).key, FAKE_KEY)
+        self.assertIn("resolves again", "\n".join(captured.output))
+
+    def test_the_no_key_warning_is_edge_triggered_not_per_attempt(self) -> None:
+        """Issue 12 in its other shape: a vendor with NO last-known-good key
+        logged one WARN per attempt, so an 80-minute hub stop wrote ~160
+        identical lines — the 503 storm rebuilt as a WARN storm."""
+        import model_router.secrets as mod
+
+        calls = {"n": 0}
+
+        def getter(key, project=None):
+            calls["n"] += 1
+            return None
+
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=1, clock=clock)
+        with self.assertLogs(mod.logger, level=logging.WARNING) as captured:
+            for _ in range(10):
+                clock.now += 60
+                self.assertIsNone(resolver.resolve(ACME).key)
+        no_key_lines = [
+            line for line in captured.output if "no key for vendor" in line
+        ]
+        self.assertEqual(
+            len(no_key_lines), 1,
+            f"one line per vendor, not per attempt: {no_key_lines}",
+        )
+        self.assertGreater(calls["n"], 1, "precondition: it really retried")
+
+    def test_the_no_key_warning_speaks_again_after_a_recovery(self) -> None:
+        """The leave-alone half: edge-triggering must not mean say-once-ever.
+        A vendor that recovers and fails again is a NEW event."""
+        import model_router.secrets as mod
+
+        state = {"ok": False}
+
+        def getter(key, project=None):
+            return FAKE_KEY if state["ok"] else None
+
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=1, clock=clock)
+        with self.assertLogs(mod.logger, level=logging.WARNING):
+            resolver.resolve(ACME)
+        state["ok"] = True
+        clock.now += 2
+        self.assertEqual(resolver.resolve(ACME).key, FAKE_KEY)
+        state["ok"] = False
+        clock.now += 2
+        resolver.invalidate("acme")
+        with self.assertLogs(mod.logger, level=logging.WARNING) as captured:
+            self.assertIsNone(resolver.resolve(ACME).key)
+        self.assertTrue(
+            any("no key for vendor" in line for line in captured.output),
+            "a fresh failure after recovery must be stated",
+        )
+
+    def test_the_stale_key_value_never_reaches_a_log_record(self) -> None:
+        import model_router.secrets as mod
+
+        getter, state = self._flaky()
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+        resolver.resolve(ACME)
+        state["ok"] = False
+        with self.assertLogs(mod.logger, level=logging.WARNING) as captured:
+            clock.now += 301
+            result = resolver.resolve(ACME)
+        self.assertEqual(result.key, FAKE_KEY)
+        self.assertNotIn(FAKE_KEY, "\n".join(captured.output))
+        self.assertNotIn(FAKE_KEY, repr(result))
 
 
 class NoValueLeakTests(unittest.TestCase):

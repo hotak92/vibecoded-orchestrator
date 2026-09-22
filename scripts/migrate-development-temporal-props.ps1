@@ -9,7 +9,8 @@
 # Soft-fail per collection: errors are logged; exit code is always 0.
 #
 # Env vars:
-#   $env:WEAVIATE_URL  — defaults to http://localhost:8081
+#   $env:WEAVIATE_URL  — defaults to http://localhost:$env:WEAVIATE_PORT (or
+#                        8081 when neither is set); WEAVIATE_URL wins outright
 #
 # Requires: PowerShell 5.1+ (or PowerShell Core). No curl/jq needed —
 # uses Invoke-RestMethod + ConvertFrom-Json.
@@ -29,7 +30,7 @@ param()
 
 $ErrorActionPreference = "Continue"
 
-$WeaviateUrl = if ($env:WEAVIATE_URL) { $env:WEAVIATE_URL } else { "http://localhost:8081" }
+$WeaviateUrl = if ($env:WEAVIATE_URL) { $env:WEAVIATE_URL } elseif ($env:WEAVIATE_PORT) { "http://localhost:$($env:WEAVIATE_PORT)" } else { "http://localhost:8081" }
 
 # Probe readiness — exit clean on unreachable.
 try {

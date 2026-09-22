@@ -257,6 +257,10 @@ def _run_main(mod, argv: list[str], *, boom: bool):
 
     class _FakeDetector:
         scan_error = None
+        # v0.2.96: mirrors the real class's class-level default. A fake that
+        # omits an attribute the production code reads turns a contract test
+        # into an AttributeError at the first change to that contract.
+        nodes_skipped = 0
         find_duplicates = real_find  # the REAL scan logic
 
         def __init__(self, similarity_threshold: float = 0.95) -> None:
@@ -308,7 +312,13 @@ def test_clean_scan_still_exits_zero_in_json_mode() -> None:
     mod = _load_module()
     rc, out, _err = _run_main(mod, ["--json", "--threshold", "0.99"], boom=False)
     assert rc == 0, f"a clean scan must exit 0; got {rc}"
-    assert json.loads(out) == {"threshold": 0.99, "count": 0, "pairs": []}
+    # Exact dict on purpose: this is the launcher's machine contract, so a
+    # new key must be a deliberate edit here. `nodes_skipped` joined it in
+    # v0.2.96 — 0 is what "clean AND complete" looks like, as distinct from
+    # "clean among the nodes I managed to compare".
+    assert json.loads(out) == {
+        "threshold": 0.99, "count": 0, "pairs": [], "nodes_skipped": 0,
+    }
 
 
 def test_human_mode_does_not_call_a_failed_scan_clean() -> None:

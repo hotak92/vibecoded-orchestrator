@@ -86,8 +86,15 @@ use vct_launcher_core::python_resolve::resolve_python_for_vco_lib;
 // call-sites in this module (and `pub` consumers elsewhere in the crate) read
 // unchanged.
 pub use vct_launcher_core::services::model_gateway_port::{
-    base_url, last_port_path, resolve_port, DEFAULT_GATEWAY_PORT,
-    GATEWAY_SERVICE, LAST_PORT_BASENAME, PORT_BASENAME, PORT_ENV,
+    base_url, last_port_path, resolve_port, GATEWAY_SERVICE, PORT_ENV,
+};
+// NOTE-3 cleanup, corrected: these three are referenced ONLY by this
+// module's cfg(test) block (22 sites), so an unconditional re-export is an
+// unused import in non-test builds while removing it breaks `cargo test`.
+// A test-gated import satisfies both gates.
+#[cfg(test)]
+use vct_launcher_core::services::model_gateway_port::{
+    DEFAULT_GATEWAY_PORT, LAST_PORT_BASENAME, PORT_BASENAME,
 };
 
 /// Ports the starter falls back to when the resolved one is taken by
@@ -882,18 +889,18 @@ fn run_vscode_settings(args: &[String]) -> Result<serde_json::Value, String> {
 /// case (a firewall blackholing 127.0.0.1) instead of stalling a click.
 const PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// Test-only override for [`port_answers`]. `None` means "ask the network".
-///
-/// It exists because NO real socket can distinguish "[`port_is_free`]
-/// consults the connect probe" from "[`port_is_free`] is the bind probe" on
-/// Linux: a live listener there fails the bind too, whatever address it is
-/// bound to (verified empirically for specific, wildcard, dual-stack `[::]`
-/// and `SO_REUSEPORT` listeners). The platform where the difference is
-/// observable — macOS/BSD, where `SO_REUSEADDR` lets a specific bind succeed
-/// under a wildcard listener — is not the one this suite runs on. Without a
-/// seam the composition would be two lines of wiring no test can mutate, and
-/// the repo has been burned before by a mechanism credited with no evidence
-/// it fires. The seam is in the I/O primitive, not in the decision.
+// Test-only override for [`port_answers`]. `None` means "ask the network".
+//
+// It exists because NO real socket can distinguish "[`port_is_free`]
+// consults the connect probe" from "[`port_is_free`] is the bind probe" on
+// Linux: a live listener there fails the bind too, whatever address it is
+// bound to (verified empirically for specific, wildcard, dual-stack `[::]`
+// and `SO_REUSEPORT` listeners). The platform where the difference is
+// observable — macOS/BSD, where `SO_REUSEADDR` lets a specific bind succeed
+// under a wildcard listener — is not the one this suite runs on. Without a
+// seam the composition would be two lines of wiring no test can mutate, and
+// the repo has been burned before by a mechanism credited with no evidence
+// it fires. The seam is in the I/O primitive, not in the decision.
 #[cfg(test)]
 thread_local! {
     static ANSWERS_OVERRIDE: std::cell::Cell<Option<bool>> =

@@ -120,7 +120,13 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
+
+if TYPE_CHECKING:  # pragma: no cover — typing only, never imported at runtime
+    # v0.2.96 (install.py joined the pyright gate): forward references for the
+    # vco_lib types this module annotates but must not import at module scope
+    # (install.py runs BEFORE the venv that provides vco_lib is guaranteed).
+    from vco_lib.schema_migration_runner import MigrationRunReport
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -136,7 +142,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # The vco_lib modules install.py delegates to. Imported after the sys.path
 # insert above, hence the E402 waivers.
-from vco_lib.atomic import atomic_copy_file as _atomic_copy_file  # noqa: E402
+from vco_lib.atomic import atomic_copy_file as _atomic_copy_file, atomic_write_text as _atomic_write_text  # noqa: E402
+from vco_lib.child_process import run_child_logged  # noqa: E402
+from vco_lib import launcher_db_reader as _launcher_db_reader  # noqa: E402
 from vco_lib import launcher_db_writer as _launcher_db_writer  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import self_install as _self_install  # noqa: E402
@@ -154,6 +162,8 @@ from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
+from vco_lib import service_adoption as _service_adoption  # noqa: E402
+from vco_lib import progress_event as _progress_event  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -212,22 +222,33 @@ from vco_lib.symlink_handler import (  # noqa: E402
 # so in-module callers AND external importers (`install.select_*`, used by
 # tests/test_hardware_auto_selection.py +
 # tests/test_inference_pull_list_matches_summary_backend.py) keep working.
+# The five names carrying a per-line `pyright: ignore[reportUnusedImport]`
+# have no in-module caller — they are RE-EXPORTS this module's public surface
+# owes to `tests/test_hardware_auto_selection.py`, which imports all sixteen
+# `from install import …`. Deleting them would break that suite and shrink a
+# published surface to satisfy a checker, which is the opposite of the rule
+# (v0.2.96: install.py joined the pyright gate; pyrightconfig.json names the
+# per-line ignore + rationale as the sanctioned form for exactly this case).
 from vco_lib.embedding_selection import (  # noqa: E402,F401
-    _cpu_meets,
+    # v0.2.96: the profile->model-id table's ONE home. Imported at module
+    # scope on purpose — `_model_id_for_active` runs at step 2, before the
+    # venv exists, so it may only reach a pure stdlib leaf.
+    model_id_for_active as _model_id_for_active_shared,
+    _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
     select_code_embedding_backend,
     select_kg_embedding_backend,
     select_summary_backend,
     _CODE_BACKEND_CODESAGE,
     _CODE_BACKEND_QWEN3,
-    _CODE_BACKEND_JINA,
-    _CODE_BACKEND_OPENAI,
+    _CODE_BACKEND_JINA,  # pyright: ignore[reportUnusedImport] — re-export
+    _CODE_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
     _KG_BACKEND_QWEN3,
     _KG_BACKEND_ARCTIC,
     _KG_BACKEND_OPENAI,
-    _SUMMARY_BACKEND_CLI,
+    _SUMMARY_BACKEND_CLI,  # pyright: ignore[reportUnusedImport] — re-export
     _SUMMARY_BACKEND_QWEN35_9B,
     _SUMMARY_BACKEND_GEMMA,
-    _SUMMARY_BACKEND_OPENAI,
+    _SUMMARY_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
 )
 # v0.2.77 5c task 2: install-time projection of the concurrency budget.
 from vco_lib.install_embed_concurrency import (  # noqa: E402
@@ -353,8 +374,8 @@ def _check_windows_shell_prereqs() -> None:
         )
 
 
-# Default ports (configurable via .env)
-DEFAULT_WEAVIATE_PORT = 8081
+# Default ports (configurable via .env); the Weaviate one aliases the home.
+DEFAULT_WEAVIATE_PORT = _wh.DEFAULT_WEAVIATE_PORT
 DEFAULT_WEAVIATE_GRPC_PORT = 50052
 DEFAULT_OLLAMA_PORT = 11435
 DEFAULT_CODE_EMBED_PORT = 11440
@@ -567,7 +588,10 @@ def _log_install_event(step: str, phase: str, detail: str = "",
     """
     try:
         ts = _utc_iso_now()
-        record = {
+        # `object` values, not `str`: the optional `data` key below carries a
+        # nested dict. Inferring `dict[str, str]` from the literal made that
+        # assignment a type error (v0.2.96: install.py joined the pyright gate).
+        record: dict[str, object] = {
             "ts": ts,
             "actor": actor,
             "step": step,
@@ -601,31 +625,12 @@ def _log_install_event(step: str, phase: str, detail: str = "",
             f.write(line)
             f.flush()
 
-        # v0.2.49 batch 4: optional stdout mirror so the launcher's
-        # OrchestratorUpdateProgressModal can surface sub-progress while
-        # `install.py --update` is in flight (the modal otherwise sits
-        # at 40% "Applying updates..." for the entire re-embedding
-        # phase — minutes of apparent freeze).
-        #
-        # Gated on VCO_PROGRESS_STREAM=1 so terminal users don't see
-        # the extra noise. Format: `[VCO-EVENT] <step> <phase> <detail>`
-        # — single line, no JSON, the launcher parses it via
-        # str-split on whitespace (cheap, no JSON parse cost on the
-        # hot path).
-        if os.environ.get("VCO_PROGRESS_STREAM") == "1":
-            try:
-                # Strip newlines from detail — multiline stage messages
-                # would break the launcher's line-buffered parser.
-                safe_detail = (detail or "").replace("\n", " ").replace("\r", " ")
-                sys.stdout.write(
-                    f"[VCO-EVENT] {step} {phase} {safe_detail}\n"
-                )
-                sys.stdout.flush()
-            except Exception:
-                # Stdout failure (terminal disconnect, pipe closed) is
-                # not a reason to break the install. The JSONL log
-                # above already succeeded.
-                pass
+        # v0.2.49 batch 4 + v0.2.96 D-1: the optional stdout mirror the
+        # launcher's update modal reads. Grammar, env gate and soft-fail live
+        # in `vco_lib.progress_event` (which also records WHY the mirror
+        # exists) — the ONE Python home, shared with the sync child's
+        # heartbeat and locked against the Rust consumer by a parity test.
+        _progress_event.emit(step, phase, detail)
     except Exception:
         # Per the contract: NEVER let a log failure break the install.
         pass
@@ -1410,6 +1415,24 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
     return out
 
 
+def _bootstrap_weaviate_endpoints() -> dict:
+    """Bootstrap envelope's ``weaviate_endpoints`` — NEW-4 SSOT: health is
+    ``/v1/.well-known/ready``. The base resolves through the ONE home
+    (``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > 8081); v0.2.96 (6a) replaced the
+    five hardcoded ``http://localhost:8081`` literals that read no env, so
+    ``--bootstrap --json`` advertised the wrong port on a relocated install.
+    """
+    base = _wh.weaviate_url_default().rstrip("/")
+    return {
+        "base": base,
+        "health": f"{base}/v1/.well-known/ready",
+        "meta": f"{base}/v1/meta",
+        "schema": f"{base}/v1/schema",
+        "graphql": f"{base}/v1/graphql",
+        "grpc_host": "localhost:50052",
+    }
+
+
 def _bootstrap_build_envelope(root: Path) -> dict:
     """Build the full v1 envelope. All sub-probes soft-fail."""
     canonical_os, os_family = _bootstrap_detect_os()
@@ -1507,15 +1530,9 @@ def _bootstrap_build_envelope(root: Path) -> dict:
     pm_advice = _bootstrap_package_manager_advice(system_block, distro)
     secrets_block = _bootstrap_detect_secrets(root)
 
-    # Endpoints — NEW-4 SSOT: weaviate health is `/v1/.well-known/ready`.
-    weaviate_endpoints = {
-        "base": "http://localhost:8081",
-        "health": "http://localhost:8081/v1/.well-known/ready",
-        "meta": "http://localhost:8081/v1/meta",
-        "schema": "http://localhost:8081/v1/schema",
-        "graphql": "http://localhost:8081/v1/graphql",
-        "grpc_host": "localhost:50052",
-    }
+    # Endpoints — NEW-4 SSOT: weaviate health is `/v1/.well-known/ready`;
+    # built by _bootstrap_weaviate_endpoints() from the env-resolved base.
+    weaviate_endpoints = _bootstrap_weaviate_endpoints()
     ollama_endpoints = {
         "base": "http://localhost:11435",
         "tags": "http://localhost:11435/api/tags",
@@ -3569,8 +3586,13 @@ def _log_project_name_pin_diff(
     pinned: str | None = None
     pinned_source: str = ""
     try:
+        # IMPORTABILITY PROBE, not a call: this outer `try` exists to prove
+        # `vco_lib.launcher_db_reader` loads at all before the inner block
+        # reaches the DB. The symbol is deliberately unused (v0.2.96:
+        # install.py joined the pyright gate; the per-line ignore + rationale
+        # is pyrightconfig.json's sanctioned form for a probe import).
         from vco_lib.launcher_db_reader import (  # noqa: F401
-            _discover_db_path,
+            _discover_db_path,  # pyright: ignore[reportUnusedImport] — probe
         )
         # Best-effort DB lookup. Soft-fail to .env fallback below.
         try:
@@ -7381,10 +7403,7 @@ def _apply_deferred_entries(
                 )
                 current_run_report.add_entry(entry)
             else:
-                weaviate_url = os.environ.get(
-                    "WEAVIATE_URL",
-                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
-                )
+                weaviate_url = _wh.weaviate_url_default()
                 print(f"  [try]  {cid}: re-probing schema drift on "
                       f"`{kg_collection}` ...")
                 try:
@@ -7521,10 +7540,7 @@ def _apply_deferred_entries(
         elif cid == "weaviate_unreachable_at_update":
             # THE one side-effectful handler: it STARTS a container. v0.2.91
             # split it — the reachability probe always runs; the start does not.
-            weaviate_url = os.environ.get(
-                "WEAVIATE_URL",
-                f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
-            )
+            weaviate_url = _wh.weaviate_url_default()
             if side_effects:
                 # v0.2.15: discover the actual container name + runtime on
                 # this host instead of hardcoding `weaviate_claude` +
@@ -7611,6 +7627,10 @@ def _apply_deferred_entries(
             try:
                 payload = cid[len("kg_named_vector_slot_error_"):]
                 slot_name: str | None = None
+                # Bound together with `slot_name` below; the `slot_name is
+                # None` guard raises before either is read, but a checker
+                # cannot see that the two are set on the same branch.
+                collection_name: str = ""
                 for known in _KNOWN_SLOTS:
                     if payload.endswith("_" + known):
                         slot_name = known
@@ -7621,10 +7641,7 @@ def _apply_deferred_entries(
                         f"unknown slot suffix in condition_id {cid!r}; "
                         f"known slots: {_KNOWN_SLOTS}"
                     )
-                weaviate_url = os.environ.get(
-                    "WEAVIATE_URL",
-                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
-                )
+                weaviate_url = _wh.weaviate_url_default()
                 schema_url = f"{weaviate_url}/v1/schema/{collection_name}"
                 with urllib.request.urlopen(schema_url, timeout=10) as resp:
                     schema = json.loads(resp.read())
@@ -7658,10 +7675,7 @@ def _apply_deferred_entries(
             if side_effects and getattr(args, "apply_orphan_deletes", False):
                 print(f"  [try]  {cid}: DELETE legacy orphan collection ...")
                 try:
-                    weaviate_url = os.environ.get(
-                        "WEAVIATE_URL",
-                        f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
-                    )
+                    weaviate_url = _wh.weaviate_url_default()
                     # Re-verify still-orphaned (0 rows + still exists)
                     # before destruction. A future install that
                     # repopulated the collection should NOT see its rows
@@ -7776,24 +7790,11 @@ def _apply_deferred_entries(
                 )
                 on_disk_hub_version = _read_dist_meta_version(hub_meta_name)
 
-                def _vparts(v: str) -> list[int]:
-                    out: list[int] = []
-                    for p in v.split("."):
-                        digits = ""
-                        for ch in p:
-                            if ch.isdigit():
-                                digits += ch
-                            else:
-                                break
-                        out.append(int(digits) if digits else 0)
-                    return out
-
-                def _ge(a_str: str, b_str: str) -> bool:
-                    a, b = _vparts(a_str), _vparts(b_str)
-                    n = max(len(a), len(b))
-                    a += [0] * (n - len(a))
-                    b += [0] * (n - len(b))
-                    return a >= b
+                # Was a hand-written copy of the same comparison, NESTED in
+                # this function body — so it was redefined on every call and
+                # could be neither imported nor tested. One home now:
+                # vco_lib.version_compare (v0.2.96).
+                from vco_lib.version_compare import version_ge as _ge
 
                 launcher_ok = bool(
                     source_version and on_disk_version
@@ -9876,12 +9877,10 @@ def _maybe_install_lean_ctx(args: argparse.Namespace) -> str | None:
     has_yay = shutil.which("yay") is not None
     has_paru = shutil.which("paru") is not None
 
-    if not (has_brew or has_cargo or has_yay or has_paru):
-        # No supported channel — fall through; caller prints the manual
-        # install hints (rustup-then-cargo).
-        return None
-
-    method = None
+    # One chain, not a guard plus a chain: the guard tested exactly these
+    # four flags, so the `else` below is the same early return — and this
+    # shape lets a reader (and a checker) see that `method` is always a str
+    # past this point (v0.2.96: install.py joined the pyright gate).
     if has_brew:
         method = "brew"
     elif has_cargo:
@@ -9890,6 +9889,10 @@ def _maybe_install_lean_ctx(args: argparse.Namespace) -> str | None:
         method = "yay"
     elif has_paru:
         method = "paru"
+    else:
+        # No supported channel — fall through; caller prints the manual
+        # install hints (rustup-then-cargo).
+        return None
 
     if not silent:
         # Interactive: ask before installing. Default Y because the
@@ -10274,14 +10277,6 @@ _APP_STATE_KEY_LAST_ACTIVE_EMBEDDING = "last_installed_active_embedding"
 _APP_STATE_KEY_LAST_KG_COLLECTION = "last_installed_kg_collection"
 _APP_STATE_KEY_LAST_SHARED_KG_COLLECTION = "last_installed_shared_kg_collection"
 _APP_STATE_KEY_LAST_KG_SYNC_AT = "last_kg_sync_at"
-
-# v0.2.52 V52-AJ: app_state key that the launcher's Identity-tab embedding
-# selector writes (mirrors Rust APP_STATE_KEY_ACTIVE_EMBEDDING in
-# launcher/src-tauri/src/commands/project_env_settings.rs). Different from
-# _APP_STATE_KEY_LAST_ACTIVE_EMBEDDING above: this one is the LIVE choice;
-# the LAST_* one is the snapshot of what install.py used at the last
-# successful KG seed. Both keys are present on the same launcher.db.
-_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE = "embedding.active_profile"
 _APP_STATE_KEY_LAST_KG_SYNC_STATS = "last_kg_sync_stats"
 
 # Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
@@ -10728,22 +10723,14 @@ def _model_id_for_active(active: str) -> str:
     subprocesses so the subprocess picks the same model the launcher chose,
     even when the user shell has no ``EMBEDDING_MODEL`` set.
 
-    Profiles (case-insensitive):
-      * ``arctic`` → ``snowflake-arctic-embed2:latest``
-      * ``openai`` → ``text-embedding-3-small``
-      * ``qwen3`` (or anything else) → ``qwen3-embedding:0.6b``
-
-    Mirror of ``vco_lib.embedding_service._model_id_for_active``. Both
-    functions intentionally duplicate the mapping (install.py runs from
-    the bundled-script venv that may not have ``vco_lib`` on PYTHONPATH
-    early in the bootstrap; the helper here keeps install.py self-contained).
+    v0.2.96 F-2: thin delegate to
+    :func:`vco_lib.embedding_selection.model_id_for_active` — the ONE home,
+    and a pure stdlib leaf BECAUSE this runs before the venv exists. Routing
+    it through ``embedding_service`` instead (which imports ``requests``)
+    broke every fresh install; see that function's docstring for the rule and
+    ``tests/test_v0296_install_pre_venv_is_stdlib_only.py`` for the gate.
     """
-    normalised = (active or "").strip().lower()
-    if normalised == "arctic":
-        return "snowflake-arctic-embed2:latest"
-    if normalised == "openai":
-        return "text-embedding-3-small"
-    return "qwen3-embedding:0.6b"
+    return _model_id_for_active_shared(active)
 
 
 def _read_active_embedding_from_app_state() -> "str | None":
@@ -10751,21 +10738,20 @@ def _read_active_embedding_from_app_state() -> "str | None":
 
     Reads ``app_state[embedding.active_profile]`` (canonical key written by
     the launcher's Identity-tab embedding selector + install.py's preset
-    seeding). Returns ``None`` when:
-      * launcher.db file is absent (free-tier install, no launcher), OR
-      * the ``app_state`` table has not been created yet (fresh first
-        boot pre-migration), OR
-      * the key is unset, OR
-      * the stored value is an empty/whitespace string, OR
-      * any sqlite error fires.
+    seeding). ``None`` when the DB / table / key is absent, the stored
+    value is empty after stripping, or any sqlite error fires (soft-fail
+    throughout — callers treat ``None`` as "use env or default").
 
-    Soft-fail throughout — callers treat ``None`` as "use env or default".
+    v0.2.96 F-5: delegates to
+    :func:`vco_lib.launcher_db_reader.read_app_state_active_embedding`
+    (the ONE home — install.py previously re-implemented the read + strip).
+    The explicit path threads install.py's ``_discover_app_state_db_path``
+    seam (which many tests patch) so the read targets the SAME db
+    install.py operates on.
     """
-    raw = _read_app_state_key(_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE)
-    if raw is None:
-        return None
-    stripped = raw.strip()
-    return stripped if stripped else None
+    return _launcher_db_reader.read_app_state_active_embedding(
+        _discover_app_state_db_path()
+    )
 
 
 def _resolve_active_embedding_for_install() -> "str | None":
@@ -11921,72 +11907,28 @@ _HEALTH_PATHS = {
 }
 
 
+# ~/.vct/services.toml IO — the ONE home is vco_lib.service_adoption since
+# v0.2.96 WP-4 (the adoption flow must reset rows it makes obsolete, and a
+# second hand-rolled writer would drift from install.py's). These thin
+# wrappers keep install.py's own patch surface (`_services_toml_path` is
+# what tests redirect) and the deferral/adoption semantics unchanged.
 def _services_toml_path() -> Path:
     """Path to `<VCT_STATE_DIR or ~/.vct>/services.toml` — shared with
     launcher::services::adoption (Rust). Both sides honour ``VCT_STATE_DIR``
     so a dev launcher's state stays isolated from production state."""
-    from vco_lib.paths import vct_root_dir
-    return vct_root_dir() / "services.toml"
+    return _service_adoption.services_toml_path()
 
 
 def _read_services_toml() -> dict:
-    """Parse `~/.vct/services.toml` into a list-of-tables dict.
-
-    Returns `{"services": [{name, mode, external_url, parallel_port}, ...]}`.
-    Empty dict on missing file. Empty `services` list on parse error — we'd
-    rather treat the file as missing than crash mid-install on a corrupted
-    TOML the user might have hand-edited.
-    """
-    path = _services_toml_path()
-    if not path.exists():
-        return {"services": []}
-    try:
-        # tomllib is stdlib in Python 3.11+; install.py already requires 3.11.
-        import tomllib  # noqa: PLC0415
-        return tomllib.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"  ! services.toml unreadable ({e}); treating as empty")
-        return {"services": []}
+    """Parse `~/.vct/services.toml` (see the vco_lib home for semantics)."""
+    return _service_adoption.read_services_toml(path=_services_toml_path())
 
 
 def _write_services_toml(state: dict) -> None:
-    """Serialize `{services: [...]}` to `~/.vct/services.toml`.
-
-    Hand-rolled TOML serializer because `tomli_w` isn't in the install-time
-    venv (we run BEFORE `pip install -r requirements.txt`). The schema is
-    a flat array of tables — the rust launcher's `AdoptionState` shape —
-    so a hand-rolled writer is trivial and avoids a chicken-and-egg
-    dependency. Atomic via temp-file + rename so a crashed install never
-    leaves a half-written services.toml.
-    """
-    path = _services_toml_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines: list[str] = []
-    for entry in state.get("services", []):
-        lines.append("[[services]]")
-        # Order: name, mode (always present), then optional fields.
-        lines.append(f'name = "{_toml_escape(entry["name"])}"')
-        lines.append(f'mode = "{_toml_escape(entry["mode"])}"')
-        if entry.get("external_url"):
-            lines.append(f'external_url = "{_toml_escape(entry["external_url"])}"')
-        if entry.get("parallel_port") is not None:
-            lines.append(f'parallel_port = {int(entry["parallel_port"])}')
-        lines.append("")  # blank line between tables
-
-    body = "\n".join(lines).rstrip() + "\n"
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text(body, encoding="utf-8")
-    os.replace(tmp, path)  # atomic on POSIX + Windows
-
-
-def _toml_escape(s: str) -> str:
-    """Minimal TOML basic-string escaping (backslash + double-quote).
-
-    Sufficient for our payloads — service names, mode tokens, and URLs.
-    No newlines, no control chars in any value we ever write here.
-    """
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    """Serialize `{services: [...]}` to `~/.vct/services.toml` atomically
+    (hand-rolled TOML in the vco_lib home — `tomli_w` is not in the
+    install-time venv; schema = the rust launcher's `AdoptionState`)."""
+    _service_adoption.write_services_toml(state, path=_services_toml_path())
 
 
 # ProbeResult and ProbeAction — emulated as string constants for stdlib-only
@@ -12213,10 +12155,7 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
         try:
             schema_resp = urllib.request.urlopen(f"{base}/v1/schema", timeout=3)
             schema = json.loads(schema_resp.read())
-            classes = {
-                c.get("class") for c in schema.get("classes", [])
-                if isinstance(c, dict)
-            }
+            classes = _wh.schema_class_names(schema)
             # Two recognition modes for vct ownership of a Weaviate:
             # 1. Exact canonical names (single-tenant install).
             # 2. Suffix-pattern names (multi-project orchestrator setup
@@ -13125,6 +13064,12 @@ def _start_services(
     compose_env = {**os.environ, **_compose_substitution_env(embed_config)}
 
     cmd = [*compose_cmd, "-f", str(compose_file)]
+    # v0.2.96 WP-4: an explicit -f chain disables compose's auto-load of
+    # compose.override.yaml, so a (launcher-generated or adoption-generated)
+    # override in infrastructure/ would silently NOT reach the up below.
+    # Append the present override files to the chain; stock installs carry
+    # only the empty placeholders and get an unchanged argv.
+    cmd.extend(_svc_guard.override_f_chain(infra_dir))
 
     # GPU overlay + code_embed profile.
     # NVIDIA → docker-compose.gpu.yml (deploy.resources NVIDIA driver).
@@ -13834,13 +13779,20 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
         result["action"] = "orchestrator_not_registered"
         return result
 
+    # Imported ABOVE the try, not inside it (v0.2.96: install.py joined the
+    # pyright gate, which flagged the two exception names as possibly
+    # unbound). That is a real hazard, not a typing nit: with the import
+    # inside, a broken `vco_lib` makes the `except DbUnreachable:` clause
+    # itself raise NameError, replacing the ImportError that says what is
+    # actually wrong. A missing shipped dependency must fail loudly AND
+    # legibly ("loud-fail, never silent-fallback").
+    from vco_lib.config_projection import (
+        apply_project_env,
+        project_env_from_db,
+        DbUnreachable,
+        ProjectNotFound,
+    )
     try:
-        from vco_lib.config_projection import (
-            apply_project_env,
-            project_env_from_db,
-            DbUnreachable,
-            ProjectNotFound,
-        )
         bundle = project_env_from_db(project_id)
         report = apply_project_env(bundle)
     except DbUnreachable:
@@ -13947,52 +13899,23 @@ def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
 def _resolve_project_id_by_folder(folder: Path) -> str | None:
     """Look up the project_id for a given folder_path in launcher.db.
 
-    Mirrors the soft-fail discipline of
-    `vco_lib.project_init._read_kg_binding_override`: read-only DB
-    open, return None on any failure (DB missing, file locked, no
-    matching row). On a fresh install where the launcher has never
-    started, `~/.vct/launcher.db` doesn't exist and the function
-    returns None — the caller treats this as "no-op, don't backfill".
+    v0.2.96 (ship-gate D-4): a thin wrapper over
+    `vco_lib.module_gated_delivery.resolve_project_id_for_folder`, the ONE
+    home WP-10 extracted for this pattern in this cycle. This was its FIFTH
+    copy, and inline copies are how a comparator drifts: this one compared
+    resolved paths with `==`, while the shared home uses `_canonical_path_eq`
+    — case-INSENSITIVE on Windows, because NTFS is. A launcher.db row the
+    launcher wrote as `C:\\Users\\Foo\\Proj` therefore failed to match a
+    resolved `C:\\users\\foo\\proj` here, and every caller read that miss as
+    "project not registered, don't backfill".
 
-    Honours `$VCT_STATE_DIR` so the launcher's per-launcher state
-    isolation works (multi-launcher dev setups) — delegates to
-    `vco_lib.paths.launcher_db_path` (canonical resolver, v0.2.40 F5).
+    Soft-fail discipline is unchanged (None on missing DB, locked file, no
+    matching row), and `$VCT_STATE_DIR` / `$VCT_LAUNCHER_DB_PATH` are still
+    honoured — the shared resolver goes through `vco_lib.paths.launcher_db_path`
+    too. The name stays because four call-sites here and three tests use it.
     """
-    from vco_lib.paths import launcher_db_path
-    db_path = launcher_db_path()
-    if not db_path.is_file():
-        return None
-    try:
-        folder_canonical = folder.resolve()
-    except (OSError, RuntimeError):
-        return None
-    import sqlite3 as _sqlite3
-    try:
-        conn = _sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=2.0
-        )
-    except _sqlite3.Error:
-        return None
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
-        except _sqlite3.Error:
-            return None
-        for row_id, row_folder in rows:
-            try:
-                row_canonical = Path(row_folder or "").resolve()
-            except (OSError, RuntimeError):
-                continue
-            if row_canonical == folder_canonical:
-                return str(row_id)
-        return None
-    finally:
-        try:
-            conn.close()
-        except _sqlite3.Error:
-            pass
+    from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+    return resolve_project_id_for_folder(folder)
 
 
 def _weaviate_ready_deadline_seconds() -> float:
@@ -14027,11 +13950,7 @@ def _wait_for_weaviate_ready(
         # `WEAVIATE_URL=""` must fall back instead of probing an invalid URL
         # for the full deadline and then spurious-deferring on a healthy
         # Weaviate (parity with _seed_weaviate_impl's resolution).
-        weaviate_port = os.environ.get("WEAVIATE_PORT") or str(DEFAULT_WEAVIATE_PORT)
-        weaviate_url = (
-            os.environ.get("WEAVIATE_URL")
-            or f"http://localhost:{weaviate_port}"
-        )
+        weaviate_url = _wh.weaviate_url_default()
     if deadline_seconds is None:
         deadline_seconds = _weaviate_ready_deadline_seconds()
     return _install_weaviate.wait_for_weaviate_ready(
@@ -14088,8 +14007,8 @@ def _ensure_collections(embed_config: dict,
 
     # v0.2.94 LOW-3: same chain as the readiness gate below, which honoured
     # $WEAVIATE_URL while this built from the PORT alone — two targets, one run.
-    weaviate_port = os.environ.get("WEAVIATE_PORT") or str(DEFAULT_WEAVIATE_PORT)
-    weaviate_url = os.environ.get("WEAVIATE_URL") or f"http://localhost:{weaviate_port}"
+    # v0.2.96: "same chain" is now literally the same code — both resolve here.
+    weaviate_url = _wh.weaviate_url_default()
 
     # v0.2.89 FIX 1: BOUNDED readiness gate. Raises TimeoutError on an
     # unreachable Weaviate so the caller's soft-fail-to-deferral path runs
@@ -14174,10 +14093,7 @@ def _ensure_collections(embed_config: dict,
         )
         return
 
-    existing = {
-        c.get("class") for c in schema.get("classes", [])
-        if isinstance(c, dict) and c.get("class")
-    }
+    existing = _wh.schema_class_names(schema)
 
     # v0.2.23 B1 (2026-05-21): case-insensitive adoption.
     #
@@ -14253,7 +14169,10 @@ def _ensure_collections(embed_config: dict,
 
     # 2. Required for THIS project install. Code-graph collections excluded
     #    on purpose — they're shared and created on demand.
-    required: list[tuple[str, "callable"]] = [
+    # `Callable`, not the lowercase builtin `callable` — that name is the
+    # FUNCTION, not a type, so the annotation was meaningless (v0.2.96:
+    # install.py joined the pyright gate).
+    required: list[tuple[str, "Callable[..., dict]"]] = [
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
         # fix/a1-indexing-pipeline (2026-05-25): include the Diagrams
@@ -14531,7 +14450,7 @@ def _maybe_prompt_rebuild_collections(
         return False
 
     # Detect drift on the running KG collection.
-    weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+    weaviate_url = _wh.weaviate_url_default()
     kg_collection = os.environ.get("KG_COLLECTION", "")
     if not kg_collection:
         # No KG collection configured — first install probably; let
@@ -14704,9 +14623,10 @@ def _check_dual_clone() -> Optional[tuple]:
             pass
 
         import sqlite3
+        from vco_lib.launcher_db_reader import sqlite_ro_uri as _ro_uri
         try:
             conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True, timeout=5.0
+                _ro_uri(db_path), uri=True, timeout=5.0
             )
             try:
                 row = conn.execute(
@@ -15081,11 +15001,10 @@ def _seed_weaviate_shared_kg_only(
     # adapters (VCT_EMBED_REQUEST_TIMEOUT_SECS) — a genuinely-wedged embedder
     # fails fast per chunk; a slow-but-progressing one runs to completion.
     try:
-        subprocess.run(
+        run_child_logged(
             [str(venv_py), str(sync_kg), "--all"],
-            check=True,
-            cwd=str(PROJECT_ROOT),
-            env=seed_env,
+            log_stem="shared-kg-seed", check=True,
+            cwd=str(PROJECT_ROOT), env=seed_env,
         )
     except subprocess.CalledProcessError as e:
         print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
@@ -15399,10 +15318,7 @@ def _seed_weaviate_impl(
     current_active_embedding = _resolve_active_embedding_for_install() or "qwen3"
     current_kg_collection = os.environ.get("KG_COLLECTION", "") or ""
     current_shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _wh.weaviate_url_default()
 
     # v0.2.44 V44-G1: hybrid env-vs-DB SoT resolution (replaces V44-B fill-only
     # + V44-F disagreement-WARNING). Per user directive (2026-06-01): when env
@@ -15705,11 +15621,9 @@ def _seed_weaviate_impl(
         seed_env = _subprocess_env_with_embedding()
         seed_env["KG_SYNC_PROJECT_ROOT"] = str(PROJECT_ROOT)
         try:
-            subprocess.run(
+            run_child_logged(
                 [str(venv_py), str(sync_kg)] + cmd_args,
-                check=True,
-                cwd=str(PROJECT_ROOT),
-                env=seed_env,
+                log_stem="kg-sync", check=True, cwd=str(PROJECT_ROOT), env=seed_env,
             )
             # Subprocess executed AND exited 0 — clean sync.
             sync_subprocess_ran = True
@@ -15929,10 +15843,7 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
     # = True. A NON-root project's collections are migrated by ITS OWN
     # per-project bundle update (launcher → apply_post_bundle_steps →
     # `migrate-schema --project-id <that-project>`), NOT here.
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _wh.weaviate_url_default()
     # Resolve the ROOT (base-host) project's real id so per-project collection
     # artifacts (KG / Development / Diagrams / Codegraph) are keyed correctly.
     # Falls back to VCT_PROJECT_ID env then None (orchestrator-wide only) when
@@ -16066,10 +15977,20 @@ def _trigger_codegraph_maintenance(deferral_report: "DeferralReport") -> None:
     FIRST heal any stale ``project`` identity (unconditional; NOT gated by the
     R-6 owed-probe, since identity-stale rows can be embed-revision current so
     the owed-probe reports "not owed" while the dual identity persists; root is
-    the ONE project no autobuild path migrates), THEN the revision-gated embed
-    resync. One call site keeps main()'s span flat. Both steps soft-fail.
+    the ONE project no autobuild path migrates), THEN — v0.2.96 (M-2) — the
+    truncation-exposure detection (ALL logic in ``vco_lib.code_embed_exposure``;
+    thin call, install ratchet), THEN the revision-gated embed resync (whose
+    owed gate honours the queued marker). One call site keeps main()'s span
+    flat. All steps soft-fail.
     """
     _trigger_codegraph_identity_sweep(deferral_report)
+    try:  # v0.2.96 (M-2): truncation-exposure detection — logic in vco_lib
+        from vco_lib.code_embed_exposure import detect_and_queue
+        detect_and_queue(PROJECT_ROOT, PROJECT_ROOT,
+                         _derive_orchestrator_project_name(),
+                         log_event=_log_install_event)
+    except Exception as exc:  # noqa: BLE001 — never crash the update
+        _log_install_event("code_embed_exposure", "warn", f"raised: {exc}")
     _trigger_codegraph_embed_resync(deferral_report)
 
 
@@ -16083,15 +16004,20 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
       2. calls ``spawn_background_resync`` (background, non-blocking, no global
          timeout; R-6: gated on the owed-probe — fires only when stale rows
          exist; self-degrades when the code-embed service is down),
-      3. records the returned ``DeferralEntry`` when the resync was deferred,
-      4. resolves the pending ``codegraph_embed_resync_pending`` ledger entry
-         when the probe POSITIVELY confirms zero stale rows (``not_owed``).
+      3. hands the result to ``report_trigger_result`` (v0.2.96 M-2
+         extraction, install line ratchet): the prints, the event log, the
+         deferred ``DeferralEntry`` recording and the ``not_owed`` resolve of
+         the pending ``codegraph_embed_resync_pending`` ledger entry.
 
     Soft-fail throughout: any error here converts to a log line, never a crash —
     the resync is a best-effort background refresh, not a gating step.
     """
     try:
-        from vco_lib.codegraph_resync import spawn_background_resync
+        from vco_lib.codegraph_resync import (
+            report_trigger_result,
+            spawn_background_resync,
+        )
+        from vco_lib.python_exe import resolve_root_venv_python
     except Exception as exc:  # noqa: BLE001 — missing helper must not wedge update
         _log_install_event(
             "codegraph_resync", "warn",
@@ -16100,19 +16026,11 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
         return
 
     project_name = _derive_orchestrator_project_name()
-    venv_python = None
-    try:
-        # Prefer the orchestrator venv python (has weaviate-client + vco_lib)
-        # so the spawned analyze can import its deps. Fall back to sys.executable
-        # inside the helper when this is None.
-        _vp_posix = PROJECT_ROOT / ".venv" / "bin" / "python"
-        _vp_win = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
-        if _vp_posix.is_file():
-            venv_python = str(_vp_posix)
-        elif _vp_win.is_file():
-            venv_python = str(_vp_win)
-    except Exception:  # noqa: BLE001
-        venv_python = None
+    # Prefer the orchestrator venv python (has weaviate-client + vco_lib) so
+    # the spawned analyze can import its deps; None falls back to the helper's
+    # resolver ladder. v0.2.96 (M-2): probed via python_exe — ONE home.
+    _root_venv_py = resolve_root_venv_python(PROJECT_ROOT)
+    venv_python = str(_root_venv_py) if _root_venv_py is not None else None
 
     try:
         result = spawn_background_resync(
@@ -16127,48 +16045,7 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
         )
         return
 
-    if result.status == "launched":
-        print(f"  → code-graph resync (P7) launched in background (pid {result.pid})")
-        _log_install_event(
-            "codegraph_resync", "ok",
-            f"background resync launched for {project_name} (pid {result.pid})",
-        )
-    elif result.status == "not_owed":
-        # R-6 (v0.2.73): the owed-probe POSITIVELY confirmed zero stale rows.
-        # Resolve any pending resync ledger entry — this is the ONLY way that
-        # (deliberately FOREIGN, A-2) entry clears: explicit positive
-        # confirmation, never drop-when-absent.
-        print("  → code-graph resync not owed (all rows at current embed revision)")
-        try:
-            deferral_report.mark_resolved("codegraph_embed_resync_pending")
-        except Exception as exc:  # noqa: BLE001
-            _log_install_event(
-                "codegraph_resync", "warn",
-                f"could not resolve resync deferral: {exc}",
-            )
-        _log_install_event(
-            "codegraph_resync", "ok",
-            f"no resync owed for {project_name}: {result.message}",
-        )
-    elif result.status == "deferred":
-        print(f"  ! code-graph resync deferred: {result.message}")
-        if result.deferral is not None:
-            try:
-                deferral_report.add_entry(result.deferral)
-            except Exception as exc:  # noqa: BLE001
-                _log_install_event(
-                    "codegraph_resync", "warn",
-                    f"could not record resync deferral: {exc}",
-                )
-        _log_install_event(
-            "codegraph_resync", "warn",
-            f"resync deferred for {project_name}: {result.message}",
-        )
-    else:  # skipped
-        _log_install_event(
-            "codegraph_resync", "warn",
-            f"resync skipped for {project_name}: {result.message}",
-        )
+    report_trigger_result(result, project_name, deferral_report, _log_install_event)
 
 
 def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None:
@@ -16299,7 +16176,7 @@ def _run_additive_temporal_props_migration(
 
 
 def _translate_migration_report_to_deferrals(
-    run_report: "object", deferral_report: "DeferralReport",
+    run_report: "MigrationRunReport", deferral_report: "DeferralReport",
 ) -> None:
     """Add a ``MigrationRunReport``'s findings to the run-scoped DeferralReport.
 
@@ -16357,10 +16234,7 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
 
     Soft-fail: Weaviate unreachable → skip silently.
     """
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _wh.weaviate_url_default()
 
     # Read live schema (soft-fail on transport errors).
     try:
@@ -16371,10 +16245,9 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
     except Exception:
         return  # Weaviate down — skip silently, upstream already deferred this.
 
-    all_classes: list[str] = [
-        c.get("class", "") for c in schema.get("classes", [])
-        if isinstance(c, dict) and c.get("class")
-    ]
+    all_classes: list[str] = sorted(
+        _wh.schema_class_names(schema)
+    )
     # Build a lookup: lower(name) -> set of canonical names sharing that key.
     from_lower: dict[str, list[str]] = {}
     for cls in all_classes:
@@ -16511,10 +16384,7 @@ def _emit_orchestrator_root_schema_deferrals(
 
     Soft-fail throughout: any error is logged but never raises.
     """
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _wh.weaviate_url_default()
 
     # Fetch current schema to probe both conditions.
     try:
@@ -16522,7 +16392,9 @@ def _emit_orchestrator_root_schema_deferrals(
             f"{weaviate_url}/v1/schema", timeout=5,
         )
         schema = json.loads(resp.read())
-        classes_list = schema.get("classes", [])
+        # The ENTRY question, not the name question: `class_map` below keeps
+        # each class object. The marker keeps the one-home guard honest.
+        classes_list = schema.get("classes", [])  # schema-entries (not names)
     except Exception:
         # Weaviate unreachable — skip silently.
         return
@@ -16980,10 +16852,7 @@ def _self_heal_kg_bindings_on_update(
     # Read Weaviate schema first; if Weaviate is unreachable we can't
     # build the case-insensitive lookup, so defer with a deferral entry
     # rather than touching the DB blindly.
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _wh.weaviate_url_default()
     try:
         resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
             f"{weaviate_url}/v1/schema", timeout=5,
@@ -17000,12 +16869,9 @@ def _self_heal_kg_bindings_on_update(
         )
         return
 
-    existing_classes = {
-        c.get("class") for c in schema.get("classes", [])
-        if isinstance(c, dict) and c.get("class")
-    }
+    existing_classes = _wh.schema_class_names(schema)
     existing_by_lower = {
-        name.lower(): name for name in existing_classes if name
+        name.lower(): name for name in existing_classes
     }
 
     # v0.2.49 Bug N: detect whether ANY rebind is needed BEFORE opening
@@ -17030,8 +16896,9 @@ def _self_heal_kg_bindings_on_update(
     # acceptable.
     needs_rebind = False
     try:
+        from vco_lib.launcher_db_reader import sqlite_ro_uri as _ro_uri
         ro_conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro",
+            _ro_uri(db_path),
             uri=True,
             timeout=5.0,
         )
@@ -17520,8 +17387,9 @@ def _persist_orchestrator_root_kg_collection(
     # the app_state table actually exists (older launcher.db schemas
     # that pre-date migration 008 won't have it — soft-fail).
     try:
+        from vco_lib.launcher_db_reader import sqlite_ro_uri as _ro_uri
         ro_conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro",
+            _ro_uri(db_path),
             uri=True,
             timeout=5.0,
         )
@@ -19611,7 +19479,14 @@ def _refresh_dist_binary_after_rebuild(
         install_start_ts is not None and src_mtime >= install_start_ts
     )
     version_stale = False
-    if not produced_in_run and dist_path.is_file():
+    # v0.2.96 (install.py joined the pyright gate): the condition tests
+    # `dist_mtime is not None`, not `dist_path.is_file()`. Those differ in
+    # exactly one state — the file exists but `stat()` raised OSError above,
+    # leaving `dist_mtime` None — and in that state the comparison below was
+    # `float > None`, an unhandled TypeError (the `except OSError` does not
+    # catch it). With no readable mtime there is nothing to compare, so the
+    # conservative `version_stale = False` already initialised above stands.
+    if not produced_in_run and dist_mtime is not None:
         # No "fresh in-run" evidence — fall back to version-drift check.
         current_version = _read_tauri_conf_version(install_root)
         if current_version is not None:
@@ -23752,9 +23627,17 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     # manual cleanup block below still names something real.
     container_runtime = _rt.runtime or _rt.installed
     compose_dir = PROJECT_ROOT / "infrastructure"
-    will_stop_containers = compose_argv is not None and compose_dir.exists()
-    if will_stop_containers:
-        print(f"  [1] Stop containers via `{' '.join(compose_argv)} down`")
+    # v0.2.96 (install.py joined the pyright gate): the step-1 precondition is
+    # bound ONCE, as the narrowed argv itself rather than as a bare bool, so
+    # the three use-sites below read the same value that was tested instead of
+    # re-deriving "…and therefore compose_argv is not None" by hand.
+    stop_argv: Optional[list[str]] = (
+        compose_argv
+        if (compose_argv is not None and compose_dir.exists())
+        else None
+    )
+    if stop_argv is not None:
+        print(f"  [1] Stop containers via `{' '.join(stop_argv)} down`")
         print("      (preserves volumes — separate step below)")
     elif compose_dir.exists():
         # Never silent: pre-v0.2.92 an unusable/absent runtime made step 1 a
@@ -23836,18 +23719,18 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             return 1
 
     # Step 1: stop containers.
-    if will_stop_containers:
+    if stop_argv is not None:
         if _confirm("Stop containers (compose down)?"):
             try:
                 result = subprocess.run(
-                    [*compose_argv, "down"],
+                    [*stop_argv, "down"],
                     cwd=str(compose_dir),
                     capture_output=True,
                     text=True,
                     timeout=120,
                 )
                 if result.returncode == 0:
-                    audit.append(f"stopped containers via {' '.join(compose_argv)} down")
+                    audit.append(f"stopped containers via {' '.join(stop_argv)} down")
                 else:
                     audit.append(f"WARN: compose down exited {result.returncode}: {result.stderr.strip()[:200]}")
             except (subprocess.TimeoutExpired, OSError) as e:
@@ -23916,7 +23799,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
                 mcp = data.get("mcpServers", {})
                 for key in removed_keys:
                     mcp.pop(key, None)
-                claude_json.write_text(json.dumps(data, indent=2))
+                _atomic_write_text(claude_json, json.dumps(data, indent=2))  # 14(a): one atomic home — a crash mid-write here would truncate ~/.claude.json and force a trust rebuild
                 audit.append(f"removed MCP entries {sorted(removed_keys)} from {claude_json}")
             else:
                 audit.append(f"no orchestrator MCP entries to remove in {claude_json}")

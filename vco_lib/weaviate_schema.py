@@ -401,13 +401,20 @@ class MigrationReport:
 
 
 def _weaviate_url_default() -> str:
-    """Default Weaviate URL. Late import of `os` so doc generators can
-    introspect this module without an `os.environ` side-effect at import
-    time."""
-    import os
-    return os.environ.get(
-        "WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}"
-    )
+    """Default Weaviate URL — an ALIAS, not a second implementation.
+
+    Delegates to :func:`vco_lib.weaviate_helpers.weaviate_url_default`, which
+    owns the precedence (``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > the constant)
+    and documents why it is the floor of the chain rather than a rival to the
+    hub/DB resolution above it. This copy used to read ``WEAVIATE_URL`` alone
+    and jump straight to the constant, so every one of this module's six
+    call-sites ignored ``WEAVIATE_PORT`` (v0.2.96 fix).
+
+    The historical "late import of ``os``" note is obsolete: no ``os`` access
+    happens at import time here either way, since the environment read now
+    lives behind the delegate's own call.
+    """
+    return _wh.weaviate_url_default()
 
 
 def _http_request(

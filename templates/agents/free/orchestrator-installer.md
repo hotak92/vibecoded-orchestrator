@@ -5,7 +5,7 @@ short_desc: diagnoses partial-fail installs, advises on install.py flags
 keywords: ["fresh machine", "new machine install", "install Orchestrator", "cross-platform setup", "install VCO", "install on new machine", "set up VCO", "VCO install", "bootstrap VCO", "install failure", "install diagnostics", "partial install"]
 tools: Read, Write, Edit, Bash, Glob
 model: opus
-effort: xhigh
+effort: high
 ---
 
 # Orchestrator Installer Agent

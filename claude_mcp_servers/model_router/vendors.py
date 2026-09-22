@@ -2,10 +2,13 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Vendor registry — the ONLY module in this package that names a vendor.
 
-The shipped scope is deliberately narrow: exactly the two routes that have been
-proven end-to-end on a live machine — the Claude OAuth passthrough and the
-Z.ai/GLM subscription route. Kimi, Qwen and OpenRouter are NOT shipped, not
-even as disabled rows: a disabled row is untested code shipped as config.
+The shipped scope is deliberately narrow: exactly the routes that have been
+proven end-to-end on a live machine — the Claude OAuth passthrough, the
+Z.ai/GLM subscription route, and the QwenCloud Token Plan route (owner order
+2026-09-21; the pay-as-you-go QwenCloud endpoint is deliberately absent until
+its model list is extracted and proven — see the ``qwen`` row). Kimi and
+OpenRouter are NOT shipped, not even as disabled rows: a disabled row is
+untested code shipped as config.
 
 What IS the deliverable is the SHAPE. Adding a vendor must be a row in
 :data:`VENDORS`, never a code change. ``tests/test_model_router_routing.py``
@@ -30,7 +33,7 @@ Two things intentionally live here rather than in ``routing.py``:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Optional
 
 #: Substrings Claude Code's gateway-model discovery keeps in a ``/v1/models``
 #: response, matched case-insensitively (Anthropic's gateway-protocol doc,
@@ -91,7 +94,32 @@ class Vendor:
         bare_id_prefixes: unprefixed id prefixes that also route here, so a
             user who types the vendor's real id on the CLI is not forced to
             spell the namespace. Compared case-insensitively.
-        catalog_path: path appended to ``upstream`` for the model list.
+        catalog_path: path appended to ``upstream`` for the model list, or
+            ``None`` for a vendor whose own upstream has NO model-list
+            endpoint. ``None`` together with ``catalog_url is None`` means no
+            discovery at all: the catalog is exactly the declared
+            ``static_ids``, served under the ``declared`` source without a
+            key or a fetch (see
+            :func:`model_router.catalog.CatalogService._vendor_entries`).
+            Unused while ``catalog_url`` is set.
+        catalog_url: ABSOLUTE URL of the model list, used INSTEAD of
+            ``upstream + catalog_path`` when set. For a vendor whose list
+            endpoint lives on another base than its messages endpoint: the
+            row then rides the identical live path (``live`` source, family
+            floors, the auto ``[1m]`` advert, the truth filter). A row that
+            sets it MUST also declare ``static_ids`` — the keyless and
+            fetch-failed moments have nothing else to serve, and
+            :func:`validate_registry` enforces both halves.
+        catalog_exclude_prefixes: id prefixes dropped from the LIVE list
+            before anything else sees it — the non-chat modalities a list
+            endpoint may carry (voice, image, a router alias), which would
+            otherwise be picker rows that answer an error. Compared
+            case-insensitively; applied to fetched entries only, never to
+            the row's curated ``static_ids``. Exclusion is NOT withholding:
+            an excluded id is not reported in ``hidden`` (see
+            :func:`model_router.catalog._exclude_by_prefix`). Every entry
+            must be non-blank — the empty prefix matches every id, so a
+            blank entry would drop the entire live list.
         auth_header / auth_scheme: how the resolved key is presented.
         docs_url: cited in user-facing copy about this vendor.
         alias_trap: True when the vendor's endpoint is DOCUMENTED to answer
@@ -99,17 +127,33 @@ class Vendor:
             the honest-naming guard in :func:`model_router.routing.route`
             applies to every vendor unconditionally, because a vendor that has
             not documented an alias table can still add one tomorrow.
-        static_ids: this vendor's OWN fallback catalog, served when a live
-            fetch fails. Read by
+        static_ids: this vendor's OWN catalog list, served under the
+            ``declared`` source whenever the live list cannot be — no key
+            resolved yet, or the fetch failed. Read by
             :meth:`model_router.catalog.CatalogService._resolve_static_tables`.
-            Empty on every shipped row, which is the case that defers to
-            ``static_catalog.json``; set it and the row wins outright (see
-            that method for why the more specific declaration takes
+            Empty on a row whose fallback is the shipped snapshot, which is
+            the case that defers to ``static_catalog.json`` (and answers
+            under the ``static`` source); set it and the row wins outright
+            (see that method for why the more specific declaration takes
             precedence). Its point is that adding a vendor stays a config
             change: a new row can carry its own fallback without anyone
             editing a shipped JSON file. Ids are advertised verbatim under
             the vendor's namespace and double as their own display names, so
-            they must be the vendor's real model ids.
+            they must be the vendor's real model ids. Two row shapes lean on
+            the list harder than a plain live vendor and are REQUIRED to
+            declare it (:func:`validate_registry`): a row with no discovery
+            at all (``catalog_path is None``, no ``catalog_url``), where it
+            is not a fallback but the WHOLE catalog, and a row with a
+            ``catalog_url`` override, where it is the keyless/fetch-failed
+            fallback.
+        verified_ids: the ids this registry has VERIFIED answer as
+            themselves on this vendor's endpoint. When non-empty, the catalog
+            drops every entry of this vendor whose bare id is not in the list
+            BEFORE window resolution and the latest-only filter (see
+            :func:`model_router.catalog._publish_family`), reporting the
+            dropped ids as withheld. For a vendor whose endpoint lists ids
+            that reroute server-side to other models: the picker must not
+            offer an id that answers as something else.
     """
 
     vendor_id: str
@@ -118,13 +162,21 @@ class Vendor:
     upstream: str
     secret_keys: tuple[str, ...]
     bare_id_prefixes: tuple[str, ...]
-    catalog_path: str = "/v1/models"
+    catalog_path: Optional[str] = "/v1/models"
+    catalog_url: Optional[str] = None
+    catalog_exclude_prefixes: tuple[str, ...] = ()
+    #: Ids curated out of the PUBLISHED picker under both catalog filters
+    #: (owner ruling 2026-09-22: the final advertised list). Hidden, not
+    #: excluded: reported in ``_vct_catalog_hidden`` and routable by name,
+    #: deferred to a later curation discussion rather than dropped.
+    catalog_hide_ids: tuple[str, ...] = ()
     auth_header: str = "Authorization"
     auth_scheme: str = "Bearer "
     docs_url: str = ""
     alias_trap: bool = False
     static_ids: tuple[str, ...] = ()
     display_name: str = ""
+    verified_ids: tuple[str, ...] = ()
 
 
 ANTHROPIC_FAMILY = AnthropicFamily(
@@ -138,7 +190,11 @@ ANTHROPIC_FAMILY = AnthropicFamily(
 #: The namespace shared by every shipped vendor. Kept as one value because the
 #: user-visible ids (``claude-gw/glm-5.3``) are already in the field; a second
 #: namespace would be a second thing for users to learn for no gain. A new row
-#: MAY use its own namespace — nothing in the code assumes there is only one.
+#: MAY use its own namespace — nothing in the code assumes there is only one —
+#: and a row may EXTEND this one (``claude-gw/<vendor>/``): namespace
+#: resolution picks the longest match, so the extension cannot be shadowed by
+#: the shorter prefix while every panel rule that keys on ``claude-gw/`` still
+#: holds for both.
 GATEWAY_NAMESPACE = "claude-gw/"
 
 VENDORS: Mapping[str, Vendor] = {
@@ -157,7 +213,77 @@ VENDORS: Mapping[str, Vendor] = {
         # 2026-09-02 returned HTTP 200 with model=glm-5.3-flash for every
         # claude-* name tried, and a nonsense name 400'd — i.e. a deliberate
         # alias table, not a wildcard accept.
+        #
+        # Verified again 2026-09-20 (issue 9's manual half): a direct probe
+        # with the same key asking for bare glm-5.3 got model=glm-5.3 echoed —
+        # served honestly for non-aliased ids on the non-streaming shape.
+        # Whether the STREAMING message_start carries a truthful model field
+        # remains unverified, which is exactly why the automatic check below
+        # must not fire on absence of the field: it compares whatever shape
+        # IS present. server.py's model-echo assertion (the
+        # model_echo_mismatches counter in /health) is the automatic version
+        # of this manual probe and the tripwire for the next vendor-side
+        # aliasing change.
         alias_trap=True,
+        # Owner ruling 2026-09-21: only these two ids answer as themselves on
+        # this endpoint; the older ids it still LISTS reroute server-side to
+        # other models. The catalog therefore withholds every other listed id
+        # (see `verified_ids` on Vendor) — a picker row that answers as a
+        # different model is the alias trap wearing a list.
+        verified_ids=("glm-5.3", "glm-5.3-flash"),
+    ),
+    "qwen": Vendor(
+        vendor_id="qwen",
+        display_suffix=" · QwenCloud Token Plan",
+        display_name="QwenCloud",
+        namespace="claude-gw/qwen/",
+        upstream="https://token-plan.maas.qwencloudapi.com/apps/anthropic",
+        # Both spellings: the resolver is name-EXACT and the launcher
+        # keychain stores the name the user typed. The canonical name is
+        # first; the uppercase spelling covers keys saved from the
+        # vendor's own docs/env convention (QWEN_API_KEY) — the same
+        # two-name pattern the zai row uses.
+        secret_keys=("qwen_api_key", "QWEN_API_KEY"),
+        bare_id_prefixes=("qwen", "deepseek"),
+        # The anthropic app path above has NO /v1/models (probe 2026-09-22:
+        # "Not support"), but the subscription's OpenAI-compatible base DOES
+        # serve the same {"data": [{"id": ...}]} envelope the catalog already
+        # parses. The row therefore rides the ordinary LIVE path through this
+        # absolute-URL override, and catalog_path keeps its default (unused
+        # while catalog_url is set).
+        catalog_url=(
+            "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/models"
+        ),
+        # The live list carries non-chat ids (probe 2026-09-22: two
+        # qwen-audio voice rows, two wan image rows, and the "auto" router
+        # alias; qwen-asr listed for the shape the vendor's docs describe).
+        # A chat picker row that answers an error is the deprecated-model
+        # trap worn by a different list, so these never become rows.
+        # Exclusion applies to the LIVE list only — the curated static_ids
+        # below need no filter.
+        # Dated deepseek flash snapshots are curated out (owner ruling
+        # 2026-09-22): the versioned line (deepseek-v4.1-flash) is the
+        # published flash; the prefix matches only dated builds, never it.
+        catalog_exclude_prefixes=("qwen-audio", "qwen-asr", "wan", "auto",
+                                "deepseek-v4-flash-"),
+        catalog_hide_ids=("qwen3.7-plus", "deepseek-v4-pro"),
+        docs_url="https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+        # No claude-* alias table is documented for this endpoint (UNVERIFIED
+        # either way); routing's honest-naming guard applies regardless, and
+        # server.py's model_echo_mismatches counter is the tripwire for an
+        # undocumented one.
+        alias_trap=False,
+        # The keyless / fetch-failed fallback, live-verified against the
+        # compatible-mode list (probe 2026-09-22): the fifteen live ids minus
+        # the six excluded (five non-chat modalities plus the dated deepseek
+        # flash snapshot, owner-curated out). Publishing trims two more via
+        # catalog_hide_ids below. validate_registry requires static_ids on
+        # a catalog_url row.
+        static_ids=(
+            "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
+            "qwen3.6-flash", "glm-5.3", "glm-5.2", "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+        ),
     ),
 }
 
@@ -175,6 +301,7 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
     """
     rows = VENDORS if vendors is None else vendors
     seen_namespaces: dict[str, str] = {}
+    seen_prefixes: dict[str, str] = {}
     for key, vendor in rows.items():
         if key != vendor.vendor_id:
             raise RegistryError(
@@ -217,6 +344,82 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     f"vendor {key!r}: bare_id_prefix {prefix!r} contains a "
                     "Claude marker, which would hijack first-party Claude ids",
                 )
+            # Bare prefixes resolve LONGEST-FIRST, so two vendors can share a
+            # prefix when one's is strictly longer (e.g. "glm" vs "glm-5.2").
+            # An EXACT collision between two different vendors, though, makes
+            # routing order-dependent: whichever row the mapping iterates last
+            # (or first, on a rebuilt dict) silently wins the other's ids.
+            # Compared case-insensitively like the router itself does.
+            owner = seen_prefixes.get(prefix.lower())
+            if owner is not None and owner != vendor.vendor_id:
+                raise RegistryError(
+                    f"vendors {owner!r} and {vendor.vendor_id!r} both declare "
+                    f"bare_id_prefix {prefix!r} — bare-id routing would be "
+                    "order-dependent",
+                )
+            seen_prefixes.setdefault(prefix.lower(), vendor.vendor_id)
+        if (
+            vendor.catalog_path is None
+            and vendor.catalog_url is None
+            and not vendor.static_ids
+        ):
+            raise RegistryError(
+                f"vendor {key!r}: catalog_path is None (no model-list "
+                "endpoint) but static_ids is empty — the picker would show "
+                "nothing for this vendor",
+            )
+        if vendor.catalog_url is not None:
+            if not vendor.catalog_url.startswith(("http://", "https://")):
+                raise RegistryError(
+                    f"vendor {key!r}: catalog_url {vendor.catalog_url!r} is "
+                    "not an absolute http(s) URL — it REPLACES "
+                    "upstream + catalog_path, so a relative path here would "
+                    "be fetched as a malformed URL",
+                )
+            if not vendor.static_ids:
+                # The override rides the live path, but a live path needs a
+                # key and an answering endpoint; the keyless and
+                # fetch-failed moments have nothing to serve unless the row
+                # declares its own list.
+                raise RegistryError(
+                    f"vendor {key!r}: catalog_url overrides the model-list "
+                    "fetch but static_ids is empty — with no key resolved, "
+                    "or a failed fetch, the picker would show nothing for "
+                    "this vendor",
+                )
+        for exclude_prefix in vendor.catalog_exclude_prefixes:
+            if not exclude_prefix.strip():
+                raise RegistryError(
+                    f"vendor {key!r}: catalog_exclude_prefixes contains a "
+                    "blank entry — every id starts with the empty string, "
+                    "so it would exclude the entire live list",
+                )
+        for hide_id in vendor.catalog_hide_ids:
+            # A hide entry is matched by EXACT id, so whitespace or a typo
+            # hides nothing and says nothing — the curated id keeps appearing
+            # in the picker and the row's author has no signal. The other
+            # list fields are gated the same way; this one shipped without a
+            # gate and that asymmetry is the whole defect.
+            if not hide_id.strip():
+                raise RegistryError(
+                    f"vendor {key!r}: catalog_hide_ids contains a blank entry",
+                )
+            if hide_id != hide_id.strip():
+                raise RegistryError(
+                    f"vendor {key!r}: catalog_hide_ids entry {hide_id!r} has "
+                    "surrounding whitespace — matching is exact, so it would "
+                    "hide nothing, silently",
+                )
+            if vendor.static_ids and hide_id.lower() not in {
+                declared.lower() for declared in vendor.static_ids
+            }:
+                # Only checkable when the row declares its own list: a live
+                # list can legitimately carry an id the row has never seen.
+                raise RegistryError(
+                    f"vendor {key!r}: catalog_hide_ids entry {hide_id!r} is "
+                    "not among this row's static_ids — a hide that matches "
+                    "no declared id hides nothing",
+                )
         for static_id in vendor.static_ids:
             if not static_id.strip():
                 raise RegistryError(
@@ -234,6 +437,22 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     f"vendor {key!r}: static_id {static_id!r} contains a "
                     "Claude marker, so it would be advertised and then "
                     "refused by the honest-naming guard when selected",
+                )
+        for verified_id in vendor.verified_ids:
+            if not verified_id.strip():
+                raise RegistryError(
+                    f"vendor {key!r}: verified_ids contains a blank entry",
+                )
+            if any(marker in verified_id.lower() for marker in CLAUDE_ID_MARKERS):
+                # Same shape as the static_id check above, but worse: a
+                # Claude-marked verified id would be the ONLY entry of its
+                # family kept by the truth filter — a picker row that
+                # `routing.route` is REQUIRED to refuse. The filter would
+                # actively select for an un-routable id.
+                raise RegistryError(
+                    f"vendor {key!r}: verified_id {verified_id!r} contains a "
+                    "Claude marker, so the truth filter would keep the one "
+                    "id the honest-naming guard refuses",
                 )
 
 

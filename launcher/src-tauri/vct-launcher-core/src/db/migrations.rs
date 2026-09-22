@@ -243,6 +243,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "chat_model_context_tombstone (v0.2.94 — the other half of the per-row boot seed). The seed used to write only into an EMPTY table, and that emptiness gate doubled as the \"do not reinstate what the user deleted\" guarantee; it also meant an UPGRADED install never saw a newly shipped model (v0.2.93 added four Claude 5 rows and every table that already held the ten GLM rows stayed at ten, so the gateway kept advertising Claude ids with the client's conservative default window). The seed is now per-row — insert what is absent, never touch what is there — which fixes upgrades and would otherwise resurrect a row the user deleted, because an absent row is absent whether it was deleted or is new. This table is that distinction. A TABLE and not a flag column because the row it remembers no longer exists; no FK to chat_model_context for the same reason (an FK would delete the memory with the thing remembered). Two readers, and the asymmetry is the design: the BOOT SEED skips any tombstoned id (an automatic path must never undo an explicit human delete), while \"Reseed from shipped defaults\" CLEARS the tombstones it re-inserts (a deliberate click, and that button already documents itself as restoring a deleted shipped row). Plain CREATE TABLE IF NOT EXISTS — idempotent by construction AND by the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 44->45 atomically with this migration (B-2).",
         sql: include_str!("migrations/045_chat_model_context_tombstone.sql"),
     },
+    Migration {
+        version: 46,
+        description: "chat_model_context.max_output CHECK relaxed > 0 -> >= 0 (v0.2.96, qwen-vendor lane). 0 is now the UNSTATED marker: the vendor's docs publish no per-model max-output figure for the seven new qwen Token-Plan rows (qwen3.8-max ... deepseek-v4-flash-0731), and inventing a plausible number would violate the same no-guessed-numbers principle the `source` citation CHECK enforces (R10) — so the shipped seed carries max_output: 0 and the schema must accept what the shipped data honestly says. CROSS-LANGUAGE CONTRACT: 0 = unstated at EVERY layer — the Python gateway folds it to None (model_router/catalog.py::_positive) and never publishes it as a token count, the launcher pane renders '—' and edits it as a blank field, ChatModelContextInput::validated refuses only negatives, and this CHECK refuses negatives; > 0 stays the cited vendor figure. SQLite CHECK constraints are immutable post-CREATE, so this is the table-rebuild pattern (mirror of 021/038): the replacement table carries migration 043's ENTIRE nine-column set and every other constraint VERBATIM (the trim-character-set CHECKs, context_window > 0, the window_1m/user_edited domains, NOT NULLs, defaults) with ONLY max_output's CHECK widened. No row can be lost: the old CHECK enforced > 0, so every existing row already satisfies >= 0. No index recreation (043 deliberately created none; the PRIMARY KEY provides the export order). No FK toggles / not self-transactional: nothing references chat_model_context via an inbound FOREIGN KEY (045's tombstone table deliberately has none), so the rebuild rides the runner's outer transaction exactly like 038. LAUNCHER_DB_TABLE_SET_VERSION bumps 45->46 atomically with this migration (B-2), with scripts/regen_schema_versions_json.py refreshing the committed snapshot in the same merge — either half landing alone reds the two-sided parity gates.",
+        sql: include_str!("migrations/046_chat_model_context_max_output_unstated.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2789,13 +2794,253 @@ mod tests {
         };
 
         assert!(insert("a", 0, 100, 0, 0, "zai").is_err(), "context_window > 0");
-        assert!(insert("b", 100, 0, 0, 0, "zai").is_err(), "max_output > 0");
+        // Migration 046 relaxed 043's max_output CHECK from > 0 to >= 0: 0 is
+        // the UNSTATED marker (the vendor publishes no figure — the shipped
+        // qwen Token-Plan rows carry it), negative remains impossible. This
+        // test runs after a full apply(), so it pins the LIVE (post-046)
+        // schema in both directions.
+        assert!(insert("b", 100, -1, 0, 0, "zai").is_err(), "max_output >= 0");
+        assert!(
+            insert("b0", 100, 0, 0, 0, "zai").is_ok(),
+            "max_output 0 = unstated must store (046)"
+        );
         assert!(insert("c", 100, 100, 2, 0, "zai").is_err(), "window_1m IN (0,1)");
         assert!(insert("d", 100, 100, 0, 7, "zai").is_err(), "user_edited IN (0,1)");
         assert!(insert("", 100, 100, 0, 0, "zai").is_err(), "model_id non-blank");
         assert!(insert("e", 100, 100, 0, 0, "  ").is_err(), "vendor non-blank");
         // Leave-alone: a fully valid row still inserts.
         assert!(insert("f", 100, 100, 1, 1, "zai").is_ok(), "valid row accepted");
+    }
+
+    // ─── Migration 046 — chat_model_context.max_output >= 0 (v0.2.96) ────
+    //
+    // Table-rebuild migration (mirror of 038) and destructive-CAPABLE, so the
+    // branches are proven separately: the fresh DB, the upgrade over a
+    // POPULATED table (the one that matters — every row must survive the
+    // rebuild byte-identically), and the verbatim replay convergence the
+    // rebuild shape owes. The semantic rule lives in the .sql: 0 = UNSTATED
+    // (cross-language contract with the Python gateway's `_positive()`
+    // folding), negative impossible — the CHECK assertions here pin both
+    // directions so a rebuild that accidentally widened further (or dropped
+    // the constraint entirely) reds.
+
+    /// FRESH BRANCH: after a full `apply()`, `max_output = 0` stores and a
+    /// negative is refused by the CHECK.
+    #[test]
+    fn migration_046_accepts_unstated_zero_and_still_refuses_negative() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let v: u32 = conn
+            .query_row("SELECT MAX(version) FROM _schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(v >= 46, "expected at least version 46, got {}", v);
+
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, user_edited, updated_at) \
+             VALUES ('qwen3.8-max', 'qwen', 200000, 0, 0, \
+                     'https://docs.qwencloud.com/x', 0, 'now')",
+            [],
+        )
+        .expect("max_output 0 = unstated must satisfy the relaxed CHECK");
+
+        let err = conn
+            .execute(
+                "INSERT INTO chat_model_context \
+                 (model_id, vendor, context_window, max_output, window_1m, \
+                  source, user_edited, updated_at) \
+                 VALUES ('negative', 'qwen', 200000, -1, 0, \
+                         'https://docs.qwencloud.com/x', 0, 'now')",
+                [],
+            )
+            .expect_err("a negative max_output must still fail the CHECK");
+        assert!(
+            err.to_string().to_uppercase().contains("CHECK"),
+            "expected a CHECK-constraint failure, got: {}",
+            err
+        );
+    }
+
+    /// UPGRADE BRANCH — the one that matters for a destructive-capable
+    /// change. A database stopped at v45 (the old `> 0` CHECK live, user rows
+    /// present) rebuilds cleanly: every row survives byte-identically
+    /// INCLUDING the user-edited row's note and timestamp, the full
+    /// nine-column set is intact, and only afterwards does the unstated row
+    /// store.
+    #[test]
+    fn migration_046_rebuild_preserves_every_row_on_upgrade_from_v45() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 45).expect("apply up to v45");
+
+        // At v45 the OLD CHECK is live: the unstated row is refused. This is
+        // the exact wall the shipped qwen seed rows hit before 046.
+        let pre = conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, user_edited, updated_at) \
+             VALUES ('qwen3.8-max', 'qwen', 200000, 0, 0, 'https://q/x', 0, 'now')",
+            [],
+        );
+        assert!(pre.is_err(), "0 must be refused BEFORE migration 046");
+
+        // Pre-existing user data: one shipped-shaped row, one user edit.
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, source_note, user_edited, updated_at) \
+             VALUES ('glm-5.2', 'zai', 1000000, 128000, 1, \
+                     'https://docs.z.ai/guides/llm/glm-5.2', '', 0, \
+                     '2026-09-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, source_note, user_edited, updated_at) \
+             VALUES ('my-local-model', 'zai', 42000, 8000, 0, \
+                     'internal wiki', 'hand added', 1, \
+                     '2026-09-02T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply remaining migrations (046)");
+
+        // The USER-EDITED row survives the rebuild byte-identically, every
+        // field — the value most expensive to lose.
+        let row: (String, String, i64, i64, i64, String, String, i64, String) = conn
+            .query_row(
+                "SELECT model_id, vendor, context_window, max_output, window_1m, \
+                        source, source_note, user_edited, updated_at \
+                 FROM chat_model_context WHERE model_id = 'my-local-model'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                        r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?,
+                    ))
+                },
+            )
+            .expect("the user-edited row must survive the 046 rebuild");
+        assert_eq!(
+            row,
+            (
+                "my-local-model".to_string(),
+                "zai".to_string(),
+                42000,
+                8000,
+                0,
+                "internal wiki".to_string(),
+                "hand added".to_string(),
+                1,
+                "2026-09-02T01:00:00Z".to_string(),
+            ),
+            "every field survives the rebuild byte-identically"
+        );
+
+        // The full nine-column set is intact on the rebuilt table (pins the
+        // "carry EVERY column" requirement — a future edit that drops one
+        // from the _new table reds here).
+        let cols = chat_model_context_columns(&conn);
+        let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "model_id",
+                "vendor",
+                "context_window",
+                "max_output",
+                "window_1m",
+                "source",
+                "source_note",
+                "user_edited",
+                "updated_at",
+            ],
+            "the 046 rebuild must carry every 043 column"
+        );
+        // The rebuilt table kept the PRIMARY KEY too (export order depends
+        // on it; 043 created no other index to recreate).
+        let pk: Vec<&str> = cols
+            .iter()
+            .filter(|c| c.4 == 1)
+            .map(|c| c.0.as_str())
+            .collect();
+        assert_eq!(pk, vec!["model_id"], "model_id must stay the only PK");
+
+        // And now the unstated row stores.
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, user_edited, updated_at) \
+             VALUES ('qwen3.8-max', 'qwen', 200000, 0, 0, 'https://q/x', 0, 'now')",
+            [],
+        )
+        .expect("max_output 0 must be accepted after migration 046");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_model_context", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "both survivors plus the new unstated row");
+    }
+
+    /// Idempotent through the runner, and the create-copy-drop-rename shape
+    /// CONVERGES when its SQL is replayed verbatim. The runner is atomic
+    /// (content + version record in one transaction), so a replay is not a
+    /// live scenario for a non-self-transactional migration — this is the
+    /// regression net for the by-construction claim the runner's doc makes
+    /// about rebuild migrations.
+    #[test]
+    fn migration_046_is_idempotent_and_replay_converges() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, user_edited, updated_at) \
+             VALUES ('qwen3.8-max', 'qwen', 200000, 0, 0, 'https://q/x', 0, 'now')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("second apply (idempotent, version-gated)");
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 46",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "046 recorded exactly once");
+
+        let sql = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 46)
+            .expect("migration 46 registered")
+            .sql;
+        conn.execute_batch(sql)
+            .expect("re-running 046 verbatim must converge");
+
+        let (count, max_out): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), max_output FROM chat_model_context \
+                 WHERE model_id = 'qwen3.8-max'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (count, max_out),
+            (1, 0),
+            "the unstated row survives a verbatim replay byte-identically"
+        );
     }
 
     // ─── Migration 044 — project_moves (v0.2.92 WP-17 / W3) ──────────────

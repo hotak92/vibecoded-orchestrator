@@ -414,3 +414,128 @@ def test_drain_rate_limited_leaves_shared_queue(tmp_path: Path) -> None:
     assert not argv_log.exists() or argv_log.read_text().strip() == "", (
         "rate-limited drain must not run the analyzer")
     assert shared_q.exists(), "rate-limited drain must leave the shared queue"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.96 (WP-5 S2) — an unqualified bare-PATH interpreter must not EAT the
+# queue. This hook already restores it for "no analyzer" and "no python"; an
+# interpreter that cannot import the analyzer's deps is the same condition,
+# and it was the one case that consumed the batch and lost it into a detached
+# `>/dev/null 2>&1`.
+# ---------------------------------------------------------------------------
+
+
+def _bare_path_python_dir(tmp_path: Path) -> Path:
+    """A dir to PREPEND to PATH whose `python3` cannot import weaviate/vco_lib.
+
+    The field condition is precisely "every venv tier missed, so `command -v
+    python3` answered" — so the shim must arrive through PATH, not through
+    `$VCT_PYTHON` (which is an operator statement and is deliberately NOT
+    probed). It is a real, runnable interpreter: the probe has to be defeated
+    by the IMPORT failing, not by the binary being unexecutable.
+    """
+    bindir = tmp_path / "bare-bin"
+    bindir.mkdir()
+    real = shutil.which("python3")
+    shim = bindir / "python3"
+    # `-S` (no site) is what actually removes site-packages, and is why this
+    # is deterministic wherever the suite runs: `shutil.which("python3")` on a
+    # developer machine frequently resolves to the ORCHESTRATOR's own venv,
+    # which has both packages. `-I` additionally drops cwd + PYTHONPATH, so
+    # neither `weaviate` nor `vco_lib` is importable. stdlib (`json`, `sys`,
+    # which the hook's session-id parse needs) still is.
+    shim.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        exec env -u PYTHONPATH {real} -I -S "$@"
+    """))
+    shim.chmod(0o755)
+    return bindir
+
+
+def test_drain_keeps_the_queue_when_the_only_python_cannot_run_the_analyzer(
+    tmp_path: Path,
+) -> None:
+    """Red-proof: delete the probe block in stop-codegraph-drain.sh and this
+    fails — the queue is consumed, the detached child dies into /dev/null, and
+    the turn's edited paths are gone with no trace.
+    """
+    repo = tmp_path / "proj"
+    _init_repo(repo)
+    state = repo / ".claude" / "state"
+    state.mkdir(parents=True)
+    session = "sess-unqualified"
+    f = repo / "a.py"
+    f.write_text("a=1\n")
+    queue = state / f"codegraph_drain_{session}.txt"
+    queue.write_text(f"{f}\n")
+
+    argv_log = tmp_path / "argv.jsonl"
+    stub = tmp_path / "stub.py"
+    _make_analyzer_stub(stub, argv_log)
+
+    bindir = _bare_path_python_dir(tmp_path)
+    r = _run_drain(repo, session, {
+        "VCT_ANALYZER_SCRIPT": str(stub),
+        # Every venv tier must MISS so the bare-PATH tier answers: empty
+        # string defeats the resolver's `[ -n "$VAR" ]` guards, and the
+        # clone-relative tiers find no .venv in the checkout.
+        "VCT_PYTHON": "",
+        "VCT_VENV": "",
+        "VCT_INSTALL_ROOT": "",
+        "VCO_VENV_PYTHON": "",
+        "PATH": f"{bindir}:{os.environ.get('PATH', '')}",
+        "VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS": "0",
+    })
+
+    assert r.returncode == 0, f"a Stop hook never blocks: {r.stderr}"
+    assert queue.exists() and str(f) in queue.read_text(), (
+        "the batch must be put BACK on the queue, not consumed and lost; "
+        f"queue={queue.exists()} stderr={r.stderr!r}"
+    )
+    assert "weaviate+vco_lib" in r.stderr, (
+        f"the skip must say why, not be silent: {r.stderr!r}"
+    )
+    assert not argv_log.exists(), "the analyzer must not have been dispatched"
+
+
+def test_drain_honours_vct_python_like_its_ps1_sibling(tmp_path: Path) -> None:
+    """VCT_PYTHON is an operator statement and is used verbatim, unprobed.
+
+    The `.ps1` sibling reads `$env:VCT_PYTHON` first and `code-graph-incremental.sh`
+    reads it too; only this hook ignored it. Red-proof: drop the
+    `ANALYZER_PY="${VCT_PYTHON:-}"` line and this fails — the run is attributed
+    to whatever `python3` PATH resolves to instead of the named interpreter.
+    """
+    repo = tmp_path / "proj"
+    _init_repo(repo)
+    state = repo / ".claude" / "state"
+    state.mkdir(parents=True)
+    session = "sess-vctpy"
+    f = repo / "b.py"
+    f.write_text("b=1\n")
+    (state / f"codegraph_drain_{session}.txt").write_text(f"{f}\n")
+
+    argv_log = tmp_path / "argv.jsonl"
+    stub = tmp_path / "stub.py"
+    _make_analyzer_stub(stub, argv_log)
+
+    # A wrapper that records that IT was the interpreter, then execs python3.
+    marker = tmp_path / "interpreter-used.txt"
+    shim = tmp_path / "named-python3"
+    shim.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        printf 'used\\n' >> {marker}
+        exec {shutil.which("python3")} "$@"
+    """))
+    shim.chmod(0o755)
+
+    r = _run_drain(repo, session, {
+        "VCT_ANALYZER_SCRIPT": str(stub),
+        "VCT_PYTHON": str(shim),
+        "VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS": "0",
+    })
+    assert r.returncode == 0, r.stderr
+    _wait_for_lines(argv_log, 1)
+    assert marker.exists(), (
+        "the analyzer must run under $VCT_PYTHON, not under PATH python3"
+    )

@@ -151,10 +151,12 @@ class SlowEmbedSeparationInvariantTest(unittest.TestCase):
 
         src = inspect.getsource(install._seed_weaviate_impl)
         # Guard against the pin going vacuous if the subprocess call is
-        # refactored away entirely.
+        # refactored away entirely. v0.2.96 WP-1 relocated the re-embed
+        # subprocess to run_child_logged (vco_lib.child_process) — which
+        # has no timeout parameter at all — so the pin follows the call.
         self.assertIn(
-            "subprocess.run(", src,
-            "_seed_weaviate_impl no longer calls subprocess.run directly — "
+            "run_child_logged(", src,
+            "_seed_weaviate_impl no longer calls run_child_logged directly — "
             "relocate this pin to wherever the re-embed subprocess moved",
         )
         self.assertNotIn(

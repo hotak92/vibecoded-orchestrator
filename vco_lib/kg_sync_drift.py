@@ -781,7 +781,16 @@ def main(argv: Optional[list] = None) -> int:
     )
     parser.add_argument("--project-root", type=Path, required=True,
                         help="project folder containing knowledge/")
-    parser.add_argument("--weaviate-url", default="http://localhost:8081")
+    # Resolved when the parser is BUILT — i.e. inside main(), at run time —
+    # so `--weaviate-url` defaults to whatever `WEAVIATE_URL` /
+    # `WEAVIATE_PORT` name for this shell. The former literal read neither,
+    # so `python -m vco_lib.kg_sync_drift --project-root ...` reported "no
+    # drift / unreachable" against the wrong instance on any install whose
+    # Weaviate is not on the canonical port. ONE home for the precedence:
+    # `vco_lib/weaviate_helpers.py::weaviate_url_default`.
+    from vco_lib.weaviate_helpers import weaviate_url_default
+
+    parser.add_argument("--weaviate-url", default=weaviate_url_default())
     parser.add_argument("--kg-collection", default="",
                         help="explicit KG collection name (bypasses hub/local resolution)")
     parser.add_argument("--shared-kg-collection", default="")

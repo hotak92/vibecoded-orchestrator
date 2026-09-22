@@ -1521,28 +1521,17 @@ mod cli_kg_integration_tests {
         TEST_ENV_LOCK.read().unwrap()
     }
 
-    /// Probe Weaviate. Returns true if reachable. Tests use this to
-    /// short-circuit when running in an offline environment.
-    async fn weaviate_reachable() -> bool {
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        // /v1/meta — see commands/lifecycle.rs::canonical_services for why
-        // we don't use /v1/.well-known/ready (too strict; can return 503
-        // during normal operation while queries still work).
-        match client
-            .get(format!("{}/v1/meta", weaviate_url()))
-            .send()
-            .await
-        {
-            Ok(r) => r.status().is_success(),
-            Err(_) => false,
-        }
-    }
+    // v0.2.96 (L-15): `weaviate_reachable()` lived here — a runtime probe
+    // whose docstring said "tests use this to short-circuit when running in
+    // an offline environment". No test ever called it: every test that needs
+    // the real Weaviate carries `#[ignore = "requires local Weaviate at
+    // localhost:8081"]` instead, which is the SUPERSEDING mechanism and the
+    // better one. `#[ignore]` states the requirement up front and keeps the
+    // test out of the default run; a runtime probe would turn an explicit
+    // `cargo test -- --ignored` on a machine without Weaviate into a silent
+    // pass, which is a vacuous test rather than a skipped one. Deleted
+    // rather than re-wired, so `cargo check --all-targets` is clean on the
+    // merits instead of silenced with `#[allow(dead_code)]`.
 
     /// Insert a project + grant `read` on every orchestrator-shaped
     /// collection so /cli/kg/search succeeds without manual GUI setup.
@@ -1960,11 +1949,13 @@ mod cli_kg_integration_tests {
     /// Process-global lock for env-var-mutating tests.
     ///
     /// Cargo runs unit tests in parallel by default. Tests that *mutate*
-    /// `WEAVIATE_URL` take a write lock; tests that *read* it (i.e.
-    /// every test that calls real Weaviate, directly or via
-    /// `weaviate_reachable`) take a read lock. The pattern protects
-    /// readers from seeing a transient "broken" URL set by a writer
-    /// that hasn't restored the env yet.
+    /// `WEAVIATE_URL` take a write lock; tests that *read* it (i.e. every
+    /// test that calls real Weaviate — all of them via `lock_real_weaviate`
+    /// above) take a read lock. The pattern protects readers from seeing a
+    /// transient "broken" URL set by a writer that hasn't restored the env
+    /// yet. (v0.2.96: this sentence used to also name `weaviate_reachable`,
+    /// a helper nothing called; it is gone, and naming a retired mechanism
+    /// here would keep instructing readers to look for it.)
     static TEST_ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     #[tokio::test]

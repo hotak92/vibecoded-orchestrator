@@ -295,9 +295,27 @@ def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int,
             )
         except Exception:
             kg_collection = os.getenv("KG_COLLECTION", "KnowledgeGraph")
-        # Honor WEAVIATE_URL when the launcher (or env) sets it to a non-default
-        # endpoint; otherwise default to localhost:8081 to match historical behavior.
-        weaviate_url = urlparse(os.getenv("WEAVIATE_URL", "http://localhost:8081"))
+        # ── MIRROR (category C) — must match `vco_lib/weaviate_helpers.py::
+        #    weaviate_url_default`, the SHARED HOME for this resolution.
+        #    Precedence: WEAVIATE_URL > WEAVIATE_PORT > the canonical port;
+        #    an empty/whitespace-only value at either level is UNSET, not a
+        #    literal. (Before v0.2.96 this honoured only WEAVIATE_URL, so an
+        #    install relocated via WEAVIATE_PORT summarised against whatever
+        #    answered on 8081.)
+        #
+        # Why a mirror and not a call: this file treats `vco_lib` as OPTIONAL
+        # everywhere — the only use is the `try/except Exception` import a few
+        # lines above, and the sys.path insert here adds `claude_mcp_servers`,
+        # NOT the vco_lib parent. A hard call would turn a soft dependency into
+        # a hard one inside the summary path.
+        #
+        # `tests/test_v0296_weaviate_url_port_precedence.py::
+        # TestShippedMirrorParity` EXECUTES these lines against the shared
+        # home on every case, so the two cannot drift.
+        _weaviate_url_env = (os.getenv("WEAVIATE_URL") or "").strip()
+        _weaviate_port_env = (os.getenv("WEAVIATE_PORT") or "").strip()
+        WEAVIATE_URL = _weaviate_url_env or f"http://localhost:{_weaviate_port_env or 8081}"
+        weaviate_url = urlparse(WEAVIATE_URL)
         weaviate_host = weaviate_url.hostname or "localhost"
         weaviate_port = weaviate_url.port or 8081
         weaviate_grpc = int(os.getenv("GRPC_PORT", "50052"))

@@ -251,6 +251,74 @@ class AccumulatorMergeTests(unittest.TestCase):
         self.assertEqual(acc.totals()["input_tokens"], 5)
 
 
+# ──────────────── 1b. the reported model (issue 9's echo) ────────────────
+class ReportedModelTests(unittest.TestCase):
+    """``reported_model`` feeds the echo assertion in the terminal ``access``
+    closure: it must read EXACTLY the shapes the vendor writes — the same
+    walk ``usage_block`` does — and treat absence as silence, not mismatch.
+    """
+
+    def test_the_streamed_message_start_model_is_read_from_the_nest(self) -> None:
+        acc = U.UsageAccumulator(stream=True)
+        _feed(acc, _sse("message_start", {
+            "type": "message_start",
+            "message": {"id": "msg_1", "model": "glm-5.3",
+                        "usage": {"input_tokens": 4, "output_tokens": 0}},
+        }))
+        self.assertEqual(acc.reported_model, "glm-5.3")
+
+    def test_a_top_level_model_in_a_stream_event_is_read_too(self) -> None:
+        acc = U.UsageAccumulator(stream=True)
+        _feed(acc, _message_delta(output_tokens=2))
+        self.assertIsNone(acc.reported_model)
+        _feed(acc, _sse("message_delta", {
+            "type": "message_delta", "model": "glm-5.3", "usage": {"output_tokens": 2},
+        }))
+        self.assertEqual(acc.reported_model, "glm-5.3")
+
+    def test_the_last_non_empty_model_wins(self) -> None:
+        acc = U.UsageAccumulator(stream=True)
+        _feed(acc, _sse("message_start", {
+            "type": "message_start",
+            "message": {"model": "glm-5.3", "usage": {"input_tokens": 4}},
+        }) + _sse("message_delta", {
+            "type": "message_delta", "model": "glm-5.3-flash", "usage": {"output_tokens": 2},
+        }))
+        self.assertEqual(acc.reported_model, "glm-5.3-flash")
+
+    def test_the_non_streamed_body_model_is_read_from_the_top(self) -> None:
+        acc = U.UsageAccumulator(stream=False)
+        _feed(acc, json.dumps({
+            "id": "msg_1", "model": "glm-5.3", "content": [],
+            "usage": {"input_tokens": 4, "output_tokens": 2},
+        }).encode("utf-8"))
+        self.assertEqual(acc.reported_model, "glm-5.3")
+
+    def test_absence_is_none_never_a_value(self) -> None:
+        acc = U.UsageAccumulator(stream=True)
+        _feed(acc, VENDOR_STREAM)
+        self.assertIsNone(acc.reported_model)
+
+    def test_an_empty_string_is_absent(self) -> None:
+        acc = U.UsageAccumulator(stream=False)
+        _feed(acc, json.dumps({
+            "id": "msg_1", "model": "", "content": [],
+            "usage": {"input_tokens": 4, "output_tokens": 2},
+        }).encode("utf-8"))
+        self.assertIsNone(acc.reported_model)
+
+    def test_reported_model_id_mirrors_the_usage_block_walk(self) -> None:
+        """Direct first, then nested — the one reader for both shapes."""
+        self.assertEqual(U.reported_model_id({"model": "a"}), "a")
+        self.assertEqual(U.reported_model_id({"message": {"model": "b"}}), "b")
+        self.assertEqual(
+            U.reported_model_id({"model": "a", "message": {"model": "b"}}), "a",
+        )
+        self.assertIsNone(U.reported_model_id({"model": ""}))
+        self.assertIsNone(U.reported_model_id({"model": 7}))
+        self.assertIsNone(U.reported_model_id({}))
+
+
 # ──────────────────── 2. the record and the two windows ──────────────────
 class RecordTests(unittest.TestCase):
     def _record(self, requested: str, **totals: int) -> U.UsageRecord:
@@ -693,7 +761,15 @@ class CountTokensGuardTests(unittest.TestCase):
         self.assertNotIn(U.COUNT_SOURCE_FIELD, body)
 
     def test_the_warning_fires_once_per_vendor_and_model(self) -> None:
-        with mock.patch.object(U, "_COUNT_SUBSTITUTION_LOGGED", set()):
+        # The say-it-once registry has ONE home since 2026-09-22
+        # (model_router.catalog), so isolation goes through its supported
+        # reset seam rather than by patching a module-local set that no
+        # longer exists.
+        from model_router.catalog import reset_log_once
+
+        reset_log_once(U.LOG_ONCE_COUNT_SUBSTITUTION)
+        self.addCleanup(reset_log_once, U.LOG_ONCE_COUNT_SUBSTITUTION)
+        if True:
             self.assertTrue(U.note_count_substitution("zai", "glm-5.3"))
             self.assertFalse(U.note_count_substitution("zai", "glm-5.3"))
             self.assertTrue(U.note_count_substitution("zai", "glm-5.3-flash"))
@@ -1091,7 +1167,15 @@ class CountTokensThroughTheGatewayTests(GatewayTestBase):
         self.assertNotIn(U.COUNT_SOURCE_FIELD, answered)
 
     async def test_the_substitution_is_logged_once_per_model(self) -> None:
-        with mock.patch.object(U, "_COUNT_SUBSTITUTION_LOGGED", set()):
+        # The say-it-once registry has ONE home since 2026-09-22
+        # (model_router.catalog), so isolation goes through its supported
+        # reset seam rather than by patching a module-local set that no
+        # longer exists.
+        from model_router.catalog import reset_log_once
+
+        reset_log_once(U.LOG_ONCE_COUNT_SUBSTITUTION)
+        self.addCleanup(reset_log_once, U.LOG_ONCE_COUNT_SUBSTITUTION)
+        if True:
             with self.assertLogs("model_router.usage", level="WARNING") as logs:
                 await self._count(
                     {"input_tokens": 0},

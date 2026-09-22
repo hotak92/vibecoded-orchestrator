@@ -108,6 +108,14 @@ class _Fixture:
         # ambient launcher shell cannot steer RUN_PY at a different tree.
         env.pop("VCT_VENV", None)
         env.pop("VCT_INSTALL_ROOT", None)
+        # `CODE_EMBED_PORT` above only decides the URL while nothing OUTRANKS
+        # it: `code_embed_image.service_base_url` reads
+        # `CODE_EMBED_SERVICE_URL` FIRST. An ambient value therefore points
+        # the hook at somebody else's service and the fixture's own
+        # `_HealthService` is never probed — which is what a developer with
+        # that variable exported has always seen, and what the suite-wide
+        # W-CODE-EMBED pin (conftest) would make universal.
+        env.pop("CODE_EMBED_SERVICE_URL", None)
         return env
 
     def compose_invocations(self) -> list:

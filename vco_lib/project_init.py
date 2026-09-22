@@ -1044,7 +1044,7 @@ def rebuild_collections(args, log_event=None) -> None:
     _log("7b.1/10", "start", "schema-rebuild collection drop")
 
     try:
-        weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+        weaviate_url = _weaviate_url_default()
         # v0.2.77 Part 7a: use the shared connect_v4 factory. Force
         # http_secure=False to preserve this path's historical behaviour
         # (it always connected plaintext regardless of scheme).
@@ -1142,7 +1142,14 @@ class SchemaDelta:
 
 
 def _weaviate_url_default() -> str:
-    return os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+    """Default Weaviate URL — an ALIAS, not a second implementation.
+
+    Delegates to :func:`vco_lib.weaviate_helpers.weaviate_url_default`, the
+    ONE home for the precedence ``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > the
+    constant. Until v0.2.96 this copy read ``WEAVIATE_URL`` alone, so all
+    ~20 call-sites in this module silently ignored ``WEAVIATE_PORT``.
+    """
+    return _wh.weaviate_url_default()
 
 
 def _http_request(
@@ -3714,6 +3721,9 @@ def _enumerate_bundle_files(
       .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
       .claude/scripts/<name>               from templates/scripts/  (all flavours)
       .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
+      .claude/agents/<name>.md             from templates/agents/module-gateway/
+                                           (ONLY when the model_gateway module is
+                                           active for the target — v0.2.96 WP-10)
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
       infrastructure/<name>                from infrastructure/<name>   (only docker/podman compose)
     Settings template handled separately (smart-merge, not a plain copy).
@@ -3807,6 +3817,33 @@ def _enumerate_bundle_files(
 
     if agents_src.exists():
         for agent_file in sorted(agents_src.glob("*.md")):
+            ops.append(_BundleFileOp(
+                dest_rel=str(Path(".claude") / "agents" / agent_file.name),
+                source_abs=agent_file,
+                source_rel=str(agent_file.relative_to(orchestrator_root)),
+                transform=_apply_subs,
+                always_overwrite=False,
+            ))
+
+    # v0.2.96 WP-10: model-gateway-gated agents (hardcoded `claude-gw/*`
+    # frontmatter ids) ship ONLY to projects with the model_gateway module
+    # ACTIVE — never via `free/`, the unconditional bucket. The gate, the
+    # folder→UUID key resolution (module rows are UUID-keyed, not
+    # folder-keyed — a folder-keyed gate never fires) and the
+    # runnability-posture rationale live in `vco_lib.module_gated_delivery`
+    # (one home, shared with the env projections' resolvers).
+    # `project_root is None` = orchestrator self-install: the root IS the
+    # target there (same convention as `_agent_subs` /
+    # `_is_root_bundle_target`).
+    from vco_lib.module_gated_delivery import (
+        GATEWAY_AGENTS_DIR,
+        module_gateway_agents_active,
+    )
+    gateway_agents_src = templates / "agents" / GATEWAY_AGENTS_DIR
+    if gateway_agents_src.exists() and module_gateway_agents_active(
+        orchestrator_root if project_root is None else project_root,
+    ):
+        for agent_file in sorted(gateway_agents_src.glob("*.md")):
             ops.append(_BundleFileOp(
                 dest_rel=str(Path(".claude") / "agents" / agent_file.name),
                 source_abs=agent_file,
@@ -4738,97 +4775,18 @@ def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
 
 
 def _emit_user_modified_deferral(
-    folder: Path, modified_files: list[str], orchestrator_root: Path,
+    folder: Path,
+    modified_files: list[str],
+    orchestrator_root: Path,
+    backup_failures: Optional[list[tuple[str, str]]] = None,
 ) -> None:
-    """Emit `bundle_user_modified_preserved`: one deferral entry per project
-    listing every file that diverged from the prior-shipped hash during an
-    `--update` run.
-
-    The user has three options:
-    1. Accept shipped versions wholesale: `--update --force`.
-    2. Keep customizations and dismiss the deferral via `dismiss-deferral`
-       (PR 5+ command — placeholder in the message for now).
-    3. Manually merge per-file.
-
-    Per-project grouping (single entry, file list inside) is intentional —
-    one entry per file would generate dozens of deferrals that all
-    duplicate the same actionable command.
-    """
-    if not modified_files:
-        return
-    from vco_lib.deferral_report import DeferralEntry
-    from vco_lib import deferral_emit as _de
-
-    files_md = _format_file_list_md(sorted(modified_files))
-    # Item 4 (Gap 7, 2026-05-13): emit $VCT_ORCHESTRATOR_ROOT instead of a
-    # baked literal path so the command stays portable across machines and
-    # surviving orchestrator-clone relocations. The env var is set by
-    # `.claude/env` (sourced by every VCO-installed project's tooling); if
-    # the user runs from a shell without it, the prose tells them how to
-    # set it manually.
-    # v0.2.23 B5 (D18 short-term): when a preserved file is likely
-    # CLAUDE.md (the common case — the user adds project-specific Dev
-    # Constraints / KG conventions to it), the highest-leverage action is
-    # NOT "diff manually" but "ask Claude to merge in this project session".
-    # Claude has the orchestrator's intent (this CLAUDE.md text) AND the
-    # user's project context loaded — it can produce a merged file in
-    # seconds that preserves both. We surface that as the FIRST option
-    # because it's the only one that scales when CLAUDE.md grows past the
-    # 100-line mark and per-file `diff -u` becomes impractical.
-    has_claude_md = any(
-        Path(p).name.lower() in ("claude.md", "claude.local.md")
-        for p in modified_files
+    """Thin wrapper: the emitter moved to `vco_lib.bundle_preserve` in
+    v0.2.96 (the ratchet's own remedy — see that module's header). The name
+    stays here because the bundle tests and this module's call site use it."""
+    from vco_lib.bundle_preserve import emit_user_modified_deferral
+    emit_user_modified_deferral(
+        folder, modified_files, orchestrator_root, backup_failures,
     )
-    claude_merge_hint = (
-        "# RECOMMENDED for CLAUDE.md / CLAUDE.local.md (the common case):\n"
-        "# open this folder in Claude Code and ask:\n"
-        "#   \"Merge the orchestrator's shipped CLAUDE.md against my local\n"
-        "#    one. Preserve project-specific Dev Constraints / KG conventions\n"
-        "#    but adopt new orchestrator-shipped guidance. Show me the diff\n"
-        "#    before writing.\"\n"
-        "# Claude reads $VCT_ORCHESTRATOR_ROOT/CLAUDE.md and your local one,\n"
-        "# proposes a 3-way merge, and writes the result with your approval.\n"
-        "#\n"
-        if has_claude_md else ""
-    )
-    cmd = (
-        f"{claude_merge_hint}"
-        f"# Inspect the differences (per file, if you prefer the manual path):\n"
-        f"#   diff -u <orchestrator>/<source-rel> {folder}/<dest-rel>\n"
-        f"# Run from a shell where `.claude/env` has been sourced (or\n"
-        f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/vibecoded-orchestrator). Then either\n"
-        f"# accept shipped versions (forces overwrite — destroys local edits):\n"
-        f"python -m vco_lib.project_init install-bundle "
-        f"--folder {str(folder)!r} --orchestrator-root "
-        f"\"$VCT_ORCHESTRATOR_ROOT\" --update --force --json\n"
-        f"# OR keep your customizations and dismiss this deferral:\n"
-        f"python -m vco_lib.project_init dismiss-deferral "
-        f"--folder {str(folder)!r} "
-        f"--condition-id bundle_user_modified_preserved"
-    )
-    entry = DeferralEntry(
-        condition_id="bundle_user_modified_preserved",
-        title="User-modified bundle files preserved during update",
-        detected=(
-            f"During an `install-bundle --update` run, "
-            f"{len(modified_files)} file(s) under the project's `.claude/` "
-            f"tree were found to differ from the version this orchestrator "
-            f"originally shipped. They were preserved (not overwritten):\n"
-            f"{files_md}"
-        ),
-        why_deferred=(
-            "Default-to-safety: when an installed file's hash differs "
-            "from the prior-shipped hash recorded in .vco-manifest.json, "
-            "we preserve the on-disk version. If your edits are "
-            "intentional, dismiss the deferral; if you'd rather take the "
-            "shipped version, re-run with `--force`."
-        ),
-        command_to_apply=cmd,
-        severity="info",
-        kg_node_refs=[],
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
 
 
 def _emit_symlink_redirect_deferral(
@@ -5329,16 +5287,24 @@ def merge_managed_region(
 # ---------------------------------------------------------------------------
 # Module-active resolver (Phase 1.5.B)
 #
-# Reads the launcher SQLite DB's ``project_modules`` table — Phase 1.1
-# (sibling agent) lands the actual schema. Until then we ship a STUB
-# fallback so render tests can run in isolation: when the DB or table is
-# absent, return the default-on module set. ``diagrams`` is included to
-# match Phase 1.5's "default-on with opt-out" design.
+# Reads the launcher SQLite DB's ``project_modules`` table (shipped since
+# Phase 1.1; the launcher's migration set owns the schema). When the DB or
+# the table is absent — a CLI-only install that has never booted the
+# launcher — the answer is :data:`_DEFAULT_ACTIVE_MODULES`, which is the
+# same answer a registered project with no rows gets. That is not a stub:
+# it is the resolved value for "no launcher has ever expressed an opinion".
 # ---------------------------------------------------------------------------
 
-# Default-on modules: any module with no row in `project_modules`, OR with
-# `enabled=1`, is considered active. The constant lives here so the stub
-# fallback and the live-DB path share a single source of truth.
+# v0.2.96 (ship-gate F-N5): the DEFAULT-ON SET, and it is a SET, not a
+# policy. A module NOT named here and with no `project_modules` row is
+# INACTIVE — which is exactly what the WP-10 model-gateway delivery gate
+# relies on (`module_gated_delivery.module_gateway_agents_active`, pinned by
+# `test_install_bundle.py::test_unregistered_folder_does_not_deliver`). The
+# comment here used to say "any module with no row … is considered active",
+# describing a default-on-for-everything policy the code has never had; a
+# reader who believed it would have added a gated module expecting opt-out
+# semantics and shipped it to every install. The constant lives here so the
+# no-DB path and the live-DB path share a single source of truth.
 _DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset({"diagrams"})
 
 
@@ -5368,32 +5334,46 @@ def resolve_active_modules(
 ) -> set[str]:
     """Return the set of active module names for ``project_id``.
 
-    Reads ``project_modules`` rows from the launcher SQLite DB and treats
-    a module as active when ``enabled=1`` OR when no row exists for that
-    project + module combination (default-on policy per Phase 1.5).
+    The set is ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus
+    every module with an ``enabled=1`` row in the launcher SQLite DB's
+    ``project_modules`` table, minus every default-on module with an
+    ``enabled=0`` row.
 
-    STUB BEHAVIOUR (until Phase 1.1's DB migration lands): when the DB
-    file or the ``project_modules`` table is absent, returns
-    ``_DEFAULT_ACTIVE_MODULES`` so the render pipeline still produces
-    sensible output in isolated test environments and on fresh installs.
+    **A module with NO row is active only if it is in
+    :data:`_DEFAULT_ACTIVE_MODULES`.** v0.2.96 (ship-gate F-N5): until this
+    release the text here described a default-on-for-everything policy and
+    called the no-DB answer a temporary stub awaiting a migration. Both were
+    false — the migration shipped long ago, and a row-less module outside the
+    default-on set has always resolved INACTIVE. That is load-bearing, not
+    incidental: the WP-10 model-gateway delivery gate is built on it (an
+    unregistered or opinion-less project must NOT receive ``claude-gw/*``
+    agent definitions), so a reader who took the old text at face value and
+    "fixed the code to match" would ship gateway ids onto every stock
+    install. Pinned by ``tests/test_v0296_lane_python_core.py``.
+
+    No-DB / no-table is therefore a RESOLVED answer, not a fallback: a CLI
+    install that never booted the launcher has expressed no opinion, and
+    "no opinion" means the default-on set, exactly as it does for a
+    registered project with no rows.
 
     Args:
         project_id: The project's UUID-or-slug as stored in
-            ``project_modules.project_id``.
+            ``project_modules.project_id``. The launcher writes the
+            ``projects``-table UUID; resolve a folder to it with
+            ``vco_lib.module_gated_delivery.resolve_project_id_for_folder``
+            rather than passing ``str(folder)``, which can never match.
         db_path: Override the default ``~/.vct/launcher.db`` resolution
             (used by tests to point at a fixture DB).
 
     Returns:
         Set of module name strings considered active for this project.
-        Always includes default-on modules unless a row explicitly
-        disables them (``enabled=0``).
     """
     import sqlite3
 
     target = db_path if db_path is not None else _launcher_db_path()
     if not target.is_file():
-        # Phase 1.1 not yet integrated, or fresh install before launcher
-        # has touched the DB. Return defaults.
+        # No launcher DB: a CLI-only install, or one before the launcher's
+        # first boot. No opinion recorded → the default-on set.
         return set(_DEFAULT_ACTIVE_MODULES)
 
     try:
@@ -5401,8 +5381,9 @@ def resolve_active_modules(
     except sqlite3.Error:
         return set(_DEFAULT_ACTIVE_MODULES)
     try:
-        # Probe for the table — Phase 1.1 owns the schema; until it lands
-        # the table doesn't exist and we fall back to defaults.
+        # Probe for the table. The launcher's migration set owns it; a DB
+        # written by a build that predates the table (or a foreign-schema
+        # file) carries no opinion either → the default-on set.
         try:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -9889,6 +9870,30 @@ def _is_knowledge_dest(dest_rel: str) -> bool:
     return to_posix_rel(dest_rel).startswith("knowledge/")
 
 
+def _record_preserve(
+    op: _BundleFileOp,
+    shipped_hash: str,
+    *,
+    manifest: dict,
+    new_files: dict,
+    new_preserved: dict,
+    user_modified_paths: list,
+    knowledge_preserved_paths: list,
+) -> None:
+    """Thin wrapper: preserve bookkeeping lives in `vco_lib.bundle_preserve`
+    (v0.2.96, duplication register D-5 — the two twin blocks in
+    `install_project_bundle` now share ONE home)."""
+    from vco_lib.bundle_preserve import record_preserve
+    record_preserve(
+        op, shipped_hash,
+        manifest=manifest,
+        new_files=new_files,
+        new_preserved=new_preserved,
+        user_modified_paths=user_modified_paths,
+        knowledge_preserved_paths=knowledge_preserved_paths,
+    )
+
+
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -10165,6 +10170,14 @@ def install_project_bundle(
     # adoption so a run with zero adoptions creates no backup dir.
     adopted_paths: list[tuple[str, str]] = []  # (dest_rel, backup_rel)
     _adopt_backup_ts: Optional[str] = None
+    # v0.2.96 (F-B1): `(dest_rel, error)` for every file whose ADOPTION BACKUP
+    # could not be written. Since v0.2.84 that failure is the only way a
+    # code-surface file reaches `user_modified_paths` on an update, so it is
+    # also the only true cause of the `bundle_user_modified_preserved` entry —
+    # and the entry now says so instead of describing a retired policy. Kept
+    # beside `user_modified_paths` (not derived from it) because the ERROR text
+    # is what makes the entry actionable, and only this site has it.
+    backup_failures: list[tuple[str, str]] = []
 
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
     # v0.2.85 PLAN-v0285 D6 LEG 1 (exclude from enumeration): drop the ops of
@@ -10219,9 +10232,13 @@ def install_project_bundle(
         # knowledge stays `preserve` regardless of `--force`. (The `--force
         # --force`-to-discard-knowledge use case does not exist: the user resyncs
         # KG from Weaviate or edits the .md directly, never by forcing a bundle.)
+        # v0.2.96 (D-11): this branch used to re-import `to_posix_rel` under a
+        # SECOND alias and inline `.startswith("knowledge/")` — a third copy of
+        # the prefix test `_is_knowledge_dest` exists to be the one home of
+        # (and whose own docstring says "never inline the prefix test").
+        # One import (the function-level `_to_posix_rel`), one predicate.
         if force and update_mode and action in ("preserve", "adopt"):
-            from vco_lib.paths import to_posix_rel as _to_posix_rel_force
-            if _to_posix_rel_force(op.dest_rel).startswith("knowledge/"):
+            if _is_knowledge_dest(op.dest_rel):
                 # knowledge stays preserve — force never destroys user KG state
                 pass
             else:
@@ -10268,6 +10285,12 @@ def install_project_bundle(
                         f"adoption backup failed for {op.dest_rel} ({err}); "
                         "preserved local file + deferral emitted"
                     )
+                    # v0.2.96 (F-B1): the deferral entry must NAME this cause.
+                    # Since v0.2.84 this branch is the ONLY way a code-surface
+                    # file lands in `user_modified_paths` on an update, so the
+                    # entry's text is about THIS failure, not about a
+                    # default-to-safety policy that no longer exists.
+                    backup_failures.append((op.dest_rel, err))
                     action = "preserve"
                 else:
                     # Backup captured — write the shipped bytes.
@@ -10293,52 +10316,35 @@ def install_project_bundle(
                     record_in_manifest = True
 
             # Fall-through: when `action` was flipped to "preserve" above (backup
-            # failure), do the preserve bookkeeping now (single home for that
-            # logic mirrors the `if action == "preserve"` block below). NOTE: a
-            # knowledge/** node never reaches THIS block — it is classified
-            # `preserve` directly (not `adopt`), so the adopt-backup-failure
-            # fallback can't produce it; still, route by dest for symmetry so the
-            # two preserve bookkeeping sites stay identical (NEW-1).
+            # failure), do the preserve bookkeeping now. v0.2.96 (D-5): both
+            # preserve sites call the ONE home, `_record_preserve` — the twin
+            # blocks whose comment asked them to "stay identical" are gone, so
+            # the rule cannot be changed at one site only. NOTE: a knowledge/**
+            # node never reaches THIS block (it is classified `preserve`
+            # directly, never `adopt`), but the helper routes by dest anyway so
+            # neither caller carries a special case.
             if action == "preserve":
-                if _is_knowledge_dest(op.dest_rel):
-                    knowledge_preserved_paths.append(op.dest_rel)
-                    _preserve_reason = "knowledge-preserve"
-                else:
-                    user_modified_paths.append(op.dest_rel)
-                    _preserve_reason = "preserve"
-                existing = manifest.get("files", {}).get(op.dest_rel)
-                if existing is not None:
-                    new_files[op.dest_rel] = existing
-                new_preserved[op.dest_rel] = {
-                    "shipped_sha256": shipped_hash,
-                    "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "shipped_source": op.source_rel,
-                    "reason": _preserve_reason,
-                }
+                _record_preserve(
+                    op, shipped_hash,
+                    manifest=manifest,
+                    new_files=new_files,
+                    new_preserved=new_preserved,
+                    user_modified_paths=user_modified_paths,
+                    knowledge_preserved_paths=knowledge_preserved_paths,
+                )
 
         elif action == "preserve":
-            # v0.2.85 NEW-1: route user-owned knowledge/** to the SILENT
-            # preserve list (no deferral), code-surface files to the deferred
-            # `user_modified_paths`. See the knowledge_preserved_paths comment.
-            if _is_knowledge_dest(op.dest_rel):
-                knowledge_preserved_paths.append(op.dest_rel)
-                _preserve_reason = "knowledge-preserve"
-            else:
-                user_modified_paths.append(op.dest_rel)
-                _preserve_reason = "preserve"
-            # Keep the manifest's prior entry (don't update hash) so the
-            # next update still recognizes the prior baseline.
-            existing = manifest.get("files", {}).get(op.dest_rel)
-            if existing is not None:
-                new_files[op.dest_rel] = existing
-            # Schema v2: record the preservation so a future install (or
-            # auditor) can answer "did VCO ever try to install file X here?".
-            new_preserved[op.dest_rel] = {
-                "shipped_sha256": shipped_hash,
-                "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "shipped_source": op.source_rel,
-                "reason": _preserve_reason,
-            }
+            # v0.2.85 NEW-1 routing + the manifest-baseline carry-forward + the
+            # schema-v2 `preserved` row: all three live in `_record_preserve`
+            # (v0.2.96 D-5), shared with the adopt-backup-failure fallback above.
+            _record_preserve(
+                op, shipped_hash,
+                manifest=manifest,
+                new_files=new_files,
+                new_preserved=new_preserved,
+                user_modified_paths=user_modified_paths,
+                knowledge_preserved_paths=knowledge_preserved_paths,
+            )
 
         elif action == "skip-existing":
             # First-install with pre-existing file: do not overwrite, but
@@ -11202,13 +11208,17 @@ def install_project_bundle(
         # NEW-1: `user_modified_paths` holds ONLY code-surface preserves now
         # (knowledge/** went to `knowledge_preserved_paths`), so `not force` is
         # sound again — every file here IS resolved by a subsequent `--force`
-        # run (the deferral's advertised remediation), and none is a knowledge
-        # node whose force is a no-op. The reconciler's `not force` clear is
-        # likewise honest by construction.
+        # run, and none is a knowledge node whose force is a no-op. The
+        # reconciler's `not force` clear is likewise honest by construction.
+        # v0.2.96 F-B1: `backup_failures` carries the CAUSE (the adoption
+        # backup that could not be written) into the entry — without it the
+        # user reads a policy description and a `--force` that would destroy
+        # the very bytes the failed backup was meant to capture.
         if update_mode and user_modified_paths and not force:
             try:
                 _emit_user_modified_deferral(
                     folder, user_modified_paths, orchestrator_root,
+                    backup_failures,
                 )
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -12246,47 +12256,23 @@ def _apply_canonical_env_via_config_projection(
         "resolved_values": {},
     }
 
-    # Resolve project_id from folder path. The lookup mirrors
-    # `_read_kg_binding_override`'s soft-fail pattern. Path resolution
-    # delegated to `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
+    # Resolve project_id from folder path. v0.2.96 WP-10: the folder→UUID
+    # lookup moved to `vco_lib.module_gated_delivery.
+    # resolve_project_id_for_folder` — the ONE home, shared with the
+    # module-gateway delivery gate. Path resolution delegated to
+    # `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
     from vco_lib.paths import launcher_db_path
+    from vco_lib.module_gated_delivery import resolve_project_id_for_folder
     db_path = launcher_db_path()
     if not db_path.is_file():
         result["action"] = "db_unreachable"
         return result
     try:
-        folder_canonical = folder.resolve()
+        folder.resolve()
     except (OSError, RuntimeError):
         result["action"] = "db_unreachable"
         return result
-
-    import sqlite3 as _sqlite3
-    try:
-        conn = _sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=2.0
-        )
-    except _sqlite3.Error:
-        result["action"] = "db_unreachable"
-        return result
-
-    project_id: Optional[str] = None
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
-        except _sqlite3.Error:
-            rows = []
-        for row_id, row_folder in rows:
-            if _canonical_path_eq(row_folder or "", folder_canonical):
-                project_id = str(row_id)
-                break
-    finally:
-        try:
-            conn.close()
-        except _sqlite3.Error:
-            pass
-
+    project_id = resolve_project_id_for_folder(folder, db_path=db_path)
     if project_id is None:
         result["action"] = "not_registered"
         return result
@@ -12921,37 +12907,32 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
 
     out: dict = {"collection_prefix": None, "has_manual_override": False}
 
-    # Path resolution delegated to `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
+    # Path resolution delegated to `vco_lib.paths.launcher_db_path` (v0.2.40
+    # F5). v0.2.96 WP-10: the folder→UUID lookup moved to
+    # `vco_lib.module_gated_delivery.resolve_project_id_for_folder` (the ONE
+    # home, shared with the module-gateway delivery gate).
     from vco_lib.paths import launcher_db_path
+    from vco_lib.module_gated_delivery import resolve_project_id_for_folder
     db_path = launcher_db_path()
 
     if not db_path.is_file():
         return out
 
-    try:
-        folder_canonical = folder.resolve()
-    except (OSError, RuntimeError):
+    project_id = resolve_project_id_for_folder(folder, db_path=db_path)
+    if project_id is None:
         return out
 
     try:
-        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        # v0.2.96 L-11: the ONE home for the RO URI — a hand-interpolated
+        # path containing ?/#/% truncates at the first ? and fails shut.
+        from vco_lib.launcher_db_reader import sqlite_ro_uri
+        conn = _sqlite3.connect(
+            sqlite_ro_uri(db_path), uri=True, timeout=2.0)
     except _sqlite3.Error:
         return out
 
     try:
         cur = conn.cursor()
-        try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
-        except _sqlite3.Error:
-            return out
-        project_id = None
-        for row_id, row_folder in rows:
-            if _canonical_path_eq(row_folder or "", folder_canonical):
-                project_id = row_id
-                break
-        if project_id is None:
-            return out
         try:
             cur.execute(
                 "SELECT collection_prefix, config_json "
@@ -14076,10 +14057,7 @@ def _bundle_update_pointer_heal() -> None:
         return
 
     # Weaviate schema (existence-only; the sole Weaviate call in the heal).
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _weaviate_url_default()
     try:
         resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
             f"{weaviate_url}/v1/schema", timeout=5,
@@ -14087,14 +14065,13 @@ def _bundle_update_pointer_heal() -> None:
         schema = json.loads(resp.read())
     except Exception:
         return  # Weaviate unreachable → can't verify existence → skip.
-    # Walrus + isinstance so the element type narrows to `str` (pyright:
-    # repeating `c.get("class")` in the element expression re-widens to
-    # `str | None` — CI caught exactly that on the v0.2.76 push).
-    existing_classes = {
-        name
-        for c in schema.get("classes", [])
-        if isinstance(c, dict) and isinstance((name := c.get("class")), str) and name
-    }
+    # v0.2.96: the ONE home (`weaviate_helpers.schema_class_names`). The
+    # walrus + isinstance dance this replaces existed because repeating
+    # `c.get("class")` in the element expression re-widens to `str | None`
+    # (CI caught exactly that on the v0.2.76 push) — a narrowing trick five
+    # call-sites had each rediscovered differently, and three had got wrong.
+    from vco_lib.weaviate_helpers import schema_class_names
+    existing_classes = schema_class_names(schema)
 
     # Minimal deferral sink + log shim (the CLI has no DeferralReport here).
     class _Sink:
@@ -14734,10 +14711,7 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
     db_path = Path(args.db).resolve() if getattr(args, "db", None) else _launcher_db_path()
     project_id = getattr(args, "project_id", None) or None
     now_ms = int(getattr(args, "now_ms", 0)) or _now_ms_safe()
-    weaviate_url = (
-        os.environ.get("WEAVIATE_URL")
-        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
-    )
+    weaviate_url = _weaviate_url_default()
     # The migration EDGES ship in the orchestrator clone's `migrations/`, NOT
     # in the per-project folder. The launcher runs this subcommand with
     # cwd=<orchestrator-root> (mirrors run_node_formats_schema_check), so the

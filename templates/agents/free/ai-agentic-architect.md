@@ -5,7 +5,7 @@ short_desc: orchestrate multi-agent systems and workflows
 keywords: [multi-agent, "agentic workflow", "task decomposition", "coordination strategy", "multi-agent coordination", "agent swarm", "agentic system", "parallel agents", "design multi-agent"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: xhigh
+effort: high
 mcpServers:
   orchestrator-tools:
     command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python

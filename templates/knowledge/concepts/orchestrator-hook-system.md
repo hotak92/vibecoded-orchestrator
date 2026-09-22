@@ -171,7 +171,7 @@ Context nearing limit
 - Routes edited files to the appropriate sync pipeline:
   - `knowledge/**/*.md` → `sync_knowledge_graph.py` → Weaviate KG collection
   - `docs/**/*.md` → development docs collection
-  - code files → `code-graph-incremental.sh` (incremental code-graph re-analysis)
+  - code files → appended to the per-session code-graph queue in `.claude/state/`, drained at end-of-turn by the `Stop` hook `stop-codegraph-drain.sh` (ONE analyzer pass per canonical root, rate-limited). `code-graph-incremental.sh` is NOT called by it — that hook ships unregistered and uninvoked, for standalone use.
 - Runs duplicate detection periodically.
 
 **post-edit-outcome.sh** (matcher: `Edit|Write`)

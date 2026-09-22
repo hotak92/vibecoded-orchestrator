@@ -15,7 +15,9 @@ on the Python side in a future change.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -59,18 +61,32 @@ def test_install_py_uses_canonical_health_endpoint_only():
 
 
 def test_bootstrap_envelope_publishes_canonical_health_endpoint():
-    """Bootstrap envelope's `weaviate_endpoints.health` is canonical."""
-    text = INSTALL_PY.read_text(encoding="utf-8")
-    # _bootstrap_build_envelope sets the literal endpoint.
-    assert (
-        '"health": "http://localhost:8081/v1/.well-known/ready"' in text
-        or "'health': 'http://localhost:8081/v1/.well-known/ready'" in text
-    ), (
-        "Bootstrap envelope MUST publish "
-        "http://localhost:8081/v1/.well-known/ready as the canonical "
-        "Weaviate health endpoint. See NEW-4 in "
-        "docs/INSTALL_ARCHITECTURE_v2.md §3.4."
-    )
+    """Bootstrap envelope's `weaviate_endpoints.health` is canonical AND env-resolved.
+
+    v0.2.96 (6a): the envelope hardcoded `http://localhost:8081` five times,
+    reading no environment, so `--bootstrap --json` advertised the wrong port
+    on a relocated install — and this test's previous body pinned that
+    literal. The endpoints are now built by `_bootstrap_weaviate_endpoints`
+    through the ONE home, so this asserts the RESOLVED value behaviourally:
+    install.py is imported with `WEAVIATE_PORT` set and `WEAVIATE_URL` unset
+    (the suite's sentinel-port shape), and the builder is called directly.
+    """
+    saved = {k: os.environ.get(k) for k in ("WEAVIATE_URL", "WEAVIATE_PORT")}
+    os.environ.pop("WEAVIATE_URL", None)
+    os.environ["WEAVIATE_PORT"] = "19731"
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import install
+        eps = install._bootstrap_weaviate_endpoints()
+    finally:
+        for key, val in saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+    assert eps["base"] == "http://localhost:19731", eps
+    assert eps["health"] == "http://localhost:19731/v1/.well-known/ready", eps
 
 
 def test_schema_documents_canonical_health_endpoint():

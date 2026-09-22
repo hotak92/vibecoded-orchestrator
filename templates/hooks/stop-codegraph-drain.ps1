@@ -109,10 +109,11 @@ $python = $env:VCT_PYTHON
 if (-not $python -and (Get-Command Resolve-VcoVenvPython -ErrorAction SilentlyContinue)) {
     $python = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 }
+$fellBackToPathPython = $false
 if (-not $python) {
     foreach ($c in @('python','py','python3')) {
         $cmd = Get-Command $c -ErrorAction SilentlyContinue
-        if ($cmd) { $python = $cmd.Source; break }
+        if ($cmd) { $python = $cmd.Source; $fellBackToPathPython = $true; break }
     }
 }
 if (-not $python) {
@@ -121,7 +122,24 @@ if (-not $python) {
     exit 0
 }
 
-$codeRe = '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+# v0.2.96 (WP-5 S2) -- MUST MATCH stop-codegraph-drain.sh's probe block.
+# When the venv resolver missed, $python came from the bare-PATH loop above
+# and in a user project routinely has neither `weaviate` nor `vco_lib`. The
+# detached analyzer then dies into a redirected stream while $consumed has
+# already been taken off $queue -- the batch is lost silently. Same remedy
+# the "no analyzer" / "no python" branches above already use: put the queue
+# back, say one line, exit 0. Probed only when we fell back.
+if ($fellBackToPathPython) {
+    & $python -c 'import weaviate, vco_lib' 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        try { Get-Content -LiteralPath $consumed | Add-Content -LiteralPath $queue } catch { }
+        Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
+        [Console]::Error.WriteLine("i  code-graph drain: no interpreter with weaviate+vco_lib (tried '$python'); queue kept for a later turn.")
+        exit 0
+    }
+}
+
+$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
 
 function Resolve-DrainProject {
     param([string]$Root)

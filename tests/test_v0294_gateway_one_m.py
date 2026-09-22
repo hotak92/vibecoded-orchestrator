@@ -203,8 +203,12 @@ class OneMGatewayTests(GatewayTestBase):
         entries = (await resp.json())["data"]
         ids = [e["id"] for e in entries]
 
-        self.assertIn("claude-fable-5-1", ids)
         self.assertIn("claude-fable-5-1[1m]", ids)
+        self.assertNotIn(
+            "claude-fable-5-1", ids,
+            "the plain spelling is withheld by the window-rows default",
+        )
+        self.assertIn("claude-haiku-4-5-20251001", ids, "the 200K row is untouched")
         self.assertNotIn(
             "claude-haiku-4-5-20251001[1m]", ids,
             "haiku has no 1M row — the table decides, the catalog never guesses",

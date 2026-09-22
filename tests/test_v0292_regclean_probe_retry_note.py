@@ -68,7 +68,11 @@ def _seed_trail(folder: Path, cid: str, statuses: "list[str]") -> Path:
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1_700_000_000 + i)),
                 "condition_id": cid,
                 "status": status,
-                "detail": "backend unreachable",
+                # The detail the BACKEND gate really writes (v0.2.96
+                # ship-gate MINOR-3: the note's cause is read from this row,
+                # so a paraphrase here would describe a machine that cannot
+                # happen).
+                "detail": dr.backend_block_detail(dr.CODE_BACKEND, False),
             }) + "\n")
     return path
 
@@ -88,7 +92,14 @@ def test_blocked_streak_appends_the_honest_note(tmp_path):
     assert "auto" in sentence
     # …and no longer stands alone.
     assert "unable to retry" in sentence
-    assert "until the service is back" in sentence
+    # v0.2.96 ship-gate MINOR-3: the cause comes from the BLOCKED row, not
+    # from the handler's declared preconditions. These rows are the backend
+    # gate's, so the note says the backend was unreachable — even though this
+    # CID's handler is ALSO image-gated. Naming the image here would tell the
+    # user to rebuild one for a service that was never up.
+    assert "until then" in sentence
+    assert "the backend it needs was unreachable every time" in sentence
+    assert "code-embedding image" not in sentence
 
 
 def test_the_cap_reached_note_says_vco_has_stopped(tmp_path):

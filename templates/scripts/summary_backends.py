@@ -47,6 +47,19 @@ falls back to ``KG_SUMMARY_BACKEND`` via the ``env_keys`` parameter):
                             → consecutive capacity failures before a tier is
                               demoted (default: 3; one transient 529 must not
                               cost the best tier)
+  VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN
+                            → seconds a tier stays demoted after a QUOTA
+                              (token/budget EXHAUSTION) or a TRUST failure
+                              (default: 18000 — the owner's 5 h re-check
+                              window; a 5 h or one-week limit resets on a
+                              clock nobody here controls)
+  VCO_SUMMARY_BREAKER_OTHER_COOLDOWN
+                            → seconds a tier stays demoted after N consecutive
+                              UNCLASSIFIED failures (default: 18000)
+  VCO_SUMMARY_BREAKER_OTHER_STRIKES
+                            → consecutive unclassified failures before a tier
+                              is demoted (default: 3; a single unknown error
+                              still never demotes — see REASON_OTHER)
 
 Caller integration contract:
   * ``set_logger(fn)`` — route this module's log lines through the caller's
@@ -81,8 +94,28 @@ working mid-run.
        CONSECUTIVE occurrences and gets a short cooldown
        (``VCO_SUMMARY_BREAKER_CAPACITY_COOLDOWN``, default 60 s). A
        permanent latch on a transient 529 would be its own bug.
-     * ``other`` — never trips. A breaker that demotes on every unknown
-       error falls back when it should retry.
+     * ``quota`` (v0.2.96 WP-7) — token/budget EXHAUSTION ("usage limit
+       reached", "out of credits"), DISTINCT from a transient 429: a quota
+       outage lasts HOURS (the 5 h or one-week account window), so the
+       v0.2.92 behaviour — riding the 900 s rate-limit cooldown — meant
+       ~20 futile re-probes per 5 h outage. One occurrence demotes, for
+       ``VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN`` (default 18 000 s — the
+       owner's 5 h re-check window).
+     * ``trust`` (v0.2.96 WP-7) — the CLI refused because the WORKSPACE is
+       not trusted ("this workspace has not been trusted"). TERMINAL for
+       the tier: no retry shape exists inside a headless run, so it shares
+       the quota cooldown. Field report: 175+ per-symbol CLI calls, each
+       dying on this, because trust classified as ``other`` and nothing
+       ever tripped.
+     * ``other`` — v0.2.96 WP-7: strike-gated like capacity, but with the
+       LONG cooldown (``VCO_SUMMARY_BREAKER_OTHER_STRIKES`` default 3,
+       ``VCO_SUMMARY_BREAKER_OTHER_COOLDOWN`` default 18 000 s). Before
+       v0.2.96 ``other`` NEVER tripped — a breaker that demoted on every
+       unknown error fell back when it should retry — but that also meant
+       an UNCLASSIFIED failure storm never stopped (304 consecutive
+       failures in one night). N consecutive unknowns is no longer "one
+       weird error"; it is a storm, and the tier demotes. A SINGLE unknown
+       still never demotes.
    The latch is written to ``<vct-state-dir>/summary_backend_breaker.json``
    because the KG generator runs as ONE PROCESS PER NODE — an in-process
    latch alone would be re-armed 117 times over a 117-node pass. The
@@ -125,6 +158,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -170,6 +204,9 @@ ENV_BREAKER_COOLDOWN = "VCO_SUMMARY_BREAKER_COOLDOWN"       # seconds, rate_limi
 ENV_BREAKER_AUTH_COOLDOWN = "VCO_SUMMARY_BREAKER_AUTH_COOLDOWN"
 ENV_BREAKER_CAPACITY_COOLDOWN = "VCO_SUMMARY_BREAKER_CAPACITY_COOLDOWN"
 ENV_BREAKER_CAPACITY_STRIKES = "VCO_SUMMARY_BREAKER_CAPACITY_STRIKES"
+ENV_BREAKER_QUOTA_COOLDOWN = "VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN"
+ENV_BREAKER_OTHER_COOLDOWN = "VCO_SUMMARY_BREAKER_OTHER_COOLDOWN"
+ENV_BREAKER_OTHER_STRIKES = "VCO_SUMMARY_BREAKER_OTHER_STRIKES"
 
 DEFAULT_BREAKER_COOLDOWN_S = 900.0
 #: v0.2.92 WP-Q2 (coordinator ruling). `auth` still trips on the FIRST
@@ -183,6 +220,19 @@ DEFAULT_BREAKER_COOLDOWN_S = 900.0
 DEFAULT_AUTH_COOLDOWN_S = 120.0
 DEFAULT_CAPACITY_COOLDOWN_S = 60.0
 DEFAULT_CAPACITY_STRIKES = 3
+#: v0.2.96 WP-7 (register issue 13). A quota outage lasts HOURS (the 5 h
+#: or one-week account window), so the cooldown is the owner's stated
+#: re-check cadence: 18 000 s = 5 h. `trust` shares it because trust is
+#: TERMINAL for a headless run — the only clock that ends it is a human
+#: re-accepting the workspace dialog, and retrying sooner costs a
+#: subprocess per node for nothing.
+DEFAULT_QUOTA_COOLDOWN_S = 18000.0
+#: v0.2.96 WP-7 (register issue 14). An UNCLASSIFIED failure storm gets
+#: the same long cooldown as quota: 304 consecutive `other` failures ran a
+#: whole night because `other` never tripped. Same threshold shape as
+#: capacity (N consecutive, so a single unknown still never demotes).
+DEFAULT_OTHER_COOLDOWN_S = 18000.0
+DEFAULT_OTHER_STRIKES = 3
 
 #: Cross-process latch file, beside the machine's other VCT state. The
 #: account cap this records is machine-wide, and the KG generator runs one
@@ -194,9 +244,28 @@ REASON_RATE_LIMIT = "rate_limit"
 REASON_CAPACITY = "capacity"
 REASON_AUTH = "auth"
 REASON_OTHER = "other"
+REASON_QUOTA = "quota"
+REASON_TRUST = "trust"
 
-#: Reasons that demote a tier. ``other`` is deliberately absent.
-TRIPPING_REASONS = (REASON_RATE_LIMIT, REASON_AUTH, REASON_CAPACITY)
+#: Reasons that demote a tier. v0.2.96 WP-7 added ``quota`` and ``trust``
+#: (first strike, 5 h cooldown) and ``other`` (strike-gated, long cooldown)
+#: — before it, quota rode rate_limit at 900 s and trust/other never tripped.
+TRIPPING_REASONS = (
+    REASON_RATE_LIMIT, REASON_AUTH, REASON_CAPACITY,
+    REASON_QUOTA, REASON_TRUST, REASON_OTHER,
+)
+
+#: Reasons that demote only after N CONSECUTIVE occurrences, with the
+#: strike count persisted in the same record as the latch (same
+#: cross-process lifetime argument as ``BREAKER_FILENAME``). ``other``
+#: joined in v0.2.96; the N differs by reason, so read it via
+#: ``strikes_required(reason)``.
+STRIKE_GATED_REASONS = (REASON_CAPACITY, REASON_OTHER)
+
+#: v0.2.96 WP-7: reasons whose FRESH trip also notifies the degradation
+#: ledger (best-effort detached ``python -m vco_lib.summary_health
+#: note-degradation``; a no-op when no orchestrator root resolves).
+NOTIFYING_REASONS = (REASON_QUOTA, REASON_TRUST)
 
 #: An EXIT-0 reply longer than this is never re-read as an error notice — a
 #: genuine summary that happens to discuss rate limiting is long and starts
@@ -239,10 +308,31 @@ _AUTH_SIGNALS = (
     "please run /login", "not logged in", "oauth token", "token has expired",
     "permission_error", "401", "403",
 )
+#: v0.2.96 WP-7 — TRUST-shaped failures from a headless ``claude -p``. The
+#: CLI's wording is "this workspace has not been trusted" (field-verified
+#: 2026-09-20, 175+ occurrences). Matched BEFORE any status code and before
+#: every other signal list: it is unambiguous, and misclassifying it as
+#: ``other`` is the bug this list exists to fix.
+_TRUST_SIGNALS = (
+    "not been trusted", "untrusted workspace", "workspace trust",
+    "trust dialog",
+)
+#: v0.2.96 WP-7 — QUOTA (token/budget EXHAUSTION) wording, split out of the
+#: old rate-limit list. Deliberately does NOT contain "limit reached" /
+#: "limit will reset": "rate limit reached" contains both substrings, so a
+#: quota-first match order would swallow genuine TRANSIENT rate-limit
+#: failures. The exhaustion phrases all carry their own unambiguous
+#: vocabulary ("usage limit", "quota", "credits").
+_QUOTA_SIGNALS = (
+    "usage limit", "usage_limit", "quota", "insufficient_quota",
+    "out of credits", "credit balance is too low",
+)
+#: v0.2.96 WP-7 — reduced to the TRANSIENT shapes only (429-class). Quota
+#: wording moved to ``_QUOTA_SIGNALS``; a bare HTTP 429 body with no quota
+#: vocabulary stays here.
 _RATE_LIMIT_SIGNALS = (
-    "usage limit", "usage_limit", "rate limit", "rate_limit", "ratelimit",
-    "too many requests", "quota", "insufficient_quota", "out of credits",
-    "credit balance is too low", "limit reached", "limit will reset", "429",
+    "rate limit", "rate_limit", "ratelimit",
+    "too many requests", "429",
 )
 _CAPACITY_SIGNALS = (
     "overloaded", "service unavailable", "temporarily unavailable",
@@ -334,12 +424,20 @@ def classify_backend_failure(
 ) -> "tuple[str, str]":
     """Classify a backend failure as ``(reason, signal)``.
 
-    The four reasons are kept DISTINCT because they need opposite
-    responses, and collapsing them is how a circuit breaker becomes a bug:
+    The reasons are kept DISTINCT because they need opposite responses,
+    and collapsing them is how a circuit breaker becomes a bug:
 
-    * ``rate_limit`` — the account's cap is spent. Retrying this tier
-      cannot succeed until the window rolls over → demote on the FIRST
-      occurrence, long cooldown.
+    * ``trust`` — the headless CLI refused because the workspace is not
+      trusted. TERMINAL for the tier: no retry inside a headless run can
+      end it, so it opens the breaker with the LONGEST cooldown (the
+      quota window) and the degradation notice names it. One occurrence.
+    * ``quota`` — token/budget EXHAUSTION ("usage limit reached", "out of
+      credits"). Retrying this tier cannot succeed until the account
+      window rolls over — HOURS, not minutes — so one occurrence demotes
+      with the 5 h cooldown (v0.2.96; it used to ride ``rate_limit``'s
+      900 s, i.e. ~20 futile re-probes per outage).
+    * ``rate_limit`` — a TRANSIENT 429. Retrying cannot succeed *right
+      now*, so demote on the FIRST occurrence, but the window is short.
     * ``auth`` — the credential is wrong or expired. Retrying cannot
       succeed at all → demote on the first occurrence. Still time-boxed,
       never permanent: the user may re-login while a pass is running.
@@ -347,13 +445,27 @@ def classify_backend_failure(
       overloaded and RECOVERS BY ITSELF, so a single one must not demote
       the tier (this session saw a 529 and a healthy endpoint minutes
       later). Demotion takes N consecutive strikes and a short cooldown.
-    * ``other`` — anything not positively identified. NEVER trips. A
-      breaker that fires on every unknown error falls back when it should
-      retry, which is the opposite defect from the one it was built for.
+    * ``other`` — anything not positively identified. A single one NEVER
+      trips, but v0.2.96 made it strike-gated: N CONSECUTIVE unknowns
+      demote with a long cooldown, because an unclassified STORM must
+      halt too (304 consecutive failures ran a whole night unfired).
+
+    Match order: TRUST and QUOTA wording outrank everything a status code
+    can say — a 429 whose body says the QUOTA is exhausted is a quota
+    outage wearing a transient status, and that body is the only reason it
+    was classified at all. Status codes then decide before the residual
+    signal lists (auth → rate-limit → capacity).
 
     ``signal`` is the matched keyword or status code — never raw failure
     text, which on these paths can quote node content.
     """
+    haystack = (text or "").lower()
+    for signal in _TRUST_SIGNALS:
+        if signal in haystack:
+            return REASON_TRUST, signal
+    for signal in _QUOTA_SIGNALS:
+        if signal in haystack:
+            return REASON_QUOTA, signal
     if status is not None:
         if status in _AUTH_STATUSES:
             return REASON_AUTH, str(status)
@@ -361,7 +473,6 @@ def classify_backend_failure(
             return REASON_RATE_LIMIT, str(status)
         if status in _CAPACITY_STATUSES:
             return REASON_CAPACITY, str(status)
-    haystack = (text or "").lower()
     if not haystack:
         return REASON_OTHER, ""
     for signal in _AUTH_SIGNALS:
@@ -429,21 +540,47 @@ def _int_env(name: str, default: int) -> int:
 def cooldown_for(reason: str) -> float:
     """Seconds a tier stays demoted after a *reason* failure.
 
-    Three durations, because the three reasons differ in HOW they end:
+    Four durations, because the reasons differ in HOW they end:
     ``capacity`` recovers by itself (short), ``auth`` is ended by the user
     (short — see ``DEFAULT_AUTH_COOLDOWN_S``), ``rate_limit`` is ended by a
-    clock nobody here controls (long).
+    clock nobody here controls (900 s), and ``quota`` / ``trust`` / the
+    ``other`` STORM arm are ended by HOURS-long or human clocks (5 h).
     """
     if reason == REASON_CAPACITY:
         return _float_env(ENV_BREAKER_CAPACITY_COOLDOWN, DEFAULT_CAPACITY_COOLDOWN_S)
     if reason == REASON_AUTH:
         return _float_env(ENV_BREAKER_AUTH_COOLDOWN, DEFAULT_AUTH_COOLDOWN_S)
+    if reason in (REASON_QUOTA, REASON_TRUST):
+        return _float_env(ENV_BREAKER_QUOTA_COOLDOWN, DEFAULT_QUOTA_COOLDOWN_S)
+    if reason == REASON_OTHER:
+        return _float_env(ENV_BREAKER_OTHER_COOLDOWN, DEFAULT_OTHER_COOLDOWN_S)
     return _float_env(ENV_BREAKER_COOLDOWN, DEFAULT_BREAKER_COOLDOWN_S)
 
 
 def capacity_strikes() -> int:
     """Consecutive ``capacity`` failures needed before a tier is demoted."""
     return _int_env(ENV_BREAKER_CAPACITY_STRIKES, DEFAULT_CAPACITY_STRIKES)
+
+
+def other_strikes() -> int:
+    """Consecutive UNCLASSIFIED failures needed before a tier is demoted.
+
+    v0.2.96 WP-7: the ``other`` storm arm. Distinct knob from
+    ``capacity_strikes`` because their storms are different phenomena —
+    a 529-burst clears in minutes, an unclassified failure storm is by
+    definition something nobody has diagnosed yet.
+    """
+    return _int_env(ENV_BREAKER_OTHER_STRIKES, DEFAULT_OTHER_STRIKES)
+
+
+def strikes_required(reason: str) -> int:
+    """Consecutive failures of *reason* that demote a tier (1 when not
+    strike-gated)."""
+    if reason == REASON_CAPACITY:
+        return capacity_strikes()
+    if reason == REASON_OTHER:
+        return other_strikes()
+    return 1
 
 
 def _load_breaker_file() -> dict:
@@ -533,8 +670,10 @@ def breaker_state(tier: str) -> "dict | None":
 def trip_backend(tier: str, reason: str, signal: str = "") -> bool:
     """Latch *tier* open. Returns True when it is now demoted.
 
-    ``capacity`` needs ``capacity_strikes()`` CONSECUTIVE occurrences — one
-    transient 529 must not cost the user the best tier for 15 minutes.
+    STRIKE-GATED reasons (``capacity`` and, since v0.2.96, ``other``) need
+    ``strikes_required(reason)`` CONSECUTIVE occurrences — one transient
+    529 must not cost the user the best tier for 15 minutes, and a single
+    unclassifiable failure must not either.
 
     The strike count is kept in the SAME record as the latch, on disk,
     for the same reason the latch is (v0.2.92 BLOCKER-2): the KG generator
@@ -542,12 +681,15 @@ def trip_backend(tier: str, reason: str, signal: str = "") -> bool:
     process was re-zeroed before the second 529 ever arrived and the
     capacity arm could never fire. A below-threshold record carries
     ``until: 0``, so it counts strikes without demoting anything.
+
+    A FRESH latch on a ``NOTIFYING_REASONS`` failure (quota / trust) also
+    spawns the degradation notice — see ``_notify_degradation``.
     """
     if not breaker_enabled() or reason not in TRIPPING_REASONS:
         return False
     now = _now()
     data = _load_breaker_file()
-    if reason == REASON_CAPACITY:
+    if reason in STRIKE_GATED_REASONS:
         if max(_record_until(_BREAKER_MEM.get(tier)),
                _record_until(data.get(tier))) > now:
             # Already latched. The ladder never re-trips an open tier (it
@@ -560,7 +702,7 @@ def trip_backend(tier: str, reason: str, signal: str = "") -> bool:
             _record_strikes(_BREAKER_MEM.get(tier)),
             _record_strikes(data.get(tier)),
         ) + 1
-        if strikes < capacity_strikes():
+        if strikes < strikes_required(reason):
             pending = {
                 "reason": reason,
                 "signal": str(signal or "")[:64],
@@ -586,6 +728,8 @@ def trip_backend(tier: str, reason: str, signal: str = "") -> bool:
     _BREAKER_MEM[tier] = record
     data[tier] = record
     _save_breaker_file(data)
+    if reason in NOTIFYING_REASONS:
+        _notify_degradation(tier, reason)
     return True
 
 
@@ -602,6 +746,101 @@ def clear_backend_trip(tier: str) -> None:
     if tier in data:
         del data[tier]
         _save_breaker_file(data)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.96 WP-7 — degradation notice spawn (quota / trust trips)
+# ──────────────────────────────────────────────────────────────────────
+#: Handles of detached notify children, retained so the interpreter does
+#: not GC a live Popen object into a zombie (the codegraph_resync
+#: detached-children pattern).
+_NOTIFY_CHILDREN: "list" = []
+
+
+def _notify_orchestrator_root() -> "Path | None":
+    """Best-effort orchestrator-root resolution for the notify spawn.
+
+    In a user project this module runs from ``<project>/.claude/scripts/``
+    (parents lead to the PROJECT, which has no ``vco_lib``), so only the
+    ``VCT_ORCHESTRATOR_ROOT`` env can name the root there; inside the
+    orchestrator checkout the ``templates/scripts`` path resolves by
+    derivation. Returns None when neither yields a root carrying
+    ``vco_lib`` — the caller then skips the notify entirely.
+    """
+    env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
+    if env_root and (Path(env_root) / "vco_lib").is_dir():
+        return Path(env_root)
+    derived = Path(__file__).resolve().parent.parent.parent
+    if (derived / "vco_lib").is_dir():
+        return derived
+    return None
+
+
+def _notify_python(root: Path) -> "str | None":
+    """The venv python beside *root*, else the running interpreter."""
+    for candidate in (
+        root / ".venv" / "bin" / "python",
+        root / ".venv" / "Scripts" / "python.exe",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable or None
+
+
+def _degradation_notify_argv(tier: str, reason: str) -> "list[str] | None":
+    """``python -m vco_lib.summary_health note-degradation ...`` or None.
+
+    The project root is the env the generators' spawners set
+    (``KG_PROJECT_ROOT``), else the cwd the generator was launched with —
+    the sync/resync spawn shapes both run with the project as cwd.
+    """
+    root = _notify_orchestrator_root()
+    if root is None:
+        return None
+    python = _notify_python(root)
+    if python is None:
+        return None
+    project_root = os.environ.get("KG_PROJECT_ROOT", "").strip() or os.getcwd()
+    return [
+        python, "-m", "vco_lib.summary_health", "note-degradation",
+        "--tier", tier, "--reason", reason,
+        "--project-root", project_root,
+    ]
+
+
+def _notify_degradation(tier: str, reason: str) -> None:
+    """Best-effort DETACHED notice that the preferred tier just demoted
+    on a quota/trust failure.
+
+    This module cannot emit the ledger entry itself: it is stdlib-only by
+    contract (it runs inside user projects' ``.claude/scripts/`` with no
+    ``vco_lib`` on ``sys.path``) while the locked deferral emitter lives
+    in ``vco_lib``. So the trip seam spawns the notifier detached and
+    soft-fails on EVERY obstacle — the notify is observability, never a
+    caller-visible failure (a summary run must not crash because a notice
+    could not be delivered). Skipped entirely under pytest: unit tests
+    must not spawn detached children.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    argv = _degradation_notify_argv(tier, reason)
+    if argv is None:
+        return
+    try:
+        import subprocess as _sub
+        kwargs = {}
+        if os.name == "posix":
+            kwargs["start_new_session"] = True
+        proc = _sub.Popen(
+            argv,
+            stdin=_sub.DEVNULL,
+            stdout=_sub.DEVNULL,
+            stderr=_sub.DEVNULL,
+            **kwargs,
+        )
+        _NOTIFY_CHILDREN.append(proc)
+    except Exception:  # noqa: BLE001 — observability only, never fatal
+        pass
 
 
 def _tier_selectable(tier: str, label: str) -> bool:

@@ -36,6 +36,10 @@ Design invariants (project rules)
   we DO NOT launch (a re-embed would fail per-object) — instead we return a
   ``deferred`` status and hand the caller a :class:`DeferralEntry` so the user
   is told to re-run once the service is up. The update itself still succeeds.
+  v0.2.96 (WP-3): a service that is LIVE but built from STALE source gets the
+  same refusal with different text (rebuild the image FIRST) — embedding
+  through it silently truncates — and the verdict is enforced inside the
+  driver (:func:`run_resync_and_verify`) so no entry path can bypass it.
 * **Resumable + idempotent.** Because the gate is per-object, an interrupted
   resync continues on the next run; re-running after completion is a cheap
   no-op (every row already at the current revision → all skip). v0.2.73:
@@ -52,6 +56,7 @@ Design invariants (project rules)
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -62,13 +67,21 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 # v0.2.94: THE resolver for "which interpreter can run our own code". A hard
 # import, never a guarded one — `vco_lib` importing `vco_lib` is the definition
 # of a healthy install, and a fallback here would re-create the exact silent
 # degrade this module was fixed to stop doing.
 from vco_lib import python_exe as _python_exe
+
+# v0.2.96 (WP-3): the image-freshness verdict tokens this module's gates
+# branch on. Same hard-import rule as `python_exe` above — a second copy of
+# the token strings would be a mirror free to drift from `code_embed_image`'s
+# contract.
+from vco_lib.code_embed_image import CURRENT as _CURRENT_VERDICT
+from vco_lib.code_embed_image import STALE as _STALE_VERDICT
+from vco_lib.code_embed_image import UNKNOWN as _UNKNOWN_VERDICT
 
 if TYPE_CHECKING:  # real type for annotations; runtime import is the guarded one below
     from vco_lib.deferral_report import DeferralEntry as _DeferralEntryT
@@ -321,7 +334,8 @@ def _build_client(weaviate_url: Optional[str] = None,
     try:
         import weaviate  # local import — soft-fail when not installed
 
-        url = weaviate_url or os.environ.get("WEAVIATE_URL") or "http://localhost:8081"
+        from vco_lib.weaviate_helpers import weaviate_url_default
+        url = weaviate_url or weaviate_url_default()
         m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
         host = m.group(1) if m else "localhost"
         http_port = int(m.group(2)) if (m and m.group(2)) else 8081
@@ -333,6 +347,71 @@ def _build_client(weaviate_url: Optional[str] = None,
     except Exception as exc:  # noqa: BLE001 — no Weaviate → caller degrades
         logger.warning("codegraph resync: Weaviate unavailable: %s", exc)
         return None
+
+
+@contextlib.contextmanager
+def _probe_client(client, weaviate_url: Optional[str], grpc_port: Optional[int]):
+    """Borrow the caller's Weaviate client, or build one and close it after.
+
+    ONE home for the dance every row probe in this module repeated verbatim
+    (8 call sites before v0.2.96): an INJECTED client belongs to the caller
+    and must survive the call, a BUILT one must be closed even when the body
+    raises, and a close that fails must never surface (the probe's answer is
+    already computed by then).
+
+    Yields ``None`` when no client could be built. Each caller keeps its own
+    "could not look" value — ``None`` for the tri-state probes, an empty
+    ``counts`` dict for the mutating passes — because that difference is
+    POLICY and belongs at the call site; only the mechanics live here.
+    """
+    own = client is None
+    if own:
+        client = _build_client(weaviate_url, grpc_port)
+    try:
+        yield client
+    finally:
+        if own and client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 — teardown never changes an answer
+                pass
+
+
+#: :func:`_open_collection` outcomes. Three, because the callers answer them
+#: differently and conflating any two has been a defect here before: an ABSENT
+#: collection is a positive zero (nothing stored yet), while an ERROR is
+#: undeterminable and must never be counted as "nothing owed".
+_COLL_OK = "ok"
+_COLL_ABSENT = "absent"
+_COLL_ERROR = "error"
+
+
+def _open_collection(client, coll_name: str, context: str) -> "tuple[Any, str]":
+    """Open one code-graph collection: ``(collection|None, status)``.
+
+    The collection is typed ``Any`` because it is: the weaviate client this
+    module talks to is untyped here (imported lazily, no stubs), and the
+    status token — never the object's truthiness — is what every caller
+    branches on.
+
+    ONE home for the existence guard + ``get`` + soft-fail the row probes
+    share. ``context`` names the caller in the warning so a log line still
+    says which pass could not open what.
+
+    The ``hasattr`` guard is load-bearing: ``collections.exists`` is absent on
+    some client versions and on the fakes the suite injects, and calling
+    ``get`` on a missing class raises inside the ITERATOR rather than here.
+    """
+    try:
+        if (
+            hasattr(client.collections, "exists")
+            and not client.collections.exists(coll_name)
+        ):
+            return None, _COLL_ABSENT
+        return client.collections.get(coll_name), _COLL_OK
+    except Exception as exc:  # noqa: BLE001 — undeterminable, never a crash
+        logger.warning("codegraph %s: cannot open %s: %s", context, coll_name, exc)
+        return None, _COLL_ERROR
 
 
 # v0.2.75 (P1b): the ignored-path predicate moved to the shared classifier
@@ -363,14 +442,9 @@ def prune_ignored_rows(
     if not project_name:
         return counts
 
-    own_client = False
-    if client is None:
-        client = _build_client(weaviate_url, grpc_port)
+    with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return counts
-        own_client = True
-
-    try:
         try:
             from weaviate.classes.query import Filter
         except Exception as exc:  # noqa: BLE001
@@ -384,10 +458,10 @@ def prune_ignored_rows(
             return counts
         for base in _CODEGRAPH_BASES:
             coll_name = f"{prefix}_{base}"
+            coll, status = _open_collection(client, coll_name, "prune")
+            if status != _COLL_OK:
+                continue  # absent: nothing stored; error: already logged
             try:
-                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                    continue
-                coll = client.collections.get(coll_name)
                 path_prop = _PRUNE_PATH_PROP.get(base, "file_path")
                 to_delete: list = []
                 for obj in coll.iterator(return_properties=[path_prop]):
@@ -411,12 +485,6 @@ def prune_ignored_rows(
             except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
                 logger.warning("codegraph prune: %s failed: %s", coll_name, exc)
         return counts
-    finally:
-        if own_client:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 #: Exact substring identifying orchestrator transient-scratch rows — the
@@ -1138,26 +1206,19 @@ def count_stale_rows(
     # repo_root is absent (scoping off, pre-fix behaviour).
     primary_sources = primary_sources_for(repo_root)
 
-    own_client = False
-    if client is None:
-        client = _build_client(weaviate_url, grpc_port)
+    with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return None
-        own_client = True
-
-    try:
         counts: dict = {}
         for base in _RESYNC_PROBE_BASES:
             coll_name = f"{prefix}_{base}"
-            try:
-                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                    counts[coll_name] = 0
-                    continue
-                coll = client.collections.get(coll_name)
-            except Exception as exc:  # noqa: BLE001 — undeterminable
-                logger.warning(
-                    "codegraph resync: cannot open %s: %s", coll_name, exc
-                )
+            coll, status = _open_collection(client, coll_name, "resync")
+            if status == _COLL_ABSENT:
+                # A class that does not exist holds no stale rows — a
+                # POSITIVE zero, unlike the error arm below.
+                counts[coll_name] = 0
+                continue
+            if status == _COLL_ERROR:
                 return None
             n = _count_stale_in_collection(
                 coll,
@@ -1176,12 +1237,185 @@ def count_stale_rows(
                 return None
             counts[coll_name] = n
         return counts
-    finally:
-        if own_client:
+
+
+# ── v0.2.96 (M-2): truncation-exposure probes ────────────────────────────────
+#
+# The exposure-conditional one-time re-embed (register issue 8 / review M-2;
+# state machine and per-project marker in `vco_lib.code_embed_exposure` —
+# the machine-level `observed` evidence block plus a `healed` map that
+# discharges the owed state ONE PROJECT AT A TIME).
+# Two row-side operations live HERE because this module owns the Weaviate
+# client build, the collection-prefix resolution and the revision constant —
+# the exposure module stays storage-agnostic.
+#
+# MUST MATCH templates/scripts/analyze_code_graph.py::_EMBED_REVISION_VECTORLESS
+# (0 is never a valid CODEGRAPH_EMBED_REVISION — history starts at 1 — so a
+# demoted row stays visibly stale: the fingerprint gate re-writes it on the
+# next visit, which is exactly the forced re-embed the heal wants).
+_EXPOSURE_DEMOTE_REVISION = 0
+
+
+def has_rows_at_current_revision(
+    project_name: str,
+    *,
+    current_revision: Optional[int] = None,
+    analyzer_path: Optional[Path] = None,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[bool]:
+    """M-2 COMPLETION EVIDENCE: does ANY stored row sit at the current
+    embed revision?  Tri-state: ``True`` / ``False`` (positively none) /
+    ``None`` (undeterminable — the caller must NOT read that as "no").
+
+    Why this is the strongest available historical signal (chosen over
+    launcher.db ``code_graph_builds`` rows and resync logs):
+
+    * it is the DATA ITSELF — a row at the current revision can only exist
+      because an analyze walk COMPLETED and stamped it, on this machine,
+      through this machine's embed service.  A build-tracker row only proves
+      a record was written (and pre-v0.2.91 terminal reports false-FAILED
+      successful walks, so the status column lies for exactly the older
+      era a truncating image was serving); a log file proves only that a
+      process printed a line, and logs rotate.
+    * it exists on EVERY install (CLI-only machines have no launcher GUI;
+      hub registration is best-effort) and needs no version history.
+    * it identifies exactly the population at risk: rows BELOW the current
+      revision already re-embed on any walk (fail-safe), and NULL-revision
+      pre-migration rows likewise — only rows AT the current revision with
+      correct content hashes are the ones every gate skips forever.
+
+    Probes the same three file-anchored bases as :func:`count_stale_rows`
+    (``_RESYNC_PROBE_BASES``) with the cheap filtered aggregate; short-
+    circuits on the first positive.  Never raises.
+    """
+    if not project_name:
+        return None
+    if current_revision is None:
+        current_revision = _resolve_embed_revision(analyzer_path)
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return None
+        try:
+            from weaviate.classes.query import Filter
+
+            flt = Filter.by_property("embed_revision").equal(int(current_revision))
+            for base in _RESYNC_PROBE_BASES:
+                coll_name = f"{prefix}_{base}"
+                coll, status = _open_collection(
+                    client, coll_name, "current-revision probe",
+                )
+                if status == _COLL_ABSENT:
+                    continue
+                if status == _COLL_ERROR:
+                    return None
+                try:
+                    agg = coll.aggregate.over_all(filters=flt, total_count=True)
+                    total = getattr(agg, "total_count", None)
+                    if total is not None and int(total) > 0:
+                        return True
+                except Exception as exc:  # noqa: BLE001 — undeterminable, never False
+                    logger.warning(
+                        "codegraph resync: current-revision probe failed on %s: %s",
+                        coll_name, exc,
+                    )
+                    return None
+            return False
+        except Exception as exc:  # noqa: BLE001 — never raises (docstring contract)
+            logger.warning(
+                "codegraph resync: current-revision probe unavailable: %s", exc
+            )
+            return None
+
+
+def demote_current_revision_rows(
+    project_name: str,
+    *,
+    current_revision: Optional[int] = None,
+    analyzer_path: Optional[Path] = None,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[dict]:
+    """M-2 HEAL: demote every row AT the current revision to the vectorless
+    sentinel (``embed_revision=0``) so the EXISTING revision gate forces
+    exactly those rows to re-embed on the walk that follows.
+
+    This is the "one-time embed_revision bump" inverted: instead of raising
+    the analyzer's constant (which would re-embed on EVERY machine and could
+    never be stamped back without an extra pass), the stored side is dropped
+    to the sentinel the v0.2.73 R-2 machinery already treats as "no valid
+    vector — owed".  Properties-only ``data.update`` per row: vectors and
+    content hashes are untouched, so retrieval keeps working throughout and
+    the heal is RESUMABLE — a walk that dies mid-run leaves the demoted rows
+    visibly owed, and a re-run of this function skips rows already at 0.
+
+    Scope: the three file-anchored bases a walk can converge
+    (``_RESYNC_PROBE_BASES``) — demoting CodeAPI/CodeInteraction rows would
+    risk the C-3 interlock (rows a walk cannot re-stamp keep the owed state
+    non-zero forever), and the over-window bodies the truncating image
+    corrupted live in Module/Class/Function rows.
+
+    Returns ``{"demoted": N, "failed": M}`` or ``None`` when undeterminable
+    (client/prefix/collection failure).  Per-row update failures are counted
+    in ``failed`` (the driver keeps the marker owed when ``failed > 0`` —
+    clearing it over un-demoted rows would silently under-heal).  Never
+    raises.
+    """
+    if not project_name:
+        return None
+    if current_revision is None:
+        current_revision = _resolve_embed_revision(analyzer_path)
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return None
+        totals = {"demoted": 0, "failed": 0}
+        for base in _RESYNC_PROBE_BASES:
+            coll_name = f"{prefix}_{base}"
+            coll, status = _open_collection(client, coll_name, "exposure demote")
+            if status == _COLL_ABSENT:
+                continue
+            if status == _COLL_ERROR:
+                return None
             try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
+                for obj in coll.iterator(return_properties=["embed_revision"]):
+                    props = getattr(obj, "properties", None) or {}
+                    # Already-stale rows (NULL / 0 / older) re-embed on any
+                    # walk — demoting them would be a pointless write.
+                    if _guards_is_row_revision_stale(
+                        props.get("embed_revision"), int(current_revision)
+                    ):
+                        continue
+                    try:
+                        coll.data.update(
+                            uuid=str(obj.uuid),
+                            properties={
+                                "embed_revision": _EXPOSURE_DEMOTE_REVISION
+                            },
+                        )
+                        totals["demoted"] += 1
+                    except Exception as exc:  # noqa: BLE001 — count, keep going
+                        totals["failed"] += 1
+                        logger.warning(
+                            "codegraph resync: exposure demote failed on %s "
+                            "row %s: %s", coll_name, getattr(obj, "uuid", "?"), exc,
+                        )
+            except Exception as exc:  # noqa: BLE001 — undeterminable collection
+                logger.warning(
+                    "codegraph resync: exposure demote failed on %s: %s",
+                    coll_name, exc,
+                )
+                return None
+        return totals
 
 
 def list_owed_row_identities(
@@ -1220,28 +1454,19 @@ def list_owed_row_identities(
     reachable_fn = _make_reachability_filter(repo_root)
     primary_sources = primary_sources_for(repo_root)
 
-    own_client = False
-    if client is None:
-        client = _build_client(weaviate_url, grpc_port)
+    out: list = []
+    with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return None
-        own_client = True
-
-    out: list = []
-    try:
         for base in _RESYNC_PROBE_BASES:
             if len(out) >= limit:
                 break
             coll_name = f"{prefix}_{base}"
             path_prop = _PROBE_PATH_PROP.get(base, "file_path")
-            try:
-                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                    continue
-                coll = client.collections.get(coll_name)
-            except Exception as exc:  # noqa: BLE001 — undeterminable
-                logger.warning(
-                    "codegraph owed-identities: cannot open %s: %s", coll_name, exc
-                )
+            coll, status = _open_collection(client, coll_name, "owed-identities")
+            if status != _COLL_OK:
+                # Diagnosis is best-effort: a class that is absent or
+                # unreadable simply contributes no NAMES to the report.
                 continue
             read_props = ["embed_revision", path_prop, "project_source", "full_name"]
             try:
@@ -1272,12 +1497,6 @@ def list_owed_row_identities(
                 )
                 continue
         return out
-    finally:
-        if own_client:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def classify_stale_kinds(
@@ -1333,26 +1552,17 @@ def classify_stale_kinds(
     reachable_fn = _make_reachability_filter(repo_root)
     primary_sources = primary_sources_for(repo_root)
 
-    own_client = False
-    if client is None:
-        client = _build_client(weaviate_url, grpc_port)
+    split = {"embed_owed": 0, "stamp_owed": 0}
+    with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return None
-        own_client = True
-
-    split = {"embed_owed": 0, "stamp_owed": 0}
-    try:
         for base in _RESYNC_PROBE_BASES:
             coll_name = f"{prefix}_{base}"
             path_prop = _PROBE_PATH_PROP.get(base, "file_path")
-            try:
-                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                    continue
-                coll = client.collections.get(coll_name)
-            except Exception as exc:  # noqa: BLE001 — undeterminable
-                logger.warning(
-                    "codegraph stale-kind: cannot open %s: %s", coll_name, exc
-                )
+            coll, status = _open_collection(client, coll_name, "stale-kind")
+            if status == _COLL_ABSENT:
+                continue
+            if status == _COLL_ERROR:
                 return None
             read_props = ["embed_revision"]
             if reachable_fn is not None:
@@ -1384,12 +1594,6 @@ def classify_stale_kinds(
                 )
                 return None
         return split
-    finally:
-        if own_client:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def count_cleanup_owed_rows(
@@ -1449,26 +1653,17 @@ def count_cleanup_owed_rows(
     if not primary_sources:
         primary_sources = None
 
-    own_client = False
-    if client is None:
-        client = _build_client(weaviate_url, grpc_port)
+    with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return None
-        own_client = True
-
-    try:
         total = 0
         for base in _RESYNC_PROBE_BASES:
             coll_name = f"{prefix}_{base}"
             path_prop = _PROBE_PATH_PROP.get(base, "file_path")
-            try:
-                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                    continue
-                coll = client.collections.get(coll_name)
-            except Exception as exc:  # noqa: BLE001 — undeterminable
-                logger.warning(
-                    "codegraph cleanup-owed: cannot open %s: %s", coll_name, exc
-                )
+            coll, status = _open_collection(client, coll_name, "cleanup-owed")
+            if status == _COLL_ABSENT:
+                continue
+            if status == _COLL_ERROR:
                 return None
             # Read the path + project_source (when the class carries it — an
             # absent property 500s the iterator on schema variants, same
@@ -1504,12 +1699,6 @@ def count_cleanup_owed_rows(
                 # conclusion — return None (conservative).
                 return None
         return total
-    finally:
-        if own_client:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 # ── v0.2.73 (M1/M3): metadata backfill for existing rows ─────────────────────
@@ -1623,11 +1812,10 @@ def _backfill_anchor_file_paths(
 
     for base, ref_specs in _ANCHOR_BACKFILL_REFS.items():
         coll_name = f"{prefix}_{base}"
+        coll, status = _open_collection(client, coll_name, "anchor-backfill")
+        if status != _COLL_OK:
+            continue  # absent: nothing to anchor; error: already logged
         try:
-            if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                continue
-            coll = client.collections.get(coll_name)
-
             # Cheap gate: a collection with no missing-file_path row is skipped
             # entirely (steady-state cost ≈ one point query per collection).
             # `file_path` may not even be a schema property on a pre-rider-a
@@ -1759,14 +1947,9 @@ def backfill_codegraph_metadata(
     # anchor pass still runs. Only when BOTH the metadata helpers are absent do
     # we skip the metadata loop (via the per-half `is not None` guards below).
 
-    own_client = False
-    if client is None:
-        client = _build_client(weaviate_url, grpc_port)
+    with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return counts
-        own_client = True
-
-    try:
         try:
             from weaviate.classes.query import Filter
         except Exception as exc:  # noqa: BLE001
@@ -1778,11 +1961,10 @@ def backfill_codegraph_metadata(
             _BACKFILL_BASES.items() if _run_metadata_half else []
         ):
             coll_name = f"{prefix}_{base}"
+            coll, status = _open_collection(client, coll_name, "backfill")
+            if status != _COLL_OK:
+                continue  # absent: nothing to backfill; error: already logged
             try:
-                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                    continue
-                coll = client.collections.get(coll_name)
-
                 # Cheap gate: fully-populated collections skip the scan.
                 # Probe failure (e.g. IsNull unindexed) → scan anyway
                 # (fail-open toward doing the work).
@@ -1862,12 +2044,6 @@ def backfill_codegraph_metadata(
         counts["_file_path_backfilled"] = anchored
         counts["_file_path_unresolvable"] = unresolvable
         return counts
-    finally:
-        if own_client:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 @dataclass
@@ -1877,9 +2053,11 @@ class ResyncTriggerResult:
 
     ``status`` is one of:
       * ``"launched"``   — a background analyze was spawned (``pid`` is set).
-      * ``"deferred"``   — the code-embed service was down; ``deferral`` carries
-                            a :class:`DeferralEntry` (when the type is available)
-                            for the caller to record. Nothing was spawned.
+      * ``"deferred"``   — the code-embed service was down, OR (v0.2.96 WP-3)
+                            it is live but built from stale source;
+                            ``deferral`` carries a :class:`DeferralEntry`
+                            (when the type is available) for the caller to
+                            record. Nothing was spawned.
       * ``"skipped"``    — a precondition wasn't met (analyzer/python missing,
                             no project name). Soft no-op; ``message`` explains.
       * ``"failed"``     — v0.2.94: the resolved interpreter cannot import what
@@ -1898,6 +2076,56 @@ class ResyncTriggerResult:
     message: str = ""
     pid: Optional[int] = None
     deferral: Optional[object] = None
+
+
+def report_trigger_result(
+    result: ResyncTriggerResult,
+    project_name: str,
+    deferral_report,
+    log_event,
+) -> None:
+    """Surface a :func:`spawn_background_resync` outcome (v0.2.96 M-2).
+
+    Moved VERBATIM out of install.py's ``_trigger_codegraph_embed_resync``
+    shim — the install line ratchet answered by EXTRACTION, per its own rule
+    ("put the new logic in a vco_lib module"), so the M-2 exposure thin call
+    fits without an upward re-pin.  Owns the update-output prints, the
+    install event-log rows, and the ledger's two moves:
+    ``mark_resolved("codegraph_embed_resync_pending")`` on a POSITIVE
+    ``not_owed`` (R-6: the ONLY clearing path that deliberately FOREIGN
+    (A-2) entry has — explicit positive confirmation, never
+    drop-when-absent) and ``add_entry(result.deferral)`` on ``deferred``.
+
+    ``log_event`` is install.py's ``_log_install_event(step, level, msg)``,
+    passed IN rather than imported so the event vocabulary stays
+    install.py's.  Soft-fail throughout, exactly as the shim was.
+    """
+    def _log(level: str, msg: str) -> None:
+        try:
+            log_event("codegraph_resync", level, msg)
+        except Exception:  # noqa: BLE001 — logging never gates
+            logger.debug("resync trigger: log_event failed for: %s", msg)
+
+    if result.status == "launched":
+        print(f"  → code-graph resync (P7) launched in background (pid {result.pid})")
+        _log("ok", f"background resync launched for {project_name} (pid {result.pid})")
+    elif result.status == "not_owed":
+        print("  → code-graph resync not owed (all rows at current embed revision)")
+        try:
+            deferral_report.mark_resolved(_CONDITION_ID)
+        except Exception as exc:  # noqa: BLE001
+            _log("warn", f"could not resolve resync deferral: {exc}")
+        _log("ok", f"no resync owed for {project_name}: {result.message}")
+    elif result.status == "deferred":
+        print(f"  ! code-graph resync deferred: {result.message}")
+        if result.deferral is not None:
+            try:
+                deferral_report.add_entry(result.deferral)
+            except Exception as exc:  # noqa: BLE001
+                _log("warn", f"could not record resync deferral: {exc}")
+        _log("warn", f"resync deferred for {project_name}: {result.message}")
+    else:  # skipped / failed
+        _log("warn", f"resync skipped for {project_name}: {result.message}")
 
 
 def code_embed_service_healthy(
@@ -1924,6 +2152,86 @@ def code_embed_service_healthy(
         return resp.status < 400
     except Exception:  # noqa: BLE001 — unreachable service → not healthy
         return False
+
+
+def code_embed_image_verdict(
+    repo_root: "Path | str | None",
+    code_embed_url: Optional[str] = None,
+) -> str:
+    """v0.2.96 (WP-3, register issue 8): the code-embed IMAGE-freshness verdict.
+
+    ONE home for the verdict every resync path must pass — the install
+    trigger (:func:`spawn_background_resync`), the R-7 driver
+    (:func:`run_resync_and_verify`, which is also what the deferral
+    auto-retry and the manual ``--run-resync`` entry point execute), and the
+    deferral-retry dispatcher (``vco_lib.deferral_retry``). Before this
+    helper the ordering constraint "never embed through a stale image"
+    existed only as prose in the remedy text; the 2026-09-20 update pushed
+    3 156 embed requests through exactly such a service.
+
+    Functional reuse of ``vco_lib.code_embed_image`` — the same
+    :func:`~vco_lib.code_embed_image.image_state` call the doctor and the
+    installer's compose-up make, never a shell-out. Verdict tokens are that
+    module's ``CURRENT`` / ``STALE`` / ``UNKNOWN`` (the CLI's 0/1/2):
+
+    * ``stale`` — ``/health`` without the ``source_sha`` KEY (a
+      pre-v0.2.92 image, the population that still truncates over-window
+      input silently at HTTP 200) or a digest mismatch against the source
+      this checkout would build;
+    * ``unknown`` — could not look (see below); callers keep their
+      conservative self-degrade behavior;
+    * ``current`` — positive digest match; the walk may embed.
+
+    A tree with no service source (per-project installs bundle no
+    ``claude_mcp_servers/code_embedding_service``) is judged against the
+    INSTALL root instead — v0.2.96 ship-gate MAJOR-2. The machine runs
+    exactly ONE code-embed service, built from the install root's source, so
+    "this tree cannot say" is not the same fact as "nothing can say": every
+    enforcement point below passes a PROJECT folder (the driver's
+    ``repo_root``, the spawn's, the deferral dispatcher's ``ctx.folder``),
+    and short-circuiting all of them to ``unknown`` left the gate INERT on
+    exactly the bundle path the register's issue 8 happened on, with the
+    protection live only for the orchestrator root. This mirrors the probe
+    :func:`_maybe_run_exposure_heal` already makes — one home for the
+    question "which tree's source decides the machine's image freshness",
+    so the heal cannot be stricter than the gate protecting it.
+
+    When NEITHER tree carries the source (no install root resolves, or the
+    clone is pruned) the ``/health`` payload still decides on its own: a
+    missing ``source_sha`` KEY is positive, digest-free evidence of a
+    pre-v0.2.92 image (WP-3 judgment call 3, resolved 2026-09-22 — that arm
+    used to sit below the "nothing to compare" one and was unreachable
+    without a checkout digest). An image that DOES report a digest is
+    ``unknown`` there, because comparing is the only way to tell a current
+    one from an older post-v0.2.92 one. ``VCT_CODE_EMBED_BUILD_CONTEXT``
+    names the source directly, so it keeps ``repo_root`` as the probe root
+    by definition.
+
+    ``repo_root=None`` — a caller that named no tree at all — stays
+    ``unknown`` without contacting anything.
+
+    Never raises — any failure is ``unknown``, and ``unknown`` never gates.
+    """
+    try:
+        from vco_lib.code_embed_image import (
+            image_state,
+            install_root_with_service_source,
+            service_source_dir,
+        )
+    except Exception:  # noqa: BLE001 — broken install ⇒ could-not-look
+        return _UNKNOWN_VERDICT
+    try:
+        if repo_root is None:
+            return _UNKNOWN_VERDICT
+        root = Path(repo_root)
+        if (
+            not os.environ.get("VCT_CODE_EMBED_BUILD_CONTEXT", "").strip()
+            and service_source_dir(root) is None
+        ):
+            root = install_root_with_service_source() or root
+        return image_state(root, url=code_embed_url).verdict
+    except Exception:  # noqa: BLE001 — a failed probe is unknown, never a crash
+        return _UNKNOWN_VERDICT
 
 
 def _resync_log_path(project_name: str) -> Optional[Path]:
@@ -1996,6 +2304,104 @@ def build_resync_deferral(
         severity="warning",
         kg_node_refs=[],
     )
+
+
+def build_stale_image_deferral(
+    project_name: str,
+    command_to_apply: str,
+) -> Optional["_DeferralEntryT"]:
+    """v0.2.96 (WP-3): the STALE-IMAGE flavour of ``codegraph_embed_resync_pending``.
+
+    Same condition id as the service-down flavour (:func:`build_resync_deferral`)
+    — deliberately NO new id: the registry row, the retry handler and every
+    clear-probe already exist for ``_CONDITION_ID``, and the ledger is
+    last-write-wins per condition id, so whichever path last saw the machine
+    refreshes the one entry. The field text is what differs, because the two
+    flavours tell the user to do OPPOSITE things: service-down says "bring the
+    service up, then re-run"; stale-image says "rebuild the image FIRST" —
+    re-running the resync now is the one action that makes things worse
+    (register issue 8: silent truncation at HTTP 200, vectors corrupted while
+    every exit code reads success).
+
+    Fields are single-line — the Markdown round-trip truncates multi-line
+    values (A-3, same constraint as ``build_unconverged_deferral``).
+    """
+    if DeferralEntry is None:
+        return None
+    return DeferralEntry(
+        condition_id=_CONDITION_ID,
+        title="Code-graph re-embed pending (code-embed image is stale)",
+        detected=(
+            "The running code-embedding service (:{port}) is built from "
+            "OLDER source than this checkout. The revision-gated code-graph "
+            "resync for project '{proj}' was REFUSED: embedding through a "
+            "stale image silently truncates over-window input at HTTP 200, "
+            "corrupting the vectors it writes. Run `python -m "
+            "vco_lib.code_embed_image` for the digest evidence.".format(
+                port=DEFAULT_CODE_EMBED_PORT, proj=project_name
+            )
+        ),
+        why_deferred=(
+            "Ordering constraint (register issue 8, 2026-09-20): the image "
+            "must be REBUILT before any code-graph walk re-embeds through "
+            "it — a walk now would truncate vectors while reporting "
+            "success. Once the image is current the resync re-embeds only "
+            "the stale rows and skips everything already current, so "
+            "deferring is safe and cheap."
+        ),
+        command_to_apply=command_to_apply,
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
+def _stale_image_resume_command(repo_root: Path, project_name: str) -> str:
+    """The manual recovery line the stale-image entry prints (single-line).
+
+    Rebuild FIRST (``install.py --update`` is what rebuilds the image on an
+    ordinary install), resync SECOND — the ordering is the whole point of
+    the entry, so the command must not read as one optional step.
+    """
+    resync = " ".join(shlex.quote(part) for part in (
+        "python", "-m", "vco_lib.codegraph_resync", "--run-resync",
+        "--project", project_name,
+        "--repo-root", str(repo_root),
+    ))
+    return (
+        "python install.py --update  # 1) rebuilds the code_embed image; "
+        f"2) THEN re-run the resync: {resync}"
+    )
+
+
+def _record_stale_image_deferral(
+    repo_root: Path, project_name: str,
+) -> None:
+    """Persist/refresh the stale-image entry in the driver's own ledger write.
+
+    Read-merge-write through the ONE emitter home (``vco_lib.deferral_emit``),
+    same as :func:`_record_unconverged_deferral` — foreign entries preserved.
+    Soft-fail: a ledger write failure logs; it must not crash the driver
+    (the refusal itself already happened and was printed).
+    """
+    try:
+        entry = build_stale_image_deferral(
+            project_name, _stale_image_resume_command(Path(repo_root), project_name),
+        )
+        if entry is None:
+            return
+        from vco_lib.deferral_emit import emit
+
+        folder = Path(repo_root)
+        emit(folder, entry, log=logger)
+        print(
+            "[resync-driver] stale-image deferral recorded in "
+            f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
+        logger.warning(
+            "resync driver: could not record stale-image deferral: %s", exc
+        )
 
 
 def build_unconverged_deferral(
@@ -2498,6 +2904,114 @@ def _report_terminal_to_hub(
         logger.debug("codegraph resync: hub terminal report skipped: %s", exc)
 
 
+def _maybe_run_exposure_heal(repo_root: Path, project_name: str) -> bool:
+    """v0.2.96 (M-2): run this project's owed one-time truncation-exposure
+    heal, if owed.
+
+    Returns True iff this project's demote is positively ACCOUNTED FOR — it
+    either succeeded with zero failed rows in THIS pass, or a previous pass
+    recorded it (``demoted[project]``) and this pass therefore performs none.
+    That is the driver's gate for discharging the project's owed entry
+    (``healed[project]``) on convergence: clearing over un-demoted rows would
+    silently under-heal, because they hash-skip the walk and stay truncated.
+    False in every other shape: no bump owed for THIS project, image verdict
+    not POSITIVELY current, demote undeterminable, or partial demote failure
+    — in all of them the project's owed entry SURVIVES for the next resync,
+    and other projects' owed state is never consulted or touched here.
+
+    The DEMOTE is one-time per project and the DISCHARGE is not: convergence
+    may arrive several passes later (or never). Both gates therefore stay in
+    force on every pass — including the freshness one, so a later walk under
+    an unproven image cannot declare the project healed.
+
+    A project that owes nothing asks ONCE whether anybody ever detected it
+    (``code_embed_exposure.detect_from_history``): update-time detection runs
+    for a single project and a root without current-revision rows recorded
+    nothing for anyone.
+
+    Freshness is judged against the INSTALL root (the tree that carries the
+    service source) whenever ``repo_root`` is a sourceless user project —
+    that resolution lives inside :func:`code_embed_image_verdict` since the
+    v0.2.96 ship-gate MAJOR-2 fix (before it, the heal made the install-root
+    probe itself and the WP-3 gate did not, so the heal was STRICTER than the
+    gate that is supposed to protect it). ``unknown`` must keep the marker
+    owed rather than re-embed through a service whose freshness could not be
+    proven: the WP-3 gate lets ``unknown`` proceed for ordinary walks, and
+    the heal is stricter because the ordinary walk re-embeds nothing while
+    the heal re-embeds everything.
+    """
+    from vco_lib import code_embed_exposure as _exposure
+
+    if not _exposure.exposure_bump_owed(project_name):
+        # v0.2.96 (owner ruling 2026-09-22): the heal may be owed and simply
+        # never DETECTED. Update-time detection runs for ONE project — the
+        # one whose maintenance step is running — and keys completion on THAT
+        # project's rows, so a root with no current-revision rows records
+        # nothing and every project on the machine is left unowed. The
+        # project's own resync therefore asks for itself, from the surviving
+        # machine-level history only (the live arm would say "current" — that
+        # is this function's own precondition). Cheapest disqualifier first:
+        # a machine that never saw a truncating image pays one file check.
+        status = _exposure.detect_from_history(repo_root, project_name)
+        if status == _exposure.STATUS_QUEUED:
+            print(
+                "[resync-driver] exposure heal: this project's own resync "
+                "detected the machine's truncating-image history — the "
+                "one-time re-embed is owed here",
+                flush=True,
+            )
+        if not _exposure.exposure_bump_owed(project_name):
+            return False
+    verdict = code_embed_image_verdict(repo_root)
+    if verdict != _CURRENT_VERDICT:
+        print(
+            "[resync-driver] exposure heal owed but the code-embed image "
+            f"verdict is '{verdict}' (a positive 'current' is required) — "
+            "marker kept, no re-embed through an unproven service",
+            flush=True,
+        )
+        return False
+    if _exposure.exposure_demote_recorded(project_name):
+        # v0.2.96 ship-gate MAJOR-3: the demote is ONE-TIME per project, the
+        # discharge is not. A project whose walk leaves stuck rows never
+        # converges, so re-deriving the demote from the owed state alone
+        # re-demoted the entire current-revision set — a full re-embed — on
+        # every subsequent update, forever. The rows demoted earlier are still
+        # visibly owed (sentinel revision), so THIS walk re-embeds whatever is
+        # left; the residual surfaces through the unconverged deferral.
+        print(
+            "[resync-driver] exposure heal: rows were already demoted in an "
+            "earlier pass — no second demote (the one-time re-embed is per "
+            "project); this walk re-embeds whatever is still owed",
+            flush=True,
+        )
+        return True
+    result = demote_current_revision_rows(project_name)
+    if result is None:
+        print(
+            "[resync-driver] exposure heal: demote undeterminable — marker "
+            "kept (the next resync retries)",
+            flush=True,
+        )
+        return False
+    demoted = int(result.get("demoted", 0))
+    failed = int(result.get("failed", 0))
+    print(
+        f"[resync-driver] exposure heal: demoted {demoted} row(s) to "
+        f"embed_revision=0 for the one-time re-embed through the fixed "
+        f"service (failures: {failed})",
+        flush=True,
+    )
+    if failed:
+        # Un-demoted rows would hash-skip the walk and stay truncated, so the
+        # work is NOT done: leave the demote unrecorded and let the next
+        # resync retry it (already-demoted rows are skipped, so the retry
+        # only touches the remainder).
+        return False
+    _exposure.record_exposure_demote(project_name)
+    return True
+
+
 def run_resync_and_verify(
     project_name: str,
     repo_root: Path,
@@ -2511,6 +3025,35 @@ def run_resync_and_verify(
     """R-7 driver — runs INSIDE the detached child spawned by
     :func:`spawn_background_resync`.
 
+    0. v0.2.96 (WP-3, review M-1): IMAGE-FRESHNESS GATE. The running
+       code-embed image must be provably current before ANY embed runs —
+       this function is the ONE point every path converges on (install
+       trigger's detached child, the deferral auto-retry handler
+       ``retry_codegraph_resync``, and the manual ``--run-resync`` entry
+       point), so the gate HERE is the one no caller can bypass. Verdict
+       ``stale`` → the analyzer is NOT spawned, the
+       ``codegraph_embed_resync_pending`` entry is recorded/refreshed with
+       rebuild-first ordering text, a terminal ``failed`` report closes any
+       hub row the spawn may have registered, and the driver returns 0.
+       ``unknown`` (service not answering, probe could not run, or an image
+       that reports a digest nothing on this machine can compare against)
+       keeps today's conservative self-degrade: the walk proceeds exactly as
+       before this gate existed. A per-project tree is NOT unknown: the
+       verdict is judged against the install root that owns the machine's
+       one service (ship-gate MAJOR-2), and a pre-v0.2.92 image is caught
+       from its ``/health`` alone even when no tree carries the source.
+    0b. v0.2.96 (M-2): EXPOSURE HEAL. When the one-time truncation-exposure
+       bump is owed for THIS project (``vco_lib.code_embed_exposure`` —
+       machine-level ``observed`` evidence and no ``healed`` entry for the
+       project yet) and the image verdict against the INSTALL root is
+       positively ``current``, every current-revision row is demoted to the
+       vectorless sentinel BEFORE the walk, so the walk's existing revision
+       gate re-embeds exactly those rows once through the fixed service.
+       The project's owed entry discharges (``healed[project]``) only on
+       positive convergence with a fully successful demote; every other
+       shape keeps it owed (idempotent, resumable).  Other exposed projects
+       keep their own owed entries and heal on their own next resync —
+       one heal PER exposed project, never one per machine.
     1. Runs the analyzer as a blocking subprocess (NO timeout — project
        rule; the analyzer self-guards per embed request). ``--prune-stale``
        is forwarded only when the spawn confirmed it safe (no extra paths).
@@ -2529,6 +3072,55 @@ def run_resync_and_verify(
     Always returns 0: the deferral (not the exit code) carries the signal;
     nothing waits on this process.
     """
+    # v0.2.96 (WP-3, register issue 8 / review M-1): THE gate. Placed BEFORE
+    # the identity sweep and the owed probes — none of them embed, but all of
+    # them are work in service of a walk that must not happen while the image
+    # is stale, and the refusal should be the FIRST line in the driver's log.
+    # The 2026-09-20 field sequence this closes: update detects a stale image
+    # → defers `codegraph_embed_resync_pending` → the deferral's own auto-retry
+    # driver runs `--run-resync` → the driver embedded 3 156 requests through
+    # the stale image anyway, because the ordering constraint lived only in
+    # prose. Every path now passes the same verdict here.
+    if code_embed_image_verdict(repo_root) == _STALE_VERDICT:
+        print(
+            "[resync-driver] code-embed image STALE — NOT embedding through "
+            "it; rebuild the image first (see UPDATE_DEFERRED.md)",
+            flush=True,
+        )
+        _record_stale_image_deferral(repo_root, project_name)
+        # #31 discipline: the spawn's registration (when there was one — the
+        # retry and manual paths register nothing) must not be left to the
+        # pid-aliveness reconciler's false "died before completing" verdict
+        # ~24 min later. An unregistered pid is a soft no-op server-side.
+        # Soft-fail as everywhere: observability never gates the exit.
+        try:
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=0,
+                error_message=(
+                    "code-embed image stale — walk refused before any embed "
+                    "(rebuild the image first)"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: stale-refusal report raised: %s", exc)
+        return 0
+
+    # v0.2.96 (M-2, register issue 8): the exposure heal — the walk below is
+    # the "next resync under a non-stale image" the queued one-time bump
+    # waits for.  Runs BEFORE the pre-walk owed probe so the demoted rows are
+    # counted as the progress baseline they are.  Soft-fail: a heal failure
+    # never blocks the ordinary resync (the marker simply stays owed).
+    exposure_heal_ok = False
+    try:
+        exposure_heal_ok = _maybe_run_exposure_heal(Path(repo_root), project_name)
+    except Exception as exc:  # noqa: BLE001 — heal must never block the walk
+        print(f"[resync-driver] exposure heal raised (soft-fail): {exc}",
+              flush=True)
+
     # v0.2.84 (D4/P1): pre-analyze identity sweep. Mirrors the Rust pre-build
     # rationale (codegraph.rs::migrate_stale_identities_for_build): migrate any
     # stale ``project`` identity onto the canonical prefix BEFORE the full walk
@@ -2642,6 +3234,25 @@ def run_resync_and_verify(
         # still logged above for the record).
         print(f"[resync-driver] converged: 0 stale rows (analyzer exit {rc})",
               flush=True)
+        # v0.2.96 (M-2): positive convergence is the ONLY clear for the
+        # one-time exposure marker — and only when the heal's demote itself
+        # positively succeeded (`exposure_heal_ok`).  A zero stale count
+        # AFTER the demote means every demoted row was re-embedded through
+        # the non-stale service and re-stamped: the owed bump is discharged.
+        if exposure_heal_ok:
+            try:
+                from vco_lib import code_embed_exposure as _exposure
+
+                if _exposure.clear_exposure_bump(project_name):
+                    print(
+                        "[resync-driver] exposure heal converged — one-time "
+                        "re-embed marker cleared",
+                        flush=True,
+                    )
+            except Exception as exc:  # noqa: BLE001 — a stuck marker re-heals
+                logger.warning(
+                    "resync driver: could not clear exposure marker: %s", exc
+                )
         _resolve_persisted_resync_deferral(repo_root)
         return 0
     stale_desc = (
@@ -2733,15 +3344,14 @@ def _probe_stale_identity_count(
     total = 0
     for base in _CODEGRAPH_BASES:
         coll_name = f"{prefix}_{base}"
+        coll, status = _open_collection(client, coll_name, "identity sweep probe")
+        if status == _COLL_ABSENT:
+            # Absent class = zero stale rows there (positively determinable).
+            any_determinable = True
+            continue
+        if status == _COLL_ERROR:
+            continue  # undeterminable for this class; `any_determinable` unset
         try:
-            if (
-                hasattr(client.collections, "exists")
-                and not client.collections.exists(coll_name)
-            ):
-                # Absent class = zero stale rows there (positively determinable).
-                any_determinable = True
-                continue
-            coll = client.collections.get(coll_name)
             flt = Filter.by_property("project").not_equal(canonical)
             agg = coll.aggregate.over_all(filters=flt, total_count=True)
             count = getattr(agg, "total_count", None)
@@ -3042,12 +3652,35 @@ def spawn_background_resync(
                     )
                     cleanup_owed = None
             if not (cleanup_owed and cleanup_owed > 0):
-                return ResyncTriggerResult(
-                    status="not_owed",
-                    message=(
-                        f"no resync owed for {project_name} — all rows at the "
-                        "current embed revision"
-                    ),
+                # v0.2.96 (M-2): a positive zero does NOT mean "nothing owed"
+                # for a project with a queued truncation-exposure bump — the
+                # corrupted rows are hash- AND revision-CURRENT by
+                # construction (that is precisely the defect: every gate
+                # skips them).  The project's owed entry overrides the
+                # short-circuit; the driver's heal then decides about the
+                # demote under its own freshness gate.  Soft-fail: an
+                # unreadable marker state degrades to the pre-M-2 not_owed,
+                # never to a wrong spawn.
+                owed_bump = False
+                try:
+                    from vco_lib import code_embed_exposure as _exposure
+
+                    owed_bump = _exposure.exposure_bump_owed(project_name)
+                except Exception as exc:  # noqa: BLE001 — marker read never blocks
+                    logger.warning(
+                        "codegraph resync: exposure-marker read failed: %s", exc
+                    )
+                if not owed_bump:
+                    return ResyncTriggerResult(
+                        status="not_owed",
+                        message=(
+                            f"no resync owed for {project_name} — all rows at the "
+                            "current embed revision"
+                        ),
+                    )
+                logger.info(
+                    "codegraph resync: truncation-exposure bump owed — "
+                    "spawning despite zero revision-stale rows"
                 )
             logger.info(
                 "codegraph resync: %d deleted-primary row(s) owed a CG-4 "
@@ -3064,6 +3697,38 @@ def spawn_background_resync(
             message=(
                 f"code-embed service (:{DEFAULT_CODE_EMBED_PORT}) unreachable — "
                 "resync deferred (see UPDATE_DEFERRED.md)"
+            ),
+            deferral=deferral,
+        )
+
+    # v0.2.96 (WP-3, register issue 8): a LIVE service is not a CURRENT
+    # service. Liveness above only proves something answers on the port; the
+    # stale population (image older than the service source — including every
+    # pre-v0.2.92 image, whose /health lacks source_sha) answers fine and
+    # silently truncates over-window embed input at HTTP 200. Refuse to spawn
+    # the walk, hand the caller the stale-image flavour of the SAME
+    # `codegraph_embed_resync_pending` entry (install.py records it exactly as
+    # it records the service-down one), and say "rebuild first". This is
+    # defense-in-depth around the DRIVER's gate — the authoritative verdict
+    # lives in run_resync_and_verify, so the deferral auto-retry path and the
+    # manual --run-resync cannot bypass it even if this arm never runs.
+    # `unknown` (probe could not run, or a digest-reporting image nothing on
+    # this machine can compare against) keeps the pre-gate behavior: proceed.
+    # A sourceless PROJECT tree is not unknown — the verdict helper judges it
+    # against the install root that owns the machine's one service.
+    if check_service and code_embed_image_verdict(
+        repo_root, code_embed_url,
+    ) == _STALE_VERDICT:
+        deferral = build_stale_image_deferral(
+            project_name, _stale_image_resume_command(Path(repo_root), project_name),
+        )
+        return ResyncTriggerResult(
+            status="deferred",
+            message=(
+                f"code-embed service (:{DEFAULT_CODE_EMBED_PORT}) is running "
+                "a STALE image — resync refused (an embed through it would "
+                "silently truncate); rebuild the image first "
+                "(see UPDATE_DEFERRED.md)"
             ),
             deferral=deferral,
         )

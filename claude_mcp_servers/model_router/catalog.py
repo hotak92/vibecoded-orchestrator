@@ -10,9 +10,18 @@ falls back when a fetch fails.
 There are two fallback sources and one rule between them: a vendor row may
 carry its own ids in ``Vendor.static_ids``, and when it does they win over the
 shipped ``static_catalog.json`` block for that vendor. ``_resolve_static_tables``
-holds the reasoning. Every shipped row leaves the field empty, so today's
-behaviour is snapshot-only; the field exists so that adding a vendor stays a
-config change end to end, fallback included.
+holds the reasoning, and the reported source names which one answered:
+``declared`` for the row's own ids, ``static`` for the shipped snapshot. Two
+row shapes lean on that fallback harder than a plain live vendor: a row with
+no model-list endpoint at all (``catalog_path is None`` and no
+``catalog_url``) serves its ``static_ids`` as the WHOLE catalog without a key
+or a fetch, and a row whose list endpoint lives on another base
+(``Vendor.catalog_url``, an absolute-URL override) rides the ordinary live
+path with its ``static_ids`` as the keyless/fetch-failed fallback. A live
+list may also carry ids that are not chat models — ``catalog_exclude_prefixes``
+drops them before anything else sees them (:func:`_exclude_by_prefix`). The
+field exists so that adding a vendor stays a config change end to end,
+fallback included.
 
 Vendor-neutral by construction: every upstream, credential and namespace
 arrives as a :class:`~model_router.vendors.Vendor` row or the
@@ -100,8 +109,19 @@ STATIC_CATALOG_PATH = Path(__file__).resolve().parent / "static_catalog.json"
 #: the second means a fetch happened and neither the upstream nor the shipped
 #: snapshot produced a single model. Collapsing them would make a brand-new
 #: daemon look broken, or a genuinely broken family look merely idle.
+#: ``declared`` is distinct from ``static`` for the same reason, and the two
+#: name WHERE the served list came from when no live fetch answered:
+#: ``static`` is the shipped ``static_catalog.json`` snapshot, while
+#: ``declared`` is the vendor row's own ``static_ids`` — served either
+#: because the row has no model-list endpoint at all (nothing was fetched
+#: and nothing is being retried), or because its endpoint did not answer
+#: (no key resolved yet, or the fetch failed; retried on the short TTL like
+#: any fallback). A picker that looks short has a different answer per word:
+#: troubleshooting a ``declared`` family means reading the vendor row, and a
+#: ``static`` one means the release snapshot served what it shipped.
 SOURCE_LIVE = "live"
 SOURCE_STATIC = "static"
+SOURCE_DECLARED = "declared"
 SOURCE_UNFETCHED = "unfetched"
 SOURCE_EMPTY = "unavailable"
 
@@ -122,6 +142,28 @@ CATALOG_FILTER_ALL = "all"
 CATALOG_FILTERS = (CATALOG_FILTER_LATEST, CATALOG_FILTER_ALL)
 
 DEFAULT_CATALOG_FILTER = CATALOG_FILTER_LATEST
+
+#: Publish BOTH spellings of a 1M first-party model: the plain id, which the
+#: client budgets at 200K, and its ``[1m]`` companion, which buys the full
+#: window. The escape hatch, and the only way to hold a 1M model to the
+#: smaller budget deliberately — which is what keeps a long session under the
+#: upstream's long-context pricing tier.
+WINDOW_ROWS_BOTH = "both"
+
+#: Publish ONLY the ``[1m]`` spelling of a 1M first-party model. The owner's
+#: requirement (2026-09-22): one model should be one row, and the row worth
+#: having is the one that buys the window being paid for. The plain id stays
+#: ROUTABLE BY NAME — it is withheld from the picker, not from the gateway —
+#: and is reported in ``_vct_catalog_hidden`` like every other withheld row,
+#: so a user who wants the 200K budget can still see that it exists and reach
+#: it with :data:`WINDOW_ROWS_BOTH`.
+WINDOW_ROWS_ONE_M_ONLY = "one_m_only"
+
+#: Accepted values of ``VCT_MODEL_GATEWAY_WINDOW_ROWS``, in the order the
+#: error message lists them.
+WINDOW_ROW_MODES = (WINDOW_ROWS_ONE_M_ONLY, WINDOW_ROWS_BOTH)
+
+DEFAULT_WINDOW_ROWS = WINDOW_ROWS_ONE_M_ONLY
 
 #: Appended to the display name of a ``[1m]`` companion entry so the picker
 #: shows two distinguishable rows for one model rather than the same name
@@ -159,13 +201,81 @@ WINDOW_INHERITED_PREFIX = "inherited:"
 #: resolution order exists to avoid, and it must read as absent in the picker.
 UNVERIFIED_WINDOW = "unverified"
 
-#: Ids already named in an inheritance log line, so a picker refresh every few
-#: hours does not reprint the same sentence. Process-wide and unbounded in
-#: principle, bounded in practice by the number of models two upstreams ship.
-_INHERITED_LOGGED: set[tuple[str, str]] = set()
+#: Keys already named in a say-it-once log line, so a picker refresh every few
+#: hours does not reprint the same sentence. ONE registry for all three topics
+#: (see :func:`_log_once`) — it was three parallel sets until 2026-09-22, and
+#: the third was added by copying the first, which is the moment a pattern
+#: should have become a function. Process-wide and unbounded in principle,
+#: bounded in practice by the number of models the upstreams ship.
+_LOGGED_ONCE: set[tuple[str, object]] = set()
 
-#: Ids already named in a table-disagreement warning. Same reasoning.
-_WINDOW_DISAGREEMENT_LOGGED: set[str] = set()
+#: Topics of :data:`_LOGGED_ONCE`. Named constants rather than bare strings so
+#: a typo at a call-site cannot silently open a fourth, always-empty topic that
+#: prints its line on every refresh.
+LOG_ONCE_INHERITED = "inherited"
+LOG_ONCE_WINDOW_DISAGREEMENT = "window_disagreement"
+LOG_ONCE_TRUTH_FILTER = "truth_filter"
+
+
+def _log_once(
+    topic: str,
+    key: object,
+    level: int,
+    msg: str,
+    *args: object,
+    logger_: Optional[logging.Logger] = None,
+) -> bool:
+    """Emit ``msg`` at most once per ``(topic, key)``. True when it emitted.
+
+    ``logger_`` is the caller's OWN logger, and callers outside this module
+    must pass it. A log record's logger NAME is part of its identity — it is
+    what an operator filters on and what ``assertLogs`` asserts against — so
+    routing every say-once line through this module's logger would silently
+    re-home other modules' warnings as a side effect of sharing the registry.
+    Consolidating a mechanism must not move its output.
+
+    The key is whatever identifies "the same sentence" for that topic, and
+    the three differ on purpose: an inheritance line is keyed on the id pair,
+    a table disagreement on the bare id, and the truth filter on the withheld
+    SET rather than a list — a refresh must not reprint while the withheld ids
+    are unchanged, but the day the set GROWS the new line is the operator's
+    signal that the vendor's list moved. Keying on a set is why this takes
+    ``object`` and not ``str``.
+    """
+    entry = (topic, key)
+    if entry in _LOGGED_ONCE:
+        return False
+    _LOGGED_ONCE.add(entry)
+    (logger_ or logger).log(level, msg, *args)
+    return True
+
+
+def reset_log_once(topic: Optional[str] = None) -> None:
+    """Forget what has been said — whole registry, or one topic.
+
+    The supported seam for tests, which must not reach into
+    :data:`_LOGGED_ONCE` directly: a test that clears the wrong topic reads
+    identically to one that clears the right one.
+    """
+    if topic is None:
+        _LOGGED_ONCE.clear()
+        return
+    for entry in [e for e in _LOGGED_ONCE if e[0] == topic]:
+        _LOGGED_ONCE.discard(entry)
+
+
+def _log_truth_filter_withheld(vendor_id: str, withheld: frozenset[str]) -> None:
+    """Log one INFO line per (vendor, withheld-set)."""
+    _log_once(
+        LOG_ONCE_TRUTH_FILTER,
+        (vendor_id, withheld),
+        logging.INFO,
+        "model-gateway: vendor %r lists ids this registry has not verified "
+        "to answer as themselves, so the catalog withholds them: %s. "
+        "See the verified_ids comment on the vendor row.",
+        vendor_id,
+        ", ".join(sorted(withheld)),
+    )
 
 
 @dataclass(frozen=True)
@@ -246,14 +356,28 @@ class CatalogUnion:
 
     entries: list[CatalogEntry]
     sources: dict[str, str]
-    #: Ids the latest-only filter withheld. Published so a short picker has an
-    #: answer that is not "the gateway lost my model" — the same reasoning as
+    #: Ids the union withheld: the latest-only filter, the vendor's
+    #: verified-ids truth filter, or the vendor's curated hide list
+    #: (``catalog_hide_ids``). Published so a short picker has an answer
+    #: that is not "the gateway lost my model" — the same reasoning as
     #: ``_vct_catalog_source``.
     hidden: list[str]
 
 
 def _positive(value: Optional[int]) -> Optional[int]:
-    """``None`` for anything that is not a usable token count."""
+    """``None`` for anything that is not a usable token count.
+
+    The Python home of the UNSTATED rule — ``0`` means "nobody stated this",
+    never "zero tokens", so it reads as absent rather than as a number the
+    picker could show. MUST MATCH the three other homes of the same rule:
+    ``launcher/src-tauri/migrations/046_*.sql`` (the ``>= 0`` CHECK),
+    ``launcher/src-tauri/src/commands/chat_model_context.rs`` (``validated``),
+    and ``launcher/src/lib/api/chat_model_context.ts``
+    (``parseMaxOutputTokens``). Four languages, one rule, no shared home to
+    call — so the lock is this comment on each side. Change one, change all
+    four, or a number invented in one layer reaches the picker through
+    another.
+    """
     if value is None or value <= 0:
         return None
     return value
@@ -312,16 +436,16 @@ def resolve_window(
         )
 
     if family_floor is not None:
-        key = (bare_id, family_floor.model_id)
-        if key not in _INHERITED_LOGGED:
-            _INHERITED_LOGGED.add(key)
-            logger.info(
-                "model-gateway: %s states no context window and no table row "
-                "names it; inheriting %d tokens from %s, the previous version "
-                "in its family. Add a cited row to the chat-model context "
-                "table to replace this with a verified figure.",
-                bare_id, family_floor.window, family_floor.model_id,
-            )
+        _log_once(
+            LOG_ONCE_INHERITED,
+            (bare_id, family_floor.model_id),
+            logging.INFO,
+            "model-gateway: %s states no context window and no table row "
+            "names it; inheriting %d tokens from %s, the previous version "
+            "in its family. Add a cited row to the chat-model context "
+            "table to replace this with a verified figure.",
+            bare_id, family_floor.window, family_floor.model_id,
+        )
         return WindowResolution(
             family_floor.window,
             family_floor.max_output,
@@ -436,7 +560,10 @@ def _window_qualifier(*, window: Optional[int], one_m_row: bool) -> str:
     * a row smaller than the client's default — the indicator reads full late
       and compaction fires after the upstream has already started refusing;
     * a 1M model's PLAIN row — usable, but at a fifth of the window the user
-      is paying for, and the fix is one row further down the picker.
+      is paying for, and the fix is one row further down the picker. This
+      case only arises under :data:`WINDOW_ROWS_BOTH`, which is exactly when
+      that other row is there to be pointed at; the default withholds the
+      plain row instead of annotating it.
 
     The band between (a window above the default but below 1M, on a plain
     row) is deliberately silent: the client under-budgets there, but there is
@@ -499,10 +626,12 @@ def _warn_on_table_disagreement(
     if row is None:
         return
     derived = (window or 0) >= ONE_M_WINDOW
-    if row.window_1m == derived or bare_id in _WINDOW_DISAGREEMENT_LOGGED:
+    if row.window_1m == derived:
         return
-    _WINDOW_DISAGREEMENT_LOGGED.add(bare_id)
-    logger.warning(
+    _log_once(
+        LOG_ONCE_WINDOW_DISAGREEMENT,
+        bare_id,
+        logging.WARNING,
         "model-gateway: chat-model context row %r says window_1m=%s but "
         "context_window=%s; the advertised %s suffix follows the WINDOW "
         "(%s). Fix the row in %s — one of the two fields is wrong.",
@@ -604,6 +733,7 @@ def _publish_family(
     label: str,
     vendor: Optional[Vendor],
     catalog_filter: str,
+    window_rows: str = DEFAULT_WINDOW_ROWS,
 ) -> tuple[list[CatalogEntry], list[str]]:
     """Render ONE upstream's rows: resolve, decide ``[1m]``, filter, describe.
 
@@ -616,13 +746,51 @@ def _publish_family(
     if not entries:
         return [], []
 
+    # The truth filter runs BEFORE window resolution, deliberately: an id the
+    # registry has not verified to answer as itself must not feed a family
+    # floor either (a kept sibling would otherwise inherit a window from a
+    # model that is actually a reroute to some other model), and it must not
+    # be shielded from the latest-only filter's notion of "newest" by an id
+    # that does not really exist. Hidden under the namespaced spelling, so
+    # "_vct_catalog_hidden" reads like the picker the id is missing from.
+    withheld: list[str] = []
+    if vendor is not None and vendor.verified_ids:
+        verified = {model_id.lower() for model_id in vendor.verified_ids}
+        kept_entries: list[CatalogEntry] = []
+        for entry in entries:
+            if entry.id.lower() in verified:
+                kept_entries.append(entry)
+                continue
+            withheld.append(advertised_id(vendor, entry.id, one_m=False))
+        if withheld:
+            _log_truth_filter_withheld(
+                vendor.vendor_id, frozenset(withheld),
+            )
+        if not kept_entries:
+            return [], withheld
+        entries = kept_entries
+
     parts = {entry.id: parse_model_id(entry.id) for entry in entries}
     resolved = resolve_family_windows(entries, table=table, parts=parts)
+    # Owner curation (2026-09-22, final advertised list): ids a row
+    # defers to a later discussion are HIDDEN under BOTH catalog filters
+    # — reported in ``_vct_catalog_hidden``, still routable by name, never
+    # published even when a live refresh lists them or they would win the
+    # latest ranking. Resolution still sees them (a hidden sibling may
+    # feed a published family floor), so this runs AFTER resolution.
+    hide = {i.lower() for i in (vendor.catalog_hide_ids if vendor else ())}
 
     candidates: list[_Candidate] = []
     for entry in entries:
         answer = resolved[entry.id]
         one_m = (answer.window or 0) >= ONE_M_WINDOW
+        if vendor is not None and entry.id.lower() in hide:
+            # Curated-hidden spells the id the way the picker would have
+            # advertised it ([1m] when the resolved window is 1M), mirroring
+            # latest-withheld below; the truth filter's withheld spelling
+            # stays bare (an unverified id has no verified window to name).
+            withheld.append(advertised_id(vendor, entry.id, one_m=one_m))
+            continue
         _warn_on_table_disagreement(
             parts[entry.id].bare_id, table=table, window=answer.window,
         )
@@ -649,18 +817,32 @@ def _publish_family(
     kept, hidden = _latest_only(candidates, catalog_filter=catalog_filter)
 
     published: list[CatalogEntry] = []
+    one_m_only = window_rows == WINDOW_ROWS_ONE_M_ONLY
     for candidate in kept:
-        published.append(
-            _render(
-                candidate,
-                label=label,
-                model_id=candidate.published_id,
-                display_name=candidate.display_name,
+        # A 1M first-party model's PLAIN row is the 200K budget. Under
+        # ``one_m_only`` it is withheld so one model is one row — reported in
+        # hidden like every other withheld id, and still routable by name,
+        # because the gateway rewrites what it is asked for rather than only
+        # what it advertised. The companion below is published either way: a
+        # row the client budgets correctly is the point of the pair.
+        if one_m_only and vendor is None and candidate.one_m:
+            withheld.append(candidate.published_id)
+        else:
+            published.append(
+                _render(
+                    candidate,
+                    label=label,
+                    model_id=candidate.published_id,
+                    display_name=candidate.display_name,
+                )
             )
-        )
         if vendor is None and candidate.one_m:
-            # The first-party companion. A hidden base never reaches here, so
-            # a companion can never outlive the row it belongs to.
+            # The first-party companion. A base hidden by the truth filter or
+            # by latest-only never reaches here, so a companion can never
+            # outlive a row that was FILTERED away. Under ``one_m_only`` it
+            # deliberately outlives the plain row it belongs to — that is the
+            # whole point of that mode, and the reason this is not the same
+            # condition as the one above.
             published.append(
                 _render(
                     candidate,
@@ -671,7 +853,39 @@ def _publish_family(
                     ),
                 )
             )
-    return published, [candidate.published_id for candidate in hidden]
+    return published, [
+        candidate.published_id for candidate in hidden
+    ] + withheld
+
+
+def _exclude_by_prefix(
+    entries: tuple[CatalogEntry, ...],
+    prefixes: Sequence[str],
+) -> tuple[CatalogEntry, ...]:
+    """Drop LIVE ids that start with any of the vendor's excluded prefixes.
+
+    The non-chat modalities a list endpoint may carry — voice, image, a
+    router alias — are not models a chat picker can use, and a row that
+    answers an error is the deprecated-model trap worn by a different list.
+    Applied to FETCHED entries only: the row's declared ``static_ids`` are
+    curated by whoever wrote the row, and filtering them would second-guess
+    the declaration.
+
+    Exclusion is NOT withholding. :attr:`CatalogUnion.hidden` answers "which
+    model am I missing from the picker" for ids a user would look for — the
+    latest-only filter, the verified-ids truth filter, and the vendor's
+    curated hide list (``catalog_hide_ids``: curation without removal).
+    An excluded id lands in neither list: either it was never a chat model
+    to choose (voice, image, router alias), or it is a dated chat build the
+    owner curated out of the picker entirely (owner ruling 2026-09-22: a
+    refresh must not resurrect outdated snapshots). Compared
+    case-insensitively, like every other id-prefix rule in this package.
+    """
+    lowered = tuple(prefix.lower() for prefix in prefixes)
+    return tuple(
+        entry for entry in entries
+        if not entry.id.lower().startswith(lowered)
+    )
 
 
 @dataclass
@@ -755,6 +969,15 @@ class CatalogService:
         self._static_ttl_s = max(1, int(static_ttl_s))
         self._clock = clock
         self._static = self._resolve_static_tables(_load_static(), vendors)
+        #: Family ids whose fallback table is the vendor row's OWN declared
+        #: ``static_ids`` rather than the shipped snapshot. :meth:`_fallback`
+        #: reports those as ``declared`` — the list being served is the row's
+        #: declaration, and troubleshooting it means reading the row.
+        self._declared_families = frozenset(
+            vendor_id
+            for vendor_id, vendor in vendors.items()
+            if vendor.static_ids
+        )
         self._cache: dict[str, _FamilyCache] = {}
         #: Ids the last :meth:`union` withheld. Kept so ``/health`` can report
         #: the count without building a catalog — the same rule ``sources``
@@ -839,9 +1062,18 @@ class CatalogService:
 
     def _fallback(self, family_id: str) -> _FamilyCache:
         entries = self._static.get(family_id, ())
+        if not entries:
+            source = SOURCE_EMPTY
+        elif family_id in self._declared_families:
+            # The row's own static_ids answered — see the SOURCE_DECLARED
+            # block: `declared` names the row as the list's origin, whether
+            # the live endpoint failed or was never reachable without a key.
+            source = SOURCE_DECLARED
+        else:
+            source = SOURCE_STATIC
         return _FamilyCache(
             entries=entries,
-            source=SOURCE_STATIC if entries else SOURCE_EMPTY,
+            source=source,
             fetched_at=self._clock(),
         )
 
@@ -931,17 +1163,41 @@ class CatalogService:
         cached = self._fresh(vendor.vendor_id)
         if cached is not None:
             return cached
+        if vendor.catalog_path is None and vendor.catalog_url is None:
+            # No model-list endpoint anywhere: the catalog is the row's
+            # declared ids, already folded into ``self._static`` by
+            # ``_resolve_static_tables``. No key is resolved and no fetch is
+            # attempted — a vendor whose only endpoint is the messages one
+            # must not require its key to exist for the picker to work, and
+            # there is nothing to retry, so the short static TTL governs.
+            entries = self._static.get(vendor.vendor_id, ())
+            result = _FamilyCache(
+                entries,
+                SOURCE_DECLARED if entries else SOURCE_EMPTY,
+                self._clock(),
+            )
+            self._cache[vendor.vendor_id] = result
+            return result
         key = await self._vendor_key(vendor)
         payload = None
         if key:
+            if vendor.catalog_url is not None:
+                url = vendor.catalog_url
+            else:
+                # Not None here: the no-discovery branch above returned.
+                url = f"{vendor.upstream}{vendor.catalog_path}"
             payload = await self._fetch_json(
-                f"{vendor.upstream}{vendor.catalog_path}",
+                url,
                 {
                     vendor.auth_header: f"{vendor.auth_scheme}{key}",
                     "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
                 },
             )
         entries = self._parse_models(payload)
+        if entries and vendor.catalog_exclude_prefixes:
+            entries = _exclude_by_prefix(
+                entries, vendor.catalog_exclude_prefixes,
+            )
         result = (
             _FamilyCache(entries, SOURCE_LIVE, self._clock())
             if entries
@@ -965,19 +1221,25 @@ class CatalogService:
         *,
         table: ContextTable,
         catalog_filter: str = DEFAULT_CATALOG_FILTER,
+        window_rows: str = DEFAULT_WINDOW_ROWS,
     ) -> CatalogUnion:
         """Build the picker list.
 
         Vendor ids are published under the vendor's namespace; first-party
-        ids verbatim AND, for a 1M model, a second time with the ``[1m]``
-        suffix. Both, not one: the plain id is the model, the suffixed one is
-        the client's request for the large window on that same model, and a
-        user who wants the 200K behaviour must still be able to ask for it.
-        The claim that "the client knows first-party windows natively" —
-        which is why this used to publish the plain id alone — is false in
-        the one place it mattered: with a custom base URL the client budgets
-        200K for a 1M model unless the id carries the suffix, so a long
-        session compacted at a fifth of the context the user was paying for.
+        ids verbatim and, for a 1M model, with the ``[1m]`` suffix. Which of
+        those two spellings a 1M model actually gets is ``window_rows``:
+        :data:`WINDOW_ROWS_ONE_M_ONLY` (the default) publishes the suffixed
+        row alone, so one model is one row; :data:`WINDOW_ROWS_BOTH`
+        publishes the plain row beside it for anyone who wants the 200K
+        budget on purpose. The withheld plain id is reported in
+        :attr:`CatalogUnion.hidden` and stays routable by name either way.
+
+        The suffixed row is never the one withheld, because the claim that
+        "the client knows first-party windows natively" — which is why this
+        once published the plain id alone — is false in the one place it
+        mattered: with a custom base URL the client budgets 200K for a 1M
+        model unless the id carries the suffix, so a long session compacted
+        at a fifth of the context the user was paying for.
 
         **Which rows get ``[1m]`` follows the resolved WINDOW**, not the
         table's flag. That is what makes the advert auto-update: a 1M model
@@ -987,6 +1249,12 @@ class CatalogService:
         authority for the vendor whose windows must never be guessed); it is
         no longer the ONLY input.
 
+        Ids in the vendor's ``catalog_hide_ids`` are withheld under BOTH
+        filters (curated out of the picker, reported in hidden), and they
+        still feed family floors because resolution runs before the hide
+        check consumes them. Hiding a family's newest member promotes its
+        next-older sibling to published — curation narrows, it does not
+        freeze a family out.
         ``catalog_filter`` is the owner's latest-only requirement:
         ``latest`` (the default) publishes the newest version of each family
         and reports the rest in :attr:`CatalogUnion.hidden`; ``all``
@@ -1021,6 +1289,7 @@ class CatalogService:
             label=self.first_party_label,
             vendor=None,
             catalog_filter=catalog_filter,
+            window_rows=window_rows,
         )
         # First-party rows are sorted by id so a plain row and its companion
         # sit together; vendor rows keep the order their upstream listed.
@@ -1083,11 +1352,14 @@ def to_models_response(
     extension: a client that does not know it ignores it, while the
     launcher's status card and a curious user get a straight answer.
 
-    * ``_vct_catalog_source`` — per family: live, snapshot, or neither.
-    * ``_vct_catalog_hidden`` — the ids the latest-only filter withheld, so
-      "my model is missing" resolves without reading a log or guessing at a
-      knob. Sorted, because the order rows were filtered in is not
-      information anyone can use.
+    * ``_vct_catalog_source`` — per family: live, snapshot, declared, or
+      neither.
+    * ``_vct_catalog_hidden`` — the ids the union withheld (the latest-only
+      filter, the vendor's verified-ids truth filter, or the vendor's
+      curated hide list), so "my model is missing" resolves without reading
+      a log or guessing at a knob. Sorted,
+      because the order rows were filtered in is not information anyone can
+      use.
     * ``_vct_window_source`` (per row) — which step decided that row's window.
     """
     data = [_model_row(entry) for entry in entries]
@@ -1109,10 +1381,16 @@ __all__ = [
     "CATALOG_FILTER_ALL",
     "CATALOG_FILTER_LATEST",
     "DEFAULT_CATALOG_FILTER",
+    "DEFAULT_WINDOW_ROWS",
+    "reset_log_once",
+    "WINDOW_ROWS_BOTH",
+    "WINDOW_ROWS_ONE_M_ONLY",
+    "WINDOW_ROW_MODES",
     "CLIENT_DEFAULT_WINDOW",
     "ONE_M_DISPLAY_SUFFIX",
     "ONE_M_WINDOW",
     "SOURCE_EMPTY",
+    "SOURCE_DECLARED",
     "SOURCE_LIVE",
     "SOURCE_STATIC",
     "SOURCE_UNFETCHED",

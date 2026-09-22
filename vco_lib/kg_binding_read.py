@@ -52,12 +52,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Helpers that still live in project_init (shared with other call-sites
-# there). Import cycle is impossible: project_init imports THIS module only
-# lazily, inside its thin alias — never at module top level.
-from vco_lib.project_init import (
-    _canonical_path_eq,
-)
+# v0.2.96 (ship-gate D-4): the `_canonical_path_eq` import that used to sit
+# here is gone with the inline folder→project-id loop it served — that step
+# now calls `module_gated_delivery.resolve_project_id_for_folder`, the ONE
+# home, which applies the same comparator internally.
 
 
 def config_has_manual_override(config_json) -> bool:
@@ -130,30 +128,29 @@ def _read_kg_binding_override(folder: Path) -> dict:
     if not db_path.is_file():
         return out
 
-    try:
-        folder_canonical = folder.resolve()
-    except (OSError, RuntimeError):
+    # v0.2.96 (ship-gate D-4): the folder→project-id step goes through
+    # `module_gated_delivery.resolve_project_id_for_folder` — the ONE home
+    # WP-10 extracted for exactly this pattern in this cycle. This function
+    # was its FOURTH inline copy (the module's own header lists only three
+    # migrated call-sites), and an inline copy is how the comparator drifts:
+    # the shared one is `_canonical_path_eq`, case-insensitive on Windows.
+    from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+
+    project_id = resolve_project_id_for_folder(folder, db_path=db_path)
+    if project_id is None:
         return out
 
     try:
-        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        # v0.2.96 L-11: the ONE home for this URI — a hand-interpolated
+        # path containing ?/#/% truncates at the first ? and fails shut.
+        from vco_lib.launcher_db_reader import sqlite_ro_uri
+        conn = _sqlite3.connect(
+            sqlite_ro_uri(db_path), uri=True, timeout=2.0)
     except _sqlite3.Error:
         return out
 
     try:
         cur = conn.cursor()
-        try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
-        except _sqlite3.Error:
-            return out
-        project_id = None
-        for row_id, row_folder in rows:
-            if _canonical_path_eq(row_folder or "", folder_canonical):
-                project_id = row_id
-                break
-        if project_id is None:
-            return out
         try:
             cur.execute(
                 "SELECT role, collection_name, config_json FROM project_kg_bindings "

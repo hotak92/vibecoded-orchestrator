@@ -258,7 +258,79 @@ _MAIN_SPAN_MAX = 1687
 # Bodies moved VERBATIM — the only edits are the renames the new home forces
 # (`_log_install_event` → the passed-in logger, `_make_deferral` → the passed-in
 # builder). ALL outside main() (+0 span; main() stays at its own 1687 pin).
-_TOTAL_LINES_MAX = 24005
+#
+# v0.2.96 WP-1 — re-pinned DOWN to the measured 24003 (-2): the child-output
+# lane swapped the two inherited-stdio sync spawns for `run_child_logged`
+# (vco_lib/child_process.py) and came in two lines UNDER the old pin. Pin at
+# the measured value, never above it.
+#
+# v0.2.96 WP-4 — re-pinned DOWN to the measured 23966 (-37): the adoption
+# lane moved the services.toml IO out to vco_lib/service_adoption.py and
+# left thin wrappers. Same rule: measured value, never above.
+#
+# v0.2.96 M-2 — re-pinned DOWN to the measured 23932 (-34): the exposure-bump
+# lane NEEDED lines in `_trigger_codegraph_maintenance` (the thin
+# `code_embed_exposure.detect_and_queue` call) and paid for them the ratchet's
+# own way: the resync shim's result-handling chain moved VERBATIM to
+# `codegraph_resync.report_trigger_result`, and its inline `.venv` probe to
+# `python_exe.resolve_root_venv_python`. ALL outside main() (+0 span).
+#
+# v0.2.96 python-core fix lane — the pin is UNCHANGED at the measured 23932.
+# Not raised: the file came out exactly level with the previous pin, which is
+# the honest outcome to record when a change neither grew nor shrank the
+# monolith. install.py joined the pyright gate this release (26 errors fixed,
+# two of them latent bugs), and the per-fix rationale comments are lines the
+# gate join genuinely owes. They were paid for the ratchet's own way — three
+# extractions, no prose shaved:
+#   * `[VCO-EVENT]` line grammar + env gate + soft-fail → `vco_lib/progress_event.py`
+#     (the D-1 cross-language lock; the sync child and the relay filter share it);
+#   * Weaviate `/v1/schema` class-name parsing → `weaviate_helpers.schema_class_names`
+#     (four hand-written copies here, three of them yielding `str | None`,
+#     which is where three of the type errors came from);
+#   * `_resolve_project_id_by_folder` → a thin wrapper over
+#     `module_gated_delivery.resolve_project_id_for_folder` (the D-4 one home;
+#     this was its fifth copy and the one whose comparator drifted furthest).
+# ALL outside main() (+0 span).
+#
+# v0.2.96: re-pinned DOWNWARD 23932 -> 23913 (-19). The Weaviate-URL fallback
+# had SEVEN hand-written copies here, five of them the four-line
+# `os.environ.get("WEAVIATE_URL") or f"http://localhost:{...WEAVIATE_PORT...}"`
+# block; all seven now call `_wh.weaviate_url_default()`, the ONE home, which
+# is also the only one that reads `WEAVIATE_PORT` correctly. No import was
+# added — `_wh` has been imported at module scope since v0.2.77 — so the
+# convergence is a pure subtraction rather than the usual +1-for-the-import
+# trade. Shrink measured, then pinned; never the reverse.
+#
+# v0.2.96 duplication lane (F-2 + F-5) — re-pinned DOWN to the measured
+# 23905 (-8). The install.py embedding-model mirror `_model_id_for_active`
+# became a thin delegate (its "bootstrap self-containment" receipt was read as
+# provably false — install.py hard-imports ~20 vco_lib modules at top level,
+# so the mirror looked like pure duplication), and
+# `_read_active_embedding_from_app_state` now delegates to
+# `vco_lib.launcher_db_reader.read_app_state_active_embedding` (threading
+# `_discover_app_state_db_path` explicitly). Also deleted the now-dead
+# `_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE` constant (+ comment). The one added
+# line is the `_launcher_db_reader` import. ALL outside main() (+0 span).
+# v0.2.96 (coordinator, at integration): re-pinned DOWNWARD 23905 -> 23892
+# (-13). `_vparts`/`_ge` — a version parser and comparator hand-copied into a
+# function BODY, so they were redefined on every call and could be neither
+# imported nor tested — were deleted in favour of
+# `vco_lib.version_compare.version_ge`, the one home for that rule (it had
+# three implementations and two answers; the third read `0.2.95rc1` as patch
+# 951). Measured with `wc -l`, not predicted.
+#
+# v0.2.96 (post-CI) — re-pinned DOWNWARD 23892 -> 23888 (-4). F-2's delegate
+# above was pointed at the WRONG home and broke every fresh install:
+# `vco_lib.embedding_service` imports `requests` at module scope, and this
+# helper runs before install.py has created the venv, so install-smoke went
+# red on all five platforms with `ModuleNotFoundError: requests`. The mirror's
+# "self-containment early in the bootstrap" receipt was TRUE — it was denying
+# a missing THIRD-PARTY dependency, not a missing `vco_lib`, and the rebuttal
+# above answered only the second. The consolidation still stands; the home
+# moved to `vco_lib.embedding_selection`, a pure stdlib leaf since v0.2.68.
+# The -4 is the difference between the deleted mirror and the delegate plus
+# its (now brief) docstring. Measured with `wc -l`, not predicted.
+_TOTAL_LINES_MAX = 23888
 
 
 def _measure() -> tuple:

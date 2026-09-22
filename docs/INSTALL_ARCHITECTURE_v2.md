@@ -243,10 +243,21 @@ the shipped hash of every bundled file:
 - New shipped file → created.
 - Installed file matches the prior-shipped hash (user untouched) →
   overwritten with the new shipped version.
-- Installed file differs (user-modified) → preserved on disk; a
+- Installed file differs (user-modified) → **adopted** (v0.2.84): the current
+  bytes are backed up to
+  `<project>/.claude/backups/bundle-adoptions/<timestamp>/<path>`, the shipped
+  version is written, and a one-time NOTICE lists what moved and where the
+  backup landed. Backups are kept indefinitely and are yours to prune.
+- Adoption backup could NOT be written (no free space, no write permission, a
+  symlink under the backup path) → the file is left untouched and a
   `bundle_user_modified_preserved` deferral entry is written to
-  `<project>/.claude/context/UPDATE_DEFERRED.md` naming each preserved file
-  and the explicit `--force` command to accept the shipped default.
+  `<project>/.claude/context/UPDATE_DEFERRED.md`. This is the **only** way a
+  divergent file still reaches that entry. Since v0.2.96 the entry names the
+  failed backup write and quotes its per-file error, and leads with the
+  remedy that actually resolves it — fix the backup destination and re-run the
+  ordinary update, which adopts the files and clears the entry by itself.
+  `--force` is listed last and labelled as what it is: the shipped version
+  with no backup at all.
 - Weaviate schema drift → a `schema_migration_required` deferral; the
   destructive migration is never auto-applied (explicit consent via
   `python -m vco_lib.project_init migrate-collections --name <project>`).

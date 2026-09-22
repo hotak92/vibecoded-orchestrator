@@ -76,6 +76,70 @@
       "source": "https://docs.z.ai/guides/llm/glm-4.5",
       "source_note": "This model has no page of its own (https://docs.z.ai/guides/llm/glm-4.5-air returns 404); its specification sits on the GLM-4.5 card, which is what the cited URL is. Third-party listings of a 1M variant of this model are NOT official and are deliberately not reflected here."
     },
+    "qwen3.8-max": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "Claude Code integration page states the client defaults to 200K and 'can be raised to 1M where the model supports it' WITHOUT naming which Token-Plan models support it; per-model 1M support is UNVERIFIED, so this row claims only the documented default. No per-model max_output is published on that page either (0 = unstated)."
+    },
+    "qwen3.8-flash": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+    },
+    "qwen3.7-max": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+    },
+    "qwen3.7-plus": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page. The docs' own [1m] example uses qwen3.7-plus, but that is a MECHANISM example, not a per-model capability claim."
+    },
+    "qwen3.6-flash": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+    },
+    "deepseek-v4-pro": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "Served through the same Token-Plan endpoint (the integration page lists it among its model ids). 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+    },
+    "deepseek-v4-flash-0731": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "Served through the same Token-Plan endpoint (the integration page lists it among its model ids). 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+    },
+    "deepseek-v4.1-flash": {
+      "vendor": "qwen",
+      "context_window": 200000,
+      "max_output": 0,
+      "window_1m": false,
+      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
+      "source_note": "Served through the same Token-Plan endpoint: present on the subscription's live compatible-mode model list (probe 2026-09-22), which the cited integration page predates. 1M per-model support UNVERIFIED, max_output unstated by the vendor (0 = unstated)."
+    },
     "claude-fable-5-1": {
       "vendor": "anthropic",
       "context_window": 1000000,

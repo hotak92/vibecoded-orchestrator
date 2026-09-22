@@ -36,9 +36,13 @@ Consumers:
   one-line verdict at session start via the ``__main__`` CLI below.
 
 Tri-state throughout: ``unknown`` is never rendered as "fine".  A service
-that does not answer, a tree with no service source, and an image that
-cannot compute its own digest are all *could not look* — and a caller that
-cannot prove currency REBUILDS rather than assuming.
+that does not answer, an image that cannot compute its own digest, and a
+digest-reporting image with nothing to compare it against are all *could not
+look* — and a caller that cannot prove currency REBUILDS rather than
+assuming.  A tree with no service source is NOT automatically one of them:
+an image whose ``/health`` lacks the ``source_sha`` KEY is positively
+pre-v0.2.92 — the silently-truncating population — and that reading needs no
+digest at all (WP-3 judgment call 3, resolved 2026-09-22).
 """
 from __future__ import annotations
 
@@ -50,7 +54,7 @@ import sys
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 #: Repo-relative location of the compose build context for ``code_embed``.
 #: Matches ``docker-compose.yml``'s default
@@ -115,6 +119,37 @@ def service_source_dir(install_root) -> Optional[Path]:
     if override:
         candidate = Path(override)
     return candidate if candidate.is_dir() else None
+
+
+def install_root_with_service_source() -> Optional[Path]:
+    """The orchestrator install root, but only when it can answer about the
+    image — i.e. only when it actually carries the build context.
+
+    THE one home for "which tree decides the machine's image freshness".
+    The machine runs exactly ONE ``code_embed`` service, built from the
+    install root's source, so a caller holding a PER-PROJECT tree (the resync
+    driver's ``repo_root``, the deferral dispatcher's folder, the exposure
+    heal) must ask about this tree instead of its own — and before v0.2.96's
+    ship-gate MAJOR-2 fix, only the heal did, which left the gate protecting
+    it inert on every per-project path.
+
+    ``None`` means no tree on this machine carries the build context (no
+    install root resolves — e.g. a ``vco_lib`` imported from outside a clone
+    — or the clone is pruned). Never raises: could-not-look is ``None``.
+    """
+    try:
+        from vco_lib.python_exe import resolve_install_root
+
+        install_root = resolve_install_root()
+        if install_root is None:
+            return None
+        return (
+            Path(install_root)
+            if service_source_dir(install_root) is not None
+            else None
+        )
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
 
 
 def checkout_source_sha(install_root) -> Optional[str]:
@@ -214,27 +249,34 @@ def served_state(expected_sha: Optional[str], health: Optional[dict]) -> ImageSt
     "fine" — is unit-testable without a service, a container runtime, or a
     network.  The ordering matters and is deliberate:
 
-    1. no checkout digest → ``unknown`` (nothing to compare against);
-    2. no health payload → ``unknown`` (service down / CPU tier / not ours);
+    1. no health payload → ``unknown`` (service down / CPU tier / not ours);
+    2. ``/health`` not reporting ``status=ok`` → ``unknown``;
     3. health without a ``source_sha`` KEY → ``stale``: every image that
        ships v0.2.92's ``server.py`` reports the field unconditionally, so
        its ABSENCE positively identifies a pre-v0.2.92 image — the exact
-       population that is still truncating silently;
-    4. ``source_sha`` present but ``null`` → ``unknown`` (the service could
+       population that is still truncating silently.  **This arm needs no
+       checkout digest**: it is a fact about the RUNNING image, not a
+       comparison (WP-3 judgment call 3, resolved 2026-09-22).  It used to
+       sit BELOW the no-digest arm, so on any tree without the build
+       context the evidence was discarded and the WP-3 gate could not bite
+       — including on a machine whose ``vco_lib`` does not live inside a
+       clone (the site-packages-shadow shape), where no install root
+       resolves either;
+    4. no checkout digest → ``unknown`` (the image reports a digest, so it
+       carries v0.2.92's refusal; there is simply nothing to compare it to);
+    5. ``source_sha`` present but ``null`` → ``unknown`` (the service could
        not hash its own files; different fact, different verdict);
-    5. digests equal → ``current``; otherwise ``stale``.
+    6. digests equal → ``current``; otherwise ``stale``.
     """
-    if not expected_sha:
-        return ImageState(
-            UNKNOWN,
-            "code_embed: no service source in this tree — cannot say whether "
-            "the running image is current.",
-        )
     if not health:
         return ImageState(
             UNKNOWN,
             "code_embed: service is not answering /health — cannot read the "
-            "image's source digest.",
+            "image's source digest."
+            if expected_sha else
+            "code_embed: no service source in this tree and the service is "
+            "not answering /health — cannot say whether the running image "
+            "is current.",
             expected_sha=expected_sha,
         )
     if health.get("status") != "ok":
@@ -251,6 +293,13 @@ def served_state(expected_sha: Optional[str], health: Optional[dict]) -> ImageSt
             "reports no source_sha). It still TRUNCATES over-window input "
             "silently at HTTP 200 instead of refusing it.",
             expected_sha=expected_sha,
+        )
+    if not expected_sha:
+        return ImageState(
+            UNKNOWN,
+            "code_embed: no service source in this tree — cannot say whether "
+            "the running image is current (it does report a source digest, "
+            "so it refuses over-window input rather than truncating it).",
         )
     served = health.get("source_sha")
     if served is None:
@@ -399,6 +448,19 @@ def plan_rebuild(
                 build=False,
                 lines=(f"  WARNING: could not check the code_embed image state: {exc}",),
             )
+    if state.is_stale:
+        # v0.2.96 (M-2): persist the truncating-cohort observation BEFORE the
+        # rebuild this plan sets up can erase the live evidence — on an owned
+        # machine the same update run rebuilds the image and only THEN reaches
+        # the codegraph-maintenance step whose exposure detection needs to
+        # know a pre-v0.2.92 image was serving.  Soft-fail: an observation is
+        # evidence bookkeeping and must never gate the rebuild itself.
+        try:
+            from vco_lib.code_embed_exposure import observe_stale_image
+
+            observe_stale_image(state)
+        except Exception:  # noqa: BLE001 — observation never gates the rebuild
+            pass
     if state.verdict == CURRENT:
         return RebuildPlan(
             build=False, verdict=state.verdict,
@@ -519,6 +581,7 @@ def owning_compose_identity(runtime: str = "podman"):
 
 def rebuild_command(
     install_root, compose_cmd: str = "docker compose", identity=None,
+    services: "Optional[Sequence[str]]" = None,
 ) -> str:
     """The explicit command a user can run to refresh the image themselves.
 
@@ -532,6 +595,12 @@ def rebuild_command(
       invocation, built from the container's own labels (its config files and
       working directory), because a build under any other project name
       produces an image the running container will never load.
+
+    ``services`` (v0.2.96 WP-4 Task 3a) lets a caller rebuild the OWNING
+    image name for the whole foreign set at once — the guard's deferral
+    remedy derives its Option A through this parameter.  Default (``None``)
+    keeps the byte-identical ``code_embed``-only shape every existing
+    caller and test pins.
 
     v0.2.95 F2 — this function shipped in v0.2.92 with ZERO callers while
     ``doctor.py`` promised, in prose, that the ``code_embed_image_stale``
@@ -569,6 +638,7 @@ def rebuild_command(
     """
     working_dir = (getattr(identity, "working_dir", "") or "").strip()
     config_files = (getattr(identity, "config_files", "") or "").strip()
+    service_list = " ".join(services) if services else COMPOSE_SERVICE
     if identity is not None and working_dir:
         files = [
             str(candidate if candidate.is_absolute()
@@ -584,14 +654,14 @@ def rebuild_command(
                 compose_cmd,
                 " ".join(f"-f {path}" for path in files),
                 f"-p {project}" if project else "",
-                f"--profile gpu up -d --build --force-recreate {COMPOSE_SERVICE}",
+                f"--profile gpu up -d --build --force-recreate {service_list}",
             ) if fragment
         )
         return command if files else f"cd {working_dir} && {command}"
     infra = Path(install_root) / "infrastructure"
     return (
         f"cd {infra} && {compose_cmd} --profile gpu up -d --build "
-        f"--force-recreate {COMPOSE_SERVICE}"
+        f"--force-recreate {service_list}"
     )
 
 
@@ -621,11 +691,23 @@ def _main(argv: Optional[list] = None) -> int:  # pragma: no cover — CLI entry
     elif not args.quiet_unless_stale or state.is_stale:
         print(state.summary)
         if state.is_stale:
+            # v0.2.96 (M-2): the pre-fix text promised "rebuild, THEN re-run
+            # the code-graph re-sync" — false for the rows that matter: a
+            # plain resync hash-SKIPS exactly the rows that were embedded
+            # through the truncating image (their content hashes are correct;
+            # only their vectors are corrupted).  State the real remedy.
             print(
-                "  Fix: run `python install.py --update` from "
-                f"{root} (it rebuilds the image), THEN re-run the code-graph "
-                "re-sync — rebuilding the graph first would re-walk it through "
-                "the old image."
+                "  Fix: REBUILD the image FIRST — `python install.py "
+                f"--update` from {root}, or the explicit compose command the "
+                "`code_embed_image_stale` deferral entry prints. Rows "
+                "embedded while a stale (pre-v0.2.92) image was serving are "
+                "NOT healed by a plain resync — their content hashes are "
+                "correct, so every hash gate skips them. VCO detects that "
+                "exposure at update time and queues a ONE-TIME re-embed "
+                "(vco_lib.code_embed_exposure) that fires on the next "
+                "code-graph resync running under a non-stale image; a "
+                "`--force-recreate` rebuild remains the unconditional manual "
+                "escape."
             )
     return EXIT_BY_VERDICT.get(state.verdict, 2)
 

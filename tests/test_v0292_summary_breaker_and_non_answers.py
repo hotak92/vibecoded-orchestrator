@@ -52,6 +52,9 @@ _SUMMARY_ENV = (
     "VCO_SUMMARY_BREAKER", "VCO_SUMMARY_BREAKER_COOLDOWN",
     "VCO_SUMMARY_BREAKER_CAPACITY_COOLDOWN",
     "VCO_SUMMARY_BREAKER_CAPACITY_STRIKES",
+    "VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN",
+    "VCO_SUMMARY_BREAKER_OTHER_COOLDOWN",
+    "VCO_SUMMARY_BREAKER_OTHER_STRIKES",
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
 )
 
@@ -115,9 +118,11 @@ class TestClassification:
         assert reason == expected
 
     @pytest.mark.parametrize("text,expected", [
-        ("Claude AI usage limit reached", "rate_limit"),
+        # v0.2.96 WP-7: exhaustion semantics left the rate-limit class —
+        # they ride their own QUOTA class with the 5 h cooldown.
+        ("Claude AI usage limit reached", "quota"),
         ("rate_limit_error: too many requests", "rate_limit"),
-        ("Your credit balance is too low", "rate_limit"),
+        ("Your credit balance is too low", "quota"),
         ("Invalid API key - please run /login", "auth"),
         ("authentication_error", "auth"),
         ("Overloaded", "capacity"),
@@ -134,7 +139,7 @@ class TestClassification:
         text (which on these paths can quote node content)."""
         secret = "usage limit reached; context was: SECRET-NODE-BODY"
         reason, signal = sb.classify_backend_failure(text=secret)
-        assert reason == "rate_limit"
+        assert reason == "quota"
         assert "SECRET-NODE-BODY" not in signal
         sb.trip_backend("cli", reason, signal)
         stored = (sb._breaker_path()).read_text(encoding="utf-8")
@@ -153,10 +158,15 @@ class TestBreakerPolicy:
         assert sb.trip_backend("cli", "auth", "401") is True
         assert sb.breaker_state("cli") is not None
 
-    def test_other_never_demotes(self, sb):
-        for _ in range(10):
-            assert sb.trip_backend("cli", "other", "") is False
-        assert sb.breaker_state("cli") is None
+    def test_other_demotes_only_after_the_strike_threshold(self, sb):
+        """v0.2.96 WP-7: an unclassified STORM (304 consecutive failures
+        one night) must eventually halt — one stray failure still must
+        not latch. See test_v0296 for the full arm."""
+        assert sb.trip_backend("cli", "other", "") is False
+        assert sb.trip_backend("cli", "other", "") is False
+        assert sb.trip_backend("cli", "other", "") is True
+        record = sb.breaker_state("cli")
+        assert record is not None and record["reason"] == "other"
 
     def test_single_capacity_failure_does_not_demote(self, sb):
         """A permanent (or even a 15-minute) latch on ONE transient 529
@@ -585,7 +595,7 @@ class TestCallCliTransport:
         seen["stderr"] = "Claude AI usage limit reached. Resets at 3pm."
         with pytest.raises(sb.BackendUnavailable) as excinfo:
             sb.call_cli("x")
-        assert excinfo.value.reason == "rate_limit"
+        assert excinfo.value.reason == "quota"
 
     def test_exit_zero_notice_is_a_tier_failure_not_a_summary(self, spy):
         """Some backends print the notice and exit 0. Caching it poisons the
@@ -594,7 +604,7 @@ class TestCallCliTransport:
         seen["stdout"] = "Claude AI usage limit reached"
         with pytest.raises(sb.BackendUnavailable) as excinfo:
             sb.call_cli("x")
-        assert excinfo.value.reason == "rate_limit"
+        assert excinfo.value.reason == "quota"
 
     def test_a_long_summary_mentioning_rate_limits_is_still_returned(self, spy):
         """The exit-0 re-read must not eat a genuine summary about the

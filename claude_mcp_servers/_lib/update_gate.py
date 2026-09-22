@@ -3,11 +3,16 @@
 """Update-in-progress gate — MCP-side shim.
 
 V52-AI (v0.2.52, 2026-06-09): mirror of :mod:`vco_lib.update_gate` for use
-by MCP servers (claude_mcp_servers/*/server.py). The MCP servers are
-launched by Claude Code via the venv at ``claude_mcp_servers/.venv`` —
-the orchestrator's main ``vco_lib`` package is typically importable from
-there, but we don't want to hard-depend on that path because MCPs ship
-into release tarballs without the full repo.
+by MCP servers (claude_mcp_servers/*/server.py). MCP servers are launched
+by Claude Code via the venv at the orchestrator root, ``<install-root>/.venv``
+(the legacy ``claude_mcp_servers/.venv`` location is only a fallback — see
+the venv resolver in ``launcher/src-tauri/src/mcp_registration.rs``). That
+root venv carries ``vco_lib`` (editable install), but the shim deliberately
+does not import it: release tarballs ship ``claude_mcp_servers`` WITHOUT the
+``vco_lib`` package (the staging list in ``.github/workflows/release.yml``
+copies claude_mcp_servers / templates / infrastructure / tools and the
+install scripts — no ``vco_lib`` subtree), so a cross-package import would
+break the tarball layout.
 
 This shim re-implements the bare minimum (``is_update_in_progress`` +
 ``exit_if_update_in_progress``) inline so it has no cross-package

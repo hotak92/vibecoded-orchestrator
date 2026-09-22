@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.module_gateway import MODULE_GATEWAY_AGENT_FILES
+
 REPO = Path(__file__).resolve().parent.parent
 RUST = REPO / "launcher" / "src-tauri" / "src" / "commands" / "model_gateway.rs"
 #: v0.2.95: the PORT half of the Rust mirror moved out of `model_gateway.rs`
@@ -535,6 +537,98 @@ def test_the_conditional_blocks_are_not_nested():
         render_conditional_blocks(
             TEMPLATE.read_text(encoding="utf-8"), active_modules=mods
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.96 WP-10 — the gated agent definitions (templates/agents/module-gateway/)
+# ---------------------------------------------------------------------------
+
+GATED_AGENTS_DIR = REPO / "templates" / "agents" / "module-gateway"
+FREE_AGENTS_DIR = REPO / "templates" / "agents" / "free"
+
+
+def _frontmatter_model(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    m = re.search(r"^model:\s*(\S+)\s*$", text, re.MULTILINE)
+    assert m, f"no `model:` frontmatter line in {path.name}"
+    return m.group(1)
+
+
+def test_shipped_gateway_agents_pin_to_the_router_namespace():
+    """The gated set's frontmatter model ids are `GATEWAY_NAMESPACE` + a
+    bare id the router actually catalogs — derived in THIS test from
+    vendors.py + the context-window seed, never hardcoded, so a renamed
+    namespace or model turns this red instead of shipping a dead id.
+
+    The spawn-broken case is self-surfacing ONLY if the id is real: an id
+    the router never cataloged fails at spawn with nothing to compare
+    against. That is why the pin reads the registry, not the template.
+    """
+    from model_router.vendors import GATEWAY_NAMESPACE
+
+    seed = json.loads(
+        (
+            REPO / "claude_mcp_servers" / "model_router"
+            / "chat_model_context.seed.json"
+        ).read_text(encoding="utf-8")
+    )["models"]
+
+    # The bare halves must be models the router knows (context-window rows).
+    assert "glm-5.3" in seed and "glm-5.3-flash" in seed
+
+    expected = {
+        "glm-implementer.md": f"{GATEWAY_NAMESPACE}glm-5.3",
+        "glm-reviewer.md": f"{GATEWAY_NAMESPACE}glm-5.3",
+        "glm-planner.md": f"{GATEWAY_NAMESPACE}glm-5.3",
+        "glm-flash-researcher.md": f"{GATEWAY_NAMESPACE}glm-5.3-flash",
+    }
+    # The shared tuple IS the delivered set, and the engine enumerates the
+    # directory with a glob — pin the two together, so a file dropped into
+    # module-gateway/ without a pin here (or a stale tuple entry) is red
+    # instead of silently uncovered.
+    assert sorted(MODULE_GATEWAY_AGENT_FILES) == sorted(
+        p.name for p in GATED_AGENTS_DIR.glob("*.md")
+    ), "tests/common/module_gateway.py drifted from the shipped directory"
+    assert sorted(expected) == sorted(MODULE_GATEWAY_AGENT_FILES)
+    for name, want in expected.items():
+        got = _frontmatter_model(GATED_AGENTS_DIR / name)
+        assert got == want, (
+            f"{name} frontmatter says {got!r}, the router "
+            f"catalog says {want!r}"
+        )
+
+
+def test_the_gated_dir_is_outside_the_free_bucket():
+    """Placement verdict (survey §6): the gated set NEVER sits in `free/` —
+    that bucket ships unconditionally and would put `claude-gw/*` ids on
+    stock installs. Guarded from both sides: every gated definition exists
+    in module-gateway/ and no free/ file names a gateway id."""
+    for name in MODULE_GATEWAY_AGENT_FILES:
+        assert (GATED_AGENTS_DIR / name).is_file(), (
+            f"{name} must exist in templates/agents/module-gateway/"
+        )
+        assert not (FREE_AGENTS_DIR / name).exists()
+    for free_file in FREE_AGENTS_DIR.glob("*.md"):
+        text = free_file.read_text(encoding="utf-8")
+        assert "claude-gw/" not in text, (
+            f"{free_file.name} is in the UNCONDITIONAL free bucket but "
+            "names a claude-gw/ id — stock installs would receive it"
+        )
+
+
+def test_the_definition_name_guidance_renders_inside_the_gate_only():
+    """The spawn-by-definition-name sentence ships with the routing section:
+    present when model_gateway is active, absent otherwise (the existing
+    no-vendor-words test catches the leak half; this pins the presence
+    half, so the guidance cannot be dropped from the gated render either)."""
+    at_names = [f"@{n.removesuffix('.md')}" for n in MODULE_GATEWAY_AGENT_FILES]
+    on = render({"diagrams", "model_gateway"})
+    for at_name in at_names:
+        assert at_name in on
+    assert "cannot carry `claude-gw/*` ids" in on
+    off = render({"diagrams"})
+    for at_name in at_names:
+        assert at_name not in off
 
 
 # ---------------------------------------------------------------------------

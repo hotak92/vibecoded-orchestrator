@@ -103,14 +103,19 @@ def test_bootstrap_weaviate_health_endpoint_is_canonical():
     """NEW-4: bootstrap must report `/v1/.well-known/ready` as the canonical health endpoint."""
     cp = _run_install(["--bootstrap", "--json"])
     env = json.loads(cp.stdout)
-    assert env["weaviate_endpoints"]["health"] == (
-        "http://localhost:8081/v1/.well-known/ready"
-    ), (
+    # The PATH is what NEW-4 pins; the host:port is resolved (v0.2.96 —
+    # these endpoints honour WEAVIATE_URL/WEAVIATE_PORT instead of hardcoding
+    # the default, so a relocated Weaviate is advertised correctly). Asserting
+    # the whole literal would re-pin the very hardcode that fix removed, and
+    # under this suite it reads the unroutable sentinel by design.
+    health = env["weaviate_endpoints"]["health"]
+    assert health.endswith("/v1/.well-known/ready"), (
         "NEW-4 SSOT violation: bootstrap envelope must publish "
         "`/v1/.well-known/ready` as the Weaviate health endpoint, NOT "
         "`/v1/meta`. installer.rs:627 comment is wrong; Python side is "
-        "canonical and Rust consumers must read this value from here."
+        f"canonical and Rust consumers must read this value from here. Got: {health}"
     )
+    assert "/v1/meta" not in health, f"the retired endpoint is back: {health}"
 
 
 def test_bootstrap_launcher_dist_subdir_no_experimental_macos():
@@ -210,3 +215,48 @@ def test_bootstrap_os_enum(os_value):
     # The parameterize is documentation of the schema enum; the assertion
     # above is the actual contract.
     _ = os_value
+
+
+def test_the_bootstrap_import_chain_is_stdlib_only():
+    """`install.py --bootstrap` runs on a FRESH CLONE, before any venv exists.
+
+    So every module it imports at MODULE SCOPE — and everything those import
+    at module scope, transitively — must be importable with nothing but the
+    standard library. A third-party import anywhere in that chain turns the
+    first command a new user runs into a ModuleNotFoundError.
+
+    This is not hypothetical. v0.2.96 shipped `vco_lib/service_adoption.py`
+    with a module-scope `import yaml`, imported by `install.py:165`; bootstrap
+    died on all five platforms in install-smoke. Its own comment asserted
+    PyYAML was "not the install path" — a receipt that was false the moment
+    install.py imported it. No local gate could see it, because a developer
+    checkout always HAS PyYAML.
+
+    The fix for a new violation is to move the dependency off this path — not
+    an entry on an allowlist here. A FUNCTION-LOCAL import is the usual way,
+    but it only DEFERS the import to call time: it fixes this gate and is safe
+    only if the function runs after the venv exists. See
+    ``tests/test_v0296_install_pre_venv_is_stdlib_only.py``, which covers the
+    calls that run before it — the second instance of this exact failure was a
+    function-local import that ran at step 2.
+
+    v0.2.96 (post-CI): the walk moved to ``tests/common/import_chain.py``, the
+    ONE home, after the pre-venv gate was written by copying the walker out of
+    this test and inherited a blind spot — a dotted target resolved as
+    ``vco_lib/embedding_providers.openai.py``, which is not a file, so the
+    walk skipped the subpackage and every third-party import under it. The
+    shared version resolves packages as well as modules and follows relative
+    imports.
+    """
+    from tests.common.import_chain import REPO_ROOT, third_party_reachable_from
+
+    reached = third_party_reachable_from(REPO_ROOT / "install.py", is_install_py=True)
+
+    assert not reached, (
+        "third-party imports on the bootstrap path — `install.py --bootstrap` "
+        "would fail on a fresh clone:\n  "
+        + "\n  ".join(
+            f"{package!r} imported at the module scope of vco_lib.{via}"
+            for package, via in sorted(reached.items())
+        )
+    )

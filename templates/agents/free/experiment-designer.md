@@ -5,7 +5,7 @@ short_desc: "study design: controls, power, preregistration"
 keywords: [experiment design, randomisation, blinding, preregistration, confounders, power analysis, reproducibility, "design an experiment", "study design", "A/B test design", "before collecting data", "experimental controls", RCT]
 tools: Read, Write, Edit, WebSearch, Bash, mcp__weaviate-kg__*, mcp__search__search_papers
 model: opus
-effort: xhigh
+effort: high
 ---
 
 # Experiment Designer Agent (Opus)

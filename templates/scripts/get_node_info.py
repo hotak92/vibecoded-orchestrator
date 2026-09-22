@@ -14,7 +14,22 @@ import time
 from pathlib import Path
 from weaviate.classes.query import Filter
 
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+# ── MIRROR (category C) — must match `vco_lib/weaviate_helpers.py::
+#    weaviate_url_default`, which is the SHARED HOME for this resolution.
+#    Precedence: WEAVIATE_URL > WEAVIATE_PORT > the canonical port; an
+#    empty/whitespace-only value at either level is UNSET, not a literal.
+#
+# Why a mirror and not a call: this is a MODULE-LEVEL constant evaluated
+# before anything puts `vco_lib` on `sys.path` (this file's only vco_lib use
+# is the function-local, guarded `vco_lib.paths` import far below), so a call
+# here would make the whole module unimportable without vco_lib.
+#
+# `tests/test_v0296_weaviate_url_port_precedence.py::TestShippedMirrorParity`
+# EXECUTES these lines against the shared home on every case, so the two
+# cannot drift.
+_WEAVIATE_URL_ENV = (os.getenv("WEAVIATE_URL") or "").strip()
+_WEAVIATE_PORT_ENV = (os.getenv("WEAVIATE_PORT") or "").strip()
+WEAVIATE_URL = _WEAVIATE_URL_ENV or f"http://localhost:{_WEAVIATE_PORT_ENV or 8081}"
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 

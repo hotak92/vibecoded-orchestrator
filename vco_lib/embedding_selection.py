@@ -57,6 +57,75 @@ _SUMMARY_BACKEND_QWEN35_9B = "qwen3.5:9b"
 _SUMMARY_BACKEND_GEMMA = "gemma4:e4b"
 _SUMMARY_BACKEND_OPENAI = "openai"     # routes via API tier with consent gate
 
+# ---------------------------------------------------------------------------
+# Active-embedding PROFILE -> text MODEL ID.
+#
+# A different namespace from the backend IDs above. Two of the three values
+# below are byte-identical to their `_KG_BACKEND_*` counterpart, and that is a
+# CONSEQUENCE, not a structure to depend on: for an Ollama-served model the
+# backend id simply IS the model tag. Where the two namespaces are genuinely
+# distinct they diverge — OpenAI's backend id is the VCO-internal selector
+# token ``openai-text-embedding-3-small``, its model id is
+# ``text-embedding-3-small``, which is what the OpenAI API expects.
+#
+# So: do NOT collapse these into the `_KG_BACKEND_*` constants to remove the
+# repeated literal. They answer different questions and are free to diverge
+# the moment a backend stops being named after its model — which has already
+# happened once, in the row directly below.
+TEXT_MODEL_QWEN3 = "qwen3-embedding:0.6b"
+TEXT_MODEL_ARCTIC = "snowflake-arctic-embed2:latest"
+TEXT_MODEL_OPENAI = "text-embedding-3-small"
+
+
+def model_id_for_active(active: str) -> str:
+    """Map an active-embedding profile to its canonical text model id.
+
+    ``arctic`` -> Arctic, ``openai`` -> OpenAI's model id, and everything
+    else -> :data:`TEXT_MODEL_QWEN3`, the only text embedder guaranteed
+    present on a fresh install.
+
+    That last branch is a REAL path, not just a guard against nonsense:
+    ``codesage`` is a valid profile with no text model of its own and lands
+    here by design, and the profile can also arrive from the launcher's
+    ``app_state`` where nothing validates it. Treat it as "the default",
+    not as "unreachable".
+
+    **Why this lives in this module** (v0.2.96 — a shipped regression):
+    ``install.py`` runs on whatever interpreter launched it, and on a FRESH
+    CLONE that is the system Python with no third-party packages at all. Its
+    ``main()`` calls ``_reconcile_install_active_embedding`` (which calls this)
+    BEFORE it calls ``_create_venv``, so every in-process import on that
+    stretch must resolve against the standard library alone. This module is a
+    pure stdlib leaf by construction (see the module docstring), which makes it
+    the one home such a caller can safely reach.
+
+    (The boundary is named by FUNCTION deliberately. install.py's own step
+    numbers disagree with ``docs/INSTALL_ARCHITECTURE_v2.md`` — ``main()``
+    comments call this "Step 3" and venv creation "Step 4", the architecture
+    doc numbers them 2 and 3, and the logged step id for both is ``3/10``. The
+    call order is unambiguous; the numbering is not.)
+
+    The consolidation that shipped broken put this mapping's one home in
+    ``vco_lib.embedding_service``, which imports ``requests`` at module
+    scope for its provider stack. install.py's embedding reconcile
+    then died with ``ModuleNotFoundError: requests`` on all five platforms in
+    install-smoke, having replaced an inline mirror whose own docstring said
+    it existed to keep install.py "self-contained" early in the bootstrap.
+    That receipt was accurate and was read as obsolete.
+
+    Once the venv exists the rule relaxes to SOFT-FAIL rather than stdlib-only: the
+    process still runs under the system interpreter, so a later in-process
+    third-party import must be wrapped with a working fallback (see
+    ``install.py::_enrich_slot_change``, which catches the ImportError and
+    re-embeds the expensive way).
+    """
+    normalised = (active or "").strip().lower()
+    if normalised == "arctic":
+        return TEXT_MODEL_ARCTIC
+    if normalised == "openai":
+        return TEXT_MODEL_OPENAI
+    return TEXT_MODEL_QWEN3
+
 
 def _cpu_meets(
     ram_gb: float,

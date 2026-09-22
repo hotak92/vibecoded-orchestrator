@@ -80,7 +80,10 @@ pub struct ChatModelContextRow {
     pub vendor: String,
     /// Total context tokens (the vendor's own decimal-K figure).
     pub context_window: i64,
-    /// Max output tokens.
+    /// Max output tokens. `0` = UNSTATED: the vendor publishes no figure
+    /// (cross-language contract — the Python gateway folds 0 to None via
+    /// `catalog::_positive`). A consumer must never render or apply 0 as a
+    /// token count. Negative is impossible (SQL CHECK, migration 046).
     pub max_output: i64,
     /// `true` → the gateway advertises this id as `<id>[1m]`.
     pub window_1m: bool,
@@ -105,6 +108,8 @@ pub struct ChatModelContextInput {
     pub model_id: String,
     pub vendor: String,
     pub context_window: i64,
+    /// Max output tokens; `0` = UNSTATED (see [`ChatModelContextRow`]).
+    /// Negative is refused by [`validated`](Self::validated).
     pub max_output: i64,
     pub window_1m: bool,
     pub source: String,
@@ -155,10 +160,36 @@ impl ChatModelContextInput {
                 model_id, self.context_window
             ));
         }
-        if self.max_output <= 0 {
+        // `max_output == 0` is VALID and means UNSTATED — the vendor's docs
+        // publish no per-model figure (the shipped qwen Token-Plan rows carry
+        // 0). Inventing a positive figure the citation does not state is
+        // exactly what the R10 citation rule forbids, so 0 is the only honest
+        // marker.
+        //
+        // CROSS-LANGUAGE CONTRACT — one rule, FOUR homes. MUST MATCH all of:
+        //   1. SQL  — `CHECK (max_output >= 0)` in
+        //      `launcher/src-tauri/vct-launcher-core/src/db/migrations/
+        //      046_chat_model_context_max_output_unstated.sql` (the backstop;
+        //      nothing at all can write a negative, not even a hand `UPDATE`).
+        //   2. Rust — HERE (`ChatModelContextInput::validated`): the gate
+        //      every launcher write passes through.
+        //   3. TS   — `parseMaxOutputTokens` in
+        //      `launcher/src/lib/api/chat_model_context.ts`: blank or `0`
+        //      means UNSTATED, so the pane never makes the user invent a
+        //      figure, and a stored 0 renders as blank rather than as "0".
+        //   4. Python — `model_router/catalog.py::_positive` in the gateway's
+        //      reader: folds 0 to None, so an unstated row never publishes a
+        //      token count downstream.
+        // The rule in all four: `0` = UNSTATED (valid), `> 0` = the cited
+        // vendor figure, `< 0` = impossible. Change the rule in one home and
+        // it MUST change in the other three — this is a C-tier mirror (there
+        // is no shared runtime between SQLite, Rust, TS and Python here), so
+        // the naming is what keeps the four honest. v0.2.96 D-3: pre-fix only
+        // the TS and SQL homes named the others.
+        if self.max_output < 0 {
             return Err(format!(
-                "max output for `{}` must be a positive number of tokens \
-                 (got {})",
+                "max output for `{}` cannot be negative (got {}) — use 0 \
+                 when the vendor does not publish a figure",
                 model_id, self.max_output
             ));
         }
@@ -843,7 +874,7 @@ mod tests {
                 "context window",
             ),
             (
-                ChatModelContextInput { max_output: 0, ..input("x") },
+                ChatModelContextInput { max_output: -1, ..input("x") },
                 "max output",
             ),
         ];
@@ -866,6 +897,78 @@ mod tests {
         assert_eq!(v.model_id, "glm-5.2");
         assert_eq!(v.source, "https://docs.z.ai/guides/llm/glm-5.2");
         assert_eq!(v.source_note, "noted");
+    }
+
+    /// v0.2.96 cross-language contract: `max_output == 0` means UNSTATED and
+    /// is VALID — the vendor's docs publish no per-model figure (the shipped
+    /// qwen Token-Plan rows carry 0) and inventing one is forbidden. Negative
+    /// stays invalid. Mirrors the Python mapping (`catalog::_positive` folds
+    /// 0 to None so nothing downstream publishes it as a count).
+    #[test]
+    fn zero_max_output_validates_as_unstated_and_negative_does_not() {
+        let unstated = ChatModelContextInput { max_output: 0, ..input("qwen3.8-max") }
+            .validated()
+            .expect("0 = unstated must validate");
+        assert_eq!(
+            unstated.max_output, 0,
+            "the unstated marker survives validation verbatim — never \
+             coerced to an invented figure"
+        );
+
+        let err = ChatModelContextInput { max_output: -1, ..input("qwen3.8-max") }
+            .validated()
+            .expect_err("a negative max_output must be refused");
+        assert!(err.contains("cannot be negative"), "got: {}", err);
+
+        // Leave-alone: a cited positive figure still validates.
+        assert!(input("glm-5.2").validated().is_ok());
+    }
+
+    /// The unstated marker STORES: upsert and the boot seed both write a
+    /// `max_output = 0` row through the SQL CHECK (migration 046 relaxed it
+    /// from > 0 to >= 0 for exactly this), and it lists back verbatim — never
+    /// NULL, never replaced by a guess.
+    #[test]
+    fn an_unstated_max_output_row_stores_and_lists_verbatim() {
+        let db = make_db();
+        let created = db
+            .upsert_chat_model_context(
+                ChatModelContextInput { max_output: 0, ..input("qwen3.8-max") },
+                false,
+            )
+            .expect("the relaxed CHECK must accept the unstated marker");
+        assert_eq!(created.max_output, 0);
+
+        assert_eq!(
+            db.seed_chat_model_context_upsert_missing(&[ChatModelContextInput {
+                max_output: 0,
+                ..input("deepseek-v4-pro")
+            }])
+            .unwrap(),
+            1,
+            "the boot seed writes unstated rows too"
+        );
+
+        let listed = db.list_chat_model_context().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.iter().all(|r| r.max_output == 0),
+            "0 round-trips through the DB verbatim"
+        );
+
+        // And a negative is refused — with the stored row left untouched.
+        let err = db
+            .upsert_chat_model_context(
+                ChatModelContextInput { max_output: -1, ..input("qwen3.8-max") },
+                true,
+            )
+            .expect_err("a negative max_output must be refused");
+        assert!(err.contains("cannot be negative"), "got: {}", err);
+        assert_eq!(
+            db.get_chat_model_context("qwen3.8-max").unwrap().unwrap().max_output,
+            0,
+            "a refused upsert leaves the stored unstated row untouched"
+        );
     }
 
     // ── CRUD ─────────────────────────────────────────────────────────────
@@ -1392,6 +1495,41 @@ mod tests {
         assert_eq!(parsed[1].vendor, "zai");
     }
 
+    /// The wire shape of an UNSTATED row: the export carries `max_output: 0`
+    /// VERBATIM — 0 IS the marker, and the gateway's reader folds it to "no
+    /// information" (`context_table.py` coalesces missing-or-zero with
+    /// `or 0`; `catalog::_positive` maps 0 → None so no description ever
+    /// publishes it as a count). The export must therefore never OMIT the key
+    /// and never substitute a figure; `parse_document` accepts it back.
+    #[test]
+    fn export_carries_an_unstated_max_output_as_zero_verbatim() {
+        let unstated = ChatModelContextRow {
+            max_output: 0,
+            ..row("qwen3.8-max", false, "vendor page states no max-output figure")
+        };
+        let doc = export_document(&[unstated], &[], "t");
+        let entry = &doc["models"]["qwen3.8-max"];
+        assert_eq!(
+            entry["max_output"],
+            serde_json::json!(0),
+            "the unstated marker travels as an explicit 0, the shape the \
+             shipped seed and the gateway reader both carry"
+        );
+        assert!(
+            entry.as_object().unwrap().contains_key("max_output"),
+            "the key is present — an absent key and 0 must not diverge in \
+             meaning across the wire"
+        );
+        assert_eq!(entry["context_window"], serde_json::json!(200_000));
+
+        let parsed = parse_document(&doc).expect("the unstated row must parse back");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].max_output, 0,
+            "0 round-trips through export → parse; nothing invents a figure"
+        );
+    }
+
     #[test]
     fn parse_document_skips_comment_keys_the_seed_carries() {
         let doc = serde_json::json!({
@@ -1439,6 +1577,19 @@ mod tests {
         });
         let err = parse_document(&doc).expect_err("missing window must fail");
         assert!(err.contains("context_window"), "got: {}", err);
+
+        // A NEGATIVE max_output fails the load (v0.2.96: 0 = unstated is the
+        // only non-positive value with a meaning; a missing max_output is
+        // still named rather than defaulted, as asserted above).
+        let doc = serde_json::json!({
+            "schema_version": 1,
+            "models": {"glm-5.1": {
+                "vendor": "zai", "context_window": 200000, "max_output": -1,
+                "window_1m": false, "source": "https://x.invalid"
+            }}
+        });
+        let err = parse_document(&doc).expect_err("negative max_output must fail the load");
+        assert!(err.contains("cannot be negative"), "got: {}", err);
     }
 
     #[test]

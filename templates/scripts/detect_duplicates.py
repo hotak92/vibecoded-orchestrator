@@ -67,11 +67,27 @@ except ImportError:
         category=DeprecationWarning,
     )
 
-import weaviate  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 from weaviate.classes.query import Filter, MetadataQuery  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
 
 # Configuration
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
+# ── MIRROR (category C) — must match `vco_lib/weaviate_helpers.py::
+#    weaviate_url_default`, which is the SHARED HOME for this resolution.
+#    Precedence: WEAVIATE_URL > WEAVIATE_PORT > the canonical port; an
+#    empty/whitespace-only value at either level is UNSET, not a literal.
+#
+# Why a mirror and not a call: this is a MODULE-LEVEL constant, and the
+# comment block above says why this file keeps no module-level `vco_lib`
+# dependency — `--help`, an argparse error, and every import of this file
+# would otherwise require vco_lib. Its one vco_lib use (`_target_vector`) is
+# deliberately FUNCTION-LOCAL so the requirement lands only where a verdict
+# is produced. Hoisting an import here would undo that.
+#
+# `tests/test_v0296_weaviate_url_port_precedence.py::TestShippedMirrorParity`
+# EXECUTES these lines against the shared home on every case, so the two
+# cannot drift.
+_WEAVIATE_URL_ENV = (os.getenv("WEAVIATE_URL") or "").strip()
+_WEAVIATE_PORT_ENV = (os.getenv("WEAVIATE_PORT") or "").strip()
+WEAVIATE_URL = _WEAVIATE_URL_ENV or f"http://localhost:{_WEAVIATE_PORT_ENV or 8081}"
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 DEFAULT_SIMILARITY_THRESHOLD = 0.95
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -225,6 +241,32 @@ def _target_vector(collection) -> str:
     return slot
 
 
+def _wh_connect_v4(url: str, *, grpc_port: int, skip_init_checks: bool):
+    """Connect through the ONE `connect_to_custom` home (A > B > C).
+
+    `vco_lib.weaviate_helpers.connect_v4` owns the URL → (host, port,
+    http_secure) parse that three shipped scripts used to hand-roll. Importing
+    it here is not a new dependency: this script's wrapper already gates on
+    `import weaviate, vco_lib`, and `_target_vector` above needs vco_lib on
+    the very next call anyway. The ImportError is re-raised with the same
+    remedy as `_target_vector`'s — a bare traceback from a connect would read
+    as "Weaviate is down" when the real condition is a broken install.
+    """
+    try:
+        from vco_lib.weaviate_helpers import connect_v4
+    except ImportError as exc:  # broken / partial install — never guess
+        raise RuntimeError(
+            "vco_lib.weaviate_helpers is not importable from this interpreter "
+            f"({exc}), so the Weaviate instance to scan cannot be resolved. "
+            "Re-run the orchestrator install (`python install.py --update`), "
+            "or run this via `.claude/scripts/kg-duplicates`, which selects a "
+            "venv that carries it."
+        ) from exc
+    return connect_v4(
+        url, grpc_port=grpc_port, skip_init_checks=skip_init_checks
+    )
+
+
 class DuplicateDetector:
     """Detect potential duplicate nodes in knowledge graph"""
 
@@ -240,18 +282,71 @@ class DuplicateDetector:
     #: still sees the attribute.
     scan_error: "str | None" = None
 
+    #: Nodes that VANISHED between the snapshot and their own comparison, and
+    #: were therefore never compared. A PARTIAL scan, not a failed one.
+    #:
+    #: v0.2.96 (field defect, 2026-09-22): the scan fetches every node's UUID
+    #: up front, then issues one `near_object(<that uuid>)` per node. The hook
+    #: that fires it (`route-touched-path.sh::_vco_route_knowledge_dup_scan`,
+    #: every 10th knowledge write) launches it INTO the kg-sync burst it just
+    #: scheduled, and `sync_knowledge_graph` upserts by delete-then-insert
+    #: WITHOUT a fixed uuid — so a node re-synced mid-scan gets a new UUID and
+    #: the snapshotted one stops existing. Weaviate answers a `near_object` on
+    #: a nonexistent uuid with `nearObject params: vector not found`, and the
+    #: single outer `except` turned that into "no verdict" for the whole run.
+    #: One concurrently-edited node aborted a 761-node scan; the same scan run
+    #: directly, seconds later against a quiet tree, completed.
+    #:
+    #: Tolerating it must not re-open the hole the v0.2.94 fix closed, so the
+    #: count is LOUD: `main` refuses to print "clean" while it is non-zero,
+    #: `--json` carries it, and the markdown report states it. Class-level
+    #: default for the same reason as `scan_error`.
+    nodes_skipped: int = 0
+
     def __init__(self, similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
         """Initialize detector"""
         self.threshold = similarity_threshold
-        self.client = weaviate.connect_to_custom(
-            http_host='localhost',
-            http_port=8081,
-            http_secure=False,
-            grpc_host='localhost',
+        # v0.2.96: this hand-rolled `connect_to_custom` hardcoded
+        # `localhost:8081` while the module computed `WEAVIATE_URL` right
+        # above (and a parity test pins that computation against
+        # `vco_lib.weaviate_helpers.weaviate_url_default`). The constant was
+        # therefore credited and inert: on a relocated Weaviate
+        # (`WEAVIATE_PORT=8082`, the documented way) this scanner addressed
+        # the canonical instance regardless, i.e. scanned the WRONG database
+        # or none. One home for the connect, from the URL the module already
+        # resolved. `skip_init_checks=False` keeps the pre-existing posture:
+        # an unreachable Weaviate fails at connect, loudly, not later.
+        self.client = _wh_connect_v4(
+            WEAVIATE_URL,
             grpc_port=GRPC_PORT,
-            grpc_secure=False
+            skip_init_checks=False,
         )
         self.collection = self.client.collections.get(COLLECTION_NAME)
+
+    def _node_is_gone(self, node_uuid: str) -> bool:
+        """True only when *node_uuid* is CONFIRMED absent from the collection.
+
+        The conservative half of the v0.2.96 race tolerance. Returning True
+        downgrades a query failure to "skip this node"; every path that cannot
+        POSITIVELY establish the object's absence returns False, which keeps
+        the original exception and fails the scan. That direction matters:
+        a False negative costs one aborted scan, a False positive would let a
+        wrong-slot or dead-transport scan report "0 duplicates" — the exact
+        lie this scanner has already been fixed for twice.
+
+        Not a string match on Weaviate's message: `nearObject params: vector
+        not found` is emitted BOTH for a missing object and for an object
+        with no vector in the named slot (they differ only by a trailing
+        `for target: <slot>`, which is a wording, not a contract).
+        """
+        try:
+            fetch = self.collection.query.fetch_object_by_id
+        except AttributeError:  # client too old to answer — cannot confirm
+            return False
+        try:
+            return fetch(node_uuid) is None
+        except Exception:  # noqa: BLE001 — probe failed, so nothing is confirmed
+            return False
 
     def close(self):
         """Close Weaviate connection"""
@@ -315,6 +410,7 @@ class DuplicateDetector:
 
             duplicates = []
             checked_pairs = set()
+            skipped_uuids: List[str] = []
 
             for i, node in enumerate(nodes):
                 if (i + 1) % 10 == 0:
@@ -339,7 +435,31 @@ class DuplicateDetector:
                 )
                 if target_vector:
                     near_kwargs["target_vector"] = target_vector
-                similar = self.collection.query.near_object(**near_kwargs)
+                try:
+                    similar = self.collection.query.near_object(**near_kwargs)
+                except Exception:
+                    # v0.2.96 field defect: see `nodes_skipped`. A node that
+                    # was re-synced since the snapshot no longer exists under
+                    # this uuid, and Weaviate reports that as `nearObject
+                    # params: vector not found` — the SAME sentence it uses
+                    # for "this object has no vector in the slot you named"
+                    # (which differs only by a trailing `for target: <slot>`).
+                    # So we do not read the message: we ask the collection
+                    # whether the object is still there. Keying on the
+                    # SEMANTIC rather than on an incidental error string is
+                    # the standing rule (KG: a detector keyed on a string in
+                    # the thing it inspects dies at that thing's first
+                    # refactor).
+                    #
+                    # CONFIRMED gone → benign, skip and count it. Anything
+                    # else — still present, or the probe itself failed, so we
+                    # cannot confirm — re-raises and FAILS the scan, because
+                    # a wrong slot / dead transport must stay as loud as it
+                    # was before this tolerance existed.
+                    if not self._node_is_gone(node_uuid):
+                        raise
+                    skipped_uuids.append(node_uuid)
+                    continue
 
                 for similar_node in similar.objects:
                     similar_uuid = str(similar_node.uuid)
@@ -380,6 +500,27 @@ class DuplicateDetector:
                             "confidence": max(semantic_similarity, title_sim)
                         })
 
+            # v0.2.96: account for the skips BEFORE declaring the scan
+            # complete. Two outcomes, never a silent one.
+            self.nodes_skipped = len(skipped_uuids)
+            if nodes and self.nodes_skipped == len(nodes):
+                # Nothing was compared at all. That is not a partial verdict,
+                # it is the absence of one — treat it exactly like a query
+                # failure so `main` exits non-zero and prints "no verdict".
+                raise RuntimeError(
+                    f"all {len(nodes)} nodes disappeared between the snapshot "
+                    "and their comparison, so nothing was compared. The "
+                    "collection is being rewritten wholesale (a re-embed or a "
+                    "full kg-sync); re-run this scan once it finishes."
+                )
+            if self.nodes_skipped:
+                _progress(
+                    f"⚠️  PARTIAL scan: {self.nodes_skipped} of {len(nodes)} "
+                    "nodes were re-synced while the scan ran and were not "
+                    "compared. Any duplicate involving them is NOT in this "
+                    "verdict — re-run when writes settle."
+                )
+
             _progress("\n✅ Analysis complete\n")
             return duplicates
 
@@ -404,9 +545,21 @@ class DuplicateDetector:
             f"\n**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"**Threshold**: {self.threshold}",
             f"**Total Duplicates Found**: {len(duplicates)}\n",
+        ]
+        # v0.2.96: a PARTIAL scan says so in the artefact a human reads later,
+        # not only in the terminal line that scrolled past.
+        if self.nodes_skipped:
+            report_lines.append(
+                f"> ⚠️ **PARTIAL SCAN** — {self.nodes_skipped} node(s) were "
+                "re-synced while the scan ran and were never compared. "
+                "Duplicates involving them are NOT listed below. Re-run "
+                "`.claude/scripts/kg-duplicates` when knowledge writes have "
+                "settled for a complete verdict.\n"
+            )
+        report_lines.extend([
             "---\n",
             "## Potential Duplicates\n"
-        ]
+        ])
 
         for i, dup in enumerate(duplicates, 1):
             confidence_pct = dup["confidence"] * 100
@@ -505,6 +658,12 @@ def main():
                 "threshold": args.threshold,
                 "count": len(duplicates),
                 "pairs": duplicates,
+                # v0.2.96: non-zero means the scan COMPLETED but did not
+                # compare everything (nodes re-synced under it). The machine
+                # consumer needs the same distinction the human one gets:
+                # "0 pairs" and "0 pairs, 12 nodes never looked at" are not
+                # the same verdict.
+                "nodes_skipped": detector.nodes_skipped,
             }
             json.dump(payload, sys.stdout)
             sys.stdout.write("\n")
@@ -523,12 +682,27 @@ def main():
             high_confidence = sum(1 for d in duplicates if d["confidence"] >= 0.98)
             print(f"   High confidence (≥98%): {high_confidence}")
             print(f"   Probable (≥95%): {sum(1 for d in duplicates if 0.95 <= d['confidence'] < 0.98)}")
+            if detector.nodes_skipped:
+                print(
+                    f"⚠️  PARTIAL: {detector.nodes_skipped} node(s) re-synced "
+                    "mid-scan were never compared — this count is a floor."
+                )
             print(f"\n💡 Next: Review {output_path}")
         elif detector.scan_error:
             # NOT "clean". The scan did not finish, so there is no verdict to
             # report — saying otherwise is the same lie the JSON branch above
             # stopped telling.
             print("⚠️  Scan did NOT complete — no verdict. See the error above.")
+        elif detector.nodes_skipped:
+            # v0.2.96: NOT "clean". Every node the scan never compared is a
+            # node whose duplicates were never looked for, and the hook's
+            # report grep keys on ⚠️, so this reaches the reader exactly where
+            # the false "clean" used to.
+            print(
+                f"⚠️  PARTIAL verdict: no duplicates among the nodes compared, "
+                f"but {detector.nodes_skipped} node(s) were re-synced mid-scan "
+                "and never compared. Re-run once knowledge writes settle."
+            )
         else:
             print("✅ No duplicates detected - knowledge graph is clean!")
 

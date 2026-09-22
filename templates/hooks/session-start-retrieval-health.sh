@@ -89,7 +89,17 @@ import re
 import sys
 import urllib.request
 
-WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8081").rstrip("/")
+# MIRROR (category C) — must match vco_lib/weaviate_helpers.py::
+# weaviate_url_default, the SHARED HOME. Precedence: WEAVIATE_URL >
+# WEAVIATE_PORT > the canonical port; empty/whitespace at either level is
+# UNSET, not a literal. A mirror because this probe is stdlib-only Python
+# embedded in a hook: it runs under whatever interpreter find-python resolves,
+# which is NOT guaranteed to be the VCO venv, so vco_lib may be absent.
+# Pinned by tests/test_v0296_weaviate_url_port_precedence.py::
+# TestShippedMirrorParity, which EXECUTES these lines against the shared home.
+_WEAVIATE_URL_ENV = (os.environ.get("WEAVIATE_URL") or "").strip()
+_WEAVIATE_PORT_ENV = (os.environ.get("WEAVIATE_PORT") or "").strip()
+WEAVIATE_URL = (_WEAVIATE_URL_ENV or f"http://localhost:{_WEAVIATE_PORT_ENV or 8081}").rstrip("/")
 KG_COLLECTION = os.environ.get("KG_COLLECTION", "").strip()
 # Authoritative code-graph class prefix — READ from the launcher's env
 # projection, never re-derived here (see the header block for why).
