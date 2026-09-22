@@ -611,6 +611,47 @@ class ServicePlan:
         return not self.reason
 
 
+#: A compose short-form mount is ``source:target[:opts]``, and on Windows the
+#: source carries its own colon: ``C:\\volumes\\ollama:/root/.ollama:Z``. A bare
+#: ``split(":")`` severs the drive letter and yields source ``"C"`` with the
+#: rest of the path as the TARGET — so the installer compares a mount that
+#: does not exist and reports a spurious drift on every Windows install.
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _split_mount_entry(entry: str) -> list[str]:
+    """Split ``source:target[:opts]`` without severing a Windows drive letter."""
+    parts = entry.split(":")
+    # Re-join a drive letter ONLY when doing so still leaves an absolute
+    # container target. That is what separates a Windows bind from a
+    # one-character VOLUME name: `C:\\vol:/data` has a target after the join
+    # (`/data`), while `v:/data` does not — it is volume `v` mounted at
+    # `/data`, and joining it would invent the target `.ollama` from the
+    # tail of the host path.
+    if (
+        len(parts) >= 3
+        and len(parts[0]) == 1
+        and parts[0].isalpha()
+        and parts[1][:1] in ("\\", "/")
+        and parts[2][:1] == "/"
+    ):
+        parts = [f"{parts[0]}:{parts[1]}", *parts[2:]]
+    return parts
+
+
+def _is_bind_source(source: str) -> bool:
+    """Is this mount source a HOST PATH rather than a named volume?
+
+    POSIX absolute (``/``), home-relative (``~``) and project-relative
+    (``.``) — plus a Windows drive path, which is what every bind on that
+    platform looks like. Without the last case a real Windows bind is
+    classified as a named VOLUME, and the adoption check then looks it up in
+    the top-level ``volumes:`` mapping, finds nothing, and treats the
+    service as unadoptable for a reason that is not true.
+    """
+    return source.startswith(("/", "~", ".")) or bool(_WINDOWS_DRIVE_RE.match(source))
+
+
 def config_mounts(service_cfg: dict, top_volumes: dict) -> dict[str, MountSpec]:
     """The installer-side mounts for one service, by destination.  Resolves
     named volume keys through the top-level ``volumes:`` mapping (explicit
@@ -622,11 +663,11 @@ def config_mounts(service_cfg: dict, top_volumes: dict) -> dict[str, MountSpec]:
     for entry in entries:
         kind, source, dest, opts = "volume", "", "", ""
         if isinstance(entry, str):
-            parts = entry.split(":")
+            parts = _split_mount_entry(entry)
             if len(parts) >= 2:
                 source, dest = parts[0], parts[1]
                 opts = parts[2] if len(parts) > 2 else ""
-                kind = "bind" if source.startswith(("/", "~", ".")) else "volume"
+                kind = "bind" if _is_bind_source(source) else "volume"
         elif isinstance(entry, dict):
             kind = str(entry.get("type", "volume") or "volume")
             source = str(entry.get("source", "") or "")

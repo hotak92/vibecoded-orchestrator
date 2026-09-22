@@ -72,12 +72,21 @@ CID_FOREIGN = "services_foreign_compose_identity"
 
 OWNING_PROJECT = "vibecoded"
 OWN_PROJECT = "infrastructure"
-# A host bind path OUTSIDE the project tree — the shape that makes a
-# volume "foreign-owned" in this fixture. Deliberately generic: a real
-# home directory here is a Gate-21 privacy leak, and this file's own
-# history is the reason the rule exists (the gate scans TRACKED files,
-# so a new test only gets scanned once it is committed).
-OLLAMA_BIND = "/home/testuser/podman_volumes/ollama/models"
+# A host bind path OUTSIDE the project tree — the shape that makes a volume
+# "foreign-owned" in this fixture. It is fixture DATA (it appears in compose
+# text and in container-inspect JSON and is compared verbatim); nothing here
+# touches the filesystem, so it need not exist on the machine running the
+# suite.
+#
+# Deliberately synthetic and machine-neutral. A real home directory here was
+# a Gate-21 privacy leak that shipped in the v0.2.96 release commit: the
+# privacy gate enumerates TRACKED files, so while this file was untracked no
+# local run could see it and CI caught it first.
+#
+# The Windows spelling is exercised by
+# ``MountEntryPortabilityTests`` below rather than by swapping this constant,
+# so the POSIX path that mirrors the field shape stays the default.
+OLLAMA_BIND = "/srv/vco-test/podman_volumes/ollama/models"
 
 # ---------------------------------------------------------------------------
 # The compose files the two homes contribute (mirrors of the field shape).
@@ -1157,3 +1166,50 @@ class PostAdoptDeferralClearTests(_TempCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class MountEntryPortabilityTests(unittest.TestCase):
+    """A compose short-form mount parses the same on every platform VCO installs on.
+
+    ``source:target[:opts]`` is split on ``:`` — and on Windows the SOURCE
+    carries its own colon (``C:\\volumes\\ollama:/root/.ollama:Z``). A bare
+    ``split(":")`` severs the drive letter, yielding source ``"C"`` and the
+    rest of the host path as the TARGET, and the bind test
+    ``startswith(("/", "~", "."))`` then classifies a real Windows bind as a
+    named VOLUME. Both were live until v0.2.96: the installer compared a
+    mount that does not exist and reported drift on every Windows install.
+    """
+
+    DEST = "/root/.ollama"
+
+    def _one(self, entry: str):
+        mounts = service_adoption.config_mounts({"volumes": [entry]}, {})
+        self.assertEqual(list(mounts), [self.DEST], f"bad target for {entry!r}")
+        return mounts[self.DEST]
+
+    def test_posix_bind(self):
+        spec = self._one(f"/srv/vol/ollama:{self.DEST}:Z")
+        self.assertEqual((spec.kind, spec.source), ("bind", "/srv/vol/ollama"))
+
+    def test_windows_backslash_bind(self):
+        spec = self._one(f"C:\\volumes\\ollama:{self.DEST}:Z")
+        self.assertEqual(spec.kind, "bind", "a drive path is a HOST path")
+        self.assertEqual(spec.source, "C:\\volumes\\ollama")
+
+    def test_windows_forward_slash_bind(self):
+        # Compose accepts either separator on Windows.
+        spec = self._one(f"C:/volumes/ollama:{self.DEST}:Z")
+        self.assertEqual((spec.kind, spec.source), ("bind", "C:/volumes/ollama"))
+
+    def test_a_named_volume_is_still_a_volume(self):
+        """The leave-alone half: widening the bind test must not swallow the
+        named-volume case, which is resolved through the top-level mapping."""
+        spec = self._one(f"ollama_models:{self.DEST}")
+        self.assertEqual((spec.kind, spec.source), ("volume", "ollama_models"))
+
+    def test_a_single_letter_volume_name_is_not_a_drive(self):
+        """`v:/root/.ollama` is a one-character VOLUME name, not drive `v:`.
+        The discriminator is the separator that must follow the colon."""
+        spec = self._one(f"v:{self.DEST}")
+        self.assertEqual(spec.kind, "volume", f"misread as a drive: {spec}")
+        self.assertEqual(spec.source, "v")

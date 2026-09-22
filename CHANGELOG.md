@@ -111,6 +111,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-07-03 — this fixes the paths being discarded, not the analyzer's own
   output being quiet.
 
+### Fixed — compose bind mounts parse correctly on Windows (v0.2.96)
+
+- A compose mount is written `source:target[:options]`, and on Windows the
+  source carries its own colon (`C:\volumes\ollama:/root/.ollama`). Splitting
+  on every colon severed the drive letter, so the installer read the source as
+  `C` and the rest of the host path as the target; the same path also failed
+  the "is this a host path" test, which only accepted `/`, `~` and `.`, so a
+  real Windows bind was treated as a named volume. Between them, the service
+  adoption check compared a mount that does not exist and could report drift
+  on a correctly configured Windows install. A drive letter is now kept with
+  its path, and only where doing so still leaves an absolute container target
+  — so `v:/data`, a one-character *volume* name, is still a volume.
+
 ### Fixed — a relocated Weaviate is now found by every caller (v0.2.96)
 
 - `WEAVIATE_PORT` was documented and read by only some callers. The shared
