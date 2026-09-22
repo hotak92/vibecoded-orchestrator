@@ -232,61 +232,31 @@ def test_the_bootstrap_import_chain_is_stdlib_only():
     install.py imported it. No local gate could see it, because a developer
     checkout always HAS PyYAML.
 
-    The fix for a new violation is a FUNCTION-LOCAL import in the one function
-    that needs the dependency, not an entry on an allowlist here.
+    The fix for a new violation is to move the dependency off this path — not
+    an entry on an allowlist here. A FUNCTION-LOCAL import is the usual way,
+    but it only DEFERS the import to call time: it fixes this gate and is safe
+    only if the function runs after the venv exists. See
+    ``tests/test_v0296_install_pre_venv_is_stdlib_only.py``, which covers the
+    calls that run before it — the second instance of this exact failure was a
+    function-local import that ran at step 2.
+
+    v0.2.96 (post-CI): the walk moved to ``tests/common/import_chain.py``, the
+    ONE home, after the pre-venv gate was written by copying the walker out of
+    this test and inherited a blind spot — a dotted target resolved as
+    ``vco_lib/embedding_providers.openai.py``, which is not a file, so the
+    walk skipped the subpackage and every third-party import under it. The
+    shared version resolves packages as well as modules and follows relative
+    imports.
     """
-    import ast
-    import sys
-    from pathlib import Path
+    from tests.common.import_chain import REPO_ROOT, third_party_reachable_from
 
-    repo = Path(__file__).resolve().parents[1]
-    stdlib = set(sys.stdlib_module_names)
+    reached = third_party_reachable_from(REPO_ROOT / "install.py", is_install_py=True)
 
-    def module_scope_imports(tree: ast.Module):
-        for node in tree.body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                yield node
-
-    entry = ast.parse((repo / "install.py").read_text(encoding="utf-8"))
-    pending: list[str] = []
-    for node in module_scope_imports(entry):
-        if isinstance(node, ast.ImportFrom) and node.module == "vco_lib":
-            pending += [a.name for a in node.names]
-        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("vco_lib."):
-            pending.append(node.module.split(".", 1)[1])
-        elif isinstance(node, ast.Import):
-            pending += [
-                a.name.split(".", 1)[1] for a in node.names
-                if a.name.startswith("vco_lib.")
-            ]
-
-    seen: set[str] = set()
-    violations: list[str] = []
-    while pending:
-        mod = pending.pop()
-        if mod in seen:
-            continue
-        seen.add(mod)
-        path = repo / "vco_lib" / f"{mod}.py"
-        if not path.is_file():
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in module_scope_imports(tree):
-            if isinstance(node, ast.Import):
-                names = [a.name.split(".")[0] for a in node.names]
-            else:
-                names = [(node.module or "").split(".")[0]]
-            for name in names:
-                if not name or name in stdlib or name == "vco_lib":
-                    continue
-                violations.append(f"{mod}.py imports {name!r} at module scope")
-            if isinstance(node, ast.ImportFrom) and (node.module or "") == "vco_lib":
-                pending += [a.name for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("vco_lib."):
-                pending.append(node.module.split(".", 1)[1])
-
-    assert not violations, (
+    assert not reached, (
         "third-party imports on the bootstrap path — `install.py --bootstrap` "
-        "would fail on a fresh clone:\n  " + "\n  ".join(sorted(set(violations)))
+        "would fail on a fresh clone:\n  "
+        + "\n  ".join(
+            f"{package!r} imported at the module scope of vco_lib.{via}"
+            for package, via in sorted(reached.items())
+        )
     )
-    assert len(seen) > 20, f"the walk collapsed ({len(seen)} modules) — it is not proving anything"

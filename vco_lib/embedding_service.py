@@ -95,6 +95,10 @@ from vco_lib.embedding_providers.ollama_truncation import TruncationAwareOllamaA
 from vco_lib.embedding_providers.openai import (
     KNOWN_OPENAI_EMBEDDING_MODELS,
 )
+from vco_lib.embedding_selection import (
+    TEXT_MODEL_QWEN3,
+    model_id_for_active as _model_id_for_active_shared,
+)
 from vco_lib.paths import claude_metrics_dir
 
 logger = logging.getLogger(__name__)
@@ -824,7 +828,11 @@ DEFAULT_OLLAMA_URL = "http://localhost:11435"
 #: now lives in ``vco_lib.code_embed_image.service_base_url`` (see
 #: ``_shared_service_base_url`` below), which also honours ``CODE_EMBED_PORT``.
 DEFAULT_CODE_EMBED_URL = "http://localhost:11440"
-DEFAULT_TEXT_MODEL = "qwen3-embedding:0.6b"
+#: One home with the profile->model table that yields it
+#: (:data:`vco_lib.embedding_selection.TEXT_MODEL_QWEN3`) — the default text
+#: embedder and the qwen3 row of that table are the same fact, and a literal
+#: here could drift from it.
+DEFAULT_TEXT_MODEL = TEXT_MODEL_QWEN3
 DEFAULT_CODE_MODEL = "codesage-large-v2"
 
 
@@ -1778,6 +1786,13 @@ def _resolve_active_embedding() -> str:
 def _model_id_for_active(active: str) -> str:
     """Map an active-embedding profile to its canonical Ollama / OpenAI model id.
 
+    Thin delegate to :func:`vco_lib.embedding_selection.model_id_for_active`
+    (v0.2.96 — the ONE home), kept under this name because
+    ``embedding_enrichment`` and the v0.2.52 test suite import it from here.
+    The home is the pure stdlib leaf rather than this module: install.py
+    needs the same table at step 2, before the venv exists, and cannot
+    import a module that pulls ``requests``.
+
     The mapping mirrors install.py's ``EMBEDDING_CONFIGS`` table — keeping
     one resolution rule per profile prevents drift between the install-time
     choice and the runtime ``EmbeddingService`` selection.
@@ -1798,15 +1813,7 @@ def _model_id_for_active(active: str) -> str:
         install.py ``EMBEDDING_CONFIGS`` — install-time presets that
         produce these same active→model mappings.
     """
-    normalised = (active or "").strip().lower()
-    if normalised == "arctic":
-        return "snowflake-arctic-embed2:latest"
-    if normalised == "openai":
-        return "text-embedding-3-small"
-    # ``qwen3``, ``codesage`` (text-side rarely used), or anything else:
-    # fall back to qwen3, which is the only-always-present-on-fresh-install
-    # text embedder.
-    return DEFAULT_TEXT_MODEL
+    return _model_id_for_active_shared(active)
 
 
 class EmbeddingService:

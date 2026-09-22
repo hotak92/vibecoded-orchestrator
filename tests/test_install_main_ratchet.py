@@ -303,10 +303,10 @@ _MAIN_SPAN_MAX = 1687
 #
 # v0.2.96 duplication lane (F-2 + F-5) — re-pinned DOWN to the measured
 # 23905 (-8). The install.py embedding-model mirror `_model_id_for_active`
-# became a thin delegate to `vco_lib.embedding_service` (its
-# "bootstrap self-containment" receipt was provably false — install.py
-# hard-imports ~20 vco_lib modules at top level, so the mirror only ever
-# duplicated), and `_read_active_embedding_from_app_state` now delegates to
+# became a thin delegate (its "bootstrap self-containment" receipt was read as
+# provably false — install.py hard-imports ~20 vco_lib modules at top level,
+# so the mirror looked like pure duplication), and
+# `_read_active_embedding_from_app_state` now delegates to
 # `vco_lib.launcher_db_reader.read_app_state_active_embedding` (threading
 # `_discover_app_state_db_path` explicitly). Also deleted the now-dead
 # `_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE` constant (+ comment). The one added
@@ -318,7 +318,19 @@ _MAIN_SPAN_MAX = 1687
 # `vco_lib.version_compare.version_ge`, the one home for that rule (it had
 # three implementations and two answers; the third read `0.2.95rc1` as patch
 # 951). Measured with `wc -l`, not predicted.
-_TOTAL_LINES_MAX = 23892
+#
+# v0.2.96 (post-CI) — re-pinned DOWNWARD 23892 -> 23888 (-4). F-2's delegate
+# above was pointed at the WRONG home and broke every fresh install:
+# `vco_lib.embedding_service` imports `requests` at module scope, and this
+# helper runs before install.py has created the venv, so install-smoke went
+# red on all five platforms with `ModuleNotFoundError: requests`. The mirror's
+# "self-containment early in the bootstrap" receipt was TRUE — it was denying
+# a missing THIRD-PARTY dependency, not a missing `vco_lib`, and the rebuttal
+# above answered only the second. The consolidation still stands; the home
+# moved to `vco_lib.embedding_selection`, a pure stdlib leaf since v0.2.68.
+# The -4 is the difference between the deleted mirror and the delegate plus
+# its (now brief) docstring. Measured with `wc -l`, not predicted.
+_TOTAL_LINES_MAX = 23888
 
 
 def _measure() -> tuple:

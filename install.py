@@ -230,6 +230,10 @@ from vco_lib.symlink_handler import (  # noqa: E402
 # (v0.2.96: install.py joined the pyright gate; pyrightconfig.json names the
 # per-line ignore + rationale as the sanctioned form for exactly this case).
 from vco_lib.embedding_selection import (  # noqa: E402,F401
+    # v0.2.96: the profile->model-id table's ONE home. Imported at module
+    # scope on purpose — `_model_id_for_active` runs at step 2, before the
+    # venv exists, so it may only reach a pure stdlib leaf.
+    model_id_for_active as _model_id_for_active_shared,
     _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
     select_code_embedding_backend,
     select_kg_embedding_backend,
@@ -10720,21 +10724,13 @@ def _model_id_for_active(active: str) -> str:
     even when the user shell has no ``EMBEDDING_MODEL`` set.
 
     v0.2.96 F-2: thin delegate to
-    :func:`vco_lib.embedding_service._model_id_for_active` — the ONE home.
-    The former inline mirror claimed self-containment for a bootstrap in
-    which ``vco_lib`` is unimportable, but install.py hard-imports ~20
-    ``vco_lib`` modules at module top level (see the import block above),
-    so that state dies at import time long before this helper could
-    matter — the mirror defended nothing while free to drift silently.
-    The import is function-local (not top-level) because
-    ``embedding_service`` pulls the requests-based provider stack at
-    module import time and install.py otherwise imports only the stdlib
-    at top level (same shape as ``embedding_enrichment``'s local import).
+    :func:`vco_lib.embedding_selection.model_id_for_active` — the ONE home,
+    and a pure stdlib leaf BECAUSE this runs before the venv exists. Routing
+    it through ``embedding_service`` instead (which imports ``requests``)
+    broke every fresh install; see that function's docstring for the rule and
+    ``tests/test_v0296_install_pre_venv_is_stdlib_only.py`` for the gate.
     """
-    from vco_lib.embedding_service import (
-        _model_id_for_active as _svc_model_id_for_active,
-    )
-    return _svc_model_id_for_active(active)
+    return _model_id_for_active_shared(active)
 
 
 def _read_active_embedding_from_app_state() -> "str | None":

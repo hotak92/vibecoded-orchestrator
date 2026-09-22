@@ -111,6 +111,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-07-03 — this fixes the paths being discarded, not the analyzer's own
   output being quiet.
 
+### Fixed — a first install no longer needs packages it has not installed yet (v0.2.96)
+
+- `install.py` creates its virtual environment at step 3 and installs the
+  dependencies into it at step 4, so steps 1 and 2 necessarily run on whatever
+  interpreter launched the installer — on a fresh clone, a system Python with
+  no third-party packages at all. Step 2's embedding reconcile reached a module
+  that imports `requests`, and a first install ended in
+  `ModuleNotFoundError: No module named 'requests'` on every platform.
+- The three-row "profile → text model id" table now lives in
+  `vco_lib/embedding_selection.py`, which has been a pure standard-library
+  module since v0.2.68 and is therefore reachable from every phase of the
+  install. `install.py` and `vco_lib/embedding_service.py` both call it, so the
+  table still has one home — the earlier consolidation's goal — while the
+  install's earliest phase keeps the standard-library-only guarantee it
+  depends on.
+- A test now blocks the post-venv packages at import time to reproduce a fresh
+  clone in-process, so this class of failure is caught in a second locally
+  rather than an hour later on five CI runners. Past step 4 the rule relaxes to
+  soft-fail rather than disappearing: a later in-process import of a
+  third-party package must carry a working fallback, and the one place that
+  does it is exempted by name with its fallback recorded.
+
 ### Fixed — compose bind mounts parse correctly on Windows (v0.2.96)
 
 - A compose mount is written `source:target[:options]`, and on Windows the
