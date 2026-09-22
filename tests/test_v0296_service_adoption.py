@@ -72,7 +72,12 @@ CID_FOREIGN = "services_foreign_compose_identity"
 
 OWNING_PROJECT = "vibecoded"
 OWN_PROJECT = "infrastructure"
-OLLAMA_BIND = "/home/martino/podman_volumes/ollama/models"
+# A host bind path OUTSIDE the project tree — the shape that makes a
+# volume "foreign-owned" in this fixture. Deliberately generic: a real
+# home directory here is a Gate-21 privacy leak, and this file's own
+# history is the reason the rule exists (the gate scans TRACKED files,
+# so a new test only gets scanned once it is committed).
+OLLAMA_BIND = "/home/testuser/podman_volumes/ollama/models"
 
 # ---------------------------------------------------------------------------
 # The compose files the two homes contribute (mirrors of the field shape).
