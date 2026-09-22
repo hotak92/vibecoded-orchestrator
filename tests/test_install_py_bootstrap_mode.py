@@ -215,3 +215,78 @@ def test_bootstrap_os_enum(os_value):
     # The parameterize is documentation of the schema enum; the assertion
     # above is the actual contract.
     _ = os_value
+
+
+def test_the_bootstrap_import_chain_is_stdlib_only():
+    """`install.py --bootstrap` runs on a FRESH CLONE, before any venv exists.
+
+    So every module it imports at MODULE SCOPE — and everything those import
+    at module scope, transitively — must be importable with nothing but the
+    standard library. A third-party import anywhere in that chain turns the
+    first command a new user runs into a ModuleNotFoundError.
+
+    This is not hypothetical. v0.2.96 shipped `vco_lib/service_adoption.py`
+    with a module-scope `import yaml`, imported by `install.py:165`; bootstrap
+    died on all five platforms in install-smoke. Its own comment asserted
+    PyYAML was "not the install path" — a receipt that was false the moment
+    install.py imported it. No local gate could see it, because a developer
+    checkout always HAS PyYAML.
+
+    The fix for a new violation is a FUNCTION-LOCAL import in the one function
+    that needs the dependency, not an entry on an allowlist here.
+    """
+    import ast
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    stdlib = set(sys.stdlib_module_names)
+
+    def module_scope_imports(tree: ast.Module):
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                yield node
+
+    entry = ast.parse((repo / "install.py").read_text(encoding="utf-8"))
+    pending: list[str] = []
+    for node in module_scope_imports(entry):
+        if isinstance(node, ast.ImportFrom) and node.module == "vco_lib":
+            pending += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("vco_lib."):
+            pending.append(node.module.split(".", 1)[1])
+        elif isinstance(node, ast.Import):
+            pending += [
+                a.name.split(".", 1)[1] for a in node.names
+                if a.name.startswith("vco_lib.")
+            ]
+
+    seen: set[str] = set()
+    violations: list[str] = []
+    while pending:
+        mod = pending.pop()
+        if mod in seen:
+            continue
+        seen.add(mod)
+        path = repo / "vco_lib" / f"{mod}.py"
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in module_scope_imports(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            else:
+                names = [(node.module or "").split(".")[0]]
+            for name in names:
+                if not name or name in stdlib or name == "vco_lib":
+                    continue
+                violations.append(f"{mod}.py imports {name!r} at module scope")
+            if isinstance(node, ast.ImportFrom) and (node.module or "") == "vco_lib":
+                pending += [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("vco_lib."):
+                pending.append(node.module.split(".", 1)[1])
+
+    assert not violations, (
+        "third-party imports on the bootstrap path — `install.py --bootstrap` "
+        "would fail on a fresh clone:\n  " + "\n  ".join(sorted(set(violations)))
+    )
+    assert len(seen) > 20, f"the walk collapsed ({len(seen)} modules) — it is not proving anything"

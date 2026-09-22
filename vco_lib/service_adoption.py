@@ -75,7 +75,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-import yaml  # PyYAML — hard dep of the orchestrator venv (not the install path)
+# PyYAML is NOT imported at module scope. This module's own comment used to
+# say it was "a hard dep of the orchestrator venv (not the install path)" —
+# and that was false: `install.py` imports this module at MODULE SCOPE
+# (install.py:165), which puts it on the bootstrap path, where the venv does
+# not exist yet. `install.py --bootstrap` on a fresh clone therefore died with
+# ModuleNotFoundError on every platform (caught by install-smoke, v0.2.96).
+#
+# The three functions that actually parse or emit YAML import it locally. They
+# all run long after the venv exists; the ones install.py calls during
+# bootstrap (the services.toml helpers) do not touch YAML at all.
 
 from vco_lib import containers as _containers
 from vco_lib import compose_env as _compose_env
@@ -478,6 +487,8 @@ def _substitute_tree(node: Any, env: dict) -> Any:
 def load_compose_doc(path: Path, env: dict) -> Optional[dict]:
     """Parse one compose file with ``${VAR}`` / ``${VAR:-default}``
     substitution.  ``None`` when unreadable/unparseable."""
+    import yaml  # local: see the module header — not available at bootstrap
+
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
@@ -916,6 +927,8 @@ def render_adoption_override(plans: Sequence[ServicePlan]) -> str:
     body = {"services": services_block or {}}
     body["networks"] = networks_block or {}
     body["volumes"] = volumes_block or {}
+    import yaml  # local: see the module header — not available at bootstrap
+
     text = yaml.safe_dump(body, default_flow_style=False, sort_keys=True)
     return _OVERRIDE_HEADER + "\n" + text
 
@@ -1402,6 +1415,13 @@ def adopt_services(
         if doc is None:
             continue
         cfg = doc if cfg is None else merge_compose(cfg, doc)
+    # ABOVE the try, not inside it: the `except` clause names `yaml`, so an
+    # import that failed in the try would leave the handler referencing an
+    # unbound name and raise NameError instead of the error it exists to
+    # catch. (pyright: reportPossiblyUnbound — the same shape this cycle
+    # already fixed twice in install.py.)
+    import yaml  # local: see the module header
+
     try:
         rendered = yaml.safe_load(override_body)
     except yaml.YAMLError:
