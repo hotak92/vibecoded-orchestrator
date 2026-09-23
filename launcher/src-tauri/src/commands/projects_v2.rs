@@ -5323,31 +5323,49 @@ pub(crate) fn surgically_strip_env_surfaces(
 /// surface of `folder`, and REPORT the rest — the unregister's evidence rule.
 ///
 /// A confirmed "unregister" consents to removing what VCO wrote, not a
-/// same-named key the user typed. So a launcher-known user secret (any
-/// bucket) or `GITHUB_TOKEN` with a value in `.env`, `.claude/env` (outside
-/// the managed block, which step 2 excised whole) or a JSON env block is
-/// removed only when that value EQUALS the one the launcher stores — decided
-/// by the ONE evidence classifier,
-/// [`crate::services::vco_lib_bridge::classify_secret_values`] (Python; the
-/// value is compared inside the child, through the hub, and never crosses
-/// this boundary). Must run BEFORE the unregister forgets the project's
-/// secret rows and deletes its DB row: the hub resolves the stored value
-/// only while the project is registered.
+/// same-named key the user typed. The whole decision AND the edit live in
+/// the ONE Python implementation, `vco_lib.config_projection
+/// strip-proven-secret-values` (via
+/// [`crate::services::vco_lib_bridge::strip_proven_secret_values`]): a
+/// launcher-known user secret (any bucket) or `GITHUB_TOKEN` goes only where
+/// its value EQUALS the launcher's stored one — per LINE in `.env` /
+/// `.claude/env` (a file can hold a key twice; only the proven line goes,
+/// review R3 F23), per key in the JSON env blocks (JSONC in place, refusal
+/// recorded). No Rust copy of the line grammar exists (review R3 F24). Must
+/// run BEFORE the unregister forgets the project's secret rows and deletes its
+/// DB row: the hub resolves the stored value only while the project is
+/// registered.
 ///
 /// Everything not proven is left byte-for-byte and listed in ONE `warnings`
-/// line — the unregister result the GUI shows (the project is leaving VCO,
-/// so a deferral in its ledger might never be read). A classifier failure
-/// removes nothing and says so. Replaces the pre-v0.2.97
-/// `surgically_strip_user_secret_keys`, which removed per-project user-secret
-/// NAMES from every surface — a key the user typed included.
+/// line ([`report_left_secret_values`]) — the unregister result the GUI shows
+/// (the project is leaving VCO, so a deferral in its ledger might never be
+/// read). A failure removes nothing and says so.
 pub(crate) fn strip_proven_secret_values(
     root: Option<&Path>,
     folder: &Path,
     purged: &mut std::collections::BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) {
-    match crate::services::vco_lib_bridge::classify_secret_values(root, folder) {
-        Ok(verdicts) => apply_secret_verdicts(root, folder, &verdicts, purged, warnings),
+    match crate::services::vco_lib_bridge::strip_proven_secret_values(root, folder) {
+        Ok(reply) => {
+            if let Some(removed) = reply.get("removed").and_then(serde_json::Value::as_object) {
+                for names in removed.values() {
+                    for name in names.as_array().into_iter().flatten() {
+                        if let Some(n) = name.as_str() {
+                            purged.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+            for e in reply.get("errors").and_then(serde_json::Value::as_array).into_iter().flatten() {
+                if let Some(msg) = e.as_str() {
+                    warnings.push(msg.to_string());
+                }
+            }
+            if let Some(line) = report_left_secret_values(&reply) {
+                warnings.push(line);
+            }
+        }
         Err(e) => warnings.push(format!(
             "could not check which secret values in this project's env files VCO \
              wrote, so none were removed (a value you typed is never removed by \
@@ -5357,99 +5375,34 @@ pub(crate) fn strip_proven_secret_values(
     }
 }
 
-/// Act on a verdict map `{file: {KEY: "proven"|"not_vco"|"unknown"}}`:
-/// remove the `proven` names from their file, report every other one.
-/// Split from [`strip_proven_secret_values`] so the decision is unit-testable
-/// without a hub.
-pub(crate) fn apply_secret_verdicts(
-    root: Option<&Path>,
-    folder: &Path,
-    verdicts: &serde_json::Map<String, serde_json::Value>,
-    purged: &mut std::collections::BTreeSet<String>,
-    warnings: &mut Vec<String>,
-) {
+/// The one warning line for the values left in place, from a
+/// `strip-proven-secret-values` reply: `KEY in <file> (<reason>)` per entry,
+/// with the reason's wording taken from the reply's `reasons` map — the ONE
+/// wording, owned by `config_projection.EVIDENCE_REASONS` (review R3 F22: a
+/// paused key reads "VCO could not check it — the launcher's copy is paused",
+/// never "not the value the launcher stores"). Key names only. `None` when
+/// nothing was left.
+pub(crate) fn report_left_secret_values(reply: &serde_json::Value) -> Option<String> {
+    let reasons = reply.get("reasons").and_then(serde_json::Value::as_object);
     let mut left: Vec<String> = Vec::new();
-    for (rel, per_key) in verdicts {
-        let Some(per_key) = per_key.as_object() else { continue };
-        let mut proven: Vec<&str> = Vec::new();
-        for (name, verdict) in per_key {
-            match verdict.as_str() {
-                Some("proven") => proven.push(name.as_str()),
-                Some("unknown") => left.push(format!("{} in {} (could not be checked)", name, rel)),
-                _ => left.push(format!(
-                    "{} in {} (not the value the launcher stores for it)", name, rel
-                )),
-            }
-        }
-        if proven.is_empty() {
-            continue;
-        }
-        match rel.as_str() {
-            ".env" | ".claude/env" => {
-                let path = folder.join(rel);
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => {
-                        let (new_text, removed) = strip_active_env_lines(&text, &proven);
-                        if !removed.is_empty() {
-                            match std::fs::write(&path, new_text) {
-                                Ok(()) => purged.extend(removed),
-                                Err(e) => warnings.push(format!(
-                                    "could not rewrite {}: {}", path.display(), e
-                                )),
-                            }
-                        }
-                    }
-                    Err(e) => warnings.push(format!("could not read {}: {}", path.display(), e)),
-                }
-            }
-            ".claude/settings.json" | ".vscode/settings.json" => {
-                let surface = if rel == ".claude/settings.json" {
-                    "claude_settings_json"
-                } else {
-                    "vscode_settings_json"
-                };
-                match crate::services::vco_lib_bridge::strip_settings_env_keys(
-                    root, folder, surface, &proven,
-                ) {
-                    Ok(removed) => purged.extend(removed),
-                    Err(e) => warnings.push(format!("{} left untouched: {}", rel, e)),
-                }
-            }
-            _ => {}
+    for (rel, per_key) in reply.get("left").and_then(serde_json::Value::as_object)? {
+        for (name, verdict) in per_key.as_object().into_iter().flatten() {
+            let verdict = verdict.as_str().unwrap_or("unknown");
+            let reason = reasons
+                .and_then(|r| r.get(verdict))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(verdict);
+            left.push(format!("{} in {} ({})", name, rel, reason));
         }
     }
-    if !left.is_empty() {
-        warnings.push(format!(
-            "left in place — VCO cannot prove it wrote these values, so unregister did \
-             not remove them (remove any that are not yours to keep): {}",
-            left.join("; ")
-        ));
+    if left.is_empty() {
+        return None;
     }
-}
-
-/// Pure helper: drop the ACTIVE `KEY=value` / `export KEY=value` lines whose
-/// key is in `keys`. Commented lines are kept — a `# KEY=…` line is not a
-/// value VCO proved it wrote. Returns `(new_text, removed_keys)`.
-pub(crate) fn strip_active_env_lines(text: &str, keys: &[&str]) -> (String, Vec<String>) {
-    let mut removed = std::collections::BTreeSet::new();
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let body = trimmed.strip_prefix("export ").map(str::trim_start).unwrap_or(trimmed);
-        let key = body.find('=').filter(|&i| i > 0).map(|i| body[..i].trim());
-        if let Some(k) = key {
-            if !trimmed.starts_with('#') && keys.contains(&k) {
-                removed.insert(k.to_string());
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    (out, removed.into_iter().collect())
+    Some(format!(
+        "left in place — VCO cannot prove it wrote these values, so unregister did \
+         not remove them (remove any that are not yours to keep): {}",
+        left.join("; ")
+    ))
 }
 
 // The unregister-flow env-key strippers + launcher-file purge were
@@ -10009,63 +9962,26 @@ USER_DB_URL=postgres://user:pass@db/app
 
     const ALL_SURFACES: [&str; 4] = [".env", ".claude/env", ".claude/settings.json", ".vscode/settings.json"];
 
-    /// v0.2.97 (act): a secret VALUE the classifier PROVED VCO wrote (equal to
-    /// the launcher's stored value) is removed from every surface; canonical
-    /// and by-hand keys around it survive, and nothing is reported as left.
-    /// The verdict map is given directly — the evidence itself is the Python
-    /// classifier's (`tests/test_v0297_unregister_evidence.py`).
+    /// v0.2.97 (review R3 F22): the left-in-place line takes each verdict's
+    /// wording from the reply — a paused key is "could not check", never "not
+    /// the value the launcher stores" — and carries key names only.
     #[test]
-    fn unregister_removes_a_proven_secret_value_from_every_surface() {
-        let tmp = strip_test_folder("proven");
-        seed_all_surfaces(&tmp, "USER_SECRET_FROM_GUI", "ghp_test_canary");
-        let verdicts: serde_json::Map<String, serde_json::Value> = ALL_SURFACES
-            .iter()
-            .map(|rel| (rel.to_string(), serde_json::json!({"USER_SECRET_FROM_GUI": "proven"})))
-            .collect();
-        let (mut purged, mut warnings) = (std::collections::BTreeSet::new(), Vec::new());
-
-        apply_secret_verdicts(None, &tmp, &verdicts, &mut purged, &mut warnings);
-
-        assert!(warnings.is_empty(), "{:?}", warnings);
-        assert_eq!(purged.into_iter().collect::<Vec<_>>(), vec!["USER_SECRET_FROM_GUI".to_string()]);
-        for rel in ALL_SURFACES {
-            let text = std::fs::read_to_string(tmp.join(rel)).unwrap();
-            assert!(!text.contains("ghp_test_canary"), "{} still holds the value", rel);
-            assert!(text.contains("BY_HAND_KEY") && text.contains("KG_COLLECTION"), "{}: {}", rel, text);
-        }
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// v0.2.97 (leave-alone): a same-named value that is NOT the stored one,
-    /// or one that could not be checked, is left byte-for-byte in every
-    /// surface and listed in ONE warning — the unregister result the GUI shows.
-    #[test]
-    fn unregister_leaves_and_reports_an_unproven_secret_value() {
-        let tmp = strip_test_folder("unproven");
-        seed_all_surfaces(&tmp, "OPENAI_API_KEY", "sk-user-typed");
-        let before: Vec<String> =
-            ALL_SURFACES.iter().map(|r| std::fs::read_to_string(tmp.join(r)).unwrap()).collect();
-        let verdicts: serde_json::Map<String, serde_json::Value> = ALL_SURFACES
-            .iter()
-            .enumerate()
-            .map(|(i, rel)| {
-                let v = if i % 2 == 0 { "not_vco" } else { "unknown" };
-                (rel.to_string(), serde_json::json!({"OPENAI_API_KEY": v}))
-            })
-            .collect();
-        let (mut purged, mut warnings) = (std::collections::BTreeSet::new(), Vec::new());
-
-        apply_secret_verdicts(None, &tmp, &verdicts, &mut purged, &mut warnings);
-
-        assert!(purged.is_empty());
-        for (rel, text) in ALL_SURFACES.iter().zip(before) {
-            assert_eq!(std::fs::read_to_string(tmp.join(rel)).unwrap(), text, "{} changed", rel);
-        }
-        assert_eq!(warnings.len(), 1, "{:?}", warnings);
-        assert!(warnings[0].contains("left in place") && warnings[0].contains("OPENAI_API_KEY in .env"));
-        assert!(warnings[0].contains("could not be checked"));
-        assert!(!warnings[0].contains("sk-user-typed"), "a value is never reported");
-        std::fs::remove_dir_all(&tmp).ok();
+    fn the_left_in_place_report_uses_the_replys_wording_per_verdict() {
+        let reply = serde_json::json!({
+            "removed": {".env": ["A"]},
+            "left": {
+                ".env": {"PAUSED_KEY": "paused"},
+                ".claude/settings.json": {"TYPED_KEY": "not_vco"}
+            },
+            "reasons": {
+                "paused": "VCO could not check it — the launcher's copy is paused (or not granted) for this project",
+                "not_vco": "it is not the value the launcher stores for it"
+            }
+        });
+        let line = report_left_secret_values(&reply).expect("something was left");
+        assert!(line.contains("PAUSED_KEY in .env (VCO could not check it — the launcher's copy is paused"), "{}", line);
+        assert!(line.contains("TYPED_KEY in .claude/settings.json (it is not the value the launcher stores for it)"), "{}", line);
+        assert!(report_left_secret_values(&serde_json::json!({"left": {}})).is_none());
     }
 
     /// v0.2.97: a `GITHUB_TOKEN` the user typed survives the WHOLE unregister
@@ -10092,16 +10008,6 @@ USER_DB_URL=postgres://user:pass@db/app
             warnings
         );
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// A commented `# KEY=…` line is not a value VCO proved it wrote: the
-    /// proven-value strip drops ACTIVE lines only.
-    #[test]
-    fn strip_active_env_lines_keeps_commented_lines() {
-        let text = "A=1\n# A=old\nexport A=\"2\"\nB=3";
-        let (out, removed) = strip_active_env_lines(text, &["A"]);
-        assert_eq!(out, "# A=old\nB=3");
-        assert_eq!(removed, vec!["A".to_string()]);
     }
 
     /// `GITHUB_TOKEN` is the one canonical key unregister never removes by

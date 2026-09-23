@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.97] - 2026-09-23
+
+### Fixed — on Windows, a failed update was reported as a success (v0.2.97)
+
+- `install.py` re-runs itself under the project's virtual environment. It did
+  so with `os.execve`, which on Linux and macOS *replaces* the process. On
+  Windows it does not: Python starts a new process and the original one exits
+  at once with code 0. Because a Windows venv's `python.exe` is a copy rather
+  than a link, the re-run happened on every launcher-driven update since
+  v0.2.45 — so the launcher, `install.ps1` and `first-install.bat` all saw
+  "success" immediately, whatever the update actually did. A failed update
+  cleared the previous failure, and the binary refresh and hub restart went
+  ahead on top of it.
+- On Windows the original process now waits for the re-run and exits with its
+  real exit code. Linux and macOS still use `execve`. If the launcher cancels
+  an install, the re-run notices that its waiting parent is gone and stops,
+  exactly as it would on Linux; services the install started (hub, updater,
+  code-graph analyzer) keep running.
+
+### Fixed — updates ran under the system Python on Linux and macOS (v0.2.97)
+
+- The same re-run was silently skipped on Linux and macOS: the check for "am I
+  already in the venv?" compared the two interpreters' resolved paths, and a
+  venv's `python` is a symlink to the system one, so the answer was always
+  "yes". GUI updates therefore ran on the system interpreter, and any step
+  that needed a venv-only package failed into a log line nobody saw. The most
+  visible casualty: the one-time removal of a leftover `ANTHROPIC_MODEL` pin
+  from VS Code's settings (shipped in v0.2.95) never ran on any machine, so
+  that pin kept overriding the model you picked in Claude Code.
+- The check now asks whether this process *is* the venv. The pin removal runs
+  after the venv exists, in the venv, on every install and update (not on
+  `--uninstall`), and a failure now appears in `UPDATE_DEFERRED.md` instead of
+  a log.
+- `--rebuild-venv` always rebuilds, the Python-version drift check compares
+  against the interpreter that launched the install, and a rebuild never
+  deletes the environment it is running from.
+
+### Fixed — settings files VCO could not parse were overwritten (v0.2.97)
+
+- Several writers of `.claude/settings.json` replaced a file they could not
+  parse with a new one containing only their own keys, deleting everything
+  else in it. One comment in the file was enough. The worst of these ran
+  unattended every 24 hours for every project with an installed module.
+- VCO now never overwrites a settings file it cannot read. The write is
+  refused, the file is left byte-for-byte as it was, and an entry in
+  `UPDATE_DEFERRED.md` names the file and what to fix. `~/.claude.json` was
+  never affected.
+- Settings files with comments (JSONC — VS Code's own format) are now read and
+  edited in place everywhere VCO touches them, keeping every comment and line
+  ending: VS Code's user settings, `.claude/settings.json`, the Hooks tab,
+  env projection, bundle updates, and the verify commands.
+
+### Fixed — a bundle update turned disabled hooks back on (v0.2.97)
+
+- Disabling a hook in the launcher's Hooks tab removes it from
+  `.claude/settings.json`; the next bundle update added it back while the tab
+  still showed it as disabled. Updates now leave hooks you disabled out, on
+  every update path, including the CLI with the launcher closed. The choice
+  is kept on the machine where you made it; it does not travel with a copied
+  project. A project that was already affected gets an entry naming each hook
+  and the two ways to settle it.
+- A registration of a hook shipped under several matchers is re-added if it
+  goes missing.
+
+### Fixed — moving or renaming a project never updated its env files (v0.2.97)
+
+- Project move and collection rename called the env re-projection with a flag
+  that command does not accept, so every move and rename silently skipped it.
+  Fixed, and a failure is now shown in the move dialog and recorded as an
+  entry that clears itself once the env files match again. A new test checks
+  every `python -m vco_lib …` call VCO builds, in Python and Rust, against the
+  real argument parser; it also found four commands VCO printed that did not
+  exist, now corrected.
+
+### Fixed — secret values left in project settings by older launchers (v0.2.97)
+
+- Launchers before v0.2.73 wrote some secret values into project env files.
+  The update notice promised the next refresh would remove them; for
+  `.claude/settings.json` it never did. Every env refresh now removes such a
+  value — but only when it provably came from VCO: it must equal the value the
+  launcher stores for that key (the secret itself stays in the keychain, and
+  only the key name is recorded). A key that merely shares a name with one of
+  the launcher's secrets, including a paused one, is never removed; neither is
+  anything VCO cannot check (for example while the hub is down). Those, and
+  secret-looking keys you added yourself, are reported in a separate entry
+  with the steps to move them into the secrets store. Unregistering a project
+  follows the same rule.
+- `GITHUB_TOKEN` in a project's `.claude/settings.json` is no longer deleted by
+  name on every env refresh (it had been since v0.2.73, including a token you
+  typed yourself); it is removed only when it equals the stored GitHub token.
+
+### Added — the model gateway tells you when it needs a restart (v0.2.97)
+
+- An update never restarted the model gateway, so it kept serving the previous
+  release's code until you restarted it by hand. The gateway now reports which
+  code it is running; after an update, when it is provably out of date, the
+  launcher asks whether to restart it now (**Continue**) or later
+  (**Dismiss**). It never restarts on its own — a restart ends any chat that
+  is running through it. A CLI-only update prints the restart command.
+
+### Added — real subscription usage instead of estimated costs (v0.2.97)
+
+- With the VS Code panel routed through the gateway, Claude Code's Account &
+  Usage view shows a dollar figure computed at API list prices, which means
+  nothing on a subscription. VCO now shows the real numbers:
+  - on the launcher's home page: Claude's session, weekly and per-model
+    weekly usage, and Z.ai's 5-hour and weekly usage, with reset times;
+    QwenCloud's plan exposes no usage data, so it shows tokens used this month;
+  - in the model picker, on vendor rows (e.g. `… · 5h 10% · wk 72% used`),
+    as of the start of the session — Claude Code uses its own labels for its
+    own models. Turn it off with `VCT_MODEL_GATEWAY_PICKER_USAGE=off`;
+  - in terminal `claude` sessions, through an optional status-line script
+    (`templates/scripts/gateway-usage-statusline.sh` / `.ps1`; see
+    `docs/CONFIGURATION.md`).
+- Usage is refreshed in the background while chats are flowing and never on
+  the request path; an idle gateway makes no calls. Unknown is shown as
+  unknown, never as 0 %.
+
+### Fixed — smaller issues (v0.2.97)
+
+- The Projects page kept showing "N stale project bundles" after **Update all**
+  finished; it now re-checks when the update ends and on **Refresh**.
+- The root `CLAUDE.md` no longer gets a `CLAUDE.md.from-upstream-<sha>` copy
+  on every update, and old ones are removed when git provably holds their
+  contents.
+- A project that disabled shared-KG reads still read it when its settings file
+  had comments.
+- The search MCP no longer fails to start on a machine without a GitHub token;
+  it never needed one.
+- `infrastructure/docker-compose.yml` accepts `VCT_<SERVICE>_DATA_SOURCE` and
+  `VCT_<SERVICE>_VOLUME_NAME` overrides, so services that already store their
+  data in a folder or an existing volume can adopt it without copying.
+
+### Changed (v0.2.97)
+
+- Hook commands in `.claude/settings.json` no longer start with
+  `[ -n "$VCT_DISABLE_HOOKS" ] ||`; every hook script already checks that
+  variable itself. Existing projects are rewritten in place on their next
+  update. `VCT_DISABLE_HOOKS=1` works exactly as before.
+
 ## [0.2.96] - 2026-09-22
 
 ### Fixed — the "your files were preserved" update notice names the real cause (v0.2.96)

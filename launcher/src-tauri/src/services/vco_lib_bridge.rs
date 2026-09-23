@@ -215,28 +215,26 @@ pub fn strip_settings_env_keys(
     run_env_block_command(cmd, &python, root, project_folder, &body, "removed")
 }
 
-/// v0.2.97: which launcher-known secret values in `project_folder`'s env files
-/// VCO can PROVE it wrote — `python -m vco_lib.config_projection
-/// classify-secret-values`. `{file: {KEY: "proven"|"not_vco"|"unknown"}}`:
-/// key names and verdicts only, never a value (the comparison with the stored
-/// value happens inside the child, through the hub). The unregister flow acts
-/// on it (`projects_v2::surgically_strip_env_surfaces`).
-pub fn classify_secret_values(
+/// v0.2.97: remove from `project_folder`'s env files the secret values VCO
+/// can PROVE it wrote, and report the rest — `python -m
+/// vco_lib.config_projection strip-proven-secret-values`. Returns the whole
+/// `ok: true` reply: `removed` `{file: [KEY]}`, `left` `{file: {KEY:
+/// verdict}}`, `reasons` `{verdict: sentence}`, `errors` `[message]` — key
+/// names, verdicts and wording only, never a value (the comparison with the
+/// stored value happens inside the child, through the hub). The unregister
+/// flow acts on it (`projects_v2::strip_proven_secret_values`).
+pub fn strip_proven_secret_values(
     root: Option<&Path>,
     project_folder: &Path,
-) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+) -> Result<serde_json::Value, String> {
     let python = vco_lib_python()?;
     let mut cmd = Command::new(&python).silent();
     cmd.arg("-m")
         .arg("vco_lib.config_projection")
-        .arg("classify-secret-values")
+        .arg("strip-proven-secret-values")
         .arg("--project-folder")
         .arg(project_folder);
-    let reply = run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)?;
-    match reply.get("verdicts") {
-        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
-        _ => Err(format!("classify-secret-values reply has no `verdicts` object: {}", reply)),
-    }
+    run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)
 }
 
 /// v0.2.97: the env objects of each folder's JSON env surfaces
@@ -331,6 +329,26 @@ pub(crate) fn vco_lib_cwd(root: Option<&Path>, project_folder: &Path) -> std::pa
     }
 }
 
+/// The `VCT_STATE_DIR` a test child runs with: the test's own (set through
+/// `test_env::env_guard`), else a per-process scratch dir. GUARD: it must lie
+/// under the temp dir — a child of a unit test reading a real state dir
+/// (the developer's `~/.vct/launcher.db`) is a test defect, so it panics.
+#[cfg(test)]
+pub(crate) fn test_child_state_dir() -> std::path::PathBuf {
+    let state = std::env::var_os("VCT_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("vct-bridge-test-state-{}", std::process::id()))
+        });
+    assert!(
+        state.starts_with(std::env::temp_dir()),
+        "a vco_lib child of a unit test would read a non-scratch state dir ({}): set a \
+         temp VCT_STATE_DIR in the test",
+        state.display()
+    );
+    state
+}
+
 /// The repository root this test binary was compiled from.
 #[cfg(test)]
 pub(crate) fn test_checkout_root() -> std::path::PathBuf {
@@ -374,9 +392,15 @@ fn run_vco_lib_json<T>(
     reinject_minimal_env(&mut cmd);
     // Unit tests must never reach the developer's live hub (a verb that
     // resolves a stored secret would otherwise ask it): the discard port makes
-    // every such lookup "unknown" — no evidence, nothing removed.
+    // every such lookup "unknown" — no evidence, nothing removed. Nor may the
+    // child read the developer's real state dir (launcher.db, hub token):
+    // a test that set no `VCT_STATE_DIR` gets a scratch one (review R3 note).
     #[cfg(test)]
-    cmd.env("VCT_HUB_PORT", "9");
+    {
+        cmd.env("VCT_HUB_PORT", "9");
+        let state = test_child_state_dir();
+        cmd.env("VCT_STATE_DIR", &state);
+    }
     cmd.current_dir(vco_lib_cwd(root, project_folder));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
@@ -550,6 +574,17 @@ mod tests {
         let empty: serde_json::Value =
             serde_json::from_str(&build_write_env_block_request(&[], &["K"])).unwrap();
         assert_eq!(empty["set"], serde_json::json!({}), "strip-all is an empty set");
+    }
+
+    /// Review R3 note: a test child never reads the developer's real state
+    /// dir — the scratch default lies under the temp dir, and a non-scratch
+    /// `VCT_STATE_DIR` is refused.
+    #[test]
+    fn a_test_childs_state_dir_is_always_scratch() {
+        let dir = test_child_state_dir();
+        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        let _env = vct_launcher_core::test_env::env_guard(&[("VCT_STATE_DIR", Some("/home/not-a-scratch-dir/.vct"))]);
+        assert!(std::panic::catch_unwind(test_child_state_dir).is_err(), "a real state dir must be refused");
     }
 
     /// v0.2.97 review F11: a child that writes far more than a pipe buffer to

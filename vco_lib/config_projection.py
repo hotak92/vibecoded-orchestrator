@@ -190,7 +190,7 @@ strip of every launcher-known key NAME. v0.2.97 retired that verb too — it
 had no caller, and removing a value by NAME destroys a key the user typed.
 It is SUPERSEDED by the evidence-gated scrub inside every
 :func:`apply_project_env` (and the launcher's unregister, via
-``classify-secret-values``): a value is removed only when it equals the
+``strip-proven-secret-values``): a value is removed only when it equals the
 launcher's stored value. The surviving contract is
 
   **VCO never writes secret values into the project tree** — pinned by
@@ -2844,10 +2844,25 @@ _JSON_SECRET_SURFACES: tuple[tuple[str, str], ...] = (
     (".vscode/settings.json", "claude-code.env"),
 )
 
-#: ``classify_json_env_secrets`` verdicts, per in-file key.
-EVIDENCE_PROVEN = "proven"      # the value equals the launcher's stored value
-EVIDENCE_NOT_VCO = "not_vco"    # the launcher answered: not its value / not active
-EVIDENCE_UNKNOWN = "unknown"    # the resolver could not answer (hub down, ...)
+#: Evidence verdicts, per in-file key (or, in a ``.env``-style file, per line).
+EVIDENCE_PROVEN = "proven"              # the value equals the launcher's stored value
+EVIDENCE_NOT_VCO = "not_vco"            # the launcher holds a different value, or none
+EVIDENCE_PAUSED = "paused"              # the hub refused: not active for this project
+EVIDENCE_UNKNOWN = "unknown"            # the resolver could not answer (hub down, ...)
+EVIDENCE_NEVER_STORED = "never_stored"  # a secret-shaped name the launcher never stored
+
+#: The ONE wording of each verdict, used in every report (the Python deferral
+#: entries and — handed over the bridge — the launcher's unregister result).
+EVIDENCE_REASONS: dict[str, str] = {
+    EVIDENCE_PROVEN: "it equals the value the launcher stores (VCO wrote it)",
+    EVIDENCE_NOT_VCO: "it is not the value the launcher stores for it",
+    EVIDENCE_PAUSED: (
+        "VCO could not check it — the launcher's copy is paused (or not "
+        "granted) for this project"
+    ),
+    EVIDENCE_UNKNOWN: "VCO could not check it — the launcher could not be asked",
+    EVIDENCE_NEVER_STORED: "the launcher never stored a secret with this name",
+}
 
 #: ``export KEY="value"`` inside the ``.claude/env`` managed block — the shape
 #: the projection writer emits. Only ``bool(value)`` is ever used.
@@ -2859,20 +2874,23 @@ _MANAGED_EXPORT_RE = re.compile(
 def _stored_secret_value(env_key: str, project_root: Path) -> tuple[str, Optional[str]]:
     """What the launcher stores for ``env_key``, through the sanctioned resolver.
 
-    ``("ok", value)``; ``("absent", None)`` when the hub answered that the key
-    is not active for this project or does not exist (a paused secret is NOT
-    read around the permission matrix — no evidence); ``("unknown", None)`` on
-    any resolver failure. Hub tier ONLY (``allow_file_fallback=False``): the
-    pre-v0.2.73 writer copied the keychain value, so the keychain is the only
-    store whose value is evidence. The value never leaves this process and is
-    never logged — the resolver's errors name keys, not values.
+    ``("ok", value)``; ``("paused", None)`` when the hub refused the key as not
+    active for this project (a paused secret is NOT read around the permission
+    matrix — no evidence either way); ``("absent", None)`` when the launcher
+    holds no value for it; ``("unknown", None)`` on any resolver failure. Hub
+    tier ONLY (``allow_file_fallback=False``): the pre-v0.2.73 writer copied the
+    keychain value, so the keychain is the only store whose value is evidence.
+    The value never leaves this process and is never logged — the resolver's
+    errors name keys, not values.
     """
     from vco_lib import agent_secrets
 
     slot = _STORED_SLOT_FOR_ENV_KEY.get(env_key, env_key)
     try:
         return "ok", agent_secrets.get(slot, project=str(project_root), allow_file_fallback=False)
-    except (agent_secrets.AccessDenied, agent_secrets.SecretNotFound):
+    except agent_secrets.AccessDenied:
+        return "paused", None
+    except agent_secrets.SecretNotFound:
         return "absent", None
     except Exception:  # noqa: BLE001 — any resolver failure is "no evidence"
         return "unknown", None
@@ -2893,15 +2911,13 @@ def classify_json_env_secrets(
     launcher-known user secret / ``GITHUB_TOKEN`` (verdict by value evidence,
     :func:`_stored_secret_value`, compared with :func:`hmac.compare_digest`) or
     merely secret-SHAPED (:func:`vco_lib.secrets_audit.is_secret_shaped_env_key`
-    — a name the launcher never stored: always ``not_vco``). VCO's other
-    canonical keys are never candidates. Values are compared and dropped;
-    only verdicts leave this function.
+    — ``never_stored``). VCO's other canonical keys are never candidates.
+    Values are compared and dropped; only verdicts leave this function.
     """
     from vco_lib.secrets_audit import is_secret_shaped_env_key
 
     folder = Path(folder)
-    known = known_user_secret_keys_for_folder(folder) if known_keys is None else list(known_keys)
-    vco_names = set(known) | _LEGACY_SECRET_ENV_KEYS
+    vco_names = _vco_secret_names(folder, known_keys)
     other_canonical = list_canonical_keys() - _LEGACY_SECRET_ENV_KEYS
     lookups: dict[str, tuple[str, Optional[str]]] = {}
     verdicts: dict[str, dict[str, str]] = {}
@@ -2912,11 +2928,16 @@ def classify_json_env_secrets(
             if name in vco_names:
                 verdict = _value_verdict(name, value, folder, lookups)
             elif is_secret_shaped_env_key(name):
-                verdict = EVIDENCE_NOT_VCO
+                verdict = EVIDENCE_NEVER_STORED
             else:
                 continue
             verdicts.setdefault(rel, {})[name] = verdict
     return verdicts
+
+
+def _vco_secret_names(folder: Path, known_keys: Optional[Iterable[str]]) -> set[str]:
+    known = known_user_secret_keys_for_folder(folder) if known_keys is None else list(known_keys)
+    return set(known) | _LEGACY_SECRET_ENV_KEYS
 
 
 def _value_verdict(
@@ -2935,48 +2956,106 @@ def _value_verdict(
         value.encode("utf-8"), stored.encode("utf-8"),
     ):
         return EVIDENCE_PROVEN
-    return EVIDENCE_UNKNOWN if status == "unknown" else EVIDENCE_NOT_VCO
+    return {
+        "paused": EVIDENCE_PAUSED, "unknown": EVIDENCE_UNKNOWN,
+    }.get(status, EVIDENCE_NOT_VCO)
 
 
-def classify_vco_secret_values(
-    folder: Path, *, known_keys: Optional[Iterable[str]] = None,
-) -> dict[str, dict[str, str]]:
-    """``{file: {KEY: verdict}}`` for every launcher-known user secret (or
-    ``GITHUB_TOKEN``) that carries a value in ANY of the four env surfaces a
-    pre-v0.2.73 launcher wrote: ``.env``, ``.claude/env`` (outside VCO's
-    managed block — the block itself is VCO's region and is handled whole),
-    and the two JSON env blocks.
+def _strip_proven_env_lines(
+    path: Path, vco_names: set[str], folder: Path,
+    lookups: dict[str, tuple[str, Optional[str]]],
+) -> tuple[list[str], dict[str, str]]:
+    """Drop from one ``.env``-style file every line whose OWN value is proven;
+    ``(removed names, {name: verdict of a line left})``.
 
-    The unregister flow's evidence (v0.2.97): a confirmed "unregister" consents
-    to removing what VCO wrote, not a same-named key the user typed, so the
-    launcher removes exactly the ``proven`` names (the value equals the stored
-    one) and reports the rest. Names the launcher never stored are not listed:
-    they were never VCO's. Verdicts only — a value never leaves this function.
+    Per OCCURRENCE (review R3 F23): a file may carry a key twice — a line the
+    user wrote above one VCO wrote — and only the line whose value equals the
+    stored one goes. Lines are read with the ONE line grammar,
+    :func:`vco_lib.envfile.parse_env_line`; comments, blank lines and every
+    line inside ``.claude/env``'s managed block (VCO's region, handled whole
+    by the unregister) are kept. Every other byte, CRLF included, is kept.
     """
-    from vco_lib.envfile import extract_managed_block, parse_env_lines
+    from vco_lib.envfile import parse_env_line
 
+    try:
+        with path.open(encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except (OSError, ValueError):
+        return [], {}
+    skip_from, skip_to = len(text), len(text)
+    if path.name == "env":
+        begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
+        end = text.find(CLAUDE_ENV_MANAGED_END, begin + len(CLAUDE_ENV_MANAGED_BEGIN)) if begin != -1 else -1
+        if begin != -1 and end != -1:
+            skip_from, skip_to = begin, end + len(CLAUDE_ENV_MANAGED_END)
+    kept: list[str] = []
+    removed: list[str] = []
+    left: dict[str, str] = {}
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        start, offset = offset, offset + len(line)
+        pair = None if skip_from <= start < skip_to else parse_env_line(line)
+        if pair is not None and pair[0] in vco_names and pair[1]:
+            verdict = _value_verdict(pair[0], pair[1], folder, lookups)
+            if verdict == EVIDENCE_PROVEN:
+                removed.append(pair[0])
+                continue
+            left[pair[0]] = verdict
+        kept.append(line)
+    if removed:
+        _atomic_write_text(path, "".join(kept))
+    return sorted(set(removed)), left
+
+
+def strip_proven_secret_values(
+    folder: Path, *, known_keys: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
+    """Remove every secret VALUE VCO can PROVE it wrote from the four env
+    files a pre-v0.2.73 launcher wrote; report the rest. The unregister's
+    evidence step (v0.2.97): a confirmed "unregister" consents to removing
+    what VCO wrote, not a same-named key the user typed.
+
+    Candidates are the launcher-known user secrets (every bucket) and
+    ``GITHUB_TOKEN``. ``.env`` / ``.claude/env`` (outside the managed block)
+    are edited per LINE — only a line whose own value equals the stored one
+    goes; the JSON env blocks per key, through :func:`strip_env_keys` (JSONC
+    in place, refusal recorded). Names the launcher never stored are not
+    touched or listed — they were never VCO's.
+
+    Returns ``{"removed": {file: [KEY]}, "left": {file: {KEY: verdict}},
+    "errors": [message]}`` — names and verdicts only, never a value.
+    """
     folder = Path(folder)
-    known = known_user_secret_keys_for_folder(folder) if known_keys is None else list(known_keys)
-    vco_names = set(known) | _LEGACY_SECRET_ENV_KEYS
+    vco_names = _vco_secret_names(folder, known_keys)
     lookups: dict[str, tuple[str, Optional[str]]] = {}
-    verdicts: dict[str, dict[str, str]] = {}
+    removed: dict[str, list[str]] = {}
+    left: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
     for rel in (".env", ".claude/env"):
-        try:
-            text = (folder / rel).read_text(encoding="utf-8")
-        except (OSError, ValueError):
-            continue
-        if rel == ".claude/env":
-            block = extract_managed_block(text, CLAUDE_ENV_MANAGED_BEGIN, CLAUDE_ENV_MANAGED_END)
-            if block is not None:
-                text = text.replace(block, "", 1)
-        for name, value in parse_env_lines(text):
-            if name in vco_names and value:
-                verdicts.setdefault(rel, {})[name] = _value_verdict(name, value, folder, lookups)
+        gone, kept = _strip_proven_env_lines(folder / rel, vco_names, folder, lookups)
+        if gone:
+            removed[rel] = gone
+        if kept:
+            left[rel] = kept
     for rel, env_key in _JSON_SECRET_SURFACES:
+        proven: list[str] = []
         for name, value in _json_env_block(folder / rel, env_key).items():
             if name in vco_names and isinstance(value, str) and value:
-                verdicts.setdefault(rel, {})[name] = _value_verdict(name, value, folder, lookups)
-    return verdicts
+                verdict = _value_verdict(name, value, folder, lookups)
+                if verdict == EVIDENCE_PROVEN:
+                    proven.append(name)
+                else:
+                    left.setdefault(rel, {})[name] = verdict
+        if proven:
+            surface = next(s for s, (r, _k) in _JSON_SURFACE_FILES.items() if r == rel)
+            try:
+                gone = strip_env_keys(folder, surface, proven)
+            except SettingsWriteRefused as exc:
+                errors.append(str(exc))
+                gone = []
+            if gone:
+                removed[rel] = gone
+    return {"removed": removed, "left": left, "errors": errors}
 
 
 def _managed_block_secret_exports(path: Path) -> list[str]:
@@ -3071,7 +3150,9 @@ def retained_user_secret_state(folder: Path) -> Optional[bool]:
     verdicts = classify_json_env_secrets(Path(folder))
     if retained_user_secret_values(folder, verdicts=verdicts):
         return True
-    if any(v == EVIDENCE_UNKNOWN for per in verdicts.values() for v in per.values()):
+    if any(
+        v in (EVIDENCE_UNKNOWN, EVIDENCE_PAUSED) for per in verdicts.values() for v in per.values()
+    ):
         return None
     return False
 
@@ -3923,21 +4004,23 @@ def _cli_strip_env_keys(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cli_classify_secret_values(args: argparse.Namespace) -> int:
-    """``python -m vco_lib.config_projection classify-secret-values``.
+def _cli_strip_proven_secret_values(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection strip-proven-secret-values``.
 
-    stdout: ONE JSON object — ``{"ok": true, "verdicts": {file: {KEY:
-    verdict}}}`` (key names and verdicts only, never a value) — the evidence
-    the launcher's unregister acts on (:func:`classify_vco_secret_values`).
-    Exit 0; 4 with ``{"ok": false, ...}`` on an unexpected failure.
+    stdout: ONE JSON object — ``{"ok": true, "removed": {file: [KEY]},
+    "left": {file: {KEY: verdict}}, "reasons": {verdict: sentence},
+    "errors": [message]}`` — key names, verdicts and the ONE wording of each
+    verdict; never a value. The launcher's unregister acts on it
+    (:func:`strip_proven_secret_values`). Exit 0; 4 with ``{"ok": false, ...}``
+    on an unexpected failure.
     """
     try:
-        verdicts = classify_vco_secret_values(Path(args.project_folder))
+        result = strip_proven_secret_values(Path(args.project_folder))
     except Exception as exc:  # noqa: BLE001 — the caller must see a failure, loudly
-        print(json.dumps({"ok": False, "error": "classify_failed",
+        print(json.dumps({"ok": False, "error": "strip_failed",
                           "message": f"{type(exc).__name__}: {exc}"}))
         return 4
-    print(json.dumps({"ok": True, "verdicts": verdicts}))
+    print(json.dumps({"ok": True, **result, "reasons": EVIDENCE_REASONS}))
     return 0
 
 
@@ -4111,7 +4194,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # v0.2.97: the `apply-user-secrets` verb (a strip of every launcher-known
     # key NAME) was retired — SUPERSEDED by the evidence-gated scrub every
-    # `apply` performs and by `classify-secret-values` for the unregister.
+    # `apply` performs and by `strip-proven-secret-values` for the unregister.
     p_us_known = sub.add_parser(
         "user-secret-known-keys",
         help="print every user-bucket KEY observed in the DB (the names the "
@@ -4170,14 +4253,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_strip.set_defaults(handler=_cli_strip_env_keys)
 
-    # v0.2.97: the unregister's value evidence (names + verdicts only).
-    p_classify = sub.add_parser(
-        "classify-secret-values",
-        help="which launcher-known secret values in a project's env files "
-             "VCO provably wrote (names and verdicts only; never a value)",
+    # v0.2.97: the unregister's evidence step (names + verdicts only).
+    p_proven = sub.add_parser(
+        "strip-proven-secret-values",
+        help="remove the secret values VCO provably wrote from a project's env "
+             "files; report the rest (names and verdicts only; never a value)",
     )
-    p_classify.add_argument("--project-folder", required=True)
-    p_classify.set_defaults(handler=_cli_classify_secret_values)
+    p_proven.add_argument("--project-folder", required=True)
+    p_proven.set_defaults(handler=_cli_strip_proven_secret_values)
 
     return p
 
@@ -4293,7 +4376,7 @@ __all__ = [
     "reproject_all_registered_projects",
     "resolve_project_folder",
     "classify_json_env_secrets",
-    "classify_vco_secret_values",
+    "strip_proven_secret_values",
     "retained_secret_keys_in",
     "retained_user_secret_state",
     "retained_user_secret_values",

@@ -471,7 +471,7 @@ def test_the_env_block_bridge_verbs_are_collected():
     """v0.2.97 review F5: every Rust env-block edit goes through
     `vco_lib_bridge.rs`'s two literal argv chains — `write-env-block` and its
     removal-only twin `strip-env-keys` (plus the surface-free unregister
-    evidence verb `classify-secret-values`). Pin that the collector SEES all
+    evidence verb `strip-proven-secret-values`). Pin that the collector SEES all
     three (so the parametrised parse below covers their verb, flags and
     `--surface` choice), and that each carries the flags its verb requires."""
     bridge = [
@@ -480,7 +480,7 @@ def test_the_env_block_bridge_verbs_are_collected():
         and s.module == "vco_lib.config_projection"
     ]
     verbs = {s.tokens[0] for s in bridge if s.tokens}
-    assert {"write-env-block", "strip-env-keys", "classify-secret-values"} <= verbs, verbs
+    assert {"write-env-block", "strip-env-keys", "strip-proven-secret-values"} <= verbs, verbs
     for s in bridge:
         assert "--project-folder" in s.tokens, s
         if s.tokens[0] in ("write-env-block", "strip-env-keys"):

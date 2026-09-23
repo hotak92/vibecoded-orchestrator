@@ -26,28 +26,36 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Optional
 
-__all__ = ["CID", "emit_deferral", "found", "still_present"]
+__all__ = ["CID", "emit_deferral", "found", "found_with_reasons", "still_present"]
 
 CID = "user_owned_secret_value_in_tree"
 
-def found(folder: Path, *, known_keys: Optional[Iterable[str]] = None) -> dict[str, list[str]]:
-    """``{file: [key NAMES]}`` — env keys with a value in a JSON env block
-    that VCO cannot prove it wrote: a secret-shaped name the launcher never
-    stored, or a launcher-known name whose value does NOT equal the stored one
-    (or could not be checked — paused, unknown, resolver down). The verdicts
-    are :func:`vco_lib.config_projection.classify_json_env_secrets`' — the SAME
+def found_with_reasons(
+    folder: Path, *, known_keys: Optional[Iterable[str]] = None,
+) -> dict[str, dict[str, str]]:
+    """``{file: {KEY: verdict}}`` — env keys with a value in a JSON env block
+    that VCO cannot prove it wrote. Verdicts (and their one wording,
+    :data:`vco_lib.config_projection.EVIDENCE_REASONS`) are
+    :func:`vco_lib.config_projection.classify_json_env_secrets`' — the SAME
     classification every env refresh acts on, so what one removes the other
-    never reports. Empty when there are none; an unreadable file contributes
-    nothing."""
+    never reports: ``never_stored`` (a secret-shaped name the launcher never
+    stored), ``not_vco`` (not the value it stores), ``paused`` (its copy is
+    paused for this project — no evidence either way), ``unknown`` (it could
+    not be asked). An unreadable file contributes nothing."""
     from vco_lib.config_projection import EVIDENCE_PROVEN, classify_json_env_secrets
 
     verdicts = classify_json_env_secrets(Path(folder), known_keys=known_keys)
-    hits: dict[str, list[str]] = {}
+    hits: dict[str, dict[str, str]] = {}
     for rel, per_key in verdicts.items():
-        names = sorted(k for k, v in per_key.items() if v != EVIDENCE_PROVEN)
-        if names:
-            hits[rel] = names
+        left = {k: v for k, v in sorted(per_key.items()) if v != EVIDENCE_PROVEN}
+        if left:
+            hits[rel] = left
     return hits
+
+
+def found(folder: Path, *, known_keys: Optional[Iterable[str]] = None) -> dict[str, list[str]]:
+    """``{file: [key NAMES]}`` of :func:`found_with_reasons`."""
+    return {rel: sorted(per) for rel, per in found_with_reasons(folder, known_keys=known_keys).items()}
 
 
 def still_present(folder: Path) -> bool:
@@ -66,22 +74,29 @@ def emit_deferral(folder: Path) -> None:
     from vco_lib.deferral_emit import emit
     from vco_lib.deferral_report import DeferralEntry
 
+    from vco_lib.config_projection import EVIDENCE_REASONS
+
     folder = Path(folder)
-    hits = found(folder)
+    hits = found_with_reasons(folder)
     if not hits:
         return
-    fields = {"keys": sorted(f"{rel}:{name}" for rel, names in hits.items() for name in names)}
+    fields = {"keys": sorted(f"{rel}:{name}" for rel, per in hits.items() for name in per)}
     if dismissal_suppresses(folder, CID, fields):
         return
-    where = "; ".join(f"`{rel}`: {', '.join(names)}" for rel, names in hits.items())
+    where = "; ".join(
+        f"`{rel}`: " + ", ".join(
+            f"{name} ({EVIDENCE_REASONS.get(verdict, verdict)})" for name, verdict in per.items()
+        )
+        for rel, per in hits.items()
+    )
     emit(folder, DeferralEntry(
         condition_id=CID,
         title="A secret-like env key with a value sits in a committable settings file",
         detected=(
-            f"{where} — each of these env keys looks like a secret, or has the name "
-            "of one the launcher stores, and carries a value that VCO cannot prove "
-            "it wrote (it is not the value the launcher stores for that key, or the "
-            "launcher could not be asked). Key names only. VCO will NOT remove them."
+            f"{where}. Each of these env keys looks like a secret, or has the name "
+            "of one the launcher stores, and carries a value VCO cannot prove it "
+            "wrote — the reason is given per key. Key names only. VCO will NOT "
+            "remove them."
         ),
         why_deferred=(
             "These files are often committed to version control, where a secret "

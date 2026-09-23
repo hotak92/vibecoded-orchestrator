@@ -7,7 +7,7 @@ VCO never writes a secret value into the project tree. Phase 0.E
 strip of every launcher-known key NAME, and v0.2.97 retired it: removing a
 value by NAME destroys a key the user typed. It is SUPERSEDED by the
 evidence-gated scrub inside every ``apply_project_env`` (and the launcher's
-unregister, via ``classify-secret-values``) — a value is removed only when
+unregister, via ``strip-proven-secret-values``) — a value is removed only when
 it equals the launcher's stored value; that behaviour is tested in
 ``tests/test_v0297_user_secret_scrub.py``.
 

@@ -54,6 +54,7 @@ from typing import Iterator, Optional, Tuple
 
 __all__ = [
     "extract_managed_block",
+    "parse_env_line",
     "parse_env_lines",
     "parse_managed_env_lines",
     "env_value",
@@ -112,13 +113,26 @@ def parse_env_lines(text: str, *, writer_escapes: bool = False) -> Iterator[Tupl
     take the first yielded pair for a given key.
     """
     for line in text.splitlines():  # universal-newline split → CRLF-safe
-        s = line.strip()  # trailing \r stripped here too
-        if s.startswith("export "):
-            s = s[len("export "):].lstrip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        yield k.strip(), _strip_one_quote_pair(v.strip(), writer_escapes=writer_escapes)
+        pair = parse_env_line(line, writer_escapes=writer_escapes)
+        if pair is not None:
+            yield pair
+
+
+def parse_env_line(line: str, *, writer_escapes: bool = False) -> Optional[Tuple[str, str]]:
+    """``(key, value)`` of ONE line under the :func:`parse_env_lines` rule, or
+    ``None`` for a blank line, a ``#`` comment or a line with no ``=``.
+
+    The single line grammar: callers that must act on individual lines (the
+    unregister's per-occurrence secret strip, v0.2.97) parse with this, never a
+    copy of it.
+    """
+    s = line.strip()  # trailing \r stripped here too
+    if s.startswith("export "):
+        s = s[len("export "):].lstrip()
+    if not s or s.startswith("#") or "=" not in s:
+        return None
+    k, _, v = s.partition("=")
+    return k.strip(), _strip_one_quote_pair(v.strip(), writer_escapes=writer_escapes)
 
 
 def parse_managed_env_lines(
