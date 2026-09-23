@@ -68,12 +68,14 @@ def test_a_canonical_key_is_removed_from_a_jsonc_file_in_place(tmp_path: Path):
     assert path.read_text(encoding="utf-8") == HEAD + TAIL
 
 
-def test_the_user_secret_strip_edits_a_jsonc_file_in_place(tmp_path: Path):
+def test_a_key_removal_edits_a_jsonc_file_in_place(tmp_path: Path):
+    """The removal-only editor (``strip_env_keys`` — which superseded the
+    retired strip-by-name verb) edits JSONC in place."""
     path = _write(tmp_path, HEAD + '        "MY_TOKEN": "x",\n' + TAIL)
 
-    existed, stripped = cp._user_secret_apply_json(path, ["MY_TOKEN"], env_key=ENV_KEY)
+    stripped = cp.strip_env_keys(tmp_path, "vscode_settings_json", ["MY_TOKEN"])
 
-    assert existed is True and stripped == ["MY_TOKEN"]
+    assert stripped == ["MY_TOKEN"]
     assert path.read_text(encoding="utf-8") == HEAD + TAIL
 
 

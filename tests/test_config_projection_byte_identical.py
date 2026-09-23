@@ -376,19 +376,26 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
 # ``..._excludes_user_set_secrets``) pinned before the Rust writer was
 # retired in v0.2.97 — the invariant, not just the canonical layout.
 
-from vco_lib.config_projection import apply_user_secrets  # noqa: E402
 
 
-def test_parity_github_token_scrubbed_from_settings_json(tmp_path: Path) -> None:
+def test_parity_github_token_scrubbed_from_settings_json(tmp_path: Path, monkeypatch) -> None:
     """Inherited from the retired Rust ``..._never_emits_github_token_value``.
 
     ``GITHUB_TOKEN`` is a canonical key that no bundle carries a value
-    for post-v0.2.73 (the Rust value arm returns ``None``; the Python
-    ``project_env_from_db`` never resolved it). A stale value written
-    by a pre-fix launcher must be REMOVED on the next apply
-    (signal-to-remove for absent canonical keys).
+    for post-v0.2.73. A stale value written by a pre-fix launcher is
+    REMOVED on the next apply — v0.2.97 review R2 F18: only on positive
+    evidence that VCO wrote it (it equals the launcher's stored
+    ``github_pat``); a GITHUB_TOKEN the user typed is never removed by name
+    (``test_a_user_typed_github_token_is_never_removed_by_name``). The
+    resolver is faked here — never a live hub.
     """
+    import vco_lib.config_projection as cp
+
     stale = "ghp_stale_previously_projected_value_999"
+    monkeypatch.setattr(
+        cp, "_stored_secret_value",
+        lambda key, _root: ("ok", stale) if key == "GITHUB_TOKEN" else ("absent", None),
+    )
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir(parents=True)
     (claude_dir / "settings.json").write_text(
@@ -408,48 +415,48 @@ def test_parity_github_token_scrubbed_from_settings_json(tmp_path: Path) -> None
     assert stale not in text
 
 
-def test_parity_user_secret_strip_shape_no_value_in_tree(tmp_path: Path) -> None:
-    """Mirrors the Rust strip-only production call shape (v0.2.73):
-    EMPTY emit pairs + FULL known-keys strip set. Stale user-secret
-    values written by a pre-fix launcher leave BOTH surfaces, and the
-    value strings appear nowhere under the project tree afterwards.
-    """
-    secret_value = "synthetic-not-a-real-secret-a7f3"
+def test_a_user_typed_github_token_is_never_removed_by_name(tmp_path: Path, monkeypatch) -> None:
+    """v0.2.97 review R2 F18 leave-alone twin: the launcher's stored
+    ``github_pat`` differs from the in-file GITHUB_TOKEN, so VCO did not write
+    it — it survives the apply."""
+    import vco_lib.config_projection as cp
+
+    monkeypatch.setattr(
+        cp, "_stored_secret_value",
+        lambda key, _root: ("ok", "ghp_the_launcher_pat") if key == "GITHUB_TOKEN"
+        else ("absent", None),
+    )
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir(parents=True)
-    (claude_dir / "settings.json").write_text(
-        json.dumps({"env": {"EXAMPLE_API_TOKEN": secret_value}})
-    )
-    # Real pre-fix shape: the Rust writer emitted user secrets under the
-    # section header inside the managed block (the retired Rust block
-    # builder); the rebuild
-    # keys its canonical/user split off that header.
-    (claude_dir / "env").write_text(
-        f"{CLAUDE_ENV_MANAGED_BEGIN}\n"
-        'export KG_COLLECTION="ParityFixture_KnowledgeGraph"\n'
-        "\n"
-        "# user secrets (per-project; managed via launcher GUI Secrets panel)\n"
-        f'export EXAMPLE_API_TOKEN="{secret_value}"\n'
-        f"{CLAUDE_ENV_MANAGED_END}\n"
-    )
+    (claude_dir / "settings.json").write_text(json.dumps({"env": {"GITHUB_TOKEN": "ghp_mine"}}))
+    apply_project_env(_my_test_bundle(tmp_path), surfaces=["claude_settings_json"])
+    env = json.loads((claude_dir / "settings.json").read_text())["env"]
+    assert env["GITHUB_TOKEN"] == "ghp_mine"
 
-    # Production shape post-v0.2.73: empty pairs, full known keys.
-    apply_user_secrets(
-        {
-            "user_secret_pairs": [],
-            "user_secret_known_keys": ["EXAMPLE_API_TOKEN"],
-            "project_id": "parity-fixture",
-            "project_root": tmp_path,
-        },
-        surfaces=["claude_settings_json", "claude_env"],
-    )
 
-    # Tree-wide sweep: the value appears in NO file under the tree.
+def test_parity_user_secret_values_leave_the_tree_on_evidence(tmp_path: Path, monkeypatch) -> None:
+    """The v0.2.73 strip invariant, on the v0.2.97 evidence rule (the retired
+    strip-by-name verb is superseded): stale user-secret
+    values a pre-fix launcher wrote — equal to the launcher's stored values —
+    leave BOTH JSON surfaces, and the value strings appear nowhere under the
+    project tree afterwards. Fake resolver; never a live hub."""
+    import vco_lib.config_projection as cp
+
+    stored = {"STALE_A": "stale-value-a-1234", "STALE_B": "stale-value-b-5678"}
+    monkeypatch.setattr(
+        cp, "_stored_secret_value",
+        lambda key, _root: ("ok", stored[key]) if key in stored else ("absent", None),
+    )
+    for rel, block in ((".claude/settings.json", "env"), (".vscode/settings.json", "claude-code.env")):
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({block: dict(stored)}))
+
+    bundle = dict(_my_test_bundle(tmp_path), user_secret_known_keys=sorted(stored))
+    apply_project_env(bundle, surfaces=["claude_settings_json"])  # .vscode scrubbed too
+
     for p in tmp_path.rglob("*"):
         if p.is_file():
-            assert secret_value not in p.read_text(encoding="utf-8"), (
-                f"secret value found in {p} — write-invariant parity violated"
-            )
-    parsed = json.loads((claude_dir / "settings.json").read_text())
-    assert "EXAMPLE_API_TOKEN" not in parsed.get("env", {})
-    assert "EXAMPLE_API_TOKEN" not in (claude_dir / "env").read_text()
+            text = p.read_text(encoding="utf-8")
+            assert all(v not in text for v in stored.values()), p
+

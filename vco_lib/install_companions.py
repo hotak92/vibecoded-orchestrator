@@ -470,6 +470,42 @@ RERUN_OUTSIDE_VENV_EXIT = 0x5643
 #: Windows only: the exit code of a run that stopped because the install.py
 #: waiting for it was killed (:func:`start_parent_watch`).
 PARENT_GONE_EXIT = 0x5644
+#: A fresh nonce per hop, set in the child's env AND passed on its argv as
+#: ``RELAUNCH_TOKEN_ARG<token>``. Env is inherited by every descendant; argv
+#: reaches only the direct child — so a matching pair proves the record was
+#: made for THIS run (:func:`adopt_relaunch`).
+ENV_RELAUNCH_TOKEN = "VCT_INSTALL_RELAUNCH_TOKEN"
+RELAUNCH_TOKEN_ARG = "--vct-relaunch-token="
+
+
+def _load_relaunch_env_keys() -> Tuple[str, ...]:
+    """The record's keys, from the table the launcher embeds too
+    (``install_relaunch_env.toml``). Missing or malformed = a broken install."""
+    import tomllib
+
+    table = tomllib.loads((Path(__file__).with_name("install_relaunch_env.toml"))
+                          .read_text(encoding="utf-8"))
+    return tuple(table["keys"])
+
+
+#: Every key of the relaunch record — never to be inherited by a later run.
+RELAUNCH_ENV_KEYS: Tuple[str, ...] = _load_relaunch_env_keys()
+
+
+def scrub_install_relaunch_env(env):
+    """Remove the relaunch record from ``env`` (a dict or ``os.environ``) and
+    return it. Every long-lived child install.py starts gets a scrubbed env:
+    the record describes one hop, and a detached child that outlives the run
+    (vct-updater -> the relaunched launcher -> its next install.py) would hand
+    a stale one on."""
+    for key in RELAUNCH_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def detached_child_env() -> dict:
+    """``os.environ`` without the relaunch record — the env of a long-lived child."""
+    return scrub_install_relaunch_env(os.environ.copy())
 
 
 def is_running_inside_venv(venv_python, prefix: Optional[str] = None) -> bool:
@@ -492,14 +528,24 @@ def is_running_inside_venv(venv_python, prefix: Optional[str] = None) -> bool:
     return _norm(current) == _norm(Path(venv_python).parent.parent)
 
 
-def mark_relaunch(env: dict) -> None:
-    """Stamp a relaunched child's ``env``: the loop guard, and — only on the
-    FIRST hop — the interpreter that launched install.py. A second hop (the
-    rebuild handoff, :func:`reexec_outside_venv`) keeps the original record."""
+def mark_relaunch(env: dict, base: Optional[str] = None) -> None:
+    """Stamp a relaunched child's ``env``: the loop guard, a fresh token for
+    :func:`hand_off` to pass on argv, and — only on the FIRST hop — the base
+    interpreter: ``base`` when given, else this process's own. A second hop
+    (the rebuild handoff, :func:`reexec_outside_venv`) keeps the original.
+
+    ``base`` exists for the rebuild handoff run straight from an activated
+    venv (no relaunch before it): there ``sys.executable`` is the venv's own
+    python, and the record must name the interpreter the run is handed TO —
+    the same build, so its ``X.Y`` is this process's.
+    """
+    import secrets
+
     if os.environ.get(ENV_RELAUNCHED) != "1":
-        env[ENV_BASE_PYTHON] = sys.executable
+        env[ENV_BASE_PYTHON] = base or sys.executable
         env[ENV_BASE_PYTHON_VERSION] = f"{sys.version_info.major}.{sys.version_info.minor}"
     env[ENV_RELAUNCHED] = "1"
+    env[ENV_RELAUNCH_TOKEN] = secrets.token_hex(8)
 
 
 def launcher_python_version() -> str:
@@ -611,6 +657,9 @@ def hand_off(executable: str, argv: List[str], env: dict) -> None:
     the venv, and exit with that run's code. Returns only when ``os.execve`` is
     replaced by a recorder (tests).
     """
+    token = env.get(ENV_RELAUNCH_TOKEN, "")
+    if token:  # the half of the proof only the direct child receives
+        argv = [*argv, RELAUNCH_TOKEN_ARG + token]
     if _exec_replaces_process():
         os.execve(executable, argv, env)
         return
@@ -622,6 +671,32 @@ def hand_off(executable: str, argv: List[str], env: dict) -> None:
         sys.stdout.flush()
         rc = run_child([sys.executable, *argv[1:]], child_env)
     _exit_now(exit_status(rc))
+
+
+def adopt_relaunch(argv: List[str]) -> bool:
+    """First thing install.py's ``main()`` does: is this run a relaunch its
+    DIRECT parent made? Returns True when it is.
+
+    Always removes the token arguments from ``argv`` (in place — argparse never
+    sees them). A relaunch is genuine when ``argv`` carried exactly one token
+    and it equals :data:`ENV_RELAUNCH_TOKEN`; then the parent-watch starts.
+    Otherwise any relaunch keys in this environment were INHERITED from an
+    older run through some other process, and acting on them would skip the
+    venv relaunch or watch an unrelated pid: they are removed from
+    ``os.environ`` (one stderr line), and the run proceeds as a fresh one.
+    """
+    tokens = [arg[len(RELAUNCH_TOKEN_ARG):] for arg in argv if arg.startswith(RELAUNCH_TOKEN_ARG)]
+    argv[:] = [arg for arg in argv if not arg.startswith(RELAUNCH_TOKEN_ARG)]
+    expected = os.environ.get(ENV_RELAUNCH_TOKEN, "")
+    if expected and tokens == [expected]:
+        start_parent_watch()
+        return True
+    inherited = [key for key in RELAUNCH_ENV_KEYS if key in os.environ]
+    if inherited:
+        scrub_install_relaunch_env(os.environ)
+        print(f"[vct] ignoring {', '.join(inherited)}: inherited from another run, not set by "
+              "the install.py that started this one", file=sys.stderr)
+    return False
 
 
 def waiting_parent_pid() -> Optional[int]:
@@ -642,11 +717,13 @@ def start_parent_watch() -> bool:
     the POSIX outcome — the run, not the daemons it started (a kill-on-close Job
     object would also kill vct-updater mid-swap, the hub and the analyzer).
 
-    Pid reuse: the handle is opened at startup, while the parent is waiting in
-    :func:`run_child` — it only ends before this run does when it is killed. So
-    the handle can name another process only when the parent was already killed,
-    when stopping is the intent anyway: the worst case is a missed stop (the
-    pre-v0.2.97 behaviour), never a wrong one.
+    Pid reuse: only called by :func:`adopt_relaunch` once the argv token has
+    proved the pid was set by this run's own parent (an INHERITED pid is
+    dropped there, never watched). The handle is opened at startup, while that
+    parent is waiting in :func:`run_child` — it only ends before this run does
+    when it is killed. So the handle can name another process only when the
+    parent was already killed, when stopping is the intent anyway: the worst
+    case is a missed stop (the pre-v0.2.97 behaviour), never a wrong one.
 
     Returns whether a watcher runs. A failed open is reported on stderr and the
     run continues — an install is never aborted because it could not be watched.
@@ -708,7 +785,7 @@ def reexec_outside_venv(argv, venv_root) -> bool:
         _exit_now(RERUN_OUTSIDE_VENV_EXIT)
         return False  # only reachable when os._exit is replaced (tests)
     env = os.environ.copy()
-    mark_relaunch(env)
+    mark_relaunch(env, base=base)
     print(f"[vct] rebuilding {venv_root}: relaunching install.py under {base}, "
           "outside the venv it was running from")
     sys.stdout.flush()

@@ -144,9 +144,10 @@ fn is_user_emit_bucket(scope: &str, module_id: &str) -> bool {
 /// v0.2.97: no secret VALUE is written by any of these refreshes (see
 /// `is_user_emit_bucket`); the re-projection keeps each project's
 /// canonical env current, rebuilds its `.claude/env` managed block (which
-/// drops an export a pre-v0.2.73 launcher left there), and strips the
-/// launcher-known user-secret keys' in-tree values from the JSON env blocks. Pinned by the
-/// `*_leaves_no_secret_value_*` / `*_without_the_value` tests below.
+/// drops an export a pre-v0.2.73 launcher left there), and removes from the
+/// JSON env blocks only the values it can PROVE VCO wrote (equal to the
+/// launcher's stored value; review R2 F18). Pinned by the
+/// `delete_secret_v2_*` / `*_without_the_value` tests below.
 ///   * Anything else (`module_id != 'user'`, etc.) — skip. Module-owned
 ///     secrets are resolved by the hub's `/projects/{id}/env` endpoint
 ///     and don't go through the env-file emit path.
@@ -2228,10 +2229,13 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&state).unwrap();
-        let env = vct_launcher_core::test_env::env_guard(&[(
-            "VCT_STATE_DIR",
-            Some(state.to_str().unwrap()),
-        )]);
+        // `VCT_HUB_PORT=9` (discard): the projection child's value-evidence
+        // resolver must never reach the developer's live hub — it answers
+        // "unknown", which means "no evidence, remove nothing" (v0.2.97 R2 F18).
+        let env = vct_launcher_core::test_env::env_guard(&[
+            ("VCT_STATE_DIR", Some(state.to_str().unwrap())),
+            ("VCT_HUB_PORT", Some("9")),
+        ]);
         let conn = Connection::open(state.join("launcher.db")).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::db::migrations::apply(&conn).unwrap();
@@ -2248,6 +2252,15 @@ mod tests {
     /// (the canonical env landed for THIS project, so the check is not
     /// vacuous) and the secret's value and key are in none of its env files.
     fn assert_refreshed_without_secret(folder: &std::path::Path, project_id: &str, key: &str, canary: &str) {
+        assert_refreshed_without_secret_in(
+            folder, project_id, key, canary,
+            &[".claude/settings.json", ".claude/env", ".env", ".vscode/settings.json"],
+        );
+    }
+
+    fn assert_refreshed_without_secret_in(
+        folder: &std::path::Path, project_id: &str, key: &str, canary: &str, rels: &[&str],
+    ) {
         let cs_path = folder.join(".claude/settings.json");
         let cs: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&cs_path)
@@ -2259,8 +2272,10 @@ mod tests {
             "the canonical env landed — the refresh really ran for {}: {}",
             project_id, cs["env"]
         );
-        assert!(cs["env"].get(key).is_none(), "the secret KEY was projected into {}: {}", project_id, cs["env"]);
-        for rel in [".claude/settings.json", ".claude/env", ".env", ".vscode/settings.json"] {
+        if rels.contains(&".claude/settings.json") {
+            assert!(cs["env"].get(key).is_none(), "the secret KEY was projected into {}: {}", project_id, cs["env"]);
+        }
+        for rel in rels {
             if let Ok(text) = std::fs::read_to_string(folder.join(rel)) {
                 assert!(!text.contains(canary), "secret VALUE present in {}/{}", project_id, rel);
             }
@@ -2268,9 +2283,9 @@ mod tests {
     }
 
     /// Plant the value where a pre-v0.2.73 launcher put a user secret: an
-    /// `export` line INSIDE the `.claude/env` managed block, AND the
-    /// `.claude/settings.json` `env` block (beside a user key VCO never wrote,
-    /// which must survive).
+    /// `export` line INSIDE the `.claude/env` managed block (VCO's own region),
+    /// AND the `.claude/settings.json` `env` block (beside a user key VCO never
+    /// wrote).
     fn plant_legacy_claude_env_export(folder: &std::path::Path, key: &str, canary: &str) {
         std::fs::create_dir_all(folder.join(".claude")).unwrap();
         std::fs::write(
@@ -2291,34 +2306,40 @@ mod tests {
         .unwrap();
     }
 
-    /// The user's own env key (never written by VCO) survived the scrub.
-    fn assert_user_key_kept(folder: &std::path::Path) {
+    /// v0.2.97 review R2 F18: after the launcher DELETED the secret it holds no
+    /// value to compare the in-file copy with, so there is no evidence VCO
+    /// wrote it — the settings.json copy (and the user's own key beside it)
+    /// is left for the user, reported by `user_owned_secret_value_in_tree`.
+    fn assert_unprovable_settings_value_left(folder: &std::path::Path, key: &str, canary: &str) {
         let cs: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(cs["env"][key], canary, "no evidence VCO wrote it ⇒ not removed");
         assert_eq!(cs["env"]["USER_OWN_KEY"], "keep", "a key VCO never wrote is untouched");
     }
 
+    const NOT_SETTINGS: &[&str] = &[".claude/env", ".env", ".vscode/settings.json"];
+
 
     /// `remove_secret_v2` against the per-project user bucket: the refresh
-    /// runs for the project, no secret value is in any of its env files
-    /// afterwards, and a LEGACY value a pre-v0.2.73 launcher left in the
-    /// `.claude/env` managed block is gone (the projection rebuilds that
-    /// block from the canonical env alone).
+    /// runs for the project, VCO projects no secret value anywhere, and a
+    /// LEGACY value a pre-v0.2.73 launcher left in the `.claude/env` managed
+    /// block is gone (the projection rebuilds that block from the canonical
+    /// env alone).
     ///
     /// v0.2.97 review F6 (owner decision 2026-09-23): replaces an ignored test
     /// that asserted the env block first CARRIED the key — the promise
     /// SUPERSEDED in v0.2.73 (VCO writes no secret value into a project;
     /// consumers resolve at need through the hub).
     ///
-    /// The same holds for a legacy value in the `.claude/settings.json` `env`
-    /// block: since v0.2.97 every refresh strips the launcher-known user-secret
-    /// keys there (`config_projection.apply_project_env`) — the refresh here
-    /// runs BEFORE `forget_secret_active_state`, so the key is still known —
-    /// while a key the launcher never knew survives.
+    /// A legacy copy in the `.claude/settings.json` `env` block is different
+    /// (review R2 F18): VCO removes a settings value only on POSITIVE evidence
+    /// that it wrote it — the value equals the one the launcher stores. After
+    /// this delete the launcher stores nothing, so the copy is left (and
+    /// reported as the user's), with the user's own key beside it.
     #[test]
-    fn delete_secret_v2_per_project_leaves_no_secret_value_in_the_project() {
+    fn delete_secret_v2_per_project_drops_vco_exports_and_leaves_unprovable_copies() {
         let fx = refresh_fixture();
         let folder = seed_project_with_real_folder(&fx.db, "p_del_strip", "DelStripProj");
         let (scope, project_id, module_id, key) = ("per_project", "p_del_strip", "user", "STRIP_TEST_KEY");
@@ -2333,10 +2354,10 @@ mod tests {
         refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "remove_secret_v2");
         fx.db.forget_secret_active_state(scope, project_id, module_id, key).unwrap();
 
-        assert_refreshed_without_secret(&folder, project_id, key, &canary);
+        assert_refreshed_without_secret_in(&folder, project_id, key, &canary, NOT_SETTINGS);
         let claude_env = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
         assert!(!claude_env.contains(key), "legacy export survived:\n{}", claude_env);
-        assert_user_key_kept(&folder);
+        assert_unprovable_settings_value_left(&folder, key, &canary);
         std::fs::remove_dir_all(&folder).ok();
     }
 
@@ -2480,13 +2501,13 @@ mod tests {
     }
 
     /// H2 + v0.2.97 review F6: `remove_secret_v2` on a SHARED user-bucket key
-    /// refreshes every registered project; afterwards no secret value is in
-    /// any of their env files and a legacy `.claude/env` managed-block export
-    /// is gone from each, as is the legacy `.claude/settings.json` value. Same as the
+    /// refreshes every registered project; VCO projects no secret value, a
+    /// legacy `.claude/env` managed-block export is gone from each, and the
+    /// unprovable `.claude/settings.json` copy is left. Same as the
     /// per-project delete test. Replaces an ignored test of the SUPERSEDED
     /// promise (owner decision 2026-09-23).
     #[test]
-    fn delete_secret_v2_shared_bucket_leaves_no_secret_value_in_any_project() {
+    fn delete_secret_v2_shared_bucket_drops_vco_exports_and_leaves_unprovable_copies() {
         let fx = refresh_fixture();
         let (folder1, folder2) = seed_two_registered_projects(&fx.db);
         let (scope, project_id, module_id) = ("shared", "_user_shared_", "user");
@@ -2503,10 +2524,10 @@ mod tests {
         fx.db.forget_secret_active_state(scope, project_id, module_id, &key).unwrap();
 
         for (pid, folder) in [("h2-p1", &folder1), ("h2-p2", &folder2)] {
-            assert_refreshed_without_secret(folder, pid, &key, &canary);
+            assert_refreshed_without_secret_in(folder, pid, &key, &canary, NOT_SETTINGS);
             let claude_env = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
             assert!(!claude_env.contains(&key), "[{}] legacy export survived:\n{}", pid, claude_env);
-            assert_user_key_kept(folder);
+            assert_unprovable_settings_value_left(folder, &key, &canary);
         }
         let _ = std::fs::remove_dir_all(&folder1);
         let _ = std::fs::remove_dir_all(&folder2);
@@ -2515,7 +2536,7 @@ mod tests {
     /// H2 + v0.2.97 review F6: `remove_secret_v2` on a GLOBAL user-bucket key
     /// — symmetric with the shared delete test (owner decision 2026-09-23).
     #[test]
-    fn delete_secret_v2_global_bucket_leaves_no_secret_value_in_any_project() {
+    fn delete_secret_v2_global_bucket_drops_vco_exports_and_leaves_unprovable_copies() {
         let fx = refresh_fixture();
         let (folder1, folder2) = seed_two_registered_projects(&fx.db);
         let (scope, project_id, module_id) = ("global", "_global_", "user");
@@ -2532,10 +2553,10 @@ mod tests {
         fx.db.forget_secret_active_state(scope, project_id, module_id, &key).unwrap();
 
         for (pid, folder) in [("h2-p1", &folder1), ("h2-p2", &folder2)] {
-            assert_refreshed_without_secret(folder, pid, &key, &canary);
+            assert_refreshed_without_secret_in(folder, pid, &key, &canary, NOT_SETTINGS);
             let claude_env = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
             assert!(!claude_env.contains(&key), "[{}] legacy export survived:\n{}", pid, claude_env);
-            assert_user_key_kept(folder);
+            assert_unprovable_settings_value_left(folder, &key, &canary);
         }
         let _ = std::fs::remove_dir_all(&folder1);
         let _ = std::fs::remove_dir_all(&folder2);

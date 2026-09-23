@@ -846,10 +846,13 @@ clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
 notes = """Probed clear (B-F8 re-scan) on every bundle update. v0.2.97: the \
 detection is `config_projection.retained_user_secret_values` — the SAME set \
-every `apply_project_env` strips (launcher-known user-secret keys + \
-GITHUB_TOKEN in the JSON env blocks, secret-shaped exports in the .claude/env \
-managed block) — and that refresh also clears the entry (paired) once nothing \
-remains, trailing each removed key NAME in auto-resolutions.jsonl."""
+every `apply_project_env` removes: a JSON env-block value that EQUALS the \
+launcher's stored value for that key (resolved through the hub, active-gated, \
+compared in constant time; GITHUB_TOKEN against github_pat), and secret-shaped \
+exports in VCO's own .claude/env managed block. A name match alone proves \
+nothing (review R2 F18). The refresh also clears the entry (paired) once \
+nothing remains, trailing each removed key NAME in auto-resolutions.jsonl; an \
+unanswerable check keeps it (reconciler reads None as "keep")."""
 
 [conditions.user_owned_secret_value_in_tree]
 class = "action_required"
@@ -857,12 +860,13 @@ owner = "vco_lib.user_owned_secrets"
 clear_probe = "probe:py:user_owned_secret_values_still_present"
 emit_surfaces = ["ledger"]
 dismiss_key = ["keys"]
-notes = """v0.2.97. A secret-shaped env key (vco_lib.secrets_audit.is_secret_shaped_env_key) \
-with a non-empty value in `.claude/settings.json` env or `.vscode/settings.json` \
-claude-code.env that VCO did NOT write (not canonical, not a launcher-known user \
-secret — those are user_secret_values_retained_in_tree's, and every refresh \
-removes them). VCO never removes it; a human moves it into the secrets store or \
-keeps it. Emitted by the bundle update; cleared by the probe once no such key \
+notes = """v0.2.97. An env key with a non-empty value in `.claude/settings.json` \
+env or `.vscode/settings.json` claude-code.env that VCO cannot PROVE it wrote: a \
+secret-shaped name (vco_lib.secrets_audit.is_secret_shaped_env_key) the launcher \
+never stored, or a launcher-known name whose value differs from the stored one or \
+cannot be checked (paused, resolver down) — review R2 F18. Provably VCO-written \
+values are user_secret_values_retained_in_tree's, and every refresh removes them. \
+VCO never removes these; a human moves the value into the secrets store or keeps it. Emitted by the bundle update; cleared by the probe once no such key \
 carries a value; dismissible per set of `file:KEY` names (a new key re-fires)."""
 
 [conditions.template_review_pending]
@@ -1444,7 +1448,10 @@ bundle's settings.json merge (`vco_lib.bundle_settings_io`) records its own \
 surface, `bundle_claude_settings_json`: before v0.2.97 it skipped any \
 non-strict-JSON file SILENTLY, so newly shipped hooks never landed in a JSONC \
 settings.json; it now edits JSONC in place and refuses only what it cannot \
-verify. One \
+verify. The Hooks tab (`vco_lib.hooks_settings`) records its own too, \
+`hooks_claude_settings_json` (review F19: sharing the projection's surface let a \
+successful hook edit clear the projection's still-true refusal). ONE surface \
+per WRITER, so each refusal is cleared only by the writer that made it. One \
 entry per surface (`settings_write_refused_<surface>`). Cleared by the next \
 successful write of that surface (paired, `settings_refusal.clear_recorded`) and \
 by the probe: resolved once the file is gone or reads as an object; a refused \

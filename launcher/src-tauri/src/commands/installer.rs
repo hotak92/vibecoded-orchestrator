@@ -1384,6 +1384,9 @@ pub(crate) fn warn_if_binary_ahead_of_install(install_root: &Path) -> bool {
 mod version_info;
 pub(crate) use version_info::*;
 
+// v0.2.97: install.py's relaunch-record keys, from the table Python reads.
+mod relaunch_env;
+
 /// Classify what an install target looks like:
 /// - `Fresh` if the path doesn't exist or is empty.
 /// - `Adopt` if it has `.claude/` (or any other orchestrator-managed path).
@@ -3077,6 +3080,12 @@ pub(crate) fn install_py_command<S: AsRef<std::ffi::OsStr>>(
     // Set on the CHILD only.
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.env("PYTHONUTF8", "1");
+    // v0.2.97: never hand an inherited install.py relaunch record to a fresh
+    // install.py (see `relaunch_env`): a launcher relaunched by a vct-updater
+    // that an install.py started carries one for its whole life.
+    for key in relaunch_env::RELAUNCH_ENV_KEYS.iter() {
+        cmd.env_remove(key);
+    }
     cmd
 }
 
@@ -11048,10 +11057,11 @@ pub fn register_github_pat(
     //    resolve the PAT at need through the hub (`vct_secrets_resolve.sh`,
     //    `vco_lib.agent_secrets.get`; the "Secrets" section of
     //    `templates/ORCHESTRATOR-CLAUDE.md.template`). The re-projection
-    //    that remains keeps each project's canonical env current and
-    //    removes the in-tree VALUES a pre-v0.2.73 writer left: `GITHUB_TOKEN`
-    //    and the launcher-known user-secret keys from the JSON env blocks,
-    //    and any export in the rebuilt `.claude/env` managed block.
+    //    that remains keeps each project's canonical env current and removes
+    //    the in-tree VALUES it can prove a pre-v0.2.73 writer left: a JSON
+    //    env-block value that EQUALS the launcher's stored one (`GITHUB_TOKEN`
+    //    against `github_pat` included), and any export in the rebuilt
+    //    `.claude/env` managed block. A name match alone removes nothing.
     //
     //    Soft-fail per project: a single project's writer failure (e.g.
     //    .claude/env unwritable) shouldn't block PAT registration. We
@@ -15680,6 +15690,28 @@ MemAvailable:   23456789 kB
         ///
         /// RED-PROOF: delete either `cmd.env(...)` line from
         /// `install_py_command` and this fails by name.
+        /// v0.2.97 review F17: a launcher that inherited install.py's relaunch
+        /// record (vct-updater -> relaunched launcher) must not pass it to the
+        /// next install.py, which would skip its venv relaunch and watch a
+        /// stale pid. RED-PROOF: delete the `env_remove` loop.
+        #[test]
+        fn every_install_py_spawn_drops_the_relaunch_record() {
+            let cmd = install_py_command("python3", Path::new("/tmp/vco-root"), ["--update"]);
+            let envs = envs_of(&cmd);
+            for key in [
+                "VCT_INSTALL_RELAUNCHED",
+                "VCT_INSTALL_BASE_PYTHON",
+                "VCT_INSTALL_BASE_PYTHON_VERSION",
+                "VCT_INSTALL_PARENT_WAITS",
+                "VCT_INSTALL_RELAUNCH_TOKEN",
+            ] {
+                assert!(
+                    envs.contains(&(key.to_string(), None)),
+                    "{key} is not removed from the install.py env, so an inherited                      relaunch record would reach the next run. Got: {envs:?}"
+                );
+            }
+        }
+
         #[test]
         fn every_install_py_spawn_carries_the_utf8_env_pair() {
             let cmd = install_py_command("python3", Path::new("/tmp/vco-root"), ["--update"]);

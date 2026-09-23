@@ -74,6 +74,8 @@ def test_mark_relaunch_records_the_launcher_on_the_first_hop_only(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     first: dict = {}
     ic.mark_relaunch(first)
+    token = first.pop(ic.ENV_RELAUNCH_TOKEN)
+    assert len(token) == 16, "a fresh per-hop nonce"
     assert first == {
         ic.ENV_RELAUNCHED: "1",
         ic.ENV_BASE_PYTHON: sys.executable,
@@ -223,7 +225,9 @@ def test_a_rebuild_from_inside_the_venv_hands_off_and_deletes_nothing(
 
     assert (root / ".venv" / "bin" / "python").is_file(), "nothing was deleted before the handoff"
     ((path, argv, env),) = lightweight
-    assert path == str(base) and argv == [str(base), "install.py", "--lightweight", "--rebuild-venv"]
+    token = env[ic.ENV_RELAUNCH_TOKEN]
+    assert path == str(base) and argv == [str(base), "install.py", "--lightweight", "--rebuild-venv",
+                                          f"--vct-relaunch-token={token}"]
     assert env[ic.ENV_RELAUNCHED] == "1", "the child must not relaunch back into the venv"
     assert env[ic.ENV_BASE_PYTHON] == str(base)
     assert "outside the venv it was running from" in capsys.readouterr().out

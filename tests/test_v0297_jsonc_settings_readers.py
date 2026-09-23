@@ -36,7 +36,10 @@ from vco_lib import kg_sync_drift, knowledge_residue, project_init  # noqa: E402
 from vco_lib.config_projection import _build_managed_block  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
-REFUSED_CID = "settings_write_refused_claude_settings_json"
+#: The hooks editor's OWN refusal surface (v0.2.97 review F19) — and the env
+#: projection's, which the hooks editor must never clear.
+REFUSED_CID = "settings_write_refused_hooks_claude_settings_json"
+PROJECTION_CID = "settings_write_refused_claude_settings_json"
 
 
 def _settings(folder: Path, data: dict, *, jsonc: bool) -> Path:
@@ -173,6 +176,68 @@ def test_an_unverifiable_jsonc_edit_is_refused_visibly_and_cleared_after(tmp_pat
     hs.register_hook(doc, "Stop", "", NOTIFY)
     hs.write_settings(doc)
     assert not DeferralReport.read(tmp_path).has_condition(REFUSED_CID)
+
+
+def _projection_refused_file(folder: Path) -> Path:
+    """A JSONC settings.json the env projection refuses to edit (a duplicated
+    `env` key — `jsonc_edit` will not pick which one to change) while its
+    `hooks` member edits fine."""
+    path = folder / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{\n  // mine\n  "env": {"A": "1"},\n  "env": {"A": "1"},\n'
+                    '  "hooks": {}\n}\n', encoding="utf-8")
+    return path
+
+
+def _apply(folder: Path) -> None:
+    from vco_lib import config_projection as cp
+
+    cp.apply_project_env({"canonical_env": {"KG_COLLECTION": "P_KnowledgeGraph"},
+                          "project_id": "", "project_root": folder})
+
+
+def test_a_hooks_write_never_clears_the_projections_refusal(tmp_path):
+    """F19. RED before: both writers shared one surface, so this successful
+    hooks write cleared the projection's still-true refusal."""
+    from vco_lib.config_projection import SettingsWriteRefused
+
+    path = _projection_refused_file(tmp_path)
+    with pytest.raises(SettingsWriteRefused):
+        _apply(tmp_path)
+    assert DeferralReport.read(tmp_path).has_condition(PROJECTION_CID)
+
+    doc = hs.load_settings(path)
+    hs.register_hook(doc, "Stop", "", NOTIFY)
+    hs.write_settings(doc)  # succeeds: `hooks` is not the duplicated member
+    assert DeferralReport.read(tmp_path).has_condition(PROJECTION_CID), \
+        "the projection's refusal is still true and must stay recorded"
+
+
+def test_each_writer_clears_only_its_own_refusal(tmp_path):
+    """Both refusals recorded; each writer's success clears ITS entry only."""
+    from vco_lib import settings_refusal
+    from vco_lib.config_projection import SettingsWriteRefused
+
+    path = _projection_refused_file(tmp_path)
+    with pytest.raises(SettingsWriteRefused):
+        _apply(tmp_path)
+    hs._record_jsonc_refusal(path, hs.jsonc_edit.JsoncEditRefused("x", "a test refusal"))
+    report = DeferralReport.read(tmp_path)
+    assert report.has_condition(PROJECTION_CID) and report.has_condition(REFUSED_CID)
+
+    # The file is repaired; the projection's success clears its own entry only.
+    path.write_text('{\n  // mine\n  "env": {"A": "1"},\n  "hooks": {}\n}\n', encoding="utf-8")
+    _apply(tmp_path)
+    report = DeferralReport.read(tmp_path)
+    assert not report.has_condition(PROJECTION_CID)
+    assert report.has_condition(REFUSED_CID), "the projection must not clear the hooks entry"
+
+    # The hooks editor's success clears its own.
+    doc = hs.load_settings(path)
+    hs.register_hook(doc, "Stop", "", NOTIFY)
+    hs.write_settings(doc)
+    assert not DeferralReport.read(tmp_path).has_condition(REFUSED_CID)
+    assert settings_refusal.condition_id(hs._SETTINGS_SURFACE) == REFUSED_CID
 
 
 @pytest.mark.parametrize("raw,code", [

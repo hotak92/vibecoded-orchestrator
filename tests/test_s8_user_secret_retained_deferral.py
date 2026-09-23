@@ -30,6 +30,20 @@ def clean_project(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _launcher_stores_the_planted_github_pat(monkeypatch):
+    """v0.2.97 R2 F18: a settings.json value counts as VCO-written only when it
+    equals the launcher's stored value. The resolver is faked (never a live hub):
+    the launcher stores exactly the value the fixture planted as GITHUB_TOKEN."""
+    import vco_lib.config_projection as cp
+
+    stored = {"GITHUB_TOKEN": "synthetic-secret-value-in-settings"}
+    monkeypatch.setattr(
+        cp, "_stored_secret_value",
+        lambda key, _root: ("ok", stored[key]) if key in stored else ("absent", None),
+    )
+
+
 @pytest.fixture()
 def project_with_secret_in_env(tmp_path: Path) -> Path:
     """Project with a stale secret-shaped line in .claude/env managed block."""

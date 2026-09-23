@@ -106,6 +106,20 @@ def _write_dirty_env(folder: Path) -> None:
 class UserSecretSelfClearTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-b2-secret-"))
+        # v0.2.97 R2 F18: a settings.json value is VCO-written only when it
+        # equals the launcher's stored one. Fake resolver (never a live hub):
+        # the launcher stores exactly the planted GITHUB_TOKEN value.
+        from unittest import mock
+
+        import vco_lib.config_projection as cp
+
+        patcher = mock.patch.object(
+            cp, "_stored_secret_value",
+            lambda key, _root: ("ok", "synthetic-value") if key == "GITHUB_TOKEN"
+            else ("absent", None),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         import shutil

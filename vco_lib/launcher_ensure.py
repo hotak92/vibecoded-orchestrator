@@ -596,9 +596,12 @@ def _spawn(argv: Sequence[str], cwd: Optional[Path]) -> None:
         creationflags = 0x0000_0008 | 0x0800_0000
     else:
         start_new_session = True
+    from vco_lib.install_companions import detached_child_env
+
     subprocess.Popen(  # noqa: S603 — argv[0] is a resolved absolute path
         list(argv),
         cwd=str(cwd) if cwd else None,
+        env=detached_child_env(),  # the launcher outlives us: no relaunch record
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

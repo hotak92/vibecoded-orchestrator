@@ -893,10 +893,13 @@
             <strong>Remove launcher-managed files</strong>
             <small>
               Removes <code>.claude/hooks/</code>, <code>.claude/scripts/</code>,
-              infra compose YAMLs, and the canonical keys from your
-              <code>.env</code> / <code>.claude/env</code> /
+              infra compose YAMLs, the launcher's routing keys and its managed
+              block from your <code>.env</code> / <code>.claude/env</code> /
               <code>.claude/settings.json</code> /
-              <code>.vscode/settings.json</code>.
+              <code>.vscode/settings.json</code>, and a secret value in them
+              only where it equals the one the launcher stores (so VCO wrote
+              it). A same-named secret you typed yourself is kept, and listed
+              when the unregister finishes.
               Your agents, skills, <code>CONTEXT_STATE.md</code>,
               <code>CLAUDE.md</code>, source code, and user-added
               <code>.env</code> values are preserved.

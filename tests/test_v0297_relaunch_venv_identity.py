@@ -84,7 +84,8 @@ def test_symlinked_venv_interpreter_relaunches(
     assert len(execve_calls) == 1, "a symlinked venv interpreter must still be relaunched into"
     call = execve_calls[0]
     assert call["path"] == str(venv_python)
-    assert call["argv"] == [str(venv_python), "install.py", "--update"]
+    token = call["env"]["VCT_INSTALL_RELAUNCH_TOKEN"]
+    assert call["argv"] == [str(venv_python), "install.py", "--update", f"--vct-relaunch-token={token}"]
     assert call["env"]["VCT_INSTALL_RELAUNCHED"] == "1"
 
 

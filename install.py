@@ -5383,7 +5383,9 @@ def _run_root_claude_dir_install(
 
 
 def main() -> int:
-    _install_companions.start_parent_watch()  # Windows: a kill of the waiting parent stops this run
+    # A relaunch record counts only if THIS run's parent made it (argv token);
+    # then (Windows) a kill of that waiting parent stops this run too.
+    _install_companions.adopt_relaunch(sys.argv)
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
     # probe is usable on a freshly cloned repo with no .venv. The bootstrap
@@ -9031,6 +9033,7 @@ def _try_start_docker_daemon() -> tuple[bool, str]:
                 subprocess.Popen(
                     ["cmd", "/c", "start", "", str(exe)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=_install_companions.detached_child_env(),
                 )
             )
         except OSError as e:
@@ -18888,6 +18891,7 @@ def _try_invoke_windows_stage1_updater(
                 stderr=subprocess.DEVNULL,
                 creationflags=creation_flags,
                 close_fds=True,
+                env=_install_companions.detached_child_env(),  # outlives us: no relaunch record
             )
         )
     except OSError as exc:
@@ -20525,7 +20529,7 @@ def _deploy_and_start_vct_hub(
     # the old hub's PWD. Mirrors the v0.2.63 hub-staleness manual-fix
     # recipe (VCT_ORCHESTRATOR_ROOT/VCT_INSTALL_ROOT pinned to the
     # install dir). The hub inherits these via the spawned child's env.
-    hub_env = os.environ.copy()
+    hub_env = _install_companions.detached_child_env()  # the hub outlives us
     hub_env["VCT_ORCHESTRATOR_ROOT"] = str(install_root.resolve())
     hub_env["VCT_INSTALL_ROOT"] = str(install_root.resolve())
     run_kwargs["env"] = hub_env

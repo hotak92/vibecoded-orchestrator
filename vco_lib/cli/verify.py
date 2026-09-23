@@ -47,7 +47,7 @@ Two upstream modules land in parallel branches:
   ``project_env_from_db(project_id: str) -> ProjectEnvBundle`` (a
   TypedDict carrying ``canonical_env``, ``project_id``,
   ``project_root``) and ``apply_project_env(bundle: ProjectEnvBundle,
-  *, surfaces=None, user_secret_bundle=None) -> dict[str, list[str]]``.
+  *, surfaces=None) -> dict[str, list[str]]``.
   The wrappers below adapt that landed API to this module's internal
   flat ``Mapping[str, str]`` contract (the plan-era API differed; see
   the wrapper docstrings).

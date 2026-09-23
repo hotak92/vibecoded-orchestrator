@@ -3827,11 +3827,14 @@ def spawn_background_resync(
                     pass
             log_handle = None
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
+    from vco_lib.install_companions import detached_child_env
+
     popen_kwargs = {
         "cwd": str(repo_root),
         "stdout": child_out,
         "stderr": child_out,
         "stdin": subprocess.DEVNULL,
+        "env": detached_child_env(),  # outlives the caller: no relaunch record
     }
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True

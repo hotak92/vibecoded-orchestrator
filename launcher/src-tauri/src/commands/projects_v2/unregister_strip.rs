@@ -1,94 +1,18 @@
-//! Unregister-flow env-key strippers + launcher-file purge.
+//! Unregister-flow launcher-file purge.
 //!
-//! Verbatim extraction (v0.2.77 Part 7d) of the caller-supplied-key-set
-//! strippers (`strip_named_keys_from_env_text`,
-//! `strip_named_keys_from_claude_env_text`; the JSON-object twin was retired in
-//! v0.2.97 for the ONE Python strip, `projects_v2::strip_json_env_surfaces`)
-//! and the launcher-artifact filesystem purge
-//! (`purge_launcher_files_from_project`) that previously lived inline in
-//! `projects_v2.rs`. Behaviour is unchanged; the facade re-exports every
-//! symbol. `UNREGISTER_PURGE_PATHS` stays in the facade (shared with the
+//! Verbatim extraction (v0.2.77 Part 7d) of the launcher-artifact filesystem
+//! purge (`purge_launcher_files_from_project`) that previously lived inline in
+//! `projects_v2.rs`. The caller-supplied-key-set NAME strippers that also
+//! lived here (`strip_named_keys_from_{env_text,claude_env_text,env_object}`)
+//! were retired in v0.2.97: unregister removes a secret value only on value
+//! evidence (`projects_v2::strip_proven_secret_values`), never by name. The
+//! facade re-exports every symbol. `UNREGISTER_PURGE_PATHS` stays in the
+//! facade (shared with the
 //! unregister command surface) and is pulled in via `super::`.
 
 use std::path::Path;
 
 use super::UNREGISTER_PURGE_PATHS;
-
-/// Pure helper: strip a named set of KEY names from `.env`-style text.
-/// Mirror of `strip_canonical_keys_from_env_text` but with a caller-
-/// supplied key set instead of `UNREGISTER_CANONICAL_ENV_KEYS`.
-pub(crate) fn strip_named_keys_from_env_text(
-    text: &str,
-    keys: &std::collections::HashSet<&str>,
-) -> (String, Vec<String>) {
-    let mut removed = std::collections::BTreeSet::new();
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let body = if let Some(rest) = trimmed.strip_prefix('#') {
-            rest.trim_start()
-        } else {
-            trimmed
-        };
-        let key_to_check = body
-            .find('=')
-            .filter(|&i| i > 0)
-            .map(|i| body[..i].trim());
-        if let Some(k) = key_to_check {
-            if keys.contains(k) {
-                removed.insert(k.to_string());
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    if text.ends_with('\n') && out.is_empty() {
-        out.push('\n');
-    }
-    (out, removed.into_iter().collect())
-}
-
-/// Pure helper: strip a named set of KEY names from `.claude/env`
-/// POSIX-export text. Mirror of `strip_canonical_keys_from_claude_env_text`.
-pub(crate) fn strip_named_keys_from_claude_env_text(
-    text: &str,
-    keys: &std::collections::HashSet<&str>,
-) -> (String, Vec<String>) {
-    let mut removed = std::collections::BTreeSet::new();
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let after_hash = if let Some(rest) = trimmed.strip_prefix('#') {
-            rest.trim_start()
-        } else {
-            trimmed
-        };
-        let body = after_hash.strip_prefix("export ").unwrap_or(after_hash);
-        let key_to_check = body
-            .find('=')
-            .filter(|&i| i > 0)
-            .map(|i| body[..i].trim());
-        if let Some(k) = key_to_check {
-            if keys.contains(k) {
-                removed.insert(k.to_string());
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    if text.ends_with('\n') && out.is_empty() {
-        out.push('\n');
-    }
-    (out, removed.into_iter().collect())
-}
 
 /// Surgically remove every entry in `UNREGISTER_PURGE_PATHS` from
 /// `<folder>/`. Returns `(relative_paths_removed, warnings)`.

@@ -2,12 +2,14 @@
 # Copyright (c) 2026 VibeCoded Tools
 """A secret the USER put in a committable settings file: reported, never removed.
 
-v0.2.97. ``user_secret_values_retained_in_tree`` covers values VCO itself wrote
-before v0.2.73 — and every env refresh removes those. A secret-SHAPED key the
-launcher does not know (a hand-added ``MY_TOKEN`` in ``.claude/settings.json``
-``env``) is different: VCO did not write it, so VCO must not delete it, but
-the file is often version-controlled and the value can leak with the
-repository. This condition, ``user_owned_secret_value_in_tree``, says exactly
+v0.2.97. ``user_secret_values_retained_in_tree`` covers values VCO can PROVE it
+wrote before v0.2.73 (the value equals the launcher's stored one) — and every
+env refresh removes those. Everything else is the user's (review R2 F18: a
+name match proves nothing): a secret-SHAPED key the launcher does not know (a
+hand-added ``MY_TOKEN`` in ``.claude/settings.json`` ``env``), or a key the
+launcher does know whose value differs or cannot be checked. VCO must not
+delete it, but the file is often version-controlled and the value can leak
+with the repository. This condition, ``user_owned_secret_value_in_tree``, says exactly
 that and hands the decision to the user: move the value into the secrets store
 and delete the key, or dismiss (keep it deliberately).
 
@@ -24,50 +26,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Optional
 
-from vco_lib import jsonc_edit
-
 __all__ = ["CID", "emit_deferral", "found", "still_present"]
 
 CID = "user_owned_secret_value_in_tree"
 
-#: The JSON env surfaces a user can hand-edit: ``(file, env-block key)``.
-_SURFACES: tuple[tuple[str, str], ...] = (
-    (".claude/settings.json", "env"),
-    (".vscode/settings.json", "claude-code.env"),
-)
-
-
-def _vco_written_keys(folder: Path, known_keys: Optional[Iterable[str]]) -> set[str]:
-    """Keys VCO itself writes (canonical, ``GITHUB_TOKEN`` included) or wrote
-    before v0.2.73 (the launcher-known user secrets) — the sibling condition's
-    and every env refresh's business, never this one's."""
-    from vco_lib.config_projection import (
-        known_user_secret_keys_for_folder,
-        list_canonical_keys,
-    )
-
-    known = known_user_secret_keys_for_folder(folder) if known_keys is None else known_keys
-    return set(known) | list_canonical_keys()
-
-
 def found(folder: Path, *, known_keys: Optional[Iterable[str]] = None) -> dict[str, list[str]]:
-    """``{file: [key NAMES]}`` — secret-shaped keys with a non-empty value that
-    the user put in a JSON env block. Empty when there are none. Soft: an
-    unreadable file contributes nothing."""
-    from vco_lib.secrets_audit import is_secret_shaped_env_key
+    """``{file: [key NAMES]}`` — env keys with a value in a JSON env block
+    that VCO cannot prove it wrote: a secret-shaped name the launcher never
+    stored, or a launcher-known name whose value does NOT equal the stored one
+    (or could not be checked — paused, unknown, resolver down). The verdicts
+    are :func:`vco_lib.config_projection.classify_json_env_secrets`' — the SAME
+    classification every env refresh acts on, so what one removes the other
+    never reports. Empty when there are none; an unreadable file contributes
+    nothing."""
+    from vco_lib.config_projection import EVIDENCE_PROVEN, classify_json_env_secrets
 
-    folder = Path(folder)
-    vco_written = _vco_written_keys(folder, known_keys)
+    verdicts = classify_json_env_secrets(Path(folder), known_keys=known_keys)
     hits: dict[str, list[str]] = {}
-    for rel, env_key in _SURFACES:
-        loaded = jsonc_edit.load_object(folder / rel) if (folder / rel).is_file() else None
-        block = loaded[0].get(env_key) if loaded is not None else None
-        if not isinstance(block, dict):
-            continue
-        names = sorted(
-            k for k, v in block.items()
-            if k not in vco_written and isinstance(v, str) and v and is_secret_shaped_env_key(k)
-        )
+    for rel, per_key in verdicts.items():
+        names = sorted(k for k, v in per_key.items() if v != EVIDENCE_PROVEN)
         if names:
             hits[rel] = names
     return hits
@@ -99,11 +76,12 @@ def emit_deferral(folder: Path) -> None:
     where = "; ".join(f"`{rel}`: {', '.join(names)}" for rel, names in hits.items())
     emit(folder, DeferralEntry(
         condition_id=CID,
-        title="A secret-shaped key with a value sits in a committable settings file",
+        title="A secret-like env key with a value sits in a committable settings file",
         detected=(
-            f"{where} — each of these env keys looks like a secret and carries a "
-            "value (key names only; VCO never reads a value out). VCO did not "
-            "write them, so VCO will NOT remove them."
+            f"{where} — each of these env keys looks like a secret, or has the name "
+            "of one the launcher stores, and carries a value that VCO cannot prove "
+            "it wrote (it is not the value the launcher stores for that key, or the "
+            "launcher could not be asked). Key names only. VCO will NOT remove them."
         ),
         why_deferred=(
             "These files are often committed to version control, where a secret "

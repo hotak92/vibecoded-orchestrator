@@ -280,6 +280,9 @@ export interface UpdateAllReport {
  *     managed files (.claude/hooks, .claude/scripts, .claude/env, infra
  *     compose YAMLs) AND strip canonical env keys from .env / .claude/env
  *     / .claude/settings.json env / .vscode/settings.json claude-code.env.
+ *     A secret VALUE (a user secret, or GITHUB_TOKEN) is removed only where
+ *     it equals the one the launcher stores (v0.2.97); a same-named value
+ *     the user typed is kept and listed in `UnregisterReport.warnings`.
  *     User content (agents/skills/CONTEXT_STATE/CLAUDE.md/source code/
  *     user-added .env keys) is preserved.
  *   - `purgeCollections` (default false): drop the project's OWN Weaviate

@@ -462,16 +462,20 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_MODULE_PULL_TIMEOUT_SECS=<n>` | Upper bound, in seconds, on a single module-image `podman`/`docker pull` during a module install or update. Default `1800` (30 min). The bound exists to catch a genuinely *stalled* registry (network black hole, half-open connection, a registry that accepts the connection but never streams layers) — without it, a stalled pull leaves the install row wedged at `status='installing'` forever (the pull future never resolves). On timeout the pull is killed and the install transitions to `status='error'` with an actionable message, then becomes retry-eligible. Raise it for unusually large GPU-variant images on a slow link. A zero, negative, or non-numeric value is **ignored** and the default is used — the bound is never disabled (a stalled pull must always be able to fail). |
 | `VCT_INSTALL_DOCKER_TIMEOUT=<seconds>` | Cap on the `compose up -d` step of `install.py` / `install.py --update` (first-run image pulls included). Default `900` (15 min), clamped to a 60 s minimum; a non-numeric value falls back to the default. A hung container daemon fails the step with a message naming this variable instead of blocking forever — raise it (e.g. `1800`) on slow links with a cold image cache where healthy pulls legitimately exceed 15 min. |
 
-The four `VCT_INSTALL_*` names below are **internal — do not set them**. `install.py` sets them itself when it
+The five `VCT_INSTALL_*` names below are **internal — do not set them**. `install.py` sets them itself when it
 relaunches under the install's `.venv` (the launcher starts it with the system `python3`, which cannot import the
 venv's packages) and reads them back in the relaunched run (`vco_lib/install_companions.py`); they are listed here so
-their names are not a mystery in a process listing:
+their names are not a mystery in a process listing. They describe ONE hop, so they are never passed on: every
+long-lived process `install.py` starts (hub, updater, launcher, background drivers) and every `install.py` the
+launcher spawns gets an environment without them — the list both sides strip is `vco_lib/install_relaunch_env.toml`
+— and a run whose argv does not carry the matching token ignores and drops any it finds (one stderr line).
 
 | Var | Meaning |
 |---|---|
 | `VCT_INSTALL_RELAUNCHED` | `1` on every relaunched run — the loop guard: a relaunched run never relaunches again. |
 | `VCT_INSTALL_BASE_PYTHON` | The interpreter that STARTED `install.py`, recorded on the first hop only. A venv (re)build uses it, never the venv's own python, so a rebuild follows the Python you launched with and never runs from the tree it deletes. |
 | `VCT_INSTALL_BASE_PYTHON_VERSION` | That interpreter's `X.Y`. The venv-drift check compares the `.venv` against it — after the relaunch `install.py`'s own version IS the venv's, so comparing with that would never see drift. |
+| `VCT_INSTALL_RELAUNCH_TOKEN` | A fresh random token per relaunch, also passed to the relaunched run as its last argument (`--vct-relaunch-token=<token>`, removed before the arguments are parsed). The environment reaches every descendant; the argument reaches only the run it was made for — so a match proves the other four were set for THIS run, not inherited from an older one through some other process. |
 | `VCT_INSTALL_PARENT_WAITS` | Windows only: the **pid** of the `install.py` waiting for this run. Windows cannot replace a process (`os.exec*` starts a new one and ends the caller with exit code 0 at once), so there the relaunch runs as a child and the parent exits with the child's exit code. The child uses the pid twice: a relaunched run that must rebuild the venv it runs from hands the run back to that parent (exit code `22083`, `0x5643`), which runs outside the venv and re-runs it once; and the child watches the parent, so when the parent is killed (the launcher cancelling a run) the run stops at once with exit code `22084` (`0x5644`) and one stderr line — what killing `install.py` does on Linux/macOS. Only the run stops: services it already started (hub, model gateway, updater, analyzer) keep running there too. If the watch cannot be set up, a stderr line says so and the run continues. |
 
 ## Runtime env knobs

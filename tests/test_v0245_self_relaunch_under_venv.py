@@ -195,8 +195,11 @@ def test_execve_called_when_all_conditions_met(
         f"execve path must be the resolved venv interpreter; got {call['path']}"
     )
     # argv[0] must be the same target; remaining argv preserved verbatim
-    assert call["argv"] == [str(fake_python), "/some/path/install.py", "--update"], (
-        f"execve argv must be [target, *sys.argv]; got {call['argv']}"
+    # v0.2.97: plus the per-hop token that proves the record is this run's own.
+    token = call["env"]["VCT_INSTALL_RELAUNCH_TOKEN"]
+    assert call["argv"] == [str(fake_python), "/some/path/install.py", "--update",
+                            f"--vct-relaunch-token={token}"], (
+        f"execve argv must be [target, *sys.argv, token]; got {call['argv']}"
     )
     # Re-entry guard env var must be set in the child env
     assert call["env"].get("VCT_INSTALL_RELAUNCHED") == "1", (

@@ -516,17 +516,23 @@ def write_settings(doc: SettingsDoc) -> None:
         ) from None
     root = _project_root_of(doc.path)
     if root is not None:
-        # The paired clear of a refusal recorded for this surface — by this
-        # writer or the env projection's (same file, same ledger entry).
+        # The paired clear of a refusal THIS writer recorded. Writer-scoped on
+        # purpose (v0.2.97 review F19): the env projection's refusal of the
+        # same file is a different edit (a duplicated `env` key refuses its
+        # edit while `hooks` edits fine), and only ITS next success proves it
+        # over — clearing it here would be a false clear until the next
+        # re-projection re-recorded it.
         from vco_lib import settings_refusal
 
         settings_refusal.clear_recorded(root, _SETTINGS_SURFACE)
 
 
-#: The ``settings_refusal`` surface name of ``.claude/settings.json`` — the
-#: one the env projection records under, so a refusal of this file has ONE
-#: ledger entry whichever writer met it.
-_SETTINGS_SURFACE = "claude_settings_json"
+#: This writer's ``settings_refusal`` surface — ``settings_write_refused_
+#: hooks_claude_settings_json``. One surface per WRITER of the file, the rule
+#: the bundle merge set (``bundle_claude_settings_json``): each refusal is a
+#: different edit, so each is recorded and cleared by the writer that made it,
+#: and the env projection keeps ``claude_settings_json`` for its own.
+_SETTINGS_SURFACE = "hooks_claude_settings_json"
 
 
 def _project_root_of(path: Path) -> Optional[Path]:

@@ -9641,17 +9641,20 @@ def _scan_user_secret_values_retained(folder: Path) -> bool:
     """True when a pre-v0.2.73 secret VALUE survives in any VCO env surface
     (``.claude/env`` managed block, ``.claude/settings.json`` / ``.vscode/
     settings.json`` env blocks). Shared by the emitter and the reconciler so
-    the self-clear uses the SAME detection the emit uses (v0.2.83 B-F8)."""
-    from vco_lib.config_projection import retained_user_secret_values
-    return bool(retained_user_secret_values(Path(folder)))
+    the self-clear uses the SAME detection the emit uses (v0.2.83 B-F8).
+    v0.2.97 R2 F18: only values VCO can PROVE it wrote count; an unanswerable
+    check (``None``) keeps the entry — no evidence it is over."""
+    from vco_lib.config_projection import retained_user_secret_state
+    return retained_user_secret_state(Path(folder)) is not False
 
 
 def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
-    """Emit ``user_secret_values_retained_in_tree``: a VALUE a pre-v0.2.73
-    launcher wrote into a committable env file is still there.
+    """Emit ``user_secret_values_retained_in_tree``: a VALUE VCO can prove a
+    pre-v0.2.73 launcher wrote (it equals the launcher's stored value, or sits
+    in VCO's own ``.claude/env`` managed block) is still in a committable file.
 
-    Runs on the bundle update AFTER its env refresh, which already strips
-    these values (``config_projection.apply_project_env``, v0.2.97) — so an
+    Runs on the bundle update AFTER its env refresh, which already removes
+    exactly these values (``config_projection.apply_project_env``) — so an
     entry here means the refresh could not: the settings file was refused
     (its own ``settings_write_refused_*`` entry names it) or the project is
     not registered with the launcher (no refresh ran). Key NAMES are listed;
@@ -9672,11 +9675,13 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
         title="Pre-v0.2.73: user-secret VALUES are still in committable env files",
         detected=(
             "These env surfaces still hold a value a pre-v0.2.73 launcher wrote "
-            f"for a user secret (key names only): {where}."
+            "for a user secret — it equals the value the launcher stores (or sits "
+            f"in VCO's own .claude/env block); key names only: {where}."
         ),
         why_deferred=(
-            "Every env refresh removes these values — the secrets themselves stay "
-            "in your keychain — but this update's refresh could not: either a "
+            "Every env refresh removes the values it can prove VCO wrote — the "
+            "secrets themselves stay in your keychain — but this update's refresh "
+            "could not: either a "
             "settings file could not be edited safely (a settings_write_refused "
             "entry names it and what to fix) or this folder is not registered "
             "with the launcher, so there is no refresh to run. This entry clears "

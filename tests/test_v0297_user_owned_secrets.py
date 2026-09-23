@@ -27,6 +27,18 @@ CID = user_owned_secrets.CID
 VALUE = "synthetic-secret-value-in-settings"
 
 
+@pytest.fixture(autouse=True)
+def stored(monkeypatch) -> dict:
+    """The launcher's stored values by env key — a fake of the sanctioned
+    resolver (never a live hub). Missing ⇒ ``absent`` (paused / not found)."""
+    values: dict = {}
+    monkeypatch.setattr(
+        cp, "_stored_secret_value",
+        lambda key, _root: ("ok", values[key]) if key in values else ("absent", None),
+    )
+    return values
+
+
 @pytest.fixture()
 def project(tmp_path: Path, monkeypatch) -> Path:
     folder = tmp_path / "proj"
@@ -90,12 +102,15 @@ def test_the_vscode_block_is_covered_too(project):
     assert user_owned_secrets.found(project) == {".vscode/settings.json": ["STALE_SECRET"]}
 
 
-def test_vco_written_keys_belong_to_the_sibling_condition_not_this_one(project):
+def test_provably_vco_written_values_belong_to_the_sibling_condition(project, stored):
+    """v0.2.97 R2 F18: the split is by VALUE evidence, not by name. Equal to the
+    launcher's stored value ⇒ VCO wrote it (the sibling removes it); a launcher-
+    known NAME with a different value is the user's ⇒ reported here."""
+    stored["GITHUB_TOKEN"] = VALUE
+    stored["LAUNCHER_KNOWN_TOKEN"] = "the-launchers-own-value"
     _write(project, {"GITHUB_TOKEN": VALUE, "LAUNCHER_KNOWN_TOKEN": VALUE})
-    assert user_owned_secrets.found(project) == {}
-    assert cp.retained_user_secret_values(project) == {
-        ".claude/settings.json": ["GITHUB_TOKEN", "LAUNCHER_KNOWN_TOKEN"],
-    }
+    assert user_owned_secrets.found(project) == {".claude/settings.json": ["LAUNCHER_KNOWN_TOKEN"]}
+    assert cp.retained_user_secret_values(project) == {".claude/settings.json": ["GITHUB_TOKEN"]}
 
 
 def test_leave_alone_the_env_refresh_never_removes_a_user_owned_secret(project):

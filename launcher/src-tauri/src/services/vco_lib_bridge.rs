@@ -215,6 +215,30 @@ pub fn strip_settings_env_keys(
     run_env_block_command(cmd, &python, root, project_folder, &body, "removed")
 }
 
+/// v0.2.97: which launcher-known secret values in `project_folder`'s env files
+/// VCO can PROVE it wrote — `python -m vco_lib.config_projection
+/// classify-secret-values`. `{file: {KEY: "proven"|"not_vco"|"unknown"}}`:
+/// key names and verdicts only, never a value (the comparison with the stored
+/// value happens inside the child, through the hub). The unregister flow acts
+/// on it (`projects_v2::surgically_strip_env_surfaces`).
+pub fn classify_secret_values(
+    root: Option<&Path>,
+    project_folder: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.config_projection")
+        .arg("classify-secret-values")
+        .arg("--project-folder")
+        .arg(project_folder);
+    let reply = run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)?;
+    match reply.get("verdicts") {
+        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+        _ => Err(format!("classify-secret-values reply has no `verdicts` object: {}", reply)),
+    }
+}
+
 /// v0.2.97: the env objects of each folder's JSON env surfaces
 /// (`claude_settings_json`, `vscode_settings_json`), read by the ONE JSONC
 /// reader — `python -m vco_lib.env_projection_check read-env`. The launcher's
@@ -348,6 +372,11 @@ fn run_vco_lib_json<T>(
     parse: impl FnOnce(&[u8], &[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
     reinject_minimal_env(&mut cmd);
+    // Unit tests must never reach the developer's live hub (a verb that
+    // resolves a stored secret would otherwise ask it): the discard port makes
+    // every such lookup "unknown" — no evidence, nothing removed.
+    #[cfg(test)]
+    cmd.env("VCT_HUB_PORT", "9");
     cmd.current_dir(vco_lib_cwd(root, project_folder));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd

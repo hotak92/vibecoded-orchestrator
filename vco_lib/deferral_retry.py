@@ -1256,11 +1256,14 @@ def spawn_detached(folder: Path, *, python: str = "") -> bool:
         except Exception:  # noqa: BLE001 — logging must never block the spawn
             log_handle = None
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
+    from vco_lib.install_companions import detached_child_env
+
     kwargs = {
         "cwd": str(folder),
         "stdout": child_out,
         "stderr": child_out,
         "stdin": subprocess.DEVNULL,
+        "env": detached_child_env(),  # outlives the caller: no relaunch record
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True

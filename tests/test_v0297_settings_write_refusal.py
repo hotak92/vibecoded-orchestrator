@@ -111,17 +111,6 @@ def test_vscode_refusal_has_its_own_entry_and_never_touches_the_claude_one(tmp_p
     assert json.loads((tmp_path / ".claude" / "settings.json").read_text())["env"]["KG_COLLECTION"] == "TestKG"
 
 
-def test_the_user_secret_strip_refuses_too(tmp_path):
-    path = _settings(tmp_path, UNPARSEABLE["syntax"])
-    with pytest.raises(cp.SettingsWriteRefused):
-        cp.apply_user_secrets({
-            "user_secret_pairs": [], "user_secret_known_keys": ["MY_TOKEN"],
-            "project_id": "pid-refusal", "project_root": tmp_path,
-        })
-    assert path.read_bytes() == UNPARSEABLE["syntax"]
-    assert _entry(tmp_path) is not None
-
-
 def test_a_refused_jsonc_edit_is_raised_and_recorded(tmp_path):
     raw = b'{\n  // mine\n  "env": {"KG_COLLECTION": "a", "KG_COLLECTION": "b"},\n}\n'
     path = _settings(tmp_path, raw)

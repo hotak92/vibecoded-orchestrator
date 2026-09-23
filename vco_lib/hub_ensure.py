@@ -459,7 +459,10 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
     short-circuits when already running and returns within ~100 ms, so the
     cost of the spawn is bounded either way.
     """
+    from vco_lib.install_companions import detached_child_env
+
     argv = [str(binary), "--start-if-not-running"]
+    env = detached_child_env()  # the hub outlives us: no relaunch record
     creationflags = 0
     start_new_session = False
     if os.name == "nt":
@@ -472,6 +475,7 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
         if wait:
             completed = subprocess.run(
                 argv,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -489,6 +493,7 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
         else:
             subprocess.Popen(  # noqa: S603 — argv is a resolved absolute path
                 argv,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

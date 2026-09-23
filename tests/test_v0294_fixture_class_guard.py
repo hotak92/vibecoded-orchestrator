@@ -133,7 +133,7 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "OldCanonical", "OldName", "OldProject", "Operator",
     "OperatorsOwnProject", "Orchestrator", "Orchestrator_root",
     "OrchestratorFixtureProj", "Other", "OtherProj", "OtherProject", "P",
-    "ParityFixture", "ParityTest", "Pasted", "Peer", "Peer1", "Peer2",
+    "ParityTest", "Pasted", "Peer", "Peer1", "Peer2",
     "PeerOne", "PeerTwo", "Populated", "PostRename", "PreExisting",
     "Prefixexampleorchestrator", "PrefixExampleOrchestrator", "PreRename",
     "Proj", "Proj_Backend", "ProjCodeless", "Project", "ProjectA", "Q",

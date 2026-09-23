@@ -3432,9 +3432,10 @@ pub async fn update_all_projects(
 ///     `warnings` push is what makes the refusal visible in the GUI.
 ///
 /// User secrets: VCO never writes a secret VALUE into the project tree
-/// (v0.2.75), so there is no emit step to route anywhere. Their key names
-/// are stripped on unregister by `surgically_strip_user_secret_keys`, which
-/// refuses a file it cannot parse rather than rewriting it.
+/// (v0.2.75), so there is no emit step to route anywhere. On unregister a
+/// value a pre-v0.2.73 launcher left is removed only where it equals the
+/// launcher's stored value (`strip_proven_secret_values`); a file that
+/// cannot be parsed is refused rather than rewritten.
 /// v0.2.37 (Finding F1 testability helper): builds the argument list
 /// passed to the `python -m vco_lib.config_projection apply` subprocess.
 /// Pure function; no I/O. Lets unit tests assert the
@@ -5046,9 +5047,26 @@ pub(crate) const UNREGISTER_PURGE_PATHS: &[&str] = &[
     "infrastructure/podman-compose.amd-rocm.yml",
 ];
 
+/// Canonical keys whose VALUE is a secret, so unregister removes them only on
+/// value evidence, never by name (v0.2.97): a `GITHUB_TOKEN` the user typed
+/// is theirs. MUST MATCH `vco_lib/config_projection.py::_LEGACY_SECRET_ENV_KEYS`
+/// (pinned by `tests/test_v0297_unregister_evidence.py`).
+pub(crate) const EVIDENCE_GATED_ENV_KEYS: &[&str] = &["GITHUB_TOKEN"];
+
+/// The canonical keys unregister removes BY NAME: every launcher-owned key
+/// except the [`EVIDENCE_GATED_ENV_KEYS`].
+fn unregister_by_name_keys() -> std::collections::HashSet<&'static str> {
+    UNREGISTER_CANONICAL_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !EVIDENCE_GATED_ENV_KEYS.contains(k))
+        .collect()
+}
+
 /// Pure helper: strip launcher-canonical keys from a `.env`-style text.
 ///
-/// "Canonical" = membership in `UNREGISTER_CANONICAL_ENV_KEYS`. Lines
+/// "Canonical" = membership in `UNREGISTER_CANONICAL_ENV_KEYS`, minus the
+/// [`EVIDENCE_GATED_ENV_KEYS`]. Lines
 /// matching `<KEY>=...` (active) or `# <KEY>=...` (commented) at the
 /// start of the trimmed line are removed; user-added keys are preserved
 /// verbatim. Comment-only lines and blank lines are preserved verbatim.
@@ -5062,8 +5080,7 @@ pub(crate) const UNREGISTER_PURGE_PATHS: &[&str] = &[
 /// followed by lines we just removed) because doing so robustly would
 /// require multi-pass bookkeeping the unregister doesn't need.
 pub(crate) fn strip_canonical_keys_from_env_text(text: &str) -> (String, Vec<String>) {
-    let canonical: std::collections::HashSet<&str> =
-        UNREGISTER_CANONICAL_ENV_KEYS.iter().copied().collect();
+    let canonical = unregister_by_name_keys();
     let mut removed = std::collections::BTreeSet::new();
     let mut out = String::with_capacity(text.len());
 
@@ -5124,8 +5141,7 @@ pub(crate) fn strip_canonical_keys_from_env_text(text: &str) -> (String, Vec<Str
 pub(crate) fn strip_canonical_keys_from_claude_env_text(
     text: &str,
 ) -> (String, Vec<String>) {
-    let canonical: std::collections::HashSet<&str> =
-        UNREGISTER_CANONICAL_ENV_KEYS.iter().copied().collect();
+    let canonical = unregister_by_name_keys();
     let mut removed = std::collections::BTreeSet::new();
     let mut out = String::with_capacity(text.len());
 
@@ -5294,116 +5310,146 @@ pub(crate) fn surgically_strip_env_surfaces(
 
     // 3 + 4. `.claude/settings.json` `env` and `.vscode/settings.json`
     //        `claude-code.env` — the ONE Python strip (v0.2.97 review F5).
-    let canonical: Vec<&str> = UNREGISTER_CANONICAL_ENV_KEYS.iter().copied().collect();
+    let canonical: Vec<&str> = unregister_by_name_keys().into_iter().collect();
     strip_json_env_surfaces(root, folder, &canonical, "env-key strip", &mut keys, &mut warnings);
+
+    // 5. Secret VALUES (user secrets + `GITHUB_TOKEN`) — only on evidence.
+    strip_proven_secret_values(root, folder, &mut keys, &mut warnings);
 
     (keys.into_iter().collect(), warnings)
 }
 
-/// Subagent G (2026-05-08): strip a caller-supplied set of user-bucket
-/// secret KEY names from the project's env surfaces.
+/// v0.2.97: remove the secret VALUES VCO can PROVE it wrote from every env
+/// surface of `folder`, and REPORT the rest — the unregister's evidence rule.
 ///
-/// Different from `surgically_strip_env_surfaces` (which strips only
-/// the launcher-canonical key set known at compile time): user-secret
-/// key names are project-specific and dynamically discovered from
-/// `secret_active_state`, so they need a per-call list.
+/// A confirmed "unregister" consents to removing what VCO wrote, not a
+/// same-named key the user typed. So a launcher-known user secret (any
+/// bucket) or `GITHUB_TOKEN` with a value in `.env`, `.claude/env` (outside
+/// the managed block, which step 2 excised whole) or a JSON env block is
+/// removed only when that value EQUALS the one the launcher stores — decided
+/// by the ONE evidence classifier,
+/// [`crate::services::vco_lib_bridge::classify_secret_values`] (Python; the
+/// value is compared inside the child, through the hub, and never crosses
+/// this boundary). Must run BEFORE the unregister forgets the project's
+/// secret rows and deletes its DB row: the hub resolves the stored value
+/// only while the project is registered.
 ///
-/// Strips:
-///   * `.env`: lines matching `<KEY>=...` or `# <KEY>=...` are removed
-///     verbatim. Lines outside that shape (comments, blank, user
-///     overrides) are preserved.
-///   * `.claude/env`: lines matching `export <KEY>="..."` (active or
-///     commented form) are removed. Outside-the-managed-block exports
-///     follow the same rule.
-///   * `.claude/settings.json` `env` block and `.vscode/settings.json`
-///     `claude-code.env` block: keys removed by the ONE Python strip
-///     ([`strip_json_env_surfaces`]); adjacent canonical / by-hand user
-///     keys survive, JSONC is edited in place.
-///
-/// Soft-fail discipline mirrors `surgically_strip_env_surfaces`. The
-/// keychain itself is NOT touched — that's the user's call to make
-/// before unregister via the SecretsPanel "Remove" action. This
-/// function exists so a forgotten key from the SecretsPanel doesn't
-/// survive as a stale env var post-unregister.
-///
-/// Returns `(keys_actually_purged, warnings)`. `keys_actually_purged`
-/// is sorted + de-duped across surfaces; the report layer dumps it
-/// into `keys_purged_from_env` alongside the canonical purge result.
-pub(crate) fn surgically_strip_user_secret_keys(
+/// Everything not proven is left byte-for-byte and listed in ONE `warnings`
+/// line — the unregister result the GUI shows (the project is leaving VCO,
+/// so a deferral in its ledger might never be read). A classifier failure
+/// removes nothing and says so. Replaces the pre-v0.2.97
+/// `surgically_strip_user_secret_keys`, which removed per-project user-secret
+/// NAMES from every surface — a key the user typed included.
+pub(crate) fn strip_proven_secret_values(
     root: Option<&Path>,
     folder: &Path,
-    keys: &[String],
-) -> (Vec<String>, Vec<String>) {
-    if keys.is_empty() {
-        return (Vec::new(), Vec::new());
+    purged: &mut std::collections::BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    match crate::services::vco_lib_bridge::classify_secret_values(root, folder) {
+        Ok(verdicts) => apply_secret_verdicts(root, folder, &verdicts, purged, warnings),
+        Err(e) => warnings.push(format!(
+            "could not check which secret values in this project's env files VCO \
+             wrote, so none were removed (a value you typed is never removed by \
+             name): {}",
+            e
+        )),
     }
-    let key_set: std::collections::HashSet<&str> =
-        keys.iter().map(|s| s.as_str()).collect();
-    let mut purged = std::collections::BTreeSet::new();
-    let mut warnings: Vec<String> = Vec::new();
+}
 
-    // 1. .env (root)
-    let env_path = folder.join(".env");
-    if env_path.exists() {
-        match std::fs::read_to_string(&env_path) {
-            Ok(text) => {
-                let (new_text, removed) = strip_named_keys_from_env_text(&text, &key_set);
-                if !removed.is_empty() {
-                    if let Err(e) = std::fs::write(&env_path, new_text) {
-                        warnings.push(format!(
-                            "could not rewrite {} (user-secret strip): {}",
-                            env_path.display(),
-                            e
-                        ));
-                    } else {
-                        for k in removed {
-                            purged.insert(k);
+/// Act on a verdict map `{file: {KEY: "proven"|"not_vco"|"unknown"}}`:
+/// remove the `proven` names from their file, report every other one.
+/// Split from [`strip_proven_secret_values`] so the decision is unit-testable
+/// without a hub.
+pub(crate) fn apply_secret_verdicts(
+    root: Option<&Path>,
+    folder: &Path,
+    verdicts: &serde_json::Map<String, serde_json::Value>,
+    purged: &mut std::collections::BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    let mut left: Vec<String> = Vec::new();
+    for (rel, per_key) in verdicts {
+        let Some(per_key) = per_key.as_object() else { continue };
+        let mut proven: Vec<&str> = Vec::new();
+        for (name, verdict) in per_key {
+            match verdict.as_str() {
+                Some("proven") => proven.push(name.as_str()),
+                Some("unknown") => left.push(format!("{} in {} (could not be checked)", name, rel)),
+                _ => left.push(format!(
+                    "{} in {} (not the value the launcher stores for it)", name, rel
+                )),
+            }
+        }
+        if proven.is_empty() {
+            continue;
+        }
+        match rel.as_str() {
+            ".env" | ".claude/env" => {
+                let path = folder.join(rel);
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let (new_text, removed) = strip_active_env_lines(&text, &proven);
+                        if !removed.is_empty() {
+                            match std::fs::write(&path, new_text) {
+                                Ok(()) => purged.extend(removed),
+                                Err(e) => warnings.push(format!(
+                                    "could not rewrite {}: {}", path.display(), e
+                                )),
+                            }
                         }
                     }
+                    Err(e) => warnings.push(format!("could not read {}: {}", path.display(), e)),
                 }
             }
-            Err(e) => warnings.push(format!(
-                "could not read {} for user-secret strip: {}",
-                env_path.display(),
-                e
-            )),
-        }
-    }
-
-    // 2. .claude/env (POSIX exports)
-    let claude_env = folder.join(".claude").join("env");
-    if claude_env.exists() {
-        match std::fs::read_to_string(&claude_env) {
-            Ok(text) => {
-                let (new_text, removed) = strip_named_keys_from_claude_env_text(&text, &key_set);
-                if !removed.is_empty() {
-                    if let Err(e) = std::fs::write(&claude_env, new_text) {
-                        warnings.push(format!(
-                            "could not rewrite {} (user-secret strip): {}",
-                            claude_env.display(),
-                            e
-                        ));
-                    } else {
-                        for k in removed {
-                            purged.insert(k);
-                        }
-                    }
+            ".claude/settings.json" | ".vscode/settings.json" => {
+                let surface = if rel == ".claude/settings.json" {
+                    "claude_settings_json"
+                } else {
+                    "vscode_settings_json"
+                };
+                match crate::services::vco_lib_bridge::strip_settings_env_keys(
+                    root, folder, surface, &proven,
+                ) {
+                    Ok(removed) => purged.extend(removed),
+                    Err(e) => warnings.push(format!("{} left untouched: {}", rel, e)),
                 }
             }
-            Err(e) => warnings.push(format!(
-                "could not read {} for user-secret strip: {}",
-                claude_env.display(),
-                e
-            )),
+            _ => {}
         }
     }
+    if !left.is_empty() {
+        warnings.push(format!(
+            "left in place — VCO cannot prove it wrote these values, so unregister did \
+             not remove them (remove any that are not yours to keep): {}",
+            left.join("; ")
+        ));
+    }
+}
 
-    // 3 + 4. The two JSON env surfaces — the ONE Python strip (v0.2.97
-    //        review F5), same as the canonical strip above.
-    let names: Vec<&str> = keys.iter().map(String::as_str).collect();
-    strip_json_env_surfaces(root, folder, &names, "user-secret strip", &mut purged, &mut warnings);
-
-    (purged.into_iter().collect(), warnings)
+/// Pure helper: drop the ACTIVE `KEY=value` / `export KEY=value` lines whose
+/// key is in `keys`. Commented lines are kept — a `# KEY=…` line is not a
+/// value VCO proved it wrote. Returns `(new_text, removed_keys)`.
+pub(crate) fn strip_active_env_lines(text: &str, keys: &[&str]) -> (String, Vec<String>) {
+    let mut removed = std::collections::BTreeSet::new();
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let body = trimmed.strip_prefix("export ").map(str::trim_start).unwrap_or(trimmed);
+        let key = body.find('=').filter(|&i| i > 0).map(|i| body[..i].trim());
+        if let Some(k) = key {
+            if !trimmed.starts_with('#') && keys.contains(&k) {
+                removed.insert(k.to_string());
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    (out, removed.into_iter().collect())
 }
 
 // The unregister-flow env-key strippers + launcher-file purge were
@@ -5595,37 +5641,18 @@ pub async fn delete_project_v2(
     if opts.purge_launcher_files {
         let folder = Path::new(&row.folder_path);
         if folder.is_dir() {
-            // 1a (Subagent G, 2026-05-08). Strip user-bucket secret
-            // keys from all surfaces FIRST. The canonical strip below
-            // doesn't know about user keys (their names are dynamic
-            // per-project), so without this step a registered project's
-            // user secrets would survive the unregister + persist as
-            // stale env vars in any subprocess that re-reads the
-            // surfaces.
-            //
-            // Implementation: enumerate every key in the project's
-            // user bucket from `secret_active_state` (active OR
-            // inactive — both must be stripped), then surgically strip
-            // those KEY names from each surface. Doesn't touch the
-            // keychain itself; the user can decide whether to also
-            // delete those entries via the SecretsPanel before
-            // unregistering.
-            let user_keys = db.list_user_secret_keys_for_project(&row.id);
+            // 1a. Strip the launcher's env keys from all four env
+            //     surfaces: canonical routing keys by name, VCO's own
+            //     `.claude/env` managed block whole, and secret VALUES
+            //     (user secrets of every bucket + GITHUB_TOKEN) ONLY where
+            //     the value equals the launcher's stored one — anything
+            //     else is left and listed in `report.warnings` (v0.2.97).
+            //     Runs BEFORE step 2.5 forgets the project's secret rows
+            //     and before the DB row goes: the stored values are
+            //     resolvable only while the project is registered. Done
+            //     BEFORE the file delete as well. The keychain itself is
+            //     never touched.
             let vco_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
-            let (user_keys_purged, user_strip_warnings) =
-                surgically_strip_user_secret_keys(vco_root.as_deref(), folder, &user_keys);
-            for k in user_keys_purged {
-                if !report.keys_purged_from_env.contains(&k) {
-                    report.keys_purged_from_env.push(k);
-                }
-            }
-            report.warnings.extend(user_strip_warnings);
-
-            // 1b. Strip canonical env keys from all four env surfaces.
-            //     Done BEFORE the file delete so `.claude/env` (which is
-            //     in UNREGISTER_PURGE_PATHS) gets stripped first; the
-            //     subsequent file delete is a no-op for that file but
-            //     leaves the strip's "keys removed" record intact.
             let (keys, env_warnings) = surgically_strip_env_surfaces(vco_root.as_deref(), folder);
             for k in keys {
                 if !report.keys_purged_from_env.contains(&k) {
@@ -5634,7 +5661,7 @@ pub async fn delete_project_v2(
             }
             report.warnings.extend(env_warnings);
 
-            // 1c. File / directory purge.
+            // 1b. File / directory purge.
             let (files, file_warnings) = purge_launcher_files_from_project(folder);
             report.files_purged = files;
             report.warnings.extend(file_warnings);
@@ -9263,7 +9290,7 @@ export USER_PROJECT_VAR=\"keep me\"
         let original = "{\"env\": {\"KG_COLLECTION\": \"x\"},, }";
         std::fs::write(&settings, original).unwrap();
 
-        let (_keys, warnings) = surgically_strip_user_secret_keys(None, &tmp, &["KG_COLLECTION".to_string()]);
+        let (_keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
 
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
         assert!(
@@ -9950,122 +9977,140 @@ USER_DB_URL=postgres://user:pass@db/app
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Subagent G (2026-05-08): unregister-cleanup integration.
-    ///
-    /// Pins the contract that `surgically_strip_user_secret_keys` strips
-    /// caller-supplied user-secret KEY names from all 4 env surfaces
-    /// while leaving canonical keys + by-hand user keys intact.
-    /// Mirrors the call shape of the real `delete_project_v2` step 1a.
-    #[test]
-    fn unregister_strips_user_secrets_from_env_surfaces() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vct-unreg-user-strip-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+    /// Fill every env surface with the same three kinds of key: a canonical
+    /// routing key, a secret (`secret_key` = `canary`), and a by-hand key.
+    fn seed_all_surfaces(tmp: &std::path::Path, secret_key: &str, canary: &str) {
         std::fs::create_dir_all(tmp.join(".claude")).unwrap();
         std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
-
-        // Pre-populate every surface with a mix of:
-        //   * a canonical key (must survive — canonical strip handles it)
-        //   * a user-secret key the launcher emitted (must be stripped)
-        //   * a by-hand user key (must survive)
         std::fs::write(
             tmp.join(".env"),
-            "\
-# vibecoded-orchestrator per-project .env
-KG_COLLECTION=Some_KnowledgeGraph
-USER_SECRET_FROM_GUI=ghp_test_canary
-BY_HAND_KEY=user_typed
-",
+            format!("KG_COLLECTION=Some_KnowledgeGraph\n{secret_key}={canary}\nBY_HAND_KEY=user_typed\n"),
         )
         .unwrap();
         std::fs::write(
             tmp.join(".claude/env"),
-            "# vco-managed-begin
-export KG_COLLECTION=\"Some_KnowledgeGraph\"
-export USER_SECRET_FROM_GUI=\"ghp_test_canary\"
-# vco-managed-end
-export BY_HAND_KEY=\"user_typed\"
-",
+            format!(
+                "# vco-managed-begin\nexport KG_COLLECTION=\"Some_KnowledgeGraph\"\n# vco-managed-end\n\
+                 export {secret_key}=\"{canary}\"\nexport BY_HAND_KEY=\"user_typed\"\n"
+            ),
         )
         .unwrap();
-        std::fs::write(
-            tmp.join(".claude/settings.json"),
-            r#"{
-                "env": {
-                    "KG_COLLECTION": "Some_KnowledgeGraph",
-                    "USER_SECRET_FROM_GUI": "ghp_test_canary",
-                    "BY_HAND_KEY": "user_typed"
-                }
-            }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            tmp.join(".vscode/settings.json"),
-            r#"{
-                "claude-code.env": {
-                    "KG_COLLECTION": "Some_KnowledgeGraph",
-                    "USER_SECRET_FROM_GUI": "ghp_test_canary",
-                    "BY_HAND_KEY": "user_typed"
-                }
-            }"#,
-        )
-        .unwrap();
+        for (rel, block) in [(".claude/settings.json", "env"), (".vscode/settings.json", "claude-code.env")] {
+            std::fs::write(
+                tmp.join(rel),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    block: {"KG_COLLECTION": "Some_KnowledgeGraph", secret_key: canary, "BY_HAND_KEY": "user_typed"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
 
-        // Strip ONLY the user-secret KEY name. Canonical + by-hand
-        // keys must survive (the canonical strip runs separately).
-        let user_keys = vec!["USER_SECRET_FROM_GUI".to_string()];
-        let (purged, warnings) = surgically_strip_user_secret_keys(None, &tmp, &user_keys);
-        assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
-        assert_eq!(purged, vec!["USER_SECRET_FROM_GUI".to_string()]);
+    const ALL_SURFACES: [&str; 4] = [".env", ".claude/env", ".claude/settings.json", ".vscode/settings.json"];
 
-        // .env: user secret gone, canonical + by-hand survive.
-        let env = std::fs::read_to_string(tmp.join(".env")).unwrap();
-        assert!(!env.contains("USER_SECRET_FROM_GUI"));
-        assert!(env.contains("KG_COLLECTION=Some_KnowledgeGraph"));
-        assert!(env.contains("BY_HAND_KEY=user_typed"));
+    /// v0.2.97 (act): a secret VALUE the classifier PROVED VCO wrote (equal to
+    /// the launcher's stored value) is removed from every surface; canonical
+    /// and by-hand keys around it survive, and nothing is reported as left.
+    /// The verdict map is given directly — the evidence itself is the Python
+    /// classifier's (`tests/test_v0297_unregister_evidence.py`).
+    #[test]
+    fn unregister_removes_a_proven_secret_value_from_every_surface() {
+        let tmp = strip_test_folder("proven");
+        seed_all_surfaces(&tmp, "USER_SECRET_FROM_GUI", "ghp_test_canary");
+        let verdicts: serde_json::Map<String, serde_json::Value> = ALL_SURFACES
+            .iter()
+            .map(|rel| (rel.to_string(), serde_json::json!({"USER_SECRET_FROM_GUI": "proven"})))
+            .collect();
+        let (mut purged, mut warnings) = (std::collections::BTreeSet::new(), Vec::new());
 
-        // .claude/env: user secret gone (whether inside or outside the
-        // managed block — we strip both shapes); canonical + by-hand
-        // survive.
-        let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
-        assert!(!claude_env.contains("USER_SECRET_FROM_GUI"));
-        assert!(claude_env.contains("KG_COLLECTION"));
-        assert!(claude_env.contains("BY_HAND_KEY"));
+        apply_secret_verdicts(None, &tmp, &verdicts, &mut purged, &mut warnings);
 
-        // .claude/settings.json: same.
-        let cs: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
-                .unwrap();
-        assert!(cs["env"].get("USER_SECRET_FROM_GUI").is_none());
-        assert_eq!(cs["env"]["KG_COLLECTION"], "Some_KnowledgeGraph");
-        assert_eq!(cs["env"]["BY_HAND_KEY"], "user_typed");
-
-        // .vscode/settings.json: same.
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
-                .unwrap();
-        assert!(vsc["claude-code.env"].get("USER_SECRET_FROM_GUI").is_none());
-        assert_eq!(vsc["claude-code.env"]["KG_COLLECTION"], "Some_KnowledgeGraph");
-        assert_eq!(vsc["claude-code.env"]["BY_HAND_KEY"], "user_typed");
-
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        assert_eq!(purged.into_iter().collect::<Vec<_>>(), vec!["USER_SECRET_FROM_GUI".to_string()]);
+        for rel in ALL_SURFACES {
+            let text = std::fs::read_to_string(tmp.join(rel)).unwrap();
+            assert!(!text.contains("ghp_test_canary"), "{} still holds the value", rel);
+            assert!(text.contains("BY_HAND_KEY") && text.contains("KG_COLLECTION"), "{}: {}", rel, text);
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Empty key list short-circuits — no surface reads, no warnings.
-    /// Pins the cheap-no-op invariant the unregister flow relies on
-    /// when a project never registered any user secrets.
+    /// v0.2.97 (leave-alone): a same-named value that is NOT the stored one,
+    /// or one that could not be checked, is left byte-for-byte in every
+    /// surface and listed in ONE warning — the unregister result the GUI shows.
     #[test]
-    fn surgically_strip_user_secret_keys_short_circuits_on_empty_list() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vct-strip-empty-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let (purged, warnings) = surgically_strip_user_secret_keys(None, &tmp, &[]);
+    fn unregister_leaves_and_reports_an_unproven_secret_value() {
+        let tmp = strip_test_folder("unproven");
+        seed_all_surfaces(&tmp, "OPENAI_API_KEY", "sk-user-typed");
+        let before: Vec<String> =
+            ALL_SURFACES.iter().map(|r| std::fs::read_to_string(tmp.join(r)).unwrap()).collect();
+        let verdicts: serde_json::Map<String, serde_json::Value> = ALL_SURFACES
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                let v = if i % 2 == 0 { "not_vco" } else { "unknown" };
+                (rel.to_string(), serde_json::json!({"OPENAI_API_KEY": v}))
+            })
+            .collect();
+        let (mut purged, mut warnings) = (std::collections::BTreeSet::new(), Vec::new());
+
+        apply_secret_verdicts(None, &tmp, &verdicts, &mut purged, &mut warnings);
+
         assert!(purged.is_empty());
-        assert!(warnings.is_empty());
+        for (rel, text) in ALL_SURFACES.iter().zip(before) {
+            assert_eq!(std::fs::read_to_string(tmp.join(rel)).unwrap(), text, "{} changed", rel);
+        }
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(warnings[0].contains("left in place") && warnings[0].contains("OPENAI_API_KEY in .env"));
+        assert!(warnings[0].contains("could not be checked"));
+        assert!(!warnings[0].contains("sk-user-typed"), "a value is never reported");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// v0.2.97: a `GITHUB_TOKEN` the user typed survives the WHOLE unregister
+    /// strip. It is a canonical key, but its value is a secret: it is never
+    /// removed by name — and in a unit test the classifier cannot reach a hub
+    /// (discard port), so there is no evidence at all.
+    #[test]
+    fn unregister_never_removes_a_user_typed_github_token_by_name() {
+        let tmp = strip_test_folder("ghtoken");
+        seed_all_surfaces(&tmp, "GITHUB_TOKEN", "ghp_the_user_typed_this");
+
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+
+        assert!(!keys.contains(&"GITHUB_TOKEN".to_string()), "{:?}", keys);
+        assert!(keys.contains(&"KG_COLLECTION".to_string()), "routing keys still go by name");
+        for rel in ALL_SURFACES {
+            let text = std::fs::read_to_string(tmp.join(rel)).unwrap();
+            assert!(text.contains("ghp_the_user_typed_this"), "{} lost the user's token: {}", rel, text);
+            assert!(!text.contains("Some_KnowledgeGraph"), "{} kept a routing key", rel);
+        }
+        assert!(
+            warnings.iter().any(|w| w.contains("left in place") && w.contains("GITHUB_TOKEN")),
+            "{:?}",
+            warnings
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A commented `# KEY=…` line is not a value VCO proved it wrote: the
+    /// proven-value strip drops ACTIVE lines only.
+    #[test]
+    fn strip_active_env_lines_keeps_commented_lines() {
+        let text = "A=1\n# A=old\nexport A=\"2\"\nB=3";
+        let (out, removed) = strip_active_env_lines(text, &["A"]);
+        assert_eq!(out, "# A=old\nB=3");
+        assert_eq!(removed, vec!["A".to_string()]);
+    }
+
+    /// `GITHUB_TOKEN` is the one canonical key unregister never removes by
+    /// name — and the Rust list stays in step with the Python one.
+    #[test]
+    fn github_token_is_evidence_gated_not_stripped_by_name() {
+        assert_eq!(EVIDENCE_GATED_ENV_KEYS, &["GITHUB_TOKEN"]);
+        assert!(!unregister_by_name_keys().contains("GITHUB_TOKEN"));
+        assert!(unregister_by_name_keys().contains("KG_COLLECTION"));
     }
 
     // ─── 0.2.x backlog #4: Update-all projects ──────────────────────────

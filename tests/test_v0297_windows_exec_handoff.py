@@ -245,7 +245,7 @@ def test_relaunch_on_windows_waits_and_forwards(prims, weaviate_missing, monkeyp
         install._ensure_running_under_mcp_venv()
     assert done.value.code == rc and prims["execve"] == []
     ((cmd, env),) = prims["runs"]
-    assert cmd == [str(target), "install.py", "--update"]
+    assert cmd == [str(target), "install.py", "--update", ic.RELAUNCH_TOKEN_ARG + env[ic.ENV_RELAUNCH_TOKEN]]
     assert env[ic.ENV_RELAUNCHED] == "1"
     assert env[ic.ENV_BASE_PYTHON] == sys.executable
     assert env[ic.ENV_PARENT_WAITS] == str(os.getpid())
@@ -316,7 +316,8 @@ def test_posix_rebuild_still_execs_the_base_interpreter(root, prims, monkeypatch
     install._run_lightweight(_rebuild())  # the recorded execve returns, so this then refuses
     ((path, argv, env),) = prims["execve"]
     base = os.environ[ic.ENV_BASE_PYTHON]
-    assert path == base and argv == [base, "install.py", "--lightweight", "--rebuild-venv"]
+    assert path == base and argv == [base, "install.py", "--lightweight", "--rebuild-venv",
+                                     ic.RELAUNCH_TOKEN_ARG + env[ic.ENV_RELAUNCH_TOKEN]]
     assert env[ic.ENV_RELAUNCHED] == "1" and ic.ENV_PARENT_WAITS not in env
 
 
@@ -434,15 +435,17 @@ def test_waiting_parent_pid(monkeypatch, raw, pid):
     assert ic.waiting_parent_pid() == pid
 
 
-def test_install_main_starts_the_watch_first(monkeypatch):
-    """Wired at the top of ``main()``: before anything a kill should interrupt."""
+def test_install_main_adopts_the_relaunch_record_first(monkeypatch):
+    """Wired at the top of ``main()``: the record is validated (and the watch
+    started) before anything reads it or a kill should interrupt."""
     class _Started(Exception):
         pass
 
-    def _start():
+    def _start(argv):
+        assert argv is install.sys.argv, "the token must be stripped from the argv argparse reads"
         raise _Started
 
-    monkeypatch.setattr(ic, "start_parent_watch", _start)
+    monkeypatch.setattr(ic, "adopt_relaunch", _start)
     monkeypatch.setattr(install, "_ensure_running_under_mcp_venv",
                         lambda: pytest.fail("main() ran on before starting the watch"))
     monkeypatch.setattr(install.sys, "argv", ["install.py", "--help"])
