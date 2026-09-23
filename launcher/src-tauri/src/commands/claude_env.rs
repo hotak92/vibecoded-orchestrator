@@ -4,8 +4,8 @@
 //! `templates/hooks/lean-ctx-rewrite.{sh,ps1}` consults
 //! `<project>/.claude/env` for that key (line-based parsing, default = "on"
 //! when absent). This module exposes the minimum surface the GUI needs to
-//! flip that knob without re-deriving the wider env-pair builder used by
-//! `installer::write_project_env_files`.
+//! flip that knob without re-deriving the wider env projection
+//! (`vco_lib.config_projection`).
 //!
 //! File format:
 //!   * Simple `KEY=VALUE` lines (no quoting, no escaping).

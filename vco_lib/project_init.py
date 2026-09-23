@@ -76,6 +76,7 @@ from vco_lib import migration_plan_classify as _mpc
 # v0.2.92 W3 (§3 item 11): `.git/info/exclude` computation + append moved to
 # their own module when the project-move engine became a third caller.
 from vco_lib import git_exclude as _git_exclude
+from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
@@ -113,17 +114,16 @@ from vco_lib.hook_retirements import (
     emit_removal_audit_rows, removal_envelope_rows,
     vco_hook_script_identity as _vco_hook_script_identity,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
 )
-# v0.2.95: the settings.json merge ALGORITHM — the user-wins recursive merge
-# and the per-event hooks merge it delegates to — lives in
-# ``vco_lib.settings_merge``. What stays in THIS module is the I/O around it:
-# ``_merge_settings_template_for_bundle`` reads the template, reads the target
-# and writes atomically, and is the thin orchestration shim over the pure
-# decision. Both private names survive as ALIASES (same object-identity rule
-# as the import above) because this module and the merge's test suite reach
-# them here.
+from vco_lib.parked_hooks import ParkedHooksState, read_parked_hooks, report_parked_hooks
+# v0.2.95: the settings.json merge ALGORITHM lives in ``vco_lib.settings_merge``;
+# THIS module keeps only a shim (``_merge_settings_template_for_bundle``) over its
+# I/O half, which moved to ``vco_lib.bundle_settings_io`` in v0.2.97.
+# Both private names survive as ALIASES (object identity, as above) because
+# this module and the merge's test suite reach them here. v0.2.97: which hooks
+# the merge must not put back comes from ``vco_lib.parked_hooks``.
 from vco_lib.settings_merge import (
     merge_hooks_block as _merge_hooks_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
-    smart_merge_settings as _smart_merge_for_bundle,
+    smart_merge_settings as _smart_merge_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
 )
 
 # Default Weaviate port. Canonical value lives in
@@ -6085,7 +6085,7 @@ def _cleanup_legacy_bash_env_in_project(
 # ---------------------------------------------------------------------------
 # v0.2.24 RL-defect-2026-05-22 Fix 2 (cleanup hygiene):
 #
-# Pre-v0.2.12 the launcher's Rust `write_project_env_files` wrote a
+# Pre-v0.2.12 the launcher's Rust env writer (retired v0.2.97) wrote a
 # `claude-code.env` sub-object inside `.vscode/settings.json` containing
 # MCP_WEAVIATE_SERVER / MCP_PYTHON / MCP_OLLAMA_SERVER / MCP_PYTHONPATH
 # absolute paths. PR-27 (v0.2.12, 2026-05-16) removed that write because
@@ -6124,6 +6124,7 @@ def _detect_legacy_vscode_mcp_env_keys(folder: Path) -> dict:
         dict with:
           - action: "none" (no .vscode dir / file / parseable JSON / no
                    keys) | "detected" (≥1 legacy key found) | "unparseable"
+                   (not valid JSON or JSONC — a JSONC file is read, v0.2.97)
           - keys: list[str] of detected key names (empty when action != "detected")
           - file: relative path string (for the deferral message)
     """
@@ -6131,18 +6132,13 @@ def _detect_legacy_vscode_mcp_env_keys(folder: Path) -> dict:
     if not settings_file.exists():
         return {"action": "none", "keys": [], "file": ".vscode/settings.json"}
 
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        # Don't surface a deferral on unparseable JSON — the file may
-        # have trailing-comma user edits, and our cleanup logic should
-        # never push the user toward fixing JSON syntax just so we can
-        # check for hygiene-only keys.
+    loaded = _jsonc_edit.load_object(settings_file)
+    if loaded is None:
+        # Don't surface a deferral on a file that is not even JSONC — our
+        # cleanup logic should never push the user toward fixing syntax just
+        # so we can check for hygiene-only keys.
         return {"action": "unparseable", "keys": [], "file": ".vscode/settings.json"}
-
-    if not isinstance(data, dict):
-        return {"action": "unparseable", "keys": [], "file": ".vscode/settings.json"}
+    data = loaded[0]
 
     env_block = data.get("claude-code.env")
     if not isinstance(env_block, dict):
@@ -6261,8 +6257,10 @@ def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool
     four keys is provably non-destructive to project behaviour, so it is a
     DEFAULT-ON automation (D8): no env gate.
 
-    Guard (D8/B-F4): proceed ONLY when ``settings.json`` parses via
-    ``json.loads`` to a dict AND ``"claude-code.env"`` is a dict. Otherwise
+    Guard (D8/B-F4): proceed ONLY when ``settings.json`` parses — as JSON or
+    JSONC (v0.2.97; a JSONC file is edited in place, comments kept, and an
+    edit that cannot be verified is not written) — to a dict AND
+    ``"claude-code.env"`` is a dict. Otherwise
     return ``False`` (caller falls back to the deferral). An empty
     ``claude-code.env`` dict is LEFT in place (conservative — we prune keys, we
     don't restructure the file). Any write error also returns ``False`` so the
@@ -6283,15 +6281,12 @@ def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool
         return False
 
     settings_file = folder / settings_rel
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        # Unparseable (JSONC / trailing-comma user edits) → keep today's
-        # no-op-detection behaviour; do NOT push the user toward fixing JSON.
+    loaded = _jsonc_edit.load_object(settings_file)
+    if loaded is None:
+        # Not even JSONC → keep today's no-op-detection behaviour; do NOT
+        # push the user toward fixing syntax.
         return False
-    if not isinstance(data, dict):
-        return False
+    data, raw = loaded
     env_block = data.get("claude-code.env")
     if not isinstance(env_block, dict):
         return False
@@ -6306,10 +6301,12 @@ def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool
         del env_block[k]
     data["claude-code.env"] = env_block  # empty dict left in place if now empty
 
-    # Re-serialise with a stable indent + trailing newline (match VS Code's
-    # 4-space convention used elsewhere for these settings files).
+    # Strict JSON: re-serialise with a stable indent + trailing newline
+    # (VS Code's 4-space convention). JSONC: edited in place, or not at all.
+    serialised = _jsonc_edit.dumps_preserving(raw, data, indent=4)
+    if serialised is None:
+        return False
     try:
-        serialised = json.dumps(data, indent=4) + "\n"
         atomic_write_text(settings_file, serialised)
     except (OSError, TypeError, ValueError):
         # Write / serialisation failure → fall back to the deferral.
@@ -9986,7 +9983,7 @@ def install_project_bundle(
         # v0.2.85 D6: the sorted list of kinds skipped this run (additive; only
         # present when non-empty, so the default-run envelope is unchanged).
         "skip_kinds": [<kind>...],          # absent when skip_kinds is empty
-        "settings_action": "created"|"merged"|"unchanged"|"unchanged (user file unparseable)"|"" ,
+        "settings_action": "created"|"merged"|"unchanged"|"unchanged (...)"|"" ,
         "manifest_written": bool,
         "vco_version": str,
         "warnings": [...],
@@ -10733,9 +10730,8 @@ def install_project_bundle(
                 f"knowledge-residue cleanup failed (non-fatal): {err}"
             )
 
-    # Smart-merge settings.json template separately. The template carries
-    # the orchestrator's hooks block + permissions defaults. The merge
-    # logic mirrors install.py:_merge_settings_template + _smart_merge_settings.
+    # Smart-merge settings.json template separately (hooks block + permission
+    # defaults); v0.2.97: minus the hooks the user disabled (vco_lib.parked_hooks).
     #
     # v0.2.85 PLAN-v0285 D6 (settings skip): `settings` is the ONLY skip-kind
     # that is not a file-kind — it names this merge step, not an enumerated op.
@@ -10751,11 +10747,18 @@ def install_project_bundle(
             # removed (`vco_lib.hook_retirements`); collected at this level
             # because the audit row needs the FOLDER, not just the hooks.
             retired_removed: list = []
+            parked, kept_out = read_parked_hooks(folder), []
             settings_action, settings_redirect = _merge_settings_template_for_bundle(
-                settings_template, settings_target,
-                dry_run=dry_run, retired_removed=retired_removed,
+                settings_template, settings_target, dry_run=dry_run,
+                retired_removed=retired_removed, parked=parked, kept_out=kept_out,
+                project_root=folder,
             )
             result["settings_action"] = settings_action
+            if settings_action.startswith("unchanged ("):  # v0.2.97: never silent
+                result["warnings"].append(f"settings.json: {settings_action} — newly "
+                                          "shipped hooks NOT added; see UPDATE_DEFERRED.md")
+            report_parked_hooks(folder, result, parked, kept_out, dry_run=dry_run,
+                                settings_action=settings_action, log=_log)
             if retired_removed:
                 # Envelope on BOTH paths (dry-run reports what it WOULD
                 # remove); audit rows only after a real write.
@@ -12145,70 +12148,36 @@ def _find_orchestrator_root_from_module() -> Path:
 def _merge_settings_template_for_bundle(
     template_path: Path, target_path: Path, *, dry_run: bool,
     retired_removed: Optional[list] = None,
+    parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
+    project_root: Optional[Path] = None,
 ) -> tuple[str, Optional[Path]]:
-    """The I/O half of the settings.json merge: read the template, read the
-    target, hand both to :func:`vco_lib.settings_merge.smart_merge_settings`,
-    write the answer atomically.
+    """The I/O half of the settings.json merge — a shim since v0.2.97.
 
-    The DECISION half — what a merge may change, and the per-event hooks
-    merge underneath it — lives in ``vco_lib.settings_merge`` (v0.2.95). The
-    split is deliberate: that half is pure and heavily tested on its own,
-    this half owns the filesystem. The docstring here used to call the pair a
-    "mirror of install.py:_merge_settings_template + _smart_merge_settings",
-    inlined so ``vco_lib`` need not import ``install.py``. Neither name exists
-    in ``install.py`` any more — v0.2.85 (D2) deleted its bespoke Steps 5b/9b
-    and routed the root install through this one engine — so there is no
-    mirror, and the claim is retired rather than carried forward.
+    The body lives in :func:`vco_lib.bundle_settings_io.merge_settings_template`
+    (read template + target, the pure DECISION half in
+    ``vco_lib.settings_merge``, the atomic write through THIS module's
+    ``_write_file_atomic``, resolved at call time). It edits a JSONC file in
+    place and refuses — visibly, as a deferral — one it cannot edit.
 
     Returns ``(status, redirect_target)``:
       * ``status`` — one of ``would-create`` / ``created`` / ``would-merge`` /
-        ``merged`` / ``unchanged`` / ``unchanged (user file unparseable)``.
+        ``merged`` / ``unchanged`` / ``unchanged (user file unparseable)`` /
+        ``unchanged (JSONC edit refused)``.
       * ``redirect_target`` — v0.2.70 (Bug B / W-F1): the ``.vco-new`` Path
-        when the settings.json write was redirected because ``.claude`` (or
-        the file itself) is a symlink VCO refused to write through, else
-        ``None``. The caller (``install_project_bundle``) threads this into
-        the SAME ``symlink_redirect_events`` accumulator as the main file
-        loop so the consolidated symlink deferral also lists settings.json
-        (the symlinked-``.claude`` case would otherwise under-report).
+        when a symlinked ``.claude`` (or file) redirected the write, else
+        ``None``; the caller adds it to ``symlink_redirect_events`` so the
+        consolidated symlink deferral lists settings.json too.
 
-    ``retired_removed`` — v0.2.95: optional accumulator handed to the hooks
-    merge, which appends one record per RETIRED registration it removed (see
-    ``hook_retirements.scrub_retired_registrations``). The caller writes the
-    audit rows; this function only reports. On the fresh-create path (no
-    target file) and on the unparseable-file path nothing is appended,
-    because neither path merges anything.
+    ``retired_removed`` — v0.2.95: accumulator the hooks merge appends one
+    record to per RETIRED registration it removed; the caller writes the audit
+    rows. ``parked`` / ``kept_out`` — v0.2.97 (``vco_lib.parked_hooks``):
+    launcher-disabled hooks stay out on the merge AND create paths.
     """
-    template_data = json.loads(template_path.read_text(encoding="utf-8"))
-
-    if not target_path.exists():
-        if dry_run:
-            return "would-create", None
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        redirect = _write_file_atomic(
-            target_path,
-            (json.dumps(template_data, indent=2) + "\n").encode("utf-8"),
-        )
-        return "created", redirect
-
-    try:
-        existing = json.loads(target_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return "unchanged (user file unparseable)", None
-
-    merged = _smart_merge_for_bundle(
-        existing, template_data, retired_removed=retired_removed,
-    )
-    if merged == existing:
-        return "unchanged", None
-
-    if dry_run:
-        return "would-merge", None
-
-    redirect = _write_file_atomic(
-        target_path,
-        (json.dumps(merged, indent=2) + "\n").encode("utf-8"),
-    )
-    return "merged", redirect
+    from vco_lib.bundle_settings_io import merge_settings_template
+    return merge_settings_template(
+        template_path, target_path, dry_run=dry_run, write=_write_file_atomic,
+        retired_removed=retired_removed, parked=parked, kept_out=kept_out,
+        project_root=project_root)
 
 
 def _apply_canonical_env_via_config_projection(
@@ -12995,7 +12964,7 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
 #     can override per-project.
 #
 # Coordination with the Rust writer:
-#   Pre-PR-27, the launcher's `write_project_env_files` (Rust, at
+#   Pre-PR-27, the launcher's Rust env writer (retired v0.2.97; at
 #   commands/projects_v2.rs) wrote a `claude-code.env` sub-object
 #   inside `.vscode/settings.json`. That write was removed in PR-27
 #   (v0.2.12, 2026-05-16) because the key did NOT propagate to MCP
@@ -13102,9 +13071,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
       - Missing settings file → create it with just the exclude block
         + a marker comment. `_template_origin: "vibecoded-orchestrator
         v0.2.11+ — vscode-excludes backfill"` so the file is identifiable.
-      - File unparseable JSON → action="unparseable" (no-op, preserves
-        user file untouched). Hand-edited JSON with trailing commas is
-        a common case — we don't want to clobber that.
+      - File not valid JSON or JSONC → action="unparseable" (no-op,
+        preserves user file untouched). A JSONC file (comments, trailing
+        commas — the common hand-edited case) is READ and the missing keys
+        are inserted into its text, comments kept (v0.2.97); an insertion
+        that cannot be verified is action="jsonc_edit_refused", untouched.
       - Top-level key already present → user-wins, leave alone (covers
         the "user set `files.watcherExclude: {}` to explicitly disable
         the feature" case the addendum calls out).
@@ -13120,6 +13091,8 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
           - "backfilled"  — file existed; added one or more missing keys
           - "noop"        — file existed; every canonical key already present
           - "unparseable" — file existed but couldn't be parsed; left alone
+          - "jsonc_edit_refused" — JSONC file whose edit could not be
+            verified; left alone
           - "write_failed:<ErrorClass>" — atomic write raised
     """
     settings_file = folder / ".vscode" / "settings.json"
@@ -13135,7 +13108,7 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
         # write of that block from `.vscode/settings.json` because it
         # didn't propagate to MCP subprocesses on Linux. The canonical
         # channel for per-project MCP env is `.claude/settings.json`
-        # env, written by the Rust launcher's `write_project_env_files`.)
+        # env, written by the launcher's config_projection apply.)
         payload: dict = {
             "_template_origin": (
                 "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"
@@ -13154,16 +13127,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
         result["added_keys"] = list(_VSCODE_EXCLUDE_DEFAULTS.keys())
         return result
 
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
+    loaded = _jsonc_edit.load_object(settings_file)
+    if loaded is None:
         result["action"] = "unparseable"
         return result
-
-    if not isinstance(data, dict):
-        result["action"] = "unparseable"
-        return result
+    data, raw = loaded
 
     added: list[str] = []
     for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
@@ -13174,8 +13142,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     if not added:
         return result  # action stays "noop"
 
+    payload_text = _jsonc_edit.dumps_preserving(raw, data, indent=2)
+    if payload_text is None:
+        result["action"] = "jsonc_edit_refused"
+        return result
     try:
-        payload_text = json.dumps(data, indent=2) + "\n"
         _write_file_atomic(settings_file, payload_text.encode("utf-8"))
     except OSError as e:
         result["action"] = f"write_failed:{type(e).__name__}"

@@ -857,9 +857,36 @@ notes = """v0.2.91 decision #7: keeps emitting, but tiers as a record so the \
 content-keyed dismissal (v0.2.83 D9 reference-sidecar hashes) is now ONE \
 instance of the generalized dismiss_key mechanism, not a bespoke path."""
 
+[conditions.parked_hook_live_conflict]
+class = "action_required"
+owner = "vco_lib.parked_hooks"
+clear_probe = "probe:py:parked_hook_conflict_still_present"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97. A hook is parked as disabled in launcher.db AND registered \
+in settings.json, so it runs while the Hooks tab keeps a disabled record. Every \
+bundle update before v0.2.97 produced this for each disabled hook (it re-added \
+them); a line restored by hand looks identical, so VCO never removes the running \
+entry — the user picks the state (re-disable, or Enable on the Disabled row, \
+which clears the stale parked row). Emitted by the bundle update; cleared by the \
+probe once no hook is both parked and running (None — keep — when launcher.db \
+or settings.json cannot be read)."""
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Paired-resolution conditions (family C)
 # ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.vscode_default_pin_migration_failed]
+class = "action_required"
+owner = "vco_lib.machine_migrations"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: the one-time panel ANTHROPIC_MODEL pin migration could \
+not run (no venv, the venv child failed, or a settings file it could not \
+read). Added to install.py's run report after step 5. Cleared ONLY by \
+positive evidence: `machine_migrations._panel_default_pin` calls \
+mark_resolved on a run whose venv child answers without a refusal \
+(`already-migrated` included) — a run that never reached the leg leaves it \
+standing, which drop-when-absent would not."""
 
 [conditions.kg_summary_no_backend]
 class = "auto_retryable"
@@ -1170,7 +1197,12 @@ notes = """v0.2.91: had NO lifecycle at all (31 days and counting on the \
 maintainer's own install). The entry names its `<path>.from-upstream-<sha>` \
 sidecars; once the user has accepted or deleted every one of them the \
 condition is objectively over, so the probe resolves it. Follows the \
-`stale_codegraph_wrapper_pending` probed-clear precedent."""
+`stale_codegraph_wrapper_pending` probed-clear precedent. v0.2.97: a sidecar of \
+a RENDERED file (`vco_lib/rendered_root_files.toml`, CLAUDE.md today) holds only \
+upstream's placeholder — nothing to adopt — so the launcher writes none, \
+install.py's re-render reaps the stale ones (`rendered_root_files.reap_stale_sidecars`, \
+recorded in `.claude/logs/auto-resolutions.jsonl` under this cid), and the \
+probe does not count them."""
 
 [conditions.rendered_file_upstream_changed]
 class = "informational_record"
@@ -1369,6 +1401,37 @@ class = "action_required"
 owner = "vco_lib.config_projection"
 clear_probe = "manual-dismiss"
 emit_surfaces = ["ledger"]
+notes = """`reproject-all` could not re-project one registered project (its \
+folder unreachable, a write error). v0.2.97: NOT emitted when the cause is a \
+settings file the writer refused to touch — that project gets a `refused` \
+outcome instead, and its own ledger already holds the accurate \
+`settings_write_refused_<surface>` entry (re-running `reproject-all` would not \
+fix an unparseable file, which is what this entry's command says to do)."""
+
+[conditions."settings_write_refused_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.settings_refusal"
+clear_probe = "probe:py:settings_write_refusal_still_applies"
+emit_surfaces = ["ledger"]
+dismiss_key = ["path", "kind", "sha256"]
+notes = """v0.2.97. An env-block writer (the canonical projection, the user-secret \
+strip, or `write-env-block` for the launcher's module-deprecation keys) found \
+`.claude/settings.json` / `.vscode/settings.json` existing but not editable — \
+not JSON(C), not UTF-8, unreadable, a non-object root, or a JSONC edit that could \
+not be verified — and left it byte-identical instead of rewriting it as `{}` plus \
+its block (the pre-v0.2.97 behaviour, which destroyed every other setting). The \
+bundle's settings.json merge (`vco_lib.bundle_settings_io`) records its own \
+surface, `bundle_claude_settings_json`: before v0.2.97 it skipped any \
+non-strict-JSON file SILENTLY, so newly shipped hooks never landed in a JSONC \
+settings.json; it now edits JSONC in place and refuses only what it cannot \
+verify. One \
+entry per surface (`settings_write_refused_<surface>`). Cleared by the next \
+successful write of that surface (paired, `settings_refusal.clear_recorded`) and \
+by the probe: resolved once the file is gone or reads as an object; a refused \
+JSONC edit stays while its bytes are unchanged (None once they change). \
+dismiss_key includes the file's sha256, so a dismissal re-fires if the file \
+changes and is still refused."""
 
 [conditions.code_formats_schema_migration_pending]
 class = "action_required"
@@ -1613,6 +1676,24 @@ touches `~/.claude.json` (house rule 4) — so the entry SURFACES the copy \
 command rather than running it, and the command is `cp`, never `mv`. Emitted \
 ONLY when the old slug directory actually exists; a project that never \
 hosted a session gets no entry at all."""
+
+[conditions.project_move_env_reprojection_failed]
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: the post-flip `python -m vco_lib.config_projection apply` \
+exited non-zero, so the moved project's `.claude/settings.json` / \
+`.claude/env` were not re-derived from the new row and may still name the \
+old folder. Until v0.2.97 this failed on EVERY move (the mover passed a \
+`--folder` flag `apply` never had) and the only trace was a warning in the \
+post-flip JSON the GUI did not render. The entry quotes the child's stderr \
+and carries the exact re-run command (argv from \
+`config_projection.build_apply_argv`, the builder beside the parser). \
+`manual-dismiss` because nothing re-runs the projection automatically: the \
+entry's command is the fix, and the dismissal follows it. A stale path left \
+behind is ALSO reported by `project_move_stale_path_reference`, whose \
+`vco project move --verify` re-scan clears on its own."""
 
 # ── v0.2.92 WP-18 / W14: `vco project rename-collections` ──────────────────
 #

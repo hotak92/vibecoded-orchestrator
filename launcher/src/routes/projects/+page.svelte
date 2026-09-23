@@ -26,16 +26,22 @@
   import {
     summaryLine,
     needsAttentionCount,
-    undeterminedCensus,
-    shouldRecensusOnUpdaterEdge,
+    createCensusController,
+    type CensusView,
   } from '$lib/bundle-staleness';
   import type { BundleStalenessCensus } from '$lib/types/launcher';
   import { updater } from '$lib/stores/updater';
+  import { projectSetup } from '$lib/stores/project-setup';
 
+  // Declared BEFORE the effects below on purpose: `projects.load()` flips the
+  // store to `loading` synchronously, so the projects-set effect's first
+  // settled observation is the loaded list (its baseline), not an empty
+  // pre-load list that would read as "projects were added" and cost a
+  // second census on every mount.
   onMount(() => {
     void projects.load();
     void loadFolderHealth();
-    void loadBundleCensus();
+    void censusCtl.load();
   });
 
   const store = $derived($projects);
@@ -71,57 +77,63 @@
   // Updating the ORCHESTRATOR does not update the bundles installed into
   // each project — that gap is exactly what let 12 of one user's 13
   // projects sit on June bundles while the launcher said "up to date".
-  // So the census runs on mount AND again the moment an orchestrator
-  // update finishes, which is the moment the gap is created.
+  // So the census is re-taken after EVERY action that changes a bundle:
+  // page mount, an orchestrator update completing (the moment the gap is
+  // created), "Update all" finishing (success, partial or failed), the
+  // Refresh button, a project added or removed from any surface, and a new
+  // project's background bundle install finishing. A per-project "Update
+  // bundle" runs on /project/[id]/settings, a different route: coming back
+  // here re-mounts this page and the mount census covers it.
   //
-  // `null` means "not determined" — never "all fine". The helpers in
+  // Every trigger — and the rule that an OLDER census response never
+  // overwrites a newer one — lives in `createCensusController`, where each
+  // is unit-tested. This page only feeds it and renders its view.
+  //
+  // `null` census means "not determined" — never "all fine". The helpers in
   // `$lib/bundle-staleness` hold that distinction; this page just renders
-  // whatever they return.
-  let census = $state<BundleStalenessCensus | null>(null);
-  // False until the FIRST census attempt has resolved. Gates the summary
-  // line so a page that is still asking never renders "could not determine"
-  // — "not yet asked" and "asked and could not tell" are different states,
-  // and conflating them is the same class of error this feature exists to
-  // prevent, one level down.
-  let censusAttempted = $state(false);
-  // True from the completion of an orchestrator update until the user
-  // dismisses the notice — it promotes the summary from a quiet line to a
-  // call-out, because that is the moment the projects fell behind.
-  let postUpdateNotice = $state(false);
+  // whatever they return. `attempted` stays false until the FIRST census
+  // resolves, so "not yet asked" never renders as "asked and could not
+  // tell". `postUpdateNotice` promotes the summary to a call-out from the
+  // completion of an orchestrator update, because that is the moment the
+  // projects fell behind.
+  const censusCtl = createCensusController({
+    fetchCensus: () => invoke<BundleStalenessCensus>('bundle_staleness_census'),
+    onChange: (v) => (censusView = v),
+    enabled: tauriAvailable,
+  });
+  let censusView = $state<CensusView>(censusCtl.view());
 
-  async function loadBundleCensus() {
-    if (!tauriAvailable()) return;
-    try {
-      census = await invoke<BundleStalenessCensus>('bundle_staleness_census');
-    } catch (e) {
-      // The command is contracted to never reject, so this path means the
-      // command is missing entirely (older launcher binary). Report it as
-      // undetermined — NOT as an absence of findings.
-      census = undeterminedCensus(e instanceof Error ? e.message : String(e));
-    } finally {
-      censusAttempted = true;
-    }
-  }
-
+  // Falling edge of the orchestrator updater only — the controller holds
+  // the previous tick, so the naive `!updating` form (true on every tick →
+  // a subprocess poll loop) cannot creep back in here.
   const upd = $derived($updater);
-  // Plain `let`, NOT `$state`: the effect both reads and writes it, and a
-  // reactive cell in that position re-triggers its own effect. This is a
-  // memo of the previous tick, never rendered, so it must not be tracked.
-  let prevUpdating = false;
   $effect(() => {
-    const isUpdating = upd.updating;
-    // Falling edge only: an orchestrator update just completed. Re-census
-    // and call the result out — this is the moment project bundles fell
-    // behind. The predicate is pure + unit-tested so the naive `!updating`
-    // form (true on every tick → a subprocess poll loop) can't creep back.
-    const fire = shouldRecensusOnUpdaterEdge(prevUpdating, isUpdating);
-    prevUpdating = isUpdating;
-    if (fire) {
-      postUpdateNotice = true;
-      void loadBundleCensus();
-    }
+    censusCtl.updaterTick(upd.updating);
   });
 
+  // Adds and deletes happen from the MenuBar project selector while this
+  // page is mounted. The controller fires only when the SET of ids changes.
+  $effect(() => {
+    censusCtl.projectsChanged(
+      store.projects.map((p) => p.id),
+      store.loading,
+    );
+  });
+
+  // A new project's bundle is installed by a detached background phase
+  // AFTER `create_project_v2` returns; its row only becomes readable when
+  // that phase reaches a terminal status.
+  const setup = $derived($projectSetup.active);
+  $effect(() => {
+    censusCtl.setupObserved(setup);
+  });
+
+  function refreshAll() {
+    void projects.load();
+    void censusCtl.refresh();
+  }
+
+  const census = $derived(censusView.census);
   const attention = $derived(needsAttentionCount(census));
   const censusSummary = $derived(summaryLine(census));
 
@@ -136,7 +148,10 @@
 </svelte:head>
 
 <Toast />
-<UpdateAllProjectsModal bind:open={updateAllOpen} />
+<!-- `onFinished` fires when a run reaches its done phase (success, partial or
+     failure) and never for a dialog cancelled before running: a run changes
+     bundle state, so the census on this page is re-taken. -->
+<UpdateAllProjectsModal bind:open={updateAllOpen} onFinished={censusCtl.updateAllFinished} />
 
 <div class="pl-page">
   <header class="pl-header">
@@ -156,7 +171,15 @@
     >
       ⟳ Update all
     </button>
-    <button class="pl-refresh" onclick={() => projects.load()} disabled={store.loading}>
+    <!-- Refreshes the project list AND re-takes the bundle census: a
+         Refresh that left the chips as they were would repeat the stale
+         "Bundle stale" lie this button is the user's remedy for. -->
+    <button
+      class="pl-refresh"
+      onclick={refreshAll}
+      disabled={store.loading}
+      title="Reload the project list and re-check every project's bundle"
+    >
       {store.loading ? 'Loading…' : 'Refresh'}
     </button>
   </header>
@@ -164,16 +187,20 @@
   <!-- v0.2.92 WP-D: population-level bundle-staleness line. Promoted to a
        call-out right after an orchestrator update completes, because that
        is when the projects fell behind the orchestrator. Informational
-       only — the remedy is the user choosing "Update all". -->
-  {#if censusAttempted}
+       only — the remedy is the user choosing "Update all".
+       `role="status"` makes the re-taken summary reach a screen reader
+       politely; `aria-busy` marks the shown figures as about to change. -->
+  {#if censusView.attempted}
     <div
       class="pl-census"
-      class:notice={postUpdateNotice}
+      class:notice={censusView.postUpdateNotice}
       class:undetermined={attention === null}
       class:attention={attention !== null && attention > 0}
       data-testid="bundle-census-summary"
+      role="status"
+      aria-busy={censusView.checking}
     >
-      {#if postUpdateNotice}
+      {#if censusView.postUpdateNotice}
         <strong>Orchestrator updated.</strong>
         Project bundles are not updated with it —
       {/if}
@@ -181,11 +208,20 @@
       {#if attention !== null && attention > 0}
         <span class="pl-census-remedy">Use “Update all” to bring them forward.</span>
       {/if}
-      {#if postUpdateNotice}
-        <button class="pl-census-dismiss" onclick={() => (postUpdateNotice = false)}>
+      {#if censusView.checking}
+        <span class="pl-census-checking">Re-checking…</span>
+      {/if}
+      {#if censusView.postUpdateNotice}
+        <button class="pl-census-dismiss" onclick={censusCtl.dismissNotice}>
           Dismiss
         </button>
       {/if}
+    </div>
+  {:else if censusView.checking}
+    <!-- First census still running: say so, rather than rendering nothing
+         (or, worse, "could not determine" for a question not yet answered). -->
+    <div class="pl-census" role="status" aria-busy="true" data-testid="bundle-census-summary">
+      <span class="pl-census-checking">Checking project bundles…</span>
     </div>
   {/if}
 
@@ -295,6 +331,7 @@
   }
   .pl-census strong { color: inherit; font-style: normal; }
   .pl-census-remedy { opacity: 0.85; }
+  .pl-census-checking { opacity: 0.75; font-style: italic; }
   .pl-census-dismiss {
     margin-left: auto;
     padding: 2px 10px;

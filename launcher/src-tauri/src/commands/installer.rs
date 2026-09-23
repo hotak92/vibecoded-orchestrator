@@ -10379,8 +10379,8 @@ fn github_pat_resolve_existing_file() -> Option<PathBuf> {
     None
 }
 
-/// Public read-side hook for the env-pair builder
-/// (`commands/projects_v2.rs::write_project_env_files`). Returns the
+/// Read-side resolver for the shared-scope PAT slot (its env-pair
+/// consumer, the Rust env writer, was retired in v0.2.97). Returns the
 /// keychain-resolved PAT (active-flag gated) or falls back to the
 /// legacy file when the file→keychain migration hasn't run yet.
 ///
@@ -10880,8 +10880,8 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
 /// call pulls them into the keychain.
 ///
 /// BOUNDARY #4 (v0.2.80 Part A — HIGHEST BLAST RADIUS): this feeds
-/// `github_pat_for_env` → `write_project_env_files` writes `GITHUB_TOKEN` into
-/// EVERY registered project's env-pair, and it fires AUTOMATICALLY on env-file
+/// `github_pat_for_env`, whose value once reached EVERY registered project's
+/// env-pair (no writer emits `GITHUB_TOKEN` since v0.2.73), and it fires AUTOMATICALLY on env-file
 /// builds (not an explicit import click). A blob here (a token on line 0 + a
 /// `KEY=value` continuation line, an embedded newline, or a control char) would
 /// be handed to `git push` / `gh` as a multi-line password → silent auth
@@ -11053,7 +11053,7 @@ pub fn register_github_pat(
     // 6. Propagate to all registered projects' env files (B2 fix from
     //    2026-05-08 integration review). Without this, a user with N
     //    existing registered projects has to manually re-trigger
-    //    write_project_env_files (e.g. via rename) for each one before
+    //    the env projection (e.g. via rename) for each one before
     //    GITHUB_TOKEN appears in their .claude/env. With it: the moment
     //    the OnboardingWizard saves, every registered project's env
     //    surfaces are rewritten and Claude Code subprocesses inherit the

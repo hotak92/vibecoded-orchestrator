@@ -1,44 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Byte-identical parity test: ``apply_project_env`` (Python) vs
-``write_project_env_files`` (Rust).
+"""Byte-layout pins for ``apply_project_env`` (Python), inherited from the
+former Rust env writer.
 
-The Python contract MUST produce byte-identical surface output to the
-Rust legacy writer for the same input. This is the acceptance criterion
-of Phase 0.B — until the parity holds, we can't flip production callers
-to the Python CLI without risking on-disk diffs that confuse users
-with "why did my settings.json reformat".
+Phase 0.B required the Python contract to produce byte-identical surface
+output to the Rust legacy writer before production callers could flip to
+the Python CLI. They flipped (Phase 0.B Part 2), and the Rust writer —
+which had no production caller left — was deleted in v0.2.97 together
+with the Rust unit tests these assertions were copied from
+(``..._creates_both_paths``, ``..._emits_begin_end_markers``,
+``..._never_emits_github_token_value``, …).
 
-Strategy
-~~~~~~~~
-
-We can't easily invoke the Rust ``write_project_env_files`` from
-Python (it lives inside the Tauri crate and requires cargo + the full
-launcher build). Instead, this test verifies parity by REPRODUCING THE
-SAME ASSERTIONS that the Rust unit tests make against their own
-output, then asserting them against the Python writer's output.
-
-The Rust tests pinned here are in
-``launcher/src-tauri/src/commands/projects_v2.rs``:
-
-  * ``write_project_env_files_creates_both_paths`` (L4476-4548) —
-    pins the shape of ``.claude/env`` and ``.claude/settings.json``
-    env block for ``ProjectEnvSettings::with_defaults("My Test")``.
-  * ``build_claude_env_managed_block_emits_begin_end_markers`` (L6731+)
-    — pins the BEGIN/END marker presence + format.
-  * ``merge_claude_env_managed_block_no_prior_returns_managed_only``
-    (L6748+) — pins the no-prior-file behaviour.
-
-The Python writer must satisfy every one of these assertions when fed
-the equivalent bundle. Any divergence is a contract violation.
-
-When the parity test catches a divergence
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Fix the PYTHON side. Rust is the byte-layout source of truth until the
-follow-up PR that flips production callers to the Python CLI. Once
-production callers are migrated, the parity test can be reversed
-(Python becomes the source of truth and Rust is the legacy adapter).
+Python is therefore now the byte-layout source of truth, and THIS file is
+the only pin of that layout: the assertions below are what the Rust tests
+asserted, kept so the on-disk shape users already have does not drift
+("why did my settings.json reformat"). The one Rust helper still live on
+this contract is ``merge_claude_env_managed_block`` (the launcher's
+unregister strip splices the managed block out with it); its marker tests
+remain in ``projects_v2.rs``.
 
 Run: pytest tests/test_config_projection_byte_identical.py -v
 """
@@ -118,6 +97,9 @@ def test_parity_claude_env_contains_canonical_exports(tmp_path: Path) -> None:
     assert 'export DEVELOPMENT_COLLECTION="MyTest_Development"' in env_raw
     # B5 (2026-04-30 cleanup): CONVERSATION_COLLECTION must NOT appear.
     assert "CONVERSATION_COLLECTION" not in env_raw
+    # B8 (carried from the retired Rust `rust_surfaces_do_not_write_grpc_port`):
+    # GRPC_PORT is install.py's orchestrator-root key, never a per-project one.
+    assert "GRPC_PORT" not in env_raw
     # Shared-KG fields propagate.
     assert (
         'export SHARED_KG_COLLECTION="VibeCodedOrchestrator_KnowledgeGraph"'
@@ -128,7 +110,7 @@ def test_parity_claude_env_contains_canonical_exports(tmp_path: Path) -> None:
 
 
 def test_parity_claude_env_has_managed_markers(tmp_path: Path) -> None:
-    """Mirrors Rust ``build_claude_env_managed_block_emits_begin_end_markers``:
+    """Inherited from the retired Rust ``..._emits_begin_end_markers`` test:
     the BEGIN and END markers must appear, with BEGIN on the first
     managed line and END after the exports."""
     bundle = _my_test_bundle(tmp_path)
@@ -388,17 +370,17 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
 # single most security-sensitive question — the Rust GUI writer EMITTED
 # user-secret values + the keychain-resolved GITHUB_TOKEN into the two
 # project-tree surfaces while the Python writer stripped them. Post-fix
-# both strip. These tests mirror the Rust units
-# ``write_project_env_files_never_emits_github_token_value`` and
-# ``writer_strips_all_user_keys_when_known_keys_emptied`` /
-# ``write_project_env_files_excludes_user_set_secrets`` so the parity
-# contract covers the invariant, not just the canonical layout.
+# both strip. These tests carry the invariant the Rust units
+# (``..._never_emits_github_token_value``,
+# ``writer_strips_all_user_keys_when_known_keys_emptied``,
+# ``..._excludes_user_set_secrets``) pinned before the Rust writer was
+# retired in v0.2.97 — the invariant, not just the canonical layout.
 
 from vco_lib.config_projection import apply_user_secrets  # noqa: E402
 
 
 def test_parity_github_token_scrubbed_from_settings_json(tmp_path: Path) -> None:
-    """Mirrors Rust ``write_project_env_files_never_emits_github_token_value``.
+    """Inherited from the retired Rust ``..._never_emits_github_token_value``.
 
     ``GITHUB_TOKEN`` is a canonical key that no bundle carries a value
     for post-v0.2.73 (the Rust value arm returns ``None``; the Python
@@ -439,8 +421,8 @@ def test_parity_user_secret_strip_shape_no_value_in_tree(tmp_path: Path) -> None
         json.dumps({"env": {"EXAMPLE_API_TOKEN": secret_value}})
     )
     # Real pre-fix shape: the Rust writer emitted user secrets under the
-    # section header inside the managed block (projects_v2.rs
-    # `build_claude_env_managed_block_with_user_secrets`); the rebuild
+    # section header inside the managed block (the retired Rust block
+    # builder); the rebuild
     # keys its canonical/user split off that header.
     (claude_dir / "env").write_text(
         f"{CLAUDE_ENV_MANAGED_BEGIN}\n"

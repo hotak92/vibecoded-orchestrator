@@ -407,13 +407,25 @@ tab says so above the table.
 | State | Meaning |
 |---|---|
 | **Running** | Declared in `settings.json`. The harness runs it on every matching event. |
-| **Disabled** | VCO removed its entry from `settings.json` and parked the exact entry in `project_hooks.disabled_entry_json`. It does not run; re-enabling restores it byte-for-byte, including its `timeout` / `background` keys and its position in the group. |
+| **Disabled** | VCO removed its entry from `settings.json` and parked the exact entry in `project_hooks.disabled_entry_json`. It does not run; re-enabling restores it byte-for-byte, including its `timeout` / `background` keys and its position in the group. A bundle update ("Update bundle", "Update all", `install-bundle --update`) keeps it out (v0.2.97). The parked entry lives in this machine's `launcher.db`, so the choice does not travel with a copied or cloned project: there, the next bundle update re-adds the hook. If `launcher.db` exists but cannot be read, the update re-adds no missing shipped hook and prints a warning instead. |
 | **Not in settings.json** | The launcher has a mirror row but the file does not declare the hook — someone removed it outside the launcher. It does not run, and there is nothing parked to restore, so the toggle is disabled. **Clear record** drops the stale row. |
 
 If `settings.json` is missing or unparseable, the tab refuses to edit
 it, shows why, and disables its controls. It never falls back to
 showing DB rows as though they described what runs — that fallback is
 exactly the bug above.
+
+A hook can be **parked and running at once**: bundle updates before
+v0.2.97 re-added hooks you had disabled, and putting the line back in
+`settings.json` by hand produces the same state. VCO does not remove
+the running entry for you — it cannot tell the two causes apart — so the
+bundle update records a `parked_hook_live_conflict` deferral naming each
+such hook. To keep one off, turn off the row that shows it Running. To
+keep it on, click Enable on its Disabled row (the hook is already
+registered, so nothing is added and the stale parked entry is dropped);
+if the tab shows no Disabled row for it, turn it off and on again. The
+deferral clears itself on the next update once no hook is both parked
+and running.
 
 #### How rows get there
 
@@ -546,7 +558,8 @@ The harness's `weaviate-kg` MCP server reads `KG_COLLECTION` and
 `SHARED_KG_COLLECTION` from its env (set in
 `<project>/.claude/settings.json` under `env` — the canonical
 channel). The launcher writes
-the binding row AND the per-project env via `write_project_env_files`,
+the binding row AND the per-project env via its env projection
+(`python -m vco_lib.config_projection apply`),
 so editing a binding row is normally accompanied by a launcher-
 driven env refresh. The `.vscode/settings.json`
 `claude-code.env` block is NOT used — it doesn't

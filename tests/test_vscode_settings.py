@@ -236,7 +236,7 @@ def test_the_result_names_the_base_url_it_wrote(settings_file: Path):
     assert env_block(settings_file)["ANTHROPIC_BASE_URL"] == other
     # Present on a refusal too — that is when knowing the target matters most.
     path = settings_file.parent / "broken.json"
-    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
     refused = vs.point_at_gateway(path, base_url=other, token=TOKEN)
     assert refused["ok"] is False and refused["base_url"] == other
 
@@ -287,10 +287,32 @@ def test_clear_default_is_a_no_op_when_there_is_none(settings_file: Path):
     assert settings_file.read_bytes() == before
 
 
-def test_clear_default_refuses_jsonc_byte_identical(tmp_path: Path):
+def test_clear_default_edits_jsonc_and_keeps_every_other_byte(tmp_path: Path):
+    """The launcher's "Clear default" on VS Code's own format (v0.2.97): the
+    one member is cut out of the TEXT — comments, CRLF and the rest survive."""
     path = tmp_path / "User" / "settings.json"
     path.parent.mkdir(parents=True)
-    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    head = (
+        "{\r\n    // my editor\r\n    \"editor.fontSize\": 13,\r\n"
+        f"    \"{vs.ENV_BLOCK_KEY}\": {{\r\n"
+        "        \"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:11436\", // gateway\r\n"
+    )
+    pin = f"        \"{vs.MODEL_KEY}\": \"claude-opus-5\",\r\n"
+    tail = "    },\r\n}\r\n"
+    path.write_bytes((head + pin + tail).encode("utf-8"))
+
+    result = vs.clear_default_model(path)
+
+    assert result["ok"] and result["status"] == "written"
+    assert result["cleared_value"] == "claude-opus-5"
+    assert path.read_bytes() == (head + tail).encode("utf-8"), "only the pin's line went"
+    assert Path(result["backup_path"]).read_bytes() == (head + pin + tail).encode("utf-8")
+
+
+def test_clear_default_refuses_an_invalid_file_byte_identical(tmp_path: Path):
+    path = tmp_path / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(NOT_JSONC, encoding="utf-8")
     before = path.read_bytes()
     result = vs.clear_default_model(path)
     assert result["ok"] is False and result["reason"] == "not_strict_json"
@@ -393,7 +415,8 @@ def test_slot_overrides_removed_only_when_asked(settings_file: Path):
 
 
 # ---------------------------------------------------------------------------
-# JSONC: refuse, byte-identically
+# JSONC: edited in place (v0.2.97); what cannot be read or verified is
+# refused, byte-identically
 # ---------------------------------------------------------------------------
 
 
@@ -410,20 +433,36 @@ JSONC_TRAILING_COMMA = """{
 }
 """
 
+#: Not JSON and not JSONC either: the object never closes.
+NOT_JSONC = """{
+    "editor.fontSize": 13,
+"""
 
-@pytest.mark.parametrize(
-    "body,hint",
-    [
-        (JSONC_WITH_COMMENT, "comments"),
-        (JSONC_TRAILING_COMMA, "trailing comma"),
-    ],
-)
-def test_jsonc_is_refused_and_the_file_is_byte_identical(
-    tmp_path: Path, body: str, hint: str,
-):
+
+@pytest.mark.parametrize("body", [JSONC_WITH_COMMENT, JSONC_TRAILING_COMMA])
+def test_jsonc_is_edited_and_every_other_byte_survives(tmp_path: Path, body: str):
+    """``point`` on VS Code's own format: the managed keys are ADDED after the
+    last member; everything before them — comment included — is untouched."""
     path = tmp_path / "User" / "settings.json"
     path.parent.mkdir(parents=True)
     path.write_text(body, encoding="utf-8")
+    last_value = body.index('"Default Dark+"') + len('"Default Dark+"')
+
+    result = vs.point_at_gateway(path, base_url=BASE_URL, token=TOKEN)
+
+    assert result["ok"] is True, result["message"]
+    after = path.read_text(encoding="utf-8")
+    assert after.startswith(body[:last_value]), "nothing before the edit moved"
+    assert after.endswith("\n}\n")
+    parsed = vs.jsonc_edit.loads(after)
+    assert parsed[vs.ENV_BLOCK_KEY]["ANTHROPIC_BASE_URL"] == BASE_URL
+    assert parsed["editor.fontSize"] == 13
+
+
+def test_an_invalid_file_is_refused_and_the_file_is_byte_identical(tmp_path: Path):
+    path = tmp_path / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(NOT_JSONC, encoding="utf-8")
     before = sha(path)
 
     result = vs.point_at_gateway(path, base_url=BASE_URL, token=TOKEN)
@@ -431,14 +470,36 @@ def test_jsonc_is_refused_and_the_file_is_byte_identical(
     assert result["ok"] is False
     assert result["status"] == "refused"
     assert result["reason"] == "not_strict_json"
-    assert hint in result["message"]
+    assert "not valid JSON or JSONC" in result["message"]
     assert sha(path) == before, "a refused write must not touch a single byte"
+
+
+def test_a_jsonc_edit_that_cannot_be_verified_writes_nothing(tmp_path: Path):
+    """A duplicate key: editing the first copy would leave the second one
+    governing. Refused with the reason, no write, no backup."""
+    path = tmp_path / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    body = (
+        "{\n    // dup below\n"
+        f"    \"{vs.ENV_BLOCK_KEY}\": {{\n"
+        "        \"ANTHROPIC_BASE_URL\": \"http://a\",\n"
+        "        \"ANTHROPIC_BASE_URL\": \"http://b\",\n"
+        "    },\n}\n"
+    )
+    path.write_text(body, encoding="utf-8")
+
+    result = vs.point_at_gateway(path, base_url=BASE_URL, token=TOKEN)
+
+    assert result["ok"] is False and result["reason"] == "jsonc_duplicate_key"
+    assert "JSONC" in result["message"] and "nothing was written" in result["message"]
+    assert path.read_text(encoding="utf-8") == body
+    assert not list(path.parent.glob("*.bak-*")), "not even a backup"
 
 
 def test_refusal_hands_back_a_pasteable_block(tmp_path: Path):
     path = tmp_path / "User" / "settings.json"
     path.parent.mkdir(parents=True)
-    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
 
     result = vs.point_at_gateway(path, base_url=BASE_URL, token=TOKEN)
     block = result["paste_block"]
@@ -454,7 +515,7 @@ def test_refusal_hands_back_a_pasteable_block(tmp_path: Path):
 def test_reset_refusal_names_the_two_keys_to_delete_by_hand(tmp_path: Path):
     path = tmp_path / "User" / "settings.json"
     path.parent.mkdir(parents=True)
-    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
     before = sha(path)
 
     result = vs.reset_native(path)
@@ -959,10 +1020,20 @@ def test_inspect_reports_a_pointed_panel(settings_file: Path):
     assert set(info["managed_keys_present"]) == set(vs.MANAGED_SETTINGS_KEYS)
 
 
-def test_inspect_reports_unparseable_without_guessing(tmp_path: Path):
+def test_inspect_reads_jsonc(tmp_path: Path):
+    """``panel_mode``'s reader: a commented file is read, not "unparseable"."""
     path = tmp_path / "User" / "settings.json"
     path.parent.mkdir(parents=True)
     path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    info = vs.inspect_target(path)
+    assert info["parseable"] is True
+    assert info["refusal_reason"] is None
+
+
+def test_inspect_reports_unparseable_without_guessing(tmp_path: Path):
+    path = tmp_path / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(NOT_JSONC, encoding="utf-8")
     info = vs.inspect_target(path)
     assert info["parseable"] is False
     assert info["points_at_vco_gateway"] is None, "unknown is not False"
@@ -1001,7 +1072,7 @@ def test_cli_point_takes_the_token_from_env_never_argv(settings_file: Path, caps
 def test_cli_point_exits_nonzero_on_refusal(tmp_path: Path, capsys, monkeypatch):
     path = tmp_path / "User" / "settings.json"
     path.parent.mkdir(parents=True)
-    path.write_text(JSONC_WITH_COMMENT, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
     monkeypatch.setenv(vs.ENV_TOKEN, TOKEN)
     rc = vs.main(["point", "--path", str(path), "--base-url", BASE_URL])
     assert rc == 1

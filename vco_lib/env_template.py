@@ -202,7 +202,7 @@ CLI entry point
 ~~~~~~~~~~~~~~~
 
 For Rust callers that subprocess into Python (mirrors the Phase 0.B
-Part 2 pattern for ``write_project_env_files``)::
+Part 2 pattern for the Rust env writer, retired v0.2.97)::
 
     python -m vco_lib.env_template apply --project-id <uuid> --project-folder <path>
     python -m vco_lib.env_template list-keys --json

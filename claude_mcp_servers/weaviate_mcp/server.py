@@ -3130,7 +3130,7 @@ SHARED_KG_READ_DISABLED = _resolve_shared_kg_read_disabled()
 # When set, hybrid_search also searches this collection automatically.
 # Auto-pairing convention: the launcher should set `KG_COLLECTION=Foo` AND
 # `DEVELOPMENT_COLLECTION=Foo_development` together. We do NOT auto-derive
-# here — `write_project_env_files` (Rust) and `_ensure_collections` (install.py)
+# here — `vco_lib.config_projection` and `_ensure_collections` (install.py)
 # are the canonical writers; the server just reads. semantic_graph_search
 # uses KG_COLLECTION only — docs have no WikiLinks so graph traversal can't
 # find useful neighbors there.
@@ -3347,7 +3347,7 @@ def _warn_if_shared_kg_class_missing() -> None:
 # searches across peer projects. Without these vars, the matrix was a
 # launcher-internal feature with no runtime effect.
 #
-# Format (set by `write_project_env_files` in Rust, in `.claude/env`
+# Format (set by `vco_lib.config_projection`, in `.claude/env`
 # AND `.claude/settings.json env` — PR-27 / v0.2.12 removed the historical
 # third surface `.vscode/settings.json claude-code.env` after sentinel
 # testing on `/proc/<mcp_pid>/environ` proved it does NOT propagate to

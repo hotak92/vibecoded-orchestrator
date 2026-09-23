@@ -348,7 +348,7 @@ describe('Remote Control disclosure (endpoint gate)', () => {
       makeInspection({ parseable: false, refusal_reason: 'not_strict_json' }),
     );
     expect(warnings.join(' ')).toContain('Remote Control');
-    expect(warnings.join(' ')).toContain('not strict JSON');
+    expect(warnings.join(' ')).toContain('not valid JSON or JSONC');
   });
 
   it('never promises compatibility or suggests a downgrade', () => {
@@ -518,7 +518,7 @@ describe('permission and parse warnings', () => {
     // just the JSONC one.
     expect(warnings).toHaveLength(2);
     expect(warnings[0]).toContain('Remote Control');
-    expect(warnings[1]).toContain('not strict JSON');
+    expect(warnings[1]).toContain('not valid JSON or JSONC');
     expect(warnings.join(' ')).not.toContain('CLAUDE_CODE_SUBAGENT_MODEL');
   });
 

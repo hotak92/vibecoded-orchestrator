@@ -214,8 +214,9 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
             missing = missing_count,
             probed = summary.probed_count,
             "[vct-hub] weaviate_probe: expected Weaviate classes are MISSING. \
-             Run `python -m vco_lib.weaviate_schema bootstrap-collections` (or click \
-             'Update Bundle' in the launcher GUI) to create them."
+             Run `python -m vco_lib.project_init bootstrap-collections --name \
+             <project>` for each affected project (or click 'Update Bundle' in \
+             the launcher GUI) to create them."
         );
     } else if summary.probed_count > 0 {
         tracing::info!(

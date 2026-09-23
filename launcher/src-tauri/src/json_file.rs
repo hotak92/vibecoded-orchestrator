@@ -159,6 +159,24 @@ pub fn read_json_or_empty(path: &Path) -> Result<serde_json::Value, String> {
     serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))
 }
 
+/// [`read_json_or_empty`], additionally refusing a root that is not an object.
+///
+/// The read every Rust read-modify-write of a user-owned settings file goes
+/// through (v0.2.97). A non-object root (array, string, number) is treated
+/// exactly like a parse failure: "replace the root with `{}`" destroys the
+/// user's content, and so did the env writers that used to do it on an
+/// unparseable `.claude/settings.json` — every hook and permission in it gone.
+pub fn read_object_or_empty(path: &Path) -> Result<serde_json::Value, String> {
+    let root = read_json_or_empty(path)?;
+    if !root.is_object() {
+        return Err(format!(
+            "{} does not contain a JSON object at its root; refusing to modify it",
+            path.display()
+        ));
+    }
+    Ok(root)
+}
+
 /// Serialize `value` and replace `path` atomically, honouring `policy` for
 /// the pre-write sidecar copy.
 pub fn atomic_write_json(
@@ -248,6 +266,27 @@ mod tests {
         assert!(err.contains("parse"), "unexpected error text: {}", err);
         // And the bytes are still there — the reader never rewrites.
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v0.2.97: the read every settings read-modify-write goes through
+    /// refuses a non-object root as firmly as a parse error, and still treats
+    /// absent / blank as `{}` (nothing there to lose).
+    #[test]
+    fn read_object_or_empty_refuses_non_objects_and_accepts_absent() {
+        let dir = tmp_dir("object");
+        let missing = dir.join("nope.json");
+        assert_eq!(read_object_or_empty(&missing).unwrap(), serde_json::json!({}));
+
+        for bad in ["{ not json", r#"["array"]"#, r#""string""#, "42"] {
+            let path = dir.join("settings.json");
+            fs::write(&path, bad).unwrap();
+            assert!(read_object_or_empty(&path).is_err(), "{:?} must be refused", bad);
+            assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+        }
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"hooks": {}}"#).unwrap();
+        assert_eq!(read_object_or_empty(&path).unwrap(), serde_json::json!({"hooks": {}}));
         fs::remove_dir_all(&dir).ok();
     }
 

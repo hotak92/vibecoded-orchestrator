@@ -14,21 +14,21 @@ Why this exists
 Pre-Phase-0, env values reached on-disk surfaces via FOUR independent
 paths:
 
-  * Rust ``write_project_env_files`` (the dominant writer; called during
-    project create/rename/refresh).
+  * The Rust env writer (the dominant writer until Phase 0.B Part 2;
+    retired in v0.2.97 — this module is now the only one).
   * Rust ``ensure_project_env_template`` (the ``.env`` template — sibling
     surface, NOT in scope for this contract; see Out of scope below).
   * Python ``install.py`` backfill helpers (removed v0.2.92 — superseded by the config-projection single writer) (``_backfill_kg_collection_env_in_project``
     and friends) that scribble missing canonical keys when ``install-bundle
     --update`` runs against an older project.
-  * Per-grant-change Tauri commands that called ``write_project_env_files``
+  * Per-grant-change Tauri commands that called the Rust env writer
     directly (e.g. ``kg_set_collection_access_mode``).
 
 Each path had its own opinion about what to write and how to merge. Bug-4
 of the install-flow architectural overhaul (PR-145, 2026-05-06) was
 specifically a wholesale-replace of the ``env`` sub-block in
 ``.claude/settings.json`` that silently dropped user-added keys. The
-fix was a deep-merge in ``write_project_env_files``, but other writers
+fix was a deep-merge in the Rust env writer, but other writers
 remained free to regress the same bug by accident — a CI lint had to be
 added retroactively.
 
@@ -102,7 +102,7 @@ For Rust callers that want the write surface in Python::
 
     python -m vco_lib.config_projection apply --project-id <uuid>
     python -m vco_lib.config_projection list-keys --json
-    python -m vco_lib.config_projection from-db --project-id <uuid> --json
+    python -m vco_lib.config_projection from-db --project-id <uuid>   # always JSON
 
 Out of scope
 ~~~~~~~~~~~~
@@ -176,8 +176,8 @@ Byte-identical output guarantee
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Running ``apply_project_env`` against a freshly-created project must
-produce output BYTE-IDENTICAL to what the Rust
-``write_project_env_files`` produces for the same input. This is the
+produce output BYTE-IDENTICAL to what the (since-retired, v0.2.97) Rust
+env writer produced for the same input. This is the
 regression-proof acceptance criterion of Phase 0.B and is tested by
 ``tests/test_config_projection_byte_identical.py`` (parity guard).
 Divergences caught by the parity test must be fixed by changing the
@@ -228,6 +228,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NotRequired, Optional, TypedDict
 
+from vco_lib import jsonc_edit, settings_refusal
 from vco_lib.atomic import atomic_write_text
 # v0.2.92 W18 — the tri-state probe result. Imported from `weaviate_helpers`
 # because that module is `vco_lib`'s dependency-free leaf (stdlib only), which
@@ -279,8 +280,8 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # The Rust ``CANONICAL_INSTALL_ENV_KEYS`` constant
     # (launcher/src-tauri/src/commands/projects_v2.rs L3087) does NOT
     # yet include this key — adding it there is a separate Rust-side PR.
-    # Until that lands, the Rust ``write_project_env_files`` path will
-    # NOT emit DIAGRAMS_COLLECTION (only this Python contract does).
+    # The Rust env writer never emitted DIAGRAMS_COLLECTION (it was
+    # retired in v0.2.97; only this Python contract writes the key).
     # That's deliberate: the Python ``vco_lib.config_projection apply``
     # CLI is the canonical writer per the Option-A interop strategy
     # documented at the top of this module; production callers that
@@ -405,8 +406,8 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "VCT_DIAGRAMS_ACCESS_LIST",
     "GITHUB_TOKEN",
     # A-8 (v0.2.73): KG_BASE_DIR — the project's folder path. Previously
-    # Rust-only (emitted "always" by the legacy ``write_project_env_files``
-    # SecretsPanel path) but ABSENT from this Python canonical set. Because
+    # Rust-only (emitted "always" by the legacy Rust env writer's
+    # SecretsPanel path, retired v0.2.97) but ABSENT from this Python canonical set. Because
     # the Python ``apply`` rebuilds the managed block from scratch and drops
     # keys not in this set, KG_BASE_DIR would appear after a secrets toggle
     # and VANISH on the next Python apply (create/rename/refresh) — a
@@ -1809,6 +1810,25 @@ class DbUnreachable(ConfigProjectionError):
     """Could not open the launcher DB (missing, perms, corrupt)."""
 
 
+class SettingsWriteRefused(ConfigProjectionError):
+    """A settings file exists but could not be edited safely, so it was left
+    byte-identical (v0.2.97, :mod:`vco_lib.settings_refusal`).
+
+    ``refusals`` names each file and why. Raised after every OTHER requested
+    surface was written, so one broken file never blocks the rest.
+    """
+
+    def __init__(self, refusals: Iterable["settings_refusal.Refusal"]) -> None:
+        self.refusals = list(refusals)
+        super().__init__(
+            "; ".join(r.sentence() for r in self.refusals)
+            + ". VCO never overwrites a settings file it cannot safely edit — "
+            "everything else in it would be lost. Repair the file (or move it "
+            "aside so a fresh one is created) and re-run; the project's "
+            "UPDATE_DEFERRED.md has the details."
+        )
+
+
 # ─── orchestrator-root fallback ─────────────────────────────────────────
 
 
@@ -2554,6 +2574,11 @@ _ALL_SURFACES: tuple[str, ...] = (
     _SURFACE_CLAUDE_ENV,
     _SURFACE_VSCODE_SETTINGS,
 )
+#: The JSON surfaces: ``surface -> (path relative to the project, env key)``.
+_JSON_SURFACE_FILES: dict[str, tuple[str, str]] = {
+    _SURFACE_CLAUDE_SETTINGS: (".claude/settings.json", "env"),
+    _SURFACE_VSCODE_SETTINGS: (".vscode/settings.json", "claude-code.env"),
+}
 
 
 # v0.2.84 D2 (P2) — env-repoint audit.
@@ -2580,17 +2605,14 @@ def _read_surface_canonical_value(
 
     Returns the string value under ``root[env_key][key]`` when present and
     a string; ``None`` when the file is missing / malformed / the key is
-    absent. Soft-fail throughout (audit reads never break a write).
+    absent. Soft-fail throughout (audit reads never break a write) — which
+    v0.2.97 made true: a non-UTF-8 file used to raise here, BEFORE any
+    surface was written. JSONC is read too (the same reader the writer uses).
     """
-    if not path.exists():
+    loaded = jsonc_edit.load_object(path) if path.exists() else None
+    if loaded is None:
         return None
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    block = parsed.get(env_key)
+    block = loaded[0].get(env_key)
     if not isinstance(block, dict):
         return None
     val = block.get(key)
@@ -2609,7 +2631,7 @@ def _read_managed_env_canonical_value(path: Path, key: str) -> Optional[str]:
         return None
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a non-UTF-8 file (v0.2.97)
         return None
     begin_idx = text.find(CLAUDE_ENV_MANAGED_BEGIN)
     if begin_idx == -1:
@@ -2685,7 +2707,7 @@ def apply_project_env(
         bundle: As returned by :func:`project_env_from_db`.
         surfaces: Sequence of surface names. Defaults to
             ``("claude_settings_json", "claude_env")`` — matching the
-            production Rust writer ``write_project_env_files`` after
+            former production Rust writer (retired v0.2.97) after
             PR-27 (v0.2.12, 2026-05-16) removed the historical
             ``.vscode/settings.json`` write. Pass
             ``("claude_settings_json", "claude_env", "vscode_settings_json")``
@@ -2713,6 +2735,10 @@ def apply_project_env(
             Other surfaces may have been written successfully before
             the failure — the function does NOT roll back across
             surfaces (each surface is independently atomic).
+        SettingsWriteRefused: a JSON surface exists but could not be
+            edited safely (v0.2.97). It is left byte-identical, the
+            refusal is recorded in the project's deferral ledger, and
+            every other requested surface is still written first.
     """
     if surfaces is None:
         surfaces_seq: tuple[str, ...] = _DEFAULT_SURFACES
@@ -2773,15 +2799,21 @@ def apply_project_env(
         us_strip_keys = list(user_secret_bundle["user_secret_known_keys"])
 
     report: dict[str, list[str]] = {}
+    refusals: list[settings_refusal.Refusal] = []
+    project_id = bundle.get("project_id")
 
     if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
         path = project_root / ".claude" / "settings.json"
-        keys = _write_json_env_block(
-            path, env, canonical_keys, env_key="env",
-            user_secret_pairs=us_pairs,
-            user_secret_strip_keys=us_strip_keys,
+        keys = _write_json_surface(
+            project_root, _SURFACE_CLAUDE_SETTINGS, refusals, project_id,
+            lambda: _write_json_env_block(
+                path, env, canonical_keys, env_key="env",
+                user_secret_pairs=us_pairs,
+                user_secret_strip_keys=us_strip_keys,
+            ),
         )
-        report[_SURFACE_CLAUDE_SETTINGS] = keys
+        if keys is not None:
+            report[_SURFACE_CLAUDE_SETTINGS] = keys
 
     if _SURFACE_CLAUDE_ENV in surfaces_seq:
         path = project_root / ".claude" / "env"
@@ -2796,13 +2828,17 @@ def apply_project_env(
         report[_SURFACE_CLAUDE_ENV] = keys
 
     if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
-        path = project_root / ".vscode" / "settings.json"
-        keys = _write_json_env_block(
-            path, env, canonical_keys, env_key="claude-code.env",
-            user_secret_pairs=us_pairs,
-            user_secret_strip_keys=us_strip_keys,
+        vscode_path = project_root / ".vscode" / "settings.json"
+        keys = _write_json_surface(
+            project_root, _SURFACE_VSCODE_SETTINGS, refusals, project_id,
+            lambda: _write_json_env_block(
+                vscode_path, env, canonical_keys, env_key="claude-code.env",
+                user_secret_pairs=us_pairs,
+                user_secret_strip_keys=us_strip_keys,
+            ),
         )
-        report[_SURFACE_VSCODE_SETTINGS] = keys
+        if keys is not None:
+            report[_SURFACE_VSCODE_SETTINGS] = keys
 
     # v0.2.84 D2 (P2): emit a `dev_collection_env_repointed` audit row for
     # each audited key whose existing on-disk value the write just changed
@@ -2810,6 +2846,8 @@ def apply_project_env(
     # audit reflects a completed repoint. Best-effort — never raises.
     _emit_repoint_audit_rows(project_root, old_repoint_values, env)
 
+    if refusals:
+        raise SettingsWriteRefused(refusals)
     return report
 
 
@@ -2834,7 +2872,7 @@ class ProjectReprojectOutcome(TypedDict):
 
     project_id: str
     project_name: str
-    status: str  # "migrated" | "failed" | "skipped"
+    status: str  # "migrated" | "failed" | "refused" | "skipped"
     detail: str
     keys_written: list[str]
 
@@ -2864,6 +2902,15 @@ def reproject_all_registered_projects(
     silently. A single project's failure never aborts the sweep — the
     remaining projects still migrate, and each failure gets its own
     deferral row + ``"failed"`` outcome.
+
+    v0.2.97 — a settings file the writer would not touch is NOT that
+    failure: :class:`SettingsWriteRefused` means the projection left an
+    unparseable / uneditable ``settings.json`` byte-identical and has ALREADY
+    recorded the accurate condition, ``settings_write_refused_<surface>``, in
+    THAT project's ledger. Such a project gets a ``"refused"`` outcome and no
+    ``codegraph_access_list_reprojection_failed`` entry, whose wording (a
+    code-graph migration failure, fixed by re-running ``reproject-all``)
+    would send the user after the wrong cause.
 
     Cleanup semantics: the migration IS the cleanup. Re-projecting a
     project OVERWRITES the stale slug-form ``VCT_CODE_GRAPH_ACCESS_LIST``
@@ -2932,6 +2979,16 @@ def reproject_all_registered_projects(
                     status="migrated",
                     detail="re-projected canonical env (name-based access list)",
                     keys_written=sorted(keys_written),
+                )
+            )
+        except SettingsWriteRefused as exc:
+            outcomes.append(
+                ProjectReprojectOutcome(
+                    project_id=pid,
+                    project_name=pname,
+                    status="refused",
+                    detail=str(exc),
+                    keys_written=[],
                 )
             )
         except Exception as exc:  # noqa: BLE001 — one project's failure never aborts the sweep
@@ -3025,6 +3082,8 @@ def apply_user_secrets(
     Raises:
         ConfigProjectionError: an unknown surface was passed, or the
             bundle carries a non-empty emit set (retired contract).
+        SettingsWriteRefused: a JSON surface could not be edited safely;
+            as :func:`apply_project_env`.
 
     Cross-OS: same atomic-write discipline as
     :func:`apply_project_env`. The tempfile lands in the target
@@ -3059,15 +3118,19 @@ def apply_user_secrets(
     # signal-to-remove path doesn't run for them — we drive STRIP
     # explicitly via the strip_keys argument.
     report: dict[str, dict[str, list[str]]] = {}
+    refusals: list[settings_refusal.Refusal] = []
+    project_id = secret_bundle.get("project_id")
 
     if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
         path = project_root / ".claude" / "settings.json"
-        _, stripped = _user_secret_apply_json(
-            path, strip_keys, env_key="env",
+        stripped = _write_json_surface(
+            project_root, _SURFACE_CLAUDE_SETTINGS, refusals, project_id,
+            lambda: _user_secret_apply_json(path, strip_keys, env_key="env")[1],
         )
-        report[_SURFACE_CLAUDE_SETTINGS] = {
-            "emitted": [], "stripped": stripped,
-        }
+        if stripped is not None:
+            report[_SURFACE_CLAUDE_SETTINGS] = {
+                "emitted": [], "stripped": stripped,
+            }
 
     if _SURFACE_CLAUDE_ENV in surfaces_seq:
         path = project_root / ".claude" / "env"
@@ -3081,14 +3144,20 @@ def apply_user_secrets(
         }
 
     if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
-        path = project_root / ".vscode" / "settings.json"
-        _, stripped = _user_secret_apply_json(
-            path, strip_keys, env_key="claude-code.env",
+        vscode_path = project_root / ".vscode" / "settings.json"
+        stripped = _write_json_surface(
+            project_root, _SURFACE_VSCODE_SETTINGS, refusals, project_id,
+            lambda: _user_secret_apply_json(
+                vscode_path, strip_keys, env_key="claude-code.env",
+            )[1],
         )
-        report[_SURFACE_VSCODE_SETTINGS] = {
-            "emitted": [], "stripped": stripped,
-        }
+        if stripped is not None:
+            report[_SURFACE_VSCODE_SETTINGS] = {
+                "emitted": [], "stripped": stripped,
+            }
 
+    if refusals:
+        raise SettingsWriteRefused(refusals)
     return report
 
 
@@ -3117,17 +3186,7 @@ def _user_secret_apply_json(
     parent.mkdir(parents=True, exist_ok=True)
 
     file_existed = path.exists()
-    existing_root: Any = {}
-    if file_existed:
-        try:
-            raw = path.read_text(encoding="utf-8")
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                existing_root = parsed
-            else:
-                existing_root = {}
-        except (OSError, json.JSONDecodeError):
-            existing_root = {}
+    existing_root, jsonc_text = _read_json_env_root(path)
 
     env_block_raw = existing_root.get(env_key)
     if not isinstance(env_block_raw, dict):
@@ -3143,8 +3202,7 @@ def _user_secret_apply_json(
 
     existing_root[env_key] = env_block
 
-    serialised = json.dumps(existing_root, indent=2, ensure_ascii=False)
-    _atomic_write_text(path, serialised)
+    _atomic_write_text(path, _serialise_json_env_root(path, existing_root, jsonc_text))
 
     stripped.sort()
     return file_existed, stripped
@@ -3237,12 +3295,19 @@ def _write_json_env_block(
 ) -> list[str]:
     """Write the canonical env into a JSON file's ``<env_key>`` sub-block.
 
-    Deep-merge contract (mirrors Rust's
-    ``merge_env_object_canonical_with_user_secrets``):
+    Deep-merge contract (inherited from the Rust writer's deep-merge,
+    retired v0.2.97):
 
       * Read the existing JSON (if present). Treat missing file as
-        ``{}``. Treat malformed JSON or non-object root as ``{}``
-        (matching the Rust fallback at projects_v2.rs lines 1881-1883).
+        ``{}``. A JSONC file (comments / trailing commas — VS Code's own
+        format for ``.vscode/settings.json``) is READ and later edited in
+        place, comments kept (v0.2.97, :mod:`vco_lib.jsonc_edit`). A file
+        that exists but is not JSONC either, is not UTF-8, cannot be read,
+        or has a non-object root is NEVER written:
+        :class:`SettingsWriteRefused` is raised and the file stays
+        byte-identical (v0.2.97, :mod:`vco_lib.settings_refusal`). Before
+        v0.2.97 each of those cases was treated as ``{}`` and rewritten as
+        only the env block — every other setting in it destroyed.
       * Locate the ``env_key`` sub-block. If missing or not an object,
         create a fresh object.
       * For each canonical key in ``canonical_keys``:
@@ -3262,13 +3327,16 @@ def _write_json_env_block(
           - EMIT last: ``user_secret_pairs`` are inserted after the
             canonical keys. A hypothetical KEY collision (which
             ``set_secret_v2`` prevents at the GUI layer) resolves
-            user-wins, matching the Rust ordering at
-            ``merge_env_object_canonical_with_user_secrets`` step 3.
+            user-wins, matching the retired Rust writer's ordering
+            (its step 3).
       * Non-canonical, non-user-secret keys (user-added by hand
         directly in the JSON) are PRESERVED untouched.
       * Write the result back with 2-space indent, no trailing newline,
         ``ensure_ascii=False`` (matching Rust's
-        ``serde_json::to_string_pretty`` byte layout).
+        ``serde_json::to_string_pretty`` byte layout) — for a strict-JSON
+        original. A JSONC original is edited member by member instead and
+        verified by re-parsing; an edit that cannot be verified writes
+        NOTHING and raises :class:`SettingsWriteRefused`.
 
     Returns the sorted list of canonical keys whose value was set
     (those that were deleted are not listed — the audit consumer wants
@@ -3286,22 +3354,7 @@ def _write_json_env_block(
     parent.mkdir(parents=True, exist_ok=True)
 
     # Read-merge-write.
-    existing_root: Any = {}
-    if path.exists():
-        try:
-            raw = path.read_text(encoding="utf-8")
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                existing_root = parsed
-            else:
-                # Non-object root (someone hand-edited it into an array
-                # or string) — reset to empty object, matching Rust's
-                # fallback at projects_v2.rs L1881-1883.
-                existing_root = {}
-        except (OSError, json.JSONDecodeError):
-            # Unreadable / malformed — start fresh. Matches Rust which
-            # logs a warning + falls back to {}.
-            existing_root = {}
+    existing_root, jsonc_text = _read_json_env_root(path)
 
     env_block_raw = existing_root.get(env_key)
     if not isinstance(env_block_raw, dict):
@@ -3310,8 +3363,7 @@ def _write_json_env_block(
         env_block = dict(env_block_raw)  # defensive copy
 
     # Phase 0.E step 1: STRIP paused / removed user-secret keys.
-    # Matches Rust's `merge_env_object_canonical_with_user_secrets`
-    # step 1: remove BEFORE canonical / emit so a buggy resolver
+    # Matches the retired Rust writer's deep-merge (its step 1): remove BEFORE canonical / emit so a buggy resolver
     # can't silently drop the active value.
     if user_secret_strip_keys:
         for k in user_secret_strip_keys:
@@ -3343,13 +3395,126 @@ def _write_json_env_block(
     # ``serde_json::to_string_pretty``. No trailing newline matches
     # Rust's ``std::fs::write(&path, pretty)`` where ``pretty`` has
     # no trailing newline (verified by reading projects_v2.rs L1896-1898).
-    serialised = json.dumps(
-        existing_root, indent=2, ensure_ascii=False
-    )
-    _atomic_write_text(path, serialised)
+    _atomic_write_text(path, _serialise_json_env_root(path, existing_root, jsonc_text))
 
     written_keys.sort()
     return written_keys
+
+
+def _read_json_env_root(path: Path) -> tuple[dict[str, Any], Optional[str]]:
+    """``(root, jsonc_text)`` for a JSON env surface — the ONE reader both
+    JSON writers use.
+
+    ``jsonc_text`` is the original text when the file is JSONC (valid only
+    with comments / trailing commas): the writer must then EDIT that text
+    (:func:`_serialise_json_env_root`), never re-serialise it. A missing
+    file is ``{}`` (the writer creates it). A file that exists but cannot be
+    read as an object raises :class:`SettingsWriteRefused` — it is never
+    treated as ``{}``, because writing ``{}`` plus the env block back is
+    exactly how every other setting in it used to be destroyed.
+    """
+    loaded = settings_refusal.load_for_edit(path)
+    if loaded is None:
+        return {}, None
+    if isinstance(loaded, settings_refusal.Refusal):
+        raise SettingsWriteRefused([loaded])
+    parsed, raw = loaded
+    return parsed, (None if jsonc_edit.is_strict_json(raw) else raw)
+
+
+def _serialise_json_env_root(
+    path: Path, root: Mapping[str, Any], jsonc_text: Optional[str],
+) -> str:
+    """The bytes to write.
+
+    Strict JSON (or a fresh file): the Rust-parity layout. JSONC: the
+    original text edited member by member and verified
+    (:func:`vco_lib.jsonc_edit.rewrite_preserving`); an edit that cannot be
+    verified raises :class:`SettingsWriteRefused` and the file is left
+    exactly as it was.
+    """
+    if jsonc_text is None:
+        return json.dumps(root, indent=2, ensure_ascii=False)
+    try:
+        return jsonc_edit.rewrite_preserving(jsonc_text, root)
+    except jsonc_edit.JsoncEditRefused as exc:
+        raise SettingsWriteRefused([settings_refusal.Refusal(
+            path, settings_refusal.KIND_EDIT_REFUSED,
+            "it has comments or trailing commas (JSONC) and this change could "
+            f"not be made in place without risking other content ({exc.message}); "
+            "edit it by hand, or remove the comments",
+        )]) from exc
+
+
+def _write_json_surface(
+    project_root: Path,
+    surface: str,
+    refusals: list["settings_refusal.Refusal"],
+    project_id: Optional[str],
+    write: Any,
+) -> Any:
+    """Run one JSON surface's ``write()``; a refusal is recorded, not raised.
+
+    The caller raises :class:`SettingsWriteRefused` once every requested
+    surface has had its turn, so one unreadable file never blocks the
+    others. A refusal is left in the project's deferral ledger
+    (:func:`vco_lib.settings_refusal.record`); a successful write clears a
+    refusal recorded for the same surface earlier. Returns ``write()``'s
+    result, or ``None`` when the surface was refused.
+    """
+    try:
+        result = write()
+    except SettingsWriteRefused as exc:
+        for refusal in exc.refusals:
+            settings_refusal.record(project_root, surface, refusal, project_id=project_id)
+        refusals.extend(exc.refusals)
+        return None
+    settings_refusal.clear_recorded(project_root, surface)
+    return result
+
+
+def write_env_block(
+    project_folder: Path,
+    surface: str,
+    values: Mapping[str, str],
+    owned_keys: Iterable[str],
+) -> list[str]:
+    """Set ``values`` in one JSON surface's env block; remove every other
+    ``owned_keys`` member; leave all other keys (and, for JSONC, bytes) alone.
+
+    The ONE implementation of a surgical env-block edit, for writers that own
+    a key set outside the canonical projection — the launcher's module-
+    deprecation keys (``module_deprecation.rs`` calls it through the
+    ``write-env-block`` CLI instead of carrying a second, Rust, copy). Same
+    read-merge-write, JSONC handling and refusal as :func:`apply_project_env`.
+
+    Raises:
+        ConfigProjectionError: an unknown surface, a value that is not a
+            string, or a key in ``values`` that ``owned_keys`` does not own.
+        SettingsWriteRefused: the file exists but cannot be edited safely;
+            it was left byte-identical and the refusal recorded.
+    """
+    if surface not in _JSON_SURFACE_FILES:
+        raise ConfigProjectionError(
+            f"unknown JSON surface {surface!r}; valid: {sorted(_JSON_SURFACE_FILES)}"
+        )
+    owned = set(owned_keys)
+    stray = sorted(set(values) - owned)
+    if stray:
+        raise ConfigProjectionError(f"keys not in owned_keys: {stray}")
+    if not all(isinstance(v, str) for v in values.values()):
+        raise ConfigProjectionError("every value must be a string")
+    rel, env_key = _JSON_SURFACE_FILES[surface]
+    refusals: list[settings_refusal.Refusal] = []
+    written = _write_json_surface(
+        project_folder, surface, refusals, None,
+        lambda: _write_json_env_block(
+            project_folder / rel, values, owned, env_key=env_key,
+        ),
+    )
+    if refusals:
+        raise SettingsWriteRefused(refusals)
+    return written
 
 
 def _write_shell_env_managed_block(
@@ -3361,8 +3526,8 @@ def _write_shell_env_managed_block(
 ) -> list[str]:
     """Write the canonical env between bracket markers in ``.claude/env``.
 
-    Behaviour (mirrors Rust's
-    ``merge_claude_env_managed_block`` + ``build_claude_env_managed_block``):
+    Behaviour (the splice mirrors Rust's ``merge_claude_env_managed_block``,
+    still used by the launcher's unregister strip):
 
       * If the file doesn't exist: create it with just the managed block.
       * If the file exists and contains :data:`CLAUDE_ENV_MANAGED_BEGIN`:
@@ -3381,7 +3546,7 @@ def _write_shell_env_managed_block(
     the user-secret exports land AFTER the canonical block, preceded
     by a blank line + ``# user secrets (per-project; managed via
     launcher GUI Secrets panel)`` section header — byte-identical to
-    Rust's ``build_claude_env_managed_block_with_user_secrets``.
+    the retired Rust block builder's output (v0.2.97).
 
     STRIP for ``.claude/env`` is IMPLICIT: the entire BEGIN/END block
     is replaced on every write, so a paused / removed user secret
@@ -3427,8 +3592,7 @@ def _build_managed_block(
 ) -> str:
     """Render the managed block for ``.claude/env``.
 
-    Format (byte-identical to Rust's
-    ``build_claude_env_managed_block_with_user_secrets``):
+    Format (byte-identical to the retired Rust block builder's output):
 
       ``# vco-managed-begin\\n``
       ``<header comments — 11 lines>\\n``
@@ -3448,7 +3612,7 @@ def _build_managed_block(
     Phase 0.E (2026-05-25): user-secret exports land BETWEEN the
     canonical block and the END marker, preceded by a blank line +
     section header for diff readability. This block is byte-identical
-    to Rust's ``build_claude_env_managed_block_with_user_secrets``.
+    to the retired Rust block builder's output.
     Paused / removed secrets are simply absent from this list (the
     BEGIN/END replace strips them implicitly).
     """
@@ -3494,9 +3658,8 @@ def _build_managed_block(
     # is the authority and reconciles a hand-set value away) and an
     # operator-override DEBUG knob (where the person who exported it is).
     #
-    # This section is the one deliberate divergence from Rust's
-    # `build_claude_env_managed_block_with_user_secrets`: the Rust writer has
-    # no defaulted form, and does not need one — the Python `apply` CLI is
+    # This section was the one deliberate divergence from the retired Rust
+    # block builder: the Rust writer had no defaulted form, and did not need one — the Python `apply` CLI is
     # the canonical writer for these keys (the Option-A interop strategy at
     # the top of this module), exactly as it already is for DUAL_* / the
     # code-graph floors / the RL globals.
@@ -3622,6 +3785,9 @@ def _cli_apply(args: argparse.Namespace) -> int:
         surfaces = tuple(args.surfaces.split(","))
     try:
         report = apply_project_env(bundle, surfaces=surfaces)
+    except SettingsWriteRefused as exc:
+        print(json.dumps(_refused_payload(exc)), file=sys.stderr)
+        return 4
     except ConfigProjectionError as exc:
         print(json.dumps({"error": "apply_failed", "message": str(exc)}),
               file=sys.stderr)
@@ -3629,6 +3795,47 @@ def _cli_apply(args: argparse.Namespace) -> int:
 
     print(json.dumps({"ok": True, "report": report, "project_id": args.project_id,
                       "project_root": str(bundle["project_root"])}))
+    return 0
+
+
+def _refused_payload(exc: SettingsWriteRefused) -> dict[str, Any]:
+    """The machine form of a refusal, shared by every CLI verb that writes."""
+    return {
+        "error": "settings_write_refused",
+        "message": str(exc),
+        "refused": [r.as_json() for r in exc.refusals],
+    }
+
+
+def _cli_write_env_block(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection write-env-block``.
+
+    stdin: ``{"set": {KEY: "value", ...}, "owned_keys": [KEY, ...]}``. stdout
+    carries exactly ONE JSON object on every path (``ok`` true/false), which
+    is what the launcher parses. Exit codes: 0 written, 2 bad request,
+    4 refused or failed (a refused file is left byte-identical).
+    """
+    try:
+        request = json.loads(sys.stdin.read() or "{}")
+        values = request.get("set", {}) if isinstance(request, dict) else None
+        owned = request.get("owned_keys", []) if isinstance(request, dict) else None
+        if not isinstance(values, dict) or not isinstance(owned, list):
+            raise ConfigProjectionError(
+                'stdin must be {"set": {...}, "owned_keys": [...]}'
+            )
+        written = write_env_block(
+            Path(args.project_folder), args.surface, values, owned,
+        )
+    except SettingsWriteRefused as exc:
+        print(json.dumps({"ok": False, **_refused_payload(exc)}))
+        return 4
+    except (ConfigProjectionError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": "bad_request", "message": str(exc)}))
+        return 2
+    except OSError as exc:
+        print(json.dumps({"ok": False, "error": "write_failed", "message": str(exc)}))
+        return 4
+    print(json.dumps({"ok": True, "surface": args.surface, "written": written}))
     return 0
 
 
@@ -3706,6 +3913,9 @@ def _cli_apply_user_secrets(args: argparse.Namespace) -> int:
 
     try:
         report = apply_user_secrets(secret_bundle, surfaces=surfaces)
+    except SettingsWriteRefused as exc:
+        print(json.dumps(_refused_payload(exc)), file=sys.stderr)
+        return 4
     except ConfigProjectionError as exc:
         print(
             json.dumps({"error": "apply_failed", "message": str(exc)}),
@@ -3826,10 +4036,12 @@ def _cli_reproject_all(args: argparse.Namespace) -> int:
 
     migrated = [o for o in outcomes if o["status"] == "migrated"]
     failed = [o for o in outcomes if o["status"] == "failed"]
+    refused = [o for o in outcomes if o["status"] == "refused"]
     summary = {
         "total": len(outcomes),
         "migrated": len(migrated),
         "failed": len(failed),
+        "refused": len(refused),
         "outcomes": outcomes,
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -3934,7 +4146,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_reproj.set_defaults(handler=_cli_reproject_all)
 
+    # v0.2.97: the ONE surgical env-block editor for launcher writers that
+    # own a key set outside the canonical projection (module deprecation).
+    p_block = sub.add_parser(
+        "write-env-block",
+        help="set/strip owned keys in one JSON surface's env block "
+             "(request JSON on stdin; refuses a file it cannot safely edit)",
+    )
+    p_block.add_argument("--project-folder", required=True)
+    p_block.add_argument(
+        "--surface", default=_SURFACE_CLAUDE_SETTINGS,
+        choices=sorted(_JSON_SURFACE_FILES),
+    )
+    p_block.set_defaults(handler=_cli_write_env_block)
+
     return p
+
+
+def build_apply_argv(
+    python: str,
+    project_id: str,
+    *,
+    db_path: Path | str | None = None,
+    orchestrator_root: Path | str | None = None,
+) -> list[str]:
+    """The ``apply`` verb's argv, built next to the parser that must accept it.
+
+    The ONE Python-side builder (v0.2.97): the project mover and the
+    collection rename each hand-built this argv with a ``--folder`` flag the
+    verb has never had, so argparse exited 2 and every post-move / post-rename
+    env re-projection failed. The project root is not an input: ``apply``
+    re-derives it from the launcher DB row, which is the point of calling it
+    after a flip. The Rust twin is ``build_config_projection_apply_args`` in
+    ``launcher/src-tauri/src/commands/projects_v2.rs``; both are parsed by
+    this module's real parser in ``tests/test_v0297_vco_lib_argv_contract.py``.
+    """
+    argv = [python, "-m", "vco_lib.config_projection", "apply",
+            "--project-id", project_id]
+    if db_path is not None:
+        argv += ["--db-path", str(db_path)]
+    if orchestrator_root is not None:
+        argv += ["--orchestrator-root", str(orchestrator_root)]
+    return argv
 
 
 
@@ -3970,10 +4223,14 @@ def run_update_reprojection_step(
         return
     migrated = sum(1 for o in outcomes if o["status"] == "migrated")
     failed = sum(1 for o in outcomes if o["status"] == "failed")
+    refused = sum(1 for o in outcomes if o["status"] == "refused")
     if outcomes:
         msg = f"  Access-list re-projection: {migrated} project(s) re-projected"
         if failed:
             msg += f", {failed} deferred (see UPDATE_DEFERRED.md)"
+        if refused:
+            msg += (f", {refused} with a settings file left untouched (see that "
+                    "project's own UPDATE_DEFERRED.md)")
         try:
             print_fn(msg)
         except Exception:
@@ -3983,7 +4240,7 @@ def run_update_reprojection_step(
             log_event(
                 "9/10", "info",
                 "reproject_all_registered_projects "
-                f"migrated={migrated} failed={failed}",
+                f"migrated={migrated} failed={failed} refused={refused}",
             )
         except Exception:
             pass
@@ -4008,12 +4265,15 @@ __all__ = [
     "ProjectNotFound",
     "UserSecretBundle",
     "ProjectReprojectOutcome",
+    "SettingsWriteRefused",
     "apply_project_env",
     "apply_user_secrets",
+    "build_apply_argv",
     "list_canonical_keys",
     "list_registered_projects",
     "project_env_from_db",
     "reproject_all_registered_projects",
     "resolve_project_folder",
     "user_secret_known_keys_from_db",
+    "write_env_block",
 ]

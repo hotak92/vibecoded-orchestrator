@@ -7,6 +7,9 @@ Routes (each also served with a trailing slash — see :func:`_add_route`)::
     GET  /health                    liveness; no auth, no blocking work
     GET  /usage                     per-chat token accounting, newest row per
                                     chat (``?session=<id>`` filters to one)
+    GET  /usage/windows             subscription usage windows per vendor,
+                                    from cache (``?format=line`` = one line of
+                                    text; :mod:`model_router.usage_windows`)
     GET  /v1/models                 union catalog
     POST /v1/messages               proxied, streaming or not
     POST /v1/messages/count_tokens  proxied
@@ -147,6 +150,8 @@ from .quota import (
 )
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
+from .source_identity import source_sha as _package_source_sha
+from .usage_windows import UsageWindows, render_line, session_fetcher
 from .usage import (
     UsageAccumulator,
     UsageLedger,
@@ -179,6 +184,15 @@ from .vendors import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Digest of the package source THIS process was started from, taken once at
+#: import (``model_router.source_identity``). Reported on ``/health`` so the
+#: host can PROVE whether a running gateway is behind its checkout after an
+#: update rewrote the editable install underneath it
+#: (``vco_lib.gateway_freshness``). Computed here, not per request: hashing the
+#: files at request time would hash the NEW files and report a stale daemon as
+#: current, which is the one answer this exists to never give.
+SOURCE_SHA: Optional[str] = _package_source_sha(Path(__file__).resolve().parent)
 
 #: Request headers never forwarded upstream. ``authorization`` / ``x-api-key``
 #: are dropped because the client presents the LOCAL host token there, and
@@ -474,6 +488,18 @@ class Gateway:
             live_ttl_s=config.catalog_ttl_s,
             static_ttl_s=config.static_retry_ttl_s,
         )
+        #: Subscription usage windows (``/usage/windows``). Its secrets come
+        #: through THIS gateway's reader and resolver — no second resolver —
+        #: and its fetches run in a background task a read schedules, never
+        #: on a request path. See :mod:`model_router.usage_windows`.
+        self.usage_windows = UsageWindows(
+            anthropic_upstream=anthropic.upstream,
+            vendors=vendors,
+            oauth_token=lambda: self.oauth.read().token,
+            vendor_key=self._catalog_vendor_key,
+            fetch=session_fetcher(lambda: self.session),
+            ledger_path=lambda: self.usage.path,
+        )
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -487,6 +513,8 @@ class Gateway:
         # context monitor cares most about. Bounded by the number of requests
         # still in flight, which at shutdown is none or nearly none.
         await self.usage.drain()
+        # Before the session closes: an in-flight usage refresh holds it.
+        await self.usage_windows.stop()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -754,7 +782,13 @@ async def health_handler(request: web.Request) -> web.Response:
     Emitted fields — this list and the code below are kept in step by
     ``test_health_reports_exactly_the_documented_fields``:
 
-    ``ok`` (bool), ``service``, ``version``, ``port``, ``host``,
+    ``ok`` (bool), ``service``, ``version``,
+    ``source_sha`` (sha256 of the package source this process was started
+    from, hashed once at import by ``model_router.source_identity``; ``null``
+    when it could not be read, which callers treat as unknown. Its PRESENCE is
+    itself evidence: every daemon since it was added emits the key, so a
+    ``/health`` without it is positively an older daemon),
+    ``port``, ``host``,
     ``catalog_source`` (family -> ``live``/``static``/``declared``/
     ``unfetched``/``unavailable``),
     ``catalog_filter`` (``latest``/``all`` — which versions of a family reach
@@ -816,6 +850,8 @@ async def health_handler(request: web.Request) -> web.Response:
             # the same constant to tell this daemon from any other listener.
             "service": SERVICE_NAME,
             "version": __version__,
+            # Taken at import, never recomputed: see SOURCE_SHA.
+            "source_sha": SOURCE_SHA,
             "port": gateway.config.port,
             "host": gateway.config.host,
             "catalog_source": gateway.catalog.sources(),
@@ -902,6 +938,31 @@ async def usage_handler(request: web.Request) -> web.Response:
             "rows_written": ledger.rows_written,
         }
     )
+
+
+async def usage_windows_handler(request: web.Request) -> web.Response:
+    """Subscription usage windows per vendor, from the gateway's cache.
+
+    JSON by default (:meth:`model_router.usage_windows.UsageWindows.snapshot`);
+    ``?format=line`` answers ``text/plain`` with the ONE rendering the
+    status-line scripts print verbatim (empty when nothing is known yet).
+
+    Host-token authorised and loopback-only like ``/usage``: it names the
+    user's subscription plan and consumption. Answers from MEMORY: a read that
+    finds the cache due schedules one background refresh and returns what is
+    cached now, so this route can never wait on a vendor.
+    """
+    gateway: Gateway = request.app[APP_KEY]
+    started = time.monotonic()
+    if not gateway.authorised(request):
+        _log_unauthorised(gateway, request, started=started)
+        return _unauthorised()
+    windows = gateway.usage_windows
+    windows.request_refresh()
+    snapshot = windows.snapshot()
+    if request.query.get("format") == "line":
+        return web.Response(text=render_line(snapshot), content_type="text/plain")
+    return web.json_response(snapshot)
 
 
 async def models_handler(request: web.Request) -> web.Response:
@@ -1969,6 +2030,15 @@ async def _proxy(
                 )
 
             relay = gateway.relay_headers(upstream)
+            if decision.is_anthropic:
+                # Passive read of the unified rate-limit headers the answer
+                # already carries: a dict parse, no I/O, guarded like every
+                # other optional pass so it can never cost the request.
+                _guarded(
+                    gateway.usage_windows.observe_anthropic_headers,
+                    upstream.headers,
+                    what="usage-window header capture",
+                )
             content_type = upstream.headers.get("Content-Type", "application/json")
             is_stream = _STREAM_CHUNK_HINT in content_type
 
@@ -2564,7 +2634,7 @@ async def not_found_handler(request: web.Request) -> web.Response:
         404,
         "not_found_error",
         f"the model gateway has no route for {request.path!r}. It serves "
-        "/health, /usage, /v1/models, /v1/messages and "
+        "/health, /usage, /usage/windows, /v1/models, /v1/messages and "
         "/v1/messages/count_tokens.",
     )
 
@@ -2597,6 +2667,9 @@ def create_app(
 
     _add_route(app, "GET", "/health", health_handler, name="health")
     _add_route(app, "GET", "/usage", usage_handler, name="usage")
+    _add_route(
+        app, "GET", "/usage/windows", usage_windows_handler, name="usage_windows",
+    )
     _add_route(app, "HEAD", "/api/hello", hello_handler, name="hello_head")
     _add_route(app, "GET", "/api/hello", hello_handler, name="hello_get")
     _add_route(app, "GET", "/v1/models", models_handler, name="models")
@@ -2633,4 +2706,5 @@ __all__ = [
     "create_app",
     "loopback_only_middleware",
     "usage_handler",
+    "usage_windows_handler",
 ]

@@ -85,8 +85,8 @@ VCT_TELEMETRY
 | Config | Lives in | Scope | Managed by |
 |---|---|---|---|
 | Effort level, max tokens, OS-level denies | `~/.claude/settings.json` | global | you, manually |
-| MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's `write_project_env_files` |
-| MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's `write_project_env_files` |
+| MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's env projection (`python -m vco_lib.config_projection apply`) |
+| MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's env projection (`python -m vco_lib.config_projection apply`) |
 | VS Code editor preferences (Pylance excludes, formatOnSave, etc.) | `.vscode/settings.json` | per-project | launcher's Python `_backfill_vscode_excludes_in_project` + you |
 | VS Code `folderOpen` task that ensures `vct-hub` is running | `.vscode/tasks.json` | per-project | install.py Step 8 / `update_project_v2` bundle update |
 | Shell/script env | `.env` | per-project | you, `.env.example` template |
@@ -113,7 +113,7 @@ If you see any of these in your global `~/.claude/settings.json`, move them to t
 Per-project env vars (KG / codegraph / embedding selections, service URLs) flow through a fixed 5-level precedence chain. Higher levels override lower ones; consumers (MCP subprocesses, hooks, install.py, the launcher) all resolve through this chain so the active workspace's identity is consistent:
 
 1. **vct-hub resolved values** (highest precedence). When the hub is running on `http://127.0.0.1:7700` (port configurable via `VCT_HUB_PORT`), MCP startup queries `GET /api/v1/projects/{id}/config` and uses the hub's resolved per-project record from `launcher.db`.
-2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's `write_project_env_files`, read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
+2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's env projection (`python -m vco_lib.config_projection apply`), read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
 3. **`.claude/env`** (POSIX shell-sourceable). Same keys as #2; used by CLI users sourcing it from a shell rc via the `tools/claude` wrapper.
 4. **`~/.claude.json` `mcpServers.<name>.env`**. The launcher intentionally restricts this surface to machine-invariant keys (e.g. `WEAVIATE_URL`); per-project keys like `KG_COLLECTION` are dropped here. See `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`.
 5. **Bundled defaults** baked into `claude_mcp_servers/weaviate_mcp/server.py` (lowest precedence). Reaching this layer is logged at WARNING level. Explicit empty-string env values for `KG_COLLECTION` are coerced to the default rather than used literally.
@@ -149,7 +149,7 @@ There is deliberately no per-project instance override. `project_kg_bindings` ca
 
 ## Knowledge graph env vars
 
-The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's `write_project_env_files` writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux).
+The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's env projection (`python -m vco_lib.config_projection apply`) writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux).
 
 | Var | Default | What it does |
 |---|---|---|
@@ -204,7 +204,7 @@ Secrets never live in env files or JSON configs. They live in the OS keychain (m
 **Resolver flow** (subprocess perspective):
 
 1. Wrapper script (`search_mcp/wrapper.sh` or equivalent) runs.
-2. Wrapper checks `$GITHUB_TOKEN` — if already exported (launcher's `write_project_env_files` populates it from the keychain on project registration), use it directly.
+2. Wrapper checks `$GITHUB_TOKEN` — if already exported in its environment (by you, or by `vct exec --secret github_pat=GITHUB_TOKEN`), use it directly. The launcher never writes secret values into project files (v0.2.73), so this is not populated for you.
 3. Otherwise call `vct_secrets_resolve.sh <project_path> github_pat` → hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`.
 4. Hub resolves via SENTINEL_SHARED + `module_id=user`, applies the cross-launcher active-flag gate, returns the secret.
 5. Wrapper exports the value and `exec`s the real MCP server binary.
@@ -384,6 +384,23 @@ ensure-containers: VCT_CONTAINER_RUNTIME=podman is set but `podman info` failed 
 
 Your three ways out, in the order the message lists them: **start the pinned runtime** (usual fix — `podman machine start`, `systemctl --user start podman.socket`, launch Docker Desktop); **unset `VCT_CONTAINER_RUNTIME`** to return to auto-probe; or **repin** to the runtime the message named as usable — knowing that its volumes are a different data plane, so an existing KG on the other runtime will not be there.
 
+### Volume source overrides (v0.2.97)
+
+`infrastructure/docker-compose.yml` mounts three named volumes — `weaviate_data` → `vco_weaviate_data`, `ollama_data` → `vco_ollama_data`, `code_embed_cache` → `vco_code_embed_cache`. A machine whose services were first stood up with **bind mounts** (for example an Ollama model directory at a host path shared with other containers) could not adopt that file without copying the data — and a blind `--force-recreate` from it silently re-pointed the service at an **empty** default volume, orphaning the data without deleting it. Each volume source is therefore env-overridable (the `VCT_CODE_EMBED_BUILD_CONTEXT` pattern), two knobs per service:
+
+| Var | Default | What it does |
+|---|---|---|
+| `VCT_WEAVIATE_DATA_SOURCE` | `weaviate_data` | The weaviate service's mount source. Set it to a **host path** (`/`, `./` or `~` prefix) to make the mount a bind at that path. |
+| `VCT_WEAVIATE_VOLUME_NAME` | `vco_weaviate_data` | The resolved name of the `weaviate_data` volume. Set it to an **existing volume name** to reuse that volume. |
+| `VCT_OLLAMA_DATA_SOURCE` | `ollama_data` | Same, for the ollama service's `/root/.ollama` mount. |
+| `VCT_OLLAMA_VOLUME_NAME` | `vco_ollama_data` | Same resolved-name knob for `ollama_data`. |
+| `VCT_CODE_EMBED_CACHE_SOURCE` | `code_embed_cache` | Same, for the code_embed service's `/cache` mount. |
+| `VCT_CODE_EMBED_VOLUME_NAME` | `vco_code_embed_cache` | Same resolved-name knob for `code_embed_cache`. |
+
+Why two knobs and not one: compose classifies a short-syntax source as a **bind** when it starts with `/`, `./` or `~`, and as a **named volume** otherwise — and a named volume that is not declared under top-level `volumes:` is a hard error (`service refers to undefined volume`, docker compose v2; podman-compose likewise fails to parse). So "an existing volume name" can only enter through the declared volume's `name:` field. Both runtimes honour `${VAR:-default}` in both positions (verified on docker compose v2.40.3 and podman-compose 1.5.0 via side-effect-free `config` renders, 2026-09-23).
+
+Set them in `infrastructure/.env` — compose auto-reads it from the project directory, VCO's own compose reader (`vco_lib/service_adoption.py`) merges it too, and the installer preserves unmanaged lines there on re-runs — or export them in the shell that drives compose. Nothing set → the exact pre-v0.2.97 behaviour. On SELinux-enforcing hosts, remember a swapped-in bind source needs the `:Z` flag — see [SELinux: bind-mount layouts need a `:Z` flag](TROUBLESHOOTING.md) in the troubleshooting guide.
+
 ## MCP Servers
 
 MCP servers are registered in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`).
@@ -479,11 +496,32 @@ Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.
 
 The local model-gateway daemon (`claude_mcp_servers/model_router/`, default port `11436`) is started, stopped and boot-registered by the launcher (Services page). Every knob below is optional and read at daemon startup by `model_router/config.py`; a healthy install needs none of them.
 
-The daemon serves `/health` (unauthenticated liveness), `/usage`, `/v1/models`, `/v1/messages` and
+The daemon serves `/health` (unauthenticated liveness), `/usage`, `/usage/windows`, `/v1/models`, `/v1/messages` and
 `/v1/messages/count_tokens`; all but `/health` require the host token and every route is loopback-only.
 `/usage` returns the newest token-accounting row per chat (`?session=<id>` for one of them); the rows are
 appended to `<vct-state-dir>/metrics/gateway-usage.jsonl`, whose path and counters also appear as
 `usage_ledger` in `/health`. The ledger is for CONTEXT management, not cost — no price is recorded anywhere.
+
+**Subscription usage — `/usage/windows`.** With the panel on the gateway, Claude Code's Account & Usage view shows a
+dollar figure priced at API rates, which means nothing on a subscription. `/usage/windows` (host token, loopback)
+answers the subscriptions' own windows instead: Claude's 5-hour, weekly and per-model weekly (e.g. Fable) windows
+from `api.anthropic.com/api/oauth/usage` under your Claude login plus the `anthropic-ratelimit-unified-*` headers on
+every relayed answer; Z.ai's 5-hour and weekly windows from its monitor endpoint (`quota_url` in
+`model_router/vendors.py`); and, for QwenCloud — whose Token Plan publishes no quota anywhere — the tokens this
+gateway relayed for it since the start of the month, labelled as tokens, never as a percentage. All the vendor
+sources are undocumented: anything missing, unreadable, older than 30 minutes or past its own reset reads `null`
+("unknown") with the reason, never 0 % or 100 %. The answer comes from the gateway's cache; a read that finds it due
+(every 4–5 minutes, jittered) starts one background refresh, so nothing is fetched while nobody is looking and no
+request ever waits on a vendor. `?format=line` answers one line of text — what the status-line script prints — and
+the launcher's home page shows the same data as bars with reset countdowns.
+
+**Status line.** `.claude/scripts/gateway-usage-statusline.sh` (`.ps1` on Windows) prints that line for Claude Code's
+`statusLine`, e.g. `Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72% │ Qwen 1.2M tok/mo`, and prints
+nothing at all when the gateway is not running or refuses it. VCO does not add it to your settings — a project-level
+`statusLine` would override one you set in `~/.claude/settings.json` — so enable it yourself:
+`"statusLine": {"type": "command", "command": "bash .claude/scripts/gateway-usage-statusline.sh"}` (Windows:
+`"pwsh -NoProfile -File .claude/scripts/gateway-usage-statusline.ps1"`). The status line is drawn by the terminal
+client (`claude`); the VS Code panel does not render `statusLine`.
 
 **Panel mode — `remote-control` vs `multimodel`.** The launcher's status-bar pills (CLI: `python -m vco_lib.vscode_settings mode --set {multimodel,remote-control} --path <settings.json>`) flip the VS Code Claude Code panel between two states, one at a time — `claudeCode.environmentVariables` is VS Code machine-scope, so there is no per-workspace split. **`remote-control` is the stock client**: the four routing keys and the login-prompt key are removed, the panel talks to api.anthropic.com again, and the `/model` picker, the context-window sizing and the token accounting are all Claude Code's own. VCO writes none of `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_DISABLE_1M_CONTEXT` or `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in *either* mode — that absence is what leaves the accounting native; a knob you set yourself is carried through untouched. **`multimodel` points the panel at the gateway**: the picker becomes the gateway's `/v1/models` catalog (the Z.ai subscription's GLM models, the QwenCloud Token-Plan models, and Claude in one list), and the client takes the context window from the model ID, so pick the "(1M context)" rows — their ids carry the `[1m]` suffix — when you want the 1M budget; ids only the gateway can resolve are stashed on the way to `remote-control` and restored on the way back. Remote Control (`/remote-control`, phone access) therefore works only in `remote-control` mode: Claude Code >= 2.1.196 refuses it whenever `ANTHROPIC_BASE_URL` is not api.anthropic.com, and a claude.ai sign-in does not bypass that. To have both at once, leave the panel on the gateway and run a detached native-auth server with the bundled `rc-native` skill (see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md), "Remote Control").
 

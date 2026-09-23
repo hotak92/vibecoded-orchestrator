@@ -712,6 +712,137 @@ def _open_is_write(mode, flags) -> bool:
     return False
 
 
+# ─── W-CHECKOUT-STATE (v0.2.97): no test may write a checkout's own state/ ──
+#
+# 2026-09-22 incident. `install._log_install_event` appends to
+# `<PROJECT_ROOT>/state/logs/install.jsonl`, and `PROJECT_ROOT` is the
+# directory install.py was imported from — the checkout the suite runs in.
+# In the public clone that directory has no `state/logs/`, so an unpatched
+# call only BUFFERS (`_PENDING_EVENTS`) and nothing is written. In an INSTALLED
+# orchestrator root (the maintainer's dogfood tree) the directory exists, and
+# two tests in `test_v0284_identity_sweep.py` wrote "codegraph identity sweep
+# raised: boom" into that install's REAL install log — where it reads as a
+# field failure. The suite's behaviour depended on which tree it ran in.
+#
+# Two layers, the W-STATE shape:
+#   1. Containment (`_contain_install_logs` below): every loaded copy of
+#      install.py gets an `_install_log_path` that answers None — "no log dir
+#      yet", exactly the public clone's answer — while `PROJECT_ROOT` is still
+#      that copy's own checkout. A test that points `PROJECT_ROOT` at a tmp
+#      dir gets the real function, so every log-asserting test is unchanged.
+#   2. Tripwire (the audit-hook leg): a WRITE under `<checkout>/state/` is
+#      refused and recorded, whatever the door — a copy of install.py loaded
+#      after the fixture ran, a hard-coded path, a `mkdir` of `state/`.
+
+def _install_checkouts() -> tuple:
+    """The checkout(s) whose install.py this suite can import: this tree, plus
+    wherever `import install` would resolve if `PYTHONPATH` names another."""
+    roots = {_REPO_ROOT}
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("install")
+        if spec is not None and spec.origin:
+            roots.add(Path(spec.origin).resolve().parent)
+    except (ImportError, ValueError):
+        pass
+    return tuple(sorted(roots))
+
+
+_CHECKOUT_STATE_DIRS: tuple = tuple(root / "state" for root in _install_checkouts())
+
+
+def _under_checkout_state(raw) -> "Path | None":
+    """Resolved path if ``raw`` is inside a checkout's ``state/``, else None.
+    Never raises (it runs inside an audit hook); same fast path as its siblings."""
+    try:
+        text = os.fspath(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or "state" not in text:
+        return None
+    # ABSOLUTE paths only. install.py reaches its state through the absolute
+    # PROJECT_ROOT; a relative name is ambiguous here — `shutil.rmtree` walks
+    # with `os.rmdir("state", dir_fd=...)`, relative to a directory fd the
+    # hook cannot see, and resolving it against the cwd flagged pytest's own
+    # tmp-dir cleanup as a write into this checkout.
+    if not os.path.isabs(text):
+        return None
+    try:
+        resolved = Path(os.path.normpath(text))
+    except (OSError, ValueError):
+        return None
+    for state_dir in _CHECKOUT_STATE_DIRS:
+        if _is_inside(state_dir, resolved):
+            return resolved
+    return None
+
+
+_CONTAINED_MARK = "_vco_contained_install_log"
+
+
+def contain_install_module(module) -> bool:
+    """Wrap ``module._install_log_path`` so its OWN checkout's log is invisible.
+
+    Returns True when it wrapped, False when there was nothing to wrap or it
+    already was. Public for the guard's own test.
+    """
+    original = getattr(module, "_install_log_path", None)
+    if original is None or getattr(original, _CONTAINED_MARK, False):
+        return False
+    home = Path(module.__file__).resolve().parent
+
+    def _contained_install_log_path():
+        try:
+            if Path(module.PROJECT_ROOT).resolve() == home:
+                return None
+        except (OSError, TypeError, ValueError):
+            return None
+        return original()
+
+    setattr(_contained_install_log_path, _CONTAINED_MARK, True)
+    _contained_install_log_path.__wrapped__ = original  # type: ignore[attr-defined]
+    module._install_log_path = _contained_install_log_path
+    return True
+
+
+def _loaded_install_modules() -> list:
+    """Every loaded copy of install.py — `install` and the spec-loaded aliases
+    (`install_under_test`, `install_py_v47c`, …) several suites use."""
+    found = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith("install"):
+            continue
+        origin = str(getattr(module, "__file__", "") or "")
+        if origin.endswith("install.py") and hasattr(module, "_install_log_path"):
+            found.append(module)
+    return found
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _preload_install_for_containment():
+    """Import install.py once, up front, so the first test that uses it is
+    contained too (a module first imported inside a test body would otherwise
+    only meet the tripwire)."""
+    if not _ALLOW_REAL_STATE:
+        try:
+            import install  # noqa: F401
+        except Exception:  # noqa: BLE001 — a suite that cannot import it has nothing to contain
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _contain_install_logs(_preload_install_for_containment):
+    """Layer 1 of W-CHECKOUT-STATE, re-applied per test for newly loaded copies."""
+    if not _ALLOW_REAL_STATE:
+        for module in _loaded_install_modules():
+            contain_install_module(module)
+    yield
+
+
 def _user_state_audit_hook(event: str, args) -> None:
     """Refuse WRITES into the real `~/.claude` or `~/.vct`; record reads of
     the former.
@@ -819,6 +950,17 @@ def _user_state_audit_hook(event: str, args) -> None:
     # `hub.token` at import to decide a module-level skip, and the sqlite
     # guard already lets read-only DB handles through for the same reason.
     # Recording them would red dozens of tests for no incident.
+    if is_write:
+        in_checkout = _under_checkout_state(args[0])
+        if in_checkout is not None:
+            _state_write_attempts.append(str(in_checkout))
+            raise RealUserStateWriteBlocked(
+                f"test tried to write {in_checkout}; the suite must never write "
+                f"a checkout's own install state (see tests/conftest.py "
+                f"W-CHECKOUT-STATE — the install log is contained by "
+                f"_contain_install_logs; anything else under state/ needs "
+                f"install.PROJECT_ROOT pointed at tmp_path)"
+            )
     resolved = _under_real_vct(args[0])
     if resolved is None or not is_write:
         return

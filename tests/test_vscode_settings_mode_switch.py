@@ -15,8 +15,10 @@ flip. These tests pin the four things the switch must get right:
 3. The ``multimodel`` leg puts the stashed choices back, decorated, and
    clears the stash. Both legs are idempotent, and a second click leaves the
    stash alone.
-4. A file the writer cannot parse is refused with the same JSONC message the
-   other actions use, byte-for-byte untouched.
+4. A JSONC file (comments, trailing commas — VS Code's own format) is read
+   and edited in place, comments kept (v0.2.97). A file that is not valid
+   JSONC either is refused with the same message the other actions use,
+   byte-for-byte untouched.
 
 Every test drives its own ``stash=`` path under ``tmp_path`` (the default
 resolves under ``VCT_STATE_DIR``, which conftest already redirects); the
@@ -46,6 +48,8 @@ OPUS_1M = "claude-opus-5[1m]"
 POSIX_ONLY = "POSIX mode bits do not exist on Windows"
 
 JSONC = '{\n    // a note\n    "editor.fontSize": 13\n}\n'
+#: Not JSONC either: the object never closes.
+NOT_JSONC = '{\n    // a note\n    "editor.fontSize": 13\n'
 
 
 def _sha(path: Path) -> str:
@@ -319,15 +323,31 @@ def test_remote_control_heals_a_plain_1m_claude_slot(tmp_path: Path, stash: Path
     assert "CLAUDE_CODE_SUBAGENT_MODEL" in out["message"]
 
 
-def test_remote_control_refuses_jsonc_byte_identical(tmp_path: Path, stash: Path):
+def test_remote_control_on_jsonc_keeps_the_comments(tmp_path: Path, stash: Path):
+    """The switch edits VS Code's own format in place: the routing keys go,
+    the user's comment and every other byte before them stay."""
+    path = _pointed(tmp_path, {})
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("{\n", "{\n    // mine, keep me\n", 1), encoding="utf-8")
+
+    out = vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
+
+    assert out["ok"], out["message"]
+    after = path.read_text(encoding="utf-8")
+    assert after.startswith("{\n    // mine, keep me\n")
+    assert vs.ENV_BLOCK_KEY not in vs.jsonc_edit.loads(after)
+    assert stash.exists()
+
+
+def test_remote_control_refuses_an_invalid_file_byte_identical(tmp_path: Path, stash: Path):
     path = tmp_path / "Code" / "User" / "settings.json"
     path.parent.mkdir(parents=True)
-    path.write_text(JSONC, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
     before = _sha(path)
     out = vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
     assert out["ok"] is False and out["status"] == "refused"
     assert out["reason"] == "not_strict_json"
-    assert out["message"].startswith(vs.describe_json_failure(JSONC, "")[:40])
+    assert out["message"].startswith(vs.describe_json_failure(NOT_JSONC, "")[:40])
     assert "JSONC" in out["message"]
     assert vs.ENV_BLOCK_KEY in out["message"] and vs.LOGIN_PROMPT_KEY in out["message"]
     assert _sha(path) == before
@@ -580,7 +600,7 @@ def test_an_unreadable_stash_is_reported_and_kept(tmp_path: Path, stash: Path):
 def test_multimodel_refusal_keeps_the_stash(tmp_path: Path, stash: Path):
     path = _pointed(tmp_path, {"ANTHROPIC_DEFAULT_HAIKU_MODEL": FLASH_1M})
     vs.set_mode(path, vs.MODE_REMOTE_CONTROL, stash=stash)
-    path.write_text(JSONC, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
     out = vs.set_mode(path, vs.MODE_MULTIMODEL, base_url=BASE_URL, token=TOKEN, stash=stash)
     assert out["ok"] is False and out["reason"] == "not_strict_json"
     assert stash.exists()
@@ -876,10 +896,18 @@ def test_clear_default_leaves_the_switch_state_alone(tmp_path: Path, stash: Path
     assert _block(path)["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == FLASH_1M
 
 
-def test_panel_mode_unparseable_guesses_nothing(tmp_path: Path, stash: Path):
+def test_panel_mode_reads_jsonc(tmp_path: Path, stash: Path):
+    """A commented settings file has a real mode, not "unparseable"."""
     path = tmp_path / "Code" / "User" / "settings.json"
     path.parent.mkdir(parents=True)
     path.write_text(JSONC, encoding="utf-8")
+    assert vs.panel_mode(path, stash=stash)["mode"] != vs.MODE_UNPARSEABLE
+
+
+def test_panel_mode_unparseable_guesses_nothing(tmp_path: Path, stash: Path):
+    path = tmp_path / "Code" / "User" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(NOT_JSONC, encoding="utf-8")
     out = vs.panel_mode(path, stash=stash)
     assert out["mode"] == vs.MODE_UNPARSEABLE
     assert "JSONC" in out["detail"]
@@ -951,7 +979,7 @@ def test_cli_mode_set_exits_nonzero_on_refusal(tmp_path: Path, capsys, monkeypat
     monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
     path = tmp_path / "Code" / "User" / "settings.json"
     path.parent.mkdir(parents=True)
-    path.write_text(JSONC, encoding="utf-8")
+    path.write_text(NOT_JSONC, encoding="utf-8")
     rc = vs.main(["mode", "--set", "remote-control", "--path", str(path)])
     assert rc == 1
     assert json.loads(capsys.readouterr().out)["reason"] == "not_strict_json"

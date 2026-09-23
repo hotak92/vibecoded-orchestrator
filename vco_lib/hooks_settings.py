@@ -178,8 +178,13 @@ INTERPRETER_TOKENS = frozenset(
 SCRIPT_FLAG_TOKENS = frozenset({"-file", "-command"})
 
 # Shell control operators that reset "command start", so the token after
-# them can begin a fresh invocation (e.g. the ``||`` in VCO's disable
-# guard ``[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/x.sh``).
+# them can begin a fresh invocation. STILL LOAD-BEARING post-v0.2.97: the
+# settings templates stopped shipping the ``||``-prefixed disable guard
+# (``[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/x.sh``) in v0.2.97,
+# but installs written before that release carry the prefixed command and
+# bundle update must keep recognising (and superseding) those entries; and
+# a USER's own compound command (``cmd1 && cmd2``, ``a; b``) is ordinary
+# input in any era.
 CMD_SEPARATOR_TOKENS = frozenset({"||", "&&", ";", "|", "&"})
 
 
@@ -717,6 +722,27 @@ def remove_hook(
     }
 
 
+def _hook_present_in_another_form(
+    doc: SettingsDoc, event: str, matcher: str, command: str
+) -> bool:
+    """True when ``event`` / ``matcher`` already registers the same hook as
+    ``command`` under a different command string."""
+    # Lazy: `parked_hooks` imports this module (see the retirement import in
+    # `insert_hook` for the same cycle).
+    from vco_lib.parked_hooks import same_hook_command
+
+    hooks = doc.data.get("hooks")
+    groups = hooks.get(event) if isinstance(hooks, dict) else None
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict) or normalize_matcher(group) != matcher:
+            continue
+        for item in group.get("hooks") or []:
+            other = item.get("command") if isinstance(item, dict) else None
+            if isinstance(other, str) and other and same_hook_command(other, command):
+                return True
+    return False
+
+
 def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
     """Restore a parked entry. Returns ``True`` when the document changed.
 
@@ -733,7 +759,8 @@ def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
     recorded ordinal rather than at the end.
 
     Idempotent: if an entry with the same natural key
-    (event, matcher, command) is already present anywhere in the event,
+    (event, matcher, command) is already present anywhere in the event — or
+    (v0.2.97) the same hook in another command form under the same matcher —
     nothing changes and ``False`` is returned — so a double-click, or a
     re-enable after the user restored the line by hand, cannot produce a
     duplicate invocation. That check runs before any structural edit, so
@@ -813,6 +840,17 @@ def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
     # non-mutating and keeps the restore from adding a duplicate
     # invocation to a different group.
     if isinstance(command, str) and _locate(doc, event, matcher, command) is not None:
+        return False
+    # v0.2.97: the same hook in ANOTHER command form (the pre-v0.2.97
+    # `[ -n "$VCT_DISABLE_HOOKS" ] || ` guard, an older path separator) counts
+    # as present too. A parked legacy entry whose hook an older bundle update
+    # re-added in the current form is exactly this case, and restoring the
+    # parked bytes beside it would run the hook twice — and the next update
+    # would supersede BOTH copies to the same command. Same identity rule as
+    # the bundle merge (`vco_lib.parked_hooks.same_hook_command`).
+    if isinstance(command, str) and command and _hook_present_in_another_form(
+        doc, event, matcher, command
+    ):
         return False
 
     hooks = doc.data.get("hooks")

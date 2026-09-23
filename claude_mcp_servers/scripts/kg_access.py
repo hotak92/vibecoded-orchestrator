@@ -12,7 +12,7 @@ comma-separated env vars:
   ``<Peer>_CodeFunction``, ``<Peer>_CodeClass`` (etc) collections this
   process is allowed to fan out READ queries to.
 
-Both vars are emitted by the Rust ``write_project_env_files`` writer to
+Both vars are emitted by the env projection (``vco_lib.config_projection``) to
 all 3 install surfaces (``.claude/env``, ``.claude/settings.json``'s
 ``env`` block, ``.vscode/settings.json``'s ``claude-code.env`` block) so
 EVERY surface that spawns a Python subprocess inherits them.

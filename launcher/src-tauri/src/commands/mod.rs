@@ -122,6 +122,15 @@ pub mod manifest;
 // to `python -m vco_lib.vscode_settings`, which owns the byte layout of that
 // user-owned file.
 pub mod model_gateway;
+// v0.2.97: after an update, "is the running gateway still on the previous
+// release's code?" and the Continue that restarts it. Never automatic — a
+// restart ends every agent session routed through the gateway. The verdict
+// lives in `python -m vco_lib.gateway_freshness`.
+pub mod gateway_freshness;
+// v0.2.97: subscription usage windows for the home-page card. The numbers
+// are the gateway's (`GET /usage/windows`), read through
+// `python -m vco_lib.gateway_usage` so the host token never enters Rust.
+pub mod gateway_usage;
 // v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
 // catalog metadata from the launcher-controlled Supabase edge function with
 // retry-with-backoff + 15min app_state-backed cache + schema_version

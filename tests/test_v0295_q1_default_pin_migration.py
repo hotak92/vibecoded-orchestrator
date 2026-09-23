@@ -293,10 +293,13 @@ def test_the_removal_is_safe_when_there_is_nothing_to_remove(
 
 
 def test_an_unparseable_file_is_refused_byte_for_byte(tmp_path: Path, ledger: Path):
-    """JSONC is the user's; a file we cannot parse is never rewritten."""
+    """A file we cannot parse — not even as JSONC — is never rewritten.
+
+    (JSONC itself is READ since v0.2.97; see
+    tests/test_v0297_jsonc_pin_migration.py.)"""
     path = tmp_path / "Code" / "User" / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = '{\n  // a comment VS Code allows\n  "editor.fontSize": 13,\n}\n'
+    text = '{\n  // a comment VS Code allows\n  "editor.fontSize": 13,\n'
     path.write_text(text, encoding="utf-8")
     out = vs.migrate_default_pins(ledger=ledger, targets=[path])
     assert out["targets"][0]["status"] == "refused"
@@ -325,37 +328,11 @@ def test_a_ledger_that_cannot_be_written_does_not_lose_the_removal(
 # ---------------------------------------------------------------------------
 
 
-def test_machine_migrations_runs_the_pin_leg_and_discloses_it(
-    tmp_path: Path, ledger: Path, monkeypatch,
-):
-    """The module install.py calls, driven — not a source scan.
-
-    A removal from a file the USER owns is printed, not merely logged: that
-    disclosure is what makes the one-time removal something they can undo.
-    """
-    from vco_lib import machine_migrations as mm
-
-    path = _settings(tmp_path, _pointed(model=OPUS_1M))
-    # Capture the real function BEFORE patching: a lambda that called the
-    # patched name would recurse into itself, and the soft-fail would swallow
-    # the RecursionError as a passing-looking 'error'.
-    real = vs.migrate_default_pins
-    monkeypatch.setattr(
-        vs, "migrate_default_pins",
-        lambda **_kw: real(ledger=ledger, targets=[path]),
-    )
-    monkeypatch.setattr(
-        mm, "_metrics_archive", lambda _event: {"ok": True, "status": "skipped"},
-    )
-    lines: list[str] = []
-    events: list[tuple] = []
-    out = mm.run_every_run(
-        on_event=lambda *a: events.append(a), emit=lines.append,
-    )
-    assert out["panel_default_pin"]["status"] == "migrated"
-    assert vs.MODEL_KEY not in _block(path)
-    assert any(OPUS_1M in line and str(path) in line for line in lines), lines
-    assert any(step == mm.STEP_PANEL_PIN for step, _phase, _detail in events)
+# The leg ITSELF — removal, disclosure, ledger, the visible soft-fail — is
+# driven end to end in tests/test_v0297_pin_migration_delivery.py, through
+# install.py's own helper and with the in-process `model_router` import
+# poisoned: v0.2.97 moved the leg into a venv child, because the in-process
+# version this section used to drive never ran on a launcher update.
 
 
 def test_install_py_calls_the_machine_migrations_helper(monkeypatch):
@@ -375,15 +352,18 @@ def test_install_py_calls_the_machine_migrations_helper(monkeypatch):
     monkeypatch.setattr(
         mm, "run_every_run", lambda **kw: calls.append(kw) or {},
     )
-    install._run_machine_migrations()
+    report = object()
+    install._run_machine_migrations(report)
     assert len(calls) == 1
     assert calls[0]["on_event"] is install._log_install_event
+    assert calls[0]["install_root"] == install.PROJECT_ROOT
+    assert calls[0]["report"] is report
 
     def _boom(**_kw):
         raise RuntimeError("migration exploded")
 
     monkeypatch.setattr(mm, "run_every_run", _boom)
-    install._run_machine_migrations()  # soft-fail: must not raise
+    install._run_machine_migrations(report)  # soft-fail: must not raise
 
 
 def test_main_still_carries_the_call_site():

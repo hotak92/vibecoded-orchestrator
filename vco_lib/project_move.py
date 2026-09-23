@@ -158,6 +158,7 @@ CID_EXTRA_CODEGRAPH_PREFIX = "project_move_extra_codegraph_path_"
 CID_CODEGRAPH_REANALYZE = "project_move_codegraph_reanalyze_pending"
 CID_OLD_FOLDER_RETAINED = "project_move_old_folder_retained"
 CID_HARNESS_STATE_REVIEW = "project_move_harness_state_review"
+CID_ENV_REPROJECTION_FAILED = "project_move_env_reprojection_failed"
 
 #: Every refusal the preflight can produce, with the wording that reaches the
 #: user. Each is DISTINCT: "that path is inside another project" and "that
@@ -1574,9 +1575,11 @@ def execute_post_flip(
     write_sentinel(dst, _sentinel_payload(plan, "post-flip", move_id))
 
     # Env projection at D, derived from the NEW row.
+    env_reprojection_error: Optional[str] = None
     try:
-        _reproject_env(plan, dst, runner=runner)
+        run_env_reprojection(plan.project_id, dst, runner=runner, db_path=db_path)
     except Exception as exc:  # noqa: BLE001 — surfaced, never fatal
+        env_reprojection_error = str(exc)
         result.warnings.append(f"env re-projection failed: {exc}")
 
     # kg-sync parity pass. Embeddings are reused via content_hash and stored
@@ -1610,6 +1613,7 @@ def execute_post_flip(
         stale_db_hits=result.stale_db_hits,
         harness=result.harness,
         codegraph_enqueued=codegraph_enqueued,
+        env_reprojection_error=env_reprojection_error,
     )
 
     clear_sentinel(src)
@@ -1617,41 +1621,38 @@ def execute_post_flip(
     return result
 
 
-def _reproject_env(
-    plan: MovePlan,
-    dst: Path,
+def run_env_reprojection(
+    project_id: str,
+    folder: Path,
     *,
-    runner: Optional[Callable[[Sequence[str], Mapping[str, str]], subprocess.CompletedProcess]],
+    runner: Optional[Callable[[Sequence[str], Mapping[str, str]], subprocess.CompletedProcess]] = None,
+    db_path: Optional[Path] = None,
 ) -> None:
-    """Re-run the canonical env projection against the NEW row.
+    """Re-run the canonical env projection against the project's CURRENT row.
 
-    The projection derives every value from DB state, so a re-run after the
+    The projection derives every value from DB state, so a re-run after a
     flip rewrites ``KG_BASE_DIR`` and friends without this module ever owning
     a sed list. That is why :data:`PATH_BEARING_ENV_KEYS` is a drift GATE
-    rather than a rewrite driver.
+    rather than a rewrite driver. Shared by the move and the collection
+    rename (one home, v0.2.97); the argv comes from the builder that sits
+    beside ``apply``'s parser, so it cannot name a flag the verb lacks again.
+    Raises :class:`MoveError` carrying the child's stderr tail on failure.
     """
+    from vco_lib.config_projection import build_apply_argv
     from vco_lib.python_exe import resolve_or_current  # v0.2.94: ONE resolver
 
-    argv = [
-        resolve_or_current(),
-        "-m",
-        "vco_lib.config_projection",
-        "apply",
-        "--project-id",
-        plan.project_id,
-        "--folder",
-        str(dst),
-    ]
+    argv = build_apply_argv(resolve_or_current(), project_id, db_path=db_path)
     env = build_child_env(
-        {"CLAUDE_PROJECT_DIR": str(dst), "KG_BASE_DIR": str(dst)}
+        {"CLAUDE_PROJECT_DIR": str(folder), "KG_BASE_DIR": str(folder)}
     )
     proc = (
         runner(argv, env)
         if runner is not None
         else subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
     )
-    if proc.returncode != 0:
-        raise MoveError((proc.stderr or "").strip()[-400:] or f"exit {proc.returncode}")
+    if getattr(proc, "returncode", 1) != 0:
+        tail = (getattr(proc, "stderr", "") or "").strip()[-400:]
+        raise MoveError(tail or f"exit {getattr(proc, 'returncode', '?')}")
 
 
 def _run_kg_sync(
@@ -1743,8 +1744,10 @@ def _emit_move_deferrals(
     stale_db_hits: Sequence[Mapping[str, Any]],
     harness: Mapping[str, Any],
     codegraph_enqueued: bool,
+    env_reprojection_error: Optional[str] = None,
 ) -> list[str]:
     """Emit every ledger entry the move owes, at D. Returns the condition ids."""
+    from vco_lib.config_projection import build_apply_argv
     from vco_lib.deferral_emit import emit_entries
     from vco_lib.deferral_report import DeferralEntry
 
@@ -1775,6 +1778,38 @@ def _emit_move_deferrals(
                     "which changes matter. VCO never merges user content."
                 ),
                 command_to_apply=_dismiss_command(dst, cid),
+                severity="warning",
+            )
+        )
+
+    # The env re-projection itself failed: every stale hit below is then its
+    # consequence, not a rewrite pass missing an entry class, and the reader
+    # needs the command that re-runs it rather than a scan that re-reports it.
+    if env_reprojection_error:
+        reproject_cmd = " ".join(
+            build_apply_argv("python", plan.project_id)
+        )
+        entries.append(
+            DeferralEntry(
+                condition_id=CID_ENV_REPROJECTION_FAILED,
+                title="The project's env files were not re-derived after the move",
+                detected=(
+                    "`python -m vco_lib.config_projection apply` failed after "
+                    "the database flip, so `.claude/settings.json` and "
+                    "`.claude/env` may still carry values derived from the "
+                    f"previous folder `{plan.src}`. The child reported: "
+                    f"{env_reprojection_error}"
+                ),
+                why_deferred=(
+                    "The move is committed and the project works from the new "
+                    "folder; the env surfaces are reconciliation. VCO does not "
+                    "hand-edit them — it re-derives them from the database, "
+                    "which is the command below."
+                ),
+                command_to_apply=(
+                    f"{reproject_cmd}   # then: "
+                    + _dismiss_command(dst, CID_ENV_REPROJECTION_FAILED)
+                ),
                 severity="warning",
             )
         )

@@ -273,7 +273,7 @@ def _build_python_mcp_entries(
     # per-project may override" but Claude Code's actual env precedence
     # makes ~/.claude.json mcpServers.*.env WIN against .claude/settings.json
     # env — so the override goes the wrong direction. The launcher's
-    # write_project_env_files puts these in .claude/settings.json env where
+    # the env projection (config_projection) puts these in .claude/settings.json env where
     # they reach MCP subprocesses correctly. Don't shadow them here.
     weaviate_env_raw = {
         "WEAVIATE_URL": weaviate_url,

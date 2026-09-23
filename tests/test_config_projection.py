@@ -1232,31 +1232,40 @@ def test_apply_settings_json_idempotent(tmp_path: Path) -> None:
     assert first == second
 
 
-def test_apply_settings_json_malformed_existing_resets(tmp_path: Path) -> None:
-    """A malformed existing settings.json is replaced with a fresh object."""
+def test_apply_settings_json_malformed_existing_is_refused_untouched(tmp_path: Path) -> None:
+    """v0.2.97: a malformed existing settings.json is NEVER replaced.
+
+    This test used to be ``..._malformed_existing_resets`` and asserted the
+    replacement — it encoded the data loss (every other setting in the file
+    was gone). Now the file stays byte-identical and the write is refused.
+    """
+    from vco_lib.config_projection import SettingsWriteRefused
+
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
     settings_path.write_text("not-valid-json{{{")
 
     bundle = _bundle(tmp_path)
-    apply_project_env(bundle, surfaces=["claude_settings_json"])
+    with pytest.raises(SettingsWriteRefused):
+        apply_project_env(bundle, surfaces=["claude_settings_json"])
 
-    data = json.loads(settings_path.read_text())
-    assert data["env"]["KG_COLLECTION"] == "TestKG"
+    assert settings_path.read_text() == "not-valid-json{{{"
 
 
-def test_apply_settings_json_non_object_root_resets(tmp_path: Path) -> None:
-    """A non-object root JSON value is replaced with a fresh object."""
+def test_apply_settings_json_non_object_root_is_refused_untouched(tmp_path: Path) -> None:
+    """v0.2.97: a non-object root is refused like a parse failure (it used to
+    be replaced with a fresh object — the array's content lost)."""
+    from vco_lib.config_projection import SettingsWriteRefused
+
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
     settings_path.write_text('["array", "instead", "of", "object"]')
 
     bundle = _bundle(tmp_path)
-    apply_project_env(bundle, surfaces=["claude_settings_json"])
+    with pytest.raises(SettingsWriteRefused):
+        apply_project_env(bundle, surfaces=["claude_settings_json"])
 
-    data = json.loads(settings_path.read_text())
-    assert isinstance(data, dict)
-    assert data["env"]["KG_COLLECTION"] == "TestKG"
+    assert settings_path.read_text() == '["array", "instead", "of", "object"]'
 
 
 def test_apply_vscode_surface_opt_in(tmp_path: Path) -> None:

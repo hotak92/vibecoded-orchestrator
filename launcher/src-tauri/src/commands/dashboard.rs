@@ -642,7 +642,7 @@ fn tier_meets_requirement(user_tier: &str, required: &OrchestratorTier) -> bool 
 /// live weaviate-kg MCP, and the root project's KG reads/writes silently
 /// forked into a phantom collection until the next re-projection healed
 /// the file. The canonical writer for these keys is the launcher's
-/// per-project projection (`write_project_env_files`), never this legacy
+/// per-project projection (`vco_lib.config_projection apply`), never this legacy
 /// path — same rationale as `mcp_registration::ALLOWED_ENV_KEYS` keeping
 /// them out of ~/.claude.json.
 const PROJECT_ROUTING_ENV_KEYS: &[&str] = &[
@@ -665,12 +665,12 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
         return Ok(());
     }
 
-    let data = tokio::fs::read_to_string(&settings_path)
-        .await
+    // v0.2.97: a file that cannot be read as a JSON object is REFUSED (the
+    // `Err` reaches the GUI) and left byte-identical. This used to parse as
+    // `{}` and write that back — the orchestrator's whole settings.json,
+    // hooks and permissions included, replaced by an empty object.
+    let mut settings: serde_json::Value = crate::json_file::read_object_or_empty(&settings_path)
         .map_err(|e| format!("Read settings: {}", e))?;
-
-    let mut settings: serde_json::Value =
-        serde_json::from_str(&data).unwrap_or(serde_json::json!({}));
 
     // Build env block from enabled MCP servers
     let env = settings
@@ -1477,6 +1477,42 @@ mod tests {
         // Non-Secret value still emitted, pre-existing keys preserved.
         assert_eq!(env["MY_VISIBLE"], "ok-emit");
         assert_eq!(env["PRE_EXISTING"], "keep");
+    }
+
+    /// v0.2.97: an orchestrator `.claude/settings.json` that cannot be read as
+    /// a JSON object is REFUSED and left byte-identical. Pre-fix it parsed as
+    /// `{}` and that `{}` was written back — hooks, permissions, everything
+    /// in the file replaced by an empty object.
+    #[test]
+    fn test_apply_mcp_to_claude_settings_refuses_an_unparseable_file() {
+        let (home, _guard) = setup_temp_env();
+        let install_dir = home.join("orch-install");
+        let claude_dir = install_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        let mut config = OrchestratorConfig::default();
+        config.install_path = install_dir.display().to_string();
+
+        for original in [
+            r#"{"hooks": {"Stop": []},, "permissions": {"allow": ["Bash"]}}"#,
+            r#"["an", "array", "root"]"#,
+        ] {
+            std::fs::write(&settings_path, original).unwrap();
+            let res = rt().block_on(apply_mcp_to_claude_settings(&config));
+            assert!(res.is_err(), "an unreadable settings.json must be refused: {:?}", res);
+            assert_eq!(
+                std::fs::read_to_string(&settings_path).unwrap(),
+                original,
+                "the refused file must stay byte-identical"
+            );
+        }
+
+        // Leave-alone's counterpart: a readable file is still written.
+        std::fs::write(&settings_path, r#"{"hooks": {"Stop": []}, "env": {}}"#).unwrap();
+        rt().block_on(apply_mcp_to_claude_settings(&config)).expect("readable file writes");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(parsed["hooks"], serde_json::json!({"Stop": []}));
     }
 
     /// F-4 (v0.2.73): `apply_mcp_to_claude_settings` must NOT emit

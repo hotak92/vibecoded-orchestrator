@@ -279,6 +279,70 @@ impl GatewaySupervisor {
     }
 }
 
+impl GatewaySupervisor {
+    /// The pid of a LIVE child this launcher holds, or `None`. A question,
+    /// not an action: it reaps a dead child but never respawns one (that is
+    /// [`supervise`](Self::supervise)'s job, and a staleness check must not
+    /// start a process by asking).
+    pub(crate) fn held_child_pid(&self) -> Option<u32> {
+        self.poll()
+    }
+
+    /// Restart the child THIS launcher holds, on the same port — the
+    /// post-update "Continue" for a gateway the launcher itself started
+    /// (`commands::gateway_freshness`). `Ok(None)` when no live child is held:
+    /// nothing is stopped then, because a process this launcher did not start
+    /// is never signalled from here (see [`model_gateway_stop`]).
+    ///
+    /// Same port on purpose, for the reason [`Supervised::port`] gives: the
+    /// port file, the VS Code settings and every resolver name it. Spawned
+    /// through [`spawn_gateway_child`], the one spawn recipe.
+    pub(crate) fn restart_held_child(&self) -> Result<Option<(u32, u16)>, String> {
+        self.restart_held_child_with(spawn_gateway_child)
+    }
+
+    /// [`restart_held_child`](Self::restart_held_child) with the spawn
+    /// injected, so the stop-then-respawn is testable without starting a real
+    /// gateway.
+    fn restart_held_child_with<F>(&self, spawn: F) -> Result<Option<(u32, u16)>, String>
+    where
+        F: FnOnce(u16) -> Result<Child, String>,
+    {
+        if self.poll().is_none() {
+            return Ok(None);
+        }
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| "the gateway supervisor lock is poisoned".to_string())?;
+        let Some(entry) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let Some(mut child) = entry.child.take() else {
+            return Ok(None);
+        };
+        // An already-exited child makes `kill` fail harmlessly; `wait` reaps.
+        let _ = child.kill();
+        let _ = child.wait();
+        let port = entry.port;
+        match spawn(port) {
+            Ok(new_child) => {
+                let pid = new_child.id();
+                entry.child = Some(new_child);
+                entry.dead_since = None;
+                Ok(Some((pid, port)))
+            }
+            Err(e) => {
+                // Stopped but not restarted. Record the death so the status
+                // poll's single respawn gets its chance, rather than the entry
+                // claiming a child that no longer exists.
+                entry.dead_since = Some(Instant::now());
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Who, if anyone, will restart this gateway when it dies.
 ///
 /// Reported rather than inferred by the GUI, and it distinguishes "nothing
@@ -736,6 +800,25 @@ fn gateway_command(python: &Path, orchestrator_root: Option<&Path>) -> Command {
     python_module_command(python, "model_router", orchestrator_root)
 }
 
+/// `python -m vco_lib.gateway_freshness` — the staleness check and the
+/// restart behind the post-update modal (`commands::gateway_freshness`). Same
+/// spawn recipe as the daemon, so the checkout it hashes is the checkout the
+/// daemon runs from.
+pub(crate) fn gateway_freshness_command(
+    python: &Path,
+    orchestrator_root: Option<&Path>,
+) -> Command {
+    python_module_command(python, "vco_lib.gateway_freshness", orchestrator_root)
+}
+
+/// `python -m vco_lib.gateway_usage` — the subscription usage windows behind
+/// the home-page card (`commands::gateway_usage`). Same spawn recipe as the
+/// daemon, so the port it resolves honours the same `VCT_MODEL_GATEWAY_*`
+/// pins; the host token is read by that module, never by this process.
+pub(crate) fn gateway_usage_command(python: &Path, orchestrator_root: Option<&Path>) -> Command {
+    python_module_command(python, "vco_lib.gateway_usage", orchestrator_root)
+}
+
 /// The writer spawn. Same `PYTHONPATH` as the daemon spawn (review R1-4):
 /// the writer imports `model_router` to resolve the gateway's port and its
 /// context table, and answers with a DEFAULT rather than an error when it
@@ -775,7 +858,7 @@ fn spawn_gateway_child(port: u16) -> Result<Child, String> {
         })
 }
 
-fn python_or_err() -> Result<PathBuf, String> {
+pub(crate) fn python_or_err() -> Result<PathBuf, String> {
     resolve_python_for_vco_lib().ok_or_else(|| {
         "no python interpreter found for the model gateway (checked \
          $VCT_VENV, <VCT_INSTALL_ROOT>/.venv, \
@@ -809,7 +892,7 @@ fn run_to_completion(cmd: Command, label: &str) -> Result<(i32, String, String),
 /// [`run_to_completion`] with an explicit deadline, for the one caller whose
 /// work legitimately outlasts the default: the dogfood proof sends real
 /// requests to a real API (see [`DOGFOOD_TIMEOUT`]).
-fn run_to_completion_within(
+pub(crate) fn run_to_completion_within(
     mut cmd: Command,
     label: &str,
     limit: Duration,
@@ -1875,6 +1958,56 @@ mod tests {
             "a fresh launcher supervises nothing; stop must refuse rather \
              than signal a pid it cannot identify"
         );
+    }
+
+    // ── post-update restart of a launcher-held child (v0.2.97) ──────────
+
+    #[test]
+    fn restart_of_a_held_child_leaves_everything_alone_when_nothing_is_held() {
+        let sup = GatewaySupervisor::default();
+        let mut spawned = false;
+        let out = sup.restart_held_child_with(|_| {
+            spawned = true;
+            Err("must not spawn".to_string())
+        });
+        assert_eq!(out, Ok(None));
+        assert!(!spawned, "no held child means nothing is stopped or started");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_of_a_held_child_stops_it_and_respawns_on_the_same_port() {
+        fn sleeper() -> Child {
+            Command::new("sleep").arg("30").spawn().expect("spawn sleep")
+        }
+        let sup = GatewaySupervisor::default();
+        let old = sleeper();
+        let old_pid = old.id();
+        *sup.0.lock().unwrap() = Some(Supervised {
+            child: Some(old),
+            port: 11499,
+            dead_since: None,
+            respawns: 0,
+        });
+        let mut asked_port = None;
+        let out = sup
+            .restart_held_child_with(|port| {
+                asked_port = Some(port);
+                Ok(sleeper())
+            })
+            .expect("restart");
+        let (new_pid, port) = out.expect("a held child was restarted");
+        assert_eq!(asked_port, Some(11499), "respawned on the SAME port");
+        assert_eq!(port, 11499);
+        assert_ne!(new_pid, old_pid);
+        assert!(!pid_is_alive(old_pid), "the old child was stopped");
+        assert_eq!(sup.held_child_pid(), Some(new_pid));
+        // Clean up the test's own sleeper.
+        let held = sup.0.lock().unwrap().take();
+        if let Some(mut c) = held.and_then(|entry| entry.child) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 
     // ── port collision (B3) ─────────────────────────────────────────────

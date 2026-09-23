@@ -18,10 +18,13 @@ test closes that gap. It pins TWO invariants:
   1. STRUCTURAL PARITY — the two templates register the SAME set of hooks
      for the SAME (event, matcher, if, timeout, async) shape. A hook added
      to one OS but not the other fails here.
-  2. WINDOWS GUARD VALIDITY — no Windows registration uses the bash test
-     syntax ``[ -n "$VCT_DISABLE_HOOKS" ]``. Windows hooks either self-guard
-     internally (every ``.ps1`` checks ``$env:VCT_DISABLE_HOOKS``) or use a
-     cmd-valid guard — never a bash-ism that is inert under cmd.exe.
+  2. GUARD VALIDITY — no registration on EITHER side carries the
+     settings-level ``[ -n "$VCT_DISABLE_HOOKS" ] || `` prefix. Windows
+     never had a valid one (a bash test is inert under cmd.exe — the D-4
+     fix); Linux carried it until v0.2.97, when it was retired as a
+     redundant second copy of the opt-out: the IN-SCRIPT guard (every
+     ``templates/hooks/*.{sh,ps1}`` exits 0 on the variable, pinned by
+     ``tests/test_hooks_disable_guard.py``) is the one mechanism.
 """
 from __future__ import annotations
 
@@ -34,8 +37,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LINUX = REPO_ROOT / "templates" / "settings.json.linux.template"
 WINDOWS = REPO_ROOT / "templates" / "settings.json.windows.template"
 
-# The bash test-syntax guard that is INERT under cmd.exe.
-_BASH_GUARD_RE = re.compile(r"\[\s*-n\s+\"\$VCT_DISABLE_HOOKS\"\s*\]\s*\|\|")
+# The bash test-syntax guard that is INERT under cmd.exe. The optional
+# backslashes (``\\?"``) match BOTH spellings the templates can carry: a
+# raw ``"`` (prettified JSON) and the json.dumps-escaped ``\"`` that the
+# generated form writes — without them the line-grep silently matched
+# NOTHING (a red-proof 2026-09-23 showed the check passing with the guard
+# reintroduced on a command: a guard test that cannot fail pins nothing).
+_BASH_GUARD_RE = re.compile(
+    r"\[\s*-n\s+\\?\"\$VCT_DISABLE_HOOKS\\?\"\s*\]\s*\|\|"
+)
 
 # Extract the script basename a command invokes (.sh or .ps1). Used to build
 # an OS-agnostic identity for a registration so the two templates can be
@@ -88,7 +98,28 @@ def _iter_registrations(data: dict):
 
 
 class WindowsGuardValidityTests(unittest.TestCase):
-    """Windows template must not carry bash-ism guards (D-4 core fix)."""
+    """Templates must not carry the settings-level guard prefix.
+
+    (D-4 core fix for Windows; v0.2.97 removal for Linux.)"""
+
+    def test_no_bash_guard_in_linux_template(self) -> None:
+        # v0.2.97: the linux template dropped the settings-level guard
+        # prefix entirely — re-adding it here (e.g. a hand-edit that
+        # reintroduces it) must fail.
+        body = LINUX.read_text(encoding="utf-8")
+        offenders = [
+            line.strip()
+            for line in body.splitlines()
+            if _BASH_GUARD_RE.search(line)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "Linux template must not re-introduce the settings-level guard "
+            "'[ -n \"$VCT_DISABLE_HOOKS\" ] || ' (removed v0.2.97 — the "
+            "in-script guard owns the opt-out). "
+            f"Offending line(s): {offenders!r}",
+        )
 
     def test_no_bash_guard_in_windows_template(self) -> None:
         body = WINDOWS.read_text(encoding="utf-8")

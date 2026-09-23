@@ -104,24 +104,34 @@ def resolve_project_id_for_folder(
             sqlite_ro_uri(target), uri=True, timeout=2.0)
     except sqlite3.Error:
         return None
-    project_id: Optional[str] = None
     try:
-        cur = conn.cursor()
         try:
-            cur.execute("SELECT id, folder_path FROM projects")
-            rows = cur.fetchall()
+            return project_id_for_folder_on_conn(conn, folder_canonical)
         except sqlite3.Error:
-            rows = []
-        for row_id, row_folder in rows:
-            if _canonical_path_eq(row_folder or "", folder_canonical):
-                project_id = str(row_id)
-                break
+            return None
     finally:
         try:
             conn.close()
         except sqlite3.Error:
             pass
-    return project_id
+
+
+def project_id_for_folder_on_conn(
+    conn: sqlite3.Connection, folder_canonical: Path,
+) -> Optional[str]:
+    """The folder->id match itself, on a connection the caller owns.
+
+    Unlike :func:`resolve_project_id_for_folder` this does NOT soft-fail: a
+    query error propagates as :class:`sqlite3.Error`, so a caller that must
+    tell "not registered" (``None``) from "could not ask" (the exception)
+    can — ``vco_lib.parked_hooks`` is one. ``folder_canonical`` must already
+    be resolved.
+    """
+    rows = conn.execute("SELECT id, folder_path FROM projects").fetchall()
+    for row_id, row_folder in rows:
+        if _canonical_path_eq(row_folder or "", folder_canonical):
+            return str(row_id)
+    return None
 
 
 def module_gateway_agents_active(target_folder: Path) -> bool:

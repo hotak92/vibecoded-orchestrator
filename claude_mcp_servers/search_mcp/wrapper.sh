@@ -14,13 +14,11 @@
 #   Two resolution paths, in order:
 #
 #   1. Env-first (canonical 0.1.7 path): if $GITHUB_TOKEN is already
-#      exported, use it. The launcher's `write_project_env_files`
-#      writes GITHUB_TOKEN to `.claude/env`, `.claude/settings.json`
-#      `env`, and `.vscode/settings.json` `claude-code.env` for every
-#      registered project, sourced from the keychain entry at
-#      `vct._user_shared_.shared.installer/github_pat`. Subprocesses
-#      spawned in any registered project's Claude Code session inherit
-#      it directly — no resolver call needed.
+#      exported, use it (exported by the user, or injected by
+#      `vct exec --secret github_pat=GITHUB_TOKEN`). The launcher writes
+#      NO secret values into project env files (v0.2.73 write
+#      invariant), so in a launcher-managed session this is normally
+#      unset and path 2 answers.
 #
 #   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`):
 #      reads from the launcher's hub HTTP API at
@@ -101,10 +99,8 @@ done
 
 # ── Resolve GITHUB_TOKEN ─────────────────────────────────────────────────────
 # Two paths, in order (legacy file fallback retired in 0.1.7 final, item H4):
-#   1. $GITHUB_TOKEN already exported in the environment — canonical 0.1.7
-#      path. Set by the launcher's `write_project_env_files` for every
-#      registered project, sourced from the keychain entry at
-#      `vct._user_shared_.shared.installer/github_pat`.
+#   1. $GITHUB_TOKEN already exported in the environment (by the user or
+#      `vct exec`; the launcher never writes it into project files).
 #   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`) —
 #      reads the keychain via the launcher hub. Works end-to-end for
 #      every base-host project after 0.1.7 H1: the orchestrator's

@@ -312,7 +312,7 @@ impl Db {
     /// project user-bucket secret the launcher has ever observed for
     /// `project_id` — regardless of active flag.
     ///
-    /// Used by `write_project_env_files` to drive two parallel decisions:
+    /// Used (until its retirement in v0.2.97) by the Rust env writer to drive two parallel decisions:
     ///
     ///   1. EMIT: walk the returned keys, look each up in the keychain,
     ///      apply the cross-launcher active gate, and include only the

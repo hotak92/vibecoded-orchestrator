@@ -117,7 +117,7 @@ pub fn deregister_mcp(target: &Path, mcp_name: &str) -> Result<(), String> {
 /// the secret-leak rationale. Per-project keys (KG_COLLECTION, PROJECT_NAME,
 /// DEVELOPMENT_COLLECTION, SHARED_KG_COLLECTION, CODE_GRAPH_PROJECT,
 /// KG_BASE_DIR) live in each project's `.claude/settings.json env` instead
-/// (launcher writes them via `write_project_env_files`); they are
+/// (launcher writes them via `vco_lib.config_projection apply`); they are
 /// intentionally absent from this allowlist.
 ///
 /// CRITICAL CONTRACT (Issue H.1 from mcp-instability audit 2026-05-16):
@@ -349,7 +349,7 @@ pub fn build_default_mcp_entries(
     // per-project may override" but Claude Code's actual env precedence
     // makes ~/.claude.json mcpServers.*.env WIN against
     // .claude/settings.json env — so the override goes the wrong direction.
-    // The launcher's write_project_env_files puts these in
+    // The launcher's env projection (config_projection apply) puts these in
     // .claude/settings.json env where they reach MCP subprocesses
     // correctly. Don't shadow them here.
     let mut weaviate_env = serde_json::Map::new();

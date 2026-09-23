@@ -23,6 +23,18 @@ on 2026-09-10 a system python that cannot import ``model_router``, which made
 the re-rendered unit unrunnable from the moment it was written, for every user
 who had opted in, silently, because the previous process kept serving.
 
+What it does NOT do: restart the running gateway (v0.2.97)
+----------------------------------------------------------
+Re-rendering a registration starts nothing, and the process already serving
+keeps the code it loaded — so after an update the gateway can run the previous
+release until something restarts it. Restarting it here would end every agent
+session routed through it, so this step never does; instead, once the
+registration is refreshed, it asks :mod:`vco_lib.gateway_freshness` whether the
+running gateway is PROVABLY behind the checkout and, only then, prints one line
+with the exact restart command. That tail rides this function because it is
+the gateway half of ``install.py --update``'s tail and ``install.py`` is under
+a strict line ratchet; the verdict and its reasoning live in that module.
+
 Soft-fail, and what a refusal owes the user
 -------------------------------------------
 Nothing here may block an install, on any OS. A refusal leaves the existing
@@ -89,6 +101,9 @@ def rerender_on_update(
             "warn",
             f"model-gateway boot re-render raised: {exc.__class__.__name__}: {exc}",
         )
+        # The staleness line does not depend on the registration: a gateway
+        # still serving old code is owed it even when the re-render failed.
+        _report_stale_gateway(install_root, log)
         return None
 
     if outcome.refused:
@@ -97,4 +112,30 @@ def rerender_on_update(
             "model-gateway boot unit left UNCHANGED — no entry point on this "
             f"machine could be verified: {outcome.reason}",
         )
+    _report_stale_gateway(install_root, log)
     return outcome
+
+
+def _report_stale_gateway(
+    install_root: "str | Path | None",
+    log: Optional[Callable[[str, str, str], Any]],
+) -> None:
+    """Print the one "restart it when idle" line if the gateway is stale.
+
+    Runs whether or not a registration exists: a gateway the launcher or a
+    terminal started serves stale code just the same, and the line then says
+    how to restart it by hand. Never raises (``report_after_update`` is
+    soft-fail itself; the import is guarded here for the same reason).
+    """
+    try:
+        from vco_lib import gateway_freshness  # noqa: PLC0415 — see module doc
+
+        gateway_freshness.report_after_update(
+            update=True,
+            install_root=Path(install_root) if install_root is not None else None,
+            log=log,
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail catch-all
+        if log is not None:
+            log(_LOG_PHASE, "warn",
+                f"model-gateway freshness check raised: {type(exc).__name__}: {exc}")

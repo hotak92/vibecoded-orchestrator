@@ -10,8 +10,11 @@ than merely deferred. `_autoprune_legacy_vscode_mcp_env_keys`:
   * ACT: parses the file (dict + `claude-code.env` dict), deletes exactly the 4
     keys, preserves everything else, atomic-writes valid JSON, records an
     auto-resolution, returns True.
-  * LEAVE-ALONE: unparseable JSONC / trailing-comma / unexpected shape → returns
-    False (caller falls back to the deferral); the file is untouched.
+  * JSONC (v0.2.97): a file with comments / trailing commas is READ and the
+    keys are cut out of its TEXT, every comment kept, verified by re-parsing.
+  * LEAVE-ALONE: not valid JSON or JSONC / an edit that cannot be verified /
+    unexpected shape → returns False (caller falls back to the deferral); the
+    file is untouched.
 """
 from __future__ import annotations
 
@@ -112,18 +115,48 @@ def test_act_leaves_empty_env_block_in_place(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# LEAVE-ALONE: unparseable JSONC / trailing-comma → returns False, untouched.
+# JSONC: pruned in place, comments kept (v0.2.97)
 # ---------------------------------------------------------------------------
 
-def test_leave_alone_jsonc_trailing_comma_returns_false(tmp_path: Path) -> None:
-    raw = '{\n  "claude-code.env": {\n    "MCP_PYTHON": "/x",  // comment\n  },\n}\n'
+def test_jsonc_is_pruned_in_place_keeping_every_other_byte(tmp_path: Path) -> None:
+    head = '{\n  // team settings\n  "claude-code.env": {\n    "KEEP": "1", // mine\n'
+    legacy = '    "MCP_PYTHON": "/x",\n'
+    tail = '  },\n  "editor.fontSize": 13,\n}\n'
+    settings = _write_settings(tmp_path, head + legacy + tail)
+    detection = project_init._detect_legacy_vscode_mcp_env_keys(tmp_path)
+    assert detection["action"] == "detected", "JSONC is read, not 'unparseable'"
+
+    pruned = project_init._autoprune_legacy_vscode_mcp_env_keys(tmp_path, detection)
+
+    assert pruned is True
+    assert settings.read_text(encoding="utf-8") == head + tail
+
+
+# ---------------------------------------------------------------------------
+# LEAVE-ALONE: not JSONC / unverifiable edit → returns False, untouched.
+# ---------------------------------------------------------------------------
+
+def test_leave_alone_invalid_file_returns_false(tmp_path: Path) -> None:
+    raw = '{\n  "claude-code.env": {\n    "MCP_PYTHON": "/x",  // comment\n'
     settings = _write_settings(tmp_path, raw)
-    # Detection itself reports "unparseable" for JSONC.
+    assert project_init._detect_legacy_vscode_mcp_env_keys(tmp_path)["action"] == "unparseable"
     detection = {"action": "detected", "keys": ["MCP_PYTHON"],
                  "file": ".vscode/settings.json"}
     pruned = project_init._autoprune_legacy_vscode_mcp_env_keys(tmp_path, detection)
-    assert pruned is False, "unparseable JSONC must NOT be auto-pruned"
-    # File byte-identical.
+    assert pruned is False, "a file that is not even JSONC must NOT be auto-pruned"
+    assert settings.read_text(encoding="utf-8") == raw
+
+
+def test_leave_alone_unverifiable_jsonc_edit_returns_false(tmp_path: Path) -> None:
+    """A duplicate key: cutting one copy leaves the other — refused, untouched."""
+    raw = (
+        '{\n  // dup\n  "claude-code.env": {\n    "KEEP": "1",\n'
+        '    "MCP_PYTHON": "/x",\n    "MCP_PYTHON": "/y",\n  },\n}\n'
+    )
+    settings = _write_settings(tmp_path, raw)
+    detection = {"action": "detected", "keys": ["MCP_PYTHON"],
+                 "file": ".vscode/settings.json"}
+    assert project_init._autoprune_legacy_vscode_mcp_env_keys(tmp_path, detection) is False
     assert settings.read_text(encoding="utf-8") == raw
 
 

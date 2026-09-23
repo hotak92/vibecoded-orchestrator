@@ -64,10 +64,9 @@
 //! row, eliminating the stale-shadow row that appeared when a user
 //! used both UI flows over time.
 //!
-//! That tuple is also what the env-pair builder in
-//! `commands/projects_v2.rs::write_project_env_files` reads when
-//! emitting `GITHUB_TOKEN` to per-project env files (replaces the
-//! retired `git-credential-vct` helper).
+//! That tuple is also what the launcher's PAT resolver
+//! (`commands/installer.rs::github_pat_for_env`) reads. No env writer
+//! emits `GITHUB_TOKEN` into project files since v0.2.73.
 //!
 //! `commands::installer::*` is the only path that calls into this
 //! module from outside `commands/secrets_cmd.rs`. This module remains

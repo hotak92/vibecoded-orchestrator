@@ -1138,17 +1138,17 @@ def _bootstrap_launcher_dist_subdir() -> Optional[str]:
     return None
 
 
-def _run_machine_migrations() -> None:
+def _run_machine_migrations(deferral_report: "DeferralReport") -> None:
     """Every one-time MACHINE-level migration, on every run. Soft-fail.
 
-    THE LEGS AND THE REASONING LIVE IN :mod:`vco_lib.machine_migrations`
-    (v0.2.95): the v0.2.92 WP-D metrics-archive copy + the Q1 panel
-    ``ANTHROPIC_MODEL`` pin removal. The NAME stays a module global: main()
-    calls it as one, and a test monkeypatches it there.
+    THE LEGS, THE REASONING AND WHERE IT IS CALLED LIVE IN :mod:`vco_lib.machine_migrations`.
+    A leg that could not run lands in ``deferral_report``. Called as a module global.
     """
     try:
         from vco_lib import machine_migrations
-        machine_migrations.run_every_run(on_event=_log_install_event)
+        machine_migrations.run_every_run(
+            on_event=_log_install_event, install_root=PROJECT_ROOT, report=deferral_report,
+        )
     except Exception as exc:  # noqa: BLE001 — best-effort by design
         _log_install_event("machine_migrations", "warn", f"could not run: {exc}")
 
@@ -3978,6 +3978,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     _venv_skip_entry = getattr(args, "_venv_skip_no_manifest_entry", None)
     if _venv_skip_entry is not None:
         _lightweight_deferral.add_entry(_venv_skip_entry)
+    _run_machine_migrations(_lightweight_deferral)  # after venv triage (v0.2.97)
 
     # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
     # default compose stack; Ollama MCP is dropped from the default install;
@@ -4806,25 +4807,36 @@ def _persist_storage_choice(choice: dict, install_root: Path) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+def _is_running_inside_venv(venv_python: Path, prefix: Optional[str] = None) -> bool:
+    """True when THIS process is the venv owning ``venv_python`` (two levels up).
+
+    VENV identity (``sys.prefix``), never the resolved binary: a POSIX venv's
+    python is a SYMLINK to its base (macOS framework too), so comparing binaries
+    kept every launcher update on /usr/bin/python3.12 (v0.2.97). Resolved +
+    case-normalised: /var -> /private/var, ``C:`` vs ``c:``, ``Scripts\\``."""
+    def _norm(p: "str | Path") -> str:
+        path = Path(p)
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError):  # unresolvable: compare as spelled
+            path = path.absolute()
+        return os.path.normcase(str(path))
+    current = sys.prefix if prefix is None else prefix
+    return _norm(current) == _norm(Path(venv_python).parent.parent)
+
+
 def _ensure_running_under_mcp_venv() -> None:
-    """v0.2.45 V45-A: relaunch under MCP venv if weaviate import is missing.
+    """v0.2.45 V45-A: relaunch under the install's venv when weaviate is missing.
 
-    Why: the launcher's update_orchestrator Tauri command (installer.rs)
-    spawns install.py under detect_python() — typically /usr/bin/python3.12
-    on Linux, NOT claude_mcp_servers/.venv/bin/python. install.py step 7d
-    (_migrate_kg_named_vector_slots) does an in-process `import weaviate`
-    via vco_lib.project_init._connect_v4_client. weaviate-client only lives
-    in the MCP venv. Without this relaunch, every launcher-driven update
-    deferred 4 entries to UPDATE_DEFERRED.md with ModuleNotFoundError.
+    The launcher spawns install.py under detect_python() — typically
+    /usr/bin/python3.12 — and what the venv provides (weaviate-client, the
+    editable ``model_router``) imports only from the venv.
 
-    No-op when:
-      - weaviate is already importable (CLI users with venv activated)
-      - we're already running under the resolved MCP venv (re-entry guard
-        via VCT_INSTALL_RELAUNCHED env)
-      - the resolved interpreter doesn't exist / can't be resolved
-        (soft-fail; install proceeds with system Python and step 7d will
-        still raise — but at least UPDATE_DEFERRED captures the error
-        and we have not introduced a new failure mode)
+    No-op when weaviate already imports (a CLI user with the venv activated);
+    when this process already IS that venv (:func:`_is_running_inside_venv`);
+    when ``VCT_INSTALL_RELAUNCHED`` is set (the loop guard: a relaunched child
+    that still cannot import weaviate must not exec again); or when no venv
+    interpreter resolves / exists (soft-fail with a stdout breadcrumb).
     """
     import importlib.util
     if importlib.util.find_spec("weaviate") is not None:
@@ -4832,17 +4844,13 @@ def _ensure_running_under_mcp_venv() -> None:
     # Re-entry guard: avoid exec loops if the relaunch points back at us
     if os.environ.get("VCT_INSTALL_RELAUNCHED") == "1":
         return
-    # v0.2.46 Part-1.5 H1: when any soft-fail path below short-circuits the
-    # relaunch (no MCP venv resolvable, target non-existent, etc.), print a
-    # breadcrumb so step 7d's eventual ModuleNotFoundError on `import weaviate`
-    # points the user at the venv-resolution cause rather than appearing as
-    # an unrelated traceback. Audit finding 2026-06-03 (venv-architecture).
+    # v0.2.46 H1: a soft-fail below prints a breadcrumb naming the cause.
     def _warn_silent_fallback(reason: str) -> None:
         print(
             "[v0.2.45 V45-A] could not relaunch under MCP venv "
-            f"({reason}) — proceeding with system Python; "
-            "step 7d (_migrate_kg_named_vector_slots) may fail with "
-            "ModuleNotFoundError: weaviate."
+            f"({reason}) — proceeding on {sys.executable}; a step that "
+            "imports a venv-only package in-process (weaviate-client, "
+            "model_router) may fail with ModuleNotFoundError."
         )
         sys.stdout.flush()
     try:
@@ -4853,14 +4861,8 @@ def _ensure_running_under_mcp_venv() -> None:
     if not target:
         _warn_silent_fallback("_resolve_venv_python_for_install returned None")
         return
-    # Compare resolved interpreter against sys.executable; skip if same
-    try:
-        if Path(target).resolve() == Path(sys.executable).resolve():
-            return
-    except Exception:
-        # Fallback: string-compare
-        if str(target) == sys.executable:
-            return
+    if _is_running_inside_venv(Path(target)):
+        return
     if not Path(target).is_file():
         _warn_silent_fallback(f"resolved interpreter does not exist: {target}")
         return
@@ -5977,9 +5979,6 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 — seeding is best-effort
         _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
 
-    # One-time machine migrations on every run (helper above; v0.2.92 WP-D).
-    _run_machine_migrations()
-
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
     # fork-bomb incidents (2026-04-30, 2026-05-15) before VCO 0.2.11.
@@ -6159,6 +6158,7 @@ def main() -> int:
 
     # Step 5: Install/update Python dependencies
     _install_requirements(venv_python, dev=args.dev)
+    _run_machine_migrations(_deferral_report)  # needs the venv (v0.2.97)
 
     # Step 5b (v0.2.85, PLAN-v0285 D1/D2): install the orchestrator-self runtime
     # .claude/ by DELEGATING to the SAME install-bundle engine the launcher
@@ -16227,7 +16227,7 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
         "clearly residual" — safe to drop.
       * We NEVER auto-drop. Instead, one deferral entry per qualifying
         collection is emitted to UPDATE_DEFERRED.md with an explicit
-        `python -m vco_lib.project_init drop-collection …` command.
+        single-class `DELETE /v1/schema/<class>` command (no VCO verb drops one).
 
     Idempotent — runs every update; already-absent collections produce no
     entries (the check re-reads the live schema each run).
@@ -16324,8 +16324,8 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
                     "captured in the canonical collection."
                 ),
                 command_to_apply=(
-                    f"python -m vco_lib.project_init drop-collection "
-                    f"--name {cls} --yes"
+                    f"curl -X DELETE {weaviate_url.rstrip('/')}/v1/schema/{cls}"
+                    f"   # drops ONLY this class; confirm its rows first"
                 ),
                 severity="info",
                 kg_node_refs=[],
@@ -20631,7 +20631,7 @@ def _register_mcps(
 
     Mutates ~/.claude.json (or VCT_USER_HOME_OVERRIDE/.claude.json for
     tests). Does NOT touch per-project .claude/settings.json — that's
-    managed separately by the launcher's write_project_env_files.
+    managed separately by the launcher's config_projection apply.
 
     Args:
         install_root: Repository root.
@@ -22251,7 +22251,7 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
     # there is exactly one Weaviate / Ollama / code_embed per machine; every
     # install — wherever it lives on disk — reaches them via 127.0.0.1 on the
     # default ports. Per-install isolation comes from KG_COLLECTION (set by
-    # the launcher's projects_v2::write_project_env_files), NOT from
+    # the launcher's `config_projection apply` projection), NOT from
     # different host endpoints.
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))

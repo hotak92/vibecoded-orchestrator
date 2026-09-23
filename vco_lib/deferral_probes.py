@@ -159,17 +159,53 @@ def upstream_sidecar_paths(entry: Any) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
+def is_rendered_file_sidecar(rel_path: str) -> bool:
+    """True when ``rel_path`` is a ``.from-upstream-`` sidecar of a RENDERED file.
+
+    v0.2.97. A rendered root file (``vco_lib/rendered_root_files.toml`` —
+    ``CLAUDE.md`` today) is materialized by install.py from its template, and
+    upstream's tracked copy is only the placeholder saying so. A sidecar of it
+    therefore holds nothing to adopt — adopting it would REPLACE the rendered
+    file with the placeholder — so it is not outstanding work. The launcher no
+    longer writes one, and install.py's re-render reaps the ones older
+    launchers parked (``rendered_root_files.reap_stale_sidecars``); this is the
+    probe-side half, so such a sidecar can never keep the entry alive.
+
+    The name rule is the reap's own (``rendered_root_files.is_rendered_sidecar_path``),
+    never re-stated here.
+    """
+    from vco_lib.rendered_root_files import is_rendered_sidecar_path
+
+    return is_rendered_sidecar_path(rel_path)
+
+
+def adoptable_upstream_sidecar_paths(entry: Any) -> tuple[str, ...]:
+    """:func:`upstream_sidecar_paths` minus sidecars of RENDERED files.
+
+    The set whose disappearance is the condition's lifecycle: see
+    :func:`is_rendered_file_sidecar` for why a rendered file's sidecar is not
+    in it.
+    """
+    return tuple(
+        p for p in upstream_sidecar_paths(entry) if not is_rendered_file_sidecar(p)
+    )
+
+
 def dismiss_fields_for_sidecars(entry: Any) -> dict:
     """``dismiss_key`` payload for ``orchestrator_user_modified_preserved``.
 
     Same extractor as the clear probe, so a dismissal is keyed on exactly the
     set of sidecars whose disappearance would have cleared the entry anyway.
     """
-    return {"preserved_sidecars": list(upstream_sidecar_paths(entry))}
+    return {"preserved_sidecars": list(adoptable_upstream_sidecar_paths(entry))}
 
 
 def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
-    """Bounded, read-only sweep: does ANY ``*.from-upstream-*`` file exist?
+    """Bounded, read-only sweep: does ANY adoptable ``*.from-upstream-*`` file exist?
+
+    "Adoptable" excludes a RENDERED file's sidecar (v0.2.97, see
+    :func:`is_rendered_file_sidecar`): it holds nothing to adopt, so its
+    presence is not outstanding work and must not keep an entry alive.
 
     The fallback for an entry that names no sidecar paths of its own — the
     LEGACY shape this probe could not otherwise touch (an entry written before
@@ -202,7 +238,9 @@ def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
             visited += len(dirnames) + len(filenames)
             for name in filenames:
                 if ".from-upstream-" in name:
-                    return True
+                    rel = Path(os.path.relpath(os.path.join(dirpath, name), root))
+                    if not is_rendered_file_sidecar(rel.as_posix()):
+                        return True
             if visited > _SIDECAR_SCAN_MAX_ENTRIES:
                 return None
     except OSError:
@@ -375,8 +413,16 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     the complete-list arm ends in the SAME bounded sweep the list-less arm
     uses: every sidecar this condition can create is accounted for, not the
     subset one entry happened to name.
+
+    v0.2.97 — RENDERED files. Both arms look only at ADOPTABLE sidecars
+    (:func:`adoptable_upstream_sidecar_paths`, and the same exclusion inside
+    the sweep). A ``CLAUDE.md.from-upstream-<sha>`` is upstream's placeholder
+    for a file install.py renders; it was never work the user owed, so an
+    entry naming only such sidecars clears (the field case above: both
+    ``CLAUDE.md`` sidecars were of this kind), while any genuine sidecar still
+    keeps the entry exactly as before.
     """
-    paths = upstream_sidecar_paths(ctx.entry)
+    paths = adoptable_upstream_sidecar_paths(ctx.entry)
     if not paths:
         return any_upstream_sidecar_on_disk(ctx.folder)
     try:
@@ -615,6 +661,39 @@ def kg_binding_evidence_still_mismatched(ctx: ProbeContext) -> Optional[bool]:
     return bool(scan.mismatches)
 
 
+def parked_hook_conflict_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``parked_hook_live_conflict`` — is a launcher-parked hook still running?
+
+    A thin wrapper over :func:`vco_lib.parked_hooks.conflict_still_present`,
+    the SAME detection the bundle update emits from, so the probe can never
+    clear an entry the next update would re-emit. ``None`` when launcher.db or
+    settings.json cannot be read.
+    """
+    from vco_lib.parked_hooks import conflict_still_present
+
+    try:
+        return conflict_still_present(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def settings_write_refusal_still_applies(ctx: ProbeContext) -> Optional[bool]:
+    """``settings_write_refused_*`` — is the refused settings file still unfit?
+
+    A thin wrapper over :func:`vco_lib.settings_refusal.refusal_still_applies`,
+    the SAME read the writers refuse on, so the probe can never clear an entry
+    the next write would re-emit. It reads the path the emitter recorded in
+    ``dismiss_fields`` — ``None`` when an entry carries none (a Markdown-only
+    ledger).
+    """
+    from vco_lib.settings_refusal import refusal_still_applies
+
+    try:
+        return refusal_still_applies(Path(ctx.folder), ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
     """``kg_unclaimed_populated_classes`` — is unclaimed data still unclaimed?
 
@@ -841,6 +920,8 @@ PROBES: dict[str, ProbeFn] = {
     "disk_space_still_low": disk_space_still_low,
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
+    "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
+    "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
     "code_embed_image_still_stale": code_embed_image_still_stale,
 }
 
@@ -1395,11 +1476,13 @@ __all__ = [
     "ProbeContext",
     "ProbeFn",
     "ProbePass",
+    "adoptable_upstream_sidecar_paths",
     "any_upstream_sidecar_on_disk",
     "apply_probe_statuses",
     "clear_mechanism_sentence",
     "dismiss_fields_for_sidecars",
     "format_probe_pass_summary",
+    "is_rendered_file_sidecar",
     "owned_record_is_expirable",
     "probe_report",
     "probe_status_sentence",

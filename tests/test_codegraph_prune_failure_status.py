@@ -213,8 +213,15 @@ def test_source_never_auto_drops_offers_consented_rebuild() -> None:
     assert "NEVER" in src and "auto-drop" in src, (
         "the remedy comment must state the drop is never automatic"
     )
-    assert "drop-collection" in src, (
-        "the operator remedy must point at the consented drop-collection flow"
+    # v0.2.97: the printed remedy used to be `python -m vco_lib.project_init
+    # drop-collection …`, a verb that has never existed (argparse exit 2). It
+    # is now the real single-class drop, and the phantom verb must not return.
+    assert "/v1/schema/<Prefix>_CodeFunction" in src, (
+        "the operator remedy must name a command that drops ONE class"
+    )
+    assert "project_init drop-collection" not in src, (
+        "`project_init` has no `drop-collection` verb — a printed command "
+        "must exist"
     )
 
 

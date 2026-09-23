@@ -89,10 +89,13 @@ from vco_lib.hooks_settings import invoked_script_tokens
 KIND_HOOK_SCRIPT = "hook_script"
 KIND_COMMAND = "command"
 
-#: VCO's own "the user switched hooks off" guard, which prefixes most shipped
-#: hook commands. Stripped before comparison so a registration is recognised
-#: whether or not the era that wrote it carried the guard (the `.sh` family
-#: gained it in v0.2.x; a pre-public-repo install has the bare form).
+#: VCO's own "the user switched hooks off" guard, which prefixed most
+#: shipped hook commands until v0.2.97. KEPT, not deleted: matching here is
+#: state-keyed — retirements and command-identity comparisons run against
+#: settings.json files written by EARLIER releases, and a pre-v0.2.97 install
+#: still carries the prefixed form for as long as it never runs a bundle
+#: update (and launcher-parked disabled entries restore it verbatim). Strip
+#: it here so both eras of the same registration compare equal.
 _DISABLE_GUARD_RE = re.compile(
     r"""^\[\s*-n\s+["']?\$\{?VCT_DISABLE_HOOKS(?::-)?\}?["']?\s*\]\s*\|\|\s*"""
 )
@@ -107,8 +110,9 @@ def normalize_command(command: str) -> str:
       * internal whitespace runs collapsed to one space (a re-indented or
         re-wrapped settings.json must not defeat the match);
       * a leading ``[ -n "$VCT_DISABLE_HOOKS" ] || `` guard dropped — the
-        guard is VCO's own, and the same registration exists in the wild both
-        with and without it.
+        guard stopped shipping in v0.2.97, but installs written before that
+        release carry it (see ``_DISABLE_GUARD_RE``), so both eras of one
+        registration must compare equal.
 
     Does NOT touch path separators or quoting: those are meaningful inside a
     ``python -c`` payload, and the ``KIND_HOOK_SCRIPT`` matcher (not this one)

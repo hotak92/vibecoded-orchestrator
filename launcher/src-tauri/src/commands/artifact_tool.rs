@@ -185,21 +185,13 @@ fn backup_path_if_present(path: &Path) -> Option<String> {
     bak.exists().then(|| bak.display().to_string())
 }
 
-/// Parse the settings document, refusing anything that is not a JSON object.
-///
-/// A non-object root (array, string, number) is treated exactly like a parse
-/// failure: this is a user-owned file, and "replace the root with `{}`" —
-/// which the per-project writer in `projects_v2` can afford, because the
-/// launcher authors that file — would destroy the user's content here.
+/// Parse the settings document, refusing anything that is not a JSON object —
+/// the shared [`json_file::read_object_or_empty`] (v0.2.97: lifted from here
+/// when the per-project env writers stopped replacing such a file with `{}`;
+/// the old note that they "could afford" it was wrong — no settings file
+/// holds only what the launcher put there).
 fn load_object(path: &Path) -> Result<Value, String> {
-    let root = json_file::read_json_or_empty(path)?;
-    if !root.is_object() {
-        return Err(format!(
-            "{} does not contain a JSON object at its root; refusing to modify it",
-            path.display()
-        ));
-    }
-    Ok(root)
+    json_file::read_object_or_empty(path)
 }
 
 /// Read the current state. Never writes, never creates the file — page load

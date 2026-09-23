@@ -130,7 +130,7 @@ fn is_user_emit_bucket(scope: &str, module_id: &str) -> bool {
 }
 
 /// Subagent G (2026-05-08), broadened by H2 (2026-05-08): re-run
-/// `write_project_env_files` for the affected project(s) after a
+/// the env projection (`refresh_project_env_with_db`) for the affected project(s) after a
 /// user-bucket secret change.
 ///
 /// Three cases:
@@ -2045,7 +2045,7 @@ mod tests {
     //
     // These tests pin the contract that mutating a per-project user-bucket
     // secret via `set_secret_v2` / `clear_secret_v2` / `reactivate_secret_v2`
-    // / `remove_secret_v2` triggers `write_project_env_files` so the env
+    // / `remove_secret_v2` triggers the env projection so the env
     // surfaces stay in sync without a session restart.
     //
     // Each test seeds a real on-disk project folder so the writer has
@@ -2165,7 +2165,7 @@ mod tests {
     }
 
     /// End-to-end: `set_secret_v2` against the per-project user bucket
-    /// triggers `write_project_env_files`. The keychain entry lands AND
+    /// triggers the env projection. The keychain entry lands AND
     /// the project's `.claude/settings.json` env block carries the key.
     /// Skipped without an OS keychain (most CI containers).
     ///

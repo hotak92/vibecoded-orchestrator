@@ -22,10 +22,8 @@ use std::path::{Path, PathBuf};
 use tauri::{command, State};
 
 use crate::commands::installer::find_local_repo_root;
-use crate::commands::project_env_settings::{self, ProjectEnvSettings};
-use crate::commands::projects_v2::{
-    refresh_project_env_with_db, sanitize_kg_collection, write_project_env_files,
-};
+use crate::commands::project_env_settings;
+use crate::commands::projects_v2::{refresh_project_env_with_db, sanitize_kg_collection};
 use crate::config::LocalConfig;
 use crate::db::Db;
 use crate::project_naming::canonical_class_prefix;
@@ -1791,14 +1789,12 @@ fn read_vct_module_version(folder: &Path) -> Option<String> {
 }
 
 // Suppress unused-warning when the platform layer doesn't pull
-// `find_local_repo_root` / `write_project_env_files` / `ProjectEnvSettings`
-// transitively. These are kept in the import block because they document
+// `find_local_repo_root` / `project_env_settings::populate` transitively. These are kept in the import block because they document
 // the implicit contract this file participates in (see the comment above
 // `update_project_identity` re: env-surface plumbing).
 #[allow(dead_code)]
 fn _doc_imports() {
     let _: fn() -> Result<PathBuf, String> = find_local_repo_root;
-    let _: fn(&Path, &ProjectEnvSettings) -> Result<(), String> = write_project_env_files;
     let _ = project_env_settings::populate;
 }
 

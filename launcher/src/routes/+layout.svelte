@@ -83,6 +83,12 @@
   import WeightsUpdatePrompt from '$lib/components/WeightsUpdatePrompt.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import UpdateToast from '$lib/components/UpdateToast.svelte';
+  // v0.2.97: "the model gateway needs restarting" — asked once per launcher
+  // start, because both update surfaces end in a launcher restart. Shown only
+  // for a gateway PROVEN to run older code than the checkout; never restarts
+  // anything unless the user presses Continue.
+  import GatewayRestartModal from '$lib/components/GatewayRestartModal.svelte';
+  import { gatewayFreshness } from '$lib/stores/gateway-freshness';
   import { invoke } from '$lib/tauri';
   // M-P1-5: per-install-root scoping for localStorage flags. See
   // `install-state-store.ts` for the migration rationale (two clones
@@ -184,6 +190,10 @@
         setTimeout(() => splash.remove(), 320);
       }
     }
+
+    // v0.2.97: after the boot probes have settled, ask whether the running
+    // model gateway is behind the checkout (read-only; see the import note).
+    setTimeout(() => void gatewayFreshness.check(), 4000);
 
     // Check onboarding / changelog gates once per app load.
     //
@@ -488,6 +498,7 @@
        `launcher/src-tauri/src/lib.rs` and routes them through the
        toast store. Renders nothing on its own (pure side-effect mount). -->
   <UpdateToast />
+  <GatewayRestartModal />
 {/if}
 
 <style>

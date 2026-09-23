@@ -7102,8 +7102,8 @@ def main():
                 "This is upstream shard state, not a VCO logic bug. To clear it, "
                 "rebuild the affected collection from scratch via the launcher's "
                 "Reanalyze (drop-and-rebuild) consent flow, e.g.:\n"
-                "   python -m vco_lib.project_init drop-collection "
-                "--name <project> --suffix CodeFunction   # then re-run analysis\n"
+                "   curl -X DELETE \"${WEAVIATE_URL:-http://localhost:8081}"
+                "/v1/schema/<Prefix>_CodeFunction\"   # then re-run analysis\n"
                 "   .claude/scripts/code-graph-analyze . --project <name> --prune-stale\n"
                 "The code graph is derived data, so a rebuild is cheap and "
                 "definitive — but it is NEVER done automatically.",

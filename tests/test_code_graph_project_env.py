@@ -287,14 +287,52 @@ class VscodeExcludesBackfillTests(unittest.TestCase):
             folder = Path(td)
             f = folder / ".vscode" / "settings.json"
             f.parent.mkdir(parents=True, exist_ok=True)
-            # Common case: trailing comma in hand-edited JSONC. Standard
-            # json.loads rejects → action=unparseable, user file untouched.
-            f.write_text('{"some": "key",}', encoding="utf-8")
+            # Not JSON and not JSONC either (the object never closes):
+            # action=unparseable, user file untouched.
+            f.write_text('{"some": "key",', encoding="utf-8")
             result = project_init._backfill_vscode_excludes_in_project(folder)
             self.assertEqual(result["action"], "unparseable")
             self.assertEqual(result["added_keys"], [])
             # File contents preserved verbatim.
-            self.assertEqual(f.read_text(encoding="utf-8"), '{"some": "key",}')
+            self.assertEqual(f.read_text(encoding="utf-8"), '{"some": "key",')
+
+    def test_jsonc_file_is_backfilled_in_place_keeping_comments(self):
+        """v0.2.97: the common hand-edited case — comments, a trailing comma —
+        is READ, and the missing blocks are inserted into its text."""
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            f = folder / ".vscode" / "settings.json"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            head = '{\n  // mine\n  "some": "key",'
+            f.write_text(head + "\n}\n", encoding="utf-8")
+            result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "backfilled")
+            text = f.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(head), "nothing before the insertion moved")
+            from vco_lib import jsonc_edit
+            data = jsonc_edit.loads(text)
+            self.assertEqual(data["some"], "key")
+            for key in result["added_keys"]:
+                self.assertIn(key, data)
+
+    def test_unverifiable_jsonc_edit_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            f = folder / ".vscode" / "settings.json"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            raw = '{\n  // dup\n  "some": 1,\n  "some": 2,\n}\n'
+            f.write_text(raw, encoding="utf-8")
+            from unittest import mock
+            from vco_lib import jsonc_edit
+            # The only edit here is an insertion, which cannot clash; force the
+            # verifier's verdict to prove a refusal writes nothing.
+            with mock.patch.object(
+                jsonc_edit, "rewrite_preserving",
+                side_effect=jsonc_edit.JsoncEditRefused("jsonc_edit_unverified", "x"),
+            ):
+                result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "jsonc_edit_refused")
+            self.assertEqual(f.read_text(encoding="utf-8"), raw)
 
     def test_existing_file_missing_keys_backfilled(self):
         with tempfile.TemporaryDirectory() as td:

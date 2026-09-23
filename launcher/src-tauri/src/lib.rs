@@ -3056,6 +3056,9 @@ pub fn run() {
             commands::model_gateway::model_gateway_clear_default_model,
             commands::model_gateway::model_gateway_mode_get,
             commands::model_gateway::model_gateway_mode_set,
+            commands::gateway_freshness::model_gateway_freshness,
+            commands::gateway_freshness::model_gateway_restart_stale,
+            commands::gateway_usage::model_gateway_usage_windows,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.

@@ -377,7 +377,9 @@ export function describeMode(mode: PanelMode | null): ModeDescription {
       return {
         label: 'Unreadable settings',
         tooltip:
-          'settings.json is not strict JSON (comments or trailing commas); VCO will not rewrite it.',
+          // Comments / trailing commas (JSONC) ARE read and edited in place
+          // since v0.2.97 (vco_lib.jsonc_edit); this state means neither.
+          'settings.json is not valid JSON or JSONC; VCO will not rewrite it.',
         active: null,
       };
     default:
@@ -847,7 +849,7 @@ export function stopDisabledReason(s: ModelGatewayStatus | null): string {
  * Warnings to show BEFORE the user points the panel at the gateway.
  *
  * The Remote Control note comes first and is never suppressed (it applies
- * to the JSONC paste path too): Remote Control is endpoint-gated — Claude
+ * to the paste-ready block too): Remote Control is endpoint-gated — Claude
  * Code initializes it only in sessions talking directly to
  * api.anthropic.com, so it can never work in a panel pointed at the
  * gateway, whatever model is selected. The supported shape is a native
@@ -866,7 +868,7 @@ export function pointPanelWarnings(inspection: VSCodeInspection | null): string[
   );
   if (inspection.parseable === false) {
     out.push(
-      `${inspection.path} is not strict JSON, so VCO will not rewrite it (that would delete your comments). Use the paste-ready block instead.`,
+      `${inspection.path} is not valid JSON or JSONC, so VCO will not rewrite it. Use the paste-ready block instead.`,
     );
     return out;
   }

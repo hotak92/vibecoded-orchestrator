@@ -164,10 +164,8 @@ _LEGACY_ENV_TEMPLATE_MARKER = "env_template: legacy_caller_pending_migration"
 #   * launcher/src-tauri/src/commands/projects_v2.rs — production
 #     callers (create / rename / refresh / write-disabled-toggle) now
 #     subprocess into `python -m vco_lib.config_projection apply`
-#     via `apply_project_env_via_python`. The legacy
-#     `write_project_env_files` function is retained for test fixtures
-#     and for the user-secret SecretsPanel flow (which uses an in-Rust
-#     code path the Python contract doesn't cover yet — Phase 0.E).
+#     via `apply_project_env_via_python`. The legacy Rust env
+#     writer was deleted in v0.2.97 (no production caller remained).
 #   * install.py — `_backfill_code_graph_project_env` (orchestrator-root
 #     env projection) now imports + calls `apply_project_env` directly.
 #   * vco_lib/project_init.py — the per-user-project install-bundle
@@ -197,8 +195,8 @@ _LEGACY_PRODUCTION_WRITERS: set[Path] = set()
 #   * launcher/src-tauri/src/commands/projects_v2.rs —
 #     ``ensure_project_env_template`` is the Rust legacy writer; full
 #     migration to subprocess-into-Python is Phase 0.D Part 2 (a
-#     follow-up matching the Phase 0.B Part 2 / write_project_env_files
-#     pattern; out of scope for this PR).
+#     follow-up matching the Phase 0.B Part 2 Rust-env-writer
+#     migration pattern; out of scope for this PR).
 _LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = {
     REPO_ROOT / "install.py",
     REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",

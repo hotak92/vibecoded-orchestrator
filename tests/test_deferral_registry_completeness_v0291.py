@@ -529,9 +529,12 @@ class TestRegistryCompleteness(unittest.TestCase):
         # `kg_unclaimed_populated_classes` (v0.2.92 item 3): same shape —
         # the doctor's entry builder attaches the unclaimed class set
         # (doctor._kg_unclaimed_entry's dismiss_fields).
+        # `settings_write_refused_*` (v0.2.97): `settings_refusal.record`
+        # attaches path / kind / sha256 of the refused file on every emit
+        # (pinned by tests/test_v0297_settings_write_refusal.py).
         emitter_supplied = {
             "dual_ollama_detected", "kg_binding_evidence_mismatch",
-            "kg_unclaimed_populated_classes",
+            "kg_unclaimed_populated_classes", "settings_write_refused_*",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
