@@ -657,6 +657,89 @@ def test_the_condition_is_registered_with_its_probe():
     assert "parked_hook_conflict_still_present" in deferral_probes.PROBES
 
 
+def _as_jsonc(settings: Path) -> None:
+    """Rewrite ``settings`` as JSONC — a comment and a trailing comma, the two
+    things Claude Code accepts and a strict ``json.loads`` rejects."""
+    text = settings.read_text(encoding="utf-8").rstrip()
+    assert text.endswith("}")
+    settings.write_text(
+        "// my own note about these settings\n" + text[:-1].rstrip() + ",\n}\n",
+        encoding="utf-8")
+    with pytest.raises(ValueError):
+        json.loads(settings.read_text(encoding="utf-8"))
+
+
+def _no_log(*_a, **_k) -> None:
+    return None
+
+
+def _probe_verdict(project: Path):
+    """What the registry pass (bundle update / install.py --update) sees."""
+    from vco_lib import deferral_probes
+
+    return deferral_probes.run_probe(
+        "parked_hook_conflict_still_present",
+        deferral_probes.ProbeContext(folder=project, entry=None),
+    )
+
+
+def test_a_jsonc_settings_file_with_a_parked_and_running_hook_is_reported(world):
+    """F7 ACT. RED before the fix: the strict reader read a JSONC settings.json
+    as "could not read", so the conflict was never recorded."""
+    _orch, project, settings, _db, _blob = _resurrected(world)
+    _as_jsonc(settings)
+    state = parked_hooks.read_parked_hooks(project)
+    assert state.readable
+    assert parked_hooks.emit_conflict_deferral(project, state, log=_no_log) is True
+    assert DeferralReport.read(project).has_condition(CONFLICT_CID)
+    assert conflict_still_present(project) is True
+    assert _probe_verdict(project) is True
+
+
+def test_a_jsonc_settings_file_clears_the_entry_once_the_conflict_is_gone(world):
+    """F7 CLEAR. RED before the fix: the probe answered None (unknown) for a
+    JSONC file forever, so an entry never cleared after the remedy."""
+    _orch, project, settings, db, _blob = _resurrected(world)
+    parked_hooks.emit_conflict_deferral(
+        project, parked_hooks.read_parked_hooks(project), log=_no_log)
+    assert DeferralReport.read(project).has_condition(CONFLICT_CID)
+    _disable_from_launcher(settings, db, "Stop", "", NOTIFY)  # remedy 1
+    _as_jsonc(settings)
+    assert conflict_still_present(project) is False
+    assert _probe_verdict(project) is False
+
+
+def test_a_jsonc_settings_file_without_a_conflict_records_nothing(world):
+    """F7 LEAVE-ALONE: JSONC with the hook parked and NOT running."""
+    _orch, project, settings, db = world
+    _disable_from_launcher(settings, db, "Stop", "", GUARD + NOTIFY)
+    _as_jsonc(settings)
+    state = parked_hooks.read_parked_hooks(project)
+    assert parked_hooks.emit_conflict_deferral(project, state, log=_no_log) is False
+    assert not DeferralReport.read(project).has_condition(CONFLICT_CID)
+    assert conflict_still_present(project) is False
+
+
+@pytest.mark.parametrize("raw", [
+    b"{ this is not JSONC",
+    b"[1, 2, 3]\n",
+    b"\xff\xfe{\"hooks\": {}}",
+])
+def test_an_unreadable_settings_file_keeps_the_entry_and_records_nothing(world, raw):
+    """F7 unknown is not resolved: not JSONC, a non-object top level, not
+    UTF-8 — the probe answers None (keep) and the emitter writes nothing."""
+    _orch, project, settings, _db, _blob = _resurrected(world)
+    parked_hooks.emit_conflict_deferral(
+        project, parked_hooks.read_parked_hooks(project), log=_no_log)
+    settings.write_bytes(raw)
+    assert conflict_still_present(project) is None
+    assert _probe_verdict(project) is None
+    assert parked_hooks.emit_conflict_deferral(
+        project, parked_hooks.read_parked_hooks(project), log=_no_log) is False
+    assert DeferralReport.read(project).has_condition(CONFLICT_CID), \
+        "the entry recorded earlier must survive an unreadable file"
+
+
 # ---------------------------------------------------------------------------
 # 7. restore idempotency by identity
 # ---------------------------------------------------------------------------

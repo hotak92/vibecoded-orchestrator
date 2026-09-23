@@ -303,23 +303,47 @@ def test_an_uncheckable_file_is_reported_and_retried_until_it_is_read(harness: H
 # ---------------------------------------------------------------------------
 
 
+def _top_level_call(body: list, name: str) -> "ast.Call | None":
+    """The ``name(...)`` call that is itself a statement of ``body`` — not one
+    nested under an ``if`` / ``try`` / ``with``, which could skip it."""
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == name
+        ):
+            return stmt.value
+    return None
+
+
 def test_main_runs_the_migrations_after_the_venv_step_with_the_run_report():
-    """``main()`` is a long sequential flow no unit test can drive, so its call
-    ORDER is checked on the AST (a name in a comment cannot satisfy an
-    ``ast.Call``). The migration needs the venv, so it must follow step 5 —
-    which is also what makes it run on a FIRST install."""
+    """STRUCTURAL, and stated as such (review F14): ``main()`` is a long
+    sequential flow no unit test can drive, so this reads its AST — which a
+    name in a comment cannot satisfy — rather than executing it. The
+    ``--lightweight`` and ``--uninstall`` legs below ARE executed.
+
+    What the AST can prove, it checks: exactly one call anywhere in
+    ``main()``; that call and step 5's ``_install_requirements`` are both
+    top-level statements of ``main()``'s body (so no branch inside ``main()``
+    can skip one and not the other); the migration comes after the venv
+    step (which is what makes it run on a FIRST install); and it is handed
+    the run's deferral report. What it cannot prove is which EARLY RETURN a
+    given argv takes — the two driven tests below cover the two that matter.
+    """
     tree = ast.parse((REPO_ROOT / "install.py").read_text(encoding="utf-8"))
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
-    calls = [
+    everywhere = [
         n for n in ast.walk(main)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == "_run_machine_migrations"
     ]
-    migrations = [c for c in calls if c.func.id == "_run_machine_migrations"]
-    requirements = [c for c in calls if c.func.id == "_install_requirements"]
-    assert len(migrations) == 1, "exactly one call site"
-    assert requirements, "main() no longer installs requirements?"
-    (call,) = migrations
-    assert call.lineno > max(r.lineno for r in requirements)
+    assert len(everywhere) == 1, "exactly one call site"
+    call = _top_level_call(main.body, "_run_machine_migrations")
+    requirements = _top_level_call(main.body, "_install_requirements")
+    assert call is not None, "the call must not sit under a branch of main()"
+    assert requirements is not None, "step 5 must be a top-level statement of main()"
+    assert call.lineno > requirements.lineno
     assert [a.id for a in call.args if isinstance(a, ast.Name)] == ["_deferral_report"]
 
 

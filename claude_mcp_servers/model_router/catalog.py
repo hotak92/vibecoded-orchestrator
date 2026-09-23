@@ -77,7 +77,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional, Sequence
 
@@ -324,6 +324,11 @@ class CatalogEntry:
     #: ``_vct_window_source``. ``compare=False`` for the same reason as
     #: ``capabilities``: it is provenance, never identity.
     window_source: str = field(default=WINDOW_UNKNOWN, compare=False)
+    #: The vendor whose subscription answers this row; ``None`` for a
+    #: first-party row. Set by :func:`_render`, read by
+    #: :func:`with_usage_labels`. Provenance, never identity (``compare=False``)
+    #: and never published.
+    vendor_id: Optional[str] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -703,7 +708,12 @@ def _latest_only(
 
 
 def _render(
-    candidate: _Candidate, *, label: str, model_id: str, display_name: str,
+    candidate: _Candidate,
+    *,
+    label: str,
+    model_id: str,
+    display_name: str,
+    vendor_id: Optional[str] = None,
 ) -> CatalogEntry:
     """One published row. Upstream's own fields are relayed unchanged."""
     return CatalogEntry(
@@ -723,6 +733,7 @@ def _render(
             one_m_row=model_id.endswith(ONE_M_SUFFIX),
         ),
         window_source=candidate.window.source,
+        vendor_id=vendor_id,
     )
 
 
@@ -834,6 +845,7 @@ def _publish_family(
                     label=label,
                     model_id=candidate.published_id,
                     display_name=candidate.display_name,
+                    vendor_id=vendor.vendor_id if vendor is not None else None,
                 )
             )
         if vendor is None and candidate.one_m:
@@ -1312,6 +1324,37 @@ class CatalogService:
         return CatalogUnion(entries=entries, sources=sources, hidden=hidden)
 
 
+def with_usage_labels(
+    entries: Sequence[CatalogEntry], suffixes: Mapping[str, str],
+) -> list[CatalogEntry]:
+    """Append each vendor row's subscription-usage suffix to its display name.
+
+    Only ``display_name`` changes: the ``id`` is what the client sends back
+    and what the gateway routes on, and a model name must name the model that
+    answers. ``suffixes`` is keyed by vendor id
+    (:func:`model_router.usage_windows.label_suffixes`); a vendor with no
+    entry — nothing known, or nothing fresh — keeps its label unchanged.
+
+    **First-party rows are never decorated**, and not by oversight. Claude
+    Code (2.1.280, read from the shipped binary) merges gateway rows into a
+    picker it has ALREADY filled with its own built-in Claude rows, and
+    drops every gateway row that names a model one of those already covers;
+    its model-name lookup also takes a first-party id's name from its own
+    table before it ever consults the gateway's. A Claude usage suffix would
+    therefore reach no picker at all — and on a client where some row did
+    survive, it would be text the next client release silently discards.
+    Claude usage is shown by ``/usage/windows`` and the status line instead.
+    """
+    out: list[CatalogEntry] = []
+    for entry in entries:
+        suffix = suffixes.get(entry.vendor_id) if entry.vendor_id else None
+        out.append(
+            replace(entry, display_name=f"{entry.display_name}{suffix}")
+            if suffix else entry
+        )
+    return out
+
+
 def _model_row(entry: CatalogEntry) -> dict:
     """One ``data`` row.
 
@@ -1413,4 +1456,5 @@ __all__ = [
     "resolve_window",
     "short_tokens",
     "to_models_response",
+    "with_usage_labels",
 ]

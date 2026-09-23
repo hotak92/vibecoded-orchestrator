@@ -485,6 +485,66 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.stop()
         self.assertFalse(service.refreshing)
 
+    # ── warm while chats flow (owner decision 2026-09-23) ────────────────
+    async def _settle(self, service: UsageWindows) -> None:
+        await asyncio.sleep(0)
+        while service.refreshing:
+            await asyncio.sleep(0.001)
+
+    async def test_activity_schedules_a_refresh_without_awaiting_it(self) -> None:
+        service = self.make()
+        # Synchronous and O(1): a plain call, not a coroutine, and the
+        # vendors have not been asked by the time it returns.
+        self.assertTrue(service.note_activity())
+        self.assertTrue(service.refreshing)
+        self.assertEqual(self.fetch.calls, [])
+        await self._settle(service)
+        self.assertEqual(len(self.fetch.calls), 2)  # Claude + Z.ai, once each
+        snap = service.snapshot()
+        self.assertIsNotNone(snap["last_activity_at"])
+        self.assertIsNotNone(snap["last_refresh_at"])
+
+    async def test_idle_gateway_makes_no_vendor_calls(self) -> None:
+        # A short real interval, so a timer — if anyone ever adds one —
+        # would have fired many times during the sleep below.
+        service = self.make(refresh_s=0.01, jitter_s=0.0)
+        self.assertTrue(service.note_activity())
+        await self._settle(service)
+        after_traffic = len(self.fetch.calls)
+        for _ in range(20):  # hours of simulated idle time
+            self.clock[0] += 3600
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(self.fetch.calls), after_traffic)
+        self.assertFalse(service.refreshing)
+
+    async def test_steady_traffic_refreshes_once_per_interval(self) -> None:
+        # 240 s + 0.5 * 60 s of jitter = due every 270 s. A request every 10 s
+        # for 20 minutes is 121 signals and must be 5 refreshes (t = 0, 270,
+        # 540, 810, 1080), not 121.
+        service = self.make(refresh_s=240.0, jitter_s=60.0)
+        scheduled = 0
+        for _ in range(121):
+            scheduled += service.note_activity()
+            await self._settle(service)
+            self.clock[0] += 10
+        self.assertEqual(scheduled, 5)
+        self.assertEqual(len(self.fetch.calls), 10)
+
+    async def test_a_burst_during_a_hung_refresh_stays_single_flight(self) -> None:
+        self.fetch.gate = asyncio.Event()  # the refresh hangs
+        service = self.make(refresh_s=1.0, jitter_s=0.0)
+        self.assertTrue(service.note_activity())
+        await asyncio.sleep(0)
+        for _ in range(500):
+            self.clock[0] += 60  # long past due, still one in flight
+            self.assertFalse(service.note_activity())
+            self.assertFalse(service.request_refresh())
+        self.assertEqual(len(self.fetch.calls), 1)  # stuck on the first fetch
+        self.fetch.gate.set()
+        await self._settle(service)
+        self.assertEqual(len(self.fetch.calls), 2)
+        await service.stop()
+
     async def test_secrets_never_in_snapshot_line_or_log(self) -> None:
         self._write_ledger()
         with self.assertLogs("model_router", level=logging.DEBUG) as captured:
@@ -606,21 +666,30 @@ class RouteTests(GatewayTestBase):
         self.assertEqual(body["vendors"][0]["state"], uw.STATE_PENDING)
         await self.gateway.usage_windows.stop()  # the hung task is cancelled
 
-    async def test_messages_never_trigger_a_usage_fetch_and_headers_are_captured(self) -> None:
-        recorder = _FakeFetch({})
-        self.gateway.usage_windows._fetch = recorder
-        resp = await self.client.post(
+    async def _chat(self, model: str = "claude-x"):
+        return await self.client.post(
             "/v1/messages",
             headers={**self.auth(), "Content-Type": "application/json"},
-            json={"model": "claude-x", "max_tokens": 5,
+            json={"model": model, "max_tokens": 5,
                   "messages": [{"role": "user", "content": "hi"}]},
         )
-        self.assertEqual(resp.status, 200)
-        await resp.read()
-        self.assertEqual(recorder.calls, [])
-        self.assertEqual(self.anthropic_up.message_requests[-1]["path"], "/v1/messages")
-        self.assertFalse(self.gateway.usage_windows.refreshing)
+
+    async def test_chat_traffic_schedules_one_refresh_and_headers_are_captured(self) -> None:
+        recorder = _FakeFetch({})
+        recorder.gate = asyncio.Event()  # the refresh hangs until released
+        self.gateway.usage_windows._fetch = recorder
+        for _ in range(3):
+            resp = await self._chat()
+            self.assertEqual(resp.status, 200)
+            await resp.read()
+        # Warm while chats flow: the traffic scheduled a refresh, ONE, which
+        # is still in flight — the three answers above did not wait for it.
+        self.assertTrue(self.gateway.usage_windows.refreshing)
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertEqual(len(self.anthropic_up.message_requests), 3)
         snap = self.gateway.usage_windows.snapshot()
+        self.assertIsNotNone(snap["last_activity_at"])
+        recorder.gate.set()
         claude = snap["vendors"][0]
         by_id = {w["id"]: w for w in claude["windows"]}
         self.assertEqual(by_id["5h"]["percent"], 33.0)
@@ -629,7 +698,11 @@ class RouteTests(GatewayTestBase):
 
     async def test_vendor_answers_are_not_read_as_claude_windows(self) -> None:
         # The vendor stub sends the SAME header names; they must not feed
-        # Claude's windows — the tap is first-party only.
+        # Claude's windows — the tap is first-party only. The activity-driven
+        # refresh is held so only the tap could fill the windows.
+        held = _FakeFetch({})
+        held.gate = asyncio.Event()
+        self.gateway.usage_windows._fetch = held
         resp = await self.client.post(
             "/v1/messages",
             headers={**self.auth(), "Content-Type": "application/json"},
@@ -638,6 +711,41 @@ class RouteTests(GatewayTestBase):
         )
         await resp.read()
         self.assertEqual(self.gateway.usage_windows.snapshot()["vendors"][0]["windows"], [])
+
+    async def test_a_hanging_refresh_never_delays_a_chat(self) -> None:
+        hung = _FakeFetch({})
+        hung.gate = asyncio.Event()  # never released
+        self.gateway.usage_windows._fetch = hung
+        for _ in range(3):
+            started = time.monotonic()
+            resp = await asyncio.wait_for(self._chat(), timeout=5)
+            body = await resp.json()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body["id"], "msg_1")
+            self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(len(hung.calls), 1)  # still the first, still hung
+        await self.gateway.usage_windows.stop()
+
+    async def test_a_failing_refresh_or_signal_never_fails_a_chat(self) -> None:
+        async def exploding(url: str, headers: Mapping[str, str]):
+            raise RuntimeError("usage source blew up")
+
+        self.gateway.usage_windows._fetch = exploding
+        with self.assertLogs("model_router", level=logging.ERROR):
+            resp = await self._chat()
+            self.assertEqual(resp.status, 200)
+            await resp.read()
+            while self.gateway.usage_windows.refreshing:
+                await asyncio.sleep(0.01)
+
+        def broken_signal() -> bool:
+            raise RuntimeError("defect in the activity signal")
+
+        self.gateway.usage_windows.note_activity = broken_signal  # type: ignore[method-assign]
+        with self.assertLogs("model_router", level=logging.ERROR):
+            resp = await self._chat()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["id"], "msg_1")
 
     async def test_stop_cancels_an_inflight_refresh(self) -> None:
         blocked = _FakeFetch({})

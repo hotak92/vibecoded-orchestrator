@@ -86,7 +86,6 @@ registry probe clears it once no hook is both parked and running.
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +93,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 from vco_lib.hook_retirements import normalize_command, vco_hook_script_identity
 from vco_lib.hooks_settings import normalize_matcher
+from vco_lib.jsonc_edit import load_object
 
 __all__ = [
     "KEPT_OUT_PARKED",
@@ -376,15 +376,26 @@ def find_live_conflicts(
 
 def _live_conflicts(folder: Path, state: ParkedHooksState) -> Optional[list[dict]]:
     """Conflicts for ``folder``, or ``None`` when settings.json cannot be read.
-    A missing settings.json registers nothing, so it has no conflicts."""
+    A missing settings.json registers nothing, so it has no conflicts.
+
+    Read through the ONE JSONC reader (:func:`vco_lib.jsonc_edit.load_object`)
+    — Claude Code accepts comments and trailing commas in settings.json and so
+    does every other VCO reader of it; a strict ``json.loads`` here would turn
+    such a file into "could not read", so a parked-and-running hook in it was
+    never reported and an existing entry never cleared. Unreadable (not UTF-8
+    JSONC, top level not an object, I/O error) stays ``None``: unknown is not
+    resolved, and the probe keeps the entry.
+    """
     path = folder / ".claude" / "settings.json"
     try:
         if not path.exists():
             return []
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError:
         return None
-    hooks = data.get("hooks") if isinstance(data, dict) else None
+    loaded = load_object(path)
+    if loaded is None:
+        return None
+    hooks = loaded[0].get("hooks")
     return find_live_conflicts(hooks or {}, state.hooks)
 
 

@@ -3410,16 +3410,13 @@ def _read_project_name_from_vscode_settings(install_path: Path) -> str | None:
          Claude Code VS Code extension uses)
       2. `env.PROJECT_NAME` (a degenerate layout some users hand-write)
     """
-    settings = install_path / ".vscode" / "settings.json"
-    if not settings.is_file():
+    from vco_lib.jsonc_edit import load_object
+
+    # VS Code's own settings format is JSONC — read it as such (v0.2.97).
+    loaded = load_object(install_path / ".vscode" / "settings.json")
+    if loaded is None:
         return None
-    try:
-        text = settings.read_text(encoding="utf-8")
-        data = json.loads(text)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
+    data = loaded[0]
     # Layout 1: claude-code.env.PROJECT_NAME (canonical).
     cc_env = data.get("claude-code.env")
     if isinstance(cc_env, dict):
@@ -3443,35 +3440,18 @@ def _read_project_name_from_envfile(env_path: Path) -> str | None:
     not a placeholder. Soft-fails to None on any read error.
 
     Strips surrounding single/double quotes if the value is wrapped in
-    them (common in env-file convention: PROJECT_NAME="My Project").
+    them (common in env-file convention: PROJECT_NAME="My Project"), and an
+    ``export `` prefix — the form VCO's own ``.claude/env`` managed block
+    writes, which the hand-rolled parse here missed until v0.2.97. The parse
+    is the ONE line-level env parser (:func:`vco_lib.envfile.env_value`).
     """
-    if not env_path.is_file():
-        return None
+    from vco_lib.envfile import env_value
+
     try:
-        text = env_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        return env_value(env_path.read_text(encoding="utf-8", errors="replace"),
+                         "PROJECT_NAME") or None
+    except OSError:  # includes a missing file
         return None
-    for raw in text.splitlines():
-        s = raw.lstrip()
-        # Skip blank lines + comments. A line beginning with "#" is NOT
-        # an active assignment — the V47-F resolver must not pick up a
-        # disabled placeholder.
-        if not s or s.startswith("#"):
-            continue
-        eq = s.find("=")
-        if eq <= 0:
-            continue
-        key = s[:eq].strip()
-        if key != "PROJECT_NAME":
-            continue
-        val = s[eq + 1:].strip()
-        # Strip surrounding quotes if any.
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-            val = val[1:-1]
-        if val:
-            return val
-        return None
-    return None
 
 
 def _resolve_project_name_for_adopt(
@@ -3683,12 +3663,11 @@ def _venv_triage(install_path: Path,
 
     Cases:
       1. .venv missing       → action="create", recreate fully
-      2. .venv exists, no manifest, no requirements.txt, no force →
-         action="skip-no-manifest" (NEW; 3rd-party venv VCO can't manage)
-      3. .venv exists, Python version mismatch:
-         - manifest present OR replace-all OR force_rebuild →
-           action="recreate"
-         - else → action="skip-no-manifest" (NEW; preserve 3rd-party venv)
+      1b. force_rebuild (`--rebuild-venv`) → action="recreate", always
+      2. .venv exists, no manifest, no requirements.txt → "skip-no-manifest"
+      3. .venv's Python != the LAUNCHING interpreter's (v0.2.97: recorded by
+         the venv relaunch, `install_companions.launcher_python_version`):
+         manifest present OR replace-all → "recreate"; else "skip-no-manifest"
       4. .venv exists, Python OK, requirements.txt drift →
          action="upgrade", pip install -r ... --upgrade in place
       5. .venv exists, all matches  → action="skip"
@@ -3705,6 +3684,9 @@ def _venv_triage(install_path: Path,
     if not venv.is_dir() or not venv_python.exists():
         return {"action": "create", "reason": ".venv missing",
                 "venv_python": None}
+    if force_rebuild:  # the flag's promise: a rebuild, whatever the version arm says
+        return {"action": "recreate", "reason": "--rebuild-venv: rebuild requested",
+                "venv_python": None}
 
     # v0.2.46 V47-D: figure out whether VCO has a manifest record proving
     # it owns this venv. Absence of .vco-manifest.json is the load-bearing
@@ -3718,7 +3700,6 @@ def _venv_triage(install_path: Path,
     # neither manifest nor requirements.txt → don't recreate, don't
     # upgrade, just inform the caller via deferral.
     if (not has_manifest and not has_requirements
-            and not force_rebuild
             and adopt_project_mode != "replace-all"):
         return {
             "action": "skip-no-manifest",
@@ -3742,7 +3723,7 @@ def _venv_triage(install_path: Path,
     except (subprocess.SubprocessError, OSError):
         venv_pyver = ""
 
-    expected = f"{sys.version_info.major}.{sys.version_info.minor}"
+    expected = _install_companions.launcher_python_version()
     if not venv_pyver or venv_pyver != expected:
         # v0.2.46 V47-D: ONLY recreate when (a) we have a manifest
         # proving VCO owns this venv, OR (b) the user has explicitly
@@ -3751,8 +3732,7 @@ def _venv_triage(install_path: Path,
         # environment (e.g. a large 3rd-party scientific stack) on a
         # Python-version-drift adopt — the HIGH finding from the
         # venv-architecture audit (2026-06-03).
-        if not has_manifest and adopt_project_mode != "replace-all" \
-                and not force_rebuild:
+        if not has_manifest and adopt_project_mode != "replace-all":
             return {
                 "action": "skip-no-manifest",
                 "reason": (
@@ -3857,8 +3837,12 @@ def _run_lightweight(args: argparse.Namespace) -> int:
                         else "bin/python"))
         _install_requirements(venv_python, dev=args.dev)
     elif triage["action"] == "recreate":
-        # Drop the old venv first.
+        # Drop the old venv first — never from INSIDE it: hand off to the base
+        # interpreter (install_companions.reexec_outside_venv), or refuse.
         venv = PROJECT_ROOT / ".venv"
+        if _is_running_inside_venv(venv / "bin" / "python") and not _install_companions.reexec_outside_venv(sys.argv, venv):
+            print(f"[2/4] Venv rebuild REFUSED: {venv} was left untouched (reason above).")
+            return 1
         if venv.is_dir():
             shutil.rmtree(venv, ignore_errors=True)
         _create_venv(PROJECT_ROOT)
@@ -4807,22 +4791,7 @@ def _persist_storage_choice(choice: dict, install_root: Path) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
-def _is_running_inside_venv(venv_python: Path, prefix: Optional[str] = None) -> bool:
-    """True when THIS process is the venv owning ``venv_python`` (two levels up).
-
-    VENV identity (``sys.prefix``), never the resolved binary: a POSIX venv's
-    python is a SYMLINK to its base (macOS framework too), so comparing binaries
-    kept every launcher update on /usr/bin/python3.12 (v0.2.97). Resolved +
-    case-normalised: /var -> /private/var, ``C:`` vs ``c:``, ``Scripts\\``."""
-    def _norm(p: "str | Path") -> str:
-        path = Path(p)
-        try:
-            path = path.resolve()
-        except (OSError, RuntimeError):  # unresolvable: compare as spelled
-            path = path.absolute()
-        return os.path.normcase(str(path))
-    current = sys.prefix if prefix is None else prefix
-    return _norm(current) == _norm(Path(venv_python).parent.parent)
+_is_running_inside_venv = _install_companions.is_running_inside_venv  # one home (v0.2.97)
 
 
 def _ensure_running_under_mcp_venv() -> None:
@@ -4867,10 +4836,10 @@ def _ensure_running_under_mcp_venv() -> None:
         _warn_silent_fallback(f"resolved interpreter does not exist: {target}")
         return
     env = os.environ.copy()
-    env["VCT_INSTALL_RELAUNCHED"] = "1"
+    _install_companions.mark_relaunch(env)  # loop guard + the LAUNCHING interpreter
     print(f"[v0.2.45 V45-A] relaunching install.py under MCP venv: {target}")
     sys.stdout.flush()
-    os.execve(str(target), [str(target), *sys.argv], env)
+    _install_companions.hand_off(str(target), [str(target), *sys.argv], env)  # exec; Windows: wait
 
 
 # ---------------------------------------------------------------------------
@@ -5414,6 +5383,7 @@ def _run_root_claude_dir_install(
 
 
 def main() -> int:
+    _install_companions.start_parent_watch()  # Windows: a kill of the waiting parent stops this run
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
     # probe is usable on a freshly cloned repo with no .venv. The bootstrap
@@ -5781,15 +5751,14 @@ def main() -> int:
     # could be a user's 3rd-party scientific stack"). When the user
     # KNOWS the recreate is correct, `--rebuild-venv` opts in.
     parser.add_argument("--rebuild-venv", action="store_true", default=False,
-                        help="v0.2.46: force-rebuild the project's .venv even "
-                             "when VCO can't prove it owns it (no "
-                             ".vco-manifest.json). By default, the lightweight "
-                             "re-install path refuses to destroy a 3rd-party "
-                             "venv on Python-version drift or when no "
-                             "requirements.txt is present. Pass this flag when "
-                             "you know VCO is correct to rebuild — e.g. you "
-                             "intentionally changed the launcher's Python "
-                             "version and the project's venv needs to follow.")
+                        help="Lightweight re-install: rebuild the .venv from "
+                             "scratch with the interpreter install.py was "
+                             "LAUNCHED with, even when VCO can't prove it owns "
+                             "it (no .vco-manifest.json). Without it, a 3rd-party "
+                             "venv is never destroyed on Python-version drift or "
+                             "when no requirements.txt is present. Use it when "
+                             "you changed the launcher's Python version and the "
+                             "venv needs to follow.")
     # v0.2.10 (Bug L2 — cross-OS boot-service materialization). The
     # compose-project working directory may not match the install path
     # (the canonical example: install at ~/code/orch but compose lives
@@ -11207,7 +11176,7 @@ def _create_venv(project_root: Path) -> Path:
 
     # Don't use check=True with capture_output — we want to surface stderr on failure.
     result = subprocess.run(
-        [sys.executable, "-m", "venv", str(venv_dir)],
+        [_install_companions.base_python_for_venv(), "-m", "venv", str(venv_dir)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:

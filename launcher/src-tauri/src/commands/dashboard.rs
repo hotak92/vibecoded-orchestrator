@@ -338,20 +338,24 @@ async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> R
         // Disable never registers an entry; placeholder is unused.
         serde_json::Value::Null
     };
+
+    // Apply to Claude Code settings.json (env block in orchestrator install)
+    // FIRST. v0.2.97 review F10: it is the one step that can now refuse (an
+    // unreadable settings.json is left untouched and reported), and running
+    // it last left the launcher config and ~/.claude.json already flipped
+    // while the GUI kept showing the old state. A refusal here changes
+    // nothing anywhere.
+    apply_mcp_to_claude_settings(&config).await?;
     save_config(&config).await?;
 
     // Mirror the toggle into ~/.claude.json so Claude Code actually
-    // honours the GUI flip. Soft-fail: a write hiccup must not roll back
-    // the launcher's own config (the user already saw the toggle land).
+    // honours the GUI flip.
     let target = crate::mcp_registration::user_claude_json();
     if enabled {
         crate::mcp_registration::register_mcp(&target, &mcp_id, &entry)?;
     } else {
         crate::mcp_registration::deregister_mcp(&target, &mcp_id)?;
     }
-
-    // Apply to Claude Code settings.json (env block in orchestrator install).
-    apply_mcp_to_claude_settings(&config).await?;
 
     Ok(config.mcp_servers)
 }
@@ -383,7 +387,16 @@ pub async fn update_mcp_setting(
         return Err(format!("Setting '{}' is not editable", setting_key));
     }
 
-    if setting.setting_type == McpSettingType::Secret {
+    // v0.2.97 review F10: the settings.json write — the one step that can
+    // refuse — runs BEFORE anything is persisted, so a refusal leaves the
+    // keychain and the launcher config untouched. A Secret-typed setting is
+    // never exported (see `mcp_env_block`), so its value is irrelevant here.
+    let is_secret = setting.setting_type == McpSettingType::Secret;
+    setting.value = if is_secret { String::new() } else { setting_value.clone() };
+    let updated = server.clone();
+    apply_mcp_to_claude_settings(&config).await?;
+
+    if is_secret {
         // Route to keychain. We persist an EMPTY string in the JSON config
         // so Secret material never sits at rest in `~/.vct/orchestrator.json`.
         // An empty string also means `apply_mcp_to_claude_settings` skips
@@ -403,14 +416,9 @@ pub async fn update_mcp_setting(
         } else {
             crate::secrets::set(scope, &module_id, &setting_key, &setting_value)?;
         }
-        setting.value = String::new();
-    } else {
-        setting.value = setting_value;
     }
-    let updated = server.clone();
 
     save_config(&config).await?;
-    apply_mcp_to_claude_settings(&config).await?;
 
     Ok(updated)
 }
@@ -439,6 +447,9 @@ pub async fn add_custom_mcp_server(server: McpServerConfig) -> Result<Vec<McpSer
     let entry = mcp_server_to_claude_entry(&server);
 
     config.mcp_servers.push(server);
+    // v0.2.97 review F10: the step that can refuse runs first (see
+    // `toggle_mcp_server_inner`).
+    apply_mcp_to_claude_settings(&config).await?;
     save_config(&config).await?;
 
     // Patch the user-scope Claude config so the new MCP is actually
@@ -446,8 +457,6 @@ pub async fn add_custom_mcp_server(server: McpServerConfig) -> Result<Vec<McpSer
     // no-op was the original "add doesn't work" bug.
     let target = crate::mcp_registration::user_claude_json();
     crate::mcp_registration::register_mcp(&target, &id, &entry)?;
-
-    apply_mcp_to_claude_settings(&config).await?;
 
     Ok(config.mcp_servers)
 }
@@ -491,14 +500,15 @@ pub async fn remove_mcp_server(mcp_id: String) -> Result<Vec<McpServerConfig>, S
     }
 
     config.mcp_servers.retain(|s| s.id != mcp_id);
+    // v0.2.97 review F10: the step that can refuse runs first (see
+    // `toggle_mcp_server_inner`).
+    apply_mcp_to_claude_settings(&config).await?;
     save_config(&config).await?;
 
     // Mirror the removal into ~/.claude.json so Claude Code stops
     // launching the server on next start.
     let target = crate::mcp_registration::user_claude_json();
     let _ = crate::mcp_registration::deregister_mcp(&target, &mcp_id);
-
-    apply_mcp_to_claude_settings(&config).await?;
 
     Ok(config.mcp_servers)
 }
@@ -654,69 +664,70 @@ const PROJECT_ROUTING_ENV_KEYS: &[&str] = &[
     "KG_BASE_DIR",
 ];
 
+/// The MCP-tab env block for the orchestrator's `.claude/settings.json`:
+/// `(pairs to set, every key this tab owns)`.
+///
+/// Owned = every non-Secret, non-routing setting key of every configured MCP;
+/// set = those of the ENABLED ones. An owned key absent from `set` is removed,
+/// so a disabled MCP's settings stop being exported (they used to linger until
+/// hand-edited). Secret-typed settings are never owned or emitted (P1-B,
+/// 2026-05-08): they live in the OS keychain and the consuming MCP reads them
+/// through the hub. Routing keys belong to the per-project projection (F-4,
+/// see [`PROJECT_ROUTING_ENV_KEYS`]). Sorted, so the file never reorders
+/// between runs (the settings are a `HashMap`).
+fn mcp_env_block(config: &OrchestratorConfig) -> (Vec<(String, String)>, Vec<String>) {
+    let mut set = std::collections::BTreeMap::new();
+    let mut owned = std::collections::BTreeSet::new();
+    for server in &config.mcp_servers {
+        for (key, setting) in &server.settings {
+            if setting.setting_type == McpSettingType::Secret
+                || PROJECT_ROUTING_ENV_KEYS.contains(&key.as_str())
+            {
+                continue;
+            }
+            owned.insert(key.clone());
+            if server.enabled {
+                set.insert(key.clone(), setting.value.clone());
+            }
+        }
+    }
+    (set.into_iter().collect(), owned.into_iter().collect())
+}
+
 /// Write enabled MCP servers to the orchestrator's .claude/settings.json
 /// so Claude Code picks them up.
+///
+/// v0.2.97: through the ONE env-block editor
+/// (`vco_lib.config_projection write-env-block`, via
+/// [`crate::services::vco_lib_bridge::write_settings_env_block`]) instead of
+/// a Rust read-merge-write. That copy parsed an unreadable file as `{}` and
+/// wrote it back — the whole root settings.json, hooks and permissions
+/// included, replaced by an empty object — and could not edit a JSONC file
+/// at all. Now such a file is left byte-identical, the refusal is recorded
+/// in the root's deferral ledger, and the `Err` reaches the GUI; a JSONC
+/// file is edited in place; the write is atomic.
 async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(), String> {
     let install_path = PathBuf::from(&config.install_path);
-    let settings_path = install_path.join(".claude").join("settings.json");
-
-    if !settings_path.exists() {
+    if !install_path.join(".claude").join("settings.json").exists() {
         // Not installed yet — skip silently
         return Ok(());
     }
-
-    // v0.2.97: a file that cannot be read as a JSON object is REFUSED (the
-    // `Err` reaches the GUI) and left byte-identical. This used to parse as
-    // `{}` and write that back — the orchestrator's whole settings.json,
-    // hooks and permissions included, replaced by an empty object.
-    let mut settings: serde_json::Value = crate::json_file::read_object_or_empty(&settings_path)
-        .map_err(|e| format!("Read settings: {}", e))?;
-
-    // Build env block from enabled MCP servers
-    let env = settings
-        .get_mut("env")
-        .and_then(|v| v.as_object_mut());
-
-    if let Some(env_map) = env {
-        // Inject MCP server settings into env.
-        //
-        // P1-B fix (2026-05-08): Secret-typed settings are NEVER emitted
-        // here — they live in the OS keychain (see `update_mcp_setting`)
-        // and the consuming MCP server is expected to read them via the
-        // launcher hub's `/api/v1/projects/{id}/env` endpoint (resolved
-        // via the shared `vct_secrets_resolve` helper). Emitting the
-        // empty placeholder here would mask a real keychain miss as
-        // "secret = empty string", which is worse than absent.
-        for server in &config.mcp_servers {
-            if server.enabled {
-                for (key, setting) in &server.settings {
-                    if setting.setting_type == McpSettingType::Secret {
-                        continue;
-                    }
-                    // F-4 (v0.2.73): per-project routing keys are owned by
-                    // the launcher's projection, not this legacy path —
-                    // skipping them preserves whatever the projection wrote
-                    // (see PROJECT_ROUTING_ENV_KEYS docstring).
-                    if PROJECT_ROUTING_ENV_KEYS.contains(&key.as_str()) {
-                        continue;
-                    }
-                    env_map.insert(key.clone(), serde_json::Value::String(setting.value.clone()));
-                }
-            }
-        }
-
-        // v0.2.54 Track H: the `VCT_WATERMARK` env emission was removed —
-        // no hook, MCP server, or script ever read it. Stale entries in
-        // existing settings.json files are harmless leftovers.
-    }
-
-    let json = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("Serialize settings: {}", e))?;
-    tokio::fs::write(&settings_path, json)
-        .await
-        .map_err(|e| format!("Write settings: {}", e))?;
-
-    Ok(())
+    let (set, owned) = mcp_env_block(config);
+    tokio::task::spawn_blocking(move || {
+        let pairs: Vec<(&str, String)> = set.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let owned: Vec<&str> = owned.iter().map(String::as_str).collect();
+        crate::services::vco_lib_bridge::write_settings_env_block(
+            Some(&install_path),
+            &install_path,
+            "claude_settings_json",
+            &pairs,
+            &owned,
+        )
+    })
+    .await
+    .map_err(|e| format!("Write settings: the settings editor task failed: {}", e))?
+    .map(|_| ())
+    .map_err(|e| format!("Write settings: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1258,108 @@ mod tests {
             serde_json::Value::Bool(false),
             "failed toggle must not persist the enabled flip"
         );
+    }
+
+    /// v0.2.97 review F10: a toggle whose settings.json write is REFUSED
+    /// (unreadable root settings.json) changes nothing anywhere — not the
+    /// launcher config, not ~/.claude.json, not the settings file. Pre-fix
+    /// the config and ~/.claude.json were flipped first and the refusal came
+    /// last, so the backend disagreed with the GUI.
+    #[test]
+    fn test_toggle_refused_by_unreadable_settings_changes_nothing() {
+        let (home, _guard) = setup_temp_env();
+        let (cfg_path, install_root) = seed_config_with_install_root(&home);
+        let claude_json = home.join(".claude.json");
+        let claude_json_before = serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {"search": {"type": "stdio", "command": "x", "args": [], "env": {}}}
+        }))
+        .unwrap();
+        std::fs::write(&claude_json, &claude_json_before).unwrap();
+        let settings = install_root.join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let broken = r#"{"hooks": {"Stop": []},, "permissions": {}}"#;
+        std::fs::write(&settings, broken).unwrap();
+        let cfg_before = std::fs::read_to_string(&cfg_path).unwrap();
+
+        let res = rt().block_on(toggle_mcp_server_inner("search".to_string(), false, "free"));
+
+        let msg = res.expect_err("the refused settings write must fail the toggle");
+        assert!(msg.contains("NOT updated"), "the refusal names the file: {}", msg);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), broken, "byte-identical");
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), cfg_before, "config untouched");
+        assert_eq!(
+            std::fs::read_to_string(&claude_json).unwrap(),
+            claude_json_before,
+            "~/.claude.json untouched"
+        );
+    }
+
+    /// v0.2.97 review F5 (act): a JSONC root settings.json (comments, a
+    /// trailing comma) is edited IN PLACE by the ONE Python writer — the
+    /// strict-`serde_json` Rust copy refused it, so every MCP-tab action on
+    /// such an install errored.
+    #[test]
+    fn test_apply_mcp_to_claude_settings_edits_a_jsonc_file_in_place() {
+        let (home, _guard) = setup_temp_env();
+        let install_dir = home.join("orch-install");
+        let settings_path = install_dir.join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            "{\n  // hand-kept\n  \"hooks\": {\"Stop\": []},\n  \"env\": {\"PRE_EXISTING\": \"keep\",},\n}\n",
+        )
+        .unwrap();
+        let mut config = OrchestratorConfig::default();
+        config.install_path = install_dir.display().to_string();
+
+        rt().block_on(apply_mcp_to_claude_settings(&config)).expect("JSONC is editable");
+
+        let after = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(after.contains("// hand-kept"), "comments survive: {}", after);
+        assert!(after.contains("\"PRE_EXISTING\": \"keep\""), "{}", after);
+    }
+
+    /// The MCP-tab key set: every non-Secret, non-routing key is OWNED (so a
+    /// disabled MCP's keys are removed), only the enabled MCPs' are SET, and
+    /// both lists are sorted so the file never reorders between runs.
+    #[test]
+    fn test_mcp_env_block_owns_all_sets_enabled_and_skips_secret_and_routing() {
+        let setting = |value: &str, setting_type: McpSettingType| McpSetting {
+            label: String::new(),
+            value: value.to_string(),
+            setting_type,
+            description: String::new(),
+            editable: true,
+        };
+        let server = |id: &str, enabled: bool, settings: Vec<(&str, McpSetting)>| McpServerConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            enabled,
+            command: "x".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: true,
+            settings: settings.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        };
+        let mut config = OrchestratorConfig::default();
+        config.mcp_servers = vec![
+            server("on", true, vec![
+                ("Z_KEY", setting("z", McpSettingType::Text)),
+                ("A_KEY", setting("a", McpSettingType::Text)),
+                ("A_SECRET", setting("s", McpSettingType::Secret)),
+                ("KG_COLLECTION", setting("KnowledgeGraph", McpSettingType::Text)),
+            ]),
+            server("off", false, vec![("OFF_KEY", setting("o", McpSettingType::Text))]),
+        ];
+        let (set, owned) = mcp_env_block(&config);
+        assert_eq!(
+            set,
+            vec![("A_KEY".to_string(), "a".to_string()), ("Z_KEY".to_string(), "z".to_string())]
+        );
+        assert_eq!(owned, vec!["A_KEY", "OFF_KEY", "Z_KEY"]);
     }
 
     /// F-2: user-added CUSTOM MCPs keep their stored entry shape on

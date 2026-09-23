@@ -65,8 +65,9 @@
 //! used both UI flows over time.
 //!
 //! That tuple is also what the launcher's PAT resolver
-//! (`commands/installer.rs::github_pat_for_env`) reads. No env writer
-//! emits `GITHUB_TOKEN` into project files since v0.2.73.
+//! (`commands/installer.rs::resolve_github_pat`, behind the PAT status
+//! surfaces) reads. No env writer emits `GITHUB_TOKEN` into project files
+//! since v0.2.73 — consumers resolve it at need through the hub.
 //!
 //! `commands::installer::*` is the only path that calls into this
 //! module from outside `commands/secrets_cmd.rs`. This module remains

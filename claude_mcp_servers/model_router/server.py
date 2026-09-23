@@ -137,8 +137,19 @@ from aiohttp import web
 
 from . import __version__
 from .auth import OAuthReader, host_token_stamp, token_matches
-from .catalog import CatalogEntry, CatalogService, resolve_window, to_models_response
-from .config import SERVICE_NAME, UPSTREAM_CONNECT_TIMEOUT_S, GatewayConfig
+from .catalog import (
+    CatalogEntry,
+    CatalogService,
+    resolve_window,
+    to_models_response,
+    with_usage_labels,
+)
+from .config import (
+    PICKER_USAGE_ON,
+    SERVICE_NAME,
+    UPSTREAM_CONNECT_TIMEOUT_S,
+    GatewayConfig,
+)
 from .context_table import ContextTableLoader
 from .fileperms import OwnerOnlyState
 from .quota import (
@@ -151,7 +162,12 @@ from .quota import (
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
 from .source_identity import source_sha as _package_source_sha
-from .usage_windows import UsageWindows, render_line, session_fetcher
+from .usage_windows import (
+    UsageWindows,
+    label_suffixes,
+    render_line,
+    session_fetcher,
+)
 from .usage import (
     UsageAccumulator,
     UsageLedger,
@@ -794,6 +810,9 @@ async def health_handler(request: web.Request) -> web.Response:
     ``catalog_filter`` (``latest``/``all`` — which versions of a family reach
     the picker), ``window_rows`` (``one_m_only``/``both`` — whether a 1M
     first-party model shows its plain row beside its ``[1m]`` one),
+    ``picker_usage`` (``on``/``off`` — whether vendor rows in ``/v1/models``
+    carry their subscription's usage in the label; the mode IN FORCE, so an
+    unrecognised knob value that fell back to the default shows here),
     ``catalog_hidden`` (int, how many rows the last catalog build
     withheld under that filter; ``0`` before the picker has ever opened, which
     reads the same as "nothing hidden" and correctly so),
@@ -860,6 +879,7 @@ async def health_handler(request: web.Request) -> web.Response:
             # thing /health exists not to be.
             "catalog_filter": gateway.config.catalog_filter,
             "window_rows": gateway.config.window_rows,
+            "picker_usage": gateway.config.picker_usage,
             "catalog_hidden": gateway.catalog.hidden_count(),
             "context_table_source": table.source,
             "context_table_path": str(table.path) if table.path else None,
@@ -966,6 +986,18 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
 
 
 async def models_handler(request: web.Request) -> web.Response:
+    """The picker catalog; vendor labels carry subscription usage when known.
+
+    The usage text (``picker_usage``, on by default) comes from the
+    :class:`model_router.usage_windows.UsageWindows` CACHE and nothing else:
+    this route may schedule a background refresh but never awaits one, so a
+    stalled vendor quota endpoint cannot delay the picker. A cold or stale
+    cache answers without the text. The refresh is requested BEFORE the
+    catalog is built, so on a daemon whose catalog needs fetching the usage
+    reading gets that long to land and the answer may already carry it.
+    Claude Code fetches this route once per session start, so the label is a
+    snapshot of that moment (see :func:`model_router.usage_windows.label_suffix`).
+    """
     gateway: Gateway = request.app[APP_KEY]
     started = time.monotonic()
     if not gateway.authorised(request):
@@ -975,12 +1007,20 @@ async def models_handler(request: web.Request) -> web.Response:
         # client makes FIRST.
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
+    usage_labels = gateway.config.picker_usage == PICKER_USAGE_ON
+    if usage_labels:
+        gateway.usage_windows.request_refresh()
     table = gateway.context.current()
     catalog = await gateway.catalog.union(
         table=table,
         catalog_filter=gateway.config.catalog_filter,
         window_rows=gateway.config.window_rows,
     )
+    entries = catalog.entries
+    if usage_labels:
+        entries = with_usage_labels(
+            entries, label_suffixes(gateway.usage_windows.snapshot()),
+        )
     logger.info(
         "model-gateway: /v1/models -> %d entries (%s)%s",
         len(catalog.entries),
@@ -996,7 +1036,7 @@ async def models_handler(request: web.Request) -> web.Response:
         ),
     )
     return web.json_response(
-        to_models_response(catalog.entries, catalog.sources, catalog.hidden),
+        to_models_response(entries, catalog.sources, catalog.hidden),
     )
 
 
@@ -1507,6 +1547,11 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     if not gateway.authorised(request):
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
+    # "Warm while chats flow" (owner, 2026-09-23): a synchronous O(1) signal
+    # that may schedule ONE background usage refresh per interval. Nothing is
+    # awaited here, and a defect in it is guarded like every optional pass —
+    # it can never delay, fail or alter this request.
+    _guarded(gateway.usage_windows.note_activity, what="usage-window activity signal")
 
     buffer_limit = gateway.config.rewrite_buffer_bytes
     raw, over_buffer = await _buffer_bounded(request.content, buffer_limit)

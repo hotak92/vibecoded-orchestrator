@@ -312,18 +312,18 @@ impl Db {
     /// project user-bucket secret the launcher has ever observed for
     /// `project_id` — regardless of active flag.
     ///
-    /// Used (until its retirement in v0.2.97) by the Rust env writer to drive two parallel decisions:
+    /// Used by:
     ///
-    ///   1. EMIT: walk the returned keys, look each up in the keychain,
-    ///      apply the cross-launcher active gate, and include only the
-    ///      ones that are both keychain-present AND active in the env
-    ///      surfaces. (See `build_user_secret_pairs` in projects_v2.rs.)
+    ///   * the unregister strip (`projects_v2::delete_project_v2` →
+    ///     `surgically_strip_user_secret_keys`): every returned KEY name is
+    ///     stripped from `.env`, `.claude/env` and the two JSON env
+    ///     surfaces, so a key a pre-v0.2.73 writer once emitted cannot
+    ///     survive the unregister;
+    ///   * the SecretsPanel key list (`secrets_cmd::list_user_secret_keys_impl`).
     ///
-    ///   2. STRIP: any returned key that is NOT in the EMIT set was
-    ///      written by us once and is no longer active — strip it from
-    ///      every surface so a paused / removed secret can't survive
-    ///      stale in `.claude/settings.json` / `.vscode/settings.json` /
-    ///      `.claude/env` after the user toggles it off in the GUI.
+    /// There is no EMIT use any more: VCO writes no secret VALUE into a
+    /// project since v0.2.73 (the Rust env writer that once did, and its
+    /// `build_user_secret_pairs`, were retired in v0.2.97).
     ///
     /// Scope filter is hardcoded to `('per_project', project_id, 'user')`.
     /// We do NOT enumerate the `licensing` bucket or any other module-

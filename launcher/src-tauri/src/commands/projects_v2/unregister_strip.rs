@@ -2,7 +2,8 @@
 //!
 //! Verbatim extraction (v0.2.77 Part 7d) of the caller-supplied-key-set
 //! strippers (`strip_named_keys_from_env_text`,
-//! `strip_named_keys_from_claude_env_text`, `strip_named_keys_from_env_object`)
+//! `strip_named_keys_from_claude_env_text`; the JSON-object twin was retired in
+//! v0.2.97 for the ONE Python strip, `projects_v2::strip_json_env_surfaces`)
 //! and the launcher-artifact filesystem purge
 //! (`purge_launcher_files_from_project`) that previously lived inline in
 //! `projects_v2.rs`. Behaviour is unchanged; the facade re-exports every
@@ -87,33 +88,6 @@ pub(crate) fn strip_named_keys_from_claude_env_text(
         out.push('\n');
     }
     (out, removed.into_iter().collect())
-}
-
-/// Pure helper: strip a named set of KEY names from a JSON env-shaped
-/// sub-block. Mirror of `strip_canonical_keys_from_env_object`.
-pub(crate) fn strip_named_keys_from_env_object(
-    parent: &mut serde_json::Map<String, serde_json::Value>,
-    env_key: &str,
-    keys: &std::collections::HashSet<&str>,
-) -> Vec<String> {
-    let env_obj = match parent.get_mut(env_key).and_then(|v| v.as_object_mut()) {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    let mut removed = std::collections::BTreeSet::new();
-    let to_remove: Vec<String> = env_obj
-        .keys()
-        .filter(|k| keys.contains(k.as_str()))
-        .cloned()
-        .collect();
-    for k in to_remove {
-        // `shift_remove`, never `remove` — see `json_file`'s module docs.
-        // `remove` is `swap_remove` under `preserve_order` and would
-        // relocate the user's last env key on every strip.
-        env_obj.shift_remove(&k);
-        removed.insert(k);
-    }
-    removed.into_iter().collect()
 }
 
 /// Surgically remove every entry in `UNREGISTER_PURGE_PATHS` from

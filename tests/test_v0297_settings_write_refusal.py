@@ -283,6 +283,80 @@ def test_the_cli_rejects_a_malformed_request(tmp_path):
     assert json.loads(proc.stdout)["error"] == "bad_request"
 
 
+def test_write_env_block_appends_new_keys_in_a_stable_order(tmp_path):
+    """New keys land in ``values`` order, not set-iteration order (which
+    varies with the hash seed between runs and would reorder the file)."""
+    keys = [f"K{i:02d}" for i in range(20)]
+    cp.write_env_block(tmp_path, "claude_settings_json", {k: "v" for k in keys}, keys)
+    env = json.loads((tmp_path / ".claude" / "settings.json").read_text())["env"]
+    assert list(env) == keys
+
+
+# ── strip-env-keys: the removal-only twin (v0.2.97 review F5) ───────────────
+
+
+def test_strip_env_keys_removes_only_the_named_keys_and_drops_an_emptied_block(tmp_path):
+    path = _settings(tmp_path, json.dumps({
+        "hooks": {"Stop": []}, "env": {"KG_COLLECTION": "x", "USER_KEY": "keep"},
+    }).encode())
+    assert cp.strip_env_keys(tmp_path, "claude_settings_json", ["KG_COLLECTION", "ABSENT"]) == [
+        "KG_COLLECTION",
+    ]
+    assert json.loads(path.read_text()) == {"hooks": {"Stop": []}, "env": {"USER_KEY": "keep"}}
+    assert cp.strip_env_keys(tmp_path, "claude_settings_json", ["USER_KEY"]) == ["USER_KEY"]
+    assert json.loads(path.read_text()) == {"hooks": {"Stop": []}}, "no empty env block left behind"
+
+
+def test_strip_env_keys_edits_jsonc_in_place(tmp_path):
+    raw = (
+        "{\n    // team settings\n    \"editor.formatOnSave\": true,\n"
+        "    \"claude-code.env\": {\n        \"KG_COLLECTION\": \"x\",\n"
+        "        \"USER_KEY\": \"mine\", // keep\n    },\n}\n"
+    )
+    path = _settings(tmp_path, raw.encode(), ".vscode/settings.json")
+    assert cp.strip_env_keys(tmp_path, "vscode_settings_json", ["KG_COLLECTION"]) == ["KG_COLLECTION"]
+    text = path.read_text(encoding="utf-8")
+    assert "// team settings" in text and "// keep" in text
+    assert jsonc_edit.loads(text)["claude-code.env"] == {"USER_KEY": "mine"}
+
+
+def test_strip_env_keys_never_creates_and_never_rewrites_for_nothing(tmp_path):
+    assert cp.strip_env_keys(tmp_path, "claude_settings_json", ["K"]) == []
+    assert not (tmp_path / ".claude").exists(), "a strip never creates a file"
+    original = b'{"hooks":{},"env":{"OTHER":"1"}}'
+    path = _settings(tmp_path, original)
+    assert cp.strip_env_keys(tmp_path, "claude_settings_json", ["K"]) == []
+    assert path.read_bytes() == original, "nothing to strip → not rewritten (layout kept)"
+
+
+def test_strip_env_keys_refuses_and_records_an_unreadable_file(tmp_path):
+    path = _settings(tmp_path, UNPARSEABLE["syntax"])
+    with pytest.raises(cp.SettingsWriteRefused):
+        cp.strip_env_keys(tmp_path, "claude_settings_json", ["KG_COLLECTION"])
+    assert path.read_bytes() == UNPARSEABLE["syntax"]
+    assert _entry(tmp_path) is not None
+
+
+def test_the_strip_cli_reports_removed_keys_and_refuses_with_exit_4(tmp_path):
+    def run(request: dict) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "vco_lib.config_projection", "strip-env-keys",
+             "--project-folder", str(tmp_path), "--surface", "claude_settings_json"],
+            input=json.dumps(request), capture_output=True, text=True, cwd=REPO_ROOT,
+            env=child_env(), check=False, timeout=60,
+        )
+
+    _settings(tmp_path, json.dumps({"env": {"A": "1", "B": "2"}}).encode())
+    proc = run({"keys": ["A"]})
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"ok": True, "surface": "claude_settings_json", "removed": ["A"]}
+    assert run({"keys": "A"}).returncode == 2
+    path = _settings(tmp_path, UNPARSEABLE["array_root"])
+    proc = run({"keys": ["A"]})
+    assert proc.returncode == 4 and json.loads(proc.stdout)["error"] == "settings_write_refused"
+    assert path.read_bytes() == UNPARSEABLE["array_root"]
+
+
 def test_the_apply_cli_exits_4_with_the_refusal_on_stderr(tmp_path, monkeypatch, capsys):
     """The launcher's ``apply_project_env_via_python`` puts a non-zero exit's
     stderr into its warnings — that is the GUI-visible half of the refusal."""

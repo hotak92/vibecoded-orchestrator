@@ -3,11 +3,11 @@
 //
 // v0.2.97 — the home-page subscription-usage card's presentation rules.
 // The one that matters most: an unknown window is never drawn as a bar.
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('$lib/tauri', () => ({ safeInvoke: vi.fn() }));
+vi.mock('$lib/tauri', () => ({ invoke: vi.fn(), tauriAvailable: vi.fn() }));
 
-import { safeInvoke } from '$lib/tauri';
+import { invoke, tauriAvailable } from '$lib/tauri';
 import {
   barTone,
   barWidth,
@@ -15,7 +15,9 @@ import {
   describeCountdown,
   describeTokens,
   fetchUsage,
+  INITIAL_CARD_STATE,
   nextPollMs,
+  settle,
   unknownLabel,
   USAGE_POLL_MS,
   USAGE_RETRY_WHILE_REFRESHING_MS,
@@ -50,16 +52,53 @@ function snapshot(vendors: UsageVendor[], refreshing = false): UsageSnapshot {
 }
 
 describe('cardVisible', () => {
-  it('hides the card where the gateway is not running or never ran', () => {
+  it('is quiet only in browser mode and when the gateway is not running', () => {
     expect(cardVisible(null)).toBe(false);
     expect(cardVisible({ ok: false, reason: 'not_running', message: 'm' })).toBe(false);
-    expect(cardVisible({ ok: false, reason: 'no_token', message: 'm' })).toBe(false);
   });
 
-  it('shows the card for data AND for a failure the user can act on', () => {
+  it('shows data AND every failure the user can act on — a broken install above all', () => {
     expect(cardVisible({ ok: true, port: 11460, snapshot: snapshot([]) })).toBe(true);
-    expect(cardVisible({ ok: false, reason: 'outdated_gateway', message: 'restart it' })).toBe(true);
-    expect(cardVisible({ ok: false, reason: 'unreachable', message: 'm' })).toBe(true);
+    for (const reason of [
+      'broken_install',
+      'bridge_error',
+      'no_token',
+      'outdated_gateway',
+      'unreachable',
+    ]) {
+      expect(cardVisible({ ok: false, reason, message: 'm' }), reason).toBe(true);
+    }
+  });
+});
+
+describe('settle (review F4: a transient failure must not blank a good card)', () => {
+  const good: UsageBridgeResult = { ok: true, port: 11460, snapshot: snapshot([vendor()]) };
+  const withGood = settle(INITIAL_CARD_STATE, good);
+
+  it('keeps the last good reading through a transient failure, and says so', () => {
+    for (const reason of ['bridge_error', 'unreachable']) {
+      const next = settle(withGood, { ok: false, reason, message: 'timed out after 20 s' });
+      expect(next.result).toBe(good);
+      expect(next.warning).toBe('not refreshed — timed out after 20 s');
+    }
+  });
+
+  it('never hides a broken install behind an old reading', () => {
+    const broken = { ok: false as const, reason: 'broken_install', message: 're-run install.py' };
+    expect(settle(withGood, broken)).toEqual({ result: broken, warning: null });
+  });
+
+  it('shows a transient failure when there is nothing good to keep', () => {
+    const err = { ok: false as const, reason: 'bridge_error', message: 'no interpreter' };
+    expect(settle(INITIAL_CARD_STATE, err)).toEqual({ result: err, warning: null });
+  });
+
+  it('a fresh answer clears the warning; browser mode clears everything', () => {
+    const warned = settle(withGood, { ok: false, reason: 'unreachable', message: 'm' });
+    expect(settle(warned, good)).toEqual({ result: good, warning: null });
+    expect(settle(warned, null)).toEqual(INITIAL_CARD_STATE);
+    const gone = { ok: false as const, reason: 'not_running', message: 'm' };
+    expect(settle(withGood, gone).result).toBe(gone);
   });
 });
 
@@ -159,10 +198,42 @@ describe('polling', () => {
     expect(nextPollMs(null)).toBe(USAGE_POLL_MS);
   });
 
-  it('asks the one backend command', async () => {
-    const answer: UsageBridgeResult = { ok: false, reason: 'not_running', message: 'm' };
-    vi.mocked(safeInvoke).mockResolvedValueOnce(answer);
-    await expect(fetchUsage()).resolves.toBe(answer);
-    expect(safeInvoke).toHaveBeenCalledWith('model_gateway_usage_windows');
+});
+
+describe('fetchUsage (review F4/F15: the bridge error is surfaced, not swallowed)', () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+    vi.mocked(tauriAvailable).mockReset();
+  });
+
+  it('turns a rejected command into a visible bridge_error naming the cause', async () => {
+    vi.mocked(tauriAvailable).mockReturnValue(true);
+    vi.mocked(invoke).mockRejectedValueOnce(
+      'vco_lib.gateway_usage exited 1 and did not return JSON: ModuleNotFoundError',
+    );
+    const result = await fetchUsage();
+    expect(invoke).toHaveBeenCalledWith('model_gateway_usage_windows');
+    expect(result).toEqual({
+      ok: false,
+      reason: 'bridge_error',
+      message:
+        'could not read subscription usage: vco_lib.gateway_usage exited 1 and did not ' +
+        'return JSON: ModuleNotFoundError',
+    });
+    expect(cardVisible(result)).toBe(true);
+  });
+
+  it('reads an Error rejection by its message', async () => {
+    vi.mocked(tauriAvailable).mockReturnValue(true);
+    vi.mocked(invoke).mockRejectedValueOnce(new Error('usage-windows task failed: panicked'));
+    const result = await fetchUsage();
+    expect(result?.ok).toBe(false);
+    expect(result && !result.ok && result.message).toContain('usage-windows task failed');
+  });
+
+  it('asks nothing in browser mode, and that is the only null', async () => {
+    vi.mocked(tauriAvailable).mockReturnValue(false);
+    await expect(fetchUsage()).resolves.toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

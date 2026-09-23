@@ -127,3 +127,182 @@ def test_rename_reprojection_uses_the_same_accepted_argv(moved_project):
     rename_plan = cast(cr.RenamePlan, SimpleNamespace(project_id=plan.project_id, folder=str(dst)))
     cr._reproject_env(rename_plan, runner=_real_runner)  # raises RenameError on exit != 0
     assert _settings_env(dst).get("KG_COLLECTION") == "Proj_KnowledgeGraph"
+
+
+# ---------------------------------------------------------------------------
+# F8 (v0.2.97 review): the failure entry ends on evidence, not on a dismissal
+# ---------------------------------------------------------------------------
+
+
+def _failing_runner(argv: Sequence[str], env: Mapping[str, str]) -> subprocess.CompletedProcess:
+    """The child exited non-zero (a locked DB, a crash) — nothing was written."""
+    return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="database is locked")
+
+
+def _stale_surfaces(plan: pm.MovePlan, dst: Path) -> None:
+    """What the moved folder holds when the post-flip projection did not run:
+    the surfaces still carry values derived from the PREVIOUS folder."""
+    (dst / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {},
+        "env": {"KG_BASE_DIR": plan.src, "KG_COLLECTION": "Proj_KnowledgeGraph"},
+    }, indent=2), encoding="utf-8")
+    (dst / ".claude" / "env").write_text(
+        f'export MY_OWN="kept"\nexport KG_BASE_DIR="{plan.src}"\n', encoding="utf-8")
+
+
+def _failed_move(plan: pm.MovePlan, dst: Path, db_path: Path, home: Path):
+    _stale_surfaces(plan, dst)
+    result = pm.execute_post_flip(
+        plan, run_kg_sync=False, db_path=db_path, home=home, runner=_failing_runner)
+    assert pm.CID_ENV_REPROJECTION_FAILED in result.deferrals
+    return result
+
+
+def _entry(dst: Path):
+    from vco_lib.deferral_report import DeferralReport
+
+    report = DeferralReport.read(dst)
+    return next(
+        (e for e in report.entries if e.condition_id == pm.CID_ENV_REPROJECTION_FAILED),
+        None)
+
+
+def _registry_verdict(dst: Path):
+    """What the bundle update / install.py re-probe pass decides."""
+    from vco_lib import deferral_probes
+
+    return deferral_probes.evaluate(dst, _entry(dst))
+
+
+def _run_the_printed_command(dst: Path) -> None:
+    """Run the entry's command exactly as printed (interpreter aside)."""
+    import os
+    import shlex
+
+    entry = _entry(dst)
+    assert entry is not None
+    argv = shlex.split(entry.command_to_apply.splitlines()[0], comments=True)
+    assert argv[:4] == ["python", "-m", "vco_lib.config_projection", "apply"], argv
+    proc = _real_runner([sys.executable, *argv[1:]], dict(os.environ))
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_the_condition_declares_a_real_clear_probe():
+    from vco_lib import deferral_probes
+    from vco_lib.deferral_registry import clear_probe_for
+
+    assert clear_probe_for(pm.CID_ENV_REPROJECTION_FAILED) == \
+        "probe:py:env_reprojection_still_owed"
+    assert "env_reprojection_still_owed" in deferral_probes.PROBES
+
+
+def test_a_failure_records_the_project_id_the_probe_needs(moved_project, tmp_path):
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    entry = _entry(dst)
+    assert entry is not None and entry.dismiss_fields == {"project_id": PROJECT_ID}
+    assert "database is locked" in entry.detected
+
+
+def test_the_entry_is_kept_while_the_surfaces_are_still_stale(moved_project, tmp_path):
+    """KEEP: the projection has not run since the failure."""
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    assert _registry_verdict(dst) is True
+    report = pm.verify_move(dst, old_path=plan.src, project_id=PROJECT_ID, db_path=db_path)
+    assert pm.CID_ENV_REPROJECTION_FAILED not in report["resolved"]
+    assert _entry(dst) is not None
+
+
+def test_the_entry_is_kept_while_the_reprojection_still_fails(moved_project, tmp_path):
+    """KEEP: a second failing re-projection neither clears nor hides it."""
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    with pytest.raises(pm.MoveError):
+        pm.run_env_reprojection(PROJECT_ID, dst, runner=_failing_runner, db_path=db_path)
+    assert _entry(dst) is not None
+    assert _registry_verdict(dst) is True
+
+
+def test_running_the_printed_command_lets_the_probe_clear_it(moved_project, tmp_path):
+    """CLEAR (RED before the fix: `manual-dismiss`, no probe — the entry
+    outlived the very command it printed)."""
+    from vco_lib import deferral_probes
+    from vco_lib.deferral_report import DeferralReport
+
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    _run_the_printed_command(dst)
+    assert _registry_verdict(dst) is False
+    assert pm.CID_ENV_REPROJECTION_FAILED in deferral_probes.resolvable_condition_ids(
+        dst, DeferralReport.read(dst))
+    # The user's own export outside VCO's block is never part of the question.
+    assert 'export MY_OWN="kept"' in (dst / ".claude" / "env").read_text(encoding="utf-8")
+
+
+def test_move_verify_clears_it_once_the_surfaces_match(moved_project, tmp_path):
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    _run_the_printed_command(dst)
+    report = pm.verify_move(dst, old_path=plan.src, project_id=PROJECT_ID, db_path=db_path)
+    assert pm.CID_ENV_REPROJECTION_FAILED in report["resolved"]
+    assert _entry(dst) is None
+
+
+def test_a_later_successful_reprojection_clears_it_and_leaves_a_trail(moved_project, tmp_path):
+    """Paired clear: the next successful `run_env_reprojection` of the folder."""
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    pm.run_env_reprojection(PROJECT_ID, dst, runner=_real_runner, db_path=db_path)
+    assert _entry(dst) is None
+    trail = (dst / ".claude" / "logs" / "auto-resolutions.jsonl").read_text(encoding="utf-8")
+    rows = [json.loads(ln) for ln in trail.splitlines() if ln.strip()]
+    assert any(r["condition_id"] == pm.CID_ENV_REPROJECTION_FAILED for r in rows)
+
+
+def test_a_drifted_canonical_key_keeps_it_after_a_clean_projection(moved_project, tmp_path):
+    """KEEP twin of the clear: one canonical value edited away from the
+    projection is enough — in either surface."""
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    _run_the_printed_command(dst)
+    assert _registry_verdict(dst) is False
+    settings = dst / ".claude" / "settings.json"
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    data["env"]["KG_COLLECTION"] = "Someone_Else"
+    settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    assert _registry_verdict(dst) is True
+    _run_the_printed_command(dst)
+    env_file = dst / ".claude" / "env"
+    env_file.write_text(
+        env_file.read_text(encoding="utf-8").replace(str(dst), plan.src), encoding="utf-8")
+    assert _registry_verdict(dst) is True
+
+
+def test_the_probe_does_not_guess(moved_project, tmp_path, monkeypatch):
+    """UNKNOWN: no project id, an unreadable settings.json, a row that points
+    elsewhere, an unreadable database — each keeps the entry (None)."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    plan, dst, db_path = moved_project
+    _failed_move(plan, dst, db_path, tmp_path / "home")
+    _run_the_printed_command(dst)
+    assert pm.env_reprojection_still_owed(dst, _entry(dst)) is False
+
+    bare = DeferralEntry(condition_id=pm.CID_ENV_REPROJECTION_FAILED, title="t",
+                         detected="d", why_deferred="w", command_to_apply="c",
+                         severity="warning")
+    assert pm.env_reprojection_still_owed(dst, bare) is None
+
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / ".claude").mkdir(parents=True)
+    assert pm.env_reprojection_still_owed(elsewhere, _entry(dst)) is None
+
+    settings = dst / ".claude" / "settings.json"
+    good = settings.read_bytes()
+    settings.write_bytes(b"{ not jsonc")
+    assert pm.env_reprojection_still_owed(dst, _entry(dst)) is None
+    settings.write_bytes(good)
+
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(tmp_path / "missing" / "launcher.db"))
+    assert pm.env_reprojection_still_owed(dst, _entry(dst)) is None

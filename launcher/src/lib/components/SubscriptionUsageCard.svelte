@@ -15,14 +15,17 @@
     describeCountdown,
     describeTokens,
     fetchUsage,
+    INITIAL_CARD_STATE,
     nextPollMs,
+    settle,
     unknownLabel,
     vendorStatus,
     visibleVendors,
-    type UsageBridgeResult,
+    type UsageCardState,
   } from '$lib/subscription-usage';
 
-  let result = $state<UsageBridgeResult | null>(null);
+  let card = $state<UsageCardState>(INITIAL_CARD_STATE);
+  let result = $derived(card.result);
   let now = $state(Date.now());
 
   onMount(() => {
@@ -31,7 +34,7 @@
     const poll = async () => {
       const next = await fetchUsage();
       if (stopped) return;
-      result = next;
+      card = settle(card, next);
       now = Date.now();
       timer = setTimeout(poll, nextPollMs(next));
     };
@@ -54,8 +57,11 @@
     </div>
 
     {#if !result.ok}
-      <p class="usage-problem">{result.message}</p>
+      <p class="usage-problem" role="alert">{result.message}</p>
     {:else}
+      {#if card.warning}
+        <p class="usage-warning">{card.warning}</p>
+      {/if}
       {@const vendors = visibleVendors(result.snapshot)}
       {#if vendors.length === 0}
         <p class="usage-muted">No subscription is configured on the gateway.</p>
@@ -205,6 +211,12 @@
   }
   .usage-status {
     margin-left: auto;
+  }
+  .usage-warning {
+    color: var(--color-mid, #94a3b8);
+    font-size: 11px;
+    font-style: italic;
+    margin: 0 0 8px;
   }
   .usage-problem {
     color: var(--color-pink, #ff4fa0);

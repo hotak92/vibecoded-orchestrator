@@ -99,7 +99,11 @@ function Initialize-VcoRoute {
     $script:VcoRouteDocsSep = $docsDir.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 
     # Resolve project_id once for the access checks below. Same env-then-
-    # grep-.claude/env fallback as the bash sibling.
+    # .claude/env fallback and the SAME line rule as the bash sibling
+    # (`vco_lib.envfile.parse_env_lines`): optional `export ` prefix -- the
+    # form the projection's managed block writes -- first match wins, one
+    # matching pair of quotes stripped. MUST MATCH route-touched-path.sh
+    # (parity test: tests/test_v0297_route_project_id_parity.py).
     $script:VcoRouteProjectId = $Env:VCT_PROJECT_ID
     if (-not $script:VcoRouteProjectId) {
         $envFile = Join-Path $ProjectRoot ".claude/env"
@@ -107,8 +111,12 @@ function Initialize-VcoRoute {
             try {
                 $envLines = Get-Content -LiteralPath $envFile -ErrorAction Stop
                 foreach ($line in $envLines) {
-                    if ($line -match '^\s*VCT_PROJECT_ID\s*=\s*"?([^"]+)"?\s*$') {
-                        $script:VcoRouteProjectId = $Matches[1].Trim()
+                    if ($line -match '^\s*(?:export\s+)?VCT_PROJECT_ID=(.*)$') {
+                        $v = $Matches[1].Trim()
+                        if ($v.Length -ge 2 -and $v[0] -eq $v[$v.Length - 1] -and ($v[0] -eq '"' -or $v[0] -eq "'")) {
+                            $v = $v.Substring(1, $v.Length - 2)
+                        }
+                        $script:VcoRouteProjectId = $v
                         break
                     }
                 }

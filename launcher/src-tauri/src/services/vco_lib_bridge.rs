@@ -47,7 +47,7 @@
 //! module makes itself, [`write_settings_env_block`] (v0.2.97), builds its
 //! `Command` with `.silent()` on the same line.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -130,9 +130,9 @@ pub fn resolve_orchestrator_root(db: &Db) -> Option<std::path::PathBuf> {
     crate::commands::installer::resolve_orchestrator_root(db)
 }
 
-/// Wall-clock cap for one `write-env-block` spawn: a single small JSON
+/// Wall-clock cap for one env-block spawn: a single small JSON
 /// read-modify-write that takes ~150 ms. Past this the child is stuck.
-const WRITE_ENV_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const ENV_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The stdin request `python -m vco_lib.config_projection write-env-block`
 /// reads: the values to set, and the full key set the caller owns (an owned
@@ -146,9 +146,17 @@ pub fn build_write_env_block_request(pairs: &[(&str, String)], owned_keys: &[&st
     serde_json::json!({ "set": set, "owned_keys": owned_keys }).to_string()
 }
 
+/// The stdin request `python -m vco_lib.config_projection strip-env-keys`
+/// reads: the key NAMES to remove.
+pub fn build_strip_env_keys_request(keys: &[&str]) -> String {
+    serde_json::json!({ "keys": keys }).to_string()
+}
+
 /// v0.2.97: set / strip a launcher-owned key set in one JSON env surface
-/// (`claude_settings_json` = `<folder>/.claude/settings.json` `env`) through
-/// the ONE implementation, `vco_lib.config_projection.write_env_block`.
+/// (`claude_settings_json` = `<folder>/.claude/settings.json` `env`,
+/// `vscode_settings_json` = `<folder>/.vscode/settings.json`
+/// `claude-code.env`) through the ONE implementation,
+/// `vco_lib.config_projection.write_env_block`.
 ///
 /// Why a subprocess (A-tier) rather than a Rust copy: the Rust copies of this
 /// read-merge-write are how the destroy-on-unparseable defect lived on after
@@ -159,21 +167,18 @@ pub fn build_write_env_block_request(pairs: &[(&str, String)], owned_keys: &[&st
 /// byte layout this launcher always wrote. A refusal comes back as `Err`
 /// carrying the Python message, so the caller's warning surface shows it.
 ///
-/// `cwd` is the orchestrator clone root when one resolves, so
-/// `python -m vco_lib` imports the checkout's package ahead of anything else
-/// on `sys.path` (the rule the hooks editor documents), else the project.
+/// `root` is the orchestrator clone root when the caller knows it: it
+/// becomes the child's cwd, so `python -m vco_lib` imports the checkout's
+/// package ahead of anything else on `sys.path` (the rule the hooks editor
+/// documents); `None` falls back to the project folder.
 pub fn write_settings_env_block(
-    db: &Db,
+    root: Option<&Path>,
     project_folder: &Path,
     surface: &str,
     pairs: &[(&str, String)],
     owned_keys: &[&str],
 ) -> Result<Vec<String>, String> {
-    let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib().ok_or_else(|| {
-        "no Python interpreter with vco_lib found (checked $VCT_VENV and the \
-         orchestrator venv) — the settings editor cannot run; check the install"
-            .to_string()
-    })?;
+    let python = vco_lib_python()?;
     let mut cmd = Command::new(&python).silent();
     cmd.arg("-m")
         .arg("vco_lib.config_projection")
@@ -182,43 +187,246 @@ pub fn write_settings_env_block(
         .arg(project_folder)
         .arg("--surface")
         .arg(surface);
-    reinject_minimal_env(&mut cmd);
-    cmd.current_dir(resolve_orchestrator_root(db).unwrap_or_else(|| project_folder.to_path_buf()));
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let body = build_write_env_block_request(pairs, owned_keys);
+    run_env_block_command(cmd, &python, root, project_folder, &body, "written")
+}
 
+/// The removal-only twin of [`write_settings_env_block`]
+/// (`vco_lib.config_projection.strip_env_keys`): removes `keys` from one JSON
+/// surface's env block, never creates a file, drops an env block it empties,
+/// and refuses (and records) a file it cannot safely edit. Returns the keys
+/// actually removed. Used by the unregister strips in `projects_v2`.
+pub fn strip_settings_env_keys(
+    root: Option<&Path>,
+    project_folder: &Path,
+    surface: &str,
+    keys: &[&str],
+) -> Result<Vec<String>, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.config_projection")
+        .arg("strip-env-keys")
+        .arg("--project-folder")
+        .arg(project_folder)
+        .arg("--surface")
+        .arg(surface);
+    let body = build_strip_env_keys_request(keys);
+    run_env_block_command(cmd, &python, root, project_folder, &body, "removed")
+}
+
+/// v0.2.97: the env objects of each folder's JSON env surfaces
+/// (`claude_settings_json`, `vscode_settings_json`), read by the ONE JSONC
+/// reader — `python -m vco_lib.env_projection_check read-env`. The launcher's
+/// own readers of these blocks used a strict JSON parse, so a settings.json
+/// with a comment or a trailing comma (which Claude Code and VS Code accept)
+/// read as a parse error.
+///
+/// Returns `{folder: {surface: {"status", "path", "env", "error"}}}` exactly as
+/// the Python side builds it (`read_json_env_blocks`); `status` is `ok`,
+/// `missing` or `unreadable`. One spawn for any number of folders.
+pub fn read_settings_env_blocks(
+    root: Option<&Path>,
+    project_folders: &[&Path],
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let first = project_folders
+        .first()
+        .ok_or_else(|| "read_settings_env_blocks: no folder given".to_string())?;
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m").arg("vco_lib.env_projection_check").arg("read-env");
+    for folder in project_folders {
+        cmd.arg("--project-folder").arg(folder);
+    }
+    let reply = run_vco_lib_json(cmd, &python, root, first, "", parse_ok_reply)?;
+    match reply.get("folders") {
+        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+        _ => Err(format!("read-env reply has no `folders` object: {}", reply)),
+    }
+}
+
+/// The env object `read-env` returned for `surface` of `folder`, or the
+/// reason there is none: `Ok(None)` for a missing file, `Err(message)` for a
+/// file that exists but could not be read.
+pub fn env_block_of(
+    blocks: &serde_json::Map<String, serde_json::Value>,
+    folder: &Path,
+    surface: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+    let row = blocks
+        .get(&folder.display().to_string())
+        .and_then(|f| f.get(surface))
+        .ok_or_else(|| format!("read-env returned nothing for {} {}", folder.display(), surface))?;
+    match row.get("status").and_then(serde_json::Value::as_str) {
+        Some("ok") => Ok(Some(
+            row.get("env").and_then(serde_json::Value::as_object).cloned().unwrap_or_default(),
+        )),
+        Some("missing") => Ok(None),
+        _ => Err(row
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unreadable")
+            .to_string()),
+    }
+}
+
+/// The interpreter for an env-block spawn: the shared RT-4 ladder. Under
+/// `cfg(test)` a bare `python3` is accepted as the last resort — the verbs
+/// need only the standard library, and a unit test must not depend on where
+/// `CARGO_TARGET_DIR` puts the test binary (the ladder's walk-up rung).
+fn vco_lib_python() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    {
+        Ok(vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3"))
+    }
+    #[cfg(not(test))]
+    {
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib().ok_or_else(|| {
+            "no Python interpreter with vco_lib found (checked $VCT_VENV and the \
+             orchestrator venv) — the settings editor cannot run; check the install"
+                .to_string()
+        })
+    }
+}
+
+/// The child's cwd, which decides WHICH `vco_lib` a `python -m vco_lib…`
+/// imports. Production: the caller's orchestrator root, else the project.
+/// Under `cfg(test)`: always this checkout (compile-time path, test builds
+/// only), so the tests exercise the code beside them regardless of
+/// `CARGO_TARGET_DIR` and of an ambient `$VCT_INSTALL_ROOT` pointing at an
+/// older tree (v0.2.97 review F13: `invalid choice: 'write-env-block'`).
+pub(crate) fn vco_lib_cwd(root: Option<&Path>, project_folder: &Path) -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        let _ = (root, project_folder);
+        test_checkout_root()
+    }
+    #[cfg(not(test))]
+    {
+        root.map(Path::to_path_buf).unwrap_or_else(|| project_folder.to_path_buf())
+    }
+}
+
+/// The repository root this test binary was compiled from.
+#[cfg(test)]
+pub(crate) fn test_checkout_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+/// Spawn `cmd`, feed `body` on stdin, collect stdout/stderr, bound by
+/// [`ENV_BLOCK_TIMEOUT`], and parse the one-JSON-object reply.
+///
+/// Both output pipes are drained on their own threads WHILE the child runs
+/// (v0.2.97 review F11): reading them only after exit let a child that wrote
+/// more than a pipe buffer (a long traceback) block forever and be reported
+/// as "timed out". A failed stdin write (the child exited before reading —
+/// e.g. an argparse rejection) is not fatal either: the child's own stderr
+/// is still collected and is the error the caller sees.
+fn run_env_block_command(
+    cmd: Command,
+    python: &Path,
+    root: Option<&Path>,
+    project_folder: &Path,
+    body: &str,
+    list_field: &str,
+) -> Result<Vec<String>, String> {
+    run_vco_lib_json(cmd, python, root, project_folder, body, |out, err| {
+        parse_env_block_output(out, err, list_field)
+    })
+}
+
+/// v0.2.97: the transport half of [`run_env_block_command`], shared by every
+/// bridge verb that answers with one `{"ok": …}` JSON object — the env-block
+/// edits AND the JSONC-aware read ([`read_settings_env_blocks`]). `parse`
+/// turns the collected stdout/stderr into the caller's result.
+fn run_vco_lib_json<T>(
+    mut cmd: Command,
+    python: &Path,
+    root: Option<&Path>,
+    project_folder: &Path,
+    body: &str,
+    parse: impl FnOnce(&[u8], &[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    reinject_minimal_env(&mut cmd);
+    cmd.current_dir(vco_lib_cwd(root, project_folder));
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("settings editor: spawn failed (python={}): {}", python.display(), e))?;
-    if let Some(mut sink) = child.stdin.take() {
-        let body = build_write_env_block_request(pairs, owned_keys);
-        // Dropped at the end of this block: the child reads stdin to EOF.
-        sink.write_all(body.as_bytes())
-            .map_err(|e| format!("settings editor: could not send the request: {}", e))?;
-    }
-    let deadline = Instant::now() + WRITE_ENV_BLOCK_TIMEOUT;
-    loop {
+
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_reader = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let err_reader = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stdin_error = child.stdin.take().and_then(|mut sink| sink.write_all(body.as_bytes()).err());
+    // `sink` is dropped above: the child reads stdin to EOF.
+
+    let deadline = Instant::now() + ENV_BLOCK_TIMEOUT;
+    let timed_out = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(_)) => break false,
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("settings editor: timed out after 30 s".to_string());
+                break true;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("settings editor: wait failed: {}", e)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("settings editor: wait failed: {}", e));
+            }
         }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if timed_out {
+        return Err(format!(
+            "settings editor: timed out after {} s. stderr: {}",
+            ENV_BLOCK_TIMEOUT.as_secs(),
+            String::from_utf8_lossy(&stderr).trim()
+        ));
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("settings editor: could not read its output: {}", e))?;
-    parse_write_env_block_output(&output.stdout, &output.stderr)
+    parse(&stdout, &stderr).map_err(|e| match stdin_error {
+        Some(w) => format!("{} (the request could not be sent: {})", e, w),
+        None => e,
+    })
 }
 
-/// `write-env-block` prints exactly one JSON object on stdout on every path.
-/// `ok: true` → the keys written; anything else → `Err` with the child's own
-/// message (a refusal names the file and why), or the raw output when it is
-/// not that shape (a crash before the emit is reported, never degraded).
-pub fn parse_write_env_block_output(stdout: &[u8], stderr: &[u8]) -> Result<Vec<String>, String> {
+/// The env-block verbs print exactly one JSON object on stdout on every path.
+/// `ok: true` → the key list under `list_field` (`written` / `removed`);
+/// anything else → `Err` with the child's own message (a refusal names the
+/// file and why), or the raw output when it is not that shape (a crash
+/// before the emit is reported, never degraded).
+pub fn parse_env_block_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    list_field: &str,
+) -> Result<Vec<String>, String> {
+    parse_ok_reply(stdout, stderr).map(|reply| list_at(&reply, list_field))
+}
+
+/// The string list under `field` of an `ok: true` reply (empty when absent).
+fn list_at(reply: &serde_json::Value, field: &str) -> Vec<String> {
+    reply
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// The one-JSON-object wire contract every bridge verb follows: `ok: true` →
+/// the whole object; anything else → `Err` with the child's own message (a
+/// refusal names the file and why), or the raw output when it is not that
+/// shape (a crash before the emit is reported, never degraded).
+pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
     let out = String::from_utf8_lossy(stdout);
     let err = String::from_utf8_lossy(stderr);
     let parsed: serde_json::Value = serde_json::from_str(out.trim()).map_err(|e| {
@@ -230,11 +438,7 @@ pub fn parse_write_env_block_output(stdout: &[u8], stderr: &[u8]) -> Result<Vec<
         )
     })?;
     if parsed.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Ok(parsed
-            .get("written")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default());
+        return Ok(parsed);
     }
     let code = parsed.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown");
     let message = parsed
@@ -319,21 +523,53 @@ mod tests {
         assert_eq!(empty["set"], serde_json::json!({}), "strip-all is an empty set");
     }
 
+    /// v0.2.97 review F11: a child that writes far more than a pipe buffer to
+    /// stderr before answering is drained while it runs — it completes and
+    /// its answer is parsed, instead of blocking until the 30 s deadline and
+    /// being reported as "timed out".
+    #[test]
+    fn a_child_flooding_stderr_is_drained_not_timed_out() {
+        let python = vco_lib_python().unwrap();
+        let mut cmd = Command::new(&python);
+        cmd.arg("-c").arg(
+            "import sys; sys.stdin.read(); sys.stderr.write('x' * 400000); \
+             sys.stderr.flush(); print('{\"ok\": true, \"written\": [\"A\"]}')",
+        );
+        let started = Instant::now();
+        let out = run_env_block_command(cmd, &python, None, &std::env::temp_dir(), "{}", "written");
+        assert_eq!(out, Ok(vec!["A".to_string()]));
+        assert!(started.elapsed() < Duration::from_secs(20), "must not ride the deadline");
+    }
+
+    /// A child that exits before reading its (large) request — the stdin
+    /// write fails with a broken pipe — still reports ITS OWN stderr.
+    #[test]
+    fn a_child_exiting_before_reading_stdin_keeps_its_stderr() {
+        let python = vco_lib_python().unwrap();
+        let mut cmd = Command::new(&python);
+        cmd.arg("-c").arg("import sys; sys.stderr.write('loud-failure-reason'); sys.exit(3)");
+        let body = "x".repeat(1 << 20);
+        let err = run_env_block_command(cmd, &python, None, &std::env::temp_dir(), &body, "written")
+            .unwrap_err();
+        assert!(err.contains("loud-failure-reason"), "{}", err);
+    }
+
     /// A refusal must come back as `Err` carrying the child's own message
     /// (it names the file and why) — that string is what reaches the GUI.
     #[test]
     fn write_env_block_output_parses_ok_refusal_and_garbage() {
         assert_eq!(
-            parse_write_env_block_output(br#"{"ok": true, "written": ["A", "B"]}"#, b""),
+            parse_env_block_output(br#"{"ok": true, "written": ["A", "B"]}"#, b"", "written"),
             Ok(vec!["A".to_string(), "B".to_string()])
         );
-        let refused = parse_write_env_block_output(
+        let refused = parse_env_block_output(
             br#"{"ok": false, "error": "settings_write_refused", "message": "/p/.claude/settings.json was NOT updated: it is not valid JSON"}"#,
             b"",
+            "written",
         )
         .unwrap_err();
         assert!(refused.contains("NOT updated") && refused.contains("settings_write_refused"));
-        let garbage = parse_write_env_block_output(b"Traceback ...", b"ModuleNotFoundError")
+        let garbage = parse_env_block_output(b"Traceback ...", b"ModuleNotFoundError", "written")
             .unwrap_err();
         assert!(garbage.contains("unreadable output") && garbage.contains("ModuleNotFoundError"));
     }

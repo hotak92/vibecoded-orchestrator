@@ -677,6 +677,18 @@ def parked_hook_conflict_still_present(ctx: ProbeContext) -> Optional[bool]:
         return None
 
 
+def user_owned_secret_values_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``user_owned_secret_value_in_tree`` — does a user-put secret-shaped key
+    still carry a value? The SAME detection the emitter uses
+    (:func:`vco_lib.user_owned_secrets.found`); ``None`` on any failure."""
+    from vco_lib.user_owned_secrets import still_present
+
+    try:
+        return still_present(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def settings_write_refusal_still_applies(ctx: ProbeContext) -> Optional[bool]:
     """``settings_write_refused_*`` — is the refused settings file still unfit?
 
@@ -690,6 +702,24 @@ def settings_write_refusal_still_applies(ctx: ProbeContext) -> Optional[bool]:
 
     try:
         return refusal_still_applies(Path(ctx.folder), ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def env_reprojection_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``project_move_env_reprojection_failed`` — are the env surfaces still stale?
+
+    A thin wrapper over :func:`vco_lib.project_move.env_reprojection_still_owed`,
+    which compares ``.claude/settings.json`` / ``.claude/env`` against what
+    ``config_projection apply`` derives from the project's current row — the
+    same comparison ``vco project move --verify`` clears on. It reads the
+    project id the emitter recorded in ``dismiss_fields``; ``None`` when the
+    entry carries none, or the database / settings file cannot be read.
+    """
+    from vco_lib.project_move import env_reprojection_still_owed as still_owed
+
+    try:
+        return still_owed(Path(ctx.folder), ctx.entry)
     except Exception:  # noqa: BLE001 — a probe defect is not a verdict
         return None
 
@@ -918,10 +948,12 @@ PROBES: dict[str, ProbeFn] = {
     "launcher_dist_still_dirty": launcher_dist_still_dirty,
     "launcher_binary_stale_still_applies": launcher_binary_stale_still_applies,
     "disk_space_still_low": disk_space_still_low,
+    "env_reprojection_still_owed": env_reprojection_still_owed,
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
     "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
     "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
+    "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,
 }
 

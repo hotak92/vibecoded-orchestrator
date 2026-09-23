@@ -33,11 +33,23 @@ tokens, never an invented percentage.
 
 **Never on a request path.** Nothing here is awaited by ``/v1/messages``. The
 passive header capture is a synchronous dict parse of headers the relay has
-already received. The fetches run in ONE background task that a READ of the
-snapshot schedules when the cache is due (stale-while-revalidate): a reader is
-answered from memory immediately, and a machine where nobody looks at usage
-makes no vendor calls at all. The refresh interval is jittered so two readers
-never synchronise a vendor's rate limiter.
+already received. The fetches run in ONE background task, scheduled by
+exactly two signals and nothing else:
+
+* a READ of the snapshot (``/usage/windows``, the picker's ``/v1/models``)
+  that finds the cache due — stale-while-revalidate: the reader is answered
+  from memory immediately;
+* CHAT TRAFFIC (owner decision 2026-09-23, "warm while chats flow"): every
+  ``/v1/messages`` calls :meth:`UsageWindows.note_activity`, a synchronous
+  O(1) timestamp plus the same due-check. Picker labels are frozen when a
+  session starts, so a session started during active use must find fresh
+  numbers already cached rather than trigger the first fetch itself.
+
+There is no timer. A gateway with no chat traffic and no readers makes no
+vendor calls at all; with traffic, at most one refresh per jittered interval
+(one in flight, ever) — a burst of requests schedules one task, not one per
+request. The jitter keeps two readers from synchronising a vendor's rate
+limiter.
 
 **No second secret resolver.** The Claude token comes from the gateway's own
 :class:`model_router.auth.OAuthReader`, the vendor key from its own
@@ -525,6 +537,7 @@ class UsageWindows:
         self._task: Optional[asyncio.Task] = None
         self._next_due = 0.0
         self._last_refresh: Optional[float] = None
+        self._last_activity: Optional[float] = None
         self._header_windows: dict[str, Window] = {}
         self._usage: dict[str, VendorUsage] = {
             ANTHROPIC_ID: VendorUsage(ANTHROPIC_ID, ANTHROPIC_LABEL, "Claude subscription"),
@@ -548,11 +561,25 @@ class UsageWindows:
         return self._task is not None and not self._task.done()
 
     def request_refresh(self) -> bool:
-        """Schedule a background refresh when one is due. Returns whether it did.
+        """A READ wants the numbers: schedule a background refresh if one is
+        due. Returns whether it did; never awaits the refresh."""
+        return self._schedule_if_due()
 
-        Called by the READ route; never awaits the refresh. Due means: never
-        refreshed, or the jittered interval since the last start has elapsed.
+    def note_activity(self) -> bool:
+        """Chat traffic just passed through: keep the cache warm.
+
+        Called synchronously from ``/v1/messages`` on every request, so it is
+        O(1) and never awaits: a timestamp, the due-check, and at most once
+        per interval a ``create_task``. Returns whether it scheduled one.
         """
+        self._last_activity = self._clock()
+        return self._schedule_if_due()
+
+    def _schedule_if_due(self) -> bool:
+        """The ONE gate both signals go through. Due means: never refreshed,
+        or the jittered interval since the last START has elapsed — and no
+        refresh is in flight (single-flight: a hung refresh delays the next
+        one, it never stacks a second beside it)."""
         now = self._clock()
         if self.refreshing or now < self._next_due:
             return False
@@ -719,6 +746,7 @@ class UsageWindows:
         return {
             "generated_at": _iso(now),
             "last_refresh_at": _iso(self._last_refresh) if self._last_refresh else None,
+            "last_activity_at": _iso(self._last_activity) if self._last_activity else None,
             "refreshing": self.refreshing,
             "refresh_interval_s": int(self._refresh_s),
             "vendors": vendors,
@@ -785,6 +813,17 @@ def format_tokens(count: int) -> str:
     return str(count)
 
 
+def _known(window: Mapping[str, Any]) -> bool:
+    percent = window.get("percent")
+    return isinstance(percent, (int, float)) and not isinstance(percent, bool)
+
+
+def _window_text(window: Mapping[str, Any]) -> str:
+    """``5h 31%`` — the one spelling of a known window, shared by the status
+    line and the picker label so the two cannot round differently."""
+    return f"{window['label']} {window['percent']:.0f}%"
+
+
 def render_line(snapshot: Mapping[str, Any]) -> str:
     """One compact line, e.g. ``Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10%``.
 
@@ -795,17 +834,106 @@ def render_line(snapshot: Mapping[str, Any]) -> str:
     """
     segments: list[str] = []
     for vendor in snapshot.get("vendors") or ():
-        parts = [
-            f"{w['label']} {w['percent']:.0f}%"
-            for w in vendor.get("windows") or ()
-            if isinstance(w.get("percent"), (int, float))
-        ]
+        parts = [_window_text(w) for w in vendor.get("windows") or () if _known(w)]
         tokens = vendor.get("tokens")
         if isinstance(tokens, Mapping) and isinstance(tokens.get("tokens"), int) and tokens["tokens"] > 0:
             parts.append(f"{format_tokens(tokens['tokens'])} tok/mo")
         if parts:
             segments.append(f"{vendor.get('label', vendor.get('id', '?'))} " + " · ".join(parts))
     return " │ ".join(segments)
+
+
+# ── the picker-label suffix (what /v1/models appends to a vendor row) ────
+#: Shortest window first — the one that resets soonest — then the week, then
+#: any per-model week. The owner's own example reads ``5h 10% · wk 72% used``.
+_WINDOW_ORDER = {"5h": 0, "weekly": 1}
+
+
+def _window_rank(window_id: str) -> int:
+    if window_id in _WINDOW_ORDER:
+        return _WINDOW_ORDER[window_id]
+    return 2 if window_id.startswith("weekly:") else 3
+
+
+def _local_clock(epoch_s: float) -> str:
+    return time.strftime("%H:%M", time.localtime(epoch_s))
+
+
+def _local_day(epoch_s: float) -> str:
+    """``Sep 2`` — built by hand because ``%-d`` does not exist on Windows."""
+    moment = time.localtime(epoch_s)
+    return f"{time.strftime('%b', moment)} {moment.tm_mday}"
+
+
+def label_suffix(vendor: Mapping[str, Any], *, now: float, fresh_for_s: float) -> str:
+    """``" · 5h 10% · wk 72% used"`` for one snapshot vendor, or ``""``.
+
+    What a picker row carries after its own name. The client fetches
+    ``/v1/models`` once per session start and never again, so this text is
+    FROZEN for the life of the session — which decides three things:
+
+    * **used, never remaining**, and said once at the end so no window reads
+      as the other kind;
+    * **the age is a clock time, not a duration**: when the reading is older
+      than one refresh interval at the moment it is served, ``(as of 14:05)``
+      is appended — "12m old" would still be printed an hour later, while a
+      clock time stays true for as long as the label is on screen;
+    * **unknown is absence**: an unknown or stale window is left out (the
+      snapshot has already aged it to ``null``) and a vendor with nothing
+      known gets no suffix at all — never ``0%``.
+
+    A vendor with no quota source (QwenCloud) shows the ledger's token total
+    instead — ``1.2M tokens used this month`` — when it is positive and
+    fresh. When the ledger can only vouch for part of the month (it began
+    mid-month, or rotated), the span it covers is named rather than passed
+    off as the month's: ``1.2M tokens used since Sep 2``.
+    """
+    windows = sorted(
+        (w for w in vendor.get("windows") or () if _known(w)),
+        key=lambda w: _window_rank(str(w.get("id") or "")),
+    )
+    observed = [
+        seen for seen in (_reset_epoch(w.get("fetched_at")) for w in windows)
+        if seen is not None
+    ]
+    text = " · ".join(_window_text(w) for w in windows) + " used" if windows else ""
+    tokens = vendor.get("tokens")
+    if not text and isinstance(tokens, Mapping):
+        count = tokens.get("tokens")
+        seen = _reset_epoch(tokens.get("fetched_at"))
+        if (
+            isinstance(count, int) and not isinstance(count, bool) and count > 0
+            and seen is not None and now - seen <= STALE_AFTER_S
+        ):
+            since = _reset_epoch(tokens.get("counted_since"))
+            span = "this month" if since is None else f"since {_local_day(since)}"
+            text = f"{format_tokens(count)} tokens used {span}"
+            observed.append(seen)
+    if not text:
+        return ""
+    if observed and now - min(observed) > fresh_for_s:
+        text += f" (as of {_local_clock(min(observed))})"
+    return f" · {text}"
+
+
+def label_suffixes(snapshot: Mapping[str, Any]) -> dict[str, str]:
+    """``{vendor id: suffix}`` for every vendor with something known.
+
+    Pure: ages against the snapshot's own ``generated_at`` and
+    ``refresh_interval_s``, so it needs no clock of its own and cannot
+    disagree with the snapshot it renders.
+    """
+    now = _reset_epoch(snapshot.get("generated_at"))
+    interval = snapshot.get("refresh_interval_s")
+    if now is None or not isinstance(interval, (int, float)) or isinstance(interval, bool):
+        return {}
+    out: dict[str, str] = {}
+    for vendor in snapshot.get("vendors") or ():
+        vendor_id = vendor.get("id")
+        suffix = label_suffix(vendor, now=now, fresh_for_s=float(interval))
+        if isinstance(vendor_id, str) and suffix:
+            out[vendor_id] = suffix
+    return out
 
 
 __all__ = [
@@ -815,6 +943,8 @@ __all__ = [
     "STALE_AFTER_S",
     "UsageWindows",
     "format_tokens",
+    "label_suffix",
+    "label_suffixes",
     "month_start",
     "parse_anthropic_usage",
     "parse_unified_headers",

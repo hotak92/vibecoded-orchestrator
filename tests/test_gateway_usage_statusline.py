@@ -380,3 +380,37 @@ def test_bridge_failures_are_structured(case, reason, gateway, tmp_path) -> None
     assert result["ok"] is False
     assert result["reason"] == reason
     assert result["message"]
+
+
+@pytest.mark.parametrize("poisoned,names", [
+    ("vco_lib.vscode_settings", "vco_lib.vscode_settings"),
+    ("model_router.config", "gateway package"),
+])
+def test_bridge_broken_install_is_loud(poisoned, names, gateway, tmp_path) -> None:
+    """F4: a failed import is a BROKEN INSTALL — its own reason, exit 1 and a
+    stderr line — never folded into ``no_token``, which the card hides."""
+    server = gateway(json_body=SNAPSHOT)
+    state = _state(tmp_path, port=server.port)
+    code = (
+        "import sys\n"
+        f"sys.modules[{poisoned!r}] = None  # import now raises ImportError\n"
+        "from vco_lib.gateway_usage import main\n"
+        "raise SystemExit(main(['--timeout', '2']))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                          env=child_env(_env(state)), timeout=60)
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    result = json.loads(proc.stdout)
+    assert result["ok"] is False
+    assert result["reason"] == "broken_install"
+    assert names in result["message"]
+    assert "install.py --update" in result["message"]
+    assert "broken install" in proc.stderr
+    assert server.seen == []  # it never got as far as asking the gateway
+    assert TOKEN not in proc.stdout + proc.stderr
+
+
+def test_bridge_gateway_states_stay_exit_zero(tmp_path) -> None:
+    """The quiet side of F4: "nothing is listening" is an answer, not a crash."""
+    result = _run_bridge(_state(tmp_path, port=_free_port()))  # asserts exit 0
+    assert result["reason"] == "unreachable"

@@ -535,6 +535,8 @@ class TestRegistryCompleteness(unittest.TestCase):
         emitter_supplied = {
             "dual_ollama_detected", "kg_binding_evidence_mismatch",
             "kg_unclaimed_populated_classes", "settings_write_refused_*",
+            # v0.2.97: user_owned_secrets.emit_deferral attaches the `file:KEY` set.
+            "user_owned_secret_value_in_tree",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

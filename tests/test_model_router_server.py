@@ -678,7 +678,7 @@ class HealthTests(GatewayTestBase):
     #: Kept in step with ``health_handler``'s docstring by the test below.
     DOCUMENTED_FIELDS = {
         "ok", "service", "version", "source_sha", "port", "host", "catalog_source",
-        "catalog_filter", "window_rows", "catalog_hidden",
+        "catalog_filter", "window_rows", "picker_usage", "catalog_hidden",
         "context_table_source", "context_table_path", "oauth_present",
         "oauth_state", "oauth_expires_in_s", "vendors", "vendor_keys_cached",
         "vendor_keys_stale",

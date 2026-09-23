@@ -121,6 +121,7 @@ from vco_lib.parked_hooks import ParkedHooksState, read_parked_hooks, report_par
 # Both private names survive as ALIASES (object identity, as above) because
 # this module and the merge's test suite reach them here. v0.2.97: which hooks
 # the merge must not put back comes from ``vco_lib.parked_hooks``.
+from vco_lib import user_owned_secrets as _user_owned_secrets
 from vco_lib.settings_merge import (
     merge_hooks_block as _merge_hooks_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
     smart_merge_settings as _smart_merge_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
@@ -401,16 +402,13 @@ def _resolve_bundle_collection_names_binding_first(
     except Exception:  # noqa: BLE001 — any other seam error → conservative fallthrough
         pass
 
-    # Tier 2: on-disk KG_COLLECTION pin in the project's settings.json env.
+    # Tier 2: on-disk KG_COLLECTION pin in the project's settings.json env (JSONC, v0.2.97).
     try:
-        settings_file = folder / ".claude" / "settings.json"
-        if settings_file.is_file():
-            data = json.loads(settings_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                env = data.get("env")
-                kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
-                if isinstance(kg, str) and kg:
-                    return _apply_primary(kg)
+        loaded = _jsonc_edit.load_object(folder / ".claude" / "settings.json")
+        env = loaded[0].get("env") if loaded is not None else None
+        kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
+        if isinstance(kg, str) and kg:
+            return _apply_primary(kg)
     except Exception:  # noqa: BLE001 — soft-fail to the last-resort derivation
         pass
 
@@ -6030,16 +6028,10 @@ def _cleanup_legacy_bash_env_in_project(
     if not settings_file.exists():
         return {"action": "absent", "detail": "settings.json not present"}
 
-    try:
-        settings = json.loads(settings_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        return {
-            "action": "unparseable",
-            "detail": f"{type(e).__name__}: {e}",
-        }
-
-    if not isinstance(settings, dict):
-        return {"action": "unparseable", "detail": "settings.json root not a dict"}
+    try:  # JSONC is read AND edited in place, comments kept (v0.2.97)
+        settings, raw = _jsonc_edit.read_object(settings_file)
+    except (OSError, ValueError) as e:  # not JSONC, not UTF-8, or not an object
+        return {"action": "unparseable", "detail": f"{type(e).__name__}: {e}"}
 
     env_block = settings.get("env")
     if not isinstance(env_block, dict) or "BASH_ENV" not in env_block:
@@ -6060,11 +6052,12 @@ def _cleanup_legacy_bash_env_in_project(
         }
 
     env_block.pop("BASH_ENV", None)
+    text = _jsonc_edit.dumps_preserving(raw, settings, indent=2)
+    if text is None:  # a JSONC edit that could not be verified: write nothing
+        return {"action": "write-failed", "detail": "JSONC edit could not be verified; "
+                "remove env.BASH_ENV by hand"}
     try:
-        _redirect = _write_file_atomic(
-            settings_file,
-            (json.dumps(settings, indent=2) + "\n").encode("utf-8"),
-        )
+        _redirect = _write_file_atomic(settings_file, text.encode("utf-8"))
         if _redirect is not None and redirect_sink is not None:
             redirect_sink.append((settings_file, _redirect))
     except OSError as e:
@@ -9630,179 +9623,75 @@ def _emit_safe_add_skipped_env_merge_deferral(
 
 
 def _has_user_secret_shaped_line(path: Path) -> bool:
-    """v0.2.83 PLAN-v0283 B-F8: does ``path`` carry a secret-shaped
-    managed-block line? Extracted (unchanged semantics) from the closure that
-    used to live inside ``_emit_user_secret_values_retained_deferral`` so the
-    reconciler can RE-DETECT the same state (single home, one concern).
+    """Does ``path`` (one env surface) still hold a pre-v0.2.73 secret VALUE?
+    v0.2.97: the ONE detection lives in
+    :func:`vco_lib.config_projection.retained_secret_keys_in` — the SAME set
+    every env refresh strips, so this deferral cannot promise a removal the
+    refresh does not make. No value is ever read out."""
+    from vco_lib.config_projection import retained_secret_keys_in
+    return bool(retained_secret_keys_in(path, _cp_known_secret_keys(path.parent.parent)))
 
-    - ``.claude/env``: a ``export KEY="..."`` line inside the managed block
-      whose KEY ``is_secret_shaped_env_key`` flags AND whose quoted value is
-      non-empty (v0.2.84 PLAN-v0284 D6 / P4).
-    - ``.claude/settings.json``: an ``env`` key that ``is_secret_shaped_env_key``
-      flags (the SINGLE secret-shape home — never a substring fork).
 
-    No value is ever read/printed — only a pattern/shape + emptiness match.
-    Soft-fails to ``False`` on any read/parse error.
-
-    v0.2.84 PLAN-v0284 D6 (P4): the ``.claude/env`` branch used to match a
-    COARSE regex (``export\\s+[A-Z_][A-Z0-9_]*="``) that flagged EVERY uppercase
-    export in the managed block — so every safe-add project (23/23 pure-config
-    exports, zero secrets) re-emitted the ``user_secret_values_retained_in_tree``
-    deferral forever and the reconciler's re-detect could never self-clear it.
-    Both surfaces now route through the SINGLE secret-shape home
-    (``vco_lib.secrets_audit.is_secret_shaped_env_key``); the ``.claude/env``
-    branch additionally requires a non-empty quoted value (an empty
-    ``export FOO_TOKEN=""`` carries no VALUE to worry about).
-    """
-    if not path.is_file():
-        return False
-    from vco_lib.secrets_audit import is_secret_shaped_env_key
-    # A managed-block export line: `export KEY="value"` (the canonical shape the
-    # config-projection writer emits). Captures KEY and the double-quoted value
-    # so we can shape-check the key and test the value for non-emptiness. We do
-    # NOT retain / log the value — only ``bool(value)`` participates.
-    #
-    # NOTE (v0.2.84 fix-pass): this scan deliberately does NOT route through the
-    # shared `vco_lib.envfile` line parser (which the sibling readers
-    # `install_weaviate._managed_env_value` + `agent_secrets._parse_dotenv_value`
-    # now share). Its parse is a DIFFERENT contract: a start-anchored regex that
-    # (a) REQUIRES the literal `export` keyword, (b) matches ONLY a double-quoted
-    # value, and (c) tolerates trailing content after the closing quote. The
-    # generic line parser widens (a)/(b) and narrows (c), so consolidating here
-    # would change edge behavior for hand-edited managed blocks. The shared home
-    # covers the two byte-identical readers; this stays a distinct policy.
-    _managed_export_re = re.compile(
-        r'^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"',
-        re.MULTILINE,
-    )
-    try:
-        text = path.read_text(encoding="utf-8")
-        if path.name == "env":
-            from vco_lib.config_projection import (
-                CLAUDE_ENV_MANAGED_BEGIN,
-                CLAUDE_ENV_MANAGED_END,
-            )
-            begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-            end = text.find(CLAUDE_ENV_MANAGED_END)
-            if begin == -1 or end == -1:
-                return False
-            managed_block = text[begin:end]
-            # D6 (P4): flag ONLY when a secret-SHAPED key carries a non-empty
-            # value. Pure-config routing keys (KG_COLLECTION, WEAVIATE_URL, ...)
-            # are never secret-shaped, so a config-only managed block reads
-            # clean and the deferral can self-clear.
-            for m in _managed_export_re.finditer(managed_block):
-                key, value = m.group(1), m.group(2)
-                if is_secret_shaped_env_key(key) and value != "":
-                    return True
-            return False
-        elif path.name == "settings.json":
-            # settings.json branch UNCHANGED (v0.2.84 D6): keys already
-            # route through the single secret-shape home. No value check here
-            # (the env-key MAP has no ``export KEY="..."`` quoting to inspect).
-            try:
-                data = json.loads(text)
-                env_block = data.get("env", {})
-                if not isinstance(env_block, dict):
-                    return False
-                for key in env_block:
-                    if is_secret_shaped_env_key(key):
-                        return True
-            except Exception:  # noqa: BLE001 — malformed settings.json → soft no-detection
-                return False
-        return False
-    except Exception:
-        return False
+def _cp_known_secret_keys(folder: Path) -> list[str]:
+    from vco_lib.config_projection import known_user_secret_keys_for_folder
+    return known_user_secret_keys_for_folder(folder)
 
 
 def _scan_user_secret_values_retained(folder: Path) -> bool:
-    """v0.2.83 PLAN-v0283 B-F8: True when a secret-shaped managed-block line
-    survives in EITHER VCO env surface (``.claude/env`` or
-    ``.claude/settings.json``). Shared by the emitter and the reconciler so the
-    self-clear decision uses the SAME detection the emit uses (no drift)."""
-    folder = Path(folder)
-    return (
-        _has_user_secret_shaped_line(folder / ".claude" / "env")
-        or _has_user_secret_shaped_line(folder / ".claude" / "settings.json")
-    )
+    """True when a pre-v0.2.73 secret VALUE survives in any VCO env surface
+    (``.claude/env`` managed block, ``.claude/settings.json`` / ``.vscode/
+    settings.json`` env blocks). Shared by the emitter and the reconciler so
+    the self-clear uses the SAME detection the emit uses (v0.2.83 B-F8)."""
+    from vco_lib.config_projection import retained_user_secret_values
+    return bool(retained_user_secret_values(Path(folder)))
 
 
 def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
-    """Emit `user_secret_values_retained_in_tree`: pre-v0.2.73 user-secret
-    VALUEs may still reside in committable tree files (.claude/env or
-    .claude/settings.json) from the Rust GUI writer before S-4's strip
-    invariant shipped.
+    """Emit ``user_secret_values_retained_in_tree``: a VALUE a pre-v0.2.73
+    launcher wrote into a committable env file is still there.
 
-    ONE-TIME scanner that detects a secret-shaped line in the managed block
-    (no value printed — only a pattern match). Self-clearing: once the next
-    env-projection refresh scrubs the value, the deferral is never re-emitted.
-    FOREIGN from install.py's perspective (v0.2.73 S-8): emitted ONLY on the
-    bundle-update path here, NEVER by install.py --update (which doesn't
-    re-detect it). It is therefore deliberately NOT in
-    ``install.py::_INSTALL_OWNED_CONDITION_IDS`` — install.py preserves it
-    verbatim (per ``deferral_report.condition_is_owned``: non-owned == FOREIGN
-    == preserved). If it were OWNED, an ``install.py --update`` run would seed
-    the report, fail to re-detect this bundle-update-only condition, and
-    silently DROP the secret-retention notice while the value may still be in
-    the tree (the exact A-2 clobber class this whole track fixes). It clears
-    the next time THIS bundle-update path runs and finds the value gone.
-
-    Severity is "warning" (not critical) because:
-      * The value IS still a secret until the next refresh (users should rotate
-        if the key was leaked to VCS).
-      * The next refresh will scrub it automatically.
-      * No immediate action required — just awareness + precaution.
+    Runs on the bundle update AFTER its env refresh, which already strips
+    these values (``config_projection.apply_project_env``, v0.2.97) — so an
+    entry here means the refresh could not: the settings file was refused
+    (its own ``settings_write_refused_*`` entry names it) or the project is
+    not registered with the launcher (no refresh ran). Key NAMES are listed;
+    a value never is. Cleared by the bundle reconciler, and by the next
+    refresh that leaves nothing behind. FOREIGN to install.py (v0.2.73 S-8):
+    bundle-update-only, so it is deliberately NOT install-owned.
     """
+    from vco_lib.config_projection import retained_user_secret_values
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import deferral_emit as _de
 
-    # Cheap scan (no value parsing — never print a value) across BOTH surfaces.
-    # v0.2.83 B-F8: routed through the shared module-level detector so the
-    # reconciler's self-clear uses the SAME logic.
-    if not _scan_user_secret_values_retained(folder):
-        return  # No pre-fix artifacts; don't emit.
-
-    # The rotate advice is CONDITIONAL IN PROSE ("if this project's git has a
-    # push remote…") rather than gated on a probe: the user knows their own
-    # VCS topology, and a git subprocess per bundle-update would be a wasted
-    # call (the advice reads correctly whether or not a remote exists). We also
-    # deliberately do NOT try to discover the user's real repo — it may be
-    # nested anywhere in the tree (see E-two-git-contexts) — so a single
-    # root-level `git config` probe would be unreliable anyway.
-    rotate_advice = (
-        "If this project's git has a push remote and the pre-v0.2.73 value "
-        "was committed or pushed, rotate the affected key now to be safe."
-    )
-
-    entry = DeferralEntry(
+    found = retained_user_secret_values(Path(folder))
+    if not found:
+        return
+    where = "; ".join(f"{rel}: {', '.join(names)}" for rel, names in found.items())
+    _de.emit(folder, DeferralEntry(
         condition_id="user_secret_values_retained_in_tree",
-        title="Pre-v0.2.73: user-secret VALUES may be in committable tree files",
+        title="Pre-v0.2.73: user-secret VALUES are still in committable env files",
         detected=(
-            "Secret-shaped managed-block lines were found in one or more "
-            "VCO env surfaces (.claude/env or .claude/settings.json). These "
-            "may contain VALUES from the Rust GUI writer before v0.2.73's "
-            "strip-only invariant shipped."
+            "These env surfaces still hold a value a pre-v0.2.73 launcher wrote "
+            f"for a user secret (key names only): {where}."
         ),
         why_deferred=(
-            "Deferred: the value scrubbing happens automatically at the next "
-            "env-projection refresh (which runs on the next project refresh/"
-            "CLI command / launcher restart). This deferral is a ONE-TIME "
-            "notice only; once the refresh scrubs the value from tree files, "
-            "the deferral will NOT re-emit."
+            "Every env refresh removes these values — the secrets themselves stay "
+            "in your keychain — but this update's refresh could not: either a "
+            "settings file could not be edited safely (a settings_write_refused "
+            "entry names it and what to fix) or this folder is not registered "
+            "with the launcher, so there is no refresh to run. This entry clears "
+            "itself once no such value remains."
         ),
         command_to_apply=(
-            f"# The next project env refresh will scrub the values automatically.\n"
-            f"# No manual action required UNLESS the key was committed/pushed:\n"
-            f"# {rotate_advice}\n"
-            f"# Dismiss this deferral once you've reviewed it:\n"
-            f"python -m vco_lib.project_init dismiss-deferral "
-            f"--folder {str(folder)!r} "
-            f"--condition-id user_secret_values_retained_in_tree"
+            "# Fix what the settings_write_refused entry names (if any), then re-run\n"
+            "# the bundle update (or any launcher action on this project) to refresh.\n"
+            "# If this project's git has a push remote and a value was committed or\n"
+            "# pushed, rotate the affected key now to be safe. To dismiss instead:\n"
+            f"python -m vco_lib.project_init dismiss-deferral --folder {str(folder)!r} "
+            "--condition-id user_secret_values_retained_in_tree"
         ),
         severity="warning",
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
+    ))
 
 
 def _emit_safe_add_git_exclude_deferral(
@@ -11759,10 +11648,12 @@ def install_project_bundle(
     # v0.2.73 S-8 (ONE-TIME): scan for pre-fix user-secret VALUES in tree files
     # and emit a deferral notice if found. Triggered on every bundle-update run
     # (cheap pattern scan, no value parsing); self-clears once the next env
-    # refresh removes the value.
+    # refresh removes the value. v0.2.97: a secret-shaped key the USER put there
+    # is reported separately (``vco_lib.user_owned_secrets``) — never removed.
     if update_mode:
         try:
             _emit_user_secret_values_retained_deferral(folder)
+            _user_owned_secrets.emit_deferral(folder)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.secrets_retention_audit", "warning",

@@ -844,7 +844,26 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
-notes = "Probed clear (B-F8 re-scan) on every bundle update."
+notes = """Probed clear (B-F8 re-scan) on every bundle update. v0.2.97: the \
+detection is `config_projection.retained_user_secret_values` — the SAME set \
+every `apply_project_env` strips (launcher-known user-secret keys + \
+GITHUB_TOKEN in the JSON env blocks, secret-shaped exports in the .claude/env \
+managed block) — and that refresh also clears the entry (paired) once nothing \
+remains, trailing each removed key NAME in auto-resolutions.jsonl."""
+
+[conditions.user_owned_secret_value_in_tree]
+class = "action_required"
+owner = "vco_lib.user_owned_secrets"
+clear_probe = "probe:py:user_owned_secret_values_still_present"
+emit_surfaces = ["ledger"]
+dismiss_key = ["keys"]
+notes = """v0.2.97. A secret-shaped env key (vco_lib.secrets_audit.is_secret_shaped_env_key) \
+with a non-empty value in `.claude/settings.json` env or `.vscode/settings.json` \
+claude-code.env that VCO did NOT write (not canonical, not a launcher-known user \
+secret — those are user_secret_values_retained_in_tree's, and every refresh \
+removes them). VCO never removes it; a human moves it into the secrets store or \
+keeps it. Emitted by the bundle update; cleared by the probe once no such key \
+carries a value; dismissible per set of `file:KEY` names (a new key re-fires)."""
 
 [conditions.template_review_pending]
 class = "informational_record"
@@ -1680,7 +1699,7 @@ hosted a session gets no entry at all."""
 [conditions.project_move_env_reprojection_failed]
 class = "action_required"
 owner = "vco_lib.project_move"
-clear_probe = "manual-dismiss"
+clear_probe = "probe:py:env_reprojection_still_owed"
 emit_surfaces = ["ledger"]
 notes = """v0.2.97: the post-flip `python -m vco_lib.config_projection apply` \
 exited non-zero, so the moved project's `.claude/settings.json` / \
@@ -1690,8 +1709,15 @@ old folder. Until v0.2.97 this failed on EVERY move (the mover passed a \
 post-flip JSON the GUI did not render. The entry quotes the child's stderr \
 and carries the exact re-run command (argv from \
 `config_projection.build_apply_argv`, the builder beside the parser). \
-`manual-dismiss` because nothing re-runs the projection automatically: the \
-entry's command is the fix, and the dismissal follows it. A stale path left \
+It ends on EVIDENCE, three ways, all tri-state (only a positive match clears): \
+the probe `env_reprojection_still_owed` (`project_move.env_reprojection_still_owed`, \
+reading the project id the emitter records in `dismiss_fields`) resolves it \
+once both default surfaces hold what `project_env_from_db` derives from the \
+current row — after the printed command, the launcher's re-projection or \
+`reproject-all`; `vco project move --verify` runs the same check; and the \
+next successful `project_move.run_env_reprojection` for that folder (a \
+rename) clears it as a paired resolution. Until v0.2.97's review it was \
+`manual-dismiss` and outlived a successful re-run. A stale path left \
 behind is ALSO reported by `project_move_stale_path_reference`, whose \
 `vco project move --verify` re-scan clears on its own."""
 

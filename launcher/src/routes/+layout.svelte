@@ -89,6 +89,7 @@
   // anything unless the user presses Continue.
   import GatewayRestartModal from '$lib/components/GatewayRestartModal.svelte';
   import { gatewayFreshness } from '$lib/stores/gateway-freshness';
+  import { scheduleStartupCheck } from '$lib/gateway-freshness';
   import { invoke } from '$lib/tauri';
   // M-P1-5: per-install-root scoping for localStorage flags. See
   // `install-state-store.ts` for the migration rationale (two clones
@@ -193,7 +194,8 @@
 
     // v0.2.97: after the boot probes have settled, ask whether the running
     // model gateway is behind the checkout (read-only; see the import note).
-    setTimeout(() => void gatewayFreshness.check(), 4000);
+    // Cancelled on teardown (review R1 F15) so a remount never stacks checks.
+    const cancelFreshnessCheck = scheduleStartupCheck(() => gatewayFreshness.check());
 
     // Check onboarding / changelog gates once per app load.
     //
@@ -327,6 +329,7 @@
     return () => {
       unsub();
       clearInterval(orchStatusInterval);
+      cancelFreshnessCheck();
     };
   });
 

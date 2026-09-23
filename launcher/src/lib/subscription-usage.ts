@@ -16,7 +16,7 @@
 //   * a vendor with no programmatic quota shows TOKENS, labelled as tokens,
 //     never a bar.
 
-import { safeInvoke } from '$lib/tauri';
+import { invoke, tauriAvailable } from '$lib/tauri';
 
 /** Mirrors `model_router.usage_windows._window_dict`. */
 export interface UsageWindow {
@@ -72,19 +72,73 @@ export const USAGE_POLL_MS = 60_000;
 /** Right after the first read the gateway is usually still fetching. */
 export const USAGE_RETRY_WHILE_REFRESHING_MS = 4_000;
 
-export async function fetchUsage(): Promise<UsageBridgeResult | null> {
-  return safeInvoke<UsageBridgeResult>('model_gateway_usage_windows');
+/** The command itself failed (no interpreter, timeout, a traceback). */
+export const REASON_BRIDGE_ERROR = 'bridge_error';
+/** `vco_lib` / the gateway package did not import — never hidden. */
+export const REASON_BROKEN_INSTALL = 'broken_install';
+/** The one failure the card is QUIET about. */
+export const REASON_NOT_RUNNING = 'not_running';
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return typeof err === 'string' ? err : JSON.stringify(err);
 }
 
 /**
- * Whether the card renders at all. A machine that does not run the gateway
- * (or has never started it) gets no card rather than a permanent error tile;
- * any other failure is shown, because it is something the user can fix.
+ * Ask the backend. `null` ONLY in browser mode (no backend to ask). A
+ * rejected command is NOT swallowed into `null` the way `safeInvoke` would —
+ * that hid the card, so a broken bridge looked exactly like "no gateway"
+ * (review F4). It becomes a `bridge_error` answer carrying the error text.
+ */
+export async function fetchUsage(): Promise<UsageBridgeResult | null> {
+  if (!tauriAvailable()) return null;
+  try {
+    return await invoke<UsageBridgeResult>('model_gateway_usage_windows');
+  } catch (err) {
+    return {
+      ok: false,
+      reason: REASON_BRIDGE_ERROR,
+      message: `could not read subscription usage: ${errorText(err)}`,
+    };
+  }
+}
+
+/**
+ * Whether the card renders at all. Hidden only where there is nothing to
+ * say: browser mode, and a gateway that is not running (a machine that does
+ * not use it gets no permanent error tile). Every other failure — a broken
+ * install above all — is shown, because it is something the user can fix.
  */
 export function cardVisible(result: UsageBridgeResult | null): boolean {
   if (result === null) return false;
   if (result.ok) return true;
-  return result.reason !== 'not_running' && result.reason !== 'no_token';
+  return result.reason !== REASON_NOT_RUNNING;
+}
+
+/** What the card renders: the answer, plus a note when it is a kept one. */
+export interface UsageCardState {
+  result: UsageBridgeResult | null;
+  /** Set when a refresh failed transiently and the last good answer is kept. */
+  warning: string | null;
+}
+
+export const INITIAL_CARD_STATE: UsageCardState = { result: null, warning: null };
+
+/** Failures that say nothing about the numbers already on screen. */
+const TRANSIENT = new Set([REASON_BRIDGE_ERROR, 'unreachable']);
+
+/**
+ * Fold one poll into the card. A transient failure after a good reading
+ * keeps that reading, NAMED as not refreshed — rather than blanking the card
+ * for a poll interval (review F4). A broken install, and any failure with
+ * no good reading to keep, replaces what is shown so it is seen.
+ */
+export function settle(prev: UsageCardState, next: UsageBridgeResult | null): UsageCardState {
+  if (next === null || next.ok) return { result: next, warning: null };
+  if (TRANSIENT.has(next.reason) && prev.result?.ok) {
+    return { result: prev.result, warning: `not refreshed — ${next.message}` };
+  }
+  return { result: next, warning: null };
 }
 
 export type BarTone = 'teal' | 'purple' | 'pink';

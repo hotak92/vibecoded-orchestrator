@@ -93,7 +93,7 @@ describe('state labels and tooltips are specific, not generic', () => {
 
 describe('settingsErrorBanner — a refusal the user can act on', () => {
   it('says nothing was written for the destructive-looking failures', () => {
-    for (const code of ['unparseable', 'hooks_block_malformed', 'no_python']) {
+    for (const code of ['unparseable', 'jsonc_edit_refused', 'hooks_block_malformed', 'no_python']) {
       expect(settingsErrorBanner(code, null, SETTINGS)).toMatch(/[Nn]othing was written/);
     }
   });
@@ -104,8 +104,14 @@ describe('settingsErrorBanner — a refusal the user can act on', () => {
 
   it('explains WHY an unparseable file is not rewritten', () => {
     const t = settingsErrorBanner('unparseable', null, SETTINGS);
-    expect(t).toMatch(/not valid JSON/);
+    expect(t).toMatch(/not valid JSON or JSONC/);
     expect(t).toMatch(/could destroy/);
+  });
+
+  it('explains a refused in-place JSONC edit (v0.2.97: JSONC is edited, not refused)', () => {
+    const t = settingsErrorBanner('jsonc_edit_refused', null, SETTINGS);
+    expect(t).toMatch(/comments or trailing commas/);
+    expect(t).toMatch(/UPDATE_DEFERRED\.md/);
   });
 
   it('falls back to the backend message for an unknown code', () => {

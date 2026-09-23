@@ -290,8 +290,9 @@ fn write_or_strip_deprecation_env(
     folder: &Path,
     pairs: &[(&str, String)],
 ) -> Result<(), String> {
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db);
     crate::services::vco_lib_bridge::write_settings_env_block(
-        db,
+        root.as_deref(),
         folder,
         "claude_settings_json",
         pairs,

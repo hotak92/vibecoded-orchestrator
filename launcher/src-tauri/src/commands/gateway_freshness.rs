@@ -31,6 +31,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
+use crate::commands::single_flight::{self, SingleFlightGuard, OP_GATEWAY_RESTART};
 use crate::commands::model_gateway::{
     gateway_freshness_command, probe_process, python_or_err, run_to_completion_within,
     GatewaySupervisor, ProcessState,
@@ -111,8 +112,10 @@ pub struct RestartResult {
 pub enum RestartRoute {
     /// Not proven stale — nothing is restarted.
     NotNeeded,
-    /// Stale, and this launcher holds the gateway as its own child.
-    LauncherChild,
+    /// Stale, and this launcher holds the gateway as its own child. `pid` is
+    /// the child the decision was made ABOUT; only that child may be stopped
+    /// (review R1 F9 — the supervisor can replace it during the check).
+    LauncherChild { pid: u32 },
     /// Stale, not ours — the Python module restarts it through its init
     /// system, or refuses with a reason (it re-checks and re-plans itself).
     InitSystem,
@@ -123,7 +126,7 @@ pub fn decide_restart(report: &FreshnessReport, held_child_pid: Option<u32>) -> 
         return RestartRoute::NotNeeded;
     }
     match (held_child_pid, report.pid) {
-        (Some(held), Some(serving)) if held == serving => RestartRoute::LauncherChild,
+        (Some(held), Some(serving)) if held == serving => RestartRoute::LauncherChild { pid: held },
         _ => RestartRoute::InitSystem,
     }
 }
@@ -132,7 +135,7 @@ pub fn decide_restart(report: &FreshnessReport, held_child_pid: Option<u32>) -> 
 /// serving process. Python cannot see the child handle, so without this a
 /// launcher-started gateway would read "no service manager owns it".
 pub fn overlay_launcher_child(mut report: FreshnessReport, held_child_pid: Option<u32>) -> FreshnessReport {
-    if decide_restart(&report, held_child_pid) == RestartRoute::LauncherChild {
+    if matches!(decide_restart(&report, held_child_pid), RestartRoute::LauncherChild { .. }) {
         report.restart = Some(RestartPlan {
             mechanism: MECH_LAUNCHER.to_string(),
             possible: true,
@@ -142,6 +145,21 @@ pub fn overlay_launcher_child(mut report: FreshnessReport, held_child_pid: Optio
         });
     }
     report
+}
+
+/// Outcome word for a Continue refused because a restart is already running.
+pub const OUTCOME_IN_PROGRESS: &str = "in_progress";
+
+/// Claim the one process-wide gateway restart, or the result to return
+/// instead. A refusal restarts nothing and is not an error: the restart the
+/// user asked for IS happening.
+fn claim_restart() -> Result<SingleFlightGuard, RestartResult> {
+    single_flight::try_begin(OP_GATEWAY_RESTART).ok_or_else(|| RestartResult {
+        outcome: OUTCOME_IN_PROGRESS.to_string(),
+        restarted: false,
+        message: "A gateway restart is already running; not starting a second one."
+            .to_string(),
+    })
 }
 
 fn run_freshness(args: &[&str], timeout: std::time::Duration) -> Result<serde_json::Value, String> {
@@ -211,6 +229,14 @@ fn verify_after_launcher_restart() -> FreshnessReport {
 pub async fn model_gateway_restart_stale(
     supervisor: State<'_, GatewaySupervisor>,
 ) -> Result<RestartResult, String> {
+    // Held for the whole command — check, restart AND verify — so a second
+    // Continue (another window, a double-fire, a re-armed button) cannot start
+    // a second restart while the first is still replacing the process
+    // (review R1 F3, backend half). Released by Drop on every return path.
+    let _claim = match claim_restart() {
+        Ok(guard) => guard,
+        Err(refusal) => return Ok(refusal),
+    };
     let held = supervisor.held_child_pid();
     let report = tauri::async_runtime::spawn_blocking(check_blocking)
         .await
@@ -221,14 +247,15 @@ pub async fn model_gateway_restart_stale(
             restarted: false,
             message: format!("Nothing restarted — {}", report.summary),
         }),
-        RestartRoute::LauncherChild => {
-            let restarted = supervisor.restart_held_child()?;
+        RestartRoute::LauncherChild { pid: decided_pid } => {
+            let restarted = supervisor.restart_held_child(decided_pid)?;
             let Some((pid, port)) = restarted else {
                 return Ok(RestartResult {
                     outcome: "not_needed".to_string(),
                     restarted: false,
-                    message: "The gateway this launcher started is no longer running; \
-                              nothing to restart."
+                    message: "The gateway this launcher started is no longer the process \
+                              that was found stale (it exited or was already replaced); \
+                              nothing restarted."
                         .to_string(),
                 });
             };
@@ -307,7 +334,24 @@ mod tests {
 
     #[test]
     fn a_stale_gateway_this_launcher_holds_is_restarted_by_the_launcher() {
-        assert_eq!(decide_restart(&stale(Some(7)), Some(7)), RestartRoute::LauncherChild);
+        // The route carries the pid the decision was about (review R1 F9), so
+        // the stop can refuse a child the supervisor swapped in meanwhile.
+        assert_eq!(
+            decide_restart(&stale(Some(7)), Some(7)),
+            RestartRoute::LauncherChild { pid: 7 }
+        );
+    }
+
+    #[test]
+    fn a_second_restart_while_one_is_in_flight_is_refused_without_acting() {
+        let first = claim_restart().expect("the first Continue claims the restart");
+        let second = claim_restart().expect_err("a concurrent Continue must be refused");
+        assert_eq!(second.outcome, OUTCOME_IN_PROGRESS);
+        assert!(!second.restarted);
+        drop(first);
+        // Sequential re-runs are allowed once the first has finished.
+        let again = claim_restart().expect("released on drop");
+        drop(again);
     }
 
     #[test]

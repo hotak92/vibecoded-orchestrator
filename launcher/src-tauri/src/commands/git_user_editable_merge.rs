@@ -290,16 +290,30 @@ pub(crate) enum MergeOutcomeKind {
         ours_sha: String,
         theirs_sha: String,
     },
+    /// v0.2.97: 3-way merge of a RENDERED root file (`vco_lib/rendered_root_files.toml`)
+    /// produced conflict markers. The local copy was kept in place and NO sidecar
+    /// was written — upstream's tracked copy is the placeholder install.py
+    /// replaces, so there is nothing to adopt. Nothing is staged or committed,
+    /// so the follow-up pull is routed exactly as for any tracked-modified file
+    /// (`resolve_divergence_pull_plan`: the autostash pop-probe folds it in when
+    /// the pop is clean, otherwise `--ff-only` and the divergence dialog).
+    /// Recorded in the SAME `orchestrator_user_modified_preserved` entry as
+    /// every other pre-merge outcome, so a skipped conflict is never an
+    /// unexplained dialog and never an untraceable non-event.
+    RenderedConflictKeptLocal { ours_sha: String, theirs_sha: String },
 }
 
 impl MergeOutcome {
-    /// True when this outcome contributes to a deferral entry. Both
-    /// auto-merged and sidecar-preserved files do — the user benefits
-    /// from knowing what changed even on clean merges.
+    /// True when this outcome contributes to a deferral entry. Auto-merged,
+    /// sidecar-preserved and rendered-conflict-kept files all do — the user
+    /// benefits from knowing what changed even on clean merges, and a kept
+    /// rendered copy is the only line explaining a divergence dialog.
     pub(crate) fn is_actionable_for_deferral(&self) -> bool {
         matches!(
             self.kind,
-            MergeOutcomeKind::Merged { .. } | MergeOutcomeKind::PreservedWithUpstreamSidecar { .. }
+            MergeOutcomeKind::Merged { .. }
+                | MergeOutcomeKind::PreservedWithUpstreamSidecar { .. }
+                | MergeOutcomeKind::RenderedConflictKeptLocal { .. }
         )
     }
 }
@@ -1893,14 +1907,26 @@ pub(crate) async fn pre_merge_user_editable(
                 // v0.2.97: a RENDERED file gets no sidecar — upstream's copy is
                 // the placeholder install.py replaces, so there is nothing to
                 // adopt and adopting it would destroy the rendered file. The
-                // local copy stays in place exactly as for any other conflict;
-                // no outcome ⇒ no deferral line for it.
+                // local copy stays in place exactly as for any other conflict,
+                // and the outcome is RECORDED: it becomes a line in the same
+                // `orchestrator_user_modified_preserved` entry every other
+                // pre-merge outcome lands in (emitted before the pull), because
+                // a skipped conflict must be traceable whichever way the pull
+                // then goes — folded in by the autostash, or stopped at the
+                // divergence dialog, which must not appear unexplained.
                 if is_rendered_root_file(&rel_path_str) {
                     tracing::warn!(
                         "[vct] pre_merge: {} conflicted but is a RENDERED root file — local \
                          copy kept, no .from-upstream- sidecar written (install.py re-renders it)",
                         rel_path_str
                     );
+                    outcomes.push(MergeOutcome {
+                        path: rel_path,
+                        kind: MergeOutcomeKind::RenderedConflictKeptLocal {
+                            ours_sha: short_sha(base_sha),
+                            theirs_sha: short_sha(theirs_sha),
+                        },
+                    });
                     continue;
                 }
                 // Sidecar the upstream version, keep local in place.
@@ -1977,7 +2003,8 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Emit one `orchestrator_user_modified_preserved` deferral entry
-/// summarising every actionable outcome (merged or sidecar-preserved).
+/// summarising every actionable outcome (merged, sidecar-preserved, or a
+/// rendered file's conflict kept local without a sidecar).
 /// `NoChange` outcomes are filtered out — they don't need user action.
 ///
 /// One entry per call (not per file). The entry body lists every
@@ -2076,6 +2103,23 @@ pub(crate) fn build_deferral_text(
                     theirs_sha,
                 ));
             }
+            MergeOutcomeKind::RenderedConflictKeptLocal {
+                ours_sha,
+                theirs_sha,
+            } => {
+                // Deliberately names NO sidecar path: the clear probe
+                // (`deferral_probes.orchestrator_sidecars_still_present`) reads
+                // backticked `*.from-upstream-*` paths as outstanding work, and
+                // there is none for a rendered file.
+                bullets.push(format!(
+                    "  - `{}` — conflict on a RENDERED file; your local copy was kept in place \
+                     and no upstream copy was saved (upstream's tracked copy is the placeholder \
+                     install.py renders this file from) (base={} theirs={})",
+                    outcome.path.display(),
+                    ours_sha,
+                    theirs_sha,
+                ));
+            }
             MergeOutcomeKind::NoChange => {
                 // Filtered out earlier; defensive.
                 continue;
@@ -2154,6 +2198,28 @@ pub(crate) fn build_deferral_text(
             cmd_lines.push(format!("#   rm {}      # POSIX", shell_quote(&sidecar_rel)));
             cmd_lines.push(format!("#   del {}     # Windows cmd.exe", win_quote(&sidecar_rel)));
         }
+    }
+    let rendered_kept: Vec<String> = actionable
+        .iter()
+        .take(CAP)
+        .filter(|o| matches!(o.kind, MergeOutcomeKind::RenderedConflictKeptLocal { .. }))
+        .map(|o| o.path.display().to_string())
+        .collect();
+    if !rendered_kept.is_empty() {
+        cmd_lines.push("#".to_string());
+        cmd_lines.push(format!(
+            "# Rendered file(s) kept as they are: {}. There is nothing to adopt —",
+            rendered_kept.join(", ")
+        ));
+        cmd_lines.push(
+            "# install.py re-renders the AUTO block after the update. If the update stopped"
+                .to_string(),
+        );
+        cmd_lines.push(
+            "# at the divergence dialog, this file (locally modified AND changed upstream)"
+                .to_string(),
+        );
+        cmd_lines.push("# is why; decide there — your copy is still in place.".to_string());
     }
     cmd_lines.push("#".to_string());
     cmd_lines.push("# Auto-merged files were already written to the working tree;".to_string());
@@ -9483,9 +9549,12 @@ pub(crate) mod tests {
     /// ACT leg. The rendered file conflicts in the fallback 3-way. Before
     /// v0.2.97 that parked `CLAUDE.md.from-upstream-<sha>` — upstream's
     /// placeholder, which adopting would have destroyed the rendered file
-    /// with. Now: no sidecar, no outcome (⇒ no deferral line), rendered copy
-    /// untouched. Sidecars an older launcher parked are left to install.py's
-    /// re-render (`rendered_root_files.reap_stale_sidecars`), the one reaper.
+    /// with. Now: no sidecar, rendered copy untouched, and a
+    /// `RenderedConflictKeptLocal` outcome (v0.2.97 review F12 — the first
+    /// cut recorded NO outcome, so the divergence dialog that follows had no
+    /// audit line at all). Sidecars an older launcher parked are left to
+    /// install.py's re-render (`rendered_root_files.reap_stale_sidecars`), the
+    /// one reaper.
     ///
     /// LEAVE-ALONE leg in the same run: an ordinary user-editable file in
     /// conflict gets its sidecar exactly as before.
@@ -9513,11 +9582,16 @@ pub(crate) mod tests {
 
         let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
 
+        let claude = outcomes
+            .iter()
+            .find(|o| o.path == Path::new("CLAUDE.md"))
+            .expect("a rendered conflict must be RECORDED as an outcome (F12)");
         assert!(
-            !outcomes.iter().any(|o| o.path == Path::new("CLAUDE.md")),
-            "a rendered file must yield no outcome; got {:?}",
-            outcomes
+            matches!(claude.kind, MergeOutcomeKind::RenderedConflictKeptLocal { .. }),
+            "expected RenderedConflictKeptLocal, got {:?}",
+            claude.kind
         );
+        assert!(claude.is_actionable_for_deferral(), "it must reach the deferral entry");
         assert_eq!(
             root_entries_starting_with(&local, "CLAUDE.md.from-upstream-"),
             vec!["CLAUDE.md.from-upstream-89a5530".to_string()],
@@ -9545,6 +9619,87 @@ pub(crate) mod tests {
             }
             other => panic!("expected a sidecar-preserved outcome, got {:?}", other),
         }
+    }
+
+    /// F12 (v0.2.97 review). A rendered-file conflict with NO other outcome:
+    /// before the fix the pre-merge returned an empty list, so the update
+    /// emitted nothing and the pull below still stopped at the divergence
+    /// dialog — on a file with no audit line anywhere. Pins (a) the outcome is
+    /// recorded, (b) it renders into the `orchestrator_user_modified_preserved`
+    /// text naming the kept copy WITHOUT any backticked `.from-upstream-` path
+    /// (the clear probe would read one as outstanding work), and (c) the pull
+    /// routing it leads to, executed: no synthetic commit, so no rebase arm;
+    /// in this state (both sides committed the same stub) the autostash
+    /// pop-probe is clean, so the plan is a real merge — and the pull lands
+    /// with the rendered copy byte-identical.
+    #[tokio::test]
+    async fn a0_rendered_conflict_is_recorded_and_the_pull_keeps_the_local_copy() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let rendered = rendered_claude_md("AUTO v1 body");
+        let (base, theirs) =
+            rendered_reconcile_declines(&tmp, &local, "# stub v2\nPointer only.\n", &rendered)
+                .await;
+
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs, "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1, "exactly the rendered file: {:?}", outcomes);
+        assert!(matches!(
+            outcomes[0].kind,
+            MergeOutcomeKind::RenderedConflictKeptLocal { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(), rendered);
+        assert!(root_entries_starting_with(&local, "CLAUDE.md.from-upstream-").is_empty());
+
+        // (b) the audit line.
+        let actionable: Vec<&MergeOutcome> =
+            outcomes.iter().filter(|o| o.is_actionable_for_deferral()).collect();
+        assert_eq!(actionable.len(), 1, "the kept rendered copy must reach the entry");
+        let (title, detected, _why, command) = build_deferral_text(&local, &actionable, "main");
+        assert!(title.starts_with("1 orchestrator-root file "), "{}", title);
+        assert!(
+            detected.contains("`CLAUDE.md` — conflict on a RENDERED file; your local copy was kept"),
+            "detected must name the kept rendered copy: {}",
+            detected
+        );
+        assert!(command.contains("Rendered file(s) kept as they are: CLAUDE.md"), "{}", command);
+        for text in [&detected, &command] {
+            for token in text.split('`').skip(1).step_by(2) {
+                assert!(
+                    !token.contains(".from-upstream-"),
+                    "a rendered conflict must name no sidecar path, found `{}` in: {}",
+                    token,
+                    text
+                );
+            }
+            assert!(!text.contains("mv "), "nothing to adopt, so no mv line: {}", text);
+        }
+
+        // (c) the routing, executed. Nothing was staged or committed.
+        assert!(!any_outcome_produced_synthetic_commit(&outcomes));
+        let plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "identical committed stubs + a clean autostash pop fold in without the dialog"
+        );
+        let args = plan.pull_args("vco_upstream", "main");
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = StdCommand::new("git")
+            .args(&refs)
+            .current_dir(&local)
+            .output()
+            .expect("git pull");
+        assert!(
+            out.status.success(),
+            "the pull must land; stderr was: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!has_unmerged_entry(&local), "no conflict markers");
+        assert_eq!(
+            std::fs::read_to_string(local.join("CLAUDE.md")).unwrap(),
+            rendered,
+            "the kept rendered copy survives the pull byte-for-byte"
+        );
     }
 
     /// Item: is a CLEAN 3-way merge of a rendered file harmful? It can only be

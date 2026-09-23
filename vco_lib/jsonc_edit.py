@@ -289,11 +289,32 @@ def _line_indent(text: str, pos: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _render(value: Any, indent: str, unit: str, nl: str) -> str:
+def _render(value: Any, indent: str, unit: str, nl: str, *, inline: bool = False) -> str:
     """JSON for ``value`` as it will sit after ``"key": `` on a line indented
-    ``indent`` — nested lines continue that indentation."""
-    body = json.dumps(value, indent=unit if isinstance(value, (dict, list)) else None, ensure_ascii=False)
-    return body.replace("\n", nl + indent)
+    ``indent`` — nested lines continue that indentation. ``inline`` (the
+    container is written on one line) keeps the value on one line too."""
+    if inline or not isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, indent=unit, ensure_ascii=False).replace("\n", nl + indent)
+
+
+def _is_inline(text: str, toks: Sequence[Token], open_k: int, close_k: int) -> bool:
+    """True when the object opening at ``open_k`` is written on one line."""
+    return "\n" not in text[toks[open_k][1]:toks[close_k][1]]
+
+
+def _collapse_if_empty(text: str, where: Container) -> str:
+    """``{ <whitespace> }`` left by removing an object's last member becomes
+    ``{}``. Anything else between the braces — a comment — stays."""
+    toks = tokens(text)
+    open_k = _container(text, toks, where)
+    if open_k is None:
+        return text
+    members, close_k = _members(text, toks, open_k)
+    start, end = toks[open_k][2], toks[close_k][1]
+    if members or text[start:end].strip():
+        return text
+    return text[:start] + text[end:]
 
 
 def _cut(text: str, cuts: list[tuple[int, int]], member: tuple[int, int]) -> str:
@@ -335,7 +356,7 @@ def _remove(text: str, where: Container, key: str) -> str:
         cuts.append((after[1], after[2]))  # type: ignore[index]
     elif _is(text, before, ","):
         cuts.append((before[1], before[2]))
-    return _cut(text, cuts, (start, end))
+    return _collapse_if_empty(_cut(text, cuts, (start, end)), where)
 
 
 def _set(text: str, where: Container, key: str, value: Any) -> str:
@@ -358,14 +379,16 @@ def _set(text: str, where: Container, key: str, value: Any) -> str:
             )
         indent = _line_indent(text, toks[key_k][1])
         start, end = toks[first][1], toks[last][2]
-        return text[:start] + _render(value, indent, unit, nl) + text[end:]
+        inline = _is_inline(text, toks, open_k, close_k)
+        return text[:start] + _render(value, indent, unit, nl, inline=inline) + text[end:]
 
     open_pos, close_pos = toks[open_k][1], toks[close_k][1]
     if members:
         indent = _line_indent(text, toks[members[0][1]][1])
     else:
         indent = _line_indent(text, open_pos) + unit
-    member = f"{json.dumps(key, ensure_ascii=False)}: {_render(value, indent, unit, nl)}"
+    rendered = _render(value, indent, unit, nl, inline=_is_inline(text, toks, open_k, close_k))
+    member = f"{json.dumps(key, ensure_ascii=False)}: {rendered}"
     if not members:
         if "\n" not in text[open_pos:close_pos]:
             return text[: open_pos + 1] + member + text[open_pos + 1:]

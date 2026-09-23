@@ -20,14 +20,17 @@ the dependency edge one-directional (install.py -> vco_lib.install_companions).
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 
 #: Reason codes returned by :func:`codegraph_ts_install_plan` when it decides
@@ -429,6 +432,288 @@ def resolve_install_venv_python(
         except OSError:  # pragma: no cover — defensive
             continue
     return None
+
+
+# --- the venv relaunch: who launched us, and which venv we are (v0.2.97) ---
+#
+# install.py re-execs itself under the install's venv when it was started by
+# an interpreter that cannot import the venv's packages (the launcher starts
+# it with the system `python3`). Since v0.2.97 that relaunch actually happens
+# on POSIX (it used to be skipped: see `is_running_inside_venv`), which moved
+# two questions whose answers used to be "this process":
+#
+#   * "which Python did the user LAUNCH with?" — the venv-drift check in
+#     `_venv_triage` compares the venv against it, and `--rebuild-venv` exists
+#     so the venv can follow it. After the relaunch `sys.version_info` is the
+#     venv's own, so the drift check compared the venv with itself;
+#   * "which interpreter builds a NEW venv?" — `sys.executable` is now the
+#     venv's python, so a recreate would `rmtree` the tree it runs from and
+#     then exec a path it had just deleted.
+#
+# So the relaunch RECORDS the launching interpreter in the child's env, and
+# both answers are read from that record.
+
+#: Loop guard: set on every relaunched child; a child never relaunches again.
+ENV_RELAUNCHED = "VCT_INSTALL_RELAUNCHED"
+#: The interpreter that started install.py, and its ``X.Y``.
+ENV_BASE_PYTHON = "VCT_INSTALL_BASE_PYTHON"
+ENV_BASE_PYTHON_VERSION = "VCT_INSTALL_BASE_PYTHON_VERSION"
+#: Windows only: the PID of the install.py WAITING for this run
+#: (:func:`hand_off`), set on the child it runs. Its presence is the promise
+#: that the parent honours :data:`RERUN_OUTSIDE_VENV_EXIT`; the child watches
+#: that pid and stops when the parent is killed (:func:`start_parent_watch`).
+ENV_PARENT_WAITS = "VCT_INSTALL_PARENT_WAITS"
+#: Windows only: the exit code a relaunched child uses to hand a venv rebuild
+#: back to its waiting parent, which runs outside the venv. Far from every code
+#: install.py itself returns (0, 1, 2).
+RERUN_OUTSIDE_VENV_EXIT = 0x5643
+#: Windows only: the exit code of a run that stopped because the install.py
+#: waiting for it was killed (:func:`start_parent_watch`).
+PARENT_GONE_EXIT = 0x5644
+
+
+def is_running_inside_venv(venv_python, prefix: Optional[str] = None) -> bool:
+    """True when THIS process is the venv owning ``venv_python`` (two levels up).
+
+    VENV identity (``sys.prefix``), never the resolved binary: a POSIX venv's
+    python is a SYMLINK to its base (macOS framework too), so comparing
+    binaries kept every launcher update on /usr/bin/python3.12. Resolved +
+    case-normalised: /var -> /private/var, ``C:`` vs ``c:``, ``Scripts\\``.
+    """
+    def _norm(p) -> str:
+        path = Path(p)
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError):  # unresolvable: compare as spelled
+            path = path.absolute()
+        return os.path.normcase(str(path))
+
+    current = sys.prefix if prefix is None else prefix
+    return _norm(current) == _norm(Path(venv_python).parent.parent)
+
+
+def mark_relaunch(env: dict) -> None:
+    """Stamp a relaunched child's ``env``: the loop guard, and — only on the
+    FIRST hop — the interpreter that launched install.py. A second hop (the
+    rebuild handoff, :func:`reexec_outside_venv`) keeps the original record."""
+    if os.environ.get(ENV_RELAUNCHED) != "1":
+        env[ENV_BASE_PYTHON] = sys.executable
+        env[ENV_BASE_PYTHON_VERSION] = f"{sys.version_info.major}.{sys.version_info.minor}"
+    env[ENV_RELAUNCHED] = "1"
+
+
+def launcher_python_version() -> str:
+    """``X.Y`` of the interpreter that STARTED install.py — the recorded one in
+    a relaunched child, this process's own otherwise."""
+    if os.environ.get(ENV_RELAUNCHED) == "1":
+        recorded = os.environ.get(ENV_BASE_PYTHON_VERSION, "").strip()
+        if recorded:
+            return recorded
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def base_python_for_venv() -> str:
+    """The interpreter a NEW venv is built with — never a venv's own python.
+
+    The recorded launching interpreter when it still exists (the venv must
+    follow the Python the user launched with); otherwise this process's base
+    interpreter (``sys._base_executable`` — the base behind a venv, itself
+    outside one); ``sys.executable`` only as the last resort.
+    """
+    if os.environ.get(ENV_RELAUNCHED) == "1":
+        recorded = os.environ.get(ENV_BASE_PYTHON, "").strip()
+        if recorded and Path(recorded).is_file():
+            return recorded
+    base = getattr(sys, "_base_executable", "") or ""
+    return base if base and Path(base).is_file() else sys.executable
+
+
+# --- continuing as another interpreter: exec on POSIX, spawn-and-wait on Windows
+#
+# POSIX ``os.execve`` loads the new program INTO this process: same pid, same
+# stdio, and whoever waits on the pid gets the new program's exit status.
+# Windows has no such primitive. CPython maps ``os.execv*`` onto the C
+# runtime's ``_wexecv*``, which CREATES a new process and ends the caller with
+# exit code 0 at once (CPython's own test runner, ruff's launcher and
+# python-dotenv all branch around it for exactly that). Every parent waiting on
+# install.py's pid — the launcher's update/reinstall runners, install.ps1's
+# ``$LASTEXITCODE`` — then saw success whatever the real run did, and
+# install.ps1 went on to its post-install step while the install still ran.
+# The CRT also joins argv with spaces unquoted, so a path with a space split.
+#
+# So on Windows this process stays, as a transparent parent: it runs the child
+# on its own std handles, waits, and exits with the child's code.
+
+
+def _exec_replaces_process() -> bool:
+    return sys.platform != "win32"
+
+
+def _std_stream_fds() -> List[Optional[int]]:
+    """fds 0/1/2 where open, ``None`` where not. Passed to Popen explicitly:
+    with all three ``None``, Popen on Windows sets no STARTF_USESTDHANDLES and
+    inherits no handles, so the child is not guaranteed the launcher's pipe."""
+    fds: List[Optional[int]] = []
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            fds.append(None)
+        else:
+            fds.append(fd)
+    return fds
+
+
+def run_child(cmd: List[str], env: dict) -> int:
+    """Run ``cmd`` on this process's std streams; return its exit code.
+
+    Ctrl-C reaches every process on the console, the child included, so the
+    child decides how to stop; this parent keeps waiting and reports what the
+    child did. It never kills the child.
+    """
+    stdin, stdout, stderr = _std_stream_fds()
+    proc = subprocess.Popen(cmd, env=env, stdin=stdin, stdout=stdout, stderr=stderr)
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            continue
+
+
+def exit_status(returncode: int) -> int:
+    """A child's return code as a status this process can exit with unchanged.
+
+    A POSIX signal death (negative) becomes the shell's ``128 + N``. A Windows
+    NTSTATUS such as 0xC000013A (Ctrl-C) does not fit the C ``long`` an exit
+    status is converted through there, so it goes as the same 32 bits, signed.
+    """
+    if returncode < 0:
+        return 128 - returncode
+    if returncode > 0x7FFFFFFF:
+        return (returncode & 0xFFFFFFFF) - 0x1_0000_0000
+    return returncode
+
+
+def _exit_now(code: int) -> None:
+    """End this process the way an exec would: flushed, but no ``finally`` /
+    atexit work (a replaced process never runs its own)."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def hand_off(executable: str, argv: List[str], env: dict) -> None:
+    """Continue this install.py run as ``argv`` under ``executable``.
+
+    POSIX: ``os.execve``. Windows: run it as a child, wait, exit with its code
+    — and when the child hands a venv rebuild back (:func:`reexec_outside_venv`),
+    run the same command ONCE more under this interpreter, which lives outside
+    the venv, and exit with that run's code. Returns only when ``os.execve`` is
+    replaced by a recorder (tests).
+    """
+    if _exec_replaces_process():
+        os.execve(executable, argv, env)
+        return
+    child_env = dict(env)
+    child_env[ENV_PARENT_WAITS] = str(os.getpid())
+    rc = run_child([executable, *argv[1:]], child_env)
+    if rc == RERUN_OUTSIDE_VENV_EXIT:  # honoured once: a second one is just an exit code
+        print(f"[vct] venv rebuild handed back: re-running install.py under {sys.executable}")
+        sys.stdout.flush()
+        rc = run_child([sys.executable, *argv[1:]], child_env)
+    _exit_now(exit_status(rc))
+
+
+def waiting_parent_pid() -> Optional[int]:
+    """The pid in :data:`ENV_PARENT_WAITS`, or None when no install.py waits."""
+    try:
+        pid = int(os.environ.get(ENV_PARENT_WAITS, "").strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def start_parent_watch() -> bool:
+    """Windows: stop this run when the install.py waiting for it is killed.
+
+    On POSIX a kill of install.py's pid kills the run itself (the exec kept the
+    pid) and never its detached daemons. On Windows that pid is the waiting
+    parent (:func:`hand_off`), so a kill of it left the run going. This restores
+    the POSIX outcome — the run, not the daemons it started (a kill-on-close Job
+    object would also kill vct-updater mid-swap, the hub and the analyzer).
+
+    Pid reuse: the handle is opened at startup, while the parent is waiting in
+    :func:`run_child` — it only ends before this run does when it is killed. So
+    the handle can name another process only when the parent was already killed,
+    when stopping is the intent anyway: the worst case is a missed stop (the
+    pre-v0.2.97 behaviour), never a wrong one.
+
+    Returns whether a watcher runs. A failed open is reported on stderr and the
+    run continues — an install is never aborted because it could not be watched.
+    """
+    if _exec_replaces_process():
+        return False
+    pid = waiting_parent_pid()
+    if pid is None:
+        return False
+    try:
+        # Any: typeshed declares _winapi for win32 only; this runs only there.
+        winapi: Any = importlib.import_module("_winapi")
+        handle = winapi.OpenProcess(winapi.SYNCHRONIZE, False, pid)
+    except (ImportError, OSError) as exc:
+        print(f"[vct] cannot watch the install.py waiting for this run (pid {pid}): {exc}; "
+              "continuing — a kill of that process will not stop this run", file=sys.stderr)
+        return False
+    threading.Thread(target=_stop_when_parent_ends, args=(winapi, handle, pid),
+                     name="vct-install-parent-watch", daemon=True).start()
+    return True
+
+
+def _stop_when_parent_ends(winapi: Any, handle, pid: int) -> None:
+    winapi.WaitForSingleObject(handle, winapi.INFINITE)
+    # The parent waits for this run, so it ending first means it was killed.
+    # Stop the way that kill would have on POSIX: at once, no cleanup.
+    sys.stderr.write(f"[vct] the install.py waiting for this run (pid {pid}) was killed; "
+                     f"stopping this run too (exit {PARENT_GONE_EXIT})\n")
+    sys.stderr.flush()
+    os._exit(PARENT_GONE_EXIT)
+
+
+def reexec_outside_venv(argv, venv_root) -> bool:
+    """Continue this install.py run under the base interpreter, so a venv
+    rebuild never deletes the tree it runs from.
+
+    Returns False (and does nothing but print why) when it cannot: the only
+    interpreter available lives inside ``venv_root`` itself, or — Windows —
+    no waiting install.py outside the venv can take the run back (a process
+    cannot delete the venv it runs from there, and an exec would not end it:
+    see :func:`hand_off`). The caller must then refuse the rebuild. Never
+    returns otherwise. The loop guard stays set, so the continued run does not
+    relaunch back into the venv it is about to rebuild.
+    """
+    base = base_python_for_venv()
+    root = os.path.normcase(os.path.abspath(str(venv_root)))
+    here = os.path.normcase(os.path.abspath(base))
+    if here == root or here.startswith(root + os.sep):
+        print(f"[vct] no interpreter outside {venv_root} to rebuild it with")
+        return False
+    if not _exec_replaces_process():
+        if waiting_parent_pid() is None:
+            print(f"[vct] {venv_root} cannot be rebuilt by a process running from it on "
+                  "Windows; re-run it with the base interpreter: "
+                  + subprocess.list2cmdline([base, *argv]))
+            return False
+        print(f"[vct] rebuilding {venv_root}: handing the run back to the install.py "
+              "waiting outside the venv it was running from")
+        _exit_now(RERUN_OUTSIDE_VENV_EXIT)
+        return False  # only reachable when os._exit is replaced (tests)
+    env = os.environ.copy()
+    mark_relaunch(env)
+    print(f"[vct] rebuilding {venv_root}: relaunching install.py under {base}, "
+          "outside the venv it was running from")
+    sys.stdout.flush()
+    hand_off(base, [base, *argv], env)
+    return False  # only reachable when os.execve is replaced (tests)
 
 
 def vco_lib_origin_script() -> str:

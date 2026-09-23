@@ -1653,6 +1653,79 @@ def run_env_reprojection(
     if getattr(proc, "returncode", 1) != 0:
         tail = (getattr(proc, "stderr", "") or "").strip()[-400:]
         raise MoveError(tail or f"exit {getattr(proc, 'returncode', '?')}")
+    _clear_env_reprojection_failure(folder, "the env re-projection just succeeded")
+
+
+def _clear_env_reprojection_failure(folder: Path, why: str) -> None:
+    """Paired clear of :data:`CID_ENV_REPROJECTION_FAILED` at ``folder``.
+
+    The same record/clear shape as ``settings_refusal.clear_recorded``: the
+    ledger is read first, so the common case (nothing recorded) writes
+    nothing; a clear leaves an ``auto-resolutions.jsonl`` line (B-F9). Never
+    raises — the ledger is observability, and the re-projection it describes
+    has already happened.
+    """
+    from vco_lib.deferral_emit import record_auto_resolution, resolve_conditions
+    from vco_lib.deferral_report import DeferralReport
+
+    try:
+        if not DeferralReport.read(folder).has_condition(CID_ENV_REPROJECTION_FAILED):
+            return
+    except Exception:  # noqa: BLE001 — an unreadable ledger is not ours to fix here
+        return
+    if resolve_conditions(folder, [CID_ENV_REPROJECTION_FAILED]):
+        record_auto_resolution(
+            folder, CID_ENV_REPROJECTION_FAILED, "env_reprojection_confirmed", why)
+
+
+def env_reprojection_still_owed(
+    folder: Path,
+    entry: Any = None,
+    *,
+    project_id: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> Optional[bool]:
+    """Clear probe for :data:`CID_ENV_REPROJECTION_FAILED` (tri-state, read-only).
+
+    The entry says "``config_projection apply`` failed, so the env surfaces
+    may still carry values from the previous folder". It is over once the
+    surfaces ``apply`` writes by default hold what it would write NOW, derived
+    from the project's current launcher.db row by the projection's own
+    resolver (:func:`vco_lib.config_projection.project_env_from_db`). The
+    comparison is :func:`vco_lib.env_projection_check.check_env_surfaces` —
+    the one ``vco verify-env-projection`` reports from, so the probe and the
+    verifier cannot disagree about what "re-derived" means.
+
+    So the entry clears after the user runs the printed ``apply`` command, or
+    after any later re-projection (the launcher's, ``reproject-all``, a
+    rename) — whichever wrote the surfaces. Non-canonical keys are never
+    looked at: they are the user's.
+
+    Returns:
+        True  — a surface is missing or a canonical value differs.
+        False — every surface was read and matches the projection.
+        None  — could not look: no project id (from ``project_id`` or the
+                entry's ``dismiss_fields``), launcher.db unreadable or the row
+                gone, the row now points at a DIFFERENT folder, or a surface
+                that exists cannot be read (an unparseable settings.json has
+                its own ``settings_write_refused_*`` entry). Unknown never
+                reads as repaired.
+    """
+    from vco_lib.config_projection import project_env_from_db
+    from vco_lib.env_projection_check import check_env_surfaces
+
+    pid = project_id or (getattr(entry, "dismiss_fields", None) or {}).get("project_id")
+    if not pid:
+        return None
+    folder = Path(folder)
+    try:
+        bundle = project_env_from_db(str(pid), db_path=db_path)
+        if not paths_equal(bundle["project_root"], folder):
+            return None
+        verdict = check_env_surfaces(folder, bundle["canonical_env"]).verdict
+    except Exception:  # noqa: BLE001 — could not ask the projection: unknown
+        return None
+    return None if verdict is None else not verdict
 
 
 def _run_kg_sync(
@@ -1807,10 +1880,17 @@ def _emit_move_deferrals(
                     "which is the command below."
                 ),
                 command_to_apply=(
-                    f"{reproject_cmd}   # then: "
-                    + _dismiss_command(dst, CID_ENV_REPROJECTION_FAILED)
+                    f"{reproject_cmd}\n"
+                    "# This entry clears itself once `.claude/settings.json` and "
+                    "`.claude/env` hold what the projection derives from the "
+                    "database (checked on the next update and by "
+                    "`vco project move --verify`)."
                 ),
                 severity="warning",
+                # The clear probe's input (`env_reprojection_still_owed`), the
+                # `settings_refusal` precedent. Not a dismiss_key: the
+                # registry declares none, so it cannot perturb a dismissal.
+                dismiss_fields={"project_id": plan.project_id},
             )
         )
 
@@ -2088,6 +2168,10 @@ def verify_move(
     # deferral disappears while its work never ran.
     if outstanding is False:
         to_resolve.append(CID_CODEGRAPH_REANALYZE)
+    # Same tri-state rule, same probe the registry pass runs: only a positive
+    # "the surfaces match the projection" clears the re-projection entry.
+    if pid and env_reprojection_still_owed(folder, project_id=pid, db_path=db_path) is False:
+        to_resolve.append(CID_ENV_REPROJECTION_FAILED)
     if to_resolve:
         resolve_conditions(folder, to_resolve)
         report["resolved"] = to_resolve

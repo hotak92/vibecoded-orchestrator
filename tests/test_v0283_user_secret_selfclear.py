@@ -50,9 +50,13 @@ def _seed_secret_deferral(folder: Path) -> None:
     report.write(folder)
 
 
-# The self-clear is exercised on the settings.json surface because its
-# secret-shape detector (`is_secret_shaped_env_key`) precisely distinguishes a
-# real secret key (STALE_SECRET) from a routing key (KG_COLLECTION).
+# The self-clear is exercised on the settings.json surface. v0.2.97: that
+# surface is scanned for the keys a pre-v0.2.73 writer PUT there (launcher-known
+# user secrets + GITHUB_TOKEN) — the same set every env refresh strips — not for
+# any secret-shaped name (a hand-added `STALE_SECRET` is the user's own; VCO
+# never wrote it and never removes it, so it must not keep this entry alive —
+# it is reported by `user_owned_secret_value_in_tree` instead, pinned with
+# that same key in tests/test_v0297_user_owned_secrets.py).
 #
 # v0.2.84 PLAN-v0284 D6 (P4): the `.claude/env` surface ALSO routes through
 # `is_secret_shaped_env_key` now (+ a non-empty-value check), so a routing-only
@@ -67,7 +71,7 @@ def _write_dirty_settings(folder: Path) -> None:
         json.dumps({
             "env": {
                 "KG_COLLECTION": "Test_KnowledgeGraph",
-                "STALE_SECRET": "synthetic-value",  # secret-shaped
+                "GITHUB_TOKEN": "synthetic-value",  # a key a pre-v0.2.73 writer put here
             }
         }, indent=2),
         encoding="utf-8",

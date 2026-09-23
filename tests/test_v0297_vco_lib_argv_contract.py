@@ -467,6 +467,43 @@ def test_the_collectors_find_the_known_sites():
     assert len(_rust_sites()) >= 30
 
 
+def test_the_env_block_bridge_verbs_are_collected():
+    """v0.2.97 review F5: every Rust env-block edit goes through
+    `vco_lib_bridge.rs`'s two literal argv chains — `write-env-block` and its
+    removal-only twin `strip-env-keys`. Pin that the collector SEES both (so
+    the parametrised parse below covers their verb, flags and `--surface`
+    choice), and that each carries both flags the verb requires."""
+    bridge = [
+        s for s in _rust_sites()
+        if s.where.startswith("launcher/src-tauri/src/services/vco_lib_bridge.rs")
+        and s.module == "vco_lib.config_projection"
+    ]
+    verbs = {s.tokens[0] for s in bridge if s.tokens}
+    assert {"write-env-block", "strip-env-keys"} <= verbs, verbs
+    for s in bridge:
+        assert "--project-folder" in s.tokens and "--surface" in s.tokens, s
+
+
+def test_the_jsonc_env_read_bridge_verb_is_collected_and_parses():
+    """v0.2.97: `vco_lib_bridge::read_settings_env_blocks` spawns
+    `-m vco_lib.env_projection_check read-env` and appends one
+    `--project-folder <f>` per folder. Pin that the collector SEES the chain
+    (so the parametrised parse covers the verb) and that the full argv the
+    bridge builds — verb plus repeated folders — parses with the real parser."""
+    sites = [
+        s for s in _rust_sites()
+        if s.where.startswith("launcher/src-tauri/src/services/vco_lib_bridge.rs")
+        and s.module == "vco_lib.env_projection_check"
+    ]
+    assert [s.tokens[:1] for s in sites] == [("read-env",)], sites
+    parser = real_parser("vco_lib.env_projection_check")
+    assert parser is not None
+    ok, err = _parse(parser, ["read-env", "--project-folder", "/a", "--project-folder", "/b"])
+    assert ok, err
+    ok, err = _parse(parser, ["read-env"])
+    assert not ok and "--project-folder" in err
+
+
 @pytest.mark.parametrize("site", ALL_SITES, ids=str)
 def test_built_argv_parses_with_the_real_parser(site: Site):
     if site.module in HAND_ROLLED:

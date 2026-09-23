@@ -186,6 +186,32 @@ def test_an_edit_that_does_not_reparse_as_requested_is_refused(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# layout (review F16): an emptied object collapses; inline stays inline
+# ---------------------------------------------------------------------------
+
+
+def test_removing_the_only_member_collapses_the_object():
+    doc = f'{{\n  "{ENV}": {{\n    "A": "1"\n  }},\n  // c\n}}\n'
+    assert j.rewrite_preserving(doc, {ENV: {}}) == f'{{\n  "{ENV}": {{}},\n  // c\n}}\n'
+
+
+def test_an_emptied_object_holding_a_comment_keeps_it():
+    doc = f'{{\n  "{ENV}": {{ /* keep */\n    "A": "1"\n  }}\n}}\n'
+    out = j.rewrite_preserving(doc, {ENV: {}})
+    assert "/* keep */" in out and j.loads(out) == {ENV: {}}
+
+
+def test_a_value_inserted_into_an_inline_object_stays_on_one_line():
+    assert j.rewrite_preserving("{}", {"a": {"b": 1}}) == '{"a": {"b": 1}}'
+    assert j.rewrite_preserving('{"x": {}} // k\n', {"x": {"b": [1, 2]}}) == '{"x": {"b": [1, 2]}} // k\n'
+
+
+def test_a_value_inserted_into_a_multiline_object_is_indented():
+    out = j.rewrite_preserving('{\n    "a": 1\n}\n', {"a": 1, "b": {"c": 2}})
+    assert out == '{\n    "a": 1,\n    "b": {\n        "c": 2\n    }\n}\n'
+
+
+# ---------------------------------------------------------------------------
 # the file-level pair the workspace-settings helpers use
 # ---------------------------------------------------------------------------
 

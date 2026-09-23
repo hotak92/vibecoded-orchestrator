@@ -11,12 +11,14 @@ diagrams-integration-excalidraw-mermaid-2026-05-24.md`` §3 Phase 0):
   version. Exits 0 on full agreement, 1 on drift, 2 when ``npm`` is
   missing (a sysinfo problem, not a pinning problem).
 
-* ``verify-env-projection`` — confirms that the three on-disk env
-  surfaces (``.claude/settings.json`` ``env``, ``.claude/env``,
-  ``.vscode/settings.json`` ``claude-code.env``) match the canonical
-  projection emitted by ``vco_lib.config_projection.project_env_from_db``
-  for a given project. Exits 0 on full agreement, 1 on drift, 2 when
-  the project cannot be located in the launcher DB.
+* ``verify-env-projection`` — confirms that the env surfaces
+  ``config_projection apply`` writes by default (``.claude/settings.json``
+  ``env`` and ``.claude/env``; ``.vscode/settings.json`` only when a caller
+  asks, so it is not compared) match the canonical projection emitted by
+  ``vco_lib.config_projection.project_env_from_db`` for a given project
+  (the comparison: ``vco_lib.env_projection_check``). Exits 0 on full
+  agreement, 1 on drift, 2 when the project cannot be located in the
+  launcher DB or a surface exists but cannot be read (``cannot_verify``).
 
 Both subcommands accept ``--json`` for machine-readable output and
 ``--fix`` for in-place repair. ``--fix`` aborts on the first failure
@@ -189,7 +191,7 @@ def _project_env_from_db(project_id: str) -> Mapping[str, str]:
     The landed Phase 0.B API returns a ``ProjectEnvBundle`` TypedDict
     (``canonical_env`` + ``project_id`` + ``project_root``), not the
     flat ``dict[str, str]`` the plan-era spec described. This module's
-    internal contract (``expected.keys()``, ``_diff_surface``) wants
+    internal contract (``expected.keys()``, ``_check_env_surfaces``) wants
     the flat canonical map, so we unwrap ``canonical_env`` here.
     Raises ``LookupError`` subclasses (``ProjectNotFound``) upstream.
     """
@@ -212,12 +214,12 @@ def _apply_project_env(
     carries ``project_root`` itself — there is no ``project_folder``
     kwarg) and returns ``{surface: [keys_written]}``, raising
     ``ConfigProjectionError`` on write failure. We rebuild the bundle
-    from this module's flat-map contract, opt into ALL THREE surfaces
-    (the verifier diffs ``.vscode/settings.json`` too — writing only
-    the two default surfaces would fail the round-trip idempotency
-    check), and normalise the result to the ``{ok, message}`` shape
-    ``_result_ok`` expects. Exceptions propagate to the caller's
-    ``fix_failed`` handler.
+    from this module's flat-map contract, let ``apply`` write its DEFAULT
+    surfaces — exactly the set the verifier compares (v0.2.97: it used to
+    force ``.vscode/settings.json`` too, creating a VS Code settings file in
+    projects that never had one, because the verifier diffed it) — and
+    normalise the result to the ``{ok, message}`` shape ``_result_ok``
+    expects. Exceptions propagate to the caller's ``fix_failed`` handler.
     """
     try:
         from vco_lib.config_projection import (
@@ -236,14 +238,7 @@ def _apply_project_env(
         "project_id": "",
         "project_root": project_folder,
     }
-    report = apply_project_env(
-        real_bundle,
-        surfaces=(
-            "claude_settings_json",
-            "claude_env",
-            "vscode_settings_json",
-        ),
-    )
+    report = apply_project_env(real_bundle)
     total = sum(len(keys) for keys in report.values())
     return {
         "ok": True,
@@ -618,116 +613,36 @@ def _result_message(result: Any) -> Optional[str]:
 # ===========================================================================
 
 
-@dataclasses.dataclass(frozen=True)
-class _EnvSurface:
-    """Where a key/value lives in the project on-disk env."""
+def _check_env_surfaces(folder: Path, expected: Mapping[str, str]) -> Any:
+    """The ONE comparison (:func:`vco_lib.env_projection_check.check_env_surfaces`).
 
-    name: str            # ``.claude/settings.json`` etc. — human label
-    path: Path
-    values: dict[str, str]   # the env subset read from this surface
-
-
-def _read_claude_settings_env(folder: Path) -> _EnvSurface:
-    """Load ``.claude/settings.json`` ``env`` block.
-
-    A missing file is treated as an empty surface — that's what drives
-    "DRIFT: surface is missing every expected key" rather than an
-    exception.
+    v0.2.97: this module used to carry its own readers — a strict
+    ``json.load`` of ``.claude/settings.json`` (a JSONC file read as "no
+    values", so it reported every key as drift) and a diff of
+    ``.vscode/settings.json``, which ``apply`` does not write unless asked (so
+    a project that never opted into it could never verify clean). The shared
+    check reads JSONC, compares exactly the surfaces ``apply`` writes, and
+    reports a file it cannot read as UNREADABLE rather than as either answer.
     """
-    path = folder / ".claude" / "settings.json"
-    values: dict[str, str] = {}
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-            env = payload.get("env")
-            if isinstance(env, Mapping):
-                for k, v in env.items():
-                    if isinstance(v, str):
-                        values[k] = v
-                    else:
-                        values[k] = str(v)
-        except (OSError, ValueError):
-            # Malformed JSON: keep values empty → every expected key
-            # will register as drift, which is the right signal.
-            pass
-    return _EnvSurface(name=".claude/settings.json", path=path, values=values)
+    from vco_lib.env_projection_check import check_env_surfaces
+
+    return check_env_surfaces(folder, expected)
 
 
-def _read_claude_env(folder: Path) -> _EnvSurface:
-    """Load ``.claude/env`` (KEY=VALUE shell-style)."""
-    path = folder / ".claude" / "env"
-    values: dict[str, str] = {}
-    if path.exists():
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                # Strip a leading ``export `` for shell-source compatibility.
-                if line.startswith("export "):
-                    line = line[len("export "):].lstrip()
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key:
-                    values[key] = value
-        except OSError:
-            pass
-    return _EnvSurface(name=".claude/env", path=path, values=values)
+def _surface_labels(check: Any) -> list[str]:
+    from vco_lib.env_projection_check import surface_label
+
+    return [surface_label(s) for s in check.surfaces]
 
 
-def _read_vscode_settings_env(folder: Path) -> _EnvSurface:
-    """Load ``.vscode/settings.json`` ``claude-code.env`` block.
-
-    The VS Code extension surfaces are not propagated to MCP subprocesses
-    on Linux (see CLAUDE.md note), but we still verify the projection
-    here because the launcher writes this surface for editor consistency
-    and a stale value is still drift.
-    """
-    path = folder / ".vscode" / "settings.json"
-    values: dict[str, str] = {}
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-            env = payload.get("claude-code.env")
-            if isinstance(env, Mapping):
-                for k, v in env.items():
-                    if isinstance(v, str):
-                        values[k] = v
-                    else:
-                        values[k] = str(v)
-        except (OSError, ValueError):
-            pass
-    return _EnvSurface(name=".vscode/settings.json", path=path, values=values)
-
-
-def _diff_surface(
-    surface: _EnvSurface, expected: Mapping[str, str]
-) -> list[dict[str, str]]:
-    """Compare ``surface.values`` to the canonical ``expected`` bundle.
-
-    Returns one row per drift entry — empty list means the surface
-    matches the projection for every canonical key. Extra keys on the
-    surface are NOT flagged here (they may be user-authored escape
-    hatches the projection doesn't speak about). Only deviations from
-    the canonical set count.
-    """
-    drift: list[dict[str, str]] = []
-    for key, want in expected.items():
-        have = surface.values.get(key)
-        if have == want:
-            continue
-        drift.append(
-            {
-                "surface": surface.name,
-                "key": key,
-                "expected": want,
-                "actual": have if have is not None else "<missing>",
-            }
-        )
-    return drift
+def _cannot_verify(project_id: str, check: Any) -> tuple[int, dict[str, Any]]:
+    return EXIT_TOOL_MISSING, {
+        "command": "verify-env-projection",
+        "project_id": project_id,
+        "exit_code": EXIT_TOOL_MISSING,
+        "overall": "cannot_verify",
+        "unreadable": list(check.unreadable),
+    }
 
 
 def _verify_env_projection_for_project(
@@ -736,9 +651,13 @@ def _verify_env_projection_for_project(
     """Core verifier for one project. Returns ``(exit_code, payload)``
     so the caller can aggregate over ``--all``.
 
-    Round-trip idempotency: after ``--fix`` we re-read the three surfaces
-    and re-diff. If the re-diff is non-empty the contract is broken; we
-    return EXIT_USAGE (3) with a payload that names the offending keys.
+    A surface that exists but cannot be read is ``cannot_verify`` (exit 2) —
+    never ``ok`` and never ``drift`` — and ``--fix`` does not run on it: the
+    projection writer refuses such a file too, and records why.
+
+    Round-trip idempotency: after ``--fix`` we re-read the surfaces and
+    re-diff. If the re-diff is non-empty the contract is broken; we return
+    EXIT_USAGE (3) with a payload that names the offending keys.
     """
     try:
         expected = _project_env_from_db(project_id)
@@ -760,21 +679,16 @@ def _verify_env_projection_for_project(
             "error": str(exc),
         }
 
-    surfaces = (
-        _read_claude_settings_env(folder),
-        _read_claude_env(folder),
-        _read_vscode_settings_env(folder),
-    )
-    drift_rows: list[dict[str, str]] = []
-    for s in surfaces:
-        drift_rows.extend(_diff_surface(s, expected))
-
-    if not drift_rows:
+    check = _check_env_surfaces(folder, expected)
+    if check.unreadable:
+        return _cannot_verify(project_id, check)
+    if not check.drift:
         return EXIT_OK, {
             "command": "verify-env-projection",
             "project_id": project_id,
             "exit_code": EXIT_OK,
             "overall": "ok",
+            "surfaces": _surface_labels(check),
             "expected_keys": sorted(expected.keys()),
         }
 
@@ -784,7 +698,8 @@ def _verify_env_projection_for_project(
             "project_id": project_id,
             "exit_code": EXIT_DRIFT,
             "overall": "drift",
-            "drift": drift_rows,
+            "surfaces": _surface_labels(check),
+            "drift": check.drift,
         }
 
     # --fix path: re-project from the DB. Aborts on failure with exit 3.
@@ -808,21 +723,16 @@ def _verify_env_projection_for_project(
         }
 
     # Round-trip idempotency check.
-    surfaces_after = (
-        _read_claude_settings_env(folder),
-        _read_claude_env(folder),
-        _read_vscode_settings_env(folder),
-    )
-    drift_after: list[dict[str, str]] = []
-    for s in surfaces_after:
-        drift_after.extend(_diff_surface(s, expected))
-    if drift_after:
+    after = _check_env_surfaces(folder, expected)
+    if after.unreadable:
+        return _cannot_verify(project_id, after)
+    if after.drift:
         return EXIT_USAGE, {
             "command": "verify-env-projection",
             "project_id": project_id,
             "exit_code": EXIT_USAGE,
             "overall": "fix_not_idempotent",
-            "remaining_drift": drift_after,
+            "remaining_drift": after.drift,
             "note": (
                 "apply_project_env() returned ok but a second verify "
                 "still shows drift — the projection contract is broken."
@@ -833,6 +743,7 @@ def _verify_env_projection_for_project(
         "project_id": project_id,
         "exit_code": EXIT_OK,
         "overall": "ok_after_fix",
+        "surfaces": _surface_labels(after),
         "expected_keys": sorted(expected.keys()),
     }
 
@@ -927,8 +838,15 @@ def _print_env_projection_human(payload: Mapping[str, Any]) -> None:
     if overall in {"ok", "ok_after_fix"}:
         label = "OK" if overall == "ok" else "OK (after --fix)"
         keys = payload.get("expected_keys", [])
-        print(f"{label} — {pid}: all 3 surfaces match the DB projection "
-              f"({len(keys)} canonical keys).")
+        surfaces = payload.get("surfaces", [])
+        print(f"{label} — {pid}: {', '.join(surfaces) or 'every surface'} "
+              f"match the DB projection ({len(keys)} canonical keys).")
+        return
+    if overall == "cannot_verify":
+        print(f"CANNOT VERIFY — {pid}: a surface could not be read, so no "
+              f"verdict was drawn:", file=sys.stderr)
+        for row in payload.get("unreadable", []):
+            print(f"  {row.get('surface')}: {row.get('reason')}", file=sys.stderr)
         return
     if overall == "drift":
         print(f"DRIFT — {pid}:")
@@ -1005,9 +923,10 @@ def add_subparsers(sub: Any) -> None:
     p_env = sub.add_parser(
         "verify-env-projection",
         help=(
-            "Verify .claude/settings.json env, .claude/env, and "
-            ".vscode/settings.json match the canonical DB projection for "
-            "a project. Exit 0=OK, 1=drift, 2=project/DB error."
+            "Verify the env surfaces `config_projection apply` writes "
+            "(.claude/settings.json env, .claude/env) match the canonical DB "
+            "projection for a project. Exit 0=OK, 1=drift, 2=project/DB "
+            "error or a surface that cannot be read."
         ),
     )
     p_env.add_argument(
@@ -1025,8 +944,8 @@ def add_subparsers(sub: Any) -> None:
     p_env.add_argument(
         "--fix", action="store_true",
         help=(
-            "Re-project the env bundle from the DB onto all three on-disk "
-            "surfaces via config_projection.apply_project_env. Runs a "
+            "Re-project the env bundle from the DB onto the surfaces "
+            "config_projection.apply_project_env writes. Runs a "
             "round-trip idempotency check afterwards; if the re-verify "
             "still shows drift, the contract is broken and exit 3 is "
             "returned."

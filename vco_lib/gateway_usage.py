@@ -16,8 +16,13 @@ Port and token resolution are NOT re-implemented: both come from
 
 stdout is a machine contract: exactly one JSON object —
 ``{"ok": true, "snapshot": {...}}`` or ``{"ok": false, "reason": <word>,
-"message": <text>}`` — and the exit code is 0 either way, because "the
-gateway is not running" is an answer the card renders, not a crash.
+"message": <text>}``. The exit code is 0 for every answer about the GATEWAY
+(not running, refused, outdated): those are states the card renders, not
+crashes. It is 1 for :data:`REASON_BROKEN_INSTALL` — ``vco_lib`` or the
+gateway package failed to import, which a healthy install never does — and
+the message goes to stderr as well, so the breakage reaches whoever ran it
+(CLAUDE.md: a failed import of a shipped dependency is a broken install,
+surfaced loudly, never degraded into a quieter answer).
 """
 
 from __future__ import annotations
@@ -42,6 +47,13 @@ REASON_UNREACHABLE = "unreachable"
 REASON_UNAUTHORISED = "unauthorised"
 REASON_BAD_ANSWER = "bad_answer"
 REASON_OUTDATED = "outdated_gateway"
+#: ``vco_lib`` / ``model_router`` did not import. Loud: exit 1 + stderr.
+REASON_BROKEN_INSTALL = "broken_install"
+
+_REINSTALL_HINT = (
+    "This is a broken install, not a gateway state — re-run "
+    "`python install.py --update` from the orchestrator root."
+)
 
 
 def _failure(reason: str, message: str) -> dict:
@@ -50,21 +62,33 @@ def _failure(reason: str, message: str) -> dict:
 
 def fetch_windows(*, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
     """Ask the running gateway for its usage snapshot. Never raises."""
-    # Imported here so `--help` works on a machine whose gateway package is
-    # not importable, and so the failure is reported as data.
-    from vco_lib.vscode_settings import (
-        SettingsRefused,
-        resolve_gateway_ports,
-        resolve_host_token,
-    )
-
+    # Imported here so `--help` works on a broken install, and so the failure
+    # is reported as a NAMED reason instead of a traceback the card cannot
+    # render. `resolve_host_token` imports `model_router.config` itself, so
+    # the same reason covers the gateway package going missing.
+    try:
+        from vco_lib.vscode_settings import (
+            SettingsRefused,
+            resolve_gateway_ports,
+            resolve_host_token,
+        )
+    except ImportError as exc:
+        return _failure(
+            REASON_BROKEN_INSTALL,
+            f"vco_lib.vscode_settings could not be imported ({exc}). {_REINSTALL_HINT}",
+        )
     try:
         token = resolve_host_token()
-    except (SettingsRefused, ImportError) as exc:
+        port = resolve_gateway_ports()[0]
+    except ImportError as exc:
+        return _failure(
+            REASON_BROKEN_INSTALL,
+            f"the model gateway package could not be imported ({exc}). {_REINSTALL_HINT}",
+        )
+    except SettingsRefused as exc:
         return _failure(REASON_NO_TOKEN, str(exc))
     if not token:
         return _failure(REASON_NO_TOKEN, "the gateway's host token file is empty")
-    port = resolve_gateway_ports()[0]
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{ROUTE}",
         headers={"Authorization": f"Bearer {token}"},
@@ -116,7 +140,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    sys.stdout.write(json.dumps(fetch_windows(timeout_s=args.timeout)) + "\n")
+    result = fetch_windows(timeout_s=args.timeout)
+    sys.stdout.write(json.dumps(result) + "\n")
+    if result.get("reason") == REASON_BROKEN_INSTALL:
+        sys.stderr.write(f"vco_lib.gateway_usage: {result['message']}\n")
+        return 1
     return 0
 
 

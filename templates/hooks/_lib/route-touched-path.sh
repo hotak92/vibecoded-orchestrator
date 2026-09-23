@@ -278,10 +278,18 @@ vco_route_init() {
     # Resolve project_id once for the access checks below.
     VCT_PROJECT_ID="${VCT_PROJECT_ID:-}"
     if [ -z "$VCT_PROJECT_ID" ] && [ -f "$_VCO_ROUTE_PROJECT_ROOT/.claude/env" ]; then
-        # Best-effort grep for VCT_PROJECT_ID=… in .claude/env (sourced
-        # form, not as a bash source — we don't want to inherit other env).
-        VCT_PROJECT_ID=$(grep -E '^[[:space:]]*VCT_PROJECT_ID=' "$_VCO_ROUTE_PROJECT_ROOT/.claude/env" 2>/dev/null \
-            | head -1 | sed -E 's/^[[:space:]]*VCT_PROJECT_ID=//; s/^"//; s/"$//')
+        # Best-effort read of VCT_PROJECT_ID from .claude/env (not a bash
+        # `source` — we don't want to inherit other env). The line rule is
+        # `vco_lib.envfile.parse_env_lines`: an optional `export ` prefix (the
+        # form the projection's managed block WRITES — v0.2.97: the old
+        # pattern required the bare `VCT_PROJECT_ID=` form and never matched
+        # it), first match wins, one matching pair of quotes stripped.
+        # MUST MATCH route-touched-path.ps1 (parity test:
+        # tests/test_v0297_route_project_id_parity.py).
+        VCT_PROJECT_ID=$(grep -E '^[[:space:]]*(export[[:space:]]+)?VCT_PROJECT_ID=' "$_VCO_ROUTE_PROJECT_ROOT/.claude/env" 2>/dev/null \
+            | head -1 \
+            | sed -E -e 's/^[[:space:]]*(export[[:space:]]+)?VCT_PROJECT_ID=[[:space:]]*//' -e 's/[[:space:]]+$//' \
+                     -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\\1/")
     fi
 
     # Resolve the access-matrix checker path ONCE, synchronously — mirrors

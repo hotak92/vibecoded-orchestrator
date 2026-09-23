@@ -101,6 +101,20 @@ mod tests {
         assert_eq!(failed["reason"], "unreachable");
     }
 
+    /// F4: a broken install exits 1 WITH its JSON answer. It must reach the
+    /// card as that answer (so the card can name the problem), not be
+    /// discarded for the non-zero exit.
+    #[test]
+    fn a_broken_install_answer_survives_its_nonzero_exit() {
+        let v = parse_bridge_output(
+            1,
+            r#"{"ok": false, "reason": "broken_install", "message": "re-run install.py"}"#,
+            "vco_lib.gateway_usage: broken install",
+        )
+        .unwrap();
+        assert_eq!(v["reason"], "broken_install");
+    }
+
     #[test]
     fn anything_else_is_an_error_carrying_stderr() {
         let err = parse_bridge_output(

@@ -297,14 +297,28 @@ impl GatewaySupervisor {
     /// Same port on purpose, for the reason [`Supervised::port`] gives: the
     /// port file, the VS Code settings and every resolver name it. Spawned
     /// through [`spawn_gateway_child`], the one spawn recipe.
-    pub(crate) fn restart_held_child(&self) -> Result<Option<(u32, u16)>, String> {
-        self.restart_held_child_with(spawn_gateway_child)
+    ///
+    /// `expected_pid` is the child the staleness decision was made about
+    /// (review R1 F9). The check that proves staleness can take up to 30 s, and
+    /// in that window the stale child may die and be respawned by
+    /// [`supervise`](Self::supervise) — on the NEW code. Killing "whatever is
+    /// held now" would then end the fresh gateway, so a held child whose pid is
+    /// not the decided one is left alone and the answer is `Ok(None)`.
+    pub(crate) fn restart_held_child(
+        &self,
+        expected_pid: u32,
+    ) -> Result<Option<(u32, u16)>, String> {
+        self.restart_held_child_with(expected_pid, spawn_gateway_child)
     }
 
     /// [`restart_held_child`](Self::restart_held_child) with the spawn
     /// injected, so the stop-then-respawn is testable without starting a real
     /// gateway.
-    fn restart_held_child_with<F>(&self, spawn: F) -> Result<Option<(u32, u16)>, String>
+    fn restart_held_child_with<F>(
+        &self,
+        expected_pid: u32,
+        spawn: F,
+    ) -> Result<Option<(u32, u16)>, String>
     where
         F: FnOnce(u16) -> Result<Child, String>,
     {
@@ -318,6 +332,11 @@ impl GatewaySupervisor {
         let Some(entry) = guard.as_mut() else {
             return Ok(None);
         };
+        // Compared under the SAME lock the stop happens under, so nothing can
+        // swap the child between the comparison and the kill.
+        if entry.child.as_ref().map(|c| c.id()) != Some(expected_pid) {
+            return Ok(None);
+        }
         let Some(mut child) = entry.child.take() else {
             return Ok(None);
         };
@@ -1966,12 +1985,44 @@ mod tests {
     fn restart_of_a_held_child_leaves_everything_alone_when_nothing_is_held() {
         let sup = GatewaySupervisor::default();
         let mut spawned = false;
-        let out = sup.restart_held_child_with(|_| {
+        let out = sup.restart_held_child_with(1234, |_| {
             spawned = true;
             Err("must not spawn".to_string())
         });
         assert_eq!(out, Ok(None));
         assert!(!spawned, "no held child means nothing is stopped or started");
+    }
+
+    /// Review R1 F9: the decision was made about one child; if the supervisor
+    /// replaced it during the (up to 30 s) check, the replacement is left
+    /// alone — it is already running the new code.
+    #[cfg(unix)]
+    #[test]
+    fn restart_of_a_held_child_leaves_a_different_child_alone() {
+        let sup = GatewaySupervisor::default();
+        let fresh = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let fresh_pid = fresh.id();
+        *sup.0.lock().unwrap() = Some(Supervised {
+            child: Some(fresh),
+            port: 11498,
+            dead_since: None,
+            respawns: 1,
+        });
+        let mut spawned = false;
+        let decided_pid = fresh_pid.wrapping_add(1); // the child that died
+        let out = sup.restart_held_child_with(decided_pid, |_| {
+            spawned = true;
+            Err("must not spawn".to_string())
+        });
+        assert_eq!(out, Ok(None));
+        assert!(!spawned);
+        assert!(pid_is_alive(fresh_pid), "the fresh child must NOT be killed");
+        assert_eq!(sup.held_child_pid(), Some(fresh_pid));
+        let held = sup.0.lock().unwrap().take();
+        if let Some(mut c) = held.and_then(|entry| entry.child) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 
     #[cfg(unix)]
@@ -1991,7 +2042,7 @@ mod tests {
         });
         let mut asked_port = None;
         let out = sup
-            .restart_held_child_with(|port| {
+            .restart_held_child_with(old_pid, |port| {
                 asked_port = Some(port);
                 Ok(sleeper())
             })

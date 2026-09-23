@@ -133,6 +133,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from vco_lib import jsonc_edit
 from vco_lib.atomic import atomic_write_text
 from vco_lib.symlink_handler import is_symlink_blocking
 
@@ -338,20 +339,30 @@ class SettingsDoc:
     """A parsed ``settings.json`` plus the formatting facts needed to
     render it back without gratuitous diff noise."""
 
-    def __init__(self, path: Path, data: Dict[str, Any], indent: int, trailing_newline: bool):
+    def __init__(self, path: Path, data: Dict[str, Any], indent: int, trailing_newline: bool,
+                 jsonc_text: Optional[str] = None):
         self.path = path
         self.data = data
         self.indent = indent
         self.trailing_newline = trailing_newline
+        #: The original text when the file is JSONC (comments / trailing
+        #: commas): it is then EDITED in place, never re-serialised.
+        self.jsonc_text = jsonc_text
 
     def render(self) -> str:
-        """Serialise in the house canonical form.
+        """Serialise in the house canonical form — or, for a JSONC file,
+        the original text edited member by member with every comment kept
+        (:func:`vco_lib.jsonc_edit.rewrite_preserving`, v0.2.97), which
+        raises :class:`vco_lib.jsonc_edit.JsoncEditRefused` when that edit
+        cannot be made and verified.
 
         Indent width and trailing-newline presence come from the file
         being edited; everything else is :data:`CANONICAL_ENSURE_ASCII`
         — the convention owned by the bundle-merge writer this module
         defers to. Do not localise it here.
         """
+        if self.jsonc_text is not None:
+            return jsonc_edit.rewrite_preserving(self.jsonc_text, self.data)
         body = json.dumps(
             self.data, indent=self.indent, ensure_ascii=CANONICAL_ENSURE_ASCII
         )
@@ -363,7 +374,9 @@ def load_settings(path: Path) -> SettingsDoc:
 
     Raises:
         HooksSettingsError: ``missing`` (no such file), ``unreadable``
-            (I/O error), ``unparseable`` (invalid JSON), ``not_an_object``
+            (I/O error or not UTF-8), ``unparseable`` (neither JSON nor
+            JSONC — a JSONC file, which Claude Code accepts, is read and
+            later edited in place, v0.2.97), ``not_an_object``
             (valid JSON but not a JSON object), or ``hooks_block_malformed``
             (the ``hooks`` key exists with a structurally impossible
             shape). Every one of these leaves the file untouched.
@@ -376,17 +389,16 @@ def load_settings(path: Path) -> SettingsDoc:
             f"{path} does not exist. VCO will not create a settings.json "
             f"from a hook edit — run the project's bundle install first.",
         ) from None
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: not UTF-8
         raise HooksSettingsError("unreadable", f"cannot read {path}: {exc}") from None
 
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        data = jsonc_edit.loads(raw)
+    except ValueError as exc:
         raise HooksSettingsError(
             "unparseable",
-            f"{path} is not valid JSON (line {exc.lineno}, column {exc.colno}: "
-            f"{exc.msg}). Refusing to edit it — fix the file by hand first; "
-            f"nothing was written.",
+            f"{path} is not valid JSON or JSONC ({exc}). Refusing to edit it — "
+            f"fix the file by hand first; nothing was written.",
         ) from None
 
     if not isinstance(data, dict):
@@ -402,6 +414,7 @@ def load_settings(path: Path) -> SettingsDoc:
         data=data,
         indent=detect_indent(raw),
         trailing_newline=raw.endswith("\n"),
+        jsonc_text=None if jsonc_edit.is_strict_json(raw) else raw,
     )
 
 
@@ -464,6 +477,15 @@ def write_settings(doc: SettingsDoc) -> None:
 
     try:
         rendered = doc.render()
+    except jsonc_edit.JsoncEditRefused as exc:
+        _record_jsonc_refusal(doc.path, exc)
+        raise HooksSettingsError(
+            "jsonc_edit_refused",
+            f"refusing to write {doc.path}: it has comments or trailing commas "
+            f"(JSONC) and this change could not be made in place without "
+            f"risking other content ({exc.message}). Edit it by hand, or "
+            f"remove the comments; nothing was written.",
+        ) from None
     except (TypeError, ValueError) as exc:
         raise HooksSettingsError(
             "render_failed",
@@ -472,12 +494,12 @@ def write_settings(doc: SettingsDoc) -> None:
         ) from None
 
     try:
-        reparsed = json.loads(rendered)
-    except json.JSONDecodeError as exc:
+        reparsed = jsonc_edit.loads(rendered)
+    except ValueError as exc:
         raise HooksSettingsError(
             "roundtrip_failed",
             f"refusing to write {doc.path}: the rendered document does not "
-            f"parse back ({exc.msg}). Nothing was written.",
+            f"parse back ({exc}). Nothing was written.",
         ) from None
     if reparsed != doc.data:
         raise HooksSettingsError(
@@ -492,6 +514,44 @@ def write_settings(doc: SettingsDoc) -> None:
         raise HooksSettingsError(
             "write_failed", f"cannot write {doc.path}: {exc}"
         ) from None
+    root = _project_root_of(doc.path)
+    if root is not None:
+        # The paired clear of a refusal recorded for this surface — by this
+        # writer or the env projection's (same file, same ledger entry).
+        from vco_lib import settings_refusal
+
+        settings_refusal.clear_recorded(root, _SETTINGS_SURFACE)
+
+
+#: The ``settings_refusal`` surface name of ``.claude/settings.json`` — the
+#: one the env projection records under, so a refusal of this file has ONE
+#: ledger entry whichever writer met it.
+_SETTINGS_SURFACE = "claude_settings_json"
+
+
+def _project_root_of(path: Path) -> Optional[Path]:
+    """The project folder when ``path`` is ``<project>/.claude/settings.json``."""
+    return path.parent.parent if path.parent.name == ".claude" else None
+
+
+def _record_jsonc_refusal(path: Path, exc: "jsonc_edit.JsoncEditRefused") -> None:
+    """Leave the refused JSONC edit in the project's deferral ledger
+    (:mod:`vco_lib.settings_refusal`) so it is visible beyond the one error
+    the Hooks tab shows. Soft-fail: the file is already safe."""
+    root = _project_root_of(path)
+    if root is None:
+        return
+    try:
+        from vco_lib import settings_refusal
+
+        settings_refusal.record(root, _SETTINGS_SURFACE, settings_refusal.Refusal(
+            path, settings_refusal.KIND_EDIT_REFUSED,
+            "it has comments or trailing commas (JSONC) and a hook change could "
+            f"not be made in place without risking other content ({exc.message}); "
+            "edit it by hand, or remove the comments",
+        ), retry_command="# Retry the change from the launcher: Projects -> this project -> Hooks.")
+    except Exception:  # noqa: BLE001 — the ledger is observability
+        pass
 
 
 def _refuse_symlinked_target(path: Path) -> None:

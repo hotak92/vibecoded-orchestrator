@@ -117,11 +117,12 @@ fn is_per_project_user_bucket(scope: &str, module_id: &str) -> bool {
 ///   * `(shared,      user)` — every registered project (across this user)
 ///   * `(global,      user)` — every registered project (machine-wide)
 ///
-/// Subprocesses spawned in any registered project's Claude Code session
-/// see all three classes as normal env vars. The threat model is the
-/// same as `is_per_project_user_bucket`: anything in the env surfaces
-/// is readable by any subprocess in the project — same exposure profile
-/// `~/.vct-secrets/` had pre-H2.
+/// What the predicate gates is a RE-PROJECTION of the affected project(s),
+/// never an emit: since v0.2.73 VCO writes no secret value into a project
+/// (the "every subprocess sees them as env vars" behaviour this doc once
+/// described is SUPERSEDED — consumers resolve a secret at need through the
+/// hub, `vct_secrets_resolve.sh` / `vco_lib.agent_secrets.get`; the
+/// "Secrets" section of `templates/ORCHESTRATOR-CLAUDE.md.template`).
 fn is_user_emit_bucket(scope: &str, module_id: &str) -> bool {
     if module_id != "user" {
         return false;
@@ -138,11 +139,14 @@ fn is_user_emit_bucket(scope: &str, module_id: &str) -> bool {
 ///     `project_id`).
 ///   * `(shared, user)` or `(global, user)` — refresh EVERY registered
 ///     project. Shared / global entries are user-wide / machine-wide,
-///     so a single change has to fan out to every project's env
-///     surfaces. Otherwise a key added in the Shared tab would be
-///     visible only to projects registered AFTER the change (because
-///     `populate` reads it at write time), with stale surfaces
-///     everywhere else until the next manual refresh.
+///     so a single change fans out to every project's env surfaces.
+///
+/// v0.2.97: no secret VALUE is written by any of these refreshes (see
+/// `is_user_emit_bucket`); the re-projection keeps each project's
+/// canonical env current, rebuilds its `.claude/env` managed block (which
+/// drops an export a pre-v0.2.73 launcher left there), and strips the
+/// launcher-known user-secret keys' in-tree values from the JSON env blocks. Pinned by the
+/// `*_leaves_no_secret_value_*` / `*_without_the_value` tests below.
 ///   * Anything else (`module_id != 'user'`, etc.) — skip. Module-owned
 ///     secrets are resolved by the hub's `/projects/{id}/env` endpoint
 ///     and don't go through the env-file emit path.
@@ -2165,177 +2169,174 @@ mod tests {
     }
 
     /// End-to-end: `set_secret_v2` against the per-project user bucket
-    /// triggers the env projection. The keychain entry lands AND
-    /// the project's `.claude/settings.json` env block carries the key.
-    /// Skipped without an OS keychain (most CI containers).
+    /// triggers the env re-projection — and NO secret VALUE lands in any of
+    /// the project's env files.
     ///
-    /// Phase 0.B Part 2 (2026-05-25): the env refresh inside
-    /// `set_secret_v2` now goes through
-    /// `apply_project_env_via_python` (subprocess into the Python
-    /// canonical-env contract). The Python contract is OUT OF SCOPE
-    /// for user secrets (see `vco_lib/config_projection.py` docstring
-    /// §"Out of scope") — they require an active-flag bridge that
-    /// lands in a future Phase 0.E. This test pins the end-to-end
-    /// "set_secret_v2 → env surface carries key" path which, post-
-    /// Phase-0.B-Part-2, depends on a Python module that
-    /// (a) reaches the in-memory test DB, and (b) handles user
-    /// secrets — neither holds today. Re-enable when Phase 0.E
-    /// adds user-secret routing to the Python contract.
-    #[tokio::test]
-    #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
-                see test docstring"]
-    async fn set_secret_v2_triggers_env_refresh() {
-        // Serialize against other keychain-touching tests across
-        // the crate. Required since 2026-05-13 — see crate::secrets docs.
-        let _kc_lock = keychain_test_lock();
-        let db = make_db();
-        let folder = seed_project_with_real_folder(&db, "p_set_refresh", "SetRefreshProj");
+    /// v0.2.97 review F6: this replaces `set_secret_v2_triggers_env_refresh`,
+    /// an ignored test asserting the env block "carries the key" while it
+    /// waited for a "Phase 0.E" that will never come. That promise was
+    /// SUPERSEDED in v0.2.73: VCO never writes a secret value into a project
+    /// tree; consumers resolve secrets at need through the hub
+    /// (`/api/v1/projects/{id}/env`, `vct_secrets_resolve.sh`,
+    /// `vco_lib.agent_secrets.get` — the "Secrets" section of
+    /// `templates/ORCHESTRATOR-CLAUDE.md.template`). This pins what is true:
+    /// the refresh runs (the canonical env lands, so the check is not
+    /// vacuous) and the canary value appears in no env file.
+    ///
+    /// Hermetic: see [`RefreshFixture`].
+    #[test]
+    fn set_secret_v2_refresh_writes_no_secret_value_into_the_project() {
+        let fx = refresh_fixture();
+        let folder = seed_project_with_real_folder(&fx.db, "p_set_refresh", "SetRefreshProj");
+        // Replicate the `#[command] set_secret_v2` body with the helpers the
+        // command uses (the command itself needs Tauri State).
+        let (scope, project_id, module_id, key) = ("per_project", "p_set_refresh", "user", "REFRESH_TEST_KEY");
+        let canary = format!("set-refresh-canary-{}", uuid::Uuid::new_v4().simple());
+        enforce_scope_invariants(scope, project_id, &fx.db).unwrap();
+        let scope_enum = scope_from_manifest(scope, project_id);
+        secrets::set(scope_enum, module_id, key, &canary).unwrap();
+        db_mark(&fx.db, scope, project_id, module_id, key);
+        refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "set_secret_v2");
 
-        // Wrap Db in Tauri-style state. The free function
-        // `refresh_project_env_with_db` takes &Db so the State
-        // wrapper here is for parity with the production command.
-        let state: tauri::State<Db> = unsafe {
-            // Tauri's State<T> is a thin wrapper around &T; in unit
-            // tests that don't construct a real AppHandle, we use
-            // the free-function variant of the env refresh inside
-            // `set_secret_v2`. Calling the public `#[command]`
-            // requires Tauri State plumbing, so we replicate the
-            // command body here to exercise the same code path
-            // without the Tauri runtime.
-            std::mem::transmute(&db)
-        };
-        let _ = state; // silence unused; the free-function path covers it
-
-        // Replicate the `#[command] set_secret_v2` body using the same
-        // helpers the command uses (see lines 132-180 of this file).
-        // Going through the helpers (rather than the wrapped command)
-        // skips the Tauri runtime requirement while keeping the
-        // refresh hook, audit log, and active-flag mark identical.
-        let scope = "per_project".to_string();
-        let project_id = "p_set_refresh".to_string();
-        let module_id = "user".to_string();
-        let key = "REFRESH_TEST_KEY".to_string();
-        let canary_value = format!(
-            "subagent-g-set-refresh-canary-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-
-        enforce_scope_invariants(&scope, &project_id, &db).unwrap();
-        let scope_enum = scope_from_manifest(&scope, &project_id);
-        secrets::set(scope_enum, &module_id, &key, &canary_value).unwrap();
-        db.mark_secret_active(&scope, &project_id, &module_id, &key).unwrap();
-        // The refresh hook — same call the command makes.
-        refresh_env_after_user_secret_change(
-            &db,
-            &project_id,
-            &scope,
-            &module_id,
-            "set_secret_v2",
-        );
-
-        // Project's `.claude/settings.json` env block should now carry
-        // the key.
-        let cs_path = folder.join(".claude/settings.json");
-        assert!(cs_path.exists(), "writer didn't run; .claude/settings.json absent");
-        let cs: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-        assert_eq!(
-            cs["env"][&key],
-            canary_value,
-            ".claude/settings.json env block missing or wrong value: {}",
-            cs["env"]
-        );
-
-        // Cleanup.
-        let _ = secrets::delete(scope_enum, &module_id, &key);
-        let _ = db.forget_secret_active_state(&scope, &project_id, &module_id, &key);
+        assert_refreshed_without_secret(&folder, project_id, key, &canary);
+        let _ = secrets::delete(scope_enum, module_id, key);
         std::fs::remove_dir_all(&folder).ok();
     }
 
-    /// `remove_secret_v2` against the user bucket: the env-write fires
-    /// BEFORE `forget_secret_active_state` so the row's still in the
-    /// strip set when the writer composes the new surfaces. After the
-    /// test the surfaces no longer carry the key.
-    ///
-    /// Skipped without OS keychain.
-    /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
-    /// docstring for the user-secret regression context. This test
-    /// covers the strip side of the same flow.
-    #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
-                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
-                see set_secret_v2_triggers_env_refresh docstring"]
-    async fn delete_secret_v2_strips_secret_from_env_surfaces() {
-        // Serialize against other keychain-touching tests across
-        // the crate. Required since 2026-05-13 — see crate::secrets docs.
-        let _kc_lock = keychain_test_lock();
-        let db = make_db();
-        let folder = seed_project_with_real_folder(&db, "p_del_strip", "DelStripProj");
+    fn db_mark(db: &Db, scope: &str, project_id: &str, module_id: &str, key: &str) {
+        db.mark_secret_active(scope, project_id, module_id, key).unwrap();
+    }
 
-        let scope = "per_project";
-        let project_id = "p_del_strip";
-        let module_id = "user";
-        let key = "STRIP_TEST_KEY";
-        let canary = format!(
-            "subagent-g-strip-canary-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    /// A hermetic refresh fixture (v0.2.97 review F6): the keychain is the
+    /// thread-local mock, and the launcher DB is a FILE under a scratch
+    /// `VCT_STATE_DIR`, so the Python projection child the refresh spawns
+    /// reads THIS test's rows and never `~/.vct`. Field order is drop order:
+    /// the env and the keychain baton are released last.
+    struct RefreshFixture {
+        db: Db,
+        state: std::path::PathBuf,
+        _mock: secrets::for_tests::MockGuard,
+        _env: vct_launcher_core::test_env::EnvGuard,
+        _kc: crate::secrets::test_serialize::KeychainGuard,
+    }
+
+    fn refresh_fixture() -> RefreshFixture {
+        let kc = keychain_test_lock();
+        let mock = secrets::for_tests::MockGuard::new();
+        let state = std::env::temp_dir().join(format!(
+            "vct-secret-refresh-state-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state).unwrap();
+        let env = vct_launcher_core::test_env::env_guard(&[(
+            "VCT_STATE_DIR",
+            Some(state.to_str().unwrap()),
+        )]);
+        let conn = Connection::open(state.join("launcher.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::db::migrations::apply(&conn).unwrap();
+        RefreshFixture { db: Db(Mutex::new(conn)), state, _mock: mock, _env: env, _kc: kc }
+    }
+
+    impl Drop for RefreshFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.state).ok();
+        }
+    }
+
+    /// The TRUE post-v0.2.73 behaviour of a refresh for one project: it RAN
+    /// (the canonical env landed for THIS project, so the check is not
+    /// vacuous) and the secret's value and key are in none of its env files.
+    fn assert_refreshed_without_secret(folder: &std::path::Path, project_id: &str, key: &str, canary: &str) {
+        let cs_path = folder.join(".claude/settings.json");
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cs_path)
+                .unwrap_or_else(|_| panic!("the re-projection did not run for {}", project_id)),
+        )
+        .unwrap();
+        assert_eq!(
+            cs["env"]["VCT_PROJECT_ID"], project_id,
+            "the canonical env landed — the refresh really ran for {}: {}",
+            project_id, cs["env"]
         );
+        assert!(cs["env"].get(key).is_none(), "the secret KEY was projected into {}: {}", project_id, cs["env"]);
+        for rel in [".claude/settings.json", ".claude/env", ".env", ".vscode/settings.json"] {
+            if let Ok(text) = std::fs::read_to_string(folder.join(rel)) {
+                assert!(!text.contains(canary), "secret VALUE present in {}/{}", project_id, rel);
+            }
+        }
+    }
 
-        // Step 1: set + active. Env surfaces should carry the key.
+    /// Plant the value where a pre-v0.2.73 launcher put a user secret: an
+    /// `export` line INSIDE the `.claude/env` managed block, AND the
+    /// `.claude/settings.json` `env` block (beside a user key VCO never wrote,
+    /// which must survive).
+    fn plant_legacy_claude_env_export(folder: &std::path::Path, key: &str, canary: &str) {
+        std::fs::create_dir_all(folder.join(".claude")).unwrap();
+        std::fs::write(
+            folder.join(".claude/env"),
+            format!(
+                "# vco-managed-begin\nexport {}=\"{}\"\n# vco-managed-end\n",
+                key, canary
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "env": {key: canary, "USER_OWN_KEY": "keep"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The user's own env key (never written by VCO) survived the scrub.
+    fn assert_user_key_kept(folder: &std::path::Path) {
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cs["env"]["USER_OWN_KEY"], "keep", "a key VCO never wrote is untouched");
+    }
+
+
+    /// `remove_secret_v2` against the per-project user bucket: the refresh
+    /// runs for the project, no secret value is in any of its env files
+    /// afterwards, and a LEGACY value a pre-v0.2.73 launcher left in the
+    /// `.claude/env` managed block is gone (the projection rebuilds that
+    /// block from the canonical env alone).
+    ///
+    /// v0.2.97 review F6 (owner decision 2026-09-23): replaces an ignored test
+    /// that asserted the env block first CARRIED the key — the promise
+    /// SUPERSEDED in v0.2.73 (VCO writes no secret value into a project;
+    /// consumers resolve at need through the hub).
+    ///
+    /// The same holds for a legacy value in the `.claude/settings.json` `env`
+    /// block: since v0.2.97 every refresh strips the launcher-known user-secret
+    /// keys there (`config_projection.apply_project_env`) — the refresh here
+    /// runs BEFORE `forget_secret_active_state`, so the key is still known —
+    /// while a key the launcher never knew survives.
+    #[test]
+    fn delete_secret_v2_per_project_leaves_no_secret_value_in_the_project() {
+        let fx = refresh_fixture();
+        let folder = seed_project_with_real_folder(&fx.db, "p_del_strip", "DelStripProj");
+        let (scope, project_id, module_id, key) = ("per_project", "p_del_strip", "user", "STRIP_TEST_KEY");
+        let canary = format!("del-strip-canary-{}", uuid::Uuid::new_v4().simple());
         let scope_enum = scope_from_manifest(scope, project_id);
         secrets::set(scope_enum, module_id, key, &canary).unwrap();
-        db.mark_secret_active(scope, project_id, module_id, key).unwrap();
-        refresh_env_after_user_secret_change(&db, project_id, scope, module_id, "set_secret_v2");
-        let cs_path = folder.join(".claude/settings.json");
-        let cs: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-        assert_eq!(cs["env"][key], canary, "pre-delete: key not in env");
+        db_mark(&fx.db, scope, project_id, module_id, key);
+        plant_legacy_claude_env_export(&folder, key, &canary);
 
-        // Step 2: replicate `remove_secret_v2` body — keychain delete,
-        // refresh BEFORE forget, then forget.
+        // Replicate `remove_secret_v2`: keychain delete → refresh → forget.
         secrets::delete(scope_enum, module_id, key).unwrap();
-        // Crucial: refresh BEFORE forget so the strip set carries the key.
-        refresh_env_after_user_secret_change(&db, project_id, scope, module_id, "remove_secret_v2");
-        db.forget_secret_active_state(scope, project_id, module_id, key).unwrap();
+        refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "remove_secret_v2");
+        fx.db.forget_secret_active_state(scope, project_id, module_id, key).unwrap();
 
-        // .claude/settings.json no longer carries the key.
-        let cs_after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-        assert!(
-            cs_after["env"].get(key).is_none(),
-            "post-delete: env still has {}: {}",
-            key,
-            cs_after["env"]
-        );
-        // .claude/env: BEGIN/END block should not contain the key either.
+        assert_refreshed_without_secret(&folder, project_id, key, &canary);
         let claude_env = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
-        assert!(
-            !claude_env.contains(key),
-            "post-delete: .claude/env still mentions {}:\n{}",
-            key,
-            claude_env,
-        );
-        // PR-27 (v0.2.12, 2026-05-16): the launcher's env writer no
-        // longer authors `.vscode/settings.json` `claude-code.env`,
-        // so there is nothing to strip from it on secret delete. If
-        // the file exists (because the user authored it by hand or a
-        // pre-PR-27 launcher created it), the strip helper
-        // (`surgically_strip_user_secret_keys`) still runs against it
-        // — but the writer never creates it. Assert the key isn't
-        // present whether or not the file exists.
-        let vscode_path = folder.join(".vscode/settings.json");
-        if vscode_path.exists() {
-            let vsc: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&vscode_path).unwrap()).unwrap();
-            assert!(
-                vsc.get("claude-code.env")
-                    .and_then(|b| b.get(key))
-                    .is_none(),
-                "post-delete: stale {} key in pre-existing .vscode/settings.json",
-                key,
-            );
-        }
-
+        assert!(!claude_env.contains(key), "legacy export survived:\n{}", claude_env);
+        assert_user_key_kept(&folder);
         std::fs::remove_dir_all(&folder).ok();
     }
 
@@ -2429,278 +2430,113 @@ mod tests {
         (p1, p2)
     }
 
-    /// H2: a shared user-bucket secret added via `set_secret_v2`
-    /// propagates to EVERY registered project's `.claude/settings.json`
-    /// env block (and the other two surfaces via the same writer).
-    /// Pre-H2 this was a silent no-op — the keychain landed but no
-    /// project's env files saw the key.
-    /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
-    /// docstring; this test pins fan-out propagation across projects.
-    #[tokio::test]
-    #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
-                see set_secret_v2_triggers_env_refresh docstring"]
-    async fn set_secret_v2_shared_user_bucket_propagates_to_all_registered_projects() {
-        // Serialize against other keychain-touching tests across
-        // the crate. Required since 2026-05-13 — see crate::secrets docs.
-        let _kc_lock = keychain_test_lock();
-        let db = make_db();
-        let (folder1, folder2) = seed_two_registered_projects(&db);
-
-        let scope = "shared".to_string();
-        let project_id = "_user_shared_".to_string();
-        let module_id = "user".to_string();
-        let key = format!(
-            "H2_SHARED_KEY_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-        let canary = format!(
-            "h2-shared-canary-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-
-        // Replicate the `#[command] set_secret_v2` body — same as the
-        // existing pre-H2 set test pattern.
-        enforce_scope_invariants(&scope, &project_id, &db).unwrap();
-        let scope_enum = scope_from_manifest(&scope, &project_id);
-        secrets::set(scope_enum, &module_id, &key, &canary).unwrap();
-        db.mark_secret_active(&scope, &project_id, &module_id, &key).unwrap();
-        refresh_env_after_user_secret_change(
-            &db,
-            &project_id,
-            &scope,
-            &module_id,
-            "set_secret_v2_shared",
-        );
-
-        // Both projects' `.claude/settings.json` should now carry the key.
-        for (label, folder) in [("p1", &folder1), ("p2", &folder2)] {
-            let cs_path = folder.join(".claude/settings.json");
-            assert!(
-                cs_path.exists(),
-                "[{}] writer didn't run; .claude/settings.json absent",
-                label
-            );
-            let cs: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-            assert_eq!(
-                cs["env"][&key],
-                canary,
-                "[{}] .claude/settings.json env block missing or wrong value: {}",
-                label,
-                cs["env"]
-            );
-        }
-
-        // Cleanup keychain.
-        let _ = secrets::delete(scope_enum, &module_id, &key);
-        let _ = db.forget_secret_active_state(&scope, &project_id, &module_id, &key);
-        let _ = std::fs::remove_dir_all(&folder1);
-        let _ = std::fs::remove_dir_all(&folder2);
-    }
-
-    /// H2: global user-bucket secrets propagate to every registered
-    /// project's env files. Symmetric with the shared test above —
-    /// the writer doesn't care which user-emit bucket the key lives
-    /// in, only that it's in some user-emit bucket.
-    /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
-    /// docstring; this test pins fan-out propagation across projects.
-    #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
-                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
-                see set_secret_v2_triggers_env_refresh docstring"]
-    async fn set_secret_v2_global_user_bucket_propagates_to_all_registered_projects() {
-        // Serialize against other keychain-touching tests across
-        // the crate. Required since 2026-05-13 — see crate::secrets docs.
-        let _kc_lock = keychain_test_lock();
-        let db = make_db();
-        let (folder1, folder2) = seed_two_registered_projects(&db);
-
-        let scope = "global".to_string();
-        let project_id = "_global_".to_string();
-        let module_id = "user".to_string();
-        let key = format!(
-            "H2_GLOBAL_KEY_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-        let canary = format!(
-            "h2-global-canary-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-
-        enforce_scope_invariants(&scope, &project_id, &db).unwrap();
-        let scope_enum = scope_from_manifest(&scope, &project_id);
-        secrets::set(scope_enum, &module_id, &key, &canary).unwrap();
-        db.mark_secret_active(&scope, &project_id, &module_id, &key).unwrap();
-        refresh_env_after_user_secret_change(
-            &db,
-            &project_id,
-            &scope,
-            &module_id,
-            "set_secret_v2_global",
-        );
-
-        for (label, folder) in [("p1", &folder1), ("p2", &folder2)] {
-            let cs_path = folder.join(".claude/settings.json");
-            assert!(
-                cs_path.exists(),
-                "[{}] writer didn't run for global; .claude/settings.json absent",
-                label
-            );
-            let cs: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-            assert_eq!(
-                cs["env"][&key],
-                canary,
-                "[{}] global key missing from .claude/settings.json env: {}",
-                label,
-                cs["env"]
-            );
-        }
-
-        let _ = secrets::delete(scope_enum, &module_id, &key);
-        let _ = db.forget_secret_active_state(&scope, &project_id, &module_id, &key);
-        let _ = std::fs::remove_dir_all(&folder1);
-        let _ = std::fs::remove_dir_all(&folder2);
-    }
-
-    /// H2: `remove_secret_v2` on a shared user-bucket entry strips the
-    /// key from EVERY registered project's env files. Mirrors the
-    /// per-project strip test, but the fan-out has to land in both
-    /// projects.
-    /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
-    /// docstring; this test pins fan-out strip across projects.
-    #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
-                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
-                see set_secret_v2_triggers_env_refresh docstring"]
-    async fn delete_secret_v2_shared_user_bucket_strips_from_all_projects() {
-        // Serialize against other keychain-touching tests across
-        // the crate. Required since 2026-05-13 — see crate::secrets docs.
-        let _kc_lock = keychain_test_lock();
-        let db = make_db();
-        let (folder1, folder2) = seed_two_registered_projects(&db);
-
-        let scope = "shared";
-        let project_id = "_user_shared_";
-        let module_id = "user";
-        let key = format!(
-            "H2_STRIP_KEY_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-        let canary = format!(
-            "h2-strip-canary-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-
-        // Step 1: set + active. Both projects' env surfaces carry the key.
+    /// H2 + v0.2.97 review F6: a SHARED user-bucket `set_secret_v2` refreshes
+    /// EVERY registered project (the H2 fan-out), and no secret value lands in
+    /// any of their env files. Replaces an ignored test asserting each
+    /// project's env block carried the value — the promise SUPERSEDED in
+    /// v0.2.73 (owner decision 2026-09-23).
+    #[test]
+    fn set_secret_v2_shared_bucket_refreshes_every_project_without_the_value() {
+        let fx = refresh_fixture();
+        let (folder1, folder2) = seed_two_registered_projects(&fx.db);
+        let (scope, project_id, module_id) = ("shared", "_user_shared_", "user");
+        let key = format!("H2_SHARED_KEY_{}", uuid::Uuid::new_v4().simple());
+        let canary = format!("h2-shared-canary-{}", uuid::Uuid::new_v4().simple());
+        enforce_scope_invariants(scope, project_id, &fx.db).unwrap();
         let scope_enum = scope_from_manifest(scope, project_id);
         secrets::set(scope_enum, module_id, &key, &canary).unwrap();
-        db.mark_secret_active(scope, project_id, module_id, &key).unwrap();
-        refresh_env_after_user_secret_change(&db, project_id, scope, module_id, "set_secret_v2_shared");
-        for folder in [&folder1, &folder2] {
-            let cs_path = folder.join(".claude/settings.json");
-            let cs: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-            assert_eq!(cs["env"][&key], canary);
-        }
+        db_mark(&fx.db, scope, project_id, module_id, &key);
+        refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "set_secret_v2_shared");
 
-        // Step 2: replicate the `remove_secret_v2` body for shared scope.
-        // Order: delete keychain → refresh (carries strip set) → forget.
+        assert_refreshed_without_secret(&folder1, "h2-p1", &key, &canary);
+        assert_refreshed_without_secret(&folder2, "h2-p2", &key, &canary);
+        let _ = secrets::delete(scope_enum, module_id, &key);
+        let _ = std::fs::remove_dir_all(&folder1);
+        let _ = std::fs::remove_dir_all(&folder2);
+    }
+
+    /// H2 + v0.2.97 review F6: a GLOBAL user-bucket `set_secret_v2` refreshes
+    /// every registered project, and no secret value lands in any of their
+    /// env files. Symmetric with the shared case; replaces an ignored test of
+    /// the SUPERSEDED value-propagation promise (owner decision 2026-09-23).
+    #[test]
+    fn set_secret_v2_global_bucket_refreshes_every_project_without_the_value() {
+        let fx = refresh_fixture();
+        let (folder1, folder2) = seed_two_registered_projects(&fx.db);
+        let (scope, project_id, module_id) = ("global", "_global_", "user");
+        let key = format!("H2_GLOBAL_KEY_{}", uuid::Uuid::new_v4().simple());
+        let canary = format!("h2-global-canary-{}", uuid::Uuid::new_v4().simple());
+        enforce_scope_invariants(scope, project_id, &fx.db).unwrap();
+        let scope_enum = scope_from_manifest(scope, project_id);
+        secrets::set(scope_enum, module_id, &key, &canary).unwrap();
+        db_mark(&fx.db, scope, project_id, module_id, &key);
+        refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "set_secret_v2_global");
+
+        assert_refreshed_without_secret(&folder1, "h2-p1", &key, &canary);
+        assert_refreshed_without_secret(&folder2, "h2-p2", &key, &canary);
+        let _ = secrets::delete(scope_enum, module_id, &key);
+        let _ = std::fs::remove_dir_all(&folder1);
+        let _ = std::fs::remove_dir_all(&folder2);
+    }
+
+    /// H2 + v0.2.97 review F6: `remove_secret_v2` on a SHARED user-bucket key
+    /// refreshes every registered project; afterwards no secret value is in
+    /// any of their env files and a legacy `.claude/env` managed-block export
+    /// is gone from each, as is the legacy `.claude/settings.json` value. Same as the
+    /// per-project delete test. Replaces an ignored test of the SUPERSEDED
+    /// promise (owner decision 2026-09-23).
+    #[test]
+    fn delete_secret_v2_shared_bucket_leaves_no_secret_value_in_any_project() {
+        let fx = refresh_fixture();
+        let (folder1, folder2) = seed_two_registered_projects(&fx.db);
+        let (scope, project_id, module_id) = ("shared", "_user_shared_", "user");
+        let key = format!("H2_STRIP_KEY_{}", uuid::Uuid::new_v4().simple());
+        let canary = format!("h2-strip-canary-{}", uuid::Uuid::new_v4().simple());
+        let scope_enum = scope_from_manifest(scope, project_id);
+        secrets::set(scope_enum, module_id, &key, &canary).unwrap();
+        db_mark(&fx.db, scope, project_id, module_id, &key);
+        plant_legacy_claude_env_export(&folder1, &key, &canary);
+        plant_legacy_claude_env_export(&folder2, &key, &canary);
+
         secrets::delete(scope_enum, module_id, &key).unwrap();
-        refresh_env_after_user_secret_change(
-            &db,
-            project_id,
-            scope,
-            module_id,
-            "remove_secret_v2_shared",
-        );
-        db.forget_secret_active_state(scope, project_id, module_id, &key).unwrap();
+        refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "remove_secret_v2_shared");
+        fx.db.forget_secret_active_state(scope, project_id, module_id, &key).unwrap();
 
-        // Both projects' surfaces no longer carry the key.
-        for (label, folder) in [("p1", &folder1), ("p2", &folder2)] {
-            let cs_path = folder.join(".claude/settings.json");
-            let cs_after: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&cs_path).unwrap()).unwrap();
-            assert!(
-                cs_after["env"].get(&key).is_none(),
-                "[{}] post-delete: shared env still has {}: {}",
-                label,
-                key,
-                cs_after["env"]
-            );
+        for (pid, folder) in [("h2-p1", &folder1), ("h2-p2", &folder2)] {
+            assert_refreshed_without_secret(folder, pid, &key, &canary);
             let claude_env = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
-            assert!(
-                !claude_env.contains(&key),
-                "[{}] post-delete: .claude/env still mentions {}:\n{}",
-                label,
-                key,
-                claude_env,
-            );
+            assert!(!claude_env.contains(&key), "[{}] legacy export survived:\n{}", pid, claude_env);
+            assert_user_key_kept(folder);
         }
-
         let _ = std::fs::remove_dir_all(&folder1);
         let _ = std::fs::remove_dir_all(&folder2);
     }
 
-    /// H2: `remove_secret_v2` on a global user-bucket entry strips
-    /// from every registered project. Symmetric with the shared strip
-    /// test.
-    /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
-    /// docstring; this test pins fan-out strip across projects.
-    #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
-                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
-                see set_secret_v2_triggers_env_refresh docstring"]
-    async fn delete_secret_v2_global_user_bucket_strips_from_all_projects() {
-        // Serialize against other keychain-touching tests across
-        // the crate. Required since 2026-05-13 — see crate::secrets docs.
-        let _kc_lock = keychain_test_lock();
-        let db = make_db();
-        let (folder1, folder2) = seed_two_registered_projects(&db);
-
-        let scope = "global";
-        let project_id = "_global_";
-        let module_id = "user";
-        let key = format!(
-            "H2_GLOBAL_STRIP_KEY_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-        let canary = format!(
-            "h2-global-strip-canary-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
-
+    /// H2 + v0.2.97 review F6: `remove_secret_v2` on a GLOBAL user-bucket key
+    /// — symmetric with the shared delete test (owner decision 2026-09-23).
+    #[test]
+    fn delete_secret_v2_global_bucket_leaves_no_secret_value_in_any_project() {
+        let fx = refresh_fixture();
+        let (folder1, folder2) = seed_two_registered_projects(&fx.db);
+        let (scope, project_id, module_id) = ("global", "_global_", "user");
+        let key = format!("H2_GLOBAL_STRIP_KEY_{}", uuid::Uuid::new_v4().simple());
+        let canary = format!("h2-global-strip-canary-{}", uuid::Uuid::new_v4().simple());
         let scope_enum = scope_from_manifest(scope, project_id);
         secrets::set(scope_enum, module_id, &key, &canary).unwrap();
-        db.mark_secret_active(scope, project_id, module_id, &key).unwrap();
-        refresh_env_after_user_secret_change(&db, project_id, scope, module_id, "set_secret_v2_global");
-        for folder in [&folder1, &folder2] {
-            let cs: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap()).unwrap();
-            assert_eq!(cs["env"][&key], canary);
-        }
+        db_mark(&fx.db, scope, project_id, module_id, &key);
+        plant_legacy_claude_env_export(&folder1, &key, &canary);
+        plant_legacy_claude_env_export(&folder2, &key, &canary);
 
         secrets::delete(scope_enum, module_id, &key).unwrap();
-        refresh_env_after_user_secret_change(
-            &db,
-            project_id,
-            scope,
-            module_id,
-            "remove_secret_v2_global",
-        );
-        db.forget_secret_active_state(scope, project_id, module_id, &key).unwrap();
+        refresh_env_after_user_secret_change(&fx.db, project_id, scope, module_id, "remove_secret_v2_global");
+        fx.db.forget_secret_active_state(scope, project_id, module_id, &key).unwrap();
 
-        for (label, folder) in [("p1", &folder1), ("p2", &folder2)] {
-            let cs_after: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap()).unwrap();
-            assert!(
-                cs_after["env"].get(&key).is_none(),
-                "[{}] post-delete: global env still has {}",
-                label,
-                key
-            );
+        for (pid, folder) in [("h2-p1", &folder1), ("h2-p2", &folder2)] {
+            assert_refreshed_without_secret(folder, pid, &key, &canary);
+            let claude_env = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
+            assert!(!claude_env.contains(&key), "[{}] legacy export survived:\n{}", pid, claude_env);
+            assert_user_key_kept(folder);
         }
-
         let _ = std::fs::remove_dir_all(&folder1);
         let _ = std::fs::remove_dir_all(&folder2);
     }

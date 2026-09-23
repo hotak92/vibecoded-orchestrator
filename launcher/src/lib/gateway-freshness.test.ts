@@ -13,7 +13,9 @@ import {
   INITIAL_FRESHNESS_STATE,
   MODAL_MESSAGE,
   promptIdentity,
+  scheduleStartupCheck,
   shouldOfferRestart,
+  STARTUP_CHECK_DELAY_MS,
   type FreshnessState,
   type GatewayFreshnessReport,
   type KeyValueStore,
@@ -157,6 +159,139 @@ describe('gateway freshness modal (v0.2.97)', () => {
     expect(h.state().open).toBe(true);
     await h.ctl.continueRestart();
     expect(h.calls).toEqual(['model_gateway_freshness']);
+  });
+
+  // ── review R1 F3: overlapping checks must never re-arm Continue ─────────
+
+  /** A controller whose backend calls resolve only when the test says so. */
+  function deferredHarness() {
+    let state: FreshnessState = INITIAL_FRESHNESS_STATE;
+    const calls: string[] = [];
+    const pending: Array<{ cmd: string; resolve: (v: unknown) => void }> = [];
+    const invoke = (cmd: string) =>
+      new Promise((resolve) => {
+        calls.push(cmd);
+        pending.push({ cmd, resolve });
+      });
+    const ctl = createFreshnessController({
+      invoke: invoke as never,
+      storage: memoryStore(),
+      set: (s) => (state = s),
+      get: () => state,
+    });
+    const settle = (i: number, value: unknown) => pending[i].resolve(value);
+    return { ctl, calls, settle, state: () => state };
+  }
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('two overlapping checks share one backend call', async () => {
+    const h = deferredHarness();
+    const a = h.ctl.check();
+    const b = h.ctl.check();
+    expect(h.calls).toEqual(['model_gateway_freshness']);
+    h.settle(0, report());
+    await Promise.all([a, b]);
+    expect(h.state().open).toBe(true);
+  });
+
+  it('a check that lands mid-restart does not re-enable Continue (no double restart)', async () => {
+    // The reviewer's interleaving: A (launcher-start timer) and B (an update
+    // that finished meanwhile) are BOTH in flight; A lands, the user presses
+    // Continue, then B lands while the restart is running.
+    const h = deferredHarness();
+    const a = h.ctl.check();
+    const b = h.ctl.check();
+    const freshIdx = () =>
+      h.calls.map((c, i) => (c === 'model_gateway_freshness' ? i : -1)).filter((i) => i >= 0);
+    h.settle(freshIdx()[0], report());
+    await a;
+    expect(h.state().open).toBe(true);
+    const restart = h.ctl.continueRestart();
+    await flush();
+    expect(h.state().restarting).toBe(true);
+    // B's answer (still stale — the old process is not replaced yet), if B
+    // ever reached the backend on its own.
+    if (freshIdx().length > 1) h.settle(freshIdx()[1], report());
+    await b;
+    expect(h.state().restarting).toBe(true);
+    // A second Continue while the first is in flight reaches nothing.
+    await h.ctl.continueRestart();
+    expect(h.calls.filter((c) => c === 'model_gateway_restart_stale')).toHaveLength(1);
+    // Finish the restart; a later check must not wipe the result either.
+    h.settle(h.calls.indexOf('model_gateway_restart_stale'), {
+      outcome: 'restarted', restarted: true, message: 'done',
+    });
+    await restart;
+    await h.ctl.check();
+    expect(h.state().result?.restarted).toBe(true);
+    expect(freshIdx()).toHaveLength(1);
+    expect(h.calls.filter((x) => x === 'model_gateway_restart_stale')).toHaveLength(1);
+  });
+
+  it('an answer that lands after the state moved on is dropped', async () => {
+    let state: FreshnessState = INITIAL_FRESHNESS_STATE;
+    let resolveCheck: (v: unknown) => void = () => {};
+    const ctl = createFreshnessController({
+      invoke: (() => new Promise((r) => (resolveCheck = r))) as never,
+      storage: memoryStore(),
+      set: (s) => (state = s),
+      get: () => state,
+    });
+    const pending = ctl.check();
+    // Meanwhile a restart got under way (another writer of the same store).
+    const busy: FreshnessState = { ...INITIAL_FRESHNESS_STATE, report: report(), open: true, restarting: true };
+    state = busy;
+    resolveCheck(report({ pid: 7 }));
+    await pending;
+    expect(state).toBe(busy);
+  });
+
+  it('a check while the modal is up neither asks nor replaces it', async () => {
+    const h = deferredHarness();
+    const first = h.ctl.check();
+    h.settle(0, report());
+    await first;
+    h.ctl.dismiss(); // closed, but remembered
+    // Re-open by a fresh situation, then a slow check lands with a stale reply.
+    const second = h.ctl.check();
+    h.settle(1, report({ pid: 99 }));
+    await second;
+    expect(h.state().open).toBe(true);
+    const snapshot = h.state();
+    const late = h.ctl.check(); // busy: must not even ask
+    await late;
+    expect(h.calls.filter((c) => c === 'model_gateway_freshness')).toHaveLength(2);
+    expect(h.state()).toBe(snapshot);
+  });
+
+  // ── review R1 F15: the startup timer is cancelled on teardown ────────────
+
+  it('the startup check fires once after the delay', () => {
+    vi.useFakeTimers();
+    try {
+      const check = vi.fn();
+      scheduleStartupCheck(check);
+      vi.advanceTimersByTime(STARTUP_CHECK_DELAY_MS - 1);
+      expect(check).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(check).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a cancelled startup check never fires (layout teardown)', () => {
+    vi.useFakeTimers();
+    try {
+      const check = vi.fn();
+      const cancel = scheduleStartupCheck(check);
+      cancel();
+      vi.advanceTimersByTime(STARTUP_CHECK_DELAY_MS * 10);
+      expect(check).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a restart error is shown, not swallowed', async () => {

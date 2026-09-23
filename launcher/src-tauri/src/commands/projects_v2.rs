@@ -3514,7 +3514,11 @@ fn apply_project_env_via_python(
     // VCT_INSTALL_ROOT, TEMP/TMP/TMPDIR, home-dir keys) is unchanged.
     crate::services::vco_lib_bridge::reinject_minimal_env(&mut cmd);
 
-    cmd.current_dir(folder);
+    // Production: the project folder (unchanged). Under `cfg(test)` the
+    // shared bridge rule pins this checkout, so a unit test exercises the
+    // `vco_lib` beside it rather than whatever tree `$VCT_INSTALL_ROOT` names
+    // (v0.2.97 review F13, same fix as the env-block verbs).
+    cmd.current_dir(crate::services::vco_lib_bridge::vco_lib_cwd(Some(folder), folder));
 
     // Spawn with stdout/stderr captured. 30 s wall-clock cap — the
     // happy path is ~150 ms; a hang past 30 s indicates a stuck DB
@@ -5163,41 +5167,51 @@ pub(crate) fn strip_canonical_keys_from_claude_env_text(
     (out, removed.into_iter().collect())
 }
 
-/// Pure helper: strip launcher-canonical keys from a JSON `env`-shaped
-/// sub-block (`.claude/settings.json` `env` OR `.vscode/settings.json`
-/// `claude-code.env`). Mutates `parent` in place: removes canonical keys
-/// from the named sub-object; user keys at the same level survive. If
-/// the sub-object is missing or non-object, the call is a no-op (returns
-/// empty Vec).
+/// Strip `keys` from both JSON env surfaces of `folder` —
+/// `.claude/settings.json` `env` and `.vscode/settings.json`
+/// `claude-code.env` — through the ONE Python implementation
+/// (`vco_lib.config_projection strip-env-keys`, via
+/// [`crate::services::vco_lib_bridge::strip_settings_env_keys`]).
 ///
-/// Returns the list of keys actually removed (sorted, de-duped). Inverse
-/// of the env projection's deep-merge into the `env` object.
-pub(crate) fn strip_canonical_keys_from_env_object(
-    parent: &mut serde_json::Map<String, serde_json::Value>,
-    env_key: &str,
-) -> Vec<String> {
-    let canonical: std::collections::HashSet<&str> =
-        UNREGISTER_CANONICAL_ENV_KEYS.iter().copied().collect();
-
-    let env_obj = match parent.get_mut(env_key).and_then(|v| v.as_object_mut()) {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-
-    let mut removed = std::collections::BTreeSet::new();
-    let to_remove: Vec<String> = env_obj
-        .keys()
-        .filter(|k| canonical.contains(k.as_str()))
-        .cloned()
-        .collect();
-    for k in to_remove {
-        // `shift_remove`, never `remove` — see `json_file`'s module docs.
-        // `remove` is `swap_remove` under `preserve_order` and would
-        // relocate the user's last env key on every strip.
-        env_obj.shift_remove(&k);
-        removed.insert(k);
+/// v0.2.97 review F5: both unregister strips carried a Rust read-merge-write
+/// here that parsed with strict `serde_json` and rewrote with
+/// `to_string_pretty` — a JSONC `.vscode/settings.json` (VS Code's own
+/// format) was refused with a warning, so the key NAMES it held survived the
+/// unregister, and a comment-free file was reformatted wholesale. The Python
+/// strip edits JSONC in place, drops an env block it empties, never creates a
+/// file, and refuses + records an unreadable one exactly like every other
+/// env writer. A surface whose file does not exist is not spawned for.
+///
+/// Removed keys are added to `purged`; a refusal or spawn failure becomes one
+/// `warnings` line naming the file (`what` says which strip it was).
+pub(crate) fn strip_json_env_surfaces(
+    root: Option<&Path>,
+    folder: &Path,
+    keys: &[&str],
+    what: &str,
+    purged: &mut std::collections::BTreeSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    if keys.is_empty() {
+        return;
     }
-    removed.into_iter().collect()
+    for (surface, file) in [
+        ("claude_settings_json", folder.join(".claude").join("settings.json")),
+        ("vscode_settings_json", folder.join(".vscode").join("settings.json")),
+    ] {
+        if !file.exists() {
+            continue;
+        }
+        match crate::services::vco_lib_bridge::strip_settings_env_keys(root, folder, surface, keys) {
+            Ok(removed) => purged.extend(removed),
+            Err(e) => warnings.push(format!(
+                "{} left untouched ({}): {}",
+                file.display(),
+                what,
+                e
+            )),
+        }
+    }
 }
 
 /// Drive the surgical purge across all four env surfaces in one folder.
@@ -5212,6 +5226,7 @@ pub(crate) fn strip_canonical_keys_from_env_object(
 /// no-op (the project may have been registered against a folder that
 /// the user has since cleaned up by hand).
 pub(crate) fn surgically_strip_env_surfaces(
+    root: Option<&Path>,
     folder: &Path,
 ) -> (Vec<String>, Vec<String>) {
     let mut keys = std::collections::BTreeSet::new();
@@ -5277,108 +5292,10 @@ pub(crate) fn surgically_strip_env_surfaces(
         }
     }
 
-    // 3. .claude/settings.json `env` block
-    let claude_settings = folder.join(".claude").join("settings.json");
-    if claude_settings.exists() {
-        match std::fs::read_to_string(&claude_settings) {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(mut v) => {
-                    if let Some(obj) = v.as_object_mut() {
-                        let removed = strip_canonical_keys_from_env_object(obj, "env");
-                        if !removed.is_empty() {
-                            // Drop empty env block so we don't leave
-                            // `"env": {}` behind — the bundle install's
-                            // merge writer will recreate it on the next
-                            // re-register.
-                            if obj.get("env").and_then(|x| x.as_object())
-                                .map(|o| o.is_empty()).unwrap_or(false)
-                            {
-                                // `shift_remove`: `remove` is `swap_remove`
-                                // under `preserve_order` and would move the
-                                // user's last top-level key into this slot.
-                                obj.shift_remove("env");
-                            }
-                            match serde_json::to_string_pretty(&v) {
-                                Ok(pretty) => {
-                                    if let Err(e) = std::fs::write(&claude_settings, pretty) {
-                                        warnings.push(format!(
-                                            "could not rewrite {}: {}",
-                                            claude_settings.display(), e
-                                        ));
-                                    } else {
-                                        for k in removed { keys.insert(k); }
-                                    }
-                                }
-                                Err(e) => warnings.push(format!(
-                                    "could not serialize {} after env-key strip: {}",
-                                    claude_settings.display(), e
-                                )),
-                            }
-                        }
-                    }
-                }
-                Err(e) => warnings.push(format!(
-                    "{} is not valid JSON ({}); leaving untouched on unregister",
-                    claude_settings.display(), e
-                )),
-            },
-            Err(e) => warnings.push(format!(
-                "could not read {} for env-key strip: {}",
-                claude_settings.display(), e
-            )),
-        }
-    }
-
-    // 4. .vscode/settings.json `claude-code.env` block
-    let vscode_settings = folder.join(".vscode").join("settings.json");
-    if vscode_settings.exists() {
-        match std::fs::read_to_string(&vscode_settings) {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(mut v) => {
-                    if let Some(obj) = v.as_object_mut() {
-                        let removed = strip_canonical_keys_from_env_object(
-                            obj, "claude-code.env",
-                        );
-                        if !removed.is_empty() {
-                            if obj.get("claude-code.env")
-                                .and_then(|x| x.as_object())
-                                .map(|o| o.is_empty()).unwrap_or(false)
-                            {
-                                // `shift_remove`: `remove` is `swap_remove`
-                                // under `preserve_order` and would move the
-                                // user's last top-level key into this slot.
-                                obj.shift_remove("claude-code.env");
-                            }
-                            match serde_json::to_string_pretty(&v) {
-                                Ok(pretty) => {
-                                    if let Err(e) = std::fs::write(&vscode_settings, pretty) {
-                                        warnings.push(format!(
-                                            "could not rewrite {}: {}",
-                                            vscode_settings.display(), e
-                                        ));
-                                    } else {
-                                        for k in removed { keys.insert(k); }
-                                    }
-                                }
-                                Err(e) => warnings.push(format!(
-                                    "could not serialize {} after env-key strip: {}",
-                                    vscode_settings.display(), e
-                                )),
-                            }
-                        }
-                    }
-                }
-                Err(e) => warnings.push(format!(
-                    "{} is not valid JSON ({}); leaving untouched on unregister",
-                    vscode_settings.display(), e
-                )),
-            },
-            Err(e) => warnings.push(format!(
-                "could not read {} for env-key strip: {}",
-                vscode_settings.display(), e
-            )),
-        }
-    }
+    // 3 + 4. `.claude/settings.json` `env` and `.vscode/settings.json`
+    //        `claude-code.env` — the ONE Python strip (v0.2.97 review F5).
+    let canonical: Vec<&str> = UNREGISTER_CANONICAL_ENV_KEYS.iter().copied().collect();
+    strip_json_env_surfaces(root, folder, &canonical, "env-key strip", &mut keys, &mut warnings);
 
     (keys.into_iter().collect(), warnings)
 }
@@ -5398,10 +5315,10 @@ pub(crate) fn surgically_strip_env_surfaces(
 ///   * `.claude/env`: lines matching `export <KEY>="..."` (active or
 ///     commented form) are removed. Outside-the-managed-block exports
 ///     follow the same rule.
-///   * `.claude/settings.json` `env` block: keys removed via
-///     deep-merge. Adjacent canonical / by-hand user keys at the same
-///     level survive.
-///   * `.vscode/settings.json` `claude-code.env` block: same.
+///   * `.claude/settings.json` `env` block and `.vscode/settings.json`
+///     `claude-code.env` block: keys removed by the ONE Python strip
+///     ([`strip_json_env_surfaces`]); adjacent canonical / by-hand user
+///     keys survive, JSONC is edited in place.
 ///
 /// Soft-fail discipline mirrors `surgically_strip_env_surfaces`. The
 /// keychain itself is NOT touched — that's the user's call to make
@@ -5413,6 +5330,7 @@ pub(crate) fn surgically_strip_env_surfaces(
 /// is sorted + de-duped across surfaces; the report layer dumps it
 /// into `keys_purged_from_env` alongside the canonical purge result.
 pub(crate) fn surgically_strip_user_secret_keys(
+    root: Option<&Path>,
     folder: &Path,
     keys: &[String],
 ) -> (Vec<String>, Vec<String>) {
@@ -5480,120 +5398,10 @@ pub(crate) fn surgically_strip_user_secret_keys(
         }
     }
 
-    // 3. .claude/settings.json `env` block
-    let claude_settings = folder.join(".claude").join("settings.json");
-    if claude_settings.exists() {
-        match std::fs::read_to_string(&claude_settings) {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(mut v) => {
-                    if let Some(obj) = v.as_object_mut() {
-                        let removed = strip_named_keys_from_env_object(obj, "env", &key_set);
-                        if !removed.is_empty() {
-                            if obj
-                                .get("env")
-                                .and_then(|x| x.as_object())
-                                .map(|o| o.is_empty())
-                                .unwrap_or(false)
-                            {
-                                // `shift_remove`: `remove` is `swap_remove`
-                                // under `preserve_order` and would move the
-                                // user's last top-level key into this slot.
-                                obj.shift_remove("env");
-                            }
-                            match serde_json::to_string_pretty(&v) {
-                                Ok(pretty) => {
-                                    if let Err(e) = std::fs::write(&claude_settings, pretty) {
-                                        warnings.push(format!(
-                                            "could not rewrite {} (user-secret strip): {}",
-                                            claude_settings.display(),
-                                            e
-                                        ));
-                                    } else {
-                                        for k in removed {
-                                            purged.insert(k);
-                                        }
-                                    }
-                                }
-                                Err(e) => warnings.push(format!(
-                                    "could not serialize {} after user-secret strip: {}",
-                                    claude_settings.display(),
-                                    e
-                                )),
-                            }
-                        }
-                    }
-                }
-                Err(e) => warnings.push(format!(
-                    "{} is not valid JSON ({}); skipping user-secret strip",
-                    claude_settings.display(),
-                    e
-                )),
-            },
-            Err(e) => warnings.push(format!(
-                "could not read {} for user-secret strip: {}",
-                claude_settings.display(),
-                e
-            )),
-        }
-    }
-
-    // 4. .vscode/settings.json `claude-code.env` block
-    let vscode_settings = folder.join(".vscode").join("settings.json");
-    if vscode_settings.exists() {
-        match std::fs::read_to_string(&vscode_settings) {
-            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                Ok(mut v) => {
-                    if let Some(obj) = v.as_object_mut() {
-                        let removed =
-                            strip_named_keys_from_env_object(obj, "claude-code.env", &key_set);
-                        if !removed.is_empty() {
-                            if obj
-                                .get("claude-code.env")
-                                .and_then(|x| x.as_object())
-                                .map(|o| o.is_empty())
-                                .unwrap_or(false)
-                            {
-                                // `shift_remove`: `remove` is `swap_remove`
-                                // under `preserve_order` and would move the
-                                // user's last top-level key into this slot.
-                                obj.shift_remove("claude-code.env");
-                            }
-                            match serde_json::to_string_pretty(&v) {
-                                Ok(pretty) => {
-                                    if let Err(e) = std::fs::write(&vscode_settings, pretty) {
-                                        warnings.push(format!(
-                                            "could not rewrite {} (user-secret strip): {}",
-                                            vscode_settings.display(),
-                                            e
-                                        ));
-                                    } else {
-                                        for k in removed {
-                                            purged.insert(k);
-                                        }
-                                    }
-                                }
-                                Err(e) => warnings.push(format!(
-                                    "could not serialize {} after user-secret strip: {}",
-                                    vscode_settings.display(),
-                                    e
-                                )),
-                            }
-                        }
-                    }
-                }
-                Err(e) => warnings.push(format!(
-                    "{} is not valid JSON ({}); skipping user-secret strip",
-                    vscode_settings.display(),
-                    e
-                )),
-            },
-            Err(e) => warnings.push(format!(
-                "could not read {} for user-secret strip: {}",
-                vscode_settings.display(),
-                e
-            )),
-        }
-    }
+    // 3 + 4. The two JSON env surfaces — the ONE Python strip (v0.2.97
+    //        review F5), same as the canonical strip above.
+    let names: Vec<&str> = keys.iter().map(String::as_str).collect();
+    strip_json_env_surfaces(root, folder, &names, "user-secret strip", &mut purged, &mut warnings);
 
     (purged.into_iter().collect(), warnings)
 }
@@ -5803,8 +5611,9 @@ pub async fn delete_project_v2(
             // delete those entries via the SecretsPanel before
             // unregistering.
             let user_keys = db.list_user_secret_keys_for_project(&row.id);
+            let vco_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
             let (user_keys_purged, user_strip_warnings) =
-                surgically_strip_user_secret_keys(folder, &user_keys);
+                surgically_strip_user_secret_keys(vco_root.as_deref(), folder, &user_keys);
             for k in user_keys_purged {
                 if !report.keys_purged_from_env.contains(&k) {
                     report.keys_purged_from_env.push(k);
@@ -5817,7 +5626,7 @@ pub async fn delete_project_v2(
             //     in UNREGISTER_PURGE_PATHS) gets stripped first; the
             //     subsequent file delete is a no-op for that file but
             //     leaves the strip's "keys removed" record intact.
-            let (keys, env_warnings) = surgically_strip_env_surfaces(folder);
+            let (keys, env_warnings) = surgically_strip_env_surfaces(vco_root.as_deref(), folder);
             for k in keys {
                 if !report.keys_purged_from_env.contains(&k) {
                     report.keys_purged_from_env.push(k);
@@ -9195,6 +9004,45 @@ mod tests {
         );
     }
 
+    /// v0.2.97 — the Rust side of `tests/fixtures/managed_block_merge_parity.json`.
+    /// `merge_claude_env_managed_block` is the one deliberate mirror of the
+    /// Python writer's `config_projection._merge_managed_block` (the unregister
+    /// strip splices with it). The Python test
+    /// `tests/test_v0297_managed_block_merge_parity.py` pins the SAME cases to
+    /// the SAME expected bytes, so a change on either side fails one of them.
+    #[test]
+    fn managed_block_merge_matches_the_shared_parity_fixture() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR must have two parents (repo layout)")
+            .to_path_buf();
+        let path = repo_root
+            .join("tests")
+            .join("fixtures")
+            .join("managed_block_merge_parity.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture parses");
+        assert_eq!(fixture["_format_version"], 1);
+        assert_eq!(fixture["begin_marker"], CLAUDE_ENV_MANAGED_BEGIN);
+        assert_eq!(fixture["end_marker"], CLAUDE_ENV_MANAGED_END);
+        let cases = fixture["cases"].as_array().expect("cases array");
+        assert!(cases.len() >= 10, "fixture has too few cases");
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("?");
+            let prior = case["prior"].as_str();
+            let managed = case["managed"].as_str().expect("managed is a string");
+            let expected = case["expected"].as_str().expect("expected is a string");
+            assert_eq!(
+                merge_claude_env_managed_block(prior, managed),
+                expected,
+                "case `{}` diverges from the Python writer",
+                name
+            );
+        }
+    }
+
     // ─── 2026-05-06 unregister keys / surgical purge ───────────────────
 
     /// Pin the canonical-key relationship: every key in the install
@@ -9352,43 +9200,80 @@ export USER_PROJECT_VAR=\"keep me\"
         assert!(removed_set.contains("VCT_INFRASTRUCTURE_DIR"));
     }
 
-    #[test]
-    fn strip_canonical_keys_from_env_object_preserves_user_keys() {
-        let mut parent = serde_json::Map::new();
-        parent.insert(
-            "env".to_string(),
-            serde_json::json!({
-                "KG_COLLECTION": "SomeProject_KnowledgeGraph",
-                "PROJECT_NAME": "SomeProject",
-                "USER_OPENAI_API_BASE": "https://internal.example.com",
-                "ACTIVE_EMBEDDING": "qwen3",
-            }),
-        );
-        let removed = strip_canonical_keys_from_env_object(&mut parent, "env");
-        let env = parent.get("env").unwrap().as_object().unwrap();
-
-        // Canonical gone.
-        assert!(!env.contains_key("KG_COLLECTION"));
-        assert!(!env.contains_key("PROJECT_NAME"));
-        assert!(!env.contains_key("ACTIVE_EMBEDDING"));
-        // User key intact.
-        assert_eq!(env["USER_OPENAI_API_BASE"], "https://internal.example.com");
-
-        let removed_set: std::collections::HashSet<String> =
-            removed.into_iter().collect();
-        assert!(removed_set.contains("KG_COLLECTION"));
-        assert!(removed_set.contains("PROJECT_NAME"));
-        assert!(removed_set.contains("ACTIVE_EMBEDDING"));
+    fn strip_test_folder(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-json-strip-{}-{}",
+            tag,
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
+        tmp
     }
 
+    /// v0.2.97 review F5 (act): the unregister strip goes through the ONE
+    /// Python strip, so a JSONC `.vscode/settings.json` — VS Code's own
+    /// format — has its canonical keys removed IN PLACE, comments and user
+    /// keys kept. The Rust copy refused such a file with a warning and the
+    /// key names survived the unregister.
     #[test]
-    fn strip_canonical_keys_from_env_object_missing_block_is_noop() {
-        let mut parent = serde_json::Map::new();
-        parent.insert("other_key".to_string(), serde_json::json!("value"));
+    fn unregister_strip_edits_a_jsonc_vscode_settings_in_place() {
+        let tmp = strip_test_folder("jsonc");
+        let vscode = tmp.join(".vscode/settings.json");
+        std::fs::write(
+            &vscode,
+            "{\n    // the team's settings\n    \"editor.formatOnSave\": true,\n    \"claude-code.env\": {\n        \"KG_COLLECTION\": \"P_KnowledgeGraph\",\n        \"USER_KEY\": \"mine\", // keep\n    },\n}\n",
+        )
+        .unwrap();
 
-        let removed = strip_canonical_keys_from_env_object(&mut parent, "env");
-        assert!(removed.is_empty());
-        assert_eq!(parent["other_key"], "value");
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+
+        assert!(warnings.is_empty(), "warnings: {:?}", warnings);
+        assert_eq!(keys, vec!["KG_COLLECTION".to_string()]);
+        let after = std::fs::read_to_string(&vscode).unwrap();
+        assert!(after.contains("// the team's settings") && after.contains("// keep"), "{}", after);
+        assert!(after.contains("\"USER_KEY\": \"mine\"") && !after.contains("KG_COLLECTION"), "{}", after);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Leave-alone: no env block (or none of the keys) → the file is not
+    /// rewritten at all, byte-for-byte; a missing file is not created.
+    #[test]
+    fn unregister_strip_without_an_env_block_leaves_the_file_byte_identical() {
+        let tmp = strip_test_folder("noenv");
+        let settings = tmp.join(".claude/settings.json");
+        let original = "{\"hooks\":{\"Stop\":[]},\"permissions\":{\"allow\":[]}}";
+        std::fs::write(&settings, original).unwrap();
+
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+
+        assert!(keys.is_empty() && warnings.is_empty(), "{:?} {:?}", keys, warnings);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+        assert!(!tmp.join(".vscode/settings.json").exists(), "a strip never creates a file");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Leave-alone: an unreadable settings.json is refused — byte-identical,
+    /// a warning naming it, and the same `settings_write_refused_*` deferral
+    /// every other env writer records.
+    #[test]
+    fn unregister_strip_refuses_an_unreadable_settings_json() {
+        let tmp = strip_test_folder("broken");
+        let settings = tmp.join(".claude/settings.json");
+        let original = "{\"env\": {\"KG_COLLECTION\": \"x\"},, }";
+        std::fs::write(&settings, original).unwrap();
+
+        let (_keys, warnings) = surgically_strip_user_secret_keys(None, &tmp, &["KG_COLLECTION".to_string()]);
+
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+        assert!(
+            warnings.iter().any(|w| w.contains("left untouched") && w.contains("NOT updated")),
+            "{:?}",
+            warnings
+        );
+        let ledger = std::fs::read_to_string(tmp.join(".claude/context/UPDATE_DEFERRED.json")).unwrap();
+        assert!(ledger.contains("settings_write_refused_claude_settings_json"));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `test_unregister_default_purges_hooks_scripts_compose_keeps_agents_skills`
@@ -9441,7 +9326,7 @@ export USER_PROJECT_VAR=\"keep me\"
         ).unwrap();
 
         // Run both purges (separately — drives identical to delete_project_v2).
-        let (keys_purged, env_warnings) = surgically_strip_env_surfaces(&tmp);
+        let (keys_purged, env_warnings) = surgically_strip_env_surfaces(None, &tmp);
         let (files_purged, file_warnings) = purge_launcher_files_from_project(&tmp);
 
         // No warnings on a clean folder.
@@ -9543,7 +9428,7 @@ export MY_HELPER_TOKEN=\"keep-me\"
         std::fs::write(tmp.join(".claude/env"), original).unwrap();
 
         // Run the unregister env-strip path.
-        let (keys_purged, warnings) = surgically_strip_env_surfaces(&tmp);
+        let (keys_purged, warnings) = surgically_strip_env_surfaces(None, &tmp);
         assert!(warnings.is_empty(), "warnings: {:?}", warnings);
         // Canonical keys reported as removed (they were inside the block,
         // and the block excision is what carries them off — strip_canonical
@@ -9658,7 +9543,7 @@ USER_DB_URL=postgres://user:pass@db/app
 ";
         std::fs::write(tmp.join(".env"), env_text).unwrap();
 
-        let (keys, warnings) = surgically_strip_env_surfaces(&tmp);
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
         assert!(warnings.is_empty());
 
         let after = std::fs::read_to_string(tmp.join(".env")).unwrap();
@@ -9721,14 +9606,14 @@ USER_DB_URL=postgres://user:pass@db/app
             "KG_COLLECTION=X_KnowledgeGraph\nUSER_KEY=keep\n").unwrap();
 
         // First run: should remove.
-        let (keys1, w1a) = surgically_strip_env_surfaces(&tmp);
+        let (keys1, w1a) = surgically_strip_env_surfaces(None, &tmp);
         let (files1, w1b) = purge_launcher_files_from_project(&tmp);
         assert!(w1a.is_empty() && w1b.is_empty());
         assert!(!keys1.is_empty());
         assert!(!files1.is_empty());
 
         // Second run: nothing left to remove.
-        let (keys2, w2a) = surgically_strip_env_surfaces(&tmp);
+        let (keys2, w2a) = surgically_strip_env_surfaces(None, &tmp);
         let (files2, w2b) = purge_launcher_files_from_project(&tmp);
         assert!(w2a.is_empty(), "second-run env warnings: {:?}", w2a);
         assert!(w2b.is_empty(), "second-run file warnings: {:?}", w2b);
@@ -9798,7 +9683,7 @@ USER_DB_URL=postgres://user:pass@db/app
             "vct-unreg-missing-{}", uuid::Uuid::new_v4().simple()
         ));
         // Don't create it.
-        let (keys, w_env) = surgically_strip_env_surfaces(&tmp);
+        let (keys, w_env) = surgically_strip_env_surfaces(None, &tmp);
         let (files, w_file) = purge_launcher_files_from_project(&tmp);
         assert!(keys.is_empty());
         assert!(files.is_empty());
@@ -10130,7 +10015,7 @@ export BY_HAND_KEY=\"user_typed\"
         // Strip ONLY the user-secret KEY name. Canonical + by-hand
         // keys must survive (the canonical strip runs separately).
         let user_keys = vec!["USER_SECRET_FROM_GUI".to_string()];
-        let (purged, warnings) = surgically_strip_user_secret_keys(&tmp, &user_keys);
+        let (purged, warnings) = surgically_strip_user_secret_keys(None, &tmp, &user_keys);
         assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
         assert_eq!(purged, vec!["USER_SECRET_FROM_GUI".to_string()]);
 
@@ -10177,7 +10062,7 @@ export BY_HAND_KEY=\"user_typed\"
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let (purged, warnings) = surgically_strip_user_secret_keys(&tmp, &[]);
+        let (purged, warnings) = surgically_strip_user_secret_keys(None, &tmp, &[]);
         assert!(purged.is_empty());
         assert!(warnings.is_empty());
         std::fs::remove_dir_all(&tmp).ok();

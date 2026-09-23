@@ -222,6 +222,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -474,12 +475,21 @@ class ProjectEnvBundle(TypedDict):
     JSON surfaces, and their absence is not a signal to strip anything (the
     shell block is rebuilt wholesale, so a removed key simply stops being
     emitted). Absent or empty ⇒ nothing extra is written.
+
+    ``user_secret_known_keys`` (v0.2.97, optional) — every KEY the launcher
+    knows as a user secret for this project (per-project + shared + global
+    buckets, :func:`_fetch_user_secret_known_keys`). Pre-v0.2.73 launchers
+    wrote the VALUES of exactly these keys into the JSON env blocks; every
+    :func:`apply_project_env` removes them again (the secrets stay in the
+    keychain), which is what makes the ``user_secret_values_retained_in_tree``
+    deferral's "the next refresh removes them" true.
     """
 
     canonical_env: dict[str, str]
     project_id: str
     project_root: Path
     shell_defaulted_env: NotRequired[dict[str, str]]
+    user_secret_known_keys: NotRequired[list[str]]
 
 
 class UserSecretBundle(TypedDict):
@@ -2209,6 +2219,9 @@ def project_env_from_db(
                 code_graph_project = canonical_class_prefix(proj.name)
             except ValueError:
                 code_graph_project = sanitized
+        # v0.2.97: the keys whose pre-v0.2.73 in-tree VALUES every apply
+        # removes (see ProjectEnvBundle.user_secret_known_keys).
+        user_secret_known_keys = _fetch_user_secret_known_keys(conn, project_id)
     finally:
         try:
             conn.close()
@@ -2389,14 +2402,12 @@ def project_env_from_db(
         # VCT_CODE_GRAPH_ACCESS_LIST (signal-to-remove on apply).
         _set("VCT_DIAGRAMS_ACCESS_LIST", ",".join(diagram_access))
 
-    # GITHUB_TOKEN intentionally NOT resolved here. The Rust resolver
-    # pulls it from the OS keychain with active-flag gating; replicating
-    # that lifecycle from Python would require a keychain bridge that
-    # doesn't exist yet. Production callers that need GITHUB_TOKEN
-    # should pass it as a future explicit kwarg; today the keychain
-    # path stays Rust-owned and config_projection emits no value for
-    # this key (matching the "keychain empty / paused" omit behaviour
-    # the Rust resolver already documents).
+    # GITHUB_TOKEN is never resolved here, by design: since v0.2.73 VCO
+    # writes no secret value into a project (consumers resolve the PAT at
+    # need through the hub — the "Secrets" section of
+    # templates/ORCHESTRATOR-CLAUDE.md.template). It stays in the
+    # canonical set so every apply REMOVES a GITHUB_TOKEN a pre-v0.2.73
+    # writer left in `.claude/settings.json` env (signal-to-remove).
 
     # v0.2.91 WP-L (decision #21): the diagnostic log level rides the
     # shell-defaulted channel, NOT `canonical_env` — see
@@ -2412,6 +2423,7 @@ def project_env_from_db(
         "project_id": project_id,
         "project_root": Path(proj.folder_path),
         "shell_defaulted_env": shell_defaulted,
+        "user_secret_known_keys": user_secret_known_keys,
     }
 
 
@@ -2626,28 +2638,23 @@ def _read_managed_env_canonical_value(path: Path, key: str) -> Optional[str]:
     Returns the unescaped string value when a matching export line exists
     inside the BEGIN/END managed block; ``None`` otherwise. Soft-fail:
     missing file / no marker / no matching line → ``None``.
+
+    The parse is the ONE managed-block reader,
+    :func:`vco_lib.envfile.env_value` with the block markers (v0.2.97 — this
+    was a second parser that disagreed with it on ``\\"``); this function
+    only binds the file and the markers.
     """
+    from vco_lib.envfile import env_value
+
     if not path.exists():
         return None
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, ValueError):  # ValueError: a non-UTF-8 file (v0.2.97)
         return None
-    begin_idx = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-    if begin_idx == -1:
-        return None
-    end_off = text[begin_idx:].find(CLAUDE_ENV_MANAGED_END)
-    if end_off == -1:
-        return None
-    block_text = text[begin_idx: begin_idx + end_off]
-    prefix = f'export {key}="'
-    for line in block_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(prefix) and stripped.endswith('"'):
-            raw = stripped[len(prefix): -1]
-            # Reverse the writer's only escape (`"` → `\"`).
-            return raw.replace('\\"', '"')
-    return None
+    return env_value(
+        text, key, begin_marker=CLAUDE_ENV_MANAGED_BEGIN, end_marker=CLAUDE_ENV_MANAGED_END,
+    )
 
 
 def _emit_repoint_audit_rows(
@@ -2787,7 +2794,13 @@ def apply_project_env(
     # solely to stay byte-parallel with the Rust helpers, which the
     # Rust production caller also feeds an always-empty emit set).
     us_pairs: list[tuple[str, str]] = []
-    us_strip_keys: list[str] = []
+    # v0.2.97: by default every apply strips the launcher-known user-secret
+    # keys from the JSON env blocks — the in-tree VALUES a pre-v0.2.73 writer
+    # left there (``user_secret_values_retained_in_tree``). The secrets stay
+    # in the keychain; only the copies in committable files go.
+    known_secret_keys = list(bundle.get("user_secret_known_keys") or [])
+    us_strip_keys: list[str] = list(known_secret_keys)
+    residue_before = retained_user_secret_values(project_root, known_keys=known_secret_keys)
     if user_secret_bundle is not None:
         if list(user_secret_bundle.get("user_secret_pairs") or []):
             raise ConfigProjectionError(
@@ -2840,15 +2853,167 @@ def apply_project_env(
         if keys is not None:
             report[_SURFACE_VSCODE_SETTINGS] = keys
 
+    # v0.2.97: `.vscode/settings.json` is not a default surface, but a
+    # pre-PR-27 (v0.2.12) launcher wrote its `claude-code.env` block too. When
+    # a known secret VALUE is still there, strip it through the same editor
+    # (never creates the file; refuses — and records — one it cannot edit).
+    if (
+        _SURFACE_VSCODE_SETTINGS not in surfaces_seq
+        and residue_before.get(".vscode/settings.json")
+    ):
+        try:
+            strip_env_keys(
+                project_root, _SURFACE_VSCODE_SETTINGS,
+                sorted(set(known_secret_keys) | _LEGACY_SECRET_ENV_KEYS),
+            )
+        except SettingsWriteRefused as exc:
+            refusals.extend(exc.refusals)
+
     # v0.2.84 D2 (P2): emit a `dev_collection_env_repointed` audit row for
     # each audited key whose existing on-disk value the write just changed
     # (old != new, old non-empty). Runs AFTER the surface writes so the
     # audit reflects a completed repoint. Best-effort — never raises.
     _emit_repoint_audit_rows(project_root, old_repoint_values, env)
+    _record_secret_value_scrubs(project_root, residue_before, known_secret_keys)
 
     if refusals:
         raise SettingsWriteRefused(refusals)
     return report
+
+
+# ─── Pre-v0.2.73 in-tree user-secret VALUES ─────────────────────────────
+#
+# ``user_secret_values_retained_in_tree`` (a bundle-update deferral owned by
+# ``vco_lib.project_init``) tells the user the next env refresh removes these
+# values. v0.2.97 made that true: ONE detection (below), used by the deferral's
+# emitter and its reconciler, and the SAME set stripped by every
+# :func:`apply_project_env`.
+
+#: VCO-written whenever the shared PAT was set: it reached every project's env
+#: surfaces as this key. Canonical, so every apply already removes it from
+#: ``.claude/settings.json``; listed here so detection and the ``.vscode``
+#: scrub cover it too.
+_LEGACY_SECRET_ENV_KEYS: frozenset[str] = frozenset({"GITHUB_TOKEN"})
+
+_RETAINED_SECRET_CID = "user_secret_values_retained_in_tree"
+
+#: The env surfaces a pre-v0.2.73 writer put secret values in.
+_RETAINED_SECRET_SURFACES: tuple[str, ...] = (
+    ".claude/env", ".claude/settings.json", ".vscode/settings.json",
+)
+
+#: ``export KEY="value"`` inside the ``.claude/env`` managed block — the shape
+#: the projection writer emits. Only ``bool(value)`` is ever used.
+_MANAGED_EXPORT_RE = re.compile(
+    r'^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"', re.MULTILINE,
+)
+
+
+def retained_secret_keys_in(path: Path, known_keys: Iterable[str] = ()) -> list[str]:
+    """NAMES of secret VALUES a pre-v0.2.73 VCO writer left in one env surface.
+
+    * ``.claude/env`` (file name ``env``): a secret-SHAPED key
+      (:func:`vco_lib.secrets_audit.is_secret_shaped_env_key`) exported with a
+      non-empty value inside the managed block — that block is VCO's alone and
+      every apply rebuilds it from the canonical env.
+    * ``.claude/settings.json`` ``env`` / ``.vscode/settings.json``
+      ``claude-code.env``: a key in ``known_keys`` (the launcher's user
+      secrets) or ``GITHUB_TOKEN`` with a non-empty string value — the keys a
+      pre-v0.2.73 writer put there. A secret-shaped key the launcher does NOT
+      know is the user's own; VCO never wrote it and never removes it, so it is
+      not reported. JSONC is read.
+
+    Never reads out a value (only whether one is present). Soft: ``[]`` for a
+    missing or unreadable file.
+    """
+    if not path.is_file():
+        return []
+    if path.name == "env":
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return []
+        begin, end = text.find(CLAUDE_ENV_MANAGED_BEGIN), text.find(CLAUDE_ENV_MANAGED_END)
+        if begin == -1 or end == -1:
+            return []
+        from vco_lib.secrets_audit import is_secret_shaped_env_key
+
+        return sorted({
+            key for key, value in _MANAGED_EXPORT_RE.findall(text[begin:end])
+            if value and is_secret_shaped_env_key(key)
+        })
+    env_key = "claude-code.env" if path.parent.name == ".vscode" else "env"
+    loaded = jsonc_edit.load_object(path)
+    block = loaded[0].get(env_key) if loaded is not None else None
+    if not isinstance(block, dict):
+        return []
+    owned = set(known_keys) | _LEGACY_SECRET_ENV_KEYS
+    return sorted(k for k, v in block.items() if k in owned and isinstance(v, str) and v)
+
+
+def known_user_secret_keys_for_folder(folder: Path) -> list[str]:
+    """The launcher-known user-secret keys of the project registered at
+    ``folder``; ``[]`` when there is no launcher DB or the folder is not a
+    registered project (there is then no refresh to run either)."""
+    from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+
+    db_path = _resolve_launcher_db_path()
+    if not db_path.is_file():
+        return []
+    project_id = resolve_project_id_for_folder(Path(folder), db_path=db_path)
+    if not project_id:
+        return []
+    try:
+        return user_secret_known_keys_from_db(project_id, db_path=db_path)
+    except (DbUnreachable, sqlite3.Error):
+        return []
+
+
+def retained_user_secret_values(
+    folder: Path, *, known_keys: Optional[Iterable[str]] = None,
+) -> dict[str, list[str]]:
+    """``{surface: [key NAMES]}`` of pre-v0.2.73 secret values still in the
+    project's env surfaces (:func:`retained_secret_keys_in`); empty when clean.
+
+    The ONE detection behind ``user_secret_values_retained_in_tree`` — its
+    emitter and its bundle reconciler call this, and :func:`apply_project_env`
+    strips exactly this set, so the entry cannot promise a removal the
+    refresh does not perform. ``known_keys`` defaults to the launcher DB's.
+    """
+    known = (
+        known_user_secret_keys_for_folder(folder)
+        if known_keys is None else list(known_keys)
+    )
+    found: dict[str, list[str]] = {}
+    for rel in _RETAINED_SECRET_SURFACES:
+        names = retained_secret_keys_in(Path(folder) / rel, known)
+        if names:
+            found[rel] = names
+    return found
+
+
+def _record_secret_value_scrubs(
+    project_root: Path, before: Mapping[str, list[str]], known_keys: list[str],
+) -> None:
+    """Trail each value this apply removed (key NAME only, never the value)
+    and clear ``user_secret_values_retained_in_tree`` once nothing remains.
+    Best-effort: observability never fails a write that already landed."""
+    try:
+        from vco_lib.deferral_emit import record_auto_resolution, resolve_conditions
+        from vco_lib.deferral_report import DeferralReport
+
+        after = retained_user_secret_values(project_root, known_keys=known_keys)
+        for rel, names in before.items():
+            for name in sorted(set(names) - set(after.get(rel, []))):
+                record_auto_resolution(
+                    project_root, _RETAINED_SECRET_CID, "scrubbed_user_secret_value",
+                    f"removed the in-tree value of {name} from {rel}; the secret "
+                    "itself stays in the keychain",
+                )
+        if not after and DeferralReport.read(project_root).has_condition(_RETAINED_SECRET_CID):
+            resolve_conditions(project_root, [_RETAINED_SECRET_CID])
+    except Exception:  # noqa: BLE001 — trail + ledger are observability
+        pass
 
 
 # ─── Update-time migration: re-project ALL registered projects ──────────
@@ -3287,7 +3452,7 @@ def _user_secret_apply_claude_env(
 def _write_json_env_block(
     path: Path,
     canonical_env: Mapping[str, str],
-    canonical_keys: set[str],
+    canonical_keys: Iterable[str],
     *,
     env_key: str,
     user_secret_pairs: Iterable[tuple[str, str]] | None = None,
@@ -3484,9 +3649,15 @@ def write_env_block(
 
     The ONE implementation of a surgical env-block edit, for writers that own
     a key set outside the canonical projection — the launcher's module-
-    deprecation keys (``module_deprecation.rs`` calls it through the
+    deprecation keys and the orchestrator root's MCP-setting keys
+    (``module_deprecation.rs`` / ``dashboard.rs`` call it through the
     ``write-env-block`` CLI instead of carrying a second, Rust, copy). Same
     read-merge-write, JSONC handling and refusal as :func:`apply_project_env`.
+    Its removal-only twin is :func:`strip_env_keys`.
+
+    Keys new to the block are appended in ``values`` order, then
+    ``owned_keys`` order — never in set-iteration order, which would vary
+    with the interpreter's hash seed from one run to the next.
 
     Raises:
         ConfigProjectionError: an unknown surface, a value that is not a
@@ -3505,16 +3676,69 @@ def write_env_block(
     if not all(isinstance(v, str) for v in values.values()):
         raise ConfigProjectionError("every value must be a string")
     rel, env_key = _JSON_SURFACE_FILES[surface]
+    ordered = list(dict.fromkeys([*values, *owned_keys]))
     refusals: list[settings_refusal.Refusal] = []
     written = _write_json_surface(
         project_folder, surface, refusals, None,
         lambda: _write_json_env_block(
-            project_folder / rel, values, owned, env_key=env_key,
+            project_folder / rel, values, ordered, env_key=env_key,
         ),
     )
     if refusals:
         raise SettingsWriteRefused(refusals)
     return written
+
+
+def strip_env_keys(
+    project_folder: Path, surface: str, keys: Iterable[str],
+) -> list[str]:
+    """Remove ``keys`` from one JSON surface's env block; nothing else.
+
+    The removal-only twin of :func:`write_env_block`, for the launcher's
+    unregister strips (canonical keys, and a project's user-secret KEY
+    names — ``projects_v2.rs`` calls it through the ``strip-env-keys`` CLI).
+    Unlike a write it never CREATES anything: a missing file, a missing env
+    block, or an env block holding none of ``keys`` is left alone and costs
+    no write. An env block the strip empties is removed, so no ``"env": {}``
+    is left behind. JSONC is edited in place; a file that cannot be edited
+    safely is refused and recorded exactly as a write would be.
+
+    Returns the sorted keys actually removed.
+
+    Raises:
+        ConfigProjectionError: an unknown surface.
+        SettingsWriteRefused: as :func:`write_env_block`.
+    """
+    if surface not in _JSON_SURFACE_FILES:
+        raise ConfigProjectionError(
+            f"unknown JSON surface {surface!r}; valid: {sorted(_JSON_SURFACE_FILES)}"
+        )
+    rel, env_key = _JSON_SURFACE_FILES[surface]
+    path = project_folder / rel
+    if not path.exists():
+        return []
+
+    def _strip() -> list[str]:
+        root, jsonc_text = _read_json_env_root(path)
+        block = root.get(env_key)
+        if not isinstance(block, dict):
+            return []
+        removed = sorted(k for k in dict.fromkeys(keys) if k in block)
+        if not removed:
+            return []
+        remaining = {k: v for k, v in block.items() if k not in removed}
+        if remaining:
+            root[env_key] = remaining
+        else:
+            del root[env_key]
+        _atomic_write_text(path, _serialise_json_env_root(path, root, jsonc_text))
+        return removed
+
+    refusals: list[settings_refusal.Refusal] = []
+    removed = _write_json_surface(project_folder, surface, refusals, None, _strip)
+    if refusals:
+        raise SettingsWriteRefused(refusals)
+    return removed
 
 
 def _write_shell_env_managed_block(
@@ -3839,6 +4063,32 @@ def _cli_write_env_block(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_strip_env_keys(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection strip-env-keys``.
+
+    stdin: ``{"keys": [KEY, ...]}``. Same one-JSON-object stdout contract and
+    exit codes as ``write-env-block`` (0 done, 2 bad request, 4 refused or
+    failed); success reports ``removed``.
+    """
+    try:
+        request = json.loads(sys.stdin.read() or "{}")
+        keys = request.get("keys") if isinstance(request, dict) else None
+        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+            raise ConfigProjectionError('stdin must be {"keys": ["KEY", ...]}')
+        removed = strip_env_keys(Path(args.project_folder), args.surface, keys)
+    except SettingsWriteRefused as exc:
+        print(json.dumps({"ok": False, **_refused_payload(exc)}))
+        return 4
+    except (ConfigProjectionError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": "bad_request", "message": str(exc)}))
+        return 2
+    except OSError as exc:
+        print(json.dumps({"ok": False, "error": "write_failed", "message": str(exc)}))
+        return 4
+    print(json.dumps({"ok": True, "surface": args.surface, "removed": removed}))
+    return 0
+
+
 def _cli_list_keys(args: argparse.Namespace) -> int:
     """``python -m vco_lib.config_projection list-keys --json``."""
     keys = sorted(list_canonical_keys())
@@ -4160,6 +4410,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_block.set_defaults(handler=_cli_write_env_block)
 
+    # v0.2.97: its removal-only twin, for the launcher's unregister strips.
+    p_strip = sub.add_parser(
+        "strip-env-keys",
+        help="remove keys from one JSON surface's env block (request JSON on "
+             "stdin; never creates a file; refuses one it cannot safely edit)",
+    )
+    p_strip.add_argument("--project-folder", required=True)
+    p_strip.add_argument(
+        "--surface", default=_SURFACE_CLAUDE_SETTINGS,
+        choices=sorted(_JSON_SURFACE_FILES),
+    )
+    p_strip.set_defaults(handler=_cli_strip_env_keys)
+
     return p
 
 
@@ -4269,11 +4532,15 @@ __all__ = [
     "apply_project_env",
     "apply_user_secrets",
     "build_apply_argv",
+    "known_user_secret_keys_for_folder",
     "list_canonical_keys",
     "list_registered_projects",
     "project_env_from_db",
     "reproject_all_registered_projects",
     "resolve_project_folder",
+    "retained_secret_keys_in",
+    "retained_user_secret_values",
+    "strip_env_keys",
     "user_secret_known_keys_from_db",
     "write_env_block",
 ]

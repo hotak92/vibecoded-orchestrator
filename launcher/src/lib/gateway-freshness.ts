@@ -140,18 +140,39 @@ export function createFreshnessController(deps: {
 }) {
   const { invoke, storage, set, get } = deps;
 
+  // Single-flight (review R1 F3): the launcher-start timer and an update that
+  // finishes meanwhile can both ask. A second caller shares the pending check
+  // instead of starting its own, and an answer that lands while the modal is
+  // up, restarting, or showing a result is DROPPED — before this, a late check
+  // reset `restarting`/`result`, re-enabled Continue mid-restart, and a second
+  // click restarted the gateway twice.
+  let pendingCheck: Promise<void> | null = null;
+
+  function decisionInProgress(state: FreshnessState): boolean {
+    return state.open || state.restarting || state.result !== null;
+  }
+
   /** Ask the backend. Never restarts anything. A failed check shows nothing. */
-  async function check(): Promise<void> {
-    if (get().open) return; // a modal already up is not replaced mid-decision
-    let report: GatewayFreshnessReport | null = null;
-    try {
-      report = await invoke<GatewayFreshnessReport>('model_gateway_freshness');
-    } catch (e) {
-      console.warn('[gateway-freshness] check failed:', e);
-      report = null;
-    }
-    const open = shouldOfferRestart(report, readDismissed(storage));
-    set({ ...INITIAL_FRESHNESS_STATE, report, open });
+  function check(): Promise<void> {
+    if (pendingCheck) return pendingCheck;
+    pendingCheck = (async () => {
+      // A modal already up is never replaced mid-decision.
+      if (decisionInProgress(get())) return;
+      let report: GatewayFreshnessReport | null = null;
+      try {
+        report = await invoke<GatewayFreshnessReport>('model_gateway_freshness');
+      } catch (e) {
+        console.warn('[gateway-freshness] check failed:', e);
+        report = null;
+      }
+      // Re-read AFTER the await: the state may have moved on while we waited.
+      if (decisionInProgress(get())) return;
+      const open = shouldOfferRestart(report, readDismissed(storage));
+      set({ ...INITIAL_FRESHNESS_STATE, report, open });
+    })().finally(() => {
+      pendingCheck = null;
+    });
+    return pendingCheck;
   }
 
   /** Continue: the ONLY path that restarts the gateway. */
@@ -180,4 +201,27 @@ export function createFreshnessController(deps: {
   }
 
   return { check, continueRestart, dismiss };
+}
+
+/** How long after launcher start the first check runs (boot probes first). */
+export const STARTUP_CHECK_DELAY_MS = 4000;
+
+/** Timer surface, so the schedule is testable with fake timers. */
+export interface TimerApi {
+  setTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
+}
+
+/**
+ * Arm the launcher-start check and return its cancel (review R1 F15). The
+ * layout calls the cancel on teardown, so a remount (HMR, a dev reload) never
+ * piles up checks from windows that no longer exist.
+ */
+export function scheduleStartupCheck(
+  check: () => unknown,
+  timers: TimerApi = { setTimeout, clearTimeout },
+  delayMs: number = STARTUP_CHECK_DELAY_MS,
+): () => void {
+  const handle = timers.setTimeout(() => void check(), delayMs);
+  return () => timers.clearTimeout(handle);
 }

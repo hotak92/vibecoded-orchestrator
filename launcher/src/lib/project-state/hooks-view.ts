@@ -92,7 +92,9 @@ export function settingsErrorBanner(
     case 'missing':
       return `${settingsPath} does not exist yet, so there is nothing to wire hooks into. Run the project's bundle install (Settings → Update bundle) first.`;
     case 'unparseable':
-      return `${settingsPath} is not valid JSON, so the launcher will not edit it — a rewrite could destroy what is there. Fix the file by hand and reload. Nothing was written.`;
+      return `${settingsPath} is not valid JSON or JSONC, so the launcher will not edit it — a rewrite could destroy what is there. Fix the file by hand and reload. Nothing was written.`;
+    case 'jsonc_edit_refused':
+      return `${settingsPath} has comments or trailing commas, and this change could not be made in place without risking them — a rewrite could destroy what is there. Edit it by hand, or remove the comments, and reload. Nothing was written; the project's UPDATE_DEFERRED.md names the file too.`;
     case 'hooks_block_malformed':
       return `The \`hooks\` block in ${settingsPath} has a shape the launcher cannot edit safely. Fix it by hand and reload. Nothing was written.`;
     case 'no_python':

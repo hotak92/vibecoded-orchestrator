@@ -55,7 +55,7 @@ def project_with_secret_in_settings(tmp_path: Path) -> Path:
     settings = {
         "env": {
             "KG_COLLECTION": "Test_KnowledgeGraph",
-            "STALE_SECRET": "synthetic-secret-value-in-settings",
+            "GITHUB_TOKEN": "synthetic-secret-value-in-settings",  # v0.2.97: a key VCO wrote
         }
     }
     (claude_dir / "settings.json").write_text(json.dumps(settings, indent=2))

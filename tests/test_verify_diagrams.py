@@ -145,19 +145,23 @@ def project_folder(tmp_path) -> Path:
     (folder / ".claude" / "settings.json").write_text(
         json.dumps(settings), encoding="utf-8"
     )
-    # .claude/env shell file
+    # .claude/env — the managed block, rendered by the projection's OWN
+    # block builder (what `apply` writes), with a user line outside it.
+    from vco_lib.config_projection import _build_managed_block
+
     (folder / ".claude" / "env").write_text(
-        "KG_COLLECTION=Demo_KnowledgeGraph\n"
-        "DIAGRAMS_COLLECTION=Demo_Diagrams\n"
-        "VCT_DIAGRAMS_ACCESS_LIST=\n",
-        encoding="utf-8",
-    )
-    # .vscode/settings.json
-    vscode = {
-        "claude-code.env": {
+        'export MY_OWN="kept"\n' + _build_managed_block({
             "KG_COLLECTION": "Demo_KnowledgeGraph",
             "DIAGRAMS_COLLECTION": "Demo_Diagrams",
             "VCT_DIAGRAMS_ACCESS_LIST": "",
+        }),
+        encoding="utf-8",
+    )
+    # .vscode/settings.json — NOT a surface `apply` writes by default; left
+    # deliberately stale so every env test also proves it is not compared.
+    vscode = {
+        "claude-code.env": {
+            "KG_COLLECTION": "Acme_KnowledgeGraph",
         }
     }
     (folder / ".vscode" / "settings.json").write_text(
@@ -445,119 +449,203 @@ def test_env_projection_happy(monkeypatch, project_folder):
     assert result.status == vd.STATUS_OK
 
 
+_DIAG_ENV = {
+    "KG_COLLECTION": "Demo_KnowledgeGraph",
+    "DIAGRAMS_COLLECTION": "Demo_Diagrams",
+    "VCT_DIAGRAMS_ACCESS_LIST": "",
+}
+
+
+def _stub_env(monkeypatch, env=None):
+    monkeypatch.setattr(vd, "_project_env_from_db", lambda _pid: dict(env or _DIAG_ENV))
+
+
+def _edit_settings_env(project_folder, **changes):
+    path = project_folder / ".claude" / "settings.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for key, value in changes.items():
+        if value is None:
+            data["env"].pop(key, None)
+        else:
+            data["env"][key] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _as_jsonc(path: Path) -> None:
+    text = path.read_text(encoding="utf-8").rstrip()
+    path.write_text("// my note\n" + text[:-1].rstrip() + ",\n}\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_env_projection_missing_key(monkeypatch, project_folder):
-    # Strip DIAGRAMS_COLLECTION from .vscode/settings.json
-    vscode = {"claude-code.env": {"KG_COLLECTION": "Demo_KnowledgeGraph"}}
-    (project_folder / ".vscode" / "settings.json").write_text(
-        json.dumps(vscode), encoding="utf-8"
-    )
-    monkeypatch.setattr(
-        vd, "_project_env_from_db",
-        lambda _pid: {
-            "KG_COLLECTION": "Demo_KnowledgeGraph",
-            "DIAGRAMS_COLLECTION": "Demo_Diagrams",
-            "VCT_DIAGRAMS_ACCESS_LIST": "",
-        },
-    )
+    """ACT: a diagrams key missing from an applied surface is drift."""
+    _edit_settings_env(project_folder, DIAGRAMS_COLLECTION=None)
+    _stub_env(monkeypatch)
     result = vd._check_env_projection("p-1", project_folder, fix=False)
     assert result.status == vd.STATUS_FAIL
-    assert "DIAGRAMS_COLLECTION" in result.detail
+    assert "DIAGRAMS_COLLECTION on .claude/settings.json" in result.detail
+
+
+def test_env_projection_ignores_the_vscode_surface(monkeypatch, project_folder):
+    """LEAVE-ALONE (v0.2.97): ``apply`` does not write ``.vscode/settings.json``
+    by default, so its content is not evidence. RED before: the fixture's
+    stale VS Code block (and a project with none at all) was FAIL forever."""
+    _stub_env(monkeypatch)
+    result = vd._check_env_projection("p-1", project_folder, fix=False)
+    assert result.status == vd.STATUS_OK, result.detail
+    (project_folder / ".vscode" / "settings.json").unlink()
+    assert vd._check_env_projection("p-1", project_folder, fix=False).status == vd.STATUS_OK
+
+
+def test_env_projection_reads_a_jsonc_settings_file(monkeypatch, project_folder):
+    """JSONC (v0.2.97). RED before: the strict reader read it as empty and
+    reported every key as drift; the two hook checks said "cannot parse"."""
+    _as_jsonc(project_folder / ".claude" / "settings.json")
+    _stub_env(monkeypatch)
+    assert vd._check_env_projection("p-1", project_folder, fix=False).status == vd.STATUS_OK
+    assert vd._check_pretooluse_hooks(project_folder).status == vd.STATUS_OK
+    assert vd._check_post_delete_hook(project_folder).status == vd.STATUS_OK
+
+
+def test_env_projection_an_omitted_key_is_correct_when_absent(monkeypatch, project_folder):
+    """The projection OMITS ``VCT_DIAGRAMS_ACCESS_LIST`` when no peer granted
+    diagram read, and ``apply`` removes it. RED before: that was reported as a
+    "Phase 0.B gap" FAIL for every project without diagram grants."""
+    env = {k: v for k, v in _DIAG_ENV.items() if k != "VCT_DIAGRAMS_ACCESS_LIST"}
+    _edit_settings_env(project_folder, VCT_DIAGRAMS_ACCESS_LIST=None)
+    from vco_lib.config_projection import _build_managed_block
+
+    (project_folder / ".claude" / "env").write_text(_build_managed_block(env), encoding="utf-8")
+    _stub_env(monkeypatch, env)
+    assert vd._check_env_projection("p-1", project_folder, fix=False).status == vd.STATUS_OK
 
 
 def test_env_projection_key_not_in_canonical(monkeypatch, project_folder):
-    """Canonical projection lacks DIAGRAMS_COLLECTION → reports the gap
-    as a drift entry. This is the Phase 0.B gap path."""
-    monkeypatch.setattr(
-        vd, "_project_env_from_db",
-        lambda _pid: {"KG_COLLECTION": "Demo_KnowledgeGraph"},
-    )
+    """ACT twin: a key the projection omits but a surface still carries is
+    drift (``apply`` would remove it)."""
+    _stub_env(monkeypatch, {"KG_COLLECTION": "Demo_KnowledgeGraph"})
     result = vd._check_env_projection("p-1", project_folder, fix=False)
     assert result.status == vd.STATUS_FAIL
-    assert "DIAGRAMS_COLLECTION" in result.detail
-    assert "Phase 0.B gap" in result.detail
+    assert "DIAGRAMS_COLLECTION on .claude/settings.json: expected '<absent>'" in result.detail
+
+
+@pytest.mark.parametrize("rel,raw", [
+    (".claude/settings.json", b"{ not jsonc at all"),
+    (".claude/settings.json", b"[1, 2]\n"),
+    (".claude/settings.json", b"\xff\xfe{\"env\": {}}"),
+    (".claude/env", b"export KG_COLLECTION=\"\xff\xfe\"\n"),
+])
+def test_env_projection_unreadable_is_cannot_verify(monkeypatch, project_folder, rel, raw):
+    """UNREADABLE (v0.2.97): never OK, never FAIL — and ``--fix`` writes
+    nothing to a file it cannot read."""
+    (project_folder / rel).write_bytes(raw)
+    _stub_env(monkeypatch)
+    fake_apply = mock.Mock()
+    monkeypatch.setitem(sys.modules, "vco_lib.config_projection", mock.Mock(
+        apply_project_env=fake_apply, project_env_from_db=mock.Mock()))
+    for fix in (False, True):
+        result = vd._check_env_projection("p-1", project_folder, fix=fix)
+        assert result.status == vd.STATUS_CANNOT_VERIFY, result.detail
+        assert rel in result.detail
+    fake_apply.assert_not_called()
+
+
+@pytest.mark.parametrize("check", ["_check_pretooluse_hooks", "_check_post_delete_hook"])
+def test_hook_checks_unreadable_settings_is_cannot_verify(project_folder, check):
+    (project_folder / ".claude" / "settings.json").write_bytes(b"{ broken")
+    result = getattr(vd, check)(project_folder)
+    assert result.status == vd.STATUS_CANNOT_VERIFY
+    assert "cannot read settings.json" in result.detail
+
+
+def test_cannot_verify_maps_to_exit_two():
+    report = vd._ProjectVerifyReport(
+        project_id="p", project_name="n", project_folder="f",
+        checks=[vd._CheckResult("a", vd.STATUS_FAIL, "x"),
+                vd._CheckResult("b", vd.STATUS_CANNOT_VERIFY, "y")])
+    assert report.exit_code() == vd.EXIT_ENV_PROBLEM
+    assert "1 CANNOT VERIFY" in vd._format_human(report)
 
 
 def test_env_projection_fix_delegates(monkeypatch, project_folder):
     """``--fix`` re-resolves the canonical bundle and calls
-    :func:`apply_project_env` with the (bundle, surfaces=...) contract.
+    :func:`apply_project_env` with the bundle and apply's DEFAULT surfaces,
+    then re-reads the surfaces.
 
     Regression guard for code-review B5: the prior call site invoked
     ``apply_project_env(expected, project_folder=...)`` — wrong type AND
     wrong kwarg — every ``--fix`` invocation that reached this branch
     died with ``KeyError("project_root")`` because ``expected`` was a
     flat env mapping, not a ProjectEnvBundle.
-    """
-    monkeypatch.setattr(
-        vd, "_project_env_from_db",
-        lambda _pid: {
-            "KG_COLLECTION": "Demo_KnowledgeGraph",
-            "DIAGRAMS_COLLECTION": "Demo_Diagrams",
-            "VCT_DIAGRAMS_ACCESS_LIST": "",
-        },
-    )
-    # Break one surface.
-    (project_folder / ".vscode" / "settings.json").write_text(
-        "{}", encoding="utf-8"
-    )
 
-    # Stub the real config_projection contract: project_env_from_db
-    # returns a ProjectEnvBundle, apply_project_env writes surfaces and
-    # returns a per-surface key report.
+    v0.2.97: no ``surfaces=`` — it used to force the VS Code surface too.
+    """
+    _stub_env(monkeypatch)
+    _edit_settings_env(project_folder, DIAGRAMS_COLLECTION="Drifted")
+    (project_folder / ".vscode" / "settings.json").unlink()
     fake_bundle = {
-        "canonical_env": {
-            "KG_COLLECTION": "Demo_KnowledgeGraph",
-            "DIAGRAMS_COLLECTION": "Demo_Diagrams",
-        },
+        "canonical_env": dict(_DIAG_ENV),
         "project_id": "p-1",
         "project_root": project_folder,
     }
+
+    def _write_back(bundle, **_kw):
+        _edit_settings_env(project_folder, DIAGRAMS_COLLECTION="Demo_Diagrams")
+        return {"claude_settings_json": ["DIAGRAMS_COLLECTION"], "claude_env": []}
+
     fake_from_db = mock.Mock(return_value=fake_bundle)
-    fake_apply = mock.Mock(return_value={
-        "claude_settings_json": ["KG_COLLECTION", "DIAGRAMS_COLLECTION"],
-        "claude_env": ["KG_COLLECTION", "DIAGRAMS_COLLECTION"],
-        "vscode_settings_json": ["KG_COLLECTION", "DIAGRAMS_COLLECTION"],
-    })
-    fake_cp = mock.Mock(
-        apply_project_env=fake_apply,
-        project_env_from_db=fake_from_db,
-    )
-    monkeypatch.setitem(sys.modules, "vco_lib.config_projection", fake_cp)
+    fake_apply = mock.Mock(side_effect=_write_back)
+    monkeypatch.setitem(sys.modules, "vco_lib.config_projection", mock.Mock(
+        apply_project_env=fake_apply, project_env_from_db=fake_from_db))
     result = vd._check_env_projection("p-1", project_folder, fix=True)
     assert result.status == vd.STATUS_FIXED, result.detail
 
-    # Real contract: apply_project_env(bundle, surfaces=(...)). The
-    # bundle must be the ProjectEnvBundle (NOT the flat expected env)
-    # and project_folder must NOT appear as a kwarg.
     fake_apply.assert_called_once()
     call_args = fake_apply.call_args
     assert call_args.args[0] is fake_bundle
-    assert "project_folder" not in call_args.kwargs
-    # All 3 surfaces should be written (drift detector reads all 3).
-    surfaces = tuple(call_args.kwargs.get("surfaces", ()))
-    assert set(surfaces) == {
-        "claude_settings_json",
-        "claude_env",
-        "vscode_settings_json",
-    }
-    # Bundle re-resolution wired through project_env_from_db.
+    assert call_args.kwargs == {}, "apply's default surfaces, nothing forced"
     fake_from_db.assert_called_once_with("p-1")
+    assert not (project_folder / ".vscode" / "settings.json").exists()
+
+
+def test_env_projection_fix_that_does_not_repair_is_fix_failed(monkeypatch, project_folder):
+    """FIXED means "re-read and matching", not "a write ran"."""
+    _stub_env(monkeypatch)
+    _edit_settings_env(project_folder, DIAGRAMS_COLLECTION="Drifted")
+    monkeypatch.setitem(sys.modules, "vco_lib.config_projection", mock.Mock(
+        apply_project_env=mock.Mock(return_value={}),
+        project_env_from_db=mock.Mock(return_value={"canonical_env": {}})))
+    result = vd._check_env_projection("p-1", project_folder, fix=True)
+    assert result.status == vd.STATUS_FIX_FAILED
+    assert "still 1 drift entries after apply" in result.detail
+
+
+def test_env_projection_fix_with_the_real_writer_creates_no_vscode(tmp_path, monkeypatch):
+    """The REAL ``apply_project_env`` behind --fix: the drifted surface is
+    repaired, the user's hooks survive, and no ``.vscode/`` appears."""
+    from vco_lib import config_projection as cp
+
+    folder = tmp_path / "fresh"
+    (folder / ".claude").mkdir(parents=True)
+    (folder / ".claude" / "settings.json").write_text(
+        json.dumps({"hooks": {"Stop": []}, "env": {"DIAGRAMS_COLLECTION": "Drifted"}}),
+        encoding="utf-8")
+    _stub_env(monkeypatch)
+    monkeypatch.setattr(cp, "project_env_from_db", lambda _pid: {
+        "canonical_env": dict(_DIAG_ENV), "project_id": "p-1", "project_root": folder})
+    result = vd._check_env_projection("p-1", folder, fix=True)
+    assert result.status == vd.STATUS_FIXED, result.detail
+    assert not (folder / ".vscode").exists()
+    assert json.loads((folder / ".claude" / "settings.json").read_text())["hooks"] == {"Stop": []}
 
 
 def test_env_projection_fix_apply_failure(monkeypatch, project_folder):
     """``apply_project_env`` raising ConfigProjectionError surfaces as
     STATUS_FIX_FAILED (not a silent success). The real contract signals
     failure by raising — not by an "ok" return field."""
-    monkeypatch.setattr(
-        vd, "_project_env_from_db",
-        lambda _pid: {
-            "KG_COLLECTION": "Demo_KnowledgeGraph",
-            "DIAGRAMS_COLLECTION": "Demo_Diagrams",
-            "VCT_DIAGRAMS_ACCESS_LIST": "",
-        },
-    )
-    (project_folder / ".vscode" / "settings.json").write_text(
-        "{}", encoding="utf-8"
-    )
+    _stub_env(monkeypatch)
+    _edit_settings_env(project_folder, DIAGRAMS_COLLECTION="Drifted")
     fake_bundle = {
         "canonical_env": {"KG_COLLECTION": "Demo_KnowledgeGraph"},
         "project_id": "p-1",

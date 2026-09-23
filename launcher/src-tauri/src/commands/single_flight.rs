@@ -65,6 +65,11 @@ pub const OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects";
 /// Operation key: the orchestrator-clone refresh (`installer.rs`).
 pub const OP_UPDATE_ORCHESTRATOR_AT: &str = "update_orchestrator_at";
 
+/// Operation key: the post-update model-gateway restart
+/// (`gateway_freshness::model_gateway_restart_stale`). A second Continue while
+/// one restart is in flight would end every agent session a second time.
+pub const OP_GATEWAY_RESTART: &str = "model_gateway_restart";
+
 /// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by BOTH
 /// `installer::update_orchestrator` (the MenuBar badge) and
 /// `self_update::apply_launcher_update` (Preferences → Launcher updates).
@@ -205,6 +210,14 @@ mod tests {
     #[test]
     fn guarded_operations_have_distinct_keys() {
         assert_ne!(OP_UPDATE_ALL_PROJECTS, OP_UPDATE_ORCHESTRATOR_AT);
+        // A gateway restart must never block (or be blocked by) an update.
+        for other in [
+            OP_UPDATE_ALL_PROJECTS,
+            OP_UPDATE_ORCHESTRATOR_AT,
+            OP_UPDATE_ORCHESTRATOR_CLONE,
+        ] {
+            assert_ne!(OP_GATEWAY_RESTART, other);
+        }
     }
 
     /// Both sides of the gate, on ONE key:

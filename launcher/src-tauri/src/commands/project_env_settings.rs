@@ -8,8 +8,12 @@
 //! the create-project path — see `launcher-settings-propagation-audit-2026-05-06.md`
 //! for the full inventory of "values that should propagate but don't".
 //!
-//! This module introduces `ProjectEnvSettings` as a single named bundle
-//! plumbed through both writers, plus a `populate` helper that reads the
+//! This module introduces `ProjectEnvSettings` as a single named bundle —
+//! today consumed by `ensure_project_env_template` (the project-root `.env`
+//! template), the kg-sync / kg-summary spawns, and the access-list values
+//! `refresh_project_env_with_db` reports; the canonical env SURFACES are
+//! written by `vco_lib.config_projection` alone since the Rust writer's
+//! retirement — plus a `populate` helper that reads the
 //! launcher's current state (app_state k/v + services.toml + canonical
 //! defaults) once per `create_project_v2` / rename / shared-KG-toggle
 //! call. Future launcher-state values can be added here without churning
@@ -2107,7 +2111,8 @@ mod tests {
     /// populate consumed it (a read happened → the pin fails).
     ///
     /// Fails on the pre-fix tree: pre-D8.1 populate called
-    /// `github_pat_for_env` (1 PAT read) + `resolve_user_secret_state`
+    /// `github_pat_for_env` (1 PAT read; renamed `resolve_github_pat` in
+    /// v0.2.97, now read only by the PAT status surfaces) + `resolve_user_secret_state`
     /// (one `secrets::get` per active key), so both probes would return
     /// `Ok` and the assertions flip.
     #[test]

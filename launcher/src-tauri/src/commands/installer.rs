@@ -6405,8 +6405,10 @@ pub(crate) async fn run_pre_merge_user_editable(
 }
 
 /// v0.2.24 §A0 (2026-05-22): convenience wrapper around the deferral
-/// emitter. Filters out NoChange outcomes — only Merged and
-/// PreservedWithUpstreamSidecar produce user-visible deferrals.
+/// emitter. Filters out NoChange outcomes — only Merged,
+/// PreservedWithUpstreamSidecar and (v0.2.97) RenderedConflictKeptLocal
+/// produce user-visible deferrals (`MergeOutcome::is_actionable_for_deferral`
+/// is the one list).
 pub(crate) fn maybe_emit_pre_merge_deferrals(
     install_path: &Path,
     outcomes: &[crate::commands::git_user_editable_merge::MergeOutcome],
@@ -10379,28 +10381,22 @@ fn github_pat_resolve_existing_file() -> Option<PathBuf> {
     None
 }
 
-/// Read-side resolver for the shared-scope PAT slot (its env-pair
-/// consumer, the Rust env writer, was retired in v0.2.97). Returns the
-/// keychain-resolved PAT (active-flag gated) or falls back to the
-/// legacy file when the file→keychain migration hasn't run yet.
+/// The launcher's ONE read of the shared-scope PAT slot: the keychain value
+/// (active-flag gated — a paused PAT reads as `None`), else the legacy file
+/// while the file→keychain migration has not run yet. Backs the Onboarding
+/// / Special-Secrets status surfaces (`has_github_pat`,
+/// `get_github_pat_preview`).
 ///
-/// Conservative per-project gating decision (0.1.7, 2026-05-08): every
-/// registered project receives `GITHUB_TOKEN` whenever the PAT is set
-/// and active in the keychain. This matches the pre-0.1.7 file-based
-/// behaviour (`~/.vct-secrets/shared/github_pat` is readable by every
-/// process running as the user). A finer-grained per-project access
-/// matrix for `github_pat` is out of scope for the 0.1.7 fork sweep.
-/// See `docs/MIGRATION-0.2.0.md` "Replacing `git-credential-vct`".
+/// v0.2.97 review F6: this replaces `github_pat_for_env`, which had no
+/// production caller left — its "every registered project receives
+/// `GITHUB_TOKEN`" promise was SUPERSEDED in v0.2.73: VCO never writes a
+/// secret value into a project; consumers resolve the PAT at need through
+/// the hub (`/api/v1/projects/{id}/env`, `vct_secrets_resolve.sh`,
+/// `vco_lib.agent_secrets.get`) — the "Secrets" section of
+/// `templates/ORCHESTRATOR-CLAUDE.md.template`.
 ///
-/// Soft-fail: any error short-circuits to `None` so env-file writes
-/// never block on a keychain hiccup.
-///
-// v0.2.84 PLAN D8.1: populate() no longer resolves the PAT (P7 dead-read
-// elimination); sole remaining callers are this module's keychain tests.
-// Fn kept — it is the documented resolver for the shared-scope PAT slot
-// and the natural home if a value-consumer ever returns.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn github_pat_for_env(db: &Db) -> Option<String> {
+/// Soft-fail: any error short-circuits to `None`.
+pub(crate) fn resolve_github_pat(db: &Db) -> Option<String> {
     if let Some(v) = github_pat_from_keychain(db) {
         return Some(v);
     }
@@ -10880,9 +10876,10 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
 /// call pulls them into the keychain.
 ///
 /// BOUNDARY #4 (v0.2.80 Part A — HIGHEST BLAST RADIUS): this feeds
-/// `github_pat_for_env`, whose value once reached EVERY registered project's
-/// env-pair (no writer emits `GITHUB_TOKEN` since v0.2.73), and it fires AUTOMATICALLY on env-file
-/// builds (not an explicit import click). A blob here (a token on line 0 + a
+/// `resolve_github_pat`, the value the status surfaces show and the
+/// file→keychain migration imports. (It once also reached EVERY registered
+/// project's env files as `GITHUB_TOKEN`; no writer has emitted that since
+/// v0.2.73 — secrets are resolved at need through the hub.) A blob here (a token on line 0 + a
 /// `KEY=value` continuation line, an embedded newline, or a control char) would
 /// be handed to `git push` / `gh` as a multi-line password → silent auth
 /// failure across every project. So the trimmed content is shape-checked; a
@@ -10917,18 +10914,12 @@ fn github_pat_from_legacy_file() -> Option<String> {
 
 #[command]
 pub fn has_github_pat(db: State<'_, Db>) -> bool {
-    if github_pat_from_keychain(&db).is_some() {
-        return true;
-    }
-    // Legacy file fallback — only honoured until the next `register_github_pat`
-    // call migrates everything into the keychain.
-    github_pat_from_legacy_file().is_some()
+    resolve_github_pat(&db).is_some()
 }
 
 #[command]
 pub fn get_github_pat_preview(db: State<'_, Db>) -> Option<String> {
-    // Prefer keychain.
-    let value = github_pat_from_keychain(&db).or_else(github_pat_from_legacy_file)?;
+    let value = resolve_github_pat(&db)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -11050,14 +11041,17 @@ pub fn register_github_pat(
     //    the prior behaviour silently destroyed working PATs whenever
     //    the OnboardingWizard re-saved.)
 
-    // 6. Propagate to all registered projects' env files (B2 fix from
-    //    2026-05-08 integration review). Without this, a user with N
-    //    existing registered projects has to manually re-trigger
-    //    the env projection (e.g. via rename) for each one before
-    //    GITHUB_TOKEN appears in their .claude/env. With it: the moment
-    //    the OnboardingWizard saves, every registered project's env
-    //    surfaces are rewritten and Claude Code subprocesses inherit the
-    //    fresh value on next session start.
+    // 6. Re-project every registered project's env surfaces (B2 fix from
+    //    2026-05-08 integration review). SUPERSEDED purpose, v0.2.73: this
+    //    once made `GITHUB_TOKEN` appear in each project's `.claude/env`;
+    //    VCO no longer writes secret VALUES into any project — consumers
+    //    resolve the PAT at need through the hub (`vct_secrets_resolve.sh`,
+    //    `vco_lib.agent_secrets.get`; the "Secrets" section of
+    //    `templates/ORCHESTRATOR-CLAUDE.md.template`). The re-projection
+    //    that remains keeps each project's canonical env current and
+    //    removes the in-tree VALUES a pre-v0.2.73 writer left: `GITHUB_TOKEN`
+    //    and the launcher-known user-secret keys from the JSON env blocks,
+    //    and any export in the rebuilt `.claude/env` managed block.
     //
     //    Soft-fail per project: a single project's writer failure (e.g.
     //    .claude/env unwritable) shouldn't block PAT registration. We
@@ -14490,7 +14484,7 @@ MemAvailable:   23456789 kB
     //     doesn't mask a regression.
     //
     // These tests use `pub(crate)` helpers (`migrate_github_pat_file_to_keychain`,
-    // `github_pat_for_env`) and the module-private constants from the
+    // `resolve_github_pat`) and the module-private constants from the
     // surrounding `super::*` import. The Tauri-`#[command]` wrappers
     // (`register_github_pat`, `clear_github_pat`, …) take `State<'_, Db>`
     // which we can't easily synthesise without standing up the runtime,
@@ -14666,9 +14660,9 @@ MemAvailable:   23456789 kB
 
             // The active-flag-gated read also surfaces the canary.
             assert_eq!(
-                github_pat_for_env(&db).as_deref(),
+                resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
-                "github_pat_for_env should return the freshly-written value"
+                "resolve_github_pat should return the freshly-written value"
             );
 
             // Cleanup.
@@ -15037,12 +15031,12 @@ MemAvailable:   23456789 kB
             std::fs::remove_dir_all(&home).ok();
         }
 
-        // ── Item #2: github_pat_for_env active-flag gating ────────────
+        // ── Item #2: resolve_github_pat active-flag gating ────────────
 
-        /// `github_pat_for_env` returns Some when the keychain has a
+        /// `resolve_github_pat` returns Some when the keychain has a
         /// value AND the active flag is true.
         #[test]
-        fn github_pat_for_env_returns_value_when_active_in_keychain() {
+        fn resolve_github_pat_returns_value_when_active_in_keychain() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
@@ -15069,17 +15063,18 @@ MemAvailable:   23456789 kB
             )
             .unwrap();
 
-            assert_eq!(github_pat_for_env(&db).as_deref(), Some(canary.as_str()));
+            assert_eq!(resolve_github_pat(&db).as_deref(), Some(canary.as_str()));
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
 
-        /// Paused secret (Lifecycle B unset) MUST NOT surface to env-files.
+        /// Paused secret (Lifecycle B unset) MUST NOT surface through the
+        /// resolver the status surfaces read.
         /// This is the asymmetric-leak test: keychain has the value but
         /// active-flag is false → reader returns None.
         #[test]
-        fn github_pat_for_env_returns_none_when_paused() {
+        fn resolve_github_pat_returns_none_when_paused() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
@@ -15108,19 +15103,19 @@ MemAvailable:   23456789 kB
             .unwrap();
 
             assert_eq!(
-                github_pat_for_env(&db),
+                resolve_github_pat(&db),
                 None,
-                "paused secret must NOT surface to env files (asymmetric leak)",
+                "paused secret must NOT surface through the resolver (asymmetric leak)",
             );
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
 
-        /// `github_pat_for_env` with no keychain entry AND no file
+        /// `resolve_github_pat` with no keychain entry AND no file
         /// returns None (not an empty string, not an error).
         #[test]
-        fn github_pat_for_env_returns_none_when_unset() {
+        fn resolve_github_pat_returns_none_when_unset() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
@@ -15129,7 +15124,7 @@ MemAvailable:   23456789 kB
             let db = make_db();
             delete_keychain();
 
-            assert_eq!(github_pat_for_env(&db), None);
+            assert_eq!(resolve_github_pat(&db), None);
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -15147,7 +15142,7 @@ MemAvailable:   23456789 kB
         /// call would short-circuit `github_pat_from_keychain` and the
         /// file-fallback path never gets exercised.
         #[test]
-        fn github_pat_for_env_falls_back_to_legacy_file_pre_migration() {
+        fn resolve_github_pat_falls_back_to_legacy_file_pre_migration() {
             let (home, _guard) = setup_temp_env();
             let db = make_db();
             // Clear any prior keychain residue so the file-fallback
@@ -15162,7 +15157,7 @@ MemAvailable:   23456789 kB
             std::fs::create_dir_all(&shared_dir).unwrap();
             std::fs::write(shared_dir.join("github_pat"), &canary).unwrap();
 
-            assert_eq!(github_pat_for_env(&db).as_deref(), Some(canary.as_str()));
+            assert_eq!(resolve_github_pat(&db).as_deref(), Some(canary.as_str()));
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -15508,12 +15503,12 @@ MemAvailable:   23456789 kB
         }
 
         /// Item #6.6b: upgrade-window fallback — until the module_id
-        /// migration runs, `github_pat_for_env` falls back to the
+        /// migration runs, `resolve_github_pat` falls back to the
         /// legacy `installer/` slot so a 0.2.0 user's existing PAT
         /// stays reachable across the const flip. After migration the
         /// legacy slot is empty and the fallback is a no-op.
         #[test]
-        fn github_pat_for_env_falls_back_to_legacy_installer_slot_pre_module_id_migration() {
+        fn resolve_github_pat_falls_back_to_legacy_installer_slot_pre_module_id_migration() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
@@ -15533,7 +15528,7 @@ MemAvailable:   23456789 kB
 
             // The fallback surfaces it.
             assert_eq!(
-                github_pat_for_env(&db).as_deref(),
+                resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
                 "upgrade-window fallback must surface the legacy installer slot value",
             );
@@ -15543,7 +15538,7 @@ MemAvailable:   23456789 kB
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
             assert!(report.flag_set);
             assert_eq!(
-                github_pat_for_env(&db).as_deref(),
+                resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
                 "post-migration, the same value resolves through the new slot",
             );
@@ -15559,7 +15554,7 @@ MemAvailable:   23456789 kB
         /// Item #6.6c: the upgrade-window fallback honours the legacy
         /// slot's active-flag gate. A paused 0.2.0 PAT MUST NOT leak.
         #[test]
-        fn github_pat_for_env_legacy_fallback_honours_paused_state() {
+        fn resolve_github_pat_legacy_fallback_honours_paused_state() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
@@ -15579,7 +15574,7 @@ MemAvailable:   23456789 kB
                 .unwrap();
 
             assert_eq!(
-                github_pat_for_env(&db),
+                resolve_github_pat(&db),
                 None,
                 "paused legacy PAT must NOT leak through the upgrade-window fallback",
             );
