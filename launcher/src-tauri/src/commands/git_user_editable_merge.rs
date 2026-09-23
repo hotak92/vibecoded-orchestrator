@@ -2247,8 +2247,9 @@ pub(crate) fn build_deferral_text(
     (title, detected, why_deferred, command_to_apply)
 }
 
-/// POSIX shell-safe quoting (single-quote escape).
-fn shell_quote(s: &str) -> String {
+/// POSIX shell-safe quoting (single-quote escape). Shared with the
+/// printed `.env` remediation in `projects_v2::dotenv_kg_drift_warning`.
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':')
     }) {

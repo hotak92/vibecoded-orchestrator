@@ -165,8 +165,12 @@ def project_settings_env(folder: Path) -> dict:
 
     # JSONC through the ONE reader (v0.2.97): Claude Code accepts comments and
     # trailing commas here, and a strict ``json.loads`` read such a file as
-    # "no env" — so a project that set ``SHARED_KG_READ_DISABLED`` in a
-    # commented settings.json silently read the shared KG anyway.
+    # "no env" for every caller. The sharpest case is the residue cleanup's
+    # accept-loss gate (``shared_read_disabled_for``): a project that set
+    # ``SHARED_KG_READ_DISABLED`` in a commented settings.json looked opted
+    # IN, so a bundle update could delete its on-disk curated copies — its
+    # only curated access. (The MCP's read gate reads its process env, which
+    # Claude Code builds from the JSONC file itself; it was never affected.)
     try:
         loaded = load_object(Path(folder) / ".claude" / "settings.json")
     except Exception:  # noqa: BLE001 — settings read is best-effort

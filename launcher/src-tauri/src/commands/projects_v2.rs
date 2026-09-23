@@ -13,7 +13,7 @@ use crate::commands::codegraph;
 use crate::commands::installer::{detect_system, find_local_repo_root};
 use crate::commands::kg_summary;
 use crate::commands::kg_sync;
-use crate::commands::project_env_settings::{self, ProjectEnvSettings};
+use crate::commands::project_env_settings;
 use crate::db::code_graph_builds::status as build_status;
 use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
@@ -318,10 +318,11 @@ pub struct CreateProjectV2Request {
     pub host: ProjectHost,
     /// v0.2.63 "Safe add": per-add opt-in (default OFF → no behaviour change).
     /// When ON, VCO must NOT merge its config into the project's sensitive,
-    /// often-committed project-root `.env`: instead of appending canonical
-    /// keys (`ensure_project_env_template`) or rewriting a stale
+    /// often-committed project-root `.env`: instead of writing its managed
+    /// block (`vco_lib.env_template apply`) or rewriting a stale
     /// `KG_COLLECTION=` line (`b12_repair_stale_kg_collection`), it writes the
-    /// intended `.env` content to a `.env.vco.reference` sidecar and lets the
+    /// intended `.env` content to a `.env.vco.reference` sidecar
+    /// (`vco_lib.env_template reference`) and lets the
     /// Python bundle step (`--safe-add`) record a `safe_add_skipped_env_merge`
     /// deferral + append VCO-created paths to the project's local-only
     /// `.git/info/exclude`. `#[serde(default)]` keeps older GUI builds / API
@@ -451,10 +452,8 @@ pub async fn create_project_v2(
     // Phase 0.B Part 2 (2026-05-25): canonical env writes go through the
     // Python contract `vco_lib.config_projection.apply_project_env` via
     // `apply_project_env_via_python`. `env_settings` is still populated
-    // because (a) the legacy Rust writer is invoked from the SecretsPanel
-    // user-secret path and (b) `ensure_project_env_template` below also
-    // consumes it for the `.env` template surface (which is out of scope
-    // for the Phase 0.B contract).
+    // because the project-root `.env` below renders the launcher-resolved
+    // service ports it carries.
     if let Err(e) = apply_project_env_via_python(&row.id, folder, &db) {
         // B10 (2026-05-01): surface env-write failures to the UI instead of
         // silent eprintln. Project creation still succeeds; the UI should show
@@ -465,22 +464,33 @@ pub async fn create_project_v2(
         warnings.push(msg);
     }
 
-    // Bug 33 (2026-04-28): also ensure a per-project `.env` template
-    // exists. The env projection only writes `.claude/env` +
-    // `.claude/settings.json`; a separate `.env` is what most CLI
-    // users expect to edit (esp. existing-folder projects that
-    // pre-existed any orchestrator install). The template carries
-    // commented placeholders for ANTHROPIC_API_KEY / OPENAI_API_KEY /
-    // GITHUB_TOKEN / RL_*; values stay user-controlled. Idempotent on
-    // re-runs.
-    // v0.2.63 Safe add: when ON, do NOT append canonical keys to the
-    // project-root `.env` (it may be committed to the user's VCS). Write the
-    // intended content to a `.env.vco.reference` sidecar instead; the Python
-    // bundle step (run with --safe-add) detects the sidecar and records the
-    // `safe_add_skipped_env_merge` deferral. Soft-fail throughout — a sidecar
-    // write failure must never abort project creation.
+    // Bug 33 (2026-04-28): also ensure a per-project `.env` exists. The env
+    // projection only writes `.claude/env` + `.claude/settings.json`; a
+    // separate `.env` is what most CLI users expect to edit (esp.
+    // existing-folder projects that pre-existed any orchestrator install). A
+    // new file starts with commented placeholders for ANTHROPIC_API_KEY /
+    // OPENAI_API_KEY / GITHUB_TOKEN / RL_*; values stay user-controlled.
+    // v0.2.97: written by the ONE `.env` writer, `python -m
+    // vco_lib.env_template apply` (the append-only Rust mirror is retired):
+    // the managed block is refreshed in place, a key the user assigns is
+    // never rendered, and the retired writers' legacy lines fold into the
+    // block. Idempotent on re-runs.
+    // v0.2.63 Safe add: when ON, do NOT touch the project-root `.env` (it
+    // may be committed to the user's VCS). `reference` writes the intended
+    // content to a `.env.vco.reference` sidecar instead; the Python bundle
+    // step (run with --safe-add) detects the sidecar and records the
+    // `safe_add_skipped_env_merge` deferral. Soft-fail throughout — a write
+    // failure must never abort project creation.
+    let env_ports = crate::services::vco_lib_bridge::EnvTemplatePorts {
+        weaviate: env_settings.weaviate_port,
+        ollama: env_settings.ollama_port,
+        code_embed: env_settings.code_embed_port,
+    };
+    let env_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
     if req.safe_add {
-        if let Err(e) = write_env_reference_sidecar(folder, &env_settings) {
+        if let Err(e) = crate::services::vco_lib_bridge::write_project_env_reference(
+            env_root.as_deref(), folder, &row.id, env_ports,
+        ) {
             let msg = format!(
                 "safe-add: .env.vco.reference sidecar write failed: {}. \
                  VCO did not modify your .env; intended keys were not saved to \
@@ -490,8 +500,10 @@ pub async fn create_project_v2(
             tracing::warn!("[vct] warning: {}", msg);
             warnings.push(msg);
         }
-    } else if let Err(e) = ensure_project_env_template(folder, &env_settings) {
-        let msg = format!("env template write failed (ensure_project_env_template): {}. \
+    } else if let Err(e) = crate::services::vco_lib_bridge::apply_project_env_template(
+        env_root.as_deref(), folder, &row.id, env_ports,
+    ) {
+        let msg = format!("env template write failed (vco_lib.env_template apply): {}. \
                           The .env file may be missing managed keys.", e);
         tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
@@ -532,11 +544,11 @@ pub async fn create_project_v2(
     // below, after bootstrap → bundle install → post-bundle populate.
 
     // B12 (2026-05-01, repaired in 0.2.11): rewrite stale .env from pre-existing
-    // folder registration. ensure_project_env_template is append-only, so a
-    // folder that already had a .env with a bare/wrong KG_COLLECTION (e.g.
-    // "KnowledgeGraph" without project suffix, or just the bare sanitized name)
-    // would otherwise keep that stale value as the first active KG_COLLECTION
-    // line, and consumers reading the first match would pick up the wrong
+    // folder registration. The `.env` writer never renders a key the user
+    // assigns, so a folder that already had a .env with a bare/wrong
+    // KG_COLLECTION (e.g. "KnowledgeGraph" without project suffix, or just
+    // the bare sanitized name) would otherwise keep that stale value as its
+    // only active KG_COLLECTION line, and consumers would pick up the wrong
     // collection. Pre-0.2.11 this block only warned and asked the user to fix
     // it by hand — that left the bug live in every existing install. Now we
     // call the testable helper `b12_repair_stale_kg_collection` to rewrite
@@ -822,19 +834,17 @@ pub(crate) fn create_setup_phases(
 /// `true` on create (value unused there but documents intent). See
 /// `should_spawn_kg_sync_on_bundle`.
 ///
-/// **TODO (V52-AG layer 3)**: wire `register_artifact_version` for the
-/// `bundle_materialization` artifact_type here so the schema-version
-/// registry can detect drift between expected + applied helper state.
-/// Deferred from v0.2.52 because the Rust side lacks a registry client
-/// and adding the Python-subprocess hop would balloon this PR. See
-/// `vco_lib/artifact_version_registry.py` (V52-AG layer 2, commit
-/// `d472686e`) for the Python-side contract.
-///
-/// v0.2.57: the Python-subprocess-hop pattern this TODO worried about is
-/// now established — `run_node_formats_schema_check` does exactly that for
-/// the `kg_node_formats` artifact (check + register via
-/// `check-node-formats-schema`). The `bundle_materialization` wiring can
-/// follow the same shape when picked up.
+/// **V52-AG layer 3 — the bundle records its own version (v0.2.97).**
+/// Right after the bundle and BEFORE the schema-migration runner,
+/// [`record_bundle_materialization`] writes the `bundle_materialization`
+/// row of `artifact_schema_versions` from the `schema_version` the bundle
+/// engine wrote into `.claude/.vco-manifest.json` (the Python SSOT,
+/// `vco_lib.artifact_version_registry record-bundle-materialization`). The
+/// runner is the reader: it checks every canonical artifact type, so a
+/// re-materialized bundle reads `UP_TO_DATE` and a row left behind
+/// canonical is reported as drift. install.py records the root's row the
+/// same way before its own runner pass. A failed write is a warning, never
+/// a failed bundle update.
 ///
 /// **Soft-fail discipline** — every step has the same shape:
 ///   - Queue a PENDING DB row (idempotent UPSERT). DB error → push
@@ -1310,6 +1320,12 @@ pub(crate) async fn apply_post_bundle_steps(
     // shared KG or launcher-global shapes (those are the ROOT orchestrator
     // self-update's job — install.py). Verified no-op today (empty
     // migrations/). Soft-fails to warnings; never blocks.
+    //
+    // v0.2.97 (V52-AG layer 3): the bundle's own registry row is written
+    // FIRST, so the runner reads the version this bundle just applied.
+    if let Some(w) = record_bundle_materialization(db, folder, project_id).await {
+        warnings.push(w);
+    }
     for w in run_schema_migration_check(folder, project_id).await {
         warnings.push(w);
     }
@@ -2703,6 +2719,70 @@ pub(crate) async fn run_node_formats_schema_check(
     warnings
 }
 
+/// v0.2.97 (V52-AG layer 3): record the `bundle_materialization` version this
+/// project's bundle now holds, via the Python SSOT
+/// (`vco_lib.artifact_version_registry record-bundle-materialization`), which
+/// reads the manifest the bundle engine just wrote and registers it only when
+/// it equals canonical. `--db` is the file the launcher itself has open, so
+/// the two sides cannot resolve different launcher.dbs; a connection with no
+/// file (the in-memory stand-in during an orchestrator update, or a test) is
+/// skipped. Returns the warning to surface, `None` on a recorded write.
+/// Soft-fail: never fails the bundle update; every miss is logged at WARN.
+pub(crate) async fn record_bundle_materialization(
+    db: &Db,
+    folder: &Path,
+    project_id: &str,
+) -> Option<String> {
+    let db_file = {
+        let conn = db.lock_recover();
+        conn.path().filter(|p| !p.is_empty()).map(PathBuf::from)
+    };
+    let outcome = match db_file {
+        Some(db_file) => {
+            crate::commands::project_hooks_settings::run_vco_lib_json(
+                db,
+                "vco_lib.artifact_version_registry",
+                &[
+                    std::ffi::OsStr::new("record-bundle-materialization"),
+                    std::ffi::OsStr::new("--folder"),
+                    folder.as_os_str(),
+                    std::ffi::OsStr::new("--project-id"),
+                    std::ffi::OsStr::new(project_id),
+                    std::ffi::OsStr::new("--db"),
+                    db_file.as_os_str(),
+                ],
+                None,
+                "the schema-version registry",
+            )
+            .await
+            .map_err(|e| format!("{} ({})", e.message, e.code))
+        }
+        None => Err("the launcher DB connection has no file path (in-memory)".to_string()),
+    };
+    bundle_record_warning(project_id, outcome)
+}
+
+/// The warning for a registry write that did not happen (pure, so the
+/// act/soft-fail split is unit-testable without a Python child).
+fn bundle_record_warning(
+    project_id: &str,
+    outcome: Result<serde_json::Value, String>,
+) -> Option<String> {
+    let reason = match outcome {
+        Ok(v) if v.get("action").and_then(|a| a.as_str()) == Some("registered") => return None,
+        Ok(v) => format!("unexpected reply {}", v),
+        Err(e) => e,
+    };
+    let warning = format!(
+        "bundle_materialization version NOT recorded for project {}: {}. The bundle \
+         update itself is complete; the schema-version registry keeps its previous \
+         row and the next bundle update retries.",
+        project_id, reason
+    );
+    tracing::warn!("[vct] {}", warning);
+    Some(warning)
+}
+
 // v0.2.92 (2026-09-05 field bug): the stdout-parse diagnostic lives in
 // `commands::subprocess_contract` — ONE home, because `bundle_staleness`'s
 // census parse needs the identical fragment. The three `migrate-schema`
@@ -3722,188 +3802,18 @@ pub(crate) fn merge_claude_env_managed_block(prior: Option<&str>, managed: &str)
     out
 }
 
-/// Marker tag inserted on every line `ensure_project_env_template`
-/// appends to a pre-existing `.env`. Mirror of `ENV_VCO_MARKER` in
-/// install.py — keep in lockstep. Idempotency depends on the exact
-/// substring match; do NOT translate or reformat.
-const ENV_VCO_MARKER: &str = "# added by vco";
-
-/// Canonical key list rendered by `ensure_project_env_template`.
-///
-/// Each tuple = `(KEY, default)`:
-///   - `default = Some(value)` → write `KEY=value` (active)
-///   - `default = None` → write `# KEY=...` (commented placeholder)
-///
-/// The Python canonical-key authority is
-/// `vco_lib.env_template.list_canonical_env_template_keys` (the legacy
-/// install.py `_env_canonical_template` renderer was removed in v0.2.77
-/// 7a-bis as dead code). The `<project>` / `<project_root>` tokens are
-/// substituted by the caller. Keep the two key sets in lockstep — the test
-/// `env_template_canonical_keys_match_python` (added 2026-04-28)
-/// asserts the Python and Rust key sets are identical.
-fn env_canonical_keys() -> Vec<(&'static str, Option<&'static str>)> {
-    vec![
-        // Service URLs (all commented placeholders — launcher chooses
-        // the actual ports at adopt time and writes them via the env
-        // block in `.claude/settings.json`, NOT into `.env`).
-        ("WEAVIATE_URL", None),
-        ("WEAVIATE_PORT", None),
-        ("OLLAMA_URL", None),
-        ("OLLAMA_PORT", None),
-        ("CODE_EMBED_URL", None),
-        // Per-project Weaviate collections (active — filled at create time).
-        ("KG_COLLECTION", Some("__project__:kg")),
-        // Default value: capital-C "VibeCoded" since v0.2.23 B1 (was
-        // lowercase-c "Vibecoded" v0.2.12–v0.2.22, itself renamed from
-        // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E).
-        // Picker overrides this per-project.
-        ("SHARED_KG_COLLECTION", Some("VibeCodedOrchestrator_KnowledgeGraph")),
-        ("DEVELOPMENT_COLLECTION", Some("__project__:dev")),
-        ("PROJECT_NAME", Some("__project__:raw")),
-        // CONVERSATION_COLLECTION removed 2026-04-30 (B5: zombie write cleanup).
-        // The capture flow is deprecated; MCP server no longer reads this key.
-        // LLM API keys (commented).
-        ("ANTHROPIC_API_KEY", None),
-        ("OPENAI_API_KEY", None),
-        // GitHub access (commented).
-        ("GITHUB_TOKEN", None),
-        // RL retrieval (commented — module section).
-        ("RL_SERVER_URL", None),
-        ("RL_SERVER_PORT", None),
-        ("RL_PROJECT_ROOT", None),
-        // Telemetry (commented — opt-in).
-        ("VCT_TELEMETRY", None),
-    ]
-}
-
-/// Substitute `__project__:*` tokens to the per-project values.
-fn render_canonical_default(default: &str, project_name: &str, kg_collection: &str) -> String {
-    match default {
-        "__project__:kg" => format!("{}_KnowledgeGraph", kg_collection),
-        "__project__:dev" => format!("{}_Development", kg_collection),
-        "__project__:conv" => format!("{}_conversations", kg_collection),
-        "__project__:raw" => project_name.to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// PR-3 (2026-05-06): substitute the canonical default with values from
-/// the launcher's resolved settings. Falls through to
-/// `render_canonical_default` for project-derived placeholders.
-fn render_canonical_default_with_settings(
-    key: &str,
-    default: &str,
-    settings: &ProjectEnvSettings,
-) -> String {
-    match key {
-        "SHARED_KG_COLLECTION" => settings.shared_kg_collection.clone(),
-        "WEAVIATE_URL" => settings.weaviate_url.clone(),
-        "WEAVIATE_PORT" => settings.weaviate_port.to_string(),
-        "OLLAMA_URL" => settings.ollama_url.clone(),
-        "OLLAMA_PORT" => settings.ollama_port.to_string(),
-        "CODE_EMBED_URL" => settings.code_embed_url.clone(),
-        "CODE_EMBED_PORT" => settings.code_embed_port.to_string(),
-        "ACTIVE_EMBEDDING" => settings.active_embedding.clone(),
-        _ => render_canonical_default(default, &settings.project_name, &sanitize_kg_collection(&settings.project_name)),
-    }
-}
-
-/// Build the canonical `.env` text used when no `.env` exists.
-///
-/// This Rust renderer is now the SOLE canonical `.env` text producer
-/// (the install.py `_build_canonical_env_template_text` renderer was
-/// removed in v0.2.77 7a-bis as dead code; install.py's `.env` handling
-/// goes through `_ensure_env_template` + the vco_lib canonical-key list).
-/// What MUST match cross-language: the set of declared KEY names, against
-/// `vco_lib.env_template.list_canonical_env_template_keys`. The
-/// `env_template_canonical_keys_match_python` test enforces that.
-///
-/// PR-3 (2026-05-06): when the launcher has resolved non-default ports
-/// (via app_state override or services.toml adoption), the service URL
-/// lines are rendered ACTIVE rather than commented. This is the key
-/// behaviour change closing the audit's "values that should propagate
-/// but don't" finding for the `.env` surface.
-fn build_canonical_env_text(settings: &ProjectEnvSettings) -> String {
-    let project_name = settings.project_name.as_str();
-    let kg_collection_basename = sanitize_kg_collection(project_name);
-    let today = chrono::Utc::now().format("%Y-%m-%d");
-    let mut s = String::new();
-    s.push_str("# vibecoded-orchestrator per-project .env\n");
-    s.push_str("# Edit values to override defaults. Empty / commented lines are\n");
-    s.push_str(&format!("# treated as \"use default\". Created by vco {}.\n\n", today));
-
-    s.push_str("# === Service URLs (launcher-resolved; edit only if you know what you're doing) ===\n");
-    // Only emit ACTIVE service URL lines when the launcher's value
-    // diverges from the canonical localhost default. Default-port stacks
-    // keep the commented-placeholder shape so the `.env` template stays
-    // close to what install.py emits and so the parity test continues to
-    // hold.
-    let weaviate_active =
-        settings.weaviate_port != project_env_settings::DEFAULT_WEAVIATE_PORT;
-    let ollama_active =
-        settings.ollama_port != project_env_settings::DEFAULT_OLLAMA_PORT;
-    let code_embed_active =
-        settings.code_embed_port != project_env_settings::DEFAULT_CODE_EMBED_PORT;
-    let prefix_w = if weaviate_active { "" } else { "# " };
-    let prefix_o = if ollama_active { "" } else { "# " };
-    let prefix_c = if code_embed_active { "" } else { "# " };
-    s.push_str(&format!("{}WEAVIATE_URL={}\n", prefix_w, settings.weaviate_url));
-    s.push_str(&format!("{}WEAVIATE_PORT={}\n", prefix_w, settings.weaviate_port));
-    s.push_str(&format!("{}OLLAMA_URL={}\n", prefix_o, settings.ollama_url));
-    s.push_str(&format!("{}OLLAMA_PORT={}\n", prefix_o, settings.ollama_port));
-    s.push_str(&format!("{}CODE_EMBED_URL={}\n\n", prefix_c, settings.code_embed_url));
-
-    s.push_str("# === Per-project Weaviate collections ===\n");
-    s.push_str("# Resolved by the launcher when the project is registered. Don't\n");
-    s.push_str("# edit unless you know what you're doing.\n");
-    s.push_str(&format!("KG_COLLECTION={}_KnowledgeGraph\n", kg_collection_basename));
-    s.push_str(&format!("SHARED_KG_COLLECTION={}\n", settings.shared_kg_collection));
-    s.push_str(&format!("DEVELOPMENT_COLLECTION={}_Development\n", kg_collection_basename));
-    s.push_str(&format!("PROJECT_NAME={}\n", project_name));
-    // PR-8 cross-PR handoff note (v0.2.11): `CODE_GRAPH_PROJECT` is
-    // intentionally NOT written here — the canonical `.env` key set is
-    // owned by the parity contract against
-    // `vco_lib.env_template.list_canonical_env_template_keys` (v0.2.77
-    // 7a-bis: the old install.py `_env_canonical_template` renderer was
-    // removed as dead code), and adding a key here without the Python side
-    // would break `env_template_canonical_keys_match_python`. The key DOES
-    // get written to the canonical JSON env block
-    // (`.claude/settings.json::env`) via `CANONICAL_INSTALL_ENV_KEYS`
-    // — that is the surface hook subprocesses + Claude Code consume
-    // from, so the bug PR-7 is fixing closes at the create_project_v2
-    // boundary regardless. (PR-27 / v0.2.12 / 2026-05-16 removed the
-    // historical sibling write to `.vscode/settings.json::claude-code.env`
-    // because that surface didn't propagate to MCP subprocesses on
-    // Linux — see `docs/CLAUDE_CODE_COMPATIBILITY.md`.)
-    // PR-3 (2026-05-06): ACTIVE_EMBEDDING is launcher-resolved; pre-PR-3
-    // it was only written to the orchestrator-root .env by install.py and
-    // never to per-project files. Adding it here lets every per-project
-    // shell session see the right embedding profile without sourcing the
-    // orchestrator-root file.
-    s.push_str(&format!("ACTIVE_EMBEDDING={}\n\n", settings.active_embedding));
-    // CONVERSATION_COLLECTION removed 2026-04-30 (B5). Not written to new installs.
-
-    s.push_str("# === LLM API keys (optional) ===\n");
-    s.push_str("# ANTHROPIC_API_KEY=\n");
-    s.push_str("# OPENAI_API_KEY=\n\n");
-
-    s.push_str("# === GitHub access for code-search MCP (optional) ===\n");
-    s.push_str("# GITHUB_TOKEN=\n\n");
-
-    s.push_str("# === RL retrieval module (Pro tier — uncomment when installed) ===\n");
-    s.push_str("# RL_SERVER_URL=http://localhost:8090\n");
-    s.push_str("# RL_SERVER_PORT=8090\n");
-    s.push_str("# RL_PROJECT_ROOT=<project_root>\n\n");
-
-    s.push_str("# === Telemetry (off by default; on=opt-in only) ===\n");
-    s.push_str("# VCT_TELEMETRY=off\n");
-    s
-}
+// v0.2.97: the Rust `.env` writer (`ensure_project_env_template`,
+// `build_canonical_env_text`, `write_env_reference_sidecar` and the
+// `env_canonical_keys` mirror of the Python key list) is retired. The ONE
+// `.env` writer is `vco_lib.env_template`, reached through
+// `services::vco_lib_bridge::{apply_project_env_template,
+// write_project_env_reference}` (see `create_project_v2`).
 
 /// Parse keys present in an existing `.env`. Both commented (`# KEY=`)
-/// and active (`KEY=`) lines count — the user knows about either form
-/// and we should not duplicate-append over them. Mirrors
-/// `_parse_existing_env_keys` in install.py.
+/// and active (`KEY=`) lines count. Test-only since v0.2.97: the project
+/// `.env` is written by `vco_lib.env_template` (via the bridge), and the
+/// unregister tests use this to check which keys a strip left behind.
+#[cfg(test)]
 fn parse_existing_env_keys(text: &str) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for line in text.lines() {
@@ -3934,205 +3844,6 @@ fn parse_existing_env_keys(text: &str) -> std::collections::HashSet<String> {
         }
     }
     out
-}
-
-/// Report shape returned by `ensure_project_env_template`. Mirrors the
-/// dict returned by Python's `_ensure_env_template`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EnsureEnvReport {
-    /// One of "created", "appended", "noop".
-    pub action: String,
-    /// Keys that were just written (only the canonical KEY names, not
-    /// every line of comments).
-    pub added_keys: Vec<String>,
-    /// Absolute path to the .env file.
-    pub env_path: String,
-}
-
-/// Ensure `<folder>/.env` exists and has every canonical-template key.
-///
-/// - Missing → write fresh from the canonical template (with placeholders
-///   substituted for `<project>` / `<project_root>`).
-/// - Exists → append any canonical keys that aren't already present
-///   (commented or active), tagged with `# added by vco YYYY-MM-DD`.
-/// - Idempotent: a second invocation produces a no-op.
-///
-/// User-set values are preserved verbatim — we only append new lines,
-/// never rewrite existing ones.
-///
-/// This is the Rust mirror of `_ensure_env_template` in install.py;
-/// keep them in lockstep. The 'env_template_canonical_keys_match_python'
-/// integration test is the contract that enforces this.
-///
-/// env_template: legacy_caller_pending_migration
-///
-/// PHASE 0.D NOTE (2026-05-24): This function and `build_canonical_env_text`
-/// are the Rust direct writers of `<folder>/.env` and are intentionally
-/// allowlisted by `tests/test_config_projection_single_writer.py` during
-/// the Phase 0.D migration. The Python sibling `_ensure_env_template`
-/// has been migrated to delegate to `vco_lib.env_template.apply_env_template`;
-/// this Rust function will be migrated to subprocess-into-Python in a
-/// follow-up Phase 0.D Part 2 (matching the Phase 0.B Part 2 /
-/// Rust-env-writer migration pattern). Until then, the
-/// legacy append-only `# added by vco YYYY-MM-DD` behaviour is preserved
-/// here and Python's `apply_env_template` block-replace contract runs
-/// in parallel against the same file (the two formats don't collide:
-/// the new BEGIN/END markers don't appear in legacy lines, and legacy
-/// lines sit outside the BEGIN/END markers Python writes).
-pub fn ensure_project_env_template(
-    folder: &Path,
-    settings: &ProjectEnvSettings,
-) -> Result<EnsureEnvReport, String> {
-    let env_path = folder.join(".env");
-    let project_name = settings.project_name.as_str();
-    let kg_collection = sanitize_kg_collection(project_name);
-
-    if !env_path.exists() {
-        let text = build_canonical_env_text(settings);
-        std::fs::write(&env_path, text)
-            .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
-        let added: Vec<String> = env_canonical_keys()
-            .iter()
-            .map(|(k, _)| k.to_string())
-            .collect();
-        return Ok(EnsureEnvReport {
-            action: "created".into(),
-            added_keys: added,
-            env_path: env_path.to_string_lossy().to_string(),
-        });
-    }
-
-    let existing = std::fs::read_to_string(&env_path)
-        .map_err(|e| format!("read {}: {}", env_path.display(), e))?;
-    let present = parse_existing_env_keys(&existing);
-
-    let missing: Vec<(&'static str, Option<&'static str>)> = env_canonical_keys()
-        .into_iter()
-        .filter(|(k, _)| !present.contains(*k))
-        .collect();
-
-    if missing.is_empty() {
-        return Ok(EnsureEnvReport {
-            action: "noop".into(),
-            added_keys: vec![],
-            env_path: env_path.to_string_lossy().to_string(),
-        });
-    }
-
-    let today = chrono::Utc::now().format("%Y-%m-%d");
-    let mut block = String::new();
-    if !existing.ends_with('\n') {
-        block.push('\n');
-    }
-    block.push('\n');
-    block.push_str(&format!(
-        "{} {}: appended missing canonical keys\n",
-        ENV_VCO_MARKER, today
-    ));
-    let added: Vec<String> = missing
-        .iter()
-        .map(|(k, default)| {
-            match default {
-                Some(d) => {
-                    // PR-3: if the launcher has launcher-resolved settings
-                    // for this key, prefer them over the static default
-                    // from `env_canonical_keys()`. This only diverges from
-                    // the static default when the launcher has a non-
-                    // default port / shared-KG-name override.
-                    let val = render_canonical_default_with_settings(k, d, settings);
-                    block.push_str(&format!("{}={}\n", k, val));
-                }
-                None => {
-                    // PR-3: even for keys that are commented in
-                    // `env_canonical_keys()`, the launcher may have a
-                    // resolved value (e.g. `WEAVIATE_URL` when adopted on
-                    // a non-default port). Render those active so the
-                    // launcher's config reaches the project's env.
-                    let resolved = render_canonical_default_with_settings(k, "", settings);
-                    if !resolved.is_empty()
-                        && resolved != "<project_root>"
-                        && matches!(
-                            *k,
-                            "WEAVIATE_URL"
-                                | "WEAVIATE_PORT"
-                                | "OLLAMA_URL"
-                                | "OLLAMA_PORT"
-                                | "CODE_EMBED_URL"
-                                | "CODE_EMBED_PORT"
-                                | "ACTIVE_EMBEDDING"
-                        )
-                    {
-                        block.push_str(&format!("{}={}\n", k, resolved));
-                    } else if *k == "RL_PROJECT_ROOT" {
-                        block.push_str("# RL_PROJECT_ROOT=<project_root>\n");
-                    } else {
-                        block.push_str(&format!("# {}=\n", k));
-                    }
-                }
-            }
-            (*k).to_string()
-        })
-        .collect();
-    let _ = kg_collection; // suppress unused-variable warning if helper change drops it
-
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&env_path)
-        .map_err(|e| format!("open {} for append: {}", env_path.display(), e))?;
-    use std::io::Write;
-    f.write_all(block.as_bytes())
-        .map_err(|e| format!("append to {}: {}", env_path.display(), e))?;
-
-    Ok(EnsureEnvReport {
-        action: "appended".into(),
-        added_keys: added,
-        env_path: env_path.to_string_lossy().to_string(),
-    })
-}
-
-/// v0.2.63 "Safe add": write the canonical project `.env` content VCO would
-/// have appended to a `.env.vco.reference` sidecar INSTEAD of touching the live
-/// `.env`. The sidecar lives next to the live file (`<folder>/.env`), so the
-/// project's Claude can `diff .env .env.vco.reference` and apply the keys it
-/// wants. The Python bundle step (`--safe-add`) detects the sidecar on disk and
-/// records the structured `safe_add_skipped_env_merge` deferral — keeping the
-/// deferral-format ownership entirely in Python.
-///
-/// Soft-fail: a sidecar write failure returns Err for the caller to push as a
-/// non-fatal warning; it must NEVER abort project creation. Idempotent: always
-/// rewrites the sidecar with the current canonical text (the sidecar is
-/// advisory).
-pub fn write_env_reference_sidecar(
-    folder: &Path,
-    settings: &ProjectEnvSettings,
-) -> Result<EnsureEnvReport, String> {
-    let sidecar_path = folder.join(".env.vco.reference");
-    let mut text = String::new();
-    // A short banner so a human (or agent) opening the sidecar understands it
-    // is advisory and NOT the live env. Keep it as comment lines so the file is
-    // still a valid `.env` for tools that parse it.
-    text.push_str(
-        "# vibecoded-orchestrator Safe-add REFERENCE — NOT the live .env.\n\
-         # Safe add was ON, so VCO did NOT modify your project-root .env\n\
-         # (it may be committed to your VCS). These are the keys VCO would\n\
-         # have added. Diff against your .env and copy what you want:\n\
-         #   diff .env .env.vco.reference\n\
-         # See .claude/context/UPDATE_DEFERRED.md (safe_add_skipped_env_merge).\n\n",
-    );
-    text.push_str(&build_canonical_env_text(settings));
-
-    std::fs::write(&sidecar_path, text)
-        .map_err(|e| format!("write {}: {}", sidecar_path.display(), e))?;
-
-    let added: Vec<String> = env_canonical_keys()
-        .iter()
-        .map(|(k, _)| k.to_string())
-        .collect();
-    Ok(EnsureEnvReport {
-        action: "reference_written".into(),
-        added_keys: added,
-        env_path: sidecar_path.to_string_lossy().to_string(),
-    })
 }
 
 // The KG-collection name derivation (sanitize_kg_collection) + B12 stale-name
@@ -4263,7 +3974,7 @@ pub async fn rename_project_v2(
     // didn't propagate to MCP subprocesses on Linux — refresh now
     // covers two surfaces, not three.)
     let folder = Path::new(&row.folder_path);
-    let _env_settings = project_env_settings::populate(&db, &new_name, Some(&id));
+    let env_settings = project_env_settings::populate(&db, &new_name, Some(&id));
     // HIGH-7 (2026-05-01): env-write failures now surface as structured
     // warnings instead of silent eprintln. Without this, a failed env refresh
     // leaves the project's 4 env surfaces stale until the next launcher
@@ -4281,8 +3992,9 @@ pub async fn rename_project_v2(
         tracing::warn!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
-    // ensure_project_env_template is append-only, so the project-root `.env`
-    // may carry a DRIFTED KG_COLLECTION value as an active line. VCO never
+    // The project-root `.env` is written once, at create, and a line the user
+    // owns is never rewritten, so it may carry a DRIFTED KG_COLLECTION value
+    // as an active line. VCO never
     // auto-rewrites `.env` — that file may be committed to the user's VCS, so
     // poisoning it silently is forbidden (B12 safety, matches safe-add). We
     // only DETECT the stale line and surface honest remediations (bundle
@@ -4294,30 +4006,50 @@ pub async fn rename_project_v2(
     // have flagged EVERY rename's .env as stale (it still — correctly —
     // carries the creation-time collection name). The check now fires only
     // for genuinely-drifted .env files.
-    if let Ok(env_text) = std::fs::read_to_string(folder.join(".env")) {
+    //
+    // v0.2.97: the check reads the assignment that WINS (the last active
+    // line, via the `.env` writer's own parser) and where it sits, and the
+    // advice names the command that really re-renders the managed block —
+    // bundle update never writes `.env`, so pointing there was false.
+    if folder.join(".env").is_file() {
         let resolved = vct_launcher_core::collection_naming::resolve_project_collections(
             &db,
             Some(&id),
             &new_name,
             Some(&row.slug),
         );
-        let bound_kg = resolved.kg;
-        if !env_text.contains(&format!("KG_COLLECTION={}", bound_kg)) {
-            let msg = format!(
-                "The project-root .env at {} carries a KG_COLLECTION line that \
-                 does not match the project's bound collection ({}). VCO never \
-                 rewrites .env automatically — it may be committed to your VCS. \
-                 VCO's own env channels (.claude/settings.json for MCP, \
-                 .claude/env for the shell) are re-projected from the binding, \
-                 so KG routing is NOT degraded. To fix the committed .env too, \
-                 either run \
-                 `python -m vco_lib.project_init install-bundle --update --folder {}` \
-                 (equivalently, the launcher's per-project \"Update bundle\" button), \
-                 or manually edit the stale line to read KG_COLLECTION={}.",
-                row.folder_path, bound_kg, row.folder_path, bound_kg
-            );
-            tracing::warn!("[vct] warning: {}", msg);
-            warnings.push(msg);
+        let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+        match crate::services::vco_lib_bridge::read_project_env_assignment(
+            root.as_deref(), folder, "KG_COLLECTION",
+        ) {
+            Ok((Some(value), in_block)) => {
+                if let Some(msg) =
+                    dotenv_kg_drift_warning(
+                        &row.folder_path,
+                        &id,
+                        &resolved.kg,
+                        &value,
+                        in_block,
+                        crate::services::vco_lib_bridge::EnvTemplatePorts {
+                            weaviate: env_settings.weaviate_port,
+                            ollama: env_settings.ollama_port,
+                            code_embed: env_settings.code_embed_port,
+                        },
+                    )
+                {
+                    tracing::warn!("[vct] warning: {}", msg);
+                    warnings.push(msg);
+                }
+            }
+            Ok((None, _)) => {}
+            Err(e) => {
+                let msg = format!(
+                    "Could not check the KG_COLLECTION line of the project-root .env at {}: {}",
+                    row.folder_path, e
+                );
+                tracing::warn!("[vct] warning: {}", msg);
+                warnings.push(msg);
+            }
         }
     }
 
@@ -4325,6 +4057,63 @@ pub async fn rename_project_v2(
     Ok(RenameProjectResult {
         project: ProjectView::from_row(row, count),
         warnings,
+    })
+}
+
+/// The warning a rename reports when the project-root `.env`'s EFFECTIVE
+/// `KG_COLLECTION` (`value`, the last active assignment) is not the bound
+/// collection, or `None` when it is. Where the line sits decides the advice:
+///   * inside VCO's managed block — `python -m vco_lib.env_template apply`
+///     re-renders the block from the binding (it touches nothing else);
+///   * outside it — the line is the user's: VCO never rewrites it (the file
+///     may be committed), so the user edits it, or deletes it and runs the
+///     same command so the block carries the bound value.
+fn dotenv_kg_drift_warning(
+    folder: &str,
+    project_id: &str,
+    bound_kg: &str,
+    value: &str,
+    in_block: bool,
+    ports: crate::services::vco_lib_bridge::EnvTemplatePorts,
+) -> Option<String> {
+    if value == bound_kg {
+        return None;
+    }
+    // The same flags the create path hands the writer (the launcher's
+    // resolved ports), so running the printed command re-renders exactly
+    // the block the launcher would.
+    let quote = crate::commands::git_user_editable_merge::shell_quote;
+    let flags: Vec<String> = crate::services::vco_lib_bridge::env_template_flags(None, ports)
+        .iter()
+        .map(|f| quote(f))
+        .collect();
+    let apply = format!(
+        "python -m vco_lib.env_template apply --project-id {} --project-folder {} {}",
+        quote(project_id),
+        quote(folder),
+        flags.join(" ")
+    );
+    let routing = "VCO's own env channels (.claude/settings.json for MCP, .claude/env for \
+                   the shell) are re-projected from the binding, so KG routing is NOT degraded.";
+    Some(if in_block {
+        format!(
+            "The VCO-managed block of the project-root .env at {folder} sets \
+             KG_COLLECTION={value}, not the project's bound collection ({bound_kg}). \
+             {routing} To re-render the block from the binding, run `{apply}` from the \
+             orchestrator folder with its venv active — it rewrites only the lines \
+             between the VCO-MANAGED markers. (If the project was added with Safe add \
+             to keep .env untouched, leave it or edit that line yourself.)"
+        )
+    } else {
+        format!(
+            "The project-root .env at {folder} sets KG_COLLECTION={value} on a line \
+             outside VCO's managed block, not the project's bound collection \
+             ({bound_kg}). {routing} That line is yours: VCO never rewrites it (the \
+             file may be committed to your VCS). To fix it, edit it to read \
+             KG_COLLECTION={bound_kg} — or delete it and run `{apply}` from the \
+             orchestrator folder with its venv active, so the managed block carries \
+             the bound value."
+        )
     })
 }
 
@@ -4848,8 +4637,11 @@ pub struct UnregisterReport {
     pub collections_dropped: Vec<String>,
     /// Soft-fail messages — failures that don't abort the unregister
     /// (e.g. Weaviate down → keep going + drop request becomes a
-    /// warning; unreadable file → skip + record). The DB delete and
-    /// audit log entry ALWAYS succeed regardless of warning count.
+    /// warning; unreadable file → skip + record). Warnings never stop
+    /// the DB delete and audit entry. The one stop (v0.2.97, review R4
+    /// F25): a secret value VCO provably wrote but could not remove —
+    /// the command then returns `Err` before anything irreversible and
+    /// the project stays registered (`unregister_purge_folder`).
     pub warnings: Vec<String>,
 }
 
@@ -5074,6 +4866,12 @@ fn unregister_by_name_keys() -> std::collections::HashSet<&'static str> {
 /// Returns `(new_text, removed_keys)`. `removed_keys` is sorted +
 /// de-duped so the UI shows a clean list.
 ///
+/// MUST MATCH the line grammar of `vco_lib/envfile.py::parse_env_line`
+/// (a documented Rust mirror, review R4 F27): an optional `export `, a
+/// `KEY=` split on the first `=`, the key trimmed. This by-name strip also
+/// accepts a `#`-commented line, which the Python reader skips — deliberate:
+/// a commented canonical key is launcher residue too.
+///
 /// Marker lines (`# added by vco YYYY-MM-DD`) are preserved as-is —
 /// they're informational, the user can clean them up later if desired.
 /// We don't try to strip empty marker blocks (e.g. a `# added by vco`
@@ -5133,6 +4931,9 @@ pub(crate) fn strip_canonical_keys_from_env_text(text: &str) -> (String, Vec<Str
 ///   * `export KEY=value`
 ///   * `# export KEY="value"` (commented; rare but possible)
 ///   * `KEY=value` / `# KEY=value` (env-style fallback)
+///
+/// MUST MATCH the line grammar of `vco_lib/envfile.py::parse_env_line`
+/// (see [`strip_canonical_keys_from_env_text`], review R4 F27).
 ///
 /// All lines OUTSIDE the matched-key set are preserved verbatim, INCLUDING
 /// the `# vco-managed-begin` / `# vco-managed-end` marker lines (a tidy
@@ -5241,10 +5042,27 @@ pub(crate) fn strip_json_env_surfaces(
 /// every env surface is missing returns no keys + no warnings — a clean
 /// no-op (the project may have been registered against a folder that
 /// the user has since cleaned up by hand).
+///
+/// Test-only convenience: production (`delete_project_v2`) calls
+/// [`surgically_strip_env_surfaces_checked`], which also returns the proven
+/// values it could not remove.
+#[cfg(test)]
 pub(crate) fn surgically_strip_env_surfaces(
     root: Option<&Path>,
     folder: &Path,
 ) -> (Vec<String>, Vec<String>) {
+    let (keys, warnings, _not_removed) = surgically_strip_env_surfaces_checked(root, folder);
+    (keys, warnings)
+}
+
+/// The env-surface strip documented on `surgically_strip_env_surfaces` (above),
+/// plus the proven secret values it could
+/// NOT remove (`KEY in <file>`, review R4 F25) — the unregister stops on a
+/// non-empty list (see `delete_project_v2`).
+pub(crate) fn surgically_strip_env_surfaces_checked(
+    root: Option<&Path>,
+    folder: &Path,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut keys = std::collections::BTreeSet::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -5314,9 +5132,9 @@ pub(crate) fn surgically_strip_env_surfaces(
     strip_json_env_surfaces(root, folder, &canonical, "env-key strip", &mut keys, &mut warnings);
 
     // 5. Secret VALUES (user secrets + `GITHUB_TOKEN`) — only on evidence.
-    strip_proven_secret_values(root, folder, &mut keys, &mut warnings);
+    let not_removed = strip_proven_secret_values(root, folder, &mut keys, &mut warnings);
 
-    (keys.into_iter().collect(), warnings)
+    (keys.into_iter().collect(), warnings, not_removed)
 }
 
 /// v0.2.97: remove the secret VALUES VCO can PROVE it wrote from every env
@@ -5331,7 +5149,9 @@ pub(crate) fn surgically_strip_env_surfaces(
 /// its value EQUALS the launcher's stored one — per LINE in `.env` /
 /// `.claude/env` (a file can hold a key twice; only the proven line goes,
 /// review R3 F23), per key in the JSON env blocks (JSONC in place, refusal
-/// recorded). No Rust copy of the line grammar exists (review R3 F24). Must
+/// recorded). No Rust copy of the line grammar is used for this EVIDENCE
+/// strip (review R3 F24; the by-name canonical strippers above are a
+/// separate, documented mirror — see their "must match" notes). Must
 /// run BEFORE the unregister forgets the project's secret rows and deletes its
 /// DB row: the hub resolves the stored value only while the project is
 /// registered.
@@ -5340,12 +5160,16 @@ pub(crate) fn surgically_strip_env_surfaces(
 /// line ([`report_left_secret_values`]) — the unregister result the GUI shows
 /// (the project is leaving VCO, so a deferral in its ledger might never be
 /// read). A failure removes nothing and says so.
+///
+/// Returns the proven values it could NOT remove (`KEY in <file>`): a write
+/// failure on one file no longer aborts the others (review R4 F25), and the
+/// caller must not quietly finish the unregister over them.
 pub(crate) fn strip_proven_secret_values(
     root: Option<&Path>,
     folder: &Path,
     purged: &mut std::collections::BTreeSet<String>,
     warnings: &mut Vec<String>,
-) {
+) -> Vec<String> {
     match crate::services::vco_lib_bridge::strip_proven_secret_values(root, folder) {
         Ok(reply) => {
             if let Some(removed) = reply.get("removed").and_then(serde_json::Value::as_object) {
@@ -5365,14 +5189,42 @@ pub(crate) fn strip_proven_secret_values(
             if let Some(line) = report_left_secret_values(&reply) {
                 warnings.push(line);
             }
+            let not_removed = not_removed_secret_values(&reply);
+            if !not_removed.is_empty() {
+                warnings.push(format!(
+                    "NOT removed although VCO wrote them (the file could not be \
+                     rewritten — see the error above): {}",
+                    not_removed.join("; ")
+                ));
+            }
+            not_removed
         }
-        Err(e) => warnings.push(format!(
-            "could not check which secret values in this project's env files VCO \
-             wrote, so none were removed (a value you typed is never removed by \
-             name): {}",
-            e
-        )),
+        // The step could not run at all (no interpreter, a crash): nothing
+        // was checked, so nothing is known to remain. Stopping the unregister
+        // here would trap a user whose VCO install is broken, so it goes on
+        // with this warning (contrast a KNOWN unremoved value, above).
+        Err(e) => {
+            warnings.push(format!(
+                "could not check which secret values in this project's env files VCO \
+                 wrote, so none were removed (a value you typed is never removed by \
+                 name): {}",
+                e
+            ));
+            Vec::new()
+        }
     }
+}
+
+/// `KEY in <file>` for every entry of a reply's `not_removed` — proven values
+/// whose removal failed. Key names only.
+pub(crate) fn not_removed_secret_values(reply: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rel, names) in reply.get("not_removed").and_then(serde_json::Value::as_object).into_iter().flatten() {
+        for name in names.as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
+            out.push(format!("{} in {}", name, rel));
+        }
+    }
+    out
 }
 
 /// The one warning line for the values left in place, from a
@@ -5606,18 +5458,14 @@ pub async fn delete_project_v2(
             //     BEFORE the file delete as well. The keychain itself is
             //     never touched.
             let vco_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
-            let (keys, env_warnings) = surgically_strip_env_surfaces(vco_root.as_deref(), folder);
-            for k in keys {
-                if !report.keys_purged_from_env.contains(&k) {
-                    report.keys_purged_from_env.push(k);
-                }
-            }
-            report.warnings.extend(env_warnings);
-
-            // 1b. File / directory purge.
-            let (files, file_warnings) = purge_launcher_files_from_project(folder);
-            report.files_purged = files;
-            report.warnings.extend(file_warnings);
+            // 1b. File / directory purge — only when 1a left no proven
+            //     value it could not remove; otherwise the unregister STOPS
+            //     here (review R4 F25, see `unregister_purge_folder`).
+            unregister_purge_folder(
+                folder,
+                |f| surgically_strip_env_surfaces_checked(vco_root.as_deref(), f),
+                &mut report,
+            )?;
         } else {
             // Folder gone (user moved/deleted by hand). The DB delete is
             // still useful — it removes the orphan registration. Note in
@@ -6272,6 +6120,45 @@ pub(crate) fn update_should_skip_root_autobuild(
 mod tests {
     use super::*;
 
+    // ─── v0.2.97: bundle_materialization registry write (act + soft-fail) ─
+
+    #[test]
+    fn a_registered_bundle_version_raises_no_warning() {
+        let reply = serde_json::json!({"ok": true, "action": "registered", "schema_version": 2});
+        assert_eq!(bundle_record_warning("p1", Ok(reply)), None);
+    }
+
+    #[test]
+    fn a_refused_registry_write_is_a_warning_naming_the_reason() {
+        let w = bundle_record_warning(
+            "p1",
+            Err("…records bundle schema v1… (manifest_version_mismatch)".to_string()),
+        )
+        .expect("a refusal must surface");
+        assert!(w.contains("NOT recorded for project p1"), "{}", w);
+        assert!(w.contains("manifest_version_mismatch"), "{}", w);
+        assert!(w.contains("bundle update itself is complete"), "{}", w);
+    }
+
+    #[test]
+    fn an_ok_reply_that_did_not_register_is_still_a_warning() {
+        let reply = serde_json::json!({"ok": true});
+        let w = bundle_record_warning("p1", Ok(reply)).expect("not a registration");
+        assert!(w.contains("unexpected reply"), "{}", w);
+    }
+
+    #[tokio::test]
+    async fn a_db_without_a_file_is_skipped_without_spawning() {
+        // The in-memory stand-in (orchestrator-update window, tests) has no
+        // path: the write is skipped with a warning, no child is spawned, and
+        // no launcher.db is resolved from the environment.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let w = record_bundle_materialization(&db, Path::new("/nonexistent"), "p1")
+            .await
+            .expect("skip must surface");
+        assert!(w.contains("in-memory"), "{}", w);
+    }
+
     // v0.2.92: the three `stdout_parse_diagnostic` unit tests moved WITH the
     // function to `commands::subprocess_contract::tests` (byte-identical), so
     // the behaviour stays pinned from its new home rather than from here.
@@ -6844,169 +6731,37 @@ mod tests {
         std::fs::remove_dir_all(&folder).ok();
     }
 
-    // ─── Deliverable 1 (2026-04-28): ensure_project_env_template ──
+    // ─── v0.2.97: the project `.env` is `vco_lib.env_template`'s ──
+    //
+    // The Rust writer these tests pinned (`ensure_project_env_template`,
+    // `write_env_reference_sidecar`, the `env_canonical_keys` mirror) is
+    // retired. Its behaviour is pinned where it now lives: the bridge's
+    // end-to-end tests (`services::vco_lib_bridge::env_template_tests` —
+    // create, user lines kept, legacy lines folded, idempotent, Safe-add
+    // sidecar leaves the live `.env` alone) and `tests/test_env_template.py`.
 
-    fn _scratch_dir(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "vct-envtmpl-{}-{}",
-            tag,
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    /// A scratch state dir whose `launcher.db` holds project `name`, the way
+    /// `create_project_v2` leaves it before the `.env` write. Keep the guard.
+    fn env_fixture(
+        name: &str,
+    ) -> (vct_launcher_core::test_env::StateDirGuard, String, std::path::PathBuf) {
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let folder = guard.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let db = Db::open().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug(name).unwrap();
+        db.insert_project(&id, name, &folder.display().to_string(), ProjectHost::Base, &slug)
+            .unwrap();
+        (guard, id, folder)
     }
 
-    // ─── v0.2.63 Safe add: write_env_reference_sidecar ──
-
-    #[test]
-    fn safe_add_writes_env_reference_sidecar_not_live_env() {
-        let dir = _scratch_dir("safeadd-sidecar");
-        // Simulate a pre-existing committed .env the user owns.
-        let env_path = dir.join(".env");
-        let user_env = "KG_COLLECTION=LegacyBare\nUSER_KEY=keep\n";
-        std::fs::write(&env_path, user_env).unwrap();
-
-        let report = write_env_reference_sidecar(
-            &dir,
-            &ProjectEnvSettings::with_defaults("Acme"),
-        )
-        .unwrap();
-        assert_eq!(report.action, "reference_written");
-
-        // The live .env must be byte-for-byte unchanged.
-        let live_after = std::fs::read_to_string(&env_path).unwrap();
-        assert_eq!(
-            live_after, user_env,
-            "safe-add must NOT touch the live project-root .env"
-        );
-
-        // The sidecar exists and carries VCO's canonical KG_COLLECTION.
-        let sidecar = dir.join(".env.vco.reference");
-        assert!(sidecar.exists());
-        let sidecar_text = std::fs::read_to_string(&sidecar).unwrap();
-        assert!(sidecar_text.contains("KG_COLLECTION=Acme_KnowledgeGraph"));
-        assert!(sidecar_text.contains("PROJECT_NAME=Acme"));
-        // The banner names the deferral condition so a reader can find it.
-        assert!(sidecar_text.contains("safe_add_skipped_env_merge"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn safe_add_sidecar_does_not_create_live_env_when_absent() {
-        let dir = _scratch_dir("safeadd-noenv");
-        assert!(!dir.join(".env").exists());
-        write_env_reference_sidecar(
-            &dir,
-            &ProjectEnvSettings::with_defaults("X"),
-        )
-        .unwrap();
-        // Sidecar written, but the live .env must remain absent — safe-add
-        // never materialises a `.env` (that's the whole point).
-        assert!(dir.join(".env.vco.reference").exists());
-        assert!(
-            !dir.join(".env").exists(),
-            "safe-add must not create a live .env"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_env_template_creates_when_missing() {
-        let dir = _scratch_dir("create");
-        assert!(!dir.join(".env").exists());
-        let report = ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("Acme")).unwrap();
-        assert_eq!(report.action, "created");
-        assert!(dir.join(".env").exists());
-        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
-        // Active keys filled with project-substituted values.
-        assert!(text.contains("KG_COLLECTION=Acme_KnowledgeGraph"));
-        assert!(text.contains("PROJECT_NAME=Acme"));
-        // Optional keys remain commented.
-        assert!(text.contains("# OPENAI_API_KEY="));
-        assert!(text.contains("# GITHUB_TOKEN="));
-        // Active OPENAI_API_KEY must NOT appear.
-        assert!(!text.contains("\nOPENAI_API_KEY="));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_env_template_appends_missing_with_marker() {
-        let dir = _scratch_dir("append");
-        let env_path = dir.join(".env");
-        std::fs::write(&env_path, "OPENAI_API_KEY=sk-user\n").unwrap();
-        let report = ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("X")).unwrap();
-        assert_eq!(report.action, "appended");
-        let text = std::fs::read_to_string(&env_path).unwrap();
-        // User value preserved verbatim.
-        assert!(text.contains("OPENAI_API_KEY=sk-user"));
-        // Marker present.
-        assert!(text.contains(ENV_VCO_MARKER));
-        // Missing keys appended.
-        assert!(text.contains("KG_COLLECTION=X_KnowledgeGraph"));
-        assert!(text.contains("# GITHUB_TOKEN="));
-        // OPENAI_API_KEY must appear exactly once (the user's line).
-        let count = text.matches("OPENAI_API_KEY").count();
-        assert_eq!(count, 1, "expected 1, got {count}\n{text}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_env_template_idempotent_on_double_run() {
-        let dir = _scratch_dir("idem");
-        ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("X")).unwrap();
-        let after_first = std::fs::read_to_string(dir.join(".env")).unwrap();
-        let report = ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("X")).unwrap();
-        let after_second = std::fs::read_to_string(dir.join(".env")).unwrap();
-        assert_eq!(report.action, "noop");
-        assert_eq!(after_first, after_second);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_env_template_recognises_commented_form_as_present() {
-        // User has `# ANTHROPIC_API_KEY=` — the commented canonical
-        // form. Re-running must NOT append a duplicate.
-        let dir = _scratch_dir("commented");
-        std::fs::write(
-            dir.join(".env"),
-            "# my prose\n# ANTHROPIC_API_KEY=\nGITHUB_TOKEN=ghp_user\n",
-        )
-        .unwrap();
-        ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("X")).unwrap();
-        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
-        let count = text.matches("ANTHROPIC_API_KEY").count();
-        assert_eq!(count, 1, "expected 1 occurrence, got {count}\n{text}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_env_template_handles_no_trailing_newline() {
-        let dir = _scratch_dir("nonl");
-        std::fs::write(dir.join(".env"), "FOO=bar").unwrap();
-        ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("X")).unwrap();
-        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
-        assert!(text.contains("FOO=bar\n"),
-                "user line should now end with newline: {text:?}");
-        // Marker line must not be glued to FOO=bar.
-        for line in text.lines() {
-            if line.contains(ENV_VCO_MARKER) {
-                assert!(!line.starts_with("FOO=bar"),
-                        "marker glued to user line: {line:?}");
-            }
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn ensure_env_template_user_value_for_kg_collection_not_overwritten() {
-        let dir = _scratch_dir("kguser");
-        std::fs::write(dir.join(".env"), "KG_COLLECTION=MyCustom_KG\n").unwrap();
-        ensure_project_env_template(&dir, &ProjectEnvSettings::with_defaults("Acme")).unwrap();
-        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
-        assert!(text.contains("KG_COLLECTION=MyCustom_KG"));
-        assert!(!text.contains("KG_COLLECTION=Acme_KnowledgeGraph"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    const ENV_PORTS: crate::services::vco_lib_bridge::EnvTemplatePorts =
+        crate::services::vco_lib_bridge::EnvTemplatePorts {
+            weaviate: 8081,
+            ollama: 11435,
+            code_embed: 11440,
+        };
 
     #[test]
     fn parse_existing_env_keys_handles_blank_and_comment_only_lines() {
@@ -7016,100 +6771,93 @@ mod tests {
         assert!(keys.contains("FOO"));
     }
 
+    /// B12 in the create sequence: a pre-existing `.env` whose user line holds
+    /// the stale bare `KG_COLLECTION=KnowledgeGraph`. The `.env` writer never
+    /// renders a key the user assigns, so the stale line is still the only
+    /// assignment after it; B12 then repairs THAT line in place — one
+    /// canonical assignment, user keys untouched.
     #[test]
-    fn env_template_canonical_keys_match_python() {
-        // Cross-language contract: the Rust canonical-key list MUST
-        // match install.py's. If this test fails because the lists
-        // diverge, update both sides — the user shouldn't get
-        // different keys depending on which surface ran first.
-        let rust_keys: std::collections::HashSet<String> = env_canonical_keys()
-            .iter()
-            .map(|(k, _)| (*k).to_string())
-            .collect();
-        let expected: std::collections::HashSet<String> = [
-            "WEAVIATE_URL", "WEAVIATE_PORT", "OLLAMA_URL", "OLLAMA_PORT",
-            "CODE_EMBED_URL",
-            "KG_COLLECTION", "SHARED_KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-            "PROJECT_NAME",
-            // CONVERSATION_COLLECTION removed (B5 2026-05-01).
-            "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-            "GITHUB_TOKEN",
-            "RL_SERVER_URL", "RL_SERVER_PORT", "RL_PROJECT_ROOT",
-            "VCT_TELEMETRY",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(rust_keys, expected, "Rust canonical key set drifted from Python");
+    fn create_sequence_repairs_a_stale_user_kg_collection_once() {
+        let (_guard, id, folder) = env_fixture("Acme");
+        let env_path = folder.join(".env");
+        std::fs::write(&env_path, "KG_COLLECTION=KnowledgeGraph\nMY_VAR=hello\n").unwrap();
+
+        crate::services::vco_lib_bridge::apply_project_env_template(None, &folder, &id, ENV_PORTS)
+            .unwrap();
+        let after_apply = std::fs::read_to_string(&env_path).unwrap();
+        let active_kg = |text: &str| -> Vec<String> {
+            text.lines().filter(|l| l.starts_with("KG_COLLECTION=")).map(str::to_string).collect()
+        };
+        assert_eq!(active_kg(&after_apply), ["KG_COLLECTION=KnowledgeGraph"], "{after_apply}");
+
+        let outcome = b12_repair_stale_kg_collection(&env_path, "Acme").unwrap();
+        assert!(matches!(outcome, B12Outcome::Repaired { .. }));
+        let repaired = std::fs::read_to_string(&env_path).unwrap();
+        let kg = active_kg(&repaired);
+        assert_eq!(kg.len(), 1, "{repaired}");
+        assert!(kg[0].starts_with("KG_COLLECTION=Acme_KnowledgeGraph"), "{repaired}");
+        assert!(repaired.contains("MY_VAR=hello\n"), "user keys must be preserved:\n{repaired}");
     }
 
-    // ─── PR 7 deliverable tests (env-hygiene secondary drift) ────────
-
-    /// B7: after create, the canonical key VCT_TELEMETRY is present in the
-    /// .env template, not the legacy VIBECODED_TELEMETRY active key.
-    /// (The active VIBECODED_TELEMETRY write was in install.py; the Rust
-    /// surfaces only carry VCT_TELEMETRY as a commented placeholder.)
+    /// Rename's `.env` drift advice (v0.2.97): no warning when the WINNING
+    /// assignment is the bound collection; a managed-block drift names the
+    /// command that really re-renders the block (never `install-bundle`,
+    /// which does not write `.env`); a user line is called the user's.
     #[test]
-    fn telemetry_canonical_key_is_vct_telemetry() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vct-b7-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+    fn rename_dotenv_drift_advice_is_true_for_each_case() {
+        let ports = crate::services::vco_lib_bridge::EnvTemplatePorts {
+            weaviate: 18081,
+            ollama: 11435,
+            code_embed: 11440,
+        };
+        assert!(dotenv_kg_drift_warning("/p", "id-1", "Acme_KG", "Acme_KG", true, ports).is_none());
 
-        ensure_project_env_template(&tmp, &ProjectEnvSettings::with_defaults("Acme")).unwrap();
-        let env = std::fs::read_to_string(tmp.join(".env")).unwrap();
+        let block = dotenv_kg_drift_warning("/p q", "id-1", "Acme_KG", "Old_KG", true, ports).unwrap();
+        assert!(block.contains(
+            "`python -m vco_lib.env_template apply --project-id id-1 --project-folder '/p q' \
+             --weaviate-port 18081 --ollama-port 11435 --code-embed-port 11440`"
+        ), "{block}");
+        assert!(block.contains("VCO-managed block") && !block.contains("install-bundle"));
 
-        // Canonical key must be present (as a commented placeholder).
-        assert!(env.contains("VCT_TELEMETRY"),
-                ".env must reference VCT_TELEMETRY:\n{env}");
-        // Legacy key must NOT be written by the Rust template.
-        assert!(!env.contains("VIBECODED_TELEMETRY"),
-                ".env template must not write VIBECODED_TELEMETRY (read-alias only):\n{env}");
-
-        std::fs::remove_dir_all(&tmp).ok();
+        let user = dotenv_kg_drift_warning("/p", "id-1", "Acme_KG", "Mine_KG", false, ports).unwrap();
+        assert!(user.contains("That line is yours") && user.contains("KG_COLLECTION=Acme_KG"));
+        assert!(user.contains("python -m vco_lib.env_template apply") && !user.contains("install-bundle"));
     }
 
-    /// B12: registering a folder whose .env has stale KG_COLLECTION=KnowledgeGraph
-    /// emits a warning in the result. Test via the helper logic directly since
-    /// we can't call the Tauri command without State<Db>.
+    /// The advice's inputs come from the writer's own parser: the LAST active
+    /// assignment wins and its location is reported — and the printed
+    /// `apply` really fixes a drifted block (end to end, real child).
     #[test]
-    fn register_project_with_stale_env_detects_stale_kg() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vct-b12-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+    fn rename_reads_the_winning_kg_assignment_and_apply_fixes_block_drift() {
+        use crate::services::vco_lib_bridge::{apply_project_env_template, read_project_env_assignment};
+        let (_guard, id, folder) = env_fixture("Acme");
+        let env_path = folder.join(".env");
+        assert_eq!(read_project_env_assignment(None, &folder, "KG_COLLECTION").unwrap(), (None, false));
 
-        // Pre-populate with stale bare default (the VideoFrames bug pattern).
-        std::fs::write(tmp.join(".env"), "KG_COLLECTION=KnowledgeGraph\nMY_VAR=hello\n").unwrap();
+        apply_project_env_template(None, &folder, &id, ENV_PORTS).unwrap();
+        let fresh = std::fs::read_to_string(&env_path).unwrap();
+        std::fs::write(&env_path, fresh.replace("\nKG_COLLECTION=Acme_KnowledgeGraph\n", "\nKG_COLLECTION=Drifted\n"))
+            .unwrap();
+        assert_eq!(
+            read_project_env_assignment(None, &folder, "KG_COLLECTION").unwrap(),
+            (Some("Drifted".to_string()), true)
+        );
+        apply_project_env_template(None, &folder, &id, ENV_PORTS).unwrap();
+        assert_eq!(
+            read_project_env_assignment(None, &folder, "KG_COLLECTION").unwrap(),
+            (Some("Acme_KnowledgeGraph".to_string()), true)
+        );
 
-        // ensure_project_env_template is append-only; it will not overwrite the stale line.
-        ensure_project_env_template(&tmp, &ProjectEnvSettings::with_defaults("Acme")).unwrap();
-
-        // B12 stale detection: the canonical key should be absent from .env
-        // (since the old KG_COLLECTION=KnowledgeGraph occupies the key slot
-        // and ensure_project_env_template skips it as "present").
-        let env_text = std::fs::read_to_string(tmp.join(".env")).unwrap();
-        assert!(env_text.contains("KG_COLLECTION=KnowledgeGraph"),
-                "stale value must still be present (append-only writer):\n{env_text}");
-        assert!(!env_text.contains("KG_COLLECTION=Acme_KnowledgeGraph"),
-                "canonical value must NOT have been written (stale blocked it):\n{env_text}");
-
-        // The stale detection logic that create_project_v2 would run:
-        let kg_basename = sanitize_kg_collection("Acme");
-        let canonical_kg = format!("{}_KnowledgeGraph", kg_basename);
-        let stale_bare = "KG_COLLECTION=KnowledgeGraph";
-        let has_stale = env_text.lines().any(|l| l.trim() == stale_bare);
-        let missing_canonical = !env_text.contains(&format!("KG_COLLECTION={}", canonical_kg));
-        assert!(has_stale && missing_canonical,
-                "stale detection must fire (has_stale={has_stale}, missing_canonical={missing_canonical})");
-
-        // MY_VAR user value preserved.
-        assert!(env_text.contains("MY_VAR=hello"),
-                "user keys must be preserved:\n{env_text}");
-
-        std::fs::remove_dir_all(&tmp).ok();
+        // A user line AFTER the block wins and is reported as the user's.
+        let mut text = std::fs::read_to_string(&env_path).unwrap();
+        text.push_str("KG_COLLECTION=Mine\n");
+        std::fs::write(&env_path, text).unwrap();
+        assert_eq!(
+            read_project_env_assignment(None, &folder, "KG_COLLECTION").unwrap(),
+            (Some("Mine".to_string()), false)
+        );
+        // Never a secret: only managed keys are answered.
+        assert!(read_project_env_assignment(None, &folder, "OPENAI_API_KEY").is_err());
     }
 
     /// MEDIUM-1 (refactored 2026-05-01): get_shared_kg_write_disabled reads
@@ -9879,12 +9627,6 @@ USER_DB_URL=postgres://user:pass@db/app
     /// Python twin: `tests/test_config_projection_user_secrets.py`.
     #[test]
     fn no_secret_value_anywhere_under_project_tree_after_projection() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vct-secret-tree-invariant-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-
         const SECRET_VALUE: &str = "synthetic-not-a-real-secret-a7f3";
         const PAT_VALUE: &str = "ghp_synthetic_invariant_canary_b9e1";
 
@@ -9892,14 +9634,17 @@ USER_DB_URL=postgres://user:pass@db/app
         // one reader, the retired Rust env writer, is gone), so no Rust
         // writer can be handed a value. The canaries stay as the tree-wide
         // guard against a future writer that sources one elsewhere.
-        let settings = ProjectEnvSettings::with_defaults("TreeInvariant");
-
-        // Every LIVE Rust-side project-tree writer: the root .env template
-        // and the safe-add reference sidecar. (The two JSON/shell env
-        // surfaces are Python's since Phase 0.B Part 2; its twin of this
-        // invariant is tests/test_config_projection_user_secrets.py.)
-        ensure_project_env_template(&tmp, &settings).unwrap();
-        write_env_reference_sidecar(&tmp, &settings).unwrap();
+        //
+        // The root .env and the safe-add reference sidecar, through the
+        // bridge the create path uses (`vco_lib.env_template` apply /
+        // reference, since the Rust writer's retirement). The two JSON/shell
+        // env surfaces are Python's since Phase 0.B Part 2; its twin of this
+        // invariant is tests/test_config_projection_user_secrets.py.
+        let (_guard, id, tmp) = env_fixture("TreeInvariant");
+        crate::services::vco_lib_bridge::apply_project_env_template(None, &tmp, &id, ENV_PORTS)
+            .unwrap();
+        crate::services::vco_lib_bridge::write_project_env_reference(None, &tmp, &id, ENV_PORTS)
+            .unwrap();
 
         // Walk EVERY file under the tree — the invariant is tree-wide,
         // not per-known-surface, so a future writer that adds a new

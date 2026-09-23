@@ -1,7 +1,7 @@
 //! Settings struct + populate helper for per-project env-file writers.
 //!
-//! Background: Until 2026-05-06, the Rust env writer (retired v0.2.97) and
-//! `ensure_project_env_template` accepted a hand-crafted argument list of
+//! Background: Until 2026-05-06, the Rust env writer and the Rust `.env`
+//! template writer (both retired v0.2.97) accepted a hand-crafted argument list of
 //! `(folder, project_name, write_disabled)` and derived every other value
 //! from hardcoded constants. The launcher's adopted service ports,
 //! `ACTIVE_EMBEDDING` choice, and shared-KG name were all invisible to
@@ -9,8 +9,9 @@
 //! for the full inventory of "values that should propagate but don't".
 //!
 //! This module introduces `ProjectEnvSettings` as a single named bundle —
-//! today consumed by `ensure_project_env_template` (the project-root `.env`
-//! template), the kg-sync / kg-summary spawns, and the access-list values
+//! today consumed by the project-root `.env` write (its service ports go to
+//! `vco_lib.env_template` through the bridge), the kg-sync / kg-summary
+//! spawns, and the access-list values
 //! `refresh_project_env_with_db` reports; the canonical env SURFACES are
 //! written by `vco_lib.config_projection` alone since the Rust writer's
 //! retirement — plus a `populate` helper that reads the
@@ -559,10 +560,10 @@ pub fn is_shared_kg_class_name(name: &str, canonical: &str) -> bool {
         || name.eq_ignore_ascii_case(LEGACY_SHARED_KG_COLLECTION)
 }
 
-/// Populated once per project-env write call. Plumbed through
-/// `ensure_project_env_template` and the safe-add sidecar so future
-/// launcher-state values can be added here without re-threading every
-/// call site.
+/// Populated once per project-env write call. Its ports are forwarded to
+/// the project-root `.env` writer (`vco_lib.env_template`, and its safe-add
+/// sidecar) so future launcher-state values can be added here without
+/// re-threading every call site.
 ///
 /// String-typed for trivial JSON / TOML serialisation in tests; the fields
 /// are typed numerically only where a u16 is unambiguously a port.
@@ -573,10 +574,12 @@ pub struct ProjectEnvSettings {
     pub active_embedding: String,
 
     /// Per-service URLs. Composed from the resolved port + the
-    /// canonical scheme/host.
+    /// canonical scheme/host. (v0.2.97: no `code_embed_url` — its one
+    /// reader, the retired Rust `.env` renderer, is superseded by
+    /// `vco_lib.env_template`, which composes `CODE_EMBED_URL` from the
+    /// forwarded `code_embed_port` the same way.)
     pub weaviate_url: String,
     pub ollama_url: String,
-    pub code_embed_url: String,
 
     pub weaviate_port: u16,
     pub ollama_port: u16,
@@ -649,7 +652,6 @@ impl ProjectEnvSettings {
             active_embedding: DEFAULT_ACTIVE_EMBEDDING.to_string(),
             weaviate_url: format!("http://localhost:{}", DEFAULT_WEAVIATE_PORT),
             ollama_url: format!("http://localhost:{}", DEFAULT_OLLAMA_PORT),
-            code_embed_url: format!("http://localhost:{}", DEFAULT_CODE_EMBED_PORT),
             weaviate_port: DEFAULT_WEAVIATE_PORT,
             ollama_port: DEFAULT_OLLAMA_PORT,
             code_embed_port: DEFAULT_CODE_EMBED_PORT,
@@ -938,7 +940,6 @@ pub fn populate(
         active_embedding,
         weaviate_url: format!("http://localhost:{}", weaviate_port),
         ollama_url: format!("http://localhost:{}", ollama_port),
-        code_embed_url: format!("http://localhost:{}", code_embed_port),
         weaviate_port,
         ollama_port,
         code_embed_port,
@@ -1160,7 +1161,7 @@ mod tests {
         assert_eq!(s.shared_kg_collection, "VibeCodedOrchestrator_KnowledgeGraph");
         assert_eq!(s.weaviate_url, "http://localhost:8081");
         assert_eq!(s.ollama_url, "http://localhost:11435");
-        assert_eq!(s.code_embed_url, "http://localhost:11440");
+        assert_eq!(s.code_embed_port, 11440);
         assert_eq!(s.active_embedding, "qwen3");
         assert!(!s.use_gpu);
         assert!(s.cpu_only);

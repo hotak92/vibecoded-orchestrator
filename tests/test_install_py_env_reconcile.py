@@ -22,7 +22,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import install  # type: ignore  # noqa: E402
 
-from vco_lib.env_template import list_canonical_env_template_keys
+from vco_lib.env_template import (
+    ENV_TEMPLATE_BEGIN,
+    ENV_TEMPLATE_END,
+    list_canonical_env_template_keys,
+)
 
 
 class TestReconcileEnvKeys(unittest.TestCase):
@@ -139,8 +143,9 @@ class TestReconcileEnvKeys(unittest.TestCase):
         self.assertEqual(result["action"], "skipped")
         self.assertEqual(result["added"], [])
 
-    def test_added_keys_have_comment_marker(self) -> None:
-        """Appended keys include the 'Added by install.py --update' comment."""
+    def test_added_keys_land_in_the_managed_block(self) -> None:
+        """v0.2.97: added keys go into the VCO-managed block (through the one
+        ``.env`` writer), not as ``# Added by install.py --update`` lines."""
         canonical = list_canonical_env_template_keys()
         all_keys = sorted(canonical)
         missing_key = all_keys[0]
@@ -157,10 +162,13 @@ class TestReconcileEnvKeys(unittest.TestCase):
             self.assertEqual(result["action"], "appended")
             written = env_path.read_text(encoding="utf-8")
 
-        # Comment marker must be present.
-        self.assertIn("Added by install.py --update on", written)
-        # The key itself must appear.
-        self.assertIn(f"{missing_key}=", written)
+        # The key is assigned once, inside the managed block.
+        self.assertNotIn("Added by install.py --update on", written)
+        block = written[written.index(ENV_TEMPLATE_BEGIN):written.index(ENV_TEMPLATE_END)]
+        self.assertIn(f"\n{missing_key}=", block)
+        self.assertEqual(
+            sum(1 for ln in written.splitlines() if ln.startswith(f"{missing_key}=")), 1
+        )
 
 
 if __name__ == "__main__":

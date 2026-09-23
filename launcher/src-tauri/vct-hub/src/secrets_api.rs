@@ -174,6 +174,29 @@ use crate::http_error::error_response;
 ///   * Rest: uppercase letters, digits, underscore
 ///   * Length 1..=128 (defensive — keychain entry names have OS limits;
 ///     128 is well below libsecret's 255 and Credential Manager's 256)
+/// The orchestrator's shared, `user`-bucket bundled secret names
+/// (`vct-module.json` `bundled_secrets`). Empty when the manifest cannot be
+/// found — then only env-shaped names migrate, as before.
+fn bundled_shared_user_secret_names() -> Vec<String> {
+    vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest()
+        .map(|m| {
+            m.bundled_secrets
+                .into_iter()
+                .filter(|s| s.scope == "shared" && s.module_id == IMPORT_MODULE_ID)
+                .map(|s| s.key)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A key the endpoint may write: an env-shaped name (any scope), or a
+/// declared shared bundled slot — only into the SHARED scope, which is
+/// where the hub's `/env` resolver reads it (a per-project copy would be a
+/// row nothing reads).
+fn is_migratable_key(key: &str, bundled_shared: &[String], scope_is_shared: bool) -> bool {
+    is_valid_env_key(key) || (scope_is_shared && bundled_shared.iter().any(|b| b == key))
+}
+
 fn is_valid_env_key(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.is_empty() || bytes.len() > 128 {
@@ -250,17 +273,27 @@ async fn migrate_secrets(
 
     let mut migrated: Vec<String> = Vec::with_capacity(req.secrets.len());
     let mut failed: Vec<MigrateFailure> = Vec::new();
+    // v0.2.97: the orchestrator's own shared slots (`vct-module.json`
+    // `bundled_secrets`, e.g. `openai_api_key`) are migratable under their
+    // declared name — install.py's `--openai-key` stores into the SAME row
+    // `register_openai_api_key` writes, never a second, env-shaped name.
+    let bundled_shared = bundled_shared_user_secret_names();
+    let scope_is_shared = matches!(
+        migration_scope,
+        vct_launcher_core::db::secret_scope_policy::EnvMigrationScope::Shared
+    );
 
     for item in req.secrets {
         // Validate key shape FIRST so a malformed key doesn't reach the
         // keychain layer (where it'd surface as a less-readable
         // `keyring::Error::Invalid` deep in libsecret).
-        if !is_valid_env_key(&item.key) {
+        if !is_migratable_key(&item.key, &bundled_shared, scope_is_shared) {
             failed.push(MigrateFailure {
                 key: item.key.clone(),
                 error: format!(
-                    "invalid env key shape: {:?} (must match \
-                     ^[A-Z_][A-Z0-9_]*$, length ≤ 128)",
+                    "invalid key: {:?} (must match ^[A-Z_][A-Z0-9_]*$, length ≤ 128, \
+                     or be one of the orchestrator's shared bundled secret names \
+                     migrated to the shared scope)",
                     item.key
                 ),
             });
@@ -440,6 +473,17 @@ mod tests {
         assert!(is_valid_env_key("_PRIVATE"));
         assert!(is_valid_env_key("KEY"));
         assert!(is_valid_env_key("KEY_2"));
+    }
+
+    #[test]
+    fn bundled_shared_names_migrate_only_into_the_shared_scope() {
+        let bundled = vec!["openai_api_key".to_string()];
+        assert!(is_migratable_key("openai_api_key", &bundled, true));
+        assert!(!is_migratable_key("openai_api_key", &bundled, false), "per-project copy nothing reads");
+        assert!(!is_migratable_key("other_lower", &bundled, true));
+        assert!(is_migratable_key("OPENAI_API_KEY", &bundled, false));
+        // The real manifest declares the OpenAI slot (the name install.py sends).
+        assert!(bundled_shared_user_secret_names().iter().any(|k| k == "openai_api_key"));
     }
 
     #[test]

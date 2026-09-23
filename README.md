@@ -187,7 +187,7 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 | GPU, VRAM > 2 GB           | Ollama      | `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim)| Code-specialised, low VRAM footprint.                              |
 | CPU, RAM > 24 GB & 8+ cores¹| Ollama      | `qwen3-embedding:0.6b`                                      | Pure-CPU path on capable workstations.                             |
 | CPU, otherwise             | Ollama      | `unclemusclez/jina-embeddings-v2-base-code:latest`          | Floor — runs on anything that can run Ollama.                      |
-| OpenAI API (opt-in)        | OpenAI      | `text-embedding-3-small` (1536-dim)                         | Override only; costs per embedding. Configure via `--openai-key`.  |
+| OpenAI API (opt-in)        | OpenAI      | `text-embedding-3-small` (1536-dim)                         | Override only; costs per embedding. Configure via `--openai-key` (stored in the launcher keychain / `~/.vct-secrets`, never `.env`) or launcher Preferences → Special Secrets. |
 
 **KG / text embeddings** (vectorise knowledge nodes + docs; populates `<KG_COLLECTION>`, shared KG, `<DEVELOPMENT_COLLECTION>`):
 

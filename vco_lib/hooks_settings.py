@@ -1168,8 +1168,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
         {
             "ok": True,
             "settings_path": str(path),
+            # `--with-items` keeps each inner hook object: the launcher's
+            # `project_hooks` mirror stores it as the row's config when it
+            # reads a JSONC settings.json through this verb (v0.2.97).
             "hooks": [
-                {k: v for k, v in e.items() if k != "item"} for e in entries
+                e if args.with_items else {k: v for k, v in e.items() if k != "item"}
+                for e in entries
             ],
             "skipped": skipped,
         }
@@ -1301,6 +1305,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list", help="Report what settings.json declares.")
     _common(p_list)
+    p_list.add_argument(
+        "--with-items", action="store_true",
+        help="Include each entry's whole inner hook object as `item`.",
+    )
     p_list.set_defaults(func=_cmd_list)
 
     p_disable = sub.add_parser(

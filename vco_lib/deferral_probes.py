@@ -706,6 +706,22 @@ def settings_write_refusal_still_applies(ctx: ProbeContext) -> Optional[bool]:
         return None
 
 
+def bash_env_cleanup_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``legacy_bash_env_cleanup_pending`` — does settings.json still carry the
+    legacy lean-ctx ``BASH_ENV`` pointer (or stay unreadable)?
+
+    A thin wrapper over :func:`vco_lib.project_init.legacy_bash_env_still_owed`,
+    which uses the cleanup's own read (``settings_refusal.load_for_edit``) and
+    shim rule, so the probe cannot clear what the next cleanup would re-emit.
+    """
+    from vco_lib.project_init import legacy_bash_env_still_owed
+
+    try:
+        return legacy_bash_env_still_owed(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def env_reprojection_still_owed(ctx: ProbeContext) -> Optional[bool]:
     """``project_move_env_reprojection_failed`` — are the env surfaces still stale?
 
@@ -941,6 +957,7 @@ def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
 
 
 PROBES: dict[str, ProbeFn] = {
+    "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
     "chunker_resync_still_owed": chunker_resync_still_owed,
     "gateway_exec_still_unrunnable": gateway_exec_still_unrunnable,
     "hub_back_after_restart_failure": hub_back_after_restart_failure,

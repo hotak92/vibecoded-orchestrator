@@ -43,9 +43,18 @@
 //! Callers own the `Command` and its `.silent()` marker (the
 //! `command_silent_gate` integration test scans by path, and this file
 //! is in scope). [`reinject_minimal_env`] takes a `&mut Command` that
-//! the caller has already built with `.silent()`. The one spawn this
-//! module makes itself, [`write_settings_env_block`] (v0.2.97), builds its
-//! `Command` with `.silent()` on the same line.
+//! the caller has already built with `.silent()`. The spawns this module
+//! makes itself (all v0.2.97, all through the shared transport
+//! `run_vco_lib_json`) each build their `Command` with `.silent()` on the
+//! same line:
+//!
+//!   * `vco_lib.config_projection` — [`write_settings_env_block`],
+//!     [`strip_settings_env_keys`], [`strip_proven_secret_values`];
+//!   * `vco_lib.env_projection_check` — [`read_settings_env_blocks`];
+//!   * `vco_lib.hooks_settings` — [`list_settings_hooks`];
+//!   * `vco_lib.env_template` — [`apply_project_env_template`],
+//!     [`write_project_env_reference`] (the project `.env`'s one writer) and
+//!     the read-only [`read_project_env_assignment`].
 
 use std::io::{Read as _, Write as _};
 use std::path::Path;
@@ -292,6 +301,157 @@ pub fn env_block_of(
     }
 }
 
+/// v0.2.97 (R4 F32h): every hook entry of `<folder>/.claude/settings.json`,
+/// read by the ONE JSONC reader — `python -m vco_lib.hooks_settings list
+/// --with-items` (the verb the Hooks tab lists through). The `project_hooks`
+/// mirror calls this only when a strict parse fails, so a settings.json with
+/// a comment or a trailing comma (valid for Claude Code) is mirrored instead
+/// of skipped. Each entry carries `event`, `matcher`, `command`,
+/// `timeout_seconds` and the whole inner hook object as `item`. `Err` names
+/// why the file could not be read (a broken file stays unmirrored, visibly).
+pub fn list_settings_hooks(
+    root: Option<&Path>,
+    project_folder: &Path,
+) -> Result<Vec<serde_json::Value>, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.hooks_settings")
+        .arg("list")
+        .arg("--with-items")
+        .arg("--project-folder")
+        .arg(project_folder);
+    run_vco_lib_json(cmd, &python, root, project_folder, "", |out, err| {
+        let text = String::from_utf8_lossy(out);
+        let reply: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+            format!(
+                "hooks list produced unreadable output ({}). stdout: {} stderr: {}",
+                e,
+                text.trim(),
+                String::from_utf8_lossy(err).trim()
+            )
+        })?;
+        if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(reply
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the hooks reader refused the file")
+                .to_string());
+        }
+        Ok(reply
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    })
+}
+
+/// The launcher-resolved service ports a project `.env`'s managed block
+/// renders (`ProjectEnvSettings`: app_state overrides / adopted services),
+/// forwarded to the Python resolver, whose own defaults are the stock ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvTemplatePorts {
+    pub weaviate: u16,
+    pub ollama: u16,
+    pub code_embed: u16,
+}
+
+/// The flags every `vco_lib.env_template` verb takes after
+/// `--project-id` / `--project-folder`. Pure, so the argv is testable
+/// without an interpreter. `--orchestrator-root` only when known (the CLI
+/// defaults it to `None`; an empty string would be a wrong root).
+pub fn env_template_flags(root: Option<&Path>, ports: EnvTemplatePorts) -> Vec<String> {
+    let mut flags = Vec::new();
+    if let Some(root) = root {
+        flags.push("--orchestrator-root".to_string());
+        flags.push(root.display().to_string());
+    }
+    for (flag, port) in [
+        ("--weaviate-port", ports.weaviate),
+        ("--ollama-port", ports.ollama),
+        ("--code-embed-port", ports.code_embed),
+    ] {
+        flags.push(flag.to_string());
+        flags.push(port.to_string());
+    }
+    flags
+}
+
+/// v0.2.97: write `<project_folder>/.env`'s VCO-managed block through the
+/// ONE `.env` writer — `python -m vco_lib.env_template apply` (A-tier: the
+/// Rust `ensure_project_env_template` append-only mirror that ran beside it
+/// is retired). The Python side creates a missing file (scaffold + block),
+/// folds the retired writers' legacy lines into the block, and never renders
+/// a key the user assigns outside it. Returns the `ok: true` reply
+/// (`report`: `env`, `added`, `user_set`, `migrated`, `action`); a refusal or
+/// crash is `Err` with the child's own message.
+pub fn apply_project_env_template(
+    root: Option<&Path>,
+    project_folder: &Path,
+    project_id: &str,
+    ports: EnvTemplatePorts,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.env_template")
+        .arg("apply")
+        .arg("--project-id")
+        .arg(project_id)
+        .arg("--project-folder")
+        .arg(project_folder);
+    cmd.args(env_template_flags(root, ports));
+    run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)
+}
+
+/// v0.2.97: the Safe-add twin of [`apply_project_env_template`] —
+/// `python -m vco_lib.env_template reference` writes
+/// `<project_folder>/.env.vco.reference` (what a new `.env` would hold) and
+/// NEVER touches the live `.env`, which may be committed.
+pub fn write_project_env_reference(
+    root: Option<&Path>,
+    project_folder: &Path,
+    project_id: &str,
+    ports: EnvTemplatePorts,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.env_template")
+        .arg("reference")
+        .arg("--project-id")
+        .arg(project_id)
+        .arg("--project-folder")
+        .arg(project_folder);
+    cmd.args(env_template_flags(root, ports));
+    run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)
+}
+
+/// v0.2.97: the assignment of one managed key that WINS in
+/// `<project_folder>/.env` (the last active line) and whether it sits inside
+/// the VCO-managed block — `python -m vco_lib.env_template effective`, the
+/// same parser the writer uses. Read-only; only managed (non-secret) keys are
+/// answered. `Ok((None, false))` when nothing assigns the key.
+pub fn read_project_env_assignment(
+    root: Option<&Path>,
+    project_folder: &Path,
+    key: &str,
+) -> Result<(Option<String>, bool), String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.env_template")
+        .arg("effective")
+        .arg("--project-folder")
+        .arg(project_folder)
+        .arg("--key")
+        .arg(key);
+    let reply = run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)?;
+    let value = reply.get("value").and_then(serde_json::Value::as_str).map(str::to_string);
+    let in_block = reply.get("in_block").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Ok((value, in_block))
+}
+
 /// The interpreter for an env-block spawn: the shared RT-4 ladder. Under
 /// `cfg(test)` a bare `python3` is accepted as the last resort — the verbs
 /// need only the standard library, and a unit test must not depend on where
@@ -335,18 +495,32 @@ pub(crate) fn vco_lib_cwd(root: Option<&Path>, project_folder: &Path) -> std::pa
 /// (the developer's `~/.vct/launcher.db`) is a test defect, so it panics.
 #[cfg(test)]
 pub(crate) fn test_child_state_dir() -> std::path::PathBuf {
-    let state = std::env::var_os("VCT_STATE_DIR")
+    scratch_state_dir(std::env::var_os("VCT_STATE_DIR"), &std::env::temp_dir())
+        .unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// The pure decision behind [`test_child_state_dir`]: `configured` (the
+/// test's `VCT_STATE_DIR`, if any) or a per-process scratch dir under `temp`;
+/// `Err` when the result is not under `temp`. A pure function of its inputs,
+/// so its test never has to set a process-wide variable another test's child
+/// could observe (review R4 F30).
+#[cfg(test)]
+pub(crate) fn scratch_state_dir(
+    configured: Option<std::ffi::OsString>,
+    temp: &Path,
+) -> Result<std::path::PathBuf, String> {
+    let state = configured
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("vct-bridge-test-state-{}", std::process::id()))
-        });
-    assert!(
-        state.starts_with(std::env::temp_dir()),
-        "a vco_lib child of a unit test would read a non-scratch state dir ({}): set a \
-         temp VCT_STATE_DIR in the test",
-        state.display()
-    );
-    state
+        .unwrap_or_else(|| temp.join(format!("vct-bridge-test-state-{}", std::process::id())));
+    if state.starts_with(temp) {
+        Ok(state)
+    } else {
+        Err(format!(
+            "a vco_lib child of a unit test would read a non-scratch state dir ({}): set a \
+             temp VCT_STATE_DIR in the test",
+            state.display()
+        ))
+    }
 }
 
 /// The repository root this test binary was compiled from.
@@ -581,10 +755,20 @@ mod tests {
     /// `VCT_STATE_DIR` is refused.
     #[test]
     fn a_test_childs_state_dir_is_always_scratch() {
-        let dir = test_child_state_dir();
-        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
-        let _env = vct_launcher_core::test_env::env_guard(&[("VCT_STATE_DIR", Some("/home/not-a-scratch-dir/.vct"))]);
-        assert!(std::panic::catch_unwind(test_child_state_dir).is_err(), "a real state dir must be refused");
+        let temp = Path::new("/tmp/scratch-root");
+        assert_eq!(
+            scratch_state_dir(None, temp).unwrap().parent(),
+            Some(temp),
+            "no configured dir ⇒ a scratch dir under temp"
+        );
+        assert_eq!(
+            scratch_state_dir(Some("/tmp/scratch-root/mine".into()), temp).unwrap(),
+            Path::new("/tmp/scratch-root/mine")
+        );
+        assert!(
+            scratch_state_dir(Some("/home/someone/.vct".into()), temp).is_err(),
+            "a real state dir must be refused"
+        );
     }
 
     /// v0.2.97 review F11: a child that writes far more than a pipe buffer to
@@ -636,5 +820,129 @@ mod tests {
         let garbage = parse_env_block_output(b"Traceback ...", b"ModuleNotFoundError", "written")
             .unwrap_err();
         assert!(garbage.contains("unreadable output") && garbage.contains("ModuleNotFoundError"));
+    }
+}
+
+/// v0.2.97: the project `.env` verbs end to end — a real `launcher.db` in a
+/// scratch state dir, the real `python -m vco_lib.env_template` child.
+#[cfg(test)]
+mod env_template_tests {
+    use super::*;
+    use vct_launcher_core::db::models::ProjectHost;
+    use vct_launcher_core::test_env::{state_dir_guard, StateDirGuard};
+
+    const PORTS: EnvTemplatePorts = EnvTemplatePorts { weaviate: 8081, ollama: 11435, code_embed: 11440 };
+
+    /// A scratch state dir whose `launcher.db` holds project `name` at a
+    /// fresh folder inside it. Keep the guard alive for the whole test.
+    fn fixture(name: &str) -> (StateDirGuard, String, std::path::PathBuf) {
+        let guard = state_dir_guard();
+        let folder = guard.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let db = Db::open().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug(name).unwrap();
+        db.insert_project(&id, name, &folder.display().to_string(), ProjectHost::Base, &slug)
+            .unwrap();
+        drop(db);
+        (guard, id, folder)
+    }
+
+    /// Every ACTIVE value of `key`, in file order.
+    fn assignments(text: &str, key: &str) -> Vec<String> {
+        let prefix = format!("{}=", key);
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix(&prefix).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn env_template_flags_carry_the_root_only_when_known() {
+        let ports = EnvTemplatePorts { weaviate: 18081, ollama: 11435, code_embed: 11440 };
+        assert_eq!(
+            env_template_flags(Some(Path::new("/orch")), ports),
+            ["--orchestrator-root", "/orch", "--weaviate-port", "18081", "--ollama-port",
+             "11435", "--code-embed-port", "11440"]
+        );
+        assert!(!env_template_flags(None, ports).iter().any(|f| f == "--orchestrator-root"));
+    }
+
+    #[test]
+    fn apply_creates_the_env_with_scaffold_and_block_at_the_launcher_ports() {
+        let (_guard, id, folder) = fixture("Acme");
+        let ports = EnvTemplatePorts { weaviate: 18081, ..PORTS };
+        let reply = apply_project_env_template(None, &folder, &id, ports).unwrap();
+        assert_eq!(reply["report"]["action"], serde_json::json!(["created"]));
+
+        let text = std::fs::read_to_string(folder.join(".env")).unwrap();
+        assert_eq!(assignments(&text, "KG_COLLECTION"), ["Acme_KnowledgeGraph"]);
+        assert_eq!(assignments(&text, "PROJECT_NAME"), ["Acme"]);
+        // PR-3: a launcher-resolved non-default port reaches the file.
+        assert_eq!(assignments(&text, "WEAVIATE_URL"), ["http://localhost:18081"]);
+        // Bug 33 scaffold: optional keys are commented placeholders only.
+        assert!(text.contains("# OPENAI_API_KEY=\n") && text.contains("# GITHUB_TOKEN=\n"));
+        assert!(assignments(&text, "OPENAI_API_KEY").is_empty());
+        // B7: the telemetry placeholder is the canonical key, never the alias.
+        assert!(text.contains("# VCT_TELEMETRY=") && !text.contains("VIBECODED_TELEMETRY"));
+        assert!(text.contains(&format!("# RL_PROJECT_ROOT={}", folder.display())));
+    }
+
+    #[test]
+    fn apply_keeps_user_lines_folds_legacy_lines_and_is_idempotent() {
+        let (_guard, id, folder) = fixture("Acme");
+        let user = "OPENAI_API_KEY=sk-user\nKG_COLLECTION=MyCustom_KG\n";
+        std::fs::write(
+            folder.join(".env"),
+            format!(
+                "{user}\n# added by vco 2026-05-06: appended missing canonical keys\n\
+                 # CODE_EMBED_URL=\nPROJECT_NAME=<project>\n# GITHUB_TOKEN=\n"
+            ),
+        )
+        .unwrap();
+
+        let reply = apply_project_env_template(None, &folder, &id, PORTS).unwrap();
+        let first = std::fs::read_to_string(folder.join(".env")).unwrap();
+        assert!(first.starts_with(user), "user lines untouched:\n{first}");
+        assert_eq!(assignments(&first, "KG_COLLECTION"), ["MyCustom_KG"]);
+        assert_eq!(assignments(&first, "PROJECT_NAME"), ["Acme"]);
+        assert_eq!(assignments(&first, "OPENAI_API_KEY"), ["sk-user"]);
+        assert_eq!(assignments(&first, "CODE_EMBED_URL"), ["http://localhost:11440"]);
+        assert!(first.contains("# GITHUB_TOKEN=\n") && !first.contains("<project>\n"));
+        assert_eq!(reply["report"]["user_set"], serde_json::json!(["KG_COLLECTION"]));
+
+        let again = apply_project_env_template(None, &folder, &id, PORTS).unwrap();
+        assert_eq!(std::fs::read_to_string(folder.join(".env")).unwrap(), first);
+        assert_eq!(again["report"]["action"], serde_json::json!(["unchanged"]));
+    }
+
+    #[test]
+    fn reference_writes_the_sidecar_and_never_the_live_env() {
+        let (_guard, id, folder) = fixture("Acme");
+        let live = "KG_COLLECTION=LegacyBare\nUSER_KEY=keep\n";
+        std::fs::write(folder.join(".env"), live).unwrap();
+
+        write_project_env_reference(None, &folder, &id, PORTS).unwrap();
+
+        assert_eq!(std::fs::read_to_string(folder.join(".env")).unwrap(), live);
+        let sidecar = std::fs::read_to_string(folder.join(".env.vco.reference")).unwrap();
+        assert_eq!(assignments(&sidecar, "KG_COLLECTION"), ["Acme_KnowledgeGraph"]);
+        assert_eq!(assignments(&sidecar, "PROJECT_NAME"), ["Acme"]);
+        assert!(sidecar.contains("safe_add_skipped_env_merge"));
+    }
+
+    #[test]
+    fn reference_does_not_create_a_live_env() {
+        let (_guard, id, folder) = fixture("X");
+        write_project_env_reference(None, &folder, &id, PORTS).unwrap();
+        assert!(folder.join(".env.vco.reference").exists());
+        assert!(!folder.join(".env").exists(), "safe-add must not create a live .env");
+    }
+
+    #[test]
+    fn an_unknown_project_is_an_error_naming_the_reason_and_writes_nothing() {
+        let (_guard, _id, folder) = fixture("X");
+        let err = apply_project_env_template(None, &folder, "ghost-id", PORTS).unwrap_err();
+        assert!(err.contains("project_not_found"), "{err}");
+        assert!(!folder.join(".env").exists());
     }
 }

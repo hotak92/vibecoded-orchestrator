@@ -8,8 +8,9 @@ Claude Code accepts comments and trailing commas in ``.claude/settings.json``;
 VS Code's ``.vscode/settings.json`` is JSONC by definition. Each reader below
 used a strict ``json.loads`` and so read such a file as "no settings":
 
-* ``knowledge_residue`` — the ``SHARED_KG_READ_DISABLED`` gate (a project that
-  opted out of shared-KG reads silently read it anyway);
+* ``knowledge_residue`` — the ``SHARED_KG_READ_DISABLED`` gate of the bundled-
+  knowledge residue cleanup (an opted-out project looked opted in, so a bundle
+  update could delete its on-disk curated copies — its only curated access);
 * ``project_init`` — the on-disk ``KG_COLLECTION`` pin, and the legacy
   ``BASH_ENV`` strip (which now EDITS a JSONC file in place);
 * ``hooks_settings`` — the Hooks tab refused a JSONC file as "not valid JSON";
@@ -21,6 +22,7 @@ used a strict ``json.loads`` and so read such a file as "no settings":
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -118,6 +120,57 @@ def test_the_bash_env_strip_leaves_other_values_and_broken_files_alone(tmp_path)
     path.write_bytes(b"{ broken")
     assert project_init._cleanup_legacy_bash_env_in_project(tmp_path)["action"] == "unparseable"
     assert path.read_bytes() == b"{ broken"
+
+
+BASH_ENV_CID = "legacy_bash_env_cleanup_pending"
+
+
+def _root_cleanup(monkeypatch, root: Path) -> str:
+    """install.py's own (root) legacy cleanup, pointed at ``root``."""
+    import install
+
+    monkeypatch.setattr(install, "PROJECT_ROOT", root)
+    install._cleanup_legacy_bash_env_shim(argparse.Namespace())
+    ledger = root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    return ledger.read_text(encoding="utf-8") if ledger.exists() else ""
+
+
+def test_the_root_bash_env_strip_edits_a_jsonc_file_in_place(tmp_path, monkeypatch):
+    """R4 F32(h) ACT. RED before: install.py's root copy `json.loads`-ed the
+    file, printed a skip, and left the fork-bomb pointer in a JSONC file."""
+    path = _settings(tmp_path, {"env": {
+        "BASH_ENV": "${CLAUDE_PROJECT_DIR}/.claude/scripts/leanctx-bash-env.sh",
+        "KEEP": "1"}}, jsonc=True)
+    _root_cleanup(monkeypatch, tmp_path)
+    text = path.read_text(encoding="utf-8")
+    assert "BASH_ENV" not in text and "// my own note" in text and "KEEP" in text
+    assert not DeferralReport.read(tmp_path).has_condition(BASH_ENV_CID)
+
+
+def test_the_root_bash_env_strip_records_a_file_it_cannot_read(tmp_path, monkeypatch):
+    """R4 F32(h) REFUSE + RECORD. RED before: a print nobody reads, no entry."""
+    path = tmp_path / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{ "env": { "BASH_ENV": "leanctx-bash-env.sh" ')
+    before = path.read_bytes()
+    ledger = _root_cleanup(monkeypatch, tmp_path)
+    assert path.read_bytes() == before
+    assert DeferralReport.read(tmp_path).has_condition(BASH_ENV_CID)
+    assert "could not be read" in ledger
+
+
+def test_an_unverifiable_jsonc_edit_is_refused_and_recorded(tmp_path, monkeypatch):
+    """A JSONC edit `dumps_preserving` cannot verify writes NOTHING and says
+    so truthfully (not the "read-only file system" write-failure text)."""
+    path = _settings(tmp_path, {"env": {"BASH_ENV": "leanctx-bash-env.sh"}}, jsonc=True)
+    before = path.read_bytes()
+    monkeypatch.setattr(project_init._jsonc_edit, "dumps_preserving", lambda *a, **k: None)
+    out = project_init._cleanup_legacy_bash_env_in_project(tmp_path)
+    assert out["action"] == "edit-refused", out
+    assert path.read_bytes() == before
+    rendered = _root_cleanup(monkeypatch, tmp_path)
+    assert BASH_ENV_CID in rendered and "read-only" not in rendered
+    assert "by hand" in rendered
 
 
 # ── 3. hooks_settings: the Hooks tab edits JSONC in place ──────────────────

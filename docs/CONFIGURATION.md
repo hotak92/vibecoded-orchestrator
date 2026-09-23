@@ -50,34 +50,31 @@ The envelope is also useful as a diagnostic artifact: when reporting an install 
 
 ## `.env` template management
 
-Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
-
-- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out.
-- **`.env` exists** → diff against the canonical key list. Any keys not yet present (commented or active) get appended in a marked block tagged `# added by vco YYYY-MM-DD`. The user's existing values are preserved verbatim — never overwritten.
-- **Idempotent** — a second invocation against an up-to-date file is a no-op.
-
-The Python and Rust canonical key lists are kept in lockstep by the cross-language test `env_template_canonical_keys_match_python` (in `commands/projects_v2.rs`). When you add a new key, update both `list_canonical_env_template_keys` (`vco_lib/env_template.py`, the Python authority) AND `env_canonical_keys` (projects_v2.rs).
-
-Canonical keys:
+A project's `.env` has ONE writer, `vco_lib.env_template` (v0.2.97). The launcher's `create_project_v2` runs `python -m vco_lib.env_template apply` on the project root; `install.py` Step 9 (and `--update`) writes the orchestrator root's `.env` through the same function, via `vco_lib.install_env`. VCO owns only the block between the markers:
 
 ```
-# Service URLs (commented; launcher writes resolved values into .claude/settings.json)
-WEAVIATE_URL, WEAVIATE_PORT, OLLAMA_URL, OLLAMA_PORT, CODE_EMBED_URL
+# >>> VCO-MANAGED ENV (do not edit between markers) >>>
+# added by vco — KG_COLLECTION=Acme_KnowledgeGraph
+KG_COLLECTION=Acme_KnowledgeGraph
+...
+# <<< VCO-MANAGED ENV <<<
+```
 
-# Per-project Weaviate collections (active; filled at create time)
-KG_COLLECTION, SHARED_KG_COLLECTION, DEVELOPMENT_COLLECTION, PROJECT_NAME
+- **`.env` missing** → a new file: commented placeholders for the optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`), then the managed block. For the orchestrator root the new file starts with the install-time keys instead (`EMBEDDING_MODEL`, `CODE_EMBED_*`, `EMBEDDING_PROVIDER`, `VCT_TELEMETRY`, …).
+- **`.env` exists** → the managed block is replaced in place (or appended once, when the file has none). Everything outside the markers is preserved byte-for-byte, and **a key you assign outside the block is never rendered inside it** — your line is that key's only assignment, wherever it sits. A commented `# KEY=` line sets nothing, so it does not suppress the managed value.
+- **Legacy lines** written by pre-v0.2.97 VCO (`# added by vco YYYY-MM-DD: appended missing canonical keys`, the old template's `# === Service URLs …` / `# === Per-project Weaviate collections ===` sections, `# --- Added by install.py --update on … ---`) are folded into the block: their lines for keys the block now carries are removed, so each key ends up assigned once.
+- **Safe add** → the live `.env` is never touched; `python -m vco_lib.env_template reference` writes what a new `.env` would hold to `.env.vco.reference` instead.
+- **Idempotent** — a second run against an up-to-date file writes nothing.
+- The orchestrator root's refresh (`install.py` re-install / `--update`) is fill-only: it adds keys to the block but never changes a value already there.
 
-# LLM API keys (commented)
-ANTHROPIC_API_KEY, OPENAI_API_KEY
+Keys the managed block carries (`list_canonical_env_template_keys`):
 
-# GitHub access for search-mcp wrapper (commented)
-GITHUB_TOKEN
-
-# RL retrieval module — Pro tier (commented)
-RL_SERVER_URL, RL_SERVER_PORT, RL_PROJECT_ROOT
-
-# Telemetry (commented; opt-in only)
-VCT_TELEMETRY
+```
+PROJECT_NAME, CODE_GRAPH_PROJECT
+KG_COLLECTION, DEVELOPMENT_COLLECTION, SHARED_KG_COLLECTION
+SHARED_KG_WRITE_DISABLED, SHARED_KG_OPT_OUT, SHARED_KG_READ_DISABLED
+ACTIVE_EMBEDDING
+WEAVIATE_URL, WEAVIATE_PORT, OLLAMA_URL, OLLAMA_PORT, CODE_EMBED_URL, CODE_EMBED_PORT
 ```
 
 ## What goes in each file
@@ -175,7 +172,7 @@ The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry 
 | `ACTIVE_EMBEDDING` | `qwen3` (default) | `openai` | Selects the active text-embedding slot for KG + development collections. `qwen3` → `qwen3_embed` named vector; `openai` → `openai_embed`. |
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` (default) | model id | Explicit text model override. When `ACTIVE_EMBEDDING=openai` and this is unset, defaults to `text-embedding-3-small`. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` (default) | OpenAI model id | Used only when `ACTIVE_EMBEDDING=openai` and `EMBEDDING_MODEL` is unset. |
-| `OPENAI_API_KEY` | (unset) | API key | Required when `ACTIVE_EMBEDDING=openai`. Resolved per-process from env; the launcher injects it from the shared keychain slot (see Secrets below). |
+| `OPENAI_API_KEY` | (unset) | API key | Required when `ACTIVE_EMBEDDING=openai`. Resolved per process by `vco_lib.openai_key`: `$OPENAI_API_KEY` when set, else the `openai_api_key` secret through the canonical chain (launcher keychain → `~/.vct-secrets/shared/` → the project's own `.env`). `install.py --openai-key` stores it there — never in `.env`. |
 | `OLLAMA_URL` | `http://localhost:11435` | URL | Ollama base URL used by the qwen3 slot. |
 | `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | URL | Code-embedding FastAPI service URL. |
 | `CODE_EMBED_BACKEND` | `gpu` (default) | `ollama` | `gpu` → CodeSage-Large-v2 via the FastAPI service (sentence-transformers); `ollama` → routes embeds through Ollama. The Ollama-path default model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim); install.py overrides `CODE_EMBED_MODEL` to `qwen3-embedding:0.6b` (1024-dim) on 6-12 GB GPU hosts. |

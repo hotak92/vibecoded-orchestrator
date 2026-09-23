@@ -9,7 +9,8 @@ Options:
     --no-containers     Skip Docker/Podman service setup
     --gpu               Enable GPU support for Ollama + code embeddings
     --cpu-only          Force CPU-only (skip GPU detection)
-    --openai-key KEY    Use OpenAI embeddings instead of local models
+    --openai-key KEY    Use OpenAI embeddings instead of local models (the key is
+                        stored in the launcher keychain / ~/.vct-secrets, never .env)
     --container CMD     Force container runtime: docker | podman
     --dev               Install development dependencies
     --skip-models       Skip pulling Ollama models (manual later)
@@ -5382,6 +5383,17 @@ def _run_root_claude_dir_install(
     return result
 
 
+#: ``--openai-key`` help (kept out of ``main()`` — its line count is ratcheted).
+_OPENAI_KEY_HELP = (
+    "Use OpenAI embeddings (provide API key). The key is stored in the "
+    "launcher keychain (shared slot `openai_api_key`) when the vct-hub "
+    "answers, else in the file store ~/.vct-secrets/shared/openai_api_key — "
+    "never in .env. A value on the command line is visible to other local "
+    "users and kept in shell history; setting it in the launcher "
+    "(Preferences → Special Secrets) avoids that."
+)
+
+
 def main() -> int:
     # A relaunch record counts only if THIS run's parent made it (argv token);
     # then (Windows) a kill of that waiting parent stops this run too.
@@ -5474,8 +5486,7 @@ def main() -> int:
                               f"back to CPU-only even with a discrete GPU "
                               f"present. Default: "
                               f"{_DEFAULT_GPU_VRAM_THRESHOLD_GB}."))
-    parser.add_argument("--openai-key", type=str, default="",
-                        help="Use OpenAI embeddings (provide API key)")
+    parser.add_argument("--openai-key", type=str, default="", help=_OPENAI_KEY_HELP)
     parser.add_argument("--container", type=str, choices=["docker", "podman"],
                         help="Force a specific container runtime")
     parser.add_argument("--dev", action="store_true",
@@ -6077,7 +6088,7 @@ def main() -> int:
         "session", "start",
         f"install.py {mode} mode",
         data={"mode": mode, "resume_enabled": _RESUME_ENABLED,
-              "argv": sys.argv[1:]},
+              "argv": _redact_secret_argv(sys.argv[1:])},
     )
 
     # Step 1: Check Python
@@ -15872,6 +15883,15 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
                 "codegraph edges will no-op this pass (A3 reconcile retries)",
             )
 
+        # V52-AG layer 3 (v0.2.97): the root bundle (step 5b) records its own
+        # version BEFORE the runner reads it — the SSOT the launcher's
+        # post-bundle pipeline spawns as `record-bundle-materialization`.
+        if project_id:
+            from vco_lib.artifact_version_registry import record_bundle_materialization
+            _rec = record_bundle_materialization(
+                _launcher_db, project_id=project_id, folder=PROJECT_ROOT)
+            if not _rec.get("ok"):
+                print(f"  [migrate:runner] bundle version NOT recorded: {_rec.get('error')}")
         run_report = smr.run_schema_migrations(
             db_path=_launcher_db,
             project_id=project_id,
@@ -22020,169 +22040,31 @@ def _reconcile_stale_units_step(
 # Step 8: Write .env
 # ---------------------------------------------------------------------------
 
-# Marker tag inserted on every line ensure_env_template appends to a
-# pre-existing .env. The tag is what makes the operation idempotent —
-# a second run sees the marker and refuses to re-append the same key.
+# (v0.2.97: the retired ``# added by vco YYYY-MM-DD`` append marker has one
+# reader left — ``vco_lib.env_template``'s legacy-section migration, which
+# folds those lines into the managed block. Nothing writes it any more.)
 #
-# Format: `# added by vco YYYY-MM-DD` (date is for forensic value;
-# the *literal* `# added by vco ` substring is what the dedupe check
-# looks for).
-ENV_VCO_MARKER = "# added by vco"
-
-# Module-section delimiters for template-managed .env. When a module
-# is installed via the launcher, append a section bracketed by these
-# markers; when uninstalled (v1.1+), the section can be located and
-# removed cleanly. Keep simple for v1: append-only.
-ENV_MODULE_BLOCK_START = "# >>> module: "
-ENV_MODULE_BLOCK_END = "# <<< module: "
+# (v0.2.97: the ``# >>> module: <name>`` / ``# <<< module: <name>`` .env
+# section markers declared here in 61f33bc4 are retired — they never had a
+# writer or a reader. Module configuration reaches a project through the
+# launcher DB instead (``module_ports`` / ``module_settings``): the hub's
+# per-project ``ProjectConfig`` (e.g. ``rl_server_port``) and the
+# ``.claude/settings.json`` / ``.claude/env`` projections, never ``.env``.)
 
 
-def _parse_existing_env_keys(env_path: Path) -> set[str]:
-    """Return the set of KEY names present in an existing .env file
-    (commented or active). Used by `_ensure_env_template` to decide
-    which canonical keys are missing.
+def _orchestrator_env_keys(active_embedding: Optional[str] = None) -> dict[str, str]:
+    """The orchestrator root's managed-block keys, from this run's resolved
+    state in ``os.environ`` (one builder for install, re-install and
+    ``--update`` — :func:`vco_lib.install_env.orchestrator_env_template_keys`)."""
+    from vco_lib.install_env import orchestrator_env_template_keys
 
-    A line is considered to declare KEY iff (after lstrip + optional
-    leading "#") it matches `^KEY=`. We deliberately treat commented
-    keys as PRESENT — the user knows about them, they just chose to
-    leave the value blank. Re-appending would be noisy.
-    """
-    if not env_path.is_file():
-        return set()
-    keys: set[str] = set()
-    try:
-        for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            s = raw.strip()
-            if not s:
-                continue
-            # Strip a single leading `#` and any whitespace after it.
-            if s.startswith("#"):
-                s = s[1:].lstrip()
-            # Now s should look like KEY=value (or be a pure comment we
-            # don't care about).
-            eq = s.find("=")
-            if eq <= 0:
-                continue
-            key = s[:eq].strip()
-            # Validate key shape: alnum + underscore, no spaces. Skips
-            # things like "Defaults match the podman-compose.yml ..."
-            # which would otherwise parse as an "added=" key.
-            if key and all(c.isalnum() or c == "_" for c in key) and not key[0].isdigit():
-                keys.add(key)
-    except OSError:
-        return set()
-    return keys
-
-
-def _ensure_env_template(env_path: Path, project_name: str = "<project>",
-                        project_root: str = "<project_root>") -> dict:
-    """Ensure `.env` carries the canonical managed block.
-
-    PHASE 0.D MIGRATION (2026-05-24): This function used to implement
-    append-only "# added by vco YYYY-MM-DD" semantics in-line. It now
-    delegates to ``vco_lib.env_template.apply_env_template`` — the
-    single-writer contract for the per-project ``<project_root>/.env``
-    surface. See ``knowledge/concepts/config-projection-contract-2026-05-24.md``
-    (extended for Phase 0.D) for the rationale.
-
-    Behaviour after migration:
-      - .env missing → create with just the managed block (BEGIN/END markers
-        + canonical KEY=VALUE pairs derived from the orchestrator's resolved
-        defaults).
-      - .env exists with the BEGIN marker → in-place replace the managed
-        block. Lines outside markers preserved byte-for-byte.
-      - .env exists WITHOUT the BEGIN marker (legacy format from pre-Phase-
-        0.D vco installs, or hand-written file) → append the managed block
-        at EOF. Existing legacy "# added by vco YYYY-MM-DD" annotations stay
-        in place; the next invocation in-place replaces.
-
-    The canonical keys delegated to ``apply_env_template`` are the
-    subset documented at :func:`vco_lib.env_template.list_canonical_env_template_keys`
-    — project identity, KG collections, service URLs, feature flags.
-
-    Args:
-        env_path: Path to the ``.env`` file. The parent directory IS the
-            project_folder passed to apply_env_template.
-        project_name: Used to derive KG_COLLECTION / DEVELOPMENT_COLLECTION
-            when no per-launcher value is available (install.py's case —
-            the launcher's project_init runs later and re-projects via
-            apply_env_template directly).
-        project_root: Reserved for future use (the Phase 0.D apply_env_template
-            contract doesn't render orchestrator-root paths into ``.env``;
-            see the env_template docstring's EXCLUDE rationale).
-
-    Returns:
-        ``{"action": ..., "added_keys": [...], "env_path": str}`` for
-        API back-compat with the pre-migration caller surface.
-    """
-    # Import here (not at module top) so the install.py module can be
-    # imported in environments where vco_lib isn't on sys.path yet
-    # (e.g. fresh first-install before the venv is fully populated).
-    from vco_lib.env_template import (
-        apply_env_template,
-        list_canonical_env_template_keys,
+    return orchestrator_env_template_keys(
+        os.environ,
+        default_weaviate_port=DEFAULT_WEAVIATE_PORT,
+        default_ollama_port=DEFAULT_OLLAMA_PORT,
+        default_code_embed_port=DEFAULT_CODE_EMBED_PORT,
+        active_embedding=active_embedding,
     )
-
-    # Build the canonical key map. The legacy `_ensure_env_template`
-    # took `project_name` as an explicit arg and derived KG_COLLECTION
-    # / DEVELOPMENT_COLLECTION from it directly — we preserve that
-    # contract. Service URL ports come from environ ONLY (mirrors what
-    # `_write_env_config` already does in its lines[] build above).
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
-
-    sanitized = project_name if project_name != "<project>" else "Project"
-    keys = {
-        "PROJECT_NAME": project_name,
-        "CODE_GRAPH_PROJECT": sanitized,
-        # KG / DEVELOPMENT collections derived from the explicit
-        # project_name arg — matches the pre-Phase-0.D contract where
-        # `_ensure_env_template(env, project_name="Acme")` always
-        # produced `KG_COLLECTION=Acme_KnowledgeGraph`. Reading
-        # os.environ would leak the caller's shell env into the
-        # generated file (observed in tests where the maintainer install's
-        # KG_COLLECTION was active in the shell).
-        "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
-        "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",
-        "SHARED_KG_COLLECTION": os.environ.get(
-            "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
-        ),
-        "SHARED_KG_WRITE_DISABLED": "false",
-        "SHARED_KG_OPT_OUT": "false",
-        # v0.2.46 Decision B — symmetric READ gate. No legacy alias
-        # because pre-v0.2.46 the read path was unconditional.
-        "SHARED_KG_READ_DISABLED": "false",
-        # v0.2.61/v0.2.67 (embedding reconcile): os.environ["ACTIVE_EMBEDDING"]
-        # is made authoritative upstream by `_reconcile_install_active_embedding`
-        # (called right after `_choose_embedding_config`). On the stale-qwen3-
-        # on-CPU shape AND on the empty-env GUI-install shape it already holds
-        # the hardware pick (e.g. arctic) here, so this reader no longer
-        # re-cements the value that times out KG sync. A deliberate choice
-        # (CLI flag / launcher.db) is left untouched and flows through verbatim.
-        "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
-        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-        "WEAVIATE_PORT": weaviate_port,
-        "OLLAMA_URL": f"http://localhost:{ollama_port}",
-        "OLLAMA_PORT": ollama_port,
-        "CODE_EMBED_URL": f"http://localhost:{code_embed_port}",
-        "CODE_EMBED_PORT": code_embed_port,
-    }
-    # Filter to the canonical subset (defensive — keys is already
-    # constructed as the subset, but the contract source-of-truth is
-    # list_canonical_env_template_keys()).
-    allowed = list_canonical_env_template_keys()
-    keys = {k: v for k, v in keys.items() if k in allowed}
-
-    pre_existed = env_path.exists()
-    project_folder = env_path.parent
-    report = apply_env_template(keys, project_folder=project_folder)
-
-    return {
-        "action": "appended" if pre_existed else "created",
-        "added_keys": report["env"],
-        "env_path": str(env_path),
-    }
 
 
 def _telemetry_consent(args: argparse.Namespace) -> bool:
@@ -22214,7 +22096,67 @@ def _telemetry_consent(args: argparse.Namespace) -> bool:
     return ans in ("y", "yes")
 
 
+def _redact_secret_argv(argv: list[str]) -> list[str]:
+    """``argv`` for a log line: ``--openai-key``'s value redacted."""
+    from vco_lib.openai_key import redact_secret_argv
+
+    return redact_secret_argv(argv)
+
+
+def _store_install_openai_key(value: str) -> None:
+    """``--openai-key``: store the key in the launcher keychain (via the hub)
+    or the file store — never in ``.env`` (v0.2.97). Soft-fails with a
+    warning naming where it would have gone; never prints the value."""
+    from vco_lib.openai_key import StoreFailed, describe_store, store_openai_api_key
+
+    try:
+        where = store_openai_api_key(value)
+    except StoreFailed as exc:
+        print(f"\n  WARNING: the OpenAI key was NOT stored ({exc}). Set it in the "
+              "launcher (Preferences → Special Secrets) or with "
+              "`vct set --shared --key openai_api_key` (value on stdin).")
+        _log_install_event("9/10", "warn", f"openai key not stored: {exc}")
+        return
+    print(f"\n  OpenAI key stored in {describe_store(where)} — not in .env.")
+    _log_install_event("9/10", "ok", "openai key stored", data={"store": where})
+
+
+def _migrate_install_dotenv_openai_key(root: Optional[Path] = None) -> None:
+    """Move a pre-v0.2.97 VCO-written ``OPENAI_API_KEY`` line out of
+    ``<root>/.env`` (default: the install root) on value evidence
+    (:func:`vco_lib.openai_key.migrate_dotenv_openai_key`); report a line left
+    in place. Never prints the value."""
+    from vco_lib.openai_key import migrate_dotenv_openai_key
+
+    try:
+        result = migrate_dotenv_openai_key(root or PROJECT_ROOT)
+    except (OSError, UnicodeDecodeError) as exc:
+        result = {"status": "left_unverified", "detail": str(exc)}
+    if result["status"] == "absent":
+        return
+    if result["status"] == "migrated":
+        print(f"  .env: moved the OpenAI key VCO wrote there into {result['detail']}.")
+        _log_install_event("9/10", "ok", "openai key moved out of .env",
+                           data={"status": result["status"]})
+        return
+    print(f"  .env: the OpenAI key VCO wrote there was LEFT in place — {result['detail']}. "
+          "Remove the `OPENAI_API_KEY=` line under `# OpenAI (for embeddings)` once the "
+          "key is stored (launcher Preferences → Special Secrets).")
+    _log_install_event("9/10", "warn", f".env openai key left: {result['detail']}",
+                       data={"status": result["status"]})
+
+
 def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
+    """Step 9: the orchestrator root's ``.env``.
+
+    v0.2.97 — one writer per concern: the canonical keys go into the
+    VCO-managed block through ``vco_lib.env_template.apply_env_template``
+    (via ``vco_lib.install_env.write_orchestrator_env``); the install-time
+    keys (embedding model/dims/backend, ``CODE_EMBED_*``, provider,
+    telemetry) are the text a NEW file starts with
+    (``render_install_env_tail``). An existing file is refreshed fill-only:
+    keys are added to its block, never changed.
+    """
     print("[9/10] Writing configuration ... ", end="", flush=True)
     _log_install_event("9/10", "start", "writing .env")
     env_file = PROJECT_ROOT / ".env"
@@ -22226,260 +22168,85 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
     # default ports. Per-install isolation comes from KG_COLLECTION (set by
     # the launcher's `config_projection apply` projection), NOT from
     # different host endpoints.
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
+    from vco_lib.install_env import render_install_env_tail, write_orchestrator_env
 
-    lines = [
-        "# VibeCoded Tools — Orchestrator Configuration",
-        "# Generated by install.py — edit as needed",
-        "",
-        "# Weaviate",
-        f"WEAVIATE_URL=http://localhost:{weaviate_port}",
-        f"WEAVIATE_PORT={weaviate_port}",
-        f"WEAVIATE_GRPC_PORT={weaviate_grpc}",
-        "",
-        "# Ollama",
-        f"OLLAMA_URL=http://localhost:{ollama_port}",
-        f"OLLAMA_PORT={ollama_port}",
-        "",
-        "# Embedding models",
-        f"EMBEDDING_MODEL={embed_config['text_model']}",
-        f"EMBEDDING_DIMS={embed_config['text_dims']}",
-        f"CODE_EMBED_BACKEND={embed_config['code_backend']}",
-        f"CODE_EMBED_MODEL={embed_config['code_model']}",
-        f"CODE_EMBED_DIMS={embed_config['code_dims']}",
-        f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
-        # v0.2.77 5c task 2: hardware-derived in-flight cap (honour-explicit).
-        *_code_embed_max_concurrent_env_lines(embed_config),
-        # v0.2.50 audit F1 (2026-06-08): per-arch Dockerfile selection
-        # for the code-embed image build. NVIDIA hosts opt into the CUDA
-        # base image; everyone else (AMD ROCm, Apple Silicon, CPU-only)
-        # uses the multi-arch CPU default. The compose file reads this
-        # via ${CODE_EMBED_DOCKERFILE:-Dockerfile}. Only emitted when
-        # NVIDIA was detected — leaves CPU/AMD/Metal hosts on the default.
-        *(["CODE_EMBED_DOCKERFILE=Dockerfile.cuda"]
-          if embed_config.get("gpu_vendor") == "nvidia" else []),
-        # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
-        # reads/writes. Per-profile so low-resource/openai installs don't
-        # cross-write qwen3 vectors into a slot labelled for a different
-        # model (audit fix 2026-04-30, see kg-embedding-vector-audit-2026-04-30.md).
-        f"ACTIVE_EMBEDDING={embed_config.get('active_embedding', 'qwen3')}",
-        "",
-        "# Knowledge Graph",
-        # Resolved by _ensure_collections (per-install naming on adopt mode,
-        # bare defaults when we own the Weaviate). Defaults pinned here in
-        # case _ensure_collections didn't run (e.g. --no-containers).
-        f"KG_COLLECTION={os.environ.get('KG_COLLECTION', 'KnowledgeGraph')}",
-        f"DEVELOPMENT_COLLECTION={os.environ.get('DEVELOPMENT_COLLECTION', 'Development')}",
-        "",
-        "# Cross-project shared KG (all vco installs on this machine read",
-        "# from it alongside their own KG by default — v0.2.46 added a",
-        "# symmetric per-project READ opt-out gate, asymmetric-by-default).",
-        "# Seeded at install time from vibecoded-orchestrator/knowledge/.",
-        "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project,",
-        "# SHARED_KG_READ_DISABLED=true to gate READS. SHARED_KG_OPT_OUT is",
-        "# the legacy write alias kept for ~3 releases (target removal:",
-        "# 2026-08); no read alias because the read path was unconditional",
-        "# pre-v0.2.46.",
-        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedOrchestrator_KnowledgeGraph')}",
-        "SHARED_KG_WRITE_DISABLED=false",
-        "SHARED_KG_OPT_OUT=false",
-        "SHARED_KG_READ_DISABLED=false",
-        "",
-    ]
-
+    tail = render_install_env_tail(
+        embed_config,
+        weaviate_grpc_port=os.environ.get(
+            "WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT)
+        ),
+        code_embed_port=os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT)),
+        telemetry_enabled=telemetry_enabled,
+        concurrency_lines=_code_embed_max_concurrent_env_lines(embed_config),
+    )
+    # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
+    # reads/writes; per-profile so low-resource/openai installs don't
+    # cross-write qwen3 vectors into a slot labelled for a different model.
+    keys = _orchestrator_env_keys(embed_config.get("active_embedding", "qwen3"))
     if embed_config.get("openai_key"):
-        lines.extend([
-            "# OpenAI (for embeddings)",
-            f"OPENAI_API_KEY={embed_config['openai_key']}",
-            "EMBEDDING_PROVIDER=openai",
-            "",
-        ])
-    else:
-        lines.extend([
-            "# Embedding provider",
-            "EMBEDDING_PROVIDER=ollama",
-            "",
-        ])
-
-    # Anonymous telemetry consent (default OFF; matches collector/uploader
-    # default-OFF semantics — README promises "no telemetry unless you opt in").
-    # Belt-and-suspenders: the flag is also written explicitly so user / sysadmin
-    # can audit consent state by reading .env, not just by trusting the lib default.
-    lines.extend([
-        "# Anonymous telemetry (default: off — README promise)",
-        "# Set to 'true' to enable; collector + uploader both honour this.",
-        # B7 (2026-05-01): canonical key is VCT_TELEMETRY (matches template at
-        # line ~4986 and Rust). VIBECODED_TELEMETRY remains as a read-time alias
-        # in the telemetry module for ~3 releases of back-compat.
-        f"VCT_TELEMETRY={'true' if telemetry_enabled else 'false'}",
-        "",
-    ])
-
-    # env_template: legacy_caller_pending_migration
-    #
-    # PHASE 0.D NOTE (2026-05-24): the fresh-write branch below at the
-    # ``else`` arm is intentionally allowlisted by
-    # ``tests/test_config_projection_single_writer.py``. install.py
-    # writes a mix of canonical Phase 0.D keys AND non-canonical
-    # install-time-only keys (EMBEDDING_MODEL / EMBEDDING_DIMS /
-    # CODE_EMBED_BACKEND / EMBEDDING_PROVIDER /
-    # VCT_TELEMETRY / banner comments / RL-section placeholders).
-    # Splitting "managed-block keys" from "install-time-only keys" so
-    # the install.py fresh-write fully routes through
-    # ``apply_env_template`` is a follow-up refactor scoped outside
-    # Phase 0.D's brief — the brief's literal directive was migrating
-    # ``_ensure_env_template`` (done above).
-    # The EXISTING-file branch DOES route through apply_env_template
-    # (via _ensure_env_template, now Phase 0.D-migrated).
-    if env_file.exists():
-        report = _ensure_env_template(env_file)
-        if report["action"] == "appended":
-            print(f"already exists — refreshed managed block ({len(report['added_keys'])} canonical keys)")
-            _log_install_event(
-                "9/10", "ok",
-                f".env managed-block refreshed ({len(report['added_keys'])} keys)",
-                data={"env_file": str(env_file),
-                      "added_keys": report["added_keys"]},
-            )
-        else:
-            print("already exists (not overwritten)")
-            _log_install_event(
-                "9/10", "skip",
-                ".env already exists — preserved",
-                data={"env_file": str(env_file)},
-            )
-    else:
-        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        if telemetry_enabled:
-            print("OK (telemetry: on, opt-in)")
-        else:
-            print("OK (telemetry: off)")
+        _store_install_openai_key(embed_config["openai_key"])
+    report = write_orchestrator_env(PROJECT_ROOT, keys, tail=tail)
+    _migrate_install_dotenv_openai_key()
+    action = report["action"][0]
+    if action == "created":
+        print("OK (telemetry: on, opt-in)" if telemetry_enabled else "OK (telemetry: off)")
         _log_install_event(
             "9/10", "ok",
             ".env written",
-            data={"env_file": str(env_file),
-                  "telemetry_on": telemetry_enabled},
+            data={"env_file": str(env_file), "telemetry_on": telemetry_enabled},
+        )
+    elif action == "updated":
+        print(f"already exists — managed block refreshed "
+              f"({len(report['added'])} canonical key(s) added)")
+        _log_install_event(
+            "9/10", "ok",
+            f".env managed-block refreshed ({len(report['added'])} keys added)",
+            data={"env_file": str(env_file), "added_keys": report["added"],
+                  "migrated_keys": report["migrated"]},
+        )
+    else:
+        print("already exists (not overwritten)")
+        _log_install_event(
+            "9/10", "skip",
+            ".env already exists — preserved",
+            data={"env_file": str(env_file)},
         )
 
 
 def _reconcile_env_keys(env_path: Path) -> dict:
-    """Append canonical env keys missing from an existing .env file.
+    """Add the canonical env keys an existing ``.env`` lacks (``--update``).
 
-    # A3 (2026-05-28): install.py --update skips _write_env_config to
-    # preserve user values, so keys added in newer orchestrator versions
-    # (e.g. DIAGRAMS_COLLECTION added between v0.2.10 and v0.2.34) were
-    # silently absent. This function closes that gap with an additive-only
-    # write: parse existing keys, compare against the canonical list from
-    # vco_lib.env_template, append each missing key with its default value
-    # and a comment marker. User-set values are NEVER overwritten.
-
-    Args:
-        env_path: Path to the project's ``.env`` file. No-op if the file
-            does not exist (fresh install wrote it; nothing to reconcile).
+    A3 (2026-05-28): ``install.py --update`` skips ``_write_env_config`` to
+    preserve user values, so keys added in newer orchestrator versions were
+    silently absent. v0.2.97: they are added to the file's VCO-managed block
+    through the one ``.env`` writer, FILL-ONLY — a key the user assigns, or
+    the block already carries, is never changed (the V47-F non-destructive
+    rule). The retired writers' annotated lines are folded into the block.
 
     Returns:
-        ``{"added": [keys...], "action": "appended"|"noop"|"skipped"}``
+        ``{"added": [keys...], "action": "appended"|"noop"|"skipped"}`` —
+        ``skipped`` when there is no ``.env`` (a fresh install writes it) or
+        it could not be read/written.
     """
     if not env_path.is_file():
         return {"added": [], "action": "skipped"}
-
-    from vco_lib.env_template import list_canonical_env_template_keys
-
-    canonical_keys = list_canonical_env_template_keys()
-    existing_keys = _parse_existing_env_keys(env_path)
-    missing = [k for k in canonical_keys if k not in existing_keys]
-    if not missing:
-        return {"added": [], "action": "noop"}
-
-    # Build a default-value map from the legacy canonical template
-    # (same source _ensure_env_template uses so defaults are consistent).
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
-    sanitized = os.environ.get("PROJECT_NAME", "Project")
-    defaults: dict[str, str] = {
-        "PROJECT_NAME": sanitized,
-        "CODE_GRAPH_PROJECT": sanitized,
-        "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
-        "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",
-        "SHARED_KG_COLLECTION": os.environ.get(
-            "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
-        ),
-        "SHARED_KG_WRITE_DISABLED": "false",
-        "SHARED_KG_OPT_OUT": "false",
-        # v0.2.46 Decision B — symmetric READ gate.
-        "SHARED_KG_READ_DISABLED": "false",
-        # v0.2.61/v0.2.67 (embedding reconcile): see the matching note in
-        # `_ensure_env_template`. os.environ["ACTIVE_EMBEDDING"] is already made
-        # authoritative (hardware pick on the stale-qwen3 OR empty-env shapes;
-        # a deliberate choice flows through verbatim) by
-        # `_reconcile_install_active_embedding` before this additive-write
-        # runs, so a qwen3 default is never re-appended for a CPU host whose
-        # selector chose arctic.
-        "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
-        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-        "WEAVIATE_PORT": weaviate_port,
-        "OLLAMA_URL": f"http://localhost:{ollama_port}",
-        "OLLAMA_PORT": ollama_port,
-        "CODE_EMBED_URL": f"http://localhost:{code_embed_port}",
-        "CODE_EMBED_PORT": code_embed_port,
-    }
-
-    date_str = _utc_iso_now()[:10]
-    append_lines: list[str] = [
-        "",
-        f"# --- Added by install.py --update on {date_str} ---",
-    ]
-    added: list[str] = []
-    for key in missing:
-        default = defaults.get(key, "")
-        append_lines.append(
-            f"# Added by install.py --update on {date_str}"
-        )
-        append_lines.append(f"{key}={default}")
-        added.append(key)
+    from vco_lib.install_env import write_orchestrator_env
 
     try:
-        existing_text = env_path.read_text(encoding="utf-8")
-        new_text = existing_text
-        if not existing_text.endswith("\n"):
-            new_text += "\n"
-        new_text += "\n".join(append_lines) + "\n"
-        # Atomic write — same pattern as _atomic_write_text in env_template.
-        import tempfile
-        parent = env_path.parent
-        fd, tmp_path_str = tempfile.mkstemp(
-            prefix=env_path.name + ".",
-            suffix=".tmp",
-            dir=str(parent),
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-                f.write(new_text)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp_path_str, str(env_path))
-        except Exception:
-            try:
-                Path(tmp_path_str).unlink()
-            except OSError:
-                pass
-            raise
-    except OSError as exc:
+        report = write_orchestrator_env(env_path.parent, _orchestrator_env_keys())
+    except (OSError, UnicodeDecodeError) as exc:
         _log_install_event(
             "9/10", "warn",
             f"_reconcile_env_keys: write failed: {exc}",
             data={"env_path": str(env_path), "error": str(exc)},
         )
         return {"added": [], "action": "skipped"}
-
-    return {"added": added, "action": "appended"}
+    # The same --update pass moves a pre-v0.2.97 VCO-written OpenAI key
+    # out of this .env (value evidence only; reported when left).
+    _migrate_install_dotenv_openai_key(env_path.parent)
+    if not report["added"]:
+        return {"added": [], "action": "noop"}
+    return {"added": report["added"], "action": "appended"}
 
 
 # ---------------------------------------------------------------------------
@@ -22901,65 +22668,24 @@ def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
     later run picks up the rest. Errors are surfaced as warnings, never
     raised.
     """
-    # Path construction split across two assignments so the
-    # single-writer lint (which detects chained `.claude/settings.json`
-    # literals in a single assignment expression) treats this BASH_ENV
-    # cleanup as orthogonal to the canonical-env contract. BASH_ENV is
-    # NOT a canonical key — the cleanup pops one non-canonical key and
-    # re-writes the surrounding JSON verbatim. The Phase 0.B contract
-    # owns CANONICAL key writes; this targeted strip + re-write is a
-    # legitimate orthogonal concern.
-    _claude_root = PROJECT_ROOT / ".claude"
-    settings_file = _claude_root / "settings.json"
-    shim_path = _claude_root / "scripts" / "leanctx-bash-env.sh"
+    shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
 
     # ----- Part 1: strip BASH_ENV from .claude/settings.json -----
-    if settings_file.exists():
+    # ONE home (v0.2.97): the bundle engine's per-project cleanup reads JSONC
+    # through `settings_refusal.load_for_edit` and edits it in place; a file
+    # it cannot edit is left byte-identical AND recorded
+    # (`legacy_bash_env_cleanup_pending`). Step 5b's bundle already ran it for
+    # the root; this idempotent re-run covers a 5b that did not complete.
+    outcome = _project_init._cleanup_legacy_bash_env_in_project(PROJECT_ROOT)
+    action, detail = outcome.get("action"), outcome.get("detail", "")
+    if action in ("removed", "left-alone"):
+        print(f"  legacy BASH_ENV cleanup: {action}: {detail}")
+    elif action in ("write-failed", "unparseable", "edit-refused"):
+        print(f"  legacy BASH_ENV cleanup deferred ({action}): {detail}")
         try:
-            settings_text = settings_file.read_text(encoding="utf-8")
-            settings = json.loads(settings_text)
-        except (OSError, json.JSONDecodeError) as e:
-            print(
-                f"  legacy BASH_ENV cleanup: settings.json read/parse failed "
-                f"({type(e).__name__}: {e}) — skipping (re-run after fixing)"
-            )
-            settings = None
-
-        if isinstance(settings, dict):
-            env_block = settings.get("env")
-            if isinstance(env_block, dict) and "BASH_ENV" in env_block:
-                raw_val = str(env_block.get("BASH_ENV", ""))
-                # Detect the shim — accept both ${CLAUDE_PROJECT_DIR}-templated
-                # and absolute-path forms (older installs wrote literal paths).
-                points_at_shim = (
-                    "leanctx-bash-env.sh" in raw_val
-                    or raw_val.endswith(str(shim_path))
-                )
-                if points_at_shim:
-                    env_block.pop("BASH_ENV", None)
-                    try:
-                        settings_file.write_text(
-                            json.dumps(settings, indent=2) + "\n",
-                            encoding="utf-8",
-                        )
-                        print(
-                            "  legacy BASH_ENV cleanup: removed BASH_ENV "
-                            "from .claude/settings.json (was wired to "
-                            "leanctx-bash-env.sh shim)"
-                        )
-                    except OSError as e:
-                        print(
-                            f"  legacy BASH_ENV cleanup: settings.json write "
-                            f"failed ({type(e).__name__}: {e}) — re-run after "
-                            f"fixing permissions"
-                        )
-                else:
-                    print(
-                        f"  legacy BASH_ENV cleanup: BASH_ENV present in "
-                        f"settings.json but doesn't point at the shim "
-                        f"({raw_val!r}) — leaving alone (user/other tooling)"
-                    )
-            # else: env_block missing or BASH_ENV already gone — no-op.
+            _project_init._emit_bash_env_cleanup_deferral(PROJECT_ROOT, outcome)
+        except Exception as e:  # noqa: BLE001 — the ledger is observability
+            print(f"  legacy BASH_ENV cleanup: deferral write failed: {e}")
 
     # ----- Part 2: disable the shim file itself -----
     if shim_path.exists():

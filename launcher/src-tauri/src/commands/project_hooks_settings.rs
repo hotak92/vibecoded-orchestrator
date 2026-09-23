@@ -208,7 +208,10 @@ async fn run_hooks_cli(
 ///
 /// `what` names the tool in error messages, so a refusal reads as "the hooks
 /// editor refused…" rather than naming a module path at the user.
-async fn run_vco_lib_json(
+///
+/// Crate-visible since v0.2.97: the post-bundle pipeline's registry write
+/// (`projects_v2::record_bundle_materialization`) is a third caller.
+pub(crate) async fn run_vco_lib_json(
     db: &Db,
     module: &str,
     args: &[&std::ffi::OsStr],

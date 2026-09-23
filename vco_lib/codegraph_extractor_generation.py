@@ -174,6 +174,18 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "charge EVERY project with a graph one forced re-extraction to fix a "
         "population identified by evidence."
     ),
+    "0.2.97": (
+        "No extraction-semantics change. `git diff v0.2.96..HEAD` across the "
+        "same extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) "
+        "touches ONE file: analyze_code_graph.py, +2/-2 — a printed recovery "
+        "command replaced (the nonexistent `project_init drop-collection` verb "
+        "-> a real single-collection DELETE). codegraph_resync.py (+3) only "
+        "scrubs the install relaunch record from its detached child's env. "
+        "_CHUNKER_REVISION unchanged at v0.2.92.1; CODEGRAPH_EMBED_REVISION "
+        "unchanged at 1; CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
+    ),
 }
 
 #: The newest generation a freshly-built graph satisfies.

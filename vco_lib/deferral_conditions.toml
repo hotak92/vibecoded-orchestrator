@@ -1474,8 +1474,14 @@ emit_surfaces = ["ledger"]
 [conditions.legacy_bash_env_cleanup_pending]
 class = "action_required"
 owner = "vco_lib.project_init"
-clear_probe = "manual-dismiss"
+clear_probe = "probe:py:bash_env_cleanup_still_owed"
 emit_surfaces = ["ledger"]
+notes = """v0.2.97: state-keyed. Cleared once `.claude/settings.json` holds no \
+`BASH_ENV` naming the lean-ctx shim (or is gone); kept while the file is \
+unreadable or still points at the shim. Every re-probe pass runs AFTER its \
+update's cleanup (bundle engine; install.py), so a cleanup that now succeeds \
+removes the key first and the same pass clears the entry. Before v0.2.97 \
+this row was manual-dismiss only."""
 
 [conditions.orphan_code_collections_detected]
 class = "action_required"
@@ -1501,6 +1507,56 @@ pointer, the seed snapshot and the root's shared binding directly — the \
 printed remedy (pick, then re-run install.py --update) is the thing that \
 clears the entry. A pick naming a dead class still defers, with the dead \
 pick named in the reasons."""
+
+# ── schema_migration_runner tagged errors (v0.2.97) ────────────────────────
+# These ids travel as a trailing `[id]` tag inside an error detail and become
+# condition ids in `build_deferral_entries` — which is why a `condition_id=`
+# source scan never saw them. The runner now DECLARES them
+# (`ERROR_CONDITION_IDS`), the decoder refuses an undeclared tag, and the
+# completeness test imports that set. The runner re-evaluates every artifact
+# on every pass, so the lifecycle is "not re-detected ⇒ over": install.py
+# owns them for the root ledger (its finalize drops an id it did not re-emit),
+# and `project_init._clear_runner_conditions_not_reemitted` is the paired
+# clear a per-project `migrate-schema` pass runs on its own ledger.
+
+[conditions.schema_migration_script_missing]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A recorded version is behind canonical and no migration edge \
+ships for the gap (or the shipped ladder has a hole). Per-project clear: \
+_clear_runner_conditions_not_reemitted."""
+
+[conditions.schema_migration_probe_unreachable]
+class = "auto_retryable"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """Weaviate did not answer the NEVER_MATERIALIZED existence probe, so \
+the runner refused to stamp born-at-canonical; the next pass with Weaviate \
+up re-evaluates and, not re-emitting it, drops the row. Per-project clear: \
+_clear_runner_conditions_not_reemitted."""
+
+[conditions.schema_migration_classification]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A shipped edge's declared classification disagrees with the \
+artifact's. Per-project clear: _clear_runner_conditions_not_reemitted."""
+
+[conditions.schema_version_unrecorded]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A SELF-RECORDED artifact (bundle_materialization) has no row, or \
+one behind canonical: the materializer's own record (from the manifest it \
+wrote) did not happen. Remedy: re-run the bundle update (launcher) or \
+install.py --update for the root; the successful record makes the next pass \
+read UP_TO_DATE and the row drops. Per-project clear: \
+_clear_runner_conditions_not_reemitted."""
 
 [conditions.schema_migration_refuse_downgrade]
 class = "action_required"

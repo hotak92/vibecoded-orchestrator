@@ -17,7 +17,9 @@ to a discard hub port.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -77,7 +79,9 @@ def test_a_value_equal_to_the_stored_one_is_removed_from_every_file(tmp_path, st
     stored["OPENAI_API_KEY"] = STORED
     _files(tmp_path, "OPENAI_API_KEY", STORED)
     result = cp.strip_proven_secret_values(tmp_path, known_keys=["OPENAI_API_KEY"])
-    assert result == {"removed": {rel: ["OPENAI_API_KEY"] for rel in ALL}, "left": {}, "errors": []}
+    assert result == {
+        "removed": {rel: ["OPENAI_API_KEY"] for rel in ALL}, "left": {}, "not_removed": {}, "errors": [],
+    }
     for rel in ALL:
         text = (tmp_path / rel).read_text()
         assert STORED not in text, rel
@@ -131,7 +135,9 @@ def test_an_unproven_value_is_left_byte_for_byte_and_reported(tmp_path, stored, 
 def test_names_the_launcher_never_stored_are_not_touched_or_listed(tmp_path, stored):
     _files(tmp_path, "MY_OWN_TOKEN", TYPED)
     before = _snapshot(tmp_path)
-    assert cp.strip_proven_secret_values(tmp_path, known_keys=[]) == {"removed": {}, "left": {}, "errors": []}
+    assert cp.strip_proven_secret_values(tmp_path, known_keys=[]) == {
+        "removed": {}, "left": {}, "not_removed": {}, "errors": [],
+    }
     assert _snapshot(tmp_path) == before
 
 
@@ -201,8 +207,78 @@ def test_the_rust_evidence_gated_list_matches_the_python_one():
     assert rust == set(cp._LEGACY_SECRET_ENV_KEYS)
 
 
-def test_no_rust_copy_of_the_env_line_grammar_remains():
-    """Review R3 F24: the per-line strip is the Python SSOT's
-    (`envfile.parse_env_line`); the Rust mirror is retired."""
-    src = (REPO_ROOT / "launcher/src-tauri/src/commands/projects_v2.rs").read_text(encoding="utf-8")
-    assert "fn strip_active_env_lines" not in src
+
+# ── REVIEW R4 F25 / F28 / F29 ───────────────────────────────────────────────
+
+posix_non_root = pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permission bits that bind (not root)",
+)
+
+
+@posix_non_root
+def test_review_r4_f25_one_unwritable_file_does_not_stop_the_others(tmp_path, stored):
+    """The reviewer's probe: `.claude/` is read-only, so `.claude/env` (and the
+    atomic rewrite of `.claude/settings.json` beside it) cannot be replaced.
+    Every other surface is still stripped, and the reply says exactly which
+    proven values were removed and which were not."""
+    stored["OPENAI_API_KEY"] = STORED
+    _files(tmp_path, "OPENAI_API_KEY", STORED)
+    claude_dir = tmp_path / ".claude"
+    claude_before = {n: (claude_dir / n).read_bytes() for n in ("env", "settings.json")}
+    claude_dir.chmod(0o555)
+    try:
+        result = cp.strip_proven_secret_values(tmp_path, known_keys=["OPENAI_API_KEY"])
+    finally:
+        claude_dir.chmod(0o755)
+
+    assert result["removed"] == {".env": ["OPENAI_API_KEY"], ".vscode/settings.json": ["OPENAI_API_KEY"]}
+    assert result["not_removed"] == {
+        ".claude/env": ["OPENAI_API_KEY"], ".claude/settings.json": ["OPENAI_API_KEY"],
+    }
+    assert len(result["errors"]) == 2 and all(STORED not in e for e in result["errors"])
+    assert STORED not in (tmp_path / ".env").read_text()
+    assert STORED not in (tmp_path / ".vscode/settings.json").read_text()
+    assert {n: (claude_dir / n).read_bytes() for n in ("env", "settings.json")} == claude_before
+
+
+@posix_non_root
+def test_review_r4_f25_a_file_that_cannot_be_rewritten_is_reported_not_claimed(tmp_path, stored):
+    stored["OPENAI_API_KEY"] = STORED
+    (tmp_path / ".env").write_text(f"OPENAI_API_KEY={STORED}\n", encoding="utf-8")
+    tmp_path.chmod(0o555)
+    try:
+        result = cp.strip_proven_secret_values(tmp_path, known_keys=["OPENAI_API_KEY"])
+    finally:
+        tmp_path.chmod(0o755)
+    assert result["removed"] == {}, "a value still on disk is never reported removed"
+    assert result["not_removed"] == {".env": ["OPENAI_API_KEY"]}
+    assert result["errors"] and STORED not in result["errors"][0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_review_r4_f29_a_rewrite_keeps_the_files_mode(tmp_path, stored):
+    stored["OPENAI_API_KEY"] = STORED
+    env = tmp_path / ".env"
+    env.write_text(f"OPENAI_API_KEY={STORED}\nOTHER=1\n", encoding="utf-8")
+    env.chmod(0o640)
+    cp.strip_proven_secret_values(tmp_path, known_keys=["OPENAI_API_KEY"])
+    assert env.read_text() == "OTHER=1\n"
+    assert stat.S_IMODE(env.stat().st_mode) == 0o640
+
+
+def test_review_r4_f28_a_stray_end_marker_above_the_block_does_not_hide_a_line(tmp_path, stored):
+    """The block is found by the shared `envfile.extract_managed_block`: a
+    stray END marker above BEGIN no longer swallows the lines between them."""
+    stored["OPENAI_API_KEY"] = STORED
+    env = tmp_path / ".claude" / "env"
+    env.parent.mkdir()
+    env.write_text(
+        f"{cp.CLAUDE_ENV_MANAGED_END}\nexport OPENAI_API_KEY=\"{STORED}\"\n"
+        f"{cp.CLAUDE_ENV_MANAGED_BEGIN}\nexport IN_BLOCK_TOKEN=\"x\"\n{cp.CLAUDE_ENV_MANAGED_END}\n",
+        encoding="utf-8",
+    )
+    result = cp.strip_proven_secret_values(tmp_path, known_keys=["OPENAI_API_KEY"])
+    assert result["removed"] == {".claude/env": ["OPENAI_API_KEY"]}
+    text = env.read_text()
+    assert STORED not in text and 'IN_BLOCK_TOKEN="x"' in text

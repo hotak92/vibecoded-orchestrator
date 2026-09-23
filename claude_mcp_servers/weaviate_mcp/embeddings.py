@@ -61,7 +61,11 @@ import aiohttp
 LEGACY_TEXT_EMBEDDING_MODEL = os.getenv("LEGACY_TEXT_EMBEDDING_MODEL", "snowflake-arctic-embed2:latest")
 # OpenAI embedding config (only used when ACTIVE_EMBEDDING=openai or DUAL_EMBEDDING_ENABLED=true)
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# v0.2.97: env first, else the `openai_api_key` secret through the canonical
+# chain (launcher keychain → file store → the project's .env).
+from vco_lib.openai_key import resolve_openai_api_key  # noqa: E402
+
+OPENAI_API_KEY = resolve_openai_api_key()
 # Code embedding service URL (CodeSage-Large-v2 via FastAPI, or Ollama-compatible endpoint)
 CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
 

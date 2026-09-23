@@ -395,35 +395,296 @@ def test_apply_handles_missing_end_marker(tmp_path: Path) -> None:
 
 
 def test_apply_appends_managed_block_to_legacy_env(tmp_path: Path) -> None:
-    """An existing .env WITHOUT the BEGIN marker (legacy append-only
-    format from _ensure_env_template / ensure_project_env_template):
-    the managed block is APPENDED at EOF. User content fully preserved.
-    The next apply will then in-place replace because BEGIN is present."""
+    """An existing .env WITHOUT the BEGIN marker: the managed block is
+    APPENDED at EOF. v0.2.97: a key the USER assigns outside the markers
+    is left out of the block (the user's line is the one assignment), and
+    the retired append writer's line for a key the block renders is
+    migrated into the block — never two assignments of one key."""
     env_path = tmp_path / ".env"
     env_path.write_text(
         "# vibecoded-orchestrator per-project .env (legacy)\n"
         "KG_COLLECTION=LegacyValue\n"
         "PROJECT_NAME=LegacyName\n"
+        "\n"
         "# added by vco 2026-04-28: appended missing canonical keys\n"
         "WEAVIATE_URL=http://localhost:8081\n"
     )
 
-    apply_env_template(_keys(), project_folder=tmp_path)
+    report = apply_env_template(_keys(), project_folder=tmp_path)
     text = env_path.read_text()
 
-    # All legacy lines preserved.
-    assert "KG_COLLECTION=LegacyValue" in text
-    assert "PROJECT_NAME=LegacyName" in text
-    assert "# added by vco 2026-04-28" in text
-    # Managed block now present at EOF.
+    # User lines preserved byte-for-byte, and they stay the only assignment.
+    assert text.startswith(
+        "# vibecoded-orchestrator per-project .env (legacy)\n"
+        "KG_COLLECTION=LegacyValue\n"
+        "PROJECT_NAME=LegacyName\n"
+    )
+    assert _assignments(text, "KG_COLLECTION") == ["LegacyValue"]
+    assert _assignments(text, "PROJECT_NAME") == ["LegacyName"]
+    # The legacy section's only line moved into the block (with its header).
+    assert "# added by vco 2026-04-28" not in text
+    assert _assignments(text, "WEAVIATE_URL") == ["http://localhost:8081"]
     assert ENV_TEMPLATE_BEGIN in text
     assert text.rstrip().endswith(ENV_TEMPLATE_END)
-    # Managed block carries the launcher's resolved KG_COLLECTION.
-    # (User's LegacyValue line earlier in the file still wins under
-    # shell-source last-wins semantics — but the managed block IS
-    # rendered correctly.)
-    managed = text[text.find(ENV_TEMPLATE_BEGIN) :]
-    assert "KG_COLLECTION=TestKG" in managed
+    managed = text[text.find(ENV_TEMPLATE_BEGIN):]
+    assert "WEAVIATE_URL=http://localhost:8081" in managed
+    assert "KG_COLLECTION" not in managed
+    assert report["user_set"] == ["KG_COLLECTION", "PROJECT_NAME"]
+    assert report["migrated"] == ["WEAVIATE_URL"]
+    assert report["action"] == ["updated"]
+
+
+def _assignments(text: str, key: str) -> list[str]:
+    """Every ACTIVE value of ``key`` in ``text``, in file order."""
+    out = []
+    for line in text.splitlines():
+        body = line.strip()
+        if body.startswith("export "):
+            body = body[len("export "):].lstrip()
+        if body.startswith(f"{key}="):
+            out.append(body.split("=", 1)[1])
+    return out
+
+
+# ─── v0.2.97: legacy VCO-authored lines migrate into ONE set ─────────────
+
+# What the retired Rust ``ensure_project_env_template`` appended to an
+# existing .env, and what ``install.py --update`` appended (field shapes).
+_RUST_APPEND_BLOCK = (
+    "\n"
+    "# added by vco 2026-05-06: appended missing canonical keys\n"
+    "# CODE_EMBED_URL=\n"
+    "KG_COLLECTION=Acme_KnowledgeGraph\n"
+    "PROJECT_NAME=<project>\n"
+    "# ANTHROPIC_API_KEY=\n"
+    "# GITHUB_TOKEN=\n"
+    "# RL_PROJECT_ROOT=<project_root>\n"
+)
+_UPDATE_BLOCK = (
+    "\n"
+    "# --- Added by install.py --update on 2026-05-28 ---\n"
+    "# Added by install.py --update on 2026-05-28\n"
+    "CODE_EMBED_PORT=11440\n"
+    "# Added by install.py --update on 2026-05-28\n"
+    "UNKNOWN_FUTURE_KEY=keep\n"
+)
+# The retired Rust fresh-file template's two managed sections.
+_RUST_TEMPLATE = (
+    "# vibecoded-orchestrator per-project .env\n"
+    "# Edit values to override defaults. Empty / commented lines are\n"
+    "# treated as \"use default\". Created by vco 2026-05-06.\n"
+    "\n"
+    "# === Service URLs (launcher-resolved; edit only if you know what you're doing) ===\n"
+    "# WEAVIATE_URL=http://localhost:8081\n"
+    "# WEAVIATE_PORT=8081\n"
+    "# OLLAMA_URL=http://localhost:11435\n"
+    "# OLLAMA_PORT=11435\n"
+    "# CODE_EMBED_URL=http://localhost:11440\n"
+    "\n"
+    "# === Per-project Weaviate collections ===\n"
+    "# Resolved by the launcher when the project is registered. Don't\n"
+    "# edit unless you know what you're doing.\n"
+    "KG_COLLECTION=Acme_KnowledgeGraph\n"
+    "SHARED_KG_COLLECTION=VibeCodedOrchestrator_KnowledgeGraph\n"
+    "DEVELOPMENT_COLLECTION=Acme_Development\n"
+    "PROJECT_NAME=Acme\n"
+    "ACTIVE_EMBEDDING=qwen3\n"
+    "\n"
+    "# === LLM API keys (optional) ===\n"
+    "# ANTHROPIC_API_KEY=\n"
+    "# OPENAI_API_KEY=\n"
+)
+
+
+def _acme_keys() -> dict[str, str]:
+    return {
+        "PROJECT_NAME": "Acme",
+        "CODE_GRAPH_PROJECT": "Acme",
+        "KG_COLLECTION": "Acme_KnowledgeGraph",
+        "DEVELOPMENT_COLLECTION": "Acme_Development",
+        "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
+        "ACTIVE_EMBEDDING": "arctic",
+        "WEAVIATE_URL": "http://localhost:8081",
+        "WEAVIATE_PORT": "8081",
+        "OLLAMA_URL": "http://localhost:11435",
+        "OLLAMA_PORT": "11435",
+        "CODE_EMBED_URL": "http://localhost:11440",
+        "CODE_EMBED_PORT": "11440",
+    }
+
+
+def _assert_one_set(text: str, keys: dict[str, str]) -> None:
+    for key in keys:
+        assert len(_assignments(text, key)) == 1, (key, text)
+
+
+def test_legacy_append_block_migrates_to_one_set(tmp_path: Path) -> None:
+    """The Rust append block: its lines for managed keys (and the bogus
+    ``PROJECT_NAME=<project>``) move into the block; its placeholders for
+    keys the block never carries stay, under their header; user lines are
+    byte-identical and keep their own assignment."""
+    env_path = tmp_path / ".env"
+    user = "MY_TOKEN=abc\nWEAVIATE_URL=http://remote:8081\n"
+    env_path.write_text(user + _RUST_APPEND_BLOCK)
+
+    report = apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+
+    assert text.startswith(user)
+    _assert_one_set(text, _acme_keys())
+    assert _assignments(text, "WEAVIATE_URL") == ["http://remote:8081"]
+    assert _assignments(text, "PROJECT_NAME") == ["Acme"]
+    assert "<project>\n" not in text
+    # Placeholders the block does not own survive with their header.
+    assert (
+        "# added by vco 2026-05-06: appended missing canonical keys\n"
+        "# ANTHROPIC_API_KEY=\n"
+        "# GITHUB_TOKEN=\n"
+        "# RL_PROJECT_ROOT=<project_root>\n"
+    ) in text
+    assert "# CODE_EMBED_URL=\n" not in text
+    assert report["migrated"] == ["CODE_EMBED_URL", "KG_COLLECTION", "PROJECT_NAME"]
+    assert report["user_set"] == ["WEAVIATE_URL"]
+
+
+def test_legacy_rust_template_sections_migrate(tmp_path: Path) -> None:
+    """A .env born from the retired Rust template: both managed sections
+    (header, notes, commented and active lines) are replaced by the block;
+    the banner and the optional-keys section stay."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(_RUST_TEMPLATE)
+
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+
+    _assert_one_set(text, _acme_keys())
+    assert _assignments(text, "ACTIVE_EMBEDDING") == ["arctic"]
+    assert "# === Service URLs" not in text
+    assert "# === Per-project Weaviate collections ===" not in text
+    assert "Resolved by the launcher" not in text
+    assert "# WEAVIATE_URL=" not in text
+    assert text.startswith("# vibecoded-orchestrator per-project .env\n")
+    assert "# === LLM API keys (optional) ===\n# ANTHROPIC_API_KEY=\n" in text
+    # No gap left where the sections were.
+    assert "\n\n\n" not in text
+
+
+def test_legacy_update_block_migrates_owned_pairs_only(tmp_path: Path) -> None:
+    """``install.py --update``'s annotated pairs: an owned key's pair is
+    removed; an unknown key's pair (and so the header) stays."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("KG_COLLECTION=Acme_KnowledgeGraph\n" + _UPDATE_BLOCK)
+
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+
+    _assert_one_set(text, _acme_keys())
+    assert (
+        "# --- Added by install.py --update on 2026-05-28 ---\n"
+        "# Added by install.py --update on 2026-05-28\n"
+        "UNKNOWN_FUTURE_KEY=keep\n"
+    ) in text
+    assert _assignments(text, "CODE_EMBED_PORT") == ["11440"]
+    assert "# Added by install.py --update on 2026-05-28\nCODE_EMBED_PORT" not in text
+
+
+def test_user_line_under_legacy_block_is_not_migrated(tmp_path: Path) -> None:
+    """A user line glued right under a legacy block (``echo … >> .env``)
+    breaks the writer's key order, so it is the user's — kept, and it keeps
+    the key out of the block."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "# added by vco 2026-05-06: appended missing canonical keys\n"
+        "PROJECT_NAME=<project>\n"
+        "# GITHUB_TOKEN=\n"
+        "KG_COLLECTION=MyCustom_KG\n"
+    )
+
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+
+    assert _assignments(text, "KG_COLLECTION") == ["MyCustom_KG"]
+    _assert_one_set(text, _acme_keys())
+
+
+def test_legacy_file_migration_is_idempotent(tmp_path: Path) -> None:
+    """Second apply over a migrated legacy file: byte-identical, no write."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("A=1\n" + _RUST_TEMPLATE + _RUST_APPEND_BLOCK + _UPDATE_BLOCK)
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    first = env_path.read_bytes()
+    mtime = env_path.stat().st_mtime_ns
+
+    report = apply_env_template(_acme_keys(), project_folder=tmp_path)
+
+    assert env_path.read_bytes() == first
+    assert env_path.stat().st_mtime_ns == mtime
+    assert report["action"] == ["unchanged"]
+    assert report["migrated"] == []
+
+
+def test_all_keys_user_set_appends_no_empty_block(tmp_path: Path) -> None:
+    """Leave-alone: a file that already assigns every key gets no block and
+    no write (the pre-v0.2.97 reconcile's noop, kept)."""
+    env_path = tmp_path / ".env"
+    body = "".join(f"export {k}={v}\n" for k, v in _acme_keys().items())
+    env_path.write_text(body)
+    mtime = env_path.stat().st_mtime_ns
+
+    report = apply_env_template(_acme_keys(), project_folder=tmp_path)
+
+    assert env_path.read_text() == body
+    assert env_path.stat().st_mtime_ns == mtime
+    assert report["env"] == []
+    assert report["action"] == ["unchanged"]
+
+
+def test_block_drops_a_key_the_user_later_sets(tmp_path: Path) -> None:
+    """Act: once the user assigns a key outside the block, the block stops
+    rendering it — the user's value becomes the only assignment."""
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    env_path = tmp_path / ".env"
+    env_path.write_text("KG_COLLECTION=Override_KG\n" + env_path.read_text())
+
+    report = apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+
+    assert _assignments(text, "KG_COLLECTION") == ["Override_KG"]
+    assert report["user_set"] == ["KG_COLLECTION"]
+
+
+def test_commented_line_does_not_suppress_the_managed_value(tmp_path: Path) -> None:
+    """A ``# KEY=`` line assigns nothing, so the block still renders KEY."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("# KG_COLLECTION=\n")
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    assert _assignments(env_path.read_text(), "KG_COLLECTION") == ["Acme_KnowledgeGraph"]
+
+
+def test_unreadable_existing_env_is_an_error_not_a_rewrite(tmp_path: Path) -> None:
+    """A .env that exists but cannot be read must never be replaced by a
+    fresh block (pre-v0.2.97 treated it as absent). Non-UTF-8 bytes stand
+    in for the unreadable file; they must survive byte-for-byte."""
+    env_path = tmp_path / ".env"
+    raw = b"SECRET=\xff\xfe not utf-8\n"
+    env_path.write_bytes(raw)
+    with pytest.raises(UnicodeDecodeError):
+        apply_env_template(_acme_keys(), project_folder=tmp_path)
+    assert env_path.read_bytes() == raw
+
+
+def test_scaffold_only_on_creation(tmp_path: Path) -> None:
+    """The scaffold starts a NEW file; an existing file never gets it."""
+    scaffold = "# header\n# OPTIONAL=\n\n"
+    apply_env_template(_keys(), project_folder=tmp_path, scaffold=scaffold)
+    text = (tmp_path / ".env").read_text()
+    assert text.startswith(scaffold + ENV_TEMPLATE_BEGIN)
+
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / ".env").write_text("USER=1\n")
+    apply_env_template(_keys(), project_folder=other, scaffold=scaffold)
+    assert "# OPTIONAL=" not in (other / ".env").read_text()
 
 
 def test_apply_legacy_then_idempotent(tmp_path: Path) -> None:

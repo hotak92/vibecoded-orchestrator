@@ -107,15 +107,13 @@ For Rust callers that want the write surface in Python::
 Out of scope
 ~~~~~~~~~~~~
 
-* The ``<project_root>/.env`` template file managed by
-  ``ensure_project_env_template`` (Rust) and
-  ``_ensure_env_template`` (Python). That file uses different rules
-  (append-only, ``# added by vco`` markers, commented placeholders)
-  and a different audience (CLI users who edit it by hand). It will
-  be migrated through a parallel ``apply_project_env_template``
-  contract in a future Phase 0.D when the cross-language ``.env``
-  template-key parity test (``env_template_canonical_keys_match_python``)
-  is also tightened.
+* The ``<project_root>/.env`` file. It has different rules (a
+  VCO-managed block inside a human-edited file, commented placeholders)
+  and a different audience (CLI users who edit it by hand), so it has
+  its own contract: :mod:`vco_lib.env_template` (Phase 0.D) — since
+  v0.2.97 that file's only writer, reached from the launcher through
+  ``python -m vco_lib.env_template apply`` and from ``install.py``
+  through :mod:`vco_lib.install_env`.
 * Adding new canonical env keys. This module ROUTES existing keys
   through one contract; widening the canonical key set is a separate
   governance step that must update both the Rust ``CANONICAL_INSTALL_ENV_KEYS``
@@ -210,6 +208,7 @@ import argparse
 import json
 import re
 import sqlite3
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -2963,31 +2962,41 @@ def _value_verdict(
 
 def _strip_proven_env_lines(
     path: Path, vco_names: set[str], folder: Path,
-    lookups: dict[str, tuple[str, Optional[str]]],
-) -> tuple[list[str], dict[str, str]]:
+    lookups: dict[str, tuple[str, Optional[str]]], *, managed_block: bool,
+) -> tuple[list[str], dict[str, str], Optional[str]]:
     """Drop from one ``.env``-style file every line whose OWN value is proven;
-    ``(removed names, {name: verdict of a line left})``.
+    ``(proven names, {name: verdict of a line left}, error or None)`` — with an
+    error, the proven names are the ones that were NOT removed.
 
     Per OCCURRENCE (review R3 F23): a file may carry a key twice — a line the
     user wrote above one VCO wrote — and only the line whose value equals the
     stored one goes. Lines are read with the ONE line grammar,
-    :func:`vco_lib.envfile.parse_env_line`; comments, blank lines and every
-    line inside ``.claude/env``'s managed block (VCO's region, handled whole
-    by the unregister) are kept. Every other byte, CRLF included, is kept.
+    :func:`vco_lib.envfile.parse_env_line`; comments, blank lines and — when
+    ``managed_block`` (``.claude/env``) — every line of VCO's managed block
+    (located by the ONE extractor, :func:`vco_lib.envfile.extract_managed_block`;
+    VCO's region, handled whole by the unregister) are kept. Every other byte,
+    CRLF included, is kept, and so is the file's MODE (review R4 F29).
+
+    A failed REWRITE is not raised (review R4 F25): the file is untouched (the
+    write is atomic), and the error comes back with the proven names so the
+    caller can report exactly what was NOT removed and move on to the next
+    surface.
     """
-    from vco_lib.envfile import parse_env_line
+    from vco_lib.envfile import extract_managed_block, parse_env_line
 
     try:
         with path.open(encoding="utf-8", newline="") as handle:
             text = handle.read()
     except (OSError, ValueError):
-        return [], {}
+        return [], {}, None
     skip_from, skip_to = len(text), len(text)
-    if path.name == "env":
-        begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-        end = text.find(CLAUDE_ENV_MANAGED_END, begin + len(CLAUDE_ENV_MANAGED_BEGIN)) if begin != -1 else -1
-        if begin != -1 and end != -1:
-            skip_from, skip_to = begin, end + len(CLAUDE_ENV_MANAGED_END)
+    block = (
+        extract_managed_block(text, CLAUDE_ENV_MANAGED_BEGIN, CLAUDE_ENV_MANAGED_END)
+        if managed_block else None
+    )
+    if block is not None:
+        skip_from = text.find(block)
+        skip_to = skip_from + len(block) + len(CLAUDE_ENV_MANAGED_END)
     kept: list[str] = []
     removed: list[str] = []
     left: dict[str, str] = {}
@@ -3003,8 +3012,11 @@ def _strip_proven_env_lines(
             left[pair[0]] = verdict
         kept.append(line)
     if removed:
-        _atomic_write_text(path, "".join(kept))
-    return sorted(set(removed)), left
+        try:
+            _atomic_write_text(path, "".join(kept))
+        except OSError as exc:
+            return sorted(set(removed)), left, f"could not rewrite {path}: {exc.strerror or exc}"
+    return sorted(set(removed)), left, None
 
 
 def strip_proven_secret_values(
@@ -3023,17 +3035,26 @@ def strip_proven_secret_values(
     touched or listed — they were never VCO's.
 
     Returns ``{"removed": {file: [KEY]}, "left": {file: {KEY: verdict}},
-    "errors": [message]}`` — names and verdicts only, never a value.
+    "not_removed": {file: [KEY]}, "errors": [message]}`` — names and verdicts
+    only, never a value. ``not_removed`` lists PROVEN names whose removal
+    failed (a rewrite error, a refused JSONC edit); each surface is attempted
+    regardless of an earlier one's failure (review R4 F25).
     """
     folder = Path(folder)
     vco_names = _vco_secret_names(folder, known_keys)
     lookups: dict[str, tuple[str, Optional[str]]] = {}
     removed: dict[str, list[str]] = {}
     left: dict[str, dict[str, str]] = {}
+    not_removed: dict[str, list[str]] = {}
     errors: list[str] = []
     for rel in (".env", ".claude/env"):
-        gone, kept = _strip_proven_env_lines(folder / rel, vco_names, folder, lookups)
-        if gone:
+        gone, kept, error = _strip_proven_env_lines(
+            folder / rel, vco_names, folder, lookups, managed_block=rel == ".claude/env",
+        )
+        if gone and error:
+            errors.append(error)
+            not_removed[rel] = gone
+        elif gone:
             removed[rel] = gone
         if kept:
             left[rel] = kept
@@ -3050,12 +3071,13 @@ def strip_proven_secret_values(
             surface = next(s for s, (r, _k) in _JSON_SURFACE_FILES.items() if r == rel)
             try:
                 gone = strip_env_keys(folder, surface, proven)
-            except SettingsWriteRefused as exc:
-                errors.append(str(exc))
+            except (SettingsWriteRefused, OSError) as exc:
+                errors.append(f"{rel}: {exc}")
+                not_removed[rel] = sorted(proven)
                 gone = []
             if gone:
                 removed[rel] = gone
-    return {"removed": removed, "left": left, "errors": errors}
+    return {"removed": removed, "left": left, "not_removed": not_removed, "errors": errors}
 
 
 def _managed_block_secret_exports(path: Path) -> list[str]:
@@ -3396,19 +3418,16 @@ def _write_json_env_block(
           - if absent from ``canonical_env``: delete ``env[key]`` if
             present (signal-to-remove semantics; supports "the launcher
             decided this project no longer has any peer KG access").
-      * Phase 0.E user-secret handling (mirrors Rust):
-          - STRIP first: ``user_secret_strip_keys`` are removed from
-            ``env_block`` BEFORE inserting active pairs. Run before
-            canonical so a same-tick toggle (active→inactive across
-            two writes) can't rely on residual state. The strip set
-            is by construction disjoint from the emit set (the resolver
-            computes ``strip = known - emit``), so removing-then-
-            inserting is safe.
-          - EMIT last: ``user_secret_pairs`` are inserted after the
-            canonical keys. A hypothetical KEY collision (which
-            ``set_secret_v2`` prevents at the GUI layer) resolves
-            user-wins, matching the retired Rust writer's ordering
-            (its step 3).
+      * User-secret keys (v0.2.97, review R4 F26):
+          - ``user_secret_strip_keys`` are the names whose in-file value
+            the CALLER PROVED equals the launcher's stored value
+            (:func:`classify_json_env_secrets`) — a paused, unknown or
+            different value is never in it. They are removed before the
+            canonical keys are applied.
+          - ``user_secret_pairs`` is always empty since v0.2.73: VCO never
+            writes a secret value. The parameter survives only so the
+            call shape stays stable; a non-empty list would be inserted
+            after the canonical keys.
       * Non-canonical, non-user-secret keys (user-added by hand
         directly in the JSON) are PRESERVED untouched.
       * Write the result back with 2-space indent, no trailing newline,
@@ -3442,9 +3461,9 @@ def _write_json_env_block(
     else:
         env_block = dict(env_block_raw)  # defensive copy
 
-    # Phase 0.E step 1: STRIP paused / removed user-secret keys.
-    # Matches the retired Rust writer's deep-merge (its step 1): remove BEFORE canonical / emit so a buggy resolver
-    # can't silently drop the active value.
+    # Remove the user-secret keys whose value the caller PROVED VCO wrote
+    # (equal to the launcher's stored value; never a paused / unknown /
+    # different one), before the canonical keys are applied.
     if user_secret_strip_keys:
         for k in user_secret_strip_keys:
             env_block.pop(k, None)
@@ -3462,8 +3481,8 @@ def _write_json_env_block(
             del env_block[key]
         # else: not in bundle, not in surface — nothing to do.
 
-    # Phase 0.E step 3: EMIT active user-secret pairs LAST so they
-    # win on a hypothetical KEY collision with a canonical key.
+    # `user_secret_pairs` is always empty since v0.2.73 (VCO never writes a
+    # secret value); kept only for the call shape.
     if user_secret_pairs:
         for k, v in user_secret_pairs:
             env_block[k] = v
@@ -3890,8 +3909,17 @@ def _atomic_write_text(path: Path, content: str) -> None:
     equivalent to the previous ``newline="\\n"``), so ``\\n`` in
     ``content`` lands verbatim as LF, matching Rust's
     ``std::fs::write`` which never CRLF-converts.
+
+    v0.2.97 (review R4 F29): an EXISTING file keeps its permission bits —
+    ``mkstemp`` creates the replacement 0600, so without this a group-readable
+    ``.env`` / settings file came out unreadable to its group. A new file is
+    created as before.
     """
-    atomic_write_text(path, content)
+    try:
+        mode: Optional[int] = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
+    atomic_write_text(path, content, mode=mode)
 
 
 # ─── CLI entry point ────────────────────────────────────────────────────

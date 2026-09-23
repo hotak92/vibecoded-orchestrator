@@ -178,35 +178,40 @@ _LEGACY_PRODUCTION_WRITERS: set[Path] = set()
 
 # Phase 0.D: production code that writes ``.env`` directly and hasn't
 # been fully migrated. Each entry MUST carry
-# ``_LEGACY_ENV_TEMPLATE_MARKER``. Empty allowlist = full migration
-# complete.
-#
-# Current entries:
-#   * install.py — the fresh-write branch in ``_write_env_config`` still
-#     writes a mix of canonical Phase 0.D keys + install-time-only keys
-#     (EMBEDDING_MODEL / EMBEDDING_DIMS / EMBEDDING_PROVIDER /
-#     CODE_EMBED_BACKEND / CODE_EMBED_MODEL / CODE_EMBED_DIMS /
-#     VCT_JOERN_AVAILABLE / VCT_TELEMETRY / banner comments /
-#     RL-section placeholders). Splitting those into a managed-block-
-#     only path + a separate writer for the install-time tail is a
-#     follow-up refactor beyond Phase 0.D's brief. The EXISTING-file
-#     branch DOES route through ``apply_env_template`` via
-#     ``_ensure_env_template`` (migrated in this PR).
-#   * launcher/src-tauri/src/commands/projects_v2.rs —
-#     ``ensure_project_env_template`` is the Rust legacy writer; full
-#     migration to subprocess-into-Python is Phase 0.D Part 2 (a
-#     follow-up matching the Phase 0.B Part 2 Rust-env-writer
-#     migration pattern; out of scope for this PR).
-_LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = {
-    REPO_ROOT / "install.py",
-    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
-    # v0.2.54 Track B: writes to infrastructure/.env (compose project's
-    # env file, a different surface from the canonical project .env).
-    # Pre-extraction the same write lived in install.py and was on this
-    # allowlist; carry forward until the compose-env surface gets its
-    # own contract decision (Phase 0.D follow-up).
+# ``_LEGACY_ENV_TEMPLATE_MARKER``. The project ``.env`` surface is fully
+# migrated (v0.2.97) — see
+# ``test_project_dotenv_writers_are_migrated_v0297`` below, which fails if
+# either retired writer comes back:
+#   * install.py — ``_write_env_config`` (fresh + existing file) and
+#     ``_reconcile_env_keys`` go through
+#     ``vco_lib.install_env.write_orchestrator_env`` →
+#     ``vco_lib.env_template.apply_env_template``; the install-time-only
+#     keys are the new-file scaffold ``render_install_env_tail`` returns.
+#   * launcher/src-tauri/src/commands/projects_v2.rs — the Rust
+#     ``ensure_project_env_template`` / ``build_canonical_env_text`` /
+#     ``write_env_reference_sidecar`` are deleted; ``create_project_v2``
+#     runs ``python -m vco_lib.env_template apply`` (``reference`` under
+#     Safe add) through ``services/vco_lib_bridge.rs``.
+_LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = set()
+
+# Writers of a file NAMED ``.env`` that is NOT the project ``.env`` surface
+# — allowlisted as the one writer of THEIR surface, not as a pending
+# migration (so no marker):
+#   * ``vco_lib/compose_env.py`` writes ``infrastructure/.env``, the
+#     container-compose project's variable file (read by ``podman/docker
+#     compose`` for the shared Weaviate/Ollama/code-embed services — image
+#     build knobs, not per-project keys). It has no VCO-managed block and a
+#     different reader, so ``apply_env_template``'s contract does not apply;
+#     ``compose_env.write_infrastructure_env`` is that surface's one writer.
+_OTHER_DOTENV_SURFACE_WRITERS: set[Path] = {
     REPO_ROOT / "vco_lib" / "compose_env.py",
 }
+
+# The files the project-``.env`` migration emptied out of the allowlist.
+_MIGRATED_DOTENV_WRITERS: tuple[Path, ...] = (
+    REPO_ROOT / "install.py",
+    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
+)
 
 
 # ─── Scanners ───────────────────────────────────────────────────────────
@@ -841,7 +846,7 @@ def test_no_direct_writes_to_dotenv_outside_contract() -> None:
     legacy_files_with_hits: set[Path] = set()
 
     for path in _iter_target_files():
-        if path in _ALLOWLIST_FILES:
+        if path in _ALLOWLIST_FILES or path in _OTHER_DOTENV_SURFACE_WRITERS:
             continue
         if any(_path_is_under(path, d) for d in _ALLOWLIST_DIRS):
             continue
@@ -914,6 +919,34 @@ def test_no_direct_writes_to_dotenv_outside_contract() -> None:
             f"Allowed path: vco_lib.env_template.apply_env_template "
             f"(or its CLI: `python -m vco_lib.env_template apply`).\n"
         )
+
+
+def test_project_dotenv_writers_are_migrated_v0297() -> None:
+    """v0.2.97: the project ``.env`` migration is complete — the legacy
+    allowlist is EMPTY, so the scan above treats any direct ``.env`` write
+    in the two retired writers' files as a violation; they carry no
+    migration marker and no longer define the retired writer functions."""
+    assert _LEGACY_ENV_TEMPLATE_WRITERS == set()
+    for path in _MIGRATED_DOTENV_WRITERS:
+        assert path not in _LEGACY_ENV_TEMPLATE_WRITERS, path
+        content = _read_text_safely(path)
+        assert not _file_carries_env_template_marker(content), path
+    install_src = _read_text_safely(REPO_ROOT / "install.py")
+    assert "def _ensure_env_template(" not in install_src
+    rust_src = _read_text_safely(_MIGRATED_DOTENV_WRITERS[1])
+    for retired in ("fn ensure_project_env_template(", "fn build_canonical_env_text(",
+                    "fn write_env_reference_sidecar("):
+        assert retired not in rust_src, retired
+
+
+def test_other_dotenv_surface_writers_write_a_non_project_env() -> None:
+    """Each non-project ``.env`` writer really writes ANOTHER surface: its
+    source names that surface's directory next to the ``.env`` literal."""
+    compose = _read_text_safely(REPO_ROOT / "vco_lib" / "compose_env.py")
+    assert 'infra_env = infra_dir / ".env"' in compose
+    for path in _OTHER_DOTENV_SURFACE_WRITERS:
+        assert path.exists(), path
+        assert not _file_carries_env_template_marker(_read_text_safely(path)), path
 
 
 def test_legacy_env_template_writers_carry_marker() -> None:

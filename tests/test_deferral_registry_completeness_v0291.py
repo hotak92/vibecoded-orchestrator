@@ -244,6 +244,20 @@ _V0295_OWNED_ADDITIONS = frozenset({
 })
 
 
+# v0.2.97: the schema-migration runner's tagged-error ids, declared for the
+# first time. The runner re-evaluates every artifact on every pass and its
+# report lands in install.py's run report IN the same run (so the finalize
+# keeps a re-detected id and drops one that is over) — the same lifecycle the
+# `schema_migration_failed_*` family already had. Per-project ledgers get the
+# paired clear in `project_init._clear_runner_conditions_not_reemitted`.
+_V0297_OWNED_ADDITIONS = frozenset({
+    "schema_migration_script_missing",
+    "schema_migration_probe_unreachable",
+    "schema_migration_classification",
+    "schema_version_unrecorded",
+})
+
+
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
         if not path.is_file() or path.suffix not in suffixes:
@@ -322,6 +336,47 @@ def scan_emitted_condition_ids() -> dict:
             if name in consts:
                 _emit(consts[name], m.start())
 
+    # The tagged-error protocol (v0.2.97): a schema-migration error detail
+    # ends in ``[<id>]`` and ``build_deferral_entries`` files it under that id.
+    # No ``condition_id=`` ever names these, which is how
+    # ``schema_migration_script_missing`` / ``_probe_unreachable`` shipped
+    # undeclared. The decoder only accepts DECLARED ids, so the emittable set
+    # is imported, not guessed; ``test_every_runner_error_tag_is_declared``
+    # pins the declaration against the tags actually written.
+    from vco_lib import schema_migration_runner as smr  # noqa: PLC0415
+
+    where = "vco_lib/schema_migration_runner.py (tagged errors)"
+    for cid in smr.ERROR_CONDITION_IDS | {smr.UNTAGGED_CONDITION_ID}:
+        add(cid, where)
+    for prefix in smr.ERROR_CONDITION_PREFIXES:
+        add(prefix + "*", where)
+
+    return found
+
+
+#: A trailing ``[id]`` inside a string literal (optionally an f-string field),
+#: preceded by a quote or whitespace — the runner's tag grammar in source.
+_RUNNER_TAG = re.compile(
+    r"""(?:["']|\s)\[(?P<val>[a-z][a-z0-9_]*(?:\{[^}]*\}[a-z0-9_]*)*)\]["']"""
+)
+
+
+def scan_runner_error_tags() -> dict:
+    """Every ``[id]`` tag written in a file that produces tagged errors — any
+    shipped module that appends to a ``MigrationRunReport``'s ``errors``
+    (identified structurally: it defines or constructs ``MigrationRunReport``
+    AND appends to ``.errors``)."""
+    found: dict = {}
+    for rel, path in _iter_source_files({".py"}):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "MigrationRunReport" not in text or "errors.append(" not in text:
+            continue
+        if "class MigrationRunReport" not in text and "MigrationRunReport(" not in text:
+            continue
+        for m in _RUNNER_TAG.finditer(text):
+            val = re.sub(r"\{[^}]*\}", "*", m.group("val"))
+            line = text[: m.start()].count("\n") + 1
+            found.setdefault(val, []).append(f"{rel}:{line}")
     return found
 
 
@@ -370,12 +425,32 @@ class TestRegistryCompleteness(unittest.TestCase):
             "launcher_binary_stale",            # rust const
             "launcher_update_diverged",         # rust hand-rendered markdown
             "kg_sync_no_embedding_backend",     # the template script
+            "schema_migration_script_missing",  # runner tagged error (v0.2.97)
+            "schema_migration_probe_unreachable",
         ):
             self.assertIn(
                 cid, emitted,
                 f"scanner missed {cid!r} — the completeness gate is only as "
                 f"good as this scan",
             )
+
+    def test_every_runner_error_tag_is_declared(self):
+        """v0.2.97: every ``[id]`` tag the runner WRITES is in its declared
+        emittable set (or a declared non-emitted tag). A tag missing from the
+        declaration would be filed under the untagged fallback at runtime —
+        wrong condition, wrong remedy — and would dodge the gate above."""
+        from vco_lib import schema_migration_runner as smr  # noqa: PLC0415
+
+        tags = scan_runner_error_tags()
+        self.assertIn("schema_migration_script_missing", tags,
+                      "the tag scan matched nothing — fix it before trusting it")
+        undeclared = {
+            tag: sites for tag, sites in tags.items()
+            if tag not in smr.ERROR_CONDITION_IDS
+            and tag not in smr.NOT_EMITTED_TAGS
+            and not any(tag.startswith(p) for p in smr.ERROR_CONDITION_PREFIXES)
+        }
+        self.assertFalse(undeclared, f"undeclared runner error tags: {undeclared}")
 
     def test_lock_exemption_needs_both_structural_signals(self):
         """Self-check for the exemption the scan above grants.
@@ -573,7 +648,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             _V0291_OWNED_ADDITIONS
             | _V0292_OWNED_ADDITIONS
             | _V0293_OWNED_ADDITIONS
-            | _V0295_OWNED_ADDITIONS,
+            | _V0295_OWNED_ADDITIONS
+            | _V0297_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

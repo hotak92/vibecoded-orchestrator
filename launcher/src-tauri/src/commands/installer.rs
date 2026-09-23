@@ -3977,18 +3977,17 @@ fn poll_hub_health_for_30s(root: &Path) -> bool {
 /// — an emit failure logs + is swallowed (it must NEVER mask the conflict
 /// outcome the caller is surfacing). NO retries, NO binary swaps, NO auto-heal.
 ///
-/// Self-clear (plan §11 #4 follow-up — cross-file, NOT in this Phase-2a scope):
-/// install.py's condition-id dispatch (`install.py::_maybe_resolve_deferral*`)
-/// does NOT yet special-case `hub_restart_failed_after_abort`, so on the next
-/// successful install.py run the entry falls through the `else` → PRESERVED
-/// (never lost — the conservative default). A dedicated handler that re-probes
-/// the hub /health and marks it resolved when the hub is back up (mirroring the
-/// `generated_files_reconciled` / `launcher_update_diverged` legs) is the
-/// intended follow-up, owned by the install.py surface (Phase 2c / a follow-on).
-/// The entry is honest either way: if the hub really is still down when the user
-/// reads it, the note is correct; once install.py runs it will have restarted
-/// the hub, and the (harmless, informational) note is cleared by the user or by
-/// that follow-up handler.
+/// Self-clear (v0.2.95 F1): the entry is STATE-keyed, not event-keyed. Its
+/// `vco_lib/deferral_conditions.toml` row declares
+/// `clear_probe = "probe:py:hub_back_after_restart_failure"`
+/// (`vco_lib/deferral_probes.py`), a read-only GET of `/api/v1/health` on the
+/// resolved hub port with a 0.5 s timeout. Every re-probe pass runs it —
+/// install.py's end-of-run phase (ordered AFTER `_deploy_and_start_vct_hub`, so
+/// the run that restarts the hub also clears the row), the bundle engine, and
+/// `vco doctor`'s reconcile — and the row is removed only on positive evidence
+/// (the hub answered), with an audit line in `.claude/logs/auto-resolutions.jsonl`.
+/// A hub that does not answer, or a port that cannot be resolved, KEEPS it.
+/// Pinned by `tests/test_v0295_deferral_reconcile_hub_restart.py`.
 fn emit_hub_restart_failed_after_abort_deferral(install_path: &Path) {
     let detected = "The orchestrator update aborted on a genuine (source-file) conflict, and the \
                     launcher's best-effort `vct-hub --start-if-not-running` restart did NOT reach \

@@ -27,12 +27,13 @@ Why ``.env`` warrants its own module (and not a fourth surface inside
   (JSON) or bracket-marker block-replace (``.claude/env``). ``.env`` uses
   a stricter bracket-marker model where the managed block is
   **wholesale-replaced** on every call (so re-runs are byte-identical),
-  and everything outside the markers — including user-added KEY=value
-  lines for the SAME key — is preserved verbatim. This means a user who
-  copies ``KG_COLLECTION=`` out of the managed block to override it gets
-  what they want: the managed block re-renders the launcher's value
-  every run, but their override (lower in the file, last-write-wins
-  under shell sourcing rules) takes effect.
+  and everything outside the markers is preserved verbatim. A key the
+  USER sets anywhere outside the markers (``KEY=value`` or ``export
+  KEY=value``) is left out of the managed block entirely (v0.2.97), so
+  the user's value is the only active assignment of that key — it wins
+  wherever it sits in the file, and no key is ever assigned twice. A
+  commented line (``# KEY=``) sets nothing, so it does not suppress the
+  managed value.
 * **Different key set.** The three Phase 0.B surfaces carry the full
   canonical key set (~20 keys including launcher-internal access lists
   like ``VCT_KG_ACCESS_LIST``). ``.env`` carries a STRICT SUBSET — only
@@ -138,30 +139,39 @@ canonical key set; no semantic state lives in it.
 Out of scope
 ~~~~~~~~~~~~
 
-* The legacy append-only ``# added by vco YYYY-MM-DD`` block format
-  emitted by ``install.py::_ensure_env_template`` and Rust's
-  ``ensure_project_env_template``. Both writers are being MIGRATED to
-  call into :func:`apply_env_template` (block-replace) instead of
-  append-only — see Step 2 of the Phase 0.D task brief. Existing
-  ``.env`` files with legacy ``# added by vco YYYY-MM-DD`` annotations
-  will pick up the new managed block on the next run; their old
-  annotations sit outside the markers and are preserved verbatim. (They
-  become inert: the same keys are re-emitted inside the managed block,
-  and shell-sourcing rules mean the LAST assignment wins. The old
-  annotated lines were appended AFTER any user values, so on most files
-  they end up dominated by the new block — same effective behaviour
-  as before; users who care can manually delete the legacy lines.)
-* The full template body (banner comments, commented-out RL section,
-  telemetry section, LLM API keys) is emitted by the Rust renderer
-  ``build_canonical_env_text`` in ``commands/projects_v2.rs`` (the sole
-  full-body ``.env`` producer since v0.2.77 7a-bis removed the legacy
-  install.py ``_build_canonical_env_template_text`` renderer as dead code).
-  Phase 0.D's contract is for the MANAGED block only; the Rust renderer
-  keeps emitting the commented-placeholder lines for OPTIONAL keys
-  (ANTHROPIC_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN, RL_SERVER_URL,
-  VCT_TELEMETRY) outside the managed markers. Those keys are intentionally
-  outside the contract because they are user-secrets-or-modules — the
-  launcher never autopopulates them.
+* Nothing. Since v0.2.97 this module is the ONLY writer of a project's
+  ``.env``: the launcher's project create path runs
+  ``python -m vco_lib.env_template apply`` (and ``reference`` for a
+  Safe-add project, which writes the ``.env.vco.reference`` sidecar and
+  never the live file), and ``install.py`` routes the orchestrator
+  root's ``.env`` through :mod:`vco_lib.install_env`, which calls
+  :func:`apply_env_template` with its install-time scaffold. The
+  single-writer lint (``tests/test_config_projection_single_writer.py``)
+  enforces it.
+
+Legacy lines (migrated, v0.2.97)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before v0.2.97 two append-only writers ran against the same file: the
+launcher's Rust ``ensure_project_env_template`` / ``build_canonical_env_text``
+and ``install.py``'s ``_ensure_env_template`` / ``_reconcile_env_keys``. Their
+output is recognisable by the section headers they wrote (see
+:func:`_migrate_legacy_sections`):
+
+  * ``# added by vco YYYY-MM-DD: appended missing canonical keys``;
+  * the Rust template's ``# === Service URLs …`` and
+    ``# === Per-project Weaviate collections ===`` sections;
+  * ``# --- Added by install.py --update on YYYY-MM-DD ---`` with its
+    per-line ``# Added by install.py --update on …`` annotations.
+
+Inside such a section, a line for a key the managed block now renders is
+REMOVED (the block carries it, with the current value), as is an active
+line still holding the unsubstituted ``<project>`` placeholder. Anything
+else in the section — a commented ``# GITHUB_TOKEN=`` placeholder, a key
+the block does not carry — stays, and so does every line outside those
+sections. A section left with no key lines loses its header too. The
+result is ONE set: each managed key is assigned once, either by the block
+or by the user.
 
 Cross-OS rules (non-negotiable)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -174,13 +184,12 @@ Cross-OS rules (non-negotiable)
 * Line endings: ``.env`` is written with Unix-style **LF** even on
   Windows. CLI users on Windows typically source from bash via WSL2 or
   git-bash, both of which accept LF natively. CRLF would be rejected by
-  POSIX shells. (The Rust legacy writer also uses LF; this matches.)
+  POSIX shells.
 * UTF-8 encoding; values are passed through verbatim. Double-quoted
   shell escaping is NOT applied because ``.env`` lines are
   ``KEY=value`` (no quotes around value) — the de-facto ``.env`` format
   consumed by python-decouple, python-dotenv, direnv, etc. If a value
-  contains shell metacharacters the user must quote it themselves; the
-  legacy writer didn't quote either.
+  contains shell metacharacters the user must quote it themselves.
 
 Public API
 ~~~~~~~~~~
@@ -201,10 +210,10 @@ Public API
 CLI entry point
 ~~~~~~~~~~~~~~~
 
-For Rust callers that subprocess into Python (mirrors the Phase 0.B
-Part 2 pattern for the Rust env writer, retired v0.2.97)::
+The launcher subprocesses into these (``services/vco_lib_bridge.rs``)::
 
     python -m vco_lib.env_template apply --project-id <uuid> --project-folder <path>
+    python -m vco_lib.env_template reference --project-id <uuid> --project-folder <path>
     python -m vco_lib.env_template list-keys --json
     python -m vco_lib.env_template from-db --project-id <uuid> --json
 """
@@ -213,9 +222,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 from vco_lib.atomic import atomic_write_text
 from vco_lib.config_projection import (
@@ -406,71 +416,360 @@ def apply_env_template(
     keys: Mapping[str, str],
     *,
     project_folder: Path,
+    scaffold: Optional[str] = None,
+    keep_existing_values: bool = False,
 ) -> dict[str, list[str]]:
     """Project ``keys`` into ``<project_folder>/.env``'s managed block.
 
     Idempotent block-replace:
 
-      * If ``.env`` doesn't exist: create it containing just the managed
-        block.
-      * If ``.env`` exists and contains :data:`ENV_TEMPLATE_BEGIN`: locate
-        the segment from BEGIN through END (inclusive) and replace it
-        wholesale. Content outside the markers is preserved verbatim.
-      * If ``.env`` exists but does NOT contain BEGIN (legacy format
-        from ``_ensure_env_template`` / ``ensure_project_env_template``,
-        or a hand-written file): append the managed block at EOF
-        (ensuring a leading newline so we don't glue onto the last line).
-        On the next call BEGIN is present and in-place replace kicks in.
+      * ``.env`` missing: create it as ``scaffold`` (when given — the
+        user-owned header and commented placeholders a new file starts
+        with) followed by the managed block.
+      * ``.env`` present: first migrate the legacy VCO-authored lines
+        (:func:`_migrate_legacy_sections`); then leave out of the block
+        every key the user sets outside the markers
+        (:func:`_user_set_keys`); then replace the block between the
+        markers wholesale, or append it at EOF when the file has none.
+        ``scaffold`` is ignored — content outside the markers belongs to
+        the user once the file exists.
+      * No block is APPENDED when every key is user-set (it would be
+        empty), and nothing is written when the result equals the file.
 
-    Re-running with the same ``keys`` produces byte-identical output —
-    this is what makes it safe to invoke unconditionally from every
-    project-create / refresh / grant-toggle code path.
+    Re-running with the same ``keys`` produces byte-identical output
+    (and, since v0.2.97, no write at all) — which is what makes it safe
+    to invoke unconditionally.
 
     Atomic write: tempfile in the same directory as ``.env``, then
-    :func:`os.replace`. No ``.tmp`` leaks on success; the tempfile is
-    cleaned up on every error path before re-raising.
+    :func:`os.replace`. A ``.env`` that exists but cannot be read is an
+    error, never treated as absent (that would replace the user's file).
 
     Args:
         keys: The canonical key→value map to render. Typically from
-            :func:`project_env_template_from_db`; arbitrary maps are
-            also accepted (useful for tests and for callers that mix in
-            extra resolved values). Keys outside
-            :func:`list_canonical_env_template_keys` are STILL rendered
-            (no allowlist filter at the writer) — the SUBSET decision
-            lives in the RESOLVER, not the writer, so callers can pass
-            an extended map without surprises. The single-writer lint
-            governs which CALLERS may invoke this module, not which
-            keys land inside.
+            :func:`project_env_template_from_db`. Keys outside
+            :func:`list_canonical_env_template_keys` are STILL rendered —
+            the subset decision lives in the RESOLVER, not the writer.
         project_folder: The project's root directory. ``.env`` lives
             directly inside it (NOT under ``.claude/``).
+        scaffold: Text a NEW ``.env`` starts with (see
+            :func:`render_project_env_scaffold`); ``None`` = the block only.
+        keep_existing_values: Fill-only mode for callers whose resolution
+            is not authoritative over an existing file (``install.py``'s
+            update / re-install): a key the existing block already renders
+            keeps ITS value (and a key only the old block carries stays),
+            and a key migrated from a legacy line keeps that line's value,
+            so the call can add keys but never change or drop one. A value
+            still holding ``<project>`` is not kept.
 
     Returns:
-        ``{"env": [keys_written, ...]}`` — a one-key dict for audit
-        symmetry with :func:`vco_lib.config_projection.apply_project_env`
-        (which returns a multi-key dict for its multi-surface case).
-        Keys are sorted for deterministic logging.
+        ``{"env": [...], "added": [...], "user_set": [...],
+        "migrated": [...], "action": ["created"|"updated"|"unchanged"]}`` —
+        ``env`` the keys the block now renders, ``added`` those among them
+        no line assigned before, ``user_set`` the keys of ``keys`` the user
+        sets outside the block, ``migrated`` the keys whose legacy lines
+        were removed. Lists sorted; ``action`` is a one-element list so the
+        dict keeps one value type.
 
     Raises:
-        :class:`OSError`: write failed (perms, disk full, etc.). The
+        :class:`OSError`: the file could not be read or written. The
             target ``.env`` is left untouched (atomic rename guarantee).
+        :class:`UnicodeDecodeError`: the existing file is not UTF-8.
     """
     env_path = project_folder / ".env"
     project_folder.mkdir(parents=True, exist_ok=True)
 
-    prior: Optional[str]
-    if env_path.exists():
-        try:
-            prior = env_path.read_text(encoding="utf-8")
-        except OSError:
-            prior = None
+    prior: Optional[str] = (
+        env_path.read_text(encoding="utf-8") if env_path.exists() else None
+    )
+
+    if prior is None:
+        rendered = dict(keys)
+        new_text = _merge_managed_block(scaffold, _build_managed_block(rendered))
+        _atomic_write_text(env_path, new_text)
+        return _report(rendered, set(), set(), set(), "created")
+
+    before, block, after = _split_managed(prior)
+    previously_set = _user_set_keys(before + after) | _user_set_keys(block or "")
+    before, migrated_before = _migrate_legacy_sections(before, set(keys))
+    after, migrated_after = _migrate_legacy_sections(after, set(keys))
+    migrated = {**migrated_before, **migrated_after}
+    user_set = _user_set_keys(before + after) & set(keys)
+    wanted = dict(keys)
+    if keep_existing_values:
+        # Precedence: the old block's value > a migrated legacy line's value
+        # > the caller's. Nothing a previous run settled changes.
+        kept = {k: v for k, v in migrated.items() if v is not None}
+        if block is not None:
+            kept.update(
+                (k, v) for k, v in _block_values(block).items()
+                if _PLACEHOLDER_TOKEN not in v
+            )
+        wanted = {**{k: kept.get(k, v) for k, v in keys.items()}, **kept}
+        user_set = _user_set_keys(before + after) & set(wanted)
+    rendered = {k: v for k, v in wanted.items() if k not in user_set}
+
+    if block is None and not rendered and keys:
+        new_text = before
+    elif block is None:
+        new_text = _merge_managed_block(before, _build_managed_block(rendered))
     else:
-        prior = None
+        new_text = before + _build_managed_block(rendered) + after
 
-    managed = _build_managed_block(keys)
-    new_text = _merge_managed_block(prior, managed)
-    _atomic_write_text(env_path, new_text)
+    action = "unchanged" if new_text == prior else "updated"
+    if action == "updated":
+        _atomic_write_text(env_path, new_text)
+    return _report(rendered, user_set, set(migrated), previously_set, action)
 
-    return {"env": sorted(keys.keys())}
+
+def _report(
+    rendered: Mapping[str, str],
+    user_set: set[str],
+    migrated: set[str],
+    previously_set: set[str],
+    action: str,
+) -> dict[str, list[str]]:
+    return {
+        "env": sorted(rendered),
+        "added": sorted(set(rendered) - previously_set),
+        "user_set": sorted(user_set),
+        "migrated": sorted(migrated),
+        "action": [action],
+    }
+
+
+def _split_managed(text: str) -> tuple[str, Optional[str], str]:
+    """``(before, block, after)`` around the managed block. ``block`` is
+    ``None`` when the file has no BEGIN marker (then ``before`` is the
+    whole text). A block missing its END runs to EOF (crash recovery); the
+    single newline after END belongs to the block."""
+    begin = text.find(ENV_TEMPLATE_BEGIN)
+    if begin == -1:
+        return text, None, ""
+    end_off = text[begin:].find(ENV_TEMPLATE_END)
+    if end_off == -1:
+        return text[:begin], text[begin:], ""
+    stop = begin + end_off + len(ENV_TEMPLATE_END)
+    if stop < len(text) and text[stop] == "\n":
+        stop += 1
+    return text[:begin], text[begin:stop], text[stop:]
+
+
+# ─── Keys the user sets outside the block ────────────────────────────────
+
+_ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def _block_values(block: str) -> dict[str, str]:
+    """``KEY -> value`` of the managed block's assignment lines, in order."""
+    values: dict[str, str] = {}
+    for raw in block.splitlines():
+        match = _ASSIGNMENT.match(raw.strip())
+        if match:
+            values[match.group(1)] = raw.strip()[match.end():]
+    return values
+
+
+def _user_set_keys(text: str) -> set[str]:
+    """Keys ASSIGNED by an active line (``KEY=…`` / ``export KEY=…``).
+    Comment lines assign nothing, so they are not counted."""
+    found: set[str] = set()
+    for raw in text.splitlines():
+        match = _ASSIGNMENT.match(raw.strip())
+        if match:
+            found.add(match.group(1))
+    return found
+
+
+def effective_assignment(text: str, key: str) -> tuple[Optional[str], bool]:
+    """``(value, in_block)`` of the assignment of ``key`` that WINS when the
+    file is sourced — the LAST active one — and whether it sits inside the
+    VCO-managed block. ``(None, False)`` when no active line assigns it."""
+    before, block, after = _split_managed(text)
+    value: Optional[str] = None
+    in_block = False
+    for part, is_block in ((before, False), (block or "", True), (after, False)):
+        for raw in part.splitlines():
+            match = _ASSIGNMENT.match(raw.strip())
+            if match and match.group(1) == key:
+                value, in_block = raw.strip()[match.end():], is_block
+    return value, in_block
+
+
+def remove_line_under(
+    project_folder: Path,
+    header: str,
+    key: str,
+    *,
+    remove_if: Callable[[str], bool],
+) -> Optional[bool]:
+    """Remove the ``key=`` line sitting DIRECTLY under the VCO-authored
+    comment line ``header`` (the only provenance a pre-v0.2.97 line has)
+    when ``remove_if(value)`` says so. ``None``: no such line (or no file);
+    ``True``: removed (atomic write, every other byte kept); ``False``:
+    left. The value goes only to ``remove_if`` — never into a return value,
+    a log, or an exception message. Only the first such pair is handled."""
+    env_path = project_folder / ".env"
+    if not env_path.is_file():
+        return None
+    with env_path.open(encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    lines = text.splitlines(keepends=True)
+    prefix = f"{key}="
+    for i in range(len(lines) - 1):
+        if lines[i].rstrip("\r\n") == header and lines[i + 1].startswith(prefix):
+            value = lines[i + 1].rstrip("\r\n")[len(prefix):]
+            if not remove_if(value):
+                return False
+            _atomic_write_text(env_path, "".join(lines[:i + 1] + lines[i + 2:]))
+            return True
+    return None
+
+
+# ─── Legacy VCO-authored lines (pre-v0.2.97 writers) ────────────────────
+#
+# The headers the retired append-only writers put above their lines. Byte
+# strings of shipped files — see the module docstring, "Legacy lines".
+
+_LEGACY_APPEND_HEADER = re.compile(
+    r"^# added by vco \d{4}-\d{2}-\d{2}: appended missing canonical keys$"
+)
+_LEGACY_TEMPLATE_HEADERS = (
+    "# === Service URLs ",  # prefix: its parenthetical changed across releases
+    "# === Per-project Weaviate collections ===",
+)
+_LEGACY_TEMPLATE_NOTES = frozenset({
+    "# Resolved by the launcher when the project is registered. Don't",
+    "# edit unless you know what you're doing.",
+})
+_LEGACY_UPDATE_HEADER = re.compile(
+    r"^# --- Added by install\.py --update on \d{4}-\d{2}-\d{2} ---$"
+)
+_LEGACY_UPDATE_NOTE = re.compile(
+    r"^# Added by install\.py --update on \d{4}-\d{2}-\d{2}$"
+)
+# The order both legacy writers emitted keys in. A body is the run of key
+# lines in NON-DECREASING order of this list: a line out of order (or a
+# key not in it) is not theirs — e.g. the user's ``echo KG_COLLECTION=…
+# >> .env`` right under an append block — and ends the body.
+_LEGACY_KEY_ORDER: tuple[str, ...] = (
+    "WEAVIATE_URL", "WEAVIATE_PORT", "OLLAMA_URL", "OLLAMA_PORT",
+    "CODE_EMBED_URL", "CODE_EMBED_PORT",
+    "KG_COLLECTION", "SHARED_KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+    "PROJECT_NAME", "CONVERSATION_COLLECTION", "ACTIVE_EMBEDDING",
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN",
+    "RL_SERVER_URL", "RL_SERVER_PORT", "RL_PROJECT_ROOT", "VCT_TELEMETRY",
+)
+_KEY_LINE = re.compile(r"^(#\s*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_PLACEHOLDER_TOKEN = "<project>"
+
+
+def _legacy_header_kind(line: str) -> Optional[str]:
+    if _LEGACY_APPEND_HEADER.match(line):
+        return "append"
+    if line.startswith(_LEGACY_TEMPLATE_HEADERS):
+        return "template"
+    if _LEGACY_UPDATE_HEADER.match(line):
+        return "update"
+    return None
+
+
+def _legacy_body_end(lines: list[str], start: int, kind: str) -> int:
+    """Index one past the last line of the legacy body starting at ``start``."""
+    i, rank = start, -1
+    while i < len(lines):
+        line = lines[i].rstrip("\r")
+        if kind == "update":
+            nxt = lines[i + 1].rstrip("\r") if i + 1 < len(lines) else ""
+            key = _KEY_LINE.match(nxt)
+            if _LEGACY_UPDATE_NOTE.match(line) and key and not key.group(1):
+                i += 2
+                continue
+            return i
+        if kind == "template" and line in _LEGACY_TEMPLATE_NOTES:
+            i += 1
+            continue
+        key = _KEY_LINE.match(line)
+        if not key or key.group(2) not in _LEGACY_KEY_ORDER:
+            return i
+        key_rank = _LEGACY_KEY_ORDER.index(key.group(2))
+        if key_rank < rank:
+            return i
+        rank = key_rank
+        i += 1
+    return i
+
+
+def _legacy_line_is_retired(
+    line: str, owned: set[str]
+) -> Optional[tuple[str, Optional[str]]]:
+    """``(key, value)`` of a legacy key line to REMOVE, else ``None``: its
+    key is rendered by the block, or it is active and still holds
+    ``<project>``. ``value`` is the line's value when it is an active,
+    real one (a fill-only caller carries it into the block), else ``None``."""
+    key = _KEY_LINE.match(line.rstrip("\r"))
+    if not key:
+        return None
+    active = not key.group(1)
+    placeholder = _PLACEHOLDER_TOKEN in key.group(3)
+    if key.group(2) in owned or (active and placeholder):
+        return key.group(2), key.group(3) if active and not placeholder else None
+    return None
+
+
+def _migrate_legacy_sections(
+    text: str, owned: set[str]
+) -> tuple[str, dict[str, Optional[str]]]:
+    """Remove the retired writers' lines for keys the block now carries.
+
+    Returns ``(new_text, removed)`` — ``removed`` maps each removed key to
+    its last active value (``None`` for a commented or placeholder line).
+    Lines outside a recognised legacy section are never touched. See the
+    module docstring, "Legacy lines".
+    """
+    removed: dict[str, Optional[str]] = {}
+    if not text:
+        return text, removed
+    lines = text.split("\n")
+    out: list[str] = []
+
+    def retire(found: tuple[str, Optional[str]]) -> None:
+        key, value = found
+        if value is not None or key not in removed:
+            removed[key] = value
+    i = 0
+    while i < len(lines):
+        kind = _legacy_header_kind(lines[i].rstrip("\r"))
+        if kind is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        end = _legacy_body_end(lines, i + 1, kind)
+        kept: list[str] = []
+        j = i + 1
+        while j < end:
+            if kind == "update":
+                retired = _legacy_line_is_retired(lines[j + 1], owned)
+                if retired:
+                    retire(retired)
+                else:
+                    kept.extend((lines[j], lines[j + 1]))
+                j += 2
+                continue
+            retired = _legacy_line_is_retired(lines[j], owned)
+            if retired:
+                retire(retired)
+            else:
+                kept.append(lines[j])
+            j += 1
+        if any(_KEY_LINE.match(k.rstrip("\r")) for k in kept):
+            out.append(lines[i])
+            out.extend(kept)
+        elif out and not out[-1].strip():
+            # The whole section is gone: drop the blank line its writer
+            # put in front of it too, so migration leaves no gap behind.
+            out.pop()
+        i = end
+    return "\n".join(out), removed
 
 
 # ─── Managed block renderer ─────────────────────────────────────────────
@@ -583,11 +882,85 @@ def _atomic_write_text(path: Path, content: str) -> None:
     atomic_write_text(path, content)
 
 
+# ─── New-file scaffold + the Safe-add reference sidecar ──────────────────
+
+# The header + commented placeholders a NEW project ``.env`` starts with
+# (user-owned lines outside the managed block: the launcher never fills
+# them — they are secrets or paid-module settings). Written once, at
+# creation; after that the file's non-block content is the user's.
+_PROJECT_ENV_SCAFFOLD = """\
+# vibecoded-orchestrator per-project .env
+# VCO keeps the block between the VCO-MANAGED markers below up to date.
+# To override one of its keys, set it anywhere OUTSIDE the block — VCO
+# then stops writing that key. A commented line sets nothing.
+
+# === LLM API keys (optional) ===
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+
+# === GitHub access for code-search MCP (optional) ===
+# GITHUB_TOKEN=
+
+# === RL retrieval module (Pro tier — uncomment when installed) ===
+# RL_SERVER_URL=http://localhost:8090
+# RL_SERVER_PORT=8090
+# RL_PROJECT_ROOT={project_root}
+
+# === Telemetry (off by default; on=opt-in only) ===
+# VCT_TELEMETRY=off
+
+"""
+
+# Banner of the Safe-add sidecar: advisory, never the live file.
+_REFERENCE_BANNER = """\
+# vibecoded-orchestrator Safe-add REFERENCE — NOT the live .env.
+# Safe add was ON, so VCO did NOT modify your project-root .env
+# (it may be committed to your VCS). These are the keys VCO would
+# have added. Diff against your .env and copy what you want:
+#   diff .env .env.vco.reference
+# See .claude/context/UPDATE_DEFERRED.md (safe_add_skipped_env_merge).
+
+"""
+
+
+def render_project_env_scaffold(project_folder: Path) -> str:
+    """The text a new project ``.env`` starts with (see
+    :data:`_PROJECT_ENV_SCAFFOLD`); ``RL_PROJECT_ROOT``'s placeholder
+    carries the real folder."""
+    return _PROJECT_ENV_SCAFFOLD.format(project_root=str(project_folder))
+
+
+def write_env_reference(keys: Mapping[str, str], *, project_folder: Path) -> Path:
+    """Write the Safe-add sidecar ``<project_folder>/.env.vco.reference``:
+    the ``.env`` a new project would get (scaffold + managed block) under
+    an advisory banner. NEVER reads or writes the live ``.env`` — that
+    file may be committed, which is why Safe add exists. Always rewritten
+    (the sidecar is advisory). Returns the sidecar path."""
+    from vco_lib.git_exclude import SAFE_ADD_SIDECAR_SUFFIX
+
+    project_folder.mkdir(parents=True, exist_ok=True)
+    sidecar = project_folder / (".env" + SAFE_ADD_SIDECAR_SUFFIX)
+    body = _merge_managed_block(
+        render_project_env_scaffold(project_folder), _build_managed_block(keys)
+    )
+    _atomic_write_text(sidecar, _REFERENCE_BANNER + body)
+    return sidecar
+
+
 # ─── CLI entry points ───────────────────────────────────────────────────
 
 
-def _cli_apply(args: argparse.Namespace) -> int:
-    """``python -m vco_lib.env_template apply --project-id <id> --project-folder <path>``."""
+def _cli_error(code: str, message: str) -> None:
+    """One JSON error object on stderr (the documented contract) AND on
+    stdout, so the launcher's bridge — which reads one JSON object from
+    stdout — shows the real reason instead of "unreadable output"."""
+    print(json.dumps({"ok": False, "error": code, "message": message}))
+    print(json.dumps({"error": code, "message": message}), file=sys.stderr)
+
+
+def _cli_resolve(args: argparse.Namespace) -> tuple[Optional[dict[str, str]], int]:
+    """``(keys, 0)`` for ``--project-id``, or ``(None, exit_code)`` after
+    printing the error (2 = project not found, 3 = DB unreachable)."""
     try:
         keys = project_env_template_from_db(
             args.project_id,
@@ -600,36 +973,26 @@ def _cli_apply(args: argparse.Namespace) -> int:
             code_embed_port_default=args.code_embed_port,
         )
     except ProjectNotFound as exc:
-        print(
-            json.dumps({"error": "project_not_found", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 2
+        _cli_error("project_not_found", str(exc))
+        return None, 2
     except DbUnreachable as exc:
-        print(
-            json.dumps({"error": "db_unreachable", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 3
+        _cli_error("db_unreachable", str(exc))
+        return None, 3
+    return keys, 0
 
+
+def _cli_apply(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.env_template apply --project-id <id> --project-folder <path>``."""
+    keys, failed = _cli_resolve(args)
+    if keys is None:
+        return failed
+    folder = Path(args.project_folder)
     try:
         report = apply_env_template(
-            keys, project_folder=Path(args.project_folder)
+            keys, project_folder=folder, scaffold=render_project_env_scaffold(folder)
         )
-    except OSError as exc:
-        print(
-            json.dumps({"error": "apply_failed", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 4
-    except ConfigProjectionError as exc:
-        # Forwarded for symmetry with Phase 0.B's CLI — apply_env_template
-        # doesn't raise this directly today, but the contract surface
-        # leaves room for future validation errors that share the type.
-        print(
-            json.dumps({"error": "apply_failed", "message": str(exc)}),
-            file=sys.stderr,
-        )
+    except (OSError, UnicodeDecodeError, ConfigProjectionError) as exc:
+        _cli_error("apply_failed", str(exc))
         return 4
 
     print(
@@ -638,10 +1001,43 @@ def _cli_apply(args: argparse.Namespace) -> int:
                 "ok": True,
                 "report": report,
                 "project_id": args.project_id,
-                "project_folder": str(Path(args.project_folder).resolve()),
+                "project_folder": str(folder.resolve()),
             }
         )
     )
+    return 0
+
+
+def _cli_reference(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.env_template reference --project-id <id> --project-folder <path>``
+    — the Safe-add sidecar; the live ``.env`` is never touched."""
+    keys, failed = _cli_resolve(args)
+    if keys is None:
+        return failed
+    try:
+        sidecar = write_env_reference(keys, project_folder=Path(args.project_folder))
+    except OSError as exc:
+        _cli_error("reference_failed", str(exc))
+        return 4
+    print(json.dumps({"ok": True, "path": str(sidecar), "keys": sorted(keys)}))
+    return 0
+
+
+def _cli_effective(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.env_template effective --project-folder <p> --key K``
+    — the winning assignment of one MANAGED key (never a secret: only keys
+    of :func:`list_canonical_env_template_keys` are answered)."""
+    if args.key not in list_canonical_env_template_keys():
+        _cli_error("key_not_managed", f"{args.key} is not a key the managed block carries")
+        return 2
+    env_path = Path(args.project_folder) / ".env"
+    try:
+        text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        _cli_error("read_failed", str(exc))
+        return 4
+    value, in_block = effective_assignment(text, args.key)
+    print(json.dumps({"ok": True, "key": args.key, "value": value, "in_block": in_block}))
     return 0
 
 
@@ -705,33 +1101,50 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_apply = sub.add_parser(
-        "apply",
-        help="resolve env from launcher DB and write to <project>/.env managed block",
-    )
-    p_apply.add_argument("--project-id", required=True)
-    p_apply.add_argument(
-        "--project-folder",
-        required=True,
-        help="absolute path to the project root (where .env will be written)",
-    )
-    p_apply.add_argument(
-        "--db-path",
-        default=None,
-        help="override launcher DB path (defaults to <vct_root_dir>/launcher.db)",
-    )
-    p_apply.add_argument(
-        "--orchestrator-root",
-        default=None,
-        help=(
-            "path to orchestrator clone (forwarded to project_env_from_db; "
-            "no .env effect today)"
+    for verb, help_text, handler in (
+        (
+            "apply",
+            "resolve env from launcher DB and write to <project>/.env managed block",
+            _cli_apply,
         ),
+        (
+            "reference",
+            "Safe add: write <project>/.env.vco.reference (the live .env is never touched)",
+            _cli_reference,
+        ),
+    ):
+        p_verb = sub.add_parser(verb, help=help_text)
+        p_verb.add_argument("--project-id", required=True)
+        p_verb.add_argument(
+            "--project-folder",
+            required=True,
+            help="absolute path to the project root",
+        )
+        p_verb.add_argument(
+            "--db-path",
+            default=None,
+            help="override launcher DB path (defaults to <vct_root_dir>/launcher.db)",
+        )
+        p_verb.add_argument(
+            "--orchestrator-root",
+            default=None,
+            help=(
+                "path to orchestrator clone (forwarded to project_env_from_db; "
+                "no .env effect today)"
+            ),
+        )
+        p_verb.add_argument("--weaviate-port", type=int, default=8081)
+        p_verb.add_argument("--ollama-port", type=int, default=11435)
+        p_verb.add_argument("--code-embed-port", type=int, default=11440)
+        p_verb.set_defaults(handler=handler)
+
+    p_eff = sub.add_parser(
+        "effective",
+        help="the winning (last) assignment of one managed key in <project>/.env (read-only)",
     )
-    p_apply.add_argument("--weaviate-port", type=int, default=8081)
-    p_apply.add_argument("--ollama-port", type=int, default=11435)
-    p_apply.add_argument("--code-embed-port", type=int, default=11440)
-    p_apply.set_defaults(handler=_cli_apply)
+    p_eff.add_argument("--project-folder", required=True)
+    p_eff.add_argument("--key", required=True)
+    p_eff.set_defaults(handler=_cli_effective)
 
     p_list = sub.add_parser(
         "list-keys",
@@ -767,6 +1180,10 @@ __all__ = [
     "ENV_TEMPLATE_BEGIN",
     "ENV_TEMPLATE_END",
     "apply_env_template",
+    "effective_assignment",
     "list_canonical_env_template_keys",
     "project_env_template_from_db",
+    "remove_line_under",
+    "render_project_env_scaffold",
+    "write_env_reference",
 ]

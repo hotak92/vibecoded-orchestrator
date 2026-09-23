@@ -57,6 +57,12 @@ from . import schema_versions as sv
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ERROR_CONDITION_IDS",
+    "ERROR_CONDITION_PREFIXES",
+    "NOT_EMITTED_TAGS",
+    "SELF_RECORDED_TYPES",
+    "UNTAGGED_CONDITION_ID",
+    "runner_conditions_to_clear",
     "EdgeResult",
     "MigrationEdge",
     "MigrationRunReport",
@@ -152,6 +158,75 @@ ORCHESTRATOR_WIDE_TYPES: frozenset[str] = frozenset(
         "rl_events_payload_shape",
     }
 )
+
+#: Artifact_types whose registry row is written by their own MATERIALIZER
+#: straight after it runs (``artifact_version_registry.
+#: record_bundle_materialization``, from the manifest the bundle engine just
+#: wrote) — never stamped by this runner. A row that is missing or behind
+#: canonical therefore means the latest materialization did not RECORD
+#: (``[schema_version_unrecorded]``, remedy: re-run it), not that a migration
+#: edge is missing.
+SELF_RECORDED_TYPES: frozenset[str] = frozenset({"bundle_materialization"})
+
+# ---------------------------------------------------------------------------
+# The tagged-error protocol: an error detail ends in ``[<condition_id>]`` and
+# ``build_deferral_entries`` turns that tag into the ledger condition_id. The
+# ids are DECLARED here so the decoder can refuse an undeclared one and the
+# registry-completeness test can import the emittable set instead of hoping a
+# source scan sees an id travelling inside a detail string.
+# ---------------------------------------------------------------------------
+
+#: Exact condition ids an error detail may carry.
+ERROR_CONDITION_IDS: frozenset[str] = frozenset({
+    "schema_migration_script_missing",
+    "schema_migration_probe_unreachable",
+    "schema_migration_classification",
+    "schema_version_unrecorded",
+})
+#: Id families an error detail may carry (``<prefix><edge stem>``).
+ERROR_CONDITION_PREFIXES: tuple[str, ...] = ("schema_migration_failed_",)
+#: The id a detail with no (or an undeclared) tag is filed under — a member of
+#: the ``schema_migration_failed_*`` family.
+UNTAGGED_CONDITION_ID = "schema_migration_failed_untagged"
+#: Tags that are NOT ledger conditions: the builder skips them because another
+#: channel already carries the finding (``pending_regenerate``).
+NOT_EMITTED_TAGS: frozenset[str] = frozenset({"schema_migration_needs_choice"})
+#: The decoder's tag grammar (trailing ``[id]``).
+ERROR_TAG_RE = re.compile(r"\[([a-z0-9_]+)\]\s*$")
+#: Runner-emitted ids of the ``schema_migration_failed_*`` family (edge stems
+#: are ``<from>_to_<to>``) — what a per-project pass may clear on its own.
+_EDGE_FAILURE_ID_RE = re.compile(r"^schema_migration_failed_(?:\d+_to_\d+|untagged)$")
+
+
+def _unrecorded_detail(
+    db_path: Path,
+    project_id: Optional[str],
+    artifact_type: str,
+    artifact_name: str,
+    canonical: int,
+) -> str:
+    stored = _read_stored_version(db_path, project_id=project_id,
+                                  artifact_type=artifact_type,
+                                  artifact_name=artifact_name)
+    return (
+        f"the recorded version is v{stored}, canonical is v{canonical}: the "
+        f"latest materialization did not record the version it applied — "
+        f"re-run it [schema_version_unrecorded]"
+    )
+
+
+def runner_conditions_to_clear(present: "set[str] | frozenset[str]",
+                               emitted: "set[str] | frozenset[str]") -> list[str]:
+    """Runner-owned ledger ids a completed (non-check) per-project pass did
+    NOT re-emit: the condition is over. Only ids this runner can emit are
+    candidates — never ``schema_regenerate_or_defer_*`` (a user choice) nor
+    install.py's own ``schema_migration_failed_<migration-id>``."""
+    return sorted(
+        cid for cid in present
+        if cid not in emitted
+        and (cid in ERROR_CONDITION_IDS or _EDGE_FAILURE_ID_RE.match(cid))
+    )
+
 
 #: The 5 code-graph Weaviate class suffixes that compose the single
 #: ``codegraph_collection`` artifact_type. All share one recorded version; the
@@ -991,8 +1066,9 @@ def _resolve_artifact_names(
         return [name] if name else []
 
     # Non-Weaviate-class artifact (vocabularies, shapes, bundle, etc.) — one
-    # row per project keyed on the stable sentinel.
-    return ["default"]
+    # row per project keyed on the stable sentinel — the registry's constant,
+    # which the bundle's own write (`record_bundle_materialization`) also uses.
+    return [avr.DEFAULT_ARTIFACT_NAME]
 
 
 def _live_probe_for(
@@ -1295,6 +1371,10 @@ def run_schema_migrations(
             continue
         # Orchestrator-wide rows are keyed NULL; per-project rows by project_id.
         effective_pid = None if is_wide else project_id
+        if artifact_type in SELF_RECORDED_TYPES and effective_pid is None:
+            # A per-project materialization with no project to key it on
+            # (launcher-less root run): nothing to check, nothing to stamp.
+            continue
 
         for artifact_name in _resolve_artifact_names(
             artifact_type, env, artifact_names
@@ -1317,6 +1397,25 @@ def run_schema_migrations(
                     )
                 )
                 continue
+
+            if artifact_type in SELF_RECORDED_TYPES:
+                # The materializer writes this row itself, straight before
+                # this pass. NEVER stamp it here (that would claim a version
+                # nobody verified): an absent row is left for the next record
+                # (the materializer already surfaced why it did not record),
+                # and a row BEHIND canonical is the drift this registry exists
+                # to show — its record did not happen, which is not a missing
+                # migration edge.
+                if status == Status.NEVER_MATERIALIZED:
+                    logger.info("run_schema_migrations: %s/%s has no recorded "
+                                "version; left for its materializer to record",
+                                artifact_type, artifact_name)
+                    continue
+                if status != Status.UP_TO_DATE and not discover_edges(
+                        migrations_dir, artifact_type):
+                    report.errors.append((artifact_type, artifact_name, _unrecorded_detail(
+                        db_path, effective_pid, artifact_type, artifact_name, canonical)))
+                    continue
 
             if status == Status.NEVER_MATERIALIZED:
                 # A2 (v0.2.74): NEVER_MATERIALIZED assumes born-at-canonical.
@@ -2200,13 +2299,44 @@ def build_deferral_entries(report: MigrationRunReport) -> list:
     # Edge failures / missing-script / classification mismatch. The runner
     # tags each detail with a trailing ``[condition_id]``.
     for artifact_type, artifact_name, detail in report.errors:
-        m = re.search(r"\[([a-z0-9_]+)\]\s*$", detail)
-        condition_id = m.group(1) if m else "schema_migration_failed"
-        clean_detail = re.sub(r"\s*\[[a-z0-9_]+\]\s*$", "", detail).strip()
+        m = ERROR_TAG_RE.search(detail)
+        tag = m.group(1) if m else ""
+        clean_detail = ERROR_TAG_RE.sub("", detail).strip()
         # The needs_choice case is already covered by pending_regenerate above;
         # skip the duplicate error row so the deferral file stays clean.
-        if condition_id == "schema_migration_needs_choice":
+        if tag in NOT_EMITTED_TAGS:
             continue
+        if tag in ERROR_CONDITION_IDS or tag.startswith(ERROR_CONDITION_PREFIXES):
+            condition_id = tag
+        else:
+            if tag:
+                logger.warning("build_deferral_entries: undeclared tag [%s] filed "
+                               "as %s", tag, UNTAGGED_CONDITION_ID)
+            condition_id = UNTAGGED_CONDITION_ID
+        if condition_id == "schema_version_unrecorded":
+            why = (
+                "The registry row for this artifact is written by the step that "
+                "materializes it (for the bundle: the launcher's bundle update and "
+                "install.py, from the manifest the bundle engine wrote), right "
+                "before this check. It is missing or behind, so that record did "
+                "not happen — the bundle update's own warnings say why. No "
+                "migration edge is involved and none is missing."
+            )
+            command = (
+                "# Re-run the bundle update: launcher → this project → Update "
+                "bundle\n# (it re-materializes AND records the version). For the "
+                "orchestrator root:\npython install.py --update"
+            )
+        else:
+            why = (
+                "The migration edge could not be applied (or is missing / "
+                "mis-declared). The recorded schema version was NOT "
+                "advanced; the next `install.py --update` re-attempts it."
+            )
+            command = (
+                "python -m vco_lib.project_init migrate-schema --folder . "
+                "--check   # inspect, then re-run install.py --update"
+            )
         entries.append(
             DeferralEntry(
                 condition_id=condition_id,
@@ -2214,15 +2344,8 @@ def build_deferral_entries(report: MigrationRunReport) -> list:
                 detected=(
                     f"`{artifact_type}` (`{artifact_name}`): {clean_detail}."
                 ),
-                why_deferred=(
-                    "The migration edge could not be applied (or is missing / "
-                    "mis-declared). The recorded schema version was NOT "
-                    "advanced; the next `install.py --update` re-attempts it."
-                ),
-                command_to_apply=(
-                    "python -m vco_lib.project_init migrate-schema --folder . "
-                    "--check   # inspect, then re-run install.py --update"
-                ),
+                why_deferred=why,
+                command_to_apply=command,
                 severity="warning",
                 kg_node_refs=[],
             )

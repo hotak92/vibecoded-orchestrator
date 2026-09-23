@@ -5974,6 +5974,36 @@ from vco_lib.migrate_deferral import (  # noqa: E402,F401
 from vco_lib import migrate_deferral as _migrate_deferral  # noqa: E402
 
 
+def _points_at_legacy_shim(raw_val: str, folder: Path) -> bool:
+    """Does a ``BASH_ENV`` value name the pre-0.2.11 lean-ctx shim? Accepts
+    the ``${CLAUDE_PROJECT_DIR}``-templated and absolute-path forms."""
+    shim = folder / ".claude" / "scripts" / "leanctx-bash-env.sh"
+    return "leanctx-bash-env.sh" in raw_val or raw_val.endswith(str(shim))
+
+
+def legacy_bash_env_still_owed(folder: Path) -> Optional[bool]:
+    """Clear probe for ``legacy_bash_env_cleanup_pending`` (read-only).
+
+    Keyed on the file's STATE, with the cleanup's own read and shim rule:
+    ``False`` — no settings file, no ``BASH_ENV``, or one that no longer names
+    the shim (nothing left for the cleanup to do); ``True`` — the file cannot
+    be read, or still points at the shim. A cleanup that would now succeed
+    clears the entry by DOING it: every re-probe pass runs after its
+    update's cleanup (bundle engine, install.py), which removes the key first.
+    """
+    from vco_lib import settings_refusal as _refusal
+
+    loaded = _refusal.load_for_edit(Path(folder) / ".claude" / "settings.json")
+    if loaded is None:
+        return False
+    if isinstance(loaded, _refusal.Refusal):
+        return True
+    env_block = loaded[0].get("env")
+    if not isinstance(env_block, dict) or "BASH_ENV" not in env_block:
+        return False
+    return _points_at_legacy_shim(str(env_block.get("BASH_ENV", "")), Path(folder))
+
+
 def _cleanup_legacy_bash_env_in_project(
     folder: Path, *, redirect_sink: Optional[list] = None,
 ) -> dict:
@@ -6019,30 +6049,30 @@ def _cleanup_legacy_bash_env_in_project(
     `result["errors"]` without raising.
 
     Returns:
-        ``{"action": "removed"|"absent"|"left-alone"|"unparseable"|"write-failed",
-           "detail": <free text>}``
+        ``{"action": "removed"|"absent"|"left-alone"|"unparseable"|
+           "write-failed"|"edit-refused", "detail": <free text>}``
     """
     settings_file = folder / ".claude" / "settings.json"
-    shim_rel = folder / ".claude" / "scripts" / "leanctx-bash-env.sh"
 
-    if not settings_file.exists():
+    # The ONE settings read-for-edit (v0.2.97): JSONC is read AND edited in
+    # place, comments kept; a file it cannot read is left byte-identical and
+    # the refusal's reason is what the deferral quotes. install.py's root
+    # cleanup calls THIS function, so both paths refuse and record alike.
+    from vco_lib import settings_refusal as _refusal
+
+    loaded = _refusal.load_for_edit(settings_file)
+    if loaded is None:
         return {"action": "absent", "detail": "settings.json not present"}
-
-    try:  # JSONC is read AND edited in place, comments kept (v0.2.97)
-        settings, raw = _jsonc_edit.read_object(settings_file)
-    except (OSError, ValueError) as e:  # not JSONC, not UTF-8, or not an object
-        return {"action": "unparseable", "detail": f"{type(e).__name__}: {e}"}
+    if isinstance(loaded, _refusal.Refusal):
+        return {"action": "unparseable", "detail": loaded.reason}
+    settings, raw = loaded
 
     env_block = settings.get("env")
     if not isinstance(env_block, dict) or "BASH_ENV" not in env_block:
         return {"action": "absent", "detail": "no BASH_ENV in settings.env"}
 
     raw_val = str(env_block.get("BASH_ENV", ""))
-    points_at_shim = (
-        "leanctx-bash-env.sh" in raw_val
-        or raw_val.endswith(str(shim_rel))
-    )
-    if not points_at_shim:
+    if not _points_at_legacy_shim(raw_val, folder):
         return {
             "action": "left-alone",
             "detail": (
@@ -6054,8 +6084,9 @@ def _cleanup_legacy_bash_env_in_project(
     env_block.pop("BASH_ENV", None)
     text = _jsonc_edit.dumps_preserving(raw, settings, indent=2)
     if text is None:  # a JSONC edit that could not be verified: write nothing
-        return {"action": "write-failed", "detail": "JSONC edit could not be verified; "
-                "remove env.BASH_ENV by hand"}
+        return {"action": "edit-refused", "detail": "it has comments or trailing "
+                "commas (JSONC) and removing env.BASH_ENV could not be verified "
+                "in place; remove it by hand"}
     try:
         _redirect = _write_file_atomic(settings_file, text.encode("utf-8"))
         if _redirect is not None and redirect_sink is not None:
@@ -6344,9 +6375,8 @@ def _emit_bash_env_cleanup_deferral(
     if action == "unparseable":
         detected = (
             f"During the 0.2.11 legacy BASH_ENV cleanup, "
-            f"`{settings_rel}` could not be parsed as JSON "
-            f"({detail}). The cleanup was skipped to avoid corrupting "
-            f"user state."
+            f"`{settings_rel}` could not be read: {detail}. The cleanup was "
+            f"skipped and the file left untouched."
         )
         cmd = (
             f"# Inspect / fix the JSON, then re-run the bundle update:\n"
@@ -6366,6 +6396,18 @@ def _emit_bash_env_cleanup_deferral(
             f"#   Windows: attrib -R <path>   (cmd.exe)  |  "
             f"Set-ItemProperty <path> IsReadOnly $false   (PowerShell)\n"
             f"chmod u+w {folder}/{settings_rel}\n"
+            f"python -m vco_lib.project_init install-bundle "
+            f"--folder {str(folder)!r} --update --json"
+        )
+    elif action == "edit-refused":
+        detected = (
+            f"During the 0.2.11 legacy BASH_ENV cleanup, `{settings_rel}` was "
+            f"left untouched: {detail}."
+        )
+        cmd = (
+            f"# Delete the \"BASH_ENV\" line from the env block of\n"
+            f"#   {folder}/{settings_rel}\n"
+            f"# by hand, then re-run the bundle update:\n"
             f"python -m vco_lib.project_init install-bundle "
             f"--folder {str(folder)!r} --update --json"
         )
@@ -10699,7 +10741,7 @@ def install_project_bundle(
                 _log("4.bundle.bashenv-cleanup", "ok",
                      f"legacy BASH_ENV stripped: {detail}",
                      data=cleanup_result)
-            elif action in ("write-failed", "unparseable"):
+            elif action in ("write-failed", "unparseable", "edit-refused"):
                 # Surfacing via warnings (not errors): the rest of the bundle
                 # install is still useful. The deferral entry below also
                 # tells the operator to re-run after fixing the cause.
@@ -14762,6 +14804,7 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
                     f"[migrate-schema] deferral write failed (non-fatal): {exc}",
                     file=sys.stderr,
                 )
+        _clear_runner_conditions_not_reemitted(folder, entries, include_wide)
 
     result = {
         "folder": str(folder),
@@ -14781,6 +14824,37 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
     }
     print(json.dumps(result, indent=2))
     return 0
+
+
+def _clear_runner_conditions_not_reemitted(
+    folder: Path, entries: list, include_wide: bool,
+) -> None:
+    """Paired clear for the schema-migration runner's ids in a project ledger.
+
+    install.py OWNS these ids for the root ledger (owned-drop-when-absent);
+    a per-project ledger has no such finalize, so a completed pass that did
+    not re-emit a runner id resolves it here. Skipped for the orchestrator
+    root unless the pass covered the orchestrator-wide artifacts too — the
+    root ledger may hold an install.py finding about one this pass never
+    looked at. Soft-fail: the ledger is observability.
+    """
+    from vco_lib import deferral_emit as _de
+    from vco_lib import schema_migration_runner as smr
+    from vco_lib.deferral_report import DeferralReport
+
+    try:
+        if not include_wide and (
+            Path(folder).resolve() == Path(__file__).resolve().parent.parent
+        ):
+            return
+        present = {e.condition_id for e in DeferralReport.read(folder).entries}
+        stale = smr.runner_conditions_to_clear(
+            present, {e.condition_id for e in entries})
+        if stale:
+            _de.resolve_conditions(folder, stale)
+    except Exception as exc:  # noqa: BLE001 — never block the pass
+        print(f"[migrate-schema] ledger clear failed (non-fatal): {exc}",
+              file=sys.stderr)
 
 
 def _now_ms_safe() -> int:

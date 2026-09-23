@@ -2,17 +2,15 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Compose-substitution env helpers (v0.2.54 gpu-audit C-4).
 
-env_template: legacy_caller_pending_migration
-
 This module writes to ``infrastructure/.env`` (the docker-compose
 project's env file), a DIFFERENT surface from the canonical project
-``.env`` that ``vco_lib.env_template.apply_env_template`` owns. The
+``.env`` that ``vco_lib.env_template.apply_env_template`` owns: compose
+reads it for the shared services' build knobs, it has no VCO-managed
+block and no per-project keys. Contract decision (v0.2.97): this module
+is that surface's one writer. The
 ``test_no_direct_writes_to_dotenv_outside_contract`` lint flags any
-``.env`` write; this marker pins the module on the
-``_LEGACY_ENV_TEMPLATE_WRITERS`` allowlist while the compose-env
-surface gets its own contract decision (Phase 0.D follow-up). Before
-this v0.2.54 extraction the same write lived in install.py and was
-already on the allowlist.
+``.env`` write; this module is on its ``_OTHER_DOTENV_SURFACE_WRITERS``
+allowlist (a separate surface, not a pending migration).
 
 Extracted from install.py per the search-before-add /
 extract-before-duplicate discipline.

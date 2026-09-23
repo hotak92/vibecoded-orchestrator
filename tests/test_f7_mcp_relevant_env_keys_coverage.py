@@ -64,8 +64,11 @@ DOCUMENTED_EXCLUSIONS: frozenset[str] = frozenset(
         # Secrets — routed via ~/.claude.json / keychain, not settings.json
         # env; and not consumed for search-ROUTING behaviour the watcher
         # gates (GITHUB_TOKEN is the existing documented exclusion in the
-        # Rust header for the same reason).
-        "OPENAI_API_KEY",
+        # Rust header for the same reason). (OPENAI_API_KEY was here until
+        # v0.2.97: the MCP now resolves it through
+        # `vco_lib.openai_key.resolve_openai_api_key` — env, else the
+        # `openai_api_key` secret — so no literal read of it is left in
+        # weaviate_mcp for this grep to find, and the entry went with it.)
         "ANTHROPIC_API_KEY",
         # RL-server plumbing: read by the optional RL enrichment path, not
         # the base search fan-out; a change reconnects lazily, no reload

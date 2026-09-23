@@ -309,7 +309,8 @@ services:
 # already has its data in a DIFFERENTLY-NAMED volume can point the
 # service at it without an override file. This is the second knob of
 # the per-service pair documented in the service stanzas above: a HOST
-# PATH goes in VCT_<SERVICE>_DATA_SOURCE (service stanza, becomes a
+# PATH goes in the stanza's SOURCE knob — VCT_WEAVIATE_DATA_SOURCE,
+# VCT_OLLAMA_DATA_SOURCE, VCT_CODE_EMBED_CACHE_SOURCE (it becomes a
 # bind); an EXISTING VOLUME NAME goes here (a plain name in the service
 # stanza would be an undeclared volume — a hard compose error). Set
 # these in infrastructure/.env (compose auto-reads it; the installer's

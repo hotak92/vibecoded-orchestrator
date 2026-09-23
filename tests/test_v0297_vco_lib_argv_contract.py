@@ -76,6 +76,11 @@ RUST_COMMAND_HELPERS: dict[str, Optional[str]] = {
     "gateway_usage_command": "vco_lib.gateway_usage",
 }
 
+#: Async helpers that take the module as their SECOND argument (a string
+#: literal) and the argv as a literal ``&[OsStr::new(..), ..]`` array
+#: (commands/project_hooks_settings.rs; also called from projects_v2.rs).
+RUST_MODULE_ARG_HELPERS = ("run_vco_lib_json",)
+
 #: Argv vectors built WITHOUT the ``-m <module>`` prefix (a bridge adds it):
 #: file → module → the verbs that open such a ``vec![..]`` in that file.
 RUST_VERB_VECS: dict[str, dict[str, frozenset]] = {
@@ -157,6 +162,8 @@ _RS_ARGS = re.compile(r"\.args\(\s*(?:&)?\[(.*?)\]\s*\)", re.S)
 def _rs_token(expr: str):
     expr = expr.strip()
     m = re.fullmatch(_RS_STR + r"(?:\.(?:into|to_string|to_owned)\(\))?", expr)
+    if not m:  # `std::ffi::OsStr::new("x")` — the `&[&OsStr]` argv form
+        m = re.fullmatch(r"(?:std::ffi::)?OsStr::new\(\s*" + _RS_STR + r"\s*\)", expr)
     return m.group(1) if m else VALUE
 
 
@@ -324,6 +331,16 @@ def _rust_sites() -> list[Site]:
                     continue
                 line = text.count("\n", 0, m.start()) + 1
                 out.append(Site(f"{rel}:{line}", module, tuple(toks) + suffix, False))
+
+        # 3d. `helper(db, "vco_lib.x", &[OsStr::new("verb"), ..], ..)`.
+        for helper in RUST_MODULE_ARG_HELPERS:
+            for m in re.finditer(
+                rf'\b{helper}\(\s*[^,()]+,\s*"(vco_lib\.[a-z_]+)"\s*,\s*&\[(.*?)\]', text, re.S,
+            ):
+                toks = _rs_array_tokens(m.group(2))
+                if toks and toks[0] is not VALUE:
+                    line = text.count("\n", 0, m.start()) + 1
+                    out.append(Site(f"{rel}:{line}", m.group(1), tuple(toks), False))
     return out
 
 
@@ -505,6 +522,60 @@ def test_the_jsonc_env_read_bridge_verb_is_collected_and_parses():
     assert ok, err
     ok, err = _parse(parser, ["read-env"])
     assert not ok and "--project-folder" in err
+
+
+def test_the_bundle_record_and_jsonc_hooks_read_verbs_are_collected():
+    """v0.2.97: the post-bundle registry write
+    (`projects_v2::record_bundle_materialization`, via `run_vco_lib_json`) and
+    the `project_hooks` mirror's JSONC read (`vco_lib_bridge::
+    list_settings_hooks`) are spawn sites. Pin that the collector SEES both —
+    so the parametrised parse covers their verbs and flags — and that each
+    carries the flags its verb requires."""
+    sites = _rust_sites()
+    record = [s for s in sites if s.module == "vco_lib.artifact_version_registry"]
+    assert [s.where.split(":")[0] for s in record] == [
+        "launcher/src-tauri/src/commands/projects_v2.rs"], record
+    assert record[0].tokens[0] == "record-bundle-materialization"
+    assert {"--folder", "--project-id", "--db"} <= set(record[0].tokens), record[0]
+    hooks = [s for s in sites if s.module == "vco_lib.hooks_settings"
+             and s.where.startswith("launcher/src-tauri/src/services/vco_lib_bridge.rs")]
+    assert [s.tokens[:2] for s in hooks] == [("list", "--with-items")], hooks
+    parser = real_parser("vco_lib.artifact_version_registry")
+    assert parser is not None
+    ok, err = _parse(parser, ["record-bundle-materialization", "--folder", "/p"])
+    assert not ok and "--project-id" in err
+
+
+def test_the_project_env_bridge_verbs_are_collected_and_parse():
+    """v0.2.97: the project `.env` has one writer, reached from Rust through
+    `vco_lib_bridge::{apply_project_env_template, write_project_env_reference}`
+    — `-m vco_lib.env_template apply|reference` chains, then the flags
+    `env_template_flags` appends. Pin that the collector SEES both verbs (so
+    the parametrised parse covers them), and that the FULL argv the bridge
+    builds — verb, ids and every appended flag — parses with the real parser."""
+    sites = [
+        s for s in _rust_sites()
+        if s.where.startswith("launcher/src-tauri/src/services/vco_lib_bridge.rs")
+        and s.module == "vco_lib.env_template"
+    ]
+    assert sorted(s.tokens[0] for s in sites) == ["apply", "effective", "reference"], sites
+    for s in sites:
+        if s.tokens[0] == "effective":  # the read-only drift probe rename uses
+            assert s.tokens[1:5] == ("--project-folder", VALUE, "--key", VALUE), s
+        else:
+            assert s.tokens[1:5] == ("--project-id", VALUE, "--project-folder", VALUE), s
+    parser = real_parser("vco_lib.env_template")
+    assert parser is not None
+    tail = ["--orchestrator-root", "/orch", "--weaviate-port", "18081",
+            "--ollama-port", "11435", "--code-embed-port", "11440"]
+    for verb in ("apply", "reference"):
+        ok, err = _parse(parser, [verb, "--project-id", "p", "--project-folder", "/f", *tail])
+        assert ok, err
+    ok, err = _parse(parser, ["effective", "--project-folder", "/f", "--key", "KG_COLLECTION"])
+    assert ok, err
+    ok, err = _parse(parser, ["apply", "--project-id", "p", "--project-folder", "/f",
+                              "--folder", "/x"])
+    assert not ok and "--folder" in err
 
 
 @pytest.mark.parametrize("site", ALL_SITES, ids=str)

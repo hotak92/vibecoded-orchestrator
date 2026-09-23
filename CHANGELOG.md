@@ -34,15 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "yes". GUI updates therefore ran on the system interpreter, and any step
   that needed a venv-only package failed into a log line nobody saw. The most
   visible casualty: the one-time removal of a leftover `ANTHROPIC_MODEL` pin
-  from VS Code's settings (shipped in v0.2.95) never ran on any machine, so
-  that pin kept overriding the model you picked in Claude Code.
+  from VS Code's settings (shipped in v0.2.95) never ran on a Linux or macOS
+  machine updated from the launcher, so that pin kept overriding the model you
+  picked in Claude Code.
 - The check now asks whether this process *is* the venv. The pin removal runs
   after the venv exists, in the venv, on every install and update (not on
   `--uninstall`), and a failure now appears in `UPDATE_DEFERRED.md` instead of
   a log.
-- `--rebuild-venv` always rebuilds, the Python-version drift check compares
-  against the interpreter that launched the install, and a rebuild never
-  deletes the environment it is running from.
+- `install.py --lightweight --rebuild-venv` always rebuilds (the flag applies
+  to the lightweight path, as its help says), the Python-version drift check
+  compares against the interpreter that launched the install, and a rebuild
+  never deletes the environment it is running from.
 
 ### Fixed — settings files VCO could not parse were overwritten (v0.2.97)
 
@@ -74,12 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed — moving or renaming a project never updated its env files (v0.2.97)
 
 - Project move and collection rename called the env re-projection with a flag
-  that command does not accept, so every move and rename silently skipped it.
-  Fixed, and a failure is now shown in the move dialog and recorded as an
-  entry that clears itself once the env files match again. A new test checks
-  every `python -m vco_lib …` call VCO builds, in Python and Rust, against the
-  real argument parser; it also found four commands VCO printed that did not
-  exist, now corrected.
+  that command does not accept, so every move and rename skipped it (the
+  rename reported this as a warning; the move did not show it at all). Fixed,
+  and a failure is now shown in the move dialog and recorded as an entry that
+  clears itself once the env files match again. A new test checks every
+  `python -m vco_lib …` call VCO builds, in Python and Rust, against the real
+  argument parser; it also found three commands VCO printed (in four places)
+  that did not exist, now corrected.
 
 ### Fixed — secret values left in project settings by older launchers (v0.2.97)
 
@@ -95,8 +98,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the steps to move them into the secrets store. Unregistering a project
   follows the same rule.
 - `GITHUB_TOKEN` in a project's `.claude/settings.json` is no longer deleted by
-  name on every env refresh (it had been since v0.2.73, including a token you
-  typed yourself); it is removed only when it equals the stored GitHub token.
+  name on every env refresh (it had been for as long as VCO has managed that
+  file, including a token you typed yourself); it is removed only when it
+  equals the stored GitHub token.
+
+### Security — `install.py --openai-key` no longer writes the key into the project (v0.2.97)
+
+- The key passed with `--openai-key` was written as plain text into the
+  orchestrator's `.env`, and the whole command line — key included — was
+  recorded in the install log under `state/logs/`. VCO's rule is that secret
+  values never live in the project tree. The key is now stored in the
+  launcher's keychain (or, with the launcher not running, the file store under
+  `~/.vct-secrets/`) under its existing name `openai_api_key`, the install log
+  records the flag with its value redacted, and the embedding services read it
+  from there. A key an older install wrote into `.env` is moved into the store
+  and removed from the file once the stored copy is confirmed equal; a key you
+  wrote there yourself is left alone. A failed embedding call no longer logs
+  the first characters of the key. A key typed on the command line still ends
+  up in your shell history — the help text now says so.
+
+### Changed — one writer for a project's `.env` (v0.2.97)
+
+- A project's `.env` had two writers — one in the launcher, one in the
+  installer — that appended lines in different formats. Both now go through
+  one: VCO's keys live in a single marked block, keys you set yourself are
+  never written over, and lines older versions appended (`# added by vco …`)
+  are folded into the block so each key is set once. Placeholder comments are
+  written only when the file is first created, and re-running `install.py`
+  over an existing `.env` no longer appends `PROJECT_NAME` /
+  `KG_COLLECTION` lines that overrode your real values. Safe-add projects
+  still get only `.env.vco.reference`, never a live `.env`.
+
+### Changed — unregistering a project stops rather than lose track of a secret (v0.2.97)
+
+- If unregister finds a secret value in the project that it can prove VCO
+  wrote, but cannot remove it (for example because the file is read-only), it
+  now stops before removing the project and tells you which key, which file
+  and what to fix. Continuing would have left a value that VCO could never
+  identify again. Fix the cause and unregister again; every step is safe to
+  repeat.
 
 ### Added — the model gateway tells you when it needs a restart (v0.2.97)
 
@@ -121,9 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - in terminal `claude` sessions, through an optional status-line script
     (`templates/scripts/gateway-usage-statusline.sh` / `.ps1`; see
     `docs/CONFIGURATION.md`).
-- Usage is refreshed in the background while chats are flowing and never on
-  the request path; an idle gateway makes no calls. Unknown is shown as
-  unknown, never as 0 %.
+- Usage is refreshed in the background — while chats are flowing, and when
+  the launcher card or a status line asks for it — and never on a chat's
+  request path; the gateway has no timer of its own, so with nothing running
+  and nothing looking it makes no calls. Unknown is shown as unknown, never
+  as 0 %.
 
 ### Fixed — smaller issues (v0.2.97)
 
@@ -132,13 +174,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The root `CLAUDE.md` no longer gets a `CLAUDE.md.from-upstream-<sha>` copy
   on every update, and old ones are removed when git provably holds their
   contents.
-- A project that disabled shared-KG reads still read it when its settings file
-  had comments.
+- On a project that opted out of shared-KG reads (`SHARED_KG_READ_DISABLED`),
+  a settings file with comments made a bundle update miss the opt-out and
+  remove the project's own copies of the bundled knowledge — its only access
+  to them.
 - The search MCP no longer fails to start on a machine without a GitHub token;
   it never needed one.
-- `infrastructure/docker-compose.yml` accepts `VCT_<SERVICE>_DATA_SOURCE` and
-  `VCT_<SERVICE>_VOLUME_NAME` overrides, so services that already store their
-  data in a folder or an existing volume can adopt it without copying.
+- After renaming a project's collections, the warning about a stale
+  `KG_COLLECTION` in `.env` now tells you the command that actually fixes it
+  (or that the line is your own), instead of suggesting a bundle update, which
+  never touches `.env`.
+- Several update notices that could only be dismissed by hand now clear
+  themselves once the condition is gone, and a failed schema-version record
+  is reported as what it is, with the right fix, instead of "no migration
+  shipped".
+- `infrastructure/docker-compose.yml` accepts overrides for where each service
+  keeps its data — `VCT_WEAVIATE_DATA_SOURCE`, `VCT_OLLAMA_DATA_SOURCE`,
+  `VCT_CODE_EMBED_CACHE_SOURCE` (a folder or an existing volume) and the
+  matching `…_VOLUME_NAME` knobs — so services that already store their data
+  somewhere can adopt it without copying. See `docs/CONFIGURATION.md`.
 
 ### Changed (v0.2.97)
 
