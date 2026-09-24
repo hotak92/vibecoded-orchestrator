@@ -3920,6 +3920,8 @@ mod tests {
     fn service_port_placeholders_follow_the_machine_resolver() {
         use crate::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
         let _g = crate::test_env::state_dir_guard();
+        // About the compiled default itself (nothing is requested).
+        let _allow = crate::services::service_endpoints::allow_compiled_default_on_this_thread();
         let ctx = PlaceholderCtx::new("vct-example");
         assert_eq!(
             ctx.resolve("http://localhost:{code_embed_port}/health"),

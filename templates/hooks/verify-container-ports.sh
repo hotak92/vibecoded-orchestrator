@@ -207,35 +207,71 @@ echo "🩺 Container port-binding watchdog: ${#zombies[@]} zombie state(s) detec
 echo "   (container says 'running' but host port is unbound AND container PID is dead)"
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# v0.2.97: the installer's compose (infrastructure/) FIRST — a VCO-managed
+# service is re-created under the project that owns it, never under the
+# legacy claude_mcp_servers/ home (whose project label is what made
+# containers foreign-owned in the first place). Same tiers as
+# ensure-containers.
 compose_dir=""
-for candidate in "$project_root/claude_mcp_servers" "$project_root/infrastructure" "$project_root"; do
+for candidate in "${VCT_COMPOSE_DIR:-}" "${VCT_INFRASTRUCTURE_DIR:-}" \
+        "${VCT_ORCHESTRATOR_ROOT:+$VCT_ORCHESTRATOR_ROOT/infrastructure}" \
+        "$project_root/infrastructure" "$project_root/claude_mcp_servers" "$project_root"; do
+    [ -n "$candidate" ] || continue
     if [ -f "$candidate/compose.yaml" ] || [ -f "$candidate/compose.yml" ] || [ -f "$candidate/docker-compose.yml" ]; then
         compose_dir="$candidate"
         break
     fi
 done
 
+# v0.2.97 (plan invariants I1 + the zombie gate): what may be done to each
+# container comes from the launcher.db service_endpoints plan. Only a
+# VCO-managed service is `rm -f`'d and re-created — by compose, naming that
+# ONE service with `--no-deps`. An adopted container is never removed: a
+# re-create would put it on the installer's default, EMPTY volume. No
+# readable plan → nothing is re-created.
+up_args=()
+__vcp_plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || __vcp_plan=""
+[ -n "$__vcp_plan" ] && eval "$__vcp_plan"
+zombie_policy() {  # container → "<service|-> <on_zombie>"
+    local i
+    for i in "${!VCO_LC_CONTAINER[@]}"; do
+        if [ "${VCO_LC_CONTAINER[$i]}" = "$1" ]; then
+            printf '%s %s\n' "${VCO_LC_SERVICE[$i]}" "${VCO_LC_ON_ZOMBIE[$i]}"
+            return 0
+        fi
+    done
+    printf -- '- ignore\n'
+}
+
 for entry in "${zombies[@]}"; do
     IFS='|' read -r name port <<< "$entry"
-    # Derive compose service name from the container name. Compose
-    # files use unprefixed service keys (weaviate / ollama / code_embed),
-    # but the actual containers ship under various names — strip every
-    # known prefix and suffix VCO has ever used. Order matters: longest
-    # discriminators first so "vco_code_embed" doesn't collapse to "embed".
-    service="$name"
-    service="${service#vco_}"
-    service="${service#vct_}"
-    service="${service%_claude}"
     echo "   → recovering $name (port :$port) via $RUNTIME"
     if [ "$RUNTIME" = "podman" ]; then
+        if [ -z "$__vcp_plan" ]; then
+            echo "     ! the service_endpoints plan could not be read — $name left as is (manual: $RUNTIME start $name)"
+            continue
+        fi
+        read -r service on_zombie <<< "$(zombie_policy "$name")"
+        if [ "$on_zombie" != "recreate" ]; then
+            # Not VCO-managed (adopted / unlisted): ensure-containers cleans
+            # its orphan runtime state and starts it BY NAME; never removed.
+            echo "     ! $name is not VCO-managed — never removed or re-created here (manual: $RUNTIME start $name)"
+            continue
+        fi
         # Podman state-DB desync: force-rm + recreate. `podman restart`
         # would be a no-op because Podman thinks the container is alive.
+        up_line="$("$RUN_PY" -m vco_lib.service_lifecycle compose-args --shell --services "$service" 2>/dev/null)" || up_line=""
+        if [ -z "$up_line" ]; then
+            echo "     ! no compose argv for $service — $name left as is"
+            continue
+        fi
+        eval "up_args=($up_line)"
         if "$RUNTIME" rm -f "$name" >/dev/null 2>&1; then
             if [ -n "$compose_dir" ]; then
-                ( cd "$compose_dir" && "${COMPOSE_CMD[@]}" up -d "$service" >/dev/null 2>&1 ) || \
-                    echo "     ! ${COMPOSE_CMD[*]} up -d $service failed; manual: cd $compose_dir && ${COMPOSE_CMD[*]} up -d $service"
+                ( cd "$compose_dir" && "${COMPOSE_CMD[@]}" "${up_args[@]}" >/dev/null 2>&1 ) || \
+                    echo "     ! ${COMPOSE_CMD[*]} $up_line failed; manual: cd $compose_dir && ${COMPOSE_CMD[*]} $up_line"
             else
-                echo "     ! could not auto-detect compose dir; manual: ${COMPOSE_CMD[*]} up -d $service"
+                echo "     ! could not auto-detect compose dir; manual: ${COMPOSE_CMD[*]} $up_line"
             fi
         else
             echo "     ! $RUNTIME rm -f $name failed"

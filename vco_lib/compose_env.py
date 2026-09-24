@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any, Mapping, Optional
 
 
 def compose_substitution_env(embed_config: dict) -> dict[str, str]:
@@ -90,6 +91,8 @@ def write_infrastructure_env(
     A successful no-op (no managed keys to write) returns
     ``(True, "")``.
     """
+    from vco_lib.atomic import atomic_rewrite_text  # noqa: PLC0415
+
     managed = compose_substitution_env(embed_config)
     if not managed:
         return True, ""
@@ -98,18 +101,33 @@ def write_infrastructure_env(
         existing_lines: list[str] = []
         if infra_env.is_file():
             existing_lines = infra_env.read_text(encoding="utf-8").splitlines()
-        kept = [
-            ln for ln in existing_lines
-            if not any(ln.strip().startswith(f"{k}=") for k in managed)
-            and not ln.strip().startswith("# Managed-by-install.py")
-        ]
+        # The service-endpoints block (write_service_keys) is ANOTHER writer's
+        # region of this file: every line inside it is kept verbatim, so this
+        # rewrite can never drop or edit a key the rows project — whatever
+        # key names the two writers grow in future.
+        kept: list[str] = []
+        in_block = False
+        for ln in existing_lines:
+            marker = ln.strip()
+            if marker == _SERVICE_BLOCK_BEGIN:
+                in_block = True
+            if in_block:
+                kept.append(ln)
+                if marker == _SERVICE_BLOCK_END:
+                    in_block = False
+                continue
+            if any(marker.startswith(f"{k}=") for k in managed):
+                continue
+            if marker.startswith("# Managed-by-install.py"):
+                continue
+            kept.append(ln)
         out = kept + [
             "# Managed-by-install.py: compose ${...} substitution keys for the",
             "# Managed-by-install.py: code-embed image build. Re-running install",
             "# Managed-by-install.py: rewrites these lines; edit via install flags.",
         ] + [f"{k}={v}" for k, v in sorted(managed.items())]
         infra_env.parent.mkdir(parents=True, exist_ok=True)
-        infra_env.write_text("\n".join(out) + "\n", encoding="utf-8")
+        atomic_rewrite_text(infra_env, "\n".join(out) + "\n")
         return True, ""
     except OSError as exc:
         return False, str(exc)
@@ -175,6 +193,249 @@ def set_infrastructure_env_key(infra_dir: Path, key: str, value: str) -> str:
     infra_dir.mkdir(parents=True, exist_ok=True)
     atomic_rewrite_text(infra_env, text)
     return "set"
+
+
+# ─── The service-endpoint keys (v0.2.97 SE-3) ────────────────────────────
+#
+# ``infrastructure/.env`` is where compose finds the ``${WEAVIATE_PORT}`` /
+# ``${VCT_*_DATA_SOURCE}`` / … substitutions the base file declares. Before
+# v0.2.97 nothing wrote them persistently (an alt port lived in one install
+# run's ``os.environ``; the data-source knobs were documented as a hand edit),
+# so every later compose run — the session hook, the boot wrapper, the
+# watchdog — bound the defaults. They are now PROJECTED from the launcher.db
+# ``service_endpoints`` rows (the one source of truth) by
+# :func:`write_service_keys`, which ``service_endpoints.apply_change`` calls on
+# every row change. This module stays the file's one writer.
+
+#: Per-service host-port key compose substitutes (``vco_managed`` rows only).
+SERVICE_PORT_KEYS: dict[str, str] = {
+    "weaviate": "WEAVIATE_PORT",
+    "ollama": "OLLAMA_PORT",
+    "code_embed": "CODE_EMBED_PORT",
+}
+WEAVIATE_GRPC_PORT_KEY = "WEAVIATE_GRPC_PORT"
+
+#: Per-service data-source knob pair ``(SOURCE, VOLUME_NAME)`` — MUST MATCH
+#: ``infrastructure/docker-compose.yml``. A HOST PATH goes in SOURCE (compose
+#: then mounts a bind); an existing named volume goes in VOLUME_NAME (SOURCE
+#: stays unset so the stanza keeps its declared volume key). code_embed's
+#: SOURCE knob is ``…_CACHE_SOURCE`` (documented and tested under that name).
+DATA_KNOBS: dict[str, tuple[str, str]] = {
+    "weaviate": ("VCT_WEAVIATE_DATA_SOURCE", "VCT_WEAVIATE_VOLUME_NAME"),
+    "ollama": ("VCT_OLLAMA_DATA_SOURCE", "VCT_OLLAMA_VOLUME_NAME"),
+    "code_embed": ("VCT_CODE_EMBED_CACHE_SOURCE", "VCT_CODE_EMBED_VOLUME_NAME"),
+}
+
+#: code_embed's CPU (``CODE_EMBED_BACKEND=ollama``) backend reaches Ollama by
+#: the in-network name ``vco_ollama`` — which does not exist when Ollama is not
+#: VCO's compose service. Then this key carries a URL that does resolve.
+CODE_EMBED_OLLAMA_URL_KEY = "CODE_EMBED_OLLAMA_URL"
+#: The address compose maps ``vco-host-gateway`` to inside code_embed
+#: (``extra_hosts`` in docker-compose.yml). Docker needs the literal
+#: ``host-gateway`` for it; podman reaches the host as
+#: ``host.containers.internal`` natively and keeps the inert default, because
+#: podman 4.x does not accept ``host-gateway`` (plan risk R4).
+CODE_EMBED_HOST_GATEWAY_KEY = "VCT_CODE_EMBED_HOST_GATEWAY"
+CODE_EMBED_HOST_GATEWAY_NAME = "vco-host-gateway"
+
+#: Every key :func:`write_service_keys` may own.
+SERVICE_KEYS: frozenset[str] = frozenset(
+    list(SERVICE_PORT_KEYS.values())
+    + [WEAVIATE_GRPC_PORT_KEY, CODE_EMBED_OLLAMA_URL_KEY, CODE_EMBED_HOST_GATEWAY_KEY]
+    + [k for pair in DATA_KNOBS.values() for k in pair]
+)
+
+_SERVICE_BLOCK_BEGIN = (
+    "# >>> VCO service endpoints: written from launcher.db service_endpoints; "
+    "change them with `python -m vco_lib.service_endpoints` >>>"
+)
+_SERVICE_BLOCK_END = "# <<< VCO service endpoints <<<"
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
+
+
+class ServiceKeysResult:
+    """What :func:`write_service_keys` did. ``values``: the managed keys now
+    in the block. ``superseded``: ``{key: old_value}`` for lines OUTSIDE the
+    block that assigned a key the rows now state (the row is the truth; the
+    old value is returned so a caller can report it). ``notes``: why a key
+    was not written. ``action``: ``"set"`` / ``"unchanged"``."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.superseded: dict[str, str] = {}
+        self.notes: list[str] = []
+        self.action = "unchanged"
+
+
+def _env_value(value: str) -> str:
+    """One ``.env`` value, quoted when it needs to be. Single quotes: compose
+    and python-dotenv (podman-compose's reader) take them literally, so a
+    ``$`` in a path is never interpolated."""
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"a value cannot contain a line break: {value!r}")
+    if value and all(c.isalnum() or c in "/._-:+@%,=" for c in value):
+        return value
+    if "'" in value:
+        raise ValueError(f"a value with a single quote cannot be written safely: {value!r}")
+    return f"'{value}'"
+
+
+def _host_alias_for(runtime: Optional[str]) -> Optional[str]:
+    if runtime == "podman":
+        return "host.containers.internal"
+    if runtime == "docker":
+        return CODE_EMBED_HOST_GATEWAY_NAME
+    return None
+
+
+def service_key_values(
+    rows: "Mapping[str, Any]", *, runtime: Optional[str] = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Pure: the managed keys *rows* state (``""`` = stated ABSENT), plus
+    notes for keys it could not decide.
+
+    A service with NO row states nothing — its keys are left alone, because
+    the absence of a row is not a statement. Port keys and data knobs come
+    from ``vco_managed`` rows only; a data knob only when the row carries an
+    observed mount (a vco_managed row without one leaves any existing knob
+    line alone rather than re-pointing the service at the default volume).
+    ``CODE_EMBED_OLLAMA_URL`` is stated when the Ollama row is NOT
+    ``vco_managed``; *runtime* picks the host alias for an adopted Ollama on
+    this machine (``podman``/``docker``)."""
+    from vco_lib.service_endpoints import render_grpc_port, render_url  # noqa: PLC0415
+
+    values: dict[str, str] = {}
+    notes: list[str] = []
+    for service, port_key in SERVICE_PORT_KEYS.items():
+        row = rows.get(service)
+        if row is None or row.mode != "vco_managed":
+            continue
+        values[port_key] = str(int(row.port))
+        if service == "weaviate":
+            values[WEAVIATE_GRPC_PORT_KEY] = str(render_grpc_port(row))
+        mount = row.data_mount
+        if mount:
+            source_key, volume_key = DATA_KNOBS[service]
+            kind, source = mount.get("kind"), str(mount.get("source") or "")
+            if kind == "bind" and source:
+                values[source_key] = source
+                values[volume_key] = ""
+            elif kind == "volume" and source:
+                values[volume_key] = source
+                values[source_key] = ""
+    ollama = rows.get("ollama")
+    if ollama is not None and ollama.mode != "vco_managed":
+        if ollama.host in _LOCAL_HOSTS:
+            alias = _host_alias_for(runtime)
+            if alias is None:
+                notes.append(
+                    f"{CODE_EMBED_OLLAMA_URL_KEY} not written: the container runtime is "
+                    "unknown, so the host alias code_embed must use for this machine's "
+                    "Ollama cannot be chosen"
+                )
+            else:
+                values[CODE_EMBED_OLLAMA_URL_KEY] = f"{ollama.scheme}://{alias}:{int(ollama.port)}"
+                values[CODE_EMBED_HOST_GATEWAY_KEY] = "host-gateway" if runtime == "docker" else ""
+        else:
+            values[CODE_EMBED_OLLAMA_URL_KEY] = render_url("ollama", ollama)
+            values[CODE_EMBED_HOST_GATEWAY_KEY] = ""
+    # When Ollama IS VCO's compose service the in-network default is right and
+    # nothing is stated: a URL this writer put in its block earlier leaves with
+    # the block rewrite, and a user line OUTSIDE the block (the documented
+    # power-user override to an Ollama on the host) is kept.
+    return values, notes
+
+
+def write_service_keys(
+    infra_dir: Path,
+    rows: "Mapping[str, Any]",
+    *,
+    runtime: Optional[str] = None,
+) -> ServiceKeysResult:
+    """Project the managed ``infrastructure/.env`` keys from the
+    ``service_endpoints`` *rows* (``{service: EndpointRow}``).
+
+    The keys live in ONE marker-delimited block this function owns: every
+    call rewrites the block from the rows, so a key the rows no longer state
+    leaves the block. A line OUTSIDE the block that assigns a key the rows
+    now state (a value, or stated-absent — the other half of a data-knob
+    pair) is removed, and its old value reported in ``superseded``: the row
+    is the source of truth, and compose must never see two assignments. An
+    outside line for a key the rows do NOT state is left exactly as it is.
+    Every other byte of the file is kept.
+
+    *runtime* (``podman``/``docker``) is needed only for an adopted Ollama on
+    this machine; ``None`` resolves it (``vco_lib.containers.resolve``) only
+    in that case. Raises ``ValueError`` for an unwritable value, ``OSError``
+    on a failed write.
+    """
+    from vco_lib.atomic import atomic_rewrite_text  # noqa: PLC0415
+    from vco_lib.envfile import parse_env_line  # noqa: PLC0415
+
+    ollama = rows.get("ollama")
+    if (runtime is None and ollama is not None and ollama.mode != "vco_managed"
+            and ollama.host in _LOCAL_HOSTS):
+        try:
+            from vco_lib import containers as _containers  # noqa: PLC0415
+
+            runtime = _containers.resolve(probe_compose=False).runtime
+        except Exception:  # noqa: BLE001 — unresolved ⇒ noted, never guessed
+            runtime = None
+    stated, notes = service_key_values(rows, runtime=runtime)
+    result = ServiceKeysResult()
+    result.notes = notes
+    written = {k: v for k, v in stated.items() if v != ""}
+
+    infra_env = infra_dir / ".env"
+    prior = ""
+    if infra_env.is_file():
+        with infra_env.open(encoding="utf-8", newline="") as handle:
+            prior = handle.read()
+    eol = "\r\n" if "\r\n" in prior else "\n"
+    kept: list[str] = []
+    block_at: Optional[int] = None  # where an existing block stood: rewritten IN PLACE
+    in_block = False
+    for line in prior.splitlines():
+        marker = line.strip()
+        if marker == _SERVICE_BLOCK_BEGIN:
+            in_block = True
+            if block_at is None:
+                block_at = len(kept)
+            continue
+        if in_block:
+            if marker == _SERVICE_BLOCK_END:
+                in_block = False
+            continue
+        pair = parse_env_line(line)
+        if pair is not None and pair[0] in stated:
+            if pair[1] != written.get(pair[0], ""):
+                result.superseded[pair[0]] = pair[1]
+            continue
+        kept.append(line)
+    block: list[str] = []
+    if written:
+        block = [_SERVICE_BLOCK_BEGIN]
+        block.extend(f"{k}={_env_value(v)}" for k, v in sorted(written.items()))
+        block.append(_SERVICE_BLOCK_END)
+    if block_at is not None:
+        lines = kept[:block_at] + block + kept[block_at:]
+    else:
+        while kept and not kept[-1].strip():
+            kept.pop()
+        lines = list(kept)
+        if block:
+            if lines:
+                lines.append("")
+            lines.extend(block)
+    text = eol.join(lines) + eol if lines else ""
+    result.values = written
+    if text == prior:
+        return result
+    infra_dir.mkdir(parents=True, exist_ok=True)
+    atomic_rewrite_text(infra_env, text)
+    result.action = "set"
+    return result
 
 
 def _main(argv: "list[str] | None" = None) -> int:

@@ -63,10 +63,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
 use crate::db::Db;
-use crate::mcp_registration::{
-    register_default_orchestrator_mcps, user_claude_json, DEFAULT_CODE_EMBED_PORT,
-    DEFAULT_GRPC_PORT, DEFAULT_OLLAMA_PORT, DEFAULT_WEAVIATE_PORT, ServicePorts,
-};
+use crate::mcp_registration::{register_default_orchestrator_mcps, user_claude_json};
 use vct_launcher_core::process::CommandExt as _;
 
 /// Consent-token TTL for `run_schema_migrations`. Tokens issued by the
@@ -508,16 +505,10 @@ pub async fn rerun_mcp_registration(
     }
     let install_path = PathBuf::from(&install_root);
 
-    // We don't currently re-read user-overridden ports from app_state;
-    // the canonical defaults match what the installer wrote into the
-    // entries originally. A future PR can wire user-overridden ports
-    // here if a user changes them post-install.
-    let ports = ServicePorts {
-        weaviate_port: DEFAULT_WEAVIATE_PORT,
-        ollama_port: DEFAULT_OLLAMA_PORT,
-        grpc_port: DEFAULT_GRPC_PORT,
-        code_embed_port: DEFAULT_CODE_EMBED_PORT,
-    };
+    // v0.2.97: the machine's `service_endpoints` rows — the same values the
+    // installer's registration writes. (This used the compiled defaults, so
+    // a repair re-registered an adopted or moved service at 8081 / 11435.)
+    let ports = crate::mcp_registration::machine_service_ports();
 
     let report = register_default_orchestrator_mcps(
         &install_path,
@@ -630,11 +621,11 @@ const TEMPORAL_PROPS: &[&str] = &["created", "updated", "valid_from", "valid_unt
 /// the source-of-truth constant.
 const DEFAULT_SHARED_KG_CLASS: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 
-/// The ONE launcher client resolver (`service_endpoints::client_weaviate_url`,
-/// v0.2.97 lane W) — this was a private copy that never saw an adopted
-/// external Weaviate.
+/// The machine row (`service_endpoints::machine_weaviate_url`, v0.2.97) —
+/// this was a private copy that never saw an adopted external Weaviate. No
+/// endpoint env var is read (the launcher is machine-scoped).
 fn resolve_weaviate_url(db: &Db) -> String {
-    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
 fn parse_schema_response(

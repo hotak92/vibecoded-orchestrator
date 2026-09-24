@@ -70,10 +70,34 @@ use crate::db::models::ProjectRow;
 use crate::manifest::{ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
 use crate::services::gpu_mode::GpuMode;
 
-/// Default Ollama port used to resolve `{ollama_port}` in env values when
-/// the manifest doesn't override it. Matches the launcher's well-known
-/// service-port layout.
+/// The compiled-default Ollama port (a string for placeholder maps). The
+/// `{ollama_port}` placeholder itself resolves to the machine's Ollama
+/// `service_endpoints` row ([`ollama_port_placeholder`]); this is only its
+/// absent-row answer. MUST MATCH `service_endpoints::DEFAULT_OLLAMA_PORT`.
 pub const DEFAULT_OLLAMA_PORT: &str = "11435";
+
+/// `{ollama_port}` for the RL placeholder maps: the machine's Ollama row
+/// (v0.2.97) — the same answer `PlaceholderCtx::resolve` gives, so the two
+/// placeholder layers cannot disagree.
+fn ollama_port_placeholder() -> String {
+    crate::services::service_endpoints::machine_port_from_disk(
+        crate::services::service_endpoints::CoreService::Ollama,
+    )
+    .to_string()
+}
+
+/// `{ollama_url}` (v0.2.97, lane Y): the machine's Ollama URL AS SEEN FROM
+/// INSIDE a module container — the ONE container-view helper in
+/// `service_endpoints`. A loopback row renders as the runtime host alias
+/// (`host.containers.internal`, which the `--add-host` below resolves to the
+/// host gateway); a non-loopback `adopted_external` row is the row's host as
+/// is. New manifests write `OLLAMA_URL: "{ollama_url}"` instead of hardcoding
+/// the alias + `{ollama_port}`.
+fn ollama_url_placeholder() -> String {
+    crate::services::service_endpoints::machine_url_from_container_disk(
+        crate::services::service_endpoints::CoreService::Ollama,
+    )
+}
 
 /// Fixed host port the GLOBAL (machine-wide) RL reranker container listens
 /// on, used after a module migrates from per-project to global scope
@@ -736,7 +760,8 @@ pub fn rl_placeholders_global(rl_port: u16) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
     m.insert("{project_slug}".to_string(), "global".to_string());
-    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
+    m.insert("{ollama_port}".to_string(), ollama_port_placeholder());
+    m.insert("{ollama_url}".to_string(), ollama_url_placeholder());
     m
 }
 
@@ -875,8 +900,27 @@ pub fn rl_placeholders(rl_port: u16, project_slug: &str) -> HashMap<String, Stri
     let mut m = HashMap::new();
     m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
     m.insert("{project_slug}".to_string(), project_slug.to_string());
-    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
+    m.insert("{ollama_port}".to_string(), ollama_port_placeholder());
+    m.insert("{ollama_url}".to_string(), ollama_url_placeholder());
     m
+}
+
+/// Env values are the one place a manifest may name a core-service URL
+/// (`OLLAMA_URL=http://host.containers.internal:{ollama_port}`, the only
+/// form pre-v0.2.97 manifests could write). After placeholder substitution,
+/// apply the container-view host rule (v0.2.97, lane Y): a non-loopback
+/// Ollama row must be reached at its own host, not at the runtime host
+/// alias (which resolves to THIS machine).
+fn resolve_env_value(
+    raw: &str,
+    ctx: &PlaceholderCtx,
+    placeholders: &HashMap<String, String>,
+) -> String {
+    let resolved = resolve_value(raw, ctx, placeholders);
+    crate::services::service_endpoints::rewrite_alias_url_in_env(
+        &resolved,
+        crate::services::service_endpoints::CoreService::Ollama,
+    )
 }
 
 /// Two-layer placeholder resolver:
@@ -1156,12 +1200,12 @@ pub fn build_podman_run_args_with_env(
     // then env_derived. HashMap iteration is non-deterministic — tests
     // must assert on set membership, not exact ordering.
     for (k, v) in &runtime.env_fixed {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
     for (k, v) in &runtime.env_derived {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
@@ -1345,12 +1389,12 @@ pub fn build_podman_run_args_global_inheriting(
     }
 
     for (k, v) in &runtime.env_fixed {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
     for (k, v) in &runtime.env_derived {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
@@ -3275,6 +3319,136 @@ mod tests {
         assert!(env_flags.contains(&"RL_PROJECT_ROOT=/data"), "{env_flags:?}");
         assert!(env_flags.contains(&"RL_SERVER_PORT=11438"), "{env_flags:?}");
         assert!(args.iter().any(|a| a == "127.0.0.1:11533:11438"));
+    }
+
+    // ─── the Ollama URL a module container receives (v0.2.97, lane Y) ────
+    //
+    // The pre-v0.2.97 manifest form is
+    // `OLLAMA_URL=http://host.containers.internal:{ollama_port}` — correct
+    // ONLY for a loopback row. An `adopted_external` row on a non-loopback
+    // host must be named AS IS: the alias resolves to THIS machine, where
+    // that Ollama does not run. Same rule for podman and docker (the
+    // `--add-host` alias the builders emit is runtime-independent).
+
+    fn manifest_with_legacy_ollama_url() -> ModuleManifest {
+        let mut m = make_manifest(true, true);
+        m.runtime
+            .env_derived
+            .insert("OLLAMA_URL".to_string(), "http://host.containers.internal:{ollama_port}".to_string());
+        m
+    }
+
+    fn seed_ollama_row(mode: crate::db::service_endpoints::EndpointMode, host: &str, port: u16) {
+        crate::db::Db::open()
+            .unwrap()
+            .service_endpoint_seed_for_tests(&crate::db::service_endpoints::ServiceEndpointRow::new(
+                "ollama", mode, host, port,
+            ))
+            .unwrap();
+    }
+
+    fn ollama_env_flag(args: &[String]) -> String {
+        args.windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .find(|e| e.starts_with("OLLAMA_URL="))
+            .expect("OLLAMA_URL env flag")
+            .to_string()
+    }
+
+    #[test]
+    fn module_container_ollama_url_keeps_the_alias_for_a_loopback_row() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(crate::db::service_endpoints::EndpointMode::VcoManaged, "localhost", 21435);
+        let manifest = manifest_with_legacy_ollama_url();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://host.containers.internal:21435");
+    }
+
+    #[test]
+    fn module_container_ollama_url_names_a_remote_row_host_podman() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(
+            crate::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            31434,
+        );
+        let manifest = manifest_with_legacy_ollama_url();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://ollama.lan:31434");
+    }
+
+    /// Same rule under docker — the alias the runtime maps is the same, so
+    /// the rewrite must not be podman-only.
+    #[test]
+    fn module_container_ollama_url_names_a_remote_row_host_docker() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(
+            crate::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            31434,
+        );
+        let manifest = manifest_with_legacy_ollama_url();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "docker", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://ollama.lan:31434");
+    }
+
+    /// The global builder follows the same rule (one container-view helper,
+    /// every spawn site).
+    #[test]
+    fn global_module_container_ollama_url_names_a_remote_row_host() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(
+            crate::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            31434,
+        );
+        let mut manifest = make_rl_manifest_global_for_test();
+        manifest.runtime.env_derived.insert(
+            "OLLAMA_URL".to_string(),
+            "http://host.containers.internal:{ollama_port}".to_string(),
+        );
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args_global(
+            &manifest, &ctx, 11443, "vct-rl-reranker", "img:tag", "podman", None, &[],
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://ollama.lan:31434");
+        // The alias itself still maps to the host gateway for everything else
+        // (the hub's VCT_HUB_BASE_URL) — only the Ollama pair was rewritten.
+        assert!(args.iter().any(|a| a == "--add-host=host.containers.internal:host-gateway"));
+    }
+
+    /// New manifests write `OLLAMA_URL: "{ollama_url}"` — the token resolves
+    /// to the container-view URL for both loopback and remote rows.
+    #[test]
+    fn ollama_url_placeholder_token_resolves_to_the_container_view_url() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(crate::db::service_endpoints::EndpointMode::VcoManaged, "127.0.0.1", 21435);
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.env_derived.insert("OLLAMA_URL".to_string(), "{ollama_url}".to_string());
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://host.containers.internal:21435");
     }
 
     /// v0.2.97 (lane V): the caller's resolved `env_from_settings` pairs

@@ -15,7 +15,6 @@ on the Python side in a future change.
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -60,33 +59,30 @@ def test_install_py_uses_canonical_health_endpoint_only():
     )
 
 
-def test_bootstrap_envelope_publishes_canonical_health_endpoint():
-    """Bootstrap envelope's `weaviate_endpoints.health` is canonical AND env-resolved.
+def test_bootstrap_envelope_publishes_canonical_health_endpoint(tmp_path, monkeypatch):
+    """Bootstrap envelope's `weaviate_endpoints.health` is canonical AND the row's.
 
-    v0.2.96 (6a): the envelope hardcoded `http://localhost:8081` five times,
-    reading no environment, so `--bootstrap --json` advertised the wrong port
-    on a relocated install — and this test's previous body pinned that
-    literal. The endpoints are now built by `_bootstrap_weaviate_endpoints`
-    through the ONE home, so this asserts the RESOLVED value behaviourally:
-    install.py is imported with `WEAVIATE_PORT` set and `WEAVIATE_URL` unset
-    (the suite's sentinel-port shape), and the builder is called directly.
+    v0.2.96 (6a): the envelope hardcoded `http://localhost:8081` five times.
+    v0.2.97 SE-2: the endpoints are this machine's launcher.db
+    `service_endpoints` row — install.py takes no endpoint from env, so a
+    `WEAVIATE_PORT` / `WEAVIATE_URL` exported beside it changes nothing.
     """
-    saved = {k: os.environ.get(k) for k in ("WEAVIATE_URL", "WEAVIATE_PORT")}
-    os.environ.pop("WEAVIATE_URL", None)
-    os.environ["WEAVIATE_PORT"] = "19731"
-    try:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import install
-        eps = install._bootstrap_weaviate_endpoints()
-    finally:
-        for key, val in saved.items():
-            if val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = val
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import install
+    from tests.common.launcher_db_fixture import make_launcher_db
+    from vco_lib import service_endpoints as se
+
+    db = make_launcher_db(tmp_path / "launcher.db")
+    se.write_rows([se.EndpointRow("weaviate", "vco_managed", 19731, "install_probe",
+                                  grpc_port=51731)], db_path=db)
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db))
+    monkeypatch.setenv("WEAVIATE_PORT", "19999")
+    monkeypatch.setenv("WEAVIATE_URL", "http://env.invalid:1")
+    eps = install._bootstrap_weaviate_endpoints()
     assert eps["base"] == "http://localhost:19731", eps
     assert eps["health"] == "http://localhost:19731/v1/.well-known/ready", eps
+    assert eps["grpc_host"] == "localhost:51731", eps
 
 
 def test_schema_documents_canonical_health_endpoint():

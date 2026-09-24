@@ -132,8 +132,11 @@ def test_build_defaults_service_urls_follow_the_machine_chain(
         se.EndpointRow(service="code_embed", mode="vco_managed", host="127.0.0.1", port=21440,
                        source="install_probe"),
     ], db_path=db)
+    # v0.2.97 SE-2: the gRPC port is the row's too — an exported one is ignored.
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "59999")
     defaults = install_py._build_vco_settings_defaults(embed_config)
     assert defaults["env"]["WEAVIATE_URL"] == "http://weaviate.lan:8090"
+    assert defaults["env"]["GRPC_PORT"] == "50051"
     assert defaults["env"]["OLLAMA_URL"] == "http://localhost:21435"
     assert defaults["env"]["CODE_EMBED_SERVICE_URL"] == "http://127.0.0.1:21440"
 

@@ -53,6 +53,7 @@ values in. Behaviour is byte-for-byte the pre-extraction behaviour.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import urllib.request
@@ -1206,6 +1207,35 @@ def rebind_orchestrator_root_bindings(
             "WHERE project_id = ? AND role = ?",
             (canonical, now_ms, project_id, role),
         )
+
+
+#: The shipped-default Weaviate URL literals older launchers stamped into every
+#: binding row. After the service-endpoints import they are no longer a
+#: statement anybody made — the ``service_endpoints`` row is the source of truth.
+_LEGACY_DEFAULT_BINDING_URL_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1):8081/?$")
+
+
+def null_legacy_default_binding_urls(conn: sqlite3.Connection) -> int:
+    """NULL every ``project_kg_bindings.weaviate_url`` that holds only the
+    legacy shipped default (``http://localhost:8081`` / ``127.0.0.1``), so the
+    binding stops shadowing the ``service_endpoints`` row. A URL the user set
+    to anything else is left alone. Returns the number of rows nulled; a
+    database without the column/table returns 0.
+
+    The caller owns the connection and the transaction (service_reconcile
+    runs this inside the same ``with conn:`` block that deletes the consumed
+    port-override keys, so the legacy cleanup commits or rolls back as one).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT rowid, weaviate_url FROM project_kg_bindings WHERE weaviate_url IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    ids = [r[0] for r in rows if _LEGACY_DEFAULT_BINDING_URL_RE.match(str(r[1]).strip())]
+    for rowid in ids:
+        conn.execute("UPDATE project_kg_bindings SET weaviate_url = NULL WHERE rowid = ?", (rowid,))
+    return len(ids)
 
 
 #: app_state keys R8 converges. `orchestrator_root_kg_collection` is the pointer

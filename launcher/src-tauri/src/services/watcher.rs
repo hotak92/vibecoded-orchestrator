@@ -238,17 +238,16 @@ async fn handle_service_tick<R: Runtime + 'static>(
                 return;
             }
 
-            // v0.2.7 (E1+E2): only attempt restart when we have a real
-            // pinned container to act on. Re-discovery from the watcher
-            // is the v0.2.6 bug — it would auto-spawn a different compose
-            // project's container if our pin was missing. Surface a
-            // `needs_user_pick` alert so the FE can prompt the user
-            // instead.
-            if needs_user_pick(svc).await {
+            // v0.2.97: only VCO's OWN services are restarted — the row says
+            // which. An adopted container's stop is its owner's decision
+            // (respected until the next session, plan §4b); an adopted URL
+            // has no lifecycle; a disabled service is not part of this
+            // install. Logged once, then quiet until the service recovers.
+            if !watcher_may_restart(svc) {
                 log_event(WatcherLogEvent {
                     ts: now_iso(),
                     service: &svc.name,
-                    event: "needs_user_pick",
+                    event: "not_vco_managed",
                     prev_running: prev_running_logged,
                     new_running: Some(false),
                     attempt: None,
@@ -256,17 +255,6 @@ async fn handle_service_tick<R: Runtime + 'static>(
                     container_name: svc.container_name.as_deref(),
                     container_status: None,
                 });
-                let _ = app.emit(
-                    EVT_WATCHER_ALERT,
-                    serde_json::json!({
-                        "service": svc.name,
-                        "kind": "needs_user_pick",
-                        "container_name": svc.container_name,
-                    }),
-                );
-                // Mark given_up so we don't re-emit on every poll tick
-                // until the user resolves it. Recovery (the service
-                // coming back) resets this flag.
                 entry.given_up = true;
                 return;
             }
@@ -393,28 +381,15 @@ async fn schedule_restart<R: Runtime + 'static>(
     });
 }
 
-/// v0.2.7 (E1): true when the watcher MUST NOT auto-restart this
-/// service — either we have no pinned container yet, or the pinned
-/// container is gone. In both cases the FE is prompted to pick.
-async fn needs_user_pick(svc: &ServiceRuntimeState) -> bool {
-    let Some(name) = svc.container_name.as_deref() else {
-        return true; // no pin → can't safely restart
-    };
-    if name.is_empty() {
-        return true;
-    }
-    // Pin exists; verify it still resolves. Soft-fail on runtime
-    // detection — if we can't even find podman/docker, the watcher
-    // doesn't have a path forward either; treat as needs-pick so we
-    // surface the issue.
-    let Some(info) = crate::services::runtime::detect_runtime().await else {
-        return true;
-    };
-    match crate::commands::lifecycle::container_exists(&info, name).await {
-        Ok(true) => false,
-        Ok(false) => true,
-        Err(_) => true,
-    }
+/// May the watcher restart `svc`? Only a `vco_managed` service that is
+/// enabled (its `service_endpoints` row — or none: VCO's own stack). Pure.
+///
+/// This replaces the v0.2.7 "pinned container" check (`needs_user_pick`):
+/// which container a service is, is now its row, never a discovery the
+/// watcher makes.
+pub(crate) fn watcher_may_restart(svc: &ServiceRuntimeState) -> bool {
+    svc.mode == Some(vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged)
+        && svc.endpoint.as_ref().map_or(true, |r| r.enabled)
 }
 
 /// Read the watcher-enabled toggle from app_state. Returns Ok(None) when
@@ -598,37 +573,27 @@ mod tests {
         );
     }
 
-    /// v0.2.7 (E1): `needs_user_pick` short-circuits to `true` when the
-    /// service has no pinned container — without ever invoking the
-    /// runtime. This is the watcher's safety property: missing pin =>
-    /// surface to user, NEVER auto-restart from re-discovery.
-    #[tokio::test]
-    async fn needs_user_pick_short_circuits_when_pin_is_none() {
-        let svc = ServiceRuntimeState {
-            name: "weaviate".to_string(),
-            running: false,
-            port: 8081,
-            url: "http://localhost:8081/v1/meta".to_string(),
-            externally_managed: false,
-            adoption_mode: crate::services::adoption::AdoptionMode::Unresolved,
-            container_name: None,
-            zombie: false, // PR-15: field added; default false for non-zombie test fixture
-        };
-        assert!(needs_user_pick(&svc).await);
-    }
+    /// v0.2.97: the watcher restarts VCO's own services only. Red if the
+    /// gate stops consulting the row's mode.
+    #[test]
+    fn watcher_restarts_only_vco_managed_services() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        use vct_launcher_core::services::service_endpoints::CoreService;
+        use vct_launcher_core::services::service_status::service_state;
+        let own = service_state(CoreService::CodeEmbed, None);
+        assert!(watcher_may_restart(&own), "no row = VCO's own stack");
 
-    #[tokio::test]
-    async fn needs_user_pick_short_circuits_when_pin_is_empty_string() {
-        let svc = ServiceRuntimeState {
-            name: "weaviate".to_string(),
-            running: false,
-            port: 8081,
-            url: "http://localhost:8081/v1/meta".to_string(),
-            externally_managed: false,
-            adoption_mode: crate::services::adoption::AdoptionMode::Adopt,
-            container_name: Some("".to_string()),
-            zombie: false, // PR-15: field added; default false for non-zombie test fixture
-        };
-        assert!(needs_user_pick(&svc).await);
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedContainer, "localhost", 8081);
+        w.grpc_port = Some(50052);
+        w.container_name = Some("their_weaviate".into());
+        assert!(!watcher_may_restart(&service_state(CoreService::Weaviate, Some(w))));
+
+        let o = ServiceEndpointRow::new("ollama", EndpointMode::AdoptedExternal, "gpu.lan", 11434);
+        assert!(!watcher_may_restart(&service_state(CoreService::Ollama, Some(o))));
+
+        let mut c = ServiceEndpointRow::new("code_embed", EndpointMode::VcoManaged, "localhost", 11440);
+        assert!(watcher_may_restart(&service_state(CoreService::CodeEmbed, Some(c.clone()))));
+        c.enabled = false;
+        assert!(!watcher_may_restart(&service_state(CoreService::CodeEmbed, Some(c))));
     }
 }

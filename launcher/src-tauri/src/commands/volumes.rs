@@ -1062,9 +1062,27 @@ async fn restart_services_for_rollback(runtime: &str, compose_dir: &Path) -> Res
     Ok(())
 }
 
-/// HTTP-probe the three default endpoints in a tight loop until they
-/// all respond 2xx/3xx, or `timeout_secs` elapses.
+/// The health URLs [`wait_until_healthy`] polls: Weaviate's and Ollama's
+/// at their `service_endpoints` rows (v0.2.97) — the literals 8081 / 11435
+/// it used before timed out on a machine whose services live elsewhere.
+fn healthy_probe_urls() -> Vec<String> {
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    [CoreService::Weaviate, CoreService::Ollama]
+        .into_iter()
+        .map(|s| health_url(s, machine_row_from_disk(s).as_ref()))
+        .collect()
+}
+
+/// HTTP-probe Weaviate and Ollama in a tight loop until they both respond
+/// 2xx/3xx, or `timeout_secs` elapses.
 async fn wait_until_healthy(timeout_secs: u64) -> bool {
+    let urls = healthy_probe_urls();
+    wait_until_urls_healthy(&urls, timeout_secs).await
+}
+
+/// [`wait_until_healthy`] over explicit `urls` (the test seam).
+async fn wait_until_urls_healthy(urls: &[String], timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -1073,17 +1091,12 @@ async fn wait_until_healthy(timeout_secs: u64) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    // /v1/meta is the right liveness probe for Weaviate — see
-    // commands/lifecycle.rs::canonical_services for why
-    // /v1/.well-known/ready is too strict.
-    let urls = [
-        "http://localhost:8081/v1/meta",
-        "http://localhost:11435/api/tags",
-    ];
+    // /v1/meta is the right liveness probe for Weaviate (see
+    // `service_status::health_path`).
     while std::time::Instant::now() < deadline {
         let mut all_ok = true;
-        for u in &urls {
-            match client.get(*u).send().await {
+        for u in urls {
+            match client.get(u.as_str()).send().await {
                 Ok(r) if r.status().as_u16() < 400 => {}
                 _ => {
                     all_ok = false;
@@ -1614,5 +1627,45 @@ mod tests {
             "found {} `return Err(...)` past the override-write without rollback cleanup",
             suspicious
         );
+    }
+
+    /// SE-4 red-proof (6): `wait_until_healthy` polls Weaviate and Ollama
+    /// where their `service_endpoints` ROWS say — here two live mocks on
+    /// non-default ports. Red against the literal 8081 / 11435 it polled
+    /// before (nothing answers there in a harness; it would time out).
+    #[tokio::test]
+    async fn wait_until_healthy_probes_the_rows() {
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        async fn mock(path: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let app = axum::Router::new().route(path, axum::routing::get(|| async { "{}" }));
+                let _ = axum::serve(listener, app).await;
+            });
+            port
+        }
+        let weaviate_port = mock("/v1/meta").await;
+        let ollama_port = mock("/api/tags").await;
+        let db = crate::db::Db::open().unwrap();
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "127.0.0.1", weaviate_port);
+        w.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::VcoManaged,
+            "127.0.0.1",
+            ollama_port,
+        ))
+        .unwrap();
+        assert_eq!(
+            healthy_probe_urls(),
+            vec![
+                format!("http://127.0.0.1:{}/v1/meta", weaviate_port),
+                format!("http://127.0.0.1:{}/api/tags", ollama_port),
+            ]
+        );
+        assert!(wait_until_healthy(5).await, "both rows' endpoints answer");
     }
 }

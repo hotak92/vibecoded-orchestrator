@@ -1,24 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 """Pure-function tests for `_resolve_compose_working_dir` and
-`_persist_runtime_txt` (v0.2.10 Bug L2 / L3, updated PR-12 v0.2.11 Bug C).
+`_persist_runtime_txt` (v0.2.10 Bug L2 / L3; v0.2.97 SE-2).
 
 The resolution helper is the cross-OS pivot for boot-service
-materialization: it has to pick the right compose-project directory
-without spawning a container runtime. We test the priority matrix
-(NEW priority order, post-PR-12):
+materialization. Its whole matrix since v0.2.97:
 
-    1. CLI override (--compose-working-dir)
-    2. <install>/claude_mcp_servers/
-    3. <install>/infrastructure/
-    4. ps-label probe result (caller-supplied so this stays pure) —
-       last-resort fallback only
-    5. None (give up, caller logs)
+    1. CLI override (--compose-working-dir) — a missing dir is None
+    2. <install>/infrastructure/ — the installer's compose project
+    3. None (give up, caller logs)
 
-The PR-12 inversion (ps_label demoted from priority 2 to priority 4)
-prevents stale `com.docker.compose.project.working_dir` labels from
-prior installs from pinning the boot-service WorkingDirectory to an
-obsolete path across upgrades.
+The legacy `<install>/claude_mcp_servers/` leg and the `claude-mcp`
+ps-label leg are SUPERSEDED by infrastructure/ (every shipped layout has
+it): containers the legacy home created are adopted by name through the
+service_endpoints rows, never composed from there.
 
 These tests do NOT touch the real filesystem outside tmp_path and do
 NOT spawn subprocesses — they're hermetic and run on every OS.
@@ -43,185 +38,57 @@ def test_cli_override_wins_when_dir_exists(tmp_path: Path):
     override.mkdir()
     install_path = tmp_path / "install"
     install_path.mkdir()
-    # Even if other candidates exist, CLI override beats them all.
-    (install_path / "claude_mcp_servers").mkdir()
     (install_path / "infrastructure").mkdir()
-
     resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=str(override),
-        ps_label_value=str(install_path / "claude_mcp_servers"),
+        install_path=install_path, cli_override=str(override),
     )
     assert resolved == override.resolve()
 
 
 def test_cli_override_missing_dir_returns_none(tmp_path: Path):
-    # Override points at a non-existent dir → resolution returns None
-    # (per design: explicit user error worth surfacing — not a silent
-    # fall-through to a fallback that might be wrong).
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=str(tmp_path / "does-not-exist"),
-        ps_label_value=None,
+        install_path=install_path, cli_override=str(tmp_path / "does-not-exist"),
     )
     assert resolved is None
 
 
-def test_install_subdir_wins_over_ps_label(tmp_path: Path):
-    """PR-12 Bug C: when both `<install>/claude_mcp_servers/` AND a
-    ps_label_value exist, the install subdir wins. This is the priority
-    inversion that prevents stale containers from a prior install path
-    from pinning the new boot-service WorkingDirectory.
-
-    Pre-PR-12 this assertion was the OPPOSITE (ps_label won)."""
-    label_dir = tmp_path / "label-compose-dir"
-    label_dir.mkdir()
+def test_infrastructure_is_the_working_dir(tmp_path: Path):
     install_path = tmp_path / "install"
-    install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
-    cms.mkdir()
-
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=str(label_dir),
-    )
-    # NEW priority order — install subdir wins over ps_label.
-    assert resolved == cms.resolve()
-
-
-def test_ps_label_used_only_when_no_install_subdir(tmp_path: Path):
-    """PR-12 Bug C: ps_label is now the LAST-RESORT fallback (priority
-    4). It only takes effect when neither
-    `<install>/claude_mcp_servers/` nor `<install>/infrastructure/`
-    exists locally — the rare edge case where compose.yaml ships in a
-    sibling repo entirely outside install_path."""
-    label_dir = tmp_path / "label-compose-dir"
-    label_dir.mkdir()
-    install_path = tmp_path / "install"
-    install_path.mkdir()
-    # Note: no claude_mcp_servers/ or infrastructure/ subdirs created.
-
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=str(label_dir),
-    )
-    assert resolved == label_dir.resolve()
-
-
-def test_ps_label_missing_dir_falls_through(tmp_path: Path):
-    install_path = tmp_path / "install"
-    install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
-    cms.mkdir()
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=str(tmp_path / "label-does-not-exist"),
-    )
-    # ps label dir doesn't exist → install/claude_mcp_servers wins
-    # (also wins on the new priority order even if the label dir DID
-    # exist — covered by test_install_subdir_wins_over_ps_label).
-    assert resolved == cms.resolve()
-
-
-def test_ps_label_skipped_when_install_subdir_present(tmp_path: Path):
-    """PR-12 Bug C regression guard: even when ps_label points at a
-    perfectly valid existing dir that is DIFFERENT from the install
-    subdirs, the install subdir still wins. This is the canonical
-    "stale prior-install container" scenario."""
-    install_path = tmp_path / "install"
-    install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
-    cms.mkdir()
-    # A stale ps-label value pointing at an old install location that
-    # still exists on disk (common: user kept the old install around).
-    stale_old_install = tmp_path / "old-install" / "claude_mcp_servers"
-    stale_old_install.mkdir(parents=True)
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=str(stale_old_install),
-    )
-    # Must resolve to the NEW install location, not the stale one.
-    assert resolved == cms.resolve()
-    assert resolved != stale_old_install.resolve()
-
-
-def test_install_claude_mcp_servers_fallback(tmp_path: Path):
-    install_path = tmp_path / "install"
-    install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
-    cms.mkdir()
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=None,
-    )
-    assert resolved == cms.resolve()
-
-
-def test_install_infrastructure_fallback(tmp_path: Path):
-    """When claude_mcp_servers/ doesn't exist, fall through to
-    infrastructure/ — the VCO-native layout."""
-    install_path = tmp_path / "install"
-    install_path.mkdir()
     infra = install_path / "infrastructure"
-    infra.mkdir()
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=None,
-    )
+    infra.mkdir(parents=True)
+    resolved = install._resolve_compose_working_dir(install_path=install_path, cli_override=None)
     assert resolved == infra.resolve()
 
 
-def test_claude_mcp_servers_preferred_over_infrastructure(tmp_path: Path):
-    """When both exist, claude_mcp_servers/ wins (priority 3 < priority 4
-    in the resolver's spec)."""
+def test_the_legacy_home_is_never_the_working_dir(tmp_path: Path):
+    """Superseded by infrastructure/: a checkout that has ONLY the legacy
+    `claude_mcp_servers/` gets no working dir (the caller warns and asks for
+    --compose-working-dir) rather than composing VCO's services there."""
     install_path = tmp_path / "install"
-    install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
-    cms.mkdir()
+    (install_path / "claude_mcp_servers").mkdir(parents=True)
+    assert install._resolve_compose_working_dir(install_path=install_path, cli_override=None) is None
     (install_path / "infrastructure").mkdir()
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=None,
-    )
-    assert resolved == cms.resolve()
+    assert install._resolve_compose_working_dir(
+        install_path=install_path, cli_override=None) == (install_path / "infrastructure").resolve()
 
 
 def test_no_candidate_returns_none(tmp_path: Path):
-    """Empty install dir, no override, no ps label → None."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override=None,
-        ps_label_value=None,
-    )
-    assert resolved is None
+    assert install._resolve_compose_working_dir(install_path=install_path, cli_override=None) is None
 
 
 def test_empty_string_override_treated_as_missing(tmp_path: Path):
     """Argparse may pass "" for an absent --compose-working-dir flag
     depending on caller wrapper. Treat as None."""
     install_path = tmp_path / "install"
-    install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
-    cms.mkdir()
-    resolved = install._resolve_compose_working_dir(
-        install_path=install_path,
-        cli_override="",
-        ps_label_value=None,
-    )
-    # Empty string falsey → skip override → fall through to claude_mcp_servers
-    assert resolved == cms.resolve()
+    infra = install_path / "infrastructure"
+    infra.mkdir(parents=True)
+    resolved = install._resolve_compose_working_dir(install_path=install_path, cli_override="")
+    assert resolved == infra.resolve()
 
 
 # ---------------------------------------------------------------------------

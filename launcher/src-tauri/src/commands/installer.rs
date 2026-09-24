@@ -214,6 +214,15 @@ pub struct InstallConfig {
     /// regenerates state files in place).
     #[serde(default)]
     pub lightweight_old_path: Option<String>,
+    /// v0.2.97 (lane Y, owner ruling Q1): the wizard's explicit per-service
+    /// endpoint answers, forwarded to install.py's repeatable
+    /// `--service SVC=CHOICE` flag (`weaviate=adopt:container:<name>`,
+    /// `ollama=adopt:url:<url>`, `weaviate=vco[:<port>]`, …). Each value is
+    /// validated by [`service_choice_args`] against the grammar install.py's
+    /// `parse_service_flag` enforces — a malformed one would abort the whole
+    /// install (strict argparse), so the GUI can never send one.
+    #[serde(default)]
+    pub service_choices: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,12 +679,9 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
     })
 }
 
-/// Default ports for the shared services. Match install.py constants —
-/// changing them here without changing install.py would mean the wizard
-/// reports "no services running" while install.py happily reuses them.
-pub(crate) const DEFAULT_WEAVIATE_PORT: u16 = 8081;
-pub(crate) const DEFAULT_OLLAMA_PORT: u16 = 11435;
-pub(crate) const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
+// v0.2.97: the wizard's default-port constants are gone — every probe here
+// resolves through `vct_launcher_core::services::service_endpoints` (the
+// row, else ITS compiled defaults, the one copy).
 
 /// HTTP probe with short timeout. Returns the URL on 2xx/3xx, None otherwise.
 /// Takes an owned String so callers can compose URLs via format! without
@@ -713,18 +719,18 @@ async fn probe_http(url: String) -> Option<String> {
 /// on purpose (Rust = "any signal Weaviate is reachable", Python =
 /// "Weaviate fully initialised and ready to serve queries"). See
 /// commands/lifecycle.rs::canonical_services for the rationale.
-/// The wizard's service-detection probe URLs. v0.2.97: ports come from the
-/// ONE resolver (`machine_service_ports` over `service_endpoints`: the
-/// launcher.db row, else the default) — the compiled-in defaults this
-/// replaces meant a moved service was probed on the wrong port during
-/// onboarding detection.
+/// The wizard's service-detection probe URLs: each service's health URL at
+/// its launcher.db `service_endpoints` row (host AND port), else the
+/// compiled default. This command also runs before install, when no
+/// orchestrator clone — and so no Python detector — exists yet; it answers
+/// "does something answer where VCO would reach it?". The full candidate
+/// detection (containers, upstream-default ports, VCO-data fingerprints) is
+/// `commands::lifecycle::services_endpoint_candidates`.
 fn detect_probe_urls() -> (String, String, String) {
-    let ports = crate::mcp_registration::machine_service_ports();
-    (
-        format!("http://localhost:{}/v1/meta", ports.weaviate_port),
-        format!("http://localhost:{}/api/tags", ports.ollama_port),
-        format!("http://localhost:{}/health", ports.code_embed_port),
-    )
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    let url = |s: CoreService| health_url(s, machine_row_from_disk(s).as_ref());
+    (url(CoreService::Weaviate), url(CoreService::Ollama), url(CoreService::CodeEmbed))
 }
 
 #[command]
@@ -2474,9 +2480,14 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// already present on the running instance; empty Vec if Weaviate is
 /// not reachable.
 async fn detect_existing_collections() -> Vec<String> {
+    // v0.2.97: the machine's Weaviate (its `service_endpoints` row), not the
+    // literal 8081 — the preflight reported an adopted or moved instance's
+    // classes as absent.
     let url = format!(
-        "http://localhost:{}/v1/schema",
-        DEFAULT_WEAVIATE_PORT
+        "{}/v1/schema",
+        vct_launcher_core::services::service_endpoints::machine_url_from_disk(
+            vct_launcher_core::services::service_endpoints::CoreService::Weaviate
+        )
     );
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
@@ -2856,21 +2867,19 @@ pub async fn install_orchestrator(
     if config.skip_containers {
         install_args.push("--no-containers".to_string());
     }
+    // v0.2.97 (lane Y): the wizard's per-service endpoint answers (owner
+    // ruling Q1) — install.py's `--service SVC=CHOICE` flags.
+    install_args.extend(service_choice_args(config.service_choices.as_deref().unwrap_or(&[]))?);
 
     let python_cmd = &system.python_cmd;
     // v0.2.95 phase 3 (WP-3): the ONE home (see `install_py_command`).
     let mut cmd = install_py_command(python_cmd, &install_path, &install_args);
 
-    // PR-3 (2026-05-06): forward the launcher's resolved service ports to
-    // install.py (whose own chain starts from these env keys). v0.2.97
-    // (lane X): the ports themselves come from the ONE home —
-    // `mcp_registration::machine_service_ports` over `service_endpoints`
-    // (the launcher.db row, else the default). See
-    // `launcher-settings-propagation-audit-2026-05-06.md` §9.
-    let ports = crate::mcp_registration::machine_service_ports();
-    cmd.env("WEAVIATE_PORT", ports.weaviate_port.to_string())
-        .env("OLLAMA_PORT", ports.ollama_port.to_string())
-        .env("CODE_EMBED_PORT", ports.code_embed_port.to_string());
+    // v0.2.97 (lane Y): the `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT`
+    // env hand-off that used to live here is GONE — install.py no longer
+    // reads those keys from its environment (it resolves everything from
+    // the `service_endpoints` rows, which it reads and writes itself), and
+    // the wizard's explicit answers now travel as `--service` flags.
 
     // Windows: suppress the transient cmd console window that pops up
     // when Tauri (a windowed app, no console) spawns a subprocess.
@@ -2919,8 +2928,9 @@ pub async fn install_orchestrator(
     // fallback) backstops this anyway.
     emit_progress(&window, "register", "Registering MCP servers in ~/.claude.json...", 92.0);
     let install_root_path = std::path::PathBuf::from(&config.install_path);
-    // v0.2.97 (lane X): same ONE port source resolved above for the env
-    // hand-off — `machine_service_ports` (grpc: env → default).
+    // v0.2.97: the machine rows (`machine_service_ports`, gRPC included),
+    // re-read now that install.py has run.
+    let ports = crate::mcp_registration::machine_service_ports();
     let db_for_register = window.app_handle().try_state::<Db>();
     let db_ref = db_for_register.as_ref().map(|s| s.inner());
     match crate::mcp_registration::register_default_orchestrator_mcps(
@@ -3078,6 +3088,117 @@ pub(crate) fn install_py_command<S: AsRef<std::ffi::OsStr>>(
     cmd
 }
 
+/// v0.2.97 (lane Y): `adopt:url:` validation — a faithful mirror of install.py's
+/// `vco_lib/service_reconcile.py::parse_url` + the grammar cap.
+/// MUST MATCH that Python function (the authoritative grammar) and the ONE
+/// committed table `tests/fixtures/service_flag_grammar_cases.json`, which
+/// locks BOTH sides (tier C mirror, A>B>C rule — the wizard runs before the
+/// orchestrator clone exists, so it cannot call Python).
+fn valid_adopt_url(url: &str) -> bool {
+    // Grammar data: at most 512 characters (bytes ≡ chars for the ASCII the
+    // rest of the check forces), no whitespace, no control characters.
+    if url.is_empty() || url.len() > 512 {
+        return false;
+    }
+    if url.chars().any(|c: char| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    // parse_url: scheme://authority[/path]; the scheme is case-insensitive.
+    let Some((scheme, after)) = url.split_once("://") else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let authority = after.split('/').next().unwrap_or("");
+    let host = if authority.starts_with('[') {
+        // IPv6 literal: everything up to and including the closing bracket.
+        match authority.find(']') {
+            Some(i) => &authority[..=i],
+            None => "",
+        }
+    } else if authority.contains(':') {
+        authority.rsplit_once(':').map_or("", |(h, _)| h)
+    } else {
+        authority
+    };
+    if host.is_empty() {
+        return false;
+    }
+    // port_of_url: an explicit port must be digits within u16; an absent,
+    // empty or non-digit suffix falls back to the scheme default (accepted).
+    let tail = match authority.rfind(']') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    if let Some((_, port)) = tail.rsplit_once(':') {
+        if !port.is_empty()
+            && port.bytes().all(|b: u8| b.is_ascii_digit())
+            && port.parse::<u16>().is_err()
+        {
+            return false; // digits, but over 65535
+        }
+    }
+    true
+}
+
+/// v0.2.97 (lane Y): validates and normalises ONE `--service` value against
+/// install.py's grammar. Returns `(service, kind, value)` — the exact parse
+/// `vco_lib/service_reconcile.py::parse_service_flag` produces (value: the
+/// container name, the URL, or the port text; `None` for a bare `vco`).
+///
+/// MUST MATCH `vco_lib/service_reconcile.py::parse_service_flag` (the
+/// authoritative grammar install.py acts on). The grammar's DATA lives in the
+/// ONE committed table `tests/fixtures/service_flag_grammar_cases.json`;
+/// both sides run every case against it
+/// (`service_flag_grammar_matches_the_committed_fixture` here,
+/// `test_service_flag_grammar_fixture` in tests/test_v0297_service_reconcile.py).
+/// A case that disagrees is a drift in one implementation, never a reason to
+/// fork the table.
+fn parse_service_choice(choice: &str) -> Result<(&str, &str, Option<&str>), String> {
+    let bad = |why: &str| format!("service choice {:?}: {}", choice, why);
+    let (service, rest) = match choice.split_once('=') {
+        Some((s, r)) => (s.trim(), r),
+        None => return Err(bad("expected <weaviate|ollama|code_embed>=<choice>")),
+    };
+    if !matches!(service, "weaviate" | "ollama" | "code_embed") {
+        return Err(bad("expected <weaviate|ollama|code_embed>=<choice>"));
+    }
+    let kind = if let Some(name) = rest.strip_prefix("adopt:container:") {
+        if name.is_empty() {
+            return Err(bad("adopt:container: needs a container name"));
+        }
+        "adopt_container"
+    } else if let Some(url) = rest.strip_prefix("adopt:url:") {
+        if !valid_adopt_url(url) {
+            return Err(bad(
+                "adopt:url: needs an http(s)://host[:port] URL of at most 512 characters, \
+                 with no whitespace",
+            ));
+        }
+        "adopt_url"
+    } else if rest == "vco"
+        || (rest.starts_with("vco:")
+            && rest.len() > 4
+            && rest[4..].bytes().all(|b: u8| b.is_ascii_digit())
+            && rest[4..].parse::<u16>().map(|p| p >= 1).unwrap_or(false))
+    {
+        "vco"
+    } else {
+        return Err(bad("choice must be adopt:container:<name>, adopt:url:<url> or vco[:<port>]"));
+    };
+    if service == "code_embed" && kind != "vco" {
+        return Err(bad("code-embed is always VCO's own (use vco[:<port>])"));
+    }
+    let value = match kind {
+        "adopt_container" => rest.strip_prefix("adopt:container:"),
+        "adopt_url" => rest.strip_prefix("adopt:url:"),
+        _ => rest.strip_prefix("vco:").filter(|p| !p.is_empty()),
+    };
+    Ok((service, kind, value))
+}
+
 /// Builds the install.py argv for the subprocess. Extracted as a
 /// pub(crate) helper so unit tests can verify the argv shape WITHOUT
 /// spawning a real subprocess (which would require a Python interpreter
@@ -3085,6 +3206,21 @@ pub(crate) fn install_py_command<S: AsRef<std::ffi::OsStr>>(
 ///
 /// v0.2.95 phase 3: the returned argv no longer carries `install.py` itself —
 /// [`install_py_command`] owns that, so no call site can spell it.
+/// v0.2.97 (lane Y): the wizard's per-service endpoint answers → install.py's
+/// repeatable `--service SVC=CHOICE` flags, as `["--service", "<choice>", …]`,
+/// each validated by [`parse_service_choice`] so a malformed value errors on
+/// the LAUNCHER side — install.py's strict argparse would abort the whole
+/// install with exit 2 otherwise.
+pub(crate) fn service_choice_args(choices: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for choice in choices {
+        parse_service_choice(choice)?;
+        out.push("--service".to_string());
+        out.push(choice.clone());
+    }
+    Ok(out)
+}
+
 pub(crate) fn build_lightweight_install_argv(
     use_gpu: bool,
     cpu_only: bool,
@@ -3166,16 +3302,9 @@ async fn run_install_orchestrator_lightweight(
     // v0.2.95 phase 3 (WP-3): the ONE home (see `install_py_command`).
     let mut cmd = install_py_command(python_cmd, &install_path, &argv);
 
-    // Forward the same launcher-resolved service ports the full path
-    // does — from the ONE home (`machine_service_ports`, v0.2.97 lane
-    // X: app_state override → services.toml adoption → default).
-    // install.py's lightweight branch reads these so a port override
-    // survives a re-install. See `install.py:1352 _run_lightweight` and
-    // the env-write block in `_lightweight_rewrite_paths`.
-    let ports = crate::mcp_registration::machine_service_ports();
-    cmd.env("WEAVIATE_PORT", ports.weaviate_port.to_string())
-        .env("OLLAMA_PORT", ports.ollama_port.to_string())
-        .env("CODE_EMBED_PORT", ports.code_embed_port.to_string());
+    // v0.2.97 (lane Y): no service-port env hand-off here either —
+    // install.py no longer reads WEAVIATE_PORT/OLLAMA_PORT/CODE_EMBED_PORT
+    // from its environment (see the full path's note above).
 
     #[cfg(windows)]
     {
@@ -3225,8 +3354,9 @@ async fn run_install_orchestrator_lightweight(
         95.0,
     );
     let install_root_path = std::path::PathBuf::from(install_path.to_string_lossy().to_string());
-    // v0.2.97 (lane X): same ONE port source resolved above for the env
-    // hand-off — `machine_service_ports` (grpc: env → default).
+    // v0.2.97: the machine rows (`machine_service_ports`, gRPC included),
+    // re-read now that install.py has run.
+    let ports = crate::mcp_registration::machine_service_ports();
     let db_for_register = window.app_handle().try_state::<Db>();
     let db_ref = db_for_register.as_ref().map(|s| s.inner());
     match crate::mcp_registration::register_default_orchestrator_mcps(
@@ -11376,7 +11506,8 @@ mod tests {
         // not a leg.
         let _g = vct_launcher_core::test_env::state_dir_guard();
         let (w, _o, _c) = detect_probe_urls();
-        assert_eq!(w, "http://localhost:8081/v1/meta");
+        // No row on this harness state dir: the unroutable sentinel.
+        assert_eq!(w, "http://127.0.0.1:9/v1/meta");
         let db = vct_launcher_core::db::Db::open().unwrap();
         db.app_state_set("weaviate.port_override", "18083").unwrap();
         let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
@@ -11389,6 +11520,16 @@ mod tests {
         db.service_endpoint_seed_for_tests(&row).unwrap();
         let (w, _o, _c) = detect_probe_urls();
         assert_eq!(w, "http://localhost:18081/v1/meta");
+        // An adopted external Ollama is probed at its host.
+        db.service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "ollama",
+            vct_launcher_core::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "gpu.lan",
+            11434,
+        ))
+        .unwrap();
+        let (_w, o, _c) = detect_probe_urls();
+        assert_eq!(o, "http://gpu.lan:11434/api/tags");
     }
 
     // ── v0.2.60 Piece 5: min_upgradable_from version floor ──────────────
@@ -16127,6 +16268,119 @@ MemAvailable:   23456789 kB
             let cfg: InstallConfig = serde_json::from_value(json_full).unwrap();
             assert!(cfg.lightweight);
             assert_eq!(cfg.lightweight_old_path.as_deref(), Some("/old/path"));
+        }
+
+        /// v0.2.97 (lane Y): `service_choices` deserialises when absent
+        /// (older wizard payloads) and round-trips when set.
+        #[test]
+        fn install_config_deserialises_service_choices() {
+            let json_minimal = serde_json::json!({
+                "install_path": "/x",
+                "use_gpu": false,
+                "cpu_only": false,
+                "openai_key": null,
+                "container_runtime": null,
+                "skip_containers": false,
+            });
+            let cfg: InstallConfig = serde_json::from_value(json_minimal).unwrap();
+            assert!(cfg.service_choices.is_none(), "default service_choices=None");
+
+            let json_full = serde_json::json!({
+                "install_path": "/x",
+                "use_gpu": false,
+                "cpu_only": false,
+                "openai_key": null,
+                "container_runtime": null,
+                "skip_containers": false,
+                "service_choices": ["weaviate=vco", "ollama=adopt:url:http://ollama.lan:11434"],
+            });
+            let cfg: InstallConfig = serde_json::from_value(json_full).unwrap();
+            assert_eq!(
+                cfg.service_choices.as_deref().unwrap_or(&[]),
+                &["weaviate=vco".to_string(), "ollama=adopt:url:http://ollama.lan:11434".to_string()],
+            );
+        }
+
+        /// v0.2.97 (lane Y): the wizard's answers become `--service` flags,
+        /// and a value install.py's `parse_service_flag` would reject is
+        /// refused on the LAUNCHER side (strict argparse would abort the
+        /// whole install otherwise).
+        #[test]
+        fn service_choice_args_builds_flags_and_rejects_malformed_values() {
+            // Red-proof pair for the flag forwarding: adopt-by-container,
+            // adopt-by-url, vco and vco-with-port all pass through verbatim.
+            let argv = service_choice_args(&[
+                "weaviate=adopt:container:their_weaviate".to_string(),
+                "ollama=adopt:url:http://ollama.lan:11434".to_string(),
+                "weaviate=vco".to_string(),
+                "code_embed=vco:21440".to_string(),
+            ])
+            .expect("all valid");
+            assert_eq!(
+                argv,
+                vec![
+                    "--service".to_string(),
+                    "weaviate=adopt:container:their_weaviate".to_string(),
+                    "--service".to_string(),
+                    "ollama=adopt:url:http://ollama.lan:11434".to_string(),
+                    "--service".to_string(),
+                    "weaviate=vco".to_string(),
+                    "--service".to_string(),
+                    "code_embed=vco:21440".to_string(),
+                ]
+            );
+            assert!(service_choice_args(&[]).unwrap().is_empty());
+
+            // The rejections mirror install.py's grammar.
+            for bad in [
+                "redis=adopt:url:http://x:1",           // unknown service
+                "weaviate=adopt:container:",            // empty container name
+                "weaviate=adopt:url:not-a-url",         // not http(s)
+                "weaviate=adopt:url:http://a b",        // whitespace in URL
+                "weaviate=vco:abc",                     // non-numeric port
+                "weaviate=vco:",                        // empty port suffix
+                "code_embed=adopt:container:c",         // code-embed is VCO's own
+                "weaviate",                             // no '=' at all
+            ] {
+                let err = service_choice_args(&[bad.to_string()])
+                    .expect_err("must be rejected on the launcher side");
+                assert!(err.contains(bad), "error names the value: {err}");
+            }
+        }
+
+        /// v0.2.97: the ONE committed `--service` grammar table (tier C mirror,
+        /// A>B>C): every case runs through BOTH this validator and install.py's
+        /// `parse_service_flag` (tests/test_v0297_service_reconcile.py::
+        /// test_service_flag_grammar_fixture). A disagreement here is a drift in
+        /// one of the two implementations, never a reason to fork the table.
+        #[test]
+        fn service_flag_grammar_matches_the_committed_fixture() {
+            let table: serde_json::Value = serde_json::from_str(
+                include_str!("../../../../tests/fixtures/service_flag_grammar_cases.json"),
+            )
+            .expect("fixture must parse");
+            let accept = table["accept"].as_array().expect("accept cases");
+            let reject = table["reject"].as_array().expect("reject cases");
+            assert!(!accept.is_empty() && !reject.is_empty());
+            for case in accept {
+                let input = case["input"].as_str().expect("input");
+                let expect = &case["expect"];
+                let (service, kind, value) =
+                    parse_service_choice(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+                assert_eq!(service, expect["service"].as_str().expect("service"), "{input}");
+                assert_eq!(kind, expect["kind"].as_str().expect("kind"), "{input}");
+                match expect["value"].as_str() {
+                    Some(want) => assert_eq!(value, Some(want), "{input}"),
+                    None => assert_eq!(value, None, "{input}"),
+                }
+            }
+            for case in reject {
+                let input = case["input"].as_str().expect("input");
+                assert!(
+                    parse_service_choice(input).is_err(),
+                    "{input} must be rejected on the launcher side"
+                );
+            }
         }
     }
 

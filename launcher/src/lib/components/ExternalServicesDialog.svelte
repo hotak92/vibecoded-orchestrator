@@ -1,284 +1,380 @@
 <script lang="ts">
-  // ExternalServicesDialog — surfaces the list of services that the
-  // launcher detected running on the canonical ports BUT didn't start
-  // itself. The user picks adopt-vs-parallel-vs-cancel per service; the
-  // choice is persisted to ~/.vct/services.toml so we don't re-prompt
-  // every launcher boot.
+  // ExternalServicesDialog — "where should this service run?"
   //
-  // Triggered by the `vct-external-services-detected` event emitted by
-  // `commands::lifecycle::auto_start_on_boot` (Rust side). Subscribed
-  // from +layout.svelte so any route can show the dialog.
+  // v0.2.97 (service endpoints SSOT). Two ways in:
+  //   * launcher boot: `commands::lifecycle::auto_start_on_boot` emits
+  //     `vct-external-services-detected` with the Python detector's
+  //     candidate report when a service's endpoint is undecided — above all
+  //     a third-party Weaviate, which VCO never adopts without the user's
+  //     explicit confirmation (owner ruling Q1). Mounted once in
+  //     +layout.svelte, so any route shows it.
+  //   * the Services page's "Change…" / "Detect services", which passes a
+  //     `report` (and optionally the one service to show).
+  //
+  // Per service the user either picks a candidate ("Use this one") or runs
+  // VCO's own copy on a free port. Both are `python -m
+  // vco_lib.service_endpoints` verbs (the rows' one writer), which also
+  // re-project every project, refresh the MCP registration and resolve the
+  // UPDATE_DEFERRED entry that asked the question (for the third-party
+  // Weaviate: `service_adoption_confirmation_required`, whose row is the
+  // DISABLED `vco_managed` Weaviate — "waiting for your choice"; nothing
+  // starts or heals it meanwhile). There is no "refuse" and
+  // no "reset": "Decide later" leaves the question open, and the launcher
+  // asks again next time.
 
   import { onMount } from 'svelte';
-  import { invoke, listen } from '$lib/tauri';
+  import { listen } from '$lib/tauri';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import {
+    adoptActionFor,
+    adoptNeedsKgConfirm,
+    buildCandidateReport,
+    candidateFacts,
+    CORE_SERVICES,
+    isAdoptable,
+    pendingServices,
+    runEndpointAction,
+    serviceLabel,
+    vcoCopyAction,
+    vcoCopyNeedsKgConfirm,
+    vcoDataLine,
+    type CandidateReport,
+    type ChoiceEvent,
+    type CoreServiceName,
+    type EndpointAction,
+    type EndpointCandidate,
+  } from '$lib/api/service_endpoints';
 
-  interface ServiceRuntimeState {
-    name: string;
-    running: boolean;
-    port: number;
-    url: string;
-    externally_managed: boolean;
-    adoption_mode: 'unresolved' | 'adopt' | 'parallel' | 'refuse';
-  }
+  let {
+    open = $bindable(false),
+    report = $bindable<CandidateReport | null>(null),
+    only = null,
+    listenForBoot = true,
+    onchanged,
+  }: {
+    open?: boolean;
+    report?: CandidateReport | null;
+    /** Show just this service (the Services page's "Change…"). */
+    only?: CoreServiceName | null;
+    /** The +layout instance listens for the boot event; page instances don't. */
+    listenForBoot?: boolean;
+    /** Called after a verb succeeded, so the caller re-reads the snapshot. */
+    onchanged?: () => void;
+  } = $props();
 
-  type Mode = 'adopt' | 'parallel' | 'refuse';
-
-  let detected = $state<ServiceRuntimeState[]>([]);
-  let open = $state(false);
-  // Per-service user choice + parallel-port pick.
-  let choices = $state<Record<string, Mode>>({});
-  let parallelPorts = $state<Record<string, number>>({});
-  let saving = $state(false);
+  let busy = $state<string | null>(null);
   let error = $state<string | null>(null);
+  let done = $state<Record<string, string>>({});
+  let kgConfirmed = $state<Record<string, boolean>>({});
 
-  // Suggested port ranges for parallel mode. We start above the canonical
-  // ports + 10 to give headroom for users who already shifted ports.
-  const parallelRanges: Record<string, [number, number]> = {
-    weaviate: [8090, 8200],
-    ollama: [11445, 11500],
-    code_embed: [11450, 11500],
-  };
+  const shown = $derived.by((): CoreServiceName[] => {
+    if (!report) return [];
+    if (only) return report.services[only] ? [only] : [];
+    const pending = pendingServices(report);
+    return pending.length > 0 ? pending : CORE_SERVICES.filter((s) => s !== 'code_embed' && report?.services[s]);
+  });
 
-  async function probeFreePort(name: string): Promise<number | null> {
-    const range = parallelRanges[name];
-    if (!range) return null;
-    try {
-      return await invoke<number>('services_find_free_port', {
-        start: range[0],
-        end: range[1],
-      });
-    } catch (e) {
-      console.error(`[external-services-dialog] free port probe failed: ${e}`);
-      return null;
-    }
+  function candidateTitle(c: EndpointCandidate): string {
+    return c.container_name ?? c.url;
   }
 
-  async function onModeChange(name: string, newMode: Mode) {
-    choices[name] = newMode;
-    if (newMode === 'parallel' && !parallelPorts[name]) {
-      const port = await probeFreePort(name);
-      if (port) parallelPorts[name] = port;
-    }
-  }
-
-  async function applyChoices() {
-    saving = true;
+  async function run(service: CoreServiceName, action: EndpointAction, key: string) {
+    busy = key;
     error = null;
     try {
-      for (const svc of detected) {
-        const mode = choices[svc.name];
-        if (!mode) continue;
-        await invoke('services_set_adoption', {
-          decision: {
-            name: svc.name,
-            mode,
-            parallel_port: mode === 'parallel' ? parallelPorts[svc.name] : null,
-            external_url: svc.url,
-          },
-        });
+      await runEndpointAction(action);
+      done = {
+        ...done,
+        [service]: action.action === 'use_vco_copy' ? "VCO's own copy" : 'the endpoint you picked',
+      };
+      onchanged?.();
+      if (shown.every((s) => done[s])) {
+        open = false;
       }
-      open = false;
     } catch (e) {
       error = String(e);
     } finally {
-      saving = false;
+      busy = null;
     }
   }
 
-  function cancel() {
-    // Cancel = leave them all unresolved. The launcher will re-prompt
-    // on next boot. We don't persist anything.
+  function decideLater() {
     open = false;
   }
 
+  function reset() {
+    done = {};
+    kgConfirmed = {};
+    error = null;
+  }
+
   onMount(() => {
+    if (!listenForBoot) return;
     let unlisten: (() => void) | null = null;
-    listen<ServiceRuntimeState[]>('vct-external-services-detected', (e) => {
-      detected = e.payload ?? [];
-      // Default everyone to "adopt" — the safest no-op default. User
-      // can flip to parallel/refuse before clicking Apply.
-      const fresh: Record<string, Mode> = {};
-      for (const svc of detected) fresh[svc.name] = 'adopt';
-      choices = fresh;
-      parallelPorts = {};
-      open = detected.length > 0;
+    listen<ChoiceEvent>('vct-external-services-detected', (e) => {
+      const p = e.payload;
+      report = p ? buildCandidateReport(p.detection, p.rows ?? {}, p.pending ?? []) : null;
+      reset();
+      open = pendingServices(report).length > 0;
     }).then((u) => {
       unlisten = u;
     });
-    return () => {
-      if (unlisten) unlisten();
-    };
+    return () => unlisten?.();
   });
 </script>
 
-{#if open}
-  <div class="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="external-services-title">
-    <div class="dialog-card">
-      <h2 id="external-services-title">Existing services detected</h2>
-      <p class="lead">
-        VCT found services already running on this machine that weren't
-        started by the launcher. Pick how you want to handle each one:
+<DialogRoot bind:open width="720px" ariaLabelledBy="endpoint-dialog-title" onClose={reset}>
+  {#snippet header()}
+    <h2 id="endpoint-dialog-title" class="title">
+      {only ? `Where should ${serviceLabel(only)} run?` : 'Where should VCO’s services run?'}
+    </h2>
+    <p class="lead">
+      VCO found services it did not start. Pick one to use as it is, or let VCO run
+      its own copy next to it on a free port. VCO never starts a second copy of a
+      service you already run without asking.
+    </p>
+  {/snippet}
+
+  {#snippet body()}
+    {#if !report}
+      <p class="muted">Detecting services…</p>
+    {:else if shown.length === 0}
+      <p class="muted">Nothing to decide: every service has an endpoint.</p>
+    {/if}
+    {#if report?.error}
+      <p class="error" role="alert">
+        Detecting existing services failed ({report.error}). You can still run VCO’s own copy.
       </p>
-      <ul class="service-list">
-        {#each detected as svc}
-          <li>
-            <div class="svc-header">
-              <strong>{svc.name}</strong>
-              <span class="svc-url">{svc.url}</span>
-            </div>
-            <div class="svc-options">
-              <label>
-                <input
-                  type="radio"
-                  name="mode-{svc.name}"
-                  value="adopt"
-                  checked={choices[svc.name] === 'adopt'}
-                  onchange={() => onModeChange(svc.name, 'adopt')}
-                />
-                Adopt — route to this existing endpoint as-is
-              </label>
-              <label>
-                <input
-                  type="radio"
-                  name="mode-{svc.name}"
-                  value="parallel"
-                  checked={choices[svc.name] === 'parallel'}
-                  onchange={() => onModeChange(svc.name, 'parallel')}
-                />
-                Run parallel on different port
-                {#if choices[svc.name] === 'parallel'}
-                  <input
-                    type="number"
-                    min="1024"
-                    max="65535"
-                    bind:value={parallelPorts[svc.name]}
-                    placeholder="port"
-                    class="port-input"
-                  />
+    {/if}
+    {#each shown as service (service)}
+      {@const sc = report?.services[service]}
+      <section class="svc glass-card" data-testid="endpoint-service-{service}">
+        <header class="svc-head">
+          <h3>{serviceLabel(service)}</h3>
+          {#if done[service]}
+            <span class="badge ok">Now using {done[service]}</span>
+          {:else if sc?.pending_consent}
+            <span class="badge wait">Your choice needed</span>
+          {/if}
+        </header>
+        {#if sc?.reason}
+          <p class="reason">{sc.reason}</p>
+        {/if}
+        {#if service === 'weaviate'}
+          <p class="note">
+            Using an existing Weaviate adds VCO’s own collections (named after your
+            projects) to it; nothing already in it is changed.
+          </p>
+        {/if}
+
+        {#if (sc?.candidates.length ?? 0) === 0}
+          <p class="muted">No existing {serviceLabel(service)} was found.</p>
+        {/if}
+        <ul class="candidates">
+          {#each sc?.candidates ?? [] as c, i (i)}
+            {@const needsKgForThis = adoptNeedsKgConfirm(service, sc, c)}
+            <li class="cand" class:recommended={c.recommended} class:incompatible={!isAdoptable(c)}>
+              <div class="cand-main">
+                <div class="cand-title">
+                  <code>{candidateTitle(c)}</code>
+                  {#if c.recommended}<span class="badge rec">Recommended</span>{/if}
+                  {#if c.current}<span class="badge cur">In use</span>{/if}
+                </div>
+                <div class="cand-url"><code>{c.url}</code></div>
+                {#if candidateFacts(c).length > 0}
+                  <div class="cand-facts">{candidateFacts(c).join(' · ')}</div>
                 {/if}
-              </label>
-              <label>
+                <div class="cand-data">{vcoDataLine(service, c)}</div>
+                {#if !isAdoptable(c)}
+                  <div class="cand-bad">Not usable: {c.incompatible_reason ?? 'incompatible'}</div>
+                {/if}
+              </div>
+              <button
+                class="btn-3d {c.recommended ? 'btn-3d-primary' : 'btn-3d-ghost'}"
+                disabled={!!busy ||
+                  !isAdoptable(c) ||
+                  c.current === true ||
+                  !!done[service] ||
+                  (needsKgForThis && !kgConfirmed[service])}
+                title={needsKgForThis && !kgConfirmed[service]
+                  ? 'This instance holds no VCO data — confirm below that VCO’s knowledge graph restarts empty.'
+                  : undefined}
+                onclick={() => run(service, adoptActionFor(service, c, needsKgForThis), `${service}:${i}`)}
+              >
+                {busy === `${service}:${i}` ? 'Applying…' : 'Use this one'}
+              </button>
+            </li>
+          {/each}
+        </ul>
+
+        {#if service !== 'code_embed'}
+          {@const needsKg = vcoCopyNeedsKgConfirm(service, sc)}
+          <div class="own-copy">
+            {#if needsKg || (sc?.candidates ?? []).some((c) => adoptNeedsKgConfirm(service, sc, c))}
+              <label class="confirm">
                 <input
-                  type="radio"
-                  name="mode-{svc.name}"
-                  value="refuse"
-                  checked={choices[svc.name] === 'refuse'}
-                  onchange={() => onModeChange(svc.name, 'refuse')}
+                  type="checkbox"
+                  checked={kgConfirmed[service] ?? false}
+                  onchange={(e) => (kgConfirmed = { ...kgConfirmed, [service]: e.currentTarget.checked })}
                 />
-                Don't manage — keep handling this service yourself
+                I understand: VCO’s knowledge graph starts empty in the new copy — it
+                re-seeds from each project’s <code>knowledge/</code> folder, and the code
+                graph re-analyses.
               </label>
-            </div>
-          </li>
-        {/each}
-      </ul>
-      {#if error}
-        <p class="error">{error}</p>
-      {/if}
-      <div class="actions">
-        <button onclick={cancel} disabled={saving}>Cancel</button>
-        <button onclick={applyChoices} disabled={saving} class="primary">
-          {saving ? 'Saving…' : 'Apply'}
-        </button>
-      </div>
+            {/if}
+            <button
+              class="btn-3d btn-3d-secondary"
+              disabled={!!busy || !!done[service] || (needsKg && !kgConfirmed[service])}
+              onclick={() => run(service, vcoCopyAction(service, needsKg), `${service}:own`)}
+            >
+              {busy === `${service}:own` ? 'Applying…' : 'Run VCO’s own copy'}
+            </button>
+          </div>
+        {/if}
+      </section>
+    {/each}
+    {#if error}
+      <p class="error" role="alert">{error}</p>
+    {/if}
+  {/snippet}
+
+  {#snippet footer()}
+    <div class="actions">
+      <button class="btn-3d btn-3d-ghost" onclick={decideLater} disabled={!!busy}>
+        {shown.every((s) => done[s]) ? 'Close' : 'Decide later'}
+      </button>
     </div>
-  </div>
-{/if}
+  {/snippet}
+</DialogRoot>
 
 <style>
-  .dialog-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
+  .title {
+    margin: 0 0 0.35rem;
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--color-text);
   }
-  .dialog-card {
-    background: var(--surface, #1a1a1a);
-    color: var(--text, #f0f0f0);
-    border-radius: 8px;
-    padding: 1.5rem;
-    width: min(640px, 92vw);
-    max-height: 80vh;
-    overflow-y: auto;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-  }
-  h2 {
-    margin: 0 0 0.5rem 0;
-    font-size: 1.25rem;
-  }
-  .lead {
-    margin: 0 0 1rem 0;
-    color: var(--text-muted, #aaa);
+  .lead,
+  .muted {
+    margin: 0 0 0.75rem;
+    color: var(--color-mid);
     font-size: 0.9rem;
   }
-  .service-list {
-    list-style: none;
-    padding: 0;
-    margin: 0 0 1rem 0;
+  .svc {
+    padding: 1rem 1.1rem;
+    margin-bottom: 0.9rem;
   }
-  .service-list li {
-    border: 1px solid var(--border, #333);
-    border-radius: 6px;
-    padding: 0.75rem;
-    margin-bottom: 0.5rem;
-  }
-  .svc-header {
+  .svc-head {
     display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    margin-bottom: 0.5rem;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
   }
-  .svc-url {
-    font-family: monospace;
+  .svc-head h3 {
+    margin: 0;
+    font-size: 1rem;
+    color: var(--color-text);
+  }
+  .reason,
+  .note {
+    margin: 0 0 0.6rem;
     font-size: 0.85rem;
-    color: var(--text-muted, #aaa);
+    color: var(--color-mid);
   }
-  .svc-options {
+  .candidates {
+    list-style: none;
+    margin: 0 0 0.75rem;
+    padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
+    gap: 0.5rem;
   }
-  .svc-options label {
+  .cand {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    font-size: 0.9rem;
-    cursor: pointer;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    background: var(--color-bg2);
   }
-  .port-input {
-    width: 80px;
-    padding: 0.2rem 0.4rem;
-    border: 1px solid var(--border, #333);
-    border-radius: 4px;
-    background: var(--input-bg, #0a0a0a);
-    color: inherit;
-    font-family: monospace;
+  .cand.recommended {
+    border-color: rgba(0, 191, 166, 0.45);
+  }
+  .cand.incompatible {
+    opacity: 0.65;
+  }
+  .cand-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+  .cand-title {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .cand-url,
+  .cand-facts,
+  .cand-data {
+    font-size: 0.8rem;
+    color: var(--color-mid);
+    overflow-wrap: anywhere;
+  }
+  .cand-bad {
+    font-size: 0.8rem;
+    color: var(--color-pink);
+  }
+  code {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 0.82rem;
+  }
+  .badge {
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.12rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+  }
+  .badge.rec,
+  .badge.ok {
+    color: var(--color-teal);
+    border-color: rgba(0, 191, 166, 0.4);
+  }
+  .badge.wait {
+    color: var(--color-pink);
+    border-color: rgba(255, 79, 160, 0.4);
+  }
+  .badge.cur {
+    color: var(--color-purple);
+    border-color: rgba(123, 95, 255, 0.4);
+  }
+  .own-copy {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  .confirm {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+    font-size: 0.82rem;
+    color: var(--color-mid);
   }
   .error {
-    color: var(--error, #f87171);
-    margin: 0.5rem 0;
+    color: var(--color-pink);
+    margin: 0.5rem 0 0;
+    font-size: 0.85rem;
   }
   .actions {
     display: flex;
     justify-content: flex-end;
     gap: 0.5rem;
-  }
-  button {
-    padding: 0.5rem 1rem;
-    border: 1px solid var(--border, #333);
-    border-radius: 4px;
-    background: var(--button-bg, #2a2a2a);
-    color: inherit;
-    cursor: pointer;
-  }
-  button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  button.primary {
-    background: var(--color-teal);
-    border-color: var(--color-teal);
   }
 </style>

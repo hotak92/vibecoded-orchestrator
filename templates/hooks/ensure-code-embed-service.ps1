@@ -148,7 +148,33 @@ try {
         exit 0
     }
 
+    # v0.2.97 (plan invariant I1, parity with the .sh sibling): compose may
+    # create code_embed only while the launcher.db service_endpoints plan
+    # lists it as VCO-managed and enabled, and only with the argv
+    # `vco_lib.service_lifecycle compose-args` builds (`--no-deps`: its
+    # `depends_on: ollama` must never create an Ollama next to an ADOPTED
+    # one; plus the gpu profile it lives in). $null = compose must not run.
+    function Get-CodeEmbedUpArgs {
+        param([bool]$Build)
+        try {
+            $plan = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json
+        } catch { return $null }
+        if (-not $plan -or (@($plan.compose_services) -notcontains 'code_embed')) { return $null }
+        $pyArgs = @('-m', 'vco_lib.service_lifecycle', 'compose-args', '--json', '--services', 'code_embed')
+        if ($Build) { $pyArgs += '--build' }
+        try {
+            $parsed = (& $RunPy @pyArgs 2>$null | Out-String) | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { return $null }
+            return ,@($parsed.args)
+        } catch { return $null }
+    }
+
     if ($ComposeCmd -and (Test-Path $ComposeDir)) {
+        $upArgs = Get-CodeEmbedUpArgs -Build $true
+        if (-not $upArgs -or $upArgs.Count -eq 0) {
+            Write-Output "[code_embed] not created: launcher.db service_endpoints does not list code_embed as a VCO-managed, enabled service (see ``python -m vco_lib.service_endpoints show``)"
+            exit 0
+        }
         Write-Output "[code_embed] Starting code embedding service via $ComposeCmd..."
         Push-Location $ComposeDir
         try {
@@ -160,7 +186,7 @@ try {
             $composeInvocation = Split-VcoComposeCommand -ComposeCmd $ComposeCmd
             $cmdHead = $composeInvocation.Head
             $cmdRest = @($composeInvocation.Rest)
-            $output = & $cmdHead @cmdRest up -d --build code_embed 2>&1
+            $output = & $cmdHead @cmdRest @upArgs 2>&1
             $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
         } finally { Pop-Location }
         # The runtime, not an exit code, decides whether the retry is needed.
@@ -175,11 +201,14 @@ try {
             # stays stale, which Report-VcoCodeEmbedStaleness and `vco doctor`
             # both surface.
             Write-Output "[code_embed] compose up --build did not create the container - retrying without --build"
-            Push-Location $ComposeDir
-            try {
-                $output = & $cmdHead @cmdRest up -d code_embed 2>&1
-                $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
-            } finally { Pop-Location }
+            $plainArgs = Get-CodeEmbedUpArgs -Build $false
+            if ($plainArgs -and $plainArgs.Count -gt 0) {
+                Push-Location $ComposeDir
+                try {
+                    $output = & $cmdHead @cmdRest @plainArgs 2>&1
+                    $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
+                } finally { Pop-Location }
+            }
             Write-Output "[code_embed] NOTE: the image was NOT rebuilt from source; run 'python install.py --update' from the orchestrator root to refresh it."
         }
         Write-Output "[code_embed] Started container $ContainerName on port $Port"

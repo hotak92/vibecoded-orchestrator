@@ -14,7 +14,9 @@ container and data mount behind it. This module is:
   the migration's CHECKs before writing, and :func:`apply_change`, the
   follow-up chain every change triggers (infra ``.env`` → reproject every
   project → refresh the MCP registration);
-* **the CLI** — ``python -m vco_lib.service_endpoints show | resolve | plan``.
+* **the CLI** — ``python -m vco_lib.service_endpoints show | resolve | plan``
+  (plus ``candidates | adopt | use-vco-copy | move | hand-to-vco | reconcile``,
+  whose logic lives in :mod:`vco_lib.service_reconcile`).
 
 The rule (MUST MATCH ``launcher/src-tauri/vct-launcher-core/src/services/
 service_endpoints.rs``): **row → compiled default.** An absent row (first
@@ -40,6 +42,7 @@ scripts) read only the transport the projection renders from the rows.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import shlex
@@ -59,6 +62,7 @@ __all__ = [
     "MODES",
     "RETIRED_APP_STATE_KEYS",
     "RETIRED_ENV_INPUTS",
+    "RETIRED_MACHINE_ENV",
     "SERVICES",
     "SOURCES",
     "ApplyChangeReport",
@@ -66,7 +70,11 @@ __all__ = [
     "InvalidEndpointRow",
     "ServiceRegistryUnavailable",
     "WriteResult",
+    "PROPAGATED_DIGEST_KEY",
     "apply_change",
+    "awaits_choice",
+    "propagated_digest",
+    "rows_digest",
     "commit_rows",
     "describe",
     "load_rows",
@@ -85,6 +93,8 @@ __all__ = [
     "render_grpc_port",
     "render_port",
     "render_url",
+    "transport_env",
+    "urls_from_rows",
     "validate_row",
     "warn_absent",
     "weaviate_port_for_url",
@@ -129,6 +139,10 @@ RETIRED_ENV_INPUTS: tuple[str, ...] = (
     "CODE_EMBED_PORT",
     "CODE_EMBED_SERVICE_URL",
 )
+#: The subset a USER set by hand for the hub/launcher (not the projected
+#: transport every project process legitimately carries): ``vco doctor``
+#: warns while one is still exported — nothing reads it any more.
+RETIRED_MACHINE_ENV: tuple[str, ...] = ("VCT_WEAVIATE_URL", "VCT_OLLAMA_URL", "VCT_GRPC_PORT")
 RETIRED_APP_STATE_KEYS: dict[str, str] = {
     "weaviate": "weaviate.port_override",
     "ollama": "ollama.port_override",
@@ -441,6 +455,12 @@ def machine_service_urls(db_path: Optional[Path] = None) -> dict[str, Any]:
     ``.claude/settings.json`` defaults, the standalone project env)."""
     rows = load_rows(db_path)
     warn_absent(rows)
+    return urls_from_rows(rows)
+
+
+def urls_from_rows(rows: Mapping[str, EndpointRow]) -> dict[str, Any]:
+    """:func:`machine_service_urls` for rows the caller already holds — e.g.
+    install.py's in-memory pins when launcher.db could not be written."""
     w, o, c = rows.get("weaviate"), rows.get("ollama"), rows.get("code_embed")
     return {
         "weaviate_url": render_url("weaviate", w),
@@ -453,7 +473,39 @@ def machine_service_urls(db_path: Optional[Path] = None) -> dict[str, Any]:
     }
 
 
+def transport_env(rows: Mapping[str, EndpointRow]) -> dict[str, str]:
+    """The projected transport (the env names project-process clients read)
+    for *rows*. install.py pins its OWN process env to this after step [5b],
+    so every client leaf it runs (and every child it spawns) reaches the
+    recorded endpoints, not whatever the invoking shell exported."""
+    u = urls_from_rows(rows)
+    return {
+        "WEAVIATE_URL": u["weaviate_url"],
+        "WEAVIATE_PORT": str(u["weaviate_port"]),
+        "WEAVIATE_GRPC_PORT": str(u["weaviate_grpc_port"]),
+        "GRPC_PORT": str(u["weaviate_grpc_port"]),
+        "OLLAMA_URL": u["ollama_url"],
+        "OLLAMA_PORT": str(u["ollama_port"]),
+        "CODE_EMBED_URL": u["code_embed_url"],
+        "CODE_EMBED_PORT": str(u["code_embed_port"]),
+        "CODE_EMBED_SERVICE_URL": u["code_embed_url"],
+    }
+
+
 # ─── the plan (what the session hook / wrappers act on) ─────────────────
+
+
+def awaits_choice(service: str, row: Optional[EndpointRow]) -> bool:
+    """Does *service* wait for the user's choice? MUST MATCH the Rust
+    ``service_endpoints::awaits_choice`` (pinned by the parity table's
+    ``awaits_choice_cases``). No row yet → yes (nothing has been decided);
+    Weaviate's "waiting for your choice" row — ``vco_managed`` with
+    ``enabled=0``, the owner-ruling-Q1 parking state
+    (``service_reconcile._decide_third_party``) → yes; anything else → no
+    (a disabled Ollama/code_embed is a plain "not run", not a pending choice)."""
+    if row is None:
+        return True
+    return service == "weaviate" and row.mode == "vco_managed" and not row.enabled
 
 
 def plan(rows: Mapping[str, EndpointRow]) -> dict[str, Any]:
@@ -709,6 +761,68 @@ def describe(service: str, row: Optional[EndpointRow]) -> str:
     return f"{service}: {url}{extra} ({who})"
 
 
+#: app_state key holding the digest of the rows the follow-up chain last
+#: propagated IN FULL (written by Python at the END of a successful
+#: :func:`apply_change`). A chain cut short — the session hook's 8 s kill, a
+#: crash, a failed step — leaves it behind the rows, and the next
+#: :func:`commit_rows` that may propagate re-runs the chain even though no
+#: row changed. That is what makes the chain durable: a row commit can never
+#: strand the infra ``.env`` / project env / MCP registration on an old value.
+PROPAGATED_DIGEST_KEY = "service_endpoints.propagated_digest"
+
+
+def rows_digest(rows: Mapping[str, EndpointRow]) -> str:
+    """Digest of what the follow-up chain carries — only the propagating
+    fields, so a ``verified_at`` stamp or a ``source`` change never forces a
+    re-run."""
+    payload = {
+        service: {
+            f: (dict(v) if isinstance(v, Mapping) else v)
+            for f in _PROPAGATING_FIELDS
+            for v in [getattr(rows[service], f)]
+        }
+        for service in SERVICES if service in rows
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def propagated_digest(db_path: Optional[Path] = None) -> Optional[str]:
+    """The digest recorded by the last complete chain, or ``None``."""
+    from vco_lib.launcher_db_reader import _open_db_readonly  # noqa: PLC0415
+
+    conn = _open_db_readonly(_resolve_db_path(db_path))
+    if conn is None:
+        return None
+    try:
+        row = conn.execute("SELECT value FROM app_state WHERE key = ?",
+                           (PROPAGATED_DIGEST_KEY,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return str(row[0]) if row is not None else None
+
+
+def _record_propagated(db_path: Optional[Path], digest: str) -> None:
+    try:
+        conn = _open_rw(_resolve_db_path(db_path))
+    except ServiceRegistryUnavailable as exc:
+        _LOG.warning("service_endpoints: propagated digest not recorded: %s", exc)
+        return
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (PROPAGATED_DIGEST_KEY, digest, int(time.time() * 1000)),
+            )
+    except sqlite3.Error as exc:
+        _LOG.warning("service_endpoints: propagated digest not recorded: %s", exc)
+    finally:
+        conn.close()
+
+
 def apply_change(
     changed: Iterable[str],
     *,
@@ -758,6 +872,10 @@ def apply_change(
         line = describe(service, rows.get(service))
         report.lines.append(line)
         out(line)
+    if report.ok:
+        # LAST, and only for a complete chain: a chain cut short (killed,
+        # crashed, a step failed) leaves the digest behind the rows.
+        _record_propagated(db_path, rows_digest(rows))
     return report
 
 
@@ -771,12 +889,27 @@ def commit_rows(
     register_mcps: Optional[Registrar] = None,
     out: Callable[[str], None] = print,
     now_ms: Optional[int] = None,
+    propagate: bool = True,
 ) -> tuple[WriteResult, ApplyChangeReport]:
     """:func:`write_rows`, then :func:`apply_change` for the services whose
-    change propagates. The one call a row-changing verb makes."""
+    change propagates. The one call a row-changing verb makes.
+
+    Self-healing: when nothing changed but the rows' digest differs from the
+    one the last complete chain recorded (:data:`PROPAGATED_DIGEST_KEY`), the
+    chain runs for every recorded service anyway. ``propagate=False`` writes
+    the rows and runs NO chain (the session phase, whose caller is killed
+    after 8 s): the digest then stays behind and the next caller that may
+    propagate converges."""
     result = write_rows(rows, db_path=db_path, now_ms=now_ms)
+    if not propagate:
+        return result, ApplyChangeReport()
+    changed = list(result.propagating)
+    if not changed:
+        current = load_rows(db_path)
+        if current and rows_digest(current) != propagated_digest(db_path):
+            changed = [s for s in SERVICES if s in current]
     report = apply_change(
-        result.propagating, orchestrator_root=orchestrator_root, db_path=db_path,
+        changed, orchestrator_root=orchestrator_root, db_path=db_path,
         write_infra_env=write_infra_env, reproject=reproject,
         register_mcps=register_mcps, out=out,
     )
@@ -840,7 +973,9 @@ def _cli_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def _main(argv: Optional[Sequence[str]] = None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """The CLI's parser — also what the deferral-command sweep validates every
+    printed ``python -m vco_lib.service_endpoints …`` remedy against."""
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.service_endpoints",
         description="Where Weaviate / Ollama / code-embed are reached (launcher.db service_endpoints).",
@@ -869,7 +1004,75 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     db_arg(p_plan)
     p_plan.set_defaults(handler=_cli_plan)
 
-    args = parser.parse_args(argv)
+    # The detecting / row-changing verbs live with the decision logic
+    # (vco_lib.service_reconcile); this module stays the store + render.
+    def reconcile_verb(name: str) -> Callable[[argparse.Namespace], int]:
+        def handler(args: argparse.Namespace) -> int:
+            from vco_lib import service_reconcile  # noqa: PLC0415
+
+            return service_reconcile.cli(name, args)
+        return handler
+
+    def root_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--root", type=Path, default=None,
+                       help="orchestrator root (default: this checkout)")
+
+    p_cand = sub.add_parser("candidates", help="every Weaviate/Ollama/code-embed found, and whether VCO can use it")
+    p_cand.add_argument("--service", choices=SERVICES, default=None)
+    p_cand.add_argument("--json", action="store_true")
+    p_cand.set_defaults(handler=reconcile_verb("candidates"))
+
+    p_adopt = sub.add_parser("adopt", help="point VCO at a running Weaviate/Ollama")
+    p_adopt.add_argument("--service", required=True, choices=("weaviate", "ollama"))
+    which = p_adopt.add_mutually_exclusive_group(required=True)
+    which.add_argument("--container", help="a container VCO then starts/stops by name, never recreates")
+    which.add_argument("--url", help="a URL (a native process or another host)")
+    p_adopt.add_argument("--accept-empty-kg", action="store_true",
+                         help="switch away from a Weaviate that holds VCO data")
+    db_arg(p_adopt)
+    root_arg(p_adopt)
+    p_adopt.set_defaults(handler=reconcile_verb("adopt"))
+
+    p_copy = sub.add_parser("use-vco-copy", help="let VCO run its own copy of a service")
+    p_copy.add_argument("--service", required=True, choices=SERVICES)
+    p_copy.add_argument("--port", type=int, default=None)
+    p_copy.add_argument("--accept-empty-kg", action="store_true",
+                        help="switch away from a Weaviate that holds VCO data")
+    db_arg(p_copy)
+    root_arg(p_copy)
+    p_copy.set_defaults(handler=reconcile_verb("use-vco-copy"))
+
+    p_move = sub.add_parser(
+        "move", help="follow an adopted Weaviate/Ollama to its new endpoint, or move VCO's own "
+                     "Weaviate/Ollama/code-embed to a new port (re-created with its data)")
+    p_move.add_argument("--service", required=True, choices=SERVICES)
+    p_move.add_argument("--port", type=int, default=None)
+    p_move.add_argument("--url", default=None, help="an external endpoint's new URL")
+    p_move.add_argument("--grpc-port", type=int, default=None, help="Weaviate's gRPC port: at --url (adopted), or where VCO's own "
+                        "Weaviate moves it (default: keeps its offset from --port)")
+    p_move.add_argument("--accept-empty-kg", action="store_true",
+                        help="follow a Weaviate to an endpoint that holds no VCO data")
+    db_arg(p_move)
+    root_arg(p_move)
+    p_move.set_defaults(handler=reconcile_verb("move"))
+
+    p_hand = sub.add_parser("hand-to-vco", help="let VCO's compose manage an adopted container (same data mount)")
+    p_hand.add_argument("--service", required=True, choices=("weaviate", "ollama"))
+    root_arg(p_hand)
+    p_hand.set_defaults(handler=reconcile_verb("hand-to-vco"))
+
+    p_rec = sub.add_parser("reconcile", help="re-check the rows against what is running")
+    p_rec.add_argument("--phase", choices=("session", "update"), default="session")
+    p_rec.add_argument("--json", action="store_true")
+    db_arg(p_rec)
+    root_arg(p_rec)
+    p_rec.set_defaults(handler=reconcile_verb("reconcile"))
+
+    return parser
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
     return int(args.handler(args))
 
 

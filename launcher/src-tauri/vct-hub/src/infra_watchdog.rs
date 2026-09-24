@@ -39,11 +39,14 @@
 //!      probe error SKIPS the service this tick rather than treating it as
 //!      down, see [`ContainerProbe`]; this mirrors the launcher watcher's
 //!      restart-storm guard), AND
-//!   2. VCO MANAGES it — its adoption mode in `<vct_root>/services.toml`
-//!      is `Unresolved` (the default; no entry). `Adopt` / `Parallel` /
-//!      `Refuse` are the user's "leave it alone" / "I run my own copy"
-//!      decisions and are NEVER touched (see
-//!      `vct_launcher_core::services::adoption`), AND
+//!   2. VCO MANAGES it — its launcher.db `service_endpoints` row is
+//!      `vco_managed` and `enabled` (or there is no row yet: VCO's own
+//!      stack). An `adopted_container` / `adopted_external` row is someone
+//!      else's service and is NEVER touched; a stop by its owner is
+//!      respected (see [`supervision_for`]). Until v0.2.97 this read
+//!      `services.toml` and healed only `Unresolved` — inert on every
+//!      machine where install.py had written `adopt` for VCO's OWN
+//!      services, AND
 //!   3. the service is NOT paused — no marker file at
 //!      `<vct_root>/state/watchdog-paused/<service>` (the SHARED marker in
 //!      `vct_launcher_core::services::watchdog_pause`, PRODUCED by the
@@ -71,9 +74,11 @@
 //! same `launch-claude-mcp-stack.sh` wrapper the launcher prefers (it owns
 //! runtime detection + NVIDIA probe + CDI-wait + overlay/profile/override
 //! selection and is idempotent — `compose up -d` no-ops already-running
-//! containers). When the wrapper is not shipped, it falls back to a
-//! direct-compose invocation that REPLICATES the launcher's overlay +
-//! profile selection (see [`restart_service`]).
+//! containers), handing it the ONE service to heal as `VCO_COMPOSE_SERVICES`
+//! (v0.2.97). When the wrapper is not shipped, it falls back to direct
+//! compose with the `up` argv from the one rule
+//! (`vco_lib.service_lifecycle.compose_up_args`: `--no-deps`, `--profile
+//! gpu` for code_embed) — see [`restart_service`].
 //!
 //! ## Crash-loop backoff
 //!
@@ -118,7 +123,10 @@ use tokio::process::Command;
 
 use vct_launcher_core::db::models::ProjectHost;
 use vct_launcher_core::process::CommandExt as _;
-use vct_launcher_core::services::adoption::{self, AdoptionMode};
+use vct_launcher_core::db::Db;
+use vct_launcher_core::services::service_endpoints::{
+    is_compose_managed, lifecycle_container, machine_row, CoreService,
+};
 use vct_launcher_core::services::runtime::{detect_runtime, RuntimeInfo};
 use vct_launcher_core::services::watchdog_pause;
 
@@ -278,23 +286,38 @@ pub fn parse_interval_with(raw: Option<&str>, default_secs: u64, floor_secs: u64
 
 /// THE core decision: should this service be restarted on this tick?
 ///
-/// Restart iff DOWN **and** VCO-managed (`Unresolved`) **and** not paused.
-/// `Adopt` / `Parallel` / `Refuse` are deliberate user decisions the
-/// watchdog must never override; a running container needs nothing; a
+/// Restart iff DOWN **and** compose-managed by VCO **and** not paused. An
+/// adopted service is its owner's; a running container needs nothing; a
 /// paused service was explicitly told to stay down.
 ///
 /// The crash-loop budget is applied separately by the caller (it depends
 /// on mutable per-service state, not on this tick's observation).
-pub fn service_eligible_for_restart(running: bool, mode: AdoptionMode, paused: bool) -> bool {
-    if running {
-        return false;
+pub fn service_eligible_for_restart(running: bool, compose_managed: bool, paused: bool) -> bool {
+    !running && !paused && compose_managed
+}
+
+/// What the watchdog may do for one service, read from its launcher.db
+/// `service_endpoints` row (the ONE machine resolver).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supervision {
+    /// VCO's compose owns the container (`vco_managed` + `enabled`, or no
+    /// row) — the only case the watchdog may heal.
+    pub compose_managed: bool,
+    /// The container to probe: the row's name, else the compose default.
+    pub container: String,
+}
+
+/// [`Supervision`] for `service` on this machine. `default_container` is
+/// the compose file's name for it (from [`CANONICAL_INFRA_SERVICES`]).
+pub fn supervision_for(db: &Db, service: &str, default_container: &str) -> Supervision {
+    let svc = CoreService::from_name(service);
+    let row = svc.and_then(|s| machine_row(db, s));
+    Supervision {
+        compose_managed: is_compose_managed(row.as_ref()),
+        container: svc
+            .and_then(|s| lifecycle_container(s, row.as_ref()))
+            .unwrap_or_else(|| default_container.to_string()),
     }
-    if paused {
-        return false;
-    }
-    // Only `Unresolved` (== default / no services.toml entry) means
-    // "VCO manages this". Every other mode is the user's call.
-    matches!(mode, AdoptionMode::Unresolved)
 }
 
 /// Exponential-backoff wait (seconds) before the Nth restart attempt,
@@ -615,13 +638,14 @@ pub fn find_stack_wrapper(infra_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Run the `launch-claude-mcp-stack` wrapper (whole-stack `up -d`).
+/// Run the `launch-claude-mcp-stack` wrapper for ONE service.
 ///
 /// This is the SAME tested GPU-aware path the launcher prefers: the
 /// wrapper owns runtime detection, the NVIDIA probe, the CDI-readiness
-/// wait, and the overlay/profile/override selection. It is idempotent —
-/// `compose up -d` no-ops containers that are already running, so bringing
-/// the whole stack up to heal ONE dead service is safe. On a GPU-less host
+/// wait, and the overlay/profile/override selection. The service list
+/// travels as `VCO_COMPOSE_SERVICES` (v0.2.97): compose is never invoked
+/// without an explicit list, so healing one VCO service can never create
+/// compose copies of adopted ones (plan invariant I1). On a GPU-less host
 /// the wrapper never enables the gpu profile, so `vco_code_embed` is never
 /// built there.
 ///
@@ -635,7 +659,7 @@ pub fn find_stack_wrapper(infra_dir: &Path) -> Option<PathBuf> {
 /// compose file even if its own env-based resolution would land elsewhere,
 /// and inherit `VCT_ORCHESTRATOR_ROOT` from `infra_dir`'s parent so
 /// runtime.txt resolution matches.
-async fn run_stack_wrapper(wrapper: &Path, infra_dir: &Path) -> Result<(), String> {
+async fn run_stack_wrapper(wrapper: &Path, infra_dir: &Path, service: &str) -> Result<(), String> {
     // `CommandExt::silent` takes ownership (returns Self), so build the
     // base command silent first, then chain args by &mut.
     let mut cmd = if cfg!(target_os = "windows") {
@@ -656,6 +680,7 @@ async fn run_stack_wrapper(wrapper: &Path, infra_dir: &Path) -> Result<(), Strin
     // Point the wrapper at our resolved compose dir + orchestrator root so
     // its compose-file + runtime.txt resolution is deterministic.
     cmd.env("VCT_STACK_WORKING_DIR", infra_dir);
+    cmd.env(ENV_COMPOSE_SERVICES, service);
     if let Some(root) = infra_dir.parent() {
         cmd.env(ENV_ORCHESTRATOR_ROOT, root);
         cmd.current_dir(root);
@@ -675,19 +700,26 @@ async fn run_stack_wrapper(wrapper: &Path, infra_dir: &Path) -> Result<(), Strin
     }
 }
 
+/// Env var carrying the explicit compose service list to the
+/// `launch-claude-mcp-stack` wrapper (space-separated). MUST MATCH the
+/// wrapper's reader (`scripts/launch-claude-mcp-stack.{sh,ps1}`).
+pub const ENV_COMPOSE_SERVICES: &str = "VCO_COMPOSE_SERVICES";
+
 /// Build the direct-compose fallback argv (WITHOUT the leading compose
 /// binary — that comes from `runtime.compose_command()`).
 ///
-/// This is the wrapper-absent path. It mirrors the launcher's
-/// `services_start_all` fallback EXACTLY: a whole-stack `up -d` with NO
-/// service arg (so a future compose addition isn't silently skipped) and
-/// NO hand-rolled GPU overlay (the launcher's direct fallback is CPU-only;
-/// GPU correctness comes from the wrapper, which we already tried first).
+/// This is the wrapper-absent path: the `-f` chain, then `up_args` — the
+/// `up` argv for the ONE service being healed from the ONE rule
+/// (`vco_lib.service_lifecycle.compose_up_args` via
+/// `vct_launcher_core::services::compose_args`: `--no-deps`, `--profile gpu`
+/// for code_embed). Never a bare `up -d`, which would also create compose
+/// copies of adopted services (plan invariant I1), and never a hand-built
+/// `up -d <svc>`, which would pull code_embed's `depends_on: ollama` in.
 /// NIT-8: when the user's `docker-compose.override.yml` exists in
 /// `infra_dir` we add it explicitly with `-f` so the override isn't
 /// dropped (compose's implicit auto-load is bypassed once we pass an
 /// explicit `-f docker-compose.yml`). Pure → unit-testable.
-pub fn build_fallback_compose_args(infra_dir: &Path) -> Vec<String> {
+pub fn build_fallback_compose_args(infra_dir: &Path, up_args: &[String]) -> Vec<String> {
     let mut args: Vec<String> = vec!["-f".into(), "docker-compose.yml".into()];
     // NIT-8: preserve a user override the same way the boot wrapper does.
     let override_path = infra_dir.join("docker-compose.override.yml");
@@ -695,19 +727,27 @@ pub fn build_fallback_compose_args(infra_dir: &Path) -> Vec<String> {
         args.push("-f".into());
         args.push("docker-compose.override.yml".into());
     }
-    args.push("up".into());
-    args.push("-d".into());
+    args.extend(up_args.iter().cloned());
     args
 }
 
-/// Direct-compose fallback (wrapper not shipped): faithful to the
-/// launcher's `services_start_all` fallback. Whole-stack `up -d`.
+/// Direct-compose fallback (wrapper not shipped): the rule's `up` argv for
+/// `service`. The rule running is required — failing to compute the argv is
+/// an error recorded into the backoff, never a hand-built fallback.
 async fn restart_via_direct_compose(
     runtime: &RuntimeInfo,
     infra_dir: &Path,
+    service: &str,
 ) -> Result<(), String> {
+    let root = infra_dir.parent().ok_or("infrastructure dir has no parent")?;
+    let python = vct_launcher_core::services::compose_args::rule_python()?;
+    let up_args =
+        vct_launcher_core::services::compose_args::compose_up_args(&python, root, &[service], false).await?;
+    if up_args.is_empty() {
+        return Ok(());
+    }
     let mut cmd = runtime.compose_command();
-    cmd.args(build_fallback_compose_args(infra_dir));
+    cmd.args(build_fallback_compose_args(infra_dir, &up_args));
     cmd.current_dir(infra_dir);
     let output = cmd
         .output()
@@ -725,21 +765,19 @@ async fn restart_via_direct_compose(
     }
 }
 
-/// Restart the infra stack to heal `service` through the SAME GPU-aware
-/// path the launcher uses: PREFER the `launch-claude-mcp-stack` wrapper
-/// (GPU overlay + `--profile gpu` + CDI-wait, idempotent whole-stack
-/// `up -d`); fall back to a launcher-faithful direct `compose up -d` only
-/// when the wrapper isn't shipped or fails. `service` is logged for
-/// context; the actual op is whole-stack (idempotent), which is what makes
-/// reusing the wrapper safe. Returns `Ok(())` on success, `Err(msg)`
-/// otherwise (caller records into [`Backoff`]). Soft — never panics.
+/// Heal `service` through the SAME GPU-aware path the launcher uses:
+/// PREFER the `launch-claude-mcp-stack` wrapper (GPU overlay +
+/// `--profile gpu` + CDI-wait) with `service` as its explicit list; fall
+/// back to a direct `compose up -d <service>` only when the wrapper isn't
+/// shipped or fails. Returns `Ok(())` on success, `Err(msg)` otherwise
+/// (caller records into [`Backoff`]). Soft — never panics.
 async fn restart_service(
     runtime: &RuntimeInfo,
     infra_dir: &Path,
     service: &str,
 ) -> Result<(), String> {
     if let Some(wrapper) = find_stack_wrapper(infra_dir) {
-        match run_stack_wrapper(&wrapper, infra_dir).await {
+        match run_stack_wrapper(&wrapper, infra_dir, service).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -752,7 +790,7 @@ async fn restart_service(
             }
         }
     }
-    restart_via_direct_compose(runtime, infra_dir).await
+    restart_via_direct_compose(runtime, infra_dir, service).await
 }
 
 // ─── Spawn + tick loop ───────────────────────────────────────────────────
@@ -841,8 +879,8 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
         // (`list_projects_nonpanicking` / `app_state_get_bool_nonpanicking`
         // / `lock_recover`) rather than `lock().expect("db mutex
         // poisoned")`, so a poisoned launcher.db mutex no longer kills this
-        // detached task. `adoption::read()` and `detect_runtime()` are
-        // already non-panicking. The result is that the watchdog upholds
+        // detached task. The row reads go through `lock_recover` and
+        // `detect_runtime()` is already non-panicking. The result is that the watchdog upholds
         // its "never crashes the hub" contract: a single bad tick logs and
         // the next tick tries again.
         run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt).await;
@@ -885,12 +923,16 @@ async fn run_one_tick(
         }
     };
 
-    // Read the adoption state once per tick (cheap file read).
-    let adoption_state = adoption::read();
-
-    for (service, container) in CANONICAL_INFRA_SERVICES.iter() {
+    for (service, default_container) in CANONICAL_INFRA_SERVICES.iter() {
         let service = *service;
-        let container = *container;
+        // The row decides whether VCO may touch this service at all, and
+        // which container is its (v0.2.97). An adopted service is left
+        // alone BEFORE any probe — its owner's stop is respected.
+        let supervision = supervision_for(&db.0, service, default_container);
+        if !supervision.compose_managed {
+            continue;
+        }
+        let container = supervision.container.as_str();
 
         // BLOCKER-2 gate: don't supervise a service that isn't part of THIS
         // install. The GPU-only `code_embed` legitimately doesn't exist on a
@@ -928,17 +970,11 @@ async fn run_one_tick(
             }
         }
 
-        let mode = adoption_state
-            .get(service)
-            .map(|s| s.mode)
-            .unwrap_or(AdoptionMode::Unresolved);
         let paused = is_service_paused(service);
 
         // `running == false` here (authoritative NotRunning above).
-        if !service_eligible_for_restart(false, mode, paused) {
-            // Down, but the user adopted / parallel'd / refused / paused
-            // it. Leave it alone. (Quiet — this is the normal steady
-            // state for a deliberately-external service.)
+        if !service_eligible_for_restart(false, supervision.compose_managed, paused) {
+            // Down, but deliberately paused. Leave it alone.
             continue;
         }
 
@@ -1077,52 +1113,107 @@ mod tests {
 
     #[test]
     fn eligible_only_when_down_managed_and_not_paused() {
-        // The one TRUE case: down + Unresolved (VCO-managed) + not paused.
-        assert!(service_eligible_for_restart(false, AdoptionMode::Unresolved, false));
+        // The one TRUE case: down + compose-managed + not paused.
+        assert!(service_eligible_for_restart(false, true, false));
     }
 
     #[test]
     fn running_service_never_restarted() {
-        for mode in [
-            AdoptionMode::Unresolved,
-            AdoptionMode::Adopt,
-            AdoptionMode::Parallel,
-            AdoptionMode::Refuse,
-        ] {
-            assert!(
-                !service_eligible_for_restart(true, mode, false),
-                "a running service must never be restarted (mode={:?})",
-                mode
-            );
+        for managed in [true, false] {
+            assert!(!service_eligible_for_restart(true, managed, false));
         }
     }
 
     #[test]
     fn paused_service_never_restarted() {
-        // Paused wins even when down + VCO-managed.
-        assert!(!service_eligible_for_restart(false, AdoptionMode::Unresolved, true));
+        assert!(!service_eligible_for_restart(false, true, true));
     }
 
     #[test]
-    fn adopted_external_service_never_restarted() {
-        // Adopt / Parallel / Refuse are deliberate user decisions — the
-        // watchdog must never restart any of them, paused or not.
-        for mode in [
-            AdoptionMode::Adopt,
-            AdoptionMode::Parallel,
-            AdoptionMode::Refuse,
-        ] {
-            assert!(
-                !service_eligible_for_restart(false, mode, false),
-                "down external service (mode={:?}) must NOT be restarted",
-                mode
-            );
-            assert!(
-                !service_eligible_for_restart(false, mode, true),
-                "down+paused external service (mode={:?}) must NOT be restarted",
-                mode
-            );
+    fn adopted_service_never_restarted() {
+        for paused in [true, false] {
+            assert!(!service_eligible_for_restart(false, false, paused));
         }
+    }
+
+    /// SE-4 red-proof (5): the watchdog's supervision comes from the ROWS.
+    /// A `services.toml` saying `adopt` for every service (what install.py
+    /// wrote for VCO's OWN services) is present, as on a re-installed
+    /// machine. The `vco_managed` code_embed row is healed; the
+    /// `adopted_container` Weaviate row and the `adopted_external` Ollama
+    /// row are never touched. Red against the pre-v0.2.97 gate, which read
+    /// `services.toml` (`adopt` ⇒ nothing is ever healed).
+    #[test]
+    fn supervision_follows_the_rows_not_services_toml() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let sd = vct_launcher_core::test_env::state_dir_guard();
+        std::fs::write(
+            sd.path().join("services.toml"),
+            "[[services]]\nname = \"weaviate\"\nmode = \"adopt\"\n\n\
+             [[services]]\nname = \"ollama\"\nmode = \"adopt\"\n\n\
+             [[services]]\nname = \"code_embed\"\nmode = \"adopt\"\n",
+        )
+        .unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedContainer, "localhost", 8081);
+        w.grpc_port = Some(50052);
+        w.container_name = Some("their_weaviate".into());
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "localhost",
+            11434,
+        ))
+        .unwrap();
+        let mut c = ServiceEndpointRow::new("code_embed", EndpointMode::VcoManaged, "localhost", 11440);
+        c.container_name = Some("vco_code_embed".into());
+        db.service_endpoint_seed_for_tests(&c).unwrap();
+
+        let weaviate = supervision_for(&db, "weaviate", "vco_weaviate");
+        let ollama = supervision_for(&db, "ollama", "vco_ollama");
+        let code_embed = supervision_for(&db, "code_embed", "vco_code_embed");
+        assert!(!weaviate.compose_managed, "an adopted container is its owner's");
+        assert!(!ollama.compose_managed, "an adopted URL has no lifecycle");
+        assert!(code_embed.compose_managed, "VCO's own service is healed");
+        assert!(service_eligible_for_restart(false, code_embed.compose_managed, false));
+        assert!(!service_eligible_for_restart(false, weaviate.compose_managed, false));
+
+        // A disabled vco_managed row (code_embed on a CPU host) is not healed.
+        c.enabled = false;
+        db.service_endpoint_seed_for_tests(&c).unwrap();
+        assert!(!supervision_for(&db, "code_embed", "vco_code_embed").compose_managed);
+    }
+
+    /// Owner ruling Q1: the Weaviate "waiting for your choice" row
+    /// (`vco_managed`, `enabled = 0`) is never healed — starting it would
+    /// duplicate the third-party Weaviate the user is being asked about.
+    #[test]
+    fn the_waiting_weaviate_row_is_never_healed() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let db = Db::open_in_memory().unwrap();
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "localhost", 8081);
+        w.grpc_port = Some(50052);
+        w.enabled = false;
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        let s = supervision_for(&db, "weaviate", "vco_weaviate");
+        assert!(!s.compose_managed);
+        assert!(!service_eligible_for_restart(false, s.compose_managed, false));
+    }
+
+    /// The row's container name is what gets probed (a vco_managed row may
+    /// name its container; with no name the compose default applies).
+    #[test]
+    fn supervision_probes_the_rows_container() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let db = Db::open_in_memory().unwrap();
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "localhost", 18081);
+        w.grpc_port = Some(50053);
+        w.container_name = Some("vco_weaviate_alt".into());
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        assert_eq!(supervision_for(&db, "weaviate", "vco_weaviate").container, "vco_weaviate_alt");
+        // No row on a harness DB: the sentinel row (vco_managed, unnamed).
+        assert_eq!(supervision_for(&db, "ollama", "vco_ollama").container, "vco_ollama");
     }
 
     // ----- backoff schedule -----
@@ -1403,11 +1494,33 @@ mod tests {
     // ----- NIT-8 + wrapper-absent fallback: direct-compose argv -----
 
     #[test]
-    fn fallback_compose_args_whole_stack_no_override() {
+    fn fallback_compose_args_prefix_the_rules_argv() {
         let dir = tempfile::tempdir().unwrap();
-        let args = build_fallback_compose_args(dir.path());
-        // Whole-stack up -d, no service arg, no override (file absent).
-        assert_eq!(args, vec!["-f", "docker-compose.yml", "up", "-d"]);
+        let up: Vec<String> = ["up", "-d", "--no-deps", "weaviate"].iter().map(|s| s.to_string()).collect();
+        let args = build_fallback_compose_args(dir.path(), &up);
+        assert_eq!(args, vec!["-f", "docker-compose.yml", "up", "-d", "--no-deps", "weaviate"]);
+    }
+
+    /// SE-4 × SE-3 red-proof: the heal's compose argv — `-f` chain + the
+    /// rule's `up` argv, computed exactly as `restart_via_direct_compose`
+    /// does — carries `--no-deps` and names only the healed service
+    /// (code_embed: never ollama, which may be adopted). Red against a
+    /// hand-built `up -d <svc>`.
+    #[tokio::test]
+    async fn the_heal_argv_has_no_deps_and_names_only_the_healed_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3");
+        let up = vct_launcher_core::services::compose_args::compose_up_args(&python, &checkout, &["code_embed"], false)
+            .await
+            .unwrap();
+        let args = build_fallback_compose_args(dir.path(), &up);
+        assert!(args.iter().any(|a| a == "--no-deps"), "{:?}", args);
+        assert!(!args.iter().any(|a| a == "ollama" || a == "weaviate"), "{:?}", args);
+        assert_eq!(
+            args,
+            vec!["-f", "docker-compose.yml", "--profile", "gpu", "up", "-d", "--no-deps", "code_embed"]
+        );
     }
 
     #[test]
@@ -1418,7 +1531,8 @@ mod tests {
             "services: {}\n",
         )
         .unwrap();
-        let args = build_fallback_compose_args(dir.path());
+        let up: Vec<String> = ["up", "-d", "--no-deps", "weaviate"].iter().map(|s| s.to_string()).collect();
+        let args = build_fallback_compose_args(dir.path(), &up);
         // NIT-8: the override must be appended explicitly (LAST -f wins on
         // conflicts) since explicit `-f docker-compose.yml` bypasses
         // compose's implicit override auto-load.
@@ -1430,7 +1544,9 @@ mod tests {
                 "-f",
                 "docker-compose.override.yml",
                 "up",
-                "-d"
+                "-d",
+                "--no-deps",
+                "weaviate"
             ]
         );
     }

@@ -30,6 +30,17 @@ HOOKS = REPO_ROOT / "templates" / "hooks"
 IS_WINDOWS = os.name == "nt"
 
 
+def _assert_code_embed_build_up(case: unittest.TestCase, call: str) -> None:
+    """The creating `up` names code_embed ALONE, rebuilds it, and carries
+    `--no-deps` (v0.2.97 I1: its `depends_on: ollama` must never create an
+    Ollama next to an adopted one) plus the gpu profile it lives in."""
+    tokens = call.split()
+    case.assertEqual(tokens[-1], "code_embed", call)
+    for flag in ("up", "-d", "--build", "--no-deps"):
+        case.assertIn(flag, tokens, call)
+    case.assertIn("--profile gpu", call)
+
+
 
 
 class _Fixture:
@@ -114,8 +125,12 @@ class _Fixture:
         # the hook at somebody else's service and the fixture's own
         # `_HealthService` is never probed — which is what a developer with
         # that variable exported has always seen, and what the suite-wide
-        # W-CODE-EMBED pin (conftest) would make universal.
+        # W-CODE-EMBED pin (conftest) would make universal. v0.2.97 (lane Y):
+        # `CODE_EMBED_URL` is the second URL leg, ranked before the port —
+        # popping only the first name let an ambient alias steer the probe at
+        # the developer's live :11440 service.
         env.pop("CODE_EMBED_SERVICE_URL", None)
+        env.pop("CODE_EMBED_URL", None)
         return env
 
     def compose_invocations(self) -> list:
@@ -139,7 +154,7 @@ class BashHookTests(unittest.TestCase):
             proc = self._run(fx, free_port())
             calls = fx.compose_invocations()
             self.assertTrue(calls, f"compose was never invoked:\n{proc.stdout}\n{proc.stderr}")
-            self.assertIn("up -d --build code_embed", calls[0])
+            _assert_code_embed_build_up(self, calls[0])
             # A successful build must NOT trigger the compatibility retry.
             self.assertEqual(len(calls), 1, calls)
             self.assertNotIn("was NOT rebuilt", proc.stdout)
@@ -405,7 +420,7 @@ class PowerShellHookTests(unittest.TestCase):
             )
             calls = fx.compose_invocations()
             self.assertTrue(calls, f"compose was never invoked:\n{proc.stdout}\n{proc.stderr}")
-            self.assertIn("up -d --build code_embed", calls[0])
+            _assert_code_embed_build_up(self, calls[0])
             self.assertEqual(len(calls), 1, calls)
 
     def test_a_compose_that_rejects_build_still_brings_the_service_up(self):

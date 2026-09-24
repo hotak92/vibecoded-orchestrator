@@ -255,6 +255,20 @@ _V0297_OWNED_ADDITIONS = frozenset({
     "schema_migration_probe_unreachable",
     "schema_migration_classification",
     "schema_version_unrecorded",
+    # v0.2.97 SE-2 (service endpoints). All four are emitted by
+    # `vco_lib.service_reconcile.reconcile`, which install.py step [5b] calls
+    # INSIDE its run and whose entries it adds to THAT run's report — family A
+    # proper, never behind finalize's back. `service_registry_unavailable` and
+    # `legacy_service_statement_unimported` are re-detected on every run (the
+    # hub binary is re-tried; the settings that stay in place are re-checked
+    # against the row), so the run that settles them drops them. The two
+    # records (`service_adopted_without_prompt`, `service_endpoints_migrated`)
+    # describe a completed one-time action: the next run has rows, does not
+    # re-detect them, and the one-shot expiry is the whole lifecycle.
+    "service_registry_unavailable",
+    "legacy_service_statement_unimported",
+    "service_adopted_without_prompt",
+    "service_endpoints_migrated",
 })
 
 
@@ -612,6 +626,11 @@ class TestRegistryCompleteness(unittest.TestCase):
             "kg_unclaimed_populated_classes", "settings_write_refused_*",
             # v0.2.97: user_owned_secrets.emit_deferral attaches the `file:KEY` set.
             "user_owned_secret_value_in_tree",
+            # v0.2.97 SE-2: vco_lib.service_reconcile's entry builders attach
+            # these on every emit (pinned by tests/test_v0297_service_reconcile.py).
+            "service_endpoint_unreachable", "service_endpoint_ambiguous",
+            "legacy_service_statement_unimported", "adopted_service_config_drift",
+            "service_adoption_confirmation_required",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

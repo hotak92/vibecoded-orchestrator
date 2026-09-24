@@ -355,8 +355,10 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "OLLAMA_PORT",
     "CODE_EMBED_URL",
     "CODE_EMBED_PORT",
-    # v0.2.97: the code-embed URL under the name its clients actually read
-    # (``CODE_EMBED_URL`` above has no reader). Python-only, like the
+    # v0.2.97: the code-embed URL under the name its clients actually read.
+    # (``CODE_EMBED_URL`` above is the alias the ONE client resolver —
+    # ``vco_lib.code_embed_image.service_base_url`` — accepts after
+    # ``CODE_EMBED_SERVICE_URL``, lane Y.) Python-only, like the
     # DIAGRAMS_COLLECTION / DUAL_* keys: the Rust CANONICAL_INSTALL_ENV_KEYS
     # does not list it, and the subset parity test allows that direction.
     "CODE_EMBED_SERVICE_URL",

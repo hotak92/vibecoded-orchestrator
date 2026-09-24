@@ -422,6 +422,9 @@ class DoctorResolvers:
     #: Injected so the former-name probe is driven from a described machine
     #: without running any ``vco`` / ``vct`` it finds.
     former_launcher_cli: Optional[Callable[[], list]] = None
+    #: () -> the environment the retired-endpoint-env probe judges. Defaults
+    #: to this process's ``os.environ``; injected so a test describes it.
+    environ: Optional[Callable[[], Any]] = None
 
     def resolve_former_launcher_cli(self) -> list:
         """Copies of the launcher CLI under a former name reachable on PATH.
@@ -4089,6 +4092,52 @@ def probe_claude_code_trust(folder: Path, res: DoctorResolvers, ctx: dict) -> li
     )]
 
 
+def probe_retired_endpoint_env(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Is a retired service-endpoint variable still exported? (v0.2.97, plan §4f.4)
+
+    ``VCT_WEAVIATE_URL`` / ``VCT_OLLAMA_URL`` / ``VCT_GRPC_PORT`` used to steer
+    the hub and the launcher. Since v0.2.97 they read ONLY the launcher.db
+    ``service_endpoints`` rows, so a value still exported is silently
+    ignored — the user who set it believes it is in force. The finding names
+    what IS in force (the row) and the command that makes a still-wanted value
+    real (``service_endpoints adopt --url``, which verifies it first). The
+    projected transport (``WEAVIATE_URL`` & co.) is NOT judged: every project
+    process carries it legitimately. Read-only: env + one read-only DB read.
+    """
+    from vco_lib import service_endpoints as se  # noqa: PLC0415
+
+    env = res.environ() if res.environ is not None else os.environ
+    found = {k: str(env.get(k, "")).strip() for k in se.RETIRED_MACHINE_ENV
+             if str(env.get(k, "") or "").strip()}
+    if not found:
+        return [Finding(
+            probe="retired_endpoint_env",
+            status=STATUS_OK,
+            summary="no retired service-endpoint variable is exported",
+        )]
+    rows = se.load_rows()
+    in_force = {
+        "VCT_WEAVIATE_URL": se.render_url("weaviate", rows.get("weaviate")),
+        "VCT_OLLAMA_URL": se.render_url("ollama", rows.get("ollama")),
+        "VCT_GRPC_PORT": str(se.render_grpc_port(rows.get("weaviate"))),
+    }
+    parts = [f"{k}={v} (ignored; in force: {in_force[k]})" for k, v in sorted(found.items())]
+    lines = [f"unset {' '.join(sorted(found))}   # and drop them from your shell profile"]
+    for name, service in (("VCT_WEAVIATE_URL", "weaviate"), ("VCT_OLLAMA_URL", "ollama")):
+        value = found.get(name)
+        if value and value.rstrip("/") != in_force[name]:
+            lines.append(f"# only if {value} really is your {service}:")
+            lines.append(f"python -m vco_lib.service_endpoints adopt --service {service} --url {value}")
+    return [Finding(
+        probe="retired_endpoint_env",
+        status=STATUS_PROBLEM,
+        summary="retired service-endpoint variable(s) still exported: " + "; ".join(parts),
+        fix=FIX_DEFER,
+        command="\n".join(lines),
+        detail={"exported": found, "in_force": {k: in_force[k] for k in found}},
+    )]
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4149,6 +4198,11 @@ PROBES: dict = {
     # v0.2.97: full-only — it RUNS each `vco` / `vct` on PATH (`--version`,
     # `-h`), which is more than the boot subset's file-read budget.
     "former_launcher_cli": (probe_former_launcher_cli, (SCOPE_FULL,)),
+    # v0.2.97 SE-2: full-only for the v0.2.92 PROMISE reason above — no
+    # registered condition (it describes the user's shell, which no ledger
+    # entry can clear), so the boot counter must never point at it. It runs
+    # where it is read: `vco doctor` and install/update's end-of-run report.
+    "retired_endpoint_env": (probe_retired_endpoint_env, (SCOPE_FULL,)),
 }
 
 

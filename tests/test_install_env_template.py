@@ -161,10 +161,13 @@ class TestFreshInstall(_InstallRoot):
     def test_tail_matches_the_renderer_byte_for_byte(self):
         cfg = dict(install.EMBEDDING_CONFIGS["gpu"])
         text = self.write()
+        # v0.2.97 SE-2: the gRPC / code-embed ports are the service_endpoints
+        # rows' (the same resolver the settings defaults use), not the shell's.
+        urls = install._service_endpoint_urls()
         expected_tail = render_install_env_tail(
             cfg,
-            weaviate_grpc_port=str(install.DEFAULT_WEAVIATE_GRPC_PORT),
-            code_embed_port=str(install.DEFAULT_CODE_EMBED_PORT),
+            weaviate_grpc_port=str(urls["weaviate_grpc_port"]),
+            code_embed_port=str(urls["code_embed_port"]),
             telemetry_enabled=False,
             concurrency_lines=install._code_embed_max_concurrent_env_lines(cfg),
         )

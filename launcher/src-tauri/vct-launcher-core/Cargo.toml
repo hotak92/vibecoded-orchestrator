@@ -4,7 +4,7 @@ name = "vct-launcher-core"
 # [workspace.package]) — see vct-hub/Cargo.toml for the rationale.
 version.workspace = true
 edition = "2021"
-description = "Shared library for vct-launcher and vct-hub binaries — db, manifest, secrets, paths, config, services::runtime/picker, state, types, registry."
+description = "Shared library for vct-launcher and vct-hub binaries — db, manifest, secrets, paths, config, services::runtime, state, types, registry."
 authors = ["VibeCoded Tools"]
 license = "AGPL-3.0"
 
@@ -60,13 +60,13 @@ serde = { version = "1", features = ["derive"] }
 # `preserve_order` feature cannot drift between members. See that comment.
 serde_json.workspace = true
 
-# tokio for async paths in db (and runtime/picker async helpers)
+# tokio for async paths in db (and runtime async helpers)
 tokio = { version = "1", features = ["fs", "macros", "process", "rt", "sync", "time", "io-util", "io-std"] }
 
 # UUID for IDs
 uuid = { version = "1", features = ["v4"] }
 
-# HTTP client (used by services/picker.rs for container service-fullness probes
+# HTTP client (used by db/access.rs + services/container_runtime.rs probes
 # and by future cross-binary hub HTTP calls)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

@@ -64,7 +64,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # branch moved out of main() into `_update_env_config` (which also stores
 # `--openai-key` there now) and the post-parse normalisation into
 # `_normalise_parsed_args`; main() keeps one call for each.
-_MAIN_SPAN_MAX = 1652
+# v0.2.97 SE-2: re-pinned DOWN (1652 → 1645) — step [5b] is one shim call
+# (+ the post-start verify and the --no-containers reconcile, one line each),
+# and --compose-working-dir's help lost the superseded legacy legs.
+_MAIN_SPAN_MAX = 1645
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -334,7 +337,16 @@ _MAIN_SPAN_MAX = 1652
 # moved to `vco_lib.embedding_selection`, a pure stdlib leaf since v0.2.68.
 # The -4 is the difference between the deleted mirror and the delegate plus
 # its (now brief) docstring. Measured with `wc -l`, not predicted.
-_TOTAL_LINES_MAX = 23888
+#
+# v0.2.97 SE-2 — re-pinned DOWNWARD 23888 -> 23191 (-697; the file measured
+# 23634 at the lane's base, the rest was slack from earlier waves). Step [5b]
+# became a thin shim over `vco_lib.service_reconcile` / `service_detection`:
+# `_resolve_service_safety`, `_probe_service_identity`, `_decide_action`,
+# `_find_free_port`, `_write_compose_override` and the services.toml wrappers
+# left the file; round 2 retired the superseded legacy legs of
+# `_resolve_compose_working_dir` and `_probe_compose_working_dir_via_ps`.
+# Measured with `wc -l`, not predicted.
+_TOTAL_LINES_MAX = 23191
 
 
 def _measure() -> tuple:

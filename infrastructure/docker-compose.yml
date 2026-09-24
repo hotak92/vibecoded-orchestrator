@@ -267,14 +267,32 @@ services:
       # (11434, NOT the host-mapped 11435). The gpu/codesage default backend
       # never reads OLLAMA_URL, so this is a no-op there. Power users can
       # override (e.g. an Ollama running on the host) via CODE_EMBED_OLLAMA_URL.
+      # v0.2.97: when Ollama is NOT VCO's compose service (an adopted
+      # container or a native/remote Ollama — launcher.db service_endpoints),
+      # vco_ollama does not exist on this network; `compose_env.
+      # write_service_keys` then writes CODE_EMBED_OLLAMA_URL into
+      # infrastructure/.env from the Ollama row.
       OLLAMA_URL: "${CODE_EMBED_OLLAMA_URL:-http://vco_ollama:11434}"
       HF_HOME: "/cache"
       HF_HUB_CACHE: "/cache"
       TRANSFORMERS_CACHE: "/cache"
+    # v0.2.97: the name an adopted Ollama ON THIS HOST is reached by under
+    # Docker (CODE_EMBED_OLLAMA_URL=http://vco-host-gateway:<port>). Docker
+    # resolves the literal `host-gateway` to the host; `compose_env` writes
+    # VCT_CODE_EMBED_HOST_GATEWAY=host-gateway only for Docker. Podman reaches
+    # the host as `host.containers.internal` natively and podman 4.x rejects
+    # `host-gateway`, so there the entry keeps the inert default and nothing
+    # uses it. A dedicated name (not host.docker.internal) so Docker Desktop's
+    # own host.docker.internal is never shadowed.
+    extra_hosts:
+      - "vco-host-gateway:${VCT_CODE_EMBED_HOST_GATEWAY:-127.0.0.1}"
     # Start after Ollama so its in-network DNS name resolves when the ollama
     # backend probes it. Short-form (start-order only) — the ollama service
     # has no healthcheck to gate on, and this must not change the gpu profile
     # gating (the gpu overlay only merges a `deploy.resources` block here).
+    # v0.2.97: every VCO compose invocation passes `--no-deps` with an
+    # explicit service list, so this never creates an Ollama when Ollama is
+    # adopted (plan invariant I1) — it only orders a joint start.
     depends_on:
       - ollama
     volumes:

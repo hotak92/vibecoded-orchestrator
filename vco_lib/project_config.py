@@ -495,6 +495,13 @@ class ProjectConfig:
     #: clients. New hubs paired with old clients have the field
     #: silently ignored.
     rl_server_port: Optional[int] = None
+    #: v0.2.97 (service endpoints SSOT): the code-embedding service URL —
+    #: the machine's ``service_endpoints`` row, rendered by the hub like
+    #: ``weaviate_url`` / ``ollama_url``. Additive (``schema_version`` is
+    #: unchanged): pre-v0.2.97 hubs omit it and the parser back-fills the
+    #: empty string, which callers treat as "unset" (fall through to the
+    #: projected ``CODE_EMBED_SERVICE_URL``).
+    code_embed_url: str = ""
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -1360,6 +1367,7 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # malformed string) as ``None`` so the MCP falls through to
             # env-resolution / disabled mode.
             rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
+            code_embed_url=str(body.get("code_embed_url") or ""),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(

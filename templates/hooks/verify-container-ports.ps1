@@ -208,9 +208,21 @@ Write-Output "🩺 Container port-binding watchdog: $($zombies.Count) zombie sta
 Write-Output "   (container says 'running' but host port is unbound AND container PID is dead)"
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+# v0.2.97: the installer's compose (infrastructure/) FIRST — a VCO-managed
+# service is re-created under the project that owns it, never under the
+# legacy claude_mcp_servers/ home. Same tiers as ensure-containers (parity
+# with the .sh sibling).
 $composeDir = $null
-foreach ($candidate in @("claude_mcp_servers", "infrastructure", ".")) {
-    $path = Join-Path $projectRoot $candidate
+$composeCandidates = @(
+    $env:VCT_COMPOSE_DIR,
+    $env:VCT_INFRASTRUCTURE_DIR,
+    $(if ($env:VCT_ORCHESTRATOR_ROOT) { Join-Path $env:VCT_ORCHESTRATOR_ROOT "infrastructure" } else { $null }),
+    (Join-Path $projectRoot "infrastructure"),
+    (Join-Path $projectRoot "claude_mcp_servers"),
+    [string]$projectRoot
+)
+foreach ($path in $composeCandidates) {
+    if (-not $path) { continue }
     if ((Test-Path (Join-Path $path "compose.yaml")) -or `
         (Test-Path (Join-Path $path "compose.yml")) -or `
         (Test-Path (Join-Path $path "docker-compose.yml"))) {
@@ -219,16 +231,39 @@ foreach ($candidate in @("claude_mcp_servers", "infrastructure", ".")) {
     }
 }
 
+# v0.2.97 (plan invariant I1 + the zombie gate, parity with the .sh
+# sibling): only a VCO-managed service (launcher.db service_endpoints plan)
+# is `rm -f`'d and re-created, by compose naming that ONE service with
+# `--no-deps`. An adopted container is never removed. No readable plan ->
+# nothing is re-created.
+$lcPlan = $null
+try { $lcPlan = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json } catch { $lcPlan = $null }
+
 foreach ($z in $zombies) {
     $name = $z.Name
     $port = $z.Port
-    # Derive compose service name from container name. Compose service
-    # keys are unprefixed (weaviate / ollama / code_embed); the actual
-    # container ships under vco_ / vct_ / unprefixed / _claude variants
-    # depending on install era. Strip every known prefix/suffix.
-    $service = $name -replace "^vco_", "" -replace "^vct_", "" -replace "_claude$", ""
     Write-Output "   → recovering $name (port :$port) via $runtime"
     if ($runtime -eq "podman") {
+        if (-not $lcPlan) {
+            Write-Output "     ! the service_endpoints plan could not be read - $name left as is (manual: $runtime start $name)"
+            continue
+        }
+        $policy = @($lcPlan.containers | Where-Object { $_.container -eq $name }) | Select-Object -First 1
+        if (-not $policy -or $policy.on_zombie -ne 'recreate') {
+            # Not VCO-managed (adopted / unlisted): ensure-containers cleans
+            # its orphan runtime state and starts it BY NAME; never removed.
+            Write-Output "     ! $name is not VCO-managed - never removed or re-created here (manual: $runtime start $name)"
+            continue
+        }
+        $service = [string]$policy.service
+        $upArgs = $null
+        try {
+            $upArgs = @(((& $RunPy -m vco_lib.service_lifecycle compose-args --json --services $service 2>$null | Out-String) | ConvertFrom-Json).args)
+        } catch { $upArgs = $null }
+        if (-not $upArgs -or $upArgs.Count -eq 0) {
+            Write-Output "     ! no compose argv for $service - $name left as is"
+            continue
+        }
         # Podman state-DB desync: force-rm + recreate. `podman restart`
         # is a no-op because Podman thinks the container is alive.
         & $runtime rm -f $name *>$null
@@ -243,15 +278,15 @@ foreach ($z in $zombies) {
                     # podman-compose up -d <svc>`. Routed through the shared
                     # splitter so all four hook sites share one correct rule.
                     $composeInvocation = Split-VcoComposeCommand -ComposeCmd ($composeArgs -join ' ')
-                    & $composeInvocation.Head @($composeInvocation.Rest) up -d $service *>$null
+                    & $composeInvocation.Head @($composeInvocation.Rest) @upArgs *>$null
                     if ($LASTEXITCODE -ne 0) {
-                        Write-Output "     ! $($composeArgs -join ' ') up -d $service failed; manual: cd $composeDir; $($composeArgs -join ' ') up -d $service"
+                        Write-Output "     ! $($composeArgs -join ' ') $($upArgs -join ' ') failed; manual: cd $composeDir; $($composeArgs -join ' ') $($upArgs -join ' ')"
                     }
                 } finally {
                     Pop-Location
                 }
             } else {
-                Write-Output "     ! could not auto-detect compose dir; manual: $($composeArgs -join ' ') up -d $service"
+                Write-Output "     ! could not auto-detect compose dir; manual: $($composeArgs -join ' ') $($upArgs -join ' ')"
             }
         } else {
             Write-Output "     ! $runtime rm -f $name failed"

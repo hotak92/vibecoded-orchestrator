@@ -5,7 +5,11 @@
 //! `services/settings_json_watcher.rs` and `services/watcher.rs` (the
 //! GUI-side supervisor) remain in the launcher crate.
 
-pub mod picker;
+// v0.2.97: `picker` (the v0.2.7 container picker) is RETIRED. Candidate
+// detection — containers, native processes, upstream-default ports, VCO-data
+// fingerprints probed on each candidate's OWN port — is one Python detector,
+// `vco_lib/service_detection.py`, which the launcher calls through
+// `vco_lib_bridge` (`python -m vco_lib.service_endpoints candidates --json`).
 pub mod runtime;
 
 // v0.2.83 WP-B6: cross-writer file lock for the `UPDATE_DEFERRED.{md,json}`
@@ -18,17 +22,12 @@ pub mod runtime;
 // Python constant by `tests/test_deferral_lock_parity.py`.
 pub mod deferral_lock;
 
-// v0.2.62: per-service adoption state (`<vct_root_dir>/services.toml`).
-// MOVED here from `launcher/src-tauri/src/services/adoption.rs` so the
-// hub-side infra watchdog (`vct-hub::infra_watchdog`) can read the same
-// adopt/parallel/refuse decisions the launcher GUI persists, WITHOUT a
-// second copy of the schema. The module is pure (serde + toml + the
-// shared `crate::paths::vct_root_dir()` lookup) — it never depended on
-// Tauri, only on its file location. The launcher's
-// `src/services/adoption.rs` is now a thin `pub use` re-export so its
-// many call-sites compile unchanged. The watchdog NEVER touches a
-// service whose adoption mode is Adopt / Parallel / Refuse.
-pub mod adoption;
+// v0.2.97: `adoption` (the `<vct_root_dir>/services.toml` reader/writer) is
+// RETIRED. What a service is — VCO-managed, an adopted container, an adopted
+// URL — is its launcher.db `service_endpoints` row (`crate::db::service_endpoints`,
+// written only by `vco_lib.service_endpoints`). The v0.2.97 update imports a
+// `services.toml` once (`vco_lib.service_reconcile`) and renames it; no Rust
+// code reads it any more.
 
 // v0.2.97 (lane W): where the three core services are reached — the ONE
 // resolver behind the hub's `/config` and the launcher's project env
@@ -36,6 +35,17 @@ pub mod adoption;
 // by `vco_lib/service_endpoints.py`; both run
 // `tests/fixtures/service_endpoint_parity.json`.
 pub mod service_endpoints;
+
+// v0.2.97 (service endpoints SE-4): the services snapshot — ONE wire shape
+// for the launcher's `services_status` and the hub's `/services/status`
+// (the hub used to hand-mirror the launcher's structs), built from the rows.
+pub mod service_status;
+
+// v0.2.97 (SE-4 × SE-3): the `compose up` argv for an explicit service list —
+// the ONE rule is Python's (`vco_lib.service_lifecycle.compose_up_args`:
+// `--no-deps`, `--profile gpu` for code_embed, nothing for an empty list);
+// the launcher and the hub watchdog call it, never hand-build `up -d <svc>`.
+pub mod compose_args;
 
 // v0.2.47: shared per-paid-module container helpers. Previously two
 // near-identical copies lived in launcher/src/commands/module_service.rs

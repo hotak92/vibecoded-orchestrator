@@ -1,15 +1,17 @@
 <script lang="ts">
   // Services preferences page — Start All / Stop All / Restart All +
-  // per-service controls + Re-detect adoption for externally-managed
-  // services. Polls `services_status` on a 5s timer to keep state fresh
-  // (matches the tray pill's cadence).
+  // per-service controls. Polls `services_status` on a 5s timer to keep
+  // state fresh (matches the tray pill's cadence).
   //
-  // v0.2.7 (Bug E1+E2): each row shows the pinned container name (the
-  // container the launcher is configured to manage) and exposes a
-  // "Re-detect" button that enumerates candidates and opens a picker
-  // modal. The picker modal also surfaces "fullness" probes per
-  // candidate (collection / model counts, etc.) so the user can tell a
-  // working container from a stale one.
+  // v0.2.97 (service endpoints SSOT): each row shows WHERE the service runs
+  // — its launcher.db `service_endpoints` row: VCO-managed, "Using your
+  // container <name>" or "Using <url>" — with its port, container and data
+  // mount. "Change…" re-detects candidates (the Python detector) and opens
+  // the adoption dialog; "Let VCO manage it" is the opt-in ownership
+  // transfer of an adopted Weaviate/Ollama container, behind a confirmation
+  // that names the data mount. There is no "Reset adoption" and no
+  // "refuse": a service always has an endpoint. Every decision lives in
+  // `$lib/api/service_endpoints` (vitest-pinned); this file is markup.
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke, listen } from '$lib/tauri';
@@ -67,96 +69,35 @@
     VSCodeWriteResult,
   } from '$lib/types/model-gateway';
   import { projects } from '$lib/stores/projects';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
+  import {
+    ACTION_LABELS,
+    buildCandidateReport,
+    describeDataMount,
+    getEndpointCandidates,
+    getServicesStatus,
+    isCoreService,
+    modeBadge,
+    parseDataMount,
+    pendingFromSnapshot,
+    rowsFromSnapshot,
+    runEndpointAction,
+    serviceActions,
+    serviceLabel,
+    type CandidateReport,
+    type CoreServiceName,
+    type ServiceActionId,
+    type ServiceRuntimeState,
+    type ServicesRuntimeSnapshot,
+  } from '$lib/api/service_endpoints';
 
-  interface ServiceRuntimeState {
-    name: string;
-    running: boolean;
-    port: number;
-    url: string;
-    externally_managed: boolean;
-    adoption_mode: 'unresolved' | 'adopt' | 'parallel' | 'refuse';
-    container_name: string | null;
-    // True when the pinned container exists per `podman ps` but its main
-    // PID is dead (state-DB desync). Mirrors `ServiceRuntimeState.zombie`
-    // in launcher/src-tauri/src/commands/lifecycle.rs.
-    zombie?: boolean;
-  }
-  interface ServicesRuntimeSnapshot {
-    services: ServiceRuntimeState[];
-    runtime: string | null;
-    needs_podman_machine_start: boolean;
-    has_unresolved_external: boolean;
-  }
   interface LifecycleProgress {
     phase: string;
     message: string;
   }
 
-  // Discriminated union mirroring `ContainerFullness` in
-  // launcher/src-tauri/src/services/picker.rs. Serde emits `kind` as the
-  // discriminator (snake_case).
-  //
-  // v0.2.92 (review MAJOR-8): the `kind` arms are the hand-listed SERVICE
-  // UNION for this page, and until now nothing pinned them to anything. They
-  // are now diffed against the hub's canonical service table
-  // (`vct-hub/src/lifecycle_api.rs::canonical_service_skeletons`) by
-  // `services-union.test.ts`, which fails if a service joins that table and no
-  // arm follows — or if an arm names something the hub does not serve.
-  //
-  // The pin has ONE declared exclusion, and it is structural rather than
-  // drift: `model_gateway` is a PROCESS, not a `vco_*` container. It has no
-  // image, no adoption mode, nothing to "re-detect", so a fullness probe for
-  // it would have no candidates to describe — the page gives it a card of its
-  // own instead (see the `$lib/api/model_gateway` import above). The test
-  // states that exclusion explicitly, mirroring
-  // `infra_watchdog::watchdog_never_supervises_the_model_gateway_process` on
-  // the Rust side, so "sync the two lists" cannot quietly undo it.
-  type ContainerFullness =
-    | {
-        kind: 'weaviate';
-        collection_count: number;
-        canonical_collections_present: string[];
-        weaviate_version: string | null;
-      }
-    | {
-        kind: 'ollama';
-        model_count: number;
-        canonical_models_present: string[];
-      }
-    | {
-        kind: 'code_embed';
-        backend: string | null;
-        model: string | null;
-        dim: number | null;
-      };
-
-  interface ContainerCandidate {
-    container_name: string;
-    compose_project: string | null;
-    image: string;
-    status: string;
-    health: string | null;
-    port_published: number | null;
-    restart_count: number;
-    fullness: ContainerFullness | null;
-  }
-
-  // services.toml-backed adoption config (read-only mirror of `services_get_adoption`).
-  // Useful for "why is this service routed externally?" diagnostics; the per-row
-  // `adoption_mode` on the snapshot is the runtime-classified value used for UI.
-  interface ServiceAdoptionConfig {
-    name: string;
-    mode: string;
-    external_url?: string | null;
-    parallel_port?: number | null;
-    container_name?: string | null;
-  }
-  interface AdoptionState {
-    services: ServiceAdoptionConfig[];
-  }
-
   let snapshot = $state<ServicesRuntimeSnapshot | null>(null);
-  let adoptionConfig = $state<AdoptionState | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let progress = $state<LifecycleProgress | null>(null);
@@ -305,15 +246,70 @@
     });
   }
 
-  // Picker-modal state. Open when `pickerService != null`.
-  let pickerService = $state<string | null>(null);
-  let pickerCandidates = $state<ContainerCandidate[]>([]);
-  let pickerLoading = $state(false);
-  let pickerError = $state<string | null>(null);
+  // ─── Where a service runs (v0.2.97) ──────────────────────────────────
+  let endpointDialogOpen = $state(false);
+  let endpointReport = $state<CandidateReport | null>(null);
+  let endpointOnly = $state<CoreServiceName | null>(null);
+  // "Let VCO manage it" confirmation: the service it is about, or null.
+  let handTarget = $state<ServiceRuntimeState | null>(null);
+  let handOpen = $state(false);
+  let handBusy = $state(false);
+
+  /** Re-detect and open the dialog — for one service ("Change…") or all. */
+  async function openEndpointDialog(service: CoreServiceName | null) {
+    endpointOnly = service;
+    endpointReport = null;
+    endpointDialogOpen = true;
+    error = null;
+    try {
+      const detection = await getEndpointCandidates(service ?? undefined);
+      endpointReport = buildCandidateReport(detection, rowsFromSnapshot(snapshot), pendingFromSnapshot(snapshot));
+    } catch (e) {
+      endpointDialogOpen = false;
+      error = `Detecting services failed: ${String(e)}`;
+    }
+  }
+
+  function askHandToVco(svc: ServiceRuntimeState) {
+    handTarget = svc;
+    handOpen = true;
+  }
+
+  async function confirmHandToVco() {
+    if (!handTarget || !isCoreService(handTarget.name)) return;
+    handBusy = true;
+    error = null;
+    try {
+      await runEndpointAction({ action: 'hand_to_vco', service: handTarget.name });
+      handOpen = false;
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      handBusy = false;
+    }
+  }
+
+  async function onRowAction(svc: ServiceRuntimeState, action: ServiceActionId) {
+    switch (action) {
+      case 'start':
+        return runServiceAction(svc.name, 'service_start');
+      case 'stop':
+        return runServiceAction(svc.name, 'service_stop');
+      case 'restart':
+        return runServiceAction(svc.name, 'service_restart');
+      case 'recover':
+        return recoverZombie(svc.name);
+      case 'change':
+        return isCoreService(svc.name) ? openEndpointDialog(svc.name) : undefined;
+      case 'hand_to_vco':
+        return askHandToVco(svc);
+    }
+  }
 
   async function refresh() {
     try {
-      snapshot = await invoke<ServicesRuntimeSnapshot>('services_status');
+      snapshot = await getServicesStatus();
       error = null;
     } catch (e) {
       error = String(e);
@@ -359,11 +355,11 @@
     }
   }
 
-  // Per-service action wrapper. v0.2.7: if the backend returns a
-  // structured error (`multiple_candidates: …` / `container_missing: …`),
-  // auto-open the picker for the offending service. We match by the
-  // colon-prefix to keep parsing trivial — the kinds are pinned by the
-  // ERR_KIND_* constants in launcher/src-tauri/src/commands/lifecycle.rs.
+  // Per-service action wrapper. A `container_missing: …` error (the row's
+  // container is gone) opens the adoption dialog for that service; a
+  // `no_lifecycle: …` error (an external endpoint) is shown as it is. The
+  // prefixes are the ERR_KIND_* constants in
+  // launcher/src-tauri/src/commands/lifecycle.rs.
   async function runServiceAction(
     name: string,
     cmd: 'service_start' | 'service_stop' | 'service_restart',
@@ -375,147 +371,29 @@
       await refresh();
     } catch (e) {
       const msg = String(e);
-      if (msg.startsWith('multiple_candidates:') || msg.startsWith('container_missing:') || msg.startsWith('no_candidates:')) {
-        // Surface the kind to the user in the modal — they need to
-        // know whether to pick, re-detect, or install something.
-        error = msg;
-        await openPicker(name);
-      } else {
-        error = msg;
+      error = msg;
+      if (msg.startsWith('container_missing:') && isCoreService(name)) {
+        await openEndpointDialog(name);
       }
     } finally {
       loading = false;
     }
   }
 
-  async function startOne(name: string) {
-    await runServiceAction(name, 'service_start');
-  }
-  async function stopOne(name: string) {
-    await runServiceAction(name, 'service_stop');
-  }
-  async function restartOne(name: string) {
-    await runServiceAction(name, 'service_restart');
-  }
-
-  // Force-recover a zombie container (podman state-DB desync: `podman ps`
-  // says "Up" but the main PID is dead). Wired to `recover_zombie`, which
-  // force-removes the stale record and re-brings-up the stack.
-  async function recoverZombie(containerName: string) {
+  // Recover a stuck (zombie) service — podman state-DB desync: `podman ps`
+  // says "Up" but the main PID is dead. `recover_zombie` is row-gated: VCO's
+  // own container is removed and brought back up; an adopted container is
+  // only restarted by name, never removed.
+  async function recoverZombie(name: string) {
     loading = true;
     error = null;
     try {
-      await invoke('recover_zombie', { containerName });
+      await invoke('recover_zombie', { name });
       await refresh();
     } catch (e) {
       error = String(e);
     } finally {
       loading = false;
-    }
-  }
-
-  async function resetAdoption() {
-    loading = true;
-    error = null;
-    try {
-      await invoke('services_reset_adoption');
-      await refresh();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
-  }
-
-  // ---------------------------------------------------------------------
-  // Picker modal
-  // ---------------------------------------------------------------------
-
-  async function openPicker(service: string) {
-    pickerService = service;
-    pickerCandidates = [];
-    pickerError = null;
-    pickerLoading = true;
-    try {
-      pickerCandidates = await invoke<ContainerCandidate[]>(
-        'services_enumerate_candidates',
-        { service },
-      );
-    } catch (e) {
-      pickerError = String(e);
-    } finally {
-      pickerLoading = false;
-    }
-  }
-
-  function closePicker() {
-    pickerService = null;
-    pickerCandidates = [];
-    pickerError = null;
-  }
-
-  async function pickCandidate(candidate: ContainerCandidate) {
-    if (!pickerService) return;
-    pickerLoading = true;
-    pickerError = null;
-    try {
-      await invoke('services_pick_container', {
-        service: pickerService,
-        containerName: candidate.container_name,
-      });
-      closePicker();
-      // Refresh both snapshot + adoption config so the row reflects the
-      // new pin immediately.
-      await refresh();
-      try {
-        adoptionConfig = await invoke<AdoptionState>('services_get_adoption');
-      } catch (e) {
-        console.warn('services_get_adoption (post-pick) failed:', e);
-      }
-    } catch (e) {
-      pickerError = String(e);
-    } finally {
-      pickerLoading = false;
-    }
-  }
-
-  function fullnessSummary(c: ContainerCandidate): string {
-    if (!c.fullness) {
-      return c.status === 'running' ? 'probe failed' : '—';
-    }
-    switch (c.fullness.kind) {
-      case 'weaviate': {
-        const f = c.fullness;
-        const canon = f.canonical_collections_present.length;
-        const ver = f.weaviate_version ? `, v${f.weaviate_version}` : '';
-        return `${f.collection_count} collections (${canon} canonical${ver})`;
-      }
-      case 'ollama': {
-        const f = c.fullness;
-        const canon = f.canonical_models_present.length;
-        return `${f.model_count} models (${canon} canonical)`;
-      }
-      case 'code_embed': {
-        const f = c.fullness;
-        const bits = [
-          f.backend ?? 'unknown backend',
-          f.model ?? 'unknown model',
-          f.dim ? `${f.dim}d` : '',
-        ].filter(Boolean);
-        return bits.join(' · ');
-      }
-    }
-  }
-
-  function fullnessDetails(c: ContainerCandidate): string[] {
-    if (!c.fullness) return [];
-    switch (c.fullness.kind) {
-      case 'weaviate':
-        return c.fullness.canonical_collections_present.slice(0, 5);
-      case 'ollama':
-        return c.fullness.canonical_models_present.slice(0, 5);
-      case 'code_embed':
-        return [];
     }
   }
 
@@ -527,14 +405,6 @@
     // system !== null).
     void orchestrator.detectSystem();
     await refresh();
-    // Mirror the on-disk adoption config for diagnostics. Failures are
-    // non-fatal — the snapshot already drives the UI.
-    try {
-      adoptionConfig = await invoke<AdoptionState>('services_get_adoption');
-    } catch (e) {
-      // Soft-fail: log to console only; this is a diagnostics fetch.
-      console.warn('services_get_adoption failed:', e);
-    }
     // Model gateway: its own probes, on the same 5 s cadence as the table.
     await refreshGateway();
     await refreshVSCodeTargets();
@@ -620,11 +490,20 @@
       <button onclick={restartAll} disabled={loading || !snapshot.runtime}>
         Restart All
       </button>
-      <button onclick={resetAdoption} disabled={loading} class="secondary">
-        Reset adoption
+      <button onclick={() => openEndpointDialog(null)} disabled={loading} class="secondary">
+        Detect services
       </button>
     </div>
 
+    {#if snapshot.endpoints_missing}
+      <div class="banner warn" data-testid="endpoints-missing">
+        <strong>Where some services run is not recorded yet.</strong>
+        A finished install or update records it. You can choose now:
+        <button class="linklike" onclick={() => openEndpointDialog(null)} disabled={loading}>
+          Detect services
+        </button>
+      </div>
+    {/if}
     {#if error}
       <div class="banner error">{error}</div>
     {/if}
@@ -639,82 +518,58 @@
         <tr>
           <th>Service</th>
           <th>Status</th>
+          <th>Where it runs</th>
           <th>Port</th>
-          <th>Mode</th>
-          <th>Managing</th>
+          <th>Container &amp; data</th>
           <th>Actions</th>
         </tr>
       </thead>
       <tbody>
-        {#each snapshot.services as svc}
-          <tr>
-            <td><strong>{svc.name}</strong></td>
+        {#each snapshot.services as svc (svc.name)}
+          {@const badge = modeBadge(svc)}
+          {@const mount = parseDataMount(svc.endpoint?.data_mount_json)}
+          <tr data-testid="service-row-{svc.name}">
+            <td><strong>{serviceLabel(svc.name)}</strong></td>
             <td>
               <span class="status {svc.running ? 'up' : 'down'}">
                 {svc.running ? 'running' : 'stopped'}
               </span>
-              {#if svc.externally_managed}
-                <span class="tag">external</span>
-              {/if}
               {#if svc.zombie}
                 <span
                   class="tag tag-zombie"
-                  title="The container exists but its main process is dead (state-DB desync). Use Recover to force-remove and restart it."
+                  title="The container exists but its main process is dead (state-DB desync). Use Recover."
                 >stuck</span>
               {/if}
             </td>
-            <td>{svc.port}</td>
-            <td
-              class="mode-cell"
-              title={
-                adoptionConfig?.services.find((a) => a.name === svc.name)
-                  ?.external_url ?? ''
-              }
-            >{svc.adoption_mode}</td>
+            <td class="mode-cell">
+              <span class="mode-badge {badge.tone}" title={badge.title}>{badge.label}</span>
+            </td>
+            <td>
+              {svc.port}
+              {#if svc.endpoint?.grpc_port}
+                <span class="muted small">gRPC {svc.endpoint.grpc_port}</span>
+              {/if}
+            </td>
             <td class="container-cell">
               {#if svc.container_name}
                 <code>{svc.container_name}</code>
               {:else}
-                <span class="muted">unpinned</span>
+                <span class="muted">no container</span>
+              {/if}
+              {#if svc.endpoint}
+                <span class="mount" title="Where this service keeps its data">{describeDataMount(mount)}</span>
               {/if}
             </td>
             <td class="actions-cell">
-              <button
-                onclick={() => startOne(svc.name)}
-                disabled={loading}
-              >
-                Start
-              </button>
-              <button
-                onclick={() => stopOne(svc.name)}
-                disabled={loading}
-              >
-                Stop
-              </button>
-              <button
-                onclick={() => restartOne(svc.name)}
-                disabled={loading}
-              >
-                Restart
-              </button>
-              <button
-                onclick={() => openPicker(svc.name)}
-                disabled={loading}
-                class="secondary"
-                title="Enumerate candidate containers for this service"
-              >
-                Re-detect
-              </button>
-              {#if svc.zombie && svc.container_name}
+              {#each serviceActions(svc) as action (action)}
                 <button
-                  onclick={() => svc.container_name && recoverZombie(svc.container_name)}
+                  onclick={() => onRowAction(svc, action)}
                   disabled={loading}
-                  class="recover"
-                  title="Force-remove the stuck container and restart it"
+                  class={action === 'change' || action === 'hand_to_vco' ? 'secondary' : action === 'recover' ? 'recover' : ''}
                 >
-                  Recover
+                  {action === 'change' && svc.pending_choice ? 'Choose…' : ACTION_LABELS[action]}
                 </button>
-              {/if}
+              {/each}
             </td>
           </tr>
         {/each}
@@ -1093,88 +948,43 @@
     {/if}
   </section>
 
-  {#if pickerService}
-    <div
-      class="modal-backdrop"
-      onclick={closePicker}
-      onkeydown={(e) => { if (e.key === 'Escape') closePicker(); }}
-      role="presentation"
-    >
-      <div
-        class="modal"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        tabindex="-1"
-        aria-label="Pick a container for {pickerService}"
-      >
-        <header class="modal-header">
-          <h2>Pick a container for <code>{pickerService}</code></h2>
-          <button class="close" onclick={closePicker} aria-label="Close">×</button>
-        </header>
+  <ExternalServicesDialog
+    bind:open={endpointDialogOpen}
+    bind:report={endpointReport}
+    only={endpointOnly}
+    listenForBoot={false}
+    onchanged={refresh}
+  />
 
-        {#if pickerLoading}
-          <p>Enumerating containers…</p>
-        {:else if pickerError}
-          <div class="banner error">{pickerError}</div>
-        {:else if pickerCandidates.length === 0}
-          <p class="muted">
-            No candidate containers found for <code>{pickerService}</code>.
-            Either nothing is running yet, or the launcher's container
-            runtime can't see your existing stack. Click "Start All" to
-            create fresh containers, or check your runtime config.
-          </p>
-        {:else}
-          <p class="muted">
-            {pickerCandidates.length} candidate{pickerCandidates.length === 1 ? '' : 's'} found.
-            Pick the one the launcher should manage.
-          </p>
-          <div class="candidates">
-            {#each pickerCandidates as c}
-              <article class="candidate {c.status === 'running' ? 'running' : 'stopped'}">
-                <header>
-                  <code class="cname">{c.container_name}</code>
-                  <span class="status {c.status === 'running' ? 'up' : 'down'}">
-                    {c.status}
-                  </span>
-                  {#if c.health}
-                    <span class="health {c.health}">{c.health}</span>
-                  {/if}
-                </header>
-                <dl class="meta">
-                  {#if c.compose_project}
-                    <dt>project</dt><dd><code>{c.compose_project}</code></dd>
-                  {/if}
-                  <dt>image</dt><dd><code>{c.image}</code></dd>
-                  <dt>port</dt><dd>
-                    {#if c.port_published}{c.port_published}{:else}—{/if}
-                  </dd>
-                  <dt>restarts</dt><dd>{c.restart_count}</dd>
-                  <dt>fullness</dt><dd>{fullnessSummary(c)}</dd>
-                </dl>
-                {#if fullnessDetails(c).length > 0}
-                  <ul class="fullness-list">
-                    {#each fullnessDetails(c) as d}
-                      <li><code>{d}</code></li>
-                    {/each}
-                  </ul>
-                {/if}
-                <footer>
-                  <button
-                    onclick={() => pickCandidate(c)}
-                    disabled={pickerLoading}
-                  >
-                    Pick this one
-                  </button>
-                </footer>
-              </article>
-            {/each}
-          </div>
-        {/if}
+  <DialogRoot bind:open={handOpen} ariaLabelledBy="hand-to-vco-title" width="560px">
+    {#snippet header()}
+      <h2 id="hand-to-vco-title">Let VCO manage {handTarget ? serviceLabel(handTarget.name) : ''}?</h2>
+    {/snippet}
+    {#snippet body()}
+      {#if handTarget}
+        {@const handMount = parseDataMount(handTarget.endpoint?.data_mount_json)}
+        <p>
+          VCO will take over your container <code>{handTarget.container_name}</code>: stop it,
+          remove the container (never its data), and recreate it from VCO’s compose file with
+          VCO’s settings — keeping the SAME data:
+        </p>
+        <p class="hand-mount"><code>{describeDataMount(handMount)}</code></p>
+        <p class="muted small">
+          VCO checks the new container mounts exactly that data before it starts, and again
+          after; on any mismatch it puts your original container back. From then on VCO
+          starts, stops and heals it.
+        </p>
+      {/if}
+    {/snippet}
+    {#snippet footer()}
+      <div class="bulk-actions">
+        <button class="secondary" onclick={() => (handOpen = false)} disabled={handBusy}>Cancel</button>
+        <button onclick={confirmHandToVco} disabled={handBusy || !handTarget?.endpoint?.data_mount_json}>
+          {handBusy ? 'Handing over…' : 'Let VCO manage it'}
+        </button>
       </div>
-    </div>
-  {/if}
+    {/snippet}
+  </DialogRoot>
 </section>
 
 <style>
@@ -1412,108 +1222,46 @@
     flex-wrap: wrap;
   }
 
-  /* ---------- Picker modal ---------- */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.55);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
+  /* v0.2.97: where a service runs. */
+  .mode-badge {
+    display: inline-block;
+    font-size: 0.78rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    white-space: nowrap;
   }
-  .modal {
-    background: var(--modal-bg, #1c1c1c);
-    border: 1px solid var(--border, #333);
-    border-radius: 6px;
-    padding: 1.25rem;
-    max-width: 720px;
-    width: 90vw;
-    max-height: 85vh;
-    overflow: auto;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  .mode-badge.managed {
+    color: var(--color-teal);
+    border-color: rgba(0, 191, 166, 0.4);
   }
-  .modal-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 0.75rem;
+  .mode-badge.adopted {
+    color: var(--color-purple);
+    border-color: rgba(123, 95, 255, 0.4);
   }
-  .modal-header h2 {
-    margin: 0;
-    font-size: 1.15rem;
+  .mode-badge.external {
+    color: var(--color-mid);
   }
-  .close {
-    background: transparent;
+  .mode-badge.pending {
+    color: var(--color-pink);
+    border-color: rgba(255, 79, 160, 0.4);
+  }
+  .container-cell .mount {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--color-mid);
+    overflow-wrap: anywhere;
+  }
+  .hand-mount {
+    margin: 0.25rem 0 0.75rem;
+  }
+  .linklike {
+    background: none;
     border: none;
-    color: inherit;
-    font-size: 1.5rem;
+    color: var(--color-teal);
+    text-decoration: underline;
     cursor: pointer;
-    padding: 0 0.4rem;
-  }
-  .candidates {
-    display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-  }
-  .candidate {
-    border: 1px solid var(--border, #333);
-    border-radius: 4px;
-    padding: 0.6rem 0.8rem;
-    background: rgba(255, 255, 255, 0.02);
-  }
-  .candidate.stopped {
-    opacity: 0.75;
-  }
-  .candidate header {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-bottom: 0.4rem;
-  }
-  .candidate .cname {
-    font-weight: 600;
-  }
-  .health {
-    text-transform: uppercase;
-    font-size: 0.7rem;
-    padding: 0.1rem 0.3rem;
-    border-radius: 3px;
-  }
-  .health.healthy {
-    background: rgba(34, 197, 94, 0.2);
-    color: #4ade80;
-  }
-  .health.unhealthy {
-    background: rgba(239, 68, 68, 0.2);
-    color: #fca5a5;
-  }
-  .health.starting {
-    background: rgba(245, 158, 11, 0.2);
-    color: #fbbf24;
-  }
-  .candidate .meta {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 0.15rem 0.6rem;
-    font-size: 0.85rem;
-    margin: 0.2rem 0;
-  }
-  .candidate .meta dt {
-    color: var(--text-muted, #aaa);
-  }
-  .candidate .meta dd {
-    margin: 0;
-  }
-  .fullness-list {
-    margin: 0.3rem 0 0.5rem 0;
-    padding-left: 1.2rem;
-    font-size: 0.8rem;
-    color: var(--text-muted, #aaa);
-  }
-  .candidate footer {
-    margin-top: 0.4rem;
-    display: flex;
-    justify-content: flex-end;
+    padding: 0;
+    font: inherit;
   }
 </style>

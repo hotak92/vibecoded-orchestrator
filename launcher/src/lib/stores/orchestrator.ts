@@ -32,6 +32,13 @@ export interface InstallConfig {
   openai_key: string | null;
   container_runtime: string | null;
   skip_containers: boolean;
+  /**
+   * v0.2.97 (lane Y): ruling-Q1 service adoption choices, each
+   * `<weaviate|ollama|code_embed>=<adopt:container:<name>|adopt:url:<url>|vco[:<port>]`,
+   * forwarded to install.py as `--service` flags. `null`/absent = no
+   * adoption flags (older wizard payloads).
+   */
+  service_choices?: string[] | null;
 }
 
 export interface InstallProgress {

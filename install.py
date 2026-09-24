@@ -164,7 +164,6 @@ from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
-from vco_lib import service_adoption as _service_adoption  # noqa: E402
 from vco_lib import progress_event as _progress_event  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
@@ -1419,19 +1418,21 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
 
 def _bootstrap_weaviate_endpoints() -> dict:
     """Bootstrap envelope's ``weaviate_endpoints`` — NEW-4 SSOT: health is
-    ``/v1/.well-known/ready``. The base resolves through the ONE home
-    (``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > 8081); v0.2.96 (6a) replaced the
-    five hardcoded ``http://localhost:8081`` literals that read no env, so
-    ``--bootstrap --json`` advertised the wrong port on a relocated install.
+    ``/v1/.well-known/ready``. v0.2.96 (6a) replaced five hardcoded literals;
+    v0.2.97: the base is this machine's ``service_endpoints`` row (else the
+    compiled default) — install.py takes no endpoint from env.
     """
-    base = _wh.weaviate_url_default().rstrip("/")
+    urls = _service_endpoint_urls()
+    base = str(urls["weaviate_url"]).rstrip("/")
+    host = base.split("://", 1)[-1].split("/", 1)[0]
+    host = host.rsplit(":", 1)[0] if not host.endswith("]") and ":" in host else host
     return {
         "base": base,
         "health": f"{base}/v1/.well-known/ready",
         "meta": f"{base}/v1/meta",
         "schema": f"{base}/v1/schema",
         "graphql": f"{base}/v1/graphql",
-        "grpc_host": "localhost:50052",
+        "grpc_host": f"{host}:{urls['weaviate_grpc_port']}",
     }
 
 
@@ -5725,11 +5726,17 @@ def main() -> int:
     parser.add_argument("--on-conflict",
                         choices=["alt-port", "adopt", "abort"],
                         default=None,
-                        help="Non-interactive resolution when a foreign service is "
-                             "detected on a canonical port. 'alt-port' (default for "
-                             "foreign): pick a free port and write compose.override.yaml. "
-                             "'adopt' (advanced): reuse the foreign service in place — "
-                             "WILL write our collections into it. 'abort': stop install.")
+                        help="Answer for a Weaviate/Ollama found running that VCO did "
+                             "not start and that holds no VCO data. 'adopt': use it "
+                             "(VCO adds its own collections to a Weaviate). 'alt-port': "
+                             "run VCO's own copy on a free port beside it. 'abort': stop. "
+                             "Unset + unattended: an Ollama is used; a Weaviate waits "
+                             "for your choice (UPDATE_DEFERRED.md).")
+    parser.add_argument("--service", action="append", default=[], metavar="SVC=CHOICE",
+                        help="Explicit endpoint for one service (repeatable): "
+                             "weaviate|ollama=adopt:container:<name>, "
+                             "weaviate|ollama=adopt:url:<url>, or <svc>=vco[:<port>] "
+                             "(VCO's own copy). The launcher's setup wizard passes these.")
     # Re-install file-conflict resolution. Mirrors the 4-option modal in
     # the launcher's OnboardingWizard. CLI users running install.py
     # directly against a populated install path get explicit flags
@@ -5777,22 +5784,16 @@ def main() -> int:
                              "when no requirements.txt is present. Use it when "
                              "you changed the launcher's Python version and the "
                              "venv needs to follow.")
-    # v0.2.10 (Bug L2 — cross-OS boot-service materialization). The
-    # compose-project working directory may not match the install path
-    # (the canonical example: install at ~/code/orch but compose lives
-    # at ~/code/claude/claude_mcp_servers). When set, this is the highest-
-    # priority signal for _resolve_compose_working_dir; otherwise we
-    # probe a running container's working_dir label, then fall back to
-    # install-path probes.
+    # v0.2.10 (Bug L2 — cross-OS boot-service materialization). When set,
+    # this is the highest-priority signal for _resolve_compose_working_dir;
+    # otherwise <install>/infrastructure/ (v0.2.97: the only other leg).
     parser.add_argument("--compose-working-dir", type=str, default=None,
                         help="Absolute path to the directory containing "
                              "compose.yaml for the Claude MCP stack. Used by "
                              "the boot-service materialization step to record "
                              "WorkingDirectory= in the systemd unit / launchd "
-                             "plist / Task Scheduler XML. When unset, the "
-                             "installer probes a running container's label, "
-                             "then falls back to <install>/claude_mcp_servers/ "
-                             "or <install>/infrastructure/.")
+                             "plist / Task Scheduler XML. When unset: "
+                             "<install>/infrastructure/.")
     parser.add_argument("--preserve-paths",
                         type=str, default=None,
                         help="Comma-separated list of install-relative paths to "
@@ -6209,16 +6210,12 @@ def main() -> int:
             {"reason": "post-detection (incl. prompt-install if any)"},
         )
 
-        # Step 5b: probe BEFORE compose up. Honors content-based detection
-        # and persists the resolution in ~/.vct/services.toml. Foreign
-        # services on the canonical port either get an alt-port (default)
-        # or, with explicit consent, are adopted in place. We never POST
-        # collections into a service we didn't start.
-        decisions = _resolve_service_safety(args)
-        if any(d["action"] == ACTION_ABORT for d in decisions.values()):
-            for name, d in decisions.items():
-                if d["action"] == ACTION_ABORT:
-                    print(f"  [{name}] aborted: {d['evidence']}")
+        # Step 5b (v0.2.97): detect BEFORE compose up and record the rows in
+        # launcher.db (vco_lib.service_reconcile). VCO's own services are
+        # started/recreated; an adopted Weaviate/Ollama is never touched; a
+        # third-party Weaviate is never written into without consent.
+        decisions = _reconcile_service_endpoints(args, sysinfo, _deferral_report)
+        if decisions is None:
             return 1
 
         _start_services(sysinfo, args, embed_config, decisions,
@@ -6253,17 +6250,11 @@ def main() -> int:
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
         # that aren't there yet — leave existing ones alone.
         #
-        # Pollution guarantee: collection writes only happen when the user
-        # consented. The matrix:
-        #   - ACTION_START / ACTION_ALT_PORT (we run our own Weaviate)
-        #     ⇒ writes to our instance
-        #   - ACTION_ADOPT vct-managed (prior install of ours)
-        #     ⇒ writes to a Weaviate we already populated
-        #   - ACTION_ADOPT foreign (user typed "2" / passed
-        #     --on-conflict adopt)
-        #     ⇒ writes to user-owned Weaviate WITH EXPLICIT CONSENT
-        # No path writes without consent. The default for foreign is
-        # alt-port, so the no-consent case never hits ACTION_ADOPT.
+        # Pollution guarantee: collection writes only happen where the rows
+        # say VCO's Weaviate is — VCO's own, one that already holds VCO data,
+        # or a third-party instance the user confirmed. An unattended run
+        # that found a third-party Weaviate writes nothing anywhere
+        # (_weaviate_awaits_confirmation).
         # Schema-rebuild gate (--update only): if the running KG
         # collection is on an older schema lacking today's invariants
         # (named-vector slots, index_null_state, etc.), prompt to drop
@@ -6553,8 +6544,11 @@ def main() -> int:
             # for known schema drift that requires explicit consent to fix.
             if _is_orchestrator_root_install():
                 _emit_orchestrator_root_schema_deferrals(_deferral_report)
+        _verify_service_endpoints(_deferral_report)  # v0.2.97: every row must answer now
     else:
         print("\n[skip] Container services (--no-containers)")
+        if _reconcile_service_endpoints(args, sysinfo, _deferral_report, runtime=None) is None:
+            return 1  # the rows are owed even with no containers (HTTP-only detection)
         print("[skip] Weaviate seeding (--no-containers)")
 
     # Step 7: Create state directory
@@ -11811,92 +11805,24 @@ def _detect_existing_services(weaviate_port: int = DEFAULT_WEAVIATE_PORT,
 
 
 # ---------------------------------------------------------------------------
-# Step 5b: Safe-by-default service detection
+# Step 5b: where the services are reached (v0.2.97)
 # ---------------------------------------------------------------------------
 #
-# Goal: install.py must NOT touch a Weaviate / Ollama / code-embed service
-# that wasn't started by us, EVEN IF it's running on our canonical port. The
-# old behavior — blindly POSTing to localhost:8081 — would pollute a foreign
-# user-owned Weaviate with our collections (`KnowledgeGraph` etc.) and could
-# even bind-conflict the compose `up -d` against it.
-#
-# Detection is content-based, not name-based: we probe the port and
-# fingerprint the response. A container called `weaviate` is irrelevant —
-# what matters is "did WE start whatever's responding here?".
-#
-# Decision matrix:
-#
-#   probe state    | default action             | non-interactive override
-#   ---------------+----------------------------+------------------------
-#   not-running    | start our compose service  | (none — no conflict)
-#   vct-managed    | adopt (skip compose start) | (none — auto-handled)
-#   foreign        | alt-port (free port)       | --on-conflict
-#   incompatible   | abort                      | (cannot override)
-#
-# State persistence: the chosen action is recorded in
-# `~/.vct/services.toml`, the SAME file the launcher's
-# `services::adoption` reads/writes (commit 8b1890f). install.py and the
-# launcher therefore see consistent state. Schema is the launcher's
-# `AdoptionState` (rust serde) but expressed as flat TOML so plain Python
-# can produce it without depending on the `tomli_w` package.
+# Detection, the evidence ranking, the legacy import (services.toml, the
+# app_state port overrides, vct-config.toml, env, the old alt-port override)
+# and consent live in ``vco_lib.service_reconcile`` / ``service_detection``;
+# the rows are written only by ``vco_lib.service_endpoints``. This file keeps
+# the thin shim (``_reconcile_service_endpoints``) and step 5's compose
+# vocabulary below, which the shim derives from the rows.
 
-# Canonical service identifiers used in services.toml. Match the launcher's
-# launcher::services::adoption canonical names.
-_CANONICAL_SERVICES = ("weaviate", "ollama", "code_embed")
+# Step 5's per-service compose decision, in the vocabulary
+# ``_classify_service_compose_action`` / ``code_embed_image.plan_rebuild`` read.
+PROBE_NOT_RUNNING = "not-running"   # VCO's own, not answering → compose starts it
+PROBE_VCT_MANAGED = "vct-managed"   # VCO's own container under the installer's project
+PROBE_FOREIGN = "foreign"           # adopted / awaiting a choice / migrated — never touched
 
-# Default ports per service. Mirrors the DEFAULT_*_PORT constants above but
-# keyed by canonical name for table-driven loops.
-_DEFAULT_PORTS = {
-    "weaviate": DEFAULT_WEAVIATE_PORT,
-    "ollama": DEFAULT_OLLAMA_PORT,
-    "code_embed": DEFAULT_CODE_EMBED_PORT,
-}
-
-# Health-probe paths per service. GET / 2xx-3xx ⇒ "something is listening";
-# we then fingerprint the body to decide vct-managed vs. foreign.
-_HEALTH_PATHS = {
-    "weaviate": "/v1/.well-known/ready",
-    "ollama": "/api/tags",
-    "code_embed": "/health",
-}
-
-
-# ~/.vct/services.toml IO — the ONE home is vco_lib.service_adoption since
-# v0.2.96 WP-4 (the adoption flow must reset rows it makes obsolete, and a
-# second hand-rolled writer would drift from install.py's). These thin
-# wrappers keep install.py's own patch surface (`_services_toml_path` is
-# what tests redirect) and the deferral/adoption semantics unchanged.
-def _services_toml_path() -> Path:
-    """Path to `<VCT_STATE_DIR or ~/.vct>/services.toml` — shared with
-    launcher::services::adoption (Rust). Both sides honour ``VCT_STATE_DIR``
-    so a dev launcher's state stays isolated from production state."""
-    return _service_adoption.services_toml_path()
-
-
-def _read_services_toml() -> dict:
-    """Parse `~/.vct/services.toml` (see the vco_lib home for semantics)."""
-    return _service_adoption.read_services_toml(path=_services_toml_path())
-
-
-def _write_services_toml(state: dict) -> None:
-    """Serialize `{services: [...]}` to `~/.vct/services.toml` atomically
-    (hand-rolled TOML in the vco_lib home — `tomli_w` is not in the
-    install-time venv; schema = the rust launcher's `AdoptionState`)."""
-    _service_adoption.write_services_toml(state, path=_services_toml_path())
-
-
-# ProbeResult and ProbeAction — emulated as string constants for stdlib-only
-# install.py. `enum` would work but adds import noise without buying us
-# anything; the action set is small and string-comparable.
-PROBE_NOT_RUNNING = "not-running"   # port free; we'll start compose
-PROBE_VCT_MANAGED = "vct-managed"   # our prior install — adopt seamlessly
-PROBE_FOREIGN = "foreign"           # someone else's service — DO NOT TOUCH
-PROBE_INCOMPATIBLE = "incompatible" # protocol mismatch — abort
-
-ACTION_START = "start"      # bring up the compose service on default port
-ACTION_ADOPT = "adopt"      # reuse the existing service as-is (skip compose)
-ACTION_ALT_PORT = "alt-port"  # bring up compose on an alternate free port
-ACTION_ABORT = "abort"      # bail the install
+ACTION_START = "start"      # bring up the compose service
+ACTION_ADOPT = "adopt"      # it runs already (recreated only when PROBE_VCT_MANAGED)
 
 
 def _classify_service_compose_action(action: str, probe: str) -> str:
@@ -11910,13 +11836,13 @@ def _classify_service_compose_action(action: str, probe: str) -> str:
         config (the named data volume is preserved). This is the fix for "an
         adopt skips compose, so a changed env never applies on --update."
       * "skip"     — leave the service running untouched. Critically this covers
-        a FOREIGN adopt (probe == foreign, only via explicit --on-conflict
-        adopt): we must NEVER recreate a service we don't own.
+        every ADOPTED service (probe == foreign): we must NEVER recreate a
+        service we don't own.
 
     Keeping this a pure function makes the start-vs-recreate-vs-skip rule
     unit-testable without driving the whole `_start_services` subprocess path.
     """
-    if action in (ACTION_START, ACTION_ALT_PORT):
+    if action == ACTION_START:
         return "start"
     if action == ACTION_ADOPT and probe == PROBE_VCT_MANAGED:
         return "recreate"
@@ -11978,16 +11904,9 @@ def _parse_compose_weaviate_reclaim_env(compose_text: str) -> dict:
     reclaim keys are unique across services so a flat scan is unambiguous.
     Returns a dict of only the keys found, values stripped of quotes/whitespace.
     """
-    found: dict = {}
-    for key in _WEAVIATE_RECLAIM_ENV_KEYS:
-        m = re.search(
-            rf'^\s*{re.escape(key)}\s*:\s*["\']?([^"\'\n#]+?)["\']?\s*(?:#.*)?$',
-            compose_text,
-            re.MULTILINE,
-        )
-        if m:
-            found[key] = m.group(1).strip()
-    return found
+    from vco_lib.service_reconcile import compose_reclaim_env  # noqa: PLC0415
+
+    return compose_reclaim_env(compose_text)
 
 
 def _running_container_reclaim_env(container_cmd: str, container_ref: str) -> "Optional[dict]":
@@ -12048,212 +11967,6 @@ def _weaviate_reclaim_env_drifted(
         if have != want:
             details.append((key, have, want))
     return (len(details) > 0), details
-
-
-def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
-    """Content-fingerprint whatever is listening on `localhost:<port>`.
-
-    Returns (probe_result, evidence) where:
-      - probe_result is one of PROBE_*
-      - evidence is a short human-readable string (URL, schema-class name,
-        etc.) used for log lines and the interactive prompt
-
-    Heuristic per service:
-      - weaviate: GET /v1/.well-known/ready; if 200, GET /v1/schema and
-        look for our canonical collections (KnowledgeGraph,
-        VibeCodedOrchestrator_KnowledgeGraph — the v0.2.23 B1 capital-C
-        casing, plus the lowercase-c v0.2.12–v0.2.22 variant
-        VibecodedOrchestrator_KnowledgeGraph, plus the pre-v0.2.12 PR-26
-        legacy VibeCodedTools_KnowledgeGraph). Any present ⇒ vct-managed.
-        Empty schema + no services.toml record ⇒ foreign (we don't claim
-        bare instances).
-      - ollama: GET /api/tags; if 200, look for our pinned embedding model
-        (qwen3-embedding:0.6b OR snowflake-arctic-embed2:latest) AS WELL AS
-        the services.toml record. Either signal present ⇒ vct-managed.
-        Empty tags or no signal ⇒ foreign.
-      - code_embed: GET /health; if 200 + body matches CodeSage/Ollama
-        backend marker, vct-managed. Otherwise foreign.
-
-    The services.toml lock is the strongest signal — it survives a Weaviate
-    that we previously cleared. Content fingerprints are the secondary
-    signal so we can recognise our own data even when the lock file was
-    deleted (rare; user wiped ~/.vct/).
-    """
-    path = _HEALTH_PATHS.get(name)
-    if path is None:
-        return PROBE_INCOMPATIBLE, f"unknown service '{name}'"
-
-    base = f"http://localhost:{port}"
-
-    # Step 1: liveness probe
-    try:
-        resp = urllib.request.urlopen(f"{base}{path}", timeout=2)
-        if resp.status >= 400:
-            return PROBE_NOT_RUNNING, f"{base}{path} → HTTP {resp.status}"
-    except Exception:
-        return PROBE_NOT_RUNNING, f"{base}{path} unreachable"
-
-    # Step 2: services.toml lookup (strongest signal — explicit prior claim).
-    state = _read_services_toml()
-    locked = next(
-        (s for s in state.get("services", []) if s.get("name") == name),
-        None,
-    )
-    if locked and locked.get("mode") in ("adopt", "parallel", "refuse"):
-        # We previously decided how to handle this port. Consider it
-        # "ours" in the sense that subsequent installs should not re-prompt.
-        return PROBE_VCT_MANAGED, f"prior decision: {locked['mode']}"
-
-    # Step 3: content fingerprint per service.
-    if name == "weaviate":
-        try:
-            schema_resp = urllib.request.urlopen(f"{base}/v1/schema", timeout=3)
-            schema = json.loads(schema_resp.read())
-            classes = _wh.schema_class_names(schema)
-            # Two recognition modes for vct ownership of a Weaviate:
-            # 1. Exact canonical names (single-tenant install).
-            # 2. Suffix-pattern names (multi-project orchestrator setup
-            #    where each project namespaces its collections — e.g.
-            #    `MyProject_CodeFunction`, `ClaudeKnowledgeGraph`,
-            #    `OtherProject_KnowledgeGraph`). The `_KnowledgeGraph` /
-            #    `_CodeFunction` / `_CodeClass` / `_CodeModule` suffixes
-            #    are ours by construction and don't appear in foreign
-            #    Weaviates.
-            # Legacy-detection: the canonical post-v0.2.23-B1 capital-C name,
-            # the lowercase-c v0.2.12–v0.2.22 variant, AND the pre-v0.2.12
-            # "VibeCodedTools_KnowledgeGraph" are markers of a vct-managed
-            # Weaviate (the v0.2.23 B1 case-flip is the canonical-name change
-            # only — install.py's case-insensitive adoption keeps the on-disk
-            # class unchanged so pre-flip installs still have the lowercase-c
-            # class on disk; same applies to pre-v0.2.12 installs with the
-            # VibeCodedTools name).
-            exact_markers = {"KnowledgeGraph",
-                             "VibeCodedOrchestrator_KnowledgeGraph",
-                             # v0.2.12–v0.2.22 lowercase-c variant.
-                             "VibecodedOrchestrator_KnowledgeGraph",
-                             # Pre-v0.2.12 name (PR-26 rename predecessor).
-                             "VibeCodedTools_KnowledgeGraph",
-                             "Development", "CodeFunction", "CodeClass",
-                             "CodeModule", "CodeAPI", "CodeInteraction"}
-            # `_conversations` is a legacy marker (collection deprecated
-            # 2026-04-30) — kept here for detection of old installs only.
-            # New installs do NOT create the conversations collection.
-            suffix_markers = ("_KnowledgeGraph", "_Development",
-                              "_CodeFunction", "_CodeClass", "_CodeModule",
-                              "_conversations", "_development")
-            exact_hits = classes & exact_markers
-            suffix_hits = {c for c in classes if c and any(c.endswith(s) for s in suffix_markers)}
-            hits = exact_hits | suffix_hits
-            if hits:
-                return PROBE_VCT_MANAGED, f"weaviate has vct collections: {sorted(hits)[:3]}"
-            # Weaviate alive but no vct markers — could be empty (fresh user
-            # install) or could be foreign + populated. Either way, not ours.
-            return PROBE_FOREIGN, f"weaviate alive at {base} (classes: {sorted(classes)[:3] or 'none'})"
-        except Exception as e:
-            return PROBE_INCOMPATIBLE, f"weaviate at {base} but /v1/schema failed: {e}"
-
-    if name == "ollama":
-        try:
-            tags_resp = urllib.request.urlopen(f"{base}/api/tags", timeout=3)
-            tags = json.loads(tags_resp.read())
-            model_names = {m.get("name", "") for m in tags.get("models", [])}
-            vct_markers = {"qwen3-embedding:0.6b",
-                           "snowflake-arctic-embed2:latest",
-                           "unclemusclez/jina-embeddings-v2-base-code:latest",
-                           "qwen3.5:0.8b"}
-            if model_names & vct_markers:
-                return PROBE_VCT_MANAGED, f"ollama has vct models: {sorted(model_names & vct_markers)}"
-            return PROBE_FOREIGN, f"ollama alive at {base} (models: {sorted(model_names)[:3] or 'none'})"
-        except Exception as e:
-            return PROBE_INCOMPATIBLE, f"ollama at {base} but /api/tags failed: {e}"
-
-    if name == "code_embed":
-        # Our service responds to /health with JSON {"status": "ok",
-        # "model": "codesage-large-v2", ...}. Foreign FastAPIs may also
-        # respond 200 to /health but not produce that body.
-        try:
-            health_resp = urllib.request.urlopen(f"{base}/health", timeout=3)
-            body = health_resp.read().decode("utf-8", errors="replace")
-            if "codesage" in body.lower() or "code_embed" in body.lower():
-                return PROBE_VCT_MANAGED, "code_embed responds with vct fingerprint"
-            return PROBE_FOREIGN, f"port {port} responds to /health but is not our code_embed"
-        except Exception as e:
-            return PROBE_INCOMPATIBLE, f"code_embed at {base} unrecognised: {e}"
-
-    return PROBE_INCOMPATIBLE, f"no fingerprint logic for '{name}'"
-
-
-def _find_free_port(start: int, end: int = 65000) -> int | None:
-    """Return the first free TCP port in [start, end] on 127.0.0.1.
-
-    Used when a foreign service holds the canonical port and the user
-    chose `alt-port`. We bind-and-close to test, which is racy with a
-    process spawning a millisecond later — but for install-time it's
-    fine; the compose `up -d` happens within the same install run.
-    """
-    import socket  # noqa: PLC0415 — lazy import; rare path
-    for port in range(start, end + 1):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            continue
-    return None
-
-
-def _decide_action(name: str, probe: str, evidence: str,
-                   args: argparse.Namespace) -> str:
-    """Resolve a probe result into a concrete action.
-
-    Honors:
-      1. `--on-conflict` flag (non-interactive override for `foreign`)
-      2. `--yes` / non-TTY (defaults to alt-port for foreign, abort for incompatible)
-      3. interactive prompt
-    """
-    if probe == PROBE_NOT_RUNNING:
-        return ACTION_START
-    if probe == PROBE_VCT_MANAGED:
-        return ACTION_ADOPT
-    if probe == PROBE_INCOMPATIBLE:
-        return ACTION_ABORT
-
-    # Foreign — the interesting case.
-    if args.on_conflict == "alt-port":
-        return ACTION_ALT_PORT
-    if args.on_conflict == "adopt":
-        return ACTION_ADOPT
-    if args.on_conflict == "abort":
-        return ACTION_ABORT
-
-    # Non-interactive default: alt-port. Prevents pollution; never adopts
-    # someone else's service without explicit consent.
-    if args.yes or not sys.stdin.isatty() or args.quiet:
-        print(f"  [{name}] foreign service detected ({evidence})")
-        print(f"  [{name}] non-interactive mode → using alt-port "
-              f"(override: --on-conflict adopt|abort)")
-        return ACTION_ALT_PORT
-
-    # Interactive prompt
-    print()
-    print(f"  Detected a foreign {name} on port {_DEFAULT_PORTS[name]}.")
-    print(f"  Evidence: {evidence}")
-    print()
-    print("  Options:")
-    print(f"    [1] alt-port  — pick a free port and run our own {name} alongside it (safe, default)")
-    print(f"    [2] adopt     — reuse the existing {name}; WILL write our collections into it")
-    print("    [3] abort     — stop installation")
-    try:
-        ans = input(f"  Choice for {name} [1/2/3, default 1]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return ACTION_ALT_PORT
-    if ans in ("2", "adopt"):
-        return ACTION_ADOPT
-    if ans in ("3", "abort"):
-        return ACTION_ABORT
-    return ACTION_ALT_PORT
 
 
 def _scan_foreign_compose_files(
@@ -12347,144 +12060,120 @@ def _walk(
             pass
 
 
-def _resolve_service_safety(args: argparse.Namespace) -> dict:
-    """Probe Weaviate / Ollama / code_embed and pick a safe action per service.
+#: Step [5b]'s outcome for the rest of this run: the rows (or, when launcher.db
+#: could not take them, this run's in-memory PINS) and whether Weaviate awaits
+#: the user's adoption choice (owner ruling Q1).
+_SERVICE_ENDPOINTS: dict = {"rows": {}, "pinned": False, "weaviate_pending": False}
 
-    Returns a dict shaped:
-        {
-          "weaviate":  {"action": ACTION_*, "port": int, "probe": PROBE_*, "evidence": str},
-          "ollama":    {...},
-          "code_embed":{...},
-        }
+_STEP5_DECISION: dict = {
+    "start": (ACTION_START, PROBE_NOT_RUNNING),
+    "recreate": (ACTION_ADOPT, PROBE_VCT_MANAGED),
+    "skip": (ACTION_ADOPT, PROBE_FOREIGN),
+}
 
-    Side effects:
-      - When alt-port is chosen: sets the corresponding env var
-        (WEAVIATE_PORT / OLLAMA_PORT / CODE_EMBED_PORT) for the rest of
-        the install. Compose reads these from the env via
-        `${WEAVIATE_PORT:-8081}` substitutions.
-      - Persists the resolution to `~/.vct/services.toml` so the
-        launcher and subsequent installs see it.
 
-    Design note: probing happens BEFORE compose `up -d`. That's the whole
-    point — we never start a container against an occupied port without
-    explicit consent.
+def _reconcile_service_endpoints(
+    args: argparse.Namespace, sysinfo: "SystemInfo", deferral_report, *, runtime: "str | None" = "auto",
+) -> "dict | None":
+    """Step [5b]: record where Weaviate / Ollama / code-embed are reached.
+
+    A thin shim over :func:`vco_lib.service_reconcile.reconcile` (detection,
+    the evidence ranking, the one-time legacy import, consent). Afterwards this
+    process's env carries the recorded endpoints, so every client leaf the run
+    uses (and every child it spawns) reaches them. Returns step 5's per-service
+    compose decisions, or ``None`` when the run must stop (the user chose
+    abort, or a ``--service`` flag was malformed).
     """
-    print("\n[5b/10] Probing existing services (content-based detection) ...")
+    from vco_lib import service_reconcile as _sr  # noqa: PLC0415
 
+    print("\n[5b/10] Service endpoints (detect → launcher.db) ...")
+    try:
+        choices = [_sr.parse_service_flag(f) for f in (getattr(args, "service", None) or [])]
+    except ValueError as exc:
+        print(f"  {exc}")
+        return None
+    rt = sysinfo.container_cmd if runtime == "auto" else runtime
+    result = _sr.reconcile(
+        phase="update" if getattr(args, "update", False) is True else "install",
+        orchestrator_root=PROJECT_ROOT, runtime=rt or None, has_gpu=bool(sysinfo.has_gpu),
+        interactive=not (args.yes or args.quiet or not sys.stdin.isatty()),
+        on_conflict=getattr(args, "on_conflict", None), choices=choices,
+        ensure_db=lambda: _sr.ensure_registry(PROJECT_ROOT),
+        # This run registers the MCPs from the rows itself (step 11, unless
+        # --skip-mcp-registration): no second `--register-default-mcps` here.
+        apply_kwargs={"register_mcps": lambda _root: True},
+    )
+    for line in result.lines:
+        print(line)
+    if deferral_report is not None:
+        for entry in result.entries:
+            deferral_report.add_entry(entry)
+    _log_install_event("5b/10", "abort" if result.abort else "ok", "service endpoints reconciled",
+                       data={"rows": {s: r.to_json() for s, r in result.rows.items()},
+                             "pinned": result.pinned, "abort": result.abort})
+    if result.abort:
+        print(f"  ABORT: {result.abort}")
+        return None
+    _SERVICE_ENDPOINTS.update(rows=dict(result.rows), pinned=result.pinned,
+                              weaviate_pending=result.weaviate_pending)
+    os.environ.update(_service_endpoints.transport_env(result.rows))
+    if result.migrate_code_embed and rt:
+        _migrate_code_embed_with_cache(result.rows["code_embed"], rt, deferral_report)
     decisions: dict = {}
-    state = _read_services_toml()
-    services_list = state.get("services", []) or []
-    services_by_name = {s.get("name"): s for s in services_list}
-    state_dirty = False
-
-    for name in _CANONICAL_SERVICES:
-        port = _DEFAULT_PORTS[name]
-        # Honor explicit env-var override (advanced users / CI).
-        env_port_name = {
-            "weaviate": "WEAVIATE_PORT",
-            "ollama": "OLLAMA_PORT",
-            "code_embed": "CODE_EMBED_PORT",
-        }[name]
-        explicit_port = os.environ.get(env_port_name)
-        if explicit_port:
-            try:
-                port = int(explicit_port)
-            except ValueError:
-                pass
-
-        probe, evidence = _probe_service_identity(name, port)
-        action = _decide_action(name, probe, evidence, args)
-
-        chosen_port = port
-        if action == ACTION_ALT_PORT:
-            free = _find_free_port(port + 1)
-            if free is None:
-                print(f"  [{name}] FAIL: no free port in [{port + 1}, 65000]; aborting")
-                action = ACTION_ABORT
-            else:
-                chosen_port = free
-                # Propagate to env so all downstream code (compose, env
-                # writers, MCP settings) picks up the override.
-                os.environ[env_port_name] = str(chosen_port)
-                if name == "weaviate":
-                    # gRPC port also moves; offset matches the default gap (50052 vs 8081 → +41971).
-                    # Simpler: just shift by the same delta from default.
-                    delta = chosen_port - DEFAULT_WEAVIATE_PORT
-                    grpc_port = DEFAULT_WEAVIATE_GRPC_PORT + delta
-                    free_grpc = _find_free_port(grpc_port)
-                    if free_grpc is not None:
-                        os.environ["WEAVIATE_GRPC_PORT"] = str(free_grpc)
-
-        decisions[name] = {
-            "action": action,
-            "port": chosen_port,
-            "default_port": port,
-            "probe": probe,
-            "evidence": evidence,
-        }
-
-        # Print the decision summary line
-        if action == ACTION_START:
-            print(f"  [{name}] not running → will start on port {chosen_port}")
-        elif action == ACTION_ADOPT:
-            print(f"  [{name}] adopting existing service on port {chosen_port} ({evidence})")
-        elif action == ACTION_ALT_PORT:
-            print(f"  [{name}] foreign on {port} → starting our copy on alt port {chosen_port}")
-        elif action == ACTION_ABORT:
-            print(f"  [{name}] ABORT: {evidence}")
-            return decisions  # caller must check for any ABORT
-
-        # Persist to services.toml. Mode mapping mirrors the launcher's
-        # AdoptionMode enum exactly (adoption.rs):
-        #   unresolved | adopt | parallel | refuse  (snake_case in TOML)
-        # ACTION_START → "unresolved" because there is no foreign service to
-        # adopt or run parallel to; "unresolved" tells the launcher "no
-        # conflict was seen" so it doesn't re-prompt. ACTION_ABORT also
-        # maps to "unresolved" — the install bailed before persisting a
-        # decision, so the next install should re-probe from scratch.
-        mode_map = {
-            ACTION_START: "unresolved",     # no conflict; launcher won't re-prompt
-            ACTION_ADOPT: "adopt",
-            ACTION_ALT_PORT: "parallel",
-            ACTION_ABORT: "unresolved",
-        }
-        new_entry = {
-            "name": name,
-            "mode": mode_map[action],
-            "external_url": f"http://localhost:{port}" if probe != PROBE_NOT_RUNNING else None,
-            "parallel_port": chosen_port if action == ACTION_ALT_PORT else None,
-        }
-        # Only update if changed (idempotency: re-running install on a fully
-        # adopted machine touches nothing).
-        existing = services_by_name.get(name)
-        if existing != new_entry:
-            services_by_name[name] = new_entry
-            state_dirty = True
-
-    if state_dirty:
-        new_state = {"services": list(services_by_name.values())}
-        try:
-            _write_services_toml(new_state)
-        except OSError as e:
-            print(f"  ! could not persist {_services_toml_path()}: {e}")
-
-    # If any service decision was alt-port, write a compose override.
-    alt_ports = {n: d for n, d in decisions.items()
-                 if d["action"] == ACTION_ALT_PORT}
-    if alt_ports:
-        _write_compose_override(alt_ports)
-
-    # Windows reserved-range check (v0.2.64). The probe loop above classifies
-    # a conflict by "is something listening?" — but a WinNAT/Hyper-V reserved
-    # TCP range INVERTS that: nothing listens (probe → not-running → we'd
-    # `compose up`), yet the OS refuses the host bind. So detect-foreign→
-    # alt-port never fires for this class. Check the *resolved* per-service
-    # ports (after any alt-port shift) against the OS's own excluded ranges and
-    # either auto-reserve (admin) or warn with the exact fix. Clean no-op on
-    # Linux/macOS; soft-fail on any probe error.
+    for svc in ("weaviate", "ollama", "code_embed"):
+        action, probe = _STEP5_DECISION[result.disposition(svc)]
+        row = result.rows.get(svc)
+        decisions[svc] = {"action": action, "probe": probe}
+        if row is not None and row.mode == "vco_managed":
+            decisions[svc]["port"] = row.port  # a host port VCO's compose binds
     _check_windows_reserved_ports(decisions)
-
     return decisions
+
+
+def _migrate_code_embed_with_cache(row, runtime: str, deferral_report) -> None:
+    """code-embed runs under another compose project: re-create it under the
+    installer's, on the SAME cache (plan §4c; ``service_lifecycle``). A
+    refusal leaves it running as it is and records why."""
+    from vco_lib.service_lifecycle import migrate_code_embed  # noqa: PLC0415
+
+    result = migrate_code_embed(PROJECT_ROOT, row, runtime=runtime, log=print)
+    _log_install_event("5b/10", "code_embed_migration", result.status,
+                       data={"reason": result.reason})
+    if not result.ok:
+        _svc_guard.emit_code_embed_migration_refused(
+            deferral_report, status=result.status, reason=result.reason,
+            runtime=runtime, infra_dir=PROJECT_ROOT / "infrastructure")
+
+
+def _service_endpoint_urls() -> dict:
+    """This run's endpoints: the launcher.db rows, or step [5b]'s in-memory
+    pins when launcher.db could not take them (``service_registry_unavailable``)."""
+    if _SERVICE_ENDPOINTS["pinned"] and _SERVICE_ENDPOINTS["rows"]:
+        return _service_endpoints.urls_from_rows(_SERVICE_ENDPOINTS["rows"])
+    return _service_endpoints.machine_service_urls()
+
+
+def _weaviate_awaits_confirmation() -> bool:
+    """Unattended run, a third-party Weaviate without VCO data, no answer yet:
+    nothing may be created in (or seeded into) any Weaviate this run."""
+    if not _SERVICE_ENDPOINTS["weaviate_pending"]:
+        return False
+    print("[7b/10] Skipping Weaviate collections + seed: waiting for your choice about the "
+          "Weaviate already running (UPDATE_DEFERRED.md: service_adoption_confirmation_required).")
+    return True
+
+
+def _verify_service_endpoints(deferral_report) -> None:
+    """After VCO started what it starts: stamp the rows that answer, report
+    the ones that do not (``service_endpoint_unreachable``)."""
+    if not _SERVICE_ENDPOINTS["rows"]:
+        return
+    from vco_lib import service_reconcile as _sr  # noqa: PLC0415
+
+    pinned = _SERVICE_ENDPOINTS["pinned"]
+    for entry in _sr.verify(_SERVICE_ENDPOINTS["rows"] if pinned else None, write=not pinned):
+        if deferral_report is not None:
+            deferral_report.add_entry(entry)
 
 
 def _check_windows_reserved_ports(decisions: dict) -> None:
@@ -12517,74 +12206,6 @@ def _check_windows_reserved_ports(decisions: dict) -> None:
         check_ports(ports)
     except Exception as e:  # pragma: no cover - defensive soft-fail
         print(f"  ! reserved-port check skipped ({e})")
-
-
-def _write_compose_override(alt_ports: dict) -> None:
-    """Generate `infrastructure/docker-compose.override.yml` with alternate ports.
-
-    The override is per-machine state (not source-controlled) and is
-    already covered by `.gitignore` (Bug 31 contract). We append rather
-    than overwrite when a previous override exists from the launcher's
-    volume migration — the override file at this path is read-merged by
-    docker compose, so two concurrent override files can't safely coexist
-    on the same path. Strategy: read existing, splice in our port section
-    if absent, write back.
-
-    Rather than YAML-parse without PyYAML in the pre-pip phase, we write
-    a fresh file with both the volume-migration block AND our port
-    overrides. If the launcher had an override there already, we preserve
-    its non-port content via simple text concatenation. In practice, the
-    user paths that hit alt-port (foreign service) and the volume-migration
-    path (existing volumes) are disjoint enough that this is fine — the
-    launcher writes the volume override, and install.py only writes here
-    if no launcher override exists.
-    """
-    infra_dir = PROJECT_ROOT / "infrastructure"
-    override_path = infra_dir / "docker-compose.override.yml"
-
-    if override_path.exists():
-        # Don't clobber a launcher-written volume override. Surface the
-        # collision and rely on env-var port overrides alone — compose
-        # WILL honor the env vars without needing an override file
-        # (infrastructure/docker-compose.yml uses ${WEAVIATE_PORT:-8081}).
-        print(f"  [override] {override_path} already exists; relying on env-var port overrides instead.")
-        return
-
-    # Compose v3 schema. Each alt-port service overrides only its `ports`
-    # mapping; all other config from the base file (image, volumes, env)
-    # is inherited.
-    lines = [
-        "# Auto-generated by install.py — alt-port mappings for foreign-service coexistence",
-        "# Safe to delete + regenerate by re-running `python install.py`.",
-        "# Tracked in ~/.vct/services.toml.",
-        "services:",
-    ]
-    for name, dec in alt_ports.items():
-        host_port = dec["port"]
-        if name == "weaviate":
-            grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
-            lines.extend([
-                "  weaviate:",
-                "    ports:",
-                f'      - "{host_port}:8080"',
-                f'      - "{grpc}:50051"',
-            ])
-        elif name == "ollama":
-            lines.extend([
-                "  ollama:",
-                "    ports:",
-                f'      - "{host_port}:11434"',
-            ])
-        elif name == "code_embed":
-            lines.extend([
-                "  code_embed:",
-                "    ports:",
-                f'      - "{host_port}:11440"',
-            ])
-
-    override_path.parent.mkdir(parents=True, exist_ok=True)
-    override_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"  [override] wrote {override_path}")
 
 
 def _build_orchestrator_volume_names() -> tuple[str, ...]:
@@ -12752,12 +12373,13 @@ def _start_services(
     # one Weaviate / Ollama / code_embed per machine. Per-install isolation
     # comes from KG_COLLECTION namespacing inside the shared Weaviate.
     #
-    # Escape hatch: VCT_FORCE_SEPARATE_CONTAINERS=1 forces a full `up -d`
-    # regardless of what's already running (advanced — caller is responsible
-    # for resolving port conflicts via WEAVIATE_PORT/OLLAMA_PORT overrides).
-    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
-    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
-    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+    # Escape hatch: VCT_FORCE_SEPARATE_CONTAINERS=1 brings up every service
+    # VCO manages, named. v0.2.97: the ports are the service_endpoints rows'
+    # (or step [5b]'s pins) — never an env var.
+    _urls = _service_endpoint_urls()
+    weaviate_port = int(_urls["weaviate_port"])
+    ollama_port = int(_urls["ollama_port"])
+    code_embed_port = int(_urls["code_embed_port"])
 
     force_separate = os.environ.get("VCT_FORCE_SEPARATE_CONTAINERS") == "1"
     detected = _detect_existing_services(weaviate_port, ollama_port, code_embed_port)
@@ -12793,8 +12415,13 @@ def _start_services(
     # recreated — we must not touch a service we don't own.
     services_to_recreate: list[str] = []
     if force_separate:
-        # No detection — bring everything compose declares up.
-        services_to_start = []  # empty list => `up -d` with no service args
+        # Every service VCO manages, NAMED (I1): a bare `up -d` would also
+        # create compose copies of adopted services.
+        from vco_lib.service_lifecycle import compose_services  # noqa: PLC0415
+        services_to_start = [
+            s for s in compose_services(_SERVICE_ENDPOINTS["rows"])
+            if s != "code_embed" or sysinfo.has_gpu
+        ]
     elif decisions:
         # Decision-driven: only bring up services where the action is start
         # or alt-port. Adopted services (vct-managed reuse, foreign adopt)
@@ -12920,7 +12547,7 @@ def _start_services(
         compose_file=compose_file, deferral_report=deferral_report, log_event=_log_install_event,
     )
     services_to_recreate, recreate_for_rebuild, build_services, _foreign, _guard_rows = _guard
-    if not force_separate and not services_to_start and not services_to_recreate:
+    if not services_to_start and not services_to_recreate:
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
@@ -13139,30 +12766,31 @@ def _start_services(
             else:
                 print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
 
-    cmd.extend(["up", "-d"])
-    # v0.2.92 BLOCKER-1: `--build` when (and only when) the code_embed image
-    # is not provably built from this checkout — see the escalation above.
-    # Placed before the service names so it applies to the named set.
-    if build_services:
-        cmd.append("--build")
-    # v0.2.61 (FINDING-1 fix): when a vct-managed service we OWN was adopted
-    # but its compose config changed (e.g. the Weaviate write-amp env tuning),
-    # it lands in services_to_recreate and we add `--force-recreate` + name the
-    # exact services so compose REBUILDS them from the new config. We pass the
-    # explicit service list (start ∪ recreate) so compose touches ONLY those —
-    # `--force-recreate` then recreates the named ones (no-op'ing any already
-    # at the desired config) and leaves every unnamed service (incl. a FOREIGN
-    # adopt we must not touch) running untouched. The named DATA VOLUME is
-    # preserved across `--force-recreate` (it rm's the container, not the
-    # volume) — collections survive. Without naming services, a bare
-    # `--force-recreate` would recreate the WHOLE stack, including foreign
-    # adopts; naming keeps it surgical.
+    # The named set is start ∪ recreate (v0.2.61: naming keeps
+    # `--force-recreate` surgical — every unnamed service, adopted ones above
+    # all, stays untouched; a recreate removes the container, never its named
+    # volume). v0.2.97: the argv comes from the ONE builder
+    # (`service_lifecycle.compose_up_args`) — `--no-deps` always, `--build`
+    # only for a stale code_embed image (v0.2.92 BLOCKER-1), and an empty set
+    # yields NO compose call, never a bare `up -d` (I1).
+    from vco_lib.service_lifecycle import compose_up_args  # noqa: PLC0415
     explicit_services = services_to_start + [
         s for s in services_to_recreate if s not in services_to_start
     ]
+    up_args, _dropped = compose_up_args(
+        explicit_services, build=bool(build_services),
+        force_recreate=bool(services_to_recreate),
+        gpu_mode="gpu" if sysinfo.has_gpu else "unknown",
+        prefix=cmd,  # the GPU overlay may already enable `--profile gpu`: once only
+    )
+    if not up_args:
+        print("  Nothing for compose to start or recreate.")
+        return
+    cmd.extend(up_args)
+    # The printed fallback is the same argv (a printed command is shipped
+    # code: a bare `up -d` would start copies of adopted services).
+    manual_up = " ".join([*compose_cmd, *up_args])
     if services_to_recreate:
-        cmd.append("--force-recreate")
-        cmd.extend(explicit_services)
         config_changed = [
             s for s in services_to_recreate if s not in recreate_for_rebuild
         ]
@@ -13175,9 +12803,6 @@ def _start_services(
             parts.append(f"starting: {', '.join(services_to_start)}")
         print("  Recreating (" + "; ".join(parts) + ")")
     elif services_to_start:
-        # When subset detection said only some services are missing, pass them
-        # explicitly so compose doesn't try to recreate already-running ones.
-        cmd.extend(services_to_start)
         print(f"  Starting only: {', '.join(services_to_start)}")
 
     # 15 min default cap: first-run pulls of weaviate + ollama images can
@@ -13203,7 +12828,7 @@ def _start_services(
         print(f"  FAIL (timed out after {timeout_min} min)")
         print("  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
-        print(f"    {' '.join(compose_cmd)} up -d")
+        print(f"    {manual_up}")
         print("  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
         _log_install_event(
             "5/10", "error",
@@ -13247,7 +12872,7 @@ def _start_services(
             print(f"  {line}")
         print("\n  Try starting manually:")
         print(f"    cd {infra_dir}")
-        print(f"    {' '.join(compose_cmd)} up -d")
+        print(f"    {manual_up}")
         _svc_guard.print_compose_failure_hints(result.stderr or "", sysinfo.container_cmd)
         _log_install_event(
             "5/10", "error",
@@ -13261,7 +12886,7 @@ def _start_services(
             args=args, detected=detected, has_gpu=sysinfo.has_gpu,
             deferral_report=deferral_report, exit_code=result.returncode,
             stderr=result.stderr or "",
-            manual_cmd=f"cd {infra_dir} && {' '.join(compose_cmd)} up -d",
+            manual_cmd=f"cd {infra_dir} && {manual_up}",
             log_event=_log_install_event, install_root=PROJECT_ROOT, persist_on_hard_stop=_guard_rows,
         ):
             return
@@ -13292,8 +12917,7 @@ def _wait_for_ollama() -> None:
     """Wait for Ollama to be ready."""
     print("[6/10] Waiting for Ollama ... ", end="", flush=True)
     _log_install_event("6/10", "start", "waiting for Ollama")
-    port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    url = f"http://localhost:{port}/api/tags"
+    url = f"{_service_endpoint_urls()['ollama_url'].rstrip('/')}/api/tags"
     deadline = time.monotonic() + HEALTH_TIMEOUT
 
     while time.monotonic() < deadline:
@@ -13358,7 +12982,7 @@ def _pull_ollama_models(
         f"pulling {len(models)} Ollama model(s)",
         data={"models": list(models)},
     )
-    port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    base = _service_endpoint_urls()["ollama_url"].rstrip("/")  # the row, never env
 
     if embedding_models is None:
         # Heuristic fallback for callers that don't pass the precise set
@@ -13377,7 +13001,7 @@ def _pull_ollama_models(
         try:
             data = json.dumps({"name": model}).encode()
             req = urllib.request.Request(
-                f"http://localhost:{port}/api/pull",
+                f"{base}/api/pull",
                 data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -13392,7 +13016,7 @@ def _pull_ollama_models(
         except (urllib.error.URLError, OSError) as e:
             print(f"WARN ({e})")
             print(f"    Pull manually: curl -X POST "
-                  f"http://localhost:{port}/api/pull "
+                  f"{base}/api/pull "
                   f"-d '{{\"name\": \"{model}\"}}'")
             failed.append(model)
             if model in embedding_models:
@@ -13412,7 +13036,7 @@ def _pull_ollama_models(
             "Load-bearing embedding model pull(s) failed: "
             f"{', '.join(failed_embedding)}. The Knowledge Graph cannot "
             "function without these models — install aborted. Resolve "
-            "manually (curl -X POST http://localhost:" + port + "/api/pull "
+            f"manually (curl -X POST {base}/api/pull "
             "-d '{\"name\": \"<model>\"}') then re-run install."
         )
     if failed:
@@ -13476,7 +13100,7 @@ def _probe_dual_ollama_instances(
 
 def _emit_dual_ollama_deferral(
     deferral_report: "DeferralReport",
-    canonical_port: int = DEFAULT_OLLAMA_PORT,
+    canonical_port: "int | None" = None,
     alternate_port: int = 11434,
     folder: "Path | None" = None,
 ) -> None:
@@ -13494,8 +13118,13 @@ def _emit_dual_ollama_deferral(
     and honours a matching dismissal until the topology changes. ``folder``
     locates that memory; omitted ⇒ emit anyway (failing to suppress is noise,
     failing to emit hides state).
+
+    ``canonical_port`` defaults to the Ollama row's port (v0.2.97): an
+    adopted Ollama on 11434 IS the one VCO uses, not a second daemon.
     """
     try:
+        if canonical_port is None:
+            canonical_port = int(_service_endpoint_urls()["ollama_port"])
         result = _probe_dual_ollama_instances(
             canonical_port=canonical_port,
             alternate_port=alternate_port,
@@ -13549,8 +13178,9 @@ def _emit_dual_ollama_deferral(
             f"# VCO uses :{canon} (the launcher-managed "
             f"container) as canonical.\n"
             f"# If you want VCO to use your personal Ollama "
-            f"instead, set OLLAMA_PORT={alt} in .claude/env and "
-            f"re-run install.\n"
+            f"instead (checked first, then every client follows):\n"
+            f"python -m vco_lib.service_endpoints adopt --service ollama "
+            f"--url http://localhost:{alt}\n"
             f"# If you want to stop the personal instance:\n"
             f"#   systemctl --user stop ollama   # Linux\n"
             f"#   killall ollama                 # macOS / generic\n"
@@ -13941,6 +13571,8 @@ def _ensure_collections(embed_config: dict,
     The resolved per-project / shared names are propagated back to
     `os.environ` so `_write_env_config` writes them into `.env`.
     """
+    if _weaviate_awaits_confirmation():
+        return
     # Honor --skip-seed / --skip-collections: if the user opted out of
     # seeding, they almost certainly don't want us mutating schema either.
     if args is not None and (
@@ -15157,6 +14789,8 @@ def _seed_weaviate(
     cleanup is a no-op in normal operation.
     """
     global _DUAL_CLONE_DETECTED_THIS_RUN
+    if _weaviate_awaits_confirmation():
+        return None
     try:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
         return _seed_weaviate_impl(args, deferral_report=deferral_report)
@@ -17841,103 +17475,32 @@ _BOOT_SERVICE_TASK_NAME = _boot_service.CONTAINER_STACK_TASK_NAME
 def _resolve_compose_working_dir(
     install_path: Path,
     cli_override: str | None,
-    ps_label_value: str | None,
 ) -> Optional[Path]:
     """Decide which directory the compose-up wrapper should chdir into.
 
-    The compose-project dir may NOT be the install path (canonical
-    example: install at one project dir, but compose.yaml lives in a
-    sibling repo's `claude_mcp_servers/`).
+      1. CLI override (``--compose-working-dir``) — explicit user choice
+         always wins; one that names a missing directory is ``None`` (a user
+         error worth surfacing, never a silent fall-through).
+      2. ``<install_path>/infrastructure/`` — the installer's compose
+         project, the one home VCO composes its own services from.
+      3. ``None`` — the caller skips materialization with a warning.
 
-    Resolution priority (PR-12 Bug C — install_path subdirs now BEAT the
-    ps-label probe, so a stale container from a prior install path can't
-    pin the new install's systemd unit to an obsolete WorkingDirectory):
+    v0.2.97: the ``<install_path>/claude_mcp_servers/`` leg and the
+    ``claude-mcp`` ps-label leg are SUPERSEDED by ``infrastructure/``, which
+    every shipped layout carries. Composing VCO-managed services from the
+    legacy home is how they came to be owned by a foreign compose project; a
+    container that home created is ADOPTED now (``vco_lib.service_reconcile``:
+    started/stopped by name through the ``service_endpoints`` rows, never
+    composed), so no legacy directory is ever a working dir.
 
-      1. CLI override (--compose-working-dir) — explicit user choice.
-      2. `<install_path>/claude_mcp_servers/` if it exists.
-      3. `<install_path>/infrastructure/` if it exists (VCO's own layout
-         where compose.yaml + the overlay both live there).
-      4. `ps_label_value` — the value of the
-         `com.docker.compose.project.working_dir` label on a running
-         claude-mcp container, sniffed by the caller via `<runtime> ps`.
-         Now a LAST RESORT for the rare edge case where the install path
-         has neither subdir locally (e.g. compose.yaml shipped in a
-         sibling repo). Caller passes None if probing failed.
-      5. None — caller skips materialization with a warning.
-
-    Why the priority inversion (Bug C, 2026-05-16): when a user upgrades
-    VCO via the launcher GUI / `install.py --update`, pre-existing
-    containers from a PRIOR install carry the
-    `com.docker.compose.project.working_dir=<old-path>` label. The
-    previous priority-2 ps-label probe would re-use that old path in the
-    fresh systemd unit, pinning the user's boot service to a stale
-    directory across upgrades. Inverting the order so install_path
-    subdirs win means the unit's WorkingDirectory tracks the install
-    location whenever it has a recognisable layout — which is the
-    overwhelmingly common case.
-
-    Pure function: no env reads, no subprocess. Caller supplies the ps
-    probe result (so this function is unit-testable without spawning
-    podman). Tested via tests/test_resolve_compose_working_dir.py.
+    Pure function: no env reads, no subprocess. Tested via
+    tests/test_resolve_compose_working_dir.py.
     """
-    # 1. CLI override — explicit user choice always wins.
     if cli_override:
         candidate = Path(cli_override).expanduser().resolve()
-        if candidate.is_dir():
-            return candidate
-        # Override pointed at a missing dir — that's a user error worth
-        # flagging. Caller logs and falls through.
-        return None
-    # 2. install_path/claude_mcp_servers — the canonical layout.
-    candidate = (install_path / "claude_mcp_servers").resolve()
-    if candidate.is_dir():
-        return candidate
-    # 3. install_path/infrastructure (the VCO-native layout).
+        return candidate if candidate.is_dir() else None
     candidate = (install_path / "infrastructure").resolve()
-    if candidate.is_dir():
-        return candidate
-    # 4. ps_label_value — last-resort fallback (e.g. compose.yaml lives
-    # outside install_path entirely). Pre-PR-12 this was priority 2,
-    # which caused boot-service WorkingDirectory to get pinned to stale
-    # install paths across upgrades.
-    if ps_label_value:
-        candidate = Path(ps_label_value).expanduser().resolve()
-        if candidate.is_dir():
-            return candidate
-    # 5. give up
-    return None
-
-
-def _probe_compose_working_dir_via_ps(container_cmd: str) -> Optional[str]:
-    """Best-effort: ask the running container runtime for the
-    `com.docker.compose.project.working_dir` label of any running
-    `claude-mcp` project container.
-
-    Returns the label value as a string, or None if anything goes wrong
-    (runtime absent, no running containers, label missing, etc.).
-    Soft-fail by design — `_materialize_boot_service` then falls back to
-    install-path probes.
-    """
-    if not container_cmd or not shutil.which(container_cmd):
-        return None
-    try:
-        proc = subprocess.run(
-            [
-                container_cmd, "ps",
-                "--filter", "label=com.docker.compose.project=claude-mcp",
-                "--format", '{{index .Labels "com.docker.compose.project.working_dir"}}',
-            ],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line:
-            return line
-    return None
+    return candidate if candidate.is_dir() else None
 
 
 def _read_template(template_relpath: str) -> Optional[str]:
@@ -20609,11 +20172,14 @@ def _register_mcps(
     """
     claude_json = _user_home_for_install() / ".claude.json"
 
-    # Resolve ports the same way Rust does (env-var-first, defaults).
-    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
-    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
-    grpc_port = int(os.environ.get("WEAVIATE_GRPC_PORT", DEFAULT_WEAVIATE_GRPC_PORT))
-    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+    # v0.2.97: the rows (or step [5b]'s pins). A current launcher reads the
+    # rows itself; the env hand-off below reaches an OLDER binary, which is
+    # exactly the case where the registry could not be written.
+    _urls = _service_endpoint_urls()
+    weaviate_port = int(_urls["weaviate_port"])
+    ollama_port = int(_urls["ollama_port"])
+    grpc_port = int(_urls["weaviate_grpc_port"])
+    code_embed_port = int(_urls["code_embed_port"])
 
     print()
     print("Registering bundled MCP servers in ~/.claude.json...")
@@ -21675,7 +21241,7 @@ def _repair_systemd_unit_working_dir(
     present), parses the current ``WorkingDirectory=`` value, and re-renders
     the unit when it doesn't match the correct path. The "correct" path is
     derived via the same priority order as ``_resolve_compose_working_dir``:
-    install_path subdirs (claude_mcp_servers/ then infrastructure/), or the
+    ``<install_path>/infrastructure/``, or the
     explicitly-passed ``correct_working_dir``.
 
     Behaviour:
@@ -21744,8 +21310,6 @@ def _repair_systemd_unit_working_dir(
         correct_working_dir = _resolve_compose_working_dir(
             install_path=install_path,
             cli_override=None,
-            ps_label_value=None,  # don't trust ps labels in repair path —
-                                  # they're literally what caused Bug C
         )
     if correct_working_dir is None:
         # Couldn't resolve a target — punt. _materialize_boot_service
@@ -21899,13 +21463,9 @@ def _materialize_boot_service(
         return
 
     cli_override = getattr(args, "compose_working_dir", None)
-    container_cmd = getattr(sysinfo, "container_cmd", "") if sysinfo else ""
-    ps_label = _probe_compose_working_dir_via_ps(container_cmd) if container_cmd else None
-
     working_dir = _resolve_compose_working_dir(
         install_path=install_path,
         cli_override=cli_override,
-        ps_label_value=ps_label,
     )
     if working_dir is None:
         _log_install_event(
@@ -22215,10 +21775,8 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
 
     tail = render_install_env_tail(
         embed_config,
-        weaviate_grpc_port=os.environ.get(
-            "WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT)
-        ),
-        code_embed_port=os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT)),
+        weaviate_grpc_port=str(_service_endpoint_urls()["weaviate_grpc_port"]),
+        code_embed_port=str(_service_endpoint_urls()["code_embed_port"]),
         telemetry_enabled=telemetry_enabled,
         concurrency_lines=_code_embed_max_concurrent_env_lines(embed_config),
     )
@@ -22326,13 +21884,12 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
     (launcher.db's ``service_endpoints`` rows) through
     ``vco_lib.service_endpoints`` — no other I/O.
     """
-    # v0.2.97: service URLs/ports from the ONE home — the launcher.db
-    # `service_endpoints` rows (row → compiled default), the same answer the
-    # hub and the projection give. gRPC still reads its env here; moving it
-    # to the row's `grpc_port` (`urls["weaviate_grpc_port"]`) belongs with the
-    # install.py [5b] rewrite of the service-endpoints plan.
-    urls = _service_endpoints.machine_service_urls()
-    weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
+    # v0.2.97: service URLs/ports (gRPC included) from the ONE home — the
+    # launcher.db `service_endpoints` rows (row → compiled default), the same
+    # answer the hub and the projection give; step [5b]'s pins when the
+    # registry could not be written this run.
+    urls = _service_endpoint_urls()
+    weaviate_grpc = urls["weaviate_grpc_port"]
 
     env_block: dict[str, str] = {
         "WEAVIATE_URL": urls["weaviate_url"],

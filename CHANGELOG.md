@@ -284,6 +284,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secret the manifest marks required stops the start and leaves the running
   container alone. Before, both lists were ignored.
 
+### Changed — one record of where Weaviate, Ollama and code-embed run (v0.2.97)
+
+- Where each core service is reached used to be worked out separately by the
+  installer, the launcher, the hub and each project's env files, from up to six
+  inputs (`services.toml`, port overrides, `vct-config.toml`, `VCT_WEAVIATE_URL`,
+  env ports, a compose override file). They could disagree, and an alternate
+  port the installer picked was forgotten after that run. The launcher database
+  now keeps one record per service — VCO-managed, your container, or a URL —
+  and everything reads it: the hub, the launcher, the tray, every project's env
+  files and the MCP registration.
+- Your next update moves whatever earlier versions wrote into that record, with
+  nothing to do by hand. The old files are renamed, not deleted. Anything the
+  update cannot settle on its own is listed in `UPDATE_DEFERRED.md` with the
+  command that settles it. `vco doctor` warns if `VCT_WEAVIATE_URL`,
+  `VCT_OLLAMA_URL` or `VCT_GRPC_PORT` is still exported; nothing reads them
+  any more.
+- **An existing Weaviate or Ollama is used, not duplicated.** VCO now also looks
+  on their standard ports (8080, 11434). An Ollama that is already running is
+  used without asking. A Weaviate that holds none of VCO's data is used only
+  after you choose — in the launcher, the first-install wizard, or with
+  `install.py --service weaviate=…` — and until then VCO starts no second one.
+- **A container VCO uses but did not create is never removed or re-created.**
+  It is only started and stopped by name. Container start-up, the session hook
+  and the watchdog act only on the services VCO manages, and name them
+  explicitly. Before, starting code-embed could also create an Ollama next to
+  the one you use, and recovering a stuck container could re-create it on an
+  empty volume. **Let VCO manage it** on the Services page hands such a
+  container to VCO with its data, when you ask for it.
+- **code-embed keeps its model cache.** When VCO re-creates it (after an update
+  or to move it), the cache mount is checked before anything stops and again
+  after, and a mismatch is refused or rolled back.
+  `python -m vco_lib.service_endpoints move` moves code-embed — or VCO's own
+  Weaviate or Ollama, with the same checks (Weaviate must come back with the
+  same collections) — to a new port; for a Weaviate or Ollama you run, it
+  follows the new address you gave it.
+- The Services page shows where each service runs and offers these choices;
+  the old "Reset adoption" button and container picker are gone. Module
+  containers reach an Ollama on another machine at its real address, and
+  projects now receive `CODE_EMBED_SERVICE_URL`, the name code-embed clients
+  read.
+
 ### Fixed — smaller issues (v0.2.97)
 
 - The bundled `vct-hub-api` module's port setting now sets the hub's port.
@@ -342,14 +383,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always 7700, and the hub module's catalog entry names the running hub's
   port too. The code-embedding module's entry named port 11438; the service
   runs on 11440.
-- The hub's `/config` and every project's env files now work out the
-  Weaviate URL the same way: `VCT_WEAVIATE_URL` or `vct-config.toml`, then
-  the launcher's port override, then an adopted or moved Weaviate recorded in
-  `services.toml`, then `http://localhost:8081`. Before, the project env
-  files ignored `vct-config.toml` and an adopted external Weaviate, and the
-  settings file always named port 8081, so the two could point at different
-  servers. The code-embedding module's health check follows the service's
-  actual port.
 - The launcher finds its bundled scripts (code graph, KG sync, KG summary)
   through one shared lookup instead of two copies that could disagree.
 

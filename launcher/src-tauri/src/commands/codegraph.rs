@@ -21,11 +21,11 @@ use crate::db::code_graph_builds::{status as build_status, CodeGraphBuildRow};
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
 
-/// The ONE launcher client resolver (`service_endpoints::client_weaviate_url`,
-/// v0.2.97 lane W) — this was a private copy that never saw an adopted
-/// external Weaviate.
+/// The machine row (`service_endpoints::machine_weaviate_url`, v0.2.97) —
+/// this was a private copy that never saw an adopted external Weaviate. No
+/// endpoint env var is read (the launcher is machine-scoped).
 fn resolve_weaviate_url(db: &Db) -> String {
-    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
 #[derive(Debug, Serialize)]

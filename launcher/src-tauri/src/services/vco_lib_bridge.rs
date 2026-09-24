@@ -60,7 +60,11 @@
 //!     `.env`'s one writer) and the read-only
 //!     [`read_project_env_assignment`];
 //!   * `vco_lib.compose_env` — [`set_infrastructure_env_key`] (the one writer
-//!     of `infrastructure/.env`).
+//!     of `infrastructure/.env`);
+//!   * `vco_lib.service_endpoints` — [`service_endpoint_candidates`] and
+//!     [`service_endpoint_verb`] (v0.2.97: candidate detection and the
+//!     `adopt` / `use-vco-copy` / `hand-to-vco` verbs — the
+//!     `service_endpoints` rows' one writer).
 
 use std::io::{Read as _, Write as _};
 use std::path::Path;
@@ -589,6 +593,96 @@ pub fn set_infrastructure_env_key(
     Ok(reply.get("action").and_then(serde_json::Value::as_str).unwrap_or("set").to_string())
 }
 
+/// Wall-clock cap for a `vco_lib.service_endpoints` verb. A detection pass
+/// lists containers and probes a handful of ports (seconds); a
+/// `hand-to-vco` ownership transfer stops, recreates and health-waits a
+/// container and may pull an image (minutes).
+const SERVICE_ENDPOINTS_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// v0.2.97 (service endpoints SSOT): every candidate endpoint for every core
+/// service (or `service`) from the ONE Python detector
+/// (`vco_lib/service_detection.py`) — `python -m vco_lib.service_endpoints
+/// candidates --json`, whose reply is `{"schema": 1, "candidates": {<service>:
+/// [<candidate>…]}}` (each candidate: `url`, `host`, `port`, `grpc_port`,
+/// `live`, `has_vco_data`, `vco_markers`, `version`, `compatible`, `reason`,
+/// `ownership`, `origins`, `container`). Passed to the frontend unchanged; a
+/// non-zero exit or an unparseable reply is an error naming the child's own
+/// output.
+pub fn service_endpoint_candidates(root: Option<&Path>, service: Option<&str>) -> Result<serde_json::Value, String> {
+    let root = require_root(root)?;
+    let mut argv: Vec<String> = vec!["candidates".into(), "--json".into()];
+    if let Some(s) = service {
+        argv.extend(["--service".into(), s.to_string()]);
+    }
+    let done = run_service_endpoints(root, &argv)?;
+    if !done.success {
+        return Err(child_failure("candidate detection", &done));
+    }
+    let text = String::from_utf8_lossy(&done.stdout);
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| format!("candidate detection produced unreadable output ({}): {}", e, text.trim()))?;
+    if value.get("candidates").map_or(true, |c| !c.is_object()) {
+        return Err(format!("candidate detection replied without a `candidates` map: {}", text.trim()));
+    }
+    Ok(value)
+}
+
+/// Run one row-changing verb — `python -m vco_lib.service_endpoints <argv…>
+/// --root <root>` (`adopt`, `use-vco-copy`, `hand-to-vco`). Their contract is
+/// the exit code plus human lines on stdout (what changed, or why nothing
+/// did): exit 0 → `{"ok": true, "output": <lines>}`; anything else → `Err`
+/// with those lines (a refusal such as "re-run with --accept-empty-kg" is the
+/// child's own words). `argv` is built and validated by the caller
+/// (`commands::lifecycle::endpoint_action_argv`).
+pub fn service_endpoint_verb(root: Option<&Path>, argv: &[String]) -> Result<serde_json::Value, String> {
+    let root = require_root(root)?;
+    let mut full: Vec<String> = argv.to_vec();
+    full.push("--root".into());
+    full.push(root.display().to_string());
+    let done = run_service_endpoints(root, &full)?;
+    if !done.success {
+        return Err(child_failure(argv.first().map(String::as_str).unwrap_or("service endpoint verb"), &done));
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "output": String::from_utf8_lossy(&done.stdout).trim(),
+    }))
+}
+
+fn require_root(root: Option<&Path>) -> Result<&Path, String> {
+    root.ok_or_else(|| {
+        "the orchestrator clone could not be located, so the service-endpoint tools \
+         (vco_lib.service_endpoints) cannot run — check the install"
+            .to_string()
+    })
+}
+
+fn run_service_endpoints(root: &Path, argv: &[String]) -> Result<VcoLibRun, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m").arg("vco_lib.service_endpoints");
+    for a in argv {
+        cmd.arg(a);
+    }
+    run_vco_lib_collect(cmd, &python, Some(root), root, "", SERVICE_ENDPOINTS_TIMEOUT)
+}
+
+/// The error for a failed service-endpoint child: its own last lines.
+fn child_failure(what: &str, done: &VcoLibRun) -> String {
+    let out = String::from_utf8_lossy(&done.stdout);
+    let err = String::from_utf8_lossy(&done.stderr);
+    let tail = |s: &str| -> String {
+        let lines: Vec<&str> = s.trim().lines().collect();
+        lines[lines.len().saturating_sub(12)..].join("\n")
+    };
+    let detail = [tail(&out), tail(&err)].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
+    if detail.is_empty() {
+        format!("{} failed with no output", what)
+    } else {
+        format!("{} failed: {}", what, detail)
+    }
+}
+
 /// The interpreter for an env-block spawn: the shared RT-4 ladder. Under
 /// `cfg(test)` a bare `python3` is accepted as the last resort — the verbs
 /// need only the standard library, and a unit test must not depend on where
@@ -738,13 +832,54 @@ fn run_env_block_command(
 /// edits AND the JSONC-aware read ([`read_settings_env_blocks`]). `parse`
 /// turns the collected stdout/stderr into the caller's result.
 fn run_vco_lib_json<T>(
-    mut cmd: Command,
+    cmd: Command,
     python: &Path,
     root: Option<&Path>,
     project_folder: &Path,
     body: &str,
     parse: impl FnOnce(&[u8], &[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
+    run_vco_lib_json_with_timeout(cmd, python, root, project_folder, body, ENV_BLOCK_TIMEOUT, parse)
+}
+
+/// [`run_vco_lib_json`] with the wall-clock cap as an argument (the
+/// service-endpoint verbs outlast a settings edit).
+fn run_vco_lib_json_with_timeout<T>(
+    cmd: Command,
+    python: &Path,
+    root: Option<&Path>,
+    project_folder: &Path,
+    body: &str,
+    timeout: Duration,
+    parse: impl FnOnce(&[u8], &[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    let done = run_vco_lib_collect(cmd, python, root, project_folder, body, timeout)?;
+    parse(&done.stdout, &done.stderr).map_err(|e| match done.stdin_error {
+        Some(w) => format!("{} (the request could not be sent: {})", e, w),
+        None => e,
+    })
+}
+
+/// What a finished `vco_lib` child left behind.
+struct VcoLibRun {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdin_error: Option<std::io::Error>,
+}
+
+/// The spawn half of [`run_vco_lib_json_with_timeout`]: the env sandbox, the
+/// test guards, concurrent pipe draining, the wall-clock cap — and the exit
+/// status, for the verbs whose contract is an exit code rather than a JSON
+/// reply (the `vco_lib.service_endpoints` row-changing verbs).
+fn run_vco_lib_collect(
+    mut cmd: Command,
+    python: &Path,
+    root: Option<&Path>,
+    project_folder: &Path,
+    body: &str,
+    timeout: Duration,
+) -> Result<VcoLibRun, String> {
     reinject_minimal_env(&mut cmd);
     // Unit tests must never reach the developer's live hub (a verb that
     // resolves a stored secret would otherwise ask it): the discard port makes
@@ -777,10 +912,14 @@ fn run_vco_lib_json<T>(
     let stdin_error = child.stdin.take().and_then(|mut sink| sink.write_all(body.as_bytes()).err());
     // `sink` is dropped above: the child reads stdin to EOF.
 
-    let deadline = Instant::now() + ENV_BLOCK_TIMEOUT;
+    let deadline = Instant::now() + timeout;
+    let mut success = false;
     let timed_out = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break false,
+            Ok(Some(status)) => {
+                success = status.success();
+                break false;
+            }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -799,14 +938,11 @@ fn run_vco_lib_json<T>(
     if timed_out {
         return Err(format!(
             "settings editor: timed out after {} s. stderr: {}",
-            ENV_BLOCK_TIMEOUT.as_secs(),
+            timeout.as_secs(),
             String::from_utf8_lossy(&stderr).trim()
         ));
     }
-    parse(&stdout, &stderr).map_err(|e| match stdin_error {
-        Some(w) => format!("{} (the request could not be sent: {})", e, w),
-        None => e,
-    })
+    Ok(VcoLibRun { success, stdout, stderr, stdin_error })
 }
 
 /// The env-block verbs print exactly one JSON object on stdout on every path.

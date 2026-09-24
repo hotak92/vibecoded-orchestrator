@@ -271,6 +271,22 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
         self.assertIn("--force-recreate", entry.command_to_apply)
         self.assertNotIn(" rm ", entry.command_to_apply)  # never a delete command in a remedy
 
+    def test_a_foreign_weaviate_or_ollama_alone_is_not_a_ledger_row(self):
+        """v0.2.97: the row means "code-embed's recreate-with-cache refused".
+        A foreign-owned Weaviate/Ollama is still never recreated (the guard is
+        a safety net) but it is ADOPTED by design, not a condition to report."""
+        install = self.install
+        foreign = containers.ComposeIdentity("vibecoded", "/home/u/claude_mcp_servers")
+        decisions = {
+            "code_embed": {"action": install.ACTION_ADOPT, "probe": install.PROBE_FOREIGN},
+            "weaviate": {"action": install.ACTION_ADOPT, "probe": install.PROBE_VCT_MANAGED},
+            "ollama": {"action": install.ACTION_ADOPT, "probe": install.PROBE_VCT_MANAGED},
+        }
+        cmd, out, entries = self._drive(foreign, decisions=decisions)
+        self.assertEqual(cmd, [])
+        self.assertIn("[skip-recreate] weaviate", out)
+        self.assertEqual(entries, [])
+
     def test_owned_services_still_get_the_recreate_and_build(self):
         """Red-proof of the guard's other side: same drive, our own project → unchanged v0.2.92 behaviour."""
         ours = containers.ComposeIdentity("infrastructure", str(REPO_ROOT / "infrastructure"))
@@ -344,10 +360,12 @@ class HardStopPersistsForeignRowTests(unittest.TestCase):
         foreign = containers.ComposeIdentity("vibecoded", "/home/u/claude_mcp_servers")
         harness = StartServicesIdentityGuardTests()
         harness.install = install
-        # Only weaviate is foreign (others start fresh) so compose still runs and fails.
+        # Only code_embed is foreign (others start fresh) so compose still runs
+        # and fails. v0.2.97: code_embed is the one service whose foreign
+        # ownership is a ledger row (a foreign Weaviate/Ollama is adopted).
         decisions = {
-            "code_embed": {"action": install.ACTION_START, "probe": install.PROBE_NOT_RUNNING},
-            "weaviate": {"action": install.ACTION_ADOPT, "probe": install.PROBE_VCT_MANAGED},
+            "code_embed": {"action": install.ACTION_ADOPT, "probe": install.PROBE_VCT_MANAGED},
+            "weaviate": {"action": install.ACTION_START, "probe": install.PROBE_NOT_RUNNING},
             "ollama": {"action": install.ACTION_START, "probe": install.PROBE_NOT_RUNNING},
         }
         with mock.patch.object(install._svc_guard, "compose_failure_followup", side_effect=spy):

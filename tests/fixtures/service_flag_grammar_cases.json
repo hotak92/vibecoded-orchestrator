@@ -1,0 +1,192 @@
+{
+  "_comment": [
+    "v0.2.97: ONE committed grammar table for install.py's repeatable --service flag:",
+    "  --service <weaviate|ollama|code_embed>=adopt:container:<name>|adopt:url:<url>|vco[:<port>]",
+    "The wizard runs BEFORE the orchestrator clone exists, so the launcher cannot call Python and a",
+    "(C)-tier mirror is legitimate (A>B>C rule). Its price, paid here: the grammar's DATA lives in THIS",
+    "file, both implementations are tested against every case, and each carries a MUST MATCH comment.",
+    "Authoritative implementation: vco_lib/service_reconcile.py::parse_service_flag (install.py acts on it).",
+    "Mirror: launcher/src-tauri/src/commands/installer.rs::parse_service_choice (service_choice_args calls it).",
+    "Python test: tests/test_v0297_service_reconcile.py::test_service_flag_grammar_fixture.",
+    "Rust test: installer.rs tests::service_flag_grammar_matches_the_committed_fixture.",
+    "accept: input -> normalised parse {service, kind, value} (value: container name | url | port text;",
+    "  null for a bare vco).",
+    "reject: input -> rejected by BOTH sides.",
+    "Grammar notes locked by the boundary cases: adopt:url is at most 512 characters, carries no",
+    "whitespace or control characters, needs an http(s) scheme (case-insensitive), a host and a",
+    "usable port; vco:<port> is ASCII digits in 1..=65535; the service name tolerates surrounding",
+    "whitespace; code_embed accepts the vco form only."
+  ],
+  "accept": [
+    {
+      "input": "weaviate=adopt:container:their_weaviate",
+      "expect": {
+        "service": "weaviate",
+        "kind": "adopt_container",
+        "value": "their_weaviate"
+      }
+    },
+    {
+      "input": "ollama=adopt:container:aihive-ollama",
+      "expect": {
+        "service": "ollama",
+        "kind": "adopt_container",
+        "value": "aihive-ollama"
+      }
+    },
+    {
+      "input": "weaviate=adopt:url:http://weaviate.lan:8081",
+      "expect": {
+        "service": "weaviate",
+        "kind": "adopt_url",
+        "value": "http://weaviate.lan:8081"
+      }
+    },
+    {
+      "input": "ollama=adopt:url:https://ollama.example.com",
+      "expect": {
+        "service": "ollama",
+        "kind": "adopt_url",
+        "value": "https://ollama.example.com"
+      }
+    },
+    {
+      "input": "weaviate=adopt:url:http://h:1/x",
+      "expect": {
+        "service": "weaviate",
+        "kind": "adopt_url",
+        "value": "http://h:1/x"
+      }
+    },
+    {
+      "input": "ollama=adopt:url:HTTP://localhost:11435",
+      "expect": {
+        "service": "ollama",
+        "kind": "adopt_url",
+        "value": "HTTP://localhost:11435"
+      }
+    },
+    {
+      "input": "weaviate=adopt:url:http://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+      "expect": {
+        "service": "weaviate",
+        "kind": "adopt_url",
+        "value": "http://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1"
+      }
+    },
+    {
+      "input": "weaviate=vco",
+      "expect": {
+        "service": "weaviate",
+        "kind": "vco",
+        "value": null
+      }
+    },
+    {
+      "input": "weaviate=vco:8081",
+      "expect": {
+        "service": "weaviate",
+        "kind": "vco",
+        "value": "8081"
+      }
+    },
+    {
+      "input": "ollama=vco:11435",
+      "expect": {
+        "service": "ollama",
+        "kind": "vco",
+        "value": "11435"
+      }
+    },
+    {
+      "input": "code_embed=vco",
+      "expect": {
+        "service": "code_embed",
+        "kind": "vco",
+        "value": null
+      }
+    },
+    {
+      "input": "code_embed=vco:21440",
+      "expect": {
+        "service": "code_embed",
+        "kind": "vco",
+        "value": "21440"
+      }
+    },
+    {
+      "input": " weaviate=vco",
+      "expect": {
+        "service": "weaviate",
+        "kind": "vco",
+        "value": null
+      }
+    }
+  ],
+  "reject": [
+    {
+      "input": "weaviate",
+      "why": "no '=' at all"
+    },
+    {
+      "input": "neo4j=vco",
+      "why": "unknown service"
+    },
+    {
+      "input": "weaviate=maybe",
+      "why": "not one of the three forms"
+    },
+    {
+      "input": "weaviate=adopt:container:",
+      "why": "empty container name"
+    },
+    {
+      "input": "weaviate=adopt:url:ftp://h:1",
+      "why": "non-http scheme"
+    },
+    {
+      "input": "weaviate=adopt:url:http://",
+      "why": "no host"
+    },
+    {
+      "input": "weaviate=adopt:url:http://a b:1",
+      "why": "whitespace inside the URL"
+    },
+    {
+      "input": "weaviate=adopt:url:http://a\u0001b:1",
+      "why": "control character inside the URL"
+    },
+    {
+      "input": "weaviate=adopt:url:http://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+      "why": "URL over 512 characters"
+    },
+    {
+      "input": "weaviate=adopt:url:http://h:99999",
+      "why": "port out of range in the URL"
+    },
+    {
+      "input": "weaviate=vco:abc",
+      "why": "non-digit port"
+    },
+    {
+      "input": "weaviate=vco:",
+      "why": "empty port suffix"
+    },
+    {
+      "input": "weaviate=vco:99999",
+      "why": "port out of range"
+    },
+    {
+      "input": "weaviate=vco:0",
+      "why": "port 0 is out of range"
+    },
+    {
+      "input": "code_embed=adopt:container:c",
+      "why": "code-embed is always VCO's own"
+    },
+    {
+      "input": "code_embed=adopt:url:http://h:1",
+      "why": "code-embed is always VCO's own"
+    }
+  ]
+}

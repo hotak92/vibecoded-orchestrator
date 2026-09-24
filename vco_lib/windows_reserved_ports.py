@@ -21,11 +21,11 @@ The genuine bug this closes:
 
 Why install.py's existing detection misses it:
 
-    install.py::_detect_existing_services / _probe_service_identity classify a
+    install.py::_detect_existing_services / vco_lib.service_detection classify a
     port conflict by "is something listening here?" (an HTTP probe). A reserved
     range INVERTS that signature: NOTHING is listening (the probe says
     not-running → VCO proceeds to `compose up`), but the OS still refuses the
-    bind. So the foreign-service → alt-port path never fires.
+    bind. So the "port taken → free port" path never fires.
 
 This module supplies the missing piece: parse the OS's own list of excluded
 ranges (`netsh int ipv4 show excludedportrange tcp`) and decide whether a

@@ -782,7 +782,11 @@ fn populate_kg_bindings(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    let weaviate_url = "http://localhost:8081";
+    // v0.2.97 (service endpoints plan §1 row 14): a binding records NO
+    // Weaviate URL. Where Weaviate is reached is machine-global — the
+    // launcher.db `service_endpoints` row — and a literal snapshotted here
+    // (it was `http://localhost:8081`) could only drift from it.
+    let weaviate_url: Option<&str> = None;
     let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;
 
@@ -820,7 +824,7 @@ fn populate_kg_bindings(
             project_name,
             Some(embedding_model),
             Some(embedding_dim),
-            Some(weaviate_url),
+            weaviate_url,
             &JsonValue::Null,
         ) {
             report
@@ -862,7 +866,7 @@ fn populate_kg_bindings(
                     Some(embedding_model),
                     Some(embedding_dim),
                     None,
-                    Some(weaviate_url),
+                    weaviate_url,
                     &JsonValue::Null,
                 ) {
                     report
@@ -2006,12 +2010,13 @@ mod tests {
         assert_eq!(primary.collection_name, "Acme_KnowledgeGraph");
         assert_eq!(primary.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
         assert_eq!(primary.embedding_dim, Some(1024));
-        assert_eq!(
-            primary.weaviate_url.as_deref(),
-            Some("http://localhost:8081")
-        );
+        // SE-4 red-proof (7): the binding records no Weaviate URL — the
+        // machine row is where Weaviate is reached. Red against the
+        // `http://localhost:8081` literal this writer snapshotted.
+        assert_eq!(primary.weaviate_url, None);
         let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
         assert_eq!(shared.collection_name, "VibeCodedOrchestrator_KnowledgeGraph");
+        assert_eq!(shared.weaviate_url, None);
 
         std::fs::remove_dir_all(&folder).ok();
     }

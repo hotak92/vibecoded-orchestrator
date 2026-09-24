@@ -390,7 +390,7 @@ sudo netstat -tulpn | grep 8081
 netstat -ano | findstr :8081
 ```
 
-Stop whatever is using the port, or change `WEAVIATE_PORT` in `.env` and re-run `python install.py --update`.
+Stop whatever is using the port, or move VCO's Weaviate with `python -m vco_lib.service_endpoints move --service weaviate --port <free-port>` (the row is the source of truth since v0.2.97; every surface is re-projected by the move).
 
 **Container runtime not running**:
 
@@ -419,7 +419,7 @@ docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi   # verify Docker GP
 
 If the second command fails, install the NVIDIA Container Toolkit: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>
 
-**Port 11435 in use**: same pattern as Weaviate — check with `lsof` / `netstat`, stop the conflicting process, or change `OLLAMA_PORT` in `.env`.
+**Port 11435 in use**: same pattern as Weaviate — check with `lsof` / `netstat`, stop the conflicting process, or move VCO's Ollama with `python -m vco_lib.service_endpoints move --service ollama --port <free-port>`.
 
 **Model pull fails**:
 

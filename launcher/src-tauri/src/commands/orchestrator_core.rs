@@ -545,27 +545,17 @@ pub async fn code_graph_prune_stale(
     })
 }
 
-/// The health-check probe URLs. v0.2.97 (lane X): Weaviate via the ONE
-/// client resolver (`client_weaviate_url`: its interim `VCT_WEAVIATE_URL` /
-/// `WEAVIATE_URL` env legs, then the machine row); Ollama and
-/// code-embed keep their env override (a dev-container convenience) but
-/// fall back to the machine chain instead of a compiled-in default, so
-/// an app_state override or a services.toml adoption reaches the
-/// health report.
+/// The health-check probe URLs: every one the machine row's
+/// (`service_endpoints`, v0.2.97). No endpoint env var is read — not
+/// `WEAVIATE_URL`, `OLLAMA_URL` or `CODE_EMBED_SERVICE_URL`: the launcher is
+/// machine-scoped, and a project's hook may have started it with that
+/// project's projection (plan §4f). A dev container points VCO elsewhere
+/// with `python -m vco_lib.service_endpoints adopt --url …`.
 fn health_check_urls(db: &Db) -> Vec<(String, String)> {
     use vct_launcher_core::services::service_endpoints as se;
-    let weaviate_url = se::client_weaviate_url(db);
-    let ollama_url = std::env::var("OLLAMA_URL")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| se::machine_ollama_url(db));
-    let code_embed_port = se::machine_port_from_disk(se::CoreService::CodeEmbed);
-    let code_embed_url = std::env::var("CODE_EMBED_SERVICE_URL")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("http://localhost:{}", code_embed_port));
+    let weaviate_url = se::machine_weaviate_url(db);
+    let ollama_url = se::machine_ollama_url(db);
+    let code_embed_url = se::machine_code_embed_url(db);
     vec![
         (
             "Weaviate".to_string(),
@@ -843,18 +833,23 @@ pub async fn validate_clone_manifest(
 mod tests {
     use super::*;
 
-    /// v0.2.97: the health report's Weaviate URL comes from the ONE client
-    /// resolver, so the machine's `service_endpoints` row reaches it — the
-    /// compiled-in default this replaces could not.
+    /// v0.2.97: every health-report URL is the machine row's — the
+    /// projected `WEAVIATE_URL` / `OLLAMA_URL` / `CODE_EMBED_SERVICE_URL` in
+    /// the launcher's own environment are not read.
     #[test]
     fn health_check_urls_follow_the_machine_chain() {
         let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
-            ("WEAVIATE_URL", None),
+            ("WEAVIATE_URL", Some("http://transport.invalid:1")),
+            ("OLLAMA_URL", Some("http://transport.invalid:2")),
+            ("CODE_EMBED_SERVICE_URL", Some("http://transport.invalid:3")),
             (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, None),
         ]);
         let db = crate::db::Db::open_in_memory().unwrap();
         let checks = health_check_urls(&db);
-        assert_eq!(checks[0].1, "http://localhost:8081/v1/.well-known/ready");
+        // No row on this harness DB: the unroutable sentinel.
+        assert_eq!(checks[0].1, "http://127.0.0.1:9/v1/.well-known/ready");
+        assert_eq!(checks[1].1, "http://127.0.0.1:9/api/tags");
+        assert_eq!(checks[2].1, "http://127.0.0.1:9/health");
         let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
             "weaviate",
             vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
@@ -1141,11 +1136,7 @@ mod tests {
     /// have to time out.
     #[tokio::test]
     async fn health_check_reports_failures_without_panicking() {
-        let _env_lock = vct_launcher_core::test_env::env_lock();
-        // Force probe URLs to an unused port to guarantee connect-refused.
-        std::env::set_var("WEAVIATE_URL", "http://127.0.0.1:1");
-        std::env::set_var("OLLAMA_URL", "http://127.0.0.1:1");
-        std::env::set_var("CODE_EMBED_SERVICE_URL", "http://127.0.0.1:1");
+        // Probe URLs on an unused port guarantee connect-refused.
 
         // We can't easily construct a State<'_, Db> outside Tauri; the
         // command body doesn't use the db arg today, so we invoke the
@@ -1163,9 +1154,5 @@ mod tests {
             let res = client.get(ep).send().await;
             assert!(res.is_err(), "connect refused on unused port");
         }
-
-        std::env::remove_var("WEAVIATE_URL");
-        std::env::remove_var("OLLAMA_URL");
-        std::env::remove_var("CODE_EMBED_SERVICE_URL");
     }
 }

@@ -99,6 +99,20 @@ def test_absent_row_case(case, db: Path) -> None:
     assert urls[f"{svc}_port"] == case["expect_port"]
 
 
+@pytest.mark.parametrize("case", TABLE["plan_cases"], ids=lambda c: c["name"])
+def test_plan_case(case) -> None:
+    """What lifecycle code may act on — the Rust side (the Services page, the
+    hub's infra watchdog) runs the same cases through
+    ``service_endpoints::{compose_managed_services, adopted_autostart_container,
+    lifecycle_container}``."""
+    rows = {svc: _row(svc, spec) for svc, spec in case["rows"].items() if spec is not None}
+    p = se.plan(rows)
+    assert p["managed_services"] == case["expect_managed_services"]
+    assert p["adopted_containers"] == case["expect_adopted_containers"]
+    for svc, want in case["expect_containers"].items():
+        assert p["services"][svc]["container"] == want, svc
+
+
 @pytest.mark.parametrize("case", TABLE["ignored_input_cases"], ids=lambda c: c["name"])
 def test_ignored_input_case(case, db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every retired input put in place where its old reader looked; the row

@@ -285,7 +285,7 @@ id) and `GET /api/v1/modules/{id}/status`.
   the default spelled out: the bundled `vct-hub-api` writes
   `http://127.0.0.1:{hub_port}/api/v1/health`. A port with no placeholder is
   probed where the manifest says — e.g. `vct-code-embedding` names 11440, so on
-  a machine that moved the service with `CODE_EMBED_PORT` its pill reads down
+  a machine whose `service_endpoints` row moved the service its pill reads down
   with that URL in the reason.
 
 **Container / service modules must leave `command` empty** — a non-empty
@@ -642,7 +642,7 @@ placeholders the launcher expands at runtime:
 | `{project_slug}` | The active project's slug (container-name / port templates). |
 | `{project_id}` | The active project's UUID. |
 | `{hub_port}` | The port the running vct-hub listens on: `<VCT_ROOT>/hub.port` (written by the hub after binding), else `$VCT_HUB_PORT`, else `7700`. Resolved when the string is resolved (`vct_launcher_core::services::hub_port`), so a changed `VCT_HUB_PORT` setting — or a hub that walked past a taken port — is followed without editing the manifest. |
-| `{weaviate_port}` / `{ollama_port}` / `{code_embed_port}` | The host port of that core service as the launcher resolves it for every project's env and the hub's `/config`: the `app_state` port override (`weaviate.port_override` / `ollama.port_override` / `code_embed.port_override`), else the service's `services.toml` adoption (`parallel` → its `parallel_port`, `adopt` → the port of its `external_url`), else `8081` / `11435` / `11440`. Resolved when the string is resolved (`vct_launcher_core::services::service_endpoints`), so a service moved off its default port is probed where it is. |
+| `{weaviate_port}` / `{ollama_port}` / `{code_embed_port}` | The host port of that core service as the launcher resolves it for every project's env and the hub's `/config`: the service's row in the launcher.db `service_endpoints` table (v0.2.97; mode + endpoint + container identity, written only by `vco_lib/service_endpoints.py`), else the compiled defaults `8081` / `11435` / `11440`. Resolved when the string is resolved (`vct_launcher_core::services::service_endpoints`), so a service moved off its default port is probed where it is. |
 
 ---
 

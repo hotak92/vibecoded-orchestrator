@@ -114,7 +114,25 @@ if ($env:VCT_ORCHESTRATOR_ROOT) {
 } else {
     $script:DefaultStackRoot = $env:USERPROFILE
 }
-$script:DefaultWorkingDir = Join-Path $script:DefaultStackRoot "claude_mcp_servers"
+# v0.2.97: the INSTALLER's compose (<root>/infrastructure) is the default when
+# it exists — see the bash sibling: composing a VCO-managed service from the
+# legacy claude_mcp_servers/ home gives it that project's label (and, for
+# Ollama, its differently-named volume).
+if (Test-Path -LiteralPath (Join-Path $script:DefaultStackRoot "infrastructure/docker-compose.yml") -PathType Leaf) {
+    $script:DefaultWorkingDir = Join-Path $script:DefaultStackRoot "infrastructure"
+} else {
+    $script:DefaultWorkingDir = Join-Path $script:DefaultStackRoot "claude_mcp_servers"
+}
+# v0.2.97: remember which file knobs the CALLER set, so Invoke-Main can adapt
+# the defaults to the working dir's layout (Update-FileDefaults), and whether
+# the caller handed over a service list (VCO_COMPOSE_SERVICES). See the bash
+# sibling's header for the whole service-selection contract (plan invariant
+# I1: never a bare whole-stack `up -d`; an adopted service is never composed).
+$script:ComposeFileSet       = -not [string]::IsNullOrEmpty($env:VCT_STACK_COMPOSE_FILE)
+$script:GpuOverlaySet        = -not [string]::IsNullOrEmpty($env:VCT_STACK_GPU_OVERLAY)
+$script:GpuOverlayDockerSet  = -not [string]::IsNullOrEmpty($env:VCT_STACK_GPU_OVERLAY_DOCKER)
+$script:CallerServicesSet    = Test-Path Env:VCO_COMPOSE_SERVICES
+$script:CallerServices       = if ($script:CallerServicesSet) { [string]$env:VCO_COMPOSE_SERVICES } else { '' }
 $script:VctStackWorkingDir       = Get-EnvOrDefault 'VCT_STACK_WORKING_DIR' $script:DefaultWorkingDir
 $script:VctStackLogFile          = Get-EnvOrDefault 'VCT_STACK_LOG_FILE' (Join-Path $env:TEMP 'claude-mcp-containers.log')
 $script:VctStackCdiTimeout       = [int](Get-EnvOrDefault 'VCT_STACK_CDI_TIMEOUT' '30')
@@ -617,18 +635,107 @@ function Format-Invocation {
 }
 
 # ---------------------------------------------------------------------------
+# Update-FileDefaults :: fit the DEFAULT compose-file / overlay names to the
+# working dir's layout (v0.2.97). Mirrors bash adapt_file_defaults: a
+# compose.yaml-less dir with docker-compose.yml (infrastructure/) uses that;
+# an overlay missing under infrastructure/ but present in the dir itself is
+# used from the dir. Caller-set knobs are never touched.
+# ---------------------------------------------------------------------------
+function Update-FileDefaults {
+    param([Parameter(Mandatory=$true)][string] $Dir)
+    if (-not $script:ComposeFileSet -and
+        -not (Test-Path -LiteralPath (Join-Path $Dir 'compose.yaml') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $Dir 'docker-compose.yml') -PathType Leaf)) {
+        $script:VctStackComposeFile = 'docker-compose.yml'
+    }
+    if (-not $script:GpuOverlaySet -and
+        -not (Test-Path -LiteralPath (Join-Path $Dir $script:VctStackGpuOverlay) -PathType Leaf)) {
+        $leaf = Split-Path -Leaf $script:VctStackGpuOverlay
+        if (Test-Path -LiteralPath (Join-Path $Dir $leaf) -PathType Leaf) { $script:VctStackGpuOverlay = $leaf }
+    }
+    if (-not $script:GpuOverlayDockerSet -and
+        -not (Test-Path -LiteralPath (Join-Path $Dir $script:VctStackGpuOverlayDocker) -PathType Leaf)) {
+        $leaf = Split-Path -Leaf $script:VctStackGpuOverlayDocker
+        if (Test-Path -LiteralPath (Join-Path $Dir $leaf) -PathType Leaf) { $script:VctStackGpuOverlayDocker = $leaf }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Resolve-StackPython :: an interpreter that can import vco_lib from THIS
+# checkout (the script lives in <root>/scripts). Mirrors bash
+# resolve_stack_python: VCO_VENV_PYTHON, the hooks' shared resolver,
+# <root>/.venv, then python/python3 on PATH. $null when none.
+# ---------------------------------------------------------------------------
+function Resolve-StackPython {
+    $root = if ($script:VctScriptDir) { Split-Path -Parent $script:VctScriptDir } else { '' }
+    if ($env:VCO_VENV_PYTHON -and (Test-Path -LiteralPath $env:VCO_VENV_PYTHON -PathType Leaf)) {
+        return $env:VCO_VENV_PYTHON
+    }
+    if ($root) {
+        $lib = Join-Path $root 'templates/hooks/_lib/resolve-vco-venv.ps1'
+        if (Test-Path -LiteralPath $lib -PathType Leaf) {
+            . $lib
+            try {
+                $py = Resolve-VcoVenvPython -ScriptDir (Join-Path $root 'templates/hooks')
+                if ($py -and (Test-Path -LiteralPath $py -PathType Leaf)) { return $py }
+            } catch { }
+        }
+        foreach ($candidate in @('.venv/Scripts/python.exe', '.venv/bin/python')) {
+            $p = Join-Path $root $candidate
+            if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+        }
+    }
+    foreach ($name in @('python3', 'python')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# Invoke-StackPy :: `python -m <Module> <Arguments>` with THIS checkout first
+# on PYTHONPATH. Returns @{ Rc; Stdout; Stderr }.
+# ---------------------------------------------------------------------------
+function Invoke-StackPy {
+    param(
+        [Parameter(Mandatory=$true)][string] $Python,
+        [Parameter(Mandatory=$true)][string[]] $Arguments
+    )
+    $root = if ($script:VctScriptDir) { Split-Path -Parent $script:VctScriptDir } else { '' }
+    $sep = [System.IO.Path]::PathSeparator
+    $saved = $env:PYTHONPATH
+    $errFile = Join-Path ([System.IO.Path]::GetTempPath()) "vco-stack-py.$PID.err"
+    try {
+        if ($root) { $env:PYTHONPATH = if ($saved) { "$root$sep$saved" } else { $root } }
+        $out = & $Python -m @Arguments 2>$errFile
+        $rc = $LASTEXITCODE
+    } finally {
+        $env:PYTHONPATH = $saved
+    }
+    $err = ''
+    if (Test-Path -LiteralPath $errFile) {
+        $err = ((Get-Content -LiteralPath $errFile -Tail 3) -join ' ').Trim()
+        Remove-Item -LiteralPath $errFile -ErrorAction SilentlyContinue
+    }
+    return @{ Rc = $rc; Stdout = ($out | Out-String); Stderr = $err }
+}
+
+# ---------------------------------------------------------------------------
 # Invoke-Main :: orchestrate the boot-safe compose-up. Mirrors bash main().
 #
 # Returns the exit code the script should propagate.
 # ---------------------------------------------------------------------------
 function Invoke-Main {
     param([Parameter(ValueFromRemainingArguments=$true)][string[]] $RemainingArgs)
-    # The bash main() ignores its arguments and always does `up -d`.
-    # The launcher (lifecycle.rs::run_stack_wrapper) passes `start`/`stop`/
-    # `restart` subcommands; we accept them silently for forward-compat
-    # but always perform compose `up -d`. Log the received subcommand so
-    # operators can see what the launcher requested.
-    $subcmd = if ($RemainingArgs -and $RemainingArgs.Count -gt 0) { $RemainingArgs[0] } else { '' }
+    # Optional leading verb: the launcher (lifecycle.rs::run_stack_wrapper)
+    # passes `start` / `restart`; both have always meant "bring the services
+    # up". Everything after it is an explicit compose service list (v0.2.97).
+    $names = @($RemainingArgs | Where-Object { $_ })
+    $subcmd = ''
+    if ($names.Count -gt 0 -and @('up', 'start', 'restart') -contains $names[0]) {
+        $subcmd = $names[0]
+        $names = @($names | Select-Object -Skip 1)
+    }
 
     Write-StackLog "starting (working_dir=$($script:VctStackWorkingDir) cdi_timeout=$($script:VctStackCdiTimeout) subcommand='$subcmd')"
 
@@ -643,6 +750,45 @@ function Invoke-Main {
         return 2
     }
     try {
+        Update-FileDefaults -Dir $script:VctStackWorkingDir
+
+        # The service_endpoints plan (VCO-managed list + adopted containers).
+        $stackPy = Resolve-StackPython
+        if (-not $stackPy) {
+            Write-StackLog "FATAL: no Python interpreter to read the service_endpoints plan (broken VCO install?) - nothing composed"
+            return 5
+        }
+        $planRun = Invoke-StackPy -Python $stackPy -Arguments @('vco_lib.service_lifecycle', 'plan', '--json')
+        $plan = $null
+        if ($planRun.Rc -eq 0) { try { $plan = $planRun.Stdout | ConvertFrom-Json } catch { $plan = $null } }
+        if (-not $plan) {
+            Write-StackLog "FATAL: vco_lib.service_lifecycle plan failed (rc=$($planRun.Rc)) - nothing composed: $($planRun.Stderr)"
+            return 5
+        }
+        $managed = @($plan.compose_services)
+        $adopted = @($plan.adopted_containers)
+        $fromPlan = $false
+        if ($names.Count -gt 0) {
+            $requested = $names
+        } elseif ($script:CallerServicesSet) {
+            $requested = @($script:CallerServices -split '\s+' | Where-Object { $_ })
+        } else {
+            $requested = $managed
+            $fromPlan = $true
+        }
+        $selected = @()
+        foreach ($s in $requested) {
+            if ($managed -contains $s) {
+                if ($selected -notcontains $s) { $selected += $s }
+            } else {
+                Write-StackLog "skipping '$s': not a VCO-managed service in launcher.db service_endpoints (an adopted service is never composed)"
+            }
+        }
+        if ($selected.Count -eq 0 -and (-not $fromPlan -or $adopted.Count -eq 0)) {
+            Write-StackLog "nothing to compose: no VCO-managed service selected"
+            return 0
+        }
+
         $runtime = Find-Runtime
         if ([string]::IsNullOrEmpty($runtime)) {
             Write-StackLog "FATAL: no container runtime found (tried VCT_CONTAINER_RUNTIME, runtime.txt, podman, docker)"
@@ -655,8 +801,12 @@ function Invoke-Main {
         # is primarily a Windows-host story here; on Windows we delegate
         # GPU readiness to the container runtime (Docker Desktop /
         # podman-machine WSL2 distro). Non-Linux hosts default to CPU.
-        $isWindows = [System.Environment]::OSVersion.Platform.ToString().StartsWith('Win')
-        if ($isWindows) {
+        # NOT `$isWindows`: PowerShell 7 defines the read-only automatic
+        # `$IsWindows` (names are case-insensitive), so assigning it threw
+        # "Cannot overwrite variable IsWindows" and ended Invoke-Main before
+        # compose ever ran on pwsh 7 — found by driving this script (v0.2.97).
+        $onWindowsHost = [System.Environment]::OSVersion.Platform.ToString().StartsWith('Win')
+        if ($onWindowsHost) {
             if (Test-HasNvidia) {
                 Write-StackLog "nvidia detected on Windows host; relying on $runtime's WSL2/GPU runtime hook (no Windows-host CDI poll)"
                 $gpuMode = 'gpu'
@@ -694,11 +844,42 @@ function Invoke-Main {
             $missing = if ($runtime -eq 'docker') { $script:VctStackGpuOverlayDocker } else { $script:VctStackGpuOverlay }
             Write-StackLog "WARNING: inline-GPU compose assumed — overlay file '$(Join-Path $script:VctStackWorkingDir $missing)' not found, proceeding without overlay"
         }
-        $argvString = Format-Invocation -Invocation $invocation
-        Write-StackLog "exec: $argvString up -d"
+        # Adopted containers (somebody else's, started BY NAME, never
+        # composed) come up on the boot path only.
+        if ($fromPlan) {
+            $rtBin = if ($runtime -eq 'docker') { 'docker' } else { 'podman' }
+            foreach ($name in $adopted) {
+                & $rtBin start $name *> $null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-StackLog "started adopted container $name (by name - never re-created)"
+                } else {
+                    Write-StackLog "WARNING: could not start adopted container $name"
+                }
+            }
+        }
 
-        # Actually invoke compose. We append `up -d` to the args array.
-        $finalArgs = @($invocation.Args) + @('up', '-d')
+        # The `up` argv for EXACTLY the selected services, from the one home
+        # of the rule (`--no-deps`; code_embed only with the gpu profile, not
+        # at all in CPU mode). An empty list is NO compose call.
+        $composeArgs = @('vco_lib.service_lifecycle', 'compose-args', '--json',
+                         '--services', ($selected -join ' '), '--gpu-mode', $gpuMode)
+        if ($env:VCT_STACK_BUILD -eq '1') { $composeArgs += '--build' }
+        $upRun = Invoke-StackPy -Python $stackPy -Arguments $composeArgs
+        $upArgs = $null
+        if ($upRun.Rc -eq 0) { try { $upArgs = @(($upRun.Stdout | ConvertFrom-Json).args) } catch { $upArgs = $null } }
+        if ($null -eq $upArgs) {
+            Write-StackLog "FATAL: vco_lib.service_lifecycle compose-args failed for '$($selected -join ' ')' - nothing composed: $($upRun.Stderr)"
+            return 5
+        }
+        if ($upArgs.Count -eq 0) {
+            Write-StackLog "nothing to compose (selected: '$($selected -join ' ')', gpu_mode=$gpuMode)"
+            return 0
+        }
+        $argvString = Format-Invocation -Invocation $invocation
+        Write-StackLog "exec: $argvString $($upArgs -join ' ')"
+
+        # Actually invoke compose with the explicit service list.
+        $finalArgs = @($invocation.Args) + $upArgs
         # Use Start-Process / .NET ProcessStartInfo so we can capture the
         # real exit code (`&` in PS does not always preserve it cleanly
         # for native-cmd outputs containing newlines).

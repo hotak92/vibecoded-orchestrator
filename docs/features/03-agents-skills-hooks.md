@@ -218,7 +218,7 @@ Auto-start required containers (Weaviate, Ollama, code embedding service) if sto
 <details>
 <summary>Details</summary>
 
-Non-blocking (background). Container names configurable via `VCT_REQUIRED_CONTAINERS` (space-separated). Container runtime auto-detected (podman preferred, falls back to docker). Compose dir resolves relative to hook location; override with `VCT_COMPOSE_DIR`. Uses `flock` to prevent race conditions when multiple sessions start simultaneously.
+Non-blocking (background). Container names configurable via `VCT_REQUIRED_CONTAINERS` (space-separated). Container runtime auto-detected (podman preferred, falls back to docker). Compose dir resolves relative to hook location; override with `VCT_COMPOSE_DIR` (a directory already containing the compose file) or `VCT_INFRASTRUCTURE_DIR` (an `infrastructure/` directory used as the compose dir). Uses `flock` to prevent race conditions when multiple sessions start simultaneously.
 
 </details>
 

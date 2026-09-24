@@ -14,10 +14,12 @@ use tauri::{command, State};
 
 use crate::db::Db;
 
-/// Where the KG dashboard reaches Weaviate — the ONE launcher client
-/// resolver (`service_endpoints::client_weaviate_url`, v0.2.97 lane W).
+/// Where the KG dashboard reaches Weaviate — the machine row
+/// (`service_endpoints::machine_weaviate_url`). The launcher reads no
+/// endpoint env var: it is machine-scoped, and a project's hook may have
+/// started it with that project's projected `WEAVIATE_URL` (v0.2.97).
 fn weaviate_url(db: &Db) -> String {
-    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
 fn weaviate_client() -> Result<reqwest::Client, String> {

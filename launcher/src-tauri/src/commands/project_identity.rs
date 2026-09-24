@@ -254,10 +254,10 @@ pub fn update_project_identity_with_db(
             .and_then(|b| b.embedding_model.clone())
             .unwrap_or_else(|| "qwen3-embedding:0.6b".to_string());
         let embedding_dim = existing.as_ref().and_then(|b| b.embedding_dim).unwrap_or(1024);
-        let weaviate_url = existing
-            .as_ref()
-            .and_then(|b| b.weaviate_url.clone())
-            .unwrap_or_else(|| "http://localhost:8081".to_string());
+        // v0.2.97: carry an existing value through the rename, never invent
+        // one — a binding's Weaviate URL is not read (the machine row is), and
+        // the literal this wrote could only drift from it.
+        let weaviate_url = existing.as_ref().and_then(|b| b.weaviate_url.clone());
 
         if let Err(e) = db.set_project_kg_binding(
             project_id,
@@ -266,7 +266,7 @@ pub fn update_project_identity_with_db(
             Some(&embedding_model),
             Some(embedding_dim),
             existing.as_ref().and_then(|b| b.kg_dir_path.as_deref()),
-            Some(&weaviate_url),
+            weaviate_url.as_deref(),
             &existing
                 .as_ref()
                 .map(|b| b.config.clone())
@@ -1633,11 +1633,11 @@ pub async fn set_shared_kg_collection_name(
     .await?
 }
 
-/// The ONE launcher client resolver (`service_endpoints::client_weaviate_url`,
-/// v0.2.97 lane W) — this was a private copy that never saw an adopted
-/// external Weaviate.
+/// The machine row (`service_endpoints::machine_weaviate_url`, v0.2.97) —
+/// this was a private copy that never saw an adopted external Weaviate. No
+/// endpoint env var is read (the launcher is machine-scoped).
 fn resolve_weaviate_url(db: &Db) -> String {
-    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
 async fn fetch_class_count(

@@ -74,7 +74,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+use vct_launcher_core::db::Db;
 
 use super::modules_api::LauncherDbHandle;
 
@@ -141,147 +143,64 @@ fn not_implemented_v0_2_21() -> axum::response::Response {
 
 // ─── ServicesRuntimeSnapshot shape ──────────────────────────────
 //
-// Mirrors `ServicesRuntimeSnapshot` + `ServiceRuntimeState` +
-// `AdoptionMode` from `launcher/src-tauri/src/commands/lifecycle.rs`.
-// We intentionally re-define these here rather than depend on the
-// launcher crate: vct-hub is a free-standing crate (vct-launcher-core
-// is its only intra-workspace dep) so a downstream consumer can
-// `cargo build -p vct-hub` without pulling in Tauri. The duplication
-// is small (3 structs, ~10 fields total) and the wire shape is
-// pinned by HTTP tests downstream.
-//
-// When Step 24 ports the supervisor into vct-hub, the canonical home
-// for these types will move into vct-hub (probably
-// `vct-hub/src/supervisor.rs`) and the launcher-side copies become
-// re-exports / wire-types. For v0.2.21 they live here, in the route
-// module that defines their HTTP shape.
+// v0.2.97: ONE wire shape, shared with the launcher's `services_status`
+// (`vct_launcher_core::services::service_status`). Until then this file
+// hand-mirrored the launcher's structs and its `services.toml` adoption
+// enum; both are built from the launcher.db `service_endpoints` rows now.
+pub use vct_launcher_core::services::service_status::{
+    ServiceRuntimeState, ServicesRuntimeSnapshot,
+};
 
-/// Mirror of `commands::lifecycle::AdoptionMode`. `serde(rename_all =
-/// "snake_case")` keeps the wire shape identical so a JSON snapshot
-/// produced by the launcher's `services_status` Tauri command is
-/// indistinguishable from a snapshot emitted here (and vice versa
-/// once Step 24 fills the body).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AdoptionMode {
-    #[default]
-    Unresolved,
-    Adopt,
-    Parallel,
-    Refuse,
-}
-
-/// Mirror of `commands::lifecycle::ServiceRuntimeState`. Fields kept
-/// in the same order so a `git diff` between this file and
-/// `lifecycle.rs` makes drift visible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceRuntimeState {
-    pub name: String,
-    pub running: bool,
-    pub port: u16,
-    pub url: String,
-    pub externally_managed: bool,
-    pub adoption_mode: AdoptionMode,
-    #[serde(default)]
-    pub container_name: Option<String>,
-    #[serde(default)]
-    pub zombie: bool,
-}
-
-/// Mirror of `commands::lifecycle::ServicesRuntimeSnapshot`, extended
-/// with a `degraded` field that the launcher-side struct does not
-/// (yet) carry. `degraded: true` means "this snapshot was assembled
-/// without a live probe pipeline — treat field values as defaults,
-/// not as a current observation."
+/// The services `/services/status` reports, before any probe.
 ///
-/// Adding `degraded` to the hub-side shape but not (yet) to the
-/// launcher-side shape is intentional: until Step 24 unifies these,
-/// the launcher's `services_status` Tauri command never produces a
-/// degraded snapshot (it always probes), so the field would be a
-/// pointless `false` on every payload. Hub-side callers gate on
-/// `degraded` so they know whether to trust the contents.
+/// The three core services come from their `service_endpoints` rows (the
+/// ONE machine resolver): port, health URL (the row's host and port — an
+/// adopted remote Ollama is probed where it is), mode and container. Until
+/// v0.2.97 they were the literals 8081 / 11435 / 11440 under the premise
+/// that container ports are "fixed by the compose file, with no fallback
+/// chain" — false even then (compose ports are env-substituted, and
+/// adopted/parallel endpoints existed).
 ///
-/// `serde(default)` on `degraded` means a Step 24 unification can
-/// add this field to the launcher-side struct without breaking
-/// already-deployed hub clients.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServicesRuntimeSnapshot {
-    pub services: Vec<ServiceRuntimeState>,
-    pub runtime: Option<String>,
-    pub needs_podman_machine_start: bool,
-    pub has_unresolved_external: bool,
-    /// True iff this snapshot was emitted by the v0.2.21 stub path
-    /// (no live probe). Step 24's real implementation will set this
-    /// to `false` once it has populated `services` from a podman
-    /// inspect + HTTP probe pass.
-    #[serde(default)]
-    pub degraded: bool,
-}
-
-/// Canonical service-name + default-port pairs. The default ports come from
-/// `CLAUDE.md`'s "Default ports" line — Weaviate 8081, Ollama 11435,
-/// code-embed 11440, model gateway 11436 — which is the same source the
-/// launcher reads. Pulled into a separate `fn` so the test below can re-use
-/// the names without recomputing them.
-///
-/// This list is a SUPERSET of `canonical_services()` in
-/// `src/commands/lifecycle.rs`, and v0.2.92 is where they stopped being
-/// identical. The launcher's list drives compose invocations, container
-/// adoption and volume management, so it holds containers only; this one
-/// answers "what runs on this machine?" for `/services/status`, where a
-/// process belongs. The comment used to claim the two were pinned to each
-/// other; they are not, and the difference is the container/process
-/// boundary rather than drift.
-///
-/// v0.2.92 (WP-12): `model_gateway` joins the table and is the FIRST row
-/// that is not a container. Two consequences, both deliberate:
+/// This list is a SUPERSET of the launcher's services table: it also
+/// answers "what runs on this machine?" for the model gateway, which is a
+/// PROCESS, not a container and not an endpoint row (`mode: None`):
 ///
 ///   * It is bound to loopback, so its health URL says `127.0.0.1` rather
 ///     than `localhost`. The gateway REFUSES a non-loopback bind and
 ///     rejects any request whose peer is not loopback; `localhost` can
-///     resolve to a routable address on a misconfigured host, and a probe
-///     URL that does not match the bind is a probe that reports the wrong
-///     thing.
-///   * v0.2.95: its port is RESOLVED, not assumed. This row used to spell
-///     `11436` twice as a literal, so `/services/status` reported a health
-///     URL nothing served on every machine whose gateway had fallen back off
-///     the documented port — precisely the 2026-09-08 machine, where a legacy
-///     container owned it. The resolution is
-///     `vct_launcher_core::services::model_gateway_port::resolve_port`, the
-///     same chain the launcher's card and the hub's supervisor walk; the
-///     three of them previously held three answers. The other three rows keep
-///     their literals: they are CONTAINER ports, fixed by the compose file,
-///     with no fallback chain to consult.
-///   * The infra watchdog does NOT gain a row for it and needs no
-///     exclusion: `infra_watchdog::CANONICAL_INFRA_SERVICES` is its own
-///     ALLOWLIST of `(compose_service, container_name)` pairs, and the
-///     watchdog acts only on names in that list — it never derives its
-///     work from this table. A process is not something `compose up` can
-///     heal, so the correct action there is to add nothing.
-fn canonical_service_skeletons() -> Vec<ServiceRuntimeState> {
+///     resolve to a routable address on a misconfigured host.
+///   * v0.2.95: its port is RESOLVED
+///     (`vct_launcher_core::services::model_gateway_port::resolve_port`),
+///     the same chain the launcher's card and the hub's supervisor walk.
+///   * The infra watchdog does NOT supervise it: it acts only on
+///     `infra_watchdog::CANONICAL_INFRA_SERVICES`; the gateway is healed by
+///     `crate::gateway_watchdog`.
+fn canonical_service_skeletons(db: &Db) -> Vec<ServiceRuntimeState> {
+    use vct_launcher_core::services::service_endpoints::{machine_row, CoreService};
+    use vct_launcher_core::services::service_status::service_state;
     let gateway_port = vct_launcher_core::services::model_gateway_port::resolve_port();
-    [
-        ("weaviate", 8081u16, "http://localhost:8081/v1/meta".to_string()),
-        ("ollama", 11435u16, "http://localhost:11435/api/tags".to_string()),
-        ("code_embed", 11440u16, "http://localhost:11440/health".to_string()),
-        (
-            "model_gateway",
-            gateway_port,
-            vct_launcher_core::services::model_gateway_port::health_url(gateway_port),
-        ),
-    ]
-    .iter()
-    .map(|(name, port, url)| ServiceRuntimeState {
-        name: (*name).to_string(),
+    let mut out: Vec<ServiceRuntimeState> = CoreService::ALL
+        .into_iter()
+        .map(|svc| service_state(svc, machine_row(db, svc)))
+        .collect();
+    out.push(ServiceRuntimeState {
+        name: "model_gateway".to_string(),
         running: false,
-        port: *port,
-        url: url.clone(),
+        port: gateway_port,
+        url: vct_launcher_core::services::model_gateway_port::health_url(gateway_port),
         externally_managed: false,
-        adoption_mode: AdoptionMode::Unresolved,
+        mode: None,
+        endpoint: None,
         container_name: None,
         zombie: false,
-    })
-    .collect()
+        pending_choice: false,
+    });
+    out
+}
+
+/// True when a core service has no `service_endpoints` row.
+fn endpoints_missing(services: &[ServiceRuntimeState]) -> bool {
+    services.iter().any(|s| s.mode.is_some() && s.endpoint.is_none())
 }
 
 // ─── Path-arg types ─────────────────────────────────────────────
@@ -321,12 +240,13 @@ struct ProjectModulePath {
 /// returning a *parseable* response from day one so the launcher
 /// (when it later migrates to thin-client over the hub) has a
 /// well-defined fallback while the supervisor is bootstrapping.
-async fn services_status(State(_h): State<LauncherDbHandle>) -> impl IntoResponse {
+async fn services_status(State(h): State<LauncherDbHandle>) -> impl IntoResponse {
+    let services = canonical_service_skeletons(&h.0);
     let snapshot = ServicesRuntimeSnapshot {
-        services: canonical_service_skeletons(),
+        endpoints_missing: endpoints_missing(&services),
+        services,
         runtime: None,
         needs_podman_machine_start: false,
-        has_unresolved_external: false,
         degraded: true,
     };
     Json(snapshot).into_response()
@@ -645,6 +565,9 @@ mod tests {
     /// fixtures stay symmetric across the three route modules.
     async fn spawn_lifecycle_api_hub() -> (String, LauncherDbHandle) {
         let db = Db::open_in_memory().expect("in-memory db");
+        // Every service at the unroutable sentinel; a test that is about
+        // the rows seeds its own.
+        db.seed_sentinel_service_endpoints_for_tests().expect("seed sentinel rows");
         let handle = LauncherDbHandle(Arc::new(db));
         let app: Router =
             Router::new().nest("/api/v1", super::router().with_state(handle.clone()));
@@ -695,81 +618,88 @@ mod tests {
         // makes "no evidence anywhere" true, which is what the documented
         // defaults below assert.
         let _state = VctStateDirGuard::new();
-        let (base, _h) = spawn_lifecycle_api_hub().await;
+        let (base, h) = spawn_lifecycle_api_hub().await;
+        seed_distinct_rows(&h.0);
         let resp = reqwest::get(format!("{}/services/status", base))
             .await
             .expect("hub reachable");
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.expect("json body");
 
-        // degraded must be true in v0.2.21.
+        // degraded must be true: the hub assembles no live probe.
         assert_eq!(body.get("degraded").and_then(|v| v.as_bool()), Some(true));
-
-        // Top-level snapshot fields exist with default values.
         assert!(body.get("runtime").map(|v| v.is_null()).unwrap_or(false));
         assert_eq!(
-            body.get("needs_podman_machine_start")
-                .and_then(|v| v.as_bool()),
+            body.get("needs_podman_machine_start").and_then(|v| v.as_bool()),
             Some(false)
         );
-        assert_eq!(
-            body.get("has_unresolved_external").and_then(|v| v.as_bool()),
-            Some(false)
-        );
+        assert_eq!(body.get("endpoints_missing").and_then(|v| v.as_bool()), Some(false));
 
-        // services[] carries all three canonical entries with the
-        // default ports, running: false, adoption_mode: unresolved.
-        let services = body
-            .get("services")
-            .and_then(|v| v.as_array())
-            .expect("services array");
+        let services = body.get("services").and_then(|v| v.as_array()).expect("services array");
         assert_eq!(services.len(), 4, "expected 4 canonical services");
-
         let by_name: std::collections::HashMap<&str, &serde_json::Value> = services
             .iter()
-            .map(|s| {
-                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                (name, s)
-            })
+            .map(|s| (s.get("name").and_then(|v| v.as_str()).unwrap_or(""), s))
             .collect();
 
-        for (name, expected_port) in [
-            ("weaviate", 8081),
-            ("ollama", 11435),
-            ("code_embed", 11440),
-            ("model_gateway", 11436),
+        // (name, port, url, mode, container, externally_managed)
+        for (name, port, url, mode, container, external) in [
+            ("weaviate", 18081u64, "http://localhost:18081/v1/meta", Some("adopted_container"), Some("their_weaviate"), true),
+            ("ollama", 11434, "http://gpu.lan:11434/api/tags", Some("adopted_external"), None, true),
+            ("code_embed", 21440, "http://127.0.0.1:21440/health", Some("vco_managed"), Some("vco_code_embed"), false),
+            ("model_gateway", 11436, "http://127.0.0.1:11436/health", None, None, false),
         ] {
-            let s = by_name.get(name).unwrap_or_else(|| {
-                panic!("missing canonical service {} in: {:?}", name, by_name.keys())
-            });
-            assert_eq!(s.get("running").and_then(|v| v.as_bool()), Some(false));
-            assert_eq!(
-                s.get("port").and_then(|v| v.as_u64()),
-                Some(expected_port as u64)
-            );
-            assert_eq!(
-                s.get("adoption_mode").and_then(|v| v.as_str()),
-                Some("unresolved")
-            );
-            assert_eq!(
-                s.get("externally_managed").and_then(|v| v.as_bool()),
-                Some(false)
-            );
-            assert_eq!(s.get("zombie").and_then(|v| v.as_bool()), Some(false));
-            // container_name is None → serializes to null.
-            assert!(s
-                .get("container_name")
-                .map(|v| v.is_null())
-                .unwrap_or(false));
-            // url is the canonical probe URL for that service.
-            let url = s.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            assert!(
-                url.contains(&expected_port.to_string()),
-                "url {:?} should contain port {}",
-                url,
-                expected_port
-            );
+            let s = by_name.get(name).unwrap_or_else(|| panic!("missing service {}", name));
+            assert_eq!(s.get("running").and_then(|v| v.as_bool()), Some(false), "{name}");
+            assert_eq!(s.get("port").and_then(|v| v.as_u64()), Some(port), "{name}");
+            assert_eq!(s.get("url").and_then(|v| v.as_str()), Some(url), "{name}");
+            assert_eq!(s.get("mode").and_then(|v| v.as_str()), mode, "{name}");
+            assert_eq!(s.get("container_name").and_then(|v| v.as_str()), container, "{name}");
+            assert_eq!(s.get("externally_managed").and_then(|v| v.as_bool()), Some(external), "{name}");
+            assert_eq!(s.get("zombie").and_then(|v| v.as_bool()), Some(false), "{name}");
         }
+    }
+
+    /// Three rows whose every fact differs from the compiled defaults.
+    fn seed_distinct_rows(db: &Db) {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedContainer, "localhost", 18081);
+        w.grpc_port = Some(50061);
+        w.container_name = Some("their_weaviate".into());
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "gpu.lan",
+            11434,
+        ))
+        .unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "code_embed",
+            EndpointMode::VcoManaged,
+            "127.0.0.1",
+            21440,
+        ))
+        .unwrap();
+    }
+
+    /// SE-4 red-proof (4): the skeleton's ports and health URLs are the
+    /// ROWS', not the literals 8081 / 11435 / 11440 it carried until
+    /// v0.2.97. Red against the literal skeleton.
+    #[test]
+    fn skeleton_ports_come_from_the_rows() {
+        let _state = VctStateDirGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        seed_distinct_rows(&db);
+        let rows = canonical_service_skeletons(&db);
+        let port = |n: &str| rows.iter().find(|s| s.name == n).unwrap().port;
+        assert_eq!((port("weaviate"), port("ollama"), port("code_embed")), (18081, 11434, 21440));
+        let s = services_status_endpoints_missing(&db);
+        assert!(!s, "every core service has a row");
+    }
+
+    fn services_status_endpoints_missing(db: &Db) -> bool {
+        endpoints_missing(&canonical_service_skeletons(db))
     }
 
     #[tokio::test]
@@ -956,7 +886,8 @@ mod tests {
         )
         .expect("write port file");
 
-        let row = canonical_service_skeletons()
+        let db = Db::open_in_memory().unwrap();
+        let row = canonical_service_skeletons(&db)
             .into_iter()
             .find(|s| s.name == "model_gateway")
             .expect("the gateway row exists");
@@ -964,13 +895,17 @@ mod tests {
         assert_eq!(row.url, "http://127.0.0.1:11467/health");
     }
 
-    /// The LEAVE-ALONE: with no evidence anywhere, the row is the documented
-    /// default — and the three CONTAINER rows never move, because their ports
-    /// are fixed by the compose file and have no chain to consult.
+    /// The LEAVE-ALONE: with no evidence anywhere, the gateway row is the
+    /// documented default, and a core service with no `service_endpoints`
+    /// row is reported on its compiled default and flagged missing.
     #[test]
     fn with_no_port_evidence_the_rows_are_the_documented_defaults() {
         let _guard = VctStateDirGuard::new();
-        let rows = canonical_service_skeletons();
+        // About the compiled default itself: nothing is requested.
+        let _allow = vct_launcher_core::services::service_endpoints::allow_compiled_default_on_this_thread();
+        let db = Db::open_in_memory().unwrap();
+        let rows = canonical_service_skeletons(&db);
+        assert!(endpoints_missing(&rows));
         let by_name = |n: &str| {
             rows.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{} row", n))
         };
@@ -995,11 +930,12 @@ mod tests {
     /// stack.
     #[test]
     fn services_runtime_snapshot_serializes_with_expected_field_names() {
+        let db = Db::open_in_memory().unwrap();
         let snapshot = ServicesRuntimeSnapshot {
-            services: canonical_service_skeletons(),
+            services: canonical_service_skeletons(&db),
             runtime: None,
             needs_podman_machine_start: false,
-            has_unresolved_external: false,
+            endpoints_missing: false,
             degraded: true,
         };
         let json = serde_json::to_value(&snapshot).expect("serialize");
@@ -1008,7 +944,7 @@ mod tests {
             "services",
             "runtime",
             "needs_podman_machine_start",
-            "has_unresolved_external",
+            "endpoints_missing",
             "degraded",
         ] {
             assert!(obj.contains_key(key), "missing key {} in {:?}", key, obj);
@@ -1022,28 +958,12 @@ mod tests {
             "port",
             "url",
             "externally_managed",
-            "adoption_mode",
+            "mode",
+            "endpoint",
             "container_name",
             "zombie",
         ] {
             assert!(s0.contains_key(key), "missing service key {} in {:?}", key, s0);
-        }
-    }
-
-    /// AdoptionMode must serialize in snake_case so the wire shape
-    /// is interchangeable with the launcher-side struct's. If a
-    /// future edit drops `serde(rename_all = "snake_case")` this
-    /// catches it directly.
-    #[test]
-    fn adoption_mode_serializes_snake_case() {
-        for (mode, expected) in [
-            (AdoptionMode::Unresolved, "unresolved"),
-            (AdoptionMode::Adopt, "adopt"),
-            (AdoptionMode::Parallel, "parallel"),
-            (AdoptionMode::Refuse, "refuse"),
-        ] {
-            let json = serde_json::to_value(mode).expect("serialize");
-            assert_eq!(json.as_str(), Some(expected));
         }
     }
 

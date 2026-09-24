@@ -186,7 +186,8 @@ def source_sha_of(source_dir) -> Optional[str]:
 def service_base_url(explicit: Optional[str] = None) -> str:
     """Base URL of the code-embed service.
 
-    Order: explicit arg → ``CODE_EMBED_SERVICE_URL`` → ``http://localhost:<CODE_EMBED_PORT|11440>``.
+    Order: explicit arg → ``CODE_EMBED_SERVICE_URL`` → ``CODE_EMBED_URL``
+    (the v0.2.97 client alias) → ``http://localhost:<CODE_EMBED_PORT|11440>``.
 
     THE one home for this order (v0.2.92 R2).  It was previously inlined in
     ``vco_lib/embedding_service.py`` (two sites, via
@@ -196,12 +197,21 @@ def service_base_url(explicit: Optional[str] = None) -> str:
     ``CODE_EMBED_PORT`` are both "unset" here, and the two embedding_service
     copies additionally ignored ``CODE_EMBED_PORT`` entirely, which is the
     kind of divergence a second copy produces within one release.
+
+    v0.2.97 (lane Y) adds the ``CODE_EMBED_URL`` leg: the projection emits
+    it alongside ``CODE_EMBED_SERVICE_URL`` (same value, by construction),
+    so a client that exports only the alias still reaches the moved
+    service instead of silently falling back to the compiled default.
+    An empty ``CODE_EMBED_URL`` is "unset", like the others.
     """
     if explicit:
         return _strip_health_suffix(explicit.rstrip("/"))
     from_env = os.environ.get("CODE_EMBED_SERVICE_URL", "").strip()
     if from_env:
         return _strip_health_suffix(from_env.rstrip("/"))
+    from_alias = os.environ.get("CODE_EMBED_URL", "").strip()
+    if from_alias:
+        return _strip_health_suffix(from_alias.rstrip("/"))
     port = os.environ.get("CODE_EMBED_PORT", "").strip() or str(DEFAULT_PORT)
     return f"http://localhost:{port}"
 

@@ -166,10 +166,10 @@ Each step checks before acting. Venv creation is skipped if `.venv/bin/python` e
 ## Container Start
 
 ### Shared-service reuse
-Before running `compose up -d`, install.py probes `http://localhost:<port>/v1/.well-known/ready` (Weaviate), `/api/tags` (Ollama), and `/health` (code_embed) with a 2s timeout. Services already up are reused; only missing ones are started. Multiple installs on the same machine share one Weaviate / Ollama; isolation is by KG collection namespace, not separate containers.
+Before starting anything, install.py (through `vco_lib/service_detection.py` and `service_reconcile.py`) probes the VCO ports **and** the upstream defaults (Weaviate 8081/8080, Ollama 11435/11434), content-fingerprints what answers (VCO marker classes / models), and reconciles the launcher.db `service_endpoints` rows against the live evidence. A Weaviate or Ollama that already holds VCO data is adopted. A third-party **Ollama** is adopted without asking (an informational record names it and gives the one command to switch to a VCO copy). A third-party **Weaviate** with no VCO data is never adopted or duplicated unattended: the install waits for an explicit choice — the launcher's adoption dialog, the onboarding wizard, `python -m vco_lib.service_endpoints adopt|use-vco-copy`, or `install.py --service weaviate=…` — and records the `service_adoption_confirmation_required` deferral until then. Compose invocations name only the `vco_managed` services (`--no-deps`); adopted containers are started by name only and never removed or recreated. Multiple installs on the same machine share one Weaviate / Ollama; isolation is by KG collection namespace, not separate containers.
 
 ### `VCT_FORCE_SEPARATE_CONTAINERS=1` escape hatch
-Bypasses the service-reuse check and runs `compose up -d` for everything. The caller is responsible for setting `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to avoid bind conflicts.
+Bypasses the service-reuse check and brings up every service under this install. Give each stack its own ports through the rows — `install.py --service <svc>=vco:<port>` or `python -m vco_lib.service_endpoints move` — not by hand-editing env files.
 
 ### compose command resolution
 `_get_compose_command()` tries `podman-compose` → `podman compose` → falls back on Podman. For Docker it tries `docker compose` (v2 plugin) → `docker-compose` (standalone).
@@ -358,7 +358,7 @@ Three services: `weaviate` (pinned `cr.weaviate.io/semitechnologies/weaviate:1.2
 <details>
 <summary>Details</summary>
 
-All three services use named volumes with default container-engine paths. Port numbers are configurable via env vars (`WEAVIATE_PORT`, `WEAVIATE_GRPC_PORT`, `OLLAMA_PORT`, `CODE_EMBED_PORT`). Image tags: Weaviate and ollama are pinned for supply-chain reproducibility. `check-install.sh` warns on any `:latest` tags it finds in compose files.
+All three services use named volumes with default container-engine paths. Host ports come from the `service_endpoints` rows: `vco_lib/compose_env.py` writes them (plus the data-source knobs) into `infrastructure/.env`, which the compose file substitutes — the file is VCO-written, never hand-edited. Move a service with `python -m vco_lib.service_endpoints move` or the launcher's Services page. Image tags: Weaviate and ollama are pinned for supply-chain reproducibility. `check-install.sh` warns on any `:latest` tags it finds in compose files.
 
 </details>
 

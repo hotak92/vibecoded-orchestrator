@@ -66,8 +66,16 @@ OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-s
 from vco_lib.openai_key import resolve_openai_api_key  # noqa: E402
 
 OPENAI_API_KEY = resolve_openai_api_key()
-# Code embedding service URL (CodeSage-Large-v2 via FastAPI, or Ollama-compatible endpoint)
-CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
+# Code embedding service URL (CodeSage-Large-v2 via FastAPI, or an
+# Ollama-compatible endpoint) — through the ONE client resolver
+# (``vco_lib.code_embed_image.service_base_url``, v0.2.97 lane Y): explicit →
+# ``CODE_EMBED_SERVICE_URL`` → ``CODE_EMBED_URL`` (the client alias) →
+# ``http://localhost:<CODE_EMBED_PORT|11440>``. This was a fourth inline copy
+# that ignored both the alias and ``CODE_EMBED_PORT``, so a service moved with
+# either knob was probed at the compiled default.
+from vco_lib.code_embed_image import service_base_url  # noqa: E402
+
+CODE_EMBED_SERVICE_URL = service_base_url()
 
 
 # ─── EmbeddingService accessor ──────────────────────────────────────────

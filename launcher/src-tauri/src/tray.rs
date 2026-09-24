@@ -341,15 +341,11 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // the runtime shuts down at app exit.
     let label_for_task = services_label.clone();
     tauri::async_runtime::spawn(async move {
-        // Snapshot the very first probe to decide whether services
-        // already existed before the launcher had a chance to start
-        // anything. If yes → "managed externally". The launcher does
-        // not currently track who started a given container, so this
-        // is the cleanest signal we have without parsing podman labels.
+        // "Managed externally" is what the `service_endpoints` rows say
+        // (v0.2.97) — re-read every tick, so an adoption made on the
+        // Services page shows without a restart.
         let initial = probe_services().await;
-        let externally_managed = initial.running_count() == initial.total();
-
-        let _ = label_for_task.set_text(format_label(&initial, externally_managed));
+        let _ = label_for_task.set_text(format_label(&initial, tray_all_externally_managed()));
 
         let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         // First tick fires immediately by default — burn it so we wait a
@@ -358,7 +354,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         loop {
             ticker.tick().await;
             let snapshot = probe_services().await;
-            let _ = label_for_task.set_text(format_label(&snapshot, externally_managed));
+            let _ = label_for_task.set_text(format_label(&snapshot, tray_all_externally_managed()));
         }
     });
 
@@ -430,31 +426,25 @@ async fn probe_one(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
 }
 
-/// The tray's probe URLs. v0.2.97: ports come from the ONE resolver
-/// (`machine_port_from_disk` over `service_endpoints`: the launcher.db row,
-/// else the default) — the compiled-in port constants this replaces meant
-/// a moved service or an alt-port adoption
-/// showed a red tray while the service was healthy.
+/// The tray's probe URLs: each service's health URL at its launcher.db
+/// `service_endpoints` row — host AND port (v0.2.97; an adopted Ollama on
+/// another machine is probed there, not on a local port).
 fn tray_probe_urls() -> (String, String, String) {
-    use vct_launcher_core::services::service_endpoints::{
-        machine_port_from_disk, CoreService,
-    };
-    (
-        // /v1/meta is more reliable than /v1/.well-known/ready for "is
-        // Weaviate usable?" — see commands/lifecycle.rs::canonical_services.
-        format!(
-            "http://localhost:{}/v1/meta",
-            machine_port_from_disk(CoreService::Weaviate)
-        ),
-        format!(
-            "http://localhost:{}/api/tags",
-            machine_port_from_disk(CoreService::Ollama)
-        ),
-        format!(
-            "http://localhost:{}/health",
-            machine_port_from_disk(CoreService::CodeEmbed)
-        ),
-    )
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    let url = |s: CoreService| health_url(s, machine_row_from_disk(s).as_ref());
+    (url(CoreService::Weaviate), url(CoreService::Ollama), url(CoreService::CodeEmbed))
+}
+
+/// "Services: managed externally" — true when NO core service is VCO's own
+/// (every row adopted). From the rows, not from "everything was already up
+/// when the tray started", which is what this used to infer.
+fn tray_all_externally_managed() -> bool {
+    use vct_launcher_core::db::service_endpoints::EndpointMode;
+    use vct_launcher_core::services::service_endpoints::{machine_rows_from_disk, mode_of};
+    machine_rows_from_disk()
+        .iter()
+        .all(|(_, row)| mode_of(row.as_ref()) != EndpointMode::VcoManaged)
 }
 
 /// Probe all shared services concurrently. Wall time bounded by
@@ -538,7 +528,8 @@ mod tests {
         // probe URLs (the compiled-in ports it replaced could not).
         let _g = vct_launcher_core::test_env::state_dir_guard();
         let (w, _o, _c) = tray_probe_urls();
-        assert_eq!(w, "http://localhost:8081/v1/meta");
+        // No row on a harness state dir: the unroutable sentinel.
+        assert_eq!(w, "http://127.0.0.1:9/v1/meta");
         let db = crate::db::Db::open().unwrap();
         let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
             "weaviate",

@@ -47,8 +47,10 @@ impl EndpointMode {
     }
 }
 
-/// One `service_endpoints` row, as stored.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// One `service_endpoints` row, as stored. `Deserialize` so a wire type that
+/// carries it (the launcher's and the hub's `/services/status` snapshot) can
+/// round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceEndpointRow {
     pub service: String,
     pub mode: EndpointMode,
@@ -268,6 +270,24 @@ impl Db {
     pub fn service_endpoints_all(&self) -> Result<Vec<ServiceEndpointRow>, RowReadError> {
         let guard = self.lock_recover();
         read_all(&guard)
+    }
+
+    /// TEST SEAM: point all three services at the unroutable sentinel
+    /// `127.0.0.1:9` (IANA discard) — what every Rust test harness that
+    /// resolves an endpoint seeds, the twin of `tests/conftest.py`'s rows.
+    /// (Absent rows on a test database already resolve there through the
+    /// resolver's harness guard; seeding makes a harness say so itself.)
+    #[cfg(any(test, debug_assertions))]
+    pub fn seed_sentinel_service_endpoints_for_tests(&self) -> Result<(), String> {
+        for service in ["weaviate", "ollama", "code_embed"] {
+            let mut row = ServiceEndpointRow::new(service, EndpointMode::VcoManaged, "127.0.0.1", 9);
+            if service == "weaviate" {
+                row.grpc_port = Some(9);
+            }
+            row.source = "test_harness_sentinel".to_string();
+            self.service_endpoint_seed_for_tests(&row)?;
+        }
+        Ok(())
     }
 
     /// TEST SEAM: upsert `row` verbatim. Not compiled into release builds —

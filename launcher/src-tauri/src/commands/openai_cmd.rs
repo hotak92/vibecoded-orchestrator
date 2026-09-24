@@ -138,10 +138,18 @@ const VALIDATION_TIMEOUT_SECS: u64 = 8;
 /// localhost probe; if the service isn't ready in 500ms it's not coming.
 const CODE_EMBED_HEALTH_TIMEOUT_MS: u64 = 500;
 
-/// Default URL for the code-embedding service when `CODE_EMBED_SERVICE_URL`
-/// is unset. Matches `DEFAULT_CODE_EMBED_PORT` in
-/// `mcp_registration.rs` (port 11440).
-const DEFAULT_CODE_EMBED_URL: &str = "http://localhost:11440";
+/// The code-embedding service's health URL: its launcher.db
+/// `service_endpoints` row (v0.2.97; the compiled default with none). This
+/// was `CODE_EMBED_SERVICE_URL` → the literal `http://localhost:11440` — an
+/// env read in a machine-scoped process, and a literal a moved service
+/// never answered on.
+fn code_embed_health_url() -> String {
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    vct_launcher_core::services::service_status::health_url(
+        CoreService::CodeEmbed,
+        machine_row_from_disk(CoreService::CodeEmbed).as_ref(),
+    )
+}
 
 // ─── Response / status types ────────────────────────────────────────────
 
@@ -882,10 +890,8 @@ fn clear_app_state_if_set(db: &Db, key: &str) -> Result<(), String> {
 /// doesn't enable (only `json` + `rustls-tls`). The async probe + a
 /// short block_on bridge keeps us on the existing feature surface.
 ///
-/// Environment:
-///   * `CODE_EMBED_SERVICE_URL` — overrides the default `localhost:11440`
-///   * 500ms total timeout — matches the
-///     `CODE_EMBED_HEALTH_TIMEOUT_MS` constant
+/// Probes the code-embed row's `/health` ([`code_embed_health_url`]) with a
+/// 500 ms total timeout (`CODE_EMBED_HEALTH_TIMEOUT_MS`).
 pub fn choose_best_local_code_default() -> String {
     // Two-tier guard: try to use the existing runtime when present, else
     // build a one-shot runtime. Test contexts (no Tokio runtime) hit the
@@ -916,9 +922,7 @@ pub fn choose_best_local_code_default() -> String {
 /// `true` only on a 2xx response within the configured timeout.
 /// Network errors, DNS failures, timeouts all return `false`.
 async fn probe_code_embed_reachable() -> bool {
-    let url = std::env::var("CODE_EMBED_SERVICE_URL")
-        .unwrap_or_else(|_| DEFAULT_CODE_EMBED_URL.to_string());
-    let health_url = format!("{}/health", url.trim_end_matches('/'));
+    let health_url = code_embed_health_url();
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(CODE_EMBED_HEALTH_TIMEOUT_MS))
@@ -1354,17 +1358,35 @@ mod tests {
     }
 
     #[test]
-    fn choose_best_local_code_default_returns_known_id() {
-        // We don't control whether the code-embed service is running on
-        // the test machine — assert that we get *one of* the two known
-        // local ids back. Tests both reachable + unreachable paths
-        // depending on CI environment.
-        let id = choose_best_local_code_default();
-        assert!(
-            id == LOCAL_CODE_FALLBACK_CODEEMBED || id == LOCAL_CODE_FALLBACK_OLLAMA,
-            "expected one of the known local fallbacks, got: {}",
-            id
-        );
+    fn choose_best_local_code_default_is_ollama_when_the_row_is_unreachable() {
+        // A harness state dir: no row → the unroutable sentinel, never the
+        // developer's real code-embed service.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        assert_eq!(choose_best_local_code_default(), LOCAL_CODE_FALLBACK_OLLAMA);
+    }
+
+    /// SE-4: the probe goes where the code-embed ROW says (a live mock on a
+    /// non-default port) — red against the `localhost:11440` literal.
+    #[tokio::test]
+    async fn code_embed_probe_follows_the_row() {
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+            let _ = axum::serve(listener, app).await;
+        });
+        crate::db::Db::open()
+            .unwrap()
+            .service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+                "code_embed",
+                vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+                "127.0.0.1",
+                port,
+            ))
+            .unwrap();
+        assert_eq!(code_embed_health_url(), format!("http://127.0.0.1:{}/health", port));
+        assert!(probe_code_embed_reachable().await);
     }
 
     #[test]

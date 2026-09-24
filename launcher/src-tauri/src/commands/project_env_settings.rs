@@ -15,7 +15,7 @@
 //! `refresh_project_env_with_db` reports; the canonical env SURFACES are
 //! written by `vco_lib.config_projection` alone since the Rust writer's
 //! retirement — plus a `populate` helper that reads the
-//! launcher's current state (app_state k/v + services.toml + canonical
+//! launcher's current state (app_state k/v + service_endpoints rows + canonical
 //! defaults) once per `create_project_v2` / rename / shared-KG-toggle
 //! call. Future launcher-state values can be added here without churning
 //! every call site.
@@ -29,8 +29,8 @@
 //!     "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 — etc.) so a
 //!     launcher with no custom settings produces identical output to the
 //!     pre-refactor code modulo the shared-KG rename.
-//!   * Reads are best-effort: a missing app_state row or unreadable
-//!     services.toml falls through to defaults. The write path must NEVER
+//!   * Reads are best-effort: a missing app_state row or an absent
+//!     `service_endpoints` row falls through to defaults. The write path must NEVER
 //!     fail because state lookup hiccupped.
 //!   * Adopted services (mode = `Adopt` / `Parallel`) override default
 //!     ports. Refused / Unresolved fall back to canonical defaults.
@@ -746,7 +746,7 @@ fn which_cmd(name: &str) -> Option<std::path::PathBuf> {
 ///     yet (e.g. test contexts).
 ///
 /// Soft-fail policy: every read is wrapped in `unwrap_or` of the canonical
-/// default. A poisoned mutex / corrupt JSON / missing services.toml falls
+/// default. A poisoned mutex / corrupt JSON / missing endpoint row falls
 /// through silently. The whole point is that env-file writes must not be
 /// blocked by a state-read hiccup.
 pub fn populate(
@@ -1092,6 +1092,8 @@ mod tests {
     #[test]
     fn code_embedding_health_url_is_the_resolvers_default() {
         let _state = vct_launcher_core::test_env::state_dir_guard();
+        // About the compiled default itself (nothing is requested).
+        let _allow = endpoints::allow_compiled_default_on_this_thread();
         let db = Db::open().unwrap();
         let (_, body) = vct_launcher_core::bundled_manifests::BUNDLED_MANIFESTS
             .iter()
@@ -1190,6 +1192,8 @@ mod tests {
         let _state = vct_launcher_core::test_env::state_dir_guard_with(&[
             (endpoints::STATEMENT_ENV, Some("http://statement.invalid:1")),
         ]);
+        // About the compiled default itself (nothing is requested).
+        let _allow = endpoints::allow_compiled_default_on_this_thread();
         let db = Db::open_in_memory().unwrap();
         let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedExternal, "weaviate.lan", 8090);
         row.grpc_port = Some(50051);
@@ -1213,6 +1217,8 @@ mod tests {
 
     #[test]
     fn populate_with_no_state_returns_canonical_defaults() {
+        // About the compiled default itself (nothing is requested).
+        let _allow = endpoints::allow_compiled_default_on_this_thread();
         let db = Db::open_in_memory().unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.active_embedding, "qwen3");

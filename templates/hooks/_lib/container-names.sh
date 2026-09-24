@@ -23,11 +23,16 @@
 #     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #     # shellcheck source=_lib/container-names.sh
 #     . "$SCRIPT_DIR/_lib/container-names.sh"
-#     for c in "${VCO_REQUIRED_CONTAINERS[@]}"; do ...; done
+#     [ "${#VCO_REQUIRED_CONTAINERS[@]}" -gt 0 ] && ... --required "${VCO_REQUIRED_CONTAINERS[*]}"
 #
-# Users can override the list by setting VCT_REQUIRED_CONTAINERS in their
-# shell or .claude/env (space-separated). When unset, the canonical list
-# below is used.
+# v0.2.97: WHICH containers the session hook ensures — and what it may do to
+# each — is decided by `python -m vco_lib.service_lifecycle plan`, from the
+# launcher.db `service_endpoints` rows (an adopted Weaviate may be called
+# something other than `vco_weaviate`, and must only ever be started by
+# name). VCO_REQUIRED_CONTAINERS is therefore ONLY the user's override:
+# set VCT_REQUIRED_CONTAINERS (space-separated) in the shell or .claude/env
+# to narrow or extend the set; unset, the array is EMPTY and the plan's own
+# list applies.
 #
 # This file is sourced, never executed, so it has no shebang. It is a
 # library, not a hook — it is NOT registered in settings.json.template.
@@ -45,18 +50,14 @@ VCO_CODE_EMBED_CONTAINER="vco_code_embed"   # v0.2.15 rename (was
                                              # existing installs keep
                                              # working.
 
-# Free-tier required set (no neo4j_claude — that's RL/instinct-tier only).
-# code_embed is included because it's the canonical name even when the
-# service is gpu-profile-gated; the hook tolerates a missing container.
+# The user's override only (see the header): empty unless
+# VCT_REQUIRED_CONTAINERS is set — the service_endpoints plan decides the
+# default set.
+# shellcheck disable=SC2034  # read by the sourcing hook
+VCO_REQUIRED_CONTAINERS=()
 if [ -n "${VCT_REQUIRED_CONTAINERS:-}" ]; then
-    # shellcheck disable=SC2206
+    # shellcheck disable=SC2206,SC2034
     read -ra VCO_REQUIRED_CONTAINERS <<<"$VCT_REQUIRED_CONTAINERS"
-else
-    VCO_REQUIRED_CONTAINERS=(
-        "$VCO_WEAVIATE_CONTAINER"
-        "$VCO_OLLAMA_CONTAINER"
-        "$VCO_CODE_EMBED_CONTAINER"
-    )
 fi
 
 export VCO_WEAVIATE_CONTAINER VCO_OLLAMA_CONTAINER VCO_CODE_EMBED_CONTAINER

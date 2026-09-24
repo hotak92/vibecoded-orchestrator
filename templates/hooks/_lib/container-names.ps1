@@ -21,11 +21,16 @@
 # Usage (from any .ps1 hook):
 #     $LibDir = Join-Path $PSScriptRoot "_lib"
 #     . (Join-Path $LibDir "container-names.ps1")
-#     foreach ($c in $VcoRequiredContainers) { ... }
+#     if ($VcoRequiredContainers.Count -gt 0) { ... --required ($VcoRequiredContainers -join ' ') }
 #
-# Users can override the list by setting VCT_REQUIRED_CONTAINERS in their
-# shell or .claude/env (space-separated). When unset, the canonical list
-# below is used.
+# v0.2.97: WHICH containers the session hook ensures -- and what it may do to
+# each -- is decided by `python -m vco_lib.service_lifecycle plan`, from the
+# launcher.db `service_endpoints` rows (an adopted Weaviate may be called
+# something other than `vco_weaviate`, and must only ever be started by
+# name). $VcoRequiredContainers is therefore ONLY the user's override: set
+# VCT_REQUIRED_CONTAINERS (space-separated) in the shell or .claude/env to
+# narrow or extend the set; unset, it is EMPTY and the plan's own list
+# applies. Mirror of container-names.sh.
 
 # Canonical container names. These match the `container_name:` fields in
 # infrastructure/docker-compose.yml. If those names are changed, this file
@@ -40,10 +45,9 @@ $VcoCodeEmbedContainer = "vco_code_embed"   # v0.2.15 rename (was
                                             # existing installs keep
                                             # working.
 
+$VcoRequiredContainers = @()
 if ($env:VCT_REQUIRED_CONTAINERS) {
-    $VcoRequiredContainers = $env:VCT_REQUIRED_CONTAINERS -split '\s+' | Where-Object { $_ }
-} else {
-    $VcoRequiredContainers = @($VcoWeaviateContainer, $VcoOllamaContainer, $VcoCodeEmbedContainer)
+    $VcoRequiredContainers = @($env:VCT_REQUIRED_CONTAINERS -split '\s+' | Where-Object { $_ })
 }
 
 # Make available to the dot-sourcing scope.

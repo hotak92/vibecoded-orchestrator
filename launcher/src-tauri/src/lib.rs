@@ -94,12 +94,12 @@ pub use vct_launcher_core::secrets_file_store;
 pub use vct_launcher_core::state;
 pub use vct_launcher_core::types;
 
-// `services::` is a HYBRID: `runtime` and `picker` live in core, while
-// `adoption`, `settings_json_watcher`, and `watcher` stay in the
-// launcher. The local `mod services;` declares this crate's submodule,
-// which itself re-exports the core halves so `crate::services::runtime`
-// + `crate::services::picker` still resolve from anywhere in the
-// launcher.
+// `services::` is a HYBRID: `runtime` lives in core, while
+// `settings_json_watcher` and `watcher` stay in the launcher. The local
+// `mod services;` declares this crate's submodule, which re-exports the
+// core half so `crate::services::runtime` resolves from anywhere in the
+// launcher. (v0.2.97: the `picker` and `adoption` halves are retired — the
+// `service_endpoints` rows replaced both.)
 mod services;
 
 use state::{AppManager, ProjectState, ProjectStore};
@@ -119,9 +119,9 @@ use std::sync::Mutex;
 //
 //   * `--register-default-mcps <install_root>` (PR-23, Group B): writes the
 //     canonical bundled-orchestrator MCP entries into `~/.claude.json` AND
-//     (when a project row already exists) the launcher.db. Ports forwarded
-//     by install.py via WEAVIATE_PORT / OLLAMA_PORT / CODE_EMBED_PORT /
-//     WEAVIATE_GRPC_PORT env vars.
+//     (when a project row already exists) the launcher.db. Every endpoint
+//     value comes from the launcher.db `service_endpoints` rows (v0.2.97);
+//     no env var is read.
 //
 //   * `--set-storage-config <named|bind|deferred> [--bind-path service=path]...`
 //     (PR-28, Group G): persists the user's storage-mode decision from the
@@ -243,12 +243,9 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
     // JSON write is the primary contract, DB sync is the bonus).
     let db_handle = db::Db::open().ok();
 
-    // v0.2.97 (lane X): the ONE port source. The entries land in
-    // `~/.claude.json` — a machine-global surface — so the ports come
-    // from the machine chain (app_state override → services.toml
-    // adoption → default), which subsumes the `WEAVIATE_PORT`-style env
-    // hand-off install.py makes (it persists those choices to
-    // services.toml before invoking us). gRPC keeps its env-only read.
+    // v0.2.97: the entries land in `~/.claude.json` — a machine-global
+    // surface — so every endpoint value (URLs, ports, gRPC port) is the
+    // machine's `service_endpoints` rows'. No env var is read.
     let ports = mcp_registration::machine_service_ports();
 
     match mcp_registration::register_default_orchestrator_mcps(
@@ -1800,11 +1797,10 @@ pub fn run() {
                     else {
                         return;
                     };
-                    // Weaviate URL: the launcher's ONE client resolver
-                    // (v0.2.97) — its interim env legs, then the launcher.db
-                    // `service_endpoints` row, else 8081.
+                    // Weaviate URL: the launcher.db `service_endpoints` row
+                    // (v0.2.97), else the compiled default. No env var.
                     let weaviate_url =
-                        vct_launcher_core::services::service_endpoints::client_weaviate_url(
+                        vct_launcher_core::services::service_endpoints::machine_weaviate_url(
                             db.inner(),
                         );
 
@@ -1947,12 +1943,12 @@ pub fn run() {
                     else {
                         return;
                     };
-                    // v0.2.97 (lane W): the ONE launcher client resolver —
+                    // v0.2.97: the launcher.db `service_endpoints` row —
                     // this read only `WEAVIATE_URL`, so on a machine with an
                     // adopted or moved Weaviate the boot sweep judged the
                     // wrong instance's schema.
                     let weaviate_url =
-                        vct_launcher_core::services::service_endpoints::client_weaviate_url(
+                        vct_launcher_core::services::service_endpoints::machine_weaviate_url(
                             db.inner(),
                         );
                     match db
@@ -2495,12 +2491,12 @@ pub fn run() {
                     let Some(db) = repair_handle.try_state::<db::Db>() else {
                         return;
                     };
-                    // v0.2.97 (lane W): the ONE launcher client resolver —
+                    // v0.2.97: the launcher.db `service_endpoints` row —
                     // this read only `WEAVIATE_URL`, so on a machine with an
                     // adopted or moved Weaviate the boot sweep judged the
                     // wrong instance's schema.
                     let weaviate_url =
-                        vct_launcher_core::services::service_endpoints::client_weaviate_url(
+                        vct_launcher_core::services::service_endpoints::machine_weaviate_url(
                             db.inner(),
                         );
                     let report =
@@ -2688,12 +2684,13 @@ pub fn run() {
             commands::lifecycle::service_start,
             commands::lifecycle::service_stop,
             commands::lifecycle::service_restart,
-            commands::lifecycle::services_set_adoption,
-            commands::lifecycle::services_get_adoption,
-            commands::lifecycle::services_reset_adoption,
-            commands::lifecycle::services_find_free_port,
-            commands::lifecycle::services_enumerate_candidates,
-            commands::lifecycle::services_pick_container,
+            // v0.2.97 (service endpoints SSOT): the rows (read) and the
+            // Python verbs that change them (candidates / adopt /
+            // use-vco-copy / hand-to-vco). The services.toml adoption
+            // commands and the container picker are retired.
+            commands::lifecycle::services_get_endpoints,
+            commands::lifecycle::services_endpoint_candidates,
+            commands::lifecycle::services_endpoint_action,
             // Container-runtime install (no-runtime modal). Linux uses
             // pkexec to elevate apt/dnf/pacman; macOS/Windows just open
             // the canonical install page in the user's default browser.

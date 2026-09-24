@@ -770,6 +770,56 @@ def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
     return bool(scan.unclaimed)
 
 
+def service_endpoint_still_unreachable(ctx: ProbeContext) -> Optional[bool]:
+    """``service_endpoint_unreachable`` — do the named rows still not answer?
+
+    The SAME probe the emitter uses (``service_reconcile.probe_unreachable``
+    → ``service_detection.probe_endpoint`` on the row's URL). True: one still
+    does not answer; False: every named service answers; None: no rows /
+    no service named (could not look)."""
+    from vco_lib import service_reconcile
+
+    try:
+        return service_reconcile.probe_unreachable(ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def service_endpoint_still_ambiguous(ctx: ProbeContext) -> Optional[bool]:
+    """``service_endpoint_ambiguous`` — do several instances still hold VCO
+    data for a row the user has not confirmed?"""
+    from vco_lib import service_reconcile
+
+    try:
+        return service_reconcile.probe_ambiguous(ctx.entry)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def adopted_service_config_drift_persists(ctx: ProbeContext) -> Optional[bool]:
+    """``adopted_service_config_drift`` — does an adopted container still lack
+    VCO's behaviour-critical env? Read from ``inspect`` (no container, no
+    runtime ⇒ None)."""
+    from vco_lib import service_reconcile
+
+    try:
+        root = Path(__file__).resolve().parent.parent
+        return service_reconcile.probe_config_drift(ctx.entry, orchestrator_root=root)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def service_adoption_confirmation_still_pending(ctx: ProbeContext) -> Optional[bool]:
+    """``service_adoption_confirmation_required`` — is the Weaviate row still
+    the disabled, awaiting-a-choice shape?"""
+    from vco_lib import service_reconcile
+
+    try:
+        return service_reconcile.probe_confirmation_pending(ctx.entry)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 #: name → probe. Referenced from the registry as ``probe:py:<name>``.
 def code_embed_image_still_stale(ctx: ProbeContext) -> Optional[bool]:
     """``code_embed_image_stale`` — is the running service still on old source?
@@ -994,6 +1044,10 @@ PROBES: dict[str, ProbeFn] = {
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
+    "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
+    "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
+    "adopted_service_config_drift_persists": adopted_service_config_drift_persists,
+    "service_adoption_confirmation_still_pending": service_adoption_confirmation_still_pending,
 }
 
 

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import os
 import sqlite3
 import subprocess
@@ -364,10 +365,33 @@ os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
 # Set at IMPORT time (module-scope readers resolve it during COLLECTION —
 # `weaviate_mcp/embeddings.py` and `templates/scripts/query_code_graph.py` both
 # read it into a module constant) and RE-ESTABLISHED per test below.
+#
+# BOTH URL names the resolver reads are pinned (v0.2.97): lane Y added the
+# `CODE_EMBED_URL` leg after `CODE_EMBED_SERVICE_URL`, so a test that pops the
+# first name to exercise the `CODE_EMBED_PORT` leg would otherwise fall through
+# to an AMBIENT `CODE_EMBED_URL` — on a developer's machine, the live service
+# (measured: a hook test read the live :11440 `/health` and reported
+# "predates v0.2.92").
+_CODE_EMBED_URL_KEYS: tuple[str, ...] = ("CODE_EMBED_SERVICE_URL", "CODE_EMBED_URL")
 _AMBIENT_CODE_EMBED_URL = os.environ.get("CODE_EMBED_SERVICE_URL")
 
 if not _ALLOW_REAL_STATE:
-    os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    for _key in _CODE_EMBED_URL_KEYS:
+        os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+
+
+# ─── W-SESSION-RECONCILE (v0.2.97 SE-3): no hook test probes live ports ─────
+#
+# `ensure-containers.{sh,ps1}` runs `service_endpoints reconcile --phase
+# session` (via `vco_lib.service_lifecycle session-reconcile`), and its
+# detection PROBES the canonical/upstream ports (8081, 8080, 11434, 11435, …)
+# regardless of any env — a hook test would touch whatever listens there on
+# the developer's machine. Every subprocess the suite spawns inherits this
+# pin: the runner executes this harmless stand-in instead (a test that needs
+# another stand-in sets its own). Import-time, like the pins above.
+if not _ALLOW_REAL_STATE:
+    os.environ["VCO_SESSION_RECONCILE_ARGV"] = json.dumps(
+        [sys.executable, "-c", 'print(\'{"schema": 1, "rows": {}, "entries": []}\')'])
 
 
 # ─── W-ENDPOINTS (v0.2.97): the machine resolvers answer an unroutable port ──
@@ -829,6 +853,105 @@ def _under_checkout_state(raw) -> "Path | None":
     return None
 
 
+# ─── W-CHECKOUT-LEDGER (v0.2.97): no test renders a deferral ledger into a checkout
+#
+# 2026-09-24 incident. A checkout is a repository, not an install root and
+# not a project — yet mid-suite something wrote `<checkout>/.claude/context/
+# UPDATE_DEFERRED.{json,md}` and spliced the "Pending VCO action" reminder into
+# the TRACKED `<checkout>/CLAUDE.md` (the v0.2.92 release shipped exactly that
+# block). Every ledger writer goes through `vco_lib.deferral_emit.locked_report`
+# → `DeferralReport.write`, which opens, in order: the lock
+# `.claude/context/.update-deferred.lock`, the ledger's mkstemp siblings
+# (`UPDATE_DEFERRED.json.<rand>.tmp` …), and `CLAUDE.md.<rand>.tmp`. The lock
+# is watched too, deliberately: with no ledger on disk a writer that resolves
+# the checkout renders NOTHING (empty report ⇒ no files), so it stays invisible
+# until some stale JSON happens to be there — which is how this incident hid.
+# The lock open is the one write every such writer makes, ledger or not.
+#
+# Same door as W-CHECKOUT-STATE (the audit hook below): refused AND recorded,
+# because the deferral writers soft-fail on `Exception`.
+_CHECKOUT_ROOTS: tuple = _install_checkouts()
+_LEDGER_NAME_MARKERS = ("CLAUDE.md", "UPDATE_DEFERRED", ".update-deferred.lock")
+#: Set ONLY while `_guard_repo_tracked_files_against_install_pollution` puts a
+#: checkout back the way the session found it — the one legitimate writer.
+_checkout_ledger_restoring: list = [False]
+
+
+def _checkout_ledger_write(raw) -> "Path | None":
+    """Resolved path if ``raw`` is a checkout's CLAUDE.md, deferral ledger
+    (or one of their atomic-write temp files) or the ledger lock; else None.
+    Never raises (runs inside an audit hook); absolute paths only, like
+    :func:`_under_checkout_state`."""
+    try:
+        text = os.fspath(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or not any(m in text for m in _LEDGER_NAME_MARKERS):
+        return None
+    if not os.path.isabs(text):
+        return None
+    try:
+        resolved = Path(os.path.normpath(text))
+        parent, name = resolved.parent, resolved.name
+    except (OSError, ValueError):
+        return None
+    for root in _CHECKOUT_ROOTS:
+        if parent == root and (name == "CLAUDE.md" or name.startswith("CLAUDE.md.")):
+            return resolved
+        if parent == root / ".claude" / "context" and (
+            name.startswith("UPDATE_DEFERRED.") or name == ".update-deferred.lock"
+        ):
+            return resolved
+    return None
+
+
+# The audit hook sees only THIS process. The 2026-09-24 writer was a
+# SUBPROCESS (a shell wrapper whose venv ladder found a real interpreter and
+# ran a real sync with the wrapper's script-relative root — the checkout), so
+# the second leg compares the files themselves before and after every test.
+# (inode, mtime_ns, size): an atomic replace changes the inode, an in-place
+# write the mtime/size. Stats only — cheap enough for every test.
+_CHECKOUT_LEDGER_FILES: tuple = tuple(
+    path
+    for root in _CHECKOUT_ROOTS
+    for path in (
+        root / "CLAUDE.md",
+        root / ".claude" / "context" / "UPDATE_DEFERRED.md",
+        root / ".claude" / "context" / "UPDATE_DEFERRED.json",
+    )
+)
+
+
+def _ledger_fingerprint(path: Path) -> "tuple | None":
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+@pytest.fixture(autouse=True)
+def _checkout_ledger_untouched():
+    """W-CHECKOUT-LEDGER, subprocess leg: red the test during which a
+    checkout's CLAUDE.md or deferral ledger changed, whoever changed it."""
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    before = {path: _ledger_fingerprint(path) for path in _CHECKOUT_LEDGER_FILES}
+    yield
+    changed = [str(p) for p in _CHECKOUT_LEDGER_FILES if _ledger_fingerprint(p) != before[p]]
+    if changed:
+        raise AssertionError(
+            "W-CHECKOUT-LEDGER: this test (or a process it spawned) changed "
+            + ", ".join(changed)
+            + " — something resolved the checkout as its project/install root "
+            "and rendered a deferral ledger / CLAUDE.md reminder into it. Give "
+            "the writer a fixture root (see tests/conftest.py W-CHECKOUT-LEDGER)."
+        )
+
+
 _CONTAINED_MARK = "_vco_contained_install_log"
 
 
@@ -1000,6 +1123,20 @@ def _user_state_audit_hook(event: str, args) -> None:
     # guard already lets read-only DB handles through for the same reason.
     # Recording them would red dozens of tests for no incident.
     if is_write:
+        # os.rename's destination is args[1]; the mkstemp source already
+        # matches for the ledger writers, the destination covers a plain
+        # rename onto CLAUDE.md.
+        for raw in (args[:2] if event == "os.rename" else args[:1]):
+            ledger = None if _checkout_ledger_restoring[0] else _checkout_ledger_write(raw)
+            if ledger is not None:
+                _state_write_attempts.append(str(ledger))
+                raise RealUserStateWriteBlocked(
+                    f"test tried to write {ledger}; the suite must never render "
+                    f"a deferral ledger or CLAUDE.md reminder into a checkout "
+                    f"(see tests/conftest.py W-CHECKOUT-LEDGER — the writer "
+                    f"resolved the checkout as its project/install root; give "
+                    f"it a fixture root)"
+                )
         in_checkout = _under_checkout_state(args[0])
         if in_checkout is not None:
             _state_write_attempts.append(str(in_checkout))
@@ -1282,35 +1419,49 @@ def _guard_repo_tracked_files_against_install_pollution():
     the public repo (which is NOT an installed clone and must carry no install
     artifacts).
 
-    This session-scoped guard snapshots both at session start and restores /
-    removes them at session end, so the suite never leaves the repo dirty —
-    independent of WHICH test pollutes (current or future). Best practice for
-    new tests remains: run install.py with ``--skip-materialize-claude-dir`` or
-    target a tmp install root. Soft-fail: cleanup errors never fail the session.
+    Since v0.2.97 such a write no longer passes silently: W-CHECKOUT-LEDGER
+    refuses it in-process at the write and reds the test during which a
+    subprocess made it. This session-scoped fixture remains the clean-up
+    behind those reds: it snapshots at session start and restores / removes at
+    session end, so even a red run never leaves the tracked file dirty. Best
+    practice for new tests remains: run install.py with
+    ``--skip-materialize-claude-dir`` or target a tmp install root. Soft-fail:
+    cleanup errors never fail the session.
+
+    The ledger is removed as a PAIR (``UPDATE_DEFERRED.md`` AND its ``.json``
+    source of truth). Removing only the Markdown is how a 2026-09-10 row
+    survived for two weeks: the next writer that read the ledger re-rendered
+    the ``.md`` — and the CLAUDE.md reminder — from the leftover ``.json``.
     """
     repo_root = Path(__file__).resolve().parent.parent
     claude_md = repo_root / "CLAUDE.md"
-    deferred = repo_root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    context_dir = repo_root / ".claude" / "context"
+    ledger_files = (context_dir / "UPDATE_DEFERRED.md", context_dir / "UPDATE_DEFERRED.json")
 
     claude_before = claude_md.read_bytes() if claude_md.is_file() else None
-    deferred_existed = deferred.is_file()
+    ledger_existed = {path: path.is_file() for path in ledger_files}
 
     try:
         yield
     finally:
+        _checkout_ledger_restoring[0] = True
         try:
-            if claude_before is not None:
-                if not claude_md.is_file() or claude_md.read_bytes() != claude_before:
-                    claude_md.write_bytes(claude_before)
-            elif claude_md.is_file():
-                claude_md.unlink()  # didn't exist before the session
-        except OSError:
-            pass
-        try:
-            if not deferred_existed and deferred.is_file():
-                deferred.unlink()
-        except OSError:
-            pass
+            try:
+                if claude_before is not None:
+                    if not claude_md.is_file() or claude_md.read_bytes() != claude_before:
+                        claude_md.write_bytes(claude_before)
+                elif claude_md.is_file():
+                    claude_md.unlink()  # didn't exist before the session
+            except OSError:
+                pass
+            for path, existed in ledger_existed.items():
+                try:
+                    if not existed and path.is_file():
+                        path.unlink()
+                except OSError:
+                    pass
+        finally:
+            _checkout_ledger_restoring[0] = False
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1663,15 +1814,17 @@ def _pin_code_embed_url():
     if _ALLOW_REAL_STATE:
         yield
         return
-    prev = os.environ.get("CODE_EMBED_SERVICE_URL")
-    os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    prev = {k: os.environ.get(k) for k in _CODE_EMBED_URL_KEYS}
+    for key in _CODE_EMBED_URL_KEYS:
+        os.environ[key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
     try:
         yield
     finally:
-        if prev is None:
-            os.environ.pop("CODE_EMBED_SERVICE_URL", None)
-        else:
-            os.environ["CODE_EMBED_SERVICE_URL"] = prev
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @pytest.fixture(autouse=True)

@@ -805,7 +805,9 @@ pub async fn set_project_kg_binding(
     // pool. The write's own Result rides through the join.
     let role_for_ensure = req.role.clone();
     let collection_for_ensure = req.collection_name.clone();
-    let weaviate_url_for_ensure = req.weaviate_url.clone();
+    // v0.2.97: with no URL in the request, the machine's Weaviate (its
+    // `service_endpoints` row) — not the literal 8081 (plan §4d leftover).
+    let weaviate_url_for_ensure = ensure_target_url(&db, req.weaviate_url.as_deref());
     let project_id_for_task = project_id.clone();
     let row = crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
@@ -825,9 +827,7 @@ pub async fn set_project_kg_binding(
     // treat that as success. Failure to reach Weaviate is non-fatal —
     // we log a warning and let the user retry from the GUI.
     if matches!(role_for_ensure.as_str(), "primary") {
-        let weaviate_url = weaviate_url_for_ensure
-            .as_deref()
-            .unwrap_or("http://localhost:8081");
+        let weaviate_url = weaviate_url_for_ensure.as_str();
         if let Err(e) = ensure_kg_collection(weaviate_url, &collection_for_ensure).await {
             tracing::warn!(
                 "[vct] warning: ensure_kg_collection({}) on {}: {}",
@@ -1079,6 +1079,16 @@ pub async fn delete_project_kg_binding(
 /// Returns Ok(()) on creation OR if the class already exists. The
 /// Weaviate REST contract for "already exists" is HTTP 422 with a
 /// body mentioning `class already exists` — we match on that.
+/// Where `ensure_kg_collection` creates the collection: the URL the request
+/// named, else the machine's Weaviate (its `service_endpoints` row).
+fn ensure_target_url(db: &Db, requested: Option<&str>) -> String {
+    requested
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| vct_launcher_core::services::service_endpoints::machine_weaviate_url(db))
+}
+
 async fn ensure_kg_collection(weaviate_url: &str, collection_name: &str) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -1303,6 +1313,27 @@ pub async fn delete_project_codegraph_binding(
 // `project_permissions` table; tests target the resolution logic in
 // `list_project_mcp_permissions` and the upsert/delete semantics in
 // `set_project_mcp_permission`.
+
+#[cfg(test)]
+mod ensure_target_tests {
+    use super::*;
+
+    /// SE-4 red-proof (8): with no URL in the request the collection is
+    /// ensured on the machine row's Weaviate — red against the literal
+    /// `http://localhost:8081` fallback it replaced.
+    #[test]
+    fn ensure_kg_collection_falls_back_to_the_row() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let db = Db::open_in_memory().unwrap();
+        let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedContainer, "localhost", 18081);
+        row.grpc_port = Some(50061);
+        row.container_name = Some("their_weaviate".into());
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        assert_eq!(ensure_target_url(&db, None), "http://localhost:18081");
+        assert_eq!(ensure_target_url(&db, Some("  ")), "http://localhost:18081");
+        assert_eq!(ensure_target_url(&db, Some("http://explicit:1")), "http://explicit:1");
+    }
+}
 
 #[cfg(test)]
 mod tests {

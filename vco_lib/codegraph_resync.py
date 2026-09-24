@@ -2136,7 +2136,8 @@ def code_embed_service_healthy(
     """Return True iff the code-embedding service answers ``/health`` < 400.
 
     Resolution order for the base URL: explicit arg → ``CODE_EMBED_SERVICE_URL``
-    env → ``http://localhost:<CODE_EMBED_PORT|11440>``, resolved by the ONE
+    env → ``CODE_EMBED_URL`` (the v0.2.97 client alias) →
+    ``http://localhost:<CODE_EMBED_PORT|11440>``, resolved by the ONE
     shared home ``vco_lib.code_embed_image.service_base_url`` (v0.2.92 R2 —
     this order was previously inlined here and twice in
     ``vco_lib/embedding_service.py``). Never raises — any failure (connection

@@ -20,14 +20,15 @@
 //!
 //! So the path logic lives HERE, in the shared `vct-launcher-core`, and
 //! both the hub and the launcher call the same functions. This mirrors the
-//! same shared-path discipline already applied to `services::adoption`
+//! same shared-path discipline the launcher.db `service_endpoints` rows follow
 //! (read by both processes) and `paths::finetune_sentinel_path`
 //! (writer = launcher, reader = hub).
 //!
 //! ## Lifecycle contract
 //!
-//! - A deliberate STOP of a VCO-managed service (`Unresolved` adoption
-//!   mode) CREATES its marker → the watchdog leaves it down.
+//! - A deliberate STOP of a VCO-managed service (a `vco_managed`
+//!   `service_endpoints` row, or no row) CREATES its marker → the watchdog
+//!   leaves it down. Adopted services are never supervised, so they get none.
 //! - A deliberate START / RESTART of the same service REMOVES its marker →
 //!   the watchdog resumes supervision.
 //! - A RAW external stop (the user runs `podman stop` themselves, a crash,

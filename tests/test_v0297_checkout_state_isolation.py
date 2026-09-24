@@ -116,3 +116,77 @@ def test_a_read_under_a_checkout_state_dir_is_not_refused(state_dir: Path):
         with open(missing, encoding="utf-8"):
             pass
     assert _suite.consume_state_write_attempts() == []
+
+
+# ─── W-CHECKOUT-LEDGER (v0.2.97) ─────────────────────────────────────────
+#
+# 2026-09-24: a deferral ledger was rendered into the checkout's
+# `.claude/context/` and its reminder block into the TRACKED `CLAUDE.md`.
+# The same audit hook now refuses those writes — at the lock, the ledger's
+# atomic-write temp files and CLAUDE.md — and records them.
+
+CHECKOUT_ROOTS = _suite._CHECKOUT_ROOTS
+
+
+@pytest.mark.parametrize("root", CHECKOUT_ROOTS, ids=lambda p: p.name)
+@pytest.mark.parametrize("rel", [
+    "CLAUDE.md",
+    "CLAUDE.md.abc123.tmp",
+    ".claude/context/UPDATE_DEFERRED.md",
+    ".claude/context/UPDATE_DEFERRED.json",
+    ".claude/context/UPDATE_DEFERRED.json.abc123.tmp",
+    ".claude/context/.update-deferred.lock",
+])
+def test_a_ledger_write_into_a_checkout_is_refused_and_recorded(root: Path, rel: str):
+    target = root / rel
+    existed = target.exists()
+    before = target.read_bytes() if existed else None
+    with pytest.raises(_suite.RealUserStateWriteBlocked):
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write("leak\n")
+    assert _suite.consume_state_write_attempts() == [str(target)]
+    assert target.exists() == existed
+    if existed:
+        assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("root", CHECKOUT_ROOTS, ids=lambda p: p.name)
+def test_the_real_deferral_emitter_cannot_reach_a_checkout(root: Path):
+    """End to end through the production writer, which SOFT-FAILS: the
+    refusal is swallowed by `emit_entries`, so the recording is what reds the
+    culprit test. Nothing lands on disk either way."""
+    from vco_lib.deferral_emit import emit_entries
+    from vco_lib.deferral_report import DeferralEntry
+
+    if not (root / ".claude" / "context").is_dir():
+        # The emitter's lock helper would CREATE the directory first (a mkdir
+        # the tripwire does not watch) — never do that to another checkout.
+        pytest.skip(f"{root} has no .claude/context")
+    ledger = root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    existed = ledger.exists()
+    entry = DeferralEntry(
+        condition_id="w_checkout_ledger_probe", title="probe", detected="probe",
+        why_deferred="probe", command_to_apply="probe", severity="info",
+    )
+    assert emit_entries(root, [entry]) is False
+    attempts = _suite.consume_state_write_attempts()
+    assert attempts, "the emitter's first write (the lock) must be recorded"
+    assert all(Path(a).parent in (root, root / ".claude" / "context") for a in attempts)
+    assert ledger.exists() == existed
+
+
+@pytest.mark.parametrize("root", CHECKOUT_ROOTS, ids=lambda p: p.name)
+def test_reading_the_checkout_claude_md_is_not_refused(root: Path):
+    """Many tests READ the stub; only writes are refused."""
+    target = root / "CLAUDE.md"
+    if target.exists():
+        target.read_text(encoding="utf-8")
+    assert _suite.consume_state_write_attempts() == []
+
+
+def test_a_fixture_root_is_not_the_checkout(tmp_path: Path):
+    """The fix every culprit takes — a fixture root — is untouched."""
+    (tmp_path / ".claude" / "context").mkdir(parents=True)
+    (tmp_path / "CLAUDE.md").write_text("# fixture\n", encoding="utf-8")
+    (tmp_path / ".claude" / "context" / "UPDATE_DEFERRED.md").write_text("x", encoding="utf-8")
+    assert _suite.consume_state_write_attempts() == []

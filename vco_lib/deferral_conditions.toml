@@ -206,7 +206,68 @@ class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.93: step 5 skipped --force-recreate/--build for running service(s) whose container another compose project created (labels). Human decides: apply there, or hand ownership to install.py's compose."
+notes = """v0.2.93 origin; v0.2.97 NARROWED to code-embed: the automatic recreate-with-cache (service_lifecycle.migrate_code_embed, run by install.py step [5b]) refused (nothing stopped) or failed and rolled back — or step 5's guard met a foreign-owned code_embed. A Weaviate/Ollama another compose project runs is ADOPTED by design (vco_lib.service_reconcile) and never produces this row. Re-detected every run; the run whose move goes through drops it."""
+
+[conditions.service_registry_unavailable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: `vct-hub --ensure-db` failed or left launcher.db without the service_endpoints table (a missing or pre-047 hub binary). The run used its detected endpoints as in-memory pins for compose, settings and the MCP registration. Emitted by vco_lib.service_reconcile INSIDE the install.py run (into its report) and re-detected every run, so the first run with a current hub binary drops it."""
+
+[conditions.service_endpoint_unreachable]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:service_endpoint_still_unreachable"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "endpoint"]
+notes = """v0.2.97: a recorded endpoint does not answer after VCO ran its lifecycle (compose start / start-by-name), an adopted container is gone, or the legacy import kept a previously effective endpoint nothing answers on. VCO never switches to another instance on its own (plan I6). The probe re-checks every named service's row endpoint; all answering ⇒ resolved."""
+
+[conditions.service_endpoint_ambiguous]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:service_endpoint_still_ambiguous"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "candidates"]
+notes = """v0.2.97: more than one running instance holds VCO data; the ranking picked one (continuity, else the canonical port). Clears once the user confirms a row (`service_endpoints adopt`, confirmed_by_user=1) or at most one candidate still holds VCO data."""
+
+[conditions.legacy_service_statement_unimported]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["source", "value"]
+notes = """v0.2.97: an older endpoint setting (app_state *.port_override, a non-default vct-config.toml weaviate_url, an exported VCT_*_URL, or an import run's services.toml / alt-port override value) names an endpoint that does not answer and did not win. Re-detected every install run for the settings that stay in place, so settling or removing them drops the entry."""
+
+[conditions.adopted_service_config_drift]
+class = "environmental"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:adopted_service_config_drift_persists"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "drift_keys"]
+notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2)."""
+
+[conditions.service_adopted_without_prompt]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97 (owner ruling Q1): an unattended install found an Ollama VCO did not start and uses it instead of starting a second copy. One-shot record: the next run (rows present) does not re-detect it and drops it."""
+
+[conditions.service_endpoints_migrated]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: the one-time legacy import ran (services.toml renamed .migrated-v0297, the alt-port override .retired-v0297, consumed port_override keys deleted, legacy-default binding URLs NULLed). One-shot record."""
+
+[conditions.service_adoption_confirmation_required]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:service_adoption_confirmation_still_pending"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "candidate"]
+notes = """v0.2.97 (owner ruling Q1): an unattended run found a third-party Weaviate without VCO data. VCO adopted nothing and started nothing: its Weaviate row is vco_managed but DISABLED on a free port until the user runs `service_endpoints adopt` or `use-vco-copy`. The probe reads the row: no longer the disabled shape ⇒ resolved."""
 
 [conditions.services_compose_up_failed]
 class = "action_required"

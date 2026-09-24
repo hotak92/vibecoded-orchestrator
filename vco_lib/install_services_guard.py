@@ -25,6 +25,16 @@ manifest already bumped and hooks/hub/MCP/KG-seed/schema steps never run):
 
 Kept out of ``install.py`` on purpose (the monolith ratchet + the "one concern,
 one home" rule); ``install.py`` holds two thin call sites.
+
+v0.2.97 narrowed rule 1's LEDGER ROW to code-embed. A Weaviate/Ollama
+container another compose project created is ADOPTED by design now
+(``vco_lib.service_reconcile``: VCO starts/stops it by name and never
+recreates it), so it never reaches step 5's recreate list; the only
+automatic ownership change left is code-embed's recreate-with-cache
+(``service_lifecycle.migrate_code_embed``), and
+``services_foreign_compose_identity`` means "that recreate refused". The
+guard itself still refuses ANY foreign container it is handed — a safety net,
+not a design path.
 """
 from __future__ import annotations
 
@@ -41,6 +51,7 @@ __all__ = [
     "GuardOutcome",
     "foreign_owned_services",
     "emit_foreign_compose_identity_deferral",
+    "emit_code_embed_migration_refused",
     "apply_recreate_guard",
     "compose_failure_is_survivable",
     "emit_compose_up_failed_deferral",
@@ -215,6 +226,45 @@ def emit_foreign_compose_identity_deferral(
     return entry
 
 
+def emit_code_embed_migration_refused(
+    deferral_report, *, status: str, reason: str, runtime: str, infra_dir: Path,
+) -> Optional[DeferralEntry]:
+    """``services_foreign_compose_identity`` (v0.2.97 meaning): the automatic
+    code-embed recreate-with-cache (``service_lifecycle.migrate_code_embed``)
+    refused, or failed and rolled back. The running container is untouched
+    (refused) or back under its previous owner (failed)."""
+    if deferral_report is None:
+        return None
+    root = infra_dir.parent
+    entry = DeferralEntry(
+        condition_id=CID_FOREIGN_IDENTITY,
+        title="code-embed could not be moved under VCO's compose with its cache",
+        detected=(
+            "code-embed runs under another compose project (or on an outdated image), and "
+            "the automatic re-create under the installer's compose — same cache, verified "
+            f"before and after — did not go through ({status}): {reason}"
+        ),
+        why_deferred=(
+            "VCO never starts code-embed on an empty cache when a filled one exists; it "
+            "refuses (nothing stopped) or rolls back to the previous owner instead. The "
+            "service keeps running as it was, without the new image or compose tuning."
+        ),
+        command_to_apply=(
+            "# Fix what the reason above names (for a bind cache: the host directory must\n"
+            "# exist and hold the model cache), then re-run — the move is retried:\n"
+            "python install.py --update\n"
+            "# What VCO recorded for code-embed (port, cache mount):\n"
+            "python -m vco_lib.service_endpoints show\n"
+            f"# Or silence this entry:\n#   python -m vco_lib.project_init dismiss-deferral --folder {root} "
+            f"--condition-id {CID_FOREIGN_IDENTITY}"
+        ),
+        severity="warning",
+        kg_node_refs=[],
+    )
+    deferral_report.add_entry(entry)
+    return entry
+
+
 class GuardOutcome(NamedTuple):
     services_to_recreate: list[str]
     recreate_for_rebuild: list[str]
@@ -254,12 +304,21 @@ def apply_recreate_guard(
         )
     for svc, why in sorted(foreign.items()):
         print(f"  [skip-recreate] {svc}: {why}")
-    print(
-        "      Left running as-is; the compose tuning / image rebuild did not "
-        f"reach it. See UPDATE_DEFERRED.md ({CID_FOREIGN_IDENTITY})."
-    )
+    # v0.2.97: only code-embed's refusal is a ledger row. A foreign-owned
+    # Weaviate/Ollama is adopted by design; the next run's reconcile records
+    # it as `adopted_container` (never recreated).
+    ledgered = {s: w for s, w in foreign.items() if s == "code_embed"}
+    if ledgered:
+        print(
+            "      Left running as-is; the compose tuning / image rebuild did not "
+            f"reach it. See UPDATE_DEFERRED.md ({CID_FOREIGN_IDENTITY})."
+        )
+    if set(foreign) - set(ledgered):
+        print("      (a Weaviate/Ollama another compose project runs is used as it is — "
+              "`python -m vco_lib.service_endpoints show`)")
     entry = emit_foreign_compose_identity_deferral(
-        deferral_report, foreign, runtime, infra_dir, identities=identities,
+        deferral_report, ledgered, runtime, infra_dir,
+        identities={s: v for s, v in identities.items() if s in ledgered},
     )
     log_event(
         "5/10", "skip-recreate",

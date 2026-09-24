@@ -164,8 +164,14 @@ def test_the_install_root_probe_applies_the_same_is_it_a_file_rule(tmp_path):
 
 @pytest.fixture
 def moved_port(monkeypatch):
-    """The service moved off 11440 via CODE_EMBED_PORT, with no URL override."""
+    """The service moved off 11440 via CODE_EMBED_PORT, with no URL override.
+
+    "No URL override" means NEITHER URL name the resolver reads: since v0.2.97
+    (lane Y) ``CODE_EMBED_URL`` is a URL leg too, ranked after
+    ``CODE_EMBED_SERVICE_URL`` and before the port.
+    """
     monkeypatch.delenv("CODE_EMBED_SERVICE_URL", raising=False)
+    monkeypatch.delenv("CODE_EMBED_URL", raising=False)
     monkeypatch.setenv("CODE_EMBED_PORT", "12345")
     return "http://localhost:12345"
 

@@ -174,7 +174,7 @@ FastAPI service that produces code embeddings via CodeSage-Large-v2 (1.3B params
 
 API: `POST /embed {"texts": [...], "is_query": false}` → `{"embeddings": [[...]], "dim": 2048}`. `GET /health` returns status, backend, model, and dim.
 
-Two backends: `gpu` (default, sentence-transformers on CUDA/CPU) and `ollama` (delegates to Ollama, e.g. `jina-embeddings-v2-base-code` for CPU-only users). Backend controlled by `CODE_EMBED_BACKEND` env var. Default port: 11440 (configurable via `CODE_EMBED_PORT`).
+Two backends: `gpu` (default, sentence-transformers on CUDA/CPU) and `ollama` (delegates to Ollama, e.g. `jina-embeddings-v2-base-code` for CPU-only users). Backend controlled by `CODE_EMBED_BACKEND` env var. Default port: 11440 — the machine's `service_endpoints` row decides the actual host port, and project clients reach the service through the projected `CODE_EMBED_SERVICE_URL` / `CODE_EMBED_URL`.
 
 The `ensure-code-embed-service.sh` SessionStart hook auto-starts this container if it exists. CPU-only users can leave the `code_embed` service commented out in `compose.yaml` — the MCP falls back to Ollama code embeddings automatically.
 

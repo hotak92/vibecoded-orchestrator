@@ -264,6 +264,23 @@ def _run_kg_sync(
     env.pop("VCT_INSTALL_ROOT", None)
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONPATH", None)
+    # Every OTHER ladder input the test does not control (v0.2.97): the
+    # ladder grew an explicit `$VCT_VENV` tier (RT-4) and an exported
+    # `$VCT_ORCHESTRATOR_ROOT` tier (v0.2.94 review 2a) after this helper was
+    # written. On a maintainer shell either one hands the wrapper the REAL
+    # orchestrator venv, and the wrapper then runs a REAL
+    # `sync_knowledge_graph.py --all` — measured 2026-09-24: it re-rendered a
+    # stale deferral ledger into the checkout and the reminder block into the
+    # tracked CLAUDE.md.
+    env.pop("VCT_VENV", None)
+    env.pop("VCT_ORCHESTRATOR_ROOT", None)
+    # And whatever interpreter the ladder does pick (a developer's checkout
+    # may carry its own `.venv`, the clone-relative tier), the sync's project
+    # root is a FIXTURE, never the wrapper's script-relative default — the
+    # checkout this suite runs from.
+    fixture_project = fallback_python_dir.parent / "kg_sync_fixture_project"
+    (fixture_project / ".claude" / "context").mkdir(parents=True, exist_ok=True)
+    env["KG_SYNC_PROJECT_ROOT"] = str(fixture_project)
     if vct_install_root is not None:
         env["VCT_INSTALL_ROOT"] = str(vct_install_root)
     if extra_env:

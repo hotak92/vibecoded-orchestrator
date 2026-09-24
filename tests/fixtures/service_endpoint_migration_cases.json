@@ -1,0 +1,246 @@
+{
+  "schema": 1,
+  "_doc": "v0.2.97 SE-2: the service-endpoint migration/decision table (Python-only; tests/test_v0297_service_reconcile.py executes every case through vco_lib.service_reconcile.reconcile against a fake machine). 'containers' are inspect-shaped; 'http' keys are 'host:port' with one fingerprint spec each; 'expect.rows' checks only the fields given.",
+  "cases": [
+    {
+      "id": "a_dogfood_shape",
+      "doc": "Legacy-compose VCO containers (adopt x3 in services.toml), Weaviate on its named volume, Ollama + code_embed on binds, other projects' stopped containers on 8080/8082/11434 that must NOT be picked.",
+      "phase": "update",
+      "has_gpu": true,
+      "services_toml": [
+        {"name": "weaviate", "mode": "adopt", "external_url": "http://localhost:8081"},
+        {"name": "ollama", "mode": "adopt", "external_url": "http://localhost:11435"},
+        {"name": "code_embed", "mode": "adopt", "external_url": "http://localhost:11440"}
+      ],
+      "continuity": {"WEAVIATE_URL": "http://localhost:8081", "OLLAMA_URL": "http://localhost:11435", "CODE_EMBED_SERVICE_URL": "http://localhost:11440"},
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "running",
+         "project": "vibecoded", "working_dir": "/home/u/vco/claude_mcp_servers", "service_label": "weaviate",
+         "ports": {"8080": 8081, "50051": 50052},
+         "mounts": [{"Type": "volume", "Name": "vco_weaviate_data", "Source": "/var/lib/containers/storage/volumes/vco_weaviate_data/_data", "Destination": "/var/lib/weaviate"}],
+         "env": {"PERSISTENCE_LSM_MAX_SEGMENT_SIZE": "2GiB", "TOMBSTONE_DELETION_MIN_PER_CYCLE": "10000", "TOMBSTONE_DELETION_MAX_PER_CYCLE": "10000", "TOMBSTONE_DELETION_CONCURRENCY": "1"}},
+        {"name": "vco_ollama", "image": "docker.io/ollama/ollama:0.20.2", "state": "running",
+         "project": "vibecoded", "working_dir": "/home/u/vco/claude_mcp_servers", "service_label": "ollama",
+         "ports": {"11434": 11435},
+         "mounts": [{"Type": "bind", "Source": "/home/u/volumes/ollama/models", "Destination": "/root/.ollama"}],
+         "env": {}},
+        {"name": "vco_code_embed", "image": "localhost/vibecoded_code_embed:latest", "state": "running",
+         "project": "vibecoded", "working_dir": "/home/u/vco/claude_mcp_servers", "service_label": "code_embed",
+         "ports": {"11440": 11440},
+         "mounts": [{"Type": "bind", "Source": "/home/u/volumes/code_embed_cache", "Destination": "/cache"}]},
+        {"name": "weaviate_other", "image": "semitechnologies/weaviate:1.25.0", "state": "exited",
+         "project": "otherapp", "working_dir": "/home/u/otherapp", "ports": {"8080": 8080, "50051": 50051}},
+        {"name": "weaviate_third", "image": "semitechnologies/weaviate:1.25.0", "state": "exited",
+         "project": "thirdapp", "working_dir": "/home/u/thirdapp", "ports": {"8080": 8082, "50051": 50053}},
+        {"name": "ollama_other", "image": "ollama/ollama:latest", "state": "exited",
+         "project": "otherapp", "working_dir": "/home/u/otherapp", "ports": {"11434": 11434}}
+      ],
+      "http": {
+        "localhost:8081": {"service": "weaviate", "version": "1.28.4", "classes": ["Alpha_KnowledgeGraph", "Alpha_CodeFunction"]},
+        "localhost:11435": {"service": "ollama", "models": ["qwen3-embedding:0.6b", "llama3:8b"]},
+        "localhost:11440": {"service": "code_embed", "body": "{\"status\":\"ok\",\"model\":\"codesage-large-v2\"}"}
+      },
+      "expect": {
+        "rows": {
+          "weaviate": {"mode": "adopted_container", "container_name": "vco_weaviate", "port": 8081, "grpc_port": 50052,
+                       "data_mount": {"kind": "volume", "source": "vco_weaviate_data", "destination": "/var/lib/weaviate"},
+                       "source": "migrated:legacy_compose", "confirmed_by_user": true},
+          "ollama": {"mode": "adopted_container", "container_name": "vco_ollama", "port": 11435,
+                     "data_mount": {"kind": "bind", "source": "/home/u/volumes/ollama/models", "destination": "/root/.ollama"}},
+          "code_embed": {"mode": "vco_managed", "port": 11440, "container_name": "vco_code_embed", "enabled": true,
+                         "data_mount": {"kind": "bind", "source": "/home/u/volumes/code_embed_cache", "destination": "/cache"}}
+        },
+        "migrate_code_embed": true,
+        "disposition": {"weaviate": "skip", "ollama": "skip", "code_embed": "skip"},
+        "entries": ["service_endpoints_migrated", "adopted_service_config_drift"],
+        "entries_absent": ["services_foreign_compose_identity", "service_endpoint_ambiguous", "service_adoption_confirmation_required", "legacy_service_statement_unimported", "service_endpoint_unreachable"],
+        "services_toml_renamed": true
+      }
+    },
+    {
+      "id": "b_native_ollama_on_upstream_port",
+      "doc": "Fresh install, non-interactive: a native Ollama answers on 11434, nothing on 11435. Adopt it; never start a second one.",
+      "phase": "install",
+      "has_gpu": true,
+      "http": {"localhost:11434": {"service": "ollama", "models": ["llama3:8b"]}},
+      "expect": {
+        "rows": {
+          "ollama": {"mode": "adopted_external", "host": "localhost", "port": 11434, "confirmed_by_user": false},
+          "weaviate": {"mode": "vco_managed", "port": 8081, "grpc_port": 50052, "enabled": true},
+          "code_embed": {"mode": "vco_managed", "port": 11440}
+        },
+        "disposition": {"ollama": "skip", "weaviate": "start", "code_embed": "start"},
+        "managed_services_absent": ["ollama"],
+        "entries": ["service_adopted_without_prompt"],
+        "entries_absent": ["service_endpoints_migrated"]
+      }
+    },
+    {
+      "id": "c_parallel_port_with_live_vco_copy",
+      "doc": "services.toml says parallel 18082 and VCO's own copy (installer project, holds VCO data) publishes 18082; a third-party Weaviate without VCO data holds 8081.",
+      "phase": "update",
+      "has_gpu": false,
+      "services_toml": [{"name": "weaviate", "mode": "parallel", "external_url": "http://localhost:8081", "parallel_port": 18082}],
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "running",
+         "project": "infrastructure", "service_label": "weaviate", "ports": {"8080": 18082, "50051": 50099},
+         "mounts": [{"Type": "volume", "Name": "vco_weaviate_data", "Destination": "/var/lib/weaviate"}]},
+        {"name": "their_weaviate", "image": "semitechnologies/weaviate:1.30.0", "state": "running",
+         "project": "theirs", "working_dir": "/srv/theirs", "ports": {"8080": 8081, "50051": 50051}}
+      ],
+      "http": {
+        "localhost:18082": {"service": "weaviate", "version": "1.28.4", "classes": ["Bar_KnowledgeGraph"]},
+        "localhost:8081": {"service": "weaviate", "version": "1.30.0", "classes": ["Articles"]},
+        "localhost:11435": {"service": "ollama", "models": ["qwen3-embedding:0.6b"]}
+      },
+      "expect": {
+        "rows": {"weaviate": {"mode": "vco_managed", "port": 18082, "grpc_port": 50099, "container_name": "vco_weaviate", "enabled": true}},
+        "disposition": {"weaviate": "recreate"},
+        "entries_absent": ["service_adoption_confirmation_required", "service_endpoint_ambiguous"]
+      }
+    },
+    {
+      "id": "d1_shipped_vct_config_default_is_no_statement",
+      "doc": "The release archive's uncommented vct-config.toml default is not a statement; a fresh machine gets VCO's own Weaviate.",
+      "phase": "update",
+      "has_gpu": false,
+      "vct_config": "weaviate_url = \"http://localhost:8081\"\n",
+      "expect": {
+        "rows": {"weaviate": {"mode": "vco_managed", "port": 8081, "source": "install_probe"}},
+        "entries_absent": ["legacy_service_statement_unimported"]
+      }
+    },
+    {
+      "id": "d2_non_default_vct_config_answering_with_vco_data",
+      "doc": "A user-set vct-config.toml weaviate_url that answers with VCO data (a native process) is adopted as an external endpoint.",
+      "phase": "update",
+      "has_gpu": false,
+      "vct_config": "weaviate_url = \"http://localhost:18090\"\n",
+      "http": {"localhost:18090": {"service": "weaviate", "version": "1.26.1", "classes": ["Baz_KnowledgeGraph"]}},
+      "tcp_open": ["localhost:50052"],
+      "expect": {
+        "rows": {"weaviate": {"mode": "adopted_external", "host": "localhost", "port": 18090, "grpc_port": 50052, "source": "migrated:vct-config.toml"}},
+        "entries_absent": ["legacy_service_statement_unimported"]
+      }
+    },
+    {
+      "id": "e_dead_port_override",
+      "doc": "An app_state weaviate.port_override naming a dead port loses to the live VCO Weaviate; it is reported and KEPT.",
+      "phase": "update",
+      "has_gpu": false,
+      "app_state": {"weaviate.port_override": "8099"},
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "running",
+         "project": "infrastructure", "service_label": "weaviate", "ports": {"8080": 8081, "50051": 50052}}
+      ],
+      "http": {"localhost:8081": {"service": "weaviate", "version": "1.28.4", "classes": ["KnowledgeGraph"]}},
+      "expect": {
+        "rows": {"weaviate": {"mode": "vco_managed", "port": 8081}},
+        "entries": ["legacy_service_statement_unimported", "service_endpoints_migrated"],
+        "app_state_kept": ["weaviate.port_override"]
+      }
+    },
+    {
+      "id": "f_two_weaviates_with_vco_data",
+      "doc": "Two live Weaviates hold VCO data; the root project's projected env names 18081, so that one wins and the ambiguity is recorded.",
+      "phase": "update",
+      "has_gpu": false,
+      "continuity": {"WEAVIATE_URL": "http://localhost:18081", "GRPC_PORT": "50061"},
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "running",
+         "project": "infrastructure", "service_label": "weaviate", "ports": {"8080": 8081, "50051": 50052}},
+        {"name": "weaviate_b", "image": "semitechnologies/weaviate:1.27.0", "state": "running",
+         "project": "otherproj", "working_dir": "/srv/b", "ports": {"8080": 18081, "50051": 50061}}
+      ],
+      "http": {
+        "localhost:8081": {"service": "weaviate", "version": "1.28.4", "classes": ["Alpha_KnowledgeGraph"]},
+        "localhost:18081": {"service": "weaviate", "version": "1.27.0", "classes": ["Bar_KnowledgeGraph"]}
+      },
+      "expect": {
+        "rows": {"weaviate": {"mode": "adopted_container", "container_name": "weaviate_b", "port": 18081, "grpc_port": 50061}},
+        "entries": ["service_endpoint_ambiguous"]
+      }
+    },
+    {
+      "id": "g_nothing_live_keeps_continuity",
+      "doc": "Nothing answers anywhere; the previously effective (non-default) endpoint is kept, unverified, and reported.",
+      "phase": "update",
+      "has_gpu": false,
+      "continuity": {"WEAVIATE_URL": "http://localhost:18081", "GRPC_PORT": "50061"},
+      "expect": {
+        "rows": {"weaviate": {"mode": "adopted_external", "port": 18081, "grpc_port": 50061, "verified_at": null}},
+        "entries": ["service_endpoint_unreachable"]
+      }
+    },
+    {
+      "id": "k_alt_port_override_file",
+      "doc": "install.py's header-identified alt-port override is imported and renamed; a headerless user override is untouched.",
+      "phase": "update",
+      "has_gpu": false,
+      "override_files": {
+        "docker-compose.override.yml": "# Auto-generated by install.py — alt-port mappings for foreign-service coexistence\n# Safe to delete + regenerate by re-running `python install.py`.\n# Tracked in ~/.vct/services.toml.\nservices:\n  weaviate:\n    ports:\n      - \"18082:8080\"\n      - \"50099:50051\"\n",
+        "compose.override.yaml": "services:\n  weaviate:\n    environment:\n      LOG_LEVEL: debug\n"
+      },
+      "expect": {
+        "rows": {"weaviate": {"mode": "vco_managed", "port": 18082, "grpc_port": 50099, "source": "migrated:compose-override"}},
+        "files_renamed": ["docker-compose.override.yml"],
+        "files_kept": ["compose.override.yaml"]
+      }
+    },
+    {
+      "id": "q1_third_party_weaviate_unattended",
+      "doc": "Owner ruling Q1: an unattended run that finds a third-party Weaviate without VCO data adopts nothing and starts nothing; the row is a DISABLED vco_managed parked on a free port.",
+      "phase": "install",
+      "has_gpu": false,
+      "containers": [
+        {"name": "their_weaviate", "image": "semitechnologies/weaviate:1.30.0", "state": "running",
+         "project": "theirs", "working_dir": "/srv/theirs", "ports": {"8080": 8081, "50051": 50051}}
+      ],
+      "http": {"localhost:8081": {"service": "weaviate", "version": "1.30.0", "classes": ["Articles"]}},
+      "busy_ports": [8081, 50051],
+      "expect": {
+        "rows": {"weaviate": {"mode": "vco_managed", "enabled": false, "port": 8082, "grpc_port": 50053}},
+        "disposition": {"weaviate": "skip"},
+        "managed_services_absent": ["weaviate"],
+        "weaviate_pending": true,
+        "entries": ["service_adoption_confirmation_required"],
+        "entries_absent": ["service_adopted_without_prompt"]
+      }
+    },
+    {
+      "id": "q1_third_party_weaviate_on_conflict_adopt",
+      "doc": "An explicit --on-conflict adopt is consent: the third-party Weaviate is adopted, confirmed.",
+      "phase": "install",
+      "has_gpu": false,
+      "on_conflict": "adopt",
+      "containers": [
+        {"name": "their_weaviate", "image": "semitechnologies/weaviate:1.30.0", "state": "running",
+         "project": "theirs", "working_dir": "/srv/theirs", "ports": {"8080": 8081, "50051": 50051}}
+      ],
+      "http": {"localhost:8081": {"service": "weaviate", "version": "1.30.0", "classes": []}},
+      "expect": {
+        "rows": {"weaviate": {"mode": "adopted_container", "container_name": "their_weaviate", "port": 8081, "grpc_port": 50051, "confirmed_by_user": true}},
+        "entries_absent": ["service_adoption_confirmation_required"]
+      }
+    },
+    {
+      "id": "stopped_legacy_container_kept_by_name",
+      "doc": "Update after a reboot: VCO's legacy-compose Weaviate is STOPPED. Nothing answers, so rank 5 keeps it by name and VCO starts it (by name, never recreated).",
+      "phase": "update",
+      "has_gpu": false,
+      "continuity": {"WEAVIATE_URL": "http://localhost:8081"},
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "exited",
+         "project": "vibecoded", "working_dir": "/home/u/vco/claude_mcp_servers", "service_label": "weaviate",
+         "ports": {"8080": 8081, "50051": 50052}},
+        {"name": "weaviate_other", "image": "semitechnologies/weaviate:1.25.0", "state": "exited",
+         "project": "otherapp", "ports": {"8080": 8080, "50051": 50051}}
+      ],
+      "expect": {
+        "rows": {"weaviate": {"mode": "adopted_container", "container_name": "vco_weaviate", "port": 8081, "grpc_port": 50052, "autostart": true}},
+        "started": ["vco_weaviate"],
+        "disposition": {"weaviate": "skip"}
+      }
+    }
+  ]
+}

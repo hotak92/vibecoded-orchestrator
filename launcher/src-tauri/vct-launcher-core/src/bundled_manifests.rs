@@ -276,6 +276,8 @@ mod tests {
         let url = manifest["runtime"]["health_check"]["url"].as_str().unwrap();
         assert_eq!(url, "http://localhost:{code_embed_port}/health", "health_check.url");
         let _g = crate::test_env::state_dir_guard();
+        // About the compiled default itself (nothing is requested).
+        let _allow = crate::services::service_endpoints::allow_compiled_default_on_this_thread();
         let ctx = crate::manifest::PlaceholderCtx::new("vct-code-embedding");
         assert_eq!(ctx.resolve(url), format!("http://localhost:{service}/health"));
         let db = crate::db::Db::open().unwrap();

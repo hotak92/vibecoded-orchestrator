@@ -70,7 +70,19 @@ set -u
 # orchestrator root). systemd units / launchctl jobs always set
 # VCT_STACK_WORKING_DIR explicitly so this default rarely fires.
 _VCT_DEFAULT_STACK_ROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.."
-VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-${VCT_ORCHESTRATOR_ROOT:-${_VCT_DEFAULT_STACK_ROOT}}/claude_mcp_servers}"
+# v0.2.97: the INSTALLER's compose (<root>/infrastructure) is the default when
+# it exists. A VCO-managed service composed from the legacy
+# claude_mcp_servers/ home gets THAT project's label (and, for Ollama, its
+# differently-named volume) — the foreign-owned shape the service_endpoints
+# migration exists to undo. The legacy home stays the fallback for a clone
+# without infrastructure/.
+_VCT_DEFAULT_STACK_BASE="${VCT_ORCHESTRATOR_ROOT:-${_VCT_DEFAULT_STACK_ROOT}}"
+if [ -f "$_VCT_DEFAULT_STACK_BASE/infrastructure/docker-compose.yml" ]; then
+    _VCT_DEFAULT_STACK_DIR="$_VCT_DEFAULT_STACK_BASE/infrastructure"
+else
+    _VCT_DEFAULT_STACK_DIR="$_VCT_DEFAULT_STACK_BASE/claude_mcp_servers"
+fi
+VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-$_VCT_DEFAULT_STACK_DIR}"
 VCT_STACK_LOG_FILE="${VCT_STACK_LOG_FILE:-/tmp/claude-mcp-containers.log}"
 VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
 # NOTE (PR-12 Bug B): VCT_STACK_RUNTIME_FILE is no longer eagerly defaulted
@@ -78,10 +90,34 @@ VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
 # was too narrow when systemd's WorkingDirectory pointed at a stale install
 # location (Bug C). resolve_runtime_file() now probes multiple candidates
 # and picks the first one that contains a USABLE runtime token.
+# v0.2.97: remember which file knobs the CALLER set, so main() can adapt the
+# defaults to the working dir's layout (infrastructure/ holds
+# docker-compose.yml + its overlays side by side; the legacy
+# claude_mcp_servers/ holds compose.yaml with the overlays one level down).
+_VCT_STACK_COMPOSE_FILE_SET="${VCT_STACK_COMPOSE_FILE+1}"
+_VCT_STACK_GPU_OVERLAY_SET="${VCT_STACK_GPU_OVERLAY+1}"
+_VCT_STACK_GPU_OVERLAY_DOCKER_SET="${VCT_STACK_GPU_OVERLAY_DOCKER+1}"
 VCT_STACK_GPU_OVERLAY="${VCT_STACK_GPU_OVERLAY:-infrastructure/podman-compose.gpu.yml}"
 VCT_STACK_GPU_OVERLAY_DOCKER="${VCT_STACK_GPU_OVERLAY_DOCKER:-infrastructure/docker-compose.gpu.yml}"
 VCT_STACK_COMPOSE_FILE="${VCT_STACK_COMPOSE_FILE:-compose.yaml}"
 VCT_STACK_COMPOSE_OVERRIDE="${VCT_STACK_COMPOSE_OVERRIDE:-compose.override.yaml}"
+# v0.2.97 — WHICH services this script composes (plan invariant I1: never a
+# bare whole-stack `up -d`). Order of precedence:
+#   1. service names on the command line (`launch-claude-mcp-stack.sh
+#      [up|start|restart] <service>...` — the verb is optional and means
+#      "bring up", as it always did);
+#   2. VCO_COMPOSE_SERVICES in the environment (space-separated; set but
+#      EMPTY means "nothing" → no compose call);
+#   3. the launcher.db service_endpoints plan (`python -m
+#      vco_lib.service_lifecycle plan`) — the boot unit's case, which ALSO
+#      starts adopted containers BY NAME.
+# 1 and 2 are intersected with the plan's VCO-managed list: an adopted
+# service is never composed, whoever asks. No readable plan → nothing runs.
+#   - VCT_STACK_BUILD=1       — add `--build` (code_embed's image is built
+#                                 from the checkout; the session hook sets it
+#                                 when it is creating that container).
+_VCT_CALLER_SERVICES_SET="${VCO_COMPOSE_SERVICES+1}"
+_VCT_CALLER_SERVICES="${VCO_COMPOSE_SERVICES-}"
 
 # Resolve the directory that contains THIS script — used as one fallback
 # root for runtime.txt resolution. Works whether the script is sourced or
@@ -512,16 +548,135 @@ pick_compose_invocation() {
 }
 
 # ---------------------------------------------------------------------------
+# adapt_file_defaults :: fit the DEFAULT compose-file / overlay names to the
+# working dir's layout (v0.2.97). Caller-set knobs are never touched.
+#   - compose file: `compose.yaml` when present, else `docker-compose.yml`
+#     (infrastructure/ — the installer's compose; before this the session
+#     hook and the hub watchdog pointed the wrapper at infrastructure/ and it
+#     asked for a compose.yaml that does not exist there).
+#   - GPU overlays: `infrastructure/<overlay>` when present, else the same
+#     name directly in the working dir (infrastructure/ again).
+# Arg: working dir.
+# ---------------------------------------------------------------------------
+adapt_file_defaults() {
+    local dir="$1"
+    if [ -z "$_VCT_STACK_COMPOSE_FILE_SET" ] && [ ! -f "$dir/compose.yaml" ] \
+        && [ -f "$dir/docker-compose.yml" ]; then
+        VCT_STACK_COMPOSE_FILE="docker-compose.yml"
+    fi
+    if [ -z "$_VCT_STACK_GPU_OVERLAY_SET" ] && [ ! -f "$dir/$VCT_STACK_GPU_OVERLAY" ] \
+        && [ -f "$dir/$(basename "$VCT_STACK_GPU_OVERLAY")" ]; then
+        VCT_STACK_GPU_OVERLAY="$(basename "$VCT_STACK_GPU_OVERLAY")"
+    fi
+    if [ -z "$_VCT_STACK_GPU_OVERLAY_DOCKER_SET" ] && [ ! -f "$dir/$VCT_STACK_GPU_OVERLAY_DOCKER" ] \
+        && [ -f "$dir/$(basename "$VCT_STACK_GPU_OVERLAY_DOCKER")" ]; then
+        VCT_STACK_GPU_OVERLAY_DOCKER="$(basename "$VCT_STACK_GPU_OVERLAY_DOCKER")"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# resolve_stack_python :: print an interpreter that can import vco_lib from
+# THIS checkout (the wrapper lives in <root>/scripts). VCO_VENV_PYTHON wins;
+# then the hooks' shared venv resolver; then <root>/.venv; then python3.
+# Empty when none — the caller then refuses to compose anything.
+# ---------------------------------------------------------------------------
+resolve_stack_python() {
+    local root="${_VCT_SCRIPT_DIR:+$_VCT_SCRIPT_DIR/..}"
+    if [ -n "${VCO_VENV_PYTHON:-}" ] && [ -f "$VCO_VENV_PYTHON" ] && [ -x "$VCO_VENV_PYTHON" ]; then
+        printf '%s\n' "$VCO_VENV_PYTHON"
+        return 0
+    fi
+    if [ -n "$root" ] && [ -f "$root/templates/hooks/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$root/templates/hooks/_lib/resolve-vco-venv.sh"
+        VCO_VENV_PYTHON=""
+        resolve_vco_venv_python "$root/templates/hooks"
+        if [ -n "$VCO_VENV_PYTHON" ]; then
+            printf '%s\n' "$VCO_VENV_PYTHON"
+            return 0
+        fi
+    fi
+    if [ -n "$root" ] && [ -x "$root/.venv/bin/python" ]; then
+        printf '%s\n' "$root/.venv/bin/python"
+        return 0
+    fi
+    command -v python3 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# stack_py :: run `python -m <args>` with THIS checkout first on PYTHONPATH.
+# ---------------------------------------------------------------------------
+stack_py() {
+    local root="${_VCT_SCRIPT_DIR:+$_VCT_SCRIPT_DIR/..}"
+    PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" "$STACK_PY" -m "$@"
+}
+
+# ---------------------------------------------------------------------------
+# select_services :: decide the compose service list (see the header).
+# Args: the service names from the command line (verb already stripped).
+# Sets SELECTED_SERVICES (space-separated) and FROM_PLAN (1 when the plan
+# supplied the list — the boot case that also starts adopted containers).
+# Requires the plan variables (VCO_COMPOSE_SERVICES = VCO-managed list).
+# ---------------------------------------------------------------------------
+select_services() {
+    local managed=" ${VCO_COMPOSE_SERVICES:-} " requested s
+    FROM_PLAN=0
+    if [ "$#" -gt 0 ]; then
+        requested="$*"
+    elif [ -n "$_VCT_CALLER_SERVICES_SET" ]; then
+        requested="$_VCT_CALLER_SERVICES"
+    else
+        requested="${VCO_COMPOSE_SERVICES:-}"
+        FROM_PLAN=1
+    fi
+    SELECTED_SERVICES=""
+    for s in $requested; do
+        case "$managed" in
+            *" $s "*) SELECTED_SERVICES="${SELECTED_SERVICES:+$SELECTED_SERVICES }$s" ;;
+            *) log "skipping '$s': not a VCO-managed service in launcher.db service_endpoints (an adopted service is never composed)" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
 # main :: orchestrate the boot-safe compose-up.
 # ---------------------------------------------------------------------------
 main() {
     log "starting (working_dir=$VCT_STACK_WORKING_DIR cdi_timeout=$VCT_STACK_CDI_TIMEOUT)"
+
+    # Optional leading verb: the launcher passes `start` / `restart`; both
+    # have always meant "bring the services up".
+    case "${1:-}" in
+        up|start|restart) shift ;;
+    esac
 
     if [ ! -d "$VCT_STACK_WORKING_DIR" ]; then
         log "FATAL: working directory does not exist: $VCT_STACK_WORKING_DIR"
         exit 2
     fi
     cd "$VCT_STACK_WORKING_DIR" || { log "FATAL: cd $VCT_STACK_WORKING_DIR failed"; exit 2; }
+    adapt_file_defaults "$VCT_STACK_WORKING_DIR"
+
+    # The service_endpoints plan (VCO-managed list + adopted containers).
+    STACK_PY="$(resolve_stack_python)"
+    if [ -z "$STACK_PY" ]; then
+        log "FATAL: no Python interpreter to read the service_endpoints plan (broken VCO install?) — nothing composed"
+        exit 5
+    fi
+    local plan_out plan_err
+    plan_err="${TMPDIR:-/tmp}/vco-stack-plan.$$"
+    if ! plan_out="$(stack_py vco_lib.service_lifecycle plan --shell 2>"$plan_err")"; then
+        log "FATAL: vco_lib.service_lifecycle plan failed — nothing composed: $(tail -n 3 "$plan_err" 2>/dev/null | tr '\n' ' ')"
+        rm -f "$plan_err"
+        exit 5
+    fi
+    rm -f "$plan_err"
+    eval "$plan_out"
+    select_services "$@"
+    if [ -z "$SELECTED_SERVICES" ] && { [ "$FROM_PLAN" != "1" ] || [ -z "${VCO_ADOPTED_CONTAINERS:-}" ]; }; then
+        log "nothing to compose: no VCO-managed service selected"
+        exit 0
+    fi
 
     local runtime
     runtime="$(detect_runtime)"
@@ -582,12 +737,47 @@ main() {
         esac
         log "WARNING: inline-GPU compose assumed — overlay file '${VCT_STACK_WORKING_DIR}/${missing_overlay}' not found, proceeding without overlay"
     fi
-    log "exec: $argv up -d"
+
+    # Adopted containers (somebody else's, started BY NAME, never composed)
+    # come up on the boot path only — an explicit list is a caller asking
+    # for those services and nothing else.
+    local name
+    if [ "$FROM_PLAN" = "1" ]; then
+        local rt_bin="podman"
+        [ "$runtime" = "docker" ] && rt_bin="docker"
+        for name in ${VCO_ADOPTED_CONTAINERS:-}; do
+            if "$rt_bin" start "$name" >/dev/null 2>&1; then
+                log "started adopted container $name (by name — never re-created)"
+            else
+                log "WARNING: could not start adopted container $name"
+            fi
+        done
+    fi
+
+    # The `up` argv for EXACTLY the selected services — from the one home of
+    # the rule (`--no-deps`; code_embed only with the gpu profile, and not at
+    # all in CPU mode). An empty list is NO compose call, never a bare up.
+    local up_line
+    local -a up_args=() build_flag=()
+    [ "${VCT_STACK_BUILD:-}" = "1" ] && build_flag=(--build)
+    if ! up_line="$(stack_py vco_lib.service_lifecycle compose-args --shell \
+            --services "$SELECTED_SERVICES" --gpu-mode "$gpu_mode" \
+            "${build_flag[@]}")"; then
+        log "FATAL: vco_lib.service_lifecycle compose-args failed for '$SELECTED_SERVICES' — nothing composed"
+        exit 5
+    fi
+    if [ -z "$up_line" ]; then
+        log "nothing to compose (selected: '${SELECTED_SERVICES}', gpu_mode=$gpu_mode)"
+        exit 0
+    fi
+    # `up_line` is shlex-quoted by the Python side; this only splits it.
+    eval "up_args=($up_line)"
+    log "exec: $argv $up_line"
 
     # shellcheck disable=SC2086
     # Intentional word splitting — `argv` is a space-separated string
     # built from a controlled set of values inside `pick_compose_invocation`.
-    $argv up -d
+    $argv "${up_args[@]}"
     local rc=$?
     log "compose exited rc=$rc"
     # Exit 125 from podman-compose means "one or more containers failed

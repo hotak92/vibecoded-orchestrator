@@ -222,9 +222,9 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         // MCP registry. Removed from this list 2026-05-13 after surfacing as
         // "global off" in the per-project Permissions tab (misclassification:
         // the per-project toggle has no semantic meaning since weaviate-kg's
-        // codegraph features need the service either way). The container is
-        // managed via `services.toml` (adopt mode); the launcher tray
-        // (`tray.rs::services` list) correctly tracks it as a service.
+        // codegraph features need the service either way). Where it runs is
+        // its launcher.db `service_endpoints` row (v0.2.97; code-embed is
+        // always VCO-managed); the launcher tray tracks it as a service.
         McpServerConfig {
             id: "playwright".to_string(),
             name: "Browser automation".to_string(),

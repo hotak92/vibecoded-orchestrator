@@ -808,7 +808,10 @@ mod tests {
             }
         );
         let embed = targets.iter().find(|t| t.key.module_id == "vct-code-embedding").unwrap();
-        assert!(matches!(&embed.probe, Probe::Http { url, .. } if url == "http://localhost:11440/health"));
+        // `{code_embed_port}` is the machine resolver's; this harness has no
+        // row, so its guard answers the unroutable sentinel port — never the
+        // real code-embed service's 11440.
+        assert!(matches!(&embed.probe, Probe::Http { url, .. } if url == "http://localhost:9/health"));
         assert!(!targets.iter().any(|t| t.key.module_id == "vct-probe"), "not installed yet");
 
         use vct_launcher_core::db::models::ProjectHost;

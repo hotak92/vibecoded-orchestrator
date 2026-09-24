@@ -932,6 +932,25 @@ class ResolveClaudeSessionDirTest(_ResolverTestBase):
         self.assertEqual(cfg.claude_session_dir, "")
 
 
+# ─── v0.2.97: code_embed_url (service endpoints SSOT) ──────────────────
+
+
+class ResolveCodeEmbedUrlTest(_ResolverTestBase):
+    """The hub's ``/config`` serves the code-embed row's URL (additive)."""
+
+    def test_resolve_surfaces_code_embed_url(self) -> None:
+        body = {**FULL_BODY, "code_embed_url": "http://127.0.0.1:21440"}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.code_embed_url, "http://127.0.0.1:21440")
+
+    def test_resolve_back_fills_empty_when_hub_omits_it(self) -> None:
+        body_old = {k: v for k, v in FULL_BODY.items() if k != "code_embed_url"}
+        self.session.get.return_value = _make_response(200, body_old)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.code_embed_url, "")
+
+
 # ─── v0.2.40 R2: RL Reranker flag exposure ─────────────────────────────
 
 

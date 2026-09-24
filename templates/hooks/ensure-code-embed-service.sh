@@ -140,7 +140,30 @@ if $RUNTIME container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     exit 0
 fi
 
+# v0.2.97 (plan invariant I1): compose may create code_embed only while the
+# launcher.db service_endpoints plan lists it as a VCO-managed, enabled
+# service, and only with the argv `vco_lib.service_lifecycle compose-args`
+# builds — `--no-deps` (code_embed's `depends_on: ollama` must never create an
+# Ollama next to an ADOPTED one) and the gpu profile the service lives in.
+# Prints the shell-quoted args, or nothing when compose must not run.
+code_embed_up_args() {
+    local plan
+    plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || return 1
+    case " $(eval "$plan"; printf '%s' "${VCO_COMPOSE_SERVICES:-}") " in
+        *" code_embed "*) ;;
+        *) return 0 ;;
+    esac
+    "$RUN_PY" -m vco_lib.service_lifecycle compose-args --shell --services code_embed "$@"
+}
+
 if [ -n "$COMPOSE_CMD" ] && [ -d "$COMPOSE_DIR" ]; then
+    __ce_up=()
+    __ce_args="$(code_embed_up_args --build)" || __ce_args=""
+    if [ -z "$__ce_args" ]; then
+        echo "[code_embed] not created: launcher.db service_endpoints does not list code_embed as a VCO-managed, enabled service (see \`python -m vco_lib.service_endpoints show\`)"
+        exit 0
+    fi
+    eval "__ce_up=($__ce_args)"
     echo "[code_embed] Starting code embedding service via $COMPOSE_CMD..."
     # v0.2.92 BLOCKER-1: `--build` here. We are CREATING this container, so a
     # build is already on the critical path when no image exists; the flag only
@@ -152,7 +175,8 @@ if [ -n "$COMPOSE_CMD" ] && [ -d "$COMPOSE_DIR" ]; then
     # rejects `--build` would otherwise ABORT the script here and the retry
     # below would be unreachable code. (Found by the hook-driving test, not by
     # reading — which is the point of driving it.)
-    { (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d --build code_embed) 2>&1 | tail -3; } || true
+    # shellcheck disable=SC2086  # COMPOSE_CMD is a command + its subcommand
+    { (cd "$COMPOSE_DIR" && $COMPOSE_CMD "${__ce_up[@]}") 2>&1 | tail -3; } || true
     # ASK THE RUNTIME whether the container now exists: under pipefail the
     # pipeline status is unusable as a success signal, and `tail`'s status
     # cannot fail at all.
@@ -161,7 +185,10 @@ if [ -n "$COMPOSE_CMD" ] && [ -d "$COMPOSE_DIR" ]; then
         # it rather than leaving the service down; the image then stays stale,
         # which `report_code_embed_staleness` and `vco doctor` both surface.
         echo "[code_embed] compose up --build did not create the container — retrying without --build"
-        { (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d code_embed) 2>&1 | tail -3; } || true
+        __ce_args="$(code_embed_up_args)" || __ce_args=""
+        eval "__ce_up=($__ce_args)"
+        # shellcheck disable=SC2086
+        [ -n "$__ce_args" ] && { (cd "$COMPOSE_DIR" && $COMPOSE_CMD "${__ce_up[@]}") 2>&1 | tail -3; } || true
         echo "[code_embed] NOTE: the image was NOT rebuilt from source; run 'python install.py --update' from the orchestrator root to refresh it."
     fi
     echo "[code_embed] Started container ${CONTAINER_NAME} on port ${PORT}"

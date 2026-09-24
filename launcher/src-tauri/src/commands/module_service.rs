@@ -3798,6 +3798,18 @@ mod tests {
         // both flow through to the argv unaltered. The RL container reads
         // ACTIVE_EMBEDDING at startup from its env; the launcher's job is
         // just to pass it.
+        // `{ollama_port}` is the machine's Ollama row (v0.2.97) — seeded
+        // here, so the answer is this test's, not the developer's machine's.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        crate::db::Db::open()
+            .unwrap()
+            .service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+                "ollama",
+                vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+                "localhost",
+                21435,
+            ))
+            .unwrap();
         let manifest = make_manifest(true, true);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
@@ -3813,7 +3825,7 @@ mod tests {
         // env_derived OLLAMA_URL with {ollama_port} substituted.
         assert!(
             args.iter()
-                .any(|a| a == "OLLAMA_URL=http://host.containers.internal:11435"),
+                .any(|a| a == "OLLAMA_URL=http://host.containers.internal:21435"),
             "expected env_derived OLLAMA_URL with resolved {{ollama_port}} in {:?}",
             args
         );

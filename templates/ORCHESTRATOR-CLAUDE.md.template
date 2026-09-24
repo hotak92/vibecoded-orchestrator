@@ -426,10 +426,10 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
   - KG-summary generation models (fallback only — see below): `gemma4:e4b` (low-VRAM/CPU), `qwen3.5:9b` (16 GB+ VRAM). Used by `generate-kg-summary.py` only when the `claude` CLI is not on PATH.
 
 ### Code Embedding Service
-- **URL**: `http://localhost:11440` (default; configurable via `CODE_EMBED_PORT`)
+- **URL**: `http://localhost:11440` (default; the machine's `service_endpoints` row decides the actual port — change it via the launcher's Services page or `python -m vco_lib.service_endpoints move`, never by hand-editing env files)
 - **Purpose**: GPU-accelerated code embeddings via sentence-transformers.
 - **Model**: CodeSage-Large-v2 (1.3B params, 2048-dim, Apache 2.0).
-- **Env**: `CODE_EMBED_BACKEND` (`gpu`/`ollama`), `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_PORT`.
+- **Env**: `CODE_EMBED_BACKEND` (`gpu`/`ollama`), `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`.
 - **Fallback**: set `CODE_EMBED_BACKEND=ollama` to skip the GPU path entirely (useful on CPU-only machines).
 - Started automatically by the orchestrator's container ensure-hook on session start.
 
