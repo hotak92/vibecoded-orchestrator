@@ -97,10 +97,10 @@ def test_build_defaults_includes_env_block(embed_config):
 def test_build_defaults_service_urls_follow_the_machine_chain(
     embed_config, tmp_path, monkeypatch
 ):
-    """v0.2.97 (lane X): the service URLs in the settings defaults come
-    from the ONE resolver (``vco_lib.service_endpoints``), so a
-    services.toml adoption reaches ``.claude/settings.json`` — the
-    env-only ``WEAVIATE_PORT`` read this replaced could not see one."""
+    """v0.2.97: the service URLs in the settings defaults come from the ONE
+    resolver (``vco_lib.service_endpoints``) — the launcher.db
+    ``service_endpoints`` rows — so a moved or adopted service reaches
+    ``.claude/settings.json``. A services.toml row is a retired input."""
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setenv("VCT_STATE_DIR", str(state))
@@ -113,16 +113,29 @@ def test_build_defaults_service_urls_follow_the_machine_chain(
     defaults = install_py._build_vco_settings_defaults(embed_config)
     assert defaults["env"]["WEAVIATE_URL"] == "http://localhost:8081"
 
+    from tests.common.launcher_db_fixture import make_launcher_db
+    from vco_lib import service_endpoints as se
     from vco_lib.service_adoption import write_services_toml
 
     write_services_toml({"services": [
         {"name": "weaviate", "mode": "adopt",
-         "external_url": "http://weaviate.lan:8090/v1/meta"},
-        {"name": "ollama", "mode": "parallel", "parallel_port": 21435},
+         "external_url": "http://retired.invalid:8090/v1/meta"},
     ]})
+    defaults = install_py._build_vco_settings_defaults(embed_config)
+    assert defaults["env"]["WEAVIATE_URL"] == "http://localhost:8081"
+
+    db = make_launcher_db(state / "launcher.db")
+    se.write_rows([
+        se.EndpointRow(service="weaviate", mode="adopted_external", host="weaviate.lan",
+                       port=8090, grpc_port=50051, source="user_cli"),
+        se.EndpointRow(service="ollama", mode="vco_managed", port=21435, source="install_probe"),
+        se.EndpointRow(service="code_embed", mode="vco_managed", host="127.0.0.1", port=21440,
+                       source="install_probe"),
+    ], db_path=db)
     defaults = install_py._build_vco_settings_defaults(embed_config)
     assert defaults["env"]["WEAVIATE_URL"] == "http://weaviate.lan:8090"
     assert defaults["env"]["OLLAMA_URL"] == "http://localhost:21435"
+    assert defaults["env"]["CODE_EMBED_SERVICE_URL"] == "http://127.0.0.1:21440"
 
 
 def test_build_defaults_includes_permissions(embed_config):

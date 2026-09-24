@@ -83,11 +83,11 @@ use super::retrieval_tuning_io::{read_tuning, RetrievalTuning};
 // The Ollama / Weaviate URLs are surfaced in the resolver response so a
 // fresh project that hasn't been further customised still resolves to a
 // working endpoint pair; they come from the ONE machine resolver
-// (`vct_launcher_core::services::service_endpoints`), which honours the
-// `VCT_OLLAMA_URL` / `VCT_WEAVIATE_URL` statements (set by the launcher
-// when it boots a non-default stack), the app_state port overrides and
-// services.toml adoption. The gRPC port still rides env var → compiled
-// default (it is not one of the three core services).
+// (`vct_launcher_core::services::service_endpoints`): the launcher.db
+// `service_endpoints` row, else the compiled default (v0.2.97). The gRPC
+// port still rides env var → compiled default here; the row's `grpc_port`
+// replaces that in the hub-surfaces work package of the service-endpoints
+// plan.
 const DEFAULT_GRPC_PORT: u16 = 50052;
 
 // ─── Resolver protocol version (v0.2.22 Item #2) ─────────────────
@@ -1018,12 +1018,11 @@ async fn project_config(
     // Reference: the v0.2.52 root-cause audit (Symptom B) for the full
     // root-cause walk.
     //
-    // v0.2.97 (lane W): resolved through the ONE machine resolver the
-    // launcher's project env projection (`populate`) also calls —
-    // `VCT_WEAVIATE_URL` / `vct-config.toml` → app_state port override →
-    // services.toml adoption → 8081. This served `LocalConfig` alone, so an
-    // adopted external Weaviate (or a port override) reached every project's
-    // env but not `/config`.
+    // v0.2.97: resolved through the ONE machine resolver the launcher's
+    // project env projection (`populate`) also calls — the launcher.db
+    // `service_endpoints` row, else `http://localhost:8081`. No env var is
+    // read: a hub started from one project's hook inherits that project's
+    // projected `WEAVIATE_URL`.
     let probe_weaviate_url =
         vct_launcher_core::services::service_endpoints::machine_weaviate_url(&h.0);
 
@@ -1198,12 +1197,9 @@ async fn project_config(
         .unwrap_or_else(|| "CodeSage-Large-v2".to_string());
 
     // Service URLs: weaviate_url + ollama_url are the machine resolver's
-    // answers (`service_endpoints`, v0.2.97 lane X) — the same chain the
-    // projection serves, so an `ollama.port_override` or a services.toml
-    // adoption reaches the hub's clients too. `OLLAMA_URL` (the
-    // projection's own output) is deliberately no longer read here; only
-    // the `VCT_OLLAMA_URL` statement is a leg. gRPC port rides env var →
-    // compiled default.
+    // answers (`service_endpoints`: the row, else the compiled default) —
+    // what the projection serves too. No endpoint env var is read for them.
+    // gRPC port still rides env var → compiled default (see the header).
     let weaviate_url = probe_weaviate_url.clone();
     let ollama_url =
         vct_launcher_core::services::service_endpoints::machine_ollama_url(&h.0);
@@ -1874,11 +1870,32 @@ mod tests {
             .unwrap();
     }
 
+    /// Point the machine's Weaviate at `url` (`http://host:port`) by
+    /// seeding its `service_endpoints` row — what the hub resolves from.
+    fn seed_weaviate_row(db: &Db, url: &str) {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let authority = url.trim_start_matches("http://");
+        let (host, port) = authority.rsplit_once(':').expect("http://host:port");
+        let mut row = ServiceEndpointRow::new(
+            "weaviate",
+            EndpointMode::AdoptedExternal,
+            host,
+            port.parse().expect("port"),
+        );
+        row.grpc_port = Some(50051);
+        db.service_endpoint_seed_for_tests(&row).expect("seed weaviate row");
+    }
+
     /// Spawn the config_api router on a random local port; return
     /// (base_url, handle). Mirrors `spawn_modules_api_hub` in
     /// modules_api.rs::tests.
     async fn spawn_config_api_hub() -> (String, LauncherDbHandle) {
         let db = Db::open_in_memory().expect("in-memory db");
+        // `/config` probes the machine's Weaviate (the case-rebind schema
+        // read). With no row that is the compiled default — a real local
+        // Weaviate's port — so every hub starts pointed at an unroutable
+        // one; a test that needs a fake Weaviate re-seeds the row.
+        seed_weaviate_row(&db, "http://127.0.0.1:9");
         let handle = LauncherDbHandle(Arc::new(db));
         let app: Router =
             Router::new().nest("/api/v1", super::router().with_state(handle.clone()));
@@ -4460,11 +4477,12 @@ kg_tier_full = 0.8
     // sibling classes, mirroring install.py's `_resolve_existing_casing`
     // (install.py:11848).
     //
-    // Env-var isolation note: the hub reads its Weaviate URL via
-    // `LocalConfig::load()` which honours `VCT_WEAVIATE_URL`. We set
-    // this once at the top of each test and the cache-reset path in
-    // `weaviate_schema_probe::_reset_cache_for_test` keeps tests
-    // independent.
+    // Isolation note: the hub reads its Weaviate URL from the launcher.db
+    // `service_endpoints` row (v0.2.97), so each test seeds a row pointing
+    // at its fake (or deliberately closed) Weaviate in the hub's own DB —
+    // never the compiled default, which is a real local Weaviate's port.
+    // The cache-reset path in `weaviate_schema_probe::_reset_cache_for_test`
+    // keeps tests independent.
     // ──────────────────────────────────────────────────────────────────
 
     /// Spin up a fake Weaviate that responds to GET /v1/schema with a
@@ -4513,15 +4531,8 @@ kg_tier_full = 0.8
             "Vibecodedorchestrator_Diagrams".to_string(),
         ])
         .await;
-        // SAFETY: setting env var for the duration of this test is OK
-        // because LocalConfig::load() reads it on each call and our
-        // probe cache is reset per test. Other tests that depend on
-        // LocalConfig defaults are unaffected because (a) this test is
-        // additive and (b) the probe is fail-open: even if a stale env
-        // value leaked in, the probe would just echo back the candidate.
-        std::env::set_var("VCT_WEAVIATE_URL", &weaviate_url);
-
         let (base, h) = spawn_config_api_hub().await;
+        seed_weaviate_row(&h.0, &weaviate_url);
         // Seed primary KG with capital-C canonical name (what
         // launcher.db stores after v0.2.23 B1 canonicalisation).
         let project_id = "p-case-rebind";
@@ -4580,37 +4591,24 @@ kg_tier_full = 0.8
             Some("Vibecodedorchestrator_KnowledgeGraph"),
             "shared_kg_collection must adopt on-disk casing"
         );
-        // Clean up — best-effort.
-        std::env::remove_var("VCT_WEAVIATE_URL");
     }
 
-    /// v0.2.97 (lane W): `/config`'s `weaviate_url` is the machine
-    /// resolver's — the value every project's env carries. An adopted
-    /// external Weaviate (services.toml) is served with its host, and the
-    /// projected transport variable `WEAVIATE_URL` in the hub's own
-    /// environment is NOT read back (a hub started from a hook inherits one
-    /// project's projected value). Before, this served `LocalConfig`, which
-    /// ignored the adoption and echoed `WEAVIATE_URL`.
+    /// v0.2.97: `/config`'s `weaviate_url` is the machine resolver's — the
+    /// launcher.db `service_endpoints` row, the value every project's env
+    /// carries. Neither the retired `VCT_WEAVIATE_URL` statement nor the
+    /// projected transport `WEAVIATE_URL` in the hub's own environment is
+    /// read (a hub started from a hook inherits one project's projection).
     #[tokio::test]
     async fn config_weaviate_url_is_the_machine_resolvers() {
-        use vct_launcher_core::services::adoption::{self, AdoptionMode, AdoptionState, ServiceAdoption};
         let _guard = vct_launcher_core::test_env::state_dir_guard_with(&[
-            ("VCT_WEAVIATE_URL", None),
+            ("VCT_WEAVIATE_URL", Some("http://127.0.0.1:7")),
             ("WEAVIATE_URL", Some("http://127.0.0.1:8")),
         ]);
         crate::weaviate_schema_probe::_reset_cache_for_test();
-        let mut state = AdoptionState::default();
-        state.upsert(ServiceAdoption {
-            name: "weaviate".into(),
-            mode: AdoptionMode::Adopt,
-            // Unroutable on purpose: the case-rebind probe calls this URL.
-            external_url: Some("http://127.0.0.1:9/v1/meta".into()),
-            parallel_port: None,
-            container_name: None,
-        });
-        adoption::write(&state).unwrap();
 
         let (base, h) = spawn_config_api_hub().await;
+        // Unroutable on purpose: the case-rebind probe calls this URL.
+        seed_weaviate_row(&h.0, "http://127.0.0.1:9");
         seed_full_project(&h, "p-weaviate-url", "myproject");
         let body: serde_json::Value = reqwest::get(format!("{}/projects/p-weaviate-url/config", base))
             .await
@@ -4627,30 +4625,29 @@ kg_tier_full = 0.8
         );
     }
 
-    /// v0.2.97 (lane X): `/config`'s `ollama_url` is the machine
-    /// resolver's too — the same chain the projection serves
-    /// (`VCT_OLLAMA_URL` statement → app_state `ollama.port_override` →
-    /// services.toml adoption → default). Before, an env-only chain that
-    /// also read `OLLAMA_URL` (the projection's own output) and ignored
-    /// the override and adoption entirely.
+    /// v0.2.97: `/config`'s `ollama_url` is the machine resolver's too —
+    /// the `service_endpoints` row the projection serves. The retired
+    /// `VCT_OLLAMA_URL` statement, the projected `OLLAMA_URL` and the retired
+    /// `ollama.port_override` key change nothing.
     #[tokio::test]
     async fn config_ollama_url_is_the_machine_resolvers() {
-        use vct_launcher_core::services::adoption::{self, AdoptionMode, AdoptionState, ServiceAdoption};
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
         let _guard = vct_launcher_core::test_env::state_dir_guard_with(&[
-            (vct_launcher_core::services::service_endpoints::OLLAMA_STATEMENT_ENV, None),
+            (vct_launcher_core::services::service_endpoints::OLLAMA_STATEMENT_ENV, Some("http://127.0.0.1:7")),
             ("OLLAMA_URL", Some("http://127.0.0.1:8")),
         ]);
-        let mut state = AdoptionState::default();
-        state.upsert(ServiceAdoption {
-            name: "ollama".into(),
-            mode: AdoptionMode::Adopt,
-            external_url: Some("http://ollama.lan:11439/api/tags".into()),
-            parallel_port: None,
-            container_name: None,
-        });
-        adoption::write(&state).unwrap();
+        crate::weaviate_schema_probe::_reset_cache_for_test();
 
         let (base, h) = spawn_config_api_hub().await;
+        seed_weaviate_row(&h.0, "http://127.0.0.1:9");
+        h.0.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            11439,
+        ))
+        .unwrap();
+        h.0.app_state_set("ollama.port_override", "21435").unwrap();
         seed_full_project(&h, "p-ollama-url", "myproject");
         let body: serde_json::Value = reqwest::get(format!("{}/projects/p-ollama-url/config", base))
             .await
@@ -4668,19 +4665,6 @@ kg_tier_full = 0.8
             vct_launcher_core::services::service_endpoints::machine_ollama_url(&h.0),
             "the hub and the project env projection answer one resolver"
         );
-
-        // The app_state override outranks the adoption.
-        h.0.app_state_set("ollama.port_override", "21435").unwrap();
-        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-ollama-url/config", base))
-            .await
-            .expect("hub reachable")
-            .json()
-            .await
-            .expect("json body");
-        assert_eq!(
-            body.get("ollama_url").and_then(|v| v.as_str()),
-            Some("http://localhost:21435")
-        );
     }
 
     /// NEW-2 — when Weaviate has no matching class (fresh install),
@@ -4693,9 +4677,9 @@ kg_tier_full = 0.8
 
         // Fake Weaviate: empty schema (fresh install).
         let (weaviate_url, _w) = spawn_fake_weaviate(vec![]).await;
-        std::env::set_var("VCT_WEAVIATE_URL", &weaviate_url);
 
         let (base, h) = spawn_config_api_hub().await;
+        seed_weaviate_row(&h.0, &weaviate_url);
         let project_id = "p-no-rebind";
         let slug = "freshproject";
         let folder = format!("/tmp/test-config-project-{}", project_id);
@@ -4728,7 +4712,6 @@ kg_tier_full = 0.8
             Some("FreshProject_Development"),
             "suffix-swap candidate echoed unchanged when no sibling exists"
         );
-        std::env::remove_var("VCT_WEAVIATE_URL");
     }
 
     /// NEW-2 — when Weaviate is unreachable (network failure), the hub
@@ -4745,9 +4728,9 @@ kg_tier_full = 0.8
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let unreachable_url = format!("http://{}", addr);
-        std::env::set_var("VCT_WEAVIATE_URL", &unreachable_url);
 
         let (base, h) = spawn_config_api_hub().await;
+        seed_weaviate_row(&h.0, &unreachable_url);
         let project_id = "p-unreach";
         let slug = "unreachable";
         let folder = format!("/tmp/test-config-project-{}", project_id);
@@ -4775,7 +4758,6 @@ kg_tier_full = 0.8
             body.get("development_collection").and_then(|v| v.as_str()),
             Some("Unreach_Development")
         );
-        std::env::remove_var("VCT_WEAVIATE_URL");
     }
 
     // ─── v0.2.89 (BUG 4 §5.4) — phantom-name warnings ──────────────────
@@ -5027,7 +5009,7 @@ kg_tier_full = 0.8
     }
 
     /// End-to-end `/config` legs (single sequential test to keep the
-    /// process-global VCT_WEAVIATE_URL + schema-cache footprint small):
+    /// process-global schema-cache footprint small):
     ///   1. phantom binding + reachable Weaviate → `warnings` present and
     ///      names every phantom class;
     ///   2. healthy binding → field ABSENT (skip_serializing_if wire-compat);
@@ -5058,9 +5040,9 @@ kg_tier_full = 0.8
         tokio::spawn(async move {
             let _ = axum::serve(schema_listener, schema_app).await;
         });
-        std::env::set_var("VCT_WEAVIATE_URL", format!("http://{}", schema_addr));
 
         let (base, h) = spawn_config_api_hub().await;
+        seed_weaviate_row(&h.0, &format!("http://{}", schema_addr));
 
         // Leg 1: phantom KG binding + phantom codegraph prefix.
         let phantom_id = "p-warn-phantom";
@@ -5196,7 +5178,7 @@ kg_tier_full = 0.8
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        std::env::set_var("VCT_WEAVIATE_URL", format!("http://{}", addr));
+        seed_weaviate_row(&h.0, &format!("http://{}", addr));
         let resp = reqwest::get(format!("{}/projects/{}/config", base, phantom_id))
             .await
             .expect("hub reachable");
@@ -5208,7 +5190,6 @@ kg_tier_full = 0.8
             body.get("warnings")
         );
 
-        std::env::remove_var("VCT_WEAVIATE_URL");
         crate::weaviate_schema_probe::_reset_cache_for_test();
     }
 }

@@ -738,12 +738,10 @@ const CODEGRAPH_CLASSES: &[&str] = &[
 fn weaviate_url(db: &Db) -> String {
     // v0.2.97 (lane X): the ONE client resolver. These hub endpoints are a
     // Weaviate CLIENT (the CLI's KG / codegraph proxy, the same role as the
-    // Tauri-side `commands::kg` / `commands::codegraph` dashboards lane W
-    // migrated), so they use `service_endpoints::client_weaviate_url`:
-    // the `VCT_WEAVIATE_URL` / legacy `WEAVIATE_URL` env statements this
-    // function always honoured, over the machine resolver (which adds
-    // `vct-config.toml`, the app_state port override and `services.toml`
-    // adoption — none of which the old env-only chain here saw).
+    // Tauri-side `commands::kg` / `commands::codegraph` dashboards), so they
+    // use `service_endpoints::client_weaviate_url`: its interim
+    // `VCT_WEAVIATE_URL` / `WEAVIATE_URL` env legs over the machine row. The
+    // service-endpoints plan retires those env legs here (§4f).
     vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
 }
 
@@ -1387,11 +1385,12 @@ fn is_valid_class_name(s: &str) -> bool {
 mod cli_kg_tests {
     use super::*;
 
-    /// v0.2.97 (lane X): the CLI's Weaviate URL is the ONE client resolver,
-    /// so the machine chain (app_state override, services.toml adoption) —
-    /// none of which the old env-only chain saw — reaches the hub CLI too.
+    /// v0.2.97: below its interim env legs, the CLI's Weaviate URL is the
+    /// machine row — the compiled default with none, the row once there is
+    /// one; a retired `weaviate.port_override` changes nothing.
     #[test]
-    fn weaviate_url_resolver_sees_adoption_and_overrides() {
+    fn weaviate_url_resolver_falls_to_the_machine_row() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
         let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
             (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, None),
             ("WEAVIATE_URL", None),
@@ -1399,19 +1398,13 @@ mod cli_kg_tests {
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         assert_eq!(weaviate_url(&db), "http://localhost:8081");
 
-        let mut state = vct_launcher_core::services::adoption::AdoptionState::default();
-        state.upsert(vct_launcher_core::services::adoption::ServiceAdoption {
-            name: "weaviate".into(),
-            mode: vct_launcher_core::services::adoption::AdoptionMode::Adopt,
-            external_url: Some("http://weaviate.lan:8090".into()),
-            parallel_port: None,
-            container_name: None,
-        });
-        vct_launcher_core::services::adoption::write(&state).unwrap();
+        let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedExternal, "weaviate.lan", 8090);
+        row.grpc_port = Some(50051);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         assert_eq!(weaviate_url(&db), "http://weaviate.lan:8090");
 
         db.app_state_set("weaviate.port_override", "18081").unwrap();
-        assert_eq!(weaviate_url(&db), "http://localhost:18081");
+        assert_eq!(weaviate_url(&db), "http://weaviate.lan:8090");
     }
 
     #[test]

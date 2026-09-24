@@ -546,8 +546,8 @@ pub async fn code_graph_prune_stale(
 }
 
 /// The health-check probe URLs. v0.2.97 (lane X): Weaviate via the ONE
-/// client resolver (`client_weaviate_url`: `VCT_WEAVIATE_URL` /
-/// `WEAVIATE_URL` env statement, then the machine chain); Ollama and
+/// client resolver (`client_weaviate_url`: its interim `VCT_WEAVIATE_URL` /
+/// `WEAVIATE_URL` env legs, then the machine row); Ollama and
 /// code-embed keep their env override (a dev-container convenience) but
 /// fall back to the machine chain instead of a compiled-in default, so
 /// an app_state override or a services.toml adoption reaches the
@@ -843,9 +843,9 @@ pub async fn validate_clone_manifest(
 mod tests {
     use super::*;
 
-    /// v0.2.97 (lane X): the health report's Weaviate URL comes from the
-    /// ONE client resolver, so the machine chain (override / adoption)
-    /// reaches it — the compiled-in default this replaces could not.
+    /// v0.2.97: the health report's Weaviate URL comes from the ONE client
+    /// resolver, so the machine's `service_endpoints` row reaches it — the
+    /// compiled-in default this replaces could not.
     #[test]
     fn health_check_urls_follow_the_machine_chain() {
         let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
@@ -855,7 +855,14 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let checks = health_check_urls(&db);
         assert_eq!(checks[0].1, "http://localhost:8081/v1/.well-known/ready");
-        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         let checks = health_check_urls(&db);
         assert_eq!(checks[0].1, "http://localhost:18081/v1/.well-known/ready");
     }

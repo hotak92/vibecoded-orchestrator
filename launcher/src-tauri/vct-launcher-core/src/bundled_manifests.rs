@@ -270,19 +270,21 @@ mod tests {
             .find(|s| s["key"] == "CODE_EMBED_PORT")
             .unwrap();
         assert_eq!(setting["default"].to_string(), service, "setting default");
-        // v0.2.97 (lane W): the URL names the port through `{code_embed_port}`,
-        // which resolves to that default on a machine with no override and to
-        // the override when there is one.
+        // v0.2.97: the URL names the port through `{code_embed_port}`, which
+        // resolves to that default on a machine with no `service_endpoints`
+        // row and to the row's port when there is one.
         let url = manifest["runtime"]["health_check"]["url"].as_str().unwrap();
         assert_eq!(url, "http://localhost:{code_embed_port}/health", "health_check.url");
         let _g = crate::test_env::state_dir_guard();
         let ctx = crate::manifest::PlaceholderCtx::new("vct-code-embedding");
         assert_eq!(ctx.resolve(url), format!("http://localhost:{service}/health"));
         let db = crate::db::Db::open().unwrap();
-        db.app_state_set(
-            crate::services::service_endpoints::APP_STATE_KEY_CODE_EMBED_PORT,
-            "21440",
-        )
+        db.service_endpoint_seed_for_tests(&crate::db::service_endpoints::ServiceEndpointRow::new(
+            "code_embed",
+            crate::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            21440,
+        ))
         .unwrap();
         assert_eq!(ctx.resolve(url), "http://localhost:21440/health");
     }

@@ -113,6 +113,12 @@ pub mod project_hooks_settings;
 // `commands::chat_model_context` (launcher crate).
 pub mod chat_model_context;
 
+// Migration 047 (v0.2.97) — where the three core services are reached, one
+// row per service. Read-only here; `vco_lib.service_endpoints` (Python) is
+// the table's one writer. Rendering + the compiled-default fallback live in
+// `services::service_endpoints`.
+pub mod service_endpoints;
+
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
     crate::paths::vct_root_dir().join("launcher.db")

@@ -713,12 +713,11 @@ async fn probe_http(url: String) -> Option<String> {
 /// on purpose (Rust = "any signal Weaviate is reachable", Python =
 /// "Weaviate fully initialised and ready to serve queries"). See
 /// commands/lifecycle.rs::canonical_services for the rationale.
-/// The wizard's service-detection probe URLs. v0.2.97 (lane X): ports
-/// come from the ONE chain (`machine_service_ports` over
-/// `service_endpoints`: app_state override → services.toml adoption →
-/// default) — the compiled-in defaults this replaces skipped both, so a
-/// machine with an override or an alt-port adoption probed the wrong
-/// port during onboarding detection.
+/// The wizard's service-detection probe URLs. v0.2.97: ports come from the
+/// ONE resolver (`machine_service_ports` over `service_endpoints`: the
+/// launcher.db row, else the default) — the compiled-in defaults this
+/// replaces meant a moved service was probed on the wrong port during
+/// onboarding detection.
 fn detect_probe_urls() -> (String, String, String) {
     let ports = crate::mcp_registration::machine_service_ports();
     (
@@ -2866,9 +2865,8 @@ pub async fn install_orchestrator(
     // install.py (whose own chain starts from these env keys). v0.2.97
     // (lane X): the ports themselves come from the ONE home —
     // `mcp_registration::machine_service_ports` over `service_endpoints`
-    // (app_state override → services.toml adoption → default), replacing
-    // an inline adoption-only copy here that skipped the app_state
-    // override. See `launcher-settings-propagation-audit-2026-05-06.md` §9.
+    // (the launcher.db row, else the default). See
+    // `launcher-settings-propagation-audit-2026-05-06.md` §9.
     let ports = crate::mcp_registration::machine_service_ports();
     cmd.env("WEAVIATE_PORT", ports.weaviate_port.to_string())
         .env("OLLAMA_PORT", ports.ollama_port.to_string())
@@ -11372,14 +11370,23 @@ mod tests {
 
     #[test]
     fn detect_probe_urls_follow_the_machine_chain() {
-        // v0.2.97 (lane X): an app_state override must reach the wizard's
-        // detection probes (the compiled-in defaults it replaces could
-        // not see one).
+        // v0.2.97: the wizard's detection probes follow the machine's
+        // `service_endpoints` row (the compiled-in defaults they replaced
+        // could not see a moved service); the retired app_state override is
+        // not a leg.
         let _g = vct_launcher_core::test_env::state_dir_guard();
         let (w, _o, _c) = detect_probe_urls();
         assert_eq!(w, "http://localhost:8081/v1/meta");
         let db = vct_launcher_core::db::Db::open().unwrap();
-        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        db.app_state_set("weaviate.port_override", "18083").unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         let (w, _o, _c) = detect_probe_urls();
         assert_eq!(w, "http://localhost:18081/v1/meta");
     }

@@ -430,10 +430,10 @@ async fn probe_one(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
 }
 
-/// The tray's probe URLs. v0.2.97 (lane X): ports come from the ONE
-/// chain (`machine_port_from_disk` over `service_endpoints`: app_state
-/// override → services.toml adoption → default) — the compiled-in port
-/// constants this replaces meant an override or an alt-port adoption
+/// The tray's probe URLs. v0.2.97: ports come from the ONE resolver
+/// (`machine_port_from_disk` over `service_endpoints`: the launcher.db row,
+/// else the default) — the compiled-in port constants this replaces meant
+/// a moved service or an alt-port adoption
 /// showed a red tray while the service was healthy.
 fn tray_probe_urls() -> (String, String, String) {
     use vct_launcher_core::services::service_endpoints::{
@@ -534,13 +534,20 @@ mod tests {
 
     #[test]
     fn tray_probe_urls_follow_the_machine_chain() {
-        // v0.2.97 (lane X): an app_state override reaches the tray's
-        // probe URLs (the compiled-in ports it replaces could not).
+        // v0.2.97: the machine's `service_endpoints` row reaches the tray's
+        // probe URLs (the compiled-in ports it replaced could not).
         let _g = vct_launcher_core::test_env::state_dir_guard();
         let (w, _o, _c) = tray_probe_urls();
         assert_eq!(w, "http://localhost:8081/v1/meta");
         let db = crate::db::Db::open().unwrap();
-        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         let (w, _o, _c) = tray_probe_urls();
         assert_eq!(w, "http://localhost:18081/v1/meta");
     }

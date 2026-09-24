@@ -105,15 +105,10 @@ pub const APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL: &str =
 pub const APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL: &str =
     "rl.online_training_disabled_global";
 
-/// `app_state` keys for explicit port overrides. When set, these win over
-/// services.toml adoption + the canonical defaults. v0.2.97 (lane W): declared
-/// once, in `vct_launcher_core::services::service_endpoints` — the resolver the
-/// hub's `/config` shares with [`populate`] and the Python projection mirrors —
-/// and listed in [`app_state_key_triggers_env_reprojection`] because that
-/// projection now reads them.
-use vct_launcher_core::services::service_endpoints::{
-    APP_STATE_KEY_CODE_EMBED_PORT, APP_STATE_KEY_OLLAMA_PORT, APP_STATE_KEY_WEAVIATE_PORT,
-};
+/// Where the core services are reached: `vct_launcher_core::services::
+/// service_endpoints` — the launcher.db `service_endpoints` row, else the
+/// compiled default — the resolver the hub's `/config` shares with
+/// [`populate`] and the Python projection mirrors (v0.2.97).
 use vct_launcher_core::services::service_endpoints::{self as endpoints, CoreService};
 
 /// `app_state` boolean for the GPU toggle. Used by callers that need to
@@ -216,11 +211,10 @@ pub fn set_text_embedding_and_profile(
 ///   * `codegraph.retrieval_floor` / `codegraph.post_rerank_floor` —
 ///     written only by `set_codegraph_floors`, which already refreshes.
 ///
-/// v0.2.97 (lane W): the three service port overrides ARE listed. They feed
-/// `WEAVIATE_URL` / `WEAVIATE_PORT` / `OLLAMA_*` / `CODE_EMBED_*` in every
-/// project's env (through `service_endpoints` on the Rust side and
-/// `vco_lib/service_endpoints.py` in the projection), and no dedicated setter
-/// exists — the generic `app_state_set` is the only way they are written.
+/// v0.2.97: the service endpoints are NOT app_state keys. They are
+/// `service_endpoints` rows, whose one writer (`vco_lib.service_endpoints`)
+/// re-projects every project itself after a change; the retired
+/// `*.port_override` keys feed nothing and so trigger nothing.
 pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
     matches!(
         key,
@@ -234,9 +228,6 @@ pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
             // into every project's .claude/settings.json env.
             | APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL
             | APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL
-            | APP_STATE_KEY_WEAVIATE_PORT
-            | APP_STATE_KEY_OLLAMA_PORT
-            | APP_STATE_KEY_CODE_EMBED_PORT
     )
 }
 
@@ -691,8 +682,8 @@ impl ProjectEnvSettings {
 }
 
 /// The code-embedding service port exactly as [`populate`] resolves it for
-/// the project env projection (app_state override → adopted services.toml →
-/// 11440). v0.2.97: the Core module settings panel shows it read-only for
+/// the project env projection (its `service_endpoints` row, else 11440).
+/// v0.2.97: the Core module settings panel shows it read-only for
 /// `vct-code-embedding`'s `CODE_EMBED_PORT`.
 pub fn resolve_code_embed_port(db: &Db) -> u16 {
     endpoints::machine_port(db, CoreService::CodeEmbed)
@@ -763,13 +754,11 @@ pub fn populate(
     project_name: &str,
     project_id: Option<&str>,
 ) -> ProjectEnvSettings {
-    // v0.2.97 (lane W): the Weaviate URL comes from the ONE resolver the
-    // hub's `/config` also calls (`service_endpoints::machine_weaviate_url`:
-    // `VCT_WEAVIATE_URL` / `vct-config.toml` → app_state override →
-    // services.toml adoption → 8081). Before, this built
-    // `http://localhost:<port>` from the last three legs only, while the hub
-    // served the first leg only — two answers to one question. The port is
-    // the one that URL addresses, so `WEAVIATE_PORT` cannot disagree with it.
+    // v0.2.97: the Weaviate URL comes from the ONE resolver the hub's
+    // `/config` also calls (`service_endpoints::machine_weaviate_url`: the
+    // launcher.db `service_endpoints` row, else `http://localhost:8081`). The
+    // port is the one that URL addresses, so `WEAVIATE_PORT` cannot disagree
+    // with it.
     let weaviate_url = endpoints::machine_weaviate_url(db);
     let weaviate_port = endpoints::weaviate_port_for_url(&weaviate_url);
     let ollama_port = endpoints::machine_port(db, CoreService::Ollama);
@@ -1114,7 +1103,15 @@ mod tests {
         let expect = || format!("http://localhost:{}/health", resolve_code_embed_port(&db));
         assert_eq!(ctx.resolve(&url), expect());
         assert_eq!(resolve_code_embed_port(&db), DEFAULT_CODE_EMBED_PORT);
-        db.app_state_set(APP_STATE_KEY_CODE_EMBED_PORT, "21440").unwrap();
+        db.app_state_set(endpoints::APP_STATE_KEY_CODE_EMBED_PORT, "21441").unwrap();
+        assert_eq!(resolve_code_embed_port(&db), DEFAULT_CODE_EMBED_PORT, "retired key");
+        db.service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "code_embed",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            21440,
+        ))
+        .unwrap();
         assert_eq!(ctx.resolve(&url), expect());
         assert_eq!(resolve_code_embed_port(&db), 21440);
     }
@@ -1182,32 +1179,35 @@ mod tests {
     // now, executed against the ONE resolver in
     // `vct_launcher_core::services::service_endpoints` (and its Python mirror).
 
-    /// v0.2.97 (lane W): the projection's Weaviate URL IS the machine
-    /// resolver's — the value the hub's `/config` serves. An adopted external
-    /// Weaviate keeps its host (this built `http://localhost:<port>` and lost
-    /// it), and `WEAVIATE_PORT` is that URL's port.
+    /// v0.2.97: the projection's Weaviate URL IS the machine resolver's —
+    /// the value the hub's `/config` serves, from the `service_endpoints`
+    /// row. An adopted external Weaviate keeps its host, and `WEAVIATE_PORT`
+    /// is that URL's port. The retired statement env var and app_state
+    /// override move nothing.
     #[test]
     fn populate_weaviate_url_is_the_machine_resolvers() {
-        use crate::services::adoption::{self, AdoptionMode, ServiceAdoption};
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
         let _state = vct_launcher_core::test_env::state_dir_guard_with(&[
-            (endpoints::STATEMENT_ENV, None),
+            (endpoints::STATEMENT_ENV, Some("http://statement.invalid:1")),
         ]);
         let db = Db::open_in_memory().unwrap();
-        let mut services = adoption::AdoptionState::default();
-        services.upsert(ServiceAdoption {
-            name: "weaviate".into(),
-            mode: AdoptionMode::Adopt,
-            external_url: Some("http://weaviate.lan:8090".into()),
-            parallel_port: None,
-            container_name: None,
-        });
-        adoption::write(&services).unwrap();
+        let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedExternal, "weaviate.lan", 8090);
+        row.grpc_port = Some(50051);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.weaviate_url, "http://weaviate.lan:8090");
         assert_eq!(s.weaviate_url, endpoints::machine_weaviate_url(&db));
         assert_eq!(s.weaviate_port, 8090);
 
-        db.app_state_set(APP_STATE_KEY_OLLAMA_PORT, "21435").unwrap();
+        db.app_state_set(endpoints::APP_STATE_KEY_OLLAMA_PORT, "21436").unwrap();
+        assert_eq!(populate(&db, "Acme", None).ollama_port, DEFAULT_OLLAMA_PORT);
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "localhost",
+            21435,
+        ))
+        .unwrap();
         assert_eq!(populate(&db, "Acme", None).ollama_port, 21435);
     }
 
@@ -1451,13 +1451,13 @@ mod tests {
         assert!(!app_state_key_triggers_env_reprojection(
             APP_STATE_KEY_SHARED_KG_NAME
         ));
-        // v0.2.97 (lane W): the projection reads the port overrides.
+        // v0.2.97: the retired port-override keys feed no projection.
         for key in [
-            APP_STATE_KEY_WEAVIATE_PORT,
-            APP_STATE_KEY_OLLAMA_PORT,
-            APP_STATE_KEY_CODE_EMBED_PORT,
+            endpoints::APP_STATE_KEY_WEAVIATE_PORT,
+            endpoints::APP_STATE_KEY_OLLAMA_PORT,
+            endpoints::APP_STATE_KEY_CODE_EMBED_PORT,
         ] {
-            assert!(app_state_key_triggers_env_reprojection(key), "{key}");
+            assert!(!app_state_key_triggers_env_reprojection(key), "{key}");
         }
         assert!(!app_state_key_triggers_env_reprojection("onboarding.complete"));
         assert!(!app_state_key_triggers_env_reprojection(APP_STATE_KEY_USE_GPU));

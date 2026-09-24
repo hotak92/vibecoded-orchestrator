@@ -333,7 +333,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_RL_LATEST_VERSION_URL": "staging/endpoint override for paid-module infrastructure; operator-only",
     "VCT_RL_LATEST_WEIGHTS_URL": "staging/endpoint override for paid-module infrastructure; operator-only",
     "VCT_GRPC_PORT": "hub-side gRPC port probe (vct-hub config_api); the documented user channel is GRPC_PORT",
-    "VCT_OLLAMA_URL": "hub-side Ollama URL probe (vct-hub config_api); the documented user channel is OLLAMA_URL",
     "VCT_HUB_BUILD_FINGERPRINT": "compile-time build fingerprint injected by release CI and read via option_env!; build plumbing",
     "VCT_TEST_LIVE_KEYCHAIN": "test-only gate for the live-keychain smoke (default cargo test no-ops without it)",
     # --- repo-maintainer tooling (scripts/, not a shipped user surface)

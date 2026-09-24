@@ -22323,19 +22323,15 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
 
     Builds the env block + permissions block + ``_vco_managed_keys`` sentinel
     that V47-A (Gap A) uses for managed-block merge. Reads machine state
-    (launcher.db, services.toml, vct-config.toml) through
+    (launcher.db's ``service_endpoints`` rows) through
     ``vco_lib.service_endpoints`` — no other I/O.
     """
-    # v0.2.97 (lane X): service URLs/ports from the ONE home —
-    # `vco_lib.service_endpoints` (VCT_WEAVIATE_URL/vct-config.toml
-    # statement → app_state *.port_override → services.toml adoption →
-    # default). The env-only WEAVIATE_PORT/OLLAMA_PORT/CODE_EMBED_PORT
-    # reads this replaces saw only the install-run hand-off (choices
-    # `_resolve_service_safety` had already persisted to services.toml)
-    # and missed the override and the statement, so settings.json could
-    # name a different Weaviate than the hub and the projection. gRPC
-    # keeps its env-only read (no services.toml row, no override key).
-    urls = _service_endpoints.machine_service_urls(orchestrator_root=PROJECT_ROOT)
+    # v0.2.97: service URLs/ports from the ONE home — the launcher.db
+    # `service_endpoints` rows (row → compiled default), the same answer the
+    # hub and the projection give. gRPC still reads its env here; moving it
+    # to the row's `grpc_port` (`urls["weaviate_grpc_port"]`) belongs with the
+    # install.py [5b] rewrite of the service-endpoints plan.
+    urls = _service_endpoints.machine_service_urls()
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
 
     env_block: dict[str, str] = {
@@ -22379,7 +22375,7 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
         "PROJECT_NAME": _derive_orchestrator_project_name(),
         "CODE_GRAPH_PROJECT": _derive_orchestrator_project_name(),
         "CODE_EMBED_BACKEND": embed_config["code_backend"],
-        "CODE_EMBED_SERVICE_URL": f"http://localhost:{urls['code_embed_port']}",
+        "CODE_EMBED_SERVICE_URL": urls["code_embed_url"],
     }
 
     # 0.2.11: no BASH_ENV wiring here. Lean-ctx output compression flows

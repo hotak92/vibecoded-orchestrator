@@ -40,12 +40,11 @@ pub enum LiveSource {
     /// `shared_kg_binding::resolve_shared_kg_collection`.
     SharedKgCollection,
     /// The Weaviate URL the hub's `/config` serves and every project's env
-    /// carries (`services::service_endpoints::machine_weaviate_url`:
-    /// `VCT_WEAVIATE_URL`, `vct-config.toml`, the app_state port override,
-    /// the services.toml adoption, default).
+    /// carries (`services::service_endpoints::machine_weaviate_url`: the
+    /// launcher.db `service_endpoints` row, else the compiled default).
     WeaviateUrl,
-    /// The code-embedding service port (app_state override → adopted
-    /// services.toml → 11440), as the project env projection resolves it.
+    /// The code-embedding service port (its `service_endpoints` row, else
+    /// 11440), as the project env projection resolves it.
     CodeEmbedPort,
     /// `CODE_EMBED_BACKEND` in `<orchestrator root>/infrastructure/.env` —
     /// the value docker-compose gives the code-embedding container.
@@ -138,10 +137,10 @@ pub const BUNDLED_SETTING_BINDINGS: &[(&str, &str, SettingBinding)] = &[
         "WEAVIATE_URL",
         SettingBinding::Elsewhere {
             live: LiveSource::WeaviateUrl,
-            home: "Set for this computer by `weaviate_url` in vct-config.toml (next to the \
-                   launcher binary) or the VCT_WEAVIATE_URL environment variable; otherwise \
-                   the Weaviate the launcher adopted or moved at install time; default \
-                   http://localhost:8081.",
+            home: "One Weaviate for this computer, recorded in the launcher database when \
+                   VCO is installed or updated (the Weaviate it runs, or the one it adopted); \
+                   default http://localhost:8081. `python -m vco_lib.service_endpoints show` \
+                   prints it.",
             editor_route: None,
             editor_label: None,
         },
@@ -174,9 +173,9 @@ pub const BUNDLED_SETTING_BINDINGS: &[(&str, &str, SettingBinding)] = &[
         "CODE_EMBED_PORT",
         SettingBinding::Elsewhere {
             live: LiveSource::CodeEmbedPort,
-            home: "The port the code-embedding service runs on, as the launcher detected it \
-                   (default 11440). Changed with CODE_EMBED_PORT when the services are \
-                   installed.",
+            home: "The port the code-embedding service runs on, recorded in the launcher \
+                   database when VCO is installed or updated (default 11440). \
+                   `python -m vco_lib.service_endpoints show` prints it.",
             editor_route: Some("/services"),
             editor_label: Some("Open Services"),
         },

@@ -74,6 +74,18 @@ async fn main() {
         Command::RegisterBoot => exit_with(boot::run_register_boot()),
         Command::UnregisterBoot => exit_with(boot::run_unregister_boot()),
         Command::BootStatus => exit_with(boot::run_boot_status()),
+        Command::EnsureDb => match cli::ensure_db() {
+            Ok(report) => {
+                // [vct-print-contract] stdout is the machine answer install.py
+                // parses; diagnostics stay on the tracing subscriber (stderr).
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string())
+                );
+                process::exit(0);
+            }
+            Err(e) => exit_with(LifecycleResult::Err(format!("--ensure-db: {}", e))),
+        },
         Command::Foreground => run_foreground().await,
     }
 }
@@ -97,6 +109,9 @@ async fn run_foreground() {
         pid = std::process::id(),
         "[vct-hub] starting"
     );
+    // v0.2.97: the endpoint env vars no resolver reads any more — say so
+    // once, so a user who exported one learns it stopped mattering.
+    vct_launcher_core::services::service_endpoints::warn_retired_endpoint_env("hub");
 
     let bind_result = server::start_hub_server().await;
     let port = match bind_result {

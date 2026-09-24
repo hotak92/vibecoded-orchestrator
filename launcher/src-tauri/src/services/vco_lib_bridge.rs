@@ -91,11 +91,17 @@ use vct_launcher_core::process::CommandExt as _;
 ///   * home-dir keys — `HOME` (POSIX) or
 ///     `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HOMEDRIVE`/`HOMEPATH`
 ///     (Windows) — so the `~/.vct/launcher.db` fallback resolves.
-///   * `VCT_WEAVIATE_URL` — set to the launcher's own Weaviate statement
-///     (env or `vct-config.toml`), not inherited verbatim (v0.2.97 lane W).
 ///
 /// Anything NOT on this list (e.g. an inherited `KG_COLLECTION`) is
 /// dropped by the preceding `env_clear`, which is the whole point.
+///
+/// No endpoint travels (v0.2.97): the child's `vco_lib.service_endpoints`
+/// reads the SAME `service_endpoints` rows in the same launcher.db this
+/// process resolves from, so there is nothing to hand over. (Until the rows
+/// existed the launcher handed its `VCT_WEAVIATE_URL` / `vct-config.toml`
+/// statement across as `VCT_WEAVIATE_URL`; neither is a resolver input now,
+/// and an env hand-off is exactly how one process's view leaked into
+/// another's.)
 pub fn reinject_minimal_env(cmd: &mut Command) {
     cmd.env_clear();
 
@@ -133,19 +139,6 @@ pub fn reinject_minimal_env(cmd: &mut Command) {
         if let Ok(v) = std::env::var("HOME") {
             cmd.env("HOME", v);
         }
-    }
-
-    // v0.2.97 (lane W): the launcher's own Weaviate statement — its
-    // `VCT_WEAVIATE_URL`, else the `vct-config.toml` next to ITS binary — so
-    // the child's `vco_lib.service_endpoints` resolves the same URL this
-    // process's `service_endpoints::machine_weaviate_url` does (the child
-    // cannot find a config file beside a binary it never saw). Only the
-    // statement travels; the other legs come from the launcher.db and
-    // services.toml both sides read.
-    if let Some(statement) =
-        vct_launcher_core::config::LocalConfig::machine_weaviate_url_statement()
-    {
-        cmd.env(vct_launcher_core::services::service_endpoints::STATEMENT_ENV, statement);
     }
 }
 
@@ -921,12 +914,12 @@ mod tests {
         std::env::remove_var("VCT_INSTALL_ROOT");
     }
 
-    /// v0.2.97 (lane W): the child receives the launcher's Weaviate
-    /// statement as `VCT_WEAVIATE_URL` (so `vco_lib.service_endpoints`
-    /// resolves what the launcher resolves), and never the projected
-    /// transport `WEAVIATE_URL`.
+    /// v0.2.97 (service endpoints SSOT): NO endpoint crosses into a
+    /// `vco_lib` child — neither the retired `VCT_WEAVIATE_URL` statement nor
+    /// the projected transport `WEAVIATE_URL`. The child reads the same
+    /// `service_endpoints` rows from the same launcher.db.
     #[test]
-    fn hands_the_weaviate_statement_to_the_child() {
+    fn hands_no_endpoint_to_the_child() {
         let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
             ("VCT_WEAVIATE_URL", Some("http://vm.lan:9000")),
             ("WEAVIATE_URL", Some("http://stale-projection:1")),
@@ -938,7 +931,7 @@ mod tests {
                 .find(|(k, _)| k.to_string_lossy() == key)
                 .and_then(|(_, v)| v.map(|vv| vv.to_string_lossy().to_string()))
         };
-        assert_eq!(get("VCT_WEAVIATE_URL").as_deref(), Some("http://vm.lan:9000"));
+        assert_eq!(get("VCT_WEAVIATE_URL"), None);
         assert_eq!(get("WEAVIATE_URL"), None);
     }
 

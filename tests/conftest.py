@@ -369,6 +369,52 @@ _AMBIENT_CODE_EMBED_URL = os.environ.get("CODE_EMBED_SERVICE_URL")
 if not _ALLOW_REAL_STATE:
     os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 
+
+# ─── W-ENDPOINTS (v0.2.97): the machine resolvers answer an unroutable port ──
+#
+# The two pins above cover CLIENTS (they read `WEAVIATE_URL` /
+# `CODE_EMBED_SERVICE_URL`). Since v0.2.97 the MACHINE resolvers
+# (`vco_lib.service_endpoints`: the projection, `project_init`'s standalone
+# env, install.py's settings defaults) read no env at all — they read the
+# launcher.db `service_endpoints` rows, and with no row they answer the
+# compiled default, `http://localhost:8081` / `:11435` / `:11440`: on a
+# developer's machine, the LIVE services. So the redirected state dir gets a
+# launcher.db (the real schema, every migration applied) whose three rows point
+# at the unroutable sentinel port. A test that needs other endpoints seeds its
+# own DB (`VCT_LAUNCHER_DB_PATH` / `db_path=`), exactly as before.
+#
+# Written through `vco_lib.service_endpoints.write_rows` — the one writer — so
+# the seed is also a standing check that the writer accepts the rows it must.
+# Re-established per test below when a suite removed it.
+_UNROUTABLE_PORT = int(_fixture_guard.UNROUTABLE_SENTINEL_URL.rsplit(":", 1)[1])
+
+
+def _seed_unroutable_service_endpoints(state_dir: Path) -> None:
+    """Create ``<state_dir>/launcher.db`` (real schema) with all three
+    ``service_endpoints`` rows at ``127.0.0.1:9``. No-op when it exists."""
+    db = state_dir / "launcher.db"
+    if db.is_file():
+        return
+    from tests.common.launcher_db_fixture import make_launcher_db
+    from vco_lib import service_endpoints as _se
+
+    make_launcher_db(db)
+    _se.write_rows(
+        [
+            _se.EndpointRow(
+                service=service, mode="vco_managed", host="127.0.0.1",
+                port=_UNROUTABLE_PORT, source="install_probe",
+                grpc_port=_UNROUTABLE_PORT if service == "weaviate" else None,
+            )
+            for service in _se.SERVICES
+        ],
+        db_path=db,
+    )
+
+
+if not _ALLOW_REAL_STATE:
+    _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
+
 # ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
 #
 # `weaviate_mcp.server._resolution_context()` answers "whose project is this?"
@@ -488,6 +534,9 @@ def _redirect_user_state_dir(request):
             os.environ.pop(key, None)
     else:
         os.environ.update(keys)
+        # W-ENDPOINTS: a suite that wiped the redirected state dir must not
+        # leave the next test's machine resolvers on the live default ports.
+        _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
     os.environ.update(claude_keys)
     try:
         yield

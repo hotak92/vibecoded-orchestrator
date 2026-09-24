@@ -2428,10 +2428,10 @@ pub fn render_log_path_template(template: &str, project_id: &str, project_slug: 
 /// writes `http://127.0.0.1:{hub_port}/api/v1`, never a literal 7700.
 pub const HUB_PORT_PLACEHOLDER: &str = "{hub_port}";
 
-/// v0.2.97 (lane W): the host ports of the three core services, resolved by
-/// [`crate::services::service_endpoints::machine_port_from_disk`] — the chain
-/// the project env projection and the hub's `/config` use (app_state override
-/// → `services.toml` adoption → the default). A manifest naming one of these
+/// v0.2.97: the host ports of the three core services, resolved by
+/// [`crate::services::service_endpoints::machine_port_from_disk`] — the
+/// answer the project env projection and the hub's `/config` give (the
+/// launcher.db `service_endpoints` row → the compiled default). A manifest naming one of these
 /// services writes `http://localhost:{code_embed_port}/health`, never a
 /// literal 11440, so a moved service is not reported down.
 pub const SERVICE_PORT_PLACEHOLDERS: [(&str, crate::services::service_endpoints::CoreService); 3] = [
@@ -2525,7 +2525,7 @@ impl PlaceholderCtx {
             let port = crate::services::hub_port::resolve_hub_port();
             out = out.replace(HUB_PORT_PLACEHOLDER, &port.to_string());
         }
-        // Same rule: each reads launcher.db + services.toml, so only when named.
+        // Same rule: each reads launcher.db, so only when named.
         for (token, service) in SERVICE_PORT_PLACEHOLDERS {
             if out.contains(token) {
                 let port = crate::services::service_endpoints::machine_port_from_disk(service);
@@ -3913,13 +3913,12 @@ mod tests {
         assert_eq!(ctx.resolve("{MODULE_ID}:7700"), "vct-example:7700");
     }
 
-    /// v0.2.97 (lane W): the service-port placeholders resolve through the
-    /// projection's chain — the default with no state, then an app_state
-    /// override, then (for another service) a services.toml parallel port.
+    /// v0.2.97: the service-port placeholders resolve through the machine
+    /// resolver — the compiled default with no row, then each service's
+    /// `service_endpoints` row.
     #[test]
     fn service_port_placeholders_follow_the_machine_resolver() {
-        use crate::services::adoption::{self, AdoptionMode, AdoptionState, ServiceAdoption};
-        use crate::services::service_endpoints::APP_STATE_KEY_CODE_EMBED_PORT;
+        use crate::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
         let _g = crate::test_env::state_dir_guard();
         let ctx = PlaceholderCtx::new("vct-example");
         assert_eq!(
@@ -3928,16 +3927,20 @@ mod tests {
         );
         assert_eq!(ctx.resolve("{weaviate_port}/{ollama_port}"), "8081/11435");
         let db = crate::db::Db::open().unwrap();
-        db.app_state_set(APP_STATE_KEY_CODE_EMBED_PORT, "21440").unwrap();
-        let mut state = AdoptionState::default();
-        state.upsert(ServiceAdoption {
-            name: "ollama".into(),
-            mode: AdoptionMode::Parallel,
-            external_url: None,
-            parallel_port: Some(11436),
-            container_name: None,
-        });
-        adoption::write(&state).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "code_embed",
+            EndpointMode::VcoManaged,
+            "localhost",
+            21440,
+        ))
+        .unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "localhost",
+            11436,
+        ))
+        .unwrap();
         assert_eq!(
             ctx.resolve("http://localhost:{code_embed_port}/health"),
             "http://localhost:21440/health"

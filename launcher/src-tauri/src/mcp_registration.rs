@@ -188,14 +188,13 @@ impl Default for ServicePorts {
 ///
 /// The entries `build_default_mcp_entries` writes land in `~/.claude.json` —
 /// a MACHINE-GLOBAL surface every project on this machine shares — so the
-/// ports baked into them come from the machine chain (`service_endpoints`:
-/// app_state `*.port_override` → services.toml adoption → compiled
-/// default), not from a bare env read. install.py forwards
-/// `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT` as a hand-off, but every
-/// value it can put there was already persisted to services.toml by
-/// `_resolve_service_safety` before this runs, so the chain subsumes the
-/// env. gRPC has no services.toml row and no override key; it keeps its
-/// env-only resolution (`WEAVIATE_GRPC_PORT` → compiled default).
+/// ports baked into them come from the machine resolver (`service_endpoints`:
+/// the launcher.db row, else the compiled default), not from a bare env read.
+/// install.py still forwards `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT`
+/// in the child env; none of them is read here. gRPC still keeps its
+/// env-only resolution (`WEAVIATE_GRPC_PORT` → compiled default); the row's
+/// `grpc_port` (`service_endpoints::machine_grpc_port_from_disk`) replaces
+/// that in the client-surfaces work package of the service-endpoints plan.
 pub fn machine_service_ports() -> ServicePorts {
     use vct_launcher_core::services::service_endpoints::{
         machine_port_from_disk, CoreService,
@@ -929,21 +928,27 @@ mod tests {
         ]);
         assert_eq!(machine_service_ports(), ServicePorts::default());
 
-        // The app_state override outranks the (ignored) env hand-off.
+        // The retired app_state override is not a leg; the row is.
         let db = vct_launcher_core::db::Db::open().unwrap();
-        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        db.app_state_set("weaviate.port_override", "18083").unwrap();
+        assert_eq!(machine_service_ports().weaviate_port, ServicePorts::default().weaviate_port);
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         assert_eq!(machine_service_ports().weaviate_port, 18081);
 
-        // A parallel adoption supplies the port when no override exists.
-        let mut state = vct_launcher_core::services::adoption::AdoptionState::default();
-        state.upsert(vct_launcher_core::services::adoption::ServiceAdoption {
-            name: "ollama".into(),
-            mode: vct_launcher_core::services::adoption::AdoptionMode::Parallel,
-            external_url: None,
-            parallel_port: Some(21435),
-            container_name: None,
-        });
-        vct_launcher_core::services::adoption::write(&state).unwrap();
+        db.service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "ollama",
+            vct_launcher_core::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "localhost",
+            21435,
+        ))
+        .unwrap();
         assert_eq!(machine_service_ports().ollama_port, 21435);
     }
 

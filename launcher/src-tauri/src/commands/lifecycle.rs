@@ -328,11 +328,9 @@ async fn run_stack_wrapper(subcommand: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Get the per-service effective port — the ONE chain (`service_endpoints`,
-/// v0.2.97 lane X): app_state `*.port_override` → services.toml adoption
-/// (a parallel port, or an adopted external URL's port) → canonical
-/// default. The copy this replaces read only the parallel leg, so a port
-/// override set in the launcher never reached these probes.
+/// Get the per-service effective port — the ONE resolver
+/// (`service_endpoints`, v0.2.97): the launcher.db `service_endpoints` row,
+/// else the canonical default.
 fn effective_port(name: &str) -> u16 {
     let service = match name {
         "weaviate" => vct_launcher_core::services::service_endpoints::CoreService::Weaviate,
@@ -1628,11 +1626,10 @@ mod services_lifecycle_tests {
 
     #[test]
     fn effective_port_follows_the_machine_chain() {
-        // v0.2.97 (lane X): the Services-card / tray probes use the ONE
-        // port chain — canonical default → services.toml parallel
-        // adoption → app_state override. The copy this replaced read
-        // only the parallel leg (an adopted external URL's port and the
-        // override never reached the probe URLs).
+        // v0.2.97: the Services-card / tray probes use the machine's
+        // `service_endpoints` row — the compiled default with none. A
+        // services.toml `parallel` row and an app_state override are
+        // retired inputs and move nothing.
         let _g = vct_launcher_core::test_env::state_dir_guard();
         assert_eq!(effective_port("weaviate"), 8081);
 
@@ -1645,10 +1642,18 @@ mod services_lifecycle_tests {
             container_name: None,
         });
         adoption::write(&state).unwrap();
-        assert_eq!(effective_port("weaviate"), 8091);
-
         let db = crate::db::Db::open().unwrap();
-        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        db.app_state_set("weaviate.port_override", "18083").unwrap();
+        assert_eq!(effective_port("weaviate"), 8081, "retired inputs are not legs");
+
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
         assert_eq!(effective_port("weaviate"), 18081);
     }
 

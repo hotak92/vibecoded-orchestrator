@@ -710,6 +710,30 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
         POLICY_HISTORICAL,
         "A free-text justification written at grant time.",
     ),
+    # ── service_endpoints (migration 047, v0.2.97) ───────────────────────
+    *_plain(
+        "service_endpoints",
+        "service",
+        "mode",
+        "scheme",
+        "host",
+        "container_name",
+        "compose_project",
+        "source",
+        note="Machine-global: where a core service is reached and which "
+        "container serves it. No project scope.",
+    ),
+    ColumnPolicy(
+        "service_endpoints",
+        "data_mount_json",
+        POLICY_SWEEP_ONLY,
+        "The observed data mount of a core service's container. A bind "
+        "source is a host path chosen by whoever created the container, so a "
+        "project root landing here is possible (a cache kept inside a project "
+        "folder) — and moving that folder would empty the service. Surfaced, "
+        "never rewritten: the fix is re-creating the container on the new "
+        "path, which `python -m vco_lib.service_endpoints show` names.",
+    ),
     # ── tier_cache ───────────────────────────────────────────────────────
     *_plain("tier_cache", "orchestrator_tier", "module_licenses"),
     ColumnPolicy("tier_cache", "last_error", POLICY_HISTORICAL),

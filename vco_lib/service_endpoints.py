@@ -2,363 +2,876 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Where VCO's three core services (Weaviate, Ollama, code-embed) are reached.
 
-The Python half of ONE rule. The hub's ``/config`` and the launcher's project
-env projection answer it in Rust
-(``launcher/src-tauri/vct-launcher-core/src/services/service_endpoints.rs``);
-this module answers it for :func:`vco_lib.config_projection.project_env_from_db`
-whenever no caller pins a value — ``install.py``, ``project_init``,
-``project_move`` and every other Python caller that projects a project's env.
-Before v0.2.97 those callers projected ``http://localhost:8081`` whatever the
-machine said, while the hub served a different chain again.
+The launcher DB's ``service_endpoints`` table (migration
+``047_service_endpoints.sql``) holds one row per service: its mode, its
+``scheme://host:port`` (+ gRPC port for Weaviate), and the identity of the
+container and data mount behind it. This module is:
 
-Precedence, highest first (MUST MATCH the Rust module):
+* **the reader** — :func:`read_rows` / :func:`load_rows`, and the machine
+  resolvers (:func:`machine_weaviate_url` & co.) every Python caller projects
+  env through (``config_projection``, ``project_init``, ``install.py``);
+* **the ONE writer** — :func:`write_rows` / :func:`commit_rows`, which enforce
+  the migration's CHECKs before writing, and :func:`apply_change`, the
+  follow-up chain every change triggers (infra ``.env`` → reproject every
+  project → refresh the MCP registration);
+* **the CLI** — ``python -m vco_lib.service_endpoints show | resolve | plan``.
 
-Weaviate URL
-  1. the machine statement: ``VCT_WEAVIATE_URL``, else ``weaviate_url`` in
-     ``vct-config.toml`` (next to the launcher / hub binary). Used as stated.
-  2. ``app_state[weaviate.port_override]`` → ``http://localhost:<port>``.
-  3. ``services.toml``: ``adopt`` → the adopted ``external_url``'s origin (the
-     host is kept); ``parallel`` → ``http://localhost:<parallel_port>``.
-  4. ``http://localhost:8081``.
+The rule (MUST MATCH ``launcher/src-tauri/vct-launcher-core/src/services/
+service_endpoints.rs``): **row → compiled default.** An absent row (first
+boot before the install finished, or a broken install) answers
+``http://localhost:8081`` + gRPC 50052, ``:11435``, ``:11440`` and logs one
+WARNING per process per service. Nothing else is a leg: ``services.toml``,
+the app_state ``*.port_override`` keys, ``vct-config.toml``'s
+``weaviate_url``, ``VCT_WEAVIATE_URL`` / ``VCT_OLLAMA_URL`` and the projected
+transport (``WEAVIATE_URL``, ``*_PORT``, ``GRPC_PORT``, …) are read by no
+resolver. Their values reach the rows once, through the v0.2.97 importer
+(``vco_lib.service_reconcile``).
 
-Ports (Ollama, code-embed): override → adoption (``parallel_port`` or the
-adopted URL's port) → the default. ``refuse`` / ``unresolved`` rows are not
-addresses.
+The render (``scheme://host[:port]``, ``:port`` omitted when it is the
+scheme's default; the host used verbatim so an IPv6 literal keeps its
+brackets) is the only cross-language mirror: the hub answers ``/config`` on
+every hook call and cannot spawn Python per request. Both sides execute
+``tests/fixtures/service_endpoint_parity.json``; change a rule there first.
 
-Ollama URL: the same shape as Weaviate's, with an env-only statement
-(``VCT_OLLAMA_URL`` — Ollama has no ``vct-config.toml`` key) and the default
-``http://localhost:11435`` (:func:`machine_ollama_url`).
-
-``WEAVIATE_URL`` is deliberately NOT a leg. It is what the projection WRITES;
-in a shell that sourced ``.claude/env`` it holds the previous projection, and
-reading it back would re-project a stale value over a newer launcher choice.
-Clients read it (:func:`vco_lib.weaviate_helpers.weaviate_url_default`); the
-resolver that produces it must not.
-
-Why a mirror rather than one implementation (the A>B>C rule): the hub answers
-``/config`` on every hook call and cannot spawn Python per request. Both sides
-therefore execute the SAME committed case table,
-``tests/fixtures/service_endpoint_parity.json``; a rule changes there first.
-
-``vct-config.toml`` sits next to whichever binary reads it. Python cannot see
-the running binary, so it looks where the hub is started from
-(:mod:`vco_lib.hub_ensure`'s chain, minus ``$PATH``): ``$VCT_HUB_BIN``'s
-directory, ``<orchestrator>/launcher/dist/<arch>/``, ``<orchestrator>/launcher/dist/``,
-``~/.vct/bin``. When the launcher spawns a ``vco_lib`` child (every
-projection it drives), it hands over its OWN leg 1 as ``VCT_WEAVIATE_URL``
-(``vco_lib_bridge::reinject_minimal_env``), so a launcher binary run from
-anywhere else is still honoured there; legs 2-4 come from the same
-``launcher.db`` and ``services.toml`` both sides read.
+Machine-scoped callers read rows. Project-scoped clients (MCPs, hooks,
+scripts) read only the transport the projection renders from the rows.
 """
 
 from __future__ import annotations
 
-import os
+import argparse
+import json
+import logging
+import shlex
 import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 __all__ = [
-    "CONFIG_FILE",
-    "CONFIG_KEY",
-    "OLLAMA_STATEMENT_ENV",
+    "DEFAULT_HOST",
+    "DEFAULT_PORTS",
+    "DEFAULT_SCHEME",
+    "DEFAULT_WEAVIATE_GRPC_PORT",
+    "MODES",
+    "RETIRED_APP_STATE_KEYS",
+    "RETIRED_ENV_INPUTS",
     "SERVICES",
-    "STATEMENT_ENV",
-    "adoption_row",
-    "config_file_candidates",
+    "SOURCES",
+    "ApplyChangeReport",
+    "EndpointRow",
+    "InvalidEndpointRow",
+    "ServiceRegistryUnavailable",
+    "WriteResult",
+    "apply_change",
+    "commit_rows",
+    "describe",
+    "load_rows",
+    "machine_code_embed_url",
+    "machine_grpc_port",
     "machine_ollama_url",
     "machine_port",
     "machine_service_urls",
+    "machine_url",
     "machine_weaviate_url",
-    "machine_weaviate_url_statement",
-    "parse_port_override",
+    "plan",
+    "plan_shell_lines",
     "port_of_url",
-    "read_port_override",
-    "resolve_ollama_url",
-    "resolve_port",
-    "resolve_weaviate_url",
+    "read_row",
+    "read_rows",
+    "render_grpc_port",
+    "render_port",
+    "render_url",
+    "validate_row",
+    "warn_absent",
     "weaviate_port_for_url",
+    "write_rows",
 ]
 
-#: MUST MATCH ``service_endpoints::STATEMENT_ENV`` (Rust).
-STATEMENT_ENV = "VCT_WEAVIATE_URL"
-#: The env var that states the machine's Ollama URL (the Ollama chain's
-#: leg 1 — env-only; Ollama has no ``vct-config.toml`` key).
-#: MUST MATCH ``service_endpoints::OLLAMA_STATEMENT_ENV`` (Rust).
-OLLAMA_STATEMENT_ENV = "VCT_OLLAMA_URL"
-#: The launcher's per-machine config file and the key it states the URL in.
-CONFIG_FILE = "vct-config.toml"
-CONFIG_KEY = "weaviate_url"
+_LOG = logging.getLogger(__name__)
 
-#: service → (app_state override key, default host port).
-#: MUST MATCH ``CoreService`` in the Rust module and the parity table.
-SERVICES: dict[str, tuple[str, int]] = {
-    "weaviate": ("weaviate.port_override", 8081),
-    "ollama": ("ollama.port_override", 11435),
-    "code_embed": ("code_embed.port_override", 11440),
+#: The three core services, in display order. Each is also the compose
+#: service name and the ``service_endpoints.service`` key.
+SERVICES: tuple[str, ...] = ("weaviate", "ollama", "code_embed")
+
+#: Compiled defaults — the answer for an absent row. MUST MATCH the Rust
+#: ``DEFAULT_*`` constants and the compose defaults.
+DEFAULT_PORTS: dict[str, int] = {"weaviate": 8081, "ollama": 11435, "code_embed": 11440}
+DEFAULT_WEAVIATE_GRPC_PORT = 50052
+DEFAULT_SCHEME = "http"
+DEFAULT_HOST = "localhost"
+
+#: ``service_endpoints.mode``. MUST MATCH the migration's CHECK.
+MODES: tuple[str, ...] = ("vco_managed", "adopted_container", "adopted_external")
+#: Fixed ``source`` values; ``migrated:<store>`` is the one open form.
+SOURCES: tuple[str, ...] = ("install_probe", "user_gui", "user_cli", "live_reconcile")
+_MIGRATED_PREFIX = "migrated:"
+_SCHEMES: dict[str, int] = {"http": 80, "https": 443}
+_MANAGED_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1"})
+_MOUNT_KINDS: frozenset[str] = frozenset({"bind", "volume"})
+
+#: Inputs that WERE resolver legs before v0.2.97 and are read by no resolver
+#: now. Named so tests can pin that they are ignored.
+RETIRED_ENV_INPUTS: tuple[str, ...] = (
+    "VCT_WEAVIATE_URL",
+    "VCT_OLLAMA_URL",
+    "WEAVIATE_URL",
+    "WEAVIATE_PORT",
+    "WEAVIATE_GRPC_PORT",
+    "GRPC_PORT",
+    "VCT_GRPC_PORT",
+    "OLLAMA_URL",
+    "OLLAMA_PORT",
+    "CODE_EMBED_URL",
+    "CODE_EMBED_PORT",
+    "CODE_EMBED_SERVICE_URL",
+)
+RETIRED_APP_STATE_KEYS: dict[str, str] = {
+    "weaviate": "weaviate.port_override",
+    "ollama": "ollama.port_override",
+    "code_embed": "code_embed.port_override",
 }
 
 
-def parse_port_override(raw: Optional[str]) -> Optional[int]:
-    """An app_state override as a port: ASCII digits only (surrounding
-    whitespace ignored), 1..65535. Anything else is "no override"."""
-    if raw is None:
-        return None
-    s = raw.strip()
-    if not s or not all("0" <= c <= "9" for c in s):
-        return None
-    port = int(s)
-    return port if 0 < port <= 65535 else None
+class InvalidEndpointRow(ValueError):
+    """A row the ``service_endpoints`` schema (or the writer's stricter
+    shape rules) refuses. Raised BEFORE anything is written."""
 
 
-def _origin_of(url: str) -> str:
-    url = url.strip()
-    if "://" in url:
-        scheme, rest = url.split("://", 1)
-        return f"{scheme}://{rest.split('/', 1)[0]}"
-    return url.split("/", 1)[0]
+class ServiceRegistryUnavailable(RuntimeError):
+    """launcher.db, or its ``service_endpoints`` table, is not there to write
+    to. The table is created only by the Rust migration runner
+    (``vct-hub --ensure-db``); Python never creates schema."""
 
 
-def _explicit_port(url: str) -> Optional[int]:
-    origin = _origin_of(url)
-    authority = origin.split("://", 1)[1] if "://" in origin else origin
-    if ":" not in authority:
-        return None
-    tail = authority.rsplit(":", 1)[1]
-    if not tail or not all("0" <= c <= "9" for c in tail):
-        return None
-    port = int(tail)
-    return port if port <= 65535 else None
+@dataclass(frozen=True)
+class EndpointRow:
+    """One ``service_endpoints`` row. ``data_mount`` is the parsed
+    ``data_mount_json`` (``{"kind": "bind"|"volume", "source", "destination"}``).
+    ``updated_at`` is stamped by the writer; a caller leaves it ``None``."""
+
+    service: str
+    mode: str
+    port: int
+    source: str
+    scheme: str = DEFAULT_SCHEME
+    host: str = DEFAULT_HOST
+    grpc_port: Optional[int] = None
+    container_name: Optional[str] = None
+    compose_project: Optional[str] = None
+    data_mount: Optional[Mapping[str, str]] = None
+    enabled: bool = True
+    autostart: bool = True
+    confirmed_by_user: bool = False
+    verified_at: Optional[int] = None
+    updated_at: Optional[int] = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "service": self.service,
+            "mode": self.mode,
+            "scheme": self.scheme,
+            "host": self.host,
+            "port": self.port,
+            "grpc_port": self.grpc_port,
+            "container_name": self.container_name,
+            "compose_project": self.compose_project,
+            "data_mount": dict(self.data_mount) if self.data_mount is not None else None,
+            "enabled": self.enabled,
+            "autostart": self.autostart,
+            "source": self.source,
+            "confirmed_by_user": self.confirmed_by_user,
+            "verified_at": self.verified_at,
+            "updated_at": self.updated_at,
+        }
+
+
+# ─── the render (pure; the mirror the parity table pins) ────────────────
+
+
+def render_url(service: str, row: Optional[EndpointRow], *,
+               default_port: Optional[int] = None) -> str:
+    """The URL *row* addresses, or the compiled default for *service*.
+
+    *default_port* replaces the compiled default port for an ABSENT row only
+    (a Python caller's pinned ``*_port_default``); the Rust side never passes
+    one and the parity table runs with it unset."""
+    if row is None:
+        port = DEFAULT_PORTS[service] if default_port is None else default_port
+        return f"{DEFAULT_SCHEME}://{DEFAULT_HOST}:{port}"
+    if _SCHEMES.get(row.scheme) == row.port:
+        return f"{row.scheme}://{row.host}"
+    return f"{row.scheme}://{row.host}:{row.port}"
+
+
+def render_port(service: str, row: Optional[EndpointRow], *,
+                default_port: Optional[int] = None) -> int:
+    """The host port *row* states, or *service*'s compiled default."""
+    if row is not None:
+        return row.port
+    return DEFAULT_PORTS[service] if default_port is None else default_port
+
+
+def render_grpc_port(row: Optional[EndpointRow]) -> int:
+    """Weaviate's gRPC port from its row, or 50052."""
+    if row is not None and row.grpc_port is not None:
+        return row.grpc_port
+    return DEFAULT_WEAVIATE_GRPC_PORT
 
 
 def port_of_url(url: str) -> Optional[int]:
-    """The URL's explicit port, else 443 for https / 80 for http."""
-    port = _explicit_port(url)
-    if port is not None:
-        return port
+    """The explicit port of *url*'s authority, else 443 for https / 80 for
+    http; ``None`` for a URL with neither."""
     s = url.strip()
-    if "://" not in s:
-        return None
-    scheme = s.split("://", 1)[0].lower()
-    return {"https": 443, "http": 80}.get(scheme)
-
-
-def adoption_row(services_state: Mapping[str, Any], name: str) -> Optional[Mapping[str, Any]]:
-    """The ``services.toml`` row for *name*, or ``None``."""
-    for row in services_state.get("services", []) or []:
-        if isinstance(row, Mapping) and row.get("name") == name:
-            return row
-    return None
-
-
-def resolve_port(service: str, port_override: Optional[str],
-                 adoption: Optional[Mapping[str, Any]],
-                 default_port: Optional[int] = None) -> int:
-    """Port chain: override → adoption → default. Pure.
-
-    *default_port* replaces the canonical default (the last leg only) — a
-    caller's ``--ollama-port`` / ``ollama_port_default``; the Rust side never
-    passes one, and the parity table runs with it unset."""
-    port = parse_port_override(port_override)
-    if port is not None:
-        return port
-    if adoption is not None:
-        mode = adoption.get("mode")
-        if mode == "parallel" and isinstance(adoption.get("parallel_port"), int):
-            return int(adoption["parallel_port"])
-        if mode == "adopt" and isinstance(adoption.get("external_url"), str):
-            explicit = _explicit_port(adoption["external_url"])
-            if explicit is not None:
-                return explicit
-    return SERVICES[service][1] if default_port is None else default_port
-
-
-def resolve_weaviate_url(statement: Optional[str], port_override: Optional[str],
-                         adoption: Optional[Mapping[str, Any]],
-                         default_port: Optional[int] = None) -> str:
-    """Weaviate URL chain (module docstring). Pure.
-
-    *default_port* replaces 8081 in the last leg only (see
-    :func:`resolve_port`)."""
-    if statement is not None and statement.strip():
-        return statement.strip().rstrip("/")
-    return _url_below_statement("weaviate", port_override, adoption, default_port)
-
-
-def resolve_ollama_url(statement: Optional[str], port_override: Optional[str],
-                       adoption: Optional[Mapping[str, Any]]) -> str:
-    """Ollama URL chain — the same shape as Weaviate's, with an env-only
-    statement (``VCT_OLLAMA_URL``; Ollama has no ``vct-config.toml`` key).
-    ``OLLAMA_URL`` is NOT a leg: it is what the projection WRITES. Pure."""
-    if statement is not None and statement.strip():
-        return statement.strip().rstrip("/")
-    return _url_below_statement("ollama", port_override, adoption, None)
-
-
-def _url_below_statement(service: str, port_override: Optional[str],
-                         adoption: Optional[Mapping[str, Any]],
-                         default_port: Optional[int]) -> str:
-    """The legs below the statement, shared by the Weaviate and Ollama URL
-    chains: port override → adoption → the service's default port."""
-    port = parse_port_override(port_override)
-    if port is not None:
-        return f"http://localhost:{port}"
-    if adoption is not None:
-        mode = adoption.get("mode")
-        url = adoption.get("external_url")
-        if mode == "adopt" and isinstance(url, str) and url.strip():
-            return _origin_of(url)
-        if mode == "parallel" and isinstance(adoption.get("parallel_port"), int):
-            return f"http://localhost:{int(adoption['parallel_port'])}"
-    port = SERVICES[service][1] if default_port is None else default_port
-    return f"http://localhost:{port}"
+    scheme: Optional[str] = None
+    rest = s
+    if "://" in s:
+        scheme, rest = s.split("://", 1)
+        scheme = scheme.lower()
+    authority = rest.split("/", 1)[0]
+    tail = authority[authority.rfind("]") + 1:] if "]" in authority else authority
+    if ":" in tail:
+        port = tail.rsplit(":", 1)[1]
+        if port and all("0" <= c <= "9" for c in port):
+            value = int(port)
+            return value if value <= 65535 else None
+    return _SCHEMES.get(scheme) if scheme is not None else None
 
 
 def weaviate_port_for_url(url: str) -> int:
-    """The port for ``WEAVIATE_PORT`` that goes with a resolved URL."""
+    """The ``WEAVIATE_PORT`` that goes with a Weaviate URL."""
     port = port_of_url(url)
-    return port if port is not None else SERVICES["weaviate"][1]
+    return port if port is not None else DEFAULT_PORTS["weaviate"]
 
 
-# ─── live-state readers ─────────────────────────────────────────────────
+# ─── validation (the DDL's CHECKs, enforced before any write) ───────────
 
 
-def config_file_candidates(orchestrator_root: Optional[Path],
-                           environ: Optional[Mapping[str, str]] = None) -> list[Path]:
-    """Where a ``vct-config.toml`` for this machine's binaries can sit."""
-    env = os.environ if environ is None else environ
-    dirs: list[Path] = []
-    hub_bin = (env.get("VCT_HUB_BIN") or "").strip()
-    if hub_bin:
-        dirs.append(Path(hub_bin).parent)
-    if orchestrator_root is not None:
-        from vco_lib.hub_ensure import dist_arch_dir  # noqa: PLC0415 - stdlib-only, keep import local
-
-        dist = Path(orchestrator_root) / "launcher" / "dist"
-        arch = dist_arch_dir()
-        if arch:
-            dirs.append(dist / arch)
-        dirs.append(dist)
-    home = env.get("HOME") or env.get("USERPROFILE")
-    if home:
-        dirs.append(Path(home) / ".vct" / "bin")
-    return [d / CONFIG_FILE for d in dirs]
+def _valid_host(host: str) -> bool:
+    if not host or host != host.strip():
+        return False
+    if host.startswith("["):
+        return host.endswith("]") and len(host) > 2 and all(
+            c in "0123456789abcdefABCDEF:." for c in host[1:-1]
+        )
+    return all(c.isalnum() or c in "-._" for c in host)
 
 
-def _read_config_file_url(path: Path) -> Optional[str]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        import tomllib  # noqa: PLC0415
-
-        value = tomllib.loads(text).get(CONFIG_KEY)
-    except Exception:  # noqa: BLE001 - a malformed file states nothing (Rust: same)
-        return None
-    return value if isinstance(value, str) and value else None
+def _valid_port(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
 
 
-def machine_weaviate_url_statement(orchestrator_root: Optional[Path] = None,
-                                   environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    """Leg 1: ``VCT_WEAVIATE_URL``, else the first ``vct-config.toml`` found."""
-    env = os.environ if environ is None else environ
-    value = env.get(STATEMENT_ENV) or ""
-    if value.strip():
-        return value
-    for candidate in config_file_candidates(orchestrator_root, env):
-        if candidate.is_file():
-            stated = _read_config_file_url(candidate)
-            if stated is not None:
-                return stated
-    return None
+def validate_row(row: EndpointRow) -> None:
+    """Raise :class:`InvalidEndpointRow` unless *row* satisfies every CHECK of
+    migration 047, plus the writer's shape rules (a well-formed host, a
+    known ``source``, a well-formed data mount)."""
+    problems: list[str] = []
+    if row.service not in SERVICES:
+        problems.append(f"service {row.service!r} not in {SERVICES}")
+    if row.mode not in MODES:
+        problems.append(f"mode {row.mode!r} not in {MODES}")
+    if row.scheme not in _SCHEMES:
+        problems.append(f"scheme {row.scheme!r} not http/https")
+    if not isinstance(row.host, str) or not _valid_host(row.host):
+        problems.append(f"host {row.host!r} is not a hostname, IPv4 or [IPv6] literal")
+    if not _valid_port(row.port):
+        problems.append(f"port {row.port!r} not in 1..65535")
+    if row.grpc_port is not None and not _valid_port(row.grpc_port):
+        problems.append(f"grpc_port {row.grpc_port!r} not in 1..65535")
+    if row.mode == "adopted_container" and not (row.container_name or "").strip():
+        problems.append("adopted_container needs container_name")
+    if row.mode == "vco_managed" and row.host not in _MANAGED_HOSTS:
+        problems.append(f"vco_managed host must be localhost/127.0.0.1, got {row.host!r}")
+    if row.service == "weaviate" and row.grpc_port is None:
+        problems.append("weaviate needs grpc_port")
+    if row.service == "code_embed" and row.mode != "vco_managed":
+        problems.append("code_embed is always vco_managed")
+    src = row.source if isinstance(row.source, str) else ""
+    if not (src in SOURCES or (src.startswith(_MIGRATED_PREFIX) and len(src) > len(_MIGRATED_PREFIX))):
+        problems.append(f"source {row.source!r} not in {SOURCES} or migrated:<store>")
+    if row.data_mount is not None:
+        m = row.data_mount
+        if not isinstance(m, Mapping) or m.get("kind") not in _MOUNT_KINDS or not all(
+            isinstance(m.get(k), str) and m.get(k) for k in ("source", "destination")
+        ):
+            problems.append(f"data_mount {m!r} must be {{kind: bind|volume, source, destination}}")
+    for name in ("enabled", "autostart", "confirmed_by_user"):
+        if not isinstance(getattr(row, name), bool):
+            problems.append(f"{name} must be a bool")
+    if row.verified_at is not None and (not isinstance(row.verified_at, int) or isinstance(row.verified_at, bool)):
+        problems.append("verified_at must be unix ms or None")
+    if problems:
+        raise InvalidEndpointRow(f"{row.service}: " + "; ".join(problems))
 
 
-def read_port_override(conn: Optional[sqlite3.Connection], service: str) -> Optional[str]:
-    """The raw ``app_state`` override for *service*; ``None`` on any miss."""
-    if conn is None:
-        return None
-    try:
-        row = conn.execute(
-            "SELECT value FROM app_state WHERE key = ?", (SERVICES[service][0],)
-        ).fetchone()
-    except sqlite3.Error:
-        return None
-    if row is None:
-        return None
-    value = row[0]
-    return value if isinstance(value, str) else None
+# ─── reading ────────────────────────────────────────────────────────────
+
+_COLUMNS = (
+    "service", "mode", "scheme", "host", "port", "grpc_port", "container_name",
+    "compose_project", "data_mount_json", "enabled", "autostart", "source",
+    "confirmed_by_user", "verified_at", "updated_at",
+)
+_SELECT = f"SELECT {', '.join(_COLUMNS)} FROM service_endpoints"
+
+_WARNED: set[str] = set()
 
 
-def _services_state(services_state: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
-    if services_state is not None:
-        return services_state
-    from vco_lib.service_adoption import read_services_toml  # noqa: PLC0415
-
-    return read_services_toml()
-
-
-def machine_port(conn: Optional[sqlite3.Connection], service: str, *,
-                 services_state: Optional[Mapping[str, Any]] = None) -> int:
-    """This machine's port for *service* from launcher.db + services.toml."""
-    state = _services_state(services_state)
-    return resolve_port(service, read_port_override(conn, service),
-                        adoption_row(state, service))
-
-
-def machine_weaviate_url(conn: Optional[sqlite3.Connection], *,
-                         orchestrator_root: Optional[Path] = None,
-                         environ: Optional[Mapping[str, str]] = None,
-                         services_state: Optional[Mapping[str, Any]] = None) -> str:
-    """This machine's Weaviate URL — what the hub's ``/config`` serves."""
-    state = _services_state(services_state)
-    return resolve_weaviate_url(
-        machine_weaviate_url_statement(orchestrator_root, environ),
-        read_port_override(conn, "weaviate"),
-        adoption_row(state, "weaviate"),
+def _warn_default_once(service: str, why: str) -> None:
+    if service in _WARNED:
+        return
+    _WARNED.add(service)
+    _LOG.warning(
+        "service_endpoints: no usable %s row (%s); answering the compiled default %s "
+        "(a successful install/update writes the row — run `python install.py --update` "
+        "if this persists)",
+        service, why, render_url(service, None),
     )
 
 
-def machine_service_urls(
-    orchestrator_root: Optional[Path] = None,
-    db_path: Optional[Path] = None,
-) -> dict[str, Any]:
-    """The machine's Weaviate + Ollama URLs and the three service ports,
-    opening launcher.db read-only when it exists.
+def warn_absent(rows: Mapping[str, EndpointRow]) -> None:
+    """Warn (once per process per service) for every service *rows* lacks —
+    for callers that read the rows themselves and then render."""
+    for service in SERVICES:
+        if service not in rows:
+            _warn_default_once(service, "no row")
 
-    The one-call form for callers that hold no connection (install.py's
-    ``.claude/settings.json`` defaults): every value comes from the same
-    chains as :func:`machine_weaviate_url` / :func:`machine_ollama_url` /
-    :func:`machine_port`. A missing or unreadable launcher.db simply
-    drops the override leg — the chains still resolve.
-    """
+
+def _row_from_tuple(values: Sequence[Any]) -> EndpointRow:
+    d = dict(zip(_COLUMNS, values))
+    mount = None
+    if d["data_mount_json"]:
+        mount = json.loads(d["data_mount_json"])
+    return EndpointRow(
+        service=d["service"], mode=d["mode"], scheme=d["scheme"], host=d["host"],
+        port=int(d["port"]),
+        grpc_port=int(d["grpc_port"]) if d["grpc_port"] is not None else None,
+        container_name=d["container_name"], compose_project=d["compose_project"],
+        data_mount=mount, enabled=bool(d["enabled"]), autostart=bool(d["autostart"]),
+        source=d["source"], confirmed_by_user=bool(d["confirmed_by_user"]),
+        verified_at=d["verified_at"], updated_at=d["updated_at"],
+    )
+
+
+def read_rows(conn: Optional[sqlite3.Connection]) -> dict[str, EndpointRow]:
+    """Every readable row on *conn*, by service. A ``None`` connection, a DB
+    without the table (pre-047), or any read error is ``{}`` — every resolver
+    then answers the default. A single unreadable row is skipped (logged)."""
+    if conn is None:
+        return {}
+    try:
+        raw = conn.execute(_SELECT).fetchall()
+    except sqlite3.Error as exc:
+        _LOG.debug("service_endpoints: read failed: %s", exc)
+        return {}
+    out: dict[str, EndpointRow] = {}
+    for values in raw:
+        try:
+            row = _row_from_tuple(tuple(values))
+        except (ValueError, TypeError, KeyError) as exc:
+            _LOG.warning("service_endpoints: unreadable row %r skipped: %s", tuple(values)[:1], exc)
+            continue
+        out[row.service] = row
+    return out
+
+
+def read_row(conn: Optional[sqlite3.Connection], service: str) -> Optional[EndpointRow]:
+    """*service*'s row on *conn*, or ``None`` (default applies; warned once)."""
+    row = read_rows(conn).get(service)
+    if row is None:
+        _warn_default_once(service, "no row" if conn is not None else "no launcher.db")
+    return row
+
+
+def _resolve_db_path(db_path: Optional[Path]) -> Path:
+    if db_path is not None:
+        return Path(db_path)
+    from vco_lib.paths import launcher_db_path  # noqa: PLC0415
+
+    return launcher_db_path()
+
+
+def load_rows(db_path: Optional[Path] = None) -> dict[str, EndpointRow]:
+    """Every row in launcher.db (default: :func:`vco_lib.paths.launcher_db_path`),
+    read through a read-only connection. A missing DB is ``{}``."""
     from vco_lib.launcher_db_reader import _open_db_readonly  # noqa: PLC0415
 
-    conn = _open_db_readonly(db_path)
+    conn = _open_db_readonly(_resolve_db_path(db_path))
     try:
-        return {
-            "weaviate_url": machine_weaviate_url(conn, orchestrator_root=orchestrator_root),
-            "ollama_url": machine_ollama_url(conn),
-            "weaviate_port": machine_port(conn, "weaviate"),
-            "ollama_port": machine_port(conn, "ollama"),
-            "code_embed_port": machine_port(conn, "code_embed"),
-        }
+        return read_rows(conn)
     finally:
         if conn is not None:
             conn.close()
 
 
-def machine_ollama_url(conn: Optional[sqlite3.Connection], *,
-                       environ: Optional[Mapping[str, str]] = None,
-                       services_state: Optional[Mapping[str, Any]] = None) -> str:
-    """This machine's Ollama URL: the ``VCT_OLLAMA_URL`` statement, the
-    app_state override, and ``services.toml``. ``OLLAMA_URL`` (the
-    projection's own output) is deliberately not a leg."""
-    env = os.environ if environ is None else environ
-    statement = env.get(OLLAMA_STATEMENT_ENV) or None
-    state = _services_state(services_state)
-    return resolve_ollama_url(
-        statement,
-        read_port_override(conn, "ollama"),
-        adoption_row(state, "ollama"),
+# ─── the machine resolvers (row → compiled default) ─────────────────────
+
+
+def machine_url(conn: Optional[sqlite3.Connection], service: str, *,
+                default_port: Optional[int] = None) -> str:
+    return render_url(service, read_row(conn, service), default_port=default_port)
+
+
+def machine_weaviate_url(conn: Optional[sqlite3.Connection]) -> str:
+    """This machine's Weaviate URL — what the hub's ``/config`` serves."""
+    return machine_url(conn, "weaviate")
+
+
+def machine_ollama_url(conn: Optional[sqlite3.Connection]) -> str:
+    return machine_url(conn, "ollama")
+
+
+def machine_code_embed_url(conn: Optional[sqlite3.Connection]) -> str:
+    return machine_url(conn, "code_embed")
+
+
+def machine_port(conn: Optional[sqlite3.Connection], service: str) -> int:
+    return render_port(service, read_row(conn, service))
+
+
+def machine_grpc_port(conn: Optional[sqlite3.Connection]) -> int:
+    return render_grpc_port(read_row(conn, "weaviate"))
+
+
+def machine_service_urls(db_path: Optional[Path] = None) -> dict[str, Any]:
+    """Every endpoint value at once, from launcher.db opened read-only — the
+    one-call form for callers that hold no connection (install.py's
+    ``.claude/settings.json`` defaults, the standalone project env)."""
+    rows = load_rows(db_path)
+    warn_absent(rows)
+    w, o, c = rows.get("weaviate"), rows.get("ollama"), rows.get("code_embed")
+    return {
+        "weaviate_url": render_url("weaviate", w),
+        "ollama_url": render_url("ollama", o),
+        "code_embed_url": render_url("code_embed", c),
+        "weaviate_port": render_port("weaviate", w),
+        "weaviate_grpc_port": render_grpc_port(w),
+        "ollama_port": render_port("ollama", o),
+        "code_embed_port": render_port("code_embed", c),
+    }
+
+
+# ─── the plan (what the session hook / wrappers act on) ─────────────────
+
+
+def plan(rows: Mapping[str, EndpointRow]) -> dict[str, Any]:
+    """What lifecycle code acts on, per service, derived from *rows*.
+
+    ``managed_services``: compose service names VCO may bring up — rows in
+    ``vco_managed`` mode that are ``enabled``, plus services with NO row
+    (the pre-reconcile default is VCO's own stack). ``adopted_containers``:
+    the names of ``adopted_container`` rows with ``autostart`` — started by
+    name, never recreated. ``adopted_external`` rows appear in neither."""
+    from vco_lib.containers import CANONICAL_CONTAINERS  # noqa: PLC0415
+
+    managed: list[str] = []
+    adopted: list[str] = []
+    per_service: dict[str, dict[str, Any]] = {}
+    for service in SERVICES:
+        row = rows.get(service)
+        mode = row.mode if row is not None else "vco_managed"
+        enabled = row.enabled if row is not None else True
+        autostart = row.autostart if row is not None else True
+        if mode == "vco_managed":
+            container = (row.container_name if row is not None else None) or CANONICAL_CONTAINERS[service]
+        else:
+            container = row.container_name if row is not None else None
+        if mode == "vco_managed" and enabled:
+            managed.append(service)
+        if mode == "adopted_container" and autostart and container:
+            adopted.append(container)
+        entry: dict[str, Any] = {
+            "present": row is not None,
+            "mode": mode,
+            "container": container or "",
+            "url": render_url(service, row),
+            "port": render_port(service, row),
+            "enabled": enabled,
+            "autostart": autostart,
+        }
+        if service == "weaviate":
+            entry["grpc_port"] = render_grpc_port(row)
+        per_service[service] = entry
+    return {"managed_services": managed, "adopted_containers": adopted, "services": per_service}
+
+
+def plan_shell_lines(p: Mapping[str, Any]) -> list[str]:
+    """:func:`plan` as POSIX shell assignments (every value ``shlex``-quoted)."""
+    lines = [
+        f"VCO_MANAGED_SERVICES={shlex.quote(' '.join(p['managed_services']))}",
+        f"VCO_ADOPTED_CONTAINERS={shlex.quote(' '.join(p['adopted_containers']))}",
+    ]
+    for service, entry in p["services"].items():
+        prefix = f"VCO_{service.upper()}_"
+        for key in ("present", "mode", "container", "url", "port", "grpc_port", "enabled", "autostart"):
+            if key not in entry:
+                continue
+            value = entry[key]
+            if isinstance(value, bool):
+                value = "1" if value else "0"
+            lines.append(f"{prefix}{key.upper()}={shlex.quote(str(value))}")
+    return lines
+
+
+# ─── writing (the ONE writer) ───────────────────────────────────────────
+
+#: Fields whose change reaches another surface (infra .env, project env, the
+#: MCP registration, the compose service list). A change to only
+#: ``verified_at`` / ``source`` / ``confirmed_by_user`` / ``compose_project`` /
+#: ``autostart`` is recorded but triggers no follow-up chain.
+_PROPAGATING_FIELDS: tuple[str, ...] = (
+    "mode", "scheme", "host", "port", "grpc_port", "container_name", "data_mount", "enabled",
+)
+
+
+def _open_rw(db_path: Path) -> sqlite3.Connection:
+    if not db_path.is_file():
+        raise ServiceRegistryUnavailable(
+            f"{db_path} does not exist — run `vct-hub --ensure-db` (install.py does) "
+            "to create and migrate it"
+        )
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_endpoints'"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        conn.close()
+        raise ServiceRegistryUnavailable(f"{db_path}: {exc}") from exc
+    if found is None:
+        conn.close()
+        raise ServiceRegistryUnavailable(
+            f"{db_path} has no service_endpoints table (schema older than migration 047) "
+            "— run `vct-hub --ensure-db` with a current hub binary"
+        )
+    return conn
+
+
+def _same(a: EndpointRow, b: EndpointRow, fields: Iterable[str]) -> bool:
+    def norm(v: Any) -> Any:
+        return dict(v) if isinstance(v, Mapping) else v
+    return all(norm(getattr(a, f)) == norm(getattr(b, f)) for f in fields)
+
+
+_COMPARED_FIELDS: tuple[str, ...] = tuple(
+    f for f in EndpointRow.__dataclass_fields__ if f != "updated_at"
+)
+
+
+@dataclass
+class WriteResult:
+    """What :func:`write_rows` did. ``written``: services whose stored row
+    changed at all. ``propagating``: the subset whose change must reach
+    other surfaces (feed it to :func:`apply_change`)."""
+
+    written: list[str] = field(default_factory=list)
+    propagating: list[str] = field(default_factory=list)
+
+
+def write_rows(rows: Iterable[EndpointRow], *, db_path: Optional[Path] = None,
+               now_ms: Optional[int] = None) -> WriteResult:
+    """Validate every row, then upsert the changed ones in ONE transaction.
+
+    Nothing is written unless every row validates. An unchanged row is not
+    rewritten (``updated_at`` keeps its value), so a re-run writes nothing.
+    Raises :class:`InvalidEndpointRow` or :class:`ServiceRegistryUnavailable`.
+    """
+    batch = list(rows)
+    seen: set[str] = set()
+    for row in batch:
+        validate_row(row)
+        if row.service in seen:
+            raise InvalidEndpointRow(f"{row.service}: given twice in one write")
+        seen.add(row.service)
+    stamp = int(time.time() * 1000) if now_ms is None else now_ms
+    result = WriteResult()
+    conn = _open_rw(_resolve_db_path(db_path))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = read_rows(conn)
+        for row in batch:
+            prior = current.get(row.service)
+            if prior is not None and _same(prior, row, _COMPARED_FIELDS):
+                continue
+            mount = (
+                json.dumps(dict(row.data_mount), sort_keys=True)
+                if row.data_mount is not None else None
+            )
+            conn.execute(
+                f"INSERT INTO service_endpoints ({', '.join(_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _COLUMNS)}) "
+                "ON CONFLICT(service) DO UPDATE SET "
+                + ", ".join(f"{c} = excluded.{c}" for c in _COLUMNS if c != "service"),
+                (
+                    row.service, row.mode, row.scheme, row.host, row.port, row.grpc_port,
+                    row.container_name, row.compose_project, mount, int(row.enabled),
+                    int(row.autostart), row.source, int(row.confirmed_by_user),
+                    row.verified_at, stamp,
+                ),
+            )
+            result.written.append(row.service)
+            if prior is None or not _same(prior, row, _PROPAGATING_FIELDS):
+                result.propagating.append(row.service)
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        # The schema refused what validate_row accepted: the two drifted.
+        raise InvalidEndpointRow(f"launcher.db refused the row: {exc}") from exc
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return result
+
+
+# ─── the follow-up chain (I5) ───────────────────────────────────────────
+
+#: ``(infra_dir, rows) -> None`` — writes the managed ``infrastructure/.env``
+#: keys. Production default: ``vco_lib.compose_env.write_service_keys``.
+InfraEnvWriter = Callable[[Path, Mapping[str, EndpointRow]], None]
+#: ``(db_path) -> Any`` — re-projects every registered project's env.
+Reprojector = Callable[[Optional[Path]], Any]
+#: ``(orchestrator_root) -> bool`` — refreshes the MCP registration.
+Registrar = Callable[[Path], bool]
+
+
+@dataclass
+class ApplyChangeReport:
+    changed: list[str] = field(default_factory=list)
+    steps: dict[str, str] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
+    lines: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _default_infra_env_writer(infra_dir: Path, rows: Mapping[str, EndpointRow]) -> None:
+    # compose_env stays the ONE writer of infrastructure/.env; the managed
+    # service keys (ports, data-mount knobs, CODE_EMBED_OLLAMA_URL) are its
+    # `write_service_keys`. Resolved at call time: a missing function is an
+    # AttributeError here, loud, never a silent skip.
+    from vco_lib import compose_env  # noqa: PLC0415
+
+    compose_env.write_service_keys(infra_dir, rows)
+
+
+def _default_reprojector(db_path: Optional[Path]) -> Any:
+    from vco_lib.config_projection import reproject_all_registered_projects  # noqa: PLC0415
+
+    return reproject_all_registered_projects(db_path=db_path)
+
+
+def _default_registrar(orchestrator_root: Path) -> bool:
+    """``vct-launcher --register-default-mcps <root>`` — the launcher binary
+    is the one writer of ``~/.claude.json``; its registration reads the rows.
+    No binary / non-zero exit / timeout → ``False`` (logged); the next
+    install run retries."""
+    from vco_lib.launcher_ensure import find_launcher_binary  # noqa: PLC0415
+
+    binary = find_launcher_binary(repo_root=orchestrator_root)
+    if binary is None:
+        _LOG.warning("service_endpoints: no launcher binary found; MCP registration not refreshed")
+        return False
+    try:
+        proc = subprocess.run(
+            [str(binary), "--register-default-mcps", str(orchestrator_root)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _LOG.warning("service_endpoints: MCP registration refresh failed: %s", exc)
+        return False
+    if proc.returncode != 0:
+        _LOG.warning(
+            "service_endpoints: MCP registration refresh exited %s: %s",
+            proc.returncode, (proc.stderr or "").strip()[-400:],
+        )
+        return False
+    return True
+
+
+def describe(service: str, row: Optional[EndpointRow]) -> str:
+    """One human line for *service*'s current endpoint."""
+    url = render_url(service, row)
+    if row is None:
+        return f"{service}: {url} (no row — compiled default)"
+    who = {
+        "vco_managed": "VCO-managed",
+        "adopted_container": f"your container {row.container_name}",
+        "adopted_external": "external",
+    }[row.mode]
+    extra = f", gRPC {render_grpc_port(row)}" if service == "weaviate" else ""
+    return f"{service}: {url}{extra} ({who})"
+
+
+def apply_change(
+    changed: Iterable[str],
+    *,
+    orchestrator_root: Path,
+    db_path: Optional[Path] = None,
+    write_infra_env: Optional[InfraEnvWriter] = None,
+    reproject: Optional[Reprojector] = None,
+    register_mcps: Optional[Registrar] = None,
+    out: Callable[[str], None] = print,
+) -> ApplyChangeReport:
+    """The follow-up chain every row change triggers (plan §4a.5, I5):
+
+    1. the managed ``infrastructure/.env`` keys (``write_infra_env``);
+    2. every registered project's env re-projected (``reproject``);
+    3. the MCP registration refreshed (``register_mcps``);
+    4. one printed line per changed service.
+
+    Each step is a seam (tests inject fakes; the defaults are production).
+    A failing step is recorded in ``errors`` and logged, and the chain
+    continues — a stale ``~/.claude.json`` must not keep the projects on the
+    old endpoint. Nothing runs when *changed* is empty.
+    """
+    report = ApplyChangeReport(changed=[s for s in SERVICES if s in set(changed)])
+    if not report.changed:
+        return report
+    root = Path(orchestrator_root)
+    rows = load_rows(db_path)
+    steps: list[tuple[str, Callable[[], Any]]] = [
+        ("infra_env", lambda: (write_infra_env or _default_infra_env_writer)(root / "infrastructure", rows)),
+        ("reproject", lambda: (reproject or _default_reprojector)(db_path)),
+        ("register_mcps", lambda: (register_mcps or _default_registrar)(root)),
+    ]
+    for name, step in steps:
+        try:
+            outcome = step()
+        except Exception as exc:  # noqa: BLE001 - recorded + logged; the chain goes on
+            report.errors[name] = f"{type(exc).__name__}: {exc}"
+            report.steps[name] = "failed"
+            _LOG.warning("service_endpoints: %s failed: %s", name, exc)
+            continue
+        if name == "register_mcps" and outcome is False:
+            report.errors[name] = "registration not refreshed (see log); the next install run retries"
+            report.steps[name] = "failed"
+        else:
+            report.steps[name] = "ok"
+    for service in report.changed:
+        line = describe(service, rows.get(service))
+        report.lines.append(line)
+        out(line)
+    return report
+
+
+def commit_rows(
+    rows: Iterable[EndpointRow],
+    *,
+    orchestrator_root: Path,
+    db_path: Optional[Path] = None,
+    write_infra_env: Optional[InfraEnvWriter] = None,
+    reproject: Optional[Reprojector] = None,
+    register_mcps: Optional[Registrar] = None,
+    out: Callable[[str], None] = print,
+    now_ms: Optional[int] = None,
+) -> tuple[WriteResult, ApplyChangeReport]:
+    """:func:`write_rows`, then :func:`apply_change` for the services whose
+    change propagates. The one call a row-changing verb makes."""
+    result = write_rows(rows, db_path=db_path, now_ms=now_ms)
+    report = apply_change(
+        result.propagating, orchestrator_root=orchestrator_root, db_path=db_path,
+        write_infra_env=write_infra_env, reproject=reproject,
+        register_mcps=register_mcps, out=out,
     )
+    return result, report
+
+
+# ─── CLI ────────────────────────────────────────────────────────────────
+
+
+def _show_payload(rows: Mapping[str, EndpointRow]) -> dict[str, Any]:
+    services: dict[str, Any] = {}
+    for service in SERVICES:
+        row = rows.get(service)
+        entry: dict[str, Any] = {
+            "present": row is not None,
+            "url": render_url(service, row),
+            "port": render_port(service, row),
+        }
+        if service == "weaviate":
+            entry["grpc_port"] = render_grpc_port(row)
+        entry["row"] = row.to_json() if row is not None else None
+        services[service] = entry
+    return {"schema": 1, "services": services}
+
+
+def _cli_show(args: argparse.Namespace) -> int:
+    rows = load_rows(args.db_path)
+    if args.json:
+        print(json.dumps(_show_payload(rows), indent=2, sort_keys=True))
+        return 0
+    for service in SERVICES:
+        print(describe(service, rows.get(service)))
+    return 0
+
+
+def _cli_resolve(args: argparse.Namespace) -> int:
+    rows = load_rows(args.db_path)
+    row = rows.get(args.service)
+    value: Any
+    if args.field == "url":
+        value = render_url(args.service, row)
+    elif args.field == "port":
+        value = render_port(args.service, row)
+    elif args.field == "grpc_port":
+        if args.service != "weaviate":
+            print("grpc_port exists only for weaviate", file=sys.stderr)
+            return 2
+        value = render_grpc_port(row)
+    else:  # mode
+        value = row.mode if row is not None else "vco_managed"
+    print(value)
+    return 0
+
+
+def _cli_plan(args: argparse.Namespace) -> int:
+    p = plan(load_rows(args.db_path))
+    if args.json:
+        print(json.dumps(p, indent=2, sort_keys=True))
+    else:
+        print("\n".join(plan_shell_lines(p)))
+    return 0
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.service_endpoints",
+        description="Where Weaviate / Ollama / code-embed are reached (launcher.db service_endpoints).",
+    )
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    def db_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--db-path", type=Path, default=None,
+                       help="launcher.db (default: <vct_root_dir>/launcher.db)")
+
+    p_show = sub.add_parser("show", help="every service's endpoint (and its row)")
+    p_show.add_argument("--json", action="store_true")
+    db_arg(p_show)
+    p_show.set_defaults(handler=_cli_show)
+
+    p_res = sub.add_parser("resolve", help="print one resolved value")
+    p_res.add_argument("--service", required=True, choices=SERVICES)
+    p_res.add_argument("--field", default="url", choices=("url", "port", "grpc_port", "mode"))
+    db_arg(p_res)
+    p_res.set_defaults(handler=_cli_resolve)
+
+    p_plan = sub.add_parser("plan", help="what lifecycle code may act on")
+    fmt = p_plan.add_mutually_exclusive_group(required=True)
+    fmt.add_argument("--shell", action="store_true", help="POSIX shell assignments")
+    fmt.add_argument("--json", action="store_true")
+    db_arg(p_plan)
+    p_plan.set_defaults(handler=_cli_plan)
+
+    args = parser.parse_args(argv)
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    sys.exit(_main())

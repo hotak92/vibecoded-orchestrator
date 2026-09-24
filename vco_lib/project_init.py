@@ -12558,6 +12558,12 @@ def _apply_standalone_env(
     # scaffold-authored generic default SURVIVES adoption and the project's
     # shared-KG searches silently return nothing forever.
     shared_kg = _resolve_shared_kg_name(folder)
+    # v0.2.97: this machine's service endpoints (launcher.db rows → compiled
+    # default when there is no DB / no row) — the same answer the DB-backed
+    # projection and the hub give, never a literal.
+    from vco_lib.service_endpoints import machine_service_urls
+
+    urls = machine_service_urls()
 
     env: dict[str, str] = {
         "PROJECT_NAME": raw_name,
@@ -12569,12 +12575,13 @@ def _apply_standalone_env(
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
         "ACTIVE_EMBEDDING": "qwen3",
-        "WEAVIATE_URL": "http://localhost:8081",
-        "WEAVIATE_PORT": "8081",
-        "OLLAMA_URL": "http://localhost:11435",
-        "OLLAMA_PORT": "11435",
-        "CODE_EMBED_URL": "http://localhost:11440",
-        "CODE_EMBED_PORT": "11440",
+        "WEAVIATE_URL": urls["weaviate_url"],
+        "WEAVIATE_PORT": str(urls["weaviate_port"]),
+        "OLLAMA_URL": urls["ollama_url"],
+        "OLLAMA_PORT": str(urls["ollama_port"]),
+        "CODE_EMBED_URL": urls["code_embed_url"],
+        "CODE_EMBED_SERVICE_URL": urls["code_embed_url"],
+        "CODE_EMBED_PORT": str(urls["code_embed_port"]),
     }
 
     if orchestrator_root is not None:

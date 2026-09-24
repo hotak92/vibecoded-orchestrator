@@ -1801,8 +1801,8 @@ pub fn run() {
                         return;
                     };
                     // Weaviate URL: the launcher's ONE client resolver
-                    // (v0.2.97 lane W) — env statement, vct-config.toml,
-                    // port override, adopted/moved Weaviate, 8081.
+                    // (v0.2.97) — its interim env legs, then the launcher.db
+                    // `service_endpoints` row, else 8081.
                     let weaviate_url =
                         vct_launcher_core::services::service_endpoints::client_weaviate_url(
                             db.inner(),
