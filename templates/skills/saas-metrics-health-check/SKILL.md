@@ -4,7 +4,7 @@ description: Performs a diagnostic on a SaaS product's revenue and retention met
 short_desc: compute MRR/ARR/churn/LTV from customer CSV diagnostic
 keywords: ["SaaS metrics", "compute MRR", "compute churn", "payback period", "cohort retention", "unit economics", "revenue metrics", "SaaS health check", "are my metrics healthy", "quick ratio"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # SaaS Metrics Health-Check (Opus)

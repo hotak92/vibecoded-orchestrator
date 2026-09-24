@@ -73,7 +73,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use rusqlite::params;
-use vct_launcher_core::config::LocalConfig;
 use vct_launcher_core::db::Db;
 
 use super::modules_api::LauncherDbHandle;
@@ -81,21 +80,14 @@ use super::retrieval_tuning_io::{read_tuning, RetrievalTuning};
 
 // ─── Defaults shared with the launcher / docker-compose stack ────
 //
-// These mirror the "Default ports" line in CLAUDE.md and the
-// compiled defaults under `claude_mcp_servers/`. They are surfaced
-// in the resolver response so a fresh project that hasn't been
-// further customised still resolves to a working Ollama / gRPC
-// endpoint pair. Env-var overrides (set by the launcher when it
-// boots a non-default stack) win over the defaults.
-// v0.2.92 (§3.12): the port literal lives ONCE in vct-launcher-core
-// (`services::container_runtime::DEFAULT_OLLAMA_PORT`); this is the URL
-// form of that constant, not a second declaration of the port.
-fn default_ollama_url() -> String {
-    format!(
-        "http://localhost:{}",
-        vct_launcher_core::services::container_runtime::DEFAULT_OLLAMA_PORT
-    )
-}
+// The Ollama / Weaviate URLs are surfaced in the resolver response so a
+// fresh project that hasn't been further customised still resolves to a
+// working endpoint pair; they come from the ONE machine resolver
+// (`vct_launcher_core::services::service_endpoints`), which honours the
+// `VCT_OLLAMA_URL` / `VCT_WEAVIATE_URL` statements (set by the launcher
+// when it boots a non-default stack), the app_state port overrides and
+// services.toml adoption. The gRPC port still rides env var → compiled
+// default (it is not one of the three core services).
 const DEFAULT_GRPC_PORT: u16 = 50052;
 
 // ─── Resolver protocol version (v0.2.22 Item #2) ─────────────────
@@ -1025,8 +1017,15 @@ async fn project_config(
     //
     // Reference: the v0.2.52 root-cause audit (Symptom B) for the full
     // root-cause walk.
-    let local_cfg_for_probe = LocalConfig::load();
-    let probe_weaviate_url = local_cfg_for_probe.weaviate_url.clone();
+    //
+    // v0.2.97 (lane W): resolved through the ONE machine resolver the
+    // launcher's project env projection (`populate`) also calls —
+    // `VCT_WEAVIATE_URL` / `vct-config.toml` → app_state port override →
+    // services.toml adoption → 8081. This served `LocalConfig` alone, so an
+    // adopted external Weaviate (or a port override) reached every project's
+    // env but not `/config`.
+    let probe_weaviate_url =
+        vct_launcher_core::services::service_endpoints::machine_weaviate_url(&h.0);
 
     let kg_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
         &probe_weaviate_url,
@@ -1198,20 +1197,16 @@ async fn project_config(
         .and_then(|b| b.embedding_model.clone())
         .unwrap_or_else(|| "CodeSage-Large-v2".to_string());
 
-    // Service URLs: weaviate_url goes through LocalConfig (env +
-    // vct-config.toml + compiled default). Ollama URL + gRPC port
-    // are not (yet) in LocalConfig — they ride env var → compiled
-    // default. When LocalConfig grows fields for these in a future
-    // release, swap them in without breaking the wire contract.
-    //
-    // NEW-2 (v0.2.53) — `local_cfg_for_probe` was already loaded above
-    // for the case-rebind probe; reuse it to avoid a second TOML read.
-    let weaviate_url = local_cfg_for_probe.weaviate_url;
-    let ollama_url = std::env::var("VCT_OLLAMA_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var("OLLAMA_URL").ok().filter(|v| !v.is_empty()))
-        .unwrap_or_else(default_ollama_url);
+    // Service URLs: weaviate_url + ollama_url are the machine resolver's
+    // answers (`service_endpoints`, v0.2.97 lane X) — the same chain the
+    // projection serves, so an `ollama.port_override` or a services.toml
+    // adoption reaches the hub's clients too. `OLLAMA_URL` (the
+    // projection's own output) is deliberately no longer read here; only
+    // the `VCT_OLLAMA_URL` statement is a leg. gRPC port rides env var →
+    // compiled default.
+    let weaviate_url = probe_weaviate_url.clone();
+    let ollama_url =
+        vct_launcher_core::services::service_endpoints::machine_ollama_url(&h.0);
     let grpc_port = std::env::var("VCT_GRPC_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -4587,6 +4582,105 @@ kg_tier_full = 0.8
         );
         // Clean up — best-effort.
         std::env::remove_var("VCT_WEAVIATE_URL");
+    }
+
+    /// v0.2.97 (lane W): `/config`'s `weaviate_url` is the machine
+    /// resolver's — the value every project's env carries. An adopted
+    /// external Weaviate (services.toml) is served with its host, and the
+    /// projected transport variable `WEAVIATE_URL` in the hub's own
+    /// environment is NOT read back (a hub started from a hook inherits one
+    /// project's projected value). Before, this served `LocalConfig`, which
+    /// ignored the adoption and echoed `WEAVIATE_URL`.
+    #[tokio::test]
+    async fn config_weaviate_url_is_the_machine_resolvers() {
+        use vct_launcher_core::services::adoption::{self, AdoptionMode, AdoptionState, ServiceAdoption};
+        let _guard = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("VCT_WEAVIATE_URL", None),
+            ("WEAVIATE_URL", Some("http://127.0.0.1:8")),
+        ]);
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+        let mut state = AdoptionState::default();
+        state.upsert(ServiceAdoption {
+            name: "weaviate".into(),
+            mode: AdoptionMode::Adopt,
+            // Unroutable on purpose: the case-rebind probe calls this URL.
+            external_url: Some("http://127.0.0.1:9/v1/meta".into()),
+            parallel_port: None,
+            container_name: None,
+        });
+        adoption::write(&state).unwrap();
+
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-weaviate-url", "myproject");
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-weaviate-url/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        let served = body.get("weaviate_url").and_then(|v| v.as_str()).map(String::from);
+        assert_eq!(served.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(
+            served.unwrap(),
+            vct_launcher_core::services::service_endpoints::machine_weaviate_url(&h.0),
+            "the hub and the project env projection answer one resolver"
+        );
+    }
+
+    /// v0.2.97 (lane X): `/config`'s `ollama_url` is the machine
+    /// resolver's too — the same chain the projection serves
+    /// (`VCT_OLLAMA_URL` statement → app_state `ollama.port_override` →
+    /// services.toml adoption → default). Before, an env-only chain that
+    /// also read `OLLAMA_URL` (the projection's own output) and ignored
+    /// the override and adoption entirely.
+    #[tokio::test]
+    async fn config_ollama_url_is_the_machine_resolvers() {
+        use vct_launcher_core::services::adoption::{self, AdoptionMode, AdoptionState, ServiceAdoption};
+        let _guard = vct_launcher_core::test_env::state_dir_guard_with(&[
+            (vct_launcher_core::services::service_endpoints::OLLAMA_STATEMENT_ENV, None),
+            ("OLLAMA_URL", Some("http://127.0.0.1:8")),
+        ]);
+        let mut state = AdoptionState::default();
+        state.upsert(ServiceAdoption {
+            name: "ollama".into(),
+            mode: AdoptionMode::Adopt,
+            external_url: Some("http://ollama.lan:11439/api/tags".into()),
+            parallel_port: None,
+            container_name: None,
+        });
+        adoption::write(&state).unwrap();
+
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-ollama-url", "myproject");
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-ollama-url/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(
+            body.get("ollama_url").and_then(|v| v.as_str()),
+            Some("http://ollama.lan:11439"),
+            "an adopted external Ollama is served with its host"
+        );
+        assert_eq!(
+            body.get("ollama_url").and_then(|v| v.as_str()).unwrap(),
+            vct_launcher_core::services::service_endpoints::machine_ollama_url(&h.0),
+            "the hub and the project env projection answer one resolver"
+        );
+
+        // The app_state override outranks the adoption.
+        h.0.app_state_set("ollama.port_override", "21435").unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-ollama-url/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(
+            body.get("ollama_url").and_then(|v| v.as_str()),
+            Some("http://localhost:21435")
+        );
     }
 
     /// NEW-2 — when Weaviate has no matching class (fresh install),

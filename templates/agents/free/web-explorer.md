@@ -5,7 +5,7 @@ short_desc: web research with report saved to disk
 keywords: [web research, competitor research, link survey, blog research, research report, "comprehensive investigation", "web search", "search the web", "browse competitors", "find online", "look online for"]
 tools: WebSearch, WebFetch, Read, Grep, Glob, Bash, Write, Edit
 model: haiku
-effort: high
+effort: medium
 ---
 
 # Web Explorer Agent

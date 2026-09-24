@@ -27,16 +27,24 @@
   import { decideNumberCommit } from './numberInputCommit';
   import type { NumberInputControl } from '$lib/types/manifest';
 
+  // v0.2.97 (manifest `settings`, `CoreModuleSettingsPanel.svelte`):
+  //   * `projectId: null` addresses a MACHINE-WIDE setting (the backend's
+  //     project-less row); `''` still means "no project picked" → disabled.
+  //   * `validate` — optional client-side check of the parsed number, run
+  //     before saving; a non-null reason is shown inline and nothing is
+  //     written. The backend re-validates declared settings regardless.
   let {
     control,
     moduleId,
     projectId,
     disabled = false,
+    validate,
   }: {
     control: NumberInputControl;
     moduleId: string;
-    projectId: string;
+    projectId: string | null;
     disabled?: boolean;
+    validate?: (value: number) => string | null;
   } = $props();
 
   // Raw input value (kept as string so the user can type intermediate
@@ -58,7 +66,7 @@
     if (control.default !== null && control.default !== undefined) {
       rawValue = String(control.default);
     }
-    if (!tauriAvailable() || !projectId) {
+    if (!tauriAvailable() || projectId === '') {
       loading = false;
       return;
     }
@@ -101,6 +109,12 @@
       error = decision.message;
       return;
     }
+    const problem = validate?.(decision.value) ?? null;
+    if (problem !== null) {
+      // Refused client-side: inline reason, no persist, no "Saved" toast.
+      error = problem;
+      return;
+    }
     error = '';
     // Reflect the clamped / defaulted value back into the input.
     if (decision.display !== rawValue) {
@@ -124,7 +138,7 @@
         projectId,
       });
       if (control.on_change) {
-        await dispatchAction({ moduleId, projectId }, control.on_change, n);
+        await dispatchAction({ moduleId, projectId: projectId ?? '' }, control.on_change, n);
       }
       toast.success(`Saved ${control.label}`);
     } catch (err) {

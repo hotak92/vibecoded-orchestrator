@@ -165,7 +165,7 @@ pub const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
 
 /// Ports passed in from the caller (launcher GUI's adopted-services state
 /// or install.py's env). Defaults match the canonical-port constants.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServicePorts {
     pub weaviate_port: u16,
     pub ollama_port: u16,
@@ -181,6 +181,33 @@ impl Default for ServicePorts {
             grpc_port: DEFAULT_GRPC_PORT,
             code_embed_port: DEFAULT_CODE_EMBED_PORT,
         }
+    }
+}
+
+/// v0.2.97 (lane X): the ONE port source for MCP registration.
+///
+/// The entries `build_default_mcp_entries` writes land in `~/.claude.json` —
+/// a MACHINE-GLOBAL surface every project on this machine shares — so the
+/// ports baked into them come from the machine chain (`service_endpoints`:
+/// app_state `*.port_override` → services.toml adoption → compiled
+/// default), not from a bare env read. install.py forwards
+/// `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT` as a hand-off, but every
+/// value it can put there was already persisted to services.toml by
+/// `_resolve_service_safety` before this runs, so the chain subsumes the
+/// env. gRPC has no services.toml row and no override key; it keeps its
+/// env-only resolution (`WEAVIATE_GRPC_PORT` → compiled default).
+pub fn machine_service_ports() -> ServicePorts {
+    use vct_launcher_core::services::service_endpoints::{
+        machine_port_from_disk, CoreService,
+    };
+    ServicePorts {
+        weaviate_port: machine_port_from_disk(CoreService::Weaviate),
+        ollama_port: machine_port_from_disk(CoreService::Ollama),
+        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_GRPC_PORT),
+        code_embed_port: machine_port_from_disk(CoreService::CodeEmbed),
     }
 }
 
@@ -887,6 +914,38 @@ fn find_project_id_for_folder(db: &crate::db::Db, target: &Path) -> Option<Strin
 mod tests {
     use super::*;
     use std::fs;
+
+    /// v0.2.97 (lane X): registration ports come from the machine chain —
+    /// an app_state override and a services.toml adoption both reach the
+    /// entries, and the legacy `WEAVIATE_PORT` env hand-off is no longer a
+    /// leg (the chain subsumes it).
+    #[test]
+    fn machine_service_ports_reads_the_machine_chain() {
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("WEAVIATE_PORT", Some("19999")),
+            ("OLLAMA_PORT", Some("19998")),
+            ("CODE_EMBED_PORT", Some("19997")),
+            ("WEAVIATE_GRPC_PORT", None),
+        ]);
+        assert_eq!(machine_service_ports(), ServicePorts::default());
+
+        // The app_state override outranks the (ignored) env hand-off.
+        let db = vct_launcher_core::db::Db::open().unwrap();
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        assert_eq!(machine_service_ports().weaviate_port, 18081);
+
+        // A parallel adoption supplies the port when no override exists.
+        let mut state = vct_launcher_core::services::adoption::AdoptionState::default();
+        state.upsert(vct_launcher_core::services::adoption::ServiceAdoption {
+            name: "ollama".into(),
+            mode: vct_launcher_core::services::adoption::AdoptionMode::Parallel,
+            external_url: None,
+            parallel_port: Some(21435),
+            container_name: None,
+        });
+        vct_launcher_core::services::adoption::write(&state).unwrap();
+        assert_eq!(machine_service_ports().ollama_port, 21435);
+    }
 
     fn tmp_target() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

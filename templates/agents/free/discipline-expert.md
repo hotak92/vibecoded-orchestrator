@@ -5,7 +5,7 @@ short_desc: wear-the-hat scientific domain expert
 keywords: ["domain expert", "cross-disciplinary", "scientific consultation", "materials science", "geoscience", "neuroscience", "cross-disciplinary expert", "scientific advice", "act as expert"]
 tools: Read, Write, Edit, WebSearch, Bash, Glob, Grep
 model: opus
-effort: high
+effort: medium
 ---
 
 # Discipline Expert Agent (Opus)

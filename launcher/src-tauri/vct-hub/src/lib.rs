@@ -68,6 +68,8 @@ pub mod lifecycle_api;
 pub mod lockfile;
 pub mod mcp_tool_grants_api;
 pub mod module_identity;
+// v0.2.97 (lane V): the `runtime.health_check` poller — module up/down/unknown.
+pub mod module_health;
 pub mod module_supervisor;
 pub mod module_db_api;
 pub mod modules_api;

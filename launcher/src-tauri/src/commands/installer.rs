@@ -713,20 +713,27 @@ async fn probe_http(url: String) -> Option<String> {
 /// on purpose (Rust = "any signal Weaviate is reachable", Python =
 /// "Weaviate fully initialised and ready to serve queries"). See
 /// commands/lifecycle.rs::canonical_services for the rationale.
+/// The wizard's service-detection probe URLs. v0.2.97 (lane X): ports
+/// come from the ONE chain (`machine_service_ports` over
+/// `service_endpoints`: app_state override → services.toml adoption →
+/// default) — the compiled-in defaults this replaces skipped both, so a
+/// machine with an override or an alt-port adoption probed the wrong
+/// port during onboarding detection.
+fn detect_probe_urls() -> (String, String, String) {
+    let ports = crate::mcp_registration::machine_service_ports();
+    (
+        format!("http://localhost:{}/v1/meta", ports.weaviate_port),
+        format!("http://localhost:{}/api/tags", ports.ollama_port),
+        format!("http://localhost:{}/health", ports.code_embed_port),
+    )
+}
+
 #[command]
 pub async fn detect_existing_services() -> Result<ServicesStatus, String> {
-    let weaviate = probe_http(format!(
-        "http://localhost:{}/v1/meta",
-        DEFAULT_WEAVIATE_PORT
-    ));
-    let ollama = probe_http(format!(
-        "http://localhost:{}/api/tags",
-        DEFAULT_OLLAMA_PORT
-    ));
-    let code_embed = probe_http(format!(
-        "http://localhost:{}/health",
-        DEFAULT_CODE_EMBED_PORT
-    ));
+    let (weaviate_url, ollama_url, code_embed_url) = detect_probe_urls();
+    let weaviate = probe_http(weaviate_url);
+    let ollama = probe_http(ollama_url);
+    let code_embed = probe_http(code_embed_url);
 
     // Run probes concurrently — total wall time is capped at the 2s timeout
     // of the slowest probe, not 6s sequentially.
@@ -2372,71 +2379,87 @@ pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
     "vct_code_embed",
 ];
 
-/// Read-only volume detection. Tries `podman volume ls --format json`
-/// first, falls back to `docker volume ls --format json`. If neither is
-/// installed we return an empty list (not an error — the user may not
-/// have a container runtime yet, which is fine pre-install).
+/// Read-only volume detection for the install preflight: the orchestrator
+/// volumes under the first installed runtime of the shared candidate order
+/// (`container_runtime::runtime_candidate_order` — a `VCT_CONTAINER_RUNTIME`
+/// or `state/install/runtime.txt` pin is the ONLY candidate; unpinned,
+/// podman then docker, as before). If none is installed we return an empty
+/// list (not an error — the user may not have a container runtime yet,
+/// which is fine pre-install).
 ///
-/// Bug 31: also exposed as `detect_existing_volumes_for_volumes_module`
-/// so the volumes command module can reuse the same detector instead
-/// of duplicating it.
-pub async fn detect_existing_volumes_for_volumes_module() -> Vec<ExistingVolume> {
-    detect_existing_volumes().await
-}
-
+/// v0.2.97 owner ruling "Honour the pin": the walk used to be a hard-coded
+/// podman-then-docker, so a docker-pinned machine's preflight listed a
+/// leftover podman copy as "your data". `commands::volumes`, which used to
+/// reach this through `detect_existing_volumes_for_volumes_module`, now asks
+/// [`detect_existing_volumes_under`] for the runtime the shared daemon-aware
+/// detector chose.
 async fn detect_existing_volumes() -> Vec<ExistingVolume> {
-    for runtime in &["podman", "docker"] {
+    use vct_launcher_core::services::container_runtime as cr;
+    let recorded = find_local_repo_root().ok().and_then(|root| cr::read_runtime_txt(&root));
+    let order = cr::runtime_candidate_order(cr::runtime_preference_from_env().as_deref(), recorded.as_deref());
+    for runtime in &order {
         let runtime_path = match which_on_path(runtime) {
             Some(p) => p,
             None => continue,
         };
-        // List names matching one of our known orchestrator volume names.
-        let mut found: Vec<ExistingVolume> = Vec::new();
-        for name in ORCHESTRATOR_VOLUME_NAMES {
-            // `volume inspect <name>` returns 0 with JSON if it exists,
-            // non-zero if not. Read-only — never mutates state.
-            let out = tokio::process::Command::new(&runtime_path).silent()
-                .args(["volume", "inspect", name])
-                .output()
-                .await;
-            let out = match out {
-                Ok(o) => o,
-                Err(_) => continue,
-            };
-            if !out.status.success() {
-                continue;
-            }
-            let body = String::from_utf8_lossy(&out.stdout);
-            // Both podman and docker emit a JSON array of volume objects.
-            let arr: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(items) = arr.as_array() {
-                for item in items {
-                    let mountpoint = item
-                        .get("Mountpoint")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let driver = item
-                        .get("Driver")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("local")
-                        .to_string();
-                    found.push(ExistingVolume {
-                        name: name.to_string(),
-                        mountpoint,
-                        driver,
-                    });
-                }
-            }
-        }
+        let found = detect_existing_volumes_under(&runtime_path.to_string_lossy()).await;
         if !found.is_empty() {
             return found;
         }
     }
     Vec::new()
+}
+
+/// The orchestrator volumes that exist under ONE runtime (`podman`,
+/// `docker`, or a path to either). v0.2.97 owner ruling "Honour the pin":
+/// split out of [`detect_existing_volumes`] so `commands::volumes` can ask
+/// the runtime the shared pin-first detector chose — and the other one,
+/// only to refuse — instead of taking whichever runtime answered first.
+/// Spawns through `paths::spawn_program` (the bare name in production).
+pub(crate) async fn detect_existing_volumes_under(runtime: &str) -> Vec<ExistingVolume> {
+    let program = vct_launcher_core::paths::spawn_program(runtime);
+    let mut found: Vec<ExistingVolume> = Vec::new();
+    for name in ORCHESTRATOR_VOLUME_NAMES {
+        // `volume inspect <name>` returns 0 with JSON if it exists,
+        // non-zero if not. Read-only — never mutates state.
+        let out = tokio::process::Command::new(&program).silent()
+            .args(["volume", "inspect", name])
+            .output()
+            .await;
+        let out = match out {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let body = String::from_utf8_lossy(&out.stdout);
+        // Both podman and docker emit a JSON array of volume objects.
+        let arr: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(items) = arr.as_array() {
+            for item in items {
+                let mountpoint = item
+                    .get("Mountpoint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let driver = item
+                    .get("Driver")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("local")
+                    .to_string();
+                found.push(ExistingVolume {
+                    name: name.to_string(),
+                    mountpoint,
+                    driver,
+                });
+            }
+        }
+    }
+    found
 }
 
 /// v0.2.77 (Part 7c task 3): delegates to the shared
@@ -2839,45 +2862,17 @@ pub async fn install_orchestrator(
     // v0.2.95 phase 3 (WP-3): the ONE home (see `install_py_command`).
     let mut cmd = install_py_command(python_cmd, &install_path, &install_args);
 
-    // PR-3 (2026-05-06): forward the launcher's adopted service ports to
-    // install.py. Pre-PR-3, install.py read `WEAVIATE_PORT` / `OLLAMA_PORT`
-    // from `os.environ` (install.py:4243-4244) but the launcher never set
-    // them — the subprocess inherited the launcher's env, which was
-    // empty for these keys. Multi-stack setups silently fell through to
-    // the canonical default ports. We now bridge launcher state into
-    // the install.py subprocess env via `services.toml` adoption +
-    // explicit overrides. See `launcher-settings-propagation-audit-2026-05-06.md` §9.
-    let services_state = crate::services::adoption::read();
-    let pick_port = |name: &str, default: u16| -> u16 {
-        if let Some(svc) = services_state.get(name) {
-            match svc.mode {
-                crate::services::adoption::AdoptionMode::Parallel => {
-                    if let Some(p) = svc.parallel_port {
-                        return p;
-                    }
-                }
-                crate::services::adoption::AdoptionMode::Adopt => {
-                    if let Some(url) = svc.external_url.as_deref() {
-                        // Inline minimal port-extractor (kept here to avoid
-                        // a cross-module dep on commands::project_env_settings).
-                        let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-                        let host_port = after.split('/').next().unwrap_or(after);
-                        if let Some(p) = host_port.rsplit(':').next().and_then(|s| s.parse::<u16>().ok()) {
-                            return p;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        default
-    };
-    let weaviate_port = pick_port("weaviate", DEFAULT_WEAVIATE_PORT);
-    let ollama_port = pick_port("ollama", DEFAULT_OLLAMA_PORT);
-    let code_embed_port = pick_port("code_embed", DEFAULT_CODE_EMBED_PORT);
-    cmd.env("WEAVIATE_PORT", weaviate_port.to_string())
-        .env("OLLAMA_PORT", ollama_port.to_string())
-        .env("CODE_EMBED_PORT", code_embed_port.to_string());
+    // PR-3 (2026-05-06): forward the launcher's resolved service ports to
+    // install.py (whose own chain starts from these env keys). v0.2.97
+    // (lane X): the ports themselves come from the ONE home —
+    // `mcp_registration::machine_service_ports` over `service_endpoints`
+    // (app_state override → services.toml adoption → default), replacing
+    // an inline adoption-only copy here that skipped the app_state
+    // override. See `launcher-settings-propagation-audit-2026-05-06.md` §9.
+    let ports = crate::mcp_registration::machine_service_ports();
+    cmd.env("WEAVIATE_PORT", ports.weaviate_port.to_string())
+        .env("OLLAMA_PORT", ports.ollama_port.to_string())
+        .env("CODE_EMBED_PORT", ports.code_embed_port.to_string());
 
     // Windows: suppress the transient cmd console window that pops up
     // when Tauri (a windowed app, no console) spawns a subprocess.
@@ -2926,12 +2921,8 @@ pub async fn install_orchestrator(
     // fallback) backstops this anyway.
     emit_progress(&window, "register", "Registering MCP servers in ~/.claude.json...", 92.0);
     let install_root_path = std::path::PathBuf::from(&config.install_path);
-    let ports = crate::mcp_registration::ServicePorts {
-        weaviate_port,
-        ollama_port,
-        grpc_port: crate::mcp_registration::DEFAULT_GRPC_PORT,
-        code_embed_port,
-    };
+    // v0.2.97 (lane X): same ONE port source resolved above for the env
+    // hand-off — `machine_service_ports` (grpc: env → default).
     let db_for_register = window.app_handle().try_state::<Db>();
     let db_ref = db_for_register.as_ref().map(|s| s.inner());
     match crate::mcp_registration::register_default_orchestrator_mcps(
@@ -3178,41 +3169,15 @@ async fn run_install_orchestrator_lightweight(
     let mut cmd = install_py_command(python_cmd, &install_path, &argv);
 
     // Forward the same launcher-resolved service ports the full path
-    // does. install.py's lightweight branch reads these so a port
-    // override survives a re-install. See `install.py:1352
-    // _run_lightweight` and the env-write block in
-    // `_lightweight_rewrite_paths`.
-    let services_state = crate::services::adoption::read();
-    let pick_port = |name: &str, default: u16| -> u16 {
-        if let Some(svc) = services_state.get(name) {
-            match svc.mode {
-                crate::services::adoption::AdoptionMode::Parallel => {
-                    if let Some(p) = svc.parallel_port {
-                        return p;
-                    }
-                }
-                crate::services::adoption::AdoptionMode::Adopt => {
-                    if let Some(url) = svc.external_url.as_deref() {
-                        let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-                        let host_port = after.split('/').next().unwrap_or(after);
-                        if let Some(p) =
-                            host_port.rsplit(':').next().and_then(|s| s.parse::<u16>().ok())
-                        {
-                            return p;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        default
-    };
-    let weaviate_port = pick_port("weaviate", DEFAULT_WEAVIATE_PORT);
-    let ollama_port = pick_port("ollama", DEFAULT_OLLAMA_PORT);
-    let code_embed_port = pick_port("code_embed", DEFAULT_CODE_EMBED_PORT);
-    cmd.env("WEAVIATE_PORT", weaviate_port.to_string())
-        .env("OLLAMA_PORT", ollama_port.to_string())
-        .env("CODE_EMBED_PORT", code_embed_port.to_string());
+    // does — from the ONE home (`machine_service_ports`, v0.2.97 lane
+    // X: app_state override → services.toml adoption → default).
+    // install.py's lightweight branch reads these so a port override
+    // survives a re-install. See `install.py:1352 _run_lightweight` and
+    // the env-write block in `_lightweight_rewrite_paths`.
+    let ports = crate::mcp_registration::machine_service_ports();
+    cmd.env("WEAVIATE_PORT", ports.weaviate_port.to_string())
+        .env("OLLAMA_PORT", ports.ollama_port.to_string())
+        .env("CODE_EMBED_PORT", ports.code_embed_port.to_string());
 
     #[cfg(windows)]
     {
@@ -3262,12 +3227,8 @@ async fn run_install_orchestrator_lightweight(
         95.0,
     );
     let install_root_path = std::path::PathBuf::from(install_path.to_string_lossy().to_string());
-    let ports = crate::mcp_registration::ServicePorts {
-        weaviate_port,
-        ollama_port,
-        grpc_port: crate::mcp_registration::DEFAULT_GRPC_PORT,
-        code_embed_port,
-    };
+    // v0.2.97 (lane X): same ONE port source resolved above for the env
+    // hand-off — `machine_service_ports` (grpc: env → default).
     let db_for_register = window.app_handle().try_state::<Db>();
     let db_ref = db_for_register.as_ref().map(|s| s.inner());
     match crate::mcp_registration::register_default_orchestrator_mcps(
@@ -3942,15 +3903,13 @@ fn start_found_hub_after_update(
 /// both the synchronous (PostInstall) and background-thread (AbortRecovery)
 /// arms share ONE poll implementation.
 fn poll_hub_health_for_30s(root: &Path) -> bool {
-    let port_path = root.join("hub.port");
+    let port_path = root.join(vct_launcher_core::services::hub_port::HUB_PORT_FILE);
     let token_path = root.join("hub.token");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if port_path.exists() && token_path.exists() {
             // Both files there — try the /health probe.
-            let port = std::fs::read_to_string(&port_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u16>().ok());
+            let port = vct_launcher_core::services::hub_port::read_hub_port_file_in(root).ok();
             let token = std::fs::read_to_string(&token_path)
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -11410,6 +11369,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn detect_probe_urls_follow_the_machine_chain() {
+        // v0.2.97 (lane X): an app_state override must reach the wizard's
+        // detection probes (the compiled-in defaults it replaces could
+        // not see one).
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let (w, _o, _c) = detect_probe_urls();
+        assert_eq!(w, "http://localhost:8081/v1/meta");
+        let db = vct_launcher_core::db::Db::open().unwrap();
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        let (w, _o, _c) = detect_probe_urls();
+        assert_eq!(w, "http://localhost:18081/v1/meta");
+    }
 
     // ── v0.2.60 Piece 5: min_upgradable_from version floor ──────────────
 

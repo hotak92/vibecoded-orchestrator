@@ -214,6 +214,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NotRequired, Optional, TypedDict
 
 from vco_lib import jsonc_edit, settings_refusal
+from vco_lib import service_endpoints as _service_endpoints
 from vco_lib.atomic import atomic_rewrite_text
 # v0.2.92 W18 — the tri-state probe result. Imported from `weaviate_helpers`
 # because that module is `vco_lib`'s dependency-free leaf (stdlib only), which
@@ -1845,9 +1846,9 @@ def project_env_from_db(
     ollama_url_override: str | None = None,
     active_embedding_override: str | None = None,
     shared_kg_default: str | None = None,
-    weaviate_port_default: int = 8081,
-    ollama_port_default: int = 11435,
-    code_embed_port_default: int = 11440,
+    weaviate_port_default: int | None = None,
+    ollama_port_default: int | None = None,
+    code_embed_port_default: int | None = None,
     orchestrator_root: Path | None = None,
 ) -> ProjectEnvBundle:
     """Resolve the complete canonical env bundle for a project.
@@ -1868,21 +1869,26 @@ def project_env_from_db(
     treat omission as the signal to remove the key from existing
     surfaces (see :func:`apply_project_env`).
 
-    PURE FUNCTION: same DB state in → same dict out. No filesystem writes,
-    no caching, no environment-variable reads (overrides come in via
-    explicit keyword arguments so test fixtures can pin them).
+    PURE FUNCTION over its inputs: same DB state in → same dict out. No
+    filesystem writes, no caching. The one environment read is the machine's
+    Weaviate statement (``VCT_WEAVIATE_URL``), consulted only when no caller
+    pins the URL — see :mod:`vco_lib.service_endpoints`. The projected
+    transport ``WEAVIATE_URL`` is never read. Test fixtures pin values through
+    the keyword arguments.
 
     Args:
         project_id: The project's UUID (the ``projects.id`` column).
         db_path: Optional override of the launcher DB location. Defaults
             to :func:`_resolve_launcher_db_path`. Tests should pass an
             explicit path to avoid touching the real ``~/.vct/launcher.db``.
-        weaviate_url_override: Pin the WEAVIATE_URL value (otherwise
-            derived from ``http://localhost:<weaviate_port_default>``).
-            The Rust resolver pulls this from ``LocalConfig`` /
-            ``services.toml``; this Python contract takes the resolved
-            value as an explicit arg so the caller can plumb their own
-            services-config reader if needed.
+        weaviate_url_override: Pin the WEAVIATE_URL value. Unpinned, it is
+            this machine's Weaviate as
+            :func:`vco_lib.service_endpoints.machine_weaviate_url` resolves
+            it — ``VCT_WEAVIATE_URL`` / ``vct-config.toml``, the app_state
+            port override, the ``services.toml`` adoption, 8081 — the same
+            chain the hub's ``/config`` serves (v0.2.97 lane W; before, an
+            unpinned call always projected ``localhost:8081``). The launcher
+            pins it with its own Rust resolution.
         ollama_url_override: Same shape, for OLLAMA_URL.
         active_embedding_override: Pin ACTIVE_EMBEDDING; otherwise read
             from ``module_settings`` (orchestrator-core /
@@ -1911,12 +1917,15 @@ def project_env_from_db(
 
             Explicit string overrides (CLI tests, white-label installs)
             still win and skip the DB-read.
-        weaviate_port_default: Port to use when constructing
-            ``WEAVIATE_URL`` (and as ``WEAVIATE_PORT``). Default 8081.
-        ollama_port_default: Port for OLLAMA_URL / OLLAMA_PORT. Default
-            11435.
-        code_embed_port_default: Port for CODE_EMBED_URL / CODE_EMBED_PORT.
-            Default 11440.
+        weaviate_port_default: The port of the chain's LAST leg — used
+            when neither the machine statement, the app_state override nor
+            the ``services.toml`` adoption names one (``None`` = 8081).
+            ``WEAVIATE_PORT`` is the resolved URL's port (or this value when
+            the URL is pinned).
+        ollama_port_default: Same, for OLLAMA_URL / OLLAMA_PORT
+            (``None`` = 11435; chain: override → adoption → default).
+        code_embed_port_default: Same, for CODE_EMBED_URL /
+            CODE_EMBED_PORT (``None`` = 11440).
         orchestrator_root: The orchestrator clone to emit
             ``VCT_ORCHESTRATOR_ROOT`` / ``VCT_INFRASTRUCTURE_DIR`` /
             ``VCT_INSTALL_ROOT`` for. When ``None`` (default, and what the
@@ -2172,23 +2181,64 @@ def project_env_from_db(
         # v0.2.97: the keys whose pre-v0.2.73 in-tree VALUES every apply
         # removes (see ProjectEnvBundle.user_secret_known_keys).
         user_secret_known_keys = _fetch_user_secret_known_keys(conn, project_id)
+        # v0.2.97 (lane W): the app_state port overrides, read while the
+        # connection is open; composed below through the ONE service-endpoint
+        # rule (vco_lib/service_endpoints.py, mirrored by the hub).
+        port_overrides = {
+            service: _service_endpoints.read_port_override(conn, service)
+            for service in _service_endpoints.SERVICES
+        }
     finally:
         try:
             conn.close()
         except sqlite3.Error:
             pass
 
-    # Compose URLs from ports (matches Rust's
-    # `format!("http://localhost:{}", weaviate_port)`).
-    weaviate_url = (
-        weaviate_url_override
-        or f"http://localhost:{weaviate_port_default}"
+    # Service endpoints. A caller-pinned value wins; otherwise the machine's
+    # answer — the same chain `service_endpoints.rs` gives the hub's
+    # `/config` and the launcher's `populate`, so the three agree.
+    _services_state: Optional[dict] = None
+
+    def _adoption(service: str):
+        nonlocal _services_state
+        if _services_state is None:
+            from vco_lib.service_adoption import read_services_toml  # noqa: PLC0415
+
+            _services_state = read_services_toml()
+        return _service_endpoints.adoption_row(_services_state, service)
+
+    # A `*_port_default` is exactly that: the port of the LAST leg, used
+    # when nothing on the machine states another. (The launcher passes the
+    # ports it resolved through the same chain, so the two cannot differ.)
+    if weaviate_url_override:
+        weaviate_url = weaviate_url_override
+        weaviate_port = (
+            weaviate_port_default
+            if weaviate_port_default is not None
+            else _service_endpoints.weaviate_port_for_url(weaviate_url)
+        )
+    else:
+        weaviate_url = _service_endpoints.resolve_weaviate_url(
+            _service_endpoints.machine_weaviate_url_statement(
+                orchestrator_root
+                if orchestrator_root is not None
+                else _orchestrator_root_from_module()
+            ),
+            port_overrides["weaviate"],
+            _adoption("weaviate"),
+            default_port=weaviate_port_default,
+        )
+        weaviate_port = _service_endpoints.weaviate_port_for_url(weaviate_url)
+    ollama_port = _service_endpoints.resolve_port(
+        "ollama", port_overrides["ollama"], _adoption("ollama"),
+        default_port=ollama_port_default,
     )
-    ollama_url = (
-        ollama_url_override
-        or f"http://localhost:{ollama_port_default}"
+    code_embed_port = _service_endpoints.resolve_port(
+        "code_embed", port_overrides["code_embed"], _adoption("code_embed"),
+        default_port=code_embed_port_default,
     )
-    code_embed_url = f"http://localhost:{code_embed_port_default}"
+    ollama_url = ollama_url_override or f"http://localhost:{ollama_port}"
+    code_embed_url = f"http://localhost:{code_embed_port}"
 
     # Build the canonical env map. Keys with None/empty value are OMITTED.
     # We use a plain dict because Python's dict is insertion-ordered
@@ -2283,11 +2333,11 @@ def project_env_from_db(
     # of this function, reaching `.claude/env` only, in the defaulted form.
     # See SHELL_DEFAULTED_ENV_KEYS.)
     _set("WEAVIATE_URL", weaviate_url)
-    _set("WEAVIATE_PORT", str(weaviate_port_default))
+    _set("WEAVIATE_PORT", str(weaviate_port))
     _set("OLLAMA_URL", ollama_url)
-    _set("OLLAMA_PORT", str(ollama_port_default))
+    _set("OLLAMA_PORT", str(ollama_port))
     _set("CODE_EMBED_URL", code_embed_url)
-    _set("CODE_EMBED_PORT", str(code_embed_port_default))
+    _set("CODE_EMBED_PORT", str(code_embed_port))
 
     # NOTE (WP-Q item 3 / G6): RL_SERVER_PORT / RL_SERVER_URL are DELIBERATELY
     # NOT projected here. Per the H.1 design contract (see
@@ -3967,6 +4017,7 @@ def _cli_apply(args: argparse.Namespace) -> int:
             orchestrator_root=(
                 Path(args.orchestrator_root) if args.orchestrator_root else None
             ),
+            weaviate_url_override=args.weaviate_url,
             weaviate_port_default=args.weaviate_port,
             ollama_port_default=args.ollama_port,
             code_embed_port_default=args.code_embed_port,
@@ -4206,9 +4257,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--orchestrator-root", default=None,
         help="path to orchestrator clone (emits VCT_ORCHESTRATOR_ROOT etc.)",
     )
-    p_apply.add_argument("--weaviate-port", type=int, default=8081)
-    p_apply.add_argument("--ollama-port", type=int, default=11435)
-    p_apply.add_argument("--code-embed-port", type=int, default=11440)
+    # v0.2.97 (lane W): unset = this machine's value (vco_lib.service_endpoints);
+    # the launcher passes its own Rust resolution.
+    p_apply.add_argument("--weaviate-url", default=None)
+    p_apply.add_argument("--weaviate-port", type=int, default=None)
+    p_apply.add_argument("--ollama-port", type=int, default=None)
+    p_apply.add_argument("--code-embed-port", type=int, default=None)
     p_apply.set_defaults(handler=_cli_apply)
 
     p_list = sub.add_parser(

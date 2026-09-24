@@ -195,20 +195,30 @@ _hub_request_max_time() {
 }
 
 # ── Hub port discovery ──────────────────────────────────────────────────
+# A valid hub port is an integer in 1..65535; an invalid VCT_HUB_PORT falls
+# through to hub.port, then 7700 (v0.2.97 owner ruling). MUST MATCH
+# `vct_project_config.sh::_hub_port_value` / `hub_port` (which also warns)
+# and `vco_lib/hub_ensure.py::resolve_hub_port`. Pinned for every client by
+# `tests/test_v0297_hub_port_clients.py`.
+_hub_port_value() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    [[ "$v" =~ ^[0-9]{1,10}$ ]] || return 1
+    (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
+    printf '%s\n' "$((10#$v))"
+}
+
 hub_port() {
     if [[ -n "${VCT_HUB_PORT:-}" ]]; then
-        printf '%s\n' "$VCT_HUB_PORT"
-        return 0
+        _hub_port_value "$VCT_HUB_PORT" && return 0
     fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
     local port_file="$state_dir/hub.port"
     if [[ -f "$port_file" ]]; then
         local p
-        p=$(tr -d '[:space:]' < "$port_file")
-        if [[ -n "$p" ]]; then
-            printf '%s\n' "$p"
-            return 0
-        fi
+        p=$(tr -d '[:space:]' < "$port_file" 2>/dev/null)
+        _hub_port_value "$p" && return 0
     fi
     # Default — matches launcher's server.rs::DEFAULT_PORT.
     printf '7700\n'

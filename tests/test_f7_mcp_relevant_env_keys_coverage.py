@@ -45,7 +45,9 @@ WEAVIATE_MCP_DIR = REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp"
 DOCUMENTED_EXCLUSIONS: frozenset[str] = frozenset(
     {
         # Never in settings.json env — resolved from hub files / per call.
-        "VCT_HUB_PORT",
+        # (VCT_HUB_PORT was here until v0.2.97: the MCP now reads the port
+        # through `vco_lib.hub_ensure.resolve_hub_port`, so no literal read of
+        # it is left in weaviate_mcp for this grep to find.)
         "VCT_HUB_TOKEN",
         # v0.2.91 (WP-D item 4): the hermeticity guard for the stale-env
         # token fallback. Same channel as the VCT_HUB_TOKEN it guards — a

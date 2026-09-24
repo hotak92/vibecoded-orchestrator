@@ -531,6 +531,67 @@ fn free_bytes_at(_path: &Path) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Which runtime owns the volumes (v0.2.97 owner ruling "Honour the pin")
+// ---------------------------------------------------------------------------
+
+/// The orchestrator volumes under the runtime storage commands drive
+/// (`storage_ux::storage_runtime`, the shared pin-first detector) — or a
+/// REFUSAL when they exist only under the other runtime.
+///
+/// Pre-v0.2.97 this file listed volumes under whichever runtime answered
+/// first (podman, then docker) and ran `compose stop` / `volume rm` under a
+/// separate podman-first PATH probe — both ignoring `VCT_CONTAINER_RUNTIME`.
+/// On a docker-pinned machine with a leftover podman copy, that inspected
+/// and migrated the podman copy. podman and docker keep separate volumes, so
+/// a volume only the other runtime has is refused, never adopted.
+async fn existing_volumes_owned_by(
+    rt: &super::storage_ux::StorageRuntime,
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    use vct_launcher_core::services::container_runtime::{check_runtime_owns, other_runtime};
+    let under_chosen = super::installer::detect_existing_volumes_under(&rt.name).await;
+    if !under_chosen.is_empty() {
+        return Ok(under_chosen);
+    }
+    let under_other = super::installer::detect_existing_volumes_under(other_runtime(&rt.name)).await;
+    let names: Vec<String> = under_other.iter().map(|v| format!("`{}`", v.name)).collect();
+    check_runtime_owns(
+        action,
+        &format!("the orchestrator volume(s) {}", names.join(", ")),
+        &rt.name,
+        rt.pin,
+        false,
+        !under_other.is_empty(),
+    )?;
+    Ok(Vec::new())
+}
+
+/// [`existing_volumes_owned_by`] for the read-only and install-time
+/// commands. No usable runtime → an empty list, as before (a machine before
+/// its first install has none); the only error is the ownership refusal.
+async fn existing_volumes_on_storage_runtime(
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    let install_root = super::installer::find_local_repo_root().ok();
+    existing_volumes_on_storage_runtime_at(install_root.as_deref(), action).await
+}
+
+/// [`existing_volumes_on_storage_runtime`] with the install root passed in
+/// (tests point it at a temp dir, so no machine's `runtime.txt` leaks in).
+async fn existing_volumes_on_storage_runtime_at(
+    install_root: Option<&Path>,
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    match super::storage_ux::storage_runtime_at(install_root).await {
+        Ok(rt) => existing_volumes_owned_by(&rt, action).await,
+        Err(e) => {
+            tracing::info!("[volumes] no usable container runtime ({e}); no existing volumes");
+            Ok(Vec::new())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
 
@@ -539,7 +600,7 @@ fn free_bytes_at(_path: &Path) -> Option<u64> {
 #[command]
 pub async fn get_volumes_config() -> Result<VolumesConfig, String> {
     let cfg = read_launcher_config();
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    let existing = existing_volumes_on_storage_runtime("inspect").await?;
 
     // Compute per-volume sizes by `du`-walking each mountpoint.
     let mut volumes: Vec<VolumeWithSize> = Vec::new();
@@ -598,7 +659,7 @@ pub async fn set_volumes_config_for_install(
 ) -> Result<VolumesConfig, String> {
     // Read existing first — if anything is found, we go down the
     // "detected" branch regardless of what the caller passed.
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    let existing = existing_volumes_on_storage_runtime("adopt").await?;
     if !existing.is_empty() {
         let mut mapping: Vec<LegacyVolumeMapping> = Vec::new();
         for ev in &existing {
@@ -695,7 +756,7 @@ fn write_volumes_env_var(path: &Path) -> Result<(), String> {
 #[command]
 pub async fn set_volumes_config_dry_run(path: String) -> Result<MigrationPlan, String> {
     let cfg = read_launcher_config();
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    let existing = existing_volumes_on_storage_runtime("plan a migration of").await?;
 
     let target = if path.trim() == "default" || path.trim().is_empty() {
         // Migrating BACK to default: target path is the runtime default.
@@ -820,12 +881,12 @@ pub async fn migrate_volumes(
     let _plan = set_volumes_config_dry_run(path.clone()).await?;
     let target = validate_custom_volumes_path(path.trim())?;
 
-    // The one podman-then-docker PATH probe (v0.2.97 review R6: this file
-    // walked `$PATH` by hand, and missed `podman.exe` on Windows).
-    let runtime = super::storage_ux::which_runtime()
-        .ok_or("no container runtime (podman/docker) found on PATH")?;
-
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    // The shared pin-first runtime (v0.2.97 owner ruling "Honour the pin"),
+    // and only the volumes THAT runtime owns — refused before anything stops
+    // when they exist only under the other one.
+    let storage = super::storage_ux::storage_runtime().await?;
+    let existing = existing_volumes_owned_by(&storage, "migrate").await?;
+    let runtime = storage.name;
     if existing.is_empty() {
         return Err("no existing volumes to migrate".into());
     }
@@ -1040,8 +1101,8 @@ async fn wait_until_healthy(timeout_secs: u64) -> bool {
 
 // Force ExistingVolume to be used so the import isn't dead code (the
 // type is consumed implicitly via tokio process JSON deserialization
-// inside detect_existing_volumes_for_volumes_module which we delegate
-// to via super::installer).
+// inside `installer::detect_existing_volumes_under`, which
+// `existing_volumes_owned_by` delegates to).
 #[allow(dead_code)]
 fn _force_existing_volume_used(_: ExistingVolume) {}
 
@@ -1052,6 +1113,87 @@ fn _force_existing_volume_used(_: ExistingVolume) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- v0.2.97 owner ruling "Honour the pin" ---------------------------
+
+    #[cfg(unix)]
+    use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+    #[cfg(unix)]
+    use crate::commands::storage_ux::StorageRuntime;
+    #[cfg(unix)]
+    use vct_launcher_core::services::container_runtime::RuntimePinSource;
+
+    /// docker is pinned but the orchestrator volumes exist only under podman:
+    /// the migration is REFUSED (naming both runtimes and the fix) instead of
+    /// the pre-v0.2.97 behaviour — list podman's volumes, then drive podman.
+    #[cfg(unix)]
+    #[test]
+    fn volumes_only_the_other_runtime_owns_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data", "ollama_data"]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap_err();
+        for needle in [
+            "refusing to migrate the orchestrator volume(s) `weaviate_data`, `ollama_data`",
+            "exists only under podman",
+            "VCT_CONTAINER_RUNTIME=docker",
+            "set VCT_CONTAINER_RUNTIME=podman",
+        ] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
+    }
+
+    /// Leave-alone: the runtime VCO drives owns the volumes → exactly its
+    /// copies, even when the other runtime also has some; nobody has any →
+    /// an empty list, not a refusal.
+    #[cfg(unix)]
+    #[test]
+    fn volumes_the_chosen_runtime_owns_are_used() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data", "ollama_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let found = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap();
+        let mounts: Vec<&str> = found.iter().map(|v| v.mountpoint.as_str()).collect();
+        assert_eq!(mounts, ["/fake/docker/weaviate_data", "/fake/docker/ollama_data"]);
+
+        let empty = tempfile::tempdir().unwrap();
+        fake_runtime(empty.path(), "podman", &[]);
+        fake_runtime(empty.path(), "docker", &[]);
+        let none = with_fake_runtimes(empty.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"));
+        assert!(none.unwrap().is_empty());
+    }
+
+    /// The read-only commands go through the pin: with docker pinned they
+    /// list docker's volumes, not podman's; unpinned they still list
+    /// podman's first; a recorded `runtime.txt` pins like the env does. The
+    /// install root is a temp dir, so this machine's own `runtime.txt` (a
+    /// developer checkout may have one) cannot change the answer.
+    #[cfg(unix)]
+    #[test]
+    fn listing_follows_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data"]);
+        let root = tempfile::tempdir().unwrap();
+        let list = |pin: Option<&str>| {
+            with_fake_runtimes(
+                dir.path(),
+                pin,
+                existing_volumes_on_storage_runtime_at(Some(root.path()), "inspect"),
+            )
+            .unwrap()
+        };
+        assert_eq!(list(Some("docker"))[0].mountpoint, "/fake/docker/weaviate_data");
+        assert_eq!(list(None)[0].mountpoint, "/fake/podman/weaviate_data");
+
+        std::fs::create_dir_all(root.path().join("state/install")).unwrap();
+        std::fs::write(root.path().join("state/install/runtime.txt"), "docker\n").unwrap();
+        assert_eq!(list(None)[0].mountpoint, "/fake/docker/weaviate_data");
+    }
 
     /// Replace every Python triple-quoted docstring (both """ and ''')
     /// with whitespace of the same length. Used by the source-level

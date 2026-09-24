@@ -327,9 +327,10 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
     // ONE machine-global Weaviate URL, while `project_kg_bindings` carries a
     // per-row `weaviate_url` column. That column is only ever PRESERVED
     // (`project_identity` carries it forward on a rewrite) — no resolver reads
-    // it: the hub serves `LocalConfig::load().weaviate_url` and
-    // `project_env_settings::populate` builds `http://localhost:{port}`. So
-    // every retrieval client sees the same instance this snapshot describes,
+    // it: the hub's `/config`, every project's env and this boot sweep all
+    // resolve the ONE machine URL (`vct_launcher_core::services::
+    // service_endpoints`, v0.2.97). So every retrieval client sees the same
+    // instance this snapshot describes,
     // and "absent here" means "absent for that client". If a per-project
     // Weaviate URL ever becomes a real resolver leg, this sweep (and the
     // code-graph one below, which has the same exposure) must fetch per URL

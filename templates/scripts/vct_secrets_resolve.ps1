@@ -155,17 +155,34 @@ function Get-HubRequestTimeoutMs {
     return [int]$left
 }
 
+# A valid hub port is an integer in 1..65535; an invalid VCT_HUB_PORT falls
+# through to hub.port, then 7700 (v0.2.97 owner ruling). MUST MATCH
+# `vct_project_config.ps1::ConvertTo-HubPort` / `Get-HubPort` (which also
+# warns) and `vco_lib/hub_ensure.py::resolve_hub_port`. Pinned for every
+# client by `tests/test_v0297_hub_port_clients.py`.
+function ConvertTo-HubPort {
+    param([string]$Value)
+    if ($null -eq $Value) { return $null }
+    $v = $Value.Trim()
+    if ($v -match '^\d{1,10}$') {
+        $n = [long]$v
+        if ($n -ge 1 -and $n -le 65535) { return [int]$n }
+    }
+    return $null
+}
+
 function Get-HubPort {
     if ($Env:VCT_HUB_PORT) {
-        return [int]$Env:VCT_HUB_PORT
+        $fromEnv = ConvertTo-HubPort $Env:VCT_HUB_PORT
+        if ($null -ne $fromEnv) { return $fromEnv }
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
     $portFile = Join-Path $stateDir "hub.port"
     if (Test-Path $portFile) {
-        $raw = (Get-Content -Raw -Path $portFile).Trim()
-        if ($raw -match '^\d+$') {
-            return [int]$raw
-        }
+        $raw = $null
+        try { $raw = Get-Content -Raw -Path $portFile -ErrorAction Stop } catch { }
+        $fromFile = ConvertTo-HubPort $raw
+        if ($null -ne $fromFile) { return $fromFile }
     }
     return 7700
 }

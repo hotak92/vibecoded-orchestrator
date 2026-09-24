@@ -111,52 +111,6 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a bundled `.claude/scripts/<bin>` helper via the canonical
-/// four-tier ladder, or `None` if it isn't found anywhere.
-///
-/// v0.2.77 (Part 7c task 3): the ONE home for the "find an installed
-/// script by name" motif. `kg_sync::resolve_kg_sync_script` and
-/// `kg_summary::resolve_summary_script` were byte-for-byte identical
-/// copies of this ladder differing only in the `bin` string; both now
-/// delegate here.
-///
-/// The tiers, in order:
-///   1. **Project-local** — `<project_folder>/.claude/scripts/<bin>`. The
-///      normal case for an installed project.
-///   2. **Env override** — `$VCT_LAUNCHER_SCRIPTS_DIR/<bin>`. Lets a dev
-///      launcher point at an in-development scripts dir.
-///   3. **Sibling-of-exe** — walk `ORCHESTRATOR_HOP_SUFFIXES` from the
-///      launcher binary's directory, probing `<hop>/.claude/scripts/<bin>`
-///      at each. Covers a launcher run from inside / next to the
-///      orchestrator clone.
-///   4. **PATH** — `<path-dir>/<bin>` for each `$PATH` entry (a globally
-///      installed copy).
-///
-/// Matches on `is_file()` at every tier. Note this does NOT append a
-/// Windows extension — callers pass the fully-qualified `bin` (e.g.
-/// `kg-sync.ps1` on Windows, `kg-sync` on POSIX), matching the existing
-/// call-sites' `if cfg!(windows) { "x.ps1" } else { "x" }` selection.
-///
-/// This is the ladder WITHOUT the codegraph stale-wrapper health guard —
-/// that guard (`analyzer_wrapper_is_resilient`) is codegraph-specific and
-/// deliberately stays in `commands::codegraph`, which layers it on top of
-/// its own tier-1 check before falling through to the shared tiers.
-/// Relative hops from the launcher binary's own directory to a candidate
-/// orchestrator-clone root, probed as `<exe_dir>/<hop>/.claude/scripts/<bin>`.
-///
-/// v0.2.92 (field bug 2026-09-05) — the list used to stop at `../..`, and the
-/// SHIPPED layout puts the binary at `<root>/launcher/dist/<target>/vct-launcher`,
-/// whose root is `../../..`. So on a standard install this tier could never
-/// resolve anything: the three probes landed on `dist/<target>/.claude/scripts`,
-/// `dist/.claude/scripts` and `launcher/.claude/scripts`, none of which exist.
-/// With `$VCT_LAUNCHER_SCRIPTS_DIR` unset and `.claude/scripts` not on `$PATH`
-/// — the default for every user — the whole "fall back to the orchestrator
-/// copy" mechanism was unreachable, and the code-graph build that relied on it
-/// died with "script not found" while a deferral asserted "builds still work".
-///
-/// `../../..` covers the shipped `launcher/dist/<target>/` layout;
-/// `../../../..` covers a cargo dev build at `launcher/src-tauri/target/<profile>/`.
-/// Order is nearest-first: a genuinely adjacent clone still wins.
 /// The directories every launcher PATH lookup walks ([`which_on_path`], the
 /// script ladders): the process `PATH` — unless the calling THREAD injected
 /// one with [`with_lookup_path`] (debug/test builds only).
@@ -219,16 +173,87 @@ pub fn with_lookup_path<T>(path: Option<&std::ffi::OsStr>, f: impl FnOnce() -> T
     f()
 }
 
+/// Relative hops from the launcher binary's own directory to a candidate
+/// orchestrator-clone root, probed as `<exe_dir>/<hop>/.claude/scripts/<bin>`.
+///
+/// v0.2.92 (field bug 2026-09-05) — the list used to stop at `../..`, and the
+/// SHIPPED layout puts the binary at `<root>/launcher/dist/<target>/vct-launcher`,
+/// whose root is `../../..`. So on a standard install this tier could never
+/// resolve anything: the three probes landed on `dist/<target>/.claude/scripts`,
+/// `dist/.claude/scripts` and `launcher/.claude/scripts`, none of which exist.
+/// With `$VCT_LAUNCHER_SCRIPTS_DIR` unset and `.claude/scripts` not on `$PATH`
+/// — the default for every user — the whole "fall back to the orchestrator
+/// copy" mechanism was unreachable, and the code-graph build that relied on it
+/// died with "script not found" while a deferral asserted "builds still work".
+///
+/// `../../..` covers the shipped `launcher/dist/<target>/` layout;
+/// `../../../..` covers a cargo dev build at `launcher/src-tauri/target/<profile>/`.
+/// Order is nearest-first: a genuinely adjacent clone still wins.
 pub const ORCHESTRATOR_HOP_SUFFIXES: [&str; 5] =
     [".", "..", "../..", "../../..", "../../../.."];
 
+/// Resolve a bundled `.claude/scripts/<bin>` helper via the canonical
+/// four-tier ladder, or `None` if it isn't found anywhere.
+///
+/// v0.2.77 (Part 7c task 3): the ONE home for the "find an installed
+/// script by name" motif. `kg_sync::resolve_kg_sync_script` and
+/// `kg_summary::resolve_summary_script` were byte-for-byte identical
+/// copies of this ladder differing only in the `bin` string. Since v0.2.92
+/// both resolve through the guarded `commands::codegraph::resolve_bundled_script`,
+/// which is built from this ladder's own pieces (see the last paragraph).
+///
+/// The tiers, in order:
+///   1. **Project-local** — `<project_folder>/.claude/scripts/<bin>`. The
+///      normal case for an installed project.
+///   2. **Env override** — `$VCT_LAUNCHER_SCRIPTS_DIR/<bin>`. Lets a dev
+///      launcher point at an in-development scripts dir.
+///   3. **Sibling-of-exe** — walk `ORCHESTRATOR_HOP_SUFFIXES` from the
+///      launcher binary's directory, probing `<hop>/.claude/scripts/<bin>`
+///      at each. Covers a launcher run from inside / next to the
+///      orchestrator clone.
+///   4. **PATH** — `<path-dir>/<bin>` for each `$PATH` entry (a globally
+///      installed copy).
+///
+/// Matches on `is_file()` at every tier. Note this does NOT append a
+/// Windows extension — callers pass the fully-qualified `bin` (e.g.
+/// `kg-sync.ps1` on Windows, `kg-sync` on POSIX), matching the existing
+/// call-sites' `if cfg!(windows) { "x.ps1" } else { "x" }` selection.
+///
+/// This is the ladder WITHOUT the codegraph stale-wrapper health guard —
+/// that guard (`analyzer_wrapper_is_resilient`) is codegraph-specific and
+/// deliberately stays in `commands::codegraph::resolve_bundled_script`, which
+/// vets [`project_script_path`] and falls through to
+/// [`resolve_orchestrator_script`] — tier 1's candidate and tiers 2-4 of THIS
+/// ladder, so there is one ladder.
 pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> Option<PathBuf> {
     // 1. Project-local.
-    let p1 = project_folder.join(".claude").join("scripts").join(bin);
-    if p1.is_file() {
-        return Some(p1);
+    let local = project_script_path(project_folder, bin);
+    if local.is_file() {
+        return Some(local);
     }
+    // 2-4. The orchestrator copy.
+    resolve_orchestrator_script(bin)
+}
 
+/// Tier 1's candidate: `<project_folder>/.claude/scripts/<bin>` (existence
+/// not checked). Exposed so a caller that must vet the project-local copy
+/// before trusting it (`commands::codegraph::resolve_bundled_script`, the
+/// stale-wrapper guard) builds the SAME path this ladder probes.
+pub fn project_script_path(project_folder: &std::path::Path, bin: &str) -> PathBuf {
+    project_folder.join(".claude").join("scripts").join(bin)
+}
+
+/// Tiers 2-4 of [`resolve_installed_script`]: the ORCHESTRATOR copy of
+/// `<bin>`, via `$VCT_LAUNCHER_SCRIPTS_DIR`, then sibling-of-exe
+/// ([`ORCHESTRATOR_HOP_SUFFIXES`]), then [`lookup_path`]. First `is_file()`
+/// hit wins.
+///
+/// v0.2.97 (lane T): the one home for these tiers. `commands::codegraph`
+/// carried a second copy of them, through which every bundled-wrapper spawn —
+/// code-graph-analyze, kg-sync, kg-duplicates, generate-kg-summary — actually
+/// resolved, so a fix made here reached none of them. Pinned by
+/// `codegraph::build_tests::bundled_script_fallback_tiers_are_the_shared_ladder`.
+pub fn resolve_orchestrator_script(bin: &str) -> Option<PathBuf> {
     // 2. Env override.
     if let Ok(dir) = std::env::var("VCT_LAUNCHER_SCRIPTS_DIR") {
         let p2 = PathBuf::from(dir).join(bin);
@@ -249,7 +274,8 @@ pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> 
         }
     }
 
-    // 4. PATH lookup.
+    // 4. PATH lookup (`lookup_path`: tests inject one per thread instead of
+    // setting the shared process PATH — review R6).
     if let Some(path) = lookup_path() {
         for d in std::env::split_paths(&path) {
             let p4 = d.join(bin);

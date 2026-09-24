@@ -5,7 +5,7 @@ short_desc: Gradio web apps with WCAG 2.1 AA accessibility + workflows
 keywords: [Gradio, "Gradio app", "gr.Blocks", "WCAG 2.1", "Python GUI", "progressive disclosure", "UI design", "Gradio components", "Python web UI", "dashboard Python"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # GUI Expert Agent

@@ -1364,13 +1364,11 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
             os.path.expanduser("~"), ".vct"
         )
 
-        port = os.environ.get("VCT_HUB_PORT")
-        if not port:
-            try:
-                with open(os.path.join(state_dir, "hub.port"), encoding="utf-8") as fh:
-                    port = fh.read().strip()
-            except OSError:
-                port = "7700"
+        # The ONE Python hub-port reader (v0.2.97; this read the env and the
+        # file verbatim, so a garbage value became the URL).
+        from vco_lib.hub_ensure import resolve_hub_port
+
+        port = resolve_hub_port(Path(state_dir))
 
         # v0.2.77 Part 8 (flip) — ASSUMPTION PIN: this reads the GLOBAL
         # hub.token (NOT a scoped hub.token.<id>) deliberately. Only the

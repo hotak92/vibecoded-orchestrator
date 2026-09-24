@@ -207,7 +207,7 @@ pub async fn runtime_daemon_responsive(cmd: &str) -> bool {
 
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(cmd)
+        tokio::process::Command::new(crate::paths::spawn_program(cmd))
             .silent()
             .args(["info"])
             .stdout(Stdio::null())
@@ -227,7 +227,7 @@ async fn runtime_binary_present(cmd: &str) -> bool {
 
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(cmd)
+        tokio::process::Command::new(crate::paths::spawn_program(cmd))
             .silent()
             .args(["--version"])
             .stdout(Stdio::null())
@@ -456,6 +456,20 @@ pub fn decide_module_runtime(
 pub async fn detect_container_runtime(
     install_root: Option<&Path>,
 ) -> Result<String, String> {
+    detect_container_runtime_with_pin(install_root)
+        .await
+        .map(|(runtime, _pin)| runtime)
+}
+
+/// [`detect_container_runtime`], also saying which pin (if any) chose the
+/// runtime — what a caller needs to word a refusal that names the knob
+/// (`wrong_runtime_owner_refusal`). v0.2.97 owner ruling "Honour the pin":
+/// the launcher's storage commands (`commands::storage_ux`,
+/// `commands::volumes`) resolve their runtime HERE instead of their own
+/// podman-first PATH probe, which ignored `VCT_CONTAINER_RUNTIME`.
+pub async fn detect_container_runtime_with_pin(
+    install_root: Option<&Path>,
+) -> Result<(String, Option<RuntimePinSource>), String> {
     let env_pref = runtime_preference_from_env();
     let runtime_txt = install_root.and_then(read_runtime_txt);
 
@@ -498,6 +512,73 @@ pub async fn detect_container_runtime(
     }
 
     decide_module_runtime(&order, &probes, pinned)
+        .map(|runtime| (runtime, pinned.map(|(_, source)| source)))
+}
+
+/// The other of the two runtimes VCO drives.
+pub fn other_runtime(runtime: &str) -> &'static str {
+    if runtime == "docker" {
+        "podman"
+    } else {
+        "docker"
+    }
+}
+
+/// The refusal for acting on `object` with `chosen` when the object exists
+/// only under the OTHER runtime (v0.2.97 owner ruling "Honour the pin").
+/// podman and docker keep separate volumes and containers, so the action
+/// would run against a copy that does not hold the user's data — and a
+/// migration would then remove or rebind the wrong thing. Names both
+/// runtimes, what chose `chosen` (the env pin, the install record, or
+/// auto-detection), and the two ways out: repin to the owner and retry, or
+/// move the data into `chosen` first.
+pub fn wrong_runtime_owner_refusal(
+    action: &str,
+    object: &str,
+    chosen: &str,
+    pin: Option<RuntimePinSource>,
+) -> String {
+    let owner = other_runtime(chosen);
+    let why = match pin {
+        Some(RuntimePinSource::EnvOverride) => {
+            format!("VCT_CONTAINER_RUNTIME={chosen} pins VCO to {chosen}")
+        }
+        Some(RuntimePinSource::RuntimeTxt) => format!(
+            "the install recorded {chosen} as this machine's container runtime \
+             (state/install/runtime.txt)"
+        ),
+        None => format!("{chosen} was auto-detected (podman is preferred when both respond)"),
+    };
+    let repin = match pin {
+        Some(RuntimePinSource::EnvOverride) => {
+            format!("unset VCT_CONTAINER_RUNTIME or set VCT_CONTAINER_RUNTIME={owner}")
+        }
+        _ => format!("set VCT_CONTAINER_RUNTIME={owner}"),
+    };
+    format!(
+        "refusing to {action} {object}: it exists only under {owner}, but {why}. \
+         podman and docker keep SEPARATE volumes and containers, so doing this with \
+         {chosen} would act on a copy that does not hold your data. To fix: {repin} \
+         and retry, so it runs under {owner}, which owns the data — or, to stay on \
+         {chosen}, first move the data from {owner} into {chosen} yourself."
+    )
+}
+
+/// The ownership guard, pure: refuse when `chosen` does not own the object
+/// and the other runtime does. When neither owns it the caller's own
+/// "not found" path applies; when `chosen` owns it there is nothing to guard.
+pub fn check_runtime_owns(
+    action: &str,
+    object: &str,
+    chosen: &str,
+    pin: Option<RuntimePinSource>,
+    owned_by_chosen: bool,
+    owned_by_other: bool,
+) -> Result<(), String> {
+    if !owned_by_chosen && owned_by_other {
+        return Err(wrong_runtime_owner_refusal(action, object, chosen, pin));
+    }
+    Ok(())
 }
 
 // ─── GPU passthrough flags (v0.2.54 P0-4) ──────────────────────────────
@@ -881,6 +962,156 @@ pub fn build_podman_run_args(
     engine: &str,
     gpu_mode: Option<GpuMode>,
 ) -> Result<Vec<String>, String> {
+    build_podman_run_args_with_env(
+        manifest, ctx, project, rl_port, container_name, image, engine, gpu_mode, &[], &[],
+    )
+}
+
+/// Env names the spawn sites pass through to the `podman`/`docker` process
+/// itself (after `env_clear`). A secret with one of these names would replace
+/// the runtime's own value, so [`SpawnArgs::new`] refuses to carry it.
+pub const RESERVED_SPAWN_ENV: &[&str] = &[
+    "PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "SYSTEMROOT",
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP",
+];
+
+/// What a container spawn runs: the `podman run` argv and the SECRET values
+/// that must reach the container without appearing in it (v0.2.97, lane V
+/// round 2). Each secret is named in `args` as a bare `-e KEY` — the runtime
+/// then copies `KEY` from ITS OWN environment — and its value lives only in
+/// the secret env, which the spawn site puts on the `podman`/`docker` child
+/// with [`SpawnArgs::apply_secret_env`]. So a value is never in argv (`ps`,
+/// logs) and never on disk. `Debug` is redacted. (The container's own
+/// configuration still holds it: `podman inspect` / `docker inspect` show
+/// every container env value in `Config.Env` — a property of container env,
+/// see docs/VCT_MODULE_MANIFEST_SPEC.md §7.)
+pub struct SpawnArgs {
+    pub args: Vec<String>,
+    secret_env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for SpawnArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnArgs")
+            .field("args", &self.args)
+            .field("secret_keys", &self.secret_keys())
+            .finish()
+    }
+}
+
+impl SpawnArgs {
+    /// Keeps the secrets whose names are not [`RESERVED_SPAWN_ENV`] (a
+    /// reserved one is dropped with a warning naming the key).
+    pub fn new(args: Vec<String>, secrets: Vec<(String, String)>) -> Self {
+        let secret_env = secrets
+            .into_iter()
+            .filter(|(k, _)| {
+                let reserved = RESERVED_SPAWN_ENV.iter().any(|r| r.eq_ignore_ascii_case(k));
+                if reserved {
+                    tracing::warn!(key = %k,
+                        "[container_runtime] a module secret may not be named like the runtime's own env; not injected");
+                }
+                !reserved
+            })
+            .collect();
+        Self { args, secret_env }
+    }
+
+    /// The injected secrets' names (never their values).
+    pub fn secret_keys(&self) -> Vec<&str> {
+        self.secret_env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Put the secret values in the spawned runtime process's environment.
+    /// Call AFTER the site's `env_clear()` + base env.
+    pub fn apply_secret_env(&self, cmd: &mut tokio::process::Command) {
+        for (k, v) in &self.secret_env {
+            cmd.env(k, v);
+        }
+    }
+
+    /// Test-only read of one injected value.
+    #[cfg(any(test, debug_assertions))]
+    pub fn secret_value_for_tests(&self, key: &str) -> Option<&str> {
+        self.secret_env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
+/// What a per-project container/service spawn runs: [`build_podman_run_args`]
+/// plus the module's `runtime.env_from_settings` values for `project`
+/// (`crate::module_settings_env` — project row, else machine-wide row, else
+/// the declared default; unlisted settings never) as `-e KEY=VALUE`, and its
+/// `runtime.env_from_secrets` (`crate::module_secrets_env` — through the
+/// permission gate, THIS project as the requester) as bare `-e KEY` with the
+/// values in [`SpawnArgs`]. `Err` refuses the start: a `required` secret that
+/// did not resolve. v0.2.97 (lane V): the one builder both per-project spawn
+/// paths use — `vct_hub::module_supervisor::start_container_for_module_with_gpu_mode`
+/// and the launcher's `commands::module_service` twin.
+pub fn spawn_args_for_project(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    db: &crate::db::Db,
+) -> Result<SpawnArgs, String> {
+    let settings_env =
+        crate::module_settings_env::resolve_env_from_settings(manifest, Some(&project.id), db);
+    let secret_env =
+        crate::module_secrets_env::resolve_env_from_secrets(manifest, Some(&project.id), db)?;
+    spawn_args_with(
+        manifest, ctx, project, rl_port, container_name, image, engine, gpu_mode, &settings_env,
+        secret_env,
+    )
+}
+
+/// [`spawn_args_for_project`] with the settings and secrets already
+/// resolved.
+pub fn spawn_args_with(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    settings_env: &[(String, String)],
+    secret_env: Vec<(String, String)>,
+) -> Result<SpawnArgs, String> {
+    let draft = SpawnArgs::new(Vec::new(), secret_env);
+    let keys: Vec<String> = draft.secret_keys().into_iter().map(str::to_string).collect();
+    let args = build_podman_run_args_with_env(
+        manifest, ctx, project, rl_port, container_name, image, engine, gpu_mode, settings_env,
+        &keys,
+    )?;
+    Ok(SpawnArgs { args, ..draft })
+}
+
+/// [`build_podman_run_args`] plus caller-resolved `-e KEY=VALUE` pairs,
+/// appended after the manifest's `env_fixed` / `env_derived` (a later `-e`
+/// wins, so a listed setting overrides an author default of the same name).
+/// v0.2.97 (lane V): the spawn sites pass the module's
+/// `runtime.env_from_settings` values here
+/// (`crate::module_settings_env::resolve_env_from_settings`). Values are
+/// passed verbatim — they are resolved settings, not placeholder templates.
+pub fn build_podman_run_args_with_env(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    extra_env: &[(String, String)],
+    // v0.2.97 (lane V round 2): names emitted as a bare `-e KEY` — the
+    // runtime copies the value from its own environment ([`SpawnArgs`]).
+    inherit_env: &[String],
+) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -933,6 +1164,14 @@ pub fn build_podman_run_args(
         let resolved = resolve_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
+    }
+    for (k, v) in extra_env {
+        args.push("-e".into());
+        args.push(format!("{}={}", k, v));
+    }
+    for k in inherit_env {
+        args.push("-e".into());
+        args.push(k.clone());
     }
 
     // Positional: image, then optional command + args (override of image CMD).
@@ -1010,6 +1249,48 @@ pub fn build_podman_run_args_global(
     // second caller genuinely needs argv logging).
     extra_env: &[(String, String)],
 ) -> Result<Vec<String>, String> {
+    build_podman_run_args_global_inheriting(
+        manifest, ctx, rl_port, container_name, image, engine, gpu_mode, extra_env, &[],
+    )
+}
+
+/// What a GLOBAL container spawn runs (v0.2.97, lane V round 2):
+/// [`build_podman_run_args_global`] with `extra_env` (settings, then the
+/// identity pair) and the module's resolved `runtime.env_from_secrets` as
+/// bare `-e KEY`, values carried in [`SpawnArgs`] — never in argv.
+pub fn spawn_args_global(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    extra_env: &[(String, String)],
+    secret_env: Vec<(String, String)>,
+) -> Result<SpawnArgs, String> {
+    let draft = SpawnArgs::new(Vec::new(), secret_env);
+    let keys: Vec<String> = draft.secret_keys().into_iter().map(str::to_string).collect();
+    let args = build_podman_run_args_global_inheriting(
+        manifest, ctx, rl_port, container_name, image, engine, gpu_mode, extra_env, &keys,
+    )?;
+    Ok(SpawnArgs { args, ..draft })
+}
+
+/// [`build_podman_run_args_global`] plus `inherit_env`: names emitted as a
+/// bare `-e KEY` after `extra_env`, the value copied by the runtime from its
+/// own environment ([`SpawnArgs`]).
+pub fn build_podman_run_args_global_inheriting(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    extra_env: &[(String, String)],
+    inherit_env: &[String],
+) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -1082,6 +1363,10 @@ pub fn build_podman_run_args_global(
     for (k, v) in extra_env {
         args.push("-e".into());
         args.push(format!("{}={}", k, v));
+    }
+    for k in inherit_env {
+        args.push("-e".into());
+        args.push(k.clone());
     }
 
     args.push(image.to_string());
@@ -2992,6 +3277,162 @@ mod tests {
         assert!(args.iter().any(|a| a == "127.0.0.1:11533:11438"));
     }
 
+    /// v0.2.97 (lane V): the caller's resolved `env_from_settings` pairs
+    /// become `-e` flags AFTER the manifest's own env (so a setting wins over
+    /// an author default of the same name) and BEFORE the image positional
+    /// (anything after it would be the container's CMD). With no pairs the
+    /// argv equals `build_podman_run_args`'s.
+    #[test]
+    fn build_podman_run_args_with_env_appends_the_settings_before_the_image() {
+        let manifest = make_manifest(true, true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let image = "ghcr.io/hotak92/vct-rl-reranker:0.2.8";
+        let settings = vec![
+            ("ACTIVE_EMBEDDING".to_string(), "qwen3".to_string()),
+            ("RL_SERVER_PORT".to_string(), "12000".to_string()),
+        ];
+        let args = build_podman_run_args_with_env(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &settings, &[],
+        )
+        .expect("build args");
+        let image_at = args.iter().position(|a| a == image).expect("image positional");
+        let env_flags: Vec<&str> = args[..image_at]
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .collect();
+        let n = env_flags.len();
+        assert_eq!(&env_flags[n - 2..], &["ACTIVE_EMBEDDING=qwen3", "RL_SERVER_PORT=12000"]);
+        assert!(env_flags[..n - 2].contains(&"RL_SERVER_PORT=11438"), "{env_flags:?}");
+
+        let plain = build_podman_run_args(&manifest, &ctx, &project, 11533, "c", image, "podman", None)
+            .expect("build args");
+        let no_extra = build_podman_run_args_with_env(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &[], &[],
+        )
+        .expect("build args");
+        assert_eq!(plain, no_extra);
+    }
+
+    /// v0.2.97 (lane V): the per-project spawn argv carries the module's
+    /// LISTED settings — the project's stored value, else the declared
+    /// default — and never a declared setting the list leaves out.
+    #[test]
+    fn spawn_args_for_project_injects_only_the_listed_settings() {
+        let mut manifest = make_manifest(true, true);
+        manifest.settings = serde_json::from_value(serde_json::json!([
+            { "key": "ACTIVE_EMBEDDING", "type": "string", "default": "qwen3" },
+            { "key": "RL_BATCH", "type": "integer", "default": 8 },
+            { "key": "NOT_LISTED", "type": "string", "default": "never" }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_settings = vec!["ACTIVE_EMBEDDING".into(), "RL_BATCH".into()];
+        let project = make_project();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.insert_project(
+            &project.id, &project.name, &project.folder_path, project.host.clone(), &project.slug,
+        )
+        .unwrap();
+        db.set_setting(&project.id, &manifest.id, "ACTIVE_EMBEDDING", &serde_json::json!("arctic"))
+            .unwrap();
+        db.set_setting(&project.id, &manifest.id, "NOT_LISTED", &serde_json::json!("leak"))
+            .unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = spawn_args_for_project(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None, &db,
+        )
+        .expect("build args")
+        .args;
+        let env_flags: Vec<&str> =
+            args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
+        assert!(env_flags.contains(&"ACTIVE_EMBEDDING=arctic"), "{env_flags:?}");
+        assert!(env_flags.contains(&"RL_BATCH=8"), "{env_flags:?}");
+        assert!(!env_flags.iter().any(|e| e.starts_with("NOT_LISTED=")), "{env_flags:?}");
+    }
+
+    /// v0.2.97 (lane V round 2): a listed secret reaches the spawn as a bare
+    /// `-e KEY` — its VALUE is nowhere in the argv, only in the runtime
+    /// process env the spawn site applies — resolved through the real gate
+    /// with THIS project as the requester. An unlisted secret is not looked
+    /// up; a paused required secret refuses the start.
+    #[test]
+    fn spawn_args_for_project_passes_secrets_by_name_never_by_value() {
+        let _state = crate::test_env::state_dir_guard_with(&[]);
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let mut manifest = make_manifest(true, true);
+        manifest.secrets = serde_json::from_value(serde_json::json!([
+            { "key": "RL_API_TOKEN", "scope": "per-project" },
+            { "key": "NOT_LISTED_TOKEN", "scope": "global", "required": false }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_secrets = vec!["RL_API_TOKEN".into()];
+        let project = make_project();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let value = "s3cr3t-value-7d1f";
+        crate::secrets::set(
+            crate::secrets::SecretScope::PerProject { project_id: &project.id },
+            &manifest.id,
+            "RL_API_TOKEN",
+            value,
+        )
+        .unwrap();
+        crate::secrets::set(crate::secrets::SecretScope::Global, &manifest.id, "NOT_LISTED_TOKEN", "x9")
+            .unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let image = "img:tag";
+        let spawn = spawn_args_for_project(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &db,
+        )
+        .expect("spawn args");
+
+        assert!(!spawn.args.iter().any(|a| a.contains(value)), "value leaked into argv");
+        let image_at = spawn.args.iter().position(|a| a == image).unwrap();
+        let bare: Vec<&str> = spawn.args[..image_at]
+            .windows(2)
+            .filter(|w| w[0] == "-e" && !w[1].contains('='))
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(bare, vec!["RL_API_TOKEN"]);
+        assert_eq!(spawn.secret_keys(), vec!["RL_API_TOKEN"]);
+        assert_eq!(spawn.secret_value_for_tests("RL_API_TOKEN"), Some(value));
+        assert!(!format!("{spawn:?}").contains(value), "Debug leaked the value");
+
+        db.mark_secret_inactive_for_requester(
+            "per_project", &project.id, &manifest.id, "RL_API_TOKEN", &project.id,
+        )
+        .unwrap();
+        let err = spawn_args_for_project(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("RL_API_TOKEN") && !err.contains(value), "{err}");
+    }
+
+    /// The global builder names inherited secrets the same way, after the
+    /// identity env, and a secret named like the runtime's own env is refused.
+    #[test]
+    fn spawn_args_global_passes_secrets_by_name_and_refuses_reserved_names() {
+        let manifest = make_manifest(true, true);
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let spawn = spawn_args_global(
+            &manifest,
+            &ctx,
+            GLOBAL_RL_PORT,
+            "c",
+            "img:tag",
+            "podman",
+            None,
+            &[("VCT_MODULE_TOKEN".to_string(), "tok".to_string())],
+            vec![("G_TOKEN".into(), "g-val-91".into()), ("PATH".into(), "/evil".into())],
+        )
+        .unwrap();
+        assert!(!spawn.args.iter().any(|a| a.contains("g-val-91") || a.contains("/evil")));
+        let token_at = spawn.args.iter().position(|a| a == "VCT_MODULE_TOKEN=tok").unwrap();
+        assert_eq!(spawn.args[token_at + 1..token_at + 3], ["-e", "G_TOKEN"]);
+        assert_eq!(spawn.secret_keys(), vec!["G_TOKEN"]);
+    }
+
     #[test]
     fn build_podman_run_args_rejects_non_container_runtime() {
         let mut manifest = make_manifest(true, true);
@@ -3502,6 +3943,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// v0.2.97 owner ruling "Honour the pin": an object that only the OTHER
+    /// runtime owns is refused, naming both runtimes, what chose the runtime,
+    /// and both fixes; the chosen runtime owning it (or nobody owning it)
+    /// passes through.
+    #[test]
+    fn ownership_guard_refuses_only_when_the_other_runtime_owns_it() {
+        let env = check_runtime_owns(
+            "migrate",
+            "volume `weaviate_data`",
+            "docker",
+            Some(RuntimePinSource::EnvOverride),
+            false,
+            true,
+        )
+        .unwrap_err();
+        for needle in [
+            "refusing to migrate volume `weaviate_data`",
+            "exists only under podman",
+            "VCT_CONTAINER_RUNTIME=docker pins VCO to docker",
+            "unset VCT_CONTAINER_RUNTIME or set VCT_CONTAINER_RUNTIME=podman",
+            "first move the data from podman into docker",
+        ] {
+            assert!(env.contains(needle), "{needle:?} missing from {env:?}");
+        }
+        let recorded =
+            check_runtime_owns("inspect", "x", "podman", Some(RuntimePinSource::RuntimeTxt), false, true)
+                .unwrap_err();
+        assert!(recorded.contains("state/install/runtime.txt"), "{recorded}");
+        assert!(recorded.contains("set VCT_CONTAINER_RUNTIME=docker"), "{recorded}");
+        let auto = check_runtime_owns("inspect", "x", "podman", None, false, true).unwrap_err();
+        assert!(auto.contains("auto-detected"), "{auto}");
+
+        assert!(check_runtime_owns("migrate", "x", "docker", None, true, true).is_ok());
+        assert!(check_runtime_owns("migrate", "x", "docker", None, true, false).is_ok());
+        assert!(check_runtime_owns("migrate", "x", "docker", None, false, false).is_ok());
+        assert_eq!(other_runtime("podman"), "docker");
+        assert_eq!(other_runtime("docker"), "podman");
     }
 
     /// The refusal message splits the two remedies the way the Python

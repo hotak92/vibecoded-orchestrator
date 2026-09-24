@@ -133,14 +133,30 @@ warn() { printf 'vct: warning: %s\n' "$*" >&2; }
 # files under $VCT_STATE_DIR, per-project token preferred). Everything here is
 # best-effort and MUST soft-fail silently: no curl / no hub / no token / any
 # non-200 → treated as "hub doesn't have it", falling back to the old message.
+# A valid hub port is an integer in 1..65535; an invalid VCT_HUB_PORT falls
+# through to hub.port, then 7700 (v0.2.97 owner ruling). MUST MATCH
+# `vct_project_config.sh::_hub_port_value` / `hub_port` (which also warns)
+# and `vco_lib/hub_ensure.py::resolve_hub_port`. Pinned for every client by
+# `tests/test_v0297_hub_port_clients.py`.
+_hub_port_value() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    [[ "$v" =~ ^[0-9]{1,10}$ ]] || return 1
+    (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
+    printf '%s\n' "$((10#$v))"
+}
+
 _hub_port() {
-    if [ -n "${VCT_HUB_PORT:-}" ]; then printf '%s' "$VCT_HUB_PORT"; return 0; fi
+    if [ -n "${VCT_HUB_PORT:-}" ]; then
+        _hub_port_value "$VCT_HUB_PORT" && return 0
+    fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}" p
     if [ -f "$state_dir/hub.port" ]; then
         p=$(tr -d '[:space:]' < "$state_dir/hub.port" 2>/dev/null)
-        [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+        _hub_port_value "$p" && return 0
     fi
-    printf '7700'
+    printf '7700\n'
 }
 
 _hub_token() {

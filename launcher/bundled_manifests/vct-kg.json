@@ -70,7 +70,8 @@
       "description": "Name of the cross-project KG collection. Leave empty to disable cross-project KG access.",
       "type": "string",
       "default": "",
-      "required": false
+      "required": false,
+      "scope": "global"
     },
     {
       "key": "WEAVIATE_URL",
@@ -78,7 +79,8 @@
       "description": "Auto-configured by the launcher when Weaviate container starts.",
       "type": "string",
       "default": "http://localhost:8081",
-      "required": true
+      "required": true,
+      "scope": "global"
     }
   ],
 

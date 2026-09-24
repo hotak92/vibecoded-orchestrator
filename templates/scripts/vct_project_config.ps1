@@ -295,25 +295,36 @@ function Emit-Warning {
 # ── Hub port discovery ──────────────────────────────────────────────────
 # CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the bash sibling
 # `vct_project_config.sh::hub_port` and the python sibling
-# `vco_lib/project_config.py::_discover_hub` (port branch):
-#   * env `VCT_HUB_PORT` or `hub.port` file that is non-numeric / garbage
-#     → emit ONE rate-limited stderr warning (kind `hub_port_invalid`) and
-#     fall through to the default port 7700. NEVER throw (the previous
-#     `[int]$Env:VCT_HUB_PORT` cast raised a TERMINATING error that took
-#     the Windows hook host down — F-8 item #2).
-#   * `hub.port` present but UNREADABLE → warn (`hub_port_unreadable`) +
-#     default. The previous `Get-Content -Raw` inside `Test-Path` had no
-#     try/catch and threw on perm-denied (F-8 item #3).
-# A valid numeric port matches `^\d+$`. ONE conservative contract:
-# invalid content → warn + default, never crash, never emit garbage.
+# `vco_lib/hub_ensure.py::resolve_hub_port` (which `project_config` uses):
+#   * a valid port is an integer in 1..65535 (`ConvertTo-HubPort`);
+#   * env `VCT_HUB_PORT` set but not a valid port → ONE rate-limited stderr
+#     warning (kind `hub_port_invalid`) and FALL THROUGH to `hub.port`, then
+#     7700 (v0.2.97 owner ruling: the file names the running hub). NEVER
+#     throw (a bare `[int]$Env:VCT_HUB_PORT` cast raised a TERMINATING error
+#     that took the Windows hook host down — F-8 item #2).
+#   * `hub.port` non-empty but not a valid port → warn (`hub_port_invalid`)
+#     + default; UNREADABLE → warn (`hub_port_unreadable`) + default (F-8
+#     item #3); absent or empty → silent default.
+
+# The port `$Value` names as an [int], or $null when it is not an integer in
+# 1..65535. Never throws.
+function ConvertTo-HubPort {
+    param([string]$Value)
+    if ($null -eq $Value) { return $null }
+    $v = $Value.Trim()
+    if ($v -match '^\d{1,10}$') {
+        $n = [long]$v
+        if ($n -ge 1 -and $n -le 65535) { return [int]$n }
+    }
+    return $null
+}
+
 function Get-HubPort {
     if ($Env:VCT_HUB_PORT) {
-        if ($Env:VCT_HUB_PORT -match '^\d+$') {
-            return [int]$Env:VCT_HUB_PORT
-        }
+        $fromEnv = ConvertTo-HubPort $Env:VCT_HUB_PORT
+        if ($null -ne $fromEnv) { return $fromEnv }
         Emit-Warning -ErrorKind "hub_port_invalid" `
-            -Detail "VCT_HUB_PORT is not a positive integer; using default 7700"
-        return 7700
+            -Detail "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700"
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
     $portFile = Join-Path $stateDir "hub.port"
@@ -326,12 +337,11 @@ function Get-HubPort {
                 -Detail "hub.port is not readable; using default 7700"
             return 7700
         }
-        if ($raw -match '^\d+$') {
-            return [int]$raw
-        }
+        $fromFile = ConvertTo-HubPort $raw
+        if ($null -ne $fromFile) { return $fromFile }
         if ($raw.Length -gt 0) {
             Emit-Warning -ErrorKind "hub_port_invalid" `
-                -Detail "hub.port contains non-integer content; using default 7700"
+                -Detail "hub.port does not hold a port (1-65535); using default 7700"
         }
         # empty (whitespace-only / truncated write) → silent default.
     }

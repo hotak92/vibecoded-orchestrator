@@ -735,27 +735,16 @@ const CODEGRAPH_CLASSES: &[&str] = &[
     "CodeInteraction",
 ];
 
-fn weaviate_url() -> String {
-    // Env-var precedence mirrors `commands::kg::weaviate_url` — see
-    // `config.rs` for the full externalization policy. The hub server
-    // doesn't have access to Tauri's managed `LocalConfig` state because
-    // it runs in a parallel axum runtime with its own handle struct
-    // (`LauncherDbHandle`); plumbing the config through every handler
-    // here would balloon the diff. So we honour the same env-var keys
-    // and fall through to `config::DEFAULT_WEAVIATE_URL` when neither
-    // is set. Operators editing `vct-config.toml` see the change in the
-    // Tauri command path immediately; the hub picks it up on next
-    // restart only if they also export `VCT_WEAVIATE_URL`. Acceptable
-    // for 0.2.x since the hub-only KG endpoints are CLI-tools-only.
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    std::env::var("WEAVIATE_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vct_launcher_core::config::DEFAULT_WEAVIATE_URL.to_string())
+fn weaviate_url(db: &Db) -> String {
+    // v0.2.97 (lane X): the ONE client resolver. These hub endpoints are a
+    // Weaviate CLIENT (the CLI's KG / codegraph proxy, the same role as the
+    // Tauri-side `commands::kg` / `commands::codegraph` dashboards lane W
+    // migrated), so they use `service_endpoints::client_weaviate_url`:
+    // the `VCT_WEAVIATE_URL` / legacy `WEAVIATE_URL` env statements this
+    // function always honoured, over the machine resolver (which adds
+    // `vct-config.toml`, the app_state port override and `services.toml`
+    // adoption — none of which the old env-only chain here saw).
+    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
 }
 
 fn weaviate_client() -> Result<reqwest::Client, String> {
@@ -791,9 +780,10 @@ fn require_kg_read(db: &Db, project_id: &str, collection: &str) -> Result<(), St
 /// even one marker is dropped.
 async fn detect_orchestrator_kg_collections(
     client: &reqwest::Client,
+    weaviate_url: &str,
 ) -> Result<Vec<String>, String> {
     let resp = client
-        .get(format!("{}/v1/schema", weaviate_url()))
+        .get(format!("{}/v1/schema", weaviate_url))
         .send()
         .await
         .map_err(|e| format!("weaviate /v1/schema: {}", e))?;
@@ -862,9 +852,10 @@ async fn detect_orchestrator_kg_collections(
 /// and any prefixed variant so callers can search across all projects.
 async fn detect_codegraph_collections(
     client: &reqwest::Client,
+    weaviate_url: &str,
 ) -> Result<Vec<String>, String> {
     let resp = client
-        .get(format!("{}/v1/schema", weaviate_url()))
+        .get(format!("{}/v1/schema", weaviate_url))
         .send()
         .await
         .map_err(|e| format!("weaviate /v1/schema: {}", e))?;
@@ -918,7 +909,7 @@ fn filter_codegraph_by_scope(all: Vec<String>, scope: &str) -> Vec<String> {
         .collect()
 }
 
-async fn fetch_class_count(client: &reqwest::Client, class: &str) -> u32 {
+async fn fetch_class_count(client: &reqwest::Client, class: &str, weaviate_url: &str) -> u32 {
     // Same shape as commands::kg::fetch_class_count. No quoting needed
     // for class names — Weaviate class names are restricted to
     // [A-Za-z][A-Za-z0-9_]*.
@@ -926,7 +917,7 @@ async fn fetch_class_count(client: &reqwest::Client, class: &str) -> u32 {
         "query": format!("{{ Aggregate {{ {cls} {{ meta {{ count }} }} }} }}", cls = class)
     });
     let resp = client
-        .post(format!("{}/v1/graphql", weaviate_url()))
+        .post(format!("{}/v1/graphql", weaviate_url))
         .json(&body)
         .send()
         .await;
@@ -947,12 +938,13 @@ struct CollectionSummary {
     node_count: u32,
 }
 
-async fn kg_collections(_state: State<LauncherDbHandle>) -> axum::response::Response {
+async fn kg_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
     let client = match weaviate_client() {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let names = match detect_orchestrator_kg_collections(&client).await {
+    let wurl = weaviate_url(&state.0.0);
+    let names = match detect_orchestrator_kg_collections(&client, &wurl).await {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -964,7 +956,7 @@ async fn kg_collections(_state: State<LauncherDbHandle>) -> axum::response::Resp
     };
     let mut out: Vec<CollectionSummary> = Vec::with_capacity(names.len());
     for n in names {
-        let count = fetch_class_count(&client, &n).await;
+        let count = fetch_class_count(&client, &n, &wurl).await;
         out.push(CollectionSummary {
             name: n,
             node_count: count,
@@ -974,12 +966,13 @@ async fn kg_collections(_state: State<LauncherDbHandle>) -> axum::response::Resp
     Json(serde_json::json!({ "collections": out, "count": count })).into_response()
 }
 
-async fn codegraph_collections(_state: State<LauncherDbHandle>) -> axum::response::Response {
+async fn codegraph_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
     let client = match weaviate_client() {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let names = match detect_codegraph_collections(&client).await {
+    let wurl = weaviate_url(&state.0.0);
+    let names = match detect_codegraph_collections(&client, &wurl).await {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -991,7 +984,7 @@ async fn codegraph_collections(_state: State<LauncherDbHandle>) -> axum::respons
     };
     let mut out: Vec<CollectionSummary> = Vec::with_capacity(names.len());
     for n in names {
-        let count = fetch_class_count(&client, &n).await;
+        let count = fetch_class_count(&client, &n, &wurl).await;
         out.push(CollectionSummary {
             name: n,
             node_count: count,
@@ -1044,10 +1037,11 @@ async fn kg_search(
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    let wurl = weaviate_url(&h.0);
 
     let (collections, auto_detected) = match req.collections.clone() {
         Some(v) if !v.is_empty() => (v, false),
-        _ => match detect_orchestrator_kg_collections(&client).await {
+        _ => match detect_orchestrator_kg_collections(&client, &wurl).await {
             Ok(v) => (v, true),
             Err(e) => {
                 return (
@@ -1101,7 +1095,7 @@ async fn kg_search(
             lim = limit,
         );
         let resp = client
-            .post(format!("{}/v1/graphql", weaviate_url()))
+            .post(format!("{}/v1/graphql", wurl))
             .json(&serde_json::json!({ "query": q }))
             .send()
             .await;
@@ -1240,10 +1234,11 @@ async fn codegraph_search(
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    let wurl = weaviate_url(&h.0);
 
     let (collections, auto_detected) = match req.collections.clone() {
         Some(v) if !v.is_empty() => (filter_codegraph_by_scope(v, &scope), false),
-        _ => match detect_codegraph_collections(&client).await {
+        _ => match detect_codegraph_collections(&client, &wurl).await {
             Ok(v) => (filter_codegraph_by_scope(v, &scope), true),
             Err(e) => {
                 return (
@@ -1288,7 +1283,7 @@ async fn codegraph_search(
             label = label_field,
         );
         let resp = client
-            .post(format!("{}/v1/graphql", weaviate_url()))
+            .post(format!("{}/v1/graphql", wurl))
             .json(&serde_json::json!({ "query": q }))
             .send()
             .await;
@@ -1391,6 +1386,33 @@ fn is_valid_class_name(s: &str) -> bool {
 #[cfg(test)]
 mod cli_kg_tests {
     use super::*;
+
+    /// v0.2.97 (lane X): the CLI's Weaviate URL is the ONE client resolver,
+    /// so the machine chain (app_state override, services.toml adoption) —
+    /// none of which the old env-only chain saw — reaches the hub CLI too.
+    #[test]
+    fn weaviate_url_resolver_sees_adoption_and_overrides() {
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, None),
+            ("WEAVIATE_URL", None),
+        ]);
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        assert_eq!(weaviate_url(&db), "http://localhost:8081");
+
+        let mut state = vct_launcher_core::services::adoption::AdoptionState::default();
+        state.upsert(vct_launcher_core::services::adoption::ServiceAdoption {
+            name: "weaviate".into(),
+            mode: vct_launcher_core::services::adoption::AdoptionMode::Adopt,
+            external_url: Some("http://weaviate.lan:8090".into()),
+            parallel_port: None,
+            container_name: None,
+        });
+        vct_launcher_core::services::adoption::write(&state).unwrap();
+        assert_eq!(weaviate_url(&db), "http://weaviate.lan:8090");
+
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        assert_eq!(weaviate_url(&db), "http://localhost:18081");
+    }
 
     #[test]
     fn class_name_validation_accepts_canonical_and_namespaced() {
@@ -1550,7 +1572,8 @@ mod cli_kg_integration_tests {
 
         // Grant read on every detected orchestrator-shaped collection.
         let client = weaviate_client().unwrap();
-        let cols = detect_orchestrator_kg_collections(&client).await.unwrap_or_default();
+        let cols =
+            detect_orchestrator_kg_collections(&client, &weaviate_url(&handle.0)).await.unwrap_or_default();
         for c in &cols {
             handle.0.kg_set_access(&pid, c, "read").expect("grant read");
         }
@@ -1672,7 +1695,7 @@ mod cli_kg_integration_tests {
 
         // Pick a real orchestrator-shaped collection but DON'T grant it.
         let wclient = weaviate_client().unwrap();
-        let cols = detect_orchestrator_kg_collections(&wclient).await.unwrap();
+        let cols = detect_orchestrator_kg_collections(&wclient, &weaviate_url(&h.0)).await.unwrap();
         assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
 
@@ -1736,7 +1759,7 @@ mod cli_kg_integration_tests {
         let pid = seed_project_with_kg_grants(&h).await;
 
         let wclient = weaviate_client().unwrap();
-        let cols = detect_orchestrator_kg_collections(&wclient).await.unwrap();
+        let cols = detect_orchestrator_kg_collections(&wclient, &weaviate_url(&h.0)).await.unwrap();
         assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
 
@@ -1900,7 +1923,8 @@ mod cli_kg_integration_tests {
         unsafe { std::env::set_var("WEAVIATE_URL", format!("http://{}", addr)); }
 
         let client = weaviate_client().unwrap();
-        let detected = detect_orchestrator_kg_collections(&client).await.unwrap();
+        let detected =
+            detect_orchestrator_kg_collections(&client, &std::env::var("WEAVIATE_URL").unwrap()).await.unwrap();
 
         unsafe {
             if let Some(v) = saved {
@@ -1937,7 +1961,8 @@ mod cli_kg_integration_tests {
         unsafe { std::env::set_var("WEAVIATE_URL", format!("http://{}", addr)); }
 
         let client = weaviate_client().unwrap();
-        let detected = detect_orchestrator_kg_collections(&client).await;
+        let detected =
+            detect_orchestrator_kg_collections(&client, &std::env::var("WEAVIATE_URL").unwrap()).await;
 
         unsafe {
             if let Some(v) = saved {

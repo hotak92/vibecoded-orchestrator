@@ -3939,18 +3939,9 @@ fn default_shared_scope() -> String {
 /// from disk each call so a hub restart's rotated token propagates).
 fn hub_port_token() -> Result<(u16, String), String> {
     let root = crate::paths::vct_root_dir();
-    let port = std::fs::read_to_string(root.join("hub.port"))
-        .map_err(|e| format!("read hub.port: {}", e))?
-        .trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))?;
-    let token = std::fs::read_to_string(root.join("hub.token"))
-        .map_err(|e| format!("read hub.token: {}", e))?
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return Err("hub.token is empty".into());
-    }
+    let port = vct_launcher_core::services::hub_port::read_hub_port_file_in(&root)?;
+    let token =
+        vct_launcher_core::services::boot_token::read_nonempty_token_file(&root.join("hub.token"))?;
     Ok((port, token))
 }
 

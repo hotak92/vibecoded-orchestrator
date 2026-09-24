@@ -29,16 +29,25 @@
 
   type ValidationState = 'unknown' | 'valid' | 'invalid';
 
+  // v0.2.97 (manifest `settings`, `CoreModuleSettingsPanel.svelte`):
+  //   * `projectId: null` addresses a MACHINE-WIDE setting — the backend
+  //     routes it to the project-less row; `''` still means "no project
+  //     picked" and disables the control.
+  //   * `validate` — an optional client-side check run BEFORE anything is
+  //     dispatched or saved; a non-null reason is shown inline and nothing
+  //     is written. The backend re-validates declared settings regardless.
   let {
     control,
     moduleId,
     projectId,
     disabled = false,
+    validate,
   }: {
     control: TextInputControl;
     moduleId: string;
-    projectId: string;
+    projectId: string | null;
     disabled?: boolean;
+    validate?: (value: string) => string | null;
   } = $props();
 
   // Start empty; `onMount` seeds either from the persisted value (Tauri
@@ -57,7 +66,7 @@
   onMount(async () => {
     // Seed from declared default first; persisted value (if any) wins below.
     value = control.default ?? '';
-    if (!tauriAvailable() || !projectId) {
+    if (!tauriAvailable() || projectId === '') {
       loading = false;
       return;
     }
@@ -85,6 +94,14 @@
 
   async function apply() {
     if (isDisabled) return;
+    const problem = validate?.(value) ?? null;
+    if (problem !== null) {
+      // Refused client-side: inline reason, nothing dispatched or saved,
+      // and the user's text stays in the field.
+      validation = 'invalid';
+      message = problem;
+      return;
+    }
     busy = true;
     message = '';
     try {
@@ -93,7 +110,7 @@
 
       if (control.apply_action) {
         const resp = await dispatchAction<unknown>(
-          { moduleId, projectId },
+          { moduleId, projectId: projectId ?? '' },
           control.apply_action,
           value,
         );

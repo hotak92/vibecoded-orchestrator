@@ -5,7 +5,7 @@ short_desc: organize docs, dedupe, fix folder structure
 keywords: ["doc duplicates", "folder structure", "documentation hygiene", "broken WikiLinks", "organize docs", "dedupe docs", "cleanup documentation", "move old docs", "documentation structure"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Doc Organizer Agent

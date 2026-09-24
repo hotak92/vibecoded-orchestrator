@@ -206,6 +206,87 @@ mod tests {
         }
     }
 
+    /// v0.2.97 (lane T): the hub's port is a setting (`VCT_HUB_PORT`) and the
+    /// hub walks past a taken port, so the hub-api manifest's
+    /// `runtime.health_check.url` and `provides[http_api].base_url` name
+    /// `{hub_port}` — resolved through `services::hub_port`, the ladder the
+    /// supervisor uses — and never the default as a literal. With `:7700`
+    /// spelled out, this resolves to the default port and fails.
+    #[test]
+    fn hub_api_urls_follow_the_running_hubs_port() {
+        let guard = crate::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", None)]);
+        std::fs::write(guard.path().join("hub.port"), "8123\n").unwrap();
+        let (_, body) = BUNDLED_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "vct-hub-api.json")
+            .unwrap();
+        let manifest = crate::manifest::ModuleManifest::from_json(body).unwrap();
+        let ctx = crate::manifest::PlaceholderCtx::new(&manifest.id);
+
+        let health = manifest.runtime.health_check.as_ref().and_then(|h| h.url.as_deref());
+        assert_eq!(
+            health.map(|u| ctx.resolve(u)).as_deref(),
+            Some("http://127.0.0.1:8123/api/v1/health")
+        );
+        let base = manifest
+            .provides
+            .iter()
+            .find(|p| p["kind"] == "http_api")
+            .and_then(|p| p["base_url"].as_str());
+        assert_eq!(base.map(|u| ctx.resolve(u)).as_deref(), Some("http://127.0.0.1:8123/api/v1"));
+    }
+
+    /// v0.2.97 (lane T): the code-embedding manifest's health URL and its
+    /// `CODE_EMBED_PORT` setting default name the port the SERVICE actually
+    /// defaults to — `server.py`'s `os.getenv("CODE_EMBED_PORT", …)` and the
+    /// compose file's `${CODE_EMBED_PORT:-…}`. The URL said 11438, a port
+    /// nothing served.
+    #[test]
+    fn code_embedding_manifest_names_the_services_real_default_port() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let default_after = |file: &str, marker: &str, end: char| -> String {
+            let text = std::fs::read_to_string(repo.join(file)).unwrap();
+            let at = text.find(marker).unwrap_or_else(|| panic!("{marker:?} not in {file}"));
+            let rest = &text[at + marker.len()..];
+            rest[..rest.find(end).unwrap()].to_string()
+        };
+        let service = default_after(
+            "claude_mcp_servers/code_embedding_service/server.py",
+            "os.getenv(\"CODE_EMBED_PORT\", \"",
+            '"',
+        );
+        let compose = default_after("infrastructure/docker-compose.yml", "${CODE_EMBED_PORT:-", '}');
+        assert_eq!(service, compose, "server.py and compose disagree on the default");
+
+        let (_, body) = BUNDLED_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "vct-code-embedding.json")
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(body).unwrap();
+        let setting = manifest["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == "CODE_EMBED_PORT")
+            .unwrap();
+        assert_eq!(setting["default"].to_string(), service, "setting default");
+        // v0.2.97 (lane W): the URL names the port through `{code_embed_port}`,
+        // which resolves to that default on a machine with no override and to
+        // the override when there is one.
+        let url = manifest["runtime"]["health_check"]["url"].as_str().unwrap();
+        assert_eq!(url, "http://localhost:{code_embed_port}/health", "health_check.url");
+        let _g = crate::test_env::state_dir_guard();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-code-embedding");
+        assert_eq!(ctx.resolve(url), format!("http://localhost:{service}/health"));
+        let db = crate::db::Db::open().unwrap();
+        db.app_state_set(
+            crate::services::service_endpoints::APP_STATE_KEY_CODE_EMBED_PORT,
+            "21440",
+        )
+        .unwrap();
+        assert_eq!(ctx.resolve(url), "http://localhost:21440/health");
+    }
+
     #[test]
     fn sync_writes_every_manifest_once_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();

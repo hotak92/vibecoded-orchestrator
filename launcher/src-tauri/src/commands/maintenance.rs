@@ -62,7 +62,6 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
-use crate::config::LocalConfig;
 use crate::db::Db;
 use crate::mcp_registration::{
     register_default_orchestrator_mcps, user_claude_json, DEFAULT_CODE_EMBED_PORT,
@@ -631,18 +630,11 @@ const TEMPORAL_PROPS: &[&str] = &["created", "updated", "valid_from", "valid_unt
 /// the source-of-truth constant.
 const DEFAULT_SHARED_KG_CLASS: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 
-fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    cfg.weaviate_url.clone()
+/// The ONE launcher client resolver (`service_endpoints::client_weaviate_url`,
+/// v0.2.97 lane W) — this was a private copy that never saw an adopted
+/// external Weaviate.
+fn resolve_weaviate_url(db: &Db) -> String {
+    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
 }
 
 fn parse_schema_response(
@@ -721,10 +713,9 @@ fn parse_schema_response(
 
 #[command]
 pub async fn schema_migration_status(
-    cfg: State<'_, LocalConfig>,
     db: State<'_, Db>,
 ) -> Result<SchemaMigrationStatusReport, String> {
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
     // v0.2.49 access-matrix Phase 2 (item #7, S-1) — read the
     // persisted canonical name from `app_state` (Step A migration 028)
     // instead of the hardcoded constant. White-label installs override
@@ -915,7 +906,6 @@ fn run_migration_script(
 #[command]
 pub async fn run_schema_migrations(
     consent_token: String,
-    cfg: State<'_, LocalConfig>,
     db: State<'_, Db>,
 ) -> Result<SchemaMigrationReport, String> {
     // Validate the consent token (and remove it — single-use).
@@ -944,7 +934,7 @@ pub async fn run_schema_migrations(
         );
     }
     let install_path = PathBuf::from(&install_root);
-    let weaviate_url = resolve_weaviate_url(&cfg);
+    let weaviate_url = resolve_weaviate_url(&db);
 
     let mut outcomes = Vec::new();
     outcomes.push(run_migration_script(

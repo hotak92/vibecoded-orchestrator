@@ -246,6 +246,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and nothing looking it makes no calls. Unknown is shown as unknown, never
   as 0 %.
 
+### Added — module settings can be edited in the launcher (v0.2.97)
+
+- The module manifest spec promised that a module's settings are editable in
+  the launcher, but no page showed any module's settings. **Preferences →
+  Modules** now lists the settings of the bundled modules and of the modules
+  you installed. Machine-wide settings such as the hub's port are edited
+  directly (the page tells you to restart the hub after a change); per-project
+  ones, such as the `CONTEXT_STATE.md` size warning, for a project you pick —
+  and an installed module's only for projects where it is installed and
+  enabled.
+- Settings whose value lives somewhere else — a project's KG collection, the
+  code-embedding service's backend and port — are shown read-only with their
+  current value, where they are set and a link to where you change them. The
+  launcher never stores a second copy that nothing reads. The code-embedding
+  module's declared default port is corrected to 11440.
+- Every value is checked against the module's declared type and limits,
+  both on the page and by the launcher before it saves, so an invalid value
+  is refused with a reason. A number out of range is refused, not silently
+  clamped.
+
+### Added — module tiles show whether each module is running (v0.2.97)
+
+- Module manifests have always declared a health check, and the spec said it
+  let the launcher show the module's status — but nothing ever ran it. The
+  hub now checks every active module's declared health check, on this
+  machine only (loopback addresses; a container's check goes to its local
+  port mapping), and the module tiles show **Running**, **Down** or **Status
+  unknown**. A check that cannot run — no URL, or the hub unreachable — reads
+  unknown, never down. `VCT_HUB_MODULE_HEALTH=0` turns the checks off.
+- Container modules the orchestrator starts now receive the settings their
+  manifest lists in `runtime.env_from_settings`, and the secrets it lists in
+  `runtime.env_from_secrets` — through the same permission checks as the
+  hub's `/env` (a paused secret is not delivered). A secret's value never
+  appears on the `podman run`/`docker run` command line; note that, as with
+  any container environment, it is visible to `podman inspect`. A missing
+  secret the manifest marks required stops the start and leaves the running
+  container alone. Before, both lists were ignored.
+
 ### Fixed — smaller issues (v0.2.97)
 
 - The bundled `vct-hub-api` module's port setting now sets the hub's port.
@@ -291,6 +329,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VCT_CODE_EMBED_CACHE_SOURCE` (a folder or an existing volume) and the
   matching `…_VOLUME_NAME` knobs — so services that already store their data
   somewhere can adopt it without copying. See `docs/CONFIGURATION.md`.
+- The launcher's storage and volume commands now use the container runtime
+  you pinned with `VCT_CONTAINER_RUNTIME` (or the one the install recorded),
+  like the rest of VCO, instead of always preferring podman. If a volume
+  exists only under the other runtime, they refuse to inspect or migrate it
+  and say how to fix that, rather than acting on the wrong copy.
+- A `VCT_HUB_PORT` that is not a valid port now produces a warning, and
+  every VCO client (Python, shell and PowerShell) then uses the port the
+  running hub recorded, then 7700. Some clients used to build a broken hub
+  URL from the bad value.
+- `install.py --bootstrap --json` reports the hub's actual port instead of
+  always 7700, and the hub module's catalog entry names the running hub's
+  port too. The code-embedding module's entry named port 11438; the service
+  runs on 11440.
+- The hub's `/config` and every project's env files now work out the
+  Weaviate URL the same way: `VCT_WEAVIATE_URL` or `vct-config.toml`, then
+  the launcher's port override, then an adopted or moved Weaviate recorded in
+  `services.toml`, then `http://localhost:8081`. Before, the project env
+  files ignored `vct-config.toml` and an adopted external Weaviate, and the
+  settings file always named port 8081, so the two could point at different
+  servers. The code-embedding module's health check follows the service's
+  actual port.
+- The launcher finds its bundled scripts (code graph, KG sync, KG summary)
+  through one shared lookup instead of two copies that could disagree.
 
 ### Changed — the launcher's command-line tool is now `vct-cli` (v0.2.97)
 
@@ -334,6 +395,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[ -n "$VCT_DISABLE_HOOKS" ] ||`; every hook script already checks that
   variable itself. Existing projects are rewritten in place on their next
   update. `VCT_DISABLE_HOOKS=1` works exactly as before.
+- Bundled agents and skills now ask for `medium` reasoning effort instead of
+  `high`, following current guidance for Opus-class models, and the
+  instructions tell Claude to brief ad-hoc subagents at `medium` too. Five
+  roles that genuinely need deeper reasoning (deep research, incident
+  response, the GLM reviewer, equation checking, Terraform plan review) keep
+  `high`, which is now the ceiling: nothing shipped asks for `xhigh` or `max`.
 
 ### Removed — `VCT_HUB_LEGACY_GLOBAL_ENV`, the global-token escape hatch (v0.2.97)
 

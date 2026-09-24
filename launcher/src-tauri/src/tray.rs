@@ -26,14 +26,6 @@ use tauri::{
 use crate::commands::self_update::{self, UpdateStatus};
 use crate::db::Db;
 
-/// Default ports for the shared services. Mirror
-/// `commands::installer::DEFAULT_*_PORT` — kept inline here to avoid
-/// exposing the constants publicly. If install.py changes a port, both
-/// sides must follow.
-const WEAVIATE_PORT: u16 = 8081;
-const OLLAMA_PORT: u16 = 11435;
-const CODE_EMBED_PORT: u16 = 11440;
-
 /// Per-probe timeout for the tray refresh loop. The wizard probes use 2s
 /// because they only fire once during onboarding; the tray fires every
 /// 5s and must not stall on a slow service.
@@ -438,17 +430,37 @@ async fn probe_one(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
 }
 
+/// The tray's probe URLs. v0.2.97 (lane X): ports come from the ONE
+/// chain (`machine_port_from_disk` over `service_endpoints`: app_state
+/// override → services.toml adoption → default) — the compiled-in port
+/// constants this replaces meant an override or an alt-port adoption
+/// showed a red tray while the service was healthy.
+fn tray_probe_urls() -> (String, String, String) {
+    use vct_launcher_core::services::service_endpoints::{
+        machine_port_from_disk, CoreService,
+    };
+    (
+        // /v1/meta is more reliable than /v1/.well-known/ready for "is
+        // Weaviate usable?" — see commands/lifecycle.rs::canonical_services.
+        format!(
+            "http://localhost:{}/v1/meta",
+            machine_port_from_disk(CoreService::Weaviate)
+        ),
+        format!(
+            "http://localhost:{}/api/tags",
+            machine_port_from_disk(CoreService::Ollama)
+        ),
+        format!(
+            "http://localhost:{}/health",
+            machine_port_from_disk(CoreService::CodeEmbed)
+        ),
+    )
+}
+
 /// Probe all shared services concurrently. Wall time bounded by
 /// `PROBE_TIMEOUT`, not the sum.
 async fn probe_services() -> ServiceSnapshot {
-    // /v1/meta is more reliable than /v1/.well-known/ready for "is
-    // Weaviate usable?" — see commands/lifecycle.rs::canonical_services.
-    let weaviate_url = format!(
-        "http://localhost:{}/v1/meta",
-        WEAVIATE_PORT
-    );
-    let ollama_url = format!("http://localhost:{}/api/tags", OLLAMA_PORT);
-    let code_embed_url = format!("http://localhost:{}/health", CODE_EMBED_PORT);
+    let (weaviate_url, ollama_url, code_embed_url) = tray_probe_urls();
 
     let (w, o, c) = tokio::join!(
         probe_one(&weaviate_url),
@@ -519,6 +531,19 @@ fn format_update_label(status: &UpdateStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_probe_urls_follow_the_machine_chain() {
+        // v0.2.97 (lane X): an app_state override reaches the tray's
+        // probe URLs (the compiled-in ports it replaces could not).
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let (w, _o, _c) = tray_probe_urls();
+        assert_eq!(w, "http://localhost:8081/v1/meta");
+        let db = crate::db::Db::open().unwrap();
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        let (w, _o, _c) = tray_probe_urls();
+        assert_eq!(w, "http://localhost:18081/v1/meta");
+    }
 
     fn snap(states: &[(&'static str, bool)]) -> ServiceSnapshot {
         ServiceSnapshot {

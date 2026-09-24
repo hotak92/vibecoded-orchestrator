@@ -354,9 +354,9 @@ def project_env_template_from_db(
     ollama_url_override: str | None = None,
     active_embedding_override: str | None = None,
     shared_kg_default: str | None = None,
-    weaviate_port_default: int = 8081,
-    ollama_port_default: int = 11435,
-    code_embed_port_default: int = 11440,
+    weaviate_port_default: int | None = None,
+    ollama_port_default: int | None = None,
+    code_embed_port_default: int | None = None,
     orchestrator_root: Path | None = None,
 ) -> dict[str, str]:
     """Return the canonical key→value map for the project's ``.env`` template.
@@ -1400,6 +1400,7 @@ def _cli_resolve(args: argparse.Namespace) -> tuple[Optional[dict[str, str]], in
             orchestrator_root=(
                 Path(args.orchestrator_root) if args.orchestrator_root else None
             ),
+            weaviate_url_override=args.weaviate_url,
             weaviate_port_default=args.weaviate_port,
             ollama_port_default=args.ollama_port,
             code_embed_port_default=args.code_embed_port,
@@ -1623,9 +1624,12 @@ def _build_parser() -> argparse.ArgumentParser:
                 "no .env effect today)"
             ),
         )
-        p_verb.add_argument("--weaviate-port", type=int, default=8081)
-        p_verb.add_argument("--ollama-port", type=int, default=11435)
-        p_verb.add_argument("--code-embed-port", type=int, default=11440)
+        # v0.2.97 (lane W): unset = this machine's value
+        # (vco_lib.service_endpoints); the launcher passes its own resolution.
+        p_verb.add_argument("--weaviate-url", default=None)
+        p_verb.add_argument("--weaviate-port", type=int, default=None)
+        p_verb.add_argument("--ollama-port", type=int, default=None)
+        p_verb.add_argument("--code-embed-port", type=int, default=None)
         p_verb.set_defaults(handler=handler)
 
     p_sentinel = sub.add_parser(

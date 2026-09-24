@@ -243,29 +243,13 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
     // JSON write is the primary contract, DB sync is the bonus).
     let db_handle = db::Db::open().ok();
 
-    // No services state available in the CLI path — install.py forwards
-    // the chosen ports via env vars (WEAVIATE_PORT / OLLAMA_PORT /
-    // CODE_EMBED_PORT / WEAVIATE_GRPC_PORT) the same way it does for
-    // the launcher's `install_orchestrator()` invocation. We mirror
-    // that lookup here so a multi-stack adoption stays consistent.
-    let ports = mcp_registration::ServicePorts {
-        weaviate_port: std::env::var("WEAVIATE_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_WEAVIATE_PORT),
-        ollama_port: std::env::var("OLLAMA_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_OLLAMA_PORT),
-        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_GRPC_PORT),
-        code_embed_port: std::env::var("CODE_EMBED_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_CODE_EMBED_PORT),
-    };
+    // v0.2.97 (lane X): the ONE port source. The entries land in
+    // `~/.claude.json` — a machine-global surface — so the ports come
+    // from the machine chain (app_state override → services.toml
+    // adoption → default), which subsumes the `WEAVIATE_PORT`-style env
+    // hand-off install.py makes (it persists those choices to
+    // services.toml before invoking us). gRPC keeps its env-only read.
+    let ports = mcp_registration::machine_service_ports();
 
     match mcp_registration::register_default_orchestrator_mcps(
         install_root,
@@ -327,24 +311,8 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
 /// dry-run that prints what WOULD be rewritten and exits 0.
 fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String]) -> i32 {
     let db_handle = db::Db::open().ok();
-    let ports = mcp_registration::ServicePorts {
-        weaviate_port: std::env::var("WEAVIATE_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_WEAVIATE_PORT),
-        ollama_port: std::env::var("OLLAMA_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_OLLAMA_PORT),
-        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_GRPC_PORT),
-        code_embed_port: std::env::var("CODE_EMBED_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_CODE_EMBED_PORT),
-    };
+    // v0.2.97 (lane X): same ONE port source as cli_register_default_mcps.
+    let ports = mcp_registration::machine_service_ports();
     match mcp_registration::rewrite_stale_orchestrator_mcps(
         install_root,
         ports,
@@ -1832,13 +1800,13 @@ pub fn run() {
                     else {
                         return;
                     };
-                    // Weaviate URL: honour env override (matches the
-                    // contract in the rest of the launcher), default
-                    // to canonical localhost:8081.
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| {
-                            "http://localhost:8081".to_string()
-                        });
+                    // Weaviate URL: the launcher's ONE client resolver
+                    // (v0.2.97 lane W) — env statement, vct-config.toml,
+                    // port override, adopted/moved Weaviate, 8081.
+                    let weaviate_url =
+                        vct_launcher_core::services::service_endpoints::client_weaviate_url(
+                            db.inner(),
+                        );
 
                     let adopt_report = db
                         .inner()
@@ -1979,8 +1947,14 @@ pub fn run() {
                     else {
                         return;
                     };
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    // v0.2.97 (lane W): the ONE launcher client resolver —
+                    // this read only `WEAVIATE_URL`, so on a machine with an
+                    // adopted or moved Weaviate the boot sweep judged the
+                    // wrong instance's schema.
+                    let weaviate_url =
+                        vct_launcher_core::services::service_endpoints::client_weaviate_url(
+                            db.inner(),
+                        );
                     match db
                         .inner()
                         .reconcile_kg_collection_access_at_boot(&weaviate_url)
@@ -2521,8 +2495,14 @@ pub fn run() {
                     let Some(db) = repair_handle.try_state::<db::Db>() else {
                         return;
                     };
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    // v0.2.97 (lane W): the ONE launcher client resolver —
+                    // this read only `WEAVIATE_URL`, so on a machine with an
+                    // adopted or moved Weaviate the boot sweep judged the
+                    // wrong instance's schema.
+                    let weaviate_url =
+                        vct_launcher_core::services::service_endpoints::client_weaviate_url(
+                            db.inner(),
+                        );
                     let report =
                         crate::binding_reconcile::reconcile_half_renamed_bindings_at_boot(
                             db.inner(),
@@ -2902,6 +2882,8 @@ pub fn run() {
             commands::module_gui::get_module_nav_items,
             commands::module_gui::get_module_setting,
             commands::module_gui::set_module_setting,
+            commands::module_gui::list_module_settings,
+            commands::module_gui::module_setting_live_values,
             // Stream 2 follow-up (v0.2.20, 2026-05-19): orchestrator-core
             // config-tab actions. Backs the controls declared in the
             // repo-root `vct-module.json::gui.config_tab` block.
@@ -3129,6 +3111,7 @@ pub fn run() {
             // `module_clear_global_enabled` is the same way back at the
             // host-wide tier. Same shape as WP-L's dual-flag commands.
             commands::module_enabled::module_enable_state,
+            commands::module_health::module_health_snapshot,
             commands::module_enabled::module_set_enabled_for_project_v2,
             commands::module_enabled::module_clear_global_enabled,
             // v0.2.52 V52-AD: host-wide (global) enable toggle that

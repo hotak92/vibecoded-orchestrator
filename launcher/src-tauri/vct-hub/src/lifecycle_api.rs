@@ -524,7 +524,10 @@ async fn module_start(
 ///   * 404 `manifest_not_found`   — no on-disk manifest for `module_id`.
 ///   * 400 `not_container_module` — runtime type isn't container/service.
 ///   * 500 `container_start_failed` — supervisor/podman failure.
-async fn global_module_start(Path(module_id): Path<String>) -> impl IntoResponse {
+async fn global_module_start(
+    State(h): State<LauncherDbHandle>,
+    Path(module_id): Path<String>,
+) -> impl IntoResponse {
     let manifest = match super::module_supervisor::lookup_manifest_by_id(&module_id) {
         Some(m) => m,
         None => {
@@ -552,7 +555,7 @@ async fn global_module_start(Path(module_id): Path<String>) -> impl IntoResponse
         );
     }
 
-    match super::module_supervisor::start_global_container_supervisor(&manifest, &module_id).await {
+    match super::module_supervisor::start_global_container_supervisor(&manifest, &module_id, &h.0).await {
         Ok(container_name) => {
             Json(serde_json::json!({ "container_name": container_name })).into_response()
         }

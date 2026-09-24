@@ -45,9 +45,12 @@ use vct_launcher_core::process::CommandExt as _;
 // `vct-launcher-core::services::container_runtime` for the canonical
 // source; the previous local copies have been deleted to close the
 // drift gap that caused the supervisor-image-resolution-variant bug.
+// `build_podman_run_args` left this list in v0.2.97: the start path now calls
+// `spawn_args_for_project` (settings + secrets env), and only this file's tests
+// still use the plain form — they import it themselves.
 pub use vct_launcher_core::services::container_runtime::{
-    build_podman_run_args, container_weights_path, ensure_volume_host_dirs,
-    resolve_container_name, resolve_image_ref, sanitize_path_component,
+    container_weights_path, ensure_volume_host_dirs, resolve_container_name, resolve_image_ref,
+    sanitize_path_component,
 };
 
 // Re-exports kept available for downstream callers / tests even though
@@ -258,6 +261,10 @@ pub async fn start_container_for_module(
     ctx: &PlaceholderCtx,
     project: &ProjectRow,
     rl_port: u16,
+    // v0.2.97 (lane V): source of the module's `runtime.env_from_settings`
+    // values for this project (`module_settings_env`), which the container
+    // is started with.
+    db: &Db,
 ) -> Result<String, String> {
     // v0.2.47: resolve the persisted GpuMode for this host. Soft-fail
     // to None if no snapshot exists — `start_container_for_module_with_gpu_mode`
@@ -269,7 +276,7 @@ pub async fn start_container_for_module(
     // current state (still better than substituting bare version on
     // private images — the pull-fallback below covers that).
     let gpu_mode = read_persisted_gpu_mode();
-    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode).await
+    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode, db).await
 }
 
 /// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
@@ -293,6 +300,10 @@ pub async fn start_container_for_module_with_gpu_mode(
     project: &ProjectRow,
     rl_port: u16,
     gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+    // v0.2.97 (lane V): source of the module's `runtime.env_from_settings`
+    // and `runtime.env_from_secrets` values
+    // (`container_runtime::spawn_args_for_project`).
+    db: &Db,
 ) -> Result<String, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -318,6 +329,15 @@ pub async fn start_container_for_module_with_gpu_mode(
     let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
 
     let podman = detect_container_runtime().await?;
+
+    // v0.2.97 (lane V): the run argv with the module's listed settings
+    // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
+    // in this spawn's env, below). Built before the pre-pull and the `rm -f`
+    // so a refused start — a required secret that did not resolve — leaves
+    // the running container alone.
+    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
+    )?;
 
     // v0.2.47: pre-pull the variant-correct image with auth context
     // attached, so a cache-evicted host doesn't fall through to
@@ -358,14 +378,10 @@ pub async fn start_container_for_module_with_gpu_mode(
     // mounts of nonexistent directories.
     ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
-    // v0.2.54 (P0-4): thread detected engine + gpu_mode so variant-
-    // declaring manifests get runtime-appropriate GPU device flags.
-    let args = build_podman_run_args(
-        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode,
-    )?;
-
+    // v0.2.54 (P0-4): `spawn` (built above) threads the detected engine +
+    // gpu_mode so variant-declaring manifests get the right GPU flags.
     let mut cmd = Command::new(&podman).silent();
-    cmd.args(&args);
+    cmd.args(&spawn.args);
     cmd.env_clear();
     for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
         if let Ok(v) = std::env::var(key) {
@@ -378,6 +394,9 @@ pub async fn start_container_for_module_with_gpu_mode(
             cmd.env(key, v);
         }
     }
+    // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
+    // in this child's environment, never in its argv.
+    spawn.apply_secret_env(&mut cmd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below.
@@ -470,7 +489,7 @@ pub async fn start_container_after_install(
 ) -> Result<String, String> {
     let rl_port = ensure_project_rl_port(db, project)?;
     let ctx = PlaceholderCtx::new(&manifest.id);
-    let container_name = start_container_for_module(manifest, &ctx, project, rl_port).await?;
+    let container_name = start_container_for_module(manifest, &ctx, project, rl_port, db).await?;
     db.set_module_container_name(&project.id, &manifest.id, &container_name)?;
     // TODO(paid-modules, v0.2.40 R2): the RL container should fetch
     // `rl_use_global` / `rl_online_training_disabled` /
@@ -1281,7 +1300,7 @@ pub async fn restart_rl_container(
 
     stop_container_for_project(&container_name).await?;
     let ctx = PlaceholderCtx::new(RL_RERANKER_MODULE_ID);
-    let _ = start_container_for_module(&manifest, &ctx, &project, rl_port).await?;
+    let _ = start_container_for_module(&manifest, &ctx, &project, rl_port, &db).await?;
     Ok(())
 }
 
@@ -1319,22 +1338,17 @@ pub async fn start_module_container(
 // `Authorization: Bearer <token>`. Soft-fails (returns Err) when the
 // hub is unreachable so callers can fall back to the in-process path.
 
+/// The running hub's port, strictly from `hub.port` (the one reader:
+/// `vct_launcher_core::services::hub_port::read_hub_port_file`).
 fn hub_port_for_proxy() -> Result<u16, String> {
-    let path = crate::paths::vct_root_dir().join("hub.port");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.port: {}", e))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))
+    vct_launcher_core::services::hub_port::read_hub_port_file()
 }
 
+/// The hub bearer, re-read per call (core `read_nonempty_token_file`).
 fn hub_token_for_proxy() -> Result<String, String> {
-    let path = crate::paths::vct_root_dir().join("hub.token");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.token: {}", e))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("hub.token at {} is empty", path.display()));
-    }
-    Ok(trimmed.to_string())
+    vct_launcher_core::services::boot_token::read_nonempty_token_file(
+        &crate::paths::vct_root_dir().join("hub.token"),
+    )
 }
 
 /// Proxy for `GET /projects/{project_id}/modules/{module_id}/status`.
@@ -2900,7 +2914,7 @@ where
                             }
                         };
                         let ctx = PlaceholderCtx::new(&module_id);
-                        match start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        match start_container_for_module(&manifest, &ctx, &project, rl_port, db).await
                         {
                             Ok(resolved_name) => {
                                 // V52-D: when the manifest's template
@@ -3559,6 +3573,7 @@ pub async fn retry_failed_module_installs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vct_launcher_core::services::container_runtime::build_podman_run_args;
     use crate::db::models::ProjectHost;
     use crate::manifest::{
         Compatibility, ContainerInstallBlock, HealthCheck, InstallBlock, InstallMethod,

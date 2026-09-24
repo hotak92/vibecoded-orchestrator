@@ -65,6 +65,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tauri::command;
 use vct_launcher_core::process::CommandExt as _;
+use vct_launcher_core::services::container_runtime::{self, RuntimePinSource};
 
 // ---------------------------------------------------------------------------
 // Strict legacy-volume allowlist
@@ -519,19 +520,66 @@ pub fn is_launcher_managed_override(body: &str) -> bool {
 // Legacy-volume detection
 // ---------------------------------------------------------------------------
 
-/// Find `podman` (first) or `docker` on PATH. Returns the absolute
-/// path-as-string of the runtime, or `None` if neither is present.
+/// The container runtime a storage command drives, and the pin that chose
+/// it (`None` = auto-detected).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRuntime {
+    pub(crate) name: String,
+    pub(crate) pin: Option<RuntimePinSource>,
+}
+
+/// The runtime every storage command drives — here and in `volumes`.
 ///
-/// The one home for this probe — `volumes` calls it too (v0.2.97 review
-/// R6: both, and `runtime_install`, walked `$PATH` by hand). The walk itself
-/// is `vct_launcher_core::paths::which_on_path`, the launcher's one PATH
-/// lookup (`.exe`/`.cmd`/`.bat` on Windows; a test injects its PATH per
-/// thread instead of setting the process one).
-pub(crate) fn which_runtime() -> Option<String> {
-    ["podman", "docker"]
-        .iter()
-        .find_map(|runtime| vct_launcher_core::paths::which_on_path(runtime))
-        .map(|p| p.to_string_lossy().to_string())
+/// v0.2.97 owner ruling "Honour the pin": this was `which_runtime`, a
+/// podman-first PATH probe that ignored `VCT_CONTAINER_RUNTIME` and the
+/// install's `state/install/runtime.txt`, so a docker-pinned machine had
+/// its volumes inspected and migrated under podman. It is now the ONE
+/// shared pin-first detector
+/// (`container_runtime::detect_container_runtime_with_pin`): a pin is the
+/// only candidate and a pinned runtime that is down is refused, never
+/// substituted; unpinned, podman is still preferred, now among runtimes
+/// whose daemon answers `info`.
+pub(crate) async fn storage_runtime() -> Result<StorageRuntime, String> {
+    let install_root = super::installer::find_local_repo_root().ok();
+    storage_runtime_at(install_root.as_deref()).await
+}
+
+/// [`storage_runtime`] with the install root (where `state/install/runtime.txt`
+/// lives) passed in — a test hands it a temp dir so a developer machine's own
+/// runtime record cannot change the answer.
+pub(crate) async fn storage_runtime_at(
+    install_root: Option<&Path>,
+) -> Result<StorageRuntime, String> {
+    let (name, pin) =
+        container_runtime::detect_container_runtime_with_pin(install_root).await?;
+    Ok(StorageRuntime { name, pin })
+}
+
+/// `volume`'s mountpoint under the runtime VCO drives — or a REFUSAL when
+/// only the other runtime has it (`container_runtime::check_runtime_owns`:
+/// podman and docker keep separate volumes, so acting on it under `rt`
+/// would act on a copy without the user's data). Empty when neither
+/// runtime has it; the caller reports "not found" as before. The other
+/// runtime is asked only on that miss, and only to word the refusal.
+async fn mountpoint_on_owning_runtime(
+    rt: &StorageRuntime,
+    volume: &str,
+    action: &str,
+) -> Result<String, String> {
+    let (mountpoint, _) = inspect_volume(&rt.name, volume).await;
+    if !mountpoint.is_empty() {
+        return Ok(mountpoint);
+    }
+    let (elsewhere, _) = inspect_volume(container_runtime::other_runtime(&rt.name), volume).await;
+    container_runtime::check_runtime_owns(
+        action,
+        &format!("volume `{volume}`"),
+        &rt.name,
+        rt.pin,
+        false,
+        !elsewhere.is_empty(),
+    )?;
+    Ok(String::new())
 }
 
 /// Parse one line of `podman volume ls --format '{{.Name}}'` output and
@@ -562,7 +610,8 @@ pub fn filter_legacy_volume_names<'a>(lines: impl IntoIterator<Item = &'a str>) 
 /// Inspect a single volume by name. Returns mountpoint + driver. On
 /// any failure returns empty strings (the FE renders "(unavailable)").
 async fn inspect_volume(runtime: &str, name: &str) -> (String, String) {
-    let out = tokio::process::Command::new(runtime).silent()
+    let out = tokio::process::Command::new(vct_launcher_core::paths::spawn_program(runtime))
+        .silent()
         .args(["volume", "inspect", name])
         .output()
         .await;
@@ -603,18 +652,20 @@ async fn inspect_volume(runtime: &str, name: &str) -> (String, String) {
 /// can call it directly. Returns an empty list if no runtime is present
 /// (soft-fail: no error to the caller).
 async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
-    let runtime = match which_runtime() {
-        Some(r) => r,
-        None => {
+    let runtime = match storage_runtime().await {
+        Ok(r) => r.name,
+        Err(e) => {
             tracing::info!(
-                "[storage_ux] info: no podman/docker on PATH; returning empty legacy-volume list"
+                "[storage_ux] info: no usable container runtime ({e}); returning empty \
+                 legacy-volume list"
             );
             return Vec::new();
         }
     };
 
     // List ALL volumes, filter through the allowlist + prefix.
-    let out = tokio::process::Command::new(&runtime).silent()
+    let out = tokio::process::Command::new(vct_launcher_core::paths::spawn_program(&runtime))
+        .silent()
         .args(["volume", "ls", "--format", "{{.Name}}"])
         .output()
         .await;
@@ -1097,11 +1148,10 @@ pub async fn migrate_to_named_volume(
         ));
     }
 
-    let runtime = match which_runtime() {
-        Some(r) => r,
-        None => return Err("no container runtime (podman/docker) on PATH".into()),
-    };
-    let (mountpoint, _) = inspect_volume(&runtime, target_named_volume.trim()).await;
+    let runtime = storage_runtime().await?;
+    let mountpoint =
+        mountpoint_on_owning_runtime(&runtime, target_named_volume.trim(), "migrate data into")
+            .await?;
     if mountpoint.is_empty() {
         return Err(format!(
             "target volume {target_named_volume:?} not found (run compose up first to create it)"
@@ -1219,11 +1269,10 @@ pub async fn migrate_to_bind_path(
             target.display()
         ));
     }
-    let runtime = match which_runtime() {
-        Some(r) => r,
-        None => return Err("no container runtime (podman/docker) on PATH".into()),
-    };
-    let (mountpoint, _) = inspect_volume(&runtime, source_named_volume.trim()).await;
+    let runtime = storage_runtime().await?;
+    let mountpoint =
+        mountpoint_on_owning_runtime(&runtime, source_named_volume.trim(), "migrate data out of")
+            .await?;
     if mountpoint.is_empty() {
         return Err(format!(
             "source volume {source_named_volume:?} not found"
@@ -1313,36 +1362,201 @@ pub async fn migrate_to_bind_path(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Test support shared with `commands::volumes`: fake `podman`/`docker`
+/// scripts on a per-thread injected lookup PATH, so the shared runtime
+/// detector and the volume probes can be driven without a real runtime and
+/// without touching the process `PATH`.
+#[cfg(all(test, unix))]
+pub(crate) mod fake_runtime_support {
+    use std::path::Path;
+
+    /// A fake runtime on the injected lookup PATH: answers `info` and
+    /// `--version`, and `volume inspect <v>` for each owned volume only.
+    pub(crate) fn fake_runtime(dir: &Path, name: &str, owned: &[&str]) {
+        use std::os::unix::fs::PermissionsExt;
+        let arms: String = owned
+            .iter()
+            .map(|v| {
+                format!(
+                    "      {v}) echo '[{{\"Mountpoint\":\"/fake/{name}/{v}\",\"Driver\":\"local\"}}]'; exit 0;;\n"
+                )
+            })
+            .collect();
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  info|--version) exit 0;;\n  volume)\n    [ \"$2\" = inspect ] || exit 1\n    case \"$3\" in\n{arms}    esac\n    exit 1;;\nesac\nexit 1\n"
+        );
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        settle_exec(&path);
+    }
+
+    /// Exec `script` once, retrying (bounded) while the kernel answers
+    /// ETXTBSY — "Text file busy": another test thread forked while our
+    /// write fd was open, and its child holds that fd until it execs. Our
+    /// fd is already closed, so once ONE exec succeeds no later fork can
+    /// inherit a writer and the script stays executable for the test. The
+    /// production spawns under test get no retry — this makes their input
+    /// stable instead. Any other exec error is a broken fixture: panic.
+    fn settle_exec(script: &Path) {
+        const ATTEMPTS: u32 = 100;
+        for _ in 0..ATTEMPTS {
+            match std::process::Command::new(script)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("fake runtime {} does not execute: {e}", script.display()),
+            }
+        }
+        panic!(
+            "fake runtime {} stayed \"Text file busy\" for {ATTEMPTS} attempts",
+            script.display()
+        );
+    }
+
+    /// The retry is real: with a writer holding the script open (the exact
+    /// ETXTBSY condition), `settle_exec` waits until it closes instead of
+    /// failing.
+    #[test]
+    fn settle_exec_waits_out_text_file_busy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("busy");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&script).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            drop(writer);
+        });
+        settle_exec(&script);
+        closer.join().unwrap();
+    }
+
+    /// Run `fut` on THIS thread (a current-thread runtime), with `dir` as the
+    /// only lookup PATH and `pin` as `VCT_CONTAINER_RUNTIME` (under the
+    /// workspace env lock, restored afterwards).
+    pub(crate) fn with_fake_runtimes<T>(
+        dir: &Path,
+        pin: Option<&str>,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let mut out = None;
+        vct_launcher_core::test_env::with_env_vars(&[("VCT_CONTAINER_RUNTIME", pin)], || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            out = Some(vct_launcher_core::paths::with_lookup_path(Some(dir.as_os_str()), || {
+                rt.block_on(fut)
+            }));
+        });
+        out.unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use super::fake_runtime_support::{fake_runtime, with_fake_runtimes};
 
-    // ----- Runtime probe (v0.2.97 review R6: the one PATH lookup) ----------
+    // ----- Runtime choice (v0.2.97 owner ruling "Honour the pin") ----------
 
-    /// podman outranks docker even when docker's directory comes first; the
-    /// answer is the absolute binary path; the PATH is injected per thread.
+    /// The pin is honoured: with BOTH runtimes answering, `VCT_CONTAINER_RUNTIME=docker`
+    /// makes storage commands drive docker. The old podman-first PATH probe
+    /// (`which_runtime`) answered podman here.
     #[cfg(unix)]
     #[test]
-    fn which_runtime_prefers_podman_through_the_injected_lookup_path() {
-        use std::os::unix::fs::PermissionsExt;
-        let docker_dir = tempfile::tempdir().unwrap();
-        let podman_dir = tempfile::tempdir().unwrap();
-        let docker = docker_dir.path().join("docker");
-        let podman = podman_dir.path().join("podman");
-        for bin in [&docker, &podman] {
-            std::fs::write(bin, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn storage_runtime_honours_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &[]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let rt = with_fake_runtimes(dir.path(), Some("docker"), storage_runtime_at(None)).unwrap();
+        assert_eq!(rt, StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) });
+    }
+
+    /// No pin: unchanged — podman is preferred when both answer.
+    #[cfg(unix)]
+    #[test]
+    fn storage_runtime_without_a_pin_still_prefers_podman() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &[]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let rt = with_fake_runtimes(dir.path(), None, storage_runtime_at(None)).unwrap();
+        assert_eq!(rt, StorageRuntime { name: "podman".into(), pin: None });
+    }
+
+    /// The install-time record is a pin too (`state/install/runtime.txt`).
+    #[cfg(unix)]
+    #[test]
+    fn storage_runtime_honours_the_recorded_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &[]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("state/install")).unwrap();
+        std::fs::write(root.path().join("state/install/runtime.txt"), "docker\n").unwrap();
+        let rt = with_fake_runtimes(dir.path(), None, storage_runtime_at(Some(root.path()))).unwrap();
+        assert_eq!(rt, StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::RuntimeTxt) });
+    }
+
+    /// The refusal, end to end through the command: docker is pinned, the
+    /// volume exists only under podman — the migration is refused naming
+    /// both runtimes and the fix, before anything is copied.
+    #[cfg(unix)]
+    #[test]
+    fn migration_refuses_a_volume_only_the_other_runtime_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let source = tempfile::tempdir().unwrap();
+        let err = with_fake_runtimes(
+            dir.path(),
+            Some("docker"),
+            migrate_to_named_volume(
+                source.path().display().to_string(),
+                "weaviate_data".into(),
+            ),
+        )
+        .unwrap_err();
+        for needle in [
+            "refusing to migrate data into volume `weaviate_data`",
+            "exists only under podman",
+            "VCT_CONTAINER_RUNTIME=docker",
+            "set VCT_CONTAINER_RUNTIME=podman",
+        ] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
         }
-        let both = std::env::join_paths([docker_dir.path(), podman_dir.path()]).unwrap();
-        use vct_launcher_core::paths::with_lookup_path as lookup;
-        assert_eq!(lookup(Some(&both), which_runtime), Some(podman.to_string_lossy().to_string()));
-        assert_eq!(
-            lookup(Some(docker_dir.path().as_os_str()), which_runtime),
-            Some(docker.to_string_lossy().to_string())
+        let target = tempfile::tempdir().unwrap();
+        let out = with_fake_runtimes(
+            dir.path(),
+            Some("docker"),
+            migrate_to_bind_path("weaviate_data".into(), target.path().display().to_string()),
         );
-        let empty = tempfile::tempdir().unwrap();
-        assert_eq!(lookup(Some(empty.path().as_os_str()), which_runtime), None);
-        assert_eq!(lookup(None, which_runtime), None, "no PATH at all finds nothing");
+        assert!(out.unwrap_err().contains("refusing to migrate data out of volume"));
+    }
+
+    /// Leave-alone: the pinned runtime owns the volume → its mountpoint, no
+    /// refusal; nobody owns it → empty (the caller's "not found").
+    #[cfg(unix)]
+    #[test]
+    fn owning_runtime_passes_and_an_unknown_volume_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let (owned, unknown) = with_fake_runtimes(dir.path(), Some("docker"), async {
+            (
+                mountpoint_on_owning_runtime(&rt, "weaviate_data", "migrate").await,
+                mountpoint_on_owning_runtime(&rt, "ollama_data", "migrate").await,
+            )
+        });
+        assert_eq!(owned.unwrap(), "/fake/docker/weaviate_data");
+        assert_eq!(unknown.unwrap(), "");
     }
 
     // ----- Allowlist filtering ---------------------------------------------

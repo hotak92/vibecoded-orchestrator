@@ -5,7 +5,7 @@ short_desc: maintain code graph freshness on file changes
 keywords: ["code graph update", "incremental graph", "git commit hook", "update code graph", "rebuild code graph", "code graph stale", "reindex code", "sync code graph"]
 tools: Read, Bash, Grep, Glob
 model: haiku
-effort: high
+effort: medium
 ---
 
 # Code Graph Updater Agent

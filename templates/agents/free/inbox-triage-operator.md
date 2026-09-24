@@ -5,7 +5,7 @@ short_desc: triages multi-channel inbox, hot/warm/cold, reply drafts
 keywords: ["inbox triage", "inbox zero", "WhatsApp Business", "hot warm cold", "reply drafting", "triage inbox", "classify messages", "multi-channel inbox"]
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
-effort: high
+effort: medium
 ---
 
 # Inbox Triage Operator

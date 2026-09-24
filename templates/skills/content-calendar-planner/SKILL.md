@@ -5,7 +5,7 @@ short_desc: "30/60/90-day cross-platform content calendar"
 keywords: ["content calendar", "editorial calendar", "Instagram TikTok LinkedIn", "repurposing graph", "30 day plan", "60 day plan", "90 day plan", "social media calendar", "post schedule", "plan content for next month"]
 argument-hint: "[theme or pillar] [cadence: light|medium|heavy] [start-date]"
 model: opus
-effort: high
+effort: medium
 ---
 
 # /content-calendar-planner

@@ -62,12 +62,13 @@ fn parse_kv_line(line: &str) -> Option<(&str, &str)> {
 }
 
 /// Read the value of `key` from `path`, if the file exists and the key is
-/// present. Returns:
+/// present. Any `KEY=VALUE` env file — `module_gui` also reads the
+/// orchestrator's `infrastructure/.env` with it (v0.2.97). Returns:
 ///   * `Ok(Some(value))` — file present, key found (last occurrence wins,
 ///     mirroring shell `source` semantics).
 ///   * `Ok(None)` — file missing OR key absent.
 ///   * `Err(_)` — IO error other than NotFound (permission denied, etc.).
-fn read_key(path: &Path, key: &str) -> Result<Option<String>, String> {
+pub(crate) fn read_key(path: &Path, key: &str) -> Result<Option<String>, String> {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),

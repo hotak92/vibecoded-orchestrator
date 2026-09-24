@@ -545,40 +545,55 @@ pub async fn code_graph_prune_stale(
     })
 }
 
+/// The health-check probe URLs. v0.2.97 (lane X): Weaviate via the ONE
+/// client resolver (`client_weaviate_url`: `VCT_WEAVIATE_URL` /
+/// `WEAVIATE_URL` env statement, then the machine chain); Ollama and
+/// code-embed keep their env override (a dev-container convenience) but
+/// fall back to the machine chain instead of a compiled-in default, so
+/// an app_state override or a services.toml adoption reaches the
+/// health report.
+fn health_check_urls(db: &Db) -> Vec<(String, String)> {
+    use vct_launcher_core::services::service_endpoints as se;
+    let weaviate_url = se::client_weaviate_url(db);
+    let ollama_url = std::env::var("OLLAMA_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| se::machine_ollama_url(db));
+    let code_embed_port = se::machine_port_from_disk(se::CoreService::CodeEmbed);
+    let code_embed_url = std::env::var("CODE_EMBED_SERVICE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| format!("http://localhost:{}", code_embed_port));
+    vec![
+        (
+            "Weaviate".to_string(),
+            format!("{}/v1/.well-known/ready", weaviate_url),
+        ),
+        (
+            "Ollama".to_string(),
+            format!("{}/api/tags", ollama_url),
+        ),
+        (
+            "Code Embedding Service".to_string(),
+            format!("{}/health", code_embed_url),
+        ),
+    ]
+}
+
 /// Probe the three local infrastructure endpoints + emit a per-service
 /// status report. Total budget ~3s (each probe times out at 1s).
 #[command]
 pub async fn orchestrator_health_check(
-    _db: State<'_, Db>,
+    db: State<'_, Db>,
 ) -> Result<HealthReport, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
 
-    // Endpoints match the defaults documented in CLAUDE.md. Override
-    // via env so dev-container probes hit a non-default port.
-    let weaviate_url = std::env::var("WEAVIATE_URL")
-        .unwrap_or_else(|_| "http://localhost:8081".to_string());
-    let ollama_url = std::env::var("OLLAMA_URL")
-        .unwrap_or_else(|_| "http://localhost:11435".to_string());
-    let code_embed_url = std::env::var("CODE_EMBED_SERVICE_URL")
-        .unwrap_or_else(|_| "http://localhost:11440".to_string());
-
-    let checks = vec![
-        (
-            "Weaviate".to_string(),
-            format!("{}/v1/.well-known/ready", weaviate_url.trim_end_matches('/')),
-        ),
-        (
-            "Ollama".to_string(),
-            format!("{}/api/tags", ollama_url.trim_end_matches('/')),
-        ),
-        (
-            "Code Embedding Service".to_string(),
-            format!("{}/health", code_embed_url.trim_end_matches('/')),
-        ),
-    ];
+    let checks = health_check_urls(&db);
 
     let mut services = Vec::with_capacity(checks.len());
     for (name, endpoint) in checks {
@@ -827,6 +842,23 @@ pub async fn validate_clone_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.97 (lane X): the health report's Weaviate URL comes from the
+    /// ONE client resolver, so the machine chain (override / adoption)
+    /// reaches it — the compiled-in default this replaces could not.
+    #[test]
+    fn health_check_urls_follow_the_machine_chain() {
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("WEAVIATE_URL", None),
+            (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, None),
+        ]);
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let checks = health_check_urls(&db);
+        assert_eq!(checks[0].1, "http://localhost:8081/v1/.well-known/ready");
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        let checks = health_check_urls(&db);
+        assert_eq!(checks[0].1, "http://localhost:18081/v1/.well-known/ready");
+    }
 
     /// `tail_1kb` truncates oversize input, leaves small input alone,
     /// and never panics on multi-byte char boundaries. The boundary

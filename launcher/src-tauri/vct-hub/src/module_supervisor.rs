@@ -124,14 +124,19 @@ async fn detect_container_runtime() -> Result<String, String> {
 /// triggered an anonymous re-pull that 401'd against private GHCR for
 /// the never-published bare tag. See
 /// `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
+///
+/// v0.2.97 (lane V): `db` supplies the module's `runtime.env_from_settings`
+/// values for this project (`module_settings_env::resolve_env_from_settings`)
+/// — resolved when the run argv is built, so the container starts with them.
 pub async fn start_container_for_module(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
     project: &ProjectRow,
     rl_port: u16,
+    db: &Db,
 ) -> Result<String, String> {
     let gpu_mode = read_persisted_gpu_mode_for_supervisor();
-    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode).await
+    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode, db).await
 }
 
 /// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
@@ -145,6 +150,10 @@ pub async fn start_container_for_module_with_gpu_mode(
     project: &ProjectRow,
     rl_port: u16,
     gpu_mode: Option<GpuMode>,
+    // v0.2.97 (lane V): source of the module's `runtime.env_from_settings`
+    // and `runtime.env_from_secrets` values
+    // (`container_runtime::spawn_args_for_project`).
+    db: &Db,
 ) -> Result<String, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -167,6 +176,15 @@ pub async fn start_container_for_module_with_gpu_mode(
     let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
 
     let podman = detect_container_runtime().await?;
+
+    // v0.2.97 (lane V): the run argv with the module's listed settings
+    // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
+    // in this spawn's env, below). Built before the pre-pull and the `rm -f`
+    // so a refused start — a required secret that did not resolve — leaves
+    // the running container alone.
+    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
+    )?;
 
     // v0.2.49 Phase 3: pre-pull the variant-correct image with the
     // shared `vct_launcher_core::services::container_runtime::
@@ -211,14 +229,10 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
-    // v0.2.54 (P0-4): thread detected engine + gpu_mode so variant-
-    // declaring manifests get runtime-appropriate GPU device flags.
-    let args = build_podman_run_args(
-        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode,
-    )?;
-
+    // v0.2.54 (P0-4): `spawn` (built above) threads the detected engine +
+    // gpu_mode so variant-declaring manifests get the right GPU flags.
     let mut cmd = Command::new(&podman).silent();
-    cmd.args(&args);
+    cmd.args(&spawn.args);
     cmd.env_clear();
     for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
         if let Ok(v) = std::env::var(key) {
@@ -231,6 +245,9 @@ pub async fn start_container_for_module_with_gpu_mode(
             cmd.env(key, v);
         }
     }
+    // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
+    // in this child's environment, never in its argv.
+    spawn.apply_secret_env(&mut cmd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below —
@@ -300,7 +317,7 @@ pub async fn start_container_after_install(
 ) -> Result<String, String> {
     let rl_port = ensure_project_rl_port(db, project)?;
     let ctx = PlaceholderCtx::new(&manifest.id);
-    let container_name = start_container_for_module(manifest, &ctx, project, rl_port).await?;
+    let container_name = start_container_for_module(manifest, &ctx, project, rl_port, db).await?;
     db.set_module_container_name(&project.id, &manifest.id, &container_name)?;
     Ok(container_name)
 }
@@ -708,7 +725,7 @@ pub async fn resume_containers_on_startup_with_starter(
                 }
 
                 if let Err(e) =
-                    start_global_container_supervisor(&manifest, &module_id).await
+                    start_global_container_supervisor(&manifest, &module_id, db).await
                 {
                     tracing::error!(
                         module_id,
@@ -768,7 +785,7 @@ pub async fn resume_containers_on_startup_with_starter(
                             }
                         };
                         let ctx = PlaceholderCtx::new(&module_id);
-                        match start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        match start_container_for_module(&manifest, &ctx, &project, rl_port, db).await
                         {
                             Ok(resolved_name) => {
                                 // V52-D: mirror of the launcher-side
@@ -843,29 +860,6 @@ pub async fn resume_containers_on_startup_with_starter(
 /// Returns `Ok(container_name)` on success; the caller persists the
 /// container_name to the DB row. Returns `Err(...)` on any podman error
 /// or missing manifest field.
-/// Resolve the hub's ACTUAL listening port for building the
-/// container-facing `VCT_HUB_BASE_URL` (v0.2.61, Option H). Source order:
-///   1. `<vct_root_dir>/hub.port` — the real bound port the hub persisted
-///      at startup (`server::write_port_file`). Authoritative: the hub's
-///      `try_bind` walks past 7700 on collision, so the default may be
-///      wrong. We run inside the hub process, so this file is present.
-///   2. `$VCT_HUB_PORT` — the configured port (the hub's own first
-///      choice), used if the file is somehow unreadable.
-///   3. `7700` — the hard default, last resort.
-fn resolve_hub_base_port() -> u16 {
-    const DEFAULT_HUB_PORT: u16 = 7700;
-    let port_file = vct_launcher_core::paths::vct_root_dir().join("hub.port");
-    if let Ok(s) = std::fs::read_to_string(&port_file) {
-        if let Ok(p) = s.trim().parse::<u16>() {
-            return p;
-        }
-    }
-    std::env::var("VCT_HUB_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_HUB_PORT)
-}
-
 /// Per-module spawn serialization (v0.2.61, Option H CONCERN-1 fix).
 ///
 /// Two callers can invoke `start_global_container_supervisor` for the SAME
@@ -1024,7 +1018,7 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
             return;
         }
 
-        match start_global_container_supervisor(&manifest, &module_id).await {
+        match start_global_container_supervisor(&manifest, &module_id, &db).await {
             Ok(name) => {
                 let _ = db.set_global_module_container_name(&module_id, &name);
             }
@@ -1040,13 +1034,71 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
     });
 }
 
+/// The manifest-declared env of a GLOBAL container spawn (v0.2.97, lane V),
+/// resolved BEFORE the spawn touches the running container: a global
+/// container serves every project, so settings are the machine-wide row else
+/// the declared default, and secrets go through the permission gate as
+/// `REQUESTER_ANY` (`module_secrets_env`). `Err` refuses the start — a
+/// `required` secret that did not resolve.
+struct GlobalSpawnEnv {
+    settings: Vec<(String, String)>,
+    secrets: Vec<(String, String)>,
+}
+
+fn resolve_global_spawn_env(manifest: &ModuleManifest, db: &Db) -> Result<GlobalSpawnEnv, String> {
+    Ok(GlobalSpawnEnv {
+        settings: vct_launcher_core::module_settings_env::resolve_env_from_settings(manifest, None, db),
+        secrets: vct_launcher_core::module_secrets_env::resolve_env_from_secrets(manifest, None, db)?,
+    })
+}
+
+/// The global spawn's argv + secret env: the listed settings as
+/// `-e KEY=VALUE`, THEN the Option-H identity pair (last of the valued env, so
+/// a setting that shares its name can never shadow it — a later `-e` wins),
+/// then each secret as a bare `-e KEY` with its value only in the returned
+/// [`SpawnArgs`]. SECURITY: the argv holds `VCT_MODULE_TOKEN` — never log it.
+#[allow(clippy::too_many_arguments)]
+fn global_spawn_args(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    env: GlobalSpawnEnv,
+    module_token: String,
+    hub_port: u16,
+) -> Result<vct_launcher_core::services::container_runtime::SpawnArgs, String> {
+    let mut valued = env.settings;
+    valued.push(("VCT_MODULE_TOKEN".to_string(), module_token));
+    valued.push((
+        "VCT_HUB_BASE_URL".to_string(),
+        format!("http://host.containers.internal:{}", hub_port),
+    ));
+    vct_launcher_core::services::container_runtime::spawn_args_global(
+        manifest,
+        ctx,
+        vct_launcher_core::services::container_runtime::GLOBAL_RL_PORT,
+        container_name,
+        image,
+        engine,
+        gpu_mode,
+        &valued,
+        env.secrets,
+    )
+}
+
 pub async fn start_global_container_supervisor(
     manifest: &ModuleManifest,
     module_id: &str,
+    // v0.2.97 (lane V): source of the module's `runtime.env_from_settings`
+    // values — machine-wide rows, else the declared defaults (a global
+    // container serves every project, so no project row applies).
+    db: &Db,
 ) -> Result<String, String> {
     use vct_launcher_core::services::container_runtime::{
-        build_podman_run_args_global, ensure_volume_host_dirs_global, resolve_global_container_name,
-        resolve_image_ref, GLOBAL_RL_PORT,
+        ensure_volume_host_dirs_global, resolve_global_container_name, resolve_image_ref,
+        GLOBAL_RL_PORT,
     };
 
     let runtime = &manifest.runtime;
@@ -1071,6 +1123,11 @@ pub async fn start_global_container_supervisor(
 
     let gpu_mode = read_persisted_gpu_mode_for_supervisor();
     let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
+
+    // v0.2.97 (lane V): listed settings + secrets, resolved before anything
+    // touches the running container or mints a token — a refused start (a
+    // required secret that did not resolve) changes nothing.
+    let spawn_env = resolve_global_spawn_env(manifest, db)?;
 
     let podman = detect_container_runtime().await?;
 
@@ -1207,23 +1264,23 @@ pub async fn start_global_container_supervisor(
     // on collision and persists the real one to `hub.port`), NOT the
     // hard-coded default — so we read it from the port file the hub
     // wrote at startup, falling back to $VCT_HUB_PORT → 7700 only if the
-    // file is unreadable.
-    let hub_port = resolve_hub_base_port();
-    let extra_env = vec![
-        ("VCT_MODULE_TOKEN".to_string(), module_token),
-        (
-            "VCT_HUB_BASE_URL".to_string(),
-            format!("http://host.containers.internal:{}", hub_port),
-        ),
-    ];
-
-    let args = build_podman_run_args_global(
-        manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
-        &extra_env,
-    )?;
+    // file is unreadable. v0.2.97: that ladder is
+    // `vct_launcher_core::services::hub_port::resolve_hub_port` — shared with
+    // the manifest placeholder `{hub_port}` — not a copy in this file.
+    let hub_port = vct_launcher_core::services::hub_port::resolve_hub_port();
+    let spawn = match global_spawn_args(
+        manifest, &ctx, &container_name, &image, &podman, gpu_mode, spawn_env, module_token,
+        hub_port,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::module_identity::revoke(module_id);
+            return Err(e);
+        }
+    };
 
     let mut cmd = Command::new(&podman).silent();
-    cmd.args(&args);
+    cmd.args(&spawn.args);
     cmd.env_clear();
     for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
         if let Ok(v) = std::env::var(key) {
@@ -1236,6 +1293,9 @@ pub async fn start_global_container_supervisor(
             cmd.env(key, v);
         }
     }
+    // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
+    // in this child's environment, never in its argv.
+    spawn.apply_secret_env(&mut cmd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below —
@@ -1666,6 +1726,76 @@ mod tests {
         let got = resolve_container_name("vct-rl-reranker-{project_slug}", "acme-corp")
             .expect("resolve");
         assert_eq!(got, "vct-rl-reranker-acme-corp");
+    }
+
+    /// v0.2.97 (lane V): a GLOBAL spawn carries the module's listed
+    /// settings (the machine-wide row, else the default), then the identity
+    /// pair — last of the valued env, so a same-named setting cannot shadow
+    /// the token — then each listed secret as a bare `-e KEY` (value only in
+    /// the spawn env, resolved as REQUESTER_ANY). A required secret that does
+    /// not resolve refuses the start before anything is spawned.
+    #[test]
+    fn global_spawn_carries_settings_then_identity_then_secrets_by_name() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let mut manifest = make_manifest(true, true);
+        manifest.settings = serde_json::from_value(serde_json::json!([
+            { "key": "RL_MODE", "type": "string", "default": "online" },
+            { "key": "VCT_MODULE_TOKEN", "type": "string", "default": "not-a-token" }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_settings = vec![
+            "ACTIVE_EMBEDDING".into(),
+            "RL_MODE".into(),
+            "VCT_MODULE_TOKEN".into(),
+        ];
+        manifest.secrets = serde_json::from_value(serde_json::json!([
+            { "key": "G_API_KEY", "scope": "global" }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_secrets = vec!["G_API_KEY".into()];
+        let db = Db::open_in_memory().unwrap();
+        db.set_global_setting(&manifest.id, "ACTIVE_EMBEDDING", &serde_json::json!("arctic"))
+            .unwrap();
+
+        // Required global secret not set: refused, naming the key.
+        let err = resolve_global_spawn_env(&manifest, &db).err().expect("refused");
+        assert!(err.contains("G_API_KEY"), "{err}");
+
+        let value = "g-secret-5e2a";
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Global,
+            &manifest.id,
+            "G_API_KEY",
+            value,
+        )
+        .unwrap();
+        let env = resolve_global_spawn_env(&manifest, &db).expect("resolves");
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let spawn = global_spawn_args(
+            &manifest, &ctx, "c", "img:tag", "podman", None, env, "tok".into(), 7711,
+        )
+        .unwrap();
+        let image_at = spawn.args.iter().position(|a| a == "img:tag").unwrap();
+        let env_flags: Vec<&str> = spawn.args[..image_at]
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .collect();
+        let n = env_flags.len();
+        assert_eq!(
+            &env_flags[n - 6..],
+            &[
+                "ACTIVE_EMBEDDING=arctic",
+                "RL_MODE=online",
+                "VCT_MODULE_TOKEN=not-a-token",
+                "VCT_MODULE_TOKEN=tok",
+                "VCT_HUB_BASE_URL=http://host.containers.internal:7711",
+                "G_API_KEY",
+            ]
+        );
+        assert!(!spawn.args.iter().any(|a| a.contains(value)), "secret value in argv");
+        assert_eq!(spawn.secret_value_for_tests("G_API_KEY"), Some(value));
     }
 
     #[test]
@@ -2535,26 +2665,8 @@ mod tests {
 
     // ─── v0.2.61 (Option H): new-helper regression tests ─────────────────
 
-    /// resolve_hub_base_port: hub.port file takes priority over $VCT_HUB_PORT.
-    #[test]
-    fn v0261_resolve_hub_base_port_prefers_port_file() {
-        // Scratch state dir + the env set to something else, restored by the
-        // one guard (it holds GLOBAL_ENV_MUTEX).
-        let guard = vct_launcher_core::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", Some("9999"))]);
-        std::fs::write(guard.path().join("hub.port"), "7711\n").expect("write port file");
-        assert_eq!(resolve_hub_base_port(), 7711, "hub.port file is authoritative");
-    }
-
-    /// resolve_hub_base_port: falls back to $VCT_HUB_PORT when no port file.
-    #[test]
-    fn v0261_resolve_hub_base_port_falls_back_to_env_then_default() {
-        // Empty state dir → no hub.port.
-        let _guard = vct_launcher_core::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", Some("8800"))]);
-        assert_eq!(resolve_hub_base_port(), 8800, "env used when no port file");
-        // The guard holds the lock and restores the prior value on drop.
-        unsafe { std::env::remove_var("VCT_HUB_PORT") };
-        assert_eq!(resolve_hub_base_port(), 7700, "hard default when neither present");
-    }
+    // The v0.2.61 `resolve_hub_base_port` ladder tests moved with the helper
+    // to `vct_launcher_core::services::hub_port::tests` (v0.2.97, lane T).
 
     /// module_spawn_lock: the SAME module_id returns the SAME Arc<Mutex>
     /// (so two callers serialize); DIFFERENT module_ids get distinct locks.

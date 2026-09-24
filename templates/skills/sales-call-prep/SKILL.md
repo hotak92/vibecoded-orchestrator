@@ -5,7 +5,7 @@ short_desc: "one-pager: prospect, pains, discovery Q's, objections"
 keywords: [discovery call, sales prospect, buying committee, objection handling, MEDDIC, BANT, sales call]
 argument-hint: "[LinkedIn URL] [company URL] [optional: last email/context]"
 model: opus
-effort: high
+effort: medium
 ---
 
 # /sales-call-prep

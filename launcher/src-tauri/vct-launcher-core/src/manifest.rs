@@ -1595,9 +1595,21 @@ pub struct SettingDecl {
     pub min: Option<i64>,
     #[serde(default)]
     pub max: Option<i64>,
+    /// `"per-project"` (default) — one value per project, stored in that
+    /// project's `module_settings` row and delivered to it through the hub's
+    /// `/env`; or `"global"` — ONE machine-wide value (the `project_id IS
+    /// NULL` row), read by the module itself when it starts (e.g.
+    /// `vct-hub-api`'s `VCT_HUB_PORT`: there is one hub per machine). The
+    /// launcher's settings editor and the `set_module_setting` command route
+    /// the write by this field; see `crate::module_settings_schema`.
+    #[serde(default = "default_setting_scope")]
+    pub scope: String,
 }
 fn default_setting_type() -> String {
     "string".into()
+}
+fn default_setting_scope() -> String {
+    crate::module_settings_schema::SCOPE_PER_PROJECT.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2084,6 +2096,9 @@ impl ModuleManifest {
                 return Err(format!("secret '{}' has invalid scope '{}'", s.key, s.scope));
             }
         }
+        for s in &m.settings {
+            crate::module_settings_schema::check_setting_scope(s)?;
+        }
 
         if !matches!(
             m.runtime.r#type.as_str(),
@@ -2405,6 +2420,26 @@ pub fn render_log_path_template(template: &str, project_id: &str, project_slug: 
 
 // ─── Placeholder resolution ──────────────────────────────────────────────
 
+/// v0.2.97 (lane T): the port the running vct-hub listens on, resolved by
+/// [`crate::services::hub_port::resolve_hub_port`] (`hub.port` →
+/// `$VCT_HUB_PORT` → 7700) at the moment a string is resolved. The hub's
+/// port is configurable (the `vct-hub-api` module's `VCT_HUB_PORT` setting)
+/// and the hub walks past a taken port, so a manifest that names the hub
+/// writes `http://127.0.0.1:{hub_port}/api/v1`, never a literal 7700.
+pub const HUB_PORT_PLACEHOLDER: &str = "{hub_port}";
+
+/// v0.2.97 (lane W): the host ports of the three core services, resolved by
+/// [`crate::services::service_endpoints::machine_port_from_disk`] — the chain
+/// the project env projection and the hub's `/config` use (app_state override
+/// → `services.toml` adoption → the default). A manifest naming one of these
+/// services writes `http://localhost:{code_embed_port}/health`, never a
+/// literal 11440, so a moved service is not reported down.
+pub const SERVICE_PORT_PLACEHOLDERS: [(&str, crate::services::service_endpoints::CoreService); 3] = [
+    ("{weaviate_port}", crate::services::service_endpoints::CoreService::Weaviate),
+    ("{ollama_port}", crate::services::service_endpoints::CoreService::Ollama),
+    ("{code_embed_port}", crate::services::service_endpoints::CoreService::CodeEmbed),
+];
+
 /// Runtime environment for resolving placeholder strings.
 ///
 /// Builders fill in the fields they know; `resolve` substitutes `{TOKEN}`
@@ -2483,6 +2518,19 @@ impl PlaceholderCtx {
         ];
         for (token, value) in replacements {
             out = out.replace(token, &value);
+        }
+        // Resolved only when present: it reads `hub.port`, and most strings
+        // never name the hub.
+        if out.contains(HUB_PORT_PLACEHOLDER) {
+            let port = crate::services::hub_port::resolve_hub_port();
+            out = out.replace(HUB_PORT_PLACEHOLDER, &port.to_string());
+        }
+        // Same rule: each reads launcher.db + services.toml, so only when named.
+        for (token, service) in SERVICE_PORT_PLACEHOLDERS {
+            if out.contains(token) {
+                let port = crate::services::service_endpoints::machine_port_from_disk(service);
+                out = out.replace(token, &port.to_string());
+            }
         }
         out
     }
@@ -3850,6 +3898,51 @@ mod tests {
     #[test]
     fn log_path_template_accepts_uuid_form() {
         assert!(validate_log_path_template("/data/logs/{project_id}/events.jsonl").is_ok());
+    }
+
+    /// v0.2.97 (lane T): `{hub_port}` is the running hub's port — the port
+    /// file the hub wrote wins over `$VCT_HUB_PORT`, and the default applies
+    /// only when neither answers. A string without the token is untouched.
+    #[test]
+    fn hub_port_placeholder_resolves_to_the_running_hubs_port() {
+        let guard = crate::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", Some("8802"))]);
+        let ctx = PlaceholderCtx::new("vct-example");
+        assert_eq!(ctx.resolve("http://127.0.0.1:{hub_port}/x"), "http://127.0.0.1:8802/x");
+        std::fs::write(guard.path().join("hub.port"), "8123\n").unwrap();
+        assert_eq!(ctx.resolve("http://127.0.0.1:{hub_port}/x"), "http://127.0.0.1:8123/x");
+        assert_eq!(ctx.resolve("{MODULE_ID}:7700"), "vct-example:7700");
+    }
+
+    /// v0.2.97 (lane W): the service-port placeholders resolve through the
+    /// projection's chain — the default with no state, then an app_state
+    /// override, then (for another service) a services.toml parallel port.
+    #[test]
+    fn service_port_placeholders_follow_the_machine_resolver() {
+        use crate::services::adoption::{self, AdoptionMode, AdoptionState, ServiceAdoption};
+        use crate::services::service_endpoints::APP_STATE_KEY_CODE_EMBED_PORT;
+        let _g = crate::test_env::state_dir_guard();
+        let ctx = PlaceholderCtx::new("vct-example");
+        assert_eq!(
+            ctx.resolve("http://localhost:{code_embed_port}/health"),
+            "http://localhost:11440/health"
+        );
+        assert_eq!(ctx.resolve("{weaviate_port}/{ollama_port}"), "8081/11435");
+        let db = crate::db::Db::open().unwrap();
+        db.app_state_set(APP_STATE_KEY_CODE_EMBED_PORT, "21440").unwrap();
+        let mut state = AdoptionState::default();
+        state.upsert(ServiceAdoption {
+            name: "ollama".into(),
+            mode: AdoptionMode::Parallel,
+            external_url: None,
+            parallel_port: Some(11436),
+            container_name: None,
+        });
+        adoption::write(&state).unwrap();
+        assert_eq!(
+            ctx.resolve("http://localhost:{code_embed_port}/health"),
+            "http://localhost:21440/health"
+        );
+        assert_eq!(ctx.resolve("{ollama_port}"), "11436");
     }
 
     #[test]

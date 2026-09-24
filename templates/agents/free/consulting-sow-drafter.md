@@ -5,7 +5,7 @@ short_desc: drafts SOWs/proposals from discovery notes
 keywords: [SOW, "Statement of Work", "fixed-price", T&M, retainer, "outcome-based", "consulting proposal", "draft SOW", "write proposal"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
-effort: high
+effort: medium
 skills:
   - task-breakdown
 ---

@@ -57,6 +57,14 @@ pub mod mcp_scan_rules;
 // v0.2.97 (review R6 round 2): the `requirements.depends_on` reader — one home
 // for the install/update/enable gate and validate-manifest's known-id rule.
 pub mod module_deps;
+pub mod module_setting_bindings;
+pub mod module_settings_schema;
+// v0.2.97 (lane V): the one reader of `runtime.env_from_settings` — the
+// settings a spawned module process receives.
+pub mod module_settings_env;
+// v0.2.97 (lane V round 2): the one reader of `runtime.env_from_secrets` and the
+// permission-gated lookup of a module-declared secret (shared with the hub's /env).
+pub mod module_secrets_env;
 pub mod orchestrator_manifest;
 pub mod paths;
 pub mod process;

@@ -5,7 +5,7 @@ short_desc: refines bootstrap docs for projects with unusual structure
 keywords: [new project, bootstrap, from scratch, Claude Code setup, greenfield, "bootstrap project", "set up new project", "start a project", "init project", "create new project", "refine bootstrap docs", "iterate on CLAUDE.md"]
 tools: Read, Write, Edit, Glob, Bash, Agent, AskUserQuestion
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Project Bootstrapper Agent

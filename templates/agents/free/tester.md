@@ -5,7 +5,7 @@ short_desc: writes pytest, integration tests, coverage review
 keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test", "flaky test", "failing test first", "write tests", "add tests", "test suite", "coverage gap"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 mcpServers:
   orchestrator-tools:
     command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python

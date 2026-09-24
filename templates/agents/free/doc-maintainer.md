@@ -5,7 +5,7 @@ short_desc: update docs before archiving, prevent forgetting
 keywords: ["documentation maintenance", "before archival", "CONTEXT_STATE bloat", "canonical living documents", "before archiving", "archive old docs", "update docs", "refresh docs", "reorganize docs"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Documentation Maintainer Agent

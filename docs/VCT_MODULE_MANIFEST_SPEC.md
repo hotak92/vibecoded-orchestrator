@@ -75,6 +75,13 @@ behind it) win. This spec describes the same contract in prose.
 }
 ```
 
+`provides` and `consumes` are opaque JSON arrays. One `provides` shape has a
+reader: `{ "kind": "mcp_tools", "tool_prefix": "<mcp name>" }`, pinned against
+the MCPs VCO actually registers (§9). Other kinds (e.g. `http_api` with a
+`base_url`) are descriptive only — nothing reads them. A `base_url` whose port
+is configurable is still written with the §15 placeholder, so it never states a
+wrong port (`vct-hub-api`: `http://127.0.0.1:{hub_port}/api/v1`).
+
 **Required fields**: `id`, `name`, `version`, `category`, `install`, `runtime`.
 Everything else has a serde default. `manifest_version` defaults to `0` when
 absent.
@@ -247,6 +254,40 @@ independently of image-version pulls.
 
 `type` is one of `mcp_stdio` | `mcp_http` | `service` | `cli` | `container`.
 
+`health_check` (`type`: `stdio_ping` | `http_get`, with `url` for `http_get`)
+is polled by the hub (`vct-hub/src/module_health.rs`) for every module active
+on the machine — the bundled core modules, enabled global installs, and enabled
+per-project installs (one probe per project) — and shown as a status pill on
+the module's tile in the launcher's module catalog (`Running` / `Down` /
+`Status unknown`). The results are in memory and served on
+`GET /api/v1/modules/catalog` (`health`, and `project_health` keyed by project
+id) and `GET /api/v1/modules/{id}/status`.
+
+- **States.** `up` — the last `GET url` answered 2xx. `down` — it ran and
+  failed (refused, timed out, non-2xx; `last_error` names the URL and the
+  failure). `unknown` — nothing observed: not probed yet, `stdio_ping` (the
+  hub does not own an MCP's stdio — the process belongs to the Claude Code
+  session), no `url`, an unresolved placeholder, or a refused URL, with the
+  reason in `last_error`. Unknown is never shown as down; when the launcher
+  cannot reach the hub, every pill reads unknown.
+- **Schedule.** Every `interval_s` (clamped to 5 s – 1 h), each probe bounded
+  by `timeout_s` (clamped to 1 – 30 s) and run on its own task, so a slow module
+  never delays another. The target list is rebuilt from the manifests and
+  `launcher.db` every minute. `VCT_HUB_MODULE_HEALTH=0` turns the poller off.
+- **Hosts.** Only loopback is contacted (`localhost`, `127.0.0.0/8`, `::1`),
+  with no redirects and no proxy. A `container` / `service` module may name
+  its container port on any host: the probe goes to the loopback port that
+  `runtime.ports` maps it to. Anything else is refused (logged once, shown as
+  unknown).
+- **Placeholders.** `{RL_SERVER_PORT}` and `{project_slug}` resolve to the
+  instance's allocated port and slug (a per-project URL), plus the §15 tokens.
+  A `url` that names a port the user can change must use a placeholder, not
+  the default spelled out: the bundled `vct-hub-api` writes
+  `http://127.0.0.1:{hub_port}/api/v1/health`. A port with no placeholder is
+  probed where the manifest says — e.g. `vct-code-embedding` names 11440, so on
+  a machine that moved the service with `CODE_EMBED_PORT` its pill reads down
+  with that URL in the reason.
+
 **Container / service modules must leave `command` empty** — a non-empty
 `command` overrides the image's baked ENTRYPOINT and has historically caused the
 CMD to argparse-fail (the container CMD landing appended to a `podman run …`
@@ -301,10 +342,46 @@ module is installable without declaring every structured field.
 ```
 
 The launcher's SecretsPanel collects declared secrets and stores them in the OS
-keychain (namespace `vct.{scope}.{module_id}.{key}`); the hub's
-`/api/v1/projects/{id}/env` resolver serves them to the module at start via
-`runtime.env_from_secrets`. Modules never read secrets from user-visible config
-files. `required` defaults to `true`; `scope` defaults to `per-project`.
+keychain (namespace `vct.{scope}.{module_id}.{key}`). Modules never read
+secrets from user-visible config files. `required` defaults to `true`; `scope`
+defaults to `per-project`.
+
+Every read of a declared secret goes through ONE permission gate,
+`vct_launcher_core::module_secrets_env::resolve_module_secret`: the launcher's
+per-(scope, key, requester) active flag (every launcher DB on the machine is
+consulted; any pause wins), then a non-prompting keychain read. `shared` and
+`global` secrets live at the `_user_shared_` / `_global_` keychain slots. How
+a value reaches the module depends on who starts it:
+
+- **`container` / `service` modules VCO spawns** (the hub's module supervisor,
+  per-project and global, and the launcher's per-project start): the keys
+  listed in `runtime.env_from_secrets` — and only those — are injected. The
+  requester is the project the container serves; a global container serves
+  every project, so it asks as `*` (only a machine-wide pause applies) and
+  cannot resolve a `per-project` secret. A secret that is paused, not set,
+  unreadable (keychain locked or failing), or listed without a `secrets[]`
+  declaration is skipped with a log line naming the key and the reason — never
+  the value. If the declaration is `required`, the start is refused instead,
+  with that reason, before the running container is touched. A value never
+  appears in the `podman run` / `docker run` argv: the argv carries a bare
+  `-e KEY`, and the value is placed only in the environment of the
+  `podman`/`docker` process that VCO spawns, which copies it into the
+  container. VCO writes it to no file. A value change applies at the module's
+  next start.
+- **`mcp_stdio` / `mcp_http` / `cli` modules**, which VCO does not spawn:
+  `runtime.env_from_secrets` is not consulted. The hub's
+  `GET /api/v1/projects/{id}/env` serves every declared secret of every module
+  installed for the project, through the same gate with that project as the
+  requester (paused → omitted, never returned empty); the project's resolver
+  (`vct_secrets_resolve`, `vco_lib.agent_secrets`) reads it at need.
+
+**A property of container env, not of VCO:** once a container runs, its
+environment is part of the container's configuration. `podman inspect` /
+`docker inspect` (`Config.Env`) print every env value, the injected secrets
+included, to anyone who can talk to that container runtime as the user (or
+root). The runtime also persists the container's configuration in its own
+storage. Keeping the value out of the argv removes it from `ps` and from
+command logs; it does not hide it from the runtime's owner.
 
 ---
 
@@ -324,13 +401,73 @@ files. `required` defaults to `true`; `scope` defaults to `per-project`.
     "validation_cmd": "…",
     "required": false,
     "min": 0,
-    "max": 100
+    "max": 100,
+    "scope": "per-project"           // "per-project" (default) | "global"
   }
 ]
 ```
 
 User-editable via the launcher GUI; persisted in the generic `module_settings`
-KV store and injected via `runtime.env_from_settings`.
+KV store. How a value reaches the module depends on who starts the module:
+
+- **`container` / `service` modules VCO spawns** (the hub's module supervisor,
+  per-project and global, and the launcher's per-project start): the keys
+  listed in `runtime.env_from_settings` — and only those — are put in the
+  container's environment (`-e KEY=VALUE`, after `env_fixed` / `env_derived`,
+  so a setting overrides an author default of the same name; a global
+  container's identity env still comes last). Value: the project's row (a
+  per-project spawn, unless the setting is `scope: "global"`), else the
+  machine-wide row, else the declared `default`; nothing when all are empty.
+  One resolver: `vct_launcher_core::module_settings_env`. A value change
+  applies at the module's next start.
+- **`mcp_stdio` / `mcp_http` / `cli` modules**, which VCO does not spawn (Claude
+  Code starts an MCP from its registration; hooks and CLIs run in the user's
+  session): `runtime.env_from_settings` is not consulted. Their settings reach
+  them through the hub's `GET /api/v1/projects/{id}/env`, which serves EVERY
+  declared per-project setting of every module installed for the project
+  (bundled modules included), listed or not. This is not a newer mechanism
+  that superseded the list — `/env` has served every declared setting since
+  the launcher's first commit (2026-04-25), the same commit that introduced
+  `env_from_settings`, and its source comment claiming it followed the list was
+  wrong until v0.2.97.
+- **Bundled modules the orchestrator starts outside the launcher** —
+  `vct-code-embedding` runs as the `code_embed` service of
+  `infrastructure/docker-compose.yml` (started by the install, the
+  SessionStart hook `ensure-containers`, the launcher's services start and
+  the hub's infra watchdog). Compose takes `CODE_EMBED_BACKEND` and the host
+  port from `infrastructure/.env` / the environment and fixes
+  `CODE_EMBED_DEVICE` to `auto`; the manifest's list is descriptive there
+  (see the settings' bindings in `vct_launcher_core::module_setting_bindings`).
+
+- **Scope.** A `per-project` setting has one value per project (that project's
+  `module_settings` row). A `global` setting has ONE machine-wide value (the
+  row with no project) — for something there is only one of per machine, e.g.
+  `vct-hub-api`'s `VCT_HUB_PORT`. The module reads a `global` value itself when
+  it starts, so a change takes effect on its next start.
+- **Where.** Settings are edited on **Preferences → Modules → Module
+  settings**, which lists the modules bundled with the launcher
+  (`launcher/bundled_manifests/`) and every installed module that declares
+  settings. Machine-wide values are edited directly; the page says to restart
+  the module after a change (the hub, for `VCT_HUB_PORT`). Per-project values
+  are edited for a project picked on the page. An installed module's
+  per-project settings are offered only for projects where that module is
+  installed and enabled.
+- **One value, one home (bundled modules).** A bundled setting whose live
+  value is owned by something else is shown read-only with that live value,
+  where it is set, and a link to its editor when there is one. It is never
+  stored a second time. Examples: `vct-kg`'s collection names come from the
+  project's KG binding (Identity tab), and the code-embedding settings come
+  from the service configuration. The table
+  `vct_launcher_core::module_setting_bindings` names the reader or home of
+  every bundled setting, and a test fails when a new one has neither.
+- **Validation.** Every write goes through the launcher's `set_module_setting`
+  command, which checks the value against its declaration — `type`,
+  `min`/`max`, `options`, `validation` (a regex search), `required` (refuses a
+  blank string / empty list) — and refuses a `global` setting sent with a
+  project or a `per-project` one without. It also refuses a setting bound
+  elsewhere, and an installed module's per-project setting for a project that
+  module is not installed / enabled in. The GUI applies the same rules first
+  for immediate feedback. `validation_cmd` is never run by a write.
 
 ---
 
@@ -504,6 +641,8 @@ placeholders the launcher expands at runtime:
 | `{MODULE_ID}` | The module's `id`. |
 | `{project_slug}` | The active project's slug (container-name / port templates). |
 | `{project_id}` | The active project's UUID. |
+| `{hub_port}` | The port the running vct-hub listens on: `<VCT_ROOT>/hub.port` (written by the hub after binding), else `$VCT_HUB_PORT`, else `7700`. Resolved when the string is resolved (`vct_launcher_core::services::hub_port`), so a changed `VCT_HUB_PORT` setting — or a hub that walked past a taken port — is followed without editing the manifest. |
+| `{weaviate_port}` / `{ollama_port}` / `{code_embed_port}` | The host port of that core service as the launcher resolves it for every project's env and the hub's `/config`: the `app_state` port override (`weaviate.port_override` / `ollama.port_override` / `code_embed.port_override`), else the service's `services.toml` adoption (`parallel` → its `parallel_port`, `adopt` → the port of its `external_url`), else `8081` / `11435` / `11440`. Resolved when the string is resolved (`vct_launcher_core::services::service_endpoints`), so a service moved off its default port is probed where it is. |
 
 ---
 

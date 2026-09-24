@@ -5,7 +5,7 @@ short_desc: deep prompt review, optimization, agent/skill authoring
 keywords: ["prompt review", "prompt optimization", "chain-of-thought", "few-shot", "prompt template", "agent prompt", "prompt tuning", "optimize my prompt", "improve this prompt", "agent frontmatter", "skill description", "SKILL.md"]
 tools: Read, Write, Edit, Grep, Glob
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Prompt Engineering Specialist Agent

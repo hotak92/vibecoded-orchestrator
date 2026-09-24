@@ -5,7 +5,7 @@ short_desc: end-to-end design, tech stack, impl plan
 keywords: ["end-to-end design", "tech stack selection", "system architecture", "implementation plan", "system design", "design the whole project", "pick the stack", "architecture for", "project design"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 mcpServers:
   orchestrator-tools:
     command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python

@@ -4,7 +4,7 @@ description: Crafts production-grade prompts for AI image generation (Midjourney
 short_desc: "image-gen prompts: Midjourney/Flux/SDXL/Imagen"
 keywords: [Midjourney, Flux, SDXL, ComfyUI, ControlNet, "negative prompt", "image prompt", "image generation", Imagen, Firefly, "style reference", "create image prompts"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # AI Image Prompting

@@ -2608,24 +2608,11 @@ def _hub_post_codegraph_build(project_name: str, payload: dict,
     from vco_lib.paths import vct_root_dir
 
     root = vct_root_dir()
-    port_raw = os.environ.get("VCT_HUB_PORT") or ""
-    if port_raw:
-        try:
-            port = int(port_raw.strip())
-        except ValueError:
-            port = 7700
-    else:
-        # ONE reader for "the integer in a small state file" — first line,
-        # trimmed, bounds-checked. This module previously parsed the WHOLE file
-        # as an int, so a `hub.port` with any trailing line raised where a
-        # sibling reader answered. `vco_lib.intfile` lands with the gateway lane
-        # (v0.2.94) — the shared reader, imported locally like every other
-        # vco_lib import in this function.
-        from vco_lib.intfile import read_int_line
+    # The ONE Python hub-port reader (v0.2.97), imported locally like every
+    # other vco_lib import in this function.
+    from vco_lib.hub_ensure import resolve_hub_port
 
-        port = read_int_line(
-            root / "hub.port", sentinel=7700, minimum=1, maximum=65535,
-        )
+    port = resolve_hub_port(root)
     token = os.environ.get("VCT_HUB_TOKEN") or ""
     if not token:
         token = (root / "hub.token").read_text(encoding="utf-8").strip()

@@ -5,7 +5,7 @@ short_desc: design complete visual identity systems and brand books
 keywords: [brand identity, logomark, wordmark, typography system, brand guidelines, visual identity, rebrand, "design tokens"]
 tools: Read, Write, Edit, Glob, Grep, WebFetch
 model: opus
-effort: high
+effort: medium
 ---
 
 # Brand Identity Architect Agent (Opus)

@@ -95,7 +95,8 @@ from typing import Any, Callable, Optional
 import requests
 import requests.adapters
 
-from vco_lib.intfile import parse_int_line
+from vco_lib.hub_ensure import DEFAULT_HUB_PORT as _HUB_DEFAULT_PORT
+from vco_lib.hub_ensure import resolve_hub_port
 from vco_lib.paths import vct_root_dir
 
 
@@ -117,9 +118,10 @@ RESOLVER_PROTOCOL_VERSION: int = 1
 
 # ─── Constants ──────────────────────────────────────────────────────────
 
-#: Default hub port. Mirrors ``DEFAULT_PORT`` in
-#: ``launcher/src-tauri/vct-hub/src/server.rs``.
-DEFAULT_HUB_PORT: int = 7700
+#: Default hub port — :data:`vco_lib.hub_ensure.DEFAULT_HUB_PORT`, which
+#: mirrors ``DEFAULT_HUB_PORT`` in
+#: ``launcher/src-tauri/vct-launcher-core/src/services/hub_port.rs``.
+DEFAULT_HUB_PORT: int = _HUB_DEFAULT_PORT
 
 #: TTL (seconds) for the in-process hub-discovery cache. Short enough
 #: that a launcher restart is observed quickly, long enough to amortise
@@ -567,56 +569,12 @@ def _discover_hub() -> tuple[int, str]:
         if cached is not None and cached.expires_at > now:
             return cached.port, cached.token
 
-        # Port: env > file > default.
-        #
-        # F-8 corrupt-input contract — MUST MATCH the bash sibling
-        # `vct_project_config.sh::hub_port` and the ps1 sibling
-        # `vct_project_config.ps1::Get-HubPort`: a non-integer
-        # `VCT_HUB_PORT`, a non-integer `hub.port` file, or an unreadable
-        # `hub.port` (perm-denied) must NOT raise — the port has a sane
-        # default (7700), so we emit ONE stderr warning and fall through to
-        # it. Only a truly ABSENT file (FileNotFoundError) is the silent
-        # default path (that is the normal env-only / dev case). This makes
-        # all three resolvers behave identically on corrupt port input:
-        # warn + default, never crash, never a garbage/partial resolution.
-        port_env = os.environ.get("VCT_HUB_PORT", "").strip()
-        if port_env:
-            try:
-                port = int(port_env)
-            except ValueError:
-                _warn_discovery(
-                    "hub_port_invalid",
-                    "VCT_HUB_PORT is not a positive integer; "
-                    "using default 7700",
-                )
-                port = DEFAULT_HUB_PORT
-        else:
-            port_file = vct_root_dir() / "hub.port"
-            try:
-                raw = port_file.read_text(encoding="utf-8").strip()
-            except FileNotFoundError:
-                port = DEFAULT_HUB_PORT
-            except OSError:
-                _warn_discovery(
-                    "hub_port_unreadable",
-                    "hub.port is not readable; using default 7700",
-                )
-                port = DEFAULT_HUB_PORT
-            else:
-                # The PARSE is shared (:func:`vco_lib.intfile.parse_int_line`);
-                # the classification above is not, and must not be — an
-                # unreadable file and a file of nonsense emit DIFFERENT
-                # warnings here, and that difference is the cross-language
-                # contract with the .sh/.ps1 siblings. Sharing the reader
-                # instead of the parser would have collapsed both into one.
-                parsed = parse_int_line(raw, minimum=1, maximum=65535)
-                if raw and parsed is None:
-                    _warn_discovery(
-                        "hub_port_invalid",
-                        "hub.port contains non-integer content; "
-                        "using default 7700",
-                    )
-                port = parsed if parsed is not None else DEFAULT_HUB_PORT
+        # Port: env > file > default — the ONE Python reader,
+        # :func:`vco_lib.hub_ensure.resolve_hub_port` (moved there in v0.2.97
+        # so stdlib-only callers can use it). The F-8 corrupt-input contract
+        # (warn once + default, never crash) is unchanged: this module's
+        # warner is handed in, and this module's ``vct_root_dir`` too.
+        port = resolve_hub_port(vct_root_dir(), _warn_discovery)
 
         # Token: env > file > fail.
         #

@@ -5,7 +5,7 @@ short_desc: extract KG relationships, update cross-refs
 keywords: ["knowledge curation", "cross-reference", "WikiLinks", "typed relationships", "KG curation", "update KG", "sync KG", "cross-link nodes", "link knowledge nodes"]
 tools: Read, Bash, Grep, Glob
 model: haiku
-effort: high
+effort: medium
 ---
 
 # Knowledge Curator Agent

@@ -44,12 +44,10 @@ const MIN_TIER: &str = "pro";
 /// Feature noun-phrase for the refusal copy (`tier_required_message`).
 const FEATURE: &str = "The Orchestrator Hub";
 
+/// The running hub's port, strictly from `hub.port` (the one reader:
+/// `vct_launcher_core::services::hub_port::read_hub_port_file`).
 fn hub_port() -> Result<u16, String> {
-    let path = crate::paths::vct_root_dir().join("hub.port");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.port: {}", e))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))
+    vct_launcher_core::services::hub_port::read_hub_port_file()
 }
 
 /// Read the per-startup auth token written by `hub::auth::write_token_file`.
@@ -58,13 +56,9 @@ fn hub_port() -> Result<u16, String> {
 /// `hub_port()` (the hub isn't fully up; treat both as "hub
 /// unreachable" upstream so callers don't have to differentiate).
 fn hub_token() -> Result<String, String> {
-    let path = crate::paths::vct_root_dir().join("hub.token");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.token: {}", e))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("hub.token at {} is empty", path.display()));
-    }
-    Ok(trimmed.to_string())
+    vct_launcher_core::services::boot_token::read_nonempty_token_file(
+        &crate::paths::vct_root_dir().join("hub.token"),
+    )
 }
 
 fn hub_client() -> Result<reqwest::Client, String> {

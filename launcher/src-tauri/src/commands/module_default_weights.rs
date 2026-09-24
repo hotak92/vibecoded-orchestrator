@@ -829,16 +829,11 @@ pub async fn download_to_module_dir(
 
 // ─── Best-effort hub upsert ─────────────────────────────────────────────
 
-/// Read the hub.port file. Same pattern as
-/// `module_db_client::hub_port`. Duplicated (3 lines) to keep this
-/// module self-contained.
+/// The running hub's port, strictly from `hub.port` (the one reader:
+/// `vct_launcher_core::services::hub_port::read_hub_port_file` — this was
+/// a duplicated copy "to keep this module self-contained").
 fn hub_port() -> Result<u16, String> {
-    let path = crate::paths::vct_root_dir().join("hub.port");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read hub.port: {}", e))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))
+    vct_launcher_core::services::hub_port::read_hub_port_file()
 }
 
 /// Generate a hex-encoded 32-byte random token from the OS CSPRNG.

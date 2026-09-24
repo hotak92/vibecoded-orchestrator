@@ -2,7 +2,7 @@
 name: glm-flash-researcher
 description: Read-only research and investigation lane routed to GLM 5.3 Flash via the local claude-gw gateway. Use for bounded surveys, code-comprehension sweeps, and diagnostic legwork that write one report. Explicitly NOT a reviewer — for review use glm-reviewer. Not for edits (glm-implementer). Requires the model gateway.
 model: claude-gw/glm-5.3-flash
-effort: high
+effort: medium
 tools: Read, Grep, Glob, Bash, Write
 ---
 

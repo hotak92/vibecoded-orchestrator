@@ -36,11 +36,12 @@
 //!     `VCT_VALIDATE_TIER_URL` (env-only, no file).
 //!   * `commands::installer::ORCHESTRATOR_REPO` — canonical GitHub repo
 //!     URL; not a per-machine value.
-//!   * Per-service ports (`DEFAULT_WEAVIATE_PORT` etc. in
-//!     `project_env_settings.rs` / `installer.rs`) — already overridable
-//!     via the `app_state` per-project override keys + `services.toml`
-//!     adoption flow. Layering a third source on top would duplicate that
-//!     machinery without benefit.
+//!   * Per-service ports (`services::service_endpoints`) — resolved from
+//!     the machine-global `app_state` `*.port_override` keys + the
+//!     `services.toml` adoption flow. This file's `weaviate_url` is the TOP
+//!     leg of that module's Weaviate chain
+//!     ([`LocalConfig::machine_weaviate_url_statement`]); the hub's `/config`
+//!     and every project's env resolve the whole chain there.
 //!   * `services/adoption.rs::ServiceCatalog` — feeds the adoption flow
 //!     which has its own override path via `services.toml`.
 
@@ -119,25 +120,12 @@ impl LocalConfig {
 
         // 1. Apply file values, if any.
         if let Some(p) = path {
-            match std::fs::read_to_string(p) {
-                Ok(contents) => match toml::from_str::<LocalConfigFile>(&contents) {
-                    Ok(parsed) => {
-                        if let Some(v) = parsed.weaviate_url.as_ref().filter(|s| !s.is_empty()) {
-                            cfg.weaviate_url = v.clone();
-                            sources.push(("weaviate_url", "file"));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %p.display(),
-                            error = %e,
-                            "[vct-config] failed to parse config file; using compiled defaults"
-                        );
-                    }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Common case (user never created the file). No log.
+            match read_file_weaviate_url(p) {
+                Ok(Some(v)) => {
+                    cfg.weaviate_url = v;
+                    sources.push(("weaviate_url", "file"));
                 }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
                         path = %p.display(),
@@ -180,6 +168,29 @@ impl LocalConfig {
         cfg
     }
 
+    /// The machine's own statement of where Weaviate lives, or `None` when
+    /// it makes none: `VCT_WEAVIATE_URL`, else `vct-config.toml`'s
+    /// `weaviate_url`. Deliberately NOT the legacy `WEAVIATE_URL` alias that
+    /// [`LocalConfig::load`] honours: `WEAVIATE_URL` is what the project env
+    /// projection WRITES (`.claude/env`, `.claude/settings.json`), so a
+    /// resolver that also reads it answers with its own previous output — a
+    /// hub started from a hook inherits one project's projected value and kept
+    /// serving it after the launcher re-projected a new one. This is the top
+    /// leg of `services::service_endpoints::resolve_weaviate_url`, the ONE
+    /// resolver behind the hub's `/config` and the project env projection.
+    pub fn machine_weaviate_url_statement() -> Option<String> {
+        Self::machine_weaviate_url_statement_from_path(Self::default_config_path().as_deref())
+    }
+
+    /// Test-friendly form of [`LocalConfig::machine_weaviate_url_statement`].
+    pub fn machine_weaviate_url_statement_from_path(
+        path: Option<&std::path::Path>,
+    ) -> Option<String> {
+        nonempty_env(crate::services::service_endpoints::STATEMENT_ENV)
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| path.and_then(|p| read_file_weaviate_url(p).ok().flatten()))
+    }
+
     /// Resolve the canonical config path: directory of the running
     /// launcher binary + `vct-config.toml`. Returns `None` if the
     /// current_exe lookup fails (rare — sandboxed test runners or
@@ -190,6 +201,21 @@ impl LocalConfig {
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .map(|d| d.join(CONFIG_FILENAME))
     }
+}
+
+/// The `weaviate_url` a `vct-config.toml` states. `Ok(None)` when the file
+/// is absent or has no non-empty key; `Err` when it exists but cannot be read
+/// or parsed. One reader for both [`LocalConfig::load_from_path`] and the
+/// machine statement, so the file means the same thing to both.
+fn read_file_weaviate_url(path: &std::path::Path) -> Result<Option<String>, String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        // Common case (user never created the file). No log.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let parsed = toml::from_str::<LocalConfigFile>(&contents).map_err(|e| e.to_string())?;
+    Ok(parsed.weaviate_url.filter(|s| !s.is_empty()))
 }
 
 /// Read an env var and return Some(value) iff it's set AND non-empty.

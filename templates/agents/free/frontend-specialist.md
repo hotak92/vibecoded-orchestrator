@@ -5,7 +5,7 @@ short_desc: React/Vue/Svelte client-side implementation + responsive design
 keywords: [React, Vue, Svelte, JSX, "component library", "CSS-in-JS", Tailwind, "UI design", "web UI", "Next.js", "Nuxt", "SvelteKit", "TypeScript frontend"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 skills:
   - react-patterns

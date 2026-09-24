@@ -4,7 +4,7 @@ description: Reviews Kubernetes manifests (Deployment, StatefulSet, Service, Ing
 short_desc: "review k8s manifests: limits, probes, security"
 keywords: [Kubernetes, kubernetes, k8s, Deployment, StatefulSet, NetworkPolicy, Helm, kustomize, kubectl]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Kubernetes Manifest Reviewer (Opus)

@@ -12,7 +12,7 @@ tools:
   - Bash
   - mcp__weaviate-kg__*
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 mcpServers:
   orchestrator-tools:

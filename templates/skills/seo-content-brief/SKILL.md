@@ -5,7 +5,7 @@ short_desc: "SEO brief: intent, angle, outline, metadata, schema"
 keywords: [SEO brief, target keyword, SERP, AI Overview, search intent, E-E-A-T, "write SEO brief", "SEO content", "keyword research", "content brief", "outline for SEO", "SEO targeting"]
 argument-hint: "[target keyword] [optional: SERP URL or top-3 competitor URLs]"
 model: opus
-effort: high
+effort: medium
 ---
 
 # /seo-content-brief

@@ -24,7 +24,6 @@ use tauri::{command, State};
 use crate::commands::installer::find_local_repo_root;
 use crate::commands::project_env_settings;
 use crate::commands::projects_v2::{refresh_project_env_with_db, sanitize_kg_collection};
-use crate::config::LocalConfig;
 use crate::db::Db;
 use crate::project_naming::canonical_class_prefix;
 
@@ -563,11 +562,10 @@ pub struct OrphanCollectionGroup {
 #[command]
 pub async fn list_legacy_codegraph_collections(
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
     include_untracked_projects: Option<bool>,
 ) -> Result<LegacyCodegraphReport, String> {
     let include_untracked = include_untracked_projects.unwrap_or(false);
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -954,9 +952,8 @@ pub struct CleanupFailure {
 pub async fn cleanup_legacy_codegraph_collections(
     req: CleanupLegacyReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<CleanupLegacyReport, String> {
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1092,9 +1089,8 @@ pub struct CleanupOrphanReq {
 pub async fn cleanup_orphan_codegraph_collections(
     req: CleanupOrphanReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<CleanupLegacyReport, String> {
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1496,9 +1492,9 @@ fn extract_orchestrator_shaped_classes(schema: &serde_json::Value) -> Vec<String
 /// hides its picker button on empty.
 #[command]
 pub async fn list_orchestrator_kg_collections(
-    cfg: State<'_, LocalConfig>,
+    db: State<'_, Db>,
 ) -> Result<Vec<String>, String> {
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1637,18 +1633,11 @@ pub async fn set_shared_kg_collection_name(
     .await?
 }
 
-fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    cfg.weaviate_url.clone()
+/// The ONE launcher client resolver (`service_endpoints::client_weaviate_url`,
+/// v0.2.97 lane W) — this was a private copy that never saw an adopted
+/// external Weaviate.
+fn resolve_weaviate_url(db: &Db) -> String {
+    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
 }
 
 async fn fetch_class_count(

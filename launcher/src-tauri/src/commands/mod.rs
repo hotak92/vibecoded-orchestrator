@@ -157,6 +157,8 @@ pub mod module_dispatch;
 // the host, visible across every project) had no way to be silenced
 // per-project. See `module_enabled.rs` for the full design notes.
 pub mod module_enabled;
+// v0.2.97 (lane V): the GUI read of the hub's module health poller.
+pub mod module_health;
 pub mod module_gui;
 // v0.2.33 Agent C (L0b): post-install manifest extraction +
 // startup reconciler. `module_manifest_extract` runs after

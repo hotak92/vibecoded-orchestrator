@@ -4,7 +4,7 @@ description: Recommends the appropriate statistical test given a data descriptio
 short_desc: choose statistical test + assumptions + power analysis
 keywords: ["t-test", ANOVA, "power analysis", "Mann-Whitney", "chi-squared", Wilcoxon, "what test should I use", "analyze this dataset", "sample size guidance"]
 model: opus
-effort: high
+effort: medium
 allowed-tools: Read, Write, WebSearch, Bash
 ---
 

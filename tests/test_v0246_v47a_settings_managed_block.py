@@ -94,6 +94,37 @@ def test_build_defaults_includes_env_block(embed_config):
     assert defaults["env"]["KG_COLLECTION"] == "KnowledgeGraph"
 
 
+def test_build_defaults_service_urls_follow_the_machine_chain(
+    embed_config, tmp_path, monkeypatch
+):
+    """v0.2.97 (lane X): the service URLs in the settings defaults come
+    from the ONE resolver (``vco_lib.service_endpoints``), so a
+    services.toml adoption reaches ``.claude/settings.json`` — the
+    env-only ``WEAVIATE_PORT`` read this replaced could not see one."""
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("VCT_STATE_DIR", str(state))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
+    monkeypatch.delenv("VCT_WEAVIATE_URL", raising=False)
+    monkeypatch.delenv("VCT_HUB_BIN", raising=False)
+    monkeypatch.delenv("WEAVIATE_PORT", raising=False)
+
+    defaults = install_py._build_vco_settings_defaults(embed_config)
+    assert defaults["env"]["WEAVIATE_URL"] == "http://localhost:8081"
+
+    from vco_lib.service_adoption import write_services_toml
+
+    write_services_toml({"services": [
+        {"name": "weaviate", "mode": "adopt",
+         "external_url": "http://weaviate.lan:8090/v1/meta"},
+        {"name": "ollama", "mode": "parallel", "parallel_port": 21435},
+    ]})
+    defaults = install_py._build_vco_settings_defaults(embed_config)
+    assert defaults["env"]["WEAVIATE_URL"] == "http://weaviate.lan:8090"
+    assert defaults["env"]["OLLAMA_URL"] == "http://localhost:21435"
+
+
 def test_build_defaults_includes_permissions(embed_config):
     """Permissions stay as the existing fresh-install block."""
     defaults = install_py._build_vco_settings_defaults(embed_config)

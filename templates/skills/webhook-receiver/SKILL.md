@@ -4,7 +4,7 @@ description: Hardens an inbound webhook endpoint with HMAC signature verificatio
 short_desc: "webhook receiver: HMAC, replay protection, idempotency"
 keywords: [webhook, HMAC, signature verification, replay protection, dead-letter, X-Hub-Signature, idempotency, retry-safe, DLQ]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Webhook Receiver (Opus)

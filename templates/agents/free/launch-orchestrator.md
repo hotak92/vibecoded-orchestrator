@@ -5,7 +5,7 @@ short_desc: multi-channel release launch comms
 keywords: [release notes, changelog post, Product Hunt, Show HN, launch tweet, "launch the release", "release announcement", "prep launch", "going on Product Hunt", "release blog", "launch comms", "release email"]
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
-effort: high
+effort: medium
 ---
 
 # Launch Orchestrator Agent (Opus)

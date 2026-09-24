@@ -30,6 +30,13 @@ pub mod deferral_lock;
 // service whose adoption mode is Adopt / Parallel / Refuse.
 pub mod adoption;
 
+// v0.2.97 (lane W): where the three core services are reached — the ONE
+// resolver behind the hub's `/config` and the launcher's project env
+// projection (they had computed the Weaviate URL two different ways). Mirrored
+// by `vco_lib/service_endpoints.py`; both run
+// `tests/fixtures/service_endpoint_parity.json`.
+pub mod service_endpoints;
+
 // v0.2.47: shared per-paid-module container helpers. Previously two
 // near-identical copies lived in launcher/src/commands/module_service.rs
 // and vct-hub/src/module_supervisor.rs; the drift between them caused
@@ -46,6 +53,12 @@ pub mod gpu_mode;
 // is pure (env + two small file reads via `crate::paths::vct_root_dir`) and
 // carries the parity test against the daemon's own `model_router/config.py`.
 pub mod model_gateway_port;
+
+// v0.2.97 (lane T): where the running vct-hub listens (`hub.port` →
+// `$VCT_HUB_PORT` → 7700). Moved out of `vct_hub::module_supervisor` so the
+// manifest placeholder `{hub_port}` resolves through the same ladder that
+// builds a container's `VCT_HUB_BASE_URL`, instead of a second copy.
+pub mod hub_port;
 
 // v0.2.54 Track I: per-boot bearer-token primitives (generate /
 // persist-0o600 / constant-time-compare / Bearer parse). Extracted

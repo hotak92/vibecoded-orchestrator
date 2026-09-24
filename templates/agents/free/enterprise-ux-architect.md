@@ -5,7 +5,7 @@ short_desc: dense-dashboard + compliance-workflow UX for power users
 keywords: ["enterprise UX", "dense dashboard", "information density", "admin console", "power user", "B2B admin", "layout design", "design dashboard", "dashboard UX"]
 tools: Read, Write, Edit, Glob, Grep, WebFetch
 model: opus
-effort: high
+effort: medium
 ---
 
 # Enterprise UX Architect Agent (Opus)

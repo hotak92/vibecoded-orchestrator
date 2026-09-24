@@ -91,6 +91,8 @@ use vct_launcher_core::process::CommandExt as _;
 ///   * home-dir keys — `HOME` (POSIX) or
 ///     `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HOMEDRIVE`/`HOMEPATH`
 ///     (Windows) — so the `~/.vct/launcher.db` fallback resolves.
+///   * `VCT_WEAVIATE_URL` — set to the launcher's own Weaviate statement
+///     (env or `vct-config.toml`), not inherited verbatim (v0.2.97 lane W).
 ///
 /// Anything NOT on this list (e.g. an inherited `KG_COLLECTION`) is
 /// dropped by the preceding `env_clear`, which is the whole point.
@@ -131,6 +133,19 @@ pub fn reinject_minimal_env(cmd: &mut Command) {
         if let Ok(v) = std::env::var("HOME") {
             cmd.env("HOME", v);
         }
+    }
+
+    // v0.2.97 (lane W): the launcher's own Weaviate statement — its
+    // `VCT_WEAVIATE_URL`, else the `vct-config.toml` next to ITS binary — so
+    // the child's `vco_lib.service_endpoints` resolves the same URL this
+    // process's `service_endpoints::machine_weaviate_url` does (the child
+    // cannot find a config file beside a binary it never saw). Only the
+    // statement travels; the other legs come from the launcher.db and
+    // services.toml both sides read.
+    if let Some(statement) =
+        vct_launcher_core::config::LocalConfig::machine_weaviate_url_statement()
+    {
+        cmd.env(vct_launcher_core::services::service_endpoints::STATEMENT_ENV, statement);
     }
 }
 
@@ -904,6 +919,27 @@ mod tests {
         assert!(hit, "VCT_INSTALL_ROOT should be re-injected by the sandbox");
 
         std::env::remove_var("VCT_INSTALL_ROOT");
+    }
+
+    /// v0.2.97 (lane W): the child receives the launcher's Weaviate
+    /// statement as `VCT_WEAVIATE_URL` (so `vco_lib.service_endpoints`
+    /// resolves what the launcher resolves), and never the projected
+    /// transport `WEAVIATE_URL`.
+    #[test]
+    fn hands_the_weaviate_statement_to_the_child() {
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("VCT_WEAVIATE_URL", Some("http://vm.lan:9000")),
+            ("WEAVIATE_URL", Some("http://stale-projection:1")),
+        ]);
+        let mut cmd = Command::new("python3");
+        reinject_minimal_env(&mut cmd);
+        let get = |key: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == key)
+                .and_then(|(_, v)| v.map(|vv| vv.to_string_lossy().to_string()))
+        };
+        assert_eq!(get("VCT_WEAVIATE_URL").as_deref(), Some("http://vm.lan:9000"));
+        assert_eq!(get("WEAVIATE_URL"), None);
     }
 
     /// v0.2.97: the stdin request is exactly what

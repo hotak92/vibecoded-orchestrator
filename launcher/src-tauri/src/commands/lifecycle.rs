@@ -211,7 +211,8 @@ async fn probe_url(url: &str) -> bool {
 async fn services_already_running() -> bool {
     // /v1/meta is the right liveness probe (see canonical_services note
     // for why /v1/.well-known/ready is too strict).
-    let url = format!("http://localhost:{}/v1/meta", DEFAULT_WEAVIATE_PORT);
+    // v0.2.97 (lane X): port via the ONE chain (`effective_port`).
+    let url = format!("http://localhost:{}/v1/meta", effective_port("weaviate"));
     probe_url(&url).await
 }
 
@@ -327,15 +328,19 @@ async fn run_stack_wrapper(subcommand: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Get the per-service effective port — falls back to the canonical
-/// default unless the user picked `Mode::Parallel`, in which case we
-/// honor the recorded `parallel_port`.
-fn effective_port(name: &str, default_port: u16, state: &AdoptionState) -> u16 {
-    state
-        .get(name)
-        .filter(|s| s.mode == AdoptionMode::Parallel)
-        .and_then(|s| s.parallel_port)
-        .unwrap_or(default_port)
+/// Get the per-service effective port — the ONE chain (`service_endpoints`,
+/// v0.2.97 lane X): app_state `*.port_override` → services.toml adoption
+/// (a parallel port, or an adopted external URL's port) → canonical
+/// default. The copy this replaces read only the parallel leg, so a port
+/// override set in the launcher never reached these probes.
+fn effective_port(name: &str) -> u16 {
+    let service = match name {
+        "weaviate" => vct_launcher_core::services::service_endpoints::CoreService::Weaviate,
+        "ollama" => vct_launcher_core::services::service_endpoints::CoreService::Ollama,
+        "code_embed" => vct_launcher_core::services::service_endpoints::CoreService::CodeEmbed,
+        _ => return 0,
+    };
+    vct_launcher_core::services::service_endpoints::machine_port_from_disk(service)
 }
 
 /// Read the launcher-managed services snapshot. Probes all three
@@ -347,8 +352,8 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
 
     // Build per-service probe URLs honoring any parallel-port overrides.
     let mut probes: Vec<(String, u16, String)> = Vec::new(); // (name, port, url)
-    for (name, default_port, url_for) in canonical_services() {
-        let port = effective_port(name, default_port, &adoption_state);
+    for (name, _canonical_default, url_for) in canonical_services() {
+        let port = effective_port(name);
         probes.push((name.to_string(), port, url_for(port)));
     }
 
@@ -763,8 +768,7 @@ async fn route_service_action(
         .get(name)
         .map(|s| s.mode)
         .unwrap_or(AdoptionMode::Unresolved);
-    let canonical_port = canonical_port_for(name);
-    let effective = effective_port(name, canonical_port, &state);
+    let effective = effective_port(name);
 
     match mode {
         AdoptionMode::Parallel => {
@@ -1623,13 +1627,15 @@ mod services_lifecycle_tests {
     }
 
     #[test]
-    fn effective_port_falls_back_to_default_when_no_override() {
-        let state = AdoptionState::default();
-        assert_eq!(effective_port("weaviate", 8081, &state), 8081);
-    }
+    fn effective_port_follows_the_machine_chain() {
+        // v0.2.97 (lane X): the Services-card / tray probes use the ONE
+        // port chain — canonical default → services.toml parallel
+        // adoption → app_state override. The copy this replaced read
+        // only the parallel leg (an adopted external URL's port and the
+        // override never reached the probe URLs).
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        assert_eq!(effective_port("weaviate"), 8081);
 
-    #[test]
-    fn effective_port_uses_parallel_port_when_set() {
         let mut state = AdoptionState::default();
         state.upsert(ServiceAdoption {
             name: "weaviate".into(),
@@ -1638,23 +1644,12 @@ mod services_lifecycle_tests {
             parallel_port: Some(8091),
             container_name: None,
         });
-        assert_eq!(effective_port("weaviate", 8081, &state), 8091);
-    }
+        adoption::write(&state).unwrap();
+        assert_eq!(effective_port("weaviate"), 8091);
 
-    #[test]
-    fn effective_port_ignores_parallel_port_for_adopted_service() {
-        // If the user adopted, we route to the canonical port (where
-        // their existing service lives). Parallel port only applies in
-        // Parallel mode.
-        let mut state = AdoptionState::default();
-        state.upsert(ServiceAdoption {
-            name: "weaviate".into(),
-            mode: AdoptionMode::Adopt,
-            external_url: Some("http://localhost:8081".into()),
-            parallel_port: Some(8091), // ignored under Adopt mode
-            container_name: None,
-        });
-        assert_eq!(effective_port("weaviate", 8081, &state), 8081);
+        let db = crate::db::Db::open().unwrap();
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        assert_eq!(effective_port("weaviate"), 18081);
     }
 
     #[tokio::test]

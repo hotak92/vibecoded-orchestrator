@@ -5,7 +5,7 @@ short_desc: blameless post-mortem from incident artifacts
 keywords: ["post-mortem", postmortem, blameless, "contributing factors", "incident timeline", RCA, "write postmortem", "incident review", "lessons learned"]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
 model: opus
-effort: high
+effort: medium
 isolation: worktree
 skills:
   - debug-expert

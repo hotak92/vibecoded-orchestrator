@@ -4,7 +4,7 @@ description: Designs the idempotency strategy for a state-changing operation - k
 short_desc: idempotency strategy for state-changing endpoints
 keywords: ["idempotency key", "dedup token", "duplicate prevention", "idempotent endpoint", "prevent duplicates", "safe to retry", "idempotency design", "design for retries", "handle duplicate requests"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Idempotency Keys (Opus)

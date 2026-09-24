@@ -44,10 +44,12 @@ The hub runtime contract (read-only here; PRESERVED exactly)
 * port — ``$VCT_HUB_PORT`` → ``<vct_root_dir()>/hub.port`` → ``7700``.
 * token — ``$VCT_HUB_TOKEN`` → ``<vct_root_dir()>/hub.token``.
 
-Port and token are NOT re-implemented here: :mod:`vco_lib.project_config`
-is their home (``_discover_hub``), and a second reader would be the very
-duplication this module exists to remove. The names + default live here as
-constants only so the contract is documented in one readable place.
+The PORT reader lives here — :func:`resolve_hub_port`, moved out of
+:func:`vco_lib.project_config._discover_hub` in v0.2.97 so the stdlib-only
+callers (``install.py --bootstrap --json``, which runs before any package is
+installed, and :mod:`vco_lib.secrets_bootstrap`) report the hub's real port
+without importing ``requests``. ``_discover_hub`` calls it, so there is still
+one reader. The TOKEN reader stays in :mod:`vco_lib.project_config`.
 
 What this module deliberately does NOT own
 ------------------------------------------
@@ -92,9 +94,9 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
-from vco_lib.intfile import read_int_line
+from vco_lib.intfile import parse_int_line, read_int_line
 from vco_lib.paths import vct_root_dir
 
 __all__ = [
@@ -115,13 +117,15 @@ __all__ = [
     "hub_pid_file",
     "hub_port_file",
     "hub_token_file",
+    "resolve_hub_port",
     "is_running",
     "main",
 ]
 
 #: The hub's single-instance lockfile, port file and token file, all under
-#: :func:`vco_lib.paths.vct_root_dir`. Names only — see the module docstring
-#: for why the port/token READERS live in :mod:`vco_lib.project_config`.
+#: :func:`vco_lib.paths.vct_root_dir`. The port reader is
+#: :func:`resolve_hub_port` (below); the token reader lives in
+#: :mod:`vco_lib.project_config` — see the module docstring.
 HUB_PID_FILE = "hub.pid"
 HUB_PORT_FILE = "hub.port"
 HUB_TOKEN_FILE = "hub.token"
@@ -196,6 +200,70 @@ def hub_pid_file() -> Path:
 def hub_port_file() -> Path:
     """``<vct_root_dir()>/hub.port``."""
     return vct_root_dir() / HUB_PORT_FILE
+
+
+def resolve_hub_port(
+    vct_root: Optional[Path] = None,
+    warn: Optional[Callable[[str, str], None]] = None,
+) -> int:
+    """The hub's port: ``$VCT_HUB_PORT`` → ``<vct_root>/hub.port`` → 7700.
+
+    The ONE Python port reader. Callers: ``vco_lib.project_config._discover_hub``,
+    ``vco_lib.access_resolver._hub_port``, ``vco_lib.codegraph_resync``,
+    ``claude_mcp_servers/rl_client/hub_writer._read_hub_port``,
+    ``claude_mcp_servers/wrappers/_base`` and ``weaviate_mcp/server``'s access
+    lookup, ``install.py --bootstrap --json`` and
+    :mod:`vco_lib.secrets_bootstrap`. Stdlib-only, so it works before the
+    install has installed anything. ``vct_root`` defaults to
+    :func:`vco_lib.paths.vct_root_dir`.
+
+    A valid port is an integer in 1..65535.
+
+    F-8 corrupt-input contract — MUST MATCH the bash sibling
+    ``vct_project_config.sh::hub_port`` and the ps1 sibling
+    ``vct_project_config.ps1::Get-HubPort``: nothing here raises.
+
+    * ``VCT_HUB_PORT`` set but not a valid port → ``warn("hub_port_invalid")``
+      and FALL THROUGH to ``hub.port``, then the default (owner ruling
+      2026-09-24: the file names the RUNNING hub, which beats a guess; before
+      v0.2.97 this jumped straight to 7700, and three other readers fell
+      through to the file — the readers disagreed).
+    * ``hub.port`` unreadable → ``warn("hub_port_unreadable")`` + default;
+      non-empty but not a valid port → ``warn("hub_port_invalid")`` + default;
+      absent or empty → the silent default.
+
+    ``warn`` defaults to silence (the bootstrap JSON's stdout is a contract);
+    ``project_config`` passes its stderr warner.
+    """
+    def _warn(kind: str, detail: str) -> None:
+        if warn is not None:
+            warn(kind, detail)
+
+    port_env = os.environ.get("VCT_HUB_PORT", "").strip()
+    if port_env:
+        from_env = parse_int_line(port_env, minimum=1, maximum=65535)
+        if from_env is not None:
+            return from_env
+        _warn(
+            "hub_port_invalid",
+            "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700",
+        )
+    port_file = (vct_root if vct_root is not None else vct_root_dir()) / HUB_PORT_FILE
+    try:
+        raw = port_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return DEFAULT_HUB_PORT
+    except OSError:
+        _warn("hub_port_unreadable", "hub.port is not readable; using default 7700")
+        return DEFAULT_HUB_PORT
+    # The PARSE is shared (:func:`vco_lib.intfile.parse_int_line`); the
+    # classification above is not, and must not be — an unreadable file and
+    # a file of nonsense emit DIFFERENT warnings, and that difference is the
+    # cross-language contract with the .sh/.ps1 siblings.
+    parsed = parse_int_line(raw, minimum=1, maximum=65535)
+    if raw and parsed is None:
+        _warn("hub_port_invalid", "hub.port contains non-integer content; using default 7700")
+    return parsed if parsed is not None else DEFAULT_HUB_PORT
 
 
 def hub_token_file() -> Path:

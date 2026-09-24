@@ -24,14 +24,15 @@ use super::{
     project_state_api, project_tokens, rl_events_api, secrets_api, weaviate_probe,
 };
 
-const DEFAULT_PORT: u16 = 7700;
+/// The one default, shared with every Rust reader of `hub.port`.
+const DEFAULT_PORT: u16 = vct_launcher_core::services::hub_port::DEFAULT_HUB_PORT;
 
 /// The module whose GLOBAL setting [`HUB_PORT_KEY`] configures the port the
 /// hub binds — `launcher/bundled_manifests/vct-hub-api.json` declares it.
 pub(crate) const HUB_MODULE_ID: &str = "vct-hub-api";
 /// The setting key — the SAME name as the env var that overrides it, so the
 /// manifest names the one knob there is.
-pub(crate) const HUB_PORT_KEY: &str = "VCT_HUB_PORT";
+pub(crate) const HUB_PORT_KEY: &str = vct_launcher_core::services::hub_port::HUB_PORT_ENV;
 
 /// The port the hub binds, in precedence order:
 ///
@@ -134,8 +135,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // still boots and the rest of the routes serve normally.
     match vct_launcher_core::db::Db::open() {
         Ok(probe_db) => {
-            let local_config = vct_launcher_core::config::LocalConfig::load();
-            weaviate_probe::spawn_startup_probe(probe_db, &local_config);
+            weaviate_probe::spawn_startup_probe(probe_db);
         }
         Err(e) => {
             tracing::warn!(
@@ -425,6 +425,12 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // point rather than a second copy of the start logic.
     gateway_watchdog::spawn_gateway_watchdog(launcher_state.clone());
 
+    // v0.2.97 (lane V): poll every active module's `runtime.health_check`
+    // (loopback only, bounded, one task per probe) so the module tiles can
+    // show up / down / unknown. Results are served on /modules/catalog and
+    // /modules/{id}/status. `VCT_HUB_MODULE_HEALTH=0` disables it.
+    super::module_health::spawn_module_health_poller(launcher_state.clone());
+
     // E-2: log the ACTUAL bind host, not a hardcoded "127.0.0.1" (the prior
     // string drifted from the real 0.0.0.0 bind). Loopback is always reachable
     // as 127.0.0.1 regardless of the bind IP, so print that for the all-
@@ -643,16 +649,6 @@ async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::Tcp
     unreachable!()
 }
 
-/// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
-///
-/// v0.2.61 (Option H C-PORT): write atomically via a temp file + rename.
-/// A plain truncating write can be observed mid-write (empty / partial) by a
-/// concurrent reader (`module_service::hub_port_for_proxy`,
-/// `module_supervisor::resolve_hub_base_port`) whose `parse::<u16>()` then
-/// fails → wrong VCT_HUB_BASE_URL / a failed readiness probe on a healthy hub.
-/// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
-/// semantics, so a reader sees either the old value or the new one, never a
-/// torn one.
 /// Discovery file recording the hub's ACTUAL bind IP (v0.2.75 P1a).
 /// Sibling of `hub.port`. Readers: the launcher's module-start widen
 /// check (`module_service::widen_restart_action`) and the supervisor's
@@ -676,8 +672,20 @@ async fn write_bind_file(bind_ip: std::net::Ipv4Addr) {
     }
 }
 
+/// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
+///
+/// v0.2.61 (Option H C-PORT): write atomically via a temp file + rename.
+/// A plain truncating write can be observed mid-write (empty / partial) by a
+/// concurrent reader (`module_service::hub_port_for_proxy`,
+/// `vct_launcher_core::services::hub_port::resolve_hub_port`, which the
+/// supervisor and the manifest placeholder `{hub_port}` both use) whose
+/// `parse::<u16>()` then fails → wrong VCT_HUB_BASE_URL / a failed readiness
+/// probe on a healthy hub.
+/// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
+/// semantics, so a reader sees either the old value or the new one, never a
+/// torn one.
 async fn write_port_file(port: u16) {
-    let path = vct_launcher_core::paths::vct_root_dir().join("hub.port");
+    let path = vct_launcher_core::services::hub_port::hub_port_file();
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();

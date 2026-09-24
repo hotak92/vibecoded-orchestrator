@@ -17,30 +17,15 @@ use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, Manager, State};
 
 use crate::commands::installer::resolve_orchestrator_root;
-use crate::config::LocalConfig;
 use crate::db::code_graph_builds::{status as build_status, CodeGraphBuildRow};
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
 
-/// Resolve the local Weaviate URL, mirroring the precedence rules in
-/// `commands::kg::weaviate_url`: env (`VCT_WEAVIATE_URL`, then legacy
-/// `WEAVIATE_URL`) > `LocalConfig` > compiled default. Kept private to
-/// this module instead of factoring a shared helper because the only
-/// other caller (`commands::kg`) already has its own version in tight
-/// coupling with its `State<LocalConfig>` access pattern; sharing would
-/// require pulling LocalConfig out of Tauri state in awkward places.
-fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    cfg.weaviate_url.clone()
+/// The ONE launcher client resolver (`service_endpoints::client_weaviate_url`,
+/// v0.2.97 lane W) — this was a private copy that never saw an adopted
+/// external Weaviate.
+fn resolve_weaviate_url(db: &Db) -> String {
+    vct_launcher_core::services::service_endpoints::client_weaviate_url(db)
 }
 
 #[derive(Debug, Serialize)]
@@ -178,7 +163,6 @@ pub async fn codegraph_summary(
     acting_project_id: String,
     target_project_id: String,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<CodegraphSummary, String> {
     if acting_project_id != target_project_id {
         let level = db.codegraph_check(&target_project_id, &acting_project_id)?;
@@ -198,7 +182,7 @@ pub async fn codegraph_summary(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
 
     let project_tag = &target.name; // codegraph entities are tagged by project name
 
@@ -308,7 +292,6 @@ pub async fn codegraph_load_graph(
     target_project_id: String,
     max_nodes: Option<u32>,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<CodegraphViz, String> {
     if acting_project_id != target_project_id {
         let level = db.codegraph_check(&target_project_id, &acting_project_id)?;
@@ -329,7 +312,7 @@ pub async fn codegraph_load_graph(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
 
     let mut nodes: Vec<CgVizNode> = Vec::new();
     let mut name_to_id: std::collections::HashMap<String, String> =
@@ -496,7 +479,6 @@ pub struct EntityBulkFailure {
 pub async fn codegraph_set_entity_access_bulk(
     req: EntityAccessBulkReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<EntityBulkAccessResult, String> {
     if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
         return Err(format!("invalid mode: {}", req.mode));
@@ -523,7 +505,7 @@ pub async fn codegraph_set_entity_access_bulk(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
 
     let mut succeeded = 0usize;
     let mut failures: Vec<EntityBulkFailure> = Vec::new();
@@ -2743,8 +2725,10 @@ pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Optio
 /// Generic resolver for a bundled `.claude/scripts/<bin>` wrapper, shared by
 /// `resolve_analyzer_script` (code-graph-analyze) and
 /// `orchestrator_core::build_script_command` (kg-sync, kg-duplicates,
-/// code-graph-analyze). One home for the candidate ladder + stale-guard so a
-/// fix here reaches every wrapper.
+/// code-graph-analyze), `kg_sync::resolve_kg_sync_script` and
+/// `kg_summary::resolve_summary_script`. One home for the stale-guard so a fix
+/// here reaches every wrapper; the candidate LADDER itself is
+/// `vct_launcher_core::paths` (tier 1's path + tiers 2-4), never a copy here.
 ///
 /// Order:
 ///   1. Project-local `<project>/.claude/scripts/<bin>` — but for wrappers
@@ -2753,15 +2737,16 @@ pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Optio
 ///      (or an unreadable file) is skipped: WARN once, emit a best-effort
 ///      per-project deferral, and fall through to the orchestrator copy.
 ///   2-4. Orchestrator copy via `$VCT_LAUNCHER_SCRIPTS_DIR`, sibling-of-exe,
-///      then PATH — see `resolve_orchestrator_script`.
+///      then PATH — `vct_launcher_core::paths::resolve_orchestrator_script`,
+///      the shared ladder's own tiers.
 ///
 /// Returns `None` if nothing resolves.
 pub(crate) fn resolve_bundled_script(
     project_folder: &std::path::Path,
     bin: &str,
 ) -> Option<std::path::PathBuf> {
-    // 1. Project-local.
-    let p1 = project_folder.join(".claude").join("scripts").join(bin);
+    // 1. Project-local — the shared ladder's tier-1 path, vetted here.
+    let p1 = vct_launcher_core::paths::project_script_path(project_folder, bin);
     if p1.is_file() {
         // Live bug (2026-07-10 dogfood): a project shipped a stale 2026-02
         // (pre-RT-4) `code-graph-analyze` that hardcoded an absolute venv
@@ -2777,7 +2762,7 @@ pub(crate) fn resolve_bundled_script(
         if !wrapper_requires_resilience_marker(bin) || analyzer_wrapper_is_resilient(&p1) {
             return Some(p1);
         }
-        let fallback = resolve_orchestrator_script(bin);
+        let fallback = vct_launcher_core::paths::resolve_orchestrator_script(bin);
         tracing::warn!(
             "[codegraph] WARN: project-local wrapper {} is stale \
              (pre-RT-4: no resilient interpreter-discovery marker); \
@@ -2792,50 +2777,7 @@ pub(crate) fn resolve_bundled_script(
         return fallback;
     }
 
-    resolve_orchestrator_script(bin)
-}
-
-/// Candidates 2-4 of the bundled-script ladder: the ORCHESTRATOR copy of
-/// `<bin>`, reached via `$VCT_LAUNCHER_SCRIPTS_DIR`, sibling-of-exe, then
-/// PATH. Split out so both the project-local-first resolver and any
-/// orchestrator-fallback caller share ONE candidate walk.
-pub(crate) fn resolve_orchestrator_script(bin: &str) -> Option<std::path::PathBuf> {
-    // 2. Env override
-    if let Ok(dir) = std::env::var("VCT_LAUNCHER_SCRIPTS_DIR") {
-        let p2 = std::path::PathBuf::from(dir).join(bin);
-        if p2.is_file() {
-            return Some(p2);
-        }
-    }
-
-    // 3. Sibling-of-exe convention
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            // ONE home for the hop list: `vct_launcher_core::paths`. The two
-            // ladders (there and here) had drifted into byte-identical copies
-            // of the same three hops, and BOTH were one hop short of the
-            // shipped `launcher/dist/<target>/` layout — so fixing one would
-            // have left the other silently broken.
-            for hop in vct_launcher_core::paths::ORCHESTRATOR_HOP_SUFFIXES.iter() {
-                let p3 = parent.join(hop).join(".claude").join("scripts").join(bin);
-                if p3.is_file() {
-                    return Some(p3);
-                }
-            }
-        }
-    }
-
-    // 4. PATH lookup (`lookup_path`: tests inject one per thread instead of
-    // setting the shared process PATH — review R6).
-    if let Some(path) = vct_launcher_core::paths::lookup_path() {
-        for d in std::env::split_paths(&path) {
-            let p4 = d.join(bin);
-            if p4.is_file() {
-                return Some(p4);
-            }
-        }
-    }
-    None
+    vct_launcher_core::paths::resolve_orchestrator_script(bin)
 }
 
 /// The string a healthy (RT-4+) wrapper must still contain.
@@ -3719,6 +3661,54 @@ mod build_tests {
         }
 
         fs::remove_dir_all(&d).ok();
+    }
+
+    /// v0.2.97 (lane T): the orchestrator-copy tiers of the bundled-script
+    /// ladder — `$VCT_LAUNCHER_SCRIPTS_DIR`, sibling-of-exe, PATH — are the
+    /// SHARED ladder, `vct_launcher_core::paths::resolve_orchestrator_script`.
+    /// `resolve_bundled_script` used to walk its own copy of those tiers, so a
+    /// fix to the shared ladder never reached a code-graph, kg-sync or
+    /// kg-summary spawn (all three resolve through here).
+    ///
+    /// Mutation check: break tier 2 or tier 4 in the shared helper and this
+    /// test fails. Against the old in-module copy it stayed green, which is
+    /// the duplication this pins shut.
+    #[test]
+    fn bundled_script_fallback_tiers_are_the_shared_ladder() {
+        let proj = tmpdir("shared-ladder-proj");
+        let orch = tmpdir("shared-ladder-orch");
+        // A name no sibling-of-exe clone can carry, so tier 3 never answers.
+        let bin = "vct-lane-t-shared-ladder-probe";
+        fs::write(orch.join(bin), b"#!/bin/sh\n").unwrap();
+        let orch_dir = orch.to_string_lossy().into_owned();
+        let empty_path = std::ffi::OsStr::new("");
+
+        // Tier 2: the env override, with an empty lookup PATH.
+        let mut via_env = None;
+        vct_launcher_core::test_env::with_env_vars(
+            &[("VCT_LAUNCHER_SCRIPTS_DIR", Some(orch_dir.as_str()))],
+            || {
+                via_env = vct_launcher_core::paths::with_lookup_path(Some(empty_path), || {
+                    resolve_bundled_script(&proj, bin)
+                });
+            },
+        );
+        // Tier 4: PATH (injected for this thread only), with no env override.
+        let mut via_path = None;
+        let mut shared = None;
+        vct_launcher_core::test_env::with_env_vars(&[("VCT_LAUNCHER_SCRIPTS_DIR", None)], || {
+            vct_launcher_core::paths::with_lookup_path(Some(orch.as_os_str()), || {
+                via_path = resolve_bundled_script(&proj, bin);
+                shared = vct_launcher_core::paths::resolve_installed_script(&proj, bin);
+            });
+        });
+
+        assert_eq!(via_env, Some(orch.join(bin)), "tier 2 ($VCT_LAUNCHER_SCRIPTS_DIR)");
+        assert_eq!(via_path, Some(orch.join(bin)), "tier 4 (PATH)");
+        assert_eq!(via_path, shared, "codegraph and the shared ladder give one answer");
+
+        fs::remove_dir_all(&proj).ok();
+        fs::remove_dir_all(&orch).ok();
     }
 
     // ═══════════════════════════════════════════════════════════════════

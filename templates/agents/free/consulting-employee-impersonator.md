@@ -5,7 +5,7 @@ short_desc: wear-the-hat role simulator for draft review
 keywords: [employee archetype, role impersonation, junior dev voice, account manager voice, wear the hat, "as a PM", "as a senior dev", "act as", "pretend to be", "voice of a", "from the perspective of"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
-effort: high
+effort: medium
 ---
 
 # Consulting Employee Impersonator

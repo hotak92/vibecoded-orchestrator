@@ -277,27 +277,34 @@ _emit_warning() {
 # ── Hub port discovery ──────────────────────────────────────────────────
 # CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the ps1 sibling
 # `vct_project_config.ps1::Get-HubPort` and the python sibling
-# `vco_lib/project_config.py::_discover_hub` (port branch):
-#   * env `VCT_HUB_PORT` or `hub.port` file that is non-numeric / garbage
-#     → emit ONE rate-limited stderr warning (kind `hub_port_invalid`) and
-#     fall through to the default port. NEVER print a garbage value (that
-#     would build a malformed URL that curl then fails on, mis-classed as
-#     `hub_unreachable`).
-#   * `hub.port` present but UNREADABLE (perm-denied) → warn
-#     (`hub_port_unreadable`) + default.
-# A valid numeric port matches `^[0-9]+$`. This is the ONE conservative
-# contract: invalid content → warn + default, never crash, never emit a
-# partial/garbage resolution.
+# `vco_lib/hub_ensure.py::resolve_hub_port` (which `project_config` uses):
+#   * a valid port is an integer in 1..65535 (`_hub_port_value`);
+#   * env `VCT_HUB_PORT` set but not a valid port → ONE rate-limited stderr
+#     warning (kind `hub_port_invalid`) and FALL THROUGH to `hub.port`, then
+#     the default (v0.2.97 owner ruling: the file names the running hub;
+#     this used to jump straight to 7700);
+#   * `hub.port` non-empty but not a valid port → warn (`hub_port_invalid`)
+#     + default; UNREADABLE (perm-denied) → warn (`hub_port_unreadable`) +
+#     default; absent or empty → silent default.
+# NEVER print a garbage value (that would build a malformed URL that curl
+# then fails on, mis-classed as `hub_unreachable`).
+
+# Print the port `$1` names (normalised, e.g. `07700` → `7700`) and succeed,
+# or fail silently when it is not an integer in 1..65535.
+_hub_port_value() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    [[ "$v" =~ ^[0-9]{1,10}$ ]] || return 1
+    (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
+    printf '%s\n' "$((10#$v))"
+}
+
 hub_port() {
     if [[ -n "${VCT_HUB_PORT:-}" ]]; then
-        if [[ "$VCT_HUB_PORT" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$VCT_HUB_PORT"
-            return 0
-        fi
+        _hub_port_value "$VCT_HUB_PORT" && return 0
         _emit_warning "hub_port_invalid" \
-            "VCT_HUB_PORT is not a positive integer; using default 7700"
-        printf '7700\n'
-        return 0
+            "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700"
     fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
     local port_file="$state_dir/hub.port"
@@ -313,13 +320,10 @@ hub_port() {
             return 0
         fi
         p=$(tr -d '[:space:]' < "$port_file" 2>/dev/null)
-        if [[ "$p" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$p"
-            return 0
-        fi
+        _hub_port_value "$p" && return 0
         if [[ -n "$p" ]]; then
             _emit_warning "hub_port_invalid" \
-                "hub.port contains non-integer content; using default 7700"
+                "hub.port does not hold a port (1-65535); using default 7700"
         fi
         # empty (whitespace-only / truncated write) → silent default.
         printf '7700\n'

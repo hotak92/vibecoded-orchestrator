@@ -635,6 +635,11 @@
             "null"
           ],
           "format": "int64"
+        },
+        "scope": {
+          "description": "`\"per-project\"` (default) — one value per project, stored in that project's `module_settings` row and delivered to it through the hub's `/env`; or `\"global\"` — ONE machine-wide value (the `project_id IS NULL` row), read by the module itself when it starts (e.g. `vct-hub-api`'s `VCT_HUB_PORT`: there is one hub per machine). The launcher's settings editor and the `set_module_setting` command route the write by this field; see `crate::module_settings_schema`.",
+          "default": "per-project",
+          "type": "string"
         }
       }
     },

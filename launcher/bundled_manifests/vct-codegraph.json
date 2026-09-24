@@ -46,7 +46,8 @@
       "type": "string",
       "default": "gpu",
       "options": ["gpu", "ollama"],
-      "required": true
+      "required": true,
+      "scope": "global"
     }
   ],
 

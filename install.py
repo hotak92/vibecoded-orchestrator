@@ -159,6 +159,7 @@ from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
+from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
@@ -1543,10 +1544,9 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "base": "http://localhost:11440",
         "health": "http://localhost:11440/health",
     }
-    vct_hub_endpoints = {
-        "base": "http://127.0.0.1:7700",
-        "health": "http://127.0.0.1:7700/api/v1/health",
-    }
+    from vco_lib.hub_ensure import resolve_hub_port  # stdlib-only: bootstrap-safe
+    hub_base = f"http://127.0.0.1:{resolve_hub_port()}"
+    vct_hub_endpoints = {"base": hub_base, "health": f"{hub_base}/api/v1/health"}
 
     missing = _bootstrap_compute_missing_prereqs(system_block)
     blocker_messages = [m["human"] for m in missing if m["severity"] == "blocking"]
@@ -22322,17 +22322,25 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
     """Return the VCO-default ``settings.json`` contents (refreshed on every call).
 
     Builds the env block + permissions block + ``_vco_managed_keys`` sentinel
-    that V47-A (Gap A) uses for managed-block merge. Pure function — no I/O.
+    that V47-A (Gap A) uses for managed-block merge. Reads machine state
+    (launcher.db, services.toml, vct-config.toml) through
+    ``vco_lib.service_endpoints`` — no other I/O.
     """
-    # Build the env block for weaviate-kg MCP
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    # v0.2.97 (lane X): service URLs/ports from the ONE home —
+    # `vco_lib.service_endpoints` (VCT_WEAVIATE_URL/vct-config.toml
+    # statement → app_state *.port_override → services.toml adoption →
+    # default). The env-only WEAVIATE_PORT/OLLAMA_PORT/CODE_EMBED_PORT
+    # reads this replaces saw only the install-run hand-off (choices
+    # `_resolve_service_safety` had already persisted to services.toml)
+    # and missed the override and the statement, so settings.json could
+    # name a different Weaviate than the hub and the projection. gRPC
+    # keeps its env-only read (no services.toml row, no override key).
+    urls = _service_endpoints.machine_service_urls(orchestrator_root=PROJECT_ROOT)
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
 
     env_block: dict[str, str] = {
-        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-        "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        "WEAVIATE_URL": urls["weaviate_url"],
+        "OLLAMA_URL": urls["ollama_url"],
         # B8 (2026-05-01): .claude/settings.json surface uses GRPC_PORT (legacy
         # alias). Canonical key is WEAVIATE_GRPC_PORT (written to .env at line
         # ~5178). weaviate_mcp/server.py reads both, prefers WEAVIATE_GRPC_PORT.
@@ -22371,7 +22379,7 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
         "PROJECT_NAME": _derive_orchestrator_project_name(),
         "CODE_GRAPH_PROJECT": _derive_orchestrator_project_name(),
         "CODE_EMBED_BACKEND": embed_config["code_backend"],
-        "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
+        "CODE_EMBED_SERVICE_URL": f"http://localhost:{urls['code_embed_port']}",
     }
 
     # 0.2.11: no BASH_ENV wiring here. Lean-ctx output compression flows
