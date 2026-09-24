@@ -60,7 +60,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # (_seed_weaviate_shared_kg_only ~:15171 and _seed_weaviate_impl ~:15703;
 # main() spans ~5471–7157). The original re-pin commit (332e362f)
 # misattributed the growth to the P1 seed pins.
-_MAIN_SPAN_MAX = 1687
+# v0.2.97 review R5 (F38): re-pinned DOWN (1687 → 1652). The --update .env
+# branch moved out of main() into `_update_env_config` (which also stores
+# `--openai-key` there now) and the post-parse normalisation into
+# `_normalise_parsed_args`; main() keeps one call for each.
+_MAIN_SPAN_MAX = 1652
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.

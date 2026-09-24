@@ -756,6 +756,32 @@ def _stop_when_parent_ends(winapi: Any, handle, pid: int) -> None:
     os._exit(PARENT_GONE_EXIT)
 
 
+#: install.py flags whose VALUE is a secret (v0.2.97). Any line that echoes
+#: or logs a command line goes through :func:`redact_secret_argv` — the ONE
+#: redactor (``vco_lib.openai_key`` re-exports it; install.py's session log and
+#: :func:`reexec_outside_venv`'s re-run hint both use it).
+SECRET_ARGV_FLAGS: tuple = ("--openai-key",)
+
+
+def redact_secret_argv(argv: List[str]) -> List[str]:
+    """``argv`` with the value of every :data:`SECRET_ARGV_FLAGS` flag
+    replaced by ``<redacted>`` (both ``--flag VALUE`` and ``--flag=VALUE``)."""
+    out: List[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            out.append("<redacted>")
+            redact_next = False
+        elif arg in SECRET_ARGV_FLAGS:
+            out.append(arg)
+            redact_next = True
+        elif any(arg.startswith(f"{flag}=") for flag in SECRET_ARGV_FLAGS):
+            out.append(arg.split("=", 1)[0] + "=<redacted>")
+        else:
+            out.append(arg)
+    return out
+
+
 def reexec_outside_venv(argv, venv_root) -> bool:
     """Continue this install.py run under the base interpreter, so a venv
     rebuild never deletes the tree it runs from.
@@ -776,9 +802,12 @@ def reexec_outside_venv(argv, venv_root) -> bool:
         return False
     if not _exec_replaces_process():
         if waiting_parent_pid() is None:
+            shown = redact_secret_argv([base, *argv])
+            hint = (" (put your real value back in place of <redacted>)"
+                    if shown != [base, *argv] else "")
             print(f"[vct] {venv_root} cannot be rebuilt by a process running from it on "
                   "Windows; re-run it with the base interpreter: "
-                  + subprocess.list2cmdline([base, *argv]))
+                  + subprocess.list2cmdline(shown) + hint)
             return False
         print(f"[vct] rebuilding {venv_root}: handing the run back to the install.py "
               "waiting outside the venv it was running from")

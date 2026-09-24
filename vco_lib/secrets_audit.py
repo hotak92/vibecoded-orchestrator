@@ -63,9 +63,8 @@ import platform
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
-from vco_lib.atomic import atomic_write_text
 
 # Secret-shaped needle set. The canonical home is
 # ``vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS``, which reads the
@@ -282,110 +281,17 @@ def rewrite_env_with_sentinels(
 ) -> Tuple[int, List[str]]:
     """Replace migrated keys' values in ``.env`` with :data:`KEYCHAIN_SENTINEL`.
 
-    Returns ``(num_replaced, missed)`` where ``missed`` is the list of
-    keys that were not found in the file (defensive logging only — the
-    caller usually trusts the audit step's output, but if the user edited
-    the .env between audit and rewrite a key may have moved).
-
-    Atomic-write semantics: a temp file is written in the same directory
-    then ``os.replace()``'d into place. File mode is preserved across the
-    swap (the temp file inherits ``env_path``'s mode pre-replace via an
-    explicit ``shutil.copystat``).
-
-    Each replaced line keeps its original key + ``export`` prefix (if
-    any) + trailing comment (if any). Only the value bytes change:
-
-    .. code-block:: text
-
-       # before
-       export OPENAI_API_KEY="sk-abc123"  # team key
-
-       # after (with KEYCHAIN_SENTINEL = "__vco_keychain__")
-       export OPENAI_API_KEY=__vco_keychain__  # team key
-
-    Comments preserved; ``export`` prefix preserved; quotes stripped (the
-    sentinel doesn't need quoting and quotes-around-sentinel would just
-    add noise).
+    Returns ``(num_replaced, missed)``. The rewrite itself lives in the ONE
+    ``.env`` writer, :func:`vco_lib.env_template.replace_values_with_sentinel`
+    (v0.2.97 — the launcher's GUI "Migrate from .env" runs the same code
+    through ``python -m vco_lib.env_template sentinel`` instead of a Rust
+    mirror). Only lines whose key is in ``migrated_keys`` change; the value
+    bytes become the sentinel, ``export`` and an unquoted value's trailing
+    comment are kept, the file keeps its mode.
     """
-    try:
-        text = env_path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError) as exc:
-        raise RuntimeError(f"cannot read {env_path}: {exc}") from exc
+    from vco_lib.env_template import replace_values_with_sentinel
 
-    keyset = set(migrated_keys)
-    seen: set[str] = set()
-    out_lines: List[str] = []
-    replaced_count = 0
-
-    for raw in text.splitlines(keepends=False):
-        line = raw
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
-            out_lines.append(line)
-            continue
-        # Preserve leading whitespace + `export` prefix; identify the key.
-        leading_ws_len = len(line) - len(stripped)
-        leading_ws = line[:leading_ws_len]
-        body = stripped
-        export_prefix = ""
-        if body.startswith("export "):
-            export_prefix = "export "
-            body = body[len("export "):].lstrip()
-            # Re-measure leading_ws to include the gap absorbed by lstrip
-            # (rare, but happens with `export   KEY=val`).
-            export_prefix = "export "
-        eq = body.find("=")
-        if eq <= 0:
-            out_lines.append(line)
-            continue
-        key = body[:eq].strip()
-        if key not in keyset:
-            out_lines.append(line)
-            continue
-        if key in seen:
-            # Duplicate key — preserve as-is (user has a malformed .env;
-            # we don't try to "fix" it beyond the first-occurrence
-            # replacement).
-            out_lines.append(line)
-            continue
-        seen.add(key)
-        raw_value = body[eq + 1:]
-        # Detect trailing inline comment on an unquoted value.
-        trailing_comment = ""
-        val_str = raw_value
-        val_stripped = val_str.strip()
-        if not (val_stripped.startswith('"') or val_stripped.startswith("'")):
-            hash_pos = val_stripped.find("#")
-            if hash_pos >= 0:
-                trailing_comment = "  " + val_stripped[hash_pos:]
-        new_line = (
-            f"{leading_ws}{export_prefix}{key}={KEYCHAIN_SENTINEL}{trailing_comment}"
-        )
-        out_lines.append(new_line)
-        replaced_count += 1
-
-    missed = [k for k in keyset if k not in seen]
-
-    # Preserve trailing newline if the original had one.
-    new_text = "\n".join(out_lines)
-    if text.endswith("\n"):
-        new_text += "\n"
-
-    # Atomic write: sibling tempfile, replace, then restore the mode.
-    # Preserve the existing mode (especially important on Unix where the
-    # env file may already be 0o600). v0.2.92 (duplication-merge): through
-    # the ONE atomic writer — its mkstemp tempfile is 0600, so the swapped
-    # file is never briefly MORE permissive than before; `mode=` then
-    # restores the original bits after the rename.
-    mode: Optional[int] = None
-    if env_path.exists():
-        try:
-            mode = stat.S_IMODE(env_path.stat().st_mode)
-        except OSError:
-            mode = None
-    atomic_write_text(env_path, new_text, mode=mode)
-
-    return replaced_count, missed
+    return replace_values_with_sentinel(env_path, migrated_keys, KEYCHAIN_SENTINEL)
 
 
 def harden_env_perms(env_path: Path) -> Tuple[bool, str]:

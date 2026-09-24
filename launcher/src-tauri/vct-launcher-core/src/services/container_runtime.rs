@@ -2960,6 +2960,38 @@ mod tests {
         assert!(args.iter().any(|a| a == "127.0.0.1:11533:11438"));
     }
 
+    /// v0.2.97 (owner ruling on review R5 F43 — the retired `# >>> module:`
+    /// `.env` sections): the RL keys those sections were meant to carry reach
+    /// the module's container through its manifest — `env_fixed`
+    /// (`RL_SERVER_PORT`) and `env_derived` (`RL_PROJECT_ROOT`) become `-e`
+    /// flags of the run, with the host port from `module_ports`. No `.env`
+    /// is involved.
+    #[test]
+    fn build_podman_run_args_delivers_the_rl_module_env() {
+        let manifest = make_manifest(true, true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.8",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        let env_flags: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(env_flags.contains(&"RL_PROJECT_ROOT=/data"), "{env_flags:?}");
+        assert!(env_flags.contains(&"RL_SERVER_PORT=11438"), "{env_flags:?}");
+        assert!(args.iter().any(|a| a == "127.0.0.1:11533:11438"));
+    }
+
     #[test]
     fn build_podman_run_args_rejects_non_container_runtime() {
         let mut manifest = make_manifest(true, true);

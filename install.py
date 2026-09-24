@@ -3785,6 +3785,8 @@ def _run_lightweight(args: argparse.Namespace) -> int:
 
     # Step 1: state directory must exist before logging will hit disk.
     _create_state_directory()
+    if getattr(args, "openai_key", ""):  # review R5 F38: never silently dropped
+        _store_install_openai_key(args.openai_key)
 
     # Step 2: path rewrite in .env / .claude/settings.json
     if args.lightweight_old_path:
@@ -5385,10 +5387,13 @@ def _run_root_claude_dir_install(
 
 #: ``--openai-key`` help (kept out of ``main()`` — its line count is ratcheted).
 _OPENAI_KEY_HELP = (
-    "Use OpenAI embeddings (provide API key). The key is stored in the "
-    "launcher keychain (shared slot `openai_api_key`) when the vct-hub "
-    "answers, else in the file store ~/.vct-secrets/shared/openai_api_key — "
-    "never in .env. A value on the command line is visible to other local "
+    "Use OpenAI embeddings (provide API key). Every install, --update and "
+    "--lightweight run stores it in the launcher keychain (shared slot "
+    "`openai_api_key`) when the vct-hub answers — on a first install it does "
+    "not yet, so the key lands in the file store "
+    "~/.vct-secrets/shared/openai_api_key — never in .env (runs that store "
+    "nothing, e.g. --uninstall, refuse the flag). A value on the command line "
+    "is visible to other local "
     "users and kept in shell history; setting it in the launcher "
     "(Preferences → Special Secrets) avoids that."
 )
@@ -5905,14 +5910,8 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # VCT_NON_INTERACTIVE env var: install.ps1 (line ~97) documents that
-    # this env var should trigger non-interactive mode, but install.py
-    # never honored it — only --yes / --quiet / non-TTY did. The .bat ->
-    # .ps1 -> .py chain sets the env var as a fallback when args don't
-    # propagate cleanly; lift it into args.yes here so all downstream
-    # gates (args.yes checks) see a consistent state.
-    if not args.yes and os.environ.get("VCT_NON_INTERACTIVE"):
-        args.yes = True
+    # VCT_NON_INTERACTIVE → args.yes, and the --openai-key mode gate.
+    _normalise_parsed_args(args, parser)
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
     # icon step (post-install-launcher.sh) and exit. Skips Python version
@@ -6088,7 +6087,7 @@ def main() -> int:
         "session", "start",
         f"install.py {mode} mode",
         data={"mode": mode, "resume_enabled": _RESUME_ENABLED,
-              "argv": _redact_secret_argv(sys.argv[1:])},
+              "argv": _install_companions.redact_secret_argv(sys.argv[1:])},
     )
 
     # Step 1: Check Python
@@ -6565,35 +6564,7 @@ def main() -> int:
     if mode == "install":
         _write_env_config(embed_config, args)
     else:
-        print("[skip] .env configuration (preserved during update)")
-        # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
-        # from folder-name derivation. Pure visibility — the existing project
-        # KEEPS whatever PROJECT_NAME it already has (non-destructive rule).
-        # Helps surface pre-V47-F installs that pinned a non-canonical
-        # project name while sitting in a folder like "python/".
-        _log_project_name_pin_diff(PROJECT_ROOT, "")
-        # A3 (2026-05-28): reconcile any canonical env keys added since the
-        # user's original install. Additive-only: user-set values preserved,
-        # only missing keys are appended.
-        _env_file = PROJECT_ROOT / ".env"
-        _reconcile_result = _reconcile_env_keys(_env_file)
-        if _reconcile_result["action"] == "appended":
-            _added_keys = _reconcile_result["added"]
-            print(
-                f"  .env: added {len(_added_keys)} new env key(s): "
-                + ", ".join(_added_keys)
-            )
-            _log_install_event(
-                "9/10", "info",
-                f"_reconcile_env_keys: added {len(_added_keys)} key(s)",
-                data={"added": _added_keys, "env_file": str(_env_file)},
-            )
-        elif _reconcile_result["action"] == "noop":
-            _log_install_event(
-                "9/10", "info",
-                "_reconcile_env_keys: no missing keys (noop)",
-                data={"env_file": str(_env_file)},
-            )
+        _update_env_config(args)
 
     # Step 9: Configure Claude Code settings (skip on update)
     if mode == "install":
@@ -22045,25 +22016,39 @@ def _reconcile_stale_units_step(
 # folds those lines into the managed block. Nothing writes it any more.)
 #
 # (v0.2.97: the ``# >>> module: <name>`` / ``# <<< module: <name>`` .env
-# section markers declared here in 61f33bc4 are retired — they never had a
-# writer or a reader. Module configuration reaches a project through the
-# launcher DB instead (``module_ports`` / ``module_settings``): the hub's
-# per-project ``ProjectConfig`` (e.g. ``rl_server_port``) and the
-# ``.claude/settings.json`` / ``.claude/env`` projections, never ``.env``.)
+# section markers declared here in 61f33bc4 ("modules can append their
+# section on install") are retired — only the constants ever landed; no
+# writer, no reader. Every key a module section was meant to carry reaches its
+# consumer another way, each pinned by a test:
+#   * RL_SERVER_PORT / RL_SERVER_URL (MCP side): launcher.db ``module_ports``
+#     → the hub's ``/config`` ``rl_server_port`` → the weaviate MCP's
+#     ``_get_rl_client`` base URL (``config_emits_rl_server_port_when_allocated``,
+#     ``tests/test_v52_aa_rl_env_propagation.py``);
+#   * RL_SERVER_PORT / RL_PROJECT_ROOT (container side): the module manifest's
+#     ``runtime.env_fixed`` / ``env_derived`` → ``-e`` flags of the container
+#     run (``build_podman_run_args_delivers_the_rl_module_env``);
+#   * any other module setting / secret: launcher.db ``module_installs`` +
+#     ``module_settings`` / keychain → the hub's ``/env``
+#     (``project_env_delivers_an_installed_modules_setting``).
+# Never ``.env``.)
 
 
 def _orchestrator_env_keys(active_embedding: Optional[str] = None) -> dict[str, str]:
     """The orchestrator root's managed-block keys, from this run's resolved
     state in ``os.environ`` (one builder for install, re-install and
-    ``--update`` — :func:`vco_lib.install_env.orchestrator_env_template_keys`)."""
-    from vco_lib.install_env import orchestrator_env_template_keys
+    ``--update`` — :func:`vco_lib.install_env.orchestrator_env_template_keys`).
+    The identity keys come from the root's registered row, never the shell."""
+    from vco_lib.install_env import orchestrator_env_template_keys, registered_identity_keys
 
+    name, prefix = registered_identity_keys(PROJECT_ROOT)
     return orchestrator_env_template_keys(
         os.environ,
         default_weaviate_port=DEFAULT_WEAVIATE_PORT,
         default_ollama_port=DEFAULT_OLLAMA_PORT,
         default_code_embed_port=DEFAULT_CODE_EMBED_PORT,
         active_embedding=active_embedding,
+        project_name=name,
+        code_graph_project=prefix,
     )
 
 
@@ -22096,11 +22081,69 @@ def _telemetry_consent(args: argparse.Namespace) -> bool:
     return ans in ("y", "yes")
 
 
-def _redact_secret_argv(argv: list[str]) -> list[str]:
-    """``argv`` for a log line: ``--openai-key``'s value redacted."""
-    from vco_lib.openai_key import redact_secret_argv
+def _normalise_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Post-parse normalisation, run once in ``main()``.
 
-    return redact_secret_argv(argv)
+    * ``VCT_NON_INTERACTIVE``: install.ps1 documents that this env var should
+      trigger non-interactive mode, but install.py never honored it — only
+      --yes / --quiet / non-TTY did. The .bat -> .ps1 -> .py chain sets it as
+      a fallback when args don't propagate cleanly; lift it into ``args.yes``
+      so all downstream gates see a consistent state.
+    * ``--openai-key`` (review R5 F38): every mode that runs the install
+      stores it (fresh/re-install in step 9, ``--update`` in
+      :func:`_update_env_config`, ``--lightweight`` at its start). A mode
+      that makes no changes, or is not an install, cannot store it — it is
+      REJECTED there, loudly, instead of being accepted and dropped.
+    """
+    if not args.yes and os.environ.get("VCT_NON_INTERACTIVE"):
+        args.yes = True
+    if not getattr(args, "openai_key", ""):
+        return
+    for attr, flag in (
+        ("uninstall", "--uninstall"),
+        ("desktop_icon_only", "--desktop-icon-only"),
+        ("adopt_project_dry_run", "--adopt-project-dry-run"),
+        ("no_adopt_project", "--no-adopt-project"),
+    ):
+        if getattr(args, attr, False):
+            parser.error(
+                f"--openai-key cannot be used with {flag}: that run stores nothing, so "
+                "the key would be dropped. Store it with a normal install / --update, "
+                "in the launcher (Preferences → Special Secrets), or with "
+                "`vct set --shared --key openai_api_key` (value on stdin)."
+            )
+
+
+def _update_env_config(args: argparse.Namespace) -> None:
+    """Step 8 on ``--update``: the ``.env`` is preserved (user changes win);
+    only canonical keys added since the original install are reconciled into
+    its managed block, and ``--openai-key`` is stored (review R5 F38 — it
+    used to be accepted and dropped here)."""
+    print("[skip] .env configuration (preserved during update)")
+    # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
+    # from folder-name derivation. Pure visibility — the existing project
+    # KEEPS whatever PROJECT_NAME it already has (non-destructive rule).
+    _log_project_name_pin_diff(PROJECT_ROOT, "")
+    if getattr(args, "openai_key", ""):
+        _store_install_openai_key(args.openai_key)
+    # A3 (2026-05-28): reconcile any canonical env keys added since the
+    # user's original install. Additive-only: user-set values preserved.
+    env_file = PROJECT_ROOT / ".env"
+    result = _reconcile_env_keys(env_file)
+    if result["action"] == "appended":
+        added = result["added"]
+        print(f"  .env: added {len(added)} new env key(s): " + ", ".join(added))
+        _log_install_event(
+            "9/10", "info",
+            f"_reconcile_env_keys: added {len(added)} key(s)",
+            data={"added": added, "env_file": str(env_file)},
+        )
+    elif result["action"] == "noop":
+        _log_install_event(
+            "9/10", "info",
+            "_reconcile_env_keys: no missing keys (noop)",
+            data={"env_file": str(env_file)},
+        )
 
 
 def _store_install_openai_key(value: str) -> None:

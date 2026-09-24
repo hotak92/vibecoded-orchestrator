@@ -35,6 +35,19 @@ pub async fn start_hub_server() -> Result<u16, String> {
 
     let database = db::open_db().map_err(|e| format!("Failed to open hub database: {}", e))?;
 
+    // v0.2.97: the bundled core-module manifests are materialized here (and at
+    // launcher start) — the documented "copied to ~/.vct/bundled_manifests/"
+    // that nothing did, so `/env` never saw a bundled module's settings.
+    // Soft-fail: a failure leaves the previous copies and is logged.
+    let vct_root = vct_launcher_core::paths::vct_root_dir();
+    match vct_launcher_core::bundled_manifests::sync_bundled_manifests(&vct_root) {
+        Ok(written) if !written.is_empty() => {
+            tracing::info!("[vct-hub] bundled manifests refreshed: {}", written.join(", "))
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("[vct-hub] could not materialize bundled manifests: {}", e),
+    }
+
     // Open a second connection to launcher.db for the module/project routes.
     // WAL mode lets this coexist with the Tauri-side Db handle.
     let launcher_db = vct_launcher_core::db::Db::open()

@@ -63,10 +63,7 @@
     "_note": "command=builtin:hub is a sentinel — the launcher never spawns an external process; it already owns the hub."
   },
 
-  "mcp_registration": {
-    "enabled_by_default": false,
-    "_note": "Hub is HTTP, not MCP."
-  },
+  "_mcp_note": "Hub is HTTP, not MCP.",
 
   "uninstall": {
     "remove_install_dir": false,

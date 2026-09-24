@@ -107,27 +107,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The key passed with `--openai-key` was written as plain text into the
   orchestrator's `.env`, and the whole command line — key included — was
   recorded in the install log under `state/logs/`. VCO's rule is that secret
-  values never live in the project tree. The key is now stored in the
-  launcher's keychain (or, with the launcher not running, the file store under
-  `~/.vct-secrets/`) under its existing name `openai_api_key`, the install log
-  records the flag with its value redacted, and the embedding services read it
-  from there. A key an older install wrote into `.env` is moved into the store
-  and removed from the file once the stored copy is confirmed equal; a key you
-  wrote there yourself is left alone. A failed embedding call no longer logs
-  the first characters of the key. A key typed on the command line still ends
-  up in your shell history — the help text now says so.
+  values never live in the project tree. The key is now stored under its
+  existing name `openai_api_key` — in the launcher's keychain when the vct-hub
+  is answering (on a first install it is not yet, so the key lands in the file
+  store under `~/.vct-secrets/`). Every run that takes the flag stores it: a
+  first install, a re-install, `--update` (which used to accept the flag and
+  drop it) and `--lightweight`; a run that stores nothing (`--uninstall`, an
+  adopt dry-run) refuses the flag instead of ignoring it. The install log and
+  the Windows re-run hint show the flag with its value redacted, and the
+  embedding services read the key from the store. A key an older install
+  wrote into `.env` (the line under `# OpenAI (for embeddings)`) is moved into
+  the store and removed from the file once the stored copy is confirmed
+  equal — read the way any `.env` reader reads it, so a quoted value is
+  stored without its quotes, and a value with a trailing comment or a stray
+  quote is left in place and reported; a key you wrote there yourself is left
+  alone. A failed embedding call no longer logs the first characters of the
+  key. A key typed on the command line still ends up in your shell history —
+  the help text now says so.
 
 ### Changed — one writer for a project's `.env` (v0.2.97)
 
 - A project's `.env` had two writers — one in the launcher, one in the
   installer — that appended lines in different formats. Both now go through
-  one: VCO's keys live in a single marked block, keys you set yourself are
-  never written over, and lines older versions appended (`# added by vco …`)
-  are folded into the block so each key is set once. Placeholder comments are
-  written only when the file is first created, and re-running `install.py`
-  over an existing `.env` no longer appends `PROJECT_NAME` /
-  `KG_COLLECTION` lines that overrode your real values. Safe-add projects
-  still get only `.env.vco.reference`, never a live `.env`.
+  one: VCO's keys live in a single marked block, a key you set yourself on
+  your own line is never written over, and lines older versions appended
+  (`# added by vco …`, the old template's two key sections, `# --- Added by
+  install.py --update …`) are folded into the block so each key is set once.
+  When such a line held a value different from VCO's — one you edited, for
+  example — VCO's value goes in the block and yours is kept outside it as
+  `<KEY>_old=<value>` (`<KEY>_old2`, … if that name is taken; never
+  overwritten, never duplicated on a re-run), and the project's
+  `.claude/logs/auto-resolutions.jsonl` records the key name. Secret-looking
+  keys are never folded. Values older versions made up (`<project>`,
+  `Project`, `Project_KnowledgeGraph`) are dropped, not kept. Placeholder
+  comments are written only when the file is first created; re-running
+  `install.py` over an existing `.env` only adds missing keys and no longer
+  appends `PROJECT_NAME` / `KG_COLLECTION` lines that overrode your real
+  values, and the root's `PROJECT_NAME` comes from its launcher registration,
+  never from the shell `install.py` runs in. An existing `.env` keeps its
+  file permissions. Unregistering a project removes VCO's block whole; the
+  stale-`KG_COLLECTION` repair, the launcher's "Migrate from .env" and the
+  volumes page's `infrastructure/.env` key now go through the same writers
+  instead of their own rewrites. Safe-add projects still get only
+  `.env.vco.reference`, never a live `.env`.
+
+### Fixed — the bundled core modules' manifests load, and session-state's settings work (v0.2.97)
+
+- The six manifests under `launcher/bundled_manifests/` were documented as
+  "copied to `~/.vct/bundled_manifests/` on first launch", but nothing copied
+  them — and three of them (`vct-code-embedding`, `vct-hub-api`,
+  `vct-session-state`) did not parse, because their manifest-validation CI job
+  only ever checked the paid-module fixture. They are now embedded in the
+  launcher and hub and written there at every start, every one is validated
+  in CI and in `cargo test`, and they count as installed for every project,
+  so their settings reach the project through the hub. `vct-session-state`'s
+  two settings now do something: the `context-size-check` hook takes its
+  CONTEXT_STATE.md threshold from `CONTEXT_STATE_MAX_LINES` (default 500,
+  unchanged) and warns when Claude Code's `MEMORY.md` for the project reaches
+  `MEMORY_MAX_LINES` (default 200 — Claude Code loads only its first 200
+  lines). Each is read from the environment, else the launcher setting, else
+  the project's `.env`.
 
 ### Changed — unregistering a project stops rather than lose track of a secret (v0.2.97)
 
@@ -136,7 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now stops before removing the project and tells you which key, which file
   and what to fix. Continuing would have left a value that VCO could never
   identify again. Fix the cause and unregister again; every step is safe to
-  repeat.
+  repeat. If you cannot fix it, the same message offers "Unregister anyway —
+  leave these values": the unregister finishes and VCO writes a note —
+  `.claude/VCO-UNREGISTER-LEFTOVERS.md` in the project, or under the
+  launcher's own state folder when the project cannot be written — listing
+  each key and file to clean by hand (names only, never a value). The
+  project list's quick unregister now shows a failure instead of dropping it
+  silently.
 
 ### Added — the model gateway tells you when it needs a restart (v0.2.97)
 

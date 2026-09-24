@@ -312,6 +312,23 @@ def test_windows_rebuild_with_no_waiting_parent_is_refused(root, prims, monkeypa
     assert "--rebuild-venv" in out, "the printed command is the one to run"
 
 
+def test_the_windows_rerun_hint_never_prints_a_secret_flag_value(root, prims, monkeypatch, capsys):
+    """Review R5 F37: the re-run hint is the one argv echo install.py prints;
+    it goes through the ONE redactor, so ``--openai-key``'s value is not on
+    stdout (a terminal, install.ps1, the launcher's captured output)."""
+    canary = "sk-canary-not-a-real-key-3b8f"
+    _windows(monkeypatch)
+    monkeypatch.setattr(install.sys, "argv", [
+        "install.py", "--lightweight", "--rebuild-venv", "--openai-key", canary,
+        f"--openai-key={canary}",
+    ])
+    assert install._run_lightweight(_rebuild()) == 1
+    out = capsys.readouterr().out
+    assert canary not in out
+    assert "--openai-key <redacted>" in out and "--openai-key=<redacted>" in out
+    assert "put your real value back" in out
+
+
 def test_posix_rebuild_still_execs_the_base_interpreter(root, prims, monkeypatch):
     install._run_lightweight(_rebuild())  # the recorded execve returns, so this then refuses
     ((path, argv, env),) = prims["execve"]

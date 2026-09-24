@@ -73,6 +73,7 @@ class _InstallRoot(unittest.TestCase):
         install._PENDING_EVENTS.clear()
         env = {k: v for k, v in install.os.environ.items()
                if k not in ("PROJECT_NAME", "CODE_GRAPH_PROJECT", "ACTIVE_EMBEDDING",
+                            "VCT_LAUNCHER_DB_PATH",
                             "WEAVIATE_PORT", "OLLAMA_PORT", "CODE_EMBED_PORT",
                             "CODE_EMBED_MAX_CONCURRENT")}
         env.update(_ENV)
@@ -124,11 +125,30 @@ class TestFreshInstall(_InstallRoot):
         self.assertNotIn("<project>", text)
         self.assertNotIn("Project_KnowledgeGraph", text)
 
-    def test_known_project_name_is_rendered(self):
-        install.os.environ["PROJECT_NAME"] = "Orch"
+    def test_a_polluted_shell_never_names_the_root(self):
+        """Review R5 F41: PROJECT_NAME / CODE_GRAPH_PROJECT in the CALLER's
+        shell (another project's sourced .env) are not the root's identity —
+        install.py never publishes them — so nothing is rendered from them."""
+        install.os.environ["PROJECT_NAME"] = "Other"
+        install.os.environ["CODE_GRAPH_PROJECT"] = "Other"
+        install.os.environ["VCT_LAUNCHER_DB_PATH"] = str(self.root / "absent.db")
         text = self.write()
-        self.assertEqual(_assignments(text, "PROJECT_NAME"), ["Orch"])
-        self.assertEqual(_assignments(text, "CODE_GRAPH_PROJECT"), ["Orch"])
+        self.assertEqual(_assignments(text, "PROJECT_NAME"), [])
+        self.assertEqual(_assignments(text, "CODE_GRAPH_PROJECT"), [])
+        self.assertNotIn("Other", text)
+
+    def test_the_registered_root_identity_is_rendered_not_the_shell(self):
+        """Act: a REGISTERED root row names the root, whatever the shell says."""
+        from tests.common.launcher_db_fixture import add_project, create_empty_launcher_db
+
+        db = create_empty_launcher_db(self.root / "launcher.db")
+        add_project(db, project_id="root-1", name="Gamma", folder_path=self.root,
+                    slug="gamma", codegraph_prefix="Gamma")
+        install.os.environ["VCT_LAUNCHER_DB_PATH"] = str(db)
+        install.os.environ["PROJECT_NAME"] = "Other"
+        text = self.write()
+        self.assertEqual(_assignments(text, "PROJECT_NAME"), ["Gamma"])
+        self.assertEqual(_assignments(text, "CODE_GRAPH_PROJECT"), ["Gamma"])
 
     def test_openai_key_path_keeps_its_lines(self):
         text = self.write(openai_key="sk-test-not-real")
@@ -247,6 +267,62 @@ class TestUpdateFoldsLegacyLines(_InstallRoot):
         self.assertEqual(env.read_text(encoding="utf-8"), text)
 
 
+class TestRetiredPlaceholders(_InstallRoot):
+    """Review R5 F42: the pre-v0.2.97 re-install appended a managed block with
+    values it MADE UP (``sanitized = "Project"``). Fill-only must not keep
+    them as if a previous run had settled them."""
+
+    RETIRED_BLOCK = (
+        "# >>> VCO-MANAGED ENV (do not edit between markers) >>>\n"
+        "# added by vco — PROJECT_NAME=<project>\n"
+        "PROJECT_NAME=<project>\n"
+        "# added by vco — CODE_GRAPH_PROJECT=Project\n"
+        "CODE_GRAPH_PROJECT=Project\n"
+        "# added by vco — KG_COLLECTION=Project_KnowledgeGraph\n"
+        "KG_COLLECTION=Project_KnowledgeGraph\n"
+        "# added by vco — DEVELOPMENT_COLLECTION=Project_Development\n"
+        "DEVELOPMENT_COLLECTION=Project_Development\n"
+        "# added by vco — OLLAMA_PORT=11435\n"
+        "OLLAMA_PORT=11435\n"
+        "# <<< VCO-MANAGED ENV <<<\n"
+    )
+
+    def test_the_made_up_values_of_the_retired_block_are_not_kept(self):
+        env = self.root / ".env"
+        env.write_text("# VibeCoded Tools — Orchestrator Configuration\n" + self.RETIRED_BLOCK)
+        install._reconcile_env_keys(env)
+        text = env.read_text(encoding="utf-8")
+        self.assertEqual(_assignments(text, "CODE_GRAPH_PROJECT"), [])
+        self.assertEqual(_assignments(text, "PROJECT_NAME"), [])
+        self.assertEqual(_assignments(text, "KG_COLLECTION"), ["Gamma_KnowledgeGraph"])
+        self.assertEqual(_assignments(text, "DEVELOPMENT_COLLECTION"), ["Gamma_Development"])
+        self.assertNotIn("Project", text.replace("# VibeCoded Tools", ""))
+        # A real value the old block settled is still kept (fill-only).
+        self.assertEqual(_assignments(text, "OLLAMA_PORT"), ["11435"])
+
+    def test_a_users_own_project_line_is_theirs(self):
+        """Leave-alone: the same text on a line the USER wrote, outside any
+        VCO region, is their value — kept, and the block leaves the key out."""
+        env = self.root / ".env"
+        env.write_text("CODE_GRAPH_PROJECT=Project\n")
+        install._reconcile_env_keys(env)
+        text = env.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("CODE_GRAPH_PROJECT=Project\n"))
+        self.assertEqual(_assignments(text, "CODE_GRAPH_PROJECT"), ["Project"])
+
+    def test_a_reconcile_era_placeholder_line_is_removed(self):
+        env = self.root / ".env"
+        env.write_text(
+            "\n# --- Added by install.py --update on 2026-05-28 ---\n"
+            "# Added by install.py --update on 2026-05-28\n"
+            "CODE_GRAPH_PROJECT=Project\n"
+        )
+        install._reconcile_env_keys(env)
+        text = env.read_text(encoding="utf-8")
+        self.assertEqual(_assignments(text, "CODE_GRAPH_PROJECT"), [])
+        self.assertNotIn("Added by install.py --update", text)
+
+
 class TestBuilder(unittest.TestCase):
 
     def test_reads_environ_and_defaults(self):
@@ -260,6 +336,16 @@ class TestBuilder(unittest.TestCase):
         self.assertEqual(keys["KG_COLLECTION"], "KnowledgeGraph")
         self.assertEqual(keys["ACTIVE_EMBEDDING"], "qwen3")
         self.assertNotIn("PROJECT_NAME", keys)
+
+    def test_identity_keys_come_only_from_the_arguments(self):
+        keys = orchestrator_env_template_keys(
+            {"PROJECT_NAME": "Other", "CODE_GRAPH_PROJECT": "Other"},
+            default_weaviate_port=8081,
+            default_ollama_port=11435,
+            default_code_embed_port=11440,
+        )
+        self.assertNotIn("PROJECT_NAME", keys)
+        self.assertNotIn("CODE_GRAPH_PROJECT", keys)
 
 
 if __name__ == "__main__":

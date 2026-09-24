@@ -44,9 +44,9 @@
     {
       "key": "CONTEXT_STATE_MAX_LINES",
       "prompt": "Warn if CONTEXT_STATE.md exceeds N lines",
-      "description": "A session-start hook surfaces a warning if the file gets too long.",
+      "description": "The context-size-check SessionStart hook alerts at N lines and gives a notice from 60% of N. Read by the hook as $CONTEXT_STATE_MAX_LINES, else through the vct-hub /env (this setting), else 500.",
       "type": "integer",
-      "default": 200,
+      "default": 500,
       "min": 50,
       "max": 2000,
       "required": false
@@ -54,6 +54,7 @@
     {
       "key": "MEMORY_MAX_LINES",
       "prompt": "Warn if MEMORY.md exceeds N lines",
+      "description": "The context-size-check SessionStart hook warns when Claude Code's auto-memory MEMORY.md for this project reaches N lines (Claude Code loads only its first 200). Same resolution as CONTEXT_STATE_MAX_LINES; default 200.",
       "type": "integer",
       "default": 200,
       "min": 50,
@@ -72,10 +73,7 @@
     "_note": "Not a long-running process. The launcher installs the hooks by copying them into the user's project .claude/hooks/ directory and registering them in .claude/settings.json. This command is invoked only when the user clicks 'Run health check' in the module dashboard."
   },
 
-  "mcp_registration": {
-    "enabled_by_default": false,
-    "_note": "Not an MCP — hook scripts run under Claude Code's hook system, not the MCP protocol."
-  },
+  "_mcp_note": "Not an MCP — hook scripts run under Claude Code's hook system, not the MCP protocol.",
 
   "upgrade": {
     "strategy": "git_pull"

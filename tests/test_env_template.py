@@ -23,6 +23,8 @@ Run: pytest tests/test_env_template.py -v
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -897,3 +899,127 @@ def test_cli_apply_missing_db_exits_3(tmp_path: Path) -> None:
     assert result.returncode == 3
     err = json.loads(result.stderr)
     assert err["error"] == "db_unreachable"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_rewrite_keeps_the_env_files_mode(tmp_path: Path) -> None:
+    """Review R5 F36: the ONE .env writer keeps an existing file's mode (the
+    retired Rust writer rewrote in place); a NEW file is created 0600."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("USER=1\n")
+    env_path.chmod(0o640)
+    apply_env_template(_keys(), project_folder=tmp_path)
+    assert ENV_TEMPLATE_BEGIN in env_path.read_text()
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o640
+
+    fresh = tmp_path / "fresh"
+    apply_env_template(_keys(), project_folder=fresh)
+    assert stat.S_IMODE((fresh / ".env").stat().st_mode) == 0o600
+
+
+# ─── owner ruling F35: a replaced legacy value stays discoverable ───────
+
+_EDITED_TEMPLATE = (
+    "# === Per-project Weaviate collections ===\n"
+    "# Resolved by the launcher when the project is registered. Don't\n"
+    "# edit unless you know what you're doing.\n"
+    "KG_COLLECTION=Acme_KnowledgeGraph\n"
+    'SHARED_KG_COLLECTION="MyOwnShared_KG"\n'
+    "ACTIVE_EMBEDDING=qwen3\n"
+)
+
+
+def _trail(folder: Path) -> list[dict]:
+    path = folder / ".claude" / "logs" / "auto-resolutions.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_a_folded_value_that_differs_is_kept_as_key_old(tmp_path: Path) -> None:
+    """Act: VCO's value goes in the block; the user's differing value stays
+    OUTSIDE it as ``<KEY>_old`` with the original quoting; the trail names the
+    key and file, never the value."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(_EDITED_TEMPLATE)
+    report = apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+
+    assert _assignments(text, "SHARED_KG_COLLECTION") == ["VibeCodedOrchestrator_KnowledgeGraph"]
+    assert 'SHARED_KG_COLLECTION_old="MyOwnShared_KG"\n' in text
+    assert "ACTIVE_EMBEDDING_old=qwen3\n" in text          # VCO renders arctic
+    assert _assignments(text, "KG_COLLECTION_old") == []    # equal value: nothing kept
+    block_start = text.index(ENV_TEMPLATE_BEGIN)
+    assert text.index("SHARED_KG_COLLECTION_old") < block_start, "outside the block"
+    assert sorted(report["preserved"]) == [
+        "ACTIVE_EMBEDDING->ACTIVE_EMBEDDING_old",
+        "SHARED_KG_COLLECTION->SHARED_KG_COLLECTION_old",
+    ]
+    rows = _trail(tmp_path)
+    assert {r["detail"] for r in rows} == {
+        "ACTIVE_EMBEDDING -> ACTIVE_EMBEDDING_old in .env",
+        "SHARED_KG_COLLECTION -> SHARED_KG_COLLECTION_old in .env",
+    }
+    assert all(r["condition_id"] == "env_legacy_value_preserved" for r in rows)
+    assert "MyOwnShared_KG" not in json.dumps(rows)
+
+
+def test_key_old_is_never_overwritten_and_rerun_adds_nothing(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("SHARED_KG_COLLECTION_old=Earlier\n\n" + _EDITED_TEMPLATE)
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    first = env_path.read_text()
+    assert "SHARED_KG_COLLECTION_old=Earlier\n" in first
+    assert 'SHARED_KG_COLLECTION_old2="MyOwnShared_KG"\n' in first
+
+    report = apply_env_template(_acme_keys(), project_folder=tmp_path)
+    assert env_path.read_text() == first, "a second run creates no further _old line"
+    assert report["preserved"] == [] and report["action"] == ["unchanged"]
+    assert len(_trail(tmp_path)) == 2  # the first run's two rows only
+
+
+def test_an_existing_key_old_with_the_same_value_is_reused(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("SHARED_KG_COLLECTION_old=MyOwnShared_KG\n" + _EDITED_TEMPLATE)
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    text = env_path.read_text()
+    assert "SHARED_KG_COLLECTION_old2" not in text
+    assert _assignments(text, "SHARED_KG_COLLECTION_old") == ["MyOwnShared_KG"]
+
+
+def test_placeholders_and_fill_only_keep_no_old_value(tmp_path: Path) -> None:
+    """Leave-alone: a made-up placeholder is not a user value (nothing kept);
+    fill-only carries the legacy value INTO the block (nothing replaced)."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "# added by vco 2026-05-06: appended missing canonical keys\nPROJECT_NAME=<project>\n"
+    )
+    apply_env_template(_acme_keys(), project_folder=tmp_path)
+    assert "_old" not in env_path.read_text()
+
+    other = tmp_path / "fill"
+    other.mkdir()
+    (other / ".env").write_text(_EDITED_TEMPLATE)
+    report = apply_env_template(_acme_keys(), project_folder=other, keep_existing_values=True)
+    text = (other / ".env").read_text()
+    assert "_old" not in text and report["preserved"] == []
+    assert _assignments(text, "SHARED_KG_COLLECTION") == ["MyOwnShared_KG"]
+
+
+def test_a_secret_shaped_key_is_never_folded(tmp_path: Path) -> None:
+    """Owner ruling F35: secret-shaped keys are not folded — confirmed: no key
+    the block carries is secret-shaped, and even a caller that asks the block
+    to own one leaves its legacy line alone."""
+    from vco_lib.secrets_audit import is_secret_shaped_env_key
+
+    assert not [k for k in list_canonical_env_template_keys() if is_secret_shaped_env_key(k)]
+    env_path = tmp_path / ".env"
+    original = (
+        "# added by vco 2026-05-06: appended missing canonical keys\n"
+        "OPENAI_API_KEY=sk-canary-not-real-9a1b\n"
+    )
+    env_path.write_text(original)
+    apply_env_template({"OPENAI_API_KEY": "x"}, project_folder=tmp_path)
+    text = env_path.read_text()
+    assert text.startswith(original)
+    assert "OPENAI_API_KEY_old" not in text

@@ -827,10 +827,26 @@ async fn project_env(
         .list_module_installs_for_project(&project.id)
         .unwrap_or_default();
 
-    for install in &installs {
-        let Some((_, manifest)) = manifests.iter().find(|(_, m)| m.id == install.module_id) else {
-            continue;
-        };
+    // v0.2.97: the bundled core modules (`launcher/bundled_manifests/`,
+    // materialized by `bundled_manifests::sync_bundled_manifests`) are
+    // installed for EVERY project — the catalog's "bundled: always installed,
+    // cannot be uninstalled" — so their settings/secrets resolve without a
+    // `module_installs` row. An explicit row for one changes nothing.
+    let vct_root = vct_launcher_core::paths::vct_root_dir();
+    let mut active: Vec<&vct_launcher_core::manifest::ModuleManifest> = installs
+        .iter()
+        .filter_map(|install| manifests.iter().find(|(_, m)| m.id == install.module_id))
+        .map(|(_, m)| m)
+        .collect();
+    for (path, manifest) in &manifests {
+        if vct_launcher_core::bundled_manifests::is_bundled_manifest_path(&vct_root, path)
+            && !active.iter().any(|m| m.id == manifest.id)
+        {
+            active.push(manifest);
+        }
+    }
+
+    for manifest in active {
         // Settings (non-secret)
         for s in &manifest.settings {
             if let Ok(Some(v)) = h.0.get_setting(&project.id, &manifest.id, &s.key) {
@@ -1599,6 +1615,107 @@ mod tests {
             "filter leaked VCT_PROJECT_PATH: {}",
             body
         );
+    }
+
+    /// v0.2.97 (owner ruling on review R5 F43 — the retired `# >>> module:`
+    /// `.env` sections): an INSTALLED module's setting reaches the project's
+    /// processes through the hub's `/env` (launcher DB `module_installs` +
+    /// `module_settings` → this resolver), never through `.env`.
+    #[tokio::test]
+    async fn project_env_delivers_an_installed_modules_setting() {
+        let _kc_lock = h1_lock();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        // A module manifest that declares one setting — built from the
+        // bundled `vct-search.json` (which parses, pinned by
+        // `bundled_search_manifest_parses_cleanly`) with a `settings` entry
+        // and its own id, installed under the scratch state dir.
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+        manifest["id"] = serde_json::json!("vct-f43-probe");
+        manifest["settings"] = serde_json::json!([
+            {"key": "RL_RERANK_TOP_K", "type": "integer", "default": 10}
+        ]);
+        let module_dir = guard.path().join("modules").join("vct-f43-probe");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        assert!(
+            scan_manifests().iter().any(|(_, m)| m.id == "vct-f43-probe"),
+            "scan_manifests must see the module under the scratch state dir"
+        );
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-mod-1", "Module Project", "/tmp/module-project-1");
+
+        // Not installed: the module's key is absent.
+        let before: serde_json::Value = reqwest::get(format!("{}/projects/p-mod-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(before.get("RL_RERANK_TOP_K").is_none(), "{}", before);
+
+        h.0.insert_module_install("mi-1", "p-mod-1", "vct-f43-probe", "0.1.0", "/tmp/m")
+            .unwrap();
+        h.0.set_setting("p-mod-1", "vct-f43-probe", "RL_RERANK_TOP_K", &serde_json::json!(25))
+            .unwrap();
+        let after: serde_json::Value = reqwest::get(format!("{}/projects/p-mod-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.get("RL_RERANK_TOP_K").and_then(|v| v.as_str()),
+            Some("25"),
+            "{}",
+            after
+        );
+    }
+
+    /// v0.2.97: the bundled `vct-session-state` module, materialized by the
+    /// ONE load path (`sync_bundled_manifests`, run at hub start), is
+    /// installed for every project — its settings reach `/env` with no
+    /// `module_installs` row. Before, the manifest was never materialized
+    /// (and did not parse), so they never did.
+    #[tokio::test]
+    async fn project_env_delivers_the_bundled_session_state_settings() {
+        let _kc_lock = h1_lock();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let written = vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path()).unwrap();
+        assert!(written.contains(&"vct-session-state.json".to_string()));
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-bundled-1", "Bundled Project", "/tmp/bundled-project-1");
+
+        // No setting stored → nothing emitted (the hook applies the default).
+        let before: serde_json::Value = reqwest::get(format!("{}/projects/p-bundled-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(before.get("CONTEXT_STATE_MAX_LINES").is_none(), "{}", before);
+
+        h.0.set_setting("p-bundled-1", "vct-session-state", "CONTEXT_STATE_MAX_LINES", &serde_json::json!(800))
+            .unwrap();
+        h.0.set_setting("p-bundled-1", "vct-session-state", "MEMORY_MAX_LINES", &serde_json::json!(150))
+            .unwrap();
+        let key: serde_json::Value = reqwest::get(format!(
+            "{}/projects/p-bundled-1/env?key=CONTEXT_STATE_MAX_LINES",
+            base
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(key.get("CONTEXT_STATE_MAX_LINES").and_then(|v| v.as_str()), Some("800"), "{}", key);
+        let all: serde_json::Value = reqwest::get(format!("{}/projects/p-bundled-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.get("MEMORY_MAX_LINES").and_then(|v| v.as_str()), Some("150"), "{}", all);
     }
 
     #[tokio::test]

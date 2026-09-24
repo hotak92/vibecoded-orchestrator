@@ -39,25 +39,32 @@ def orchestrator_env_template_keys(
     default_ollama_port: int,
     default_code_embed_port: int,
     active_embedding: Optional[str] = None,
+    project_name: Optional[str] = None,
+    code_graph_project: Optional[str] = None,
 ) -> dict[str, str]:
     """The managed-block keys for the orchestrator root, from install.py's
     resolved state (``environ`` — ``_ensure_collections`` and the embedding
     reconcile publish their results there).
 
-    ``PROJECT_NAME`` / ``CODE_GRAPH_PROJECT`` are rendered only when known:
-    a made-up name (the old ``<project>`` / ``Project`` placeholders) is
-    worse than none — every shell that sources the file would carry it.
+    ``PROJECT_NAME`` / ``CODE_GRAPH_PROJECT`` come ONLY from the explicit
+    arguments — install.py passes the root's own resolved identity
+    (:func:`vco_lib.project_identity.resolve_identity`, registered rows only)
+    — and are never read from ``environ``: install.py never publishes them
+    there, so an ``environ`` value is the CALLER's shell, typically another
+    project's sourced ``.env`` (review R5 F41). Unknown → not rendered: a
+    made-up name (the old ``<project>`` / ``Project`` placeholders) is worse
+    than none — every shell that sources the file would carry it.
     """
     weaviate_port = environ.get("WEAVIATE_PORT", str(default_weaviate_port))
     ollama_port = environ.get("OLLAMA_PORT", str(default_ollama_port))
     code_embed_port = environ.get("CODE_EMBED_PORT", str(default_code_embed_port))
     keys: dict[str, str] = {}
-    project_name = environ.get("PROJECT_NAME", "").strip()
-    if project_name:
-        keys["PROJECT_NAME"] = project_name
-    code_graph_project = environ.get("CODE_GRAPH_PROJECT", "").strip() or project_name
-    if code_graph_project:
-        keys["CODE_GRAPH_PROJECT"] = code_graph_project
+    name = (project_name or "").strip()
+    if name:
+        keys["PROJECT_NAME"] = name
+    prefix = (code_graph_project or "").strip()
+    if prefix:
+        keys["CODE_GRAPH_PROJECT"] = prefix
     keys.update({
         "KG_COLLECTION": environ.get("KG_COLLECTION", "KnowledgeGraph"),
         "DEVELOPMENT_COLLECTION": environ.get("DEVELOPMENT_COLLECTION", "Development"),
@@ -74,6 +81,24 @@ def orchestrator_env_template_keys(
         "CODE_EMBED_PORT": code_embed_port,
     })
     return keys
+
+
+def registered_identity_keys(root: Path) -> tuple[Optional[str], Optional[str]]:
+    """``(PROJECT_NAME, CODE_GRAPH_PROJECT)`` for ``root`` from its REGISTERED
+    launcher row (:func:`vco_lib.project_identity.resolve_identity`), or
+    ``(None, None)`` when the root is not registered yet (a first install
+    runs before the launcher adds it) or ``launcher.db`` cannot be read. The
+    last-resort basename identity is deliberately NOT used — it is a guess,
+    and fill-only would keep it forever."""
+    try:
+        from vco_lib.project_identity import resolve_identity
+
+        identity, _snapshot = resolve_identity(root)
+    except Exception:  # noqa: BLE001 — an unreadable DB means "not known"
+        return None, None
+    if identity is None or not identity.registered:
+        return None, None
+    return identity.name or None, identity.codegraph_prefix or None
 
 
 def render_install_env_tail(

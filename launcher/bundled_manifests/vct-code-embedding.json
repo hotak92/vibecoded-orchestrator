@@ -106,10 +106,7 @@
     "log_file": "{VCT_LOGS}/vct-code-embedding.log"
   },
 
-  "mcp_registration": {
-    "enabled_by_default": false,
-    "_note": "Not an MCP — it's an HTTP service the weaviate-kg MCP calls internally."
-  },
+  "_mcp_note": "Not an MCP — it's an HTTP service the weaviate-kg MCP calls internally.",
 
   "upgrade": {
     "strategy": "git_pull"

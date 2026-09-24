@@ -3779,12 +3779,11 @@ mod tests {
 
     #[test]
     fn migration_outcome_success_migrates_and_rewrites_env() {
-        // Unquoted value + inline comment → the comment is preserved (the
-        // quoted-value case drops it; that asymmetry is pinned in
-        // env_secrets_migrate::tests and matches the Python mirror).
-        let env = "export OPENAI_API_KEY=sk-abc  # team\nPLAIN=keep\n";
+        // The `.env` rewrite itself is the one writer's (`vco_lib.env_template
+        // sentinel`, pinned by `vco_lib_bridge::…::sentinel_rewrites_only_the_
+        // confirmed_keys` and tests/test_env_secrets_migrate_parity.py).
         let hub = hub_resp(&["OPENAI_API_KEY"], &[]);
-        let (result, new_env) = build_migration_outcome(env, &hub);
+        let result = build_migration_outcome(&hub);
 
         assert!(result.ok);
         assert_eq!(result.migrated, vec!["OPENAI_API_KEY".to_string()]);
@@ -3792,12 +3791,6 @@ mod tests {
         assert!(result.error.is_none());
         // GAP-1: the hub's scope flows through to the FE result verbatim.
         assert_eq!(result.scope, "shared");
-        // The .env is rewritten: only the migrated key gets the sentinel,
-        // PLAIN is byte-identical, structure (export prefix + comment) kept.
-        assert_eq!(
-            new_env.as_deref(),
-            Some("export OPENAI_API_KEY=__vco_keychain__  # team\nPLAIN=keep\n")
-        );
     }
 
     #[test]
@@ -3805,9 +3798,8 @@ mod tests {
         // GAP-1: a per-project hub response surfaces `scope == "per_project"`
         // so SecretsTab renders the "this project's scope" banner + the
         // command triggers the per-project env refresh.
-        let env = "CLIENTA_DB_PASSWORD=pw\n";
         let hub = hub_resp_scoped(&["CLIENTA_DB_PASSWORD"], &[], "per_project");
-        let (result, _new_env) = build_migration_outcome(env, &hub);
+        let result = build_migration_outcome(&hub);
         assert!(result.ok);
         assert_eq!(result.scope, "per_project");
         assert_eq!(result.migrated, vec!["CLIENTA_DB_PASSWORD".to_string()]);
@@ -3815,10 +3807,9 @@ mod tests {
 
     #[test]
     fn migration_outcome_partial_failure_surfaces_failed_keys_no_flip_on_ok() {
-        let env = "A_TOKEN=one\nB_SECRET=two\n";
         // Hub migrated A_TOKEN, failed B_SECRET.
         let hub = hub_resp(&["A_TOKEN"], &["B_SECRET"]);
-        let (result, new_env) = build_migration_outcome(env, &hub);
+        let result = build_migration_outcome(&hub);
 
         assert!(result.ok, "partial failure must not flip ok=false");
         assert_eq!(result.migrated, vec!["A_TOKEN".to_string()]);
@@ -3826,26 +3817,19 @@ mod tests {
         let err = result.error.expect("error summary for failed keys");
         assert!(err.contains("B_SECRET"), "error names the failed key: {}", err);
         assert!(!err.contains("two"), "error must NOT leak the secret value: {}", err);
-        // Only the migrated key's value was replaced; B_SECRET stays plaintext.
-        assert_eq!(
-            new_env.as_deref(),
-            Some("A_TOKEN=__vco_keychain__\nB_SECRET=two\n")
-        );
     }
 
     #[test]
     fn migration_outcome_all_failed_writes_nothing() {
-        let env = "A_TOKEN=one\n";
         let hub = hub_resp(&[], &["A_TOKEN"]);
-        let (result, new_env) = build_migration_outcome(env, &hub);
+        let result = build_migration_outcome(&hub);
 
         assert!(result.ok);
-        assert!(result.migrated.is_empty());
-        assert_eq!(result.failed, vec!["A_TOKEN".to_string()]);
         assert!(
-            new_env.is_none(),
+            result.migrated.is_empty(),
             "no migrated keys ⇒ no .env rewrite (leave user data untouched)"
         );
+        assert_eq!(result.failed, vec!["A_TOKEN".to_string()]);
     }
 
     #[test]
@@ -3896,7 +3880,7 @@ mod tests {
 // --apply-deferred`. Nothing is written to disk in that case.
 
 use super::env_secrets_migrate::{
-    audit_env_secrets, rewrite_env_with_sentinels, EnvSecret,
+    audit_env_secrets, EnvSecret,
 };
 
 /// FE-facing result. `failed` is a flat `Vec<String>` of key names (the
@@ -4012,18 +3996,9 @@ async fn post_secrets_to_hub(
 /// migrate result, compute the FE result + the new `.env` text to write
 /// (None ⇒ nothing to write). Kept separate from I/O so the success and
 /// failure branches are unit-testable without a live hub or filesystem.
-fn build_migration_outcome(
-    env_text: &str,
-    hub: &HubMigrateResponse,
-) -> (MigrateEnvSecretsResult, Option<String>) {
+fn build_migration_outcome(hub: &HubMigrateResponse) -> MigrateEnvSecretsResult {
     let migrated = hub.migrated.clone();
     let failed_keys: Vec<String> = hub.failed.iter().map(|f| f.key.clone()).collect();
-
-    let new_env = if migrated.is_empty() {
-        None
-    } else {
-        Some(rewrite_env_with_sentinels(env_text, &migrated).text)
-    };
 
     let error = if failed_keys.is_empty() {
         None
@@ -4035,19 +4010,16 @@ fn build_migration_outcome(
         ))
     };
 
-    (
-        MigrateEnvSecretsResult {
-            // `ok` reflects "the round-trip completed" — partial failures
-            // are surfaced via `failed` + `error`, not by flipping `ok`
-            // (matches the hub's own partial-success-is-200 contract).
-            ok: true,
-            migrated,
-            failed: failed_keys,
-            error,
-            scope: hub.scope.clone(),
-        },
-        new_env,
-    )
+    MigrateEnvSecretsResult {
+        // `ok` reflects "the round-trip completed" — partial failures
+        // are surfaced via `failed` + `error`, not by flipping `ok`
+        // (matches the hub's own partial-success-is-200 contract).
+        ok: true,
+        migrated,
+        failed: failed_keys,
+        error,
+        scope: hub.scope.clone(),
+    }
 }
 
 #[command]
@@ -4106,11 +4078,20 @@ pub async fn migrate_env_secrets_from_dotenv(
         }
     };
 
-    // 4. Rewrite `.env` for the hub-confirmed keys (atomic write).
-    let (result, new_env) = build_migration_outcome(&env_text, &hub);
-    if let Some(text) = new_env {
-        write_env_atomically(&env_path, &text)
-            .map_err(|e| format!("rewrite {}: {}", env_path.display(), e))?;
+    // 4. Rewrite `.env` for the hub-confirmed keys — through the ONE `.env`
+    //    writer (`vco_lib.env_template sentinel`, v0.2.97; this was a Rust
+    //    mirror of `vco_lib.secrets_audit` plus a Rust atomic write). Only the
+    //    key NAMES cross the bridge. No confirmed key ⇒ nothing is written.
+    let result = build_migration_outcome(&hub);
+    if !result.migrated.is_empty() {
+        let migrated: Vec<&str> = result.migrated.iter().map(String::as_str).collect();
+        let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+        crate::services::vco_lib_bridge::sentinel_project_env_keys(
+            root.as_deref(),
+            std::path::Path::new(&project.folder_path),
+            &migrated,
+        )
+        .map_err(|e| format!("rewrite {}: {}", env_path.display(), e))?;
     }
 
     // 5. On a per-project migration that landed keys, refresh this project's
@@ -4260,34 +4241,3 @@ pub async fn set_shared_secrets_read_disabled(
 // read a different root entirely.
 use crate::secrets_file_store::secrets_root as vct_secrets_shared_dir_for_marker;
 
-/// Atomic `.env` rewrite: write a sibling temp file (0o600 on Unix so the
-/// sentinel-replaced file never flashes world-readable), then rename into
-/// place. Mirrors the atomic-write discipline in
-/// `vco_lib/secrets_audit.py::rewrite_env_with_sentinels`.
-fn write_env_atomically(env_path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let parent = env_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".env.vco-migrate-{}",
-        std::process::id()
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = f.set_permissions(perms);
-        }
-        f.write_all(text.as_bytes())?;
-        f.flush()?;
-    }
-    match std::fs::rename(&tmp, env_path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}

@@ -145,6 +145,11 @@ def describe_store(where: str) -> str:
     return f"the file store ({root}/shared/{OPENAI_SECRET_NAME})"
 
 
+def _is_clean_key(value: str) -> bool:
+    """A parsed ``.env`` value that is one token an API key can be."""
+    return bool(value) and not any(ch.isspace() or ch in "#'\"" for ch in value)
+
+
 def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     """Move a pre-v0.2.97 VCO-written ``OPENAI_API_KEY`` line out of
     ``<root>/.env``.
@@ -157,10 +162,14 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     removed once the copy reads back equal. Otherwise it stays and the
     status says why.
 
+    The value is read with the ONE line grammar (``envfile.parse_env_line``:
+    ``export``, one quote pair, CRLF) — what a reader of the line gets.
+
     Returns ``{"status": ..., "detail": ...}`` — status ``absent`` (no such
     line), ``migrated`` (removed; detail = where the value now lives),
     ``left_differs`` (the store holds another value), ``left_unverified``
-    (it could not be stored or read back). Never a value.
+    (it could not be stored or read back), ``left_unparsed`` (the value is
+    not one clean token). Never a value.
     """
     from vco_lib import agent_secrets
     from vco_lib.env_template import remove_line_under
@@ -168,7 +177,20 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     outcome: dict[str, str] = {"status": "absent", "detail": ""}
 
     def proven(value: str) -> bool:
-        value = value.strip()
+        # The line grammar already stripped `export` and ONE quote pair. What
+        # is left must be a single token: an API key never holds whitespace,
+        # a `#` or a quote, so anything that does (a trailing comment, a stray
+        # or mismatched quote) did not parse CLEANLY — storing it would plant
+        # a broken key. Leave the line and say why (review R5 F34).
+        if not _is_clean_key(value):
+            outcome.update(
+                status="left_unparsed",
+                detail=(
+                    "its value is not one clean token (a trailing comment, a stray "
+                    "quote or whitespace) — move it into the store by hand"
+                ),
+            )
+            return False
         state, stored = agent_secrets.lookup_stored(OPENAI_SECRET_NAME, project=str(root))
         if stored is None:
             try:
@@ -198,28 +220,12 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     return outcome
 
 
-#: install.py flags whose VALUE is a secret.
-SECRET_ARGV_FLAGS: tuple[str, ...] = ("--openai-key",)
-
-
-def redact_secret_argv(argv: list[str]) -> list[str]:
-    """``argv`` with the value of every :data:`SECRET_ARGV_FLAGS` flag
-    replaced by ``<redacted>`` (both ``--flag VALUE`` and ``--flag=VALUE``)
-    — for any log line that records the command line."""
-    out: list[str] = []
-    redact_next = False
-    for arg in argv:
-        if redact_next:
-            out.append("<redacted>")
-            redact_next = False
-        elif arg in SECRET_ARGV_FLAGS:
-            out.append(arg)
-            redact_next = True
-        elif any(arg.startswith(f"{flag}=") for flag in SECRET_ARGV_FLAGS):
-            out.append(arg.split("=", 1)[0] + "=<redacted>")
-        else:
-            out.append(arg)
-    return out
+# The ONE argv redactor lives with the install companions (stdlib only, so
+# install.py can use it before its venv exists); re-exported here.
+from vco_lib.install_companions import (  # noqa: E402
+    SECRET_ARGV_FLAGS,
+    redact_secret_argv,
+)
 
 
 __all__ = [

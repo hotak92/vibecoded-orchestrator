@@ -166,12 +166,23 @@ output is recognisable by the section headers they wrote (see
 
 Inside such a section, a line for a key the managed block now renders is
 REMOVED (the block carries it, with the current value), as is an active
-line still holding the unsubstituted ``<project>`` placeholder. Anything
+line still holding a placeholder a retired writer made up — the
+unsubstituted ``<project>``, or the exact ``Project`` / ``Project_*`` values
+of :data:`_RETIRED_PLACEHOLDER_PAIRS`. Anything
 else in the section — a commented ``# GITHUB_TOKEN=`` placeholder, a key
 the block does not carry — stays, and so does every line outside those
 sections. A section left with no key lines loses its header too. The
 result is ONE set: each managed key is assigned once, either by the block
 or by the user.
+
+A folded line whose value DIFFERS from what VCO now renders (owner ruling,
+review R5 F35) is not lost: on the launcher path VCO's value goes in the
+block and the old one stays OUTSIDE it as ``<KEY>_old=<value>`` (original
+quoting; ``_old2``, ``_old3``… when ``<KEY>_old`` already holds something
+else — never overwritten, never duplicated), recorded in the project's
+auto-resolution trail by key name only. Placeholders are not kept;
+fill-only (``install.py``) carries the old value into the block instead.
+Secret-shaped keys are never folded.
 
 Cross-OS rules (non-negotiable)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -225,9 +236,9 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
-from vco_lib.atomic import atomic_write_text
+from vco_lib.atomic import atomic_rewrite_text
 from vco_lib.config_projection import (
     ConfigProjectionError,
     DbUnreachable,
@@ -458,8 +469,9 @@ def apply_env_template(
             update / re-install): a key the existing block already renders
             keeps ITS value (and a key only the old block carries stays),
             and a key migrated from a legacy line keeps that line's value,
-            so the call can add keys but never change or drop one. A value
-            still holding ``<project>`` is not kept.
+            so the call can add keys but never change or drop one. A
+            placeholder a retired writer made up (:func:`_is_placeholder`) is
+            not kept.
 
     Returns:
         ``{"env": [...], "added": [...], "user_set": [...],
@@ -495,17 +507,23 @@ def apply_env_template(
     migrated = {**migrated_before, **migrated_after}
     user_set = _user_set_keys(before + after) & set(keys)
     wanted = dict(keys)
+    preserved: list[tuple[str, str]] = []
     if keep_existing_values:
         # Precedence: the old block's value > a migrated legacy line's value
         # > the caller's. Nothing a previous run settled changes.
-        kept = {k: v for k, v in migrated.items() if v is not None}
+        kept = {k: _parsed_value(v) for k, v in migrated.items() if v is not None}
         if block is not None:
             kept.update(
                 (k, v) for k, v in _block_values(block).items()
-                if _PLACEHOLDER_TOKEN not in v
+                if not _is_placeholder(k, v)
             )
         wanted = {**{k: kept.get(k, v) for k, v in keys.items()}, **kept}
         user_set = _user_set_keys(before + after) & set(wanted)
+    else:
+        # Owner ruling (review R5 F35): VCO's value goes in the block, and a
+        # DIFFERENT value a folded legacy line held stays discoverable as
+        # `<KEY>_old` outside it — never overwritten, never duplicated.
+        before, preserved = _preserve_replaced_values(before, after, migrated, keys)
     rendered = {k: v for k, v in wanted.items() if k not in user_set}
 
     if block is None and not rendered and keys:
@@ -518,7 +536,87 @@ def apply_env_template(
     action = "unchanged" if new_text == prior else "updated"
     if action == "updated":
         _atomic_write_text(env_path, new_text)
-    return _report(rendered, user_set, set(migrated), previously_set, action)
+        _record_preserved(project_folder, preserved)
+    report = _report(rendered, user_set, set(migrated), previously_set, action)
+    report["preserved"] = [f"{key}->{name}" for key, name in preserved]
+    return report
+
+
+#: The comment VCO puts above the `<KEY>_old` lines it keeps (owner ruling F35).
+PRESERVED_VALUES_COMMENT = (
+    "# vco: your earlier value(s) of keys VCO now sets in its block below — "
+    "kept for reference, not read by VCO"
+)
+
+
+def _parsed_value(raw: str) -> str:
+    """The value a reader gets from ``KEY=<raw>`` — THE line grammar
+    (:func:`vco_lib.envfile.parse_env_line`: one quote pair stripped)."""
+    from vco_lib.envfile import parse_env_line
+
+    pair = parse_env_line(f"K={raw}")
+    return pair[1] if pair is not None else raw
+
+
+def _preserve_replaced_values(
+    before: str,
+    after: str,
+    migrated: Mapping[str, Optional[str]],
+    keys: Mapping[str, str],
+) -> tuple[str, list[tuple[str, str]]]:
+    """Owner ruling (review R5 F35). For every folded legacy line whose value
+    DIFFERS from what VCO now renders for that key (placeholders were never
+    carried — they are ``None`` in ``migrated``), append ``<KEY>_old=<raw>``
+    — the original text after ``=``, quotes and all — to ``before``, under
+    :data:`PRESERVED_VALUES_COMMENT`. An existing ``<KEY>_old`` holding a
+    different value is never overwritten: the next free ``<KEY>_old2``,
+    ``_old3``… is used; one already holding this value is reused (so a
+    re-run adds nothing). Returns ``(before, [(KEY, name), ...])``."""
+    from vco_lib.envfile import parse_env_line
+
+    assigned: dict[str, set[str]] = {}
+    for line in (before + after).splitlines():
+        pair = parse_env_line(line)
+        if pair is not None:
+            assigned.setdefault(pair[0], set()).add(pair[1])
+    lines: list[str] = []
+    preserved: list[tuple[str, str]] = []
+    for key in sorted(migrated):
+        raw = migrated[key]
+        if raw is None or key not in keys or _parsed_value(raw) == keys[key]:
+            continue
+        n = 1
+        while True:
+            name = f"{key}_old" if n == 1 else f"{key}_old{n}"
+            held = assigned.get(name)
+            if held is None:
+                lines.append(f"{name}={raw}")
+                assigned[name] = {_parsed_value(raw)}
+                preserved.append((key, name))
+                break
+            if _parsed_value(raw) in held:
+                break
+            n += 1
+    if not lines:
+        return before, []
+    sep = "" if not before or before.endswith("\n") else "\n"
+    return before + sep + PRESERVED_VALUES_COMMENT + "\n" + "\n".join(lines) + "\n", preserved
+
+
+def _record_preserved(project_folder: Path, preserved: list[tuple[str, str]]) -> None:
+    """One auto-resolution trail row per kept value — key NAMES and the file
+    only, never a value."""
+    if not preserved:
+        return
+    from vco_lib.deferral_emit import record_auto_resolution
+
+    for key, name in preserved:
+        record_auto_resolution(
+            project_folder,
+            "env_legacy_value_preserved",
+            "kept your earlier value outside VCO's block",
+            f"{key} -> {name} in .env",
+        )
 
 
 def _report(
@@ -602,27 +700,227 @@ def remove_line_under(
     *,
     remove_if: Callable[[str], bool],
 ) -> Optional[bool]:
-    """Remove the ``key=`` line sitting DIRECTLY under the VCO-authored
-    comment line ``header`` (the only provenance a pre-v0.2.97 line has)
-    when ``remove_if(value)`` says so. ``None``: no such line (or no file);
-    ``True``: removed (atomic write, every other byte kept); ``False``:
-    left. The value goes only to ``remove_if`` — never into a return value,
-    a log, or an exception message. Only the first such pair is handled."""
+    """Remove the ``key`` assignment line sitting DIRECTLY under the
+    VCO-authored comment line ``header`` (the only provenance a pre-v0.2.97
+    line has) when ``remove_if(value)`` says so. ``None``: no such line (or
+    no file); ``True``: removed (atomic write, every other byte — CRLF
+    included — kept); ``False``: left.
+
+    The line is read with THE line grammar,
+    :func:`vco_lib.envfile.parse_env_line` (``export`` prefix, one matching
+    quote pair, CRLF) — the same value tier 3 of the secret resolver returns
+    for it — so ``remove_if`` sees the value a reader would, never the raw
+    text after ``=`` (review R5 F34: a quoted line was stored WITH its
+    quotes). The value goes only to ``remove_if`` — never into a return
+    value, a log, or an exception message. Only the first such pair is
+    handled."""
+    from vco_lib.envfile import parse_env_line
+
     env_path = project_folder / ".env"
     if not env_path.is_file():
         return None
     with env_path.open(encoding="utf-8", newline="") as handle:
         text = handle.read()
     lines = text.splitlines(keepends=True)
-    prefix = f"{key}="
     for i in range(len(lines) - 1):
-        if lines[i].rstrip("\r\n") == header and lines[i + 1].startswith(prefix):
-            value = lines[i + 1].rstrip("\r\n")[len(prefix):]
-            if not remove_if(value):
-                return False
-            _atomic_write_text(env_path, "".join(lines[:i + 1] + lines[i + 2:]))
-            return True
+        if lines[i].rstrip("\r\n") != header:
+            continue
+        pair = parse_env_line(lines[i + 1])
+        if pair is None or pair[0] != key:
+            continue
+        if not remove_if(pair[1]):
+            return False
+        _atomic_write_text(env_path, "".join(lines[:i + 1] + lines[i + 2:]))
+        return True
     return None
+
+
+def replace_values_with_sentinel(
+    env_path: Path,
+    migrated_keys: Sequence[str],
+    sentinel: str,
+) -> "tuple[int, list[str]]":
+    """Replace migrated keys' values in ``.env`` with ``sentinel`` (v0.2.97:
+    moved here from ``vco_lib.secrets_audit`` — the ``.env`` has ONE writer;
+    ``secrets_audit.rewrite_env_with_sentinels`` and the launcher's
+    "Migrate from .env" button both call this).
+
+    Returns ``(num_replaced, missed)`` where ``missed`` is the list of
+    keys that were not found in the file (defensive logging only — the
+    caller usually trusts the audit step's output, but if the user edited
+    the .env between audit and rewrite a key may have moved).
+
+    Atomic-write semantics: a temp file is written in the same directory
+    then ``os.replace()``'d into place. File mode is preserved across the
+    swap (the temp file inherits ``env_path``'s mode pre-replace via an
+    explicit ``shutil.copystat``).
+
+    Each replaced line keeps its original key + ``export`` prefix (if
+    any) + trailing comment (if any). Only the value bytes change:
+
+    .. code-block:: text
+
+       # before
+       export OPENAI_API_KEY="sk-abc123"  # team key
+
+       # after (with sentinel = "__vco_keychain__")
+       export OPENAI_API_KEY=__vco_keychain__  # team key
+
+    Comments preserved; ``export`` prefix preserved; quotes stripped (the
+    sentinel doesn't need quoting and quotes-around-sentinel would just
+    add noise).
+    """
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError(f"cannot read {env_path}: {exc}") from exc
+
+    keyset = set(migrated_keys)
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    replaced_count = 0
+
+    for raw in text.splitlines(keepends=False):
+        line = raw
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            out_lines.append(line)
+            continue
+        # Preserve leading whitespace + `export` prefix; identify the key.
+        leading_ws_len = len(line) - len(stripped)
+        leading_ws = line[:leading_ws_len]
+        body = stripped
+        export_prefix = ""
+        if body.startswith("export "):
+            export_prefix = "export "
+            body = body[len("export "):].lstrip()
+            # Re-measure leading_ws to include the gap absorbed by lstrip
+            # (rare, but happens with `export   KEY=val`).
+            export_prefix = "export "
+        eq = body.find("=")
+        if eq <= 0:
+            out_lines.append(line)
+            continue
+        key = body[:eq].strip()
+        if key not in keyset:
+            out_lines.append(line)
+            continue
+        if key in seen:
+            # Duplicate key — preserve as-is (user has a malformed .env;
+            # we don't try to "fix" it beyond the first-occurrence
+            # replacement).
+            out_lines.append(line)
+            continue
+        seen.add(key)
+        raw_value = body[eq + 1:]
+        # Detect trailing inline comment on an unquoted value.
+        trailing_comment = ""
+        val_str = raw_value
+        val_stripped = val_str.strip()
+        if not (val_stripped.startswith('"') or val_stripped.startswith("'")):
+            hash_pos = val_stripped.find("#")
+            if hash_pos >= 0:
+                trailing_comment = "  " + val_stripped[hash_pos:]
+        new_line = (
+            f"{leading_ws}{export_prefix}{key}={sentinel}{trailing_comment}"
+        )
+        out_lines.append(new_line)
+        replaced_count += 1
+
+    missed = [k for k in keyset if k not in seen]
+
+    # Preserve trailing newline if the original had one.
+    new_text = "\n".join(out_lines)
+    if text.endswith("\n"):
+        new_text += "\n"
+
+    # Atomic write: sibling tempfile, replace, then restore the mode.
+    # Preserve the existing mode (especially important on Unix where the
+    # env file may already be 0o600). v0.2.92 (duplication-merge): through
+    # the ONE atomic writer — its mkstemp tempfile is 0600, so the swapped
+    # file is never briefly MORE permissive than before; `mode=` then
+    # restores the original bits after the rename.
+    _atomic_write_text(env_path, new_text)
+
+    return replaced_count, missed
+
+
+#: The forensic tail B12 leaves on the line it repairs (byte-compatible with
+#: the pre-v0.2.97 Rust repair, so an old repaired line reads the same).
+_B12_NOTE = 'B12 auto-repaired 0.2.11: was "{old}"'
+
+
+def repair_stale_kg_collection(
+    project_folder: Path, canonical: str, stale_values: "list[str] | tuple[str, ...]"
+) -> bool:
+    """B12 (0.2.11), moved here from the launcher's Rust ``naming.rs`` in
+    v0.2.97 so a project's ``.env`` has ONE writer. When no line already
+    reads ``KG_COLLECTION=<canonical>``, the FIRST line reading exactly
+    ``KG_COLLECTION=<stale>`` (one of ``stale_values``, trimmed) becomes
+    ``KG_COLLECTION=<canonical> # B12 auto-repaired 0.2.11: was "<old>"``.
+    Every other byte (CRLF included) is kept, and the file keeps its mode.
+    Returns whether it rewrote. Which values are stale is the caller's
+    naming policy (the launcher's sanitizer), not this writer's."""
+    env_path = project_folder / ".env"
+    if not env_path.is_file():
+        return False
+    with env_path.open(encoding="utf-8", newline="") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    canonical_line = f"KG_COLLECTION={canonical}"
+    stale_lines = {f"KG_COLLECTION={v}" for v in stale_values}
+    stale_at: Optional[int] = None
+    for i, line in enumerate(lines):
+        body = line.strip()
+        # A line B12 already repaired carries its forensic ` # B12 …` tail —
+        # it IS the canonical line (the pre-v0.2.97 Rust check missed that,
+        # so a second stale line would have been "repaired" on a re-run).
+        if body == canonical_line or body.startswith(canonical_line + " #"):
+            return False
+        if stale_at is None and body in stale_lines:
+            stale_at = i
+    if stale_at is None:
+        return False
+    old = lines[stale_at]
+    ending = old[len(old.rstrip("\r\n")):]
+    lines[stale_at] = f"{canonical_line} # {_B12_NOTE.format(old=old.strip())}{ending}"
+    _atomic_write_text(env_path, "".join(lines))
+    return True
+
+
+def strip_project_env(project_folder: Path, keys: "set[str] | frozenset[str]") -> list[str]:
+    """The unregister's ``.env`` strip (v0.2.97 review R5 F40 — it was a Rust
+    read-modify-write the single-writer lint could not see).
+
+    Removes VCO's managed block WHOLE (markers and forensic comments too — a
+    by-name strip left them behind), then, outside it, every line assigning
+    one of ``keys`` — active (``KEY=`` / ``export KEY=``, THE line grammar,
+    :func:`vco_lib.envfile.parse_env_line`) or commented (``# KEY=…``, launcher
+    residue). Every other line is kept byte-for-byte (CRLF included), and the
+    file keeps its mode. Returns the removed key names, sorted; nothing is
+    written when nothing matched. A missing file is ``[]``; an unreadable one
+    raises (never a rewrite from a guess).
+    """
+    from vco_lib.envfile import parse_env_line
+
+    env_path = project_folder / ".env"
+    if not env_path.is_file():
+        return []
+    with env_path.open(encoding="utf-8", newline="") as handle:
+        prior = handle.read()
+    before, block, after = _split_managed(prior)
+    removed: set[str] = set(_block_values(block)) if block is not None else set()
+    kept: list[str] = []
+    for line in (before + after).splitlines(keepends=True):
+        body = line.strip()
+        pair = parse_env_line(body[1:] if body.startswith("#") else body)
+        if pair is not None and pair[0] in keys:
+            removed.add(pair[0])
+            continue
+        kept.append(line)
+    new_text = "".join(kept)
+    if new_text != prior:
+        _atomic_write_text(env_path, new_text)
+    return sorted(removed)
 
 
 # ─── Legacy VCO-authored lines (pre-v0.2.97 writers) ────────────────────
@@ -661,6 +959,32 @@ _LEGACY_KEY_ORDER: tuple[str, ...] = (
 )
 _KEY_LINE = re.compile(r"^(#\s*)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _PLACEHOLDER_TOKEN = "<project>"
+#: Exact ``(KEY, value)`` pairs the retired writers MADE UP when they did not
+#: know the project's name: the pre-v0.2.97 install.py re-install block
+#: (``sanitized = "Project"``) and ``--update`` reconcile defaulted to
+#: ``Project`` / ``Project_*``. Like ``<project>`` they are placeholders, not
+#: values — but only where those writers put them: inside VCO's managed block
+#: (on the fill-only path) or a recognised legacy section. A user's own line
+#: saying ``PROJECT_NAME=Project`` elsewhere is theirs (review R5 F42).
+_RETIRED_PLACEHOLDER_PAIRS: frozenset[tuple[str, str]] = frozenset({
+    ("PROJECT_NAME", "Project"),
+    ("CODE_GRAPH_PROJECT", "Project"),
+    ("KG_COLLECTION", "Project_KnowledgeGraph"),
+    ("DEVELOPMENT_COLLECTION", "Project_Development"),
+})
+
+
+def _secret_shaped(key: str) -> bool:
+    from vco_lib.secrets_audit import is_secret_shaped_env_key
+
+    return is_secret_shaped_env_key(key)
+
+
+def _is_placeholder(key: str, value: str) -> bool:
+    """A made-up value a retired VCO writer left (see
+    :data:`_RETIRED_PLACEHOLDER_PAIRS`). Callers apply it only to lines that
+    writer authored."""
+    return _PLACEHOLDER_TOKEN in value or (key, value.strip()) in _RETIRED_PLACEHOLDER_PAIRS
 
 
 def _legacy_header_kind(line: str) -> Optional[str]:
@@ -703,14 +1027,17 @@ def _legacy_line_is_retired(
     line: str, owned: set[str]
 ) -> Optional[tuple[str, Optional[str]]]:
     """``(key, value)`` of a legacy key line to REMOVE, else ``None``: its
-    key is rendered by the block, or it is active and still holds
-    ``<project>``. ``value`` is the line's value when it is an active,
-    real one (a fill-only caller carries it into the block), else ``None``."""
+    key is rendered by the block, or it is active and still holds a
+    placeholder (:func:`_is_placeholder`). ``value`` is the line's value when
+    it is an active, real one (a fill-only caller carries it into the block),
+    else ``None``."""
     key = _KEY_LINE.match(line.rstrip("\r"))
-    if not key:
+    if not key or _secret_shaped(key.group(2)):
+        # A secret-shaped key is never folded (owner ruling F35): its line is
+        # the user's, whatever section it sits in.
         return None
     active = not key.group(1)
-    placeholder = _PLACEHOLDER_TOKEN in key.group(3)
+    placeholder = _is_placeholder(key.group(2), key.group(3))
     if key.group(2) in owned or (active and placeholder):
         return key.group(2), key.group(3) if active and not placeholder else None
     return None
@@ -878,8 +1205,12 @@ def _atomic_write_text(path: Path, content: str) -> None:
     previous ``newline="\\n"`` — ``\\n`` in ``content`` lands as LF on
     every OS, never CRLF. The ``.env`` consumers (bash via WSL2 /
     git-bash) keep getting the LF bytes they require.
+
+    v0.2.97 (review R5 F36): an EXISTING file keeps its permission bits (the
+    retired Rust writer rewrote in place, so a 0640 ``.env`` stayed 0640) —
+    through the one home, :func:`vco_lib.atomic.atomic_rewrite_text`.
     """
-    atomic_write_text(path, content)
+    atomic_rewrite_text(path, content)
 
 
 # ─── New-file scaffold + the Safe-add reference sidecar ──────────────────
@@ -1041,6 +1372,64 @@ def _cli_effective(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_sentinel(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.env_template sentinel --project-folder <p>`` with
+    ``{"keys": [...]}`` on stdin — replace those keys' values in the
+    project's ``.env`` with the keychain sentinel (the launcher's "Migrate
+    from .env", after the hub confirmed each key). Never prints a value."""
+    from vco_lib.secrets_audit import KEYCHAIN_SENTINEL
+
+    try:
+        request = json.loads(sys.stdin.read() or "{}")
+        keys = [str(k) for k in request.get("keys", [])]
+    except (ValueError, AttributeError) as exc:
+        _cli_error("bad_request", f"stdin is not a {{\"keys\": [...]}} object: {exc}")
+        return 2
+    env_path = Path(args.project_folder) / ".env"
+    if not env_path.is_file():
+        print(json.dumps({"ok": True, "replaced": 0, "missed": sorted(keys)}))
+        return 0
+    try:
+        replaced, missed = replace_values_with_sentinel(env_path, keys, KEYCHAIN_SENTINEL)
+    except (OSError, UnicodeDecodeError, RuntimeError) as exc:
+        _cli_error("sentinel_failed", str(exc))
+        return 4
+    print(json.dumps({"ok": True, "replaced": replaced, "missed": sorted(missed)}))
+    return 0
+
+
+def _cli_repair_kg(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.env_template repair-kg --project-folder <p>
+    --canonical <C> --stale <S> [--stale <S2>]`` — the B12 repair."""
+    try:
+        repaired = repair_stale_kg_collection(
+            Path(args.project_folder), args.canonical, list(args.stale)
+        )
+    except (OSError, UnicodeDecodeError) as exc:
+        _cli_error("repair_failed", str(exc))
+        return 4
+    print(json.dumps({"ok": True, "action": "repaired" if repaired else "unchanged"}))
+    return 0
+
+
+def _cli_strip(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.env_template strip --project-folder <p>`` with
+    ``{"keys": [...]}`` on stdin — the unregister's ``.env`` strip."""
+    try:
+        request = json.loads(sys.stdin.read() or "{}")
+        keys = {str(k) for k in request.get("keys", [])}
+    except (ValueError, AttributeError) as exc:
+        _cli_error("bad_request", f"stdin is not a {{\"keys\": [...]}} object: {exc}")
+        return 2
+    try:
+        removed = strip_project_env(Path(args.project_folder), keys)
+    except (OSError, UnicodeDecodeError) as exc:
+        _cli_error("strip_failed", str(exc))
+        return 4
+    print(json.dumps({"ok": True, "removed": removed}))
+    return 0
+
+
 def _cli_list_keys(args: argparse.Namespace) -> int:
     """``python -m vco_lib.env_template list-keys --json``."""
     keys = sorted(list_canonical_env_template_keys())
@@ -1138,6 +1527,31 @@ def _build_parser() -> argparse.ArgumentParser:
         p_verb.add_argument("--code-embed-port", type=int, default=11440)
         p_verb.set_defaults(handler=handler)
 
+    p_sentinel = sub.add_parser(
+        "sentinel",
+        help="replace the given keys' values in <project>/.env with the keychain "
+             'sentinel (stdin: {"keys": [...]})',
+    )
+    p_sentinel.add_argument("--project-folder", required=True)
+    p_sentinel.set_defaults(handler=_cli_sentinel)
+
+    p_repair = sub.add_parser(
+        "repair-kg",
+        help="B12: rewrite a stale KG_COLLECTION= line of <project>/.env to the canonical name",
+    )
+    p_repair.add_argument("--project-folder", required=True)
+    p_repair.add_argument("--canonical", required=True)
+    p_repair.add_argument("--stale", action="append", default=[], required=True)
+    p_repair.set_defaults(handler=_cli_repair_kg)
+
+    p_strip = sub.add_parser(
+        "strip",
+        help="unregister: remove VCO's block and the given keys from <project>/.env "
+             '(stdin: {"keys": [...]})',
+    )
+    p_strip.add_argument("--project-folder", required=True)
+    p_strip.set_defaults(handler=_cli_strip)
+
     p_eff = sub.add_parser(
         "effective",
         help="the winning (last) assignment of one managed key in <project>/.env (read-only)",
@@ -1184,6 +1598,9 @@ __all__ = [
     "list_canonical_env_template_keys",
     "project_env_template_from_db",
     "remove_line_under",
+    "repair_stale_kg_collection",
+    "replace_values_with_sentinel",
+    "strip_project_env",
     "render_project_env_scaffold",
     "write_env_reference",
 ]

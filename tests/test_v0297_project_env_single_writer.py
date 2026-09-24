@@ -27,7 +27,13 @@ from pathlib import Path
 
 from tests.common.launcher_db_fixture import make_launcher_db
 from tests.common.child_env import child_env
-from vco_lib.env_template import ENV_TEMPLATE_BEGIN, ENV_TEMPLATE_END, effective_assignment
+from vco_lib.env_template import (
+    ENV_TEMPLATE_BEGIN,
+    ENV_TEMPLATE_END,
+    effective_assignment,
+    repair_stale_kg_collection,
+    strip_project_env,
+)
 
 # The retired Rust writer's two shapes, as field files carry them.
 _RUST_FRESH_TEMPLATE = (
@@ -246,3 +252,122 @@ def test_effective_verb_answers_managed_keys_only_and_never_prints_a_secret(tmp_
     assert refused.returncode == 2
     assert json.loads(refused.stdout)["error"] == "key_not_managed"
     assert canary not in refused.stdout + refused.stderr
+
+
+# ─── the unregister's .env strip (review R5 F40: moved from Rust) ───────
+
+_BY_NAME = {"KG_COLLECTION", "PROJECT_NAME", "DEVELOPMENT_COLLECTION",
+            "ACTIVE_EMBEDDING", "OLLAMA_URL", "CODE_GRAPH_PROJECT"}
+
+
+def test_strip_removes_the_block_whole_and_by_name_keys_keeps_user_lines(tmp_path: Path) -> None:
+    """Act: VCO's managed block goes WHOLE (markers and forensic comments —
+    the old by-name strip left them), plus canonical keys outside it, active
+    or commented; user lines survive byte-for-byte."""
+    folder = _folder(tmp_path)
+    db = _db(tmp_path, folder)
+    (folder / ".env").write_text(
+        "# my header\nUSER_API_KEY=secret123\nKG_COLLECTION=Old_KG\n"
+        "# OLLAMA_URL=http://localhost:11435\nexport PROJECT_NAME=Mine\n",
+        encoding="utf-8",
+    )
+    assert _cli("apply", db, folder).returncode == 0
+
+    removed = strip_project_env(folder, _BY_NAME)
+    text = (folder / ".env").read_text(encoding="utf-8")
+
+    assert text == "# my header\nUSER_API_KEY=secret123\n"
+    assert ENV_TEMPLATE_BEGIN not in text and ENV_TEMPLATE_END not in text
+    assert "added by vco" not in text
+    assert {"KG_COLLECTION", "OLLAMA_URL", "PROJECT_NAME", "WEAVIATE_URL"} <= set(removed)
+
+
+def test_strip_leaves_a_file_without_vco_lines_untouched(tmp_path: Path) -> None:
+    folder = _folder(tmp_path)
+    (folder / ".env").write_text("USER_KEY=value\r\n", encoding="utf-8", newline="")
+    mtime = (folder / ".env").stat().st_mtime_ns
+    assert strip_project_env(folder, _BY_NAME) == []
+    assert (folder / ".env").read_bytes() == b"USER_KEY=value\r\n"
+    assert (folder / ".env").stat().st_mtime_ns == mtime
+    assert strip_project_env(tmp_path / "nowhere", _BY_NAME) == []
+
+
+def test_strip_cli_takes_keys_on_stdin(tmp_path: Path) -> None:
+    folder = _folder(tmp_path)
+    (folder / ".env").write_text("KG_COLLECTION=X\nKEEP=1\n", encoding="utf-8")
+    done = subprocess.run(
+        [sys.executable, "-m", "vco_lib.env_template", "strip", "--project-folder", str(folder)],
+        input=json.dumps({"keys": ["KG_COLLECTION"]}), capture_output=True, text=True,
+        env=child_env(),
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {"ok": True, "removed": ["KG_COLLECTION"]}
+    assert (folder / ".env").read_text() == "KEEP=1\n"
+
+
+# ─── infrastructure/.env has one writer too (review R5 F40) ─────────────
+
+
+def test_the_launcher_sets_its_infra_key_through_compose_env(tmp_path: Path) -> None:
+    from vco_lib.compose_env import set_infrastructure_env_key
+
+    infra = tmp_path / "infrastructure"
+    infra.mkdir()
+    (infra / ".env").write_text("CODE_EMBED_BACKEND=gpu\nVCT_VOLUMES_PATH=/old\n")
+    assert set_infrastructure_env_key(infra, "VCT_VOLUMES_PATH", "/new") == "set"
+    assert (infra / ".env").read_text() == "CODE_EMBED_BACKEND=gpu\nVCT_VOLUMES_PATH=/new\n"
+    assert set_infrastructure_env_key(infra, "VCT_VOLUMES_PATH", "/new") == "unchanged"
+    fresh = tmp_path / "fresh"
+    assert set_infrastructure_env_key(fresh, "VCT_VOLUMES_PATH", "/v") == "set"
+    assert (fresh / ".env").read_text() == "VCT_VOLUMES_PATH=/v\n"
+
+
+def test_the_infra_setter_refuses_other_keys_and_line_breaks(tmp_path: Path) -> None:
+    import pytest
+
+    from vco_lib.compose_env import set_infrastructure_env_key
+
+    with pytest.raises(ValueError):
+        set_infrastructure_env_key(tmp_path, "CODE_EMBED_BACKEND", "cpu")
+    with pytest.raises(ValueError):
+        set_infrastructure_env_key(tmp_path, "VCT_VOLUMES_PATH", "/a\nINJECTED=1")
+    assert not (tmp_path / ".env").exists()
+
+
+# ─── B12 and the "Migrate from .env" sentinel: the one writer too ───────
+
+
+def test_b12_repair_rewrites_the_first_stale_line_once(tmp_path: Path) -> None:
+    folder = _folder(tmp_path)
+    (folder / ".env").write_bytes(b"# h\r\nKG_COLLECTION=KnowledgeGraph\r\nKG_COLLECTION=Acme\r\nX=1\r\n")
+    assert repair_stale_kg_collection(folder, "Acme_KnowledgeGraph", ["KnowledgeGraph", "Acme"])
+    assert (folder / ".env").read_bytes() == (
+        b"# h\r\nKG_COLLECTION=Acme_KnowledgeGraph # B12 auto-repaired 0.2.11: was "
+        b"\"KG_COLLECTION=KnowledgeGraph\"\r\nKG_COLLECTION=Acme\r\nX=1\r\n"
+    )
+    # Idempotent: the canonical line is present now.
+    assert not repair_stale_kg_collection(folder, "Acme_KnowledgeGraph", ["KnowledgeGraph", "Acme"])
+
+
+def test_b12_repair_leaves_a_file_without_a_stale_line_alone(tmp_path: Path) -> None:
+    folder = _folder(tmp_path)
+    (folder / ".env").write_text("KG_COLLECTION=Mine_KG\n")
+    mtime = (folder / ".env").stat().st_mtime_ns
+    assert not repair_stale_kg_collection(folder, "Acme_KnowledgeGraph", ["KnowledgeGraph", "Acme"])
+    assert (folder / ".env").stat().st_mtime_ns == mtime
+    assert not repair_stale_kg_collection(tmp_path / "nowhere", "A_KG", ["KnowledgeGraph"])
+
+
+def test_sentinel_cli_rewrites_only_named_keys_and_never_prints_a_value(tmp_path: Path) -> None:
+    folder = _folder(tmp_path)
+    canary = "sk-canary-not-real-44aa"
+    (folder / ".env").write_text(f"export OPENAI_API_KEY={canary}  # team\nB_SECRET=two\n")
+    done = subprocess.run(
+        [sys.executable, "-m", "vco_lib.env_template", "sentinel", "--project-folder", str(folder)],
+        input=json.dumps({"keys": ["OPENAI_API_KEY"]}), capture_output=True, text=True,
+        env=child_env(),
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {"ok": True, "replaced": 1, "missed": []}
+    assert (folder / ".env").read_text() == "export OPENAI_API_KEY=__vco_keychain__  # team\nB_SECRET=two\n"
+    assert canary not in done.stdout + done.stderr

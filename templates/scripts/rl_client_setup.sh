@@ -19,9 +19,15 @@
 # ``tests/test_v0292_regclean_rl_setup_state_root.py`` — change one, change
 # both.
 #
-# The launcher's ``allocate_rl_port`` flow writes ``RL_PROJECT_ROOT``
-# into ``.claude/settings.json::env`` so the logger picks the right
-# log path on multi-project machines.
+# ``RL_PROJECT_ROOT`` is NOT a logger input (v0.2.97 correction — this
+# comment used to say an ``allocate_rl_port`` flow wrote it into the settings
+# env; no such flow exists). The logger's home is
+# ``default_rl_data_dir()`` and its events go to the vct-hub ``rl_events``
+# table keyed by project id, so multi-project machines need no path hint.
+# ``RL_PROJECT_ROOT`` reaches the RL CONTAINER through its module manifest
+# (``runtime.env_derived`` → a ``-e`` flag of the run, pinned by
+# ``build_podman_run_args_delivers_the_rl_module_env``), and the legacy host
+# launcher through ``session-start-kg-loader``'s export.
 #
 # ─── v0.2.92, register item 28: this script no longer writes under ~/.claude
 #

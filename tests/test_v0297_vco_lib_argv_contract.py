@@ -558,10 +558,16 @@ def test_the_project_env_bridge_verbs_are_collected_and_parse():
         if s.where.startswith("launcher/src-tauri/src/services/vco_lib_bridge.rs")
         and s.module == "vco_lib.env_template"
     ]
-    assert sorted(s.tokens[0] for s in sites) == ["apply", "effective", "reference"], sites
+    assert sorted(s.tokens[0] for s in sites) == [
+        "apply", "effective", "reference", "repair-kg", "sentinel", "strip",
+    ], sites
     for s in sites:
         if s.tokens[0] == "effective":  # the read-only drift probe rename uses
             assert s.tokens[1:5] == ("--project-folder", VALUE, "--key", VALUE), s
+        elif s.tokens[0] in ("strip", "sentinel"):  # key NAMES on stdin
+            assert s.tokens[1:3] == ("--project-folder", VALUE), s
+        elif s.tokens[0] == "repair-kg":  # B12; `--stale` repeats after the chain
+            assert s.tokens[1:5] == ("--project-folder", VALUE, "--canonical", VALUE), s
         else:
             assert s.tokens[1:5] == ("--project-id", VALUE, "--project-folder", VALUE), s
     parser = real_parser("vco_lib.env_template")
@@ -572,6 +578,19 @@ def test_the_project_env_bridge_verbs_are_collected_and_parse():
         ok, err = _parse(parser, [verb, "--project-id", "p", "--project-folder", "/f", *tail])
         assert ok, err
     ok, err = _parse(parser, ["effective", "--project-folder", "/f", "--key", "KG_COLLECTION"])
+    assert ok, err
+    ok, err = _parse(parser, ["strip", "--project-folder", "/f"])
+    assert ok, err
+    ok, err = _parse(parser, ["sentinel", "--project-folder", "/f"])
+    assert ok, err
+    ok, err = _parse(parser, ["repair-kg", "--project-folder", "/f", "--canonical", "A_KG",
+                              "--stale", "KnowledgeGraph", "--stale", "A"])
+    assert ok, err
+    ok, err = _parse(parser, ["repair-kg", "--project-folder", "/f", "--canonical", "A_KG"])
+    assert not ok and "--stale" in err
+    compose = real_parser("vco_lib.compose_env")
+    assert compose is not None
+    ok, err = _parse(compose, ["set", "--infra-dir", "/i", "--key", "VCT_VOLUMES_PATH", "--value", "/v"])
     assert ok, err
     ok, err = _parse(parser, ["apply", "--project-id", "p", "--project-folder", "/f",
                               "--folder", "/x"])

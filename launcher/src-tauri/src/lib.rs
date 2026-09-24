@@ -2168,6 +2168,15 @@ pub fn run() {
             // has new commits — never auto-applies.
             commands::self_update::spawn_daily_check(app.handle().clone());
 
+            // v0.2.97: materialize the bundled core-module manifests into the
+            // state dir (the hub does the same at its own start) — every
+            // manifest reader looks there, and nothing used to write it.
+            if let Err(e) = vct_launcher_core::bundled_manifests::sync_bundled_manifests(
+                &crate::paths::vct_root_dir(),
+            ) {
+                tracing::warn!("[vct] could not materialize bundled manifests: {}", e);
+            }
+
             // v0.2.18 Commit 3: OpenAI key startup recovery state machine.
             // Reads the keychain row at
             //   (Shared { project_id = SENTINEL_SHARED }, module_id = "user",

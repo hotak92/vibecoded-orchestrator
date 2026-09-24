@@ -294,6 +294,10 @@ export interface UpdateAllReport {
 export interface UnregisterOptions {
   purgeLauncherFiles?: boolean;
   purgeCollections?: boolean;
+  /** Owner ruling (review R5 F39): the escape from the unregister STOP —
+   *  "Unregister anyway — leave these values". Only ever sent as the SECOND
+   *  action of that stop (`$lib/unregister-escape`). */
+  leaveUnremovable?: boolean;
 }
 
 /**
@@ -311,6 +315,10 @@ export interface UnregisterReport {
   keysPurgedFromEnv: string[];
   collectionsDropped: string[];
   warnings: string[];
+  /** `KEY in <file>` for each value left in place by "Unregister anyway". */
+  leftInPlace: string[];
+  /** Where the note listing `leftInPlace` was written, when it was. */
+  leftoversNote: string | null;
 }
 
 export interface TierCacheView {

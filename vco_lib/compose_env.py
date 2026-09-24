@@ -113,3 +113,74 @@ def write_infrastructure_env(
         return True, ""
     except OSError as exc:
         return False, str(exc)
+
+
+# ─── One key the launcher owns (v0.2.97 review R5 F40) ──────────────────
+
+#: Keys of ``infrastructure/.env`` the LAUNCHER sets (not install.py): the
+#: volumes page's bind-mount root, read by the compose override as
+#: ``${VCT_VOLUMES_PATH}``. Closed set — the setter refuses anything else, so
+#: this surface keeps one writer per key.
+LAUNCHER_INFRA_ENV_KEYS: frozenset[str] = frozenset({"VCT_VOLUMES_PATH"})
+
+
+def set_infrastructure_env_key(infra_dir: Path, key: str, value: str) -> str:
+    """Set ``key=value`` in ``<infra_dir>/.env``: the first ``key=`` line is
+    replaced in place, else the line is appended; every other line is kept
+    byte-for-byte, and an existing file keeps its mode. Returns ``"set"`` /
+    ``"unchanged"``. The launcher's volumes page used to do this with its own
+    Rust read-modify-write — a second writer of this file the single-writer
+    lint could not see until it learned the shape.
+
+    Raises ``ValueError`` for a key outside :data:`LAUNCHER_INFRA_ENV_KEYS`
+    or a value with a line break, ``OSError`` on a failed write.
+    """
+    from vco_lib.atomic import atomic_rewrite_text
+
+    if key not in LAUNCHER_INFRA_ENV_KEYS:
+        raise ValueError(f"{key} is not a launcher-owned infrastructure/.env key")
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{key}: a value cannot contain a line break")
+    infra_env = infra_dir / ".env"
+    prior = infra_env.read_text(encoding="utf-8") if infra_env.is_file() else ""
+    lines = prior.splitlines()
+    wanted = f"{key}={value}"
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = wanted
+            break
+    else:
+        lines.append(wanted)
+    text = "\n".join(lines) + "\n"
+    if text == prior:
+        return "unchanged"
+    infra_dir.mkdir(parents=True, exist_ok=True)
+    atomic_rewrite_text(infra_env, text)
+    return "set"
+
+
+def _main(argv: "list[str] | None" = None) -> int:
+    """``python -m vco_lib.compose_env set --infra-dir D --key K --value V``
+    — one JSON object on stdout (``{"ok": true, "action": …}`` or
+    ``{"ok": false, "error": …, "message": …}``)."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(prog="python -m vco_lib.compose_env")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_set = sub.add_parser("set", help="set one launcher-owned key in infrastructure/.env")
+    p_set.add_argument("--infra-dir", required=True)
+    p_set.add_argument("--key", required=True, choices=sorted(LAUNCHER_INFRA_ENV_KEYS))
+    p_set.add_argument("--value", required=True)
+    args = parser.parse_args(argv)
+    try:
+        action = set_infrastructure_env_key(Path(args.infra_dir), args.key, args.value)
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": "set_failed", "message": str(exc)}))
+        return 4
+    print(json.dumps({"ok": True, "action": action, "key": args.key}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

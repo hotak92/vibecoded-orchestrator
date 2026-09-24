@@ -13,14 +13,38 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # implementation for all four context hooks; see _lib/session-id.ps1.
 . "$PSScriptRoot/_lib/session-id.ps1"
 
-# MaxLines trigger = 500 (matches the documented CONTEXT_STATE.md "max 500";
-# the 250-350 line working range is normal, so warning earlier just nags).
-# MUST MATCH templates/hooks/context-size-check.sh (MAX_LINES).
-$MaxLines = 500
-$WarnLines = 300
 $ContextFile = ".claude/CONTEXT_STATE.md"
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+
+# v0.2.97: the thresholds are the bundled session-state module's settings
+# (launcher/bundled_manifests/vct-session-state.json) — CONTEXT_STATE_MAX_LINES
+# (default 500; the notice starts at 60% of it) and MEMORY_MAX_LINES (default
+# 200). Each resolves: the environment variable -> the vct-hub /env through the
+# shipped resolver .claude/scripts/vct_secrets_resolve.ps1 (hub -> file store ->
+# the project's .env) -> the default; outside 50..2000 or not a number -> the
+# default. MUST MATCH resolve_threshold in context-size-check.sh.
+function Resolve-Threshold {
+    param([string]$Key, [int]$Default)
+    $value = [Environment]::GetEnvironmentVariable($Key)
+    if (-not $value) {
+        $resolver = Join-Path $PSScriptRoot "../scripts/vct_secrets_resolve.ps1"
+        if (Test-Path $resolver) {
+            # A child process: the resolver writes its answer with
+            # [Console]::Out.Write, which an in-process `&` call cannot capture.
+            $pwshExe = (Get-Process -Id $PID).Path
+            try { $value = (& $pwshExe -NoProfile -File $resolver $ProjectDir $Key 2>$null | Select-Object -First 1) } catch { $value = $null }
+        }
+    }
+    $n = 0
+    if (-not ("$value" -match '^[0-9]+$') -or -not [int]::TryParse("$value", [ref]$n)) { return $Default }
+    if ($n -lt 50 -or $n -gt 2000) { return $Default }
+    return $n
+}
+
+$MaxLines = Resolve-Threshold -Key "CONTEXT_STATE_MAX_LINES" -Default 500
+$WarnLines = [int][Math]::Floor($MaxLines * 3 / 5)
+$MemoryMaxLines = Resolve-Threshold -Key "MEMORY_MAX_LINES" -Default 200
 
 # Track C (v0.2.65): must match templates/hooks/context-size-check.sh. The
 # shared Get-VcoHookSessionId parses session_id from the SessionStart stdin
@@ -101,6 +125,30 @@ if ($SessionId) {
     $SessionCtxFile = Join-Path $ProjectDir ".claude/context/CONTEXT_STATE_$SessionId.md"
     if (Test-Path $SessionCtxFile) {
         Test-ContextSizeThreshold -File $SessionCtxFile -Label "CONTEXT_STATE_$SessionId.md"
+    }
+}
+
+# 3. Claude Code's auto-memory MEMORY.md for this project (v0.2.97, the
+# MEMORY_MAX_LINES setting): <claude home>/projects/<project path, every
+# non-alphanumeric char -> '-'>/memory/MEMORY.md. MUST MATCH the .sh sibling.
+$ClaudeHome = if ($env:VCT_CLAUDE_DIR) { $env:VCT_CLAUDE_DIR } elseif ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME ".claude" }
+$MemorySlug = $ProjectDir -replace '[^A-Za-z0-9]', '-'
+$MemoryFile = Join-Path $ClaudeHome "projects/$MemorySlug/memory/MEMORY.md"
+if (Test-Path $MemoryFile) {
+    $memoryLines = (Get-Content $MemoryFile -ErrorAction SilentlyContinue | Measure-Object -Line).Lines
+    if ($memoryLines -ge $MemoryMaxLines) {
+        Write-Output @"
+
+MEMORY.md Size Notice
+========================================================================
+Current size: $memoryLines lines (threshold: $MemoryMaxLines lines)
+
+Claude Code loads only the first 200 lines of MEMORY.md into each session.
+Keep it a one-line-per-entry index and move detail into topic files.
+
+========================================================================
+
+"@
     }
 }
 

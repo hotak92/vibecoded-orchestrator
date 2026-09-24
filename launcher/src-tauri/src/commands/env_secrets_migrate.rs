@@ -1,33 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 VibeCoded Tools
 //
-//! V47-G-final (v0.2.75 / P2): pure `.env` audit + sentinel-rewrite for the
-//! launcher-side "Migrate from .env" button.
+//! V47-G-final (v0.2.75 / P2): the pure `.env` AUDIT for the launcher-side
+//! "Migrate from .env" button (which keys hold a secret-shaped value).
 //!
-//! This is the Rust MIRROR of `vco_lib/secrets_audit.py`. The install.py CLI
-//! arm uses the Python module; the launcher GUI arm (`secrets_cmd::
-//! migrate_env_secrets_from_dotenv`) uses this one so the in-process Tauri
-//! command doesn't have to shell out to Python. The two MUST stay
-//! behaviourally identical — a `.env` a user migrates from the GUI and one
-//! they migrate from the CLI must produce byte-identical rewrites.
-//!
-//! ## MUST MATCH `vco_lib/secrets_audit.py`
-//!
-//! Any change to the parse rules, placeholder set, or sentinel-rewrite
-//! behaviour here MUST be mirrored in `vco_lib/secrets_audit.py` (and vice
-//! versa). The secret-shape predicate itself is NOT duplicated — both sides
-//! consume the single B-3-guarded needle home
-//! (`crate::mcp_registration::is_secret_shaped_env_key`, whose Python twin
-//! `install.py::_is_secret_shaped_env_key` is CI-parity-tested against it in
+//! The audit is a Rust MIRROR of `vco_lib/secrets_audit.py::audit_env_secrets`
+//! (MUST MATCH it — the parse rules and placeholder set; pinned against the
+//! shared `tests/fixtures/env_secrets_parity.json` by
+//! `env_secrets_parity_matches_shared_fixture` here and
+//! `tests/test_env_secrets_migrate_parity.py`). The secret-shape predicate is
+//! NOT duplicated: both sides consume `crate::mcp_registration::
+//! is_secret_shaped_env_key` (Python twin parity-tested in
 //! `tests/test_secret_shaped_needles_parity.py`).
 //!
-//! ## Critical safety property (USER DATA NEVER LOST)
-//!
-//! Same as the Python module: [`rewrite_env_with_sentinels`] only ever
-//! touches lines whose key is in the caller-supplied `migrated_keys` set
-//! (which is derived from the hub's confirmed-migrated list). A key the
-//! audit missed (e.g. a multi-line value) is never sentinel'd — its raw
-//! value stays exactly where the user put it.
+//! The sentinel REWRITE is not here any more (v0.2.97): it writes the
+//! project's `.env`, which has ONE writer — `vco_lib.env_template.
+//! replace_values_with_sentinel`, reached through
+//! `services::vco_lib_bridge::sentinel_project_env_keys`. Its safety
+//! property (USER DATA NEVER LOST) is the same: only lines whose key the hub
+//! confirmed migrated are touched; a key the audit missed keeps its raw value.
 
 use crate::mcp_registration::is_secret_shaped_env_key;
 
@@ -144,99 +135,6 @@ pub fn audit_env_secrets(text: &str) -> Vec<EnvSecret> {
     out
 }
 
-/// Result of a sentinel rewrite: the new file text, how many lines were
-/// replaced, and which requested keys were not found in the file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RewriteResult {
-    pub text: String,
-    pub replaced: usize,
-    pub missed: Vec<String>,
-}
-
-/// Replace migrated keys' values in `.env` text with [`KEYCHAIN_SENTINEL`],
-/// preserving leading whitespace, the `export` prefix, and any trailing
-/// inline comment on an unquoted value. Only the FIRST occurrence of each
-/// key is replaced (a duplicate key is left as-is). Lines whose key is not
-/// in `migrated_keys` are passed through byte-identical.
-///
-/// Returns the rewritten text plus bookkeeping. MUST match
-/// `vco_lib/secrets_audit.py::rewrite_env_with_sentinels`. The atomic-write
-/// to disk is the caller's job (this fn is pure so it's unit-testable).
-pub fn rewrite_env_with_sentinels(text: &str, migrated_keys: &[String]) -> RewriteResult {
-    use std::collections::BTreeSet;
-    let keyset: BTreeSet<&str> = migrated_keys.iter().map(|s| s.as_str()).collect();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out_lines: Vec<String> = Vec::new();
-    let mut replaced = 0usize;
-
-    for raw in text.lines() {
-        let line = raw;
-        let stripped = line.trim_start();
-        if stripped.is_empty() || stripped.starts_with('#') {
-            out_lines.push(line.to_string());
-            continue;
-        }
-        let leading_ws_len = line.len() - stripped.len();
-        let leading_ws = &line[..leading_ws_len];
-        let mut body = stripped;
-        let mut export_prefix = "";
-        if let Some(rest) = body.strip_prefix("export ") {
-            export_prefix = "export ";
-            body = rest.trim_start();
-        }
-        let eq = match body.find('=') {
-            Some(i) if i > 0 => i,
-            _ => {
-                out_lines.push(line.to_string());
-                continue;
-            }
-        };
-        let key = body[..eq].trim();
-        if !keyset.contains(key) {
-            out_lines.push(line.to_string());
-            continue;
-        }
-        if seen.contains(key) {
-            // Duplicate key — preserve as-is (first occurrence already done).
-            out_lines.push(line.to_string());
-            continue;
-        }
-        seen.insert(key.to_string());
-        let raw_value = &body[eq + 1..];
-        // Detect trailing inline comment on an unquoted value.
-        let mut trailing_comment = String::new();
-        let val_stripped = raw_value.trim();
-        if !(val_stripped.starts_with('"') || val_stripped.starts_with('\'')) {
-            if let Some(hash_pos) = val_stripped.find('#') {
-                trailing_comment = format!("  {}", &val_stripped[hash_pos..]);
-            }
-        }
-        out_lines.push(format!(
-            "{}{}{}={}{}",
-            leading_ws, export_prefix, key, KEYCHAIN_SENTINEL, trailing_comment
-        ));
-        replaced += 1;
-    }
-
-    let missed: Vec<String> = keyset
-        .iter()
-        .filter(|k| !seen.contains(**k))
-        .map(|k| k.to_string())
-        .collect();
-
-    // Preserve a trailing newline if the original had one.
-    let mut new_text = out_lines.join("\n");
-    if text.ends_with('\n') {
-        new_text.push('\n');
-    }
-
-    RewriteResult {
-        text: new_text,
-        replaced,
-        missed,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,69 +188,6 @@ B_SECRET=\"has # inside quotes\"
         );
     }
 
-    #[test]
-    fn rewrite_replaces_only_migrated_keys_preserving_structure() {
-        // Trailing-comment preservation applies to UNQUOTED values only —
-        // for a quoted value the comment is dropped (matches the Python
-        // mirror `rewrite_env_with_sentinels`, whose trailing-comment branch
-        // is gated on the value NOT starting with a quote). `KEEP_TOKEN`
-        // exercises the unquoted+comment path where the comment IS kept.
-        let env = "\
-# header
-export OPENAI_API_KEY=\"sk-abc123\"  # quoted, comment dropped
-KEEP_TOKEN=raw  # unquoted, comment kept
-PLAIN=keepme
-DB_PASSWORD=hunter2
-";
-        let res = rewrite_env_with_sentinels(
-            env,
-            &[
-                "OPENAI_API_KEY".to_string(),
-                "KEEP_TOKEN".to_string(),
-                "DB_PASSWORD".to_string(),
-            ],
-        );
-        assert_eq!(res.replaced, 3);
-        assert!(res.missed.is_empty());
-        assert_eq!(
-            res.text,
-            "\
-# header
-export OPENAI_API_KEY=__vco_keychain__
-KEEP_TOKEN=__vco_keychain__  # unquoted, comment kept
-PLAIN=keepme
-DB_PASSWORD=__vco_keychain__
-"
-        );
-    }
-
-    #[test]
-    fn rewrite_leaves_untouched_keys_byte_identical_and_reports_missed() {
-        let env = "SECRET_A=one\nPLAIN=two\n";
-        let res = rewrite_env_with_sentinels(
-            env,
-            &["SECRET_A".to_string(), "ABSENT_TOKEN".to_string()],
-        );
-        assert_eq!(res.replaced, 1);
-        assert_eq!(res.missed, vec!["ABSENT_TOKEN".to_string()]);
-        assert_eq!(res.text, "SECRET_A=__vco_keychain__\nPLAIN=two\n");
-    }
-
-    #[test]
-    fn rewrite_only_first_occurrence_of_duplicate_key() {
-        let env = "TOKEN=first\nTOKEN=second\n";
-        let res = rewrite_env_with_sentinels(env, &["TOKEN".to_string()]);
-        assert_eq!(res.replaced, 1);
-        assert_eq!(res.text, "TOKEN=__vco_keychain__\nTOKEN=second\n");
-    }
-
-    #[test]
-    fn rewrite_preserves_absence_of_trailing_newline() {
-        let env = "TOKEN=v"; // no trailing newline
-        let res = rewrite_env_with_sentinels(env, &["TOKEN".to_string()]);
-        assert_eq!(res.text, "TOKEN=__vco_keychain__");
-    }
-
     // ── Cross-language parity (v0.2.75 Part 7 / Part 10) ─────────────────
     //
     // The Rust side of the shared `tests/fixtures/env_secrets_parity.json`.
@@ -376,21 +211,14 @@ DB_PASSWORD=__vco_keychain__
         name: String,
         input: String,
         audit_expected: Vec<AuditPair>,
-        rewrite: RewriteCase,
+        // (The fixture's `rewrite` half is the Python writer's to check since
+        // v0.2.97 — serde ignores it here.)
     }
 
     #[derive(serde::Deserialize)]
     struct AuditPair {
         key: String,
         value: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RewriteCase {
-        migrated_keys: Vec<String>,
-        expected_text: String,
-        expected_replaced: usize,
-        expected_missed: Vec<String>,
     }
 
     fn load_secrets_fixture() -> SecretsFixture {
@@ -444,30 +272,10 @@ DB_PASSWORD=__vco_keychain__
                 ));
             }
 
-            // Rewrite parity: same text, same replaced count, same missed set.
-            let res = rewrite_env_with_sentinels(&case.input, &case.rewrite.migrated_keys);
-            if res.text != case.rewrite.expected_text {
-                failures.push(format!(
-                    "  [{}] rewrite text: got {:?}, expected {:?}",
-                    case.name, res.text, case.rewrite.expected_text
-                ));
-            }
-            if res.replaced != case.rewrite.expected_replaced {
-                failures.push(format!(
-                    "  [{}] rewrite replaced: got {}, expected {}",
-                    case.name, res.replaced, case.rewrite.expected_replaced
-                ));
-            }
-            let mut got_missed = res.missed.clone();
-            got_missed.sort();
-            let mut want_missed = case.rewrite.expected_missed.clone();
-            want_missed.sort();
-            if got_missed != want_missed {
-                failures.push(format!(
-                    "  [{}] rewrite missed: got {:?}, expected {:?}",
-                    case.name, got_missed, want_missed
-                ));
-            }
+            // (Rewrite parity: the sentinel rewrite has ONE implementation
+            // since v0.2.97 — `vco_lib.env_template.replace_values_with_sentinel`,
+            // which the launcher reaches through the bridge — so its fixture
+            // cases are checked by tests/test_env_secrets_migrate_parity.py only.)
         }
 
         assert!(

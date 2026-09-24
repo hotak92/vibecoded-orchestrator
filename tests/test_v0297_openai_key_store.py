@@ -214,6 +214,118 @@ def test_update_reconcile_moves_a_legacy_line_out_of_the_reconciled_env(stores, 
     assert _stored(stores).read_text().strip() == CANARY
 
 
+# ─── review R5 F38: every run that accepts the flag stores it ───────────
+
+
+def test_update_stores_the_openai_key(stores, tmp_path, capsys) -> None:
+    """``install.py --update --openai-key``: the key lands in the store (it
+    used to be accepted and dropped — step 8 skips the fresh write)."""
+    root = tmp_path / "orch"
+    (root / "state" / "logs").mkdir(parents=True)
+    (root / ".env").write_text("KG_COLLECTION=Gamma_KG\n")
+    orig = install.PROJECT_ROOT
+    install.PROJECT_ROOT = root
+    try:
+        install._update_env_config(mock.Mock(openai_key=CANARY))
+    finally:
+        install.PROJECT_ROOT = orig
+    assert _stored(stores).read_text().strip() == CANARY
+    assert CANARY not in (root / ".env").read_text()
+    assert CANARY not in capsys.readouterr().out
+
+
+def test_lightweight_stores_the_openai_key(stores, tmp_path, monkeypatch) -> None:
+    root = tmp_path / "orch"
+    (root / "state" / "logs").mkdir(parents=True)
+    monkeypatch.setattr(install, "PROJECT_ROOT", root)
+    # Stop right after the store: the rest of the lightweight path is not
+    # under test here.
+    monkeypatch.setattr(install, "_lightweight_venv_triage",
+                        mock.Mock(side_effect=SystemExit(0)), raising=False)
+    monkeypatch.setattr(install, "_lightweight_rewrite_paths",
+                        mock.Mock(side_effect=SystemExit(0)))
+    args = mock.Mock(openai_key=CANARY, lightweight_old_path="/old")
+    with pytest.raises(SystemExit):
+        install._run_lightweight(args)
+    assert _stored(stores).read_text().strip() == CANARY
+
+
+@pytest.mark.parametrize("flag", [
+    "--uninstall", "--desktop-icon-only", "--adopt-project-dry-run", "--no-adopt-project",
+])
+def test_a_run_that_stores_nothing_refuses_the_flag_loudly(stores, monkeypatch, capsys, flag) -> None:
+    monkeypatch.setattr(install.sys, "argv", ["install.py", flag, "--openai-key", CANARY])
+    with pytest.raises(SystemExit) as done:
+        install.main()
+    assert done.value.code == 2
+    err = capsys.readouterr().err
+    assert f"--openai-key cannot be used with {flag}" in err
+    assert CANARY not in err
+    assert not _stored(stores).exists()
+
+
+# ─── review R5 F34: the line is read with the ONE grammar ───────────────
+
+
+@pytest.mark.parametrize("line", [
+    f'OPENAI_API_KEY="{CANARY}"\n',          # the reviewer's probe B
+    f"OPENAI_API_KEY='{CANARY}'\n",
+    f"export OPENAI_API_KEY={CANARY}\n",
+    f'export OPENAI_API_KEY="{CANARY}"\n',
+    f"OPENAI_API_KEY={CANARY}\r\n",          # CRLF file
+    f"  OPENAI_API_KEY = {CANARY}  \n",
+])
+def test_migrate_stores_the_parsed_value_not_the_raw_text(stores, tmp_path, line) -> None:
+    """Act: whatever shape the VCO line was edited into, the store holds the
+    value a READER of the line gets (quotes/export stripped), the line goes,
+    and resolving afterwards returns that same value."""
+    crlf = line.endswith("\r\n")
+    nl = "\r\n" if crlf else "\n"
+    (tmp_path / ".env").write_bytes(
+        f"A=1{nl}# OpenAI (for embeddings){nl}{line}B=2{nl}".encode()
+    )
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+    assert result["status"] == "migrated", result
+    assert _stored(stores).read_text().strip() == CANARY
+    assert openai_key.resolve_openai_api_key() == CANARY
+    assert (tmp_path / ".env").read_bytes() == f"A=1{nl}# OpenAI (for embeddings){nl}B=2{nl}".encode()
+
+
+def test_migrate_compares_the_parsed_value_against_the_store(stores, tmp_path) -> None:
+    """Act + leave-alone: a quoted line EQUAL to the stored key goes; a quoted
+    line whose parsed value differs stays (``left_differs``)."""
+    openai_key.store_openai_api_key(CANARY)
+    (tmp_path / ".env").write_text(f'# OpenAI (for embeddings)\nOPENAI_API_KEY="{CANARY}"\n')
+    assert openai_key.migrate_dotenv_openai_key(tmp_path)["status"] == "migrated"
+
+    other = tmp_path / "other"
+    other.mkdir()
+    original = f'# OpenAI (for embeddings)\nOPENAI_API_KEY="{OTHER}"\n'
+    (other / ".env").write_text(original)
+    assert openai_key.migrate_dotenv_openai_key(other)["status"] == "left_differs"
+    assert (other / ".env").read_text() == original
+
+
+@pytest.mark.parametrize("line", [
+    f"OPENAI_API_KEY={CANARY} # my key\n",   # trailing comment
+    f"OPENAI_API_KEY=\"{CANARY}\n",           # unmatched quote
+    f"OPENAI_API_KEY={CANARY} extra\n",
+    "OPENAI_API_KEY=\n",
+])
+def test_a_value_that_does_not_parse_cleanly_is_left_and_reported(stores, tmp_path, line) -> None:
+    """Leave-alone: a value that is not one clean token is never stored (it
+    would plant a broken key) and the line stays, byte-identical."""
+    original = f"# OpenAI (for embeddings)\n{line}"
+    (tmp_path / ".env").write_text(original)
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+    assert result["status"] == "left_unparsed", result
+    assert (tmp_path / ".env").read_text() == original
+    assert not _stored(stores).exists()
+    assert CANARY not in json.dumps(result)
+
+
 def test_the_session_log_argv_never_carries_the_key() -> None:
-    red = install._redact_secret_argv(["--yes", "--openai-key", CANARY, f"--openai-key={CANARY}"])
+    red = install._install_companions.redact_secret_argv(
+        ["--yes", "--openai-key", CANARY, f"--openai-key={CANARY}"]
+    )
     assert red == ["--yes", "--openai-key", "<redacted>", "--openai-key=<redacted>"]

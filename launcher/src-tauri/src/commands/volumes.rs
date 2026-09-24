@@ -675,38 +675,19 @@ pub async fn set_volumes_config_for_install(
 }
 
 /// Append/update `VCT_VOLUMES_PATH=<path>` in `infrastructure/.env` (or
-/// create the file). Other env keys are preserved.
+/// create the file). Other env keys are preserved. v0.2.97 (review R5 F40):
+/// through the ONE writer of that file, `vco_lib.compose_env`
+/// (`services::vco_lib_bridge::set_infrastructure_env_key`) — this was a
+/// second, Rust read-modify-write of it.
 fn write_volumes_env_var(path: &Path) -> Result<(), String> {
-    let env_path = orchestrator_root()?.join("infrastructure").join(".env");
-    let mut lines: Vec<String> = if env_path.exists() {
-        std::fs::read_to_string(&env_path)
-            .map_err(|e| format!("read {}: {}", env_path.display(), e))?
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let new_line = format!("VCT_VOLUMES_PATH={}", path.display());
-    let mut replaced = false;
-    for line in lines.iter_mut() {
-        if line.starts_with("VCT_VOLUMES_PATH=") {
-            *line = new_line.clone();
-            replaced = true;
-            break;
-        }
-    }
-    if !replaced {
-        lines.push(new_line);
-    }
-    let body = lines.join("\n") + "\n";
-    if let Some(parent) = env_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
-    }
-    std::fs::write(&env_path, body)
-        .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
-    Ok(())
+    let root = orchestrator_root()?;
+    crate::services::vco_lib_bridge::set_infrastructure_env_key(
+        Some(&root),
+        &root.join("infrastructure"),
+        "VCT_VOLUMES_PATH",
+        &path.display().to_string(),
+    )
+    .map(|_| ())
 }
 
 /// Build a migration plan WITHOUT touching anything. Frontend renders

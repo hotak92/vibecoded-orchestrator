@@ -72,6 +72,7 @@ import errno
 import json
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -108,6 +109,24 @@ def atomic_write_text(
     atomic_write_bytes(
         path, body.encode(encoding), fsync=fsync, mode=mode,
     )
+
+
+def atomic_rewrite_text(path: Path, body: str, *, encoding: str = "utf-8") -> None:
+    """:func:`atomic_write_text` that keeps an EXISTING file's permission bits.
+
+    ``mkstemp`` creates the replacement 0600, so a plain atomic rewrite turns a
+    group-readable ``.env`` / settings file unreadable to its group (v0.2.97
+    review R4 F29 / R5 F36). The mode is read before the write and re-applied
+    after the rename; a file that does not exist yet is created 0600, as
+    before. The ONE home for "rewrite a user's file in place" — the ``.env``
+    writer (``env_template``) and the env-surface editor
+    (``config_projection``) both delegate here.
+    """
+    try:
+        mode: Optional[int] = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
+    atomic_write_text(path, body, encoding=encoding, mode=mode)
 
 
 def atomic_write_bytes(

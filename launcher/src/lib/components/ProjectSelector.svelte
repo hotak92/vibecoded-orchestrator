@@ -23,6 +23,9 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import AdoptProjectModal from '$lib/components/AdoptProjectModal.svelte';
+  import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
+  import { runUnregister } from '$lib/unregister-escape';
+  import { toast } from '$lib/stores/toast';
   // v0.2.91 (#32): Name↔Path coupling extracted to pure, unit-tested
   // logic (project-selector-path-logic.test.ts). The browse handler's
   // `pathTouched = true` guard was ALREADY present at base (#32's "browse
@@ -567,14 +570,42 @@
       // purgeCollections=false. The selector's quick-trash flow keeps
       // the original UX: "remove project from launcher" with sensible
       // defaults. The settings-tab Danger zone exposes the full options.
-      await projects.delete(deletingProject.id, null);
+      const target = deletingProject;
+      const outcome = await runUnregister(
+        (options) => projects.delete(target.id, options),
+        null,
+        askLeaveAnyway,
+      );
+      if (outcome.kind === 'kept') {
+        toast.info('Unregister stopped — the project is still registered.');
+        return;
+      }
+      for (const w of outcome.report.warnings) toast.error(w);
       deletingProject = null;
       deleteConfirmText = '';
     } catch (e) {
+      // Pre-v0.2.97 this only reached the console — a failed unregister
+      // (including the stop) showed the user nothing.
       console.error('delete failed', e);
+      toast.error(e);
     } finally {
       deleting = false;
     }
+  }
+
+  // Owner ruling (review R5 F39): the unregister STOP opens a dialog whose
+  // second action is "Unregister anyway — leave these values".
+  let stopMessage = $state('');
+  let stopOpen = $state(false);
+  let resolveStop: ((leaveAnyway: boolean) => void) | null = null;
+  function askLeaveAnyway(message: string): Promise<boolean> {
+    stopMessage = message;
+    stopOpen = true;
+    return new Promise((resolve) => (resolveStop = resolve));
+  }
+  function onStopDecided(leaveAnyway: boolean) {
+    resolveStop?.(leaveAnyway);
+    resolveStop = null;
   }
 </script>
 
@@ -949,6 +980,13 @@
   {/snippet}
 </DialogRoot>
 {/if}
+
+<UnregisterStoppedDialog
+  bind:open={stopOpen}
+  message={stopMessage}
+  projectName={deletingProject?.name ?? ''}
+  onDecide={onStopDecided}
+/>
 
 <style>
   .project-wrapper {

@@ -8,6 +8,7 @@
 //! launcher and hub both depend on this crate via path dependencies in
 //! their respective Cargo.toml.
 
+pub mod bundled_manifests;
 pub mod bundled_versions;
 // v0.2.92 WP-13: the ONE "what did this probe establish?" shape —
 // `Ok | NotApplicable | Unknown{error}`. Replaces the `*_ok: bool` +

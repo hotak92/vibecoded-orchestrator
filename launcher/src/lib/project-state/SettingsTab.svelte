@@ -19,6 +19,8 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { projects } from '$lib/stores/projects';
+  import { runUnregister } from '$lib/unregister-escape';
+  import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
   import type {
     ProjectView,
     RenameCollectionsPreview,
@@ -324,14 +326,35 @@
    * On success we navigate back to /projects — the deleted project
    * is no longer in the store, so /project/<id> would 404.
    */
+  // Owner ruling (review R5 F39): the unregister STOP opens a dialog whose
+  // second action is "Unregister anyway — leave these values".
+  let stopMessage = $state('');
+  let stopOpen = $state(false);
+  let resolveStop: ((leaveAnyway: boolean) => void) | null = null;
+  function askLeaveAnyway(message: string): Promise<boolean> {
+    stopMessage = message;
+    stopOpen = true;
+    return new Promise((resolve) => (resolveStop = resolve));
+  }
+  function onStopDecided(leaveAnyway: boolean) {
+    resolveStop?.(leaveAnyway);
+    resolveStop = null;
+  }
+
   async function unregister() {
     if (!project || !unregisterReady) return;
     unregistering = true;
     try {
-      const report = await projects.delete(project.id, {
-        purgeLauncherFiles,
-        purgeCollections,
-      });
+      const outcome = await runUnregister(
+        (options) => projects.delete(project!.id, options),
+        { purgeLauncherFiles, purgeCollections },
+        askLeaveAnyway,
+      );
+      if (outcome.kind === 'kept') {
+        toast.info('Unregister stopped — the project is still registered.');
+        return;
+      }
+      const report = outcome.report;
 
       // Surface every soft-fail warning as its own error toast (each is
       // distinct enough that batching would lose information).
@@ -361,6 +384,7 @@
       unregistering = false;
     }
   }
+
 
 
   // ── v0.2.92 WP-17 (W3): change the project's folder ────────────────────
@@ -957,6 +981,13 @@
     modelSwitch={modelSwitchCtx}
   />
 {/if}
+
+<UnregisterStoppedDialog
+  bind:open={stopOpen}
+  message={stopMessage}
+  projectName={project?.name ?? ''}
+  onDecide={onStopDecided}
+/>
 
 <style>
   .ps-empty { padding: 40px; text-align: center; color: #888; }

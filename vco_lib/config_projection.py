@@ -208,14 +208,13 @@ import argparse
 import json
 import re
 import sqlite3
-import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NotRequired, Optional, TypedDict
 
 from vco_lib import jsonc_edit, settings_refusal
-from vco_lib.atomic import atomic_write_text
+from vco_lib.atomic import atomic_rewrite_text
 # v0.2.92 W18 — the tri-state probe result. Imported from `weaviate_helpers`
 # because that module is `vco_lib`'s dependency-free leaf (stdlib only), which
 # is what makes it a safe home for a type every other module needs; the type
@@ -3897,7 +3896,7 @@ def _merge_managed_block(prior: Optional[str], managed: str) -> str:
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically.
 
-    Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
+    Thin delegate to :func:`vco_lib.atomic.atomic_rewrite_text` (v0.2.54
     Track J consolidation — this module, ``env_template``,
     ``deferral_report`` and ``cli/codegraph_diagram`` each carried a
     copy of the mkstemp + fsync + ``os.replace`` recipe). The name is
@@ -3913,13 +3912,9 @@ def _atomic_write_text(path: Path, content: str) -> None:
     v0.2.97 (review R4 F29): an EXISTING file keeps its permission bits —
     ``mkstemp`` creates the replacement 0600, so without this a group-readable
     ``.env`` / settings file came out unreadable to its group. A new file is
-    created as before.
+    created as before. One home: :func:`vco_lib.atomic.atomic_rewrite_text`.
     """
-    try:
-        mode: Optional[int] = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        mode = None
-    atomic_write_text(path, content, mode=mode)
+    atomic_rewrite_text(path, content)
 
 
 # ─── CLI entry point ────────────────────────────────────────────────────

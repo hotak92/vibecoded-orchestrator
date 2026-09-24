@@ -53,8 +53,12 @@
 //!   * `vco_lib.env_projection_check` — [`read_settings_env_blocks`];
 //!   * `vco_lib.hooks_settings` — [`list_settings_hooks`];
 //!   * `vco_lib.env_template` — [`apply_project_env_template`],
-//!     [`write_project_env_reference`] (the project `.env`'s one writer) and
-//!     the read-only [`read_project_env_assignment`].
+//!     [`write_project_env_reference`], [`strip_project_env_keys`],
+//!     [`repair_project_env_kg`], [`sentinel_project_env_keys`] (the project
+//!     `.env`'s one writer) and the read-only
+//!     [`read_project_env_assignment`];
+//!   * `vco_lib.compose_env` — [`set_infrastructure_env_key`] (the one writer
+//!     of `infrastructure/.env`).
 
 use std::io::{Read as _, Write as _};
 use std::path::Path;
@@ -450,6 +454,100 @@ pub fn read_project_env_assignment(
     let value = reply.get("value").and_then(serde_json::Value::as_str).map(str::to_string);
     let in_block = reply.get("in_block").and_then(serde_json::Value::as_bool).unwrap_or(false);
     Ok((value, in_block))
+}
+
+/// v0.2.97: the "Migrate from .env" sentinel rewrite through the ONE `.env`
+/// writer — `python -m vco_lib.env_template sentinel` (stdin
+/// `{"keys": [...]}`): each hub-confirmed key's value becomes the keychain
+/// sentinel; `export`, an unquoted value's trailing comment and every other
+/// line are kept, the file keeps its mode. Replaces a Rust mirror of
+/// `vco_lib.secrets_audit` plus a Rust write. Never sees a value.
+pub fn sentinel_project_env_keys(
+    root: Option<&Path>,
+    project_folder: &Path,
+    keys: &[&str],
+) -> Result<usize, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.env_template")
+        .arg("sentinel")
+        .arg("--project-folder")
+        .arg(project_folder);
+    let body = build_strip_env_keys_request(keys);
+    let reply = run_vco_lib_json(cmd, &python, root, project_folder, &body, parse_ok_reply)?;
+    Ok(reply.get("replaced").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize)
+}
+
+/// v0.2.97: the B12 stale-`KG_COLLECTION` repair through the ONE `.env`
+/// writer — `python -m vco_lib.env_template repair-kg`. The caller decides
+/// the canonical name and which values are stale (its sanitizer); Python
+/// only rewrites the line. Returns `"repaired"` / `"unchanged"`.
+pub fn repair_project_env_kg(
+    root: Option<&Path>,
+    project_folder: &Path,
+    canonical: &str,
+    stale: &[&str],
+) -> Result<String, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.env_template")
+        .arg("repair-kg")
+        .arg("--project-folder")
+        .arg(project_folder)
+        .arg("--canonical")
+        .arg(canonical);
+    for value in stale {
+        cmd.arg("--stale").arg(value);
+    }
+    let reply = run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)?;
+    Ok(reply.get("action").and_then(serde_json::Value::as_str).unwrap_or("unchanged").to_string())
+}
+
+/// v0.2.97 (review R5 F40): the unregister's `.env` strip through the ONE
+/// `.env` writer — `python -m vco_lib.env_template strip` (stdin
+/// `{"keys": [...]}`): VCO's managed block goes whole, and every line
+/// assigning one of `keys` (active or `#`-commented) outside it. Returns the
+/// removed key names. Replaces a Rust read-modify-write of the same file.
+pub fn strip_project_env_keys(
+    root: Option<&Path>,
+    project_folder: &Path,
+    keys: &[&str],
+) -> Result<Vec<String>, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.env_template")
+        .arg("strip")
+        .arg("--project-folder")
+        .arg(project_folder);
+    let body = build_strip_env_keys_request(keys);
+    run_env_block_command(cmd, &python, root, project_folder, &body, "removed")
+}
+
+/// v0.2.97 (review R5 F40): set one launcher-owned key (e.g.
+/// `VCT_VOLUMES_PATH`) in `<infra_dir>/.env` through that file's one writer,
+/// `python -m vco_lib.compose_env set`. Returns `"set"` / `"unchanged"`.
+pub fn set_infrastructure_env_key(
+    root: Option<&Path>,
+    infra_dir: &Path,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.compose_env")
+        .arg("set")
+        .arg("--infra-dir")
+        .arg(infra_dir)
+        .arg("--key")
+        .arg(key)
+        .arg("--value")
+        .arg(value);
+    let reply = run_vco_lib_json(cmd, &python, root, infra_dir, "", parse_ok_reply)?;
+    Ok(reply.get("action").and_then(serde_json::Value::as_str).unwrap_or("set").to_string())
 }
 
 /// The interpreter for an env-block spawn: the shared RT-4 ladder. Under
@@ -928,6 +1026,38 @@ mod env_template_tests {
         assert_eq!(assignments(&sidecar, "KG_COLLECTION"), ["Acme_KnowledgeGraph"]);
         assert_eq!(assignments(&sidecar, "PROJECT_NAME"), ["Acme"]);
         assert!(sidecar.contains("safe_add_skipped_env_merge"));
+    }
+
+    /// Review R5 F40: the unregister's `.env` strip removes VCO's managed
+    /// block WHOLE (a by-name strip left its markers and comments behind) and
+    /// keeps the user's lines.
+    #[test]
+    fn strip_removes_the_whole_block_and_keeps_user_lines() {
+        let (_guard, id, folder) = fixture("Acme");
+        std::fs::write(folder.join(".env"), "USER_KEY=keep\n").unwrap();
+        apply_project_env_template(None, &folder, &id, PORTS).unwrap();
+        let removed = strip_project_env_keys(None, &folder, &["KG_COLLECTION", "PROJECT_NAME"]).unwrap();
+        assert!(removed.iter().any(|k| k == "KG_COLLECTION"), "{removed:?}");
+        assert_eq!(std::fs::read_to_string(folder.join(".env")).unwrap(), "USER_KEY=keep\n");
+    }
+
+    /// The "Migrate from .env" rewrite, through the one writer: only the
+    /// hub-confirmed keys change, structure kept (the byte shapes the retired
+    /// Rust mirror pinned, now the Python writer's).
+    #[test]
+    fn sentinel_rewrites_only_the_confirmed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "export OPENAI_API_KEY=sk-canary-not-real-7c1f  # team\nB_SECRET=two\nPLAIN=keep\n",
+        )
+        .unwrap();
+        let replaced = sentinel_project_env_keys(None, dir.path(), &["OPENAI_API_KEY"]).unwrap();
+        assert_eq!(replaced, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".env")).unwrap(),
+            "export OPENAI_API_KEY=__vco_keychain__  # team\nB_SECRET=two\nPLAIN=keep\n"
+        );
     }
 
     #[test]

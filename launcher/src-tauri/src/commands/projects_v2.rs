@@ -561,7 +561,7 @@ pub async fn create_project_v2(
     // tells the project's Claude to reconcile it.
     if !req.safe_add {
         let env_path = folder.join(".env");
-        match b12_repair_stale_kg_collection(&env_path, &req.name) {
+        match b12_repair_stale_kg_collection(env_root.as_deref(), folder, &req.name) {
             Ok(B12Outcome::Repaired { canonical_kg }) => {
                 tracing::info!(
                     "[vct] info: B12: rewrote stale KG_COLLECTION in {} → {}",
@@ -4605,6 +4605,15 @@ pub struct UnregisterOptions {
     /// code, so this is a user choice rather than a default.
     #[serde(default)]
     pub purge_collections: bool,
+
+    /// Owner ruling (review R5 F39): the explicit escape from the unregister
+    /// STOP — "Unregister anyway — leave these values". When a value VCO
+    /// wrote could not be removed, finish anyway and write a note listing
+    /// each key and file (names only). Default false: the stop stays the
+    /// default, and the GUI offers this only as the second action of that
+    /// stop.
+    #[serde(default)]
+    pub leave_unremovable: bool,
 }
 
 fn default_true() -> bool { true }
@@ -4635,6 +4644,11 @@ pub struct UnregisterReport {
     /// Names of dropped Weaviate collections (only populated when
     /// `purge_collections: true` and the drop succeeded).
     pub collections_dropped: Vec<String>,
+    /// `KEY in <file>` for every value VCO wrote and could not remove, left
+    /// in place by "Unregister anyway" (`leave_unremovable`). Names only.
+    pub left_in_place: Vec<String>,
+    /// Where the note listing `left_in_place` was written, when it was.
+    pub leftovers_note: Option<String>,
     /// Soft-fail messages — failures that don't abort the unregister
     /// (e.g. Weaviate down → keep going + drop request becomes a
     /// warning; unreadable file → skip + record). Warnings never stop
@@ -4855,76 +4869,11 @@ fn unregister_by_name_keys() -> std::collections::HashSet<&'static str> {
         .collect()
 }
 
-/// Pure helper: strip launcher-canonical keys from a `.env`-style text.
-///
-/// "Canonical" = membership in `UNREGISTER_CANONICAL_ENV_KEYS`, minus the
-/// [`EVIDENCE_GATED_ENV_KEYS`]. Lines
-/// matching `<KEY>=...` (active) or `# <KEY>=...` (commented) at the
-/// start of the trimmed line are removed; user-added keys are preserved
-/// verbatim. Comment-only lines and blank lines are preserved verbatim.
-///
-/// Returns `(new_text, removed_keys)`. `removed_keys` is sorted +
-/// de-duped so the UI shows a clean list.
-///
-/// MUST MATCH the line grammar of `vco_lib/envfile.py::parse_env_line`
-/// (a documented Rust mirror, review R4 F27): an optional `export `, a
-/// `KEY=` split on the first `=`, the key trimmed. This by-name strip also
-/// accepts a `#`-commented line, which the Python reader skips — deliberate:
-/// a commented canonical key is launcher residue too.
-///
-/// Marker lines (`# added by vco YYYY-MM-DD`) are preserved as-is —
-/// they're informational, the user can clean them up later if desired.
-/// We don't try to strip empty marker blocks (e.g. a `# added by vco`
-/// followed by lines we just removed) because doing so robustly would
-/// require multi-pass bookkeeping the unregister doesn't need.
-pub(crate) fn strip_canonical_keys_from_env_text(text: &str) -> (String, Vec<String>) {
-    let canonical = unregister_by_name_keys();
-    let mut removed = std::collections::BTreeSet::new();
-    let mut out = String::with_capacity(text.len());
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        // Strip a single leading '#' + whitespace to handle commented form.
-        let body = if let Some(rest) = trimmed.strip_prefix('#') {
-            rest.trim_start()
-        } else {
-            trimmed
-        };
-
-        let key_to_check = body
-            .find('=')
-            .filter(|&i| i > 0)
-            .map(|i| body[..i].trim());
-
-        if let Some(k) = key_to_check {
-            if canonical.contains(k) {
-                removed.insert(k.to_string());
-                continue; // drop the line
-            }
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    // Preserve the original trailing-newline shape: if the input had
-    // none, drop the one we appended on the final iteration.
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    // If the input ended with no lines but a trailing newline, our loop
-    // produced no output — re-add the trailing newline for shape parity.
-    if text.ends_with('\n') && out.is_empty() {
-        out.push('\n');
-    }
-
-    (out, removed.into_iter().collect())
-}
-
 /// Pure helper: strip launcher-canonical keys from the `.claude/env`
-/// POSIX-export file. Same semantics as `strip_canonical_keys_from_env_text`
-/// but recognizes the `export KEY="value"` shape the env projection
-/// writes inside the managed block.
+/// POSIX-export file (the project `.env` strip is `vco_lib.env_template
+/// strip`, through the bridge, since v0.2.97). Recognizes the
+/// `export KEY="value"` shape the env projection writes inside the managed
+/// block.
 ///
 /// Recognized line shapes (after trim):
 ///   * `export KEY="value"`
@@ -4933,7 +4882,10 @@ pub(crate) fn strip_canonical_keys_from_env_text(text: &str) -> (String, Vec<Str
 ///   * `KEY=value` / `# KEY=value` (env-style fallback)
 ///
 /// MUST MATCH the line grammar of `vco_lib/envfile.py::parse_env_line`
-/// (see [`strip_canonical_keys_from_env_text`], review R4 F27).
+/// (a documented Rust mirror, review R4 F27): an optional `export `, a
+/// `KEY=` split on the first `=`, the key trimmed. This by-name strip also
+/// accepts a `#`-commented line, which the Python reader skips — deliberate:
+/// a commented canonical key is launcher residue too.
 ///
 /// All lines OUTSIDE the matched-key set are preserved verbatim, INCLUDING
 /// the `# vco-managed-begin` / `# vco-managed-end` marker lines (a tidy
@@ -4973,7 +4925,7 @@ pub(crate) fn strip_canonical_keys_from_claude_env_text(
         out.push('\n');
     }
 
-    // Preserve trailing-newline shape (see strip_canonical_keys_from_env_text).
+    // Preserve the input's trailing-newline shape.
     if !text.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
@@ -5066,24 +5018,22 @@ pub(crate) fn surgically_strip_env_surfaces_checked(
     let mut keys = std::collections::BTreeSet::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // 1. .env (root)
-    let env_path = folder.join(".env");
-    if env_path.exists() {
-        match std::fs::read_to_string(&env_path) {
-            Ok(text) => {
-                let (new_text, removed) = strip_canonical_keys_from_env_text(&text);
-                if !removed.is_empty() {
-                    if let Err(e) = std::fs::write(&env_path, new_text) {
-                        warnings.push(format!(
-                            "could not rewrite {}: {}", env_path.display(), e
-                        ));
-                    } else {
-                        for k in removed { keys.insert(k); }
-                    }
-                }
+    // 1. .env (root) — v0.2.97 (review R5 F40): through the ONE `.env`
+    // writer (`vco_lib.env_template strip`): VCO's managed block goes whole,
+    // plus the by-name keys outside it. This was a Rust read-modify-write the
+    // single-writer lint could not see, and it left the block's markers and
+    // comments behind.
+    if folder.join(".env").exists() {
+        let mut by_name: Vec<&str> = unregister_by_name_keys().into_iter().collect();
+        by_name.sort_unstable();
+        match crate::services::vco_lib_bridge::strip_project_env_keys(root, folder, &by_name) {
+            Ok(removed) => {
+                for k in removed { keys.insert(k); }
             }
             Err(e) => warnings.push(format!(
-                "could not read {} for env-key strip: {}", env_path.display(), e
+                "could not strip VCO's keys from {}: {}",
+                folder.join(".env").display(),
+                e
             )),
         }
     }
@@ -5465,6 +5415,8 @@ pub async fn delete_project_v2(
                 folder,
                 |f| surgically_strip_env_surfaces_checked(vco_root.as_deref(), f),
                 &mut report,
+                opts.leave_unremovable,
+                &crate::paths::vct_root_dir(),
             )?;
         } else {
             // Folder gone (user moved/deleted by hand). The DB delete is
@@ -6487,13 +6439,21 @@ mod tests {
 
     // ─── B12: stale KG_COLLECTION .env auto-repair (0.2.11) ─────────────
 
+    /// A scratch project folder whose `.env` holds `content`; returns the
+    /// `.env` path (its parent is the folder the repair takes).
     fn b12_tmp_env(content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "vct-b12-test-{}.env",
+        let dir = std::env::temp_dir().join(format!(
+            "vct-b12-test-{}",
             uuid::Uuid::new_v4().simple()
         ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    fn b12(env: &std::path::Path, name: &str) -> B12Outcome {
+        b12_repair_stale_kg_collection(None, env.parent().unwrap(), name).unwrap()
     }
 
     #[test]
@@ -6503,7 +6463,7 @@ mod tests {
              KG_COLLECTION=KnowledgeGraph\n\
              OLLAMA_URL=http://localhost:11435\n",
         );
-        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let out = b12(&env, "My Test");
         match out {
             B12Outcome::Repaired { canonical_kg } => {
                 assert_eq!(canonical_kg, "MyTest_KnowledgeGraph");
@@ -6528,7 +6488,7 @@ mod tests {
         // Pre-0.2.11 bug: .env carried "KG_COLLECTION=MyTest" instead of
         // "KG_COLLECTION=MyTest_KnowledgeGraph".
         let env = b12_tmp_env("KG_COLLECTION=MyTest\n");
-        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let out = b12(&env, "My Test");
         assert_eq!(
             out,
             B12Outcome::Repaired {
@@ -6545,8 +6505,8 @@ mod tests {
         // After repair, re-running must be a no-op (canonical line
         // already present).
         let env = b12_tmp_env("KG_COLLECTION=KnowledgeGraph\n");
-        let _ = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
-        let out2 = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let _ = b12(&env, "My Test");
+        let out2 = b12(&env, "My Test");
         assert_eq!(out2, B12Outcome::NoChangeNeeded);
         let _ = std::fs::remove_file(&env);
     }
@@ -6558,7 +6518,7 @@ mod tests {
              OTHER=value\n",
         );
         let before = std::fs::read_to_string(&env).unwrap();
-        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let out = b12(&env, "My Test");
         assert_eq!(out, B12Outcome::NoChangeNeeded);
         let after = std::fs::read_to_string(&env).unwrap();
         assert_eq!(before, after, "file must be untouched");
@@ -6569,7 +6529,7 @@ mod tests {
     fn b12_repair_no_change_when_no_kg_collection_line() {
         let env = b12_tmp_env("OLLAMA_URL=http://localhost:11435\n");
         let before = std::fs::read_to_string(&env).unwrap();
-        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let out = b12(&env, "My Test");
         assert_eq!(out, B12Outcome::NoChangeNeeded);
         let after = std::fs::read_to_string(&env).unwrap();
         assert_eq!(before, after);
@@ -6578,14 +6538,15 @@ mod tests {
 
     #[test]
     fn b12_repair_no_change_when_env_file_missing() {
-        let nonexistent = std::env::temp_dir().join(format!(
-            "vct-b12-missing-{}.env",
+        let folder = std::env::temp_dir().join(format!(
+            "vct-b12-missing-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let out = b12_repair_stale_kg_collection(&nonexistent, "My Test").unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        let out = b12_repair_stale_kg_collection(None, &folder, "My Test").unwrap();
         assert_eq!(out, B12Outcome::NoChangeNeeded);
         // No file created as a side effect.
-        assert!(!nonexistent.exists());
+        assert!(!folder.join(".env").exists());
     }
 
     #[test]
@@ -6598,7 +6559,7 @@ mod tests {
             "KG_COLLECTION=KnowledgeGraph\n\
              KG_COLLECTION=KnowledgeGraph\n",
         );
-        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let out = b12(&env, "My Test");
         assert!(matches!(out, B12Outcome::Repaired { .. }));
         let rewritten = std::fs::read_to_string(&env).unwrap();
         let canonical_count = rewritten.matches("KG_COLLECTION=MyTest_KnowledgeGraph").count();
@@ -6615,14 +6576,14 @@ mod tests {
     fn b12_repair_preserves_trailing_newline_presence() {
         // File ends without \n → rewritten file also ends without \n.
         let env = b12_tmp_env("KG_COLLECTION=KnowledgeGraph");
-        let _ = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let _ = b12(&env, "My Test");
         let rewritten = std::fs::read_to_string(&env).unwrap();
         assert!(!rewritten.ends_with('\n'), "no trailing newline added");
         let _ = std::fs::remove_file(&env);
 
         // File ends with \n → rewritten preserves trailing \n.
         let env2 = b12_tmp_env("KG_COLLECTION=KnowledgeGraph\n");
-        let _ = b12_repair_stale_kg_collection(&env2, "My Test").unwrap();
+        let _ = b12(&env2, "My Test");
         let rewritten2 = std::fs::read_to_string(&env2).unwrap();
         assert!(rewritten2.ends_with('\n'), "trailing newline preserved");
         let _ = std::fs::remove_file(&env2);
@@ -6790,7 +6751,7 @@ mod tests {
         };
         assert_eq!(active_kg(&after_apply), ["KG_COLLECTION=KnowledgeGraph"], "{after_apply}");
 
-        let outcome = b12_repair_stale_kg_collection(&env_path, "Acme").unwrap();
+        let outcome = b12_repair_stale_kg_collection(None, &folder, "Acme").unwrap();
         assert!(matches!(outcome, B12Outcome::Repaired { .. }));
         let repaired = std::fs::read_to_string(&env_path).unwrap();
         let kg = active_kg(&repaired);
@@ -8843,57 +8804,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strip_canonical_keys_from_env_text_keeps_user_keys() {
-        let input = "\
-# vibecoded-orchestrator per-project .env
-KG_COLLECTION=SomeProject_KnowledgeGraph
-USER_API_KEY=secret123
-PROJECT_NAME=SomeProject
-SOME_USER_VAR=hello
-# OLLAMA_URL=http://localhost:11435
-DEVELOPMENT_COLLECTION=SomeProject_Development
-ACTIVE_EMBEDDING=qwen3
-";
-        let (out, removed) = strip_canonical_keys_from_env_text(input);
-
-        // Canonical keys gone from the output text.
-        assert!(!out.contains("KG_COLLECTION="));
-        assert!(!out.contains("PROJECT_NAME="));
-        assert!(!out.contains("DEVELOPMENT_COLLECTION="));
-        assert!(!out.contains("ACTIVE_EMBEDDING="));
-        // Commented canonical also gone.
-        assert!(!out.contains("OLLAMA_URL="));
-
-        // User keys + comments preserved.
-        assert!(
-            out.contains("USER_API_KEY=secret123"),
-            "user secret was clobbered: {}", out,
-        );
-        assert!(out.contains("SOME_USER_VAR=hello"));
-        assert!(out.contains("# vibecoded-orchestrator per-project .env"));
-
-        // Returned `removed` is sorted + de-duped.
-        let removed_set: std::collections::HashSet<String> =
-            removed.iter().cloned().collect();
-        assert!(removed_set.contains("KG_COLLECTION"));
-        assert!(removed_set.contains("PROJECT_NAME"));
-        assert!(removed_set.contains("DEVELOPMENT_COLLECTION"));
-        assert!(removed_set.contains("ACTIVE_EMBEDDING"));
-        assert!(removed_set.contains("OLLAMA_URL"));
-    }
-
-    #[test]
-    fn strip_canonical_keys_from_env_text_idempotent() {
-        let input = "USER_KEY=value\n";
-        let (out1, removed1) = strip_canonical_keys_from_env_text(input);
-        assert_eq!(out1, input);
-        assert!(removed1.is_empty());
-
-        let (out2, removed2) = strip_canonical_keys_from_env_text(&out1);
-        assert_eq!(out2, out1);
-        assert!(removed2.is_empty());
-    }
+    // (The `.env` by-name strip tests moved with the strip to Python:
+    // `tests/test_v0297_project_env_single_writer.py` — v0.2.97 review R5 F40.)
 
     #[test]
     fn strip_canonical_keys_from_claude_env_text_handles_export_form() {
@@ -9216,7 +9128,7 @@ export MY_HELPER_TOKEN=\"keep-me\"
 
         // Simulate `delete_project_v2` with purge_launcher_files=false:
         // the helpers are never invoked. Verify state unchanged.
-        let opts = UnregisterOptions { purge_launcher_files: false, purge_collections: false };
+        let opts = UnregisterOptions { purge_launcher_files: false, purge_collections: false, leave_unremovable: false };
         assert!(!opts.purge_launcher_files);
 
         // (Don't call helpers.) State must be intact.

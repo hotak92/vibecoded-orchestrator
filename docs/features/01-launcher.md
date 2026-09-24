@@ -91,12 +91,12 @@ Catalog entries carry a `kind` field controlling how the card renders: `bundled`
 `coming_soon_tier` and `coming_soon_target` fields display the planned tier (e.g. `"pro"`) and shipping window (e.g. `"Q3 2026"`). Reserved for roadmap-committed items only.
 
 ### Bundled Core Manifests
-Six manifest JSON files under `launcher/bundled_manifests/` ship with the launcher binary and are copied to `~/.vct/bundled_manifests/` on first launch: `vct-kg`, `vct-codegraph`, `vct-search`, `vct-code-embedding`, `vct-hub-api`, `vct-session-state`. All free/AGPL-3.0, all auto-install on first run.
+Six manifest JSON files under `launcher/bundled_manifests/` are embedded in the launcher and hub binaries (`vct_launcher_core::bundled_manifests`) and written to `~/.vct/bundled_manifests/` on every launcher and hub start, so an update refreshes them: `vct-kg`, `vct-codegraph`, `vct-search`, `vct-code-embedding`, `vct-hub-api`, `vct-session-state`. All free/AGPL-3.0. They are installed for every project (the catalog's `bundled` kind): the hub's `/env` serves their settings and secrets with no per-project install row. CI validates each with the real parser (`manifest-validate.yml`), and so does `cargo test` (`every_bundled_manifest_parses_strictly`).
 
 <details>
 <summary>Details</summary>
 
-Manifests contain only metadata + install instructions (git_clone / pip / npm methods). Module binaries are NOT bundled — the launcher fetches them at install time. This keeps the launcher binary small. See `launcher/bundled_manifests/README.md`.
+Manifests contain metadata, settings and install instructions. The components themselves ship with the orchestrator (MCP servers, hooks, the hub); a bundled module's settings reach its consumer through the hub's `/env` — e.g. `vct-session-state`'s `CONTEXT_STATE_MAX_LINES` / `MEMORY_MAX_LINES`, which the `context-size-check` hook resolves (env var → `/env` via `.claude/scripts/vct_secrets_resolve.sh` → default). See `launcher/bundled_manifests/README.md`.
 
 </details>
 
